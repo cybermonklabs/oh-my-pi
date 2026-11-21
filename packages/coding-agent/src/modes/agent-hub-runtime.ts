@@ -10,22 +10,24 @@ import { IrcBus, type IrcBusApi } from "../irc/bus";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents, sessionFileBelongsToRoot } from "../registry/persisted-agents";
+import { applyEntryPatchesInWindow } from "../session/entry-patches";
 import { normalizeAssistantUsage, parseSessionEntries } from "../session/session-loader";
-import { defaultSessionStorage, readSessionTextFrom, type SessionStorage } from "../session/session-storage";
+import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../session/session-storage";
 
 /**
  * Transcript reads and parser used by local and host-backed transcript viewers.
  * Reads go through `storage()`, the session storage holding the transcripts:
  * under `session.storage: sql` a transcript is a row with no file behind it.
+ * Each read is a window of at most 8 MiB, which the viewer reads on from.
  */
 function transcriptSource(storage: () => SessionStorage): AgentTranscriptSource {
 	return {
 		stat: file => storage().statSync(file),
-		readFrom: async (file, offset) => (await readSessionTextFrom(storage(), file, offset)).text,
+		readFrom: async (file, offset) => (await readSessionLinesFrom(storage(), file, offset)).text,
 		parseEntries: text => {
-			const entries = parseSessionEntries(text).filter(
-				entry => entry.type === "message" || entry.type === "model_change",
-			);
+			const parsed = parseSessionEntries(text);
+			applyEntryPatchesInWindow(parsed);
+			const entries = parsed.filter(entry => entry.type === "message" || entry.type === "model_change");
 			for (const entry of entries) {
 				if (entry.type === "message" && entry.message.role === "assistant") normalizeAssistantUsage(entry.message);
 			}

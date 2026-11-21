@@ -3667,9 +3667,19 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const userPrompted = records.some(record =>
 			record.role === "user" ? record.attribution === "user" : record.role === "developer" && record.userInitiated,
 		);
+		// The relay below asks what this agent sent each waker during the turn
+		// once the turn's owned work has settled. The idle TTL can park the agent
+		// before then, and the bus forgets a parked agent's marks: without the
+		// hold the relay sends a waker the answer it already has, and revives it
+		// when it is parked.
+		const releaseSentMarks = IrcBus.global().holdSentMarks(id);
 		return async turnError => {
 			unsubscribeTurn();
 			unsubscribeParentSteer();
+			// The wake turn is this run, and its drive has ended, whatever the
+			// outcome: while the turn's end is processed below, the idle ref is
+			// not a subagent between two turns of a run a host can still reach.
+			AgentRegistry.global().markRunEnded(id, session);
 			const activeSession = turnMonitor.takeActiveSession();
 			if (activeSession) turnMonitor.captureSalvage(activeSession);
 			const lastAssistant = session.getLastAssistantMessage();
@@ -3839,6 +3849,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						error: relayError instanceof Error ? relayError.message : String(relayError),
 					});
 				} finally {
+					releaseSentMarks();
 					relay.resolve();
 				}
 			}
@@ -4178,6 +4189,10 @@ async function driveFollowUpTurn(
 		sessionFile,
 		index,
 	} as const;
+	// The ref still carries the previous run's milestones (its ended drive, its
+	// acceptance) until this run's first turn starts: drop them before the
+	// started frame lists the run, so a host can reach it in between.
+	AgentRegistry.global().startRun(id, session);
 	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 	monitor.setActiveSession(session);
@@ -4221,6 +4236,8 @@ async function driveFollowUpTurn(
 				AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
 			}
 		} finally {
+			// Every outcome ends the run's drive, a thrown one included.
+			AgentRegistry.global().markRunEnded(id, session);
 			try {
 				await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
 			} catch {
@@ -5611,15 +5628,23 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			// last report turn, or a `yield`) as the run's result. Only a kept-alive
 			// agent has wake turns left to answer held messages in.
 			if (options.keepAlive !== false) releaseIrcWakes = session.holdIrcWakes();
-			const outcome = await driveSessionToResult(session, monitor, task, {
-				solutionSpace: options.solutionSpace,
-				structured,
-			});
-			// Acceptance boundary (#11079): the run's final result is settled, so
-			// stamp the lifecycle and terminalize a ref the run-state mirror left
-			// `running` before the (possibly slow) cleanup below.
-			if (resultDelivered(outcome, monitor, structured)) {
-				AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
+			let outcome: DriveOutcome;
+			try {
+				outcome = await driveSessionToResult(session, monitor, task, {
+					solutionSpace: options.solutionSpace,
+					structured,
+				});
+				// Acceptance boundary (#11079): the run's final result is settled, so
+				// stamp the lifecycle and terminalize a ref the run-state mirror left
+				// `running` before the (possibly slow) cleanup below.
+				if (resultDelivered(outcome, monitor, structured)) {
+					AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
+				}
+			} finally {
+				// Every outcome ends the run's drive, a thrown one included: a failed
+				// or resumable run stays idle and holds its session through the
+				// cleanup below without being between two turns.
+				AgentRegistry.global().markRunEnded(id, session);
 			}
 			exitCode = outcome.exitCode;
 			error = outcome.error;
@@ -5702,6 +5727,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			}
 			const session = monitor.takeActiveSession();
 			if (session) {
+				// A run that threw in its setup, before the drive that stamps its end,
+				// ended there: stamped before the cleanup leaves the ref idle, so no host
+				// reaches a run that failed and is only being cleaned up.
+				if (readyAt === undefined) AgentRegistry.global().markRunEnded(id, session);
 				monitor.captureSalvage(session);
 				if (options.keepAlive !== false && (!preparedSession || readyAt !== undefined)) {
 					attachIrcWakeTurnMonitor(session, wakeOptions);

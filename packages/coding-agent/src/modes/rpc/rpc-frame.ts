@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { RpcChunkFrame } from "./rpc-types";
 
@@ -49,17 +50,64 @@ function isStructureHeavy(content: unknown): boolean {
 }
 
 /**
- * `JSON.stringify(frame)`, byte for byte. A streaming `message_update` aliases
- * one cumulative snapshot as both `message` and `assistantMessageEvent.partial`;
- * when that snapshot is structure-heavy it is serialized once and spliced into
- * both positions instead of being re-serialized per position on every token.
+ * `JSON.stringify(value)` of a frame or a part of one, also where it nests
+ * deeper than `JSON.stringify` recurses (`get_tree` nests each entry of a long
+ * session under its parent). Typed as `JSON.stringify` is: a frame is an
+ * object, which has JSON text.
+ */
+function frameJson(value: unknown): string {
+	return stringifyDeepJson(value) as string;
+}
+
+/**
+ * Tree depth, in entries, past which a `get_tree` answer is written by
+ * `stringifyJsonIteratively` instead of `JSON.stringify`: about 4,000 levels,
+ * since a node and its `children` each nest one. Bun's `JSON.stringify` slows
+ * with depth. Measured on chains of 1 KB messages, a chain of cold entries
+ * (whose large values are getters) took it 57 ms at 1,000 entries against
+ * the writer's 76 ms, 328 ms at 4,000 against 172 ms and 4.9 s at 12,000
+ * against 0.65 s. Whole entries stay faster natively up to about 12,000
+ * entries (145 ms against 0.83 s), then take it 4.9 s at 14,000 entries,
+ * against the writer's 1.0 s, and run it out of stack at 20,000, after 9.4 s.
+ */
+export const RPC_TREE_WRITER_DEPTH = 2_000;
+
+/** Whether `frame` answers `get_tree` with a tree deeper than {@link RPC_TREE_WRITER_DEPTH}; the walk stops at the first path past it. */
+function isDeepTreeAnswer(frame: Record<string, unknown>): boolean {
+	if (frame.type !== "response" || frame.command !== "get_tree" || !isRecord(frame.data)) return false;
+	const roots = frame.data.tree;
+	if (!Array.isArray(roots)) return false;
+	const nodes: unknown[] = [...roots];
+	const depths: number[] = roots.map(() => 1);
+	while (nodes.length > 0) {
+		const node = nodes.pop();
+		const depth = depths.pop()!;
+		if (depth > RPC_TREE_WRITER_DEPTH) return true;
+		if (!isRecord(node) || !Array.isArray(node.children)) continue;
+		for (const child of node.children) {
+			nodes.push(child);
+			depths.push(depth + 1);
+		}
+	}
+	return false;
+}
+
+/**
+ * `JSON.stringify(frame)`, byte for byte. A `get_tree` answer deeper than
+ * {@link RPC_TREE_WRITER_DEPTH} is written by the iterative writer. A
+ * streaming `message_update` aliases one cumulative snapshot as both `message`
+ * and `assistantMessageEvent.partial`; when that snapshot is structure-heavy
+ * it is serialized once and spliced into both positions instead of being
+ * re-serialized per position on every token.
  */
 function serializeFrame(frame: object): string {
+	// Typed as `frameJson`: a frame is an object, which has JSON text.
+	if (isRecord(frame) && isDeepTreeAnswer(frame)) return stringifyJsonIteratively(frame) as string;
 	if (isRecord(frame) && frame.type === "message_update" && isRecord(frame.message)) {
 		const event = frame.assistantMessageEvent;
 		if (isRecord(event) && event.partial === frame.message && isStructureHeavy(frame.message.content)) {
-			const messageJson = JSON.stringify(frame.message);
-			const skeleton = JSON.stringify({
+			const messageJson = frameJson(frame.message);
+			const skeleton = frameJson({
 				...frame,
 				message: SHARED_MESSAGE_PLACEHOLDER,
 				assistantMessageEvent: { ...event, partial: SHARED_MESSAGE_PLACEHOLDER },
@@ -67,7 +115,7 @@ function serializeFrame(frame: object): string {
 			return skeleton.split(SHARED_MESSAGE_PLACEHOLDER_JSON).join(messageJson);
 		}
 	}
-	return JSON.stringify(frame);
+	return frameJson(frame);
 }
 
 interface PendingRpcChunks {
@@ -133,7 +181,7 @@ function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
 }
 
 function jsonSnapshot(value: unknown): unknown {
-	const json = JSON.stringify(value);
+	const json = stringifyDeepJson(value);
 	return json === undefined ? undefined : JSON.parse(json);
 }
 
@@ -153,7 +201,7 @@ function encodedMessageSnapshot(encoded: string): { message: unknown } | undefin
 function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): Generator<string> {
 	const byteLength = Buffer.byteLength(json, "utf8");
 	if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
-		yield `${JSON.stringify(overflowFrame(frame))}\n`;
+		yield `${frameJson(overflowFrame(frame))}\n`;
 		return;
 	}
 	const bytes = Buffer.from(json, "utf8");
@@ -169,7 +217,7 @@ function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): 
 				.subarray(index * RPC_CHUNK_PAYLOAD_BYTES, (index + 1) * RPC_CHUNK_PAYLOAD_BYTES)
 				.toString("base64"),
 		};
-		const line = `${JSON.stringify(chunk)}\n`;
+		const line = `${frameJson(chunk)}\n`;
 		if (serializedFrameBytes(line.slice(0, -1)) > MAX_RPC_FRAME_BYTES)
 			throw new Error("RPC chunk exceeded the transport limit");
 		yield line;
@@ -307,19 +355,19 @@ function encodeRpcFrameFromJson(
 ): string {
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 	if (isRecord(frame) && frame.type === "response") {
-		return `${JSON.stringify(overflowFrame(frame))}\n`;
+		return `${frameJson(overflowFrame(frame))}\n`;
 	}
 
 	const compacted = compactTerminalFrame(frame, streamedMessageCount, streamedMessages);
-	json = JSON.stringify(compacted);
+	json = frameJson(compacted);
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 
 	for (const pass of SHRINK_PASSES) {
-		json = JSON.stringify(shrinkValue(compacted, pass));
+		json = frameJson(shrinkValue(compacted, pass));
 		if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 	}
 
-	return `${JSON.stringify(overflowFrame(compacted))}\n`;
+	return `${frameJson(overflowFrame(compacted))}\n`;
 }
 
 /** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
@@ -360,7 +408,7 @@ export class RpcFrameEncoder {
 		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
 			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
 			// Reuse the original serialization when compaction was a no-op.
-			const compactedJson = compacted === frame ? json : JSON.stringify(compacted);
+			const compactedJson = compacted === frame ? json : frameJson(compacted);
 			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
 				frames = encodeChunkedRpcFrames(compacted, compactedJson, `rpc-${++this.#chunkCounter}`);
 			} else {

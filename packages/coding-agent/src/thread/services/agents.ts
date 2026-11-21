@@ -236,6 +236,7 @@ function serveBridge(): RpcServe<MainSessionBridge, SessionBridgeProtocol> {
 			bridge.forward(listener, forward => session.subscribeRunState(forward)),
 		prompt: (_bridge, session, text, options) => session.prompt(text, options),
 		steer: (_bridge, session, text, images, options) => session.steer(text, images, options),
+		removeQueuedMessage: (_bridge, session, target, queue) => session.removeQueuedMessage(target, queue),
 		abort: (_bridge, session, options) => session.abort(options),
 		dispose: (_bridge, session, options) => session.dispose(options),
 		deliverIrcMessage: (_bridge, session, msg) => session.deliverIrcMessage(msg),
@@ -253,6 +254,8 @@ function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, Agent
 		setHistory: (registry, id, history, expectedSessionFile) => registry.setHistory(id, history, expectedSessionFile),
 		setStatus: (registry, id, status, expected) => registry.setStatus(id, status, expected),
 		markResultAccepted: (registry, id, expected, responseAt) => registry.markResultAccepted(id, expected, responseAt),
+		markRunEnded: (registry, id, expected) => registry.markRunEnded(id, expected),
+		startRun: (registry, id, expected) => registry.startRun(id, expected),
 		staleAcceptedRuns: registry => registry.staleAcceptedRuns(),
 		setActivity: (registry, id, activity) => registry.setActivity(id, activity),
 		attachSession: (registry, id, session, sessionFile, expected) =>
@@ -306,6 +309,9 @@ function serveBus(bridge: MainSessionBridge): RpcServe<IrcBus, IrcBusProtocol> {
 		take: (bus, agentId, from) => bus.take(agentId, from),
 		unreadCount: (bus, agentId) => bus.unreadCount(agentId),
 		recordReply: (bus, from, to) => bus.recordReply(from, to),
+		forgetAgent: (bus, agentId) => bus.forgetAgent(agentId),
+		// A hold a dead worker took must not keep its agent's marks for the rest of the session.
+		holdSentMarks: (bus, agentId) => bridge.track(bus.holdSentMarks(agentId)),
 	};
 }
 

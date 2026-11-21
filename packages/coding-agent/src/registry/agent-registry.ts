@@ -40,6 +40,12 @@ export interface AgentRunLifecycle {
 	acceptedAt?: number;
 	/** When the ref last left `running` for a terminal status. */
 	terminalAt?: number;
+	/**
+	 * When the run's drive ended, with or without a result (a failure, an
+	 * aborted run kept for resuming): the run takes no further turn of its own,
+	 * though its cleanup may still hold the session until its terminal frame.
+	 */
+	endedAt?: number;
 }
 
 /** Historical identity and telemetry that remain available after the live session is disposed. */
@@ -107,6 +113,11 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 export function isResumable(ref: AgentRef | undefined): boolean {
 	if (ref?.status === "idle") return true;
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
+
+/** Whether `ref` is a live agent: `running` or `idle`. */
+export function isLive(ref: AgentRef | undefined): boolean {
+	return ref?.status === "running" || ref?.status === "idle";
 }
 
 /** {@link agentAncestors}' ids one at a time: `registry` is read only once every recorded one is passed. */
@@ -190,6 +201,10 @@ export interface AgentRegistryApi {
 	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean;
 	/** Record that the current run handed over its final result. */
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
+	/** Record that the current run's drive ended, whatever its outcome. */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean;
+	/** Start a new run on an existing ref: drop the previous run's milestones. */
+	startRun(id: string, expected?: AgentRefExpectation): boolean;
 	/** Accepted-but-running refs whose run already finished. */
 	staleAcceptedRuns(): AgentRef[];
 	/** Record a short activity gist for the work-aware roster. */
@@ -434,6 +449,43 @@ export class AgentRegistry implements AgentRegistryApi {
 	}
 
 	/**
+	 * Stamp `lifecycle.endedAt`: the current run's drive ended, whatever its
+	 * outcome, so the ref takes no further turn for this run even while its
+	 * cleanup still holds the session. Run-scoped like the other milestones:
+	 * {@link setStatus} clears it when the ref re-enters `running`, and
+	 * {@link startRun} when the next run starts before its first turn does.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		ref.lifecycle = { ...ref.lifecycle, endedAt: Date.now() };
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/**
+	 * Start a new run (a follow-up turn) on an existing ref: drop the previous
+	 * run's milestones (its acceptance, its ended drive), as re-entering
+	 * `running` does, but without a status change. The run announces itself
+	 * before its first turn starts; between those, the idle ref must read as this
+	 * run's, not as the previous run that ended or was accepted.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	startRun(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		if (ref.lifecycle === undefined) return true;
+		ref.lifecycle = undefined;
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/**
 	 * Accepted-but-running refs: the run's final result was handed over but the
 	 * ref never left `running`, and no turn is in flight. This is the lifecycle
 	 * leak the `proc://` running-agents roster reports so the parent can cancel it
@@ -550,9 +602,7 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * Flat namespace: every other agent is visible.
 	 */
 	listVisibleTo(id: string): AgentRef[] {
-		return this.list().filter(
-			ref => ref.id !== id && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"),
-		);
+		return this.list().filter(ref => ref.id !== id && ref.kind !== "advisor" && isLive(ref));
 	}
 
 	/** Whether a ref's claimed running state is corroborated by its attached live session. */

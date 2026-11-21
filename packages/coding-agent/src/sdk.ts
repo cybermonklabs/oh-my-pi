@@ -5880,11 +5880,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						// The teardown stops the workers' turns and their own jobs: a vibe turn the
 						// parent's teardown interrupts is not resumed (`docs/vibe-mode.md`).
 						try {
-							await vibeRegistry.suspendScope(
-								vibeRegistry.ownerScope(vibeParentSession),
-								scopedAsyncJobManager,
-								"stop",
-							);
+							await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
 						} catch (error) {
 							logger.warn("Session dispose: suspending vibe workers failed", { error: String(error) });
 						}

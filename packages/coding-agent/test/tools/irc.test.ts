@@ -5,7 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus, type IrcBusApi } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { executeSend } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
@@ -521,6 +521,384 @@ describe("IRC", () => {
 			expect(receipt).toEqual({ to: "0-Parked", outcome: "failed", error: "revive exploded" });
 			// Failed revival never enqueues: the message is lost, not buffered.
 			expect(bus.take("0-Parked")).toBeUndefined();
+		});
+
+		describe("forgetting an agent's send marks", () => {
+			const managers: AsyncJobManager[] = [];
+			afterEach(async () => {
+				for (const manager of managers.splice(0)) await manager.dispose();
+			});
+
+			/** Registers live fake agents, `0-Main` and the others as its subagents; each starts `running`. */
+			function registerAgents(...ids: string[]): void {
+				for (const id of ids) {
+					const session = makeFakeSession().session;
+					session.dispose = (async () => {}) as AgentSession["dispose"];
+					const parentId = id === "0-Main" ? undefined : "0-Main";
+					registry.register({ id, displayName: id, kind: parentId ? "sub" : "main", parentId, session });
+				}
+			}
+
+			/** Makes each delivery to the registered agent `id` run `during` before it resolves, as a park or release racing the send. */
+			function raceDelivery(id: string, during: () => void): void {
+				const session = registry.get(id)?.session;
+				if (!session) throw new Error(`${id} has no session`);
+				session.deliverIrcMessage = async () => {
+					during();
+					return "injected";
+				};
+			}
+
+			function jobManager(): AsyncJobManager {
+				const manager = new AsyncJobManager({});
+				manager.registerDeliverySink("0-Main", () => {});
+				managers.push(manager);
+				return manager;
+			}
+
+			/** A task job of `0-Sub` owned by `0-Main`; `finish` ends the run (a registered agent goes idle) and settles the job. */
+			function startSubJob(manager: AsyncJobManager): { finish: () => Promise<void> } {
+				const run = Promise.withResolvers<string>();
+				const id = manager.register("task", "0-Sub", async () => run.promise, {
+					id: "0-Sub",
+					agentId: "0-Sub",
+					ownerId: "0-Main",
+				});
+				return {
+					finish: async () => {
+						const settled = manager.getJob(id)?.promise;
+						if (registry.get("0-Sub")) registry.setStatus("0-Sub", "idle");
+						run.resolve("done");
+						await settled;
+					},
+				};
+			}
+
+			/** `0-Peer` wakes `0-Sub` for a turn that runs no job of its own, and `0-Sub` answers it. */
+			async function peerWakeTurn(): Promise<number> {
+				const turnStartTime = Date.now();
+				registry.setStatus("0-Sub", "running");
+				await bus.send({ from: "0-Peer", to: "0-Sub", body: "is auth.ts yours?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "yes, leave it to me" });
+				return turnStartTime;
+			}
+
+			// Regressed: a session keeps IRC state for every finished subagent the registry does not know.
+			it("forgets an agent the registry does not know once its last job is evicted", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await job.finish();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: evicting one finished job drops the marks a still-registered job of the
+			// same agent relies on.
+			it("keeps the marks while another job of the same agent is registered", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const first = startSubJob(manager);
+				const second = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await first.finish();
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				await second.finish();
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+			});
+
+			// Regressed: a session torn down with finished subagent jobs still listed keeps their IRC state.
+			it("forgets the agents of the jobs a disposed manager still held", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = new AsyncJobManager({});
+				manager.registerDeliverySink("0-Main", () => {});
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await job.finish();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				await manager.dispose();
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+			});
+
+			// Regressed: a subagent answers the peer that woke it, its earlier job is evicted after the
+			// turn went idle, and the wake relay sends the peer that answer a second time; or a parked
+			// subagent keeps its own IRC state, or its owner's question outlives the answer to it.
+			it("keeps an idle agent's marks when its last job is evicted; once it parks, drops its own and the direct marks on both sides, and keeps a live sender's sent marks", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await job.finish();
+				const turnStartTime = await peerWakeTurn();
+				// The turn settles idle before the wake relay asks whether it already answered the peer.
+				registry.setStatus("0-Sub", "idle");
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", turnStartTime)).toBe(true);
+
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0 });
+				await lifecycle.park("0-Sub");
+
+				expect(registry.get("0-Sub")?.status).toBe("parked");
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the parked agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+				expect(bus.unansweredSends("0-Peer", 0)).toEqual([]);
+			});
+
+			// Regressed: the eviction of a subagent's earlier job drops the marks of the turn it is running.
+			it("keeps a running agent's marks when its last job is evicted", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await job.finish();
+				const turnStartTime = await peerWakeTurn();
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+
+				expect(bus.sentSince("0-Sub", "0-Peer", turnStartTime)).toBe(true);
+			});
+
+			// Regressed: an owner waiting on a subagent across its park misses its reply, or a question
+			// to the revived subagent is never counted as owed.
+			it("ends the owner's open wait on the revived agent's reply, and a later question records fresh marks", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				const waiting = bus.wait("0-Main", { from: "0-Sub" }, 0);
+				await job.finish();
+				const revived = makeFakeSession();
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => revived.session });
+				await lifecycle.park("0-Sub");
+				// The live owner keeps its mark of what it sent the parked agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+
+				const question = await bus.send({ from: "0-Main", to: "0-Sub", body: "and the second word?" });
+				expect(question.outcome).toBe("revived");
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([
+					{ to: "0-Sub", sentAt: expect.any(Number), promised: false },
+				]);
+				await bus.send({ from: "0-Sub", to: "0-Main", body: "vermilion" });
+				expect((await waiting)?.body).toBe("vermilion");
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a released subagent keeps its IRC state for the rest of the session.
+			it("forgets an agent once it is released", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+
+				expect(await AgentLifecycleManager.global().release("0-Sub")).toBe(true);
+
+				expect(registry.get("0-Sub")).toBeUndefined();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the released agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+			});
+
+			// Regressed: a killed subagent keeps its IRC state for the rest of the session.
+			it("forgets an agent once it is killed", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+
+				expect(await AgentLifecycleManager.global().release("0-Sub", undefined, { tombstone: true })).toBe(true);
+
+				expect(registry.get("0-Sub")?.status).toBe("aborted");
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the killed agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+			});
+
+			// Regressed: a subagent parked while a message to it is delivered keeps that message's
+			// direct mark, and its owner's wait counts the parked agent as owing a reply.
+			it("records no direct mark for a recipient parked during the delivery, and keeps the live sender's sent mark", async () => {
+				registerAgents("0-Main", "0-Sub");
+				raceDelivery("0-Sub", () => {
+					registry.detachSession("0-Sub");
+					registry.setStatus("0-Sub", "parked");
+				});
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("injected");
+
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a subagent released while a message to it is delivered keeps that message's
+			// direct mark for the rest of the session.
+			it("records no direct mark for a recipient removed during the delivery, and keeps the live sender's sent mark", async () => {
+				registerAgents("0-Main", "0-Sub");
+				raceDelivery("0-Sub", () => registry.unregister("0-Sub"));
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("injected");
+
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a subagent killed while its own message is delivered keeps that message's
+			// mark for the rest of the session.
+			it("records no mark from a sender killed during the delivery", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				raceDelivery("0-Peer", () => {
+					registry.detachSession("0-Sub");
+					registry.setStatus("0-Sub", "aborted");
+				});
+
+				const receipt = await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: a question that revives a parked subagent is not counted as owed, so its
+			// owner's wait does not block for the answer.
+			it("keeps the mark for a recipient the delivery revived", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => makeFakeSession().session });
+				await lifecycle.park("0-Sub");
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("revived");
+
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([
+					{ to: "0-Sub", sentAt: expect.any(Number), promised: false },
+				]);
+			});
+
+			// Regressed: a subagent parked while its own `irc wait` is pending keeps that wait for the
+			// rest of the session, and the wait never returns.
+			it("ends a pending wait of an agent once it is parked", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const waiting = bus.wait("0-Sub", { from: "0-Main" }, 0);
+
+				registry.detachSession("0-Sub");
+				registry.setStatus("0-Sub", "parked");
+
+				// The park settles the wait at once; `Bun.sleep(0)` runs after every pending microtask, so
+				// "still waiting" wins only when the wait was left open.
+				expect(await Promise.race([waiting, Bun.sleep(0).then(() => "still waiting")])).toBeNull();
+			});
+
+			// Regressed: a subagent released while a message to it fails to hand off keeps that message
+			// buffered for the rest of the session, or its owner's wait counts it as owing a reply.
+			it("buffers no message for a recipient removed during its failed hand-off", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const session = registry.get("0-Sub")?.session;
+				if (!session) throw new Error("0-Sub has no session");
+				session.deliverIrcMessage = async () => {
+					registry.unregister("0-Sub");
+					throw new Error("Recipient session is disposed.");
+				};
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("failed");
+
+				expect(bus.unreadCount("0-Sub")).toBe(0);
+				expect(bus.take("0-Sub")).toBeUndefined();
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a subagent whose last job is evicted, or whose job manager is disposed, while its
+			// message to a peer is still being delivered keeps that message's mark for the rest of the
+			// session, and the peer's answer counts as a reply to an agent that is gone.
+			it.each([
+				{
+					when: "evicts its last job",
+					end: async (manager: AsyncJobManager) => {
+						manager.evictCompletedJobs();
+					},
+				},
+				{
+					when: "is disposed",
+					end: async (manager: AsyncJobManager) => {
+						await manager.dispose();
+					},
+				},
+			])("records no mark from an agent whose job manager $when during the delivery", async ({ end }) => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await job.finish();
+				const peer = registry.get("0-Peer")?.session;
+				if (!peer) throw new Error("0-Peer has no session");
+				peer.deliverIrcMessage = async () => {
+					await end(manager);
+					return "injected";
+				};
+
+				const receipt = await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(manager.getAllJobs()).toEqual([]);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: a message to a transcript's name, which the lifecycle hands to the agent now
+			// running that transcript, kept its direct mark when that agent parked during the delivery,
+			// and its owner's wait counted the parked agent as owing a reply. The live sender keeps only
+			// what forgetAgent keeps: its sent mark, which its wake-turn relay asks. Only a lifecycle that resolves a name
+			// to another agent (`ensureLiveTarget`) readdresses a message.
+			it.skipIf(!("ensureLiveTarget" in AgentLifecycleManager.prototype))(
+				"records no direct mark for the agent a readdressed message reached and that parked during the delivery",
+				async () => {
+					registerAgents("0-Main", "0-Running");
+					registry.register({
+						id: "0-Transcript",
+						displayName: "0-Transcript",
+						kind: "sub",
+						parentId: "0-Main",
+						session: null,
+						status: "parked",
+					});
+					const running = registry.get("0-Running")?.session;
+					if (!running) throw new Error("0-Running has no session");
+					running.deliverIrcMessage = async () => {
+						registry.detachSession("0-Running");
+						registry.setStatus("0-Running", "parked");
+						return "injected";
+					};
+					const lifecycle = {
+						manages: () => true,
+						isParking: () => false,
+						has: (id: string) => id === "0-Transcript",
+						ensureLive: async () => running,
+						ensureLiveTarget: async () => ({ session: running, agentId: "0-Running", revived: false }),
+					} as unknown as AgentLifecycleApi;
+					const readdressing = new IrcBus(registry, lifecycle);
+
+					const receipt = await readdressing.send({ from: "0-Main", to: "0-Transcript", body: "which codeword?" });
+					expect(receipt).toMatchObject({ to: "0-Running", outcome: "injected" });
+
+					expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(true);
+					expect(readdressing.unansweredSends("0-Main", 0)).toEqual([]);
+				},
+			);
 		});
 	});
 

@@ -272,7 +272,7 @@ import {
 } from "../tools/resolve";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { supportsExternalThinking } from "../tools/think";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "./session-entries";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { currentThreadId, isMainThread } from "../thread/identity";
@@ -334,6 +334,7 @@ import type {
 	OwnedJobsEnd,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResetSessionContextResult,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
@@ -392,6 +393,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
+import { approvedPlanFileOf } from "./cold-message";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
@@ -523,6 +525,7 @@ import {
 	copySessionArtifacts,
 	extractSessionInit,
 	type PersistedSessionInit,
+	type SessionContextBuildOptions,
 	type SessionManager,
 } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -703,6 +706,20 @@ export class SessionBusyError extends Error {
 	constructor(action: string) {
 		super(`Cannot ${action} while session maintenance or user work is still running`);
 		this.name = "SessionBusyError";
+	}
+}
+
+/**
+ * Call back the sender of a steer ({@link SteerOptions.onTaken}, the `onHeld`
+ * of {@link PromptOptions.idleSteer}). A sender on another thread answers with
+ * a Promise nobody awaits; a failure is logged as `label`, never thrown into the run.
+ */
+function callSteerSender(callback: () => void, label: string): void {
+	try {
+		const result = callback() as unknown;
+		if (isPromise(result)) result.catch(err => logger.warn(`${label} rejected`, { error: String(err) }));
+	} catch (err) {
+		logger.warn(`${label} threw`, { error: String(err) });
 	}
 }
 
@@ -1152,6 +1169,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * command.
 	 */
 	readonly #queuedMessageRawText = new WeakMap<AgentMessage, string>();
+	/** {@link SteerOptions.queueId} of a queued steer, for a take-back of exactly that message. */
+	readonly #queuedMessageIds = new WeakMap<AgentMessage, string>();
+	/** {@link SteerOptions.onTaken} of a queued steer, called when a run emits that message. */
+	readonly #queuedMessageTaken = new WeakMap<AgentMessage, () => void>();
 
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
@@ -1389,6 +1410,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** In-flight vision descriptions that gate prompt admission; abort() cancels them. */
 	#imageDescriptionAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
+	/**
+	 * Next-run steers (`SteerOptions.holdUntilNextRun`): they wait on the steering
+	 * queue until a run's steering poll takes them, and no queued-message drain
+	 * starts a turn for them alone.
+	 */
+	#nextRunSteers = new WeakSet<AgentMessage>();
 	#modeExitDrainSuppressionDepth = 0;
 	#usagePreflightReadyForNextModelCall = false;
 	#usagePreflightReadyModel: Model | undefined;
@@ -1900,9 +1927,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// strand at the turn tail (steered past the loop's final boundary poll). While
 		// that interrupt's suppression is still in effect, reclaim such advisor steers
 		// as visible advice once idle — mirroring abort's #extractInterruptedQueuedMessages —
-		// so they neither auto-resume the run the user stopped (a non-empty steer queue
-		// otherwise bypasses the latch in #canAutoContinueForFollowUp) nor linger to
-		// flush at the next prompt. Real user steers/follow-ups are left untouched.
+		// so they neither auto-resume the run the user stopped (a queued steer that is
+		// not a next-run steer otherwise bypasses the latch in #canAutoContinueForFollowUp)
+		// nor linger to flush at the next prompt. Real user steers/follow-ups are left untouched.
 		if (this.#advisors.autoResumeSuppressed && !this.isStreaming) {
 			for (const card of this.#extractQueuedAdvisorCards()) {
 				this.#preserveAdvisorCard(card);
@@ -1914,8 +1941,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** IRC records that arrive after the loop's final aside poll — or while an abort skipped that
 	 *  poll — land in pending IRC queues with no loop left to drain them; the queued-message drain's
-	 *  gate (agent.hasQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn so
-	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
+	 *  gate (#hasDrainableQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn
+	 *  so the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
 	#resumeStrandedIrcAsides(): void {
 		// One bracket over every exit, drain or not. Each guard below leaves the records somewhere
@@ -1950,7 +1977,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// represent one after its client turn ended. Leave the records queued, as the aside branches
 			// of #dispatchCustomMessage do; the client's next turn takes them at its first aside poll.
 			if (this.#acpDefersAgentInitiatedTurns()) return;
-			if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
+			if (this.#canAutoContinueForFollowUp() && this.#hasDrainableQueuedMessages()) return;
 			// Parked wake records resume alongside ordinary stranded asides; they were
 			// already decided wake-intended at deferral time. From the drain until the release the
 			// records are in no queue, so only this bracket can see what they still owe.
@@ -2515,7 +2542,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			canDrain &&
 			!this.#queuedMessageDrainBlocked &&
 			this.#canAutoContinueForFollowUp() &&
-			this.agent.hasQueuedMessages();
+			this.#hasDrainableQueuedMessages();
 		const ircContinuation = this.#ircContinuationWillFollow();
 		const emitted = queuedContinuation || ircContinuation ? { ...pending, isTerminal: false } : pending;
 		// A queued steer or follow-up runs on its own and settles with its own end; only the IRC
@@ -2717,12 +2744,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
-		// Only a recorded approval may turn a draft file into an execution reference.
+		// Only a recorded approval may turn a draft file into an execution reference. An older mode
+		// change names its approved plan file from memory, as goal mode records one every turn.
 		for (const entry of this.sessionManager.getBranch().reverse()) {
 			if (entry.type !== "mode_change") continue;
 			if (entry.mode === "plan" || entry.mode === "plan_paused") break;
-			if (typeof entry.data?.approvedPlanFilePath === "string") {
-				this.#planReferencePath = entry.data.approvedPlanFilePath;
+			const approvedPlanFile = approvedPlanFileOf(entry);
+			if (approvedPlanFile !== null) {
+				this.#planReferencePath = approvedPlanFile;
 				this.#planReferenceApproved = true;
 				break;
 			}
@@ -2916,6 +2945,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			configWarnings: this.configWarnings,
 			model: () => this.model,
 			contextFitsModel: (model, excludedMessage) => this.#maintenance.contextFitsModel(model, excludedMessage),
+			getContextUsage: () => this.getContextUsage(),
 			textOutputCommitted: () => this.#textOutputCommitted,
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
@@ -3391,9 +3421,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			},
 		});
-		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
-			this.#recordSessionExit(reason);
-		});
+		// A signal exit waits, within the cleanup deadline, for the record to reach the store.
+		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason =>
+			this.#recordSessionExit(reason),
+		);
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
 			const sessionId = this.sessionManager.getSessionId();
 			// `--resume <id>` fails on a session that never reached disk (issue #8860), or whose
@@ -3525,12 +3556,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
+			hasDrainableQueuedMessages: () => this.#hasDrainableQueuedMessages(),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
-			buildDisplaySessionContext: model => this.buildDisplaySessionContext(model),
+			buildDisplaySessionContext: (model, options) => this.buildDisplaySessionContext(model, options),
 			replaceMessagesFromSessionContext: messages => this.replaceMessagesFromSessionContext(messages),
 			persistEvalStateContext: () => {
 				// The rewritten history carries no snapshot yet, so always build one.
@@ -4525,10 +4557,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
 	}
 
-	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
+	/**
+	 * Append the exit record and flush it. On a storage that only queues the
+	 * publish (SQL), the returned promise settles once the store has the record,
+	 * and only then is it logged as recorded.
+	 */
+	#recordSessionExit(reason: postmortem.Reason | "dispose"): Promise<void> | undefined {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
-		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
+		// A pending call is always in the interrupted tail, after the cut: older bodies stay unread.
+		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranchFromCut());
 		if (
 			pendingToolCalls.length === 0 &&
 			!this.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")
@@ -4549,9 +4587,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			recordedAt: new Date().toISOString(),
 		};
 		if (pendingToolCalls.length > 0) data.pendingToolCalls = pendingToolCalls;
-		try {
-			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
-			this.sessionManager.flushSync();
+		const recorded = (): void => {
 			// Only pending tool calls or an abnormal teardown are noteworthy; a
 			// clean dispose logs at debug so routine exits don't read as problems.
 			const exitLog = pendingToolCalls.length > 0 || kind !== "normal" ? logger.warn : logger.debug;
@@ -4562,13 +4598,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				kind,
 				pendingToolCalls: pendingToolCalls.length,
 			});
-		} catch (error) {
+		};
+		const failed = (error: unknown): void => {
 			logger.error("Failed to record session exit", {
 				sessionId: this.sessionManager.getSessionId(),
 				sessionFile: this.sessionManager.getSessionFile(),
 				reason,
 				error: error instanceof Error ? error.message : String(error),
 			});
+		};
+		try {
+			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
+			const stored = this.sessionManager.flushSyncThenConfirm();
+			if (stored) return stored.then(recorded, failed);
+			recorded();
+		} catch (error) {
+			failed(error);
 		}
 	}
 
@@ -5253,6 +5298,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end" && event.message.role === "toolResult") {
 			this.#todo.onToolResult(event.message.toolName, event.message.isError);
 		}
+		// A run took a queued steer into its context: tell its sender, by the
+		// message's identity, before any await below can reorder it.
+		if (event.type === "message_end" && event.message.role === "user") {
+			this.#reportQueuedMessageTaken(event.message);
+		}
 		// Track the settled assistant turn synchronously as well: agent_end
 		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
 		// land in one tick its handler can run before this handler's post-emit
@@ -5915,6 +5965,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				maintenanceRoute("malformed-function-call-handled");
 				await emitAgentEndNotification({ willContinue: true });
 				return;
+			} else if (!requestBodyTimeoutTerminal && this.#recovery.isCommittedTextRateLimit(msg)) {
+				// A rate limit after text rendered: the turn cannot be sent again, so wait
+				// it out on this model and continue the answer from where it stopped.
+				const didRetry = await this.#recovery.handleRetryableError(msg, { continueCommittedText: true });
+				if (didRetry) {
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
 			} else if (!requestBodyTimeoutTerminal && this.#recovery.handleCommittedTextStreamStall(msg)) {
 				// The stream died after text rendered: replay would duplicate it and
 				// a trailing assistant prefill is rejected, so keep the partial turn
@@ -6285,12 +6343,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		suppressContinuation: boolean;
 	}): boolean {
 		if (options.suppressContinuation) return false;
-		if (this.agent.hasQueuedMessages()) {
+		if (this.#hasDrainableQueuedMessages()) {
 			this.#scheduleAgentContinue({
 				source: "compaction-queued-message",
 				delayMs: 100,
 				generation: options.generation,
-				shouldContinue: () => this.agent.hasQueuedMessages(),
+				shouldContinue: () => this.#hasDrainableQueuedMessages(),
 			});
 			return true;
 		}
@@ -6329,11 +6387,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			async signal => {
 				await Promise.resolve();
 				if (signal.aborted) return;
-				if (this.agent.hasQueuedMessages()) {
+				if (this.#hasDrainableQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						source: "auto-continue-queued-message",
 						generation,
-						shouldContinue: () => this.agent.hasQueuedMessages(),
+						shouldContinue: () => this.#hasDrainableQueuedMessages(),
 					});
 					return;
 				}
@@ -7505,7 +7563,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#cacheWarmer.onRefreshEnd = undefined;
 			this.#cacheWarmer.cancel();
 		}
-		this.#recordSessionExit(options.reason ?? "dispose");
+		// The store confirms it by the time the close below has drained the writes.
+		void this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
 		this.#cancelFatalRecoveryHint?.();
@@ -8598,8 +8657,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#providerBoundary.getImageAttachments();
 	}
 
-	buildDisplaySessionContext(model = this.model): SessionContext {
-		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+	/** The stored context as `model` reads it; `measureOnly` for a build that does not become the agent's context. */
+	buildDisplaySessionContext(
+		model = this.model,
+		options?: Pick<SessionContextBuildOptions, "measureOnly">,
+	): SessionContext {
+		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model, options));
 	}
 
 	/** Snapshots a rebuild appended that no session entry records yet. */
@@ -9379,8 +9442,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * A prompt dropped before dispatch also resolves `true` (RPC reports it as
 	 * aborted once no run started); pass `throwOnDrop: true` to reject with
 	 * {@link PromptDroppedError} instead.
+	 *
+	 * A steer with {@link PromptOptions.idleSteer} that finds the session idle
+	 * starts no turn: it is held for the next run, as {@link steer} with
+	 * `holdUntilNextRun` holds it, and resolves `true`.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const idleSteer = options?.streamingBehavior === "steer" && !this.isStreaming ? options.idleSteer : undefined;
+		if (idleSteer) {
+			await this.steer(text, options?.images, {
+				attribution: options?.attribution,
+				holdUntilNextRun: true,
+				queueId: idleSteer.queueId,
+				onTaken: idleSteer.onTaken,
+				onPromptQueued: queued => {
+					options?.onPromptQueued?.(queued);
+					options?.onPromptAdmitted?.();
+					callSteerSender(idleSteer.onHeld, "Held steer callback");
+				},
+			});
+			return true;
+		}
 		return this.#admitSubmission(() => this.#prompt(text, options));
 	}
 
@@ -9585,8 +9667,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 
-		// If streaming, queue via steer()/followUp()/aside based on option
-		if (this.isStreaming) {
+		// If streaming, queue via steer()/followUp()/aside based on option; an idle
+		// session holds a steer for its next run when asked to (PromptOptions.idleSteer).
+		const heldSteer = options?.streamingBehavior === "steer" && !this.isStreaming ? options.idleSteer : undefined;
+		if (this.isStreaming || heldSteer) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) {
 				// Busy because the agent owns a turn: that turn supersedes the interrupted
@@ -9605,11 +9689,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: prependNotices,
 				rawText: typedText,
 				onPromptQueued: options?.onPromptQueued,
-				onPromptAdmitted: onPromptQueuedAdmitted,
+				onPromptAdmitted: heldSteer
+					? () => {
+							onPromptQueuedAdmitted?.();
+							callSteerSender(heldSteer.onHeld, "Held steer callback");
+						}
+					: onPromptQueuedAdmitted,
 				promptGeneration: queueGeneration,
 				tag: options?.tag,
+				nextRun: heldSteer !== undefined,
+				queueId: heldSteer?.queueId,
+				onTaken: heldSteer?.onTaken,
 			});
-			outcome.sessionClaimed = queued;
+			// A held steer starts no turn, so it claims nothing.
+			outcome.sessionClaimed = queued && !heldSteer;
 			if (!queued) this.#reportDroppedPrompt(typedText, options, followUps);
 			if (!queued && options?.throwOnDrop) throw new PromptDroppedError();
 			return true;
@@ -9667,7 +9760,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Re-check before dispatch so the loser queues exactly like the early
 		// branch instead of racing #promptWithMessage into AgentBusyError. No
 		// await sits between this check and #beginInFlight, so the winner's
-		// in-flight increment is visible to every later re-check.
+		// in-flight increment is visible to every later re-check. (A steer with
+		// `idleSteer` never gets here: the early branch queued or held it.)
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) {
@@ -10678,7 +10772,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Queue a steering message to interrupt the agent mid-run.
+	 * Queue a steering message to interrupt the agent mid-run. With
+	 * `holdUntilNextRun` it is a next-run steer: an idle session keeps it for its
+	 * next run instead of starting one (see {@link SteerOptions.holdUntilNextRun}).
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		if (text.startsWith("/")) {
@@ -10694,6 +10790,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: options?.attribution,
 			rawText: text,
 			onPromptQueued: options?.onPromptQueued,
+			nextRun: options?.holdUntilNextRun,
+			queueId: options?.queueId,
+			onTaken: options?.onTaken,
 		});
 	}
 
@@ -10914,6 +11013,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 * streams must not auto-continue as an autonomous turn.
 			 */
 			skipIdleDrain?: boolean;
+			/** Queue next-run steers: no drain starts a turn for them alone. */
+			nextRun?: boolean;
+			/** {@link SteerOptions.queueId}: names the queued user message for a take-back. */
+			queueId?: string;
+			/** {@link SteerOptions.onTaken}: called when a run takes the queued user message. */
+			onTaken?: () => void;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
@@ -11009,6 +11114,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			rawText,
 			tagField,
 		);
+		if (options?.nextRun) {
+			for (const message of queued) this.#nextRunSteers.add(message);
+		}
+		// The group ends in the user message.
+		const queuedUser = queued.at(-1)!;
+		if (options?.queueId !== undefined) this.#queuedMessageIds.set(queuedUser, options.queueId);
+		if (options?.onTaken) this.#queuedMessageTaken.set(queuedUser, options.onTaken);
 		options?.onPromptQueued?.(queued);
 		options?.onPromptAdmitted?.();
 		// joinActiveTurn admission must never start an autonomous turn: the
@@ -11251,7 +11363,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#modeExitDrainSuppressionDepth > 0 ||
 			this.#queuedMessageDrainBlocked ||
 			!this.#canAutoContinueForFollowUp() ||
-			!this.agent.hasQueuedMessages()
+			!this.#hasDrainableQueuedMessages()
 		) {
 			return;
 		}
@@ -11263,7 +11375,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return (
 					this.#modeExitDrainSuppressionDepth === 0 &&
 					this.#canAutoContinueForFollowUp() &&
-					this.agent.hasQueuedMessages()
+					this.#hasDrainableQueuedMessages()
 				);
 			},
 			onSkip: () => {
@@ -11308,7 +11420,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// / pythonExecution record a user interrupt left as the literal transcript tail. This is
 		// why a queued user steer stranded behind a preserved advisor card (or a flushed IRC aside
 		// / eval execution record) still resumes — no tail-role enumeration needed.
-		if (this.agent.peekSteeringQueue().length > 0) return true;
+		if (this.#hasDrainableSteer()) return true;
 		// Follow-up-only auto-resume stays suppressed while a deliberate user interrupt is in effect
 		// (#advisorAutoResumeSuppressed, cleared on the next user prompt or manual retry): the user
 		// stopped, so their queued follow-up waits for an explicit resume — even if an interleaving
@@ -11321,6 +11433,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "toolResult";
+	}
+
+	/** Whether the steering queue holds a message other than a next-run steer. */
+	#hasDrainableSteer(): boolean {
+		for (const message of this.agent.peekSteeringQueue()) {
+			if (!this.#nextRunSteers.has(message)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Queued input that may start a turn of its own: a follow-up, or a steer that
+	 * is not a next-run steer. A next-run steer waits for the next run instead, so
+	 * neither the idle drain, the settle and abort drains, nor a post-compaction
+	 * or frame-rescue continuation starts a turn for it alone.
+	 */
+	#hasDrainableQueuedMessages(): boolean {
+		return this.agent.peekFollowUpQueue().length > 0 || this.#hasDrainableSteer();
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -12042,7 +12172,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *  continuing stream still delivers it. `forInterrupt` (Esc+abort) must neither lose a visible
 	 *  queued message an extension or agent sent (a peer notice, an extension card, an agent-
 	 *  attributed prompt) nor let abort()'s #drainStrandedQueuedMessages auto-resume the run the
-	 *  user just interrupted on it (the drain fires while agent.hasQueuedMessages()). So it marks
+	 *  user just interrupted on it (the drain fires while #hasDrainableQueuedMessages()). So it marks
 	 *  those messages for the abort that follows, which takes them out of the queues and records
 	 *  them in the transcript without a turn; the next turn delivers them. A recorded prompt keeps
 	 *  the hidden companions queued directly before it (keyword notices, image descriptions), as a
@@ -12182,9 +12312,58 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * skill invocation's `__queueChipText`, or untransformed text). A missing or
 	 * already delivered target changes nothing; repeated calls may remove further
 	 * duplicates.
+	 *
+	 * `{ queueId }` removes exactly the steer queued under that
+	 * {@link SteerOptions.queueId}, from `queue` or from a hold that would put it
+	 * back, never another message with the same text. A steer a run already took
+	 * off the queue but has not put into its context yet cannot be taken back
+	 * while that run holds it: the answer waits for the run, and is false once
+	 * the run takes the steer (its `onTaken` called first), or the take-back of
+	 * it once the run ends having put it back on the queue instead.
 	 */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
-		return this.takeQueuedMessage(text, queue) !== undefined;
+	removeQueuedMessage(target: string, queue: "steering" | "followUp"): boolean;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean>;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean> {
+		if (typeof target === "string") return this.takeQueuedMessage(target, queue) !== undefined;
+		const { queueId } = target;
+		if (this.#removeNamedQueuedMessage(queueId, queue)) return true;
+		const inFlight = this.#namedQueuedMessage(this.agent.peekUndeliveredQueuedMessages(), queueId);
+		if (!inFlight) return false;
+		const taken = Promise.withResolvers<void>();
+		const onTaken = this.#queuedMessageTaken.get(inFlight);
+		this.#queuedMessageTaken.set(inFlight, () => {
+			taken.resolve();
+			return onTaken?.();
+		});
+		return Promise.race([taken.promise, this.agent.waitForIdle()]).then(() =>
+			this.#removeNamedQueuedMessage(queueId, queue),
+		);
+	}
+
+	/** The message among `messages` that a steer named `queueId`. */
+	#namedQueuedMessage(messages: Iterable<AgentMessage>, queueId: string): AgentMessage | undefined {
+		for (const message of messages) if (this.#queuedMessageIds.get(message) === queueId) return message;
+		return undefined;
+	}
+
+	/** Take back the steer named `queueId` from `queue` or from a hold; false when neither has it. */
+	#removeNamedQueuedMessage(queueId: string, queue: "steering" | "followUp"): boolean {
+		const message =
+			this.#namedQueuedMessage(
+				queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue(),
+				queueId,
+			) ?? this.#namedQueuedMessage(this.#heldQueuedMessages, queueId);
+		if (!message || !this.withdrawQueuedMessage(message)) return false;
+		this.#queuedMessageTaken.delete(message);
+		return true;
+	}
+
+	/** {@link SteerOptions.onTaken}: a run took `message`, a queued steer, into its context. */
+	#reportQueuedMessageTaken(message: AgentMessage): void {
+		const onTaken = this.#queuedMessageTaken.get(message);
+		if (!onTaken) return;
+		this.#queuedMessageTaken.delete(message);
+		callSteerSender(onTaken, "Queued steer taken callback");
 	}
 
 	/**

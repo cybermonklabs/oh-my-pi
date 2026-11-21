@@ -191,6 +191,23 @@ describe("SessionAnonymizer", () => {
 		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
+	test("keeps a continued turn's marker, so a reload of the export keeps the turn", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "the first half of an answer about acme" }],
+				stopReason: "error",
+				continued: true,
+			},
+		});
+
+		expect(at(result, "message", "continued")).toBe(true);
+		expect(at(result, "message", "stopReason")).toBe("error");
+		expect(JSON.stringify(result)).not.toContain("acme");
+	});
+
 	test.each([null, "high"])("preserves per-call revival metadata with %s thinking", perCallThinkingLevel => {
 		const anonymizer = new SessionAnonymizer();
 		const metadata = {

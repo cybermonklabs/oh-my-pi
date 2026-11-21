@@ -41,6 +41,7 @@ export * from "./sdk";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";
+export * from "./session/entry-patches";
 export * from "./session/indexed-session-storage";
 export * from "./session/messages";
 export * from "./session/redis-session-storage";
@@ -53,6 +54,7 @@ export * from "./session/session-manager";
 export * from "./session/session-migrations";
 export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
+export * from "./session/tool-result-prunes";
 export * from "./task/executor";
 export type * from "./task/types";
 export type {

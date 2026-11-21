@@ -57,6 +57,29 @@ function createFakeRedis(): FakeRedis {
 				else getHash(titleKey).delete(filePath);
 				return [1, Buffer.byteLength(content, "utf8")];
 			}
+			if (script.includes("OMP_STAGE_PART")) {
+				const [stagingKey] = keys;
+				const [part] = argv;
+				const next = (strings.get(stagingKey) ?? "") + part;
+				strings.set(stagingKey, next);
+				return Buffer.byteLength(next, "utf-8");
+			}
+			if (script.includes("OMP_WRITE_STAGED")) {
+				const [stagingKey, fileKey, metaKey, titleKey] = keys;
+				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength] = argv;
+				const current = strings.get(fileKey);
+				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
+				const staged = strings.get(stagingKey) ?? "";
+				const stagedSize = Buffer.byteLength(staged, "utf8");
+				strings.delete(stagingKey);
+				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
+				if (stagedSize !== Number(byteLength)) return [-1, stagedSize];
+				strings.set(fileKey, staged);
+				getHash(metaKey).set(filePath, mtimeMs);
+				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
+				else getHash(titleKey).delete(filePath);
+				return [1, stagedSize];
+			}
 			if (script.includes("OMP_APPEND")) {
 				const [fileKey, metaKey] = keys;
 				const [line, filePath, mtimeMs] = argv;
