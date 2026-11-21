@@ -22,14 +22,14 @@ use super::{
 	Cx, Kernel,
 	builtins::trap,
 	exec, nested,
-	proc::{FrameKind, ScriptKind, Vproc},
+	proc::{FrameKind, LoopKind, LoopRec, ScriptKind, Vproc},
 	state,
 };
 use crate::bash::{
 	diag::Diag,
 	event::NodeKind,
 	ids::Dialect,
-	ir::{NodeInfo, Op, RedirTargetIr, Unit},
+	ir::{Op, RedirTargetIr, Unit},
 	signal::Signal,
 	store::{Key, KeyBuf, MiscKey, OptId, Record, StoreError, TrapKey},
 };
@@ -137,11 +137,12 @@ fn trapped(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
 /// top level (no function, `eval`, `source` or trap) or at the top of a
 /// subshell the root runs in place ([`super::proc::VprocZsh::in_place`]), as
 /// the last command of the complete command, while no trap that counts is set
-/// ([`counts_a_trap`]). bash (`evalstring.c` `should_suppress_fork`,
-/// `can_optimize_connection`) wants a simple command with no redirection
-/// that ends the complete command ([`bash_last`]); zsh takes one, and passes
-/// `last1` into compound commands, as the parse tree records
-/// ([`Unit::tails`]).
+/// ([`counts_a_trap`]), as the parse tree records ([`Unit::tails`]). bash
+/// (`evalstring.c` `should_suppress_fork`, `can_optimize_connection`) wants
+/// a simple command with no redirection that ends the complete command;
+/// zsh takes one, and passes `last1` into compound commands, into a `for`
+/// body only on the loop's last word (`execfor`: `do_exec && args &&
+/// empty(args)`).
 fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 	let Some(f) = vp.frames.last() else {
 		return false;
@@ -157,15 +158,29 @@ fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 		FrameKind::Subshell => !bash && vp.in_place() && vp.frames.len() == 1,
 		_ => false,
 	};
-	let last = if bash {
-		u.cmds
-			.get(op.a as usize)
-			.is_some_and(|cmd| cmd.redirs.is_none())
-			&& bash_last(u, op.node)
-	} else {
-		u.tails.binary_search(&op.node).is_ok()
-	};
+	let last = u.tails.binary_search(&op.node).is_ok()
+		&& if bash {
+			u.cmds
+				.get(op.a as usize)
+				.is_some_and(|cmd| cmd.redirs.is_none())
+		} else {
+			f.loops.iter().all(zsh_last_pass)
+		};
 	at_end && last && !counts_a_trap(k, cx, vp, bash).unwrap_or(true)
+}
+
+/// Whether loop record `rec`, around a command zsh may run in place
+/// ([`Unit::tails`]), passes `last1` on: a `for` on its last word (its
+/// variables took the last), and a `try`'s always-list. A tail is only ever
+/// in those.
+const fn zsh_last_pass(rec: &LoopRec) -> bool {
+	match &rec.kind {
+		LoopKind::For { items, next, .. } | LoopKind::ForMulti { items, next, .. } => {
+			*next as usize >= items.len()
+		},
+		LoopKind::Try { .. } => true,
+		LoopKind::While | LoopKind::Select { .. } | LoopKind::Repeat { .. } => false,
+	}
 }
 
 /// Whether a trap is set that makes the real shell fork its last command.
@@ -194,64 +209,6 @@ fn counts_a_trap(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, bash: bool) -> Result<
 		}
 	}
 	Ok(false)
-}
-
-/// bash: whether simple command `node` of the complete command `u` is the
-/// last command it runs with `exec`: a pipeline of its own (no `!`, `time` or
-/// second stage) that ends its and-or list, itself the last item of the
-/// complete command's own list (bash forks a compound command's last
-/// command), after a top-level item only when `;` separates them and it is
-/// alone (`connection(earlier, this, ';')`).
-fn bash_last(u: &Unit, node: u32) -> bool {
-	let Some(n) = u.nodes.get(node as usize) else {
-		return false;
-	};
-	let span = (n.lo, n.hi);
-	let around = |kind: NodeKind| {
-		u.nodes
-			.iter()
-			.filter(|m| m.kind == kind && m.lo <= span.0 && span.1 <= m.hi)
-			.min_by_key(|m| m.hi - m.lo)
-	};
-	let (Some(p), Some(ao)) = (around(NodeKind::Pipeline), around(NodeKind::AndOr)) else {
-		return false;
-	};
-	if (p.lo, p.hi) != span || ao.hi != span.1 {
-		return false;
-	}
-	let in_compound = u
-		.nodes
-		.iter()
-		.any(|m| compound(m) && m.lo <= ao.lo && ao.hi <= m.hi && (m.lo, m.hi) != (ao.lo, ao.hi));
-	if in_compound
-		|| u
-			.nodes
-			.iter()
-			.any(|m| m.kind == NodeKind::AndOr && m.lo >= ao.hi)
-	{
-		return false;
-	}
-	let earlier = u
-		.nodes
-		.iter()
-		.filter(|m| m.kind == NodeKind::AndOr && m.hi <= ao.lo)
-		.map(|m| m.hi)
-		.max();
-	earlier.is_none_or(|end| {
-		let sep = u
-			.source
-			.get(end as usize..ao.lo as usize)
-			.unwrap_or_default();
-		!sep.contains(&b'&') && (ao.lo, ao.hi) == span
-	})
-}
-
-/// Whether `m` is a compound command (not a part of a simple one).
-const fn compound(m: &NodeInfo) -> bool {
-	!matches!(
-		m.kind,
-		NodeKind::AndOr | NodeKind::Pipeline | NodeKind::Simple | NodeKind::Assign | NodeKind::Word
-	)
 }
 
 /// bash's `line_number` when it waits for the command

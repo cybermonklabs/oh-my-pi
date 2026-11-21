@@ -387,9 +387,10 @@ struct NoticeCase {
 /// command, a `for` header, a function body's first line. The last command
 /// of the `-c` string bash runs with `exec` and no fork, so it prints
 /// nothing and the shell's process dies of the signal; zsh does the same
-/// (`last1`, which it passes on into the body of an `if`, a `{ }` and a
-/// `;;` arm of a `case`, and which a trap with an action or a trap function
-/// takes away, an empty trap not), and prints no notice anywhere.
+/// (`last1`, which it passes on into the body of an `if`, a `{ }`, a `;;` arm
+/// of a `case`, a `try`'s always-list and a `for` body on its last word, and
+/// which a trap with an action or a trap function takes away, an empty trap
+/// not), and prints no notice anywhere.
 #[test]
 fn bash_reports_a_foreground_command_killed_by_a_signal() {
 	const K: &[u8] = b"/bin/sh -c 'kill -KILL $$'";
@@ -497,6 +498,14 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		zsh(cat(&[b"case a in (a) true; ", K, b"; esac"]), KILLED),
 		zsh(cat(&[b"case a in a) ", K, b";& b) true;; esac"]), Exit(0)),
 		zsh(cat(&[b"case a in a) ", K, b";| b) true;; esac"]), Exit(137)),
+		// …in a `try`'s always-list (its status is the try-list's), and in a
+		// `for` body on the last word (`for ((…))` never).
+		zsh(cat(&[b"{ true } always { ", K, b" }"]), KILLED),
+		zsh(cat(&[b"{ ", K, b" } always { true }"]), Exit(137)),
+		zsh(cat(&[b"for i in 1; do ", K, b"; done"]), KILLED),
+		zsh(cat(&[b"for i in 1 2; do ", K, b"; done"]), KILLED),
+		zsh(cat(&[b"for a b in 1 2 3; do ", K, b"; done"]), KILLED),
+		zsh(cat(&[b"for ((i = 0; i < 1; i++)); do ", K, b"; done"]), Exit(137)),
 		// A here-document in the body, from the parse tree (its body follows
 		// the line).
 		zsh(cat(&[K, b" <<EOF\nx\nEOF"]), KILLED),
