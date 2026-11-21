@@ -413,7 +413,11 @@ fn write_chain_session(dir: &Path) -> PathBuf {
 	});
 	let mut lines = vec![header.to_string()];
 	for index in 0..DEEP_CHAIN_ENTRIES {
-		let parent = if index == 0 { Value::Null } else { Value::String(format!("e{}", index - 1)) };
+		let parent = if index == 0 {
+			Value::Null
+		} else {
+			Value::String(format!("e{}", index - 1))
+		};
 		let entry = json!({
 			"type": "custom",
 			"id": format!("e{index}"),
@@ -440,7 +444,8 @@ fn smoke_get_tree_deep_chain() {
 	let dir = std::env::temp_dir().join(format!("omp-rpc-rust-tree-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let session = write_chain_session(&dir);
-	// Real RPC dispatch over the session file; its mock model is never called here.
+	// Real RPC dispatch over the session file; its mock model is never called
+	// here.
 	let mut process = Process::new("bun");
 	process
 		.arg("packages/coding-agent/test/fixtures/tree-rpc-agent.ts")
@@ -456,42 +461,44 @@ fn smoke_get_tree_deep_chain() {
 	let leaf = format!("e{}", DEEP_CHAIN_ENTRIES - 1);
 	assert_eq!(leaf_id.as_deref(), Some(leaf.as_str()));
 	assert_eq!(tree.len(), 1);
-	// Walked down and taken apart node by node: comparing or dropping the tree
-	// whole recurses once per level, past any thread's stack.
+	// Walked down by reference: comparing the tree whole recurses once per
+	// level, past any thread's stack. Dropping it is `DeepJson`'s loop.
 	let mut misplaced = Vec::new();
 	let mut depth = 0;
-	let mut deepest = String::new();
-	let mut next = tree.into_iter().next();
-	while let Some(mut node) = next {
+	let mut deepest = "";
+	let mut next = tree.first();
+	while let Some(node) = next {
 		let entry = node.get("entry").and_then(Value::as_object);
 		let id = entry
 			.and_then(|entry| entry.get("id"))
 			.and_then(Value::as_str)
-			.unwrap_or_default()
-			.to_owned();
-		let parent = entry.and_then(|entry| entry.get("parentId")).cloned();
-		let expected_parent =
-			if depth == 0 { Value::Null } else { Value::String(format!("e{}", depth - 1)) };
-		let children = match node.remove("children") {
-			Some(Value::Array(children)) => children,
-			_ => Vec::new(),
+			.unwrap_or_default();
+		let parent = entry.and_then(|entry| entry.get("parentId"));
+		let expected_parent = if depth == 0 {
+			Value::Null
+		} else {
+			Value::String(format!("e{}", depth - 1))
 		};
-		if id != format!("e{depth}") || parent != Some(expected_parent) || children.len() > 1 {
-			misplaced.push(id.clone());
+		let children = node
+			.get("children")
+			.and_then(Value::as_array)
+			.map_or(&[][..], Vec::as_slice);
+		if id != format!("e{depth}") || parent != Some(&expected_parent) || children.len() > 1 {
+			misplaced.push(id.to_owned());
 		}
 		deepest = id;
 		depth += 1;
-		next = children.into_iter().next().and_then(|child| match child {
-			Value::Object(child) => Some(child),
-			_ => None,
-		});
+		next = children.first().and_then(Value::as_object);
 	}
 	assert_eq!(misplaced, Vec::<String>::new());
 	assert_eq!(depth, DEEP_CHAIN_ENTRIES);
 	assert_eq!(deepest, leaf);
+	drop(tree);
 
 	// The client still serves commands after the deep answer.
-	client.call(&GetStateCommand {}).expect("get_state after get_tree");
+	client
+		.call(&GetStateCommand {})
+		.expect("get_state after get_tree");
 	drop(client);
 	let _ = std::fs::remove_dir_all(&dir);
 }

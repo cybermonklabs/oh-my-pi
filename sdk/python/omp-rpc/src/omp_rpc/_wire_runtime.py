@@ -27,10 +27,11 @@ class UnknownNotification:
     parse_error: str | None = field(default=None, kw_only=True)
 
 
-def _json_shell(value: object, path: str, pending: list[tuple[object, object]]) -> JsonValue:
-    """`value` when it is a JSON scalar, else an empty container of its kind, queued in `pending` with it."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return cast(JsonValue, value)
+_JSON_SCALARS = (str, int, float, bool)
+
+
+def _json_container(value: object, path: str, pending: list[tuple[object, object]]) -> JsonValue:
+    """An empty container of `value`'s kind, queued in `pending` with `value` to fill it from."""
     copy: JsonValue
     if isinstance(value, list):
         copy = []
@@ -45,23 +46,60 @@ def _json_shell(value: object, path: str, pending: list[tuple[object, object]]) 
 def decode_json(value: object, path: str) -> JsonValue:
     """Deep-copies a JSON value, rejecting anything JSON cannot represent.
 
-    Walks with a stack of its own, not recursion, so a value of any depth
-    copies: `get_tree` nests each session entry two levels under its parent.
+    Copies by recursion, the fastest way for the values a frame holds; a value
+    nested deeper than recursion reaches (`get_tree` nests each session entry
+    two levels under its parent) is copied again with a stack of its own. The
+    copy is pure, so starting it again is safe.
     """
+    try:
+        return _copy_json(value, path)
+    except RecursionError:
+        return _copy_json_deep(value, path)
+
+
+def _copy_json(value: object, path: str) -> JsonValue:
+    """`decode_json` by recursion."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return cast(JsonValue, value)
+    if isinstance(value, list):
+        return [_copy_json(item, path) for item in value]
+    if isinstance(value, dict):
+        cloned: JsonObject = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} must contain string keys")
+            cloned[key] = _copy_json(item, path)
+        return cloned
+    raise ValueError(f"{path} must be JSON-serializable")
+
+
+def _copy_json_deep(value: object, path: str) -> JsonValue:
+    """`decode_json` with a stack of its own, for a value of any depth."""
+    scalars = _JSON_SCALARS
+    if value is None or isinstance(value, scalars):
+        return cast(JsonValue, value)
     pending: list[tuple[object, object]] = []
-    copy = _json_shell(value, path, pending)
+    copy = _json_container(value, path, pending)
     while pending:
         source, target = pending.pop()
         if isinstance(source, list):
-            items = cast(list[JsonValue], target)
+            append = cast(list[object], target).append
             for item in source:
-                items.append(_json_shell(item, path, pending))
+                append(
+                    item
+                    if item is None or isinstance(item, scalars)
+                    else _json_container(item, path, pending)
+                )
             continue
-        members = cast(JsonObject, target)
+        members = cast(dict[str, object], target)
         for key, item in cast(dict[object, object], source).items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} must contain string keys")
-            members[key] = _json_shell(item, path, pending)
+            members[key] = (
+                item
+                if item is None or isinstance(item, scalars)
+                else _json_container(item, path, pending)
+            )
     return copy
 
 

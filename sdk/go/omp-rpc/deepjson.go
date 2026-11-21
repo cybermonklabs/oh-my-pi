@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 )
 
 // encoding/json refuses a value nested deeper than 10,000 levels, even into a
@@ -15,14 +14,9 @@ import (
 // but tracking the open containers on a slice, so a member may nest to any
 // depth. The decoders call them only for a value json.Unmarshal refused.
 
+// errInvalidJSON is every error of the scanners below: their callers only ask
+// whether a value is valid, and decodeObject reports json.Unmarshal's error.
 var errInvalidJSON = errors.New("omprpc: invalid JSON")
-
-func syntaxError(data []byte, i int) error {
-	if i >= len(data) {
-		return fmt.Errorf("%w: unexpected end of input", errInvalidJSON)
-	}
-	return fmt.Errorf("%w: unexpected %q at offset %d", errInvalidJSON, data[i], i)
-}
 
 // byteAt is data[i], or 0 past its end.
 func byteAt(data []byte, i int) byte {
@@ -39,10 +33,19 @@ func skipSpace(data []byte, i int) int {
 	return i
 }
 
+// valueBounds returns where the one JSON value data holds starts and ends,
+// however deep it nests; ok is false unless data is that value alone, between
+// whitespace.
+func valueBounds(data []byte) (start, end int, ok bool) {
+	start = skipSpace(data, 0)
+	end, err := scanValue(data, start)
+	return start, end, err == nil && endOfInput(data, end) == nil
+}
+
 // validJSON is json.Valid with no limit on how deep data nests.
 func validJSON(data []byte) bool {
-	end, err := scanValue(data, skipSpace(data, 0))
-	return err == nil && endOfInput(data, end) == nil
+	_, _, ok := valueBounds(data)
+	return ok
 }
 
 // decodeDeep decodes value into dst, with no limit on how deep it nests, when
@@ -51,9 +54,8 @@ func validJSON(data []byte) bool {
 func decodeDeep(value []byte, dst any) bool {
 	switch dst := dst.(type) {
 	case *json.RawMessage:
-		start := skipSpace(value, 0)
-		end, err := scanValue(value, start)
-		if err != nil || endOfInput(value, end) != nil {
+		start, end, ok := valueBounds(value)
+		if !ok {
 			return false
 		}
 		*dst = bytes.Clone(value[start:end])
@@ -90,7 +92,7 @@ func splitObject(data []byte) (map[string]json.RawMessage, error) {
 	members := map[string]json.RawMessage{}
 	i := skipSpace(data, 0)
 	if byteAt(data, i) != '{' {
-		return nil, syntaxError(data, i)
+		return nil, errInvalidJSON
 	}
 	i = skipSpace(data, i+1)
 	if byteAt(data, i) == '}' {
@@ -107,7 +109,7 @@ func splitObject(data []byte) (map[string]json.RawMessage, error) {
 		}
 		i = skipSpace(data, keyEnd)
 		if byteAt(data, i) != ':' {
-			return nil, syntaxError(data, i)
+			return nil, errInvalidJSON
 		}
 		start := skipSpace(data, i+1)
 		end, err := scanValue(data, start)
@@ -122,18 +124,18 @@ func splitObject(data []byte) (map[string]json.RawMessage, error) {
 		case '}':
 			return members, endOfInput(data, i+1)
 		default:
-			return nil, syntaxError(data, i)
+			return nil, errInvalidJSON
 		}
 	}
 }
 
 // splitArray decodes the JSON array data into its items' raw values, which may
-// nest to any depth.
+// nest to any depth. The items share data's bytes: decodeDeep only reads them.
 func splitArray(data []byte) ([]json.RawMessage, error) {
 	items := []json.RawMessage{}
 	i := skipSpace(data, 0)
 	if byteAt(data, i) != '[' {
-		return nil, syntaxError(data, i)
+		return nil, errInvalidJSON
 	}
 	i = skipSpace(data, i+1)
 	if byteAt(data, i) == ']' {
@@ -144,7 +146,7 @@ func splitArray(data []byte) ([]json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
-		items = append(items, bytes.Clone(data[i:end]))
+		items = append(items, data[i:end])
 		i = skipSpace(data, end)
 		switch byteAt(data, i) {
 		case ',':
@@ -152,7 +154,7 @@ func splitArray(data []byte) ([]json.RawMessage, error) {
 		case ']':
 			return items, endOfInput(data, i+1)
 		default:
-			return nil, syntaxError(data, i)
+			return nil, errInvalidJSON
 		}
 	}
 }
@@ -160,7 +162,7 @@ func splitArray(data []byte) ([]json.RawMessage, error) {
 // endOfInput fails unless only whitespace follows offset i.
 func endOfInput(data []byte, i int) error {
 	if i = skipSpace(data, i); i != len(data) {
-		return syntaxError(data, i)
+		return errInvalidJSON
 	}
 	return nil
 }
@@ -209,7 +211,7 @@ func scanValue(data []byte, i int) (int, error) {
 			end := open[len(open)-1]
 			if c := byteAt(data, i); c != ',' {
 				if c != end {
-					return 0, syntaxError(data, i)
+					return 0, errInvalidJSON
 				}
 				i++
 				open = open[:len(open)-1]
@@ -234,21 +236,21 @@ func scanKey(data []byte, i int) (int, error) {
 		return 0, err
 	}
 	if i = skipSpace(data, i); byteAt(data, i) != ':' {
-		return 0, syntaxError(data, i)
+		return 0, errInvalidJSON
 	}
 	return skipSpace(data, i+1), nil
 }
 
 func scanString(data []byte, i int) (int, error) {
 	if byteAt(data, i) != '"' {
-		return 0, syntaxError(data, i)
+		return 0, errInvalidJSON
 	}
 	for i++; i < len(data); i++ {
 		switch c := data[i]; {
 		case c == '"':
 			return i + 1, nil
 		case c < 0x20:
-			return 0, syntaxError(data, i)
+			return 0, errInvalidJSON
 		case c == '\\':
 			i++
 			switch byteAt(data, i) {
@@ -256,15 +258,15 @@ func scanString(data []byte, i int) (int, error) {
 			case 'u':
 				for range 4 {
 					if i++; !isHexDigit(byteAt(data, i)) {
-						return 0, syntaxError(data, i)
+						return 0, errInvalidJSON
 					}
 				}
 			default:
-				return 0, syntaxError(data, i)
+				return 0, errInvalidJSON
 			}
 		}
 	}
-	return 0, syntaxError(data, i)
+	return 0, errInvalidJSON
 }
 
 func scanNumber(data []byte, i int) (int, error) {
@@ -277,11 +279,11 @@ func scanNumber(data []byte, i int) (int, error) {
 	case c >= '1' && c <= '9':
 		i = scanDigits(data, i)
 	default:
-		return 0, syntaxError(data, i)
+		return 0, errInvalidJSON
 	}
 	if byteAt(data, i) == '.' {
 		if !isDigit(byteAt(data, i+1)) {
-			return 0, syntaxError(data, i+1)
+			return 0, errInvalidJSON
 		}
 		i = scanDigits(data, i+1)
 	}
@@ -290,7 +292,7 @@ func scanNumber(data []byte, i int) (int, error) {
 			i++
 		}
 		if !isDigit(byteAt(data, i+1)) {
-			return 0, syntaxError(data, i+1)
+			return 0, errInvalidJSON
 		}
 		i = scanDigits(data, i+1)
 	}
@@ -303,7 +305,7 @@ func scanLiteral(data []byte, i int) (int, error) {
 			return i + len(literal), nil
 		}
 	}
-	return 0, syntaxError(data, i)
+	return 0, errInvalidJSON
 }
 
 func scanDigits(data []byte, i int) int {

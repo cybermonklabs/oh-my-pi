@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from json.decoder import scanstring
+from json.decoder import WHITESPACE, scanstring
 from pathlib import Path
 from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar, cast
 
@@ -165,7 +165,6 @@ class _RpcFrameDecoder:
         return cast(JsonObject, frame)
 
 
-_JSON_SPACE = re.compile(r"[ \t\n\r]*")
 _JSON_NUMBER = re.compile(r"(-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?")
 _JSON_CONSTANTS: tuple[tuple[str, object], ...] = (
     ("true", True),
@@ -245,8 +244,8 @@ def _loads_deep(text: str) -> object:
 
 
 def _json_space(text: str, pos: int) -> int:
-    match = _JSON_SPACE.match(text, pos)
-    return pos if match is None else match.end()
+    # `[ \t\n\r]*` always matches, as `json.decoder` relies on.
+    return WHITESPACE.match(text, pos).end()  # type: ignore[union-attr]
 
 
 def _json_key(text: str, pos: int) -> tuple[str, int]:

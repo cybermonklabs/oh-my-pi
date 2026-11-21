@@ -4,10 +4,11 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { BlobStore, isBlobRef, lazyImageDataSync, parseBlobRef } from "@oh-my-pi/pi-coding-agent/session/blob-store";
-import type {
-	CompactionEntry,
-	FileEntry,
-	SessionMessageEntry,
+import {
+	type CompactionEntry,
+	CURRENT_SESSION_VERSION,
+	type FileEntry,
+	type SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	loadEntriesFromFile,
@@ -248,11 +249,16 @@ describe("session image persistence", () => {
 			});
 
 			const file = path.join(tempDir.path(), "session.jsonl");
-			const header = { type: "session", version: 3, id: "s", timestamp: new Date(0).toISOString(), cwd: "/" };
-			const persisted = prepareEntryForPersistence(original, blobStore);
+			const header = {
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "s",
+				timestamp: new Date(0).toISOString(),
+				cwd: "/",
+			};
+			const persisted = prepareEntryForPersistence(original, blobStore) as ToolResultEntry;
 			await Bun.write(file, `${JSON.stringify(header)}\n${JSON.stringify(persisted)}\n`);
-			const lines = (await Bun.file(file).text()).trim().split("\n");
-			const written = (JSON.parse(lines[1] ?? "{}") as ToolResultEntry).message.details as { image_url: string[] };
+			const written = persisted.message.details as { image_url: string[] };
 			expect(written.image_url).toHaveLength(1);
 			expect(isBlobRef(written.image_url[0] ?? "")).toBe(true);
 

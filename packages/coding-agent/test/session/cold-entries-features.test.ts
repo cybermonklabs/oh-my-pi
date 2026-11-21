@@ -441,6 +441,25 @@ function relayRestored(manager: SessionManager): unknown {
 	});
 }
 
+/**
+ * Opens `file` as a resume does, with the store (`coldStore`) or holding every
+ * entry, and closes the manager through the describe's `cleanups`.
+ */
+async function openSession(
+	cleanups: Array<() => Promise<void> | void>,
+	file: string,
+	coldStore: boolean,
+	options: { throwIfMissing?: boolean } = {},
+): Promise<SessionManager> {
+	const manager = await SessionManager.open(file, path.dirname(file), new FileSessionStorage(), {
+		suppressBreadcrumb: true,
+		coldStore,
+		...options,
+	});
+	cleanups.push(() => manager.close());
+	return manager;
+}
+
 describe("features that read older entries, on a session whose older bodies are cold", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -455,24 +474,10 @@ describe("features that read older entries, on a session whose older bodies are 
 		return dir.path();
 	}
 
-	async function open(
-		file: string,
-		coldStore: boolean,
-		options: { throwIfMissing?: boolean } = {},
-	): Promise<SessionManager> {
-		const manager = await SessionManager.open(file, path.dirname(file), new FileSessionStorage(), {
-			suppressBreadcrumb: true,
-			coldStore,
-			...options,
-		});
-		cleanups.push(() => manager.close());
-		return manager;
-	}
-
 	/** The session resumed with the store, its older bodies cold, and with every entry held. */
 	async function openBoth(file: string): Promise<{ cold: SessionManager; whole: SessionManager }> {
-		const cold = await open(file, true);
-		const whole = await open(file, false);
+		const cold = await openSession(cleanups, file, true);
+		const whole = await openSession(cleanups, file, false);
 		expect(cold.coldStoreStats().coldEntries).toBeGreaterThan(10);
 		expect(whole.coldStoreStats().coldEntries).toBe(0);
 		return { cold, whole };
@@ -483,8 +488,8 @@ describe("features that read older entries, on a session whose older bodies are 
 		const root = tempRoot();
 		const coldCopy = await writeSession(root, "cold", options);
 		const wholeCopy = await writeSession(root, "whole", options);
-		const cold = await open(coldCopy.file, true);
-		const whole = await open(wholeCopy.file, false);
+		const cold = await openSession(cleanups, coldCopy.file, true);
+		const whole = await openSession(cleanups, wholeCopy.file, false);
 		expect(cold.coldStoreStats().coldEntries).toBeGreaterThan(10);
 		return { coldCopy, wholeCopy, cold, whole };
 	}
@@ -534,7 +539,7 @@ describe("features that read older entries, on a session whose older bodies are 
 
 			const target = await resolveResumeTarget(written.id.slice(0, 8), written.cwd, written.sessionDir);
 			if (!target) throw new Error("The session was not found by its id");
-			const byId = await open(target.session.path, true);
+			const byId = await openSession(cleanups, target.session.path, true);
 			expect(wire(byId.buildSessionContext().messages)).toEqual(wire(whole.buildSessionContext().messages));
 		},
 		CASE_TIMEOUT_MS,
@@ -581,7 +586,7 @@ describe("features that read older entries, on a session whose older bodies are 
 			const { cold, whole } = await writeBoth();
 			const forkedEntries = async (file: string | undefined) => {
 				if (!file) throw new Error("The fork wrote no session file");
-				return wire((await open(file, false)).getEntries());
+				return wire((await openSession(cleanups, file, false)).getEntries());
 			};
 			const coldFork = await cold.fork();
 			const wholeFork = await whole.fork();
@@ -825,7 +830,7 @@ describe("features that read older entries, on a session whose older bodies are 
 			const child = await withSubagent();
 			// A revival reopens the transcript fresh and rebuilds the agent from its contract.
 			const revived = async (coldStore: boolean) => {
-				const reopened = await open(child, coldStore, { throwIfMissing: true });
+				const reopened = await openSession(cleanups, child, coldStore, { throwIfMissing: true });
 				const init = extractSessionInit(reopened.getEntries());
 				if (!init) throw new Error("The subagent has no contract");
 				return { init: wire(init), definition: wire(persistedAgentDefinition("Worker", init)) };
@@ -856,7 +861,7 @@ describe("features that read older entries, on a session whose older bodies are 
 			// More older rounds than the eight records a store keeps parsed: a read of a field gone cold
 			// that every turn repeats over every message misses that cache and reads the store again.
 			const written = await writeSession(root, "session", { olderTurns: 9 });
-			const manager = await open(written.file, true);
+			const manager = await openSession(cleanups, written.file, true);
 			const extensionReads: unknown[] = [];
 			const runtime = new ExtensionRuntime();
 			const extension = await loadExtensionFromFactory(
@@ -925,12 +930,10 @@ describe("features that read older entries, on a session whose older bodies are 
  * resume and a compaction rebuild, exactly as a manager that holds every entry
  * (`coldStore: false`) rebuilds it, and the turn is drawn as it was live. The
  * primary runs the real Anthropic provider; only its HTTP client is replaced.
- * This member has no session-store masking; the same cases with masking on run
- * at the head, where `secrets.maskSessionStore` lives.
  */
 describe("a turn kept and continued from after visible text", () => {
 	const sessions = useKeptTurnSessions();
-	const cleanups: Array<() => Promise<void>> = [];
+	const cleanups: Array<() => Promise<void> | void> = [];
 	const keptTurn = `assistant[text:${FIRST_TEXT}]`;
 	const reminder = expect.stringMatching(/^developer:/);
 	const continuation = `assistant[text:${CONTINUED_TEXT}]`;
@@ -940,15 +943,6 @@ describe("a turn kept and continued from after visible text", () => {
 	afterEach(async () => {
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	});
-
-	async function open(file: string, coldStore: boolean): Promise<SessionManager> {
-		const manager = await SessionManager.open(file, path.dirname(file), new FileSessionStorage(), {
-			suppressBreadcrumb: true,
-			coldStore,
-		});
-		cleanups.push(() => manager.close());
-		return manager;
-	}
 
 	/**
 	 * Resumes the cold session, sends `prompts` with the primary answering
@@ -960,7 +954,7 @@ describe("a turn kept and continued from after visible text", () => {
 		options: KeptTurnSessionOptions & { prompts?: string[] } = {},
 	) {
 		const written = await writeSession(sessions.tempDir.path(), crypto.randomUUID());
-		const cold = await open(written.file, true);
+		const cold = await openSession(cleanups, written.file, true);
 		expect(cold.coldStoreStats().coldEntries).toBeGreaterThan(10);
 		sessions.answers = answers;
 		const session = await sessions.startSession(cold, {
@@ -980,7 +974,7 @@ describe("a turn kept and continued from after visible text", () => {
 	async function reopenBoth(cold: SessionManager, file: string) {
 		const reopened = await sessions.reopen(cold);
 		expect(reopened.coldStoreStats().coldEntries).toBeGreaterThan(10);
-		const whole = await open(file, false);
+		const whole = await openSession(cleanups, file, false);
 		expect(whole.coldStoreStats().coldEntries).toBe(0);
 		return { reopened, whole };
 	}

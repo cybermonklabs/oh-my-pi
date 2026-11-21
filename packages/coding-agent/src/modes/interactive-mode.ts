@@ -218,7 +218,7 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
-import { TODO_HUD_STATE_CUSTOM_TYPE } from "../session/session-entries";
+import { GOAL_COMPLETED_CUSTOM_TYPE, TODO_HUD_STATE_CUSTOM_TYPE } from "../session/session-entries";
 import {
 	createTodoHudStateData,
 	getTodoHudVisibility,
@@ -474,7 +474,7 @@ import { cfgDefaultThinkingLevel, cfgHideThinkingBlock } from "../session/settin
 import { cfgCycleOrder, cfgModelRoles } from "../config/model-settings";
 import { cfgExtensionHandlersModeControl } from "../extensibility/settings";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
-import { GOAL_COMPLETED_CUSTOM_TYPE, goalContinuationActivity, goalFromModeData } from "../goals/state";
+import { goalContinuationActivity, goalFromModeData } from "../goals/state";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
 import { cfgSttEnabled } from "../stt/settings";

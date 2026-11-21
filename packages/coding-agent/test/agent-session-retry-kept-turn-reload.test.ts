@@ -122,6 +122,11 @@ function geminiPrimary(turns: PrimaryTurn[]): PrimarySetup {
 describe("a kept and continued turn in the context rebuilt from the session file", () => {
 	const sessions = useKeptTurnSessions();
 	const { runAndReopen } = sessions;
+	/** The Gemini primary of the malformed-call rows, with its key set for the case. */
+	const malformedCallPrimary = (turns: PrimaryTurn[]): PrimarySetup => {
+		sessions.authStorage.keys.setRuntime("google", "google-test-key");
+		return geminiPrimary(turns);
+	};
 
 	// Regression: a rate limit cuts off an answer after its text is on screen,
 	// the session waits and the model continues it, and after a resume the
@@ -497,10 +502,7 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		},
 		{
 			cut: "a malformed call",
-			primary: (turns: PrimaryTurn[]) => {
-				sessions.authStorage.keys.setRuntime("google", "google-test-key");
-				return geminiPrimary(turns);
-			},
+			primary: malformedCallPrimary,
 			retried: false,
 		},
 	])("a turn $cut ended after its text", ({ primary, retried }) => {
@@ -581,10 +583,7 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		},
 		{
 			continuation: "the malformed-call continuation",
-			primary: (turns: PrimaryTurn[]) => {
-				sessions.authStorage.keys.setRuntime("google", "google-test-key");
-				return geminiPrimary(turns);
-			},
+			primary: malformedCallPrimary,
 		},
 	])("the reminder $continuation sends after the kept turn", ({ primary }) => {
 		const reminder = expect.stringMatching(/^developer:/);

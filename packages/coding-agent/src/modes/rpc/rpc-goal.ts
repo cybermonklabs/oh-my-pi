@@ -11,13 +11,9 @@
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import { logger } from "@oh-my-pi/pi-utils";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../../goals/settings";
-import {
-	GOAL_COMPLETED_CUSTOM_TYPE,
-	type GoalModeState,
-	goalContinuationActivity,
-	goalFromModeData,
-} from "../../goals/state";
+import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { GOAL_COMPLETED_CUSTOM_TYPE } from "../../session/session-entries";
 import { nextActionableTask } from "../../tools/todo";
 
 /** `goal.continuationModes` value that enables automatic continuation for RPC hosts. */
