@@ -9,11 +9,14 @@
 # One per line: <bazel test target> <libtest test name>  <what it prints; why it is no skip>.
 //crates/pi-ast:pi-ast_test block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus  the number of files and comparisons of its sweep, after asserting more than 3000 files (run alone with --ignored, .github/sami/rust-test-ignored.txt)
 //crates/pi-builtins:pi-builtins_test find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink  the count of its 2000 swap runs and of files removed outside the tree; it asserts that count is 0
+//crates/pi-builtins:pi-builtins_test locale::tests::a_child_handed_to_a_task_already_read_is_still_caught  the panic message of the catch_unwind its child expects, which own_process passes on (#92)
 //crates/pi-builtins:pi-builtins_test mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink  the count of its 2000 swap runs and of files removed outside the tree; it asserts that count is 0
 //crates/pi-builtins:pi-builtins_test own_process::tests::a_call_off_the_test_thread_fails  the panic of the thread it starts on purpose, whose message it asserts
 //crates/pi-builtins:pi-builtins_test rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink  the count of its 2000 swap runs, of files removed outside the tree (asserted 0) and of refused swaps
 //crates/pi-builtins:pi-builtins_test rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink  the count of its 2000 swap runs, of files removed outside the tree (asserted 0) and of refused swaps
 //crates/pi-builtins:pi-builtins_test sed::script_char_provider::tests::test_current_panics_out_of_bounds  the panic its #[should_panic] expects
+//crates/pi-natives:pi_natives_test desktop::macos::release_guard::tests::a_panicking_request_leaves_its_open_presses_to_the_helper  (macOS) the panic it raises on purpose inside catch_unwind, which it asserts
+//crates/pi-natives:pi_natives_test desktop::macos::release_guard::tests::a_request_waits_for_its_helper_to_exit_with_or_without_presses_open  (macOS) the panic it raises on purpose inside catch_unwind, which it asserts
 //crates/pi-natives:pi_natives_test vcs::tests::catch_panic_converts_native_panics_into_backend_errors  the panic it raises on purpose, which catch_panic must turn into an error it asserts
 //crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_a_short_grace  the grace and the KILL step the escalation took, after it asserted KILL came after the grace; the macOS job's skip-scan canary
 //crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_the_default_grace  the grace and the KILL step the escalation took, after it asserted KILL came after the grace
@@ -28,3 +31,5 @@
 //crates/pi-walker:pi-walker_test exec::tests::input_panics_resume_in_the_consumer  the panic it raises in an input on purpose, which must reach the consumer
 //crates/pi-walker:pi-walker_test exec::tests::panics_resume_in_the_consumer  the panic it raises in the work on purpose, which must reach the consumer
 //crates/vendor/grep-searcher:grep-searcher_test searcher::glue::tests::scratch  the lines it matches in a fixed text (upstream ripgrep's scratch test)
+sdk/rust/omp-rpc:test:smoke smoke_real_server  what it reads from the server as it goes (the ready message, the protocol version it asserts is 2, the session state, command counts)
+sdk/rust/omp-rpc:test:smoke smoke_scripted_model  the scripted model server's READY line (asserted) and what the session returns as it goes

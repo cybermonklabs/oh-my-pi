@@ -330,36 +330,59 @@ EOF
 	chmod +x "$w/bin/bazelisk"
 	# The cargo workspaces: a rustup stub whose `run <channel> cargo` answers
 	# metadata and test from CARGO_MODE (pass, fail-lib, partial-test,
-	# meta-fail, empty, stderr-skip, stderr-skip-named, filtered).
+	# meta-fail, empty, stderr-skip, stderr-skip-named, filtered, ignored,
+	# ignored-fails, doc-ignored, doc-skip). With --ignored it runs the
+	# #[ignore]d test a::slow alone.
 	cat >"$w/bin/rustup" <<EOF
 #!/usr/bin/env bash
 set -u
 case "\$1" in toolchain) exit 0 ;; run) shift 2 ;; *) exit 1 ;; esac
 mode="${CARGO_MODE:-pass}"
 FMT=json
-$(declare -f lt_pass lt_fail lt_partial)
+$(declare -f lt_pass lt_fail lt_partial lt_ignored lt_out)
 if [ "\$2" = metadata ]; then
 	[ "\$mode" = meta-fail ] && { echo "error: boom" >&2; exit 101; }
 	if [ "\$mode" = empty ]; then echo '{"packages":[]}'; exit 0; fi
 	echo '{"packages":[{"name":"demo","targets":[{"name":"demo","kind":["lib"],"crate_types":["lib"],"test":true,"doctest":true},{"name":"wire","kind":["test"],"crate_types":["bin"],"test":true,"doctest":false}]}]}'
 	exit 0
 fi
-sel=""; for a in "\$@"; do case "\$a" in --lib|--doc|--test) sel="\$a" ;; esac; done
+sel="" ign=0 threads=""
+for a in "\$@"; do case "\$a" in --lib|--doc|--test) sel="\$a" ;; --ignored) ign=1 ;; --test-threads=1) threads=1 ;; esac; done
 echo "   Compiling demo v0.1.0" >&2
+if [ "\$sel" = --doc ]; then
+	case " \${RUSTDOCFLAGS:-} " in *" -Zunstable-options --no-capture "*) ;; *) echo "stub: cargo test --doc without RUSTDOCFLAGS --no-capture (\${RUSTDOCFLAGS:-})" >&2; exit 2 ;; esac
+	[ "\$threads" = 1 ] || { echo "stub: cargo test --doc without --test-threads=1" >&2; exit 2; }
+fi
+if [ "\$ign" = 1 ]; then
+	# An #[ignore]d test's run goes --offline, under RUST_TEST_OFFLINE_UNDER.
+	[ "\${OFFLINE_WRAPPED:-}" = 1 ] || { echo "stub: an --ignored cargo run not under RUST_TEST_OFFLINE_UNDER" >&2; exit 2; }
+	case " \$* " in *" --offline "*) ;; *) echo "stub: an --ignored cargo run without --offline" >&2; exit 2 ;; esac
+	case "\$mode" in
+		ignored-fails) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "name": "a::slow", "event": "failed", "stdout": "left: 1" }\n{ "type": "suite", "event": "failed", "passed": 0, "failed": 1, "ignored": 0, "measured": 0, "filtered_out": 2, "exec_time": 0.1 }\n'; exit 101 ;;
+		*) FILTERED=2 lt_pass a::slow; exit 0 ;;
+	esac
+fi
 case "\$mode:\$sel" in
 	fail-lib:--lib) lt_fail demo::broken; exit 101 ;;
 	partial-test:--test) lt_partial; exit 0 ;;
 	stderr-skip:--test) echo "skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
 	stderr-skip-named:--test) echo "a::two: skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
 	filtered:--test) FILTERED=1 lt_pass a::one; exit 0 ;;
+	ignored:--test | ignored-fails:--test | ignored-and-doc-ignored:--test) lt_ignored a::one a::slow; exit 0 ;;
+	doc-ignored:--doc | ignored-and-doc-ignored:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ignored" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
+	doc-skip:--doc) lt_out 'src/lib.rs - f (line 3)' 'skipped: no reference rsync\\n'; exit 0 ;;
+	doc-raw-skip:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nskipped: no reference rsync\n'; echo "a line on stderr" >&2; printf '{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "event": "started", "name": "src/lib.rs - g (line 9)" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
+	doc-raw-print:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nno free port: nothing to test\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	*:--doc) printf '{ "type": "suite", "event": "started", "test_count": 0 }\n{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
 	*) lt_pass a::one a::two; exit 0 ;;
 esac
 EOF
 	chmod +x "$w/bin/rustup"
+	printf '#!/bin/sh\nOFFLINE_WRAPPED=1 exec "$@"\n' >"$w/bin/offline"
+	chmod +x "$w/bin/offline"
 	local out rc
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
-		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" \
+		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
@@ -551,6 +574,30 @@ IGNORED_RUN="$D d::renamed" OWN_TESTS="d::one d::needs_network" run J99-ignored-
 IGNORED_ROOT="$B r::cycle" OWN_TESTS="a::one r::cycle" run J100-ignored-root-run-alone 0 "Ignored root test ran alone: $B r::cycle \\(ok\\)" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
 IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="FMT=json; rt $B FAILED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n{ \"type\": \"test\", \"name\": \"r::cycle\", \"event\": \"failed\", \"stdout\": \"mount --bind failed\" }\n{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 3" run J101-ignored-root-failing-body 1 "$B r::cycle failed and is not in" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
 
+# B1: an #[ignore]d cargo test runs alone (rust-test-ignored.txt), or fails
+# the job.
+CARGO_MODE=ignored run J102-cargo-ignored-unlisted 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" run J103-cargo-ignored-run-alone 0 "Ignored cargo test ran alone: sdk/rust/demo:test:wire a::slow \\(ok\\)" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored-fails IGNORED_RUN="sdk/rust/demo:test:wire a::slow" run J104-cargo-ignored-failing-body 1 "sdk/rust/demo:test:wire a::slow failed and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::gone" run J104b-cargo-ignored-listed-renamed 1 "own invocation for a::gone reported \\[" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# B2: an \`\`\`ignore doc block is no test (upstream marks it so that rustdoc
+# never runs it): it is counted and named, in Bazel's doctest log and in
+# cargo's, and fails nothing; an #[ignore]d cargo test beside it still fails.
+DOCIGN="dt $DOC PASSED printf 'running 2 tests\ntest src/lib.rs - f (line 3) ... ok\ntest src/lib.rs - g (line 9) ... ignored\n\ntest result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'"
+NOT_MSG='::error' run J105-bazel-ignore-doc-block-is-no-test 0 '```ignore doc blocks, not tests, marked ignore by upstream: 1' '' "{ $P; rt $D PASSED lt_pass a::one; $DOCIGN; } >\"\$bep\"; exit 0"
+CARGO_MODE=doc-ignored NOT_MSG='::error' run J106-cargo-ignore-doc-block-is-no-test 0 'sdk/rust/demo src/lib.rs - g \(line 9\) \(cargo.s log\)' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run J109-no-ignore-doc-blocks 0 '```ignore doc blocks, not tests, marked ignore by upstream: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail|runs in no invocation)' run J112-ignore-doc-block-passes-ignored-cargo-test-fails 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# B3: a doctest's output is read: the crate's doctests run again under cargo,
+# with rustdoc's --no-capture and one thread, and the lines printed between a
+# doctest's start and its result are its output (stdout and stderr).
+CARGO_MODE=doc-skip run J107-crate-doctest-skips-itself 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=doc-raw-skip run J110-doctest-raw-skip-line 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=doc-raw-print run J111-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+run J107b-crate-doctests-run-under-cargo 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# B4: the listings the macOS job's inventory reads.
+run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
 ONLYT="$D m::langinfo
@@ -563,6 +610,70 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$D m::langinfo" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="m::langinfo" run K4-only-canary-silent 1 "UNKNOWN: the canary $PR p::canary printed nothing" '' 'exit 9'
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" OWN_BODY="if [ \"\$OWN_TARGET\" = $D ]; then FMT=json rt $D FAILED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 2 }\n{ \"type\": \"test\", \"name\": \"m::langinfo\", \"event\": \"failed\", \"stdout\": \"left: 1\" }\n{ \"type\": \"test\", \"name\": \"m::strftime\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 3; fi; own_default" run K5-only-listed-test-fails 1 "$D m::langinfo failed and is not in" '' 'exit 9'
 ONLY="$ONLYT" OWN_TESTS="m::langinfo m::strftime" run K6-only-without-canary 1 'RUST_TEST_ONLY is set and RUST_TEST_CANARY is not' '' 'exit 9'
+
+# --- rust-test-macos-inventory.sh ------------------------------------------------
+# irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>
+# <named>: the inventory against stubs of bazelisk query, build and info.
+# <targets>: the rust_test labels the query names, one per line. <mac
+# binaries> and <linux listings>: lines of `<label> <test>...` (a label with
+# no test has a binary that lists none; a label absent has no binary, or no
+# Linux listing). <named>: rust-test-macos.txt's lines `<label> <test>`.
+# LINUX_INDEX=none leaves the Linux listings out. The output names the
+# inventory file's lines.
+irun() {
+	local name="$1" want="$2" msg="$3" targets="$4" mac="$5" linux="$6" named="$7" w out rc label tests t i=0
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/inventory.XXXXXX")"
+	mkdir -p "$w/bin" "$w/repo/.github/sami" "$w/binroot" "$w/linux" "$w/tmp"
+	printf '%s\n' "$targets" >"$w/targets.txt"
+	{ echo '# named'; [ -n "$named" ] && printf '%s\n' "$named" | while read -r a b; do printf '%s %s  macOS libc\n' "$a" "$b"; done; } >"$w/repo/.github/sami/rust-test-macos.txt"
+	while read -r label tests; do
+		[ -n "$label" ] || continue
+		t="${label#//}"
+		mkdir -p "$w/binroot/${t%%:*}"
+		{ printf '#!/bin/sh\n[ "$1" = --list ] || exit 2\n'; for x in $tests; do printf "echo '%s: test'\n" "$x"; done; } >"$w/binroot/${t%%:*}/${t#*:}"
+		chmod +x "$w/binroot/${t%%:*}/${t#*:}"
+	done <<<"$mac"
+	if [ "${LINUX_INDEX:-}" != none ]; then
+		: >"$w/linux/index.tsv"
+		while read -r label tests; do
+			[ -n "$label" ] || continue
+			i=$((i + 1))
+			# shellcheck disable=SC2086 # one line per test name
+			printf '%s\n' $tests | LC_ALL=C sort -u >"$w/linux/$i.txt"
+			printf '%s\t%s.txt\n' "$label" "$i" >>"$w/linux/index.tsv"
+		done <<<"$linux"
+	fi
+	cat >"$w/bin/bazelisk" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+[ "\${args[0]#--bazelrc=}" != "\${args[0]}" ] && args=("\${args[@]:1}")
+case "\${args[0]}" in
+	query) cat "$w/targets.txt" ;;
+	build) exit "\${BUILD_RC:-0}" ;;
+	info) echo "$w/binroot" ;;
+	*) echo "stub: bazelisk \${args[*]}" >&2; exit 2 ;;
+esac
+EOF
+	chmod +x "$w/bin/bazelisk"
+	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null bash "$repo/.github/sami/rust-test-macos-inventory.sh" "$w/linux" "$w/inventory.txt" 2>&1; echo "--- inventory"; cat "$w/inventory.txt" 2>/dev/null)"
+	rc="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null bash "$repo/.github/sami/rust-test-macos-inventory.sh" "$w/linux" "$w/inventory2.txt" >/dev/null 2>&1; echo $?)"
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+T1=//crates/pi-shell:pi-shell_test
+T2=//crates/pi-builtins:pi-builtins_test
+irun I1-compiled-only-on-macos 0 "$T1 a::mac_only  compiled only on macOS" "$T1
+$T2" "$T1 a::one a::mac_only a::named
+$T2 b::one" "$T1 a::one a::named
+$T2 b::one" "$T1 a::named"
+irun I1b-named-test-joins 0 "$T1 a::named  named in rust-test-macos.txt" "$T1" "$T1 a::one a::named" "$T1 a::one a::named" "$T1 a::named"
+irun I2-no-linux-listings 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T1 a::one" "" "" </dev/null
+LINUX_INDEX=none irun I2b-no-linux-listings-dir 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T1 a::one" "$T1 a::one" ""
+irun I3-named-test-in-no-mac-binary 1 "$T1 a::gone is in .github/sami/rust-test-macos.txt but in no macOS binary's listing" "$T1" "$T1 a::one" "$T1 a::one" "$T1 a::gone"
+irun I4-target-linux-did-not-list 0 "$T2 b::mac  compiled only on macOS" "$T1
+$T2" "$T1 a::one
+$T2 b::mac" "$T1 a::one" "$T1 a::one"
+irun I5-no-mac-binary 1 'UNKNOWN: no macOS test binary could be listed' "$T1" "" "$T1 a::one" ""
 
 # --- fetch-verified.sh -----------------------------------------------------------
 # fetch <name> <want exit> <message regex> <url=answer>...: answer is ok (the

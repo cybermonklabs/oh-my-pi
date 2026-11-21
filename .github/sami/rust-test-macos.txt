@@ -1,8 +1,10 @@
 # Tests that run only on macOS: they expect macOS's libc, libm or terminfo,
 # and are #[ignore]d on other targets. The rust_test_macos job in
-# .github/workflows/sami-build.yml runs exactly these, on macos-15, and fails
-# unless each ran there; the rust_test job (Linux) accounts for them as run
-# there, and fails for a line that names no test #[ignore]d on Linux.
+# .github/workflows/sami-build.yml runs these, with every test compiled only
+# on macOS (.github/sami/rust-test-macos-inventory.sh finds those), on
+# macos-15, and fails unless each ran there; the rust_test job (Linux)
+# accounts for them as run there, and fails for a line that names no test
+# #[ignore]d on Linux.
 # One per line: <bazel test target> <libtest test name>  <what it expects of macOS>.
 //crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_datetime::langinfo_in_the_c_locale  macOS libc's C-locale nl_langinfo values
 //crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_datetime::strftime_options  macOS's %x and an en_US.UTF-8 locale

@@ -139,9 +139,10 @@ jobs:
     name: Rust tests (bazel)
     runs-on: ubuntu-22.04
     # Uncached, the build and the tests took 17 to 25 minutes (runs
-    # 44696018007, 44841451861), and run 44867118979's 20; the #[ignore]d
-    # tests that run alone (each bounded at 1200 s) come after.
-    timeout-minutes: 90
+    # 44696018007, 44841451861), and run 44879022489's 35 with the #[ignore]d
+    # tests that run alone (each bounded at 1200 s); the native addon, the
+    # cargo doctests and the omp-rpc smoke tests come on top.
+    timeout-minutes: 150
     # Test code and dev-dependency build scripts run here, so the job gets a
     # read-only token, and checkout keeps no credential in .git/config.
     permissions:
@@ -425,16 +426,50 @@ jobs:
           # (the main invocation runs as the runner's user).
           [ "$(id -u)" != 0 ] || fail "the job runs as root, so nothing is unreadable to it"
           echo "user: $(id -un) ($(id -u)); user xattrs and localedef work"
+      # sdk/rust/omp-rpc's two #[ignore]d smoke tests run the repository's
+      # omp server (`bun packages/coding-agent/src/cli.ts --mode rpc`), so the
+      # test step runs them alone with --ignored (rust-test-ignored.txt)
+      # under the bun release_binary builds with (package.json's
+      # packageManager, through the same action), with the dependencies and
+      # the native addon in place.
+      - uses: ./.github/actions/bun-install
+      - name: The native addon the smoke tests' server loads
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          OMP_NATIVE_BUILD_BACKEND=bazel bun scripts/bazel-natives.ts host --dest packages/natives/native
+          ls -l packages/natives/native
       - name: Rust tests against the known-failure list
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+          # sdk/rust/omp-rpc's smoke_real_server starts the omp server, which
+          # will not start with no model configured ("No default model
+          # selected", run 44889772803). The test sends no prompt, so a
+          # placeholder key, which is no credential, selects a model that is
+          # never called. The cargo tests see it; Bazel's tests do not (its
+          # strict action env passes only the --test_env variables). The omp
+          # server reaches a dozen hosts as it starts (run 44898771348), so the
+          # #[ignore]d cargo tests, which start it, run with no network but
+          # loopback (.github/sami/rust-test-offline.sh).
+          ANTHROPIC_API_KEY: placeholder-no-model-call
+          RUST_TEST_OFFLINE_UNDER: ${{ github.workspace }}/.github/sami/rust-test-offline.sh
         run: |
           RUST_TEST_PATH="$HOME/rsync-ref/bin:$HOME/jj-ref/bin:/usr/local/bin:/usr/bin:/bin" \
             RUST_TEST_TMPDIR=/mnt/reflink/tmp \
             PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
             bash .github/sami/rust-test.sh
+      # Each Linux test binary's listing, for rust_test_macos's inventory.
+      - name: The test binaries' listings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-listings
+          path: ${{ runner.temp }}/rust-test/listings
+          retention-days: 3
+          if-no-files-found: error
       - name: Every Rust test has a Bazel test target
         # `bazel test //crates/...` runs only Bazel test targets, and most of
         # pi-edit's, pi-shell's and pi-vcs's tests/*.rs files, obash's unit
@@ -447,15 +482,22 @@ jobs:
         run: bash .github/sami/rust-test-parity.sh
 
   rust_test_macos:
-    # Twelve pi-shell tests expect macOS's libc, libm or terminfo and are
-    # #[ignore]d on other targets, so rust_test cannot run them. This job runs
-    # exactly those (.github/sami/rust-test-macos.txt) on macos-15, the host
-    # release_binary builds darwin-arm64 on, through the same test step with
-    # the same failure, skip and output rules; it fails unless each of them
-    # ran. A known printing test runs beside them as the skip scan's canary.
+    # The tests only macOS can run: those compiled only on macOS (in a macOS
+    # test binary's listing and not in the Linux binary's of the same target,
+    # the rust_test job's listings), and the twelve pi-shell tests that
+    # expect macOS's libc, libm or terminfo and are #[ignore]d on other
+    # targets (.github/sami/rust-test-macos.txt). This job builds every test
+    # target on macos-15, the host release_binary builds darwin-arm64 on,
+    # lists them (.github/sami/rust-test-macos-inventory.sh), and runs those
+    # tests through the same test step with the same failure, skip and output
+    # rules; it fails unless each of them ran. A known printing test runs
+    # beside them as the skip scan's canary.
+    needs: rust_test
+    # It runs whatever rust_test's verdict, once its listings are uploaded.
+    if: ${{ !cancelled() }}
     name: Rust tests (bazel, macOS-only tests)
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -486,13 +528,22 @@ jobs:
         run: bash .github/sami/tests/run.sh
       - id: bazel
         uses: ./.github/actions/bazel-cache
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rust-test-listings
+          path: ${{ runner.temp }}/linux-listings
+      - name: The tests only macOS can run
+        shell: bash
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: bash .github/sami/rust-test-macos-inventory.sh "$RUNNER_TEMP/linux-listings" "$RUNNER_TEMP/macos-inventory.txt"
       - name: The macOS-only Rust tests
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
           mkdir -p "$RUNNER_TEMP/tests"
-          RUST_TEST_ONLY=.github/sami/rust-test-macos.txt \
+          RUST_TEST_ONLY="$RUNNER_TEMP/macos-inventory.txt" \
             RUST_TEST_CANARY="//crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_a_short_grace" \
             RUST_TEST_PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             RUST_TEST_TMPDIR="$RUNNER_TEMP/tests" \

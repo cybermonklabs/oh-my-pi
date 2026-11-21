@@ -3,30 +3,39 @@
 # red Rust test stops a sami release.
 #
 # On Linux (the rust_test job) it runs every Bazel test target under
-# //crates, and every test target of the cargo workspaces Bazel does not
-# build, reads each test log, and fails when:
+# //crates, every test target of the cargo workspaces Bazel does not build,
+# and, under cargo too, the doctests of every crate that has a Bazel doctest
+# target (whose runner shows no passing doctest's output), reads each test
+# log, and fails when:
 #   - a test fails that .github/sami/rust-test-known-failures.txt does not
 #     name, or a test it names does not fail;
 #   - a target fails to build or has no result, or its test binary ends
 #     before its tests do;
-#   - a test skips itself or prints (see "Skips" below), unless a list names
-#     it;
+#   - a test or doctest skips itself or prints (see "Skips" below), unless a
+#     list names it;
 #   - a test of a test binary runs in no invocation (a filter in its target's
 #     args, or a skip this script passes, took it out), unless
 #     .github/sami/rust-test-sanctioned-skips.txt names it;
 #   - an #[ignore]d test runs nowhere: each one is run alone with --ignored
-#     (.github/sami/rust-test-ignored.txt, or as root
-#     .github/sami/rust-test-ignored-root.txt), or is a child process's entry
-#     point that another test starts (.github/sami/rust-test-child-entries.txt),
-#     or runs in the macOS job (.github/sami/rust-test-macos.txt);
+#     (.github/sami/rust-test-ignored.txt, a Bazel target or a cargo one, or
+#     as root .github/sami/rust-test-ignored-root.txt), or is a child
+#     process's entry point that another test starts
+#     (.github/sami/rust-test-child-entries.txt), or runs in the macOS job
+#     (.github/sami/rust-test-macos.txt);
+#   (An ```ignore doc block is not a test: upstream marks it so that rustdoc
+#   never runs it. It counts neither as run nor against the job; the step
+#   prints how many there are and where.)
 #   - a test named in .github/sami/rust-test-own-process.txt does not run
 #     alone in an invocation of its own, or also runs in the main one;
 #   - a target in .github/sami/rust-test-root-targets.txt prints `not run:`,
 #     or passes another number of tests than its line names.
-# With RUST_TEST_ONLY naming a list (the macOS job names
-# .github/sami/rust-test-macos.txt), it runs only the tests that list names,
-# each target once with --exact, and fails unless each of them ran here; the
-# failure, skip and output rules are the same.
+# It leaves each test binary's listing in $RUNNER_TEMP/rust-test/listings
+# (index.tsv names the binary of each), for the macOS job's inventory
+# (.github/sami/rust-test-macos-inventory.sh).
+# With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
+# runs only the tests that list names, each target once with --exact, and
+# fails unless each of them ran here; the failure, skip and output rules are
+# the same.
 #
 # Skips. libtest has no outcome for a test that skips itself: such a test
 # returns early, and passes. So a test that cannot run here prints the marker
@@ -183,8 +192,16 @@ while IFS=$'\t' read -r target name; do
 	own+=("$target"$'\t'"$name")
 	skip_flags+=(--test_arg=--skip --test_arg="$name")
 done <"$tmp/own.tsv"
+# .github/sami/rust-test-ignored.txt names Bazel targets (`//…`) and cargo
+# ones (`<directory>:<kind>:<name>`, as the cargo branch below labels them).
 ignored_run=()
-while IFS=$'\t' read -r target name; do ignored_run+=("$target"$'\t'"$name"); done <"$tmp/ignored-run.tsv"
+ignored_cargo=()
+while IFS=$'\t' read -r target name; do
+	case "$target" in
+		//*) ignored_run+=("$target"$'\t'"$name") ;;
+		*) ignored_cargo+=("$target"$'\t'"$name") ;;
+	esac
+done <"$tmp/ignored-run.tsv"
 ignored_root=()
 while IFS=$'\t' read -r target name; do ignored_root+=("$target"$'\t'"$name"); done <"$tmp/ignored-root.tsv"
 
@@ -392,8 +409,74 @@ fi
 # as a rust_test log, with the stderr cargo kept beside it. The target is
 # `<directory>:<kind>:<name>` (kind lib, bin, test, example, bench or doc). A
 # failed cargo metadata stops the step.
+# Then the doctests of each crate with a Bazel doctest target run again under
+# cargo, as `<directory>:doc`: rules_rust's doctest runner takes no test
+# arguments, so its log shows neither a passing doctest's output nor one in
+# JSON. Even under cargo, rustdoc keeps a passing doctest's output out of the
+# record (`--show-output` reaches only libtest), so these run with rustdoc's
+# `--no-capture` and one thread, and doc_attribute gives each doctest the
+# lines printed between its start and its result (run 44889772803: a planted
+# doctest's `skipped:` line reached no record without them).
+# Then each #[ignore]d cargo test that .github/sami/rust-test-ignored.txt
+# names runs alone, with --ignored and --exact.
+channel=""
+ncargo=0
+# doc_attribute: a doctest record whose output rustdoc's --no-capture printed
+# raw (stdout and stderr, one thread) between each test's `started` event and
+# its result, as libtest's record with that output as the result's stdout. A
+# line outside every test stays as it is.
+doc_attribute() {
+	jq -R -r -n '
+		reduce inputs as $l ({cur: null, buf: "", out: []};
+			(try ($l | fromjson) catch null) as $o
+			| if ($o | type) == "object" and ($o.type == "test" or $o.type == "suite") then
+				if $o.type == "test" and $o.event == "started" then .cur = $o.name | .buf = "" | .out += [$l]
+				elif $o.type == "test" and $o.name == .cur then
+					. as $s | .out += [($o | .stdout = ((.stdout // "") + $s.buf) | tojson)] | .cur = null | .buf = ""
+				else .out += [$l] end
+			elif .cur != null then .buf += $l + "\n"
+			else .out += [$l] end)
+		| .out[]'
+}
+# cargo_test <label> <manifest> <invocation> <cargo arguments>...: one
+# `cargo test`, whose arguments end with `--` and the test arguments; its
+# JSON record is a row. A --doc run goes through doc_attribute. An #[ignore]d
+# test's run (invocation ignored-cargo-<n>) runs --offline, under the
+# command RUST_TEST_OFFLINE_UNDER names when it is set: the rust_test job
+# names .github/sami/rust-test-offline.sh, which takes the network away.
+cargo_test() {
+	local label="$1" manifest="$2" inv="$3" log err code=0 doc=0 a
+	shift 3
+	for a in "$@"; do [ "$a" = --doc ] && doc=1; done
+	local under=() offline=()
+	case "$inv" in
+		ignored-cargo-*)
+			offline=(--offline)
+			[ -z "${RUST_TEST_OFFLINE_UNDER:-}" ] || under=("$RUST_TEST_OFFLINE_UNDER")
+			;;
+	esac
+	ncargo=$((ncargo + 1))
+	log="$tmp/logs/cargo-$ncargo.log"
+	err="$log.err"
+	if [ "$doc" = 1 ]; then
+		err="$log.raw"
+		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		doc_attribute <"$err" >"$log"
+		: >"$log.err"
+	else
+		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+	fi
+	if [ "$code" = 0 ]; then
+		printf '%s\tcargo test\tPASSED\tpassed\t%s\t-\t%s\n' "$label" "$log" "$inv" >>"$rows"
+	else
+		echo "::group::$label: cargo test exited $code"
+		tail -n 50 "$err"
+		echo "::endgroup::"
+		printf '%s\tcargo test\tFAILED\tfailed\t%s\t-\t%s\n' "$label" "$log" "$inv" >>"$rows"
+	fi
+}
 run_cargo() {
-	local channel n=0 manifest dir label selector name log code
+	local n=0 manifest dir label selector name kind rest i target test
 	channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
 	[ -n "$channel" ] || stop "rust-toolchain.toml names no channel"
 	rustup toolchain install "$channel" --profile minimal --no-self-update
@@ -410,21 +493,27 @@ run_cargo() {
 		[ -s "$tmp/cargo-targets.tsv" ] || stop "$manifest names no test target"
 		while IFS=$'\t' read -r label selector name; do
 			n=$((n + 1))
-			log="$tmp/logs/cargo-$n.log"
-			code=0
 			# shellcheck disable=SC2086 # $name is empty for --lib and --doc
-			rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$selector" $name -- -Zunstable-options --format=json --show-output >"$log" 2>"$log.err" || code=$?
-			if [ "$code" = 0 ]; then
-				printf '%s\tcargo test\tPASSED\tpassed\t%s\t-\tcargo\n' "$label" "$log" >>"$rows"
-			else
-				echo "::group::$label: cargo test exited $code"
-				tail -n 50 "$log.err"
-				echo "::endgroup::"
-				printf '%s\tcargo test\tFAILED\tfailed\t%s\t-\tcargo\n' "$label" "$log" >>"$rows"
-			fi
+			cargo_test "$label" "$manifest" cargo "$selector" $name --
 		done <"$tmp/cargo-targets.tsv"
 	done <"$tmp/cargo-workspaces.txt"
 	[ "$n" != 0 ] || stop "$sami/rust-test-cargo-workspaces.txt names no workspace with a test target"
+	awk -F'\t' '$2 == "rust_doc_test rule" { d = $1; sub(/^\/\//, "", d); sub(/:.*/, "", d); print d }' "$rows" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
+	while read -r dir; do
+		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc --
+	done <"$tmp/doc-dirs.txt"
+	for i in "${!ignored_cargo[@]}"; do
+		IFS=$'\t' read -r target test <<<"${ignored_cargo[$i]}"
+		dir="${target%%:*}"
+		rest="${target#*:}"
+		kind="${rest%%:*}"
+		name="${rest#*:}"
+		case "$kind" in
+			lib) cargo_test "$target" "$dir/Cargo.toml" "ignored-cargo-$i" --lib -- --ignored --exact "$test" ;;
+			bin | test | example | bench) cargo_test "$target" "$dir/Cargo.toml" "ignored-cargo-$i" "--$kind" "$name" -- --ignored --exact "$test" ;;
+			*) stop "$sami/rust-test-ignored.txt: $target is no cargo test target (<directory>:<lib|bin|test|example|bench>:<name>)" ;;
+		esac
+	done
 }
 
 # Bazel skips, without an error and without a result in the event log, a test
@@ -446,7 +535,7 @@ check_results_exist() {
 	while IFS=$'\t' read -r target src; do
 		binary_of["$target"]="$src"
 	done <"$tmp/native-src.tsv"
-	awk -F'\t' '$7 != "cargo" { print $1 }' "$rows" | LC_ALL=C sort -u >"$tmp/with-result.txt"
+	awk -F'\t' '$1 ~ /^\/\// { print $1 }' "$rows" | LC_ALL=C sort -u >"$tmp/with-result.txt"
 	while read -r label; do
 		error "Rust tests" "$label is a test target, but bazel test has no result for it: skipped as incompatible with the runner, left out by a test filter, or not built"
 	done < <(LC_ALL=C comm -23 "$tmp/test-targets.txt" "$tmp/with-result.txt")
@@ -454,6 +543,10 @@ check_results_exist() {
 
 if [ -z "$only" ]; then
 	run_cargo
+	for i in "${!ignored_cargo[@]}"; do
+		IFS=$'\t' read -r target name <<<"${ignored_cargo[$i]}"
+		check_alone "Ignored cargo test" "ignored-cargo-$i" "$target" "$name"
+	done
 	check_results_exist
 fi
 
@@ -525,6 +618,23 @@ add_failed() {
 	printf '%s\n' "$3" | awk -v label="$1" 'NF { print label "\t" $0 }' >>"$failed"
 }
 
+# doc_dir <target>: a doctest target's crate directory: crates/x for the
+# Bazel target //crates/x:x_doc_test and the cargo labels crates/x:doc and
+# crates/x:doc:<name>.
+doc_dir() {
+	local d="${1#//}"
+	printf '%s\n' "${d%%:*}"
+}
+
+# doc_ignored <origin> <target> <name>: an ```ignore doctest, by its crate's
+# directory and its name relative to it (both name it with the crate's
+# path, `crates/x/src/lib.rs - f (line 3)`).
+doc_ignored() {
+	local dir
+	dir="$(doc_dir "$2")"
+	printf '%s\t%s\t%s\n' "$1" "$dir" "${3#"$dir"/}" >>"$tmp/doc-ignored.tsv"
+}
+
 # check_libtest <target> <status> <kind> <log> <invocation>: a rust_test,
 # native_test or cargo test log must hold libtest's JSON record whole: the
 # planned test_count, a result for every planned test, and the suite's end,
@@ -561,15 +671,20 @@ check_libtest() {
 		printf '%s\n' "$log" >>"$incomplete"
 		return 0
 	fi
-	if [ "$inv" = cargo ]; then
-		scan_output "$label" "$log" "$log.err"
-		# The job gives cargo test no filter, so nothing may be taken out.
-		if [ "$filtered" != 0 ]; then
-			error "Rust test skips" "$label filtered out $filtered tests, though cargo test is given no filter"
-		fi
-	else
-		scan_output "$label" "$log"
-	fi
+	case "$inv" in
+		cargo)
+			scan_output "$label" "$log" "$log.err"
+			# The job gives cargo test no filter, so nothing may be taken out.
+			if [ "$filtered" != 0 ]; then
+				error "Rust test skips" "$label filtered out $filtered tests, though cargo test is given no filter"
+			fi
+			# Its #[ignore]d tests (and ```ignore doctests) ran nothing; they
+			# are reconciled below.
+			jq -R -r --arg target "$label" 'fromjson? | select(type == "object" and .type == "test" and .event == "ignored") | "\($target)\t\(.name)"' "$log" >>"$tmp/cargo-ignored.tsv"
+			;;
+		ignored-cargo-*) scan_output "$label" "$log" "$log.err" ;;
+		*) scan_output "$label" "$log" ;;
+	esac
 	if [ "$inv" = root ] && [ -n "${root_tests[$label]:-}" ]; then
 		check_root "$label" "$log"
 	fi
@@ -592,9 +707,11 @@ check_libtest() {
 # process printed does not stand for the runner's; a passed log's last
 # summary must be `test result: ok.`. A failed one ends with `failures:`,
 # each failed doctest indented four spaces, a blank line and `test result:
-# FAILED.`. No doctest may be filtered out: no list names one.
+# FAILED.`. No doctest may be filtered out: no list names one. An ```ignore
+# doctest runs nothing, so each `test <name> ... ignored` line fails the job,
+# and so does an ignored count with no such line.
 check_doctest() {
-	local label="$1" status="$2" kind="$3" log="$4" counts header summed verdict filtered names
+	local label="$1" status="$2" kind="$3" log="$4" counts header summed verdict filtered ignored names name
 	counts="$(awk '
 		!head && /^running [0-9]+ tests?$/ { head = $2 }
 		/^test result: / {
@@ -602,15 +719,23 @@ check_doctest() {
 			n = split($0, word, /[ ;]+/)
 			for (i = 2; i <= n; i++) if (word[i] ~ /^(passed|failed|ignored|measured)$/) sum += word[i - 1]
 		}
-		END { printf "%s\t%s\t%s\t%s\n", (head == "" ? -1 : head), (last == "" ? -1 : sum), (last ~ /^test result: ok\./ ? "ok" : "not-ok"), (last ~ / [1-9][0-9]* filtered out/ ? "some" : "none") }
+		/^test result: / { ign = 0; for (i = 2; i <= n; i++) if (word[i] ~ /^ignored$/) ign = word[i - 1] }
+		END { printf "%s\t%s\t%s\t%s\t%s\n", (head == "" ? -1 : head), (last == "" ? -1 : sum), (last ~ /^test result: ok\./ ? "ok" : "not-ok"), (last ~ / [1-9][0-9]* filtered out/ ? "some" : "none"), ign + 0 }
 	' "$log")"
-	IFS=$'\t' read -r header summed verdict filtered <<<"$counts"
+	IFS=$'\t' read -r header summed verdict filtered ignored <<<"$counts"
 	if [ "$header" -lt 0 ] || [ "$summed" != "$header" ]; then
 		error "Rust tests" "$label is $status, but its log's header plans $header doctests and its last summary counts $summed"
 		return 0
 	fi
 	if [ "$filtered" != none ]; then
 		error "Rust test skips" "$label took a doctest out, which no list names"
+	fi
+	awk '/^test .* \.\.\. ignored$/ { sub(/^test /, ""); sub(/ \.\.\. ignored$/, ""); print }' "$log" >"$tmp/doctest-ignored.txt"
+	while IFS= read -r name; do
+		doc_ignored bazel "$label" "$name"
+	done <"$tmp/doctest-ignored.txt"
+	if [ "$ignored" != 0 ] && [ ! -s "$tmp/doctest-ignored.txt" ]; then
+		error "Rust test skips" "$label's summary counts $ignored ignored doctests, and its log names none"
 	fi
 	if [ "$kind" = passed ]; then
 		if [ "$verdict" != ok ]; then
@@ -639,6 +764,32 @@ while IFS=$'\t' read -r label rule status kind log _ inv; do
 		*) error "Rust tests" "$label is a $rule, whose log this step cannot read" ;;
 	esac
 done <"$rows"
+
+# The #[ignore]d cargo tests: each must be named in
+# .github/sami/rust-test-ignored.txt, which ran it alone above; any other
+# fails the job. An ```ignore doc block is not a test (upstream marks it so
+# that rustdoc never runs it): it is counted and named, and fails nothing.
+touch "$tmp/cargo-ignored.tsv" "$tmp/doc-ignored.tsv"
+LC_ALL=C sort -u -o "$tmp/cargo-ignored.tsv" "$tmp/cargo-ignored.tsv"
+printf '%s\n' ${ignored_cargo[@]+"${ignored_cargo[@]}"} | LC_ALL=C sort -u >"$tmp/ignored-cargo-listed.tsv"
+while IFS=$'\t' read -r label name; do
+	case "$label" in
+		*:doc | *:doc:*) doc_ignored cargo "$label" "$name" ;;
+		*)
+			if grep -qxF -- "$label"$'\t'"$name" "$tmp/ignored-cargo-listed.tsv"; then
+				echo "Ignored cargo test, run alone with --ignored: $label $name"
+			else
+				error "Rust test skips" "$label $name is #[ignore]d and runs in no invocation: run it (name it in $sami/rust-test-ignored.txt)"
+			fi
+			;;
+	esac
+done <"$tmp/cargo-ignored.tsv"
+echo "::group::\`\`\`ignore doc blocks (not tests, marked ignore by upstream): $(count "$tmp/doc-ignored.tsv")"
+while IFS=$'\t' read -r origin dir name; do
+	echo "$dir $name ($origin's log)"
+done <"$tmp/doc-ignored.tsv"
+echo "::endgroup::"
+echo "\`\`\`ignore doc blocks, not tests, marked ignore by upstream: $(count "$tmp/doc-ignored.tsv")"
 
 # reconcile <found> <list> <listed> <noun> <verb> <title> <stale>: the tests
 # found (failed, skipped, printing) against a list, both ways. One found and
@@ -828,4 +979,10 @@ for list in child-entries macos; do
 	done < <(LC_ALL=C comm -13 "$tmp/ignored.tsv" "$tmp/$list.tsv")
 done
 echo "Test binaries listed: ${#listing_of[@]}; #[ignore]d tests no invocation ran: $(count "$tmp/ignored.tsv")"
+# The macOS job's inventory reads each binary's listing: index.tsv names the
+# listing file of each (a native_test's binary is its src's).
+for binary in "${!listing_of[@]}"; do
+	printf '%s\t%s\n' "$binary" "$(basename "${listing_of[$binary]}")"
+done | LC_ALL=C sort >"$listings/index.tsv"
+echo "Listings for the macOS inventory: $(count "$listings/index.tsv") binaries in $listings"
 exit "$bad"
