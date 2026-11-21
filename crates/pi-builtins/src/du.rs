@@ -1436,6 +1436,7 @@ mod tests {
 	fn unreadable_directories_are_reported_and_still_counted() {
 		use std::os::unix::fs::PermissionsExt;
 		if nix::unistd::geteuid().is_root() {
+			eprintln!("skipped: root reads a directory of mode 000, so nothing is unreadable");
 			return;
 		}
 		let (_dir, root) = tree();
