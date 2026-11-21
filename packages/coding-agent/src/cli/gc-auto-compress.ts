@@ -39,6 +39,9 @@ export const GC_AUTO_COMPRESS_LOG = "gc-auto-compress.log";
 export async function scheduleGcAutoCompress(agentDir: string): Promise<Subprocess | undefined> {
 	const logPath = path.join(agentDir, GC_AUTO_COMPRESS_LOG);
 	if (!(await runIsDue(logPath))) return undefined;
+	// The claim is a lock file beside the log, so its directory must exist first, as for every
+	// `tryAcquireFileLock` caller.
+	await fs.mkdir(agentDir, { recursive: true });
 	const claim = tryAcquireFileLock(logPath);
 	if (claim === null) return undefined;
 	try {

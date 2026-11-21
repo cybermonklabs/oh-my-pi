@@ -2906,6 +2906,22 @@ describe("runGcCommand session compression", () => {
 		expect(await Bun.file(path.join(root, GC_AUTO_COMPRESS_LOG)).text()).toContain("compress skipped: unsupported");
 		expect(await snapshot(file)).toEqual(before);
 	});
+
+	test("the background run stamps its log when the agent dir does not exist yet", async () => {
+		// The launch claims the run with a lock beside the log, and that lock is a file in the
+		// log's directory, so the launch makes the directory before it takes the lock.
+		const agentDir = path.join(root, "agent-not-made-yet");
+		const volume = spyOn(gcCompress, "compressMethod").mockResolvedValue(undefined);
+		try {
+			expect(await scheduleGcAutoCompress(agentDir)).toBeUndefined();
+		} finally {
+			volume.mockRestore();
+		}
+
+		expect(await Bun.file(path.join(agentDir, GC_AUTO_COMPRESS_LOG)).text()).toContain(
+			"compress skipped: unsupported",
+		);
+	});
 });
 
 describe("runGcCommand replay data stripping", () => {
