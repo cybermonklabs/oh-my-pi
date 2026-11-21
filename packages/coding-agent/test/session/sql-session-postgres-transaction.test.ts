@@ -2009,18 +2009,25 @@ describe("on a PostgreSQL server", () => {
 			const storeUrl = STORE_URL ?? "";
 			const admin = new SQL(ADMIN_URL ?? storeUrl, { max: 1 });
 			const probe = new SQL(storeUrl, { max: 1 });
-			try {
-				// What a run stopped between a case's ALTER ROLE … SET and its RESET leaves.
-				await admin.unsafe(`ALTER ROLE ${target} SET transaction_timeout = '1s'`);
-				expect(await resetLeftoverLoginDefault(probe, target)).toBe("1s");
-				expect(await resetLeftoverLoginDefault(probe, target)).toBeUndefined();
+			/** `transaction_timeout` on a connection of the store's login opened now. */
+			const shown = async (): Promise<unknown> => {
 				const fresh = new SQL(storeUrl, { max: 1 });
 				try {
-					const [shown] = (await fresh.unsafe("SHOW transaction_timeout")) as Array<Record<string, unknown>>;
-					expect(shown?.transaction_timeout).toBe("0");
+					const [row] = (await fresh.unsafe("SHOW transaction_timeout")) as Array<Record<string, unknown>>;
+					return row?.transaction_timeout;
 				} finally {
 					await fresh.close();
 				}
+			};
+			try {
+				// The server's own value, which its configuration or a database or role-wide default may set.
+				const before = await shown();
+				// What a run stopped between a case's ALTER ROLE … SET and its RESET leaves.
+				await admin.unsafe(`ALTER ROLE ${target} SET transaction_timeout = '1s'`);
+				expect(await shown()).toBe("1s");
+				expect(await resetLeftoverLoginDefault(probe, target)).toBe("1s");
+				expect(await resetLeftoverLoginDefault(probe, target)).toBeUndefined();
+				expect(await shown()).toBe(before);
 			} finally {
 				await admin.unsafe(`ALTER ROLE ${target} RESET transaction_timeout`).catch(() => undefined);
 				await probe.close();
