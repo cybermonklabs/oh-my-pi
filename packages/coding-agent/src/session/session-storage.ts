@@ -614,10 +614,12 @@ export interface SessionStorage {
 	 * writes complete in-body; async backends (Redis/SQL via
 	 * {@link IndexedSessionStorage}) await their per-path queues so a caller
 	 * driving a graceful shutdown does not exit while a fire-and-forget
-	 * `writeTextSync` publish is still on the wire. Rejects with the first
-	 * failure of such a publish to `path` not reported before (to any path when
-	 * `path` is omitted), so one session's drain never reports another
-	 * session's failed write.
+	 * `writeTextSync` publish is still on the wire. Rejects with a failure of
+	 * such a publish not reported before: one to `path`, or one to another
+	 * path while no write has landed on the store since it (it may be the
+	 * store refusing every write); with `path` omitted, the first to any path.
+	 * Once a later write lands, another session's failed write is never
+	 * reported to `path`'s drain.
 	 */
 	drain(path?: string): Promise<void>;
 }

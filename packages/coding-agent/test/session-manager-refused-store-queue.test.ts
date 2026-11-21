@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { FileSessionStorage, tryAcquireSessionLease } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
@@ -77,6 +77,13 @@ async function closeRefused(child: SessionManager, seal: { keepEntries?: boolean
 	child.seal(seal);
 	await expect(child.close()).rejects.toThrow();
 	return ids;
+}
+
+/** Whether another holder can take `sessionId`'s claim now (the OS lease a file store's claim holds). */
+function claimFree(sessionId: string): boolean {
+	const contender = tryAcquireSessionLease(sessionId);
+	contender?.release();
+	return contender !== null;
 }
 
 function storedFile(file: string): string[] {
@@ -169,6 +176,43 @@ describe("a session the store refused is sent again once another session's write
 		expect({ holds: child.holdsTranscript(), held: heldIds(child) }).toEqual({ holds: false, held: ids });
 		child.releaseRetainedEntries();
 		expect(child.getEntries()).toHaveLength(0);
+	});
+
+	it("a close that lands releases the session's claim at once (control)", async () => {
+		const dir = tempDir();
+		const { childDir } = subagentDisk(dir);
+		const child = await openChild(dir, childDir, "Landed");
+		const id = child.getSessionId();
+		expect(claimFree(id)).toBe(false);
+
+		child.seal();
+		await child.close();
+
+		expect(claimFree(id)).toBe(true);
+	});
+
+	it("a close the store refused for an outage keeps the session's claim while the transcript is held, and the hold's end releases it", async () => {
+		const dir = tempDir();
+		const { disk, childDir } = subagentDisk(dir);
+		const child = await openChild(dir, childDir, "Claimed");
+		const id = child.getSessionId();
+		expect(claimFree(id)).toBe(false);
+		disk.full = true;
+		child.appendMessage(assistant("Claimed: refused answer"));
+		const ids = await closeRefused(child);
+		const file = child.getSessionFile() as string;
+
+		// Held: no other holder may take the session while its transcript waits to be sent.
+		expect({ holds: child.holdsTranscript(), free: claimFree(id) }).toEqual({ holds: true, free: false });
+
+		disk.full = false;
+		const parent = SessionManager.create(dir.path(), dir.join("main"));
+		parent.appendMessage(assistant("the parent's write lands"));
+		await parent.close();
+
+		// Sent: the hold is over, and with it the claim.
+		expect(storedFile(file)).toEqual(ids);
+		expect({ holds: child.holdsTranscript(), free: claimFree(id) }).toEqual({ holds: false, free: true });
 	});
 
 	for (const refusal of ["read-only", "connection"] as const) {
