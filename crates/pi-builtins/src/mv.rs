@@ -1572,4 +1572,115 @@ mod tests {
 			(code, capture.err())
 		});
 	}
+
+	/// A source that is the destination's simple backup (`dest~` for `dest`,
+	/// by name and as the same file) is not moved over the destination when
+	/// a backup is to be made in any mode but `numbered`: the backup would be
+	/// renamed over the source first. GNU mv refuses with "backing up 'dest'
+	/// might destroy source;  'dest~' not moved", status 1, also when `dest`
+	/// is a symlink that points nowhere, and also for `./dest~`; `numbered`
+	/// backs `dest` up as `dest.~1~` and moves. A `dest~` elsewhere is
+	/// another file, and moves. Each answer is GNU coreutils 9.4's and 9.7's.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_that_is_the_destinations_simple_backup_is_not_moved_over_it() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str, dest: Option<bool>| {
+			let dir = cwd.path().join(name);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("dest~"), b"payload").unwrap();
+			match dest {
+				Some(true) => dangling(&dir.join("dest")),
+				Some(false) => fs::write(dir.join("dest"), b"old").unwrap(),
+				None => {},
+			}
+			dir
+		};
+		let refused = |source: &str| {
+			(1, format!("mv: backing up 'dest' might destroy source;  '{source}' not moved\n"))
+		};
+		for control in ["--backup=simple", "--backup=existing", "-b"] {
+			for link in [true, false] {
+				let what = format!("{control} onto a {}", if link { "dangling link" } else { "file" });
+				let dir = case(&format!("{}-{link}", control.trim_start_matches('-')), Some(link));
+				assert_eq!(mv_in(&dir, &[control, "dest~", "dest"], ""), refused("dest~"), "{what}");
+				assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "{what}: the source was lost");
+				if link {
+					assert_eq!(link_at(&dir.join("dest")), Some("missing".into()), "{what}: dest replaced");
+				} else {
+					assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "{what}: dest replaced");
+				}
+			}
+		}
+		let dir = case("dot-slash", Some(false));
+		assert_eq!(mv_in(&dir, &["-b", "./dest~", "dest"], ""), refused("./dest~"), "./dest~");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "./dest~: the source was lost");
+
+		// The controls: numbered backups, no destination, a `dest~` elsewhere.
+		for link in [true, false] {
+			let dir = case(&format!("numbered-{link}"), Some(link));
+			assert_eq!(mv_in(&dir, &["--backup=numbered", "dest~", "dest"], ""), (0, String::new()));
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "numbered: not moved");
+			if link {
+				assert_eq!(link_at(&dir.join("dest.~1~")), Some("missing".into()), "numbered: no backup");
+			} else {
+				assert_eq!(fs::read(dir.join("dest.~1~")).unwrap(), b"old", "numbered: no backup");
+			}
+		}
+		let dir = case("no-dest", None);
+		assert_eq!(mv_in(&dir, &["-b", "dest~", "dest"], ""), (0, String::new()), "no dest");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "no dest: not moved");
+		let dir = cwd.path().join("elsewhere");
+		fs::create_dir_all(dir.join("s")).unwrap();
+		fs::write(dir.join("s/dest~"), b"payload").unwrap();
+		fs::write(dir.join("dest"), b"old").unwrap();
+		assert_eq!(mv_in(&dir, &["-b", "s/dest~", "dest"], ""), (0, String::new()), "elsewhere");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "elsewhere: not moved");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"old", "elsewhere: no backup");
+	}
+
+	/// `-u` compares the source's own time, as `lstat` reports it: a source
+	/// symlink older than the destination is not moved, though the file it
+	/// points to is newer, as GNU mv decides.
+	#[cfg(unix)]
+	#[test]
+	fn update_older_compares_a_source_links_own_time() {
+		let cwd = tempdir().unwrap();
+		let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+		let target = cwd.path().join("target");
+		fs::write(&target, b"target").unwrap();
+		std::os::unix::fs::symlink("target", cwd.path().join("src")).unwrap();
+		fs::write(cwd.path().join("dest"), b"old").unwrap();
+		// The link keeps the time it was made at, now; the destination is
+		// newer than it, and the link's target newer still.
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		fs::File::options().write(true).open(&target).unwrap().set_modified(at(now + 2_000)).unwrap();
+		fs::File::options()
+			.write(true)
+			.open(cwd.path().join("dest"))
+			.unwrap()
+			.set_modified(at(now + 1_000))
+			.unwrap();
+		assert_eq!(mv_in(cwd.path(), &["-u", "src", "dest"], ""), (0, String::new()));
+		assert_eq!(fs::read(cwd.path().join("dest")).unwrap(), b"old", "the link was moved");
+		assert_eq!(link_at(&cwd.path().join("src")), Some("target".into()), "the link was moved");
+	}
+
+	/// A directory moved with `--backup=numbered` onto a symlink that points
+	/// nowhere, beside an earlier backup that is also such a link, backs the
+	/// link up one past it and keeps both, as GNU mv does: `dd/src.~1~` was
+	/// taken as free and replaced.
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_keeps_an_earlier_dangling_backup() {
+		let cwd = tempdir().unwrap();
+		fs::create_dir_all(cwd.path().join("src")).unwrap();
+		fs::create_dir(cwd.path().join("dd")).unwrap();
+		dangling(&cwd.path().join("dd/src"));
+		std::os::unix::fs::symlink("gone", cwd.path().join("dd/src.~1~")).unwrap();
+		assert_eq!(mv_in(cwd.path(), &["--backup=numbered", "src", "dd"], ""), (0, String::new()));
+		assert!(cwd.path().join("dd/src").is_dir(), "the directory was not moved");
+		assert_eq!(link_at(&cwd.path().join("dd/src.~1~")), Some("gone".into()), "the earlier backup was lost");
+		assert_eq!(link_at(&cwd.path().join("dd/src.~2~")), Some("missing".into()), "the link was not backed up");
+	}
 }
