@@ -150,9 +150,19 @@ const _: () = assert!(size_of::<Statx>() == 256);
 /// disabled for the process only when that retry opens: then the flag was
 /// the cause (not the file's owner). An `EPERM` the retry repeats has
 /// another cause, such as a sandbox policy or the file's own refusal, and is
-/// returned with the flag left on.
-fn with_noatime(mut open: impl FnMut(c_int) -> io::Result<RawFd>) -> io::Result<OwnedFd> {
-	let noatime = NOATIME.load(Ordering::Relaxed);
+/// returned with the flag left on. An open with `flags` that hold `O_PATH`
+/// gets no flag: it reads nothing, so there is no access time to keep, and
+/// `openat2` refuses `O_NOATIME` beside it (`EINVAL`), which would read as a
+/// kernel without `openat2`.
+fn with_noatime(
+	flags: c_int,
+	mut open: impl FnMut(c_int) -> io::Result<RawFd>,
+) -> io::Result<OwnedFd> {
+	let noatime = if flags & libc::O_PATH == 0 {
+		NOATIME.load(Ordering::Relaxed)
+	} else {
+		0
+	};
 	let mut extra = noatime;
 	loop {
 		match open(extra) {
@@ -184,7 +194,7 @@ fn opened(ret: c_long) -> io::Result<RawFd> {
 pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
 	#[cfg(test)]
 	let flags = seam::openat_flags(flags);
-	with_noatime(|extra| {
+	with_noatime(flags, |extra| {
 		#[cfg(test)]
 		if let Some(err) = seam::failed(seam::Call::Openat, flags | extra) {
 			return Err(err);
@@ -305,7 +315,7 @@ pub(super) fn open_beneath(
 		return walk_beneath(s, dir, rel, flags);
 	}
 	let path = s.cstr(rel)?;
-	let openat2 = with_noatime(|extra| {
+	let openat2 = with_noatime(flags, |extra| {
 		#[cfg(test)]
 		if let Some(err) = seam::failed(seam::Call::Openat2, flags | extra) {
 			return Err(err);

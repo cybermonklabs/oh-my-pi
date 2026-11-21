@@ -610,6 +610,16 @@ fn moved() -> io::Error {
 	io::Error::other("the directory was moved or replaced during the walk")
 }
 
+/// The error of a subdirectory not entered because its parent, at the
+/// absolute `parent`, could not be opened again: it names the parent, whose
+/// open failed with `err`, and keeps that error's kind.
+fn not_reopened(parent: &[u8], err: &io::Error) -> io::Error {
+	io::Error::new(
+		err.kind(),
+		format!("cannot open the parent directory {} again: {err}", as_path(parent).display()),
+	)
+}
+
 fn record_name<'n>(names: &'n [u8], record: &Record) -> &'n [u8] {
 	let start = record.name_off as usize;
 	&names[start..start + record.name_len as usize]
@@ -882,10 +892,13 @@ impl Cx {
 	/// Gives `parent` its handle back before the walk enters one of its
 	/// subdirectories, when its child's `..` did not ([`Cx::reopen`]): opened
 	/// as it was first reached, at its path lengths `saved` ([`Cx::open_as`]),
-	/// and taken only when it has the identity it recorded. An open that
-	/// fails fails only the subdirectory being entered, with its own error,
-	/// and the next one tries again. Another directory there means `parent`
-	/// was moved or replaced while the walk was below it: it is lost, and no
+	/// and taken only when it has the identity it recorded. Both opens need
+	/// only search permission on `parent` where the platform allows
+	/// ([`Session::open_dir_to_search`]), as the open through its handle
+	/// did. An open that fails fails only the subdirectory being entered,
+	/// with an error that names `parent`, whose open failed, and the next
+	/// subdirectory tries again. Another directory there means `parent` was
+	/// moved or replaced while the walk was below it: it is lost, and no
 	/// subdirectory of it is entered, a link followed under
 	/// [`Follow::Always`] included.
 	async fn hold(&mut self, parent: &mut Frame, saved: (usize, usize)) -> io::Result<()> {
@@ -895,7 +908,8 @@ impl Cx {
 		let (None, Some(id)) = (&parent.dir, parent.id) else {
 			return Ok(());
 		};
-		let Some(dir) = self.open_as(saved.0, saved.1, id).await? else {
+		let opened = self.open_as(saved.0, saved.1, id).await;
+		let Some(dir) = opened.map_err(|err| not_reopened(&self.abs[..saved.1], &err))? else {
 			parent.lost = true;
 			return Err(moved());
 		};
@@ -922,10 +936,15 @@ impl Cx {
 			Some(root) if self.opts.follow != Follow::Always => {
 				self
 					.session
-					.open_dir_beneath(root, &self.rel[..rel_len])
+					.open_dir_beneath_to_search(root, &self.rel[..rel_len])
 					.await?
 			},
-			_ => self.session.open_dir(as_path(&self.abs[..abs_len])).await?,
+			_ => {
+				self
+					.session
+					.open_dir_to_search(as_path(&self.abs[..abs_len]))
+					.await?
+			},
 		};
 		let got = self.session.identify_dir(&dir).await?;
 		Ok((got == id).then_some(dir))

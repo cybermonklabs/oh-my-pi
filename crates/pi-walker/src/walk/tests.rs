@@ -1192,11 +1192,12 @@ async fn a_parent_the_walk_returns_to_is_taken_back_only_with_its_recorded_ident
 
 /// A parent the walk gave its handle up for, and cannot open again when it
 /// returns to it, keeps its place: its subdirectories that the walk cannot
-/// open are reported with the open's own error, and those it can open once
-/// the failure ends are walked. Here every directory open on this thread
-/// fails with `EMFILE` from the report of `p/a/d`, the last before the walk
-/// leaves `p/a` for `p`, until the walk reports an error. Losing `p` instead
-/// reported `p/y` and `p/z` as moved or replaced, and walked neither.
+/// open are reported with the open's error, which names the parent, and
+/// those it can open once the failure ends are walked. Here every directory
+/// open on this thread fails with `EMFILE` from the report of `p/a/d`, the
+/// last before the walk leaves `p/a` for `p`, until the walk reports an
+/// error. Losing `p` instead reported `p/y` and `p/z` as moved or replaced,
+/// and walked neither.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
@@ -1236,7 +1237,14 @@ async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
 	}
 	drop(cursor);
 	assert!(failing.is_none(), "the walk reported no error while its opens failed");
-	assert_eq!(errors, [("p/y".to_owned(), emfile().to_string())]);
+	assert_eq!(errors, [(
+		"p/y".to_owned(),
+		format!(
+			"cannot open the parent directory {} again: {}",
+			tmp.path().join("p").display(),
+			emfile()
+		)
+	)]);
 	assert_eq!(seen, ["p/a", "p/y", "p/z/kept", "p/z", "p"]);
 }
 
