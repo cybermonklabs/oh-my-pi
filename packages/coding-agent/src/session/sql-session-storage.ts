@@ -7,6 +7,7 @@ import { digestStream } from "../utils/file-hash";
 import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
+	STALE_STAGING_MS,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 	utf8PartEnd,
@@ -838,8 +839,6 @@ const MYSQL_PLAIN_STAGING_CHARS = MYSQL_PATH_CHARS - STAGING_MARK.length - STAGI
  * in hex and {@link STAGING_MARK}. No session path starts with "#".
  */
 const HASHED_STAGING = "#omp-staging/";
-/** Age at which a staging set is a dead writer's: a live full write finishes far sooner. */
-const STALE_STAGING_MS = 60 * 60 * 1000;
 /** Hashes one blob size read asks for. */
 const BLOB_READ_BATCH = 100;
 /** Bytes one blob read asks for (a larger blob is read alone), so a read holds at most about this much at a time. */

@@ -299,12 +299,42 @@ function sweepStaleSpools(dir: string): void {
 }
 
 /**
+ * The head of a full write's lines, which its title slot and the header's
+ * session id are read from: the lines that make up their first
+ * {@link LINE_STREAM_CHUNK} UTF-16 units, so at least the whole first line.
+ * The spool ({@link spoolLines}) and a write streamed from the lines
+ * ({@link measureLines}) both read it here, so they read the same title.
+ */
+class LinesHead {
+	#text = "";
+
+	/** `lines` as they are, noting the head as they pass. */
+	*note(lines: Iterable<string>): Generator<string> {
+		for (const line of lines) {
+			if (this.#text.length < LINE_STREAM_CHUNK) this.#text += line;
+			yield line;
+		}
+	}
+
+	/** The title slot at the head of the lines {@link note} passed. */
+	title(): SessionTitleUpdate | undefined {
+		return titleUpdateFromSlot(parseTitleSlotFromContent(this.#text));
+	}
+
+	/** The session id in the header at the head of the lines {@link note} passed. */
+	sessionId(): string | undefined {
+		return sessionHeaderIdInPrefix(this.#text);
+	}
+}
+
+/**
  * Spool `lines` to a new file under {@link spoolDir}, iterating them once,
- * counting its bytes and reading the title slot from its first line. Throws
- * when the directory or the file cannot be made, opened or written, and,
- * where accounts have ids, when the directory is not one this account owns
- * that no other account can enter: another account can make the shared name
- * first, or plant a symlink there. A file it opened is closed and removed.
+ * counting their bytes and reading the title slot from their
+ * {@link LinesHead}. Throws when the directory or the file cannot be made,
+ * opened or written, and, where accounts have ids, when the directory is not
+ * one this account owns that no other account can enter: another account can
+ * make the shared name first, or plant a symlink there. A file it opened is
+ * closed and removed.
  */
 function spoolLines(lines: Iterable<string>): BodySpool {
 	const dir = spoolDir();
@@ -322,8 +352,9 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 	const fd = fs.openSync(file, "wx+", 0o600);
 	try {
 		if (!windows) fs.unlinkSync(file);
-		const { bytes, head } = writeLinesToDescriptorSync(fd, lines);
-		return new BodySpool(fd, windows ? file : undefined, bytes, titleUpdateFromSlot(parseTitleSlotFromContent(head)));
+		const head = new LinesHead();
+		const bytes = writeLinesToDescriptorSync(fd, head.note(lines));
+		return new BodySpool(fd, windows ? file : undefined, bytes, head.title());
 	} catch (err) {
 		new BodySpool(fd, file, 0, undefined).close();
 		throw err;
@@ -367,31 +398,19 @@ function* encodeLines(lines: Iterable<string>, reuse = false): Generator<Uint8Ar
 
 /**
  * Measure `lines` for a full write streamed from them ({@link streamLines}):
- * the size and SHA-256 of their UTF-8 bytes, and the title slot read from
- * their head as {@link spoolLines} reads it, from the lines that make up its
- * first {@link LINE_STREAM_CHUNK} UTF-16 units, and the header's session id.
- * Iterates them once.
+ * the size and SHA-256 of their UTF-8 bytes, and the title slot and the
+ * header's session id read from their {@link LinesHead}, as the spool reads
+ * the title. Iterates them once.
  */
 function measureLines(lines: Iterable<string>): MeasuredLines {
-	let head = "";
-	function* noteHead(): Generator<string> {
-		for (const line of lines) {
-			if (head.length < LINE_STREAM_CHUNK) head += line;
-			yield line;
-		}
-	}
+	const head = new LinesHead();
 	const hasher = new Bun.CryptoHasher("sha256");
 	let bytes = 0;
-	for (const chunk of encodeLines(noteHead(), true)) {
+	for (const chunk of encodeLines(head.note(lines), true)) {
 		hasher.update(chunk);
 		bytes += chunk.byteLength;
 	}
-	return {
-		bytes,
-		hash: hasher.digest("hex"),
-		title: titleUpdateFromSlot(parseTitleSlotFromContent(head)),
-		sessionId: sessionHeaderIdInPrefix(head),
-	};
+	return { bytes, hash: hasher.digest("hex"), title: head.title(), sessionId: head.sessionId() };
 }
 
 /**
@@ -412,6 +431,14 @@ async function* streamLines(lines: Iterable<string>, measured: MeasuredLines): A
 		throw new Error(`The lines of a session rewrite changed after they were measured (${measured.bytes} bytes)`);
 	}
 }
+
+/**
+ * Age at which the staged parts of a backend's streamed full write are a dead
+ * writer's: a live full write finishes far sooner. SQL deletes a path's older
+ * staging sets at its next swap; a Redis staging key expires this long after
+ * its last part.
+ */
+export const STALE_STAGING_MS = 60 * 60 * 1000;
 
 /**
  * Where a part of `bytes` that starts at `start` and holds at most `maxBytes`
