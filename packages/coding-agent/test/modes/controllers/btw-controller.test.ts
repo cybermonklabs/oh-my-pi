@@ -956,10 +956,11 @@ describe("BtwController inject", () => {
 		expect(shown(ctx)).not.toContain("<inject>");
 
 		expect(controller.handleInject()).toBe(true);
-		// A leading slash stays text: no slash-command or template expansion.
+		// A leading slash stays text: no slash-command or template expansion. A person sends it with the inject
+		// key, so it is input from outside the session: it ends a cyber-policy hold.
 		expect(session.prompt).toHaveBeenCalledWith(
 			steeringPrompt,
-			expect.objectContaining({ expandPromptTemplates: false }),
+			expect.objectContaining({ expandPromptTemplates: false, origin: "outside" }),
 		);
 		expect(shown(ctx)).toContain(BTW_INJECTED_LABEL);
 		expect(controller.canInject()).toBe(false);

@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { addModelCallGuard, ModelCallRefusedError, runInModelCallScope, streamSimple } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { embed } from "@oh-my-pi/pi-ai/embeddings";
+import { rerank } from "@oh-my-pi/pi-ai/rerank";
 import { synthesizeSpeech } from "@oh-my-pi/pi-ai/speech";
+import { submitVideo } from "@oh-my-pi/pi-ai/video";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai/types";
 
@@ -80,6 +83,54 @@ describe("model-call guard", () => {
 
 		expect(error).toBeInstanceOf(ModelCallRefusedError);
 		expect((error as Error).message).toBe("held: cyber_policy");
+	});
+
+	// Embeddings, rerank and video submission carry text that can be drawn from a conversation or written by a
+	// model: while a guard holds the model they send nothing; with no guard the same call reaches the endpoint.
+	describe.each([
+		[
+			"embed",
+			"openai-embeddings",
+			(model: Model<Api>, fetch: typeof globalThis.fetch) =>
+				embed(model, { input: "hello", encodingFormat: "float" }, { apiKey: "test", fetch }),
+		],
+		[
+			"rerank",
+			"openrouter-rerank",
+			(model: Model<Api>, fetch: typeof globalThis.fetch) =>
+				rerank(model, { query: "hello", documents: ["a"] }, { apiKey: "test", fetch }),
+		],
+		[
+			"submitVideo",
+			"openrouter-video",
+			(model: Model<Api>, fetch: typeof globalThis.fetch) =>
+				submitVideo(model, { prompt: "hello" }, { apiKey: "test", fetch }),
+		],
+	] as const)("%s", (_name, api, call) => {
+		const model = { api, provider: "openai", id: "held-model", baseUrl: "https://example.test/v1" } as Model<Api>;
+		it.each([
+			["holds the call while a guard holds the model, and sends nothing", true],
+			["sends the call when no guard holds it (control)", false],
+		])("%s", async (_case, held) => {
+			let requests = 0;
+			const fetch = (async () => {
+				requests++;
+				return new Response("{}", { status: 500 });
+			}) as unknown as typeof globalThis.fetch;
+			if (held) removals.push(addModelCallGuard({ refuse: () => "held: cyber_policy" }));
+
+			const error = await call(model, fetch).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+
+			if (held) {
+				expect(error).toBeInstanceOf(ModelCallRefusedError);
+				expect(requests).toBe(0);
+			} else {
+				expect(requests).toBeGreaterThan(0);
+			}
+		});
 	});
 
 	it("lets every call through when no guard is registered, as before", async () => {

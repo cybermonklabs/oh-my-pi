@@ -17,7 +17,7 @@
 import { fetchWithRetry, readSseJsonOrText, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { OpenAIHttpError } from "../error";
-import { assertModelCallAllowed, ModelCallRefusedError } from "../model-call-guard";
+import { guardedRequestUrl } from "../model-call-guard";
 
 export { OpenAIHttpError };
 
@@ -104,14 +104,10 @@ export interface OpenAIStreamHandle<TEvent> {
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
 	let response: Response;
 	try {
-		// Each resend reads the model-call guards again, in the URL callback that `fetchWithRetry` calls before
-		// every attempt and outside its retry: a hold that began during the backoff holds the resend, and the
-		// held error leaves here unretried. (`prepareInit` would rebuild the headers as a `Headers` object.)
-		const url = (attempt: number): string => {
-			if (attempt > 0) assertModelCallAllowed(init.model);
-			return init.url;
-		};
-		response = await fetchWithRetry(url, {
+		// Every attempt reads the model-call guards first: the first one (a provider-level retry, a fallback or
+		// a replay-safe stream retry calls this again after its own wait) and each retry after a backoff. The
+		// URL callback runs outside `fetchWithRetry`'s retry, so a held attempt leaves here unretried.
+		response = await fetchWithRetry(guardedRequestUrl(init.model, init.url), {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
 			body: JSON.stringify(init.body),
@@ -135,8 +131,6 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			timeout: false,
 		});
 	} catch (error) {
-		// A resend the guards held sent nothing: keep its error as it is.
-		if (error instanceof ModelCallRefusedError) throw error;
 		// Transport rejection after the retry budget: name the host and the cause
 		// instead of surfacing the runtime's bare `getaddrinfo …` text.
 		throw AIError.networkFailureError(error, init.url);

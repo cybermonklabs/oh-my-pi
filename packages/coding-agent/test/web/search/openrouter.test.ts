@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -111,6 +112,42 @@ describe("OpenRouter grounded search", () => {
 				}),
 			).rejects.toMatchObject({ provider: "openrouter", status: 503 });
 		} finally {
+			fixture.authStorage.close();
+		}
+	});
+
+	// A grounded search is a model call (its query is drawn from the conversation): while a model-call hold stands
+	// on the selected model it sends nothing; with no hold the same search is sent.
+	it.each([
+		["holds a search while a model-call hold stands on the selected model", true],
+		["sends the same search when no hold stands (control)", false],
+	])("%s", async (_name, held) => {
+		const fixture = createFixture();
+		let requests = 0;
+		const fetch: FetchImpl = async () => {
+			requests++;
+			return Response.json({ id: "or", model: fixture.model.id, choices: [{ message: { content: "Found it." } }] });
+		};
+		const removeGuard = addModelCallGuard({
+			refuse: model => (held && model.id === fixture.model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const outcome = await searchOpenRouterGrounded({
+				query: "held lookup",
+				systemPrompt: "Use web search.",
+				authStorage: fixture.authStorage,
+				modelRegistry: fixture.modelRegistry,
+				model: fixture.model,
+				fetch,
+			}).then(
+				() => "sent",
+				(error: unknown) => String(error),
+			);
+			expect(requests).toBe(held ? 0 : 1);
+			if (held) expect(outcome).toContain("held: cyber_policy");
+			else expect(outcome).toBe("sent");
+		} finally {
+			removeGuard();
 			fixture.authStorage.close();
 		}
 	});

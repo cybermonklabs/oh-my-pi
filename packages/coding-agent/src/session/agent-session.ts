@@ -2189,6 +2189,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#ownsCyberPolicyClosure = new CyberPolicyClosure();
 			this.#cyberPolicyClosure = this.#ownsCyberPolicyClosure;
 		}
+		// The closure is the scope of this tree's model calls: the agent's runs, its advisors' runs and the
+		// session's own work enter it, so another tree's guard in this process never holds them, and theirs
+		// never records this tree's refusals. Set before anything copies it (the advisors, built below).
+		this.agent.modelCallScope = this.#cyberPolicyClosure;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
@@ -3070,10 +3074,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// (`installCyberPolicyGuard`): every model call of every caller, a run in flight included, is
 		// held while the closure closes its route. Before each of this session's own calls the hook
 		// moves it to an open fallback, so another family can take the turn.
-		// The closure is the scope of this tree's model calls: the agent's runs and the session's own
-		// work enter it, so another tree's guard in this process never holds them, and theirs never
-		// records this tree's refusals.
-		this.agent.modelCallScope = this.#cyberPolicyClosure;
+		// The agent's scope is the closure (set above, before the advisors were built).
 		this.addDisposer(installCyberPolicyGuard(this.#cyberPolicyClosure));
 		this.addDisposer(this.agent.addBeforeModelCallHook(signal => this.#leaveClosedRoute(signal)));
 		this.addDisposer(
@@ -14830,6 +14831,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			/** `"outside"` when a person (`/tree`) or an RPC client asked for this move; see {@link InputOrigin}. */
 			origin?: InputOrigin;
 		} = {},
+	): Promise<NavigateTreeResult> {
+		// Public and called by hosts directly (ACP, RPC, an extension's context): its branch summary is this
+		// tree's model call, in its scope, so another tree's hold does not take it for a call made outside every
+		// session.
+		return this.#inLogContext(() => this.#navigateTreeInScope(targetId, options));
+	}
+
+	async #navigateTreeInScope(
+		targetId: string,
+		options: NonNullable<Parameters<AgentSession["navigateTree"]>[1]>,
 	): Promise<NavigateTreeResult> {
 		this.#endCyberPolicyClosureFrom(options.origin);
 		const queued = this.#enterSessionTransition(() => this.navigateTree(targetId, options));

@@ -758,7 +758,11 @@ export interface InteractiveModeContext {
 	disableGoalMode(message?: string): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
-	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
+	resolvePlanReview(
+		reviewId: string,
+		choice: PlanReviewChoice,
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
+	): boolean;
 	getPendingPlanReview(): PlanReviewRequestedEvent | undefined;
 	openPlanReview(options?: { fromExtension?: boolean }): Promise<boolean>;
 	readonly sessionModes: ExtensionSessionModes;

@@ -28,7 +28,7 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
-import { modelCallHoldReason } from "../model-call-guard";
+import { assertModelCallAllowed, guardedRequestUrl, modelCallHoldReason } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -1679,6 +1679,9 @@ async function openCodexWebSocketTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
+	// Each WebSocket request (the first, the connect loop's retries and every reopen after a recovery wait)
+	// reads the model-call guards before it goes out; a held one sends nothing.
+	assertModelCallAllowed(model);
 	let canAppendBeforeRequest = websocketState.canAppend === true;
 	let chainedBody = buildCodexChainedRequestBody(requestContext.transformedBody, websocketState);
 	const websocketHeaders = createCodexHeaders(
@@ -1901,6 +1904,7 @@ async function openCodexSseTransport(
 		requestContext.rawRequestDump.body = wireBody;
 		return requestSetup.wrapCodexSseStream(
 			await openCodexSseEventStream(
+				model,
 				requestContext.url,
 				requestContext.requestHeaders,
 				requestContext.accountId,
@@ -4061,6 +4065,7 @@ async function getOrCreateCodexWebSocketConnection(
 }
 
 async function openCodexSseEventStream(
+	model: Model<"openai-codex-responses">,
 	url: string,
 	requestHeaders: Record<string, string> | undefined,
 	accountId: string | undefined,
@@ -4127,7 +4132,9 @@ async function openCodexSseEventStream(
 
 	let response: Response;
 	try {
-		response = await fetchWithRetry(url, {
+		// Every attempt (the first, each retry after a 408, 429 or 5xx backoff, and every reopen that calls
+		// this again) reads the model-call guards first; a held attempt leaves unretried.
+		response = await fetchWithRetry(guardedRequestUrl(model, url), {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),

@@ -832,7 +832,11 @@ export interface ExtensionContext {
 	 * `input.role` names no selectable tier or accompanies a non-approval choice, or the
 	 * mode has no plan review.
 	 */
-	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
+	resolvePlanReview(
+		reviewId: string,
+		choice: PlanReviewChoice,
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
+	): boolean;
 	/**
 	 * The open interactive plan review still awaiting an answer, as `plan_review_requested` reported it,
 	 * or `undefined`. Lets an extension that loaded or reconnected after the event answer the review.
@@ -2461,7 +2465,7 @@ export interface ExtensionContextActions {
 	resolvePlanReview?: (
 		reviewId: string,
 		choice: PlanReviewChoice,
-		input?: { feedback?: string; role?: string },
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
 	) => boolean;
 	getPendingPlanReview?: () => PlanReviewRequestedEvent | undefined;
 	openPlanReview?: () => Promise<boolean>;

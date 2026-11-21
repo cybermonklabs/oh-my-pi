@@ -133,8 +133,10 @@ export function guardModelCall(
  * The guards' second read, right before a request leaves: the reason a guard that sees the current call
  * holds `model` now, else `undefined`. {@link guardModelCall} reads the guards when a call starts; a call
  * can then wait (a provider slot, a key resolution, a header resolution) or send again (an auth-retry
- * attempt, a transport resend, a live steer), so each send reads them again. A held send is not reported
- * to the guards: nothing was sent.
+ * attempt, a transport retry after a backoff, a stream reopen, a fallback, a live steer), so each send
+ * reads them again. A send this read holds still ends the call with an error that names `cyber_policy`,
+ * and {@link guardModelCall} reports that final message to its guards like any other; the guards tell it
+ * apart from OpenAI's own refusal and do not record it.
  */
 export function modelCallHoldReason(model: Model<Api>): string | undefined {
 	return guards.size === 0 ? undefined : refusal(applicable(), model);
@@ -150,6 +152,20 @@ export function heldModelCall(model: Model<Api>): AssistantMessageEventStream | 
 export function assertModelCallAllowed(model: Model<Api>): void {
 	const reason = modelCallHoldReason(model);
 	if (reason !== undefined) throw new ModelCallRefusedError(model, reason);
+}
+
+/**
+ * The URL of a `fetchWithRetry` request for `model`, read through the guards before every attempt: the
+ * first and each retry after a backoff. `fetchWithRetry` resolves the URL outside its retry, so a held
+ * attempt throws {@link ModelCallRefusedError} out of it unretried, and it leaves the caller's
+ * `networkFailureError` as it is (that wraps only transport failures), so the held call keeps its
+ * `cyber_policy` name.
+ */
+export function guardedRequestUrl(model: Model<Api>, url: string): (attempt: number) => string {
+	return () => {
+		assertModelCallAllowed(model);
+		return url;
+	};
 }
 
 /**

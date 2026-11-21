@@ -26,7 +26,7 @@ import type { Api, FetchImpl } from "@oh-my-pi/pi-catalog/types";
 import { $env, isRecord, parseImageMetadata } from "@oh-my-pi/pi-utils";
 import { type ApiKey, withAuth } from "../auth-retry";
 import * as AIError from "../error";
-import { guardModelRequest } from "../model-call-guard";
+import { assertModelCallAllowed, guardModelRequest } from "../model-call-guard";
 import { validateImageInput } from "../images/shared";
 import { withInferenceUserAgent } from "../providers/inference-headers";
 import { redactSensitiveInObject } from "../providers/transform-messages";
@@ -533,6 +533,10 @@ export class NativeJudge implements Judge {
 		};
 		for (let attempt = 0; ; attempt++) {
 			signal?.throwIfAborted();
+			// Each attempt (the first, each retry after a 408, 429 or 5xx backoff, and each auth-retry key)
+			// reads the model-call guards before it goes out; a held one sends nothing and is not retried.
+			const catalogModel = this.#catalogModel;
+			if (catalogModel) assertModelCallAllowed(catalogModel);
 			const timeout = AbortSignal.timeout(this.#timeoutMs);
 			let response: Response;
 			try {
