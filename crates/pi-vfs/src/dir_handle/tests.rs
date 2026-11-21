@@ -1612,11 +1612,28 @@ mod unix {
 		std::fs::symlink_metadata(path).unwrap().ino()
 	}
 
+	/// One release attempt, as [`record_releases`] saw it.
+	#[derive(Clone, Debug)]
+	#[allow(
+		dead_code,
+		reason = "`held` and `thread` are read through `Debug` in a failure's message"
+	)]
+	struct Release {
+		/// Whether the attempt held an end of a FIFO.
+		held:   bool,
+		/// Whether a writer to the FIFO then at the recorded path met a
+		/// reader.
+		met:    bool,
+		/// The thread the attempt ran on: the thread that dropped the open
+		/// for its first attempt, `pi-vfs-fifo-release` for the later ones.
+		thread: String,
+	}
+
 	/// Records each release attempt in this process from now on: whether it
-	/// held an end, and whether a writer to the FIFO now at the path in
-	/// `fifo` then met a reader.
-	fn record_releases(fifo: Arc<Mutex<PathBuf>>) -> Arc<Mutex<Vec<(bool, bool)>>> {
-		let attempts: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+	/// held an end, whether a writer to the FIFO now at the path in `fifo`
+	/// then met a reader, and the thread it ran on.
+	fn record_releases(fifo: Arc<Mutex<PathBuf>>) -> Arc<Mutex<Vec<Release>>> {
+		let attempts: Arc<Mutex<Vec<Release>>> = Arc::default();
 		let recorded = Arc::clone(&attempts);
 		crate::fs::fifo_seam::on_release(move |held| {
 			use std::os::unix::fs::OpenOptionsExt;
@@ -1624,7 +1641,13 @@ mod unix {
 				.write(true)
 				.custom_flags(libc::O_NONBLOCK)
 				.open(&*fifo.lock());
-			recorded.lock().push((held, writer.is_ok()));
+			let thread = std::thread::current()
+				.name()
+				.unwrap_or("unnamed")
+				.to_owned();
+			recorded
+				.lock()
+				.push(Release { held, met: writer.is_ok(), thread });
 		});
 		attempts
 	}
@@ -1647,13 +1670,11 @@ mod unix {
 
 	/// A release never holds an end of a FIFO that replaced the one its open
 	/// started on (`rm p; mkfifo p`), so a writer to the new FIFO meets no
-	/// reader that is about to go away (and would lose what it wrote). The
-	/// helper is held before its `open`, so only the open itself holds the
-	/// old FIFO: on Linux its number then goes to no other file. Through a
-	/// handle's `open_at_async` and the facade's own open; with the helper
-	/// and releases reaching the FIFO through `/proc`, and by name, as
-	/// without `/proc`; [`REPLACE_TRIES`] tries each. In a process of its
-	/// own, so the hooks take this test's helpers and releases.
+	/// reader that is about to go away (and would lose what it wrote). With
+	/// the helper and releases reaching the FIFO through `/proc`; by name in
+	/// [`a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on_by_name`].
+	/// In a process of its own, so the hooks take this test's helpers and
+	/// releases.
 	#[test]
 	fn a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on() {
 		if crate::dir_handle::alone(
@@ -1661,6 +1682,34 @@ mod unix {
 		) {
 			return;
 		}
+		release_holds_no_end_of_a_replacing_fifo(false);
+	}
+
+	/// As [`a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on`],
+	/// with the helper and releases reaching the FIFO by name, as without
+	/// `/proc`. In a process of its own, apart from the `/proc` half: there
+	/// each release keeps trying for about a second on a thread of its own
+	/// (its helper is held), and the by-name switch is the process's, so a
+	/// switch made under such a release would turn its next attempt into a
+	/// by-name one, whose writer can meet the end this test's release holds
+	/// for a moment before it finds another FIFO and closes it.
+	#[test]
+	fn a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on_by_name() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on_by_name",
+		) {
+			return;
+		}
+		release_holds_no_end_of_a_replacing_fifo(true);
+	}
+
+	/// The body of the two tests above: the helper is held before its
+	/// `open`, so only the open itself holds the old FIFO: on Linux its
+	/// number then goes to no other file. Through a handle's `open_at_async`
+	/// and the facade's own open, [`REPLACE_TRIES`] tries each; the
+	/// releases reach the FIFO by name when `by_name`.
+	fn release_holds_no_end_of_a_replacing_fifo(by_name: bool) {
+		crate::fs::fifo_seam::open_by_name(by_name);
 		let tree = Tree::new("fifo-replaced");
 		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
 		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
@@ -1669,54 +1718,52 @@ mod unix {
 		let current: Arc<Mutex<PathBuf>> = Arc::default();
 		let attempts = record_releases(Arc::clone(&current));
 		let mut reused = Vec::new();
-		for by_name in [false, true] {
-			crate::fs::fifo_seam::open_by_name(by_name);
-			for route in ["handle", "facade"] {
-				for i in 0..REPLACE_TRIES {
-					let case = format!("{route}, by name {by_name}, try {i}");
-					let name = format!("p-{route}-{by_name}-{i}");
-					let fifo = tree.at(&name);
+		for route in ["handle", "facade"] {
+			for i in 0..REPLACE_TRIES {
+				let case = format!("{route}, by name {by_name}, try {i}");
+				let name = format!("p-{route}-{i}");
+				let fifo = tree.at(&name);
+				mkfifo(&fifo);
+				current.lock().clone_from(&fifo);
+				let first = attempts.lock().len();
+				let (started_tx, started) = std::sync::mpsc::channel();
+				let (go, hold) = std::sync::mpsc::channel();
+				let _opened = hook_next_fifo_helper(started_tx, Some(hold));
+				runtime().block_on(async {
+					let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
+					tokio::select! {
+						biased;
+						_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+						() = std::future::ready(()) => {},
+					}
+					started
+						.recv_timeout(HELPER_BOUND)
+						.unwrap_or_else(|_| panic!("{case}: the helper never started"));
+					// The name now names another FIFO; then the open is
+					// dropped.
+					let old = ino(&fifo);
+					std::fs::remove_file(&fifo).unwrap();
 					mkfifo(&fifo);
-					current.lock().clone_from(&fifo);
-					let first = attempts.lock().len();
-					let (started_tx, started) = std::sync::mpsc::channel();
-					let (go, hold) = std::sync::mpsc::channel();
-					let _opened = hook_next_fifo_helper(started_tx, Some(hold));
-					runtime().block_on(async {
-						let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
-						tokio::select! {
-							biased;
-							_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
-							() = std::future::ready(()) => {},
-						}
-						started
-							.recv_timeout(HELPER_BOUND)
-							.unwrap_or_else(|_| panic!("{case}: the helper never started"));
-						// The name now names another FIFO; then the open is
-						// dropped.
-						let old = ino(&fifo);
-						std::fs::remove_file(&fifo).unwrap();
-						mkfifo(&fifo);
-						if ino(&fifo) == old {
-							reused.push(case.clone());
-						}
-					});
-					// The helper stays held before its `open` for the rest of
-					// the process.
-					std::mem::forget(go);
-					let these = attempts.lock()[first..].to_vec();
-					assert!(!these.is_empty(), "{case}: no release ran");
-					assert!(
-						these.iter().all(|&(_, met)| !met),
-						"{case}: a writer to the new FIFO met a release's end: {these:?}"
-					);
-				}
+					if ino(&fifo) == old {
+						reused.push(case.clone());
+					}
+				});
+				// The helper stays held before its `open` for the rest of the
+				// process.
+				std::mem::forget(go);
+				let these = attempts.lock()[first..].to_vec();
+				assert!(!these.is_empty(), "{case}: no release ran");
+				assert!(
+					these.iter().all(|release| !release.met),
+					"{case}: a writer to the new FIFO met a release's end; the attempts since this \
+					 open, each with the thread it ran on: {these:#?}"
+				);
 			}
 		}
 		eprintln!(
 			"the new FIFO got the old one's number in {} of {} tries",
 			reused.len(),
-			4 * REPLACE_TRIES
+			2 * REPLACE_TRIES
 		);
 		if cfg!(target_os = "linux") {
 			assert!(reused.is_empty(), "a pinned FIFO's number went to the new FIFO: {reused:?}");
@@ -1834,8 +1881,9 @@ mod unix {
 					let these = attempts.lock()[first..].to_vec();
 					assert!(!these.is_empty(), "{case}: no release ran");
 					assert!(
-						these.iter().all(|&(_, met)| !met),
-						"{case}: a writer to the new FIFO met a release's end: {these:?}"
+						these.iter().all(|release| !release.met),
+						"{case}: a writer to the new FIFO met a release's end; the attempts since this \
+						 open, each with the thread it ran on: {these:#?}"
 					);
 				}
 			}
