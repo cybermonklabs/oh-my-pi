@@ -459,10 +459,31 @@ mod tests {
 	/// descriptor its owner closes next would stay open meanwhile. Here a
 	/// FIFO's reader end: a writer opened after the close must find no reader
 	/// (`ENXIO`), not pair with the reader the program closed.
+	///
+	/// A process that another test of this process forks holds a copy of every
+	/// descriptor until its exec, this reader end too, and a writer pairs with
+	/// that copy as it would with the reader the drop left open. So the rounds
+	/// run in a process of their own, where no other test runs.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_dropped_watch_leaves_the_wait_before_its_descriptor_closes() {
 		use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
+
+		const NAME: &str =
+			"sys::ready::tests::a_dropped_watch_leaves_the_wait_before_its_descriptor_closes";
+		const ALONE: &str = "PI_SHELL_TEST_ALONE";
+		if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+			let output = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+				.env(ALONE, NAME)
+				.output()
+				.unwrap();
+			let (out, err) =
+				(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+			assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+			assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+			return;
+		}
 
 		let dir = tempfile::tempdir().unwrap();
 		for round in 0..20 {
