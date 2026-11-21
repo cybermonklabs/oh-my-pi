@@ -3200,6 +3200,11 @@ export class TurnRecovery {
 		// Quota resets elapse while the machine sleeps; capture the deadline before event delivery.
 		const usageResetDeadline = AIError.is(id, AIError.Flag.UsageLimit) ? Date.now() + delayMs : undefined;
 
+		// Registered before the retry is announced: an `abortRetry()` from an `auto_retry_start` listener
+		// (the user's Esc as the retry notice appears) cancels this retry instead of finding none.
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
@@ -3211,6 +3216,10 @@ export class TurnRecovery {
 		if (this.#host.abortInProgress() || this.#host.promptGeneration() !== generation) {
 			// A newer prompt alone supersedes the retry: the turn goes on in that prompt.
 			return this.#endCancelledRetry(message, this.#host.abortInProgress() && this.#retryCancelStopsTurn);
+		}
+		if (retryAbortController.signal.aborted) {
+			if (this.#retryAbortController !== retryAbortController) return false;
+			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 		}
 
 		// Resolved stream-stall tools and proven-unexecuted malformed/refused
@@ -3227,9 +3236,6 @@ export class TurnRecovery {
 		this.#maybeInjectMalformedFunctionCallRedirect(id, maxRetries, preserveFailedTurn, switchedModel);
 
 		// Quota waits follow the wall clock; ordinary backoff stays monotonic.
-		const retryAbortController = new AbortController();
-		this.#retryAbortController?.abort();
-		this.#retryAbortController = retryAbortController;
 		try {
 			if (usageResetDeadline !== undefined) {
 				await sleepUntil(usageResetDeadline, retryAbortController.signal);

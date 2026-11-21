@@ -205,6 +205,28 @@ describe("a stop after a key retry's backoff, before its continuation started", 
 		expect(stranded.retries.at(-1)).toEqual({ type: "auto_retry_end", finalError: "Retry cancelled" });
 	}, 30_000);
 
+	it("cancels the retry when Esc comes while the first retry is announced (abortRetry from an auto_retry_start listener)", async () => {
+		// If this regresses, the retry's controller does not exist yet while `auto_retry_start` is delivered: the Esc
+		// finds nothing to cancel, and the retry runs on.
+		const stranded = await openStrandedSession();
+		stranded.session.subscribe(event => {
+			if (event.type === "auto_retry_start") stranded.session.abortRetry();
+		});
+		void stranded.window.then(() => stranded.release());
+		const prompt = stranded.session.prompt("go");
+		await prompt.catch(() => undefined);
+		await stranded.session.waitForIdle();
+		const retryStarts = stranded.retries.filter(event => event.type === "auto_retry_start").length;
+		const reopened = await stranded.quitAndReopen();
+
+		expect(retryStarts).toBe(1);
+		expect(stranded.retries.at(-1)).toEqual({ type: "auto_retry_end", finalError: "Retry cancelled" });
+		expect(reopened).toEqual({
+			restorable: false,
+			tail: { stopReason: "aborted", errorMessage: "Retry cancelled", credentialUnavailable: undefined },
+		});
+	}, 30_000);
+
 	it("control: a quit cuts the retry off without marking a user stop, so omp --restore keeps the failed turn", async () => {
 		const stranded = await openStrandedSession();
 		const prompt = stranded.session.prompt("go");
