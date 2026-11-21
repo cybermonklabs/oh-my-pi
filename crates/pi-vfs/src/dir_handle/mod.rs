@@ -213,15 +213,20 @@ impl fmt::Debug for DirHandle {
 /// `name`'s bytes when it is one entry name: exactly one normal path
 /// component, so not empty, `.` or `..`, holding no separator, and on Windows
 /// carrying no drive or UNC prefix (`C:x`, which a join to a directory's path
-/// would turn into that drive's current directory).
+/// would turn into that drive's current directory). On Unix the byte checks
+/// are that rule; Windows also parses the name, for its prefixes.
 fn entry_name(name: &OsStr) -> io::Result<&[u8]> {
 	let bytes = name.as_encoded_bytes();
-	let mut parts = Path::new(name).components();
-	let one = matches!(
-		(parts.next(), parts.next()),
-		(Some(std::path::Component::Normal(part)), None) if part == name
-	);
-	if !one || bytes.iter().any(|&b| is_rel_separator(b)) {
+	let refused = matches!(bytes, b"" | b"." | b"..") || bytes.iter().any(|&b| is_rel_separator(b));
+	#[cfg(windows)]
+	let refused = refused || {
+		let mut parts = Path::new(name).components();
+		!matches!(
+			(parts.next(), parts.next()),
+			(Some(std::path::Component::Normal(part)), None) if part == name
+		)
+	};
+	if refused {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name"));
 	}
 	Ok(bytes)
