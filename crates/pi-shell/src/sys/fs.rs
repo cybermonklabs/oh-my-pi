@@ -2033,6 +2033,31 @@ mod tests {
 			node.path
 		}
 
+		/// Dropping a test's last copy of a pipe or FIFO end is not yet the
+		/// last close of it: while a sibling test of this process starts a
+		/// child (as `in_blocking_writer_process` does), the child shares
+		/// every descriptor of the process until its `exec` closes them. A
+		/// test that needs the end closed waits for the effect itself, here
+		/// the end of file: the verdict is the event; the 10 s bound only
+		/// ends a test that never sees it.
+		fn read_to_end_of_file(reader: &mut fs::File) -> Vec<u8> {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let mut got = Vec::new();
+			let mut buf = [0u8; 4096];
+			loop {
+				match reader.read(&mut buf) {
+					Ok(0) => return got,
+					Ok(n) => got.extend_from_slice(&buf[..n]),
+					// A write end is still open somewhere.
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+						assert!(Instant::now() < deadline, "DEADLINE: no end of file within 10 s");
+						thread::sleep(Duration::from_millis(5));
+					},
+					Err(e) => panic!("reading the FIFO: {e}"),
+				}
+			}
+		}
+
 		fn pending(p: FsPoll<Box<dyn File>>) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
 			match p {
 				FsPoll::Pending(p) => p,
@@ -2128,8 +2153,7 @@ mod tests {
 				Poll::Ready(Ok(1))
 			));
 			drop(writer);
-			let mut got = Vec::new();
-			reader.read_to_end(&mut got).unwrap();
+			let got = read_to_end_of_file(&mut reader);
 			assert_eq!(got, b"x");
 			fs::remove_file(&host).unwrap();
 		}
@@ -2246,6 +2270,20 @@ mod tests {
 
 			let (writer, reader) = pipe_with_free(0);
 			drop(reader);
+			// The reader is gone once no copy of the read end is left, which
+			// a child that a sibling test is starting can hold for a moment
+			// ([`read_to_end_of_file`]): the write end reports `POLLERR` then.
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				let mut p = libc::pollfd { fd: writer.file.as_raw_fd(), events: 0, revents: 0 };
+				// SAFETY: one `pollfd`, valid for the call.
+				let n = unsafe { libc::poll(&raw mut p, 1, 100) };
+				assert!(n >= 0, "poll: {}", io::Error::last_os_error());
+				if p.revents & libc::POLLERR != 0 {
+					break;
+				}
+				assert!(Instant::now() < deadline, "DEADLINE: the read end was not gone within 10 s");
+			}
 			assert_eq!(
 				crate::sys::ready::write_room(writer.file.as_raw_fd()),
 				crate::sys::ready::WRITE_CHUNK
