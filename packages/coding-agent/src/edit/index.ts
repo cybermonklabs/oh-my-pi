@@ -576,8 +576,8 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		if (outcome.isError) {
-			// Nothing more was written once the call was aborted; the text names
-			// any file an earlier write of this call had already changed.
+			// No write began after the abort; the text names what this call's
+			// earlier writes changed.
 			if (outcome.errorKind === "cancelled") throw new ToolAbortError(outcome.text);
 			return {
 				content: [{ type: "text", text: outcome.text }],
@@ -719,9 +719,19 @@ export class EditTool implements AgentTool<TInput> {
 
 	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
 		// Last check before anything touches disk: an aborted call begins no
-		// write. A write that has begun runs to its end even if the call is
-		// aborted meanwhile; such a call can end as a failed write
-		// (`write_failed`) rather than `cancelled`.
+		// write. Past it, `apply` does not interrupt the write; an abort that
+		// lands meanwhile is seen only where a step below checks the signal:
+		// - the ACP bridge route checks once more just before it calls the
+		//   client; an abort seen there fails the write with the abort's
+		//   reason, and nothing is written;
+		// - otherwise the change lands (on disk, or through the client). With
+		//   LSP on, the LSP notice that follows it can still fail the write
+		//   ("Operation aborted"); else the write succeeds.
+		// A failed write ends the call as `write_failed`, naming no earlier
+		// file, or, in a call that closes an LSP batch, as the batch flush's
+		// error when that flush fails too. A write that succeeds is named by
+		// the next write's `cancelled` outcome; as the call's last write, the
+		// call succeeds.
 		if (signal?.aborted) return { written: "", cancelled: true };
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));

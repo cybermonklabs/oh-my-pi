@@ -7,6 +7,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import type { ProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/types";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -153,5 +154,67 @@ describe("EditTool and its call's abort signal", () => {
 		expect(await Bun.file(path.join(tmpDir, "earlier.txt")).text()).toBe("two\n");
 		expect(error).toBeInstanceOf(ToolAbortError);
 		expect((error as ToolAbortError).message).toBe("Edit cancelled before it wrote anything; no file was changed.");
+	});
+
+	it("an edit whose write fails and that closes an LSP batch ends with the batch flush's error", async () => {
+		// The second edit writes through an ACP client bridge, and the call is aborted as that write
+		// begins (the session's bridge lookup aborts it). The bridge route's last check then fails
+		// the write before the client is asked to write, so the outcome is `write_failed`, not
+		// `cancelled`. The batch flush runs on the aborted signal and rejects; after any outcome
+		// other than `cancelled`, that rejection is the call's result.
+		const controller = new AbortController();
+		const bridgeWrites: string[] = [];
+		const bridge: ClientBridge = {
+			capabilities: { writeTextFile: true },
+			writeTextFile: async ({ path: target }) => {
+				bridgeWrites.push(target);
+			},
+		};
+		let bridgeOn = false;
+		const session: ToolSession = {
+			...createSession({ enableLsp: true }),
+			getClientBridge: () => {
+				if (!bridgeOn) return undefined;
+				controller.abort();
+				return bridge;
+			},
+		};
+		const toolCalls = [
+			{ id: "first", name: "edit" },
+			{ id: "second", name: "edit" },
+		];
+		const inBatch = (index: number) =>
+			({ toolCall: { batchId: "batch-1", index, total: 2, toolCalls } }) as unknown as AgentToolContext;
+		await Bun.write(path.join(tmpDir, "earlier.txt"), "one\n");
+		const first = await new EditTool(session, "replace").execute(
+			"first",
+			{ path: "earlier.txt", old_string: "one", new_string: "two" },
+			undefined,
+			undefined,
+			inBatch(0),
+		);
+		expect(first.isError).not.toBe(true);
+
+		const target = path.join(tmpDir, "n.md");
+		await Bun.write(target, "old\n");
+		bridgeOn = true;
+		const call = new EditTool(session, "replace").execute(
+			"second",
+			{ path: "n.md", old_string: "old", new_string: "new" },
+			controller.signal,
+			undefined,
+			inBatch(1),
+		);
+
+		const settled = await call.then(
+			result => result,
+			(rejection: unknown) => rejection,
+		);
+		// The file first, so a failure shows whether the call wrote.
+		expect(await Bun.file(target).text()).toBe("old\n");
+		expect(bridgeWrites).toEqual([]);
+		expect(await Bun.file(path.join(tmpDir, "earlier.txt")).text()).toBe("two\n");
+		expect(settled).toBeInstanceOf(ToolAbortError);
+		expect((settled as ToolAbortError).message).toBe("Operation aborted");
 	});
 });

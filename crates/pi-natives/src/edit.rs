@@ -221,11 +221,15 @@ pub struct EditApplyRequest<'env> {
 	pub lsp_batch_id: Option<String>,
 	pub lsp_flush:    bool,
 	/// Abort signal of the tool call. Once it fires, `apply` hands no further
-	/// write to the host writer, and the outcome is `cancelled`, naming what
-	/// the call's earlier writes changed. A write handed over just before the
-	/// abort can still reach the writer after it: a writer that must start
-	/// nothing after the abort checks its own signal first and returns
-	/// `cancelled: true`.
+	/// write to the host writer, and a call stopped that way ends as
+	/// `cancelled`, naming what the call's earlier writes changed. `apply` does
+	/// not interrupt a write the host has already begun, and the call ends as
+	/// that write's result: if the host fails it, `write_failed` with the
+	/// host's error, naming no earlier file; if it succeeds, it is named by the
+	/// cancel at the next write, or, as the call's last write, the call
+	/// succeeds. A write handed over just before the abort can still reach the
+	/// writer after it: a writer that must start nothing after the abort checks
+	/// its own signal first and returns `cancelled: true`.
 	pub signal:       Option<Unknown<'env>>,
 }
 
@@ -729,9 +733,10 @@ impl EditSession {
 	/// Stage and apply the finished edit through `writer`. Never rejects for
 	/// engine failures: those come back as `isError` outcomes carrying the
 	/// model-facing message. Once `request.signal` fires, no further write is
-	/// handed to `writer`, and the outcome is then `cancelled`, naming what the
-	/// call's earlier writes changed (see `EditApplyRequest.signal` for what a
-	/// writer must check itself).
+	/// handed to `writer`, and a call stopped that way ends as `cancelled`,
+	/// naming what the call's earlier writes changed. `apply` does not
+	/// interrupt a write already handed over (see `EditApplyRequest.signal` for
+	/// how it ends the call, and for what a writer must check itself).
 	#[napi]
 	pub fn apply<'env>(
 		&self,

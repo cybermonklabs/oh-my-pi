@@ -80,7 +80,9 @@ pub struct WriteResponse {
 pub trait EditWriter: Send + Sync {
 	/// Write one file. A writer that will not begin the write because the
 	/// call was cancelled returns [`EditError::Cancelled`] having touched
-	/// nothing; [`Session::apply`] then fills in the files already written.
+	/// nothing; [`Session::apply`] then returns it with `written` naming what
+	/// each earlier write of the call changed (`a.md`, `a.md (moved to c.md)`,
+	/// `d.md (deleted)`).
 	async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse>;
 }
 

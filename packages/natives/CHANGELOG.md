@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `EditSession.apply` takes the tool call's abort signal (`signal` in its request). Before, a cancelled edit could still write its files after the abort was reported. Once the signal fires, `apply` stops waiting on URL resolution or missing-path recovery and hands no further write to the host writer. The outcome is then an error of kind `cancelled` whose message names what the call's earlier writes changed (a move by its source and destination, a delete as deleted). A write handed to the host just before the abort can still reach the writer, and a write the host has begun runs to its end: a writer that must start nothing after the abort checks its own signal and returns `cancelled: true`.
+- `EditSession.apply` takes the tool call's abort signal (`signal` in its request). Before, a cancelled edit could still write its files after the abort was reported. Once the signal fires, `apply` stops waiting on URL resolution or missing-path recovery and hands no further write to the host writer; a call stopped that way ends as an error of kind `cancelled` whose message names what the call's earlier writes changed (a move by its source and destination, a delete as deleted). `apply` does not interrupt a write the host has already begun, and the call ends as that write's result: if the host fails it, `write_failed` with the host's error, naming no earlier file; if it succeeds, it is named by the cancel at the next write, or, as the call's last write, the call succeeds. A write handed to the host just before the abort can still reach the writer after it: a writer that must start nothing after the abort checks its own signal and returns `cancelled: true`.
 
 ## [18.18.6] - 2026-11-09
 
