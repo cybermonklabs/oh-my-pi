@@ -53,8 +53,9 @@ const RESTART_MAX_DELAY_MS = 30_000;
 const RESTART_BACKOFF_BASE_MS = 1_000;
 /**
  * How often a broker checks that its Unix socket still exists. Something that
- * deletes the runtime dir leaves the broker holding the scope lease while no
- * client can reach it, so the broker gives the scope up instead.
+ * deletes the runtime dir leaves the broker holding the scope lease (its lock
+ * sits beside the dir: {@link daemonBrokerLockPath}) while no client can reach
+ * it, so the broker gives the scope up instead.
  */
 const ENDPOINT_CHECK_MS = 5_000;
 /**
@@ -353,17 +354,7 @@ async function probeBrokerEndpoint(endpoint: string): Promise<boolean> {
  * the lease. Probe, allow one startup grace, then probe again.
  */
 async function holdsLiveForeignLease(pidPath: string, endpoint: string): Promise<boolean> {
-	let pid: number | undefined;
-	try {
-		// `fs.readFile` (libuv) rather than `Bun.file().json()`: the CLI entry runs
-		// as a floating promise, so an await that completes without an active
-		// libuv handle lets Bun exit this worker before it ever listens — exactly
-		// what happens on the cold-start path when broker.pid is absent.
-		const raw: unknown = JSON.parse(await fs.readFile(pidPath, "utf8"));
-		if (typeof raw === "object" && raw !== null && "pid" in raw && typeof raw.pid === "number") pid = raw.pid;
-	} catch {
-		// Missing or torn lease: nothing to honor.
-	}
+	const pid = await readLeasePid(pidPath);
 	if (pid === undefined || pid === process.pid) return false;
 	try {
 		process.kill(pid, 0);
@@ -378,14 +369,30 @@ async function holdsLiveForeignLease(pidPath: string, endpoint: string): Promise
 /**
  * Claim the one-broker-per-scope lease. The native lock is process-owned, so
  * the OS releases it however the broker dies — a crashed broker can never wedge
- * the scope behind a stale lease again (issue #11080). `broker.pid` stays as
+ * the scope behind a stale lease again (issue #11080). It locks a sidecar
+ * beside the runtime dir ({@link daemonBrokerLockPath}), so deleting the dir
+ * does not free the scope while this broker runs. `broker.pid` stays as
  * human-readable metadata for `omp ps` and dead-scope pruning.
+ *
+ * A broker of an older build locks `broker.pid` itself, which this lock never
+ * meets, and holds that lock before it writes its pid there. So the scope is
+ * refused while anyone holds `broker.pid`'s lock: on Linux the open-file
+ * description query plus the probe of the older build's abstract name, on
+ * macOS `F_GETLK` (which sees the older `flock`), on Windows the mutex listing.
+ * That is checked once, before this broker writes `broker.pid`, so an older
+ * build that starts at the same moment can still take the scope: it can lock
+ * `broker.pid` after the check and read it before this broker writes it.
  */
 async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise<BrokerLease | null> {
 	const pidPath = path.join(runtimeDir, PID_FILE);
-	const lock = FileLock.tryAcquire(pidPath);
+	const lock = FileLock.tryAcquire(daemonBrokerLockPath(runtimeDir));
 	if (!lock.acquired) return null;
 	try {
+		// A broker of an older build holds broker.pid's lock (see above).
+		if (FileLock.isHeld(pidPath)) {
+			lock.release();
+			return null;
+		}
 		// A broker from a build without the native lock cannot be seen through it;
 		// adopt the scope instead of starting a duplicate supervisor.
 		if (await holdsLiveForeignLease(pidPath, endpoint)) {
@@ -400,12 +407,59 @@ async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise
 	}
 }
 
+/**
+ * Give the scope up. `broker.pid` is removed only while it still records this
+ * broker: once a successor has written its own (the lock's sidecar was deleted
+ * with the directory that holds it, and another broker started), removing it
+ * would make `readLiveDaemonBrokerPid` report no broker for a live scope, which
+ * the pruner then deletes. The sidecar stays, as the session-owner sidecars do:
+ * unlinking a lock file can split one lease between a holder of the old inode
+ * and a creator of a new one.
+ */
 async function releaseBrokerLease(lease: BrokerLease): Promise<void> {
 	try {
-		await fs.rm(lease.path, { force: true });
+		if ((await readLeasePid(lease.path)) === process.pid) await fs.rm(lease.path, { force: true });
 	} finally {
 		lease.lock.release();
 	}
+}
+
+/**
+ * The scope lock's sidecar, `<runtimeDir>.broker.lock`: beside the runtime dir,
+ * not in it. A lock file inside the dir goes with the dir when a sweep or a
+ * cleaner deletes it, and a broker started after that takes the scope while
+ * this one still runs. On Linux the lock used to be an abstract socket keyed on
+ * the path, which no deletion freed; the sidecar outlives the dir in the same
+ * way (on macOS too, where the lock used to be `broker.pid` itself), short of a
+ * deletion of the directory that holds it.
+ *
+ * Nothing removes a sidecar: there is one empty file for each scope ever
+ * started, in the daemons root beside the scope dirs, and the pruner passes
+ * over anything that is not a directory (`pruneDeadDaemonRuntimeDirs`).
+ * Unlinking it is not safe even for a pruner that holds the lock and checks
+ * the inode first: a broker that opened the old file before the unlink can
+ * take its lock after the pruner lets go, while another broker creates and
+ * locks a new file at the path, and both serve. Removal would need every
+ * acquirer to recheck the path's inode after locking, which `FileLock` does
+ * not do.
+ */
+export function daemonBrokerLockPath(runtimeDir: string): string {
+	return `${path.resolve(runtimeDir)}.broker.lock`;
+}
+
+/** The PID a `broker.pid` records; undefined when it is missing or torn. */
+async function readLeasePid(pidPath: string): Promise<number | undefined> {
+	try {
+		// `fs.readFile` (libuv) rather than `Bun.file().json()`: the CLI entry runs
+		// as a floating promise, so an await that completes without an active
+		// libuv handle lets Bun exit this worker before it ever listens — exactly
+		// what happens on the cold-start path when broker.pid is absent.
+		const raw: unknown = JSON.parse(await fs.readFile(pidPath, "utf8"));
+		if (typeof raw === "object" && raw !== null && "pid" in raw && typeof raw.pid === "number") return raw.pid;
+	} catch {
+		// Missing or torn lease: no broker recorded.
+	}
+	return undefined;
 }
 
 function connectPort(host: string, port: number): Promise<boolean> {
