@@ -11,14 +11,16 @@
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { Api, Model, ProviderSessionState } from "../types";
 import { resolveAnthropicBaseUrl } from "./anthropic-http-options";
-import { ANTHROPIC_PROVIDER_SESSION_STATE_KEY, anthropicProviderSessionStateKey } from "./anthropic-state";
+import {
+	ANTHROPIC_PROVIDER_SESSION_STATE_KEY,
+	anthropicProviderSessionStateKey,
+	parseAnthropicProviderSessionStateKey,
+} from "./anthropic-state";
+import { OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX } from "./openai-completions-state";
 import { OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX } from "./openai-responses-state";
 import type { OpenAIStrictToolsState } from "./openai-shared";
-import { isOpenAIStrictToolsModel, openAIToolsRequest } from "./openai-tool-strict";
+import { isOpenAIToolsModel, openAIToolsApi } from "./openai-tool-strict";
 import { isAnthropicMessagesModel } from "./transform-messages";
-
-/** Prefix of a chat completions provider state key: `openai-completions:<provider>:<baseUrl>:<modelId>`. */
-export const OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX = "openai-completions:";
 
 /**
  * Each fallback Anthropic's state keeps as a flag, with the flag: tools sent without `strict`; unsigned thinking
@@ -77,14 +79,10 @@ export function isProviderFallback(value: unknown): value is ProviderFallback {
  */
 export function providerFallbacks(providerSessionState: ReadonlyMap<string, ProviderSessionState>): ProviderFallback[] {
 	const fallbacks: ProviderFallback[] = [];
-	const anthropicPrefix = `${ANTHROPIC_PROVIDER_SESSION_STATE_KEY}:`;
 	for (const [key, state] of providerSessionState) {
-		if (key.startsWith(anthropicPrefix)) {
-			const scope = key.slice(anthropicPrefix.length);
-			const separator = scope.indexOf("\0");
-			if (separator < 0) continue;
-			const baseUrl = scope.slice(0, separator);
-			const modelId = scope.slice(separator + 1);
+		const anthropicScope = parseAnthropicProviderSessionStateKey(key);
+		if (anthropicScope) {
+			const { baseUrl, modelId } = anthropicScope;
 			for (const [off, flag] of Object.entries(ANTHROPIC_FALLBACK_FLAGS) as [AnthropicFallbackFlag, string][]) {
 				if (flag in state && (state as unknown as Record<string, unknown>)[flag] === true) {
 					fallbacks.push({ api: "anthropic-messages", baseUrl, modelId, off });
@@ -134,19 +132,22 @@ export function strictToolsFallbackHolds(
 		const state = providerSessionState.get(anthropicProviderSessionStateKey(baseUrl, model.id));
 		return state !== undefined && "strictToolsDisabled" in state && state.strictToolsDisabled === true;
 	}
-	if (!isOpenAIStrictToolsModel(model)) return false;
-	const api = openAIToolsRequest(model).api;
-	if (api === "openai-codex-responses") return false;
-	const completionsPrefix = `${OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX}${model.provider}:`;
-	const responsesKey = `${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`;
-	for (const [key, state] of providerSessionState) {
-		if (api === "openai-completions" ? !key.startsWith(completionsPrefix) : key !== responsesKey) continue;
-		if (!hasOpenAIStrictToolsState(state)) continue;
-		for (const scope of state.strictTools.disabledModelScopes.values()) {
-			if (scope.provider === model.provider && scope.modelId === model.id) return true;
+	if (!isOpenAIToolsModel(model)) return false;
+	switch (openAIToolsApi(model)) {
+		case "openai-codex-responses":
+			return false;
+		case "openai-responses": {
+			const state = providerSessionState.get(`${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`);
+			return state !== undefined && keepsStrictToolsFallback(state, model);
+		}
+		case "openai-completions": {
+			const prefix = `${OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX}${model.provider}:`;
+			for (const [key, state] of providerSessionState) {
+				if (key.startsWith(prefix) && keepsStrictToolsFallback(state, model)) return true;
+			}
+			return false;
 		}
 	}
-	return false;
 }
 
 /** Turns off every fallback the provider states in `providerSessionState` keep. */
@@ -203,6 +204,15 @@ function openAIStrictToolsApi(key: string): "openai-completions" | "openai-respo
 	if (key.startsWith(OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX)) return "openai-completions";
 	if (key.startsWith(OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX)) return "openai-responses";
 	return undefined;
+}
+
+/** Whether `state` keeps the strict-tools fallback for `model`'s provider and id, whichever endpoint it names. */
+function keepsStrictToolsFallback(state: ProviderSessionState, model: Model<Api>): boolean {
+	if (!hasOpenAIStrictToolsState(state)) return false;
+	for (const scope of state.strictTools.disabledModelScopes.values()) {
+		if (scope.provider === model.provider && scope.modelId === model.id) return true;
+	}
+	return false;
 }
 
 function hasOpenAIStrictToolsState(

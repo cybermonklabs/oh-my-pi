@@ -56,14 +56,11 @@ import { compactGrammarDefinition } from "./grammar";
 import {
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
-	releaseOpenAIEffortControlSession,
 	resolveOpenAIEffortControlState,
 } from "./openai-configuration-update";
 import {
 	applyOpenAIReasoningEffortFallback,
-	clearOpenAIReasoningEffortFallbackState,
 	createOpenAIReasoningEffortFallbackKey,
-	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallbackState,
@@ -90,9 +87,7 @@ import {
 	applyWireModelIdTransform,
 	buildResponsesDeltaInput,
 	buildResponsesInput,
-	clearOpenAIStrictToolsState,
 	createInitialResponsesAssistantMessage,
-	createOpenAIStrictToolsState,
 	disableStrictToolsForScope,
 	encodeResponsesToolName,
 	getJuiceValue,
@@ -119,10 +114,10 @@ import {
 	shouldRetryWithoutStrictTools,
 	throwOpenAIResponsesEventError,
 } from "./openai-shared";
-import { openAIFunctionTools } from "./openai-tool-strict";
+import { nonFunctionTool, openAIFunctionTools, type OpenAIToolsRequest } from "./openai-tool-strict";
 import { readOpenRouterGenerationError } from "./openrouter-generation";
 import {
-	OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX,
+	getOpenAIResponsesProviderSessionState,
 	resetOpenAIResponsesChainState,
 	storesResponsesServerSide,
 } from "./openai-responses-state";
@@ -486,67 +481,6 @@ export interface OpenAIResponsesChainState {
 	staleFailures: number;
 	/** Set once chaining is judged unsupported for this session (circuit breaker). */
 	disabled: boolean;
-}
-
-function createOpenAIResponsesProviderSessionState(
-	model: Model<"openai-responses">,
-): OpenAIResponsesProviderSessionState {
-	const strictToolsState = createOpenAIStrictToolsState();
-	const reasoningEffortFallbackState = createOpenAIReasoningEffortFallbackState();
-	const state: OpenAIResponsesProviderSessionState = {
-		...strictToolsState,
-		...reasoningEffortFallbackState,
-		nativeHistoryReplayWarmed: !model.compat.connectionBoundNativeHistory,
-		closeCount: 0,
-		chains: new Map(),
-		effortControls: new Map(),
-		releaseSession: sessionId => {
-			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
-			if (!normalizedSessionId) return;
-			for (const [key, chain] of state.chains) {
-				if (chain.sessionId === normalizedSessionId) state.chains.delete(key);
-			}
-			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
-			state.transports?.releaseSession(normalizedSessionId);
-		},
-		close: () => {
-			state.nativeHistoryReplayWarmed = false;
-			state.closeCount++;
-			state.chains.clear();
-			state.effortControls.clear();
-			state.transports?.close();
-			state.transports = undefined;
-			clearOpenAIStrictToolsState(state);
-			clearOpenAIReasoningEffortFallbackState(state);
-		},
-	};
-	return state;
-}
-
-function getOpenAIResponsesProviderSessionState(
-	model: Model<"openai-responses">,
-	providerSessionState: Map<string, ProviderSessionState> | undefined,
-): OpenAIResponsesProviderSessionState | undefined {
-	if (!providerSessionState) return undefined;
-	const key = `${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`;
-	const existing = providerSessionState.get(key) as OpenAIResponsesProviderSessionState | undefined;
-	if (existing) return existing;
-	const created = createOpenAIResponsesProviderSessionState(model);
-	providerSessionState.set(key, created);
-	return created;
-}
-
-/**
- * Puts back the strict-tools fallback an earlier process of the session kept for `scope` (see
- * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): requests for `model`'s provider send no tool as strict for that
- * scope, as the requests after the endpoint rejected strict tools did.
- */
-export function restoreOpenAIResponsesStrictToolsFallback(
-	providerSessionState: Map<string, ProviderSessionState>,
-	model: Model<"openai-responses">,
-	scope: OpenAIStrictToolsScope,
-): void {
-	disableStrictToolsForScope(getOpenAIResponsesProviderSessionState(model, providerSessionState), scope);
 }
 
 function isOpenAIResponsesStatefulEnabled(
@@ -2119,45 +2053,42 @@ export function convertTools(
 	const toolNaming = responsesToolNaming(model);
 	// Models without native computer support get the computer tool as a plain function tool (name, description,
 	// schema), so function-calling models can still drive the desktop.
-	const declared = openAIFunctionTools(
-		{
-			api: "openai-responses",
-			compat: model.compat,
-			freeformApplyPatch: supportsFreeformApplyPatch(model),
-			computerUse: model.supportsComputerUse === true,
-			disableStrictTools: !strictMode,
-		},
-		tools,
-	);
+	const request: OpenAIToolsRequest = {
+		api: "openai-responses",
+		compat: model.compat,
+		freeformApplyPatch: supportsFreeformApplyPatch(model),
+		computerUse: model.supportsComputerUse === true,
+		disableStrictTools: !strictMode,
+	};
+	const declared = openAIFunctionTools(request, tools);
 	const out: OpenAITool[] = [];
 	for (let index = 0; index < tools.length; index++) {
 		const tool = tools[index]!;
-		const functionTool = declared[index];
-		if (!functionTool) {
-			// The native computer tool, or a freeform custom tool.
-			emittedTools?.push(tool);
-			const customFormat =
-				tool.native?.type === "computer" && model.supportsComputerUse === true ? undefined : tool.customFormat;
-			out.push(
-				customFormat
-					? ({
-							type: "custom",
-							// Tool advertises its wire-level name (e.g. `apply_patch`) — the
-							// agent-loop dispatcher will match incoming calls by either the
-							// internal `name` or `customWireName`.
-							name: tool.customWireName ?? tool.name,
-							description: tool.description || "",
-							format: {
-								type: "grammar",
-								syntax: customFormat.syntax,
-								definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
-							},
-						} as unknown as OpenAITool)
-					: { type: "computer" },
-			);
-			continue;
+		switch (nonFunctionTool(request, tool)) {
+			case "computer":
+				emittedTools?.push(tool);
+				out.push({ type: "computer" });
+				continue;
+			case "custom": {
+				emittedTools?.push(tool);
+				const customFormat = tool.customFormat!;
+				out.push({
+					type: "custom",
+					// Tool advertises its wire-level name (e.g. `apply_patch`) — the
+					// agent-loop dispatcher will match incoming calls by either the
+					// internal `name` or `customWireName`.
+					name: tool.customWireName ?? tool.name,
+					description: tool.description || "",
+					format: {
+						type: "grammar",
+						syntax: customFormat.syntax,
+						definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
+					},
+				} as unknown as OpenAITool);
+				continue;
+			}
 		}
-		const { strict, parameters } = functionTool;
+		const { strict, parameters } = declared[index]!;
 		// Quarantine a tool whose emitted schema carries a provider-rejecting
 		// enum/const-vs-type contradiction: dropping just that tool keeps the rest
 		// of the request valid instead of letting one bad MCP schema 400 the whole
@@ -2174,14 +2105,7 @@ export function convertTools(
 			name: encodeResponsesToolName(tool.name, toolNaming),
 			description: tool.description || "",
 			parameters,
-			// `strict: false` and an omitted `strict` are NOT equivalent for every
-			// OpenAI-compat backend — some over-fill optional args when the flag is
-			// absent (#4336). `openAIFunctionTools` preserves the author's explicit
-			// `false` unless the provider is explicitly known not to understand the
-			// field (`supportsStrictMode: false`), the strict-schema fallback is
-			// active or `PI_NO_STRICT` is set — those paths rely on a uniformly
-			// absent wire flag. Mirrors the `supportsStrictMode !== false` gate used
-			// by openai-completions (#4527).
+			// `openAIFunctionTools` decides between `strict: false` and no flag, which some backends read differently.
 			...(strict === undefined ? {} : { strict }),
 		} as OpenAITool);
 	}

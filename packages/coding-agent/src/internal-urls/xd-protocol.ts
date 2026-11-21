@@ -72,8 +72,8 @@ export class XdProtocolHandler implements ProtocolHandler {
 		if (!session) throw new ToolError(NOT_MOUNTED);
 		const topic = parseXdTopicUrl(url.href);
 		const device = topic ? null : parseXdUrl(url.href);
-		// A tool a held settings change disabled stays listed until the rebuild; a read of its docs or of one of its
-		// doc topics gives the reason a call to it is refused.
+		// A tool a held settings change disabled stays in the system prompt until the rebuild; a read of its docs or of
+		// one of its doc topics gives the reason a call to it is refused.
 		const name = topic?.name ?? device?.name;
 		const heldRefusal = name ? session.heldToolRefusal?.(name) : undefined;
 		if (heldRefusal) throw new ToolError(heldRefusal);
@@ -101,8 +101,8 @@ export class XdProtocolHandler implements ProtocolHandler {
 		const xdev = session.xdev;
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
 		if (!name) throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
-		// A device a held settings change disabled stays listed until the rebuild; a call to it is refused as a direct
-		// call to the tool is, with the reason.
+		// A device a held settings change disabled stays in the system prompt until the rebuild; a call to it is refused
+		// as a direct call to the tool is, with the reason.
 		const heldRefusal = session.heldToolRefusal?.(name);
 		if (heldRefusal) throw new ToolError(heldRefusal);
 		const toolCall = context.toolCall;

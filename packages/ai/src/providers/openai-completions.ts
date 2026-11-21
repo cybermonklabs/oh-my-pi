@@ -23,7 +23,6 @@ import type {
 	Message,
 	MessageAttribution,
 	Model,
-	ProviderSessionState,
 	ServiceTier,
 	StopReason,
 	StreamFunction,
@@ -71,12 +70,9 @@ import type {
 } from "./openai-chat-wire";
 import {
 	applyOpenAIReasoningEffortFallback,
-	clearOpenAIReasoningEffortFallbackState,
 	createOpenAIReasoningEffortFallbackKey,
-	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
-	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
 	resolveOpenAIReasoningEffortFallback,
 } from "./openai-reasoning-fallback";
@@ -92,9 +88,7 @@ import {
 	applyProviderReportedCost,
 	applyWireModelIdTransform,
 	calculateOpenAIUsageAccounting,
-	clearOpenAIStrictToolsState,
 	createInitialResponsesAssistantMessage,
-	createOpenAIStrictToolsState,
 	disableStrictToolsForScope,
 	getOpenAIPromptCacheKey,
 	getOpenAIStrictToolsScope,
@@ -104,8 +98,6 @@ import {
 	type OpenAICompletionsParams,
 	type OpenAIPromptCacheOptions,
 	type OpenAIRequestSetup,
-	type OpenAIStrictToolsScope,
-	type OpenAIStrictToolsState,
 	parseAzureDeploymentNameMap,
 	readOpenRouterRawMetadata,
 	resolveOpenAICompatPolicy,
@@ -115,8 +107,9 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { getOpenAICompletionsProviderSessionState } from "./openai-completions-state";
 import { openAIFunctionTools } from "./openai-tool-strict";
-import { OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX, reportProviderFallback } from "./provider-fallbacks";
+import { reportProviderFallback } from "./provider-fallbacks";
 import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
@@ -696,55 +689,6 @@ type BuiltOpenAICompletionTools = {
 	/** True when at least one wire tool was sent with `strict: true`. */
 	strictToolsApplied: boolean;
 };
-
-type OpenAICompletionsProviderSessionState = ProviderSessionState &
-	OpenAIStrictToolsState &
-	OpenAIReasoningEffortFallbackState;
-
-function createOpenAICompletionsProviderSessionState(): OpenAICompletionsProviderSessionState {
-	const strictToolsState = createOpenAIStrictToolsState();
-	const reasoningEffortFallbackState = createOpenAIReasoningEffortFallbackState();
-	const state: OpenAICompletionsProviderSessionState = {
-		...strictToolsState,
-		...reasoningEffortFallbackState,
-		close: () => {
-			clearOpenAIStrictToolsState(state);
-			clearOpenAIReasoningEffortFallbackState(state);
-		},
-	};
-	return state;
-}
-
-function getOpenAICompletionsProviderSessionState(
-	model: Pick<Model<"openai-completions">, "provider" | "id">,
-	baseUrl: string | undefined,
-	providerSessionState: Map<string, ProviderSessionState> | undefined,
-): OpenAICompletionsProviderSessionState | undefined {
-	if (!providerSessionState) return undefined;
-	const key = `${OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX}${model.provider}:${baseUrl ?? ""}:${model.id}`;
-	const existing = providerSessionState.get(key) as OpenAICompletionsProviderSessionState | undefined;
-	if (existing) return existing;
-	const created = createOpenAICompletionsProviderSessionState();
-	providerSessionState.set(key, created);
-	return created;
-}
-
-/**
- * Puts back the strict-tools fallback an earlier process of the session kept for `scope` (see
- * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): its requests send no tool as strict, as the requests after the
- * endpoint rejected strict tools did.
- */
-export function restoreOpenAICompletionsStrictToolsFallback(
-	providerSessionState: Map<string, ProviderSessionState>,
-	scope: OpenAIStrictToolsScope,
-): void {
-	const state = getOpenAICompletionsProviderSessionState(
-		{ provider: scope.provider, id: scope.modelId },
-		scope.baseUrl,
-		providerSessionState,
-	);
-	disableStrictToolsForScope(state, scope);
-}
 
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
 // `<｜DSML｜tool_calls｜>`) into visible `content` deltas when hosted behind providers
@@ -2940,10 +2884,7 @@ function convertTools(
 	disableStrictTools = false,
 ): BuiltOpenAICompletionTools {
 	const rejectRootObjectUnion = compat.rejectRootObjectUnion;
-	// `openAIFunctionTools` keeps the author's explicit `strict: false` (some backends over-fill optional properties
-	// when it is absent, #4336) only in "mixed" mode against a provider that understands the field: the
-	// `all_strict → none` collapse and `supportsStrictMode: false` paths deliberately keep the wire flag uniformly
-	// absent.
+	// `openAIFunctionTools` decides between `strict: false` and no flag, which some backends read differently.
 	const declared = openAIFunctionTools({ api: "openai-completions", compat, disableStrictTools }, tools);
 	const wireTools: ChatCompletionTool[] = [];
 	let anyStrictEmitted = false;

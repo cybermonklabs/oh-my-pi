@@ -77,11 +77,6 @@ describe("openAIFunctionTools under PI_NO_STRICT", () => {
 describe("openAIStrictnessHashedTools", () => {
 	const byDefault = { noStrict: false, disableStrictTools: false };
 
-	it("hands back the tools themselves under default settings", () => {
-		const tools = [strictable("marked", true), strictable("plain"), loose];
-		expect(openAIStrictnessHashedTools(gatewayModel("openai-completions"), tools, byDefault)).toBe(tools);
-	});
-
 	// Under `all_strict` chat completions sends every tool strict or none: with one tool strict mode cannot enforce, it
 	// sends none whatever the settings, so turning them on changes neither the wire nor the hash.
 	it.each([

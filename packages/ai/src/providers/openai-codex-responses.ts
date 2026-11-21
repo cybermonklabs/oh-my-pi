@@ -100,7 +100,7 @@ import { CodexApiError } from "./openai-codex/response-handler";
 import { getCodexAttestationHeader } from "./openai-codex-attestation";
 export { createOpenAICodexCompactionRequestContext } from "./openai-codex-compaction";
 import { getOpenAICodexWebSocketEnvValue } from "./openai-codex-transport";
-import { openAIFunctionTools } from "./openai-tool-strict";
+import { nonFunctionTool, openAIFunctionTools, openAIToolsRequest } from "./openai-tool-strict";
 import {
 	createCodexProviderSessionState,
 	getCodexProviderSessionState,
@@ -4517,34 +4517,15 @@ export function convertOpenAICodexResponsesTools(
 	tools: Tool[],
 	model: Model<"openai-codex-responses">,
 ): CodexToolPayload[] {
-	const declared = openAIFunctionTools(
-		{
-			api: "openai-codex-responses",
-			compat: model.compat,
-			freeformApplyPatch: model.applyPatchToolType === "freeform",
-			// Subscription models default to the function fallback. Explicit metadata
-			// remains authoritative for future Codex endpoints that implement GA computer use.
-			computerUse: model.supportsComputerUse === true,
-		},
-		tools,
-	);
+	const request = openAIToolsRequest(model);
+	const declared = openAIFunctionTools(request, tools);
 	return tools.map((tool, index): CodexToolPayload => {
-		const functionTool = declared[index];
-		if (functionTool) {
-			const { strict, parameters } = functionTool;
-			return {
-				type: "function",
-				name: tool.name,
-				description: tool.description || "",
-				parameters,
-				...(strict === undefined ? {} : { strict }),
-			};
-		}
-		// The native computer tool, or a freeform custom tool.
-		const customFormat =
-			tool.native?.type === "computer" && model.supportsComputerUse === true ? undefined : tool.customFormat;
-		return customFormat
-			? {
+		switch (nonFunctionTool(request, tool)) {
+			case "computer":
+				return { type: "computer" };
+			case "custom": {
+				const customFormat = tool.customFormat!;
+				return {
 					type: "custom",
 					name: tool.customWireName ?? tool.name,
 					description: tool.description || "",
@@ -4553,8 +4534,17 @@ export function convertOpenAICodexResponsesTools(
 						syntax: customFormat.syntax,
 						definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
 					},
-				}
-			: { type: "computer" };
+				};
+			}
+		}
+		const { strict, parameters } = declared[index]!;
+		return {
+			type: "function",
+			name: tool.name,
+			description: tool.description || "",
+			parameters,
+			...(strict === undefined ? {} : { strict }),
+		};
 	});
 }
 

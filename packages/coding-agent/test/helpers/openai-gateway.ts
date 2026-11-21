@@ -1,5 +1,7 @@
 import { vi } from "bun:test";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { GATEWAY, type WireMessage } from "./anthropic-gateway";
 import { asGlobalFetch } from "./fetch-mock";
 
@@ -7,7 +9,7 @@ import { asGlobalFetch } from "./fetch-mock";
 export type OpenAIGatewayApi = "openai-responses" | "openai-completions";
 
 /** The provider {@link openAIGatewayModelsYml} declares each API's claude-opus-5-5 under. */
-export const OPENAI_GATEWAY_PROVIDERS: Record<OpenAIGatewayApi, string> = {
+const OPENAI_GATEWAY_PROVIDERS: Record<OpenAIGatewayApi, string> = {
 	"openai-responses": "gateway-responses",
 	"openai-completions": "gateway-completions",
 };
@@ -35,6 +37,14 @@ export function openAIGatewayModelsYml(): string {
 `,
 	);
 	return `providers:\n${providers.join("")}`;
+}
+
+/** The gateway's claude-opus-5-5 in `modelRegistry`, on `api`, or on Anthropic's messages API without one. */
+export function gatewayModel(modelRegistry: ModelRegistry, api?: OpenAIGatewayApi): Model<Api> {
+	const provider = api ? OPENAI_GATEWAY_PROVIDERS[api] : "anthropic";
+	const model = modelRegistry.find(provider, "claude-opus-5-5");
+	if (!model) throw new Error(`Expected the gateway's ${provider} claude-opus-5-5`);
+	return model;
 }
 
 /** A request body as far as the tests read it, on the gateway's Anthropic or OpenAI APIs. */

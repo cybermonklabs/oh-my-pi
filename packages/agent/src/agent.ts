@@ -31,8 +31,8 @@ import {
 } from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import {
-	isOpenAIStrictToolsModel,
-	type OpenAIStrictToolsApi,
+	isOpenAIToolsModel,
+	type OpenAIToolsModelApi,
 	openAIStrictnessHashedTools,
 } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
 import { strictToolsFallbackHolds } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
@@ -468,7 +468,7 @@ export class Agent {
 				declaration: RecordedToolDeclaration | undefined;
 				sentRevision: number;
 				strictWithheld: boolean;
-				openAIWire: Model<OpenAIStrictToolsApi> | undefined;
+				openAIWire: Model<OpenAIToolsModelApi> | undefined;
 				openAIStrictFallback: boolean;
 				fingerprint: string;
 		  }
@@ -751,7 +751,7 @@ export class Agent {
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
 		const strictWithheld = this.#withholdsStrictTools(model);
 		const openAIWire =
-			model !== undefined && isOpenAIStrictToolsModel(model) && !this.#ownedDialect(model) ? model : undefined;
+			model !== undefined && isOpenAIToolsModel(model) && !this.#ownedDialect(model) ? model : undefined;
 		const openAIStrictFallback =
 			openAIWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, openAIWire);
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.

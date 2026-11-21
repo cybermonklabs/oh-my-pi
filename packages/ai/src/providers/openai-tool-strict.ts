@@ -1,5 +1,6 @@
+import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { $env } from "@oh-my-pi/pi-utils";
-import type { Api, Model, OpenAICompat, Tool } from "../types";
+import type { Api, Model, Tool } from "../types";
 import {
 	adaptSchemaForStrict,
 	flattenExclusiveRequiredRootUnion,
@@ -13,15 +14,12 @@ import {
 export type OpenAIToolsApi = "openai-completions" | "openai-responses" | "openai-codex-responses";
 
 /** The model APIs whose requests go out on an {@link OpenAIToolsApi}: those, and `openrouter`. */
-export type OpenAIStrictToolsApi = OpenAIToolsApi | "openrouter";
+export type OpenAIToolsModelApi = OpenAIToolsApi | "openrouter";
 
 /** The compat fields that decide a function tool's `strict` flag and schema: the compat the request goes out with. */
-export interface OpenAIStrictToolsCompat {
-	supportsStrictMode?: boolean;
-	toolStrictMode?: "mixed" | "all_strict" | "none";
-	rejectRootObjectUnion?: boolean;
-	toolSchemaFlavor?: OpenAICompat["toolSchemaFlavor"];
-}
+export type OpenAIStrictToolsCompat = Partial<
+	Pick<ResolvedOpenAICompat, "supportsStrictMode" | "toolStrictMode" | "rejectRootObjectUnion" | "toolSchemaFlavor">
+>;
 
 /** What decides how an OpenAI request declares its function tools. */
 export interface OpenAIToolsRequest {
@@ -54,7 +52,7 @@ export interface OpenAIFunctionToolDeclaration {
 }
 
 /** Whether `model`'s requests go out on an {@link OpenAIToolsApi}. */
-export function isOpenAIStrictToolsModel(model: Model<Api>): model is Model<OpenAIStrictToolsApi> {
+export function isOpenAIToolsModel(model: Model<Api>): model is Model<OpenAIToolsModelApi> {
 	return (
 		model.api === "openai-completions" ||
 		model.api === "openai-responses" ||
@@ -64,33 +62,39 @@ export function isOpenAIStrictToolsModel(model: Model<Api>): model is Model<Open
 }
 
 /**
- * The request `model`'s main requests declare their tools with, under no strict-tools fallback: an `openrouter`
- * model's go out on Responses, or on chat completions under `PI_OPENROUTER_RESPONSES=0`, as `stream` routes them.
+ * The API `model`'s main requests go out on: an `openrouter` model's go out on Responses, or on chat completions under
+ * `PI_OPENROUTER_RESPONSES=0`, as `stream` routes them.
  */
-export function openAIToolsRequest(model: Model<OpenAIStrictToolsApi>): OpenAIToolsRequest {
+export function openAIToolsApi(model: Model<OpenAIToolsModelApi>): OpenAIToolsApi {
+	if (model.api !== "openrouter") return model.api;
+	return $env.PI_OPENROUTER_RESPONSES !== "0" ? "openai-responses" : "openai-completions";
+}
+
+/**
+ * The request `model`'s main requests declare their tools with, under no strict-tools fallback, on the API
+ * {@link openAIToolsApi} gives.
+ */
+export function openAIToolsRequest(model: Model<OpenAIToolsModelApi>): OpenAIToolsRequest {
 	return {
-		api:
-			model.api === "openrouter"
-				? $env.PI_OPENROUTER_RESPONSES !== "0"
-					? "openai-responses"
-					: "openai-completions"
-				: model.api,
+		api: openAIToolsApi(model),
 		compat: model.compat,
 		freeformApplyPatch: model.applyPatchToolType === "freeform",
+		// Codex subscription models default to the function fallback. Explicit metadata remains authoritative for
+		// future Codex endpoints that implement GA computer use.
 		computerUse: model.supportsComputerUse === true,
 	};
 }
 
 /**
- * The function tools `request` declares from `tools`, index-aligned; `undefined` for a tool it declares otherwise (a
- * freeform custom tool, the native computer tool). `PI_NO_STRICT` asks for no strict tool on any API, and the
- * strict-tools fallback sends none on chat completions and Responses. Those two send the flag only where
- * `compat.supportsStrictMode` is not `false`; chat completions sends none under `compat.toolStrictMode: "none"`, every
- * tool strict or none under `"all_strict"` (none unless each tool's schema can be made strict), and keeps a tool's own
- * `strict: false` only under `"mixed"`, `PI_NO_STRICT` or not. Codex asks for strict only for a tool marked
- * `strict: true`. A tool asked for strict goes out `strict: true` only when its schema can be made strict. The
- * providers build their function tools from it, and the agent's declared-tools fingerprint reads its flags
- * ({@link openAIStrictnessHashedTools}), so the two cannot drift.
+ * The function tools `request` declares from `tools`, index-aligned; `undefined` for a tool it declares otherwise
+ * ({@link nonFunctionTool}). `PI_NO_STRICT` asks for no strict tool on any API, and the strict-tools fallback sends
+ * none on chat completions and Responses. Those two send the flag only where `compat.supportsStrictMode` is not
+ * `false` (#4527); chat completions sends none under `compat.toolStrictMode: "none"`, every tool strict or none under
+ * `"all_strict"` (none unless each tool's schema can be made strict), and keeps a tool's own `strict: false`, which
+ * some backends read otherwise than no flag (#4336), only under `"mixed"`, `PI_NO_STRICT` or not. Codex asks for
+ * strict only for a tool marked `strict: true`. A tool asked for strict goes out `strict: true` only when its schema
+ * can be made strict. The providers build their function tools from it, and the agent's declared-tools fingerprint
+ * reads its flags ({@link openAIStrictnessHashedTools}), so the two cannot drift.
  */
 export function openAIFunctionTools(
 	request: OpenAIToolsRequest,
@@ -101,7 +105,7 @@ export function openAIFunctionTools(
 			return chatCompletionsFunctionTools(request, tools);
 		case "openai-responses":
 			return tools.map(tool => {
-				if (declaredOtherwise(request, tool)) return undefined;
+				if (nonFunctionTool(request, tool)) return undefined;
 				const requested = requestedStrict(request, tool);
 				const sanitized = sanitizeSchemaForOpenAIResponses(toolWireSchema(tool));
 				const flattened = request.compat.rejectRootObjectUnion
@@ -118,12 +122,23 @@ export function openAIFunctionTools(
 			});
 		case "openai-codex-responses":
 			return tools.map(tool => {
-				if (declaredOtherwise(request, tool)) return undefined;
+				if (nonFunctionTool(request, tool)) return undefined;
 				const requested = requestedStrict(request, tool);
 				const schema = sanitizeSchemaForOpenAIResponses(toolWireSchema(tool), { repairArrayItems: true });
 				return declaration(requested, adaptSchemaForStrict(schema, requested === true));
 			});
 	}
+}
+
+/**
+ * How a Responses or Codex request declares `tool` other than as a function tool: `"computer"`, as the native computer
+ * tool (`{ type: "computer" }`); `"custom"`, as a freeform custom tool in its `customFormat`; `undefined` for a
+ * function tool.
+ */
+export function nonFunctionTool(request: OpenAIToolsRequest, tool: Tool): "computer" | "custom" | undefined {
+	if (tool.native?.type === "computer" && request.computerUse === true) return "computer";
+	if (request.freeformApplyPatch === true && tool.customFormat) return "custom";
+	return undefined;
 }
 
 /** A tool as a strictness-aware hash reads it: `strict: null` stands for no flag where it has one by default. */
@@ -139,7 +154,7 @@ export type StrictnessHashedTool = Omit<Tool, "strict"> & { strict?: boolean | n
  * decides both sides: a compat change between processes is not seen. `tools` itself under default settings.
  */
 export function openAIStrictnessHashedTools(
-	model: Model<OpenAIStrictToolsApi>,
+	model: Model<OpenAIToolsModelApi>,
 	tools: readonly Tool[],
 	settings: { disableStrictTools?: boolean; noStrict?: boolean } = {},
 ): readonly StrictnessHashedTool[] {
@@ -167,13 +182,14 @@ function chatCompletionsFunctionTools(
 			: toolWireSchema(tool);
 		return { requested, base, ...adaptSchemaForStrict(base, requested === true) };
 	});
+	const allStrict = compat.toolStrictMode === "all_strict";
 	const mode =
-		request.disableStrictTools || compat.toolStrictMode === "none"
+		request.disableStrictTools ||
+		compat.toolStrictMode === "none" ||
+		(allStrict && !adapted.every(tool => tool.strict))
 			? "none"
-			: compat.toolStrictMode === "all_strict"
-				? adapted.every(tool => tool.strict)
-					? "all_strict"
-					: "none"
+			: allStrict
+				? "all_strict"
 				: "mixed";
 	return adapted.map(({ requested, base, schema, strict }) =>
 		mode === "all_strict" || (mode === "mixed" && strict)
@@ -188,14 +204,6 @@ function declaration(
 	adapted: { schema: Record<string, unknown>; strict: boolean },
 ): OpenAIFunctionToolDeclaration {
 	return { strict: adapted.strict ? true : requested === false ? false : undefined, parameters: adapted.schema };
-}
-
-/** Whether a Responses or Codex request declares `tool` as something other than a function tool. */
-function declaredOtherwise(request: OpenAIToolsRequest, tool: Tool): boolean {
-	return (
-		(tool.native?.type === "computer" && request.computerUse === true) ||
-		(request.freeformApplyPatch === true && Boolean(tool.customFormat))
-	);
 }
 
 /**

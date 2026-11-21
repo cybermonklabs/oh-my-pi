@@ -1,7 +1,7 @@
 import type { Api, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { restoreAnthropicFallback } from "@oh-my-pi/pi-ai/providers/anthropic";
-import { restoreOpenAICompletionsStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import { restoreOpenAIResponsesStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { restoreOpenAICompletionsStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-completions-state";
+import { restoreOpenAIResponsesStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import {
 	clearProviderFallbacks,
 	isProviderFallback,

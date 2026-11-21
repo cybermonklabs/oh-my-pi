@@ -1535,7 +1535,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#promptCacheArmSessionId: string | undefined;
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
 	readonly #promptCacheDispatch = new WeakMap<Context, () => void>();
-	/** The request the warmer was armed with last ({@link startCacheWarming}). */
+	/** The request the warmer was armed with last ({@link startCacheWarming}), until dispose releases memory. */
 	#promptCacheArm: PromptCacheArm | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
 	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
@@ -7108,6 +7108,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
+		// The armed request holds a copy of the messages; the warmer let go of its own at dispose's cancel.
+		this.#promptCacheArm = undefined;
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */

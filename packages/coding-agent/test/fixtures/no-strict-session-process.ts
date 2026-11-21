@@ -17,8 +17,8 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { answer, gatewaySessionOptions, mockGatewayFetch } from "../helpers/anthropic-gateway";
 import {
 	type GatewayRequest,
+	gatewayModel,
 	mockOpenAIGatewayFetch,
-	OPENAI_GATEWAY_PROVIDERS,
 	type OpenAIGatewayApi,
 } from "../helpers/openai-gateway";
 
@@ -59,9 +59,7 @@ const authStorage = createInMemoryAuthStorage();
 let run: ProcessRun;
 try {
 	const modelRegistry = new ModelRegistry(authStorage, path.join(input.dir, "models.yml"));
-	const provider = input.api ? OPENAI_GATEWAY_PROVIDERS[input.api] : "anthropic";
-	const model = modelRegistry.find(provider, "claude-opus-5-5");
-	if (!model) throw new Error(`Expected the gateway's ${provider} claude-opus-5-5`);
+	const model = gatewayModel(modelRegistry, input.api);
 	const sessionManager = input.sessionFile
 		? await SessionManager.open(input.sessionFile)
 		: SessionManager.create(input.dir, path.join(input.dir, "sessions"));

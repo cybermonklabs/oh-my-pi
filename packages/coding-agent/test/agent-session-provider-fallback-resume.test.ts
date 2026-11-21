@@ -28,8 +28,8 @@ import {
 } from "./helpers/anthropic-gateway";
 import {
 	type GatewayRequest,
+	gatewayModel,
 	mockOpenAIGatewayFetch,
-	OPENAI_GATEWAY_PROVIDERS,
 	type OpenAIGatewayApi,
 	openAIGatewayModelsYml,
 } from "./helpers/openai-gateway";
@@ -152,9 +152,7 @@ async function runProcess(
 	const authStorage = createInMemoryAuthStorage();
 	try {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(dir, "models.yml"));
-		const provider = api ? OPENAI_GATEWAY_PROVIDERS[api] : "anthropic";
-		const model = modelRegistry.find(provider, "claude-opus-5-5");
-		if (!model) throw new Error(`Expected the gateway's ${provider} claude-opus-5-5`);
+		const model = gatewayModel(modelRegistry, api);
 		const sessionManager = sessionFile
 			? await SessionManager.open(sessionFile)
 			: SessionManager.create(dir, path.join(dir, "sessions"));
