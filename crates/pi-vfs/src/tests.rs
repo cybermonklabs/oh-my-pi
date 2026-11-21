@@ -1026,33 +1026,38 @@ fn fifo_opens_through_a_cancellable_view_that_create_open_the_path() {
 	assert_eq!(crate::fifo::routes::of(&fifo), want, "through the pin, for {labels:?}");
 }
 
-/// With `fs.protected_fifos` at 1 or more, an open that creates of a FIFO
-/// another user owns in a world-writable sticky directory that user does
-/// not own is refused (`EACCES`), so a command that means to create a file
-/// never writes into such a FIFO. Through a cancellable view, blocking and
-/// async, such an open is refused as the plain open is. The FIFO's read end
-/// is held, so an open that goes ahead ends at once and its write reaches
-/// that reader. As root only (which can give the FIFO to another user),
-/// where `fs.protected_fifos` is 1 or more and the plain open is refused;
-/// elsewhere it checks nothing and says so.
+/// The FIFO the sticky-directory test opens: a FIFO of another user, which
+/// any user may read and write, in a world-writable sticky directory that
+/// user does not own. `PI_TEST_STICKY_FIFO` names one when set (root makes it
+/// before a run as another user; a wrong one fails the test); else, as root,
+/// one is made in `dir`. `Err` says why there is none.
 #[cfg(target_os = "linux")]
-#[test]
-fn fifo_opens_through_a_cancellable_view_that_create_are_refused_in_a_sticky_directory() {
-	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-	let protected = std::fs::read_to_string("/proc/sys/fs/protected_fifos")
-		.ok()
-		.and_then(|value| value.trim().parse::<u32>().ok());
-	if protected.is_none_or(|value| value < 1) {
-		eprintln!("UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked");
-		return;
-	}
+fn sticky_fifo(dir: &Path) -> Result<PathBuf, String> {
+	use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 	// SAFETY: `geteuid` has no preconditions.
-	if unsafe { libc::geteuid() } != 0 {
-		eprintln!("UNKNOWN: not root, so no FIFO of another user can be made; nothing was checked");
-		return;
+	let me = unsafe { libc::geteuid() };
+	if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+		let fifo = PathBuf::from(given);
+		let meta = std::fs::metadata(&fifo)
+			.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+		let parent = std::fs::metadata(fifo.parent().unwrap()).unwrap();
+		assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+		assert_eq!(
+			parent.mode() & 0o1002,
+			0o1002,
+			"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+		);
+		assert!(
+			meta.uid() != me && meta.uid() != parent.uid(),
+			"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+		);
+		assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+		return Ok(fifo);
 	}
-	let dir = TempDir::new("fifo-sticky");
-	let sticky = dir.0.join("sticky");
+	if me != 0 {
+		return Err("not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned());
+	}
+	let sticky = dir.join("sticky");
 	std::fs::create_dir(&sticky).unwrap();
 	std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
 	let fifo = sticky.join("report.txt");
@@ -1061,6 +1066,38 @@ fn fifo_opens_through_a_cancellable_view_that_create_are_refused_in_a_sticky_dir
 		.unwrap();
 	std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o666)).unwrap();
 	std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+	Ok(fifo)
+}
+
+/// With `fs.protected_fifos` at 1 or more, an open that creates of a FIFO
+/// another user owns in a world-writable sticky directory that user does
+/// not own is refused (`EACCES`), so a command that means to create a file
+/// never writes into such a FIFO. Through a cancellable view, blocking and
+/// async, such an open is refused as the plain open is. The FIFO's read end
+/// is held, so an open that goes ahead ends at once and its write reaches
+/// that reader. As root, which can give the FIFO to another user, or as any
+/// user given such a FIFO (`sticky_fifo`), where `fs.protected_fifos` is 1
+/// or more and the plain open is refused; elsewhere it checks nothing and
+/// says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_opens_through_a_cancellable_view_that_create_are_refused_in_a_sticky_directory() {
+	use std::os::unix::fs::OpenOptionsExt;
+	let protected = std::fs::read_to_string("/proc/sys/fs/protected_fifos")
+		.ok()
+		.and_then(|value| value.trim().parse::<u32>().ok());
+	if protected.is_none_or(|value| value < 1) {
+		eprintln!("UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked");
+		return;
+	}
+	let dir = TempDir::new("fifo-sticky");
+	let fifo = match sticky_fifo(&dir.0) {
+		Ok(fifo) => fifo,
+		Err(why) => {
+			eprintln!("UNKNOWN: {why}; nothing was checked");
+			return;
+		},
+	};
 	let mut reader = std::fs::OpenOptions::new()
 		.read(true)
 		.custom_flags(libc::O_NONBLOCK)

@@ -1061,6 +1061,49 @@ mod fifo {
 			assert!(wrong.is_empty(), "{wrong:#?}");
 		}
 
+		/// The FIFO the sticky-directory test opens: a FIFO of another user,
+		/// which any user may read and write, in a world-writable sticky
+		/// directory that user does not own. `PI_TEST_STICKY_FIFO` names one
+		/// when set (root makes it before a run as another user; a wrong one
+		/// fails the test); else, as root, one is made in `dir`. `Err` says why
+		/// there is none.
+		#[cfg(target_os = "linux")]
+		fn sticky_fifo(dir: &Path) -> Result<std::path::PathBuf, String> {
+			use std::os::unix::fs::{MetadataExt, PermissionsExt};
+			// SAFETY: `geteuid` has no preconditions.
+			let me = unsafe { libc::geteuid() };
+			if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+				let fifo = std::path::PathBuf::from(given);
+				let meta = fs::metadata(&fifo)
+					.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+				let parent = fs::metadata(fifo.parent().unwrap()).unwrap();
+				assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+				assert_eq!(
+					parent.mode() & 0o1002,
+					0o1002,
+					"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+				);
+				assert!(
+					meta.uid() != me && meta.uid() != parent.uid(),
+					"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+				);
+				assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+				return Ok(fifo);
+			}
+			if me != 0 {
+				return Err(
+					"not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned(),
+				);
+			}
+			let sticky = dir.join("sticky");
+			fs::create_dir(&sticky).unwrap();
+			fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+			let fifo = make_fifo(&sticky);
+			fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
+			std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+			Ok(fifo)
+		}
+
 		/// With `fs.protected_fifos` at 1 or more, an open that may create of
 		/// a FIFO another user owns in a world-writable sticky directory that
 		/// user does not own is refused (`EACCES`), so `echo x > fifo` never
@@ -1068,13 +1111,14 @@ mod fifo {
 		/// engine opens) and the FIFO helper's (`pending`) are refused as
 		/// `open(2)` of the path is, for `>` and `>>`. The FIFO's read end is
 		/// held, so an open that goes ahead ends at once and its write reaches
-		/// that reader. As root only (which can give the FIFO to another user),
-		/// where `fs.protected_fifos` is 1 or more and the plain open is
-		/// refused; elsewhere it checks nothing and says so.
+		/// that reader. As root, which can give the FIFO to another user, or as
+		/// any user given such a FIFO (`sticky_fifo`), where
+		/// `fs.protected_fifos` is 1 or more and the plain open is refused;
+		/// elsewhere it checks nothing and says so.
 		#[cfg(target_os = "linux")]
 		#[test]
 		fn an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is() {
-			use std::{io::Read, os::unix::fs::PermissionsExt};
+			use std::io::Read;
 
 			use crate::bash::{Fs, FsPoll};
 			let protected = fs::read_to_string("/proc/sys/fs/protected_fifos")
@@ -1086,20 +1130,14 @@ mod fifo {
 				);
 				return;
 			}
-			// SAFETY: `geteuid` has no preconditions.
-			if unsafe { libc::geteuid() } != 0 {
-				eprintln!(
-					"UNKNOWN: not root, so no FIFO of another user can be made; nothing was checked"
-				);
-				return;
-			}
 			let dir = tempfile::tempdir().unwrap();
-			let sticky = dir.path().join("sticky");
-			fs::create_dir(&sticky).unwrap();
-			fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
-			let fifo = make_fifo(&sticky);
-			fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
-			std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+			let fifo = match sticky_fifo(dir.path()) {
+				Ok(fifo) => fifo,
+				Err(why) => {
+					eprintln!("UNKNOWN: {why}; nothing was checked");
+					return;
+				},
+			};
 			let mut reader = OpenOptions::new()
 				.read(true)
 				.custom_flags(libc::O_NONBLOCK)
