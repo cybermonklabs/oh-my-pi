@@ -162,6 +162,11 @@ export interface StructuredSubagentRequest {
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
 	identity?: StructuredSubagentIdentity;
+	/**
+	 * Called with the id this run reserved for the child, after preflight passed and before the child starts;
+	 * not called when `identity.id` gave the id.
+	 */
+	onIdReserved?: (id: string) => void;
 	index?: number;
 	parentToolCallId?: string;
 	detached?: boolean;
@@ -1014,6 +1019,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
+		if (!request.identity?.id) request.onIdReserved?.(id);
 		await refreshSkillsForAutoload(request.session, policy.agent);
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
 		baseOptions.onCleanupDeferred = completion => {

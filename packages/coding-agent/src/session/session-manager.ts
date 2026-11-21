@@ -775,6 +775,13 @@ export class SessionEntryIndex {
 	}
 }
 
+/**
+ * The outcome of {@link SessionManager.appendCustomEntriesToFile}: "appended", "no-records" (the
+ * session holds none of the entries the caller named), or "refused" (another live process owns the
+ * session, or the path now holds another session).
+ */
+export type CustomEntriesAppend = "appended" | "no-records" | "refused";
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -959,6 +966,8 @@ export class SessionManager {
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
+	/** The session this manager wrote before it last went on in another one; see {@link getPreviousSession}. */
+	#previousSession: { id: string; file: string } | undefined;
 	/**
 	 * Parent-derived sibling family candidate stashed by the Task executor once
 	 * the child session exists. Session-scoped and non-persisted: the header
@@ -1336,6 +1345,7 @@ export class SessionManager {
 	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
+		this.#previousSession = { id: previousSessionId, file: from };
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
 		this.#taskSiblingCandidate = undefined;
@@ -2418,7 +2428,9 @@ export class SessionManager {
 	}
 	/** Switch to a different session file (resume / branch). */
 	async setSessionFile(sessionFile: string): Promise<void> {
+		const left = this.#sessionFile ? { id: this.#sessionId, file: this.#sessionFile } : undefined;
 		await this.#setSessionFile(sessionFile);
+		if (left && this.#sessionId !== left.id) this.#previousSession = left;
 	}
 
 	async #setSessionFile(
@@ -2426,6 +2438,9 @@ export class SessionManager {
 		loadedSession?: SessionLoadResult,
 		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions },
 	): Promise<void> {
+		// An append to this file that is still running (a stopped work pool's discards) lands first,
+		// so the session loads it and its next entry follows it. `#open` waits before its own load.
+		if (!loadedSession) await SessionManager.#pendingAppends.get(path.resolve(sessionFile));
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -2550,6 +2565,7 @@ export class SessionManager {
 
 		const oldSessionFile = this.#sessionFile;
 		const parentSessionId = this.#sessionId;
+		this.#previousSession = { id: parentSessionId, file: oldSessionFile };
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
@@ -3274,6 +3290,16 @@ export class SessionManager {
 		return this.#sessionId;
 	}
 
+	/**
+	 * The session (id and file) this manager wrote before it last went on in another one: the
+	 * session a resume left, the source of a whole-session fork, or the file a move to a sibling
+	 * left. A work pool stopped by a resume writes its discards there, since the resume points this
+	 * manager at the resumed file before it cancels the session's jobs.
+	 */
+	getPreviousSession(): { id: string; file: string } | undefined {
+		return this.#previousSession;
+	}
+
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
 	}
@@ -3555,6 +3581,90 @@ export class SessionManager {
 			}
 		}
 	}
+
+	/**
+	 * Append custom entries to the session `sessionId` journaled at `sessionPath`, through this
+	 * manager's storage, when this manager does not write it now: a session a work pool's spawn
+	 * records are in, after its owner went on in another one. See {@link appendCustomEntriesToFile}.
+	 */
+	appendCustomEntriesToSession(
+		sessionId: string,
+		sessionPath: string,
+		entries: ReadonlyArray<{ customType: string; data: unknown }>,
+		options?: { holding?: readonly string[] },
+	): Promise<CustomEntriesAppend> {
+		return SessionManager.appendCustomEntriesToFile(sessionId, sessionPath, entries, this.#storage, options);
+	}
+
+	/**
+	 * Append custom entries to the session `sessionId` journaled at `sessionPath` in `storage`, a
+	 * session no manager of this process writes now. Modelled on {@link renameSessionTitle}: the
+	 * ownership lease (when `storage` has one, as the session's own writes take it) is claimed
+	 * before the transcript is loaded and held until the entries are written, so they parent to the
+	 * session's current leaf.
+	 *
+	 * Resolves "refused", and writes nothing, when another live process owns the session or the
+	 * path now holds another session: the lease refuses a header naming another id, and the loaded
+	 * session's id is checked again, for a storage without a lease. Resolves "no-records", and
+	 * writes nothing, when `holding` is given and the session holds none of those entries.
+	 * Rejects when the file is gone: the open runs with `throwIfMissing`, so no session is made at
+	 * the path.
+	 *
+	 * Until the append settles, a load of the same path in this process waits for it
+	 * ({@link #setSessionFile}, {@link open}), so a session that goes back to the file at once (a
+	 * quick `/resume` back) loads the entries and parents its next entry to them, instead of
+	 * putting them on a side branch.
+	 */
+	static appendCustomEntriesToFile(
+		sessionId: string,
+		sessionPath: string,
+		entries: ReadonlyArray<{ customType: string; data: unknown }>,
+		storage: SessionStorage = new FileSessionStorage(),
+		options?: { holding?: readonly string[] },
+	): Promise<CustomEntriesAppend> {
+		const resolvedPath = path.resolve(sessionPath);
+		const append = async (): Promise<CustomEntriesAppend> => {
+			const release = storage.claimSession ? storage.claimSession(sessionId, resolvedPath) : () => {};
+			if (!release) return "refused";
+			let manager: SessionManager | undefined;
+			try {
+				manager = await SessionManager.#open(
+					resolvedPath,
+					undefined,
+					storage,
+					{ suppressBreadcrumb: true, throwIfMissing: true },
+					{ awaitPendingAppends: false },
+				);
+				if (manager.getSessionId() !== sessionId || manager.getSessionFile() !== resolvedPath) return "refused";
+				const holding = options?.holding;
+				if (holding && !holding.some(entryId => manager?.getEntry(entryId) !== undefined)) return "no-records";
+				for (const entry of entries) manager.appendCustomEntry(entry.customType, entry.data);
+				await manager.flush();
+				return "appended";
+			} finally {
+				try {
+					await manager?.close();
+				} finally {
+					release();
+				}
+			}
+		};
+		// Appends to one path run one after another, and a load of the path waits for them all.
+		const appended = (SessionManager.#pendingAppends.get(resolvedPath) ?? Promise.resolve()).then(append);
+		const settled = appended.then(
+			() => {},
+			() => {},
+		);
+		SessionManager.#pendingAppends.set(resolvedPath, settled);
+		void settled.then(() => {
+			if (SessionManager.#pendingAppends.get(resolvedPath) === settled)
+				SessionManager.#pendingAppends.delete(resolvedPath);
+		});
+		return appended;
+	}
+
+	/** The appends of {@link appendCustomEntriesToFile} not yet settled, by resolved session path. */
+	static readonly #pendingAppends = new Map<string, Promise<void>>();
 
 	/**
 	 * Journal an idle recap for this session in history.db. Recaps never enter
@@ -4447,6 +4557,23 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		options?: { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean },
 	): Promise<SessionManager> {
+		return SessionManager.#open(filePath, sessionDir, storage, options, { awaitPendingAppends: true });
+	}
+
+	/**
+	 * {@link open}; `awaitPendingAppends` waits for the file's pending
+	 * {@link appendCustomEntriesToFile} writes first, which that writer's own load must not do.
+	 */
+	static async #open(
+		filePath: string,
+		sessionDir: string | undefined,
+		storage: SessionStorage,
+		options:
+			| { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean }
+			| undefined,
+		internal: { awaitPendingAppends: boolean },
+	): Promise<SessionManager> {
+		if (internal.awaitPendingAppends) await SessionManager.#pendingAppends.get(path.resolve(filePath));
 		const probed = await loadSessionFile(filePath, storage, { throwIfMissing: options?.throwIfMissing });
 		const header = probed.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		// Resume into the session's recorded cwd only when it is verifiably

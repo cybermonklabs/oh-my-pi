@@ -481,7 +481,8 @@ a revived agent's turn the lifecycle teardown disposes.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
-   mid-turn, that was not killed (no tombstone) and that a cold revive can rebuild
+   mid-turn, or whose turn ended because its provider key could not be resolved
+   (see below), that was not killed (no tombstone), and that a cold revive can rebuild
    (a `session_init` contract, not isolated) runs one more monitored turn as a
    background job of its parent, under the subagent's id. The lifecycle reviver
    rebuilds it from its transcript, the turn goes on as below, and the parent
@@ -495,10 +496,116 @@ a revived agent's turn the lifecycle teardown disposes.
    call was cut off runs again; otherwise the model answers from where the
    transcript stops.
 
-Nothing is continued when the last turn finished, failed, or the user interrupted
+A turn that ended because no request could resolve its provider key, even after
+its retries (a `!command` apiKey that produced nothing, stored credentials that
+were disabled or cannot serve, or that could not be read, a failed OAuth refresh),
+is retried too, whatever exit followed it: nothing was sent, and a subagent's
+process exits normally on such a turn. Because such a turn stays restorable,
+the subagent is relaunched only on positive evidence that it is still its
+parent's work:
+
+- After the parent's last `/clear`, its selected branch records the subagent.
+  A spawn writes its record before its run starts: the `task_spawn` record the
+  task tool and a work pool write, with the id the subagent runs under
+  (`Scout-2` for a name used before, `Lead.Worker` in a nested parent, a
+  generated name for an unnamed call, `notes-1` for the first worker of a pool
+  named `notes`), not the call's `name` argument; the `unsettled` record of a
+  background eval `agent()`. A result that names the subagent records it too.
+- Or no record anywhere names it (a subagent a version that wrote no spawn
+  record started), and it began while the parent's tool calls that the process
+  cut off ran: after the first of them started (its `tool_execution_start`
+  marker, else when the response that made it was written), and before the turn
+  ended. Exit recovery closes such a turn with its interrupted-turn record, and
+  the process exit record names the calls still running; a turn whose process
+  ended while a response streamed ran no call, so it has none. Before exit
+  recovery (a hard kill), the calls are those no result answers, and their turn
+  ends at the next input after them. After `--restore`'s own recovery closed a
+  turn a hard kill cut off, they are the calls it paired with its "outcome
+  unknown" result, so a second `--restore` reads the same calls. This window
+  also holds a subagent another call of the same response started while the
+  cut-off call ran.
+- That same conversation holds no result that settles its current turn, so the
+  parent acts on it itself. One settles it when it hands the parent the
+  subagent's result: a direct `task` result; an eval cell result, which names
+  the subagents its bridged `tool.task`, `tool.wait` and `wait()` calls, a
+  work pool's `peek()` and a kill the cell made (`tool.write` or `write()` to
+  `proc://<id>/kill`, whose result is the killed job's report) handed the
+  cell, each with when it was handed over (a handle's `status()` or `done()`,
+  and a pool's `status()`, hand only states); a `wait`, a kill or a background
+  delivery of a job, which names the job's subagent and the subagents the job
+  handed over (an eval job's cells', a work pool's workers');
+  or the `delivered` record of an `agent()`, which its delivery writes before
+  it queues the result. The result of a call the process exit cut off (an eval
+  cell whose bridged calls had handed it the failure) settles it only when the
+  parent took a turn after it: the parent's model never read it. A turn the
+  subagent began after its latest handover (a message to a kept-alive subagent,
+  a pool's next batch) is a new run, which that handover does not settle.
+
+A record before the last `/clear`, on a branch the parent left, or of a spawn
+whose latest spawn record (a `task_spawn` or an `agent()` record) says it was
+discarded (a launch its task call did not adopt, aborted before it ran, or a
+worker of a work pool that a stop cancelled) names
+work the parent left behind, and the subagent is not relaunched, nor are its
+descendants. A later spawn under the same id, of either kind, writes a newer
+record, which decides. A missing record proves
+nothing: the parent may have received its result through a runtime path that
+did not record the subagent id, so `--restore` leaves it. `delivered` is written
+only for an `agent()` that succeeded, and is intentionally conservative if the
+process crashed before the async result itself was queued: it must never send a
+result twice. A failed `agent()` is kept from a second run by the record of its
+failed result (its async delivery, or the `wait` that returned it). Other
+interrupted subagents keep the restore behaviour they had before this key-retry
+feature, except one whose spawn the parent's current conversation records as
+discarded: a whole-session `/fork` copies a running worker's transcript as it
+is, so the copy reads as cut off, and the worker is not relaunched from it.
+`--restore` does not relaunch a vibe worker of the session whose turn ended on
+its key: vibe mode keeps it (interactive mode rehydrates it from its lifecycle
+records before `--restore` runs), and its director decides its next turn.
+
+An abort while such a turn waits to retry ends it or leaves it by who gets its
+result:
+
+- A stop by whoever gets the result ends the turn with an aborted record ("Retry
+  cancelled") after its failed attempt, and `--restore` leaves it: the user's stop
+  (Esc, or an RPC `abort` or `abort_retry`), a quit (a dispose for `/quit`, Ctrl+C
+  or `SIGINT`), or the task executor ending a subagent's run (its request budget,
+  its time limit, or a `yield` that waits on its jobs), whose parent gets the
+  aborted result. The owner's cancel of a background job stops the subagent the job
+  runs. A stop of a work pool (a kill, the user's stop, the stop `/resume` gives
+  the jobs of the session it leaves) also records every worker the pool started as
+  discarded, so `--restore` relaunches none of them, not even a worker whose turn
+  had already ended on its key: that worker's batch had settled, so the cancel
+  could not stop it, and the cancelled pool hands no result over. The records go
+  into each session whose transcript holds the pool's spawn records, decided by
+  session and not by file path: through the session's own writer when the live
+  session is the one the pool was made in (also after `/move` or `/wt` gave its
+  file a new path) or holds those records (a whole-session `/fork`, the move to a
+  new file when another process holds the old one); and, by session id, into the
+  session the pool was made in and the one a `/resume` left, each only when its
+  file's header names that session and it holds one of the pool's spawn records.
+  That write takes the session's lease through the session's own store. When it
+  cannot happen (another live process owns the session, the path holds another
+  session, the file is gone), the pool logs a warning and writes nothing. The
+  pool's job settles once the writes have ended, and a load of the file in the
+  same process waits for them, so a quick `/resume` back follows the records.
+- A process exit cuts the turn off instead, and `--restore` goes on with it: a
+  dispose for the process exit, `SIGTERM`, `SIGHUP` or a fatal error, an abort with
+  `cutOff` or with `INTERRUPTED_TURN_ERROR` (the reason a shutdown gives), and the
+  owner's shutdown of its subagents. This follows the rule a turn still in flight
+  already has: a quit stops it, a process exit cuts it off.
+- A sync subagent follows its parent's turn, whose abort reason says which it is,
+  also one an eval cell started (`tool.task` gets the cell's own abort reason):
+  any stop of the parent (the user's, one the session makes itself such as `/new`,
+  or the task executor's stop of a parent subagent) stops it too, and the
+  parent's process exit or shutdown cuts it off. An abort reason that says
+  neither stops it, as it does a turn in flight.
+
+Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
-interrupted). `--restore` is interactive only, takes no prompt, and cannot be
-combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
+interrupted). Nothing behind a `/clear` is restored, not even a turn whose key
+could not be resolved: the user ended that conversation. `--restore` is
+interactive only, takes no prompt, and cannot be combined with `--continue`,
+`--fork`, imports, `--goal` or `--no-session`.
 `/restart` drops a launch `--restore` like the other one-shot selectors and adds
 its own for the current session.
 

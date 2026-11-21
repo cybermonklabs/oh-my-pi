@@ -78,7 +78,8 @@ function readPendingToolCalls(value: unknown): PendingToolCallDiagnostic[] | und
 	return value;
 }
 
-function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
+/** The process exit record `entry` holds, if it is one: its kind, when it was written, and the tool calls still running then. */
+export function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
 	if (entry.type !== "custom" || entry.customType !== SESSION_EXIT_CUSTOM_TYPE || !isObject(entry.data)) {
 		return undefined;
 	}
@@ -101,6 +102,20 @@ function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
 /** Why an interrupted-turn abort record ends a turn its process never finished. */
 export const INTERRUPTED_TURN_ERROR = "Previous OMP process exited before completing the turn.";
 
+/** What exit recovery's result for a tool call its process never finished says. */
+export const INTERRUPTED_TOOL_RESULT_TEXT =
+	"Previous OMP process exited before this tool returned; its outcome is unknown.";
+
+/**
+ * Whether `message` is the result exit recovery paired a tool call with because its process
+ * ended before the call returned ({@link createInterruptedToolResults}).
+ */
+export function isInterruptedToolResult(message: AgentMessage): boolean {
+	if (message.role !== "toolResult" || message.isError !== true || message.content.length !== 1) return false;
+	const [part] = message.content;
+	return part?.type === "text" && part.text === INTERRUPTED_TOOL_RESULT_TEXT;
+}
+
 /** How exit recovery reads a branch whose last process may have died without recording its exit. */
 export interface InterruptedTurnOptions {
 	/**
@@ -115,6 +130,19 @@ interface UnfinishedTurn {
 	tail: AgentMessage;
 	previousAssistant: AssistantMessage | undefined;
 	recordedAt: string;
+}
+
+/**
+ * The branch's last message and its index, after its last `/clear`
+ * (`reset_boundary`): `/clear` ends the conversation before it. Undefined without one.
+ */
+function conversationTail(entries: readonly SessionEntry[]): { index: number; message: AgentMessage } | undefined {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entry.type === "reset_boundary") return undefined;
+		if (entry.type === "message") return { index, message: entry.message };
+	}
+	return undefined;
 }
 
 /**
@@ -138,16 +166,10 @@ function findUnfinishedTurn(
 		break;
 	}
 
-	let tailIndex = -1;
-	let tail: AgentMessage | undefined;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index]!;
-		if (entry.type !== "message") continue;
-		tailIndex = index;
-		tail = entry.message;
-		break;
-	}
-	if (!tail) return undefined;
+	// Nothing behind a `/clear` is unfinished.
+	const last = conversationTail(entries);
+	if (!last) return undefined;
+	const { index: tailIndex, message: tail } = last;
 	if (!exit || tailIndex > exitIndex) {
 		if (!options?.assumeExit) return undefined;
 		exit = { reason: "restore", kind: "process_exit", recordedAt: new Date().toISOString() };
@@ -182,16 +204,44 @@ export function isInterruptedTurnAbort(message: AgentMessage): boolean {
 }
 
 /**
+ * Whether `message` ended its turn because no request could resolve the
+ * provider's key (`credentialUnavailable`), even after the turn's retries.
+ * Nothing was sent and nobody chose to stop, so the turn stays unfinished. A
+ * turn the provider refused or that failed otherwise does not carry the field.
+ */
+function isCredentialUnavailableTurn(message: AgentMessage): boolean {
+	return message.role === "assistant" && message.stopReason === "error" && message.credentialUnavailable === true;
+}
+
+/**
+ * Whether the branch's last turn ended because no request could resolve its
+ * provider's key ({@link isCredentialUnavailableTurn}): its last message, after its
+ * last `/clear`, is that marked error.
+ */
+export function endsOnCredentialUnavailableTurn(entries: readonly SessionEntry[]): boolean {
+	const tail = conversationTail(entries);
+	return tail !== undefined && isCredentialUnavailableTurn(tail.message);
+}
+
+/**
  * Whether `omp --restore` has a turn to go on with on this branch: one its last
- * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), or one exit
- * recovery already closed that nothing followed, not even a normal exit.
+ * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), one exit
+ * recovery already closed that nothing followed, not even a normal exit, or one
+ * that ended because its key could not be resolved, whatever exit followed: a
+ * worker exits normally on that turn, and nothing else would resume it. A turn
+ * behind a `/clear` is never one: the user ended that conversation. Nor is one
+ * the user stopped while it waited to retry: an aborted record follows its
+ * failed attempt and ends it.
  */
 export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
+	if (endsOnCredentialUnavailableTurn(entries)) return true;
+	let normalExit = false;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
-		const exit = readSessionExit(entry);
-		if (exit?.kind === "normal") return false;
+		if (entry.type === "reset_boundary") return false;
+		if (readSessionExit(entry)?.kind === "normal") normalExit = true;
 		if (entry.type !== "message") continue;
+		if (normalExit) return false;
 		if (isInterruptedTurnAbort(entry.message)) return true;
 		break;
 	}
@@ -214,6 +264,20 @@ export function createInterruptedTurnAbortMessage(
 	if (!model) return undefined;
 
 	const recordedAt = Date.parse(turn.recordedAt);
+	return createTurnAbortRecord(model, INTERRUPTED_TURN_ERROR, Number.isFinite(recordedAt) ? recordedAt : Date.now());
+}
+
+/**
+ * The assistant record that ends a turn as aborted: no content, no usage, written
+ * under `model`'s identity, with `errorMessage` saying why the turn ended. Exit
+ * recovery closes an interrupted turn with one; a retry the user stops closes its
+ * turn with one too.
+ */
+export function createTurnAbortRecord(
+	model: AssistantModelMetadata,
+	errorMessage: string,
+	timestamp: number,
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -229,9 +293,50 @@ export function createInterruptedTurnAbortMessage(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "aborted",
-		errorMessage: INTERRUPTED_TURN_ERROR,
-		timestamp: Number.isFinite(recordedAt) ? recordedAt : Date.now(),
+		errorMessage,
+		timestamp,
 	};
+}
+
+/**
+ * Whether an abort stops a turn or cuts it off (its process is going away), as the
+ * reason the session's agent aborts with carries it to what runs under the turn: a
+ * sync subagent's run follows its parent's turn.
+ */
+export type TurnAbortKind = "stop" | "cutOff";
+
+/**
+ * The field that marks the platform's own abort reason with its kind
+ * ({@link plainTurnAbortReason}). The thread RPC carries an error's own fields,
+ * enumerable or not, and rebuilds a `DOMException` named `AbortError` as one, so the
+ * marked reason crosses a worker thread with its mark.
+ */
+const TURN_ABORT_KIND_FIELD = "turnAbortKind";
+
+/**
+ * The reason for an abort that gives none of its own: the platform's own abort
+ * reason (a `DOMException` named `AbortError`, which every abort label reads as a
+ * plain abort), marked with `kind`.
+ */
+export function plainTurnAbortReason(kind: TurnAbortKind): DOMException {
+	const controller = new AbortController();
+	controller.abort();
+	const reason: DOMException = controller.signal.reason;
+	Object.defineProperty(reason, TURN_ABORT_KIND_FIELD, { value: kind, configurable: true });
+	return reason;
+}
+
+/**
+ * The kind of abort a reason gives a turn. The interrupted-turn reason, and the
+ * platform's own abort reason (a `DOMException` named `AbortError`) marked `cutOff`
+ * ({@link plainTurnAbortReason}), cut the turn off. Every other reason stops it, as
+ * no reason at all does: other text, a symbol, an error, a plain object, an
+ * unmarked abort.
+ */
+export function turnAbortKind(reason: unknown): TurnAbortKind {
+	if (reason === INTERRUPTED_TURN_ERROR) return "cutOff";
+	if (!(reason instanceof DOMException) || reason.name !== "AbortError") return "stop";
+	return Reflect.get(reason, TURN_ABORT_KIND_FIELD) === "cutOff" ? "cutOff" : "stop";
 }
 
 /**
@@ -288,7 +393,7 @@ export function createInterruptedToolResults(
 					text:
 						context === "fork"
 							? "The parent session may still be running this tool; its outcome is unknown."
-							: "Previous OMP process exited before this tool returned; its outcome is unknown.",
+							: INTERRUPTED_TOOL_RESULT_TEXT,
 				},
 			],
 			isError: true,
@@ -328,7 +433,8 @@ export function summarizeToolArguments(args: unknown): ToolArgumentSummary | und
 	return summary.command !== undefined || summary.path !== undefined ? summary : undefined;
 }
 
-function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
+/** The marker `entry` holds of a tool call whose implementation started running, if it is one. */
+export function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
 	if (entry.type !== "custom" || entry.customType !== TOOL_EXECUTION_START_CUSTOM_TYPE) return undefined;
 	const data = entry.data;
 	if (!isObject(data)) return undefined;

@@ -67,6 +67,7 @@ export default {
 			onStatus: opts.onStatus,
 			onReply: opts.onReply,
 			parentToolCallId: opts.parentToolCallId,
+			onAgentResults: opts.onAgentResults,
 			toolSession: opts.session,
 		};
 		const result = await executePython(code, executorOptions);

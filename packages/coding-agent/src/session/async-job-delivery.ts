@@ -8,9 +8,10 @@
  * This replaces the old single hardwired `onJobComplete` closure that routed
  * every completion — regardless of owner — into the first top-level session.
  */
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobType } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
@@ -59,6 +60,11 @@ type AsyncResultJobDetails = {
 	meta?: OutputMeta;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
+	/**
+	 * Subagent results the job handed its parent: a background eval cell's (EvalToolDetails.agentResults), a
+	 * work pool's settled workers'.
+	 */
+	agentResults?: EvalHeldAgentResult[];
 };
 
 export type AsyncResultDetails = {
@@ -147,6 +153,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		// that share a prefix would otherwise read the same in the notice that delivers them.
 		const command = entry.job?.type === "bash" ? entry.job.process?.command : undefined;
 		const headerLabel = command === undefined ? entry.job?.label : commandIdentity(command);
+		const agentResults = readEvalAgentResults(entry.job?.latestDetails);
 		return {
 			jobId: entry.jobId,
 			agentUrlId,
@@ -169,6 +176,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			schemaStatusLabel: structured ? structuredStatusLabel(structured.status) : undefined,
 			schemaError: structured?.error === undefined ? undefined : escapeHarnessTags(structured.error),
 			schemaValid: structured?.status === "valid",
+			agentResults,
 		};
 	});
 	const details: AsyncResultDetails = {
@@ -182,6 +190,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			durationMs: job.durationMs,
 			...(job.meta ? { meta: job.meta } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
+			...(job.agentResults?.length ? { agentResults: job.agentResults } : {}),
 		})),
 	};
 	const text = prompt.render(asyncResultTemplate, {
@@ -198,4 +207,23 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		details,
 		timestamp: Date.now(),
 	};
+}
+
+/**
+ * Keeps valid held-agent records from a job's details: a background eval cell's
+ * (`EvalToolDetails.agentResults`), a work pool's settled workers'.
+ */
+export function readEvalAgentResults(details: unknown): EvalHeldAgentResult[] | undefined {
+	if (!isRecord(details) || !Array.isArray(details.agentResults)) return undefined;
+	const results: EvalHeldAgentResult[] = [];
+	for (const value of details.agentResults) {
+		if (!isRecord(value) || typeof value.id !== "string") continue;
+		results.push({
+			id: value.id,
+			...(value.aborted === true ? { aborted: true } : {}),
+			...(value.workerLost === true ? { workerLost: true } : {}),
+			...(typeof value.at === "number" && Number.isFinite(value.at) ? { at: value.at } : {}),
+		});
+	}
+	return results.length > 0 ? results : undefined;
 }

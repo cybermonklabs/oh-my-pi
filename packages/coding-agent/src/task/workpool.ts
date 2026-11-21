@@ -5,6 +5,7 @@ import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { CustomMessage } from "../session/messages";
+import { SessionManager } from "../session/session-manager";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -16,6 +17,10 @@ import {
 	runStructuredSubagent,
 } from "./structured-subagent";
 import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
+import { TASK_SPAWN_MESSAGE_TYPE, type TaskSpawnRecord } from "./task-spawn-record";
+import { turnAbortKind } from "../session/exit-diagnostics";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON } from "../async";
 import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yield";
 
 import { cfgEvalWorkpoolFreshAgents } from "../eval/settings";
@@ -107,6 +112,28 @@ interface TurnOutcome {
 
 const DELIVERY_OUTPUT_LIMIT = 6_000;
 
+/**
+ * The workers whose latest batch settled, among `batches` (in the order they ran): the
+ * results a pool hands over when it shows the cell a batch's output (`peek()`) or delivers
+ * its aggregate result. A worker whose latest batch still runs owes that turn; a cancelled
+ * batch is an aborted run. With `at`, each result says when it was handed over: a turn the
+ * worker began after that is a new run.
+ */
+export function settledWorkerResults(batches: WorkPoolPeekResult["batches"], at?: number): EvalHeldAgentResult[] {
+	const latest = new Map<string, WorkPoolPeekResult["batches"][number]>();
+	for (const batch of batches) latest.set(batch.agent, batch);
+	const results: EvalHeldAgentResult[] = [];
+	for (const [id, batch] of latest) {
+		if (batch.status === "running") continue;
+		results.push({
+			id,
+			...(batch.status === "cancelled" ? { aborted: true } : {}),
+			...(at === undefined ? {} : { at }),
+		});
+	}
+	return results;
+}
+
 /** Dispatches queued items across keep-alive subagents under one aggregate job. */
 export class WorkPool {
 	readonly name: string;
@@ -130,6 +157,19 @@ export class WorkPool {
 	#poolJobStarted = false;
 	readonly #drainWaiters: PromiseWithResolvers<void>[] = [];
 	readonly #freshQueue: WorkPoolItem[] = [];
+	/**
+	 * The session the pool was made in (id and file), the first home of its spawn records. A stop
+	 * writes its discards into each session that holds those records; see {@link #recordDiscards}.
+	 */
+	readonly #ownSession: { id: string; file: string } | undefined;
+	/**
+	 * The entry ids of the pool's spawn records. A copy of the transcript (a whole-session `/fork`, the
+	 * move to a sibling file when another process holds the old one) keeps them, so a session holds the
+	 * pool's spawn records when it holds one of these entries.
+	 */
+	readonly #spawnEntryIds = new Set<string>();
+	/** A stop's discards being written into sessions the live manager does not write now. */
+	#discardsWritten: Promise<void> | undefined;
 
 	constructor(session: ToolSession, options: WorkPoolCreateOptions) {
 		this.name = options.name;
@@ -140,6 +180,9 @@ export class WorkPool {
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
 		this.freshAgents = cfgEvalWorkpoolFreshAgents.get(session.settings);
+		const ownSessionId = session.sessionManager?.getSessionId?.();
+		const ownSessionFile = session.getSessionFile();
+		this.#ownSession = ownSessionId && ownSessionFile ? { id: ownSessionId, file: ownSessionFile } : undefined;
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
 		}
@@ -179,10 +222,25 @@ export class WorkPool {
 		const id = manager.register(
 			"task",
 			this.name,
-			async ({ signal }) => {
+			async ({ signal, reportProgress }) => {
 				const onAbort = (): void => {
 					this.close();
-					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId });
+					// A stop of the pool (a kill, the user's stop) ends its work for the parent: each worker's spawn is
+					// recorded discarded, so `omp --restore` relaunches none. That covers a worker whose batch had already
+					// failed on its key: its batch settled, so the cancel below cannot stop it, and the cancelled pool
+					// hands no result over. Every worker the pool started counts, so the workers come from its batches as
+					// well as its live agents: a settled worker leaves `agents` with `eval.workpool.freshAgents`, and a
+					// dead one leaves it too. A shutdown (the manager's shutdown reason, or a cut-off) cuts the workers off
+					// instead, and `--restore` goes on with them.
+					const stopped =
+						signal.reason !== ASYNC_JOB_MANAGER_SHUTDOWN_REASON && turnAbortKind(signal.reason) === "stop";
+					if (stopped) {
+						this.#recordDiscards([
+							...new Set([...this.agents.map(agent => agent.id), ...this.batches.map(batch => batch.agentId)]),
+						]);
+					}
+					// The pool's own abort reason goes on to its workers, so a stop stops them and a shutdown cuts them off.
+					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId }, signal.reason);
 				};
 				if (signal.aborted) onAbort();
 				else signal.addEventListener("abort", onAbort, { once: true });
@@ -198,8 +256,13 @@ export class WorkPool {
 					manager.consumeJobResults(batchIds);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
+					// A stop's discards are on disk before the pool's job settles.
+					await this.#discardsWritten;
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
 					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
+					// The aggregate result carries every worker's output as of now: a `wait` or delivery of this job
+					// hands those results over, and `omp --restore` reads them, with this time, from the job's report.
+					await reportProgress(summary, { agentResults: settledWorkerResults(this.peek().batches, Date.now()) });
 					return this.#renderAggregateResult();
 				} finally {
 					signal.removeEventListener("abort", onAbort);
@@ -211,6 +274,67 @@ export class WorkPool {
 			manager.cancel(id, { ownerId: this.ownerId });
 			throw new ToolError(`workpool job id "${this.name}" is unavailable`);
 		}
+	}
+
+	/**
+	 * Record the spawns of `ids` as discarded in each session whose transcript holds the pool's spawn
+	 * records, decided by session, not by file path:
+	 * - the live session, through its manager, when it is the pool's own session (also after `/move`
+	 *   or `/worktree` renamed its file) or holds the pool's spawn records (a whole-session `/fork`,
+	 *   the move to a sibling file when another process holds the old one);
+	 * - by id, the pool's own session and the one the live manager last left (a `/resume` points the
+	 *   manager at the resumed file before it cancels the session's jobs), each only when its
+	 *   header names that session and its transcript holds one of the pool's spawn records.
+	 * A write that cannot happen (another live process owns the session, the path holds another
+	 * session, the file is gone) is logged and skipped: that session then keeps those workers owed,
+	 * and its `--restore` can relaunch one that ended on its key.
+	 */
+	#recordDiscards(ids: readonly string[]): void {
+		const records = ids.map(id => ({
+			customType: TASK_SPAWN_MESSAGE_TYPE,
+			data: { id, discarded: true } satisfies TaskSpawnRecord,
+		}));
+		const live = this.session.sessionManager;
+		const liveId = live?.getSessionId?.();
+		const own = this.#ownSession;
+		const liveHoldsSpawns =
+			liveId === undefined ||
+			liveId === own?.id ||
+			(live?.getEntries().some(entry => this.#spawnEntryIds.has(entry.id)) ?? false);
+		if (live && liveHoldsSpawns) {
+			for (const record of records) live.appendCustomEntry(record.customType, record.data);
+		}
+		// The other sessions, by id; a later sighting of one session (its file after a move) replaces an earlier one.
+		const others = new Map<string, string>();
+		for (const candidate of [own, live?.getPreviousSession?.()]) {
+			if (candidate && candidate.id !== liveId) others.set(candidate.id, candidate.file);
+		}
+		if (others.size === 0) return;
+		const holding = [...this.#spawnEntryIds];
+		const writes = [...others].map(async ([sessionId, sessionFile]) => {
+			try {
+				const outcome = live?.appendCustomEntriesToSession
+					? await live.appendCustomEntriesToSession(sessionId, sessionFile, records, { holding })
+					: await SessionManager.appendCustomEntriesToFile(sessionId, sessionFile, records, undefined, {
+							holding,
+						});
+				if (outcome === "refused") {
+					logger.warn("workpool: could not record its stopped workers' discards", {
+						pool: this.name,
+						sessionId,
+						sessionFile,
+					});
+				}
+			} catch (error) {
+				logger.warn("workpool: could not record its stopped workers' discards", {
+					pool: this.name,
+					sessionId,
+					sessionFile,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		});
+		this.#discardsWritten = Promise.all(writes).then(() => {});
 	}
 
 	async #waitForDrain(): Promise<void> {
@@ -299,6 +423,12 @@ export class WorkPool {
 		const index = this.#nextAgentIndex++;
 		const id = await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
 		if (this.closed || item.status !== "queued") return;
+		// The parent's transcript records the worker before its run starts, as the task tool records its spawns:
+		// `omp --restore` reads it as the parent's work, which only the pool's handovers settle.
+		const spawnEntryId = this.session.sessionManager?.appendCustomEntry(TASK_SPAWN_MESSAGE_TYPE, {
+			id,
+		} satisfies TaskSpawnRecord);
+		if (spawnEntryId) this.#spawnEntryIds.add(spawnEntryId);
 		const agent: WorkPoolAgent = { id, index, state: "running", queue: [item], turns: 0 };
 		item.agentId = id;
 		this.agents.push(agent);

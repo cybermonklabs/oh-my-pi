@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
-import { AsyncJobManager } from "../../src/async";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalWorkpool } from "../../src/eval/workpool-bridge";
 import { AgentRegistry } from "../../src/registry/agent-registry";
@@ -157,5 +157,84 @@ describe("workpool model validation", () => {
 		await runEvalWorkpool({ op: "create", name: "picked", agent: "scout", model }, { session });
 		await runEvalWorkpool({ op: "push", name: "picked", items: ["one"] }, { session });
 		expect(await requested.promise).toEqual(model);
+	});
+});
+
+describe("workpool records for omp --restore", () => {
+	it("records each worker before its run, and hands over a settled batch through peek() and the pool's job, not status()", async () => {
+		// If this regresses, a pool worker leaves no record in its parent's transcript, so `omp --restore` cannot tell
+		// a worker the parent still waits on from one whose result it got; or a `peek()` that showed the cell the
+		// worker's failure, or the pool's own job, hands it over unrecorded and the worker runs again. The pool's job
+		// dates its handovers when it drains, not when its delivery or a `wait` is written later.
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
+			throw new Error("No API key for provider: anthropic");
+		});
+		const records: unknown[] = [];
+		const session: ToolSession = {
+			...makeSession(),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					if (customType === "task_spawn") records.push(data);
+					return `entry-${records.length}`;
+				},
+			} as unknown as ToolSession["sessionManager"],
+		};
+		await runEvalWorkpool({ op: "create", name: "notes", agent: "scout" }, { session });
+		const pushedAt = Date.now();
+		await runEvalWorkpool({ op: "push", name: "notes", items: ["one"] }, { session });
+		const poolJob = session.asyncJobManager?.getJob("notes");
+		await poolJob?.promise;
+		const drainedBy = Date.now();
+
+		expect(records).toHaveLength(1);
+		const worker = (records[0] as { id: string }).id;
+		const held: unknown[] = [];
+		await runEvalWorkpool(
+			{ op: "status", name: "notes" },
+			{ session, onAgentResults: results => held.push(...results) },
+		);
+		expect(held).toEqual([]);
+		await runEvalWorkpool(
+			{ op: "peek", name: "notes" },
+			{ session, onAgentResults: results => held.push(...results) },
+		);
+		expect(held).toEqual([{ id: worker }]);
+		const [reported] = (poolJob?.latestDetails?.agentResults ?? []) as Array<{ id: string; at?: number }>;
+		expect(reported).toEqual({ id: worker, at: expect.any(Number) });
+		expect(reported!.at!).toBeGreaterThanOrEqual(pushedAt);
+		expect(reported!.at!).toBeLessThanOrEqual(drainedBy);
+	});
+
+	it("passes a shutdown of the pool's job on to its workers as a shutdown, and a cancel as a cancel", async () => {
+		// If this regresses, the pool cancels its workers' batches with no reason when its own job aborts for the
+		// process exit: a worker waiting to retry its key ends its turn as stopped, and `omp --restore` leaves it.
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+		let started = Promise.withResolvers<void>();
+		let aborted = Promise.withResolvers<unknown>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+			const signal = request.signal;
+			started.resolve();
+			await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+			aborted.resolve(signal?.reason);
+			throw signal?.reason;
+		});
+		const reasons: Record<string, unknown> = {};
+		for (const name of ["shutdown", "cancel"]) {
+			started = Promise.withResolvers<void>();
+			aborted = Promise.withResolvers<unknown>();
+			const session = makeSession();
+			await runEvalWorkpool({ op: "create", name, agent: "scout" }, { session });
+			await runEvalWorkpool({ op: "push", name, items: ["one"] }, { session });
+			await started.promise;
+			const manager = session.asyncJobManager!;
+			// The pool's job was registered before its worker's batch, so a shutdown reaches it first.
+			if (name === "shutdown") manager.cancelAll(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+			else manager.cancel(name);
+			reasons[name] = await aborted.promise;
+		}
+
+		expect(reasons.shutdown).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(reasons.cancel).toBeInstanceOf(DOMException);
 	});
 });

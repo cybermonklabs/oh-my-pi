@@ -104,6 +104,67 @@ describe("wait", () => {
 		expect(manager.isDeliverySuppressed(id)).toBe(true);
 	});
 
+	test("carries the subagent results a settled eval job's cells were handed, and none of a running one", async () => {
+		// If this regresses, a parent that collects a backgrounded eval cell with `wait` takes the job's delivery,
+		// but the subagent results the cell was handed reach no record, and `omp --restore` relaunches them.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const settle = Promise.withResolvers<void>();
+		const settled = manager.register(
+			"eval",
+			"eval",
+			async ({ reportProgress }) => {
+				await reportProgress("done", { agentResults: [{ id: "Worker", aborted: true }] });
+				return "done";
+			},
+			{ ownerId: "Main" },
+		);
+		const running = manager.register(
+			"eval",
+			"eval",
+			async ({ reportProgress }) => {
+				await reportProgress("working", { agentResults: [{ id: "Other" }] });
+				await settle.promise;
+				return "done";
+			},
+			{ ownerId: "Main" },
+		);
+		await manager.getJob(settled)?.promise;
+
+		const result = await new WaitTool(session(manager)).execute("wait-eval", {});
+
+		const jobs = result.details?.jobs ?? [];
+		expect(jobs.find(job => job.id === settled)).toMatchObject({
+			status: "completed",
+			agentResults: [{ id: "Worker", aborted: true }],
+		});
+		expect(jobs.find(job => job.id === running)?.agentResults).toBeUndefined();
+		settle.resolve();
+		await manager.getJob(running)?.promise;
+	});
+
+	test("carries the workers a settled work-pool job handed over", async () => {
+		// If this regresses, a parent that collects a work pool's job with `wait` takes every worker's result and
+		// the job's delivery, but no record names the workers, and `omp --restore` relaunches them.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const pool = manager.register(
+			"task",
+			"notes",
+			async ({ reportProgress }) => {
+				await reportProgress("drained", { agentResults: [{ id: "notes-1" }, { id: "notes-2", aborted: true }] });
+				return "Pool `notes` completed";
+			},
+			{ id: "notes", ownerId: "Main" },
+		);
+		await manager.getJob(pool)?.promise;
+
+		const result = await new WaitTool(session(manager)).execute("wait-pool", {});
+
+		expect(result.details?.jobs?.find(job => job.id === pool)).toMatchObject({
+			status: "completed",
+			agentResults: [{ id: "notes-1" }, { id: "notes-2", aborted: true }],
+		});
+	});
+
 	// Fake timers freeze the settle window: a wait that ends without the clock advancing added no delay.
 	test("jobs finishing moments apart are reported by one wait", async () => {
 		vi.useFakeTimers();

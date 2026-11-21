@@ -667,6 +667,124 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(message?.content).not.toContain("```json");
 	});
 
+	it("carries a background eval cell's bridged agent results into its async-result delivery", () => {
+		// If this regresses, a cell backgrounded before its tool.task settles hands the parent only its eval job,
+		// not the subagent result it got; --restore then runs that subagent again after the parent went on.
+		const job: AsyncJob = {
+			id: "eval-job",
+			type: "eval",
+			status: "completed",
+			startTime: Date.now(),
+			label: "eval",
+			abortController: new AbortController(),
+			promise: Promise.resolve(),
+			resultText: "done",
+			latestDetails: {
+				agentResults: [
+					{ id: "Worker", aborted: true },
+					{ id: "Other", workerLost: true },
+				],
+			},
+		};
+		const message = buildAsyncResultBatchMessage([
+			{ jobId: "eval-job", result: "done", job, durationMs: 5, epoch: 0 },
+		]);
+
+		expect(message?.details?.jobs[0]?.agentResults).toEqual([
+			{ id: "Worker", aborted: true },
+			{ id: "Other", workerLost: true },
+		]);
+	});
+
+	it("carries the workers a work pool's job handed over, and when each bridged handover happened", () => {
+		// If this regresses, the delivery of a pool's aggregate result names no worker, so `omp --restore` relaunches
+		// workers whose failures the parent got; or it drops the time a cell was handed a result, so a turn the
+		// subagent began after that handover reads as settled.
+		const base = {
+			status: "completed" as const,
+			startTime: Date.now(),
+			abortController: new AbortController(),
+			promise: Promise.resolve(),
+			resultText: "done",
+		};
+		const pool: AsyncJob = {
+			...base,
+			id: "notes",
+			type: "task",
+			label: "notes",
+			latestDetails: { agentResults: [{ id: "notes-1" }] },
+		};
+		const cell: AsyncJob = {
+			...base,
+			id: "eval-job",
+			type: "eval",
+			label: "eval",
+			latestDetails: { agentResults: [{ id: "Worker", at: 1_795_000_000_000 }] },
+		};
+		const message = buildAsyncResultBatchMessage([
+			{ jobId: "notes", result: "done", job: pool, durationMs: 5, epoch: 0 },
+			{ jobId: "eval-job", result: "done", job: cell, durationMs: 5, epoch: 0 },
+		]);
+
+		expect(message?.details?.jobs[0]?.agentResults).toEqual([{ id: "notes-1" }]);
+		expect(message?.details?.jobs[1]?.agentResults).toEqual([{ id: "Worker", at: 1_795_000_000_000 }]);
+	});
+
+	it("records a background agent() job's spawn as delivered before its async-result is queued", async () => {
+		// If this regresses, the parent can receive an agent() result while the spawn's record still says
+		// unsettled, and a process exit just after the delivery lets `omp --restore` run the subagent again.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Owner",
+			asyncJobManager: manager,
+		});
+		// The session's spawn records at the moment each async-result is queued.
+		const recordsAtQueue: unknown[][] = [];
+		const enqueue = session.yieldQueue.enqueueWithReceipt.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "enqueueWithReceipt").mockImplementation((kind, entry) => {
+			if (kind === "async-result") {
+				recordsAtQueue.push(
+					sessionManager
+						.getEntries()
+						.flatMap(record =>
+							record.type === "custom" && record.customType === "eval_agent_spawn" ? [record.data] : [],
+						),
+				);
+			}
+			return enqueue(kind, entry);
+		});
+
+		// A finished agent() job, as the eval agent bridge reports it: its result names the agent it ran.
+		manager.register(
+			"task",
+			"agent()",
+			async ({ reportProgress }) => {
+				await reportProgress("done", { evalResult: { text: "done", details: { id: "Helper" } } });
+				return "done";
+			},
+			{ id: "agent-job", ownerId: "Owner", agentId: "Helper" },
+		);
+		await settleOwnedJobs(session, manager);
+
+		expect(recordsAtQueue).toEqual([[{ id: "Helper", status: "delivered" }]]);
+	});
+
 	it("advertises the agent:// URL using the task's agent id, not a disambiguated job id", () => {
 		// Regression: AsyncJobManager suffixes a requested job id when it
 		// collides with another live job (e.g. a task id reusing a vibe turn's

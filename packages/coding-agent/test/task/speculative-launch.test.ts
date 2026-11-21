@@ -208,6 +208,76 @@ describe("task speculative launch", () => {
 		expect(manager.getJob("Beta")!.status).toBe("completed");
 	});
 
+	it("records each spawn's allocated id once: when its run starts, not again when dispatch adopts it", async () => {
+		// If this regresses, a streamed call's spawn has no record while the call streams (a process exit then leaves
+		// `omp --restore` nothing that names it), or an adopted run is recorded twice.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managers.push(manager);
+		const records: unknown[] = [];
+		const tool = await TaskTool.create({
+			...createSession(manager),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					if (customType === "task_spawn") records.push(data);
+					return `entry-${records.length}`;
+				},
+			},
+		} as unknown as ToolSession);
+		const session = (await tool.speculation.stream?.open({ coordinator: sink, parentToolCallId: toolCall.id })) as
+			| TaskLaunchSession
+			| undefined;
+		if (!session) throw new Error("expected a task launch session");
+
+		session.update(toolCall, alphaClosed);
+		await spawn("Alpha").started.promise;
+		expect(records).toEqual([{ id: "Alpha" }]);
+		session.finalize({ toolCall, args });
+		await spawn("Beta").started.promise;
+		await tool.execute(toolCall.id, args);
+
+		expect(records).toEqual([{ id: "Alpha" }, { id: "Beta" }]);
+		spawn("Alpha").release.resolve();
+		spawn("Beta").release.resolve();
+		await manager.getJob("Alpha")!.promise;
+		await manager.getJob("Beta")!.promise;
+	});
+
+	it("records a launch the finished call changed as discarded, once, so --restore does not take it for the call's work", async () => {
+		// If this regresses, a launch that ended on its key before the call dropped it keeps a spawn record and no
+		// result: `omp --restore` relaunches it, and the parent gets a result for a job its call never adopted.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managers.push(manager);
+		const records: unknown[] = [];
+		const tool = await TaskTool.create({
+			...createSession(manager),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					if (customType === "task_spawn") records.push(data);
+					return `entry-${records.length}`;
+				},
+			},
+		} as unknown as ToolSession);
+		const session = (await tool.speculation.stream?.open({ coordinator: sink, parentToolCallId: toolCall.id })) as
+			| TaskLaunchSession
+			| undefined;
+		if (!session) throw new Error("expected a task launch session");
+
+		session.update(toolCall, alphaClosed);
+		await spawn("Alpha").started.promise;
+		const changed = {
+			context: "ctx",
+			tasks: [
+				{ name: "Alpha", agent: "task", task: "Do something else." },
+				{ name: "Beta", agent: "task", task: "Do B." },
+			],
+		};
+		session.finalize({ toolCall, args: changed });
+		await spawn("Alpha").aborted.promise;
+		session.discard("the call settled");
+
+		expect(records).toEqual([{ id: "Alpha" }, { id: "Alpha", discarded: true }]);
+	});
+
 	it("adopts an empty model placeholder without changing the submitted arguments", async () => {
 		const { tool, manager, session } = await openSession();
 		const submitted = {

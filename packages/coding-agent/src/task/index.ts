@@ -48,6 +48,7 @@ import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails
 import { AsyncJobError, type AsyncJobManagerApi } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
+import { turnAbortKind } from "../session/exit-diagnostics";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
@@ -55,6 +56,7 @@ import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderStepsBrief } from "./steps";
+import { TASK_SPAWN_MESSAGE_TYPE, type TaskSpawnRecord } from "./task-spawn-record";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
@@ -954,6 +956,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					run.tools,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
+			// A discarded run is not the parent's work, and no call result reports it: its record says so.
+			// A discard for the call's own cut-off keeps it the call's work, cut off with the parent's turn.
+			abortReason => {
+				if (spawn.agentId !== undefined && turnAbortKind(abortReason) !== "cutOff") {
+					this.#recordSpawn({ id: spawn.agentId, discarded: true });
+				}
+			},
 		);
 	}
 
@@ -979,7 +988,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			cfgAsyncEnabled.get(this.session.settings) && this.session.asyncJobManager !== undefined && !blocking;
 		const agentId = await this.#outputManager().allocate(spawn.name?.trim() || generateTaskName());
 		if (signal.aborted) return undefined;
+		this.#recordSpawn({ id: agentId });
 		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
+	}
+
+	/**
+	 * Persist the id allocated for a spawn in the parent's transcript before its run starts. The id
+	 * is the one the subagent runs and is restored under (`X-2` for a name used before, `Parent.X`
+	 * in a nested parent, `Agent<n>`, a generated name), so `omp --restore` matches the call's
+	 * subagent by it, also when the process ends inside the call and no result names the run. A
+	 * second record marks a spawn whose run the tool discarded.
+	 */
+	#recordSpawn(record: TaskSpawnRecord): void {
+		this.session.sessionManager?.appendCustomEntry(TASK_SPAWN_MESSAGE_TYPE, record);
 	}
 
 	#getSpawnSemaphore(): Semaphore {
@@ -1232,8 +1253,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const policy = policies[index]!;
 			const agentSource = policy.agent.source;
 			const run = adopted.get(index);
-			const agentId =
-				run?.identity.agentId ?? (await outputManager.allocate(item.name?.trim() || generateTaskName()));
+			// A run adopted from the streamed call recorded its id when it started.
+			let agentId = run?.identity.agentId;
+			if (agentId === undefined) {
+				agentId = await outputManager.allocate(item.name?.trim() || generateTaskName());
+				this.#recordSpawn({ id: agentId });
+			}
 			const assignment = spawnAssignment(item);
 			spawns.push({
 				agentId,
@@ -1828,9 +1853,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			},
 			signal,
 		);
-		// A worker never invoked (call aborted first) never attached its adopted run.
+		// A worker never invoked (call aborted first) never attached its adopted run: it follows
+		// the call's abort, a stop or a cut-off (the parent's process exit), as an attached run does.
 		spawns.forEach((spawn, position) => {
-			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started");
+			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started", signal?.reason);
 		});
 		return results.map((settled, position) => {
 			if (!settled) return undefined;
@@ -1889,6 +1915,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// `name` is the spawn handle: keep it for id allocation when this
 				// path did not pre-reserve one. Do not treat it as a HUD description.
 				identity: { id: preAllocatedId, label: params.name },
+				// A spawn this path reserves its id for is recorded here; a pre-reserved id was recorded then.
+				onIdReserved: agentId => this.#recordSpawn({ id: agentId }),
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,

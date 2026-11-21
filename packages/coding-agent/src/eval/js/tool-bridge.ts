@@ -10,9 +10,12 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
+import { isTaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
+import { readEvalAgentResults } from "../../session/async-job-delivery";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
@@ -68,6 +71,13 @@ export interface ToolBridgeOptions {
 	 * would draw them, so such calls fail instead of reporting a reply nobody sees.
 	 */
 	onReply?: (text: string) => void;
+	/**
+	 * Receives the subagents whose results a bridged call hands the cell (`tool.task`, `tool.wait`,
+	 * `wait()`, a work pool's `peek()`; a handle's `status()` or `done()` and a pool's `status()` read
+	 * only states). The eval tool keeps them in its result, with when each was handed over, so
+	 * `omp --restore` knows the parent already holds them.
+	 */
+	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
 }
 
 type ToolValue =
@@ -305,7 +315,49 @@ async function dispatchSessionTool(name: string, args: unknown, options: ToolBri
 		return await runEvalMcpCall(args, options);
 	}
 	const call = await runSessionTool(getTool(options.session, name), args, options);
+	// A sync `task` call's settled runs reach the cell with its result; a background spawn's "started" result holds none.
+	if (call.name === "task" && isTaskToolDetails(call.result.details) && call.result.details.results.length > 0) {
+		options.onAgentResults?.(
+			call.result.details.results.map(result => ({
+				id: result.id,
+				...(result.aborted ? { aborted: true } : {}),
+				...(result.workerLost ? { workerLost: true } : {}),
+			})),
+		);
+	}
+	// A `wait` hands the cell the results of the jobs it settled, and takes their delivery: no
+	// `async-result` follows for them. A kill (`write` to `proc://<id>/kill`, from `tool.write` or the
+	// prelude's `write()`) of a job that had settled does the same, and its result is the same job report.
+	const jobReport = call.name === "wait" ? call.result.details : killJobReport(call);
+	if (jobReport !== undefined) {
+		const settled = waitAgentResults(jobReport);
+		if (settled.length > 0) options.onAgentResults?.(settled);
+	}
 	return bridgeValueFromToolResult(call.name, call.args, call.result, options.emitStatus);
+}
+
+/** The job report a `write` result holds when it killed a job (`write proc://<id>/kill`): its `proc` details. */
+function killJobReport(call: { name: string; result: { details?: unknown } }): unknown {
+	const { details } = call.result;
+	if (call.name !== "write" || !isRecord(details) || !isRecord(details.proc)) return undefined;
+	return details.proc.op === "cancel" ? details.proc : undefined;
+}
+
+/**
+ * The subagents whose results a `wait` result's settled jobs hand over: a task job's agent (a
+ * `task` spawn's, an `agent()` handle's or a work pool batch's), and the subagents a settled
+ * job records it handed over (an eval job's own cells', a work pool's workers': its
+ * `agentResults`).
+ */
+function waitAgentResults(details: unknown): EvalHeldAgentResult[] {
+	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
+	const results: EvalHeldAgentResult[] = [];
+	for (const job of details.jobs) {
+		if (!isRecord(job) || job.status === "running") continue;
+		if (job.type === "task" && typeof job.agentUrlId === "string") results.push({ id: job.agentUrlId });
+		results.push(...(readEvalAgentResults(job) ?? []));
+	}
+	return results;
 }
 
 /** An MCP eval namespace method (`github.search(…)`): the tool's own call, mapped by `mcpNamespaceValue`. */

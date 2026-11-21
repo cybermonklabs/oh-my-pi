@@ -214,6 +214,21 @@ describe("runtime thread services: async jobs", () => {
 		expect(await mainSide.promise).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 	});
 
+	it("carries the reason a worker cancels one main job with, as cancelAll does", async () => {
+		// If this regresses, a work pool in a worker thread that cancels its batches as the process shuts down stops
+		// them instead: their subagents' turns end as stopped, and `omp --restore` leaves them.
+		const manager = newManager();
+		const probe = await startWorker();
+		const mainSide = Promise.withResolvers<unknown>();
+		const id = manager.register("task", "main job", ({ signal }) => {
+			signal.addEventListener("abort", () => mainSide.resolve(signal.reason), { once: true });
+			return new Promise<string>(() => {});
+		});
+
+		expect(await probe("cancelShutdown", manager, id)).toBe(true);
+		expect(await mainSide.promise).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+	});
+
 	it("mirrors a worker job's process and widget inputs on main, ending with the body's last output", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

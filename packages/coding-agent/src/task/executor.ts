@@ -96,7 +96,7 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
-import { INTERRUPTED_TURN_ERROR } from "../session/exit-diagnostics";
+import { INTERRUPTED_TURN_ERROR, type TurnAbortKind, turnAbortKind } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE, usageContextTokens } from "../session/messages";
 import type { CompletionJournal } from "../session/model-usage-journal";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
@@ -123,6 +123,7 @@ import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { isMainThread } from "../thread/identity";
 import { runFollowUpTurnOnHome, runSubprocessPlaced } from "../thread/executor-routing";
+import { fromWireSignal, toWireSignal } from "../thread/services/async-jobs-protocol";
 import { existingSubagentWorkerPool, subagentWorkerPool } from "../thread/subagent-worker";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
@@ -1597,13 +1598,41 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let lastReportTurnText: string | undefined;
 	let sawAssistantMessage = false;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	/**
+	 * Whether the caller's abort (its signal's reason) cuts the subagent's turn off,
+	 * so `omp --restore` goes on with it, instead of stopping it. A sync run's signal
+	 * is its parent's turn (from adoption on, for a run launched while the call
+	 * streamed), and the subagent follows the parent ({@link turnAbortKind}): any stop
+	 * of the parent's turn (the user's, `/new`, the parent's own budget or time limit)
+	 * stops it too, as does the discard of a launch nobody adopted and any abort that
+	 * gives no reason of its own, and the parent's process exit or shutdown cuts it
+	 * off. A detached run's signal is its job's, and the
+	 * owner's cancel of the job stops it.
+	 */
+	let callerCutOff = false;
+
+	/**
+	 * How the run ends for its session's turn: `shutdown` when the run was shut
+	 * down, a cut-off when its caller cut it off ({@link callerCutOff}), and a stop for every
+	 * other end (a kill, its own budget or time limit, a finished run).
+	 */
+	const runEndKind = (): "shutdown" | TurnAbortKind =>
+		abortReason === "shutdown" ? "shutdown" : abortReason === "signal" && callerCutOff ? "cutOff" : "stop";
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
 		if (!session) return Promise.resolve();
 		// A process shutdown cuts the turn off instead of stopping it: label it as
-		// interrupted so `omp --restore` (and `/restart`) goes on with it.
-		const options = abortReason === "shutdown" ? { reason: INTERRUPTED_TURN_ERROR } : undefined;
+		// interrupted so `omp --restore` (and `/restart`) goes on with it. A caller's
+		// abort that is not a stop cuts it off too ({@link callerCutOff}). The rest
+		// (a kill, this run's own budget or time limit) stop it.
+		const endKind = runEndKind();
+		const options =
+			endKind === "shutdown"
+				? { reason: INTERRUPTED_TURN_ERROR }
+				: endKind === "cutOff"
+					? { cutOff: true }
+					: undefined;
 		activeSessionAbortPromise ??= session.abort(options).catch(error => {
 			logger.debug("Subagent session abort cleanup failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -1706,7 +1735,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		signal.addEventListener(
 			"abort",
 			() => {
-				if (!resolved) requestAbort(signal.reason === ASYNC_JOB_MANAGER_SHUTDOWN_REASON ? "shutdown" : "signal");
+				if (resolved) return;
+				if (signal.reason === ASYNC_JOB_MANAGER_SHUTDOWN_REASON) {
+					requestAbort("shutdown");
+					return;
+				}
+				callerCutOff = args.detached !== true && turnAbortKind(signal.reason) === "cutOff";
+				requestAbort("signal");
 			},
 			{ once: true, signal: listenerSignal },
 		);
@@ -4114,11 +4149,12 @@ function ownAttachedSession(id: string): AgentSession | undefined {
 export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const startTime = Date.now();
 	const session = await AgentLifecycleManager.global().ensureLive(options.id);
-	if (!isLocalAgentSession(session)) return runFollowUpTurnOnHome(session, options);
+	if (!isLocalAgentSession(session)) return runFollowUpTurnOnHome(session, withWireSignal(options));
 	// A turn of a main-homed session loads the main thread like a placed run.
 	const endMainRun = isMainThread() ? existingSubagentWorkerPool()?.beginMainRun() : undefined;
 	try {
-		return await driveFollowUpTurn(options, session, startTime);
+		// Main also runs here the follow-ups a worker routes through it, their signal in its wire form.
+		return await driveFollowUpTurn(withLocalSignal(options), session, startTime);
 	} finally {
 		endMainRun?.();
 	}
@@ -4130,7 +4166,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
  */
 export async function runFollowUpTurnOnThisThread(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const startTime = Date.now();
-	return driveFollowUpTurn(options, await ensureLocalLive(options.id), startTime);
+	return driveFollowUpTurn(withLocalSignal(options), await ensureLocalLive(options.id), startTime);
 }
 
 /** The follow-up turn itself, on `live`, the subagent's revived local session. */
@@ -4684,14 +4720,28 @@ export interface SubagentRunRequest {
 /** Package `options` for a worker, carrying what the settings' symbol tag holds explicitly. */
 export function subagentRunRequest(options: ExecutorOptions): SubagentRunRequest {
 	const settings: SubagentChainSettings | undefined = options.settings;
-	return { options, rootThresholds: settings?.[kRootCompactionThresholds] };
+	return { options: withWireSignal(options), rootThresholds: settings?.[kRootCompactionThresholds] };
 }
 
 /** Worker entry of a routed run: re-tag the settings mirror, then run here. */
 export function runSubagentRunRequest(request: SubagentRunRequest): Promise<SingleResult> {
 	const settings: SubagentChainSettings | undefined = request.options.settings;
 	if (settings && request.rootThresholds) settings[kRootCompactionThresholds] = request.rootThresholds;
-	return runSubprocessOnThisThread(request.options);
+	return runSubprocessOnThisThread(withLocalSignal(request.options));
+}
+
+/**
+ * `options` as they cross to another thread: their signal aborts there with the wire form
+ * of its reason ({@link toWireSignal}). A symbol cannot cross, and the job manager's
+ * shutdown reason, which cuts a run off, would otherwise arrive as text, which stops it.
+ */
+function withWireSignal<T extends { signal?: AbortSignal }>(options: T): T {
+	return options.signal ? { ...options, signal: toWireSignal(options.signal) } : options;
+}
+
+/** `options` as they arrive from another thread: their signal's reason back from its wire form ({@link fromWireSignal}). */
+function withLocalSignal<T extends { signal?: AbortSignal }>(options: T): T {
+	return options.signal ? { ...options, signal: fromWireSignal(options.signal) } : options;
 }
 
 /**

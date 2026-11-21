@@ -5,6 +5,7 @@
 ### Added
 
 - Added `AGENT_KILL_LABEL`, `InterruptReason` and `isInterruptReason` so hosts can tell a parent agent's kill apart from a user interrupt ([#20012](https://github.com/can1357/oh-my-pi/pull/20012) by [@nick-maderight](https://github.com/nick-maderight))
+- A task `SingleResult` now carries `workerLost` when the worker thread that ran the subagent died before the run settled, `EvalToolDetails` and `JobSnapshot` carry `agentResults` (`EvalHeldAgentResult`: a subagent whose result was handed over, with the time), and `isReasonlessAbort` tells an abort that gave no reason of its own (by [@sjawhar](https://github.com/sjawhar))
 
 ### Fixed
 

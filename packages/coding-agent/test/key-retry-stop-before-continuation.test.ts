@@ -1,7 +1,8 @@
 /**
  * A stop that comes after a key retry's backoff ended but before its continuation started. A
- * stop during the backoff cancels the retry; a stop in this window does the same, and the
- * request the user cancelled never goes out.
+ * stop during the backoff cancels the retry and ends the turn with a "Retry cancelled" record,
+ * so `omp --restore` leaves it; a stop in this window does the same, and the request the user
+ * cancelled never goes out.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -22,6 +23,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { hasRestorableTurn } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
@@ -103,7 +105,10 @@ async function openStrandedSession(options: { abortAtContinuationStart?: boolean
 			return undefined;
 		});
 	}
-	cleanups.push(() => session.dispose());
+	let disposed = false;
+	cleanups.push(async () => {
+		if (!disposed) await session.dispose();
+	});
 	const retries: Array<{ type: string; finalError?: string }> = [];
 	const secondRetry = Promise.withResolvers<void>();
 	session.subscribe(event => {
@@ -124,6 +129,8 @@ async function openStrandedSession(options: { abortAtContinuationStart?: boolean
 		options?.signal?.addEventListener("abort", () => aborted.reject(options.signal?.reason), { once: true });
 		await Promise.race([release.promise, aborted.promise]);
 	});
+	const file = sessionManager.getSessionFile();
+	if (!file) throw new Error("Expected a persisted session file");
 	return {
 		session,
 		mock,
@@ -131,6 +138,24 @@ async function openStrandedSession(options: { abortAtContinuationStart?: boolean
 		window: window.promise,
 		secondRetry: secondRetry.promise,
 		release: () => release.resolve(),
+		/** Quits (a dispose with no reason), then reads the file as `omp --restore` would. */
+		async quitAndReopen() {
+			disposed = true;
+			await session.dispose();
+			const reopened = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
+			const branch = reopened.getBranch();
+			await reopened.close();
+			const tail = branch.filter(entry => entry.type === "message").at(-1);
+			const message = tail?.type === "message" && tail.message.role === "assistant" ? tail.message : undefined;
+			return {
+				restorable: hasRestorableTurn(branch),
+				tail: message && {
+					stopReason: message.stopReason,
+					errorMessage: message.errorMessage,
+					credentialUnavailable: message.credentialUnavailable,
+				},
+			};
+		},
 	};
 }
 
@@ -152,8 +177,9 @@ describe("a stop after a key retry's backoff, before its continuation started", 
 		"Esc (abortRetry)": (session: AgentSession) => session.abortRetry(),
 	};
 	for (const [name, stop] of Object.entries(stops)) {
-		it(`${name} cancels the retry, and its request never goes out`, async () => {
-			// If this regresses, the stop finds no retry to cancel, and the retried request the user stopped is sent.
+		it(`${name} cancels the retry and ends the turn with a "Retry cancelled" record, and omp --restore leaves it`, async () => {
+			// If this regresses, the stop finds no retry to cancel: the retried request the user stopped is sent, or
+			// the turn keeps its marked error and `omp --restore` continues it after the next normal exit.
 			const stranded = await openStrandedSession();
 			const prompt = stranded.session.prompt("go");
 			await stranded.window;
@@ -162,9 +188,14 @@ describe("a stop after a key retry's backoff, before its continuation started", 
 			await prompt.catch(() => undefined);
 			await stranded.session.waitForIdle();
 			const retryStarts = stranded.retries.filter(event => event.type === "auto_retry_start").length;
+			const reopened = await stranded.quitAndReopen();
 			expect(retryStarts).toBe(1);
 			expect(stranded.retries.at(-1)).toEqual({ type: "auto_retry_end", finalError: "Retry cancelled" });
 			expect(stranded.mock.calls).toHaveLength(0);
+			expect(reopened).toEqual({
+				restorable: false,
+				tail: { stopReason: "aborted", errorMessage: "Retry cancelled", credentialUnavailable: undefined },
+			});
 		}, 30_000);
 	}
 
@@ -181,6 +212,18 @@ describe("a stop after a key retry's backoff, before its continuation started", 
 		expect(stranded.retries.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
 		expect(stranded.retries.at(-1)).toEqual({ type: "auto_retry_end", finalError: "Retry cancelled" });
 		expect(stranded.mock.calls).toHaveLength(0);
+	}, 30_000);
+
+	it('a quit (a dispose with no reason) ends the turn with a "Retry cancelled" record, and omp --restore leaves it', async () => {
+		const stranded = await openStrandedSession();
+		const prompt = stranded.session.prompt("go");
+		await stranded.window;
+		const reopened = await stranded.quitAndReopen();
+		await prompt.catch(() => undefined);
+		expect(reopened).toEqual({
+			restorable: false,
+			tail: { stopReason: "aborted", errorMessage: "Retry cancelled", credentialUnavailable: undefined },
+		});
 	}, 30_000);
 });
 

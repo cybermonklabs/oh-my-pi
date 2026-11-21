@@ -38,6 +38,8 @@ interface EvalHandleBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Receives the agent handles whose settled results a `wait()` hands the cell (`ToolBridgeOptions.onAgentResults`). */
+	onAgentResults?: (results: Array<{ id: string }>) => void;
 }
 
 type ResolvedHandle =
@@ -291,6 +293,10 @@ export async function runEvalWait(
 				.map(handle => handle.ref.id);
 			const manager = options.session.asyncJobManager;
 			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			const settledAgents = resolved.flatMap(handle =>
+				"job" in handle && handle.job.status !== "running" ? [{ id: handle.job.agentId ?? handle.job.id }] : [],
+			);
+			if (settledAgents.length > 0) options.onAgentResults?.(settledAgents);
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,
