@@ -583,7 +583,7 @@ async fn descriptor_paths_keep_their_spelling() {
 
 	assert!(!output.contains("/dev/fd/-1"), "leaked the placeholder path: {output:?}");
 	assert!(output.contains("cannot read pidfile '/dev/fd/9'"), "output: {output:?}");
-	assert!(output.contains("couldn't open file /dev/fd/9"), "output: {output:?}");
+	assert!(output.contains("creating file '/dev/fd/9'"), "output: {output:?}");
 	assert!(output.ends_with("/proc/self/fd/0\n"), "output: {output:?}");
 }
 

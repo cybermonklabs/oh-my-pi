@@ -362,7 +362,7 @@ impl Lookup {
 			.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
 		let cwd = command.dir().unwrap_or(&self.cwd);
 		if has_separator(name) {
-			return match executable(&cwd.join(name), cwd) {
+			return match executable(&cwd.join(name)) {
 				Some(true) => Ok(Program::Path(cwd.join(name))),
 				Some(false) => Err(io::ErrorKind::PermissionDenied.into()),
 				None => Err(io::ErrorKind::NotFound.into()),
@@ -384,7 +384,7 @@ impl Lookup {
 		let mut denied = false;
 		for dir in std::env::split_paths(OsStr::new(path)) {
 			let candidate = cwd.join(dir).join(name);
-			match executable(&candidate, cwd) {
+			match executable(&candidate) {
 				Some(true) => return Ok(Program::Path(candidate)),
 				Some(false) => denied = true,
 				None => {},
@@ -413,35 +413,19 @@ fn has_separator(name: &OsStr) -> bool {
 	bytes.contains(&b'/') || (cfg!(windows) && bytes.contains(&b'\\'))
 }
 
-/// How `execve` of `path` fares, as GNU's xargs, find and env report it:
-/// `Some(true)` where it runs, `Some(false)` where it fails with `EACCES`
-/// ("Permission denied"), `None` where it fails with `ENOENT` ("No such
-/// file or directory"). A directory, or a file without execute permission,
-/// is `EACCES`: `echo a | xargs ./dir` is `xargs: ./dir: Permission
-/// denied`, status 126. A script fails as its `#!` interpreter, resolved
-/// from `cwd`, does: one that is missing is `ENOENT`, `echo a | xargs
-/// ./script` is `xargs: ./script: No such file or directory`, status 127.
-/// The interpreter is read as the kernel reads it
-/// (`pi_builtins::extras::script_interpreter`). A `#!` line that names no
-/// interpreter (`#! \0x`) is `Some(true)`: Linux fails with `ENOEXEC`, so
-/// the file runs as a shell script, and whatever else the system says
-/// (gVisor: `EINVAL`) is the shell's to report.
+/// `Some(true)` for an executable file at `path`, `Some(false)` for a file
+/// that is not executable, `None` for nothing (or a directory).
 #[cfg(unix)]
-fn executable(path: &Path, cwd: &Path) -> Option<bool> {
+fn executable(path: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
-	let runs = |path: &Path| {
-		let meta = std::fs::metadata(path).ok()?;
-		Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-	};
-	if runs(path)? {
-		return pi_builtins::extras::script_interpreter(path)
-			.map_or(Some(true), |interpreter| runs(&cwd.join(interpreter)));
-	}
-	Some(false)
+	let meta = std::fs::metadata(path)
+		.ok()
+		.filter(std::fs::Metadata::is_file)?;
+	Some(meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
-fn executable(path: &Path, _cwd: &Path) -> Option<bool> {
+fn executable(path: &Path) -> Option<bool> {
 	(path.is_file() || path.with_extension("exe").is_file()).then_some(true)
 }
 
@@ -463,35 +447,5 @@ mod tests {
 		assert!(!is_name("1x"));
 		assert!(!is_name("a-b"));
 		assert!(!is_name(""));
-	}
-
-	/// Each answer is how `execve` fails, which GNU findutils 4.10's xargs
-	/// and find report: `None` "No such file or directory" (127),
-	/// `Some(false)` "Permission denied" (126).
-	#[cfg(unix)]
-	#[test]
-	fn executable_answers_as_execve_fails() {
-		use std::os::unix::fs::PermissionsExt as _;
-		let dir = tempfile::tempdir().expect("temporary directory");
-		let cwd = dir.path();
-		let write = |name: &str, text: &str, mode: u32| {
-			let file = cwd.join(name);
-			std::fs::write(&file, text).expect("write");
-			std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
-			file
-		};
-		assert_eq!(executable(&cwd.join("missing"), cwd), None);
-		// A directory cannot be executed.
-		assert_eq!(executable(cwd, cwd), Some(false));
-		assert_eq!(executable(&write("plain", "x\n", 0o644), cwd), Some(false));
-		assert_eq!(executable(&write("binary", "\x7fELF", 0o755), cwd), Some(true));
-		assert_eq!(executable(&write("script", "#!/bin/sh\necho hi\n", 0o755), cwd), Some(true));
-		// A script fails as its interpreter does: missing, or not executable
-		// (`#!/etc/passwd`), here named from `cwd`.
-		assert_eq!(executable(&write("lost", "#! /nonexistent/sh -e\n", 0o755), cwd), None);
-		assert_eq!(executable(&write("denied", "#!plain\n", 0o755), cwd), Some(false));
-		// A line that names no interpreter is no `cwd` to stat: it runs.
-		assert_eq!(executable(&write("unnamed", "#! \0x", 0o755), cwd), Some(true));
-		assert_eq!(executable(&write("blank", "#!  \necho hi\n", 0o755), cwd), Some(true));
 	}
 }

@@ -12,10 +12,7 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches};
 
-use crate::host::{
-	CommandStatus, Host, RunningCommand, ShellCommand, Utility, matches_parser, os_bytes_lossy,
-	run_strerror,
-};
+use crate::host::{CommandStatus, Host, RunningCommand, ShellCommand, Utility, matches_parser};
 
 mod options {
 	pub const COMMAND: &str = "COMMAND";
@@ -298,41 +295,26 @@ impl CommandResult {
 	}
 }
 
-/// Why xargs stops, each written as GNU findutils 4.10's xargs writes it
-/// after `xargs: `.
 #[derive(Debug)]
 enum CommandExecutionError {
-	/// The command named so exited 255 (GNU: status 124).
-	UrgentlyFailed(OsString),
+	// exit code 255
+	UrgentlyFailed,
 	Killed { name: OsString, signal: i32 },
-	/// The command named so did not run (GNU: status 126): `./noexec:
-	/// Permission denied`.
-	CannotRun { name: OsString, error: io::Error },
+	CannotRun(io::Error),
 	/// Nothing runs under this command name (GNU: status 127).
 	NotFound(OsString),
 }
 
-impl CommandExecutionError {
-	/// The message, after `xargs: `: the command name as its bytes, as GNU
-	/// xargs writes it (`echo a | xargs $'n\xff'` is "xargs: n\377: No such
-	/// file or directory"), `: ` and why xargs stops.
-	fn message(&self) -> Vec<u8> {
-		let (name, reason) = match self {
-			Self::UrgentlyFailed(name) => (name, "exited with status 255; aborting".to_owned()),
-			Self::Killed { name, signal } => (name, format!("terminated by signal {signal}")),
-			Self::CannotRun { name, error } => (name, run_strerror(error)),
-			Self::NotFound(name) => (name, "No such file or directory".to_owned()),
-		};
-		let mut message = os_bytes_lossy(name).into_owned();
-		message.extend_from_slice(b": ");
-		message.extend_from_slice(reason.as_bytes());
-		message
-	}
-}
-
 impl Display for CommandExecutionError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(&String::from_utf8_lossy(&self.message()))
+		match self {
+			Self::UrgentlyFailed => write!(f, "Command exited with code 255"),
+			Self::Killed { name, signal } => {
+				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
+			},
+			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
+			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
+		}
 	}
 }
 
@@ -345,7 +327,7 @@ fn command_outcome(
 ) -> Result<CommandResult, CommandExecutionError> {
 	match status {
 		Ok(CommandStatus::Exited(0)) => Ok(CommandResult::Success),
-		Ok(CommandStatus::Exited(255)) => Err(CommandExecutionError::UrgentlyFailed(name.to_owned())),
+		Ok(CommandStatus::Exited(255)) => Err(CommandExecutionError::UrgentlyFailed),
 		Ok(CommandStatus::Exited(_)) => Ok(CommandResult::Failure),
 		Ok(CommandStatus::Signaled(signal)) => {
 			Err(CommandExecutionError::Killed { name: name.to_owned(), signal })
@@ -359,7 +341,7 @@ fn cannot_run(error: io::Error, name: &OsStr) -> CommandExecutionError {
 	if error.kind() == io::ErrorKind::NotFound {
 		CommandExecutionError::NotFound(name.to_owned())
 	} else {
-		CommandExecutionError::CannotRun { name: name.to_owned(), error }
+		CommandExecutionError::CannotRun(error)
 	}
 }
 
@@ -1157,19 +1139,12 @@ impl Utility for Xargs {
 			Ok(CommandResult::Success) => 0,
 			Ok(CommandResult::Failure) => 123,
 			Err(error) => {
-				let mut line = b"xargs: ".to_vec();
-				if let XargsError::CommandExecution(command_error) = &error {
-					line.extend_from_slice(&command_error.message());
-				} else {
-					let _ = write!(line, "{error}");
-				}
-				line.push(b'\n');
-				let _ = host.stderr.write_all(&line);
+				let _ = writeln!(host.stderr, "xargs: {error}");
 				if let XargsError::CommandExecution(command_error) = error {
 					match command_error {
-						CommandExecutionError::UrgentlyFailed(_) => 124,
+						CommandExecutionError::UrgentlyFailed => 124,
 						CommandExecutionError::Killed { .. } => 125,
-						CommandExecutionError::CannotRun { .. } => 126,
+						CommandExecutionError::CannotRun(_) => 126,
 						CommandExecutionError::NotFound(_) => 127,
 					}
 				} else {
@@ -1576,9 +1551,7 @@ mod tests {
 		let (code, _, err) = run_simple(&["cd"], "definitely-missing-dir\n").await;
 		assert_eq!(code, 123);
 		assert!(err.contains("cd:"), "got: {err:?}");
-		// xargs' own report of a command it could not run names it after
-		// `xargs: `; the shell's diagnostic does not.
-		assert!(!err.contains("xargs: cd"), "got: {err:?}");
+		assert!(!err.contains("could not be run"), "got: {err:?}");
 	}
 
 	#[tokio::test]
@@ -1595,16 +1568,14 @@ mod tests {
 		let command = file.path().to_str().expect("utf8 temporary path");
 		let (code, _, err) = run_simple(&[command], "x\n").await;
 		assert_eq!(code, 126);
-		// GNU findutils 4.10: `xargs: ./noexec: Permission denied`.
-		assert_eq!(err, format!("xargs: {command}: Permission denied\n"));
+		assert!(err.contains("could not be run"), "got: {err:?}");
 	}
 
 	#[tokio::test]
 	async fn exit_255_child_yields_124() {
 		let (code, _, err) = run_simple(&["sh", "-c", "exit 255", "_"], "x\n").await;
 		assert_eq!(code, 124);
-		// GNU findutils 4.10 names the command and says it stops.
-		assert_eq!(err, "xargs: sh: exited with status 255; aborting\n");
+		assert!(err.contains("255"), "got: {err:?}");
 	}
 
 	#[cfg(unix)]

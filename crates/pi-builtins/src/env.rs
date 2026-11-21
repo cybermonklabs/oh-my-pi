@@ -34,7 +34,7 @@ use uucore::{
 };
 
 use crate::{
-	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, run_strerror, strip_errno},
+	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, strip_errno},
 	locale,
 	quoting_style::quoting_style_by_name,
 };
@@ -541,12 +541,14 @@ impl Run<'_> {
 		match self.host.run_command(command) {
 			Ok(status) => Ok(status.code()),
 			Err(error) => {
-				let code = match error.kind() {
+				let (code, text) = match error.kind() {
 					io::ErrorKind::Interrupted => return Err(EXIT_INTERRUPTED),
-					io::ErrorKind::NotFound => EXIT_ENOENT,
-					_ => EXIT_CANNOT_INVOKE,
+					io::ErrorKind::NotFound => (EXIT_ENOENT, "No such file or directory".to_owned()),
+					io::ErrorKind::PermissionDenied => {
+						(EXIT_CANNOT_INVOKE, "Permission denied".to_owned())
+					},
+					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				let text = run_strerror(&error);
 				self.error(&format!("{}: {text}", quote(&program)));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");

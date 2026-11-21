@@ -42,9 +42,6 @@ mod args {
 		pub const MAX_UNCHANGED_STATS: &str = "max-unchanged-stats";
 		pub const ARG_FILES: &str = "files";
 		pub const PRESUME_INPUT_PIPE: &str = "-presume-input-pipe"; // NOTE: three hyphens is correct
-		/// The long name of [`PRESUME_INPUT_PIPE`], whose alias, the id, has
-		/// the third dash GNU tail 9.7 spells it with.
-		pub const PRESUME_INPUT_PIPE_LONG: &str = "presume-input-pipe";
 		pub const DEBUG: &str = "debug";
 		pub const REVERSE: &str = "reverse";
 		pub const BLOCKS: &str = "blocks";
@@ -488,7 +485,7 @@ mod args {
 			)
 			.arg(
 				Arg::new(options::PRESUME_INPUT_PIPE)
-					.long(options::PRESUME_INPUT_PIPE_LONG)
+					.long("presume-input-pipe")
 					.alias(options::PRESUME_INPUT_PIPE)
 					.hide(true)
 					.action(ArgAction::SetTrue),
@@ -2998,7 +2995,6 @@ use std::{
 	ffi::OsString,
 	io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
-	sync::LazyLock,
 };
 
 use clap::ArgMatches;
@@ -3006,7 +3002,6 @@ use memchr::{memchr_iter, memrchr_iter};
 use uucore::display::Quotable;
 
 use crate::host::{Host, Utility, matches_parser};
-use crate::long_options::OptionTable;
 
 use args::{FilterMode, Settings, Signum};
 use chunks::ReverseChunks;
@@ -3047,6 +3042,36 @@ pub(crate) type TailResult<T> = Result<T, TailError>;
 
 pub(crate) fn map_output_error(error: io::Error) -> TailError {
 	error.into()
+}
+
+/// True when `token` is an option that takes its value from the *next* argv
+/// token, so that value must never be mistaken for an obsolete `-N`/`+N` form
+/// (e.g. the `+5` in `tail -n +5 file`).
+fn consumes_separate_value(token: &str) -> bool {
+	if let Some(long) = token.strip_prefix("--") {
+		if long.is_empty() || long.contains('=') {
+			return false;
+		}
+		// clap infers unambiguous long-option prefixes; `--follow` requires
+		// `=` for its value and never consumes the next token.
+		return ["lines", "bytes", "pid", "sleep-interval", "max-unchanged-stats"]
+			.iter()
+			.any(|name| name.starts_with(long));
+	}
+	let Some(cluster) = token.strip_prefix('-') else {
+		return false;
+	};
+	let mut chars = cluster.chars();
+	while let Some(c) = chars.next() {
+		match c {
+			// Value-taking shorts: a trailing `-n`/`-c`/`-s` consumes the next
+			// token; anything after them in the cluster is an attached value.
+			'n' | 'c' | 's' => return chars.next().is_none(),
+			'q' | 'v' | 'z' | 'f' | 'F' | 'r' | 'b' => {},
+			_ => return false,
+		}
+	}
+	false
 }
 
 /// Rewrites every obsolete `-N[bcl][f]` / `+N[bcl][f]` token (before `--`)
@@ -3107,9 +3132,7 @@ fn rewrite_tail_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 			}
 		}
 		if bytes.len() > 1 && bytes[0] == b'-' {
-			// An option that takes the next argument as its value (`-n` of
-			// `tail -n +5 file`), which is then no obsolete `+N` form.
-			skip_value = OPTIONS.value_follows(&token);
+			skip_value = consumes_separate_value(&token);
 		} else {
 			has_operand = true;
 		}
@@ -3132,22 +3155,9 @@ pub(crate) struct Tail {
 
 matches_parser!(Tail, args::uu_app);
 
-/// The options `tail` accepts, of which these are the builtin's alone, or
-/// hidden behind a third dash in GNU tail 9.7 (`---presume-input-pipe`): GNU
-/// reads `--p=1` as `--pid=1`, and `--r` and `--re` as `--retry`, where they
-/// also begin `--presume-input-pipe` and `--reverse`.
-static OPTIONS: LazyLock<OptionTable> = LazyLock::new(|| {
-	OptionTable::new(args::uu_app(), &[
-		args::options::PRESUME_INPUT_PIPE_LONG,
-		args::options::REVERSE,
-		args::options::USE_POLLING,
-		args::options::DEBUG,
-	])
-});
-
 impl Utility for Tail {
 	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
-		rewrite_tail_argv(OPTIONS.spell_out_all(argv))
+		rewrite_tail_argv(argv)
 	}
 	const NAME: &'static str = "tail";
 

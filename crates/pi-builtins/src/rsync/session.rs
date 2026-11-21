@@ -358,9 +358,9 @@ struct HostIo {
 impl HostIo {
 	fn new(host: &mut Host, env: Arc<HashMap<String, String>>, argv0: OsString) -> Self {
 		let out: Box<dyn Write + Send> = Box::new(host.stdout_writer());
-		let err: Box<dyn Write + Send> = match host.stderr.share() {
-			Some(shared) => Box::new(shared),
-			None => Box::new(StreamWriter::line(host.stderr_clone())),
+		let err: Box<dyn Write + Send> = match &host.stderr {
+			StreamWriter::Shared(shared) => Box::new(StreamWriter::Shared(Arc::clone(shared))),
+			_ => Box::new(StreamWriter::line(host.stderr_clone())),
 		};
 		let stdin: Box<dyn Read + Send> = match host.stdin.try_clone() {
 			Ok(stdin) => Box::new(stdin),
