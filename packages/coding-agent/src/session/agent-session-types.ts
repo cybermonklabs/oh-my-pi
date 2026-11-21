@@ -50,6 +50,7 @@ import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SettingsGatedToolDelta, SystemPromptRebuilder } from "./session-tools";
 import type { CostGateApi } from "./cost-gate";
+import type { CyberPolicyClosureApi } from "./cyber-policy-closure";
 import type { SessionManager } from "./session-manager";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
@@ -201,6 +202,11 @@ export interface AgentSessionConfig {
 	disableExtensionDiscovery?: boolean;
 	/** Cost gate of the session tree; refuses this session's model requests at `session.maxCost`. */
 	costGate?: CostGateApi;
+	/**
+	 * The session tree's cyber-policy closure; a subagent receives its root's. Without one the session
+	 * owns a closure of its own, which only its own prompts from a person end.
+	 */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
 	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
@@ -439,8 +445,20 @@ export interface AgentSessionConfig {
 	autoTitle?: boolean;
 }
 
+/**
+ * Where a piece of input came from, set only where it crosses the session's outer boundary.
+ * `"outside"`: a person, or the harness or an RPC client on their behalf (typed input, an RPC
+ * prompt, steer, follow-up or skill command, the CLI's initial message, the `.`/`c` continue, an
+ * extension relaying a person's turn). Anything else, unset included, came from inside the session:
+ * its extensions, loops, job results, queued drains, other agents. Only outside input ends the
+ * session's cyber-policy closure.
+ */
+export type InputOrigin = "outside" | "inside";
+
 /** Options for AgentSession.prompt(). */
 export interface PromptOptions {
+	/** Where this prompt came from; see {@link InputOrigin}. Default: inside. */
+	origin?: InputOrigin;
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
 	/**
@@ -523,6 +541,8 @@ export interface DroppedPrompt {
 
 /** Options for AgentSession.followUp(). */
 export interface FollowUpOptions {
+	/** Where this follow-up came from; see {@link InputOrigin}. Default: inside. */
+	origin?: InputOrigin;
 	/** Enqueue as a hidden developer message instead of a user follow-up. */
 	synthetic?: boolean;
 	/** Whether to expand file-based prompt templates (default: true). */
@@ -535,6 +555,8 @@ export interface FollowUpOptions {
 
 /** Options for AgentSession.steer(). */
 export interface SteerOptions {
+	/** Where this steer came from; see {@link InputOrigin}. Default: inside. */
+	origin?: InputOrigin;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
 	/** Called synchronously with the messages pushed onto the steering queue. See {@link PromptOptions.onPromptQueued}. */
@@ -547,6 +569,8 @@ export interface SendUserMessageOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Where this message came from; see {@link InputOrigin}. Default: inside. */
+	origin?: InputOrigin;
 }
 
 /** Result from a handoff operation. */
@@ -559,6 +583,8 @@ export interface HandoffResult {
 export interface SessionHandoffOptions {
 	autoTriggered?: boolean;
 	signal?: AbortSignal;
+	/** `"outside"` when a person or an RPC client asked for this handoff; see {@link InputOrigin}. */
+	origin?: InputOrigin;
 }
 
 /** Result from cycleModel(). */

@@ -112,10 +112,12 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			// under the removed SDK client. A proxy concurrency-admission 429
 			// (`rate_limit_type: max_parallel_requests`) surfaces immediately instead of
 			// being slept-and-retried here; session recovery owns its backoff/fallback
-			// (issue #8854).
+			// (issue #8854). An OpenAI `cyber_policy` refusal, even one a gateway relays
+			// as a 5xx, is never sent again: each copy adds to the organization's record.
 			shouldRetryResponse: async (response, bodyText) =>
 				getShouldRetryFromHeaders(response.headers) !== false &&
 				!isConcurrencyAdmissionRejection(response, bodyText) &&
+				!AIError.isCyberPolicyRefusal(bodyText) &&
 				(init.shouldRetryResponse === undefined || (await init.shouldRetryResponse(response, bodyText))),
 			// Bun's native fetch enforces a hard ~300s pre-response timeout (issue #2422).
 			// Cold large-context streams legitimately exceed it; the caller's

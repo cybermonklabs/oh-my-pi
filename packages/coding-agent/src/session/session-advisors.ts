@@ -112,6 +112,7 @@ import {
 	type RetryFallbackSelector,
 	retryFallbackAdmits,
 } from "./retry-fallback-chains";
+import type { CyberPolicyClosureApi } from "./cyber-policy-closure";
 import { getOpenAiRemoteCompactionPayload } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
@@ -528,6 +529,10 @@ export interface SessionAdvisorsHost {
 	): RetryFallbackSelector[];
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean;
 	noteRetryFallbackCooldown(currentSelector: string, retryAfterMs: number | undefined, errorMessage: string): void;
+	/** Records a `cyber_policy` refusal in the session tree's closure (`cyber-policy-closure.ts`). */
+	recordCyberPolicyRefusal(failure: unknown): void;
+	/** The session tree's cyber-policy closure: an advisor sends no batch to a route it closes. */
+	cyberPolicyClosure(): CyberPolicyClosureApi;
 	createCodexCompactionContext(options: {
 		trigger: CodexCompactionContext["trigger"];
 		reason: CodexCompactionContext["reason"];
@@ -926,6 +931,11 @@ export class SessionAdvisors {
 	 */
 	refreshProviderIdentity(): void {
 		for (const advisor of this.#advisors) this.#refreshAdvisorProviderIdentity(advisor);
+	}
+
+	/** Sends the batches advisors held for a closed route once a person's prompt ends the closure. */
+	resumeAfterClosedRoute(): void {
+		for (const advisor of this.#advisors) advisor.runtime.resumeAfterClosedRoute();
 	}
 
 	/**
@@ -1615,6 +1625,8 @@ export class SessionAdvisors {
 						advisorRef.pendingCoveredTurn,
 					);
 				},
+				ensureOpenRoute: signal => this.#ensureAdvisorOpenRoute(advisorRef, signal),
+				isRouteClosed: () => this.#host.cyberPolicyClosure().isClosed(advisorRef.agent.state.model),
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {
@@ -2116,6 +2128,10 @@ export class SessionAdvisors {
 		if (overflowVeto) {
 			return false;
 		}
+		// A cyber-policy refusal closes every OpenAI route to the walk below (and to the main agent and
+		// every other advisor) until a person's next prompt; it is not an account policy, so no
+		// credential rotation either.
+		this.#host.recordCyberPolicyRefusal(assistantFailure ?? error);
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
@@ -2207,11 +2223,34 @@ export class SessionAdvisors {
 
 		// A refusal by the advisor's primary judges this context, not the model's health:
 		// skip its cooldown and pin the switch. A refusing fallback gets the usual cooldown.
+		// A cyber-policy refusal is not pinned: the closure keeps OpenAI's routes out of the walk
+		// and the restore exactly as long as it does for the main agent.
 		const primaryRefused =
 			assistantFailure !== undefined &&
 			isClassifierRefusal(assistantFailure) &&
+			!AIError.isCyberPolicyRefusal(assistantFailure) &&
 			(advisor.retryFallback === undefined || advisor.retryFallback.originalSelector === currentSelector);
 		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		if (
+			await this.#switchAdvisorToFallback(advisor, chainKeys, currentSelector, currentModel, signal, {
+				pinned: primaryRefused,
+				reason: `Advisor request failed: ${message}`,
+			})
+		) {
+			return true;
+		}
+		return waitOrDecline();
+	}
+
+	/** Switches the advisor to the first usable, open candidate of `chainKeys`; false when none. */
+	async #switchAdvisorToFallback(
+		advisor: ActiveAdvisor,
+		chainKeys: readonly string[],
+		currentSelector: string,
+		currentModel: Model,
+		signal: AbortSignal,
+		options: { pinned: boolean; reason: string },
+	): Promise<boolean> {
 		for (const role of chainKeys) {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
@@ -2233,7 +2272,7 @@ export class SessionAdvisors {
 				if (advisor.retryFallback) {
 					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;
 					advisor.retryFallback.autoThinking = selector.thinkingLevel === AUTO_THINKING;
-					advisor.retryFallback.pinned ||= primaryRefused;
+					advisor.retryFallback.pinned ||= options.pinned;
 				} else {
 					advisor.retryFallback = {
 						role,
@@ -2241,7 +2280,7 @@ export class SessionAdvisors {
 						originalThinkingLevel,
 						lastAppliedThinkingLevel: nextThinkingLevel,
 						autoThinking: selector.thinkingLevel === AUTO_THINKING,
-						pinned: primaryRefused,
+						pinned: options.pinned,
 					};
 				}
 				advisor.retryFallbackPendingSuccess = true;
@@ -2251,12 +2290,32 @@ export class SessionAdvisors {
 					from: currentSelector,
 					to: selector.raw,
 					role,
-					reason: `Advisor request failed: ${message}`,
+					reason: options.reason,
 				});
 				return true;
 			}
 		}
-		return waitOrDecline();
+		return false;
+	}
+
+	/**
+	 * Before a batch is sent: an advisor on a route a cyber-policy refusal closed walks to an open
+	 * fallback, or returns false so the runtime holds the batch until a person's next prompt.
+	 */
+	async #ensureAdvisorOpenRoute(advisor: ActiveAdvisor, signal: AbortSignal): Promise<boolean> {
+		const currentModel = advisor.agent.state.model;
+		if (!this.#host.cyberPolicyClosure().isClosed(currentModel)) return true;
+		const retrySettings = cfgRetry.get(this.#host.settings);
+		if (!retrySettings.enabled || !retrySettings.modelFallback) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
+		const chainKeys = this.#host.retryFallbackChainKeys(currentSelector, currentModel, {
+			pinnedRole: advisor.retryFallback?.role,
+			roleHint: "advisor",
+		});
+		return this.#switchAdvisorToFallback(advisor, chainKeys, currentSelector, currentModel, signal, {
+			pinned: false,
+			reason: "OpenAI refused this turn's content (cyber_policy)",
+		});
 	}
 
 	/**

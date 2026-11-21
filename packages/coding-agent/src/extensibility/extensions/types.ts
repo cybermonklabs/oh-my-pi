@@ -97,7 +97,7 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
-import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
+import type { EphemeralTurnOptions, EphemeralTurnResult, InputOrigin } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -541,6 +541,11 @@ export interface CompactOptions {
 	 * skipped, so the switch does not land on a placeholder summary.
 	 */
 	readerModel?: Model;
+	/**
+	 * `"outside"` when a person (`/compact` typed) or an RPC client asked for this compaction: it ends the
+	 * session's cyber-policy hold like a prompt from outside does. Unset for compactions the session starts.
+	 */
+	origin?: InputOrigin;
 }
 
 /**
@@ -2136,15 +2141,24 @@ export interface ExtensionAPI {
 	 * `deliverAs: "aside"` injects the message at the next agent step boundary without interrupting
 	 * the in-flight tool batch; when the session is idle it starts a turn regardless of `triggerTurn`
 	 * (plan mode folds it into context instead).
+	 *
+	 * `origin: "outside"` marks a message that relays input from outside the session (a person, or a
+	 * harness on their behalf); only such a message ends the session's cyber-policy closure. Unset, the
+	 * message counts as made inside the session. An omp without the option ignores it.
 	 */
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
+			origin?: InputOrigin;
+		},
 	): void;
 
 	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set.
 	 *  `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
 	 *  batch while streaming, except that it ends a running interruptible `wait`; idle still starts a turn.
+	 *  `origin: "outside"` marks input relayed from outside the session (see {@link sendMessage}).
 	 *  Rejects with `PromptDroppedError` if the message was not admitted (e.g. abort or cost cap). */
 	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<void>;
 
@@ -2388,7 +2402,7 @@ export type SendMessageHandler = <T = unknown>(
 	 * `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight
 	 * tool batch, except that it ends a running interruptible `wait`; idle starts a turn regardless of `triggerTurn` (plan mode folds into context).
 	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
+	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside"; origin?: InputOrigin },
 ) => void;
 
 /** `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
@@ -2404,6 +2418,12 @@ export interface SendUserInputOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Caller correlation id recorded as `tag` on the message the input submits. */
 	tag?: string;
+	/**
+	 * `"outside"` when the text is a person's own input that the extension relays (a bridge's typed Send):
+	 * like a prompt typed at the terminal, it ends the session's cyber-policy hold. The extension's own
+	 * input leaves it unset and keeps the hold.
+	 */
+	origin?: InputOrigin;
 }
 
 /**

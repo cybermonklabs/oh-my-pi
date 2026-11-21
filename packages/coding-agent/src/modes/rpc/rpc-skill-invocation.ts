@@ -13,6 +13,7 @@ import {
 	type SkillRediscoverySource,
 } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
+import type { InputOrigin } from "../../session/agent-session-types";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../../session/messages";
 
 export type RpcSkillCommandSession = Pick<
@@ -52,6 +53,8 @@ export interface RpcSkillCommandOptions {
 	images?: ImageContent[];
 	/** Caller correlation id recorded as `tag` on the skill prompt message. */
 	tag?: string;
+	/** `"outside"` when a person or a client sent the invocation: it ends the session's cyber-policy hold. */
+	origin?: InputOrigin;
 }
 
 /**
@@ -66,7 +69,7 @@ export async function runRpcSkillCommand(
 	invocation: RpcSkillInvocation,
 	options: RpcSkillCommandOptions = {},
 ): Promise<boolean> {
-	const { streamingBehavior = "steer", prebuilt, onPromptAdmitted, images, tag } = options;
+	const { streamingBehavior = "steer", prebuilt, onPromptAdmitted, images, tag, origin } = options;
 	const built = prebuilt ?? (await session.buildUserSkillPrompt(invocation.skill, invocation));
 	return session.promptCustomMessage(
 		{
@@ -77,6 +80,6 @@ export async function runRpcSkillCommand(
 			attribution: "user",
 			...(tag !== undefined && { tag }),
 		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
+		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted, origin },
 	);
 }

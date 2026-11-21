@@ -1716,6 +1716,8 @@ export class SelectorController {
 							summarize: wantsSummary,
 							customInstructions,
 							allowAskReopen: true,
+							// A person's `/tree` pick: input from outside the session.
+							origin: "outside",
 						});
 
 						// Selecting an `ask` toolResult doesn't land the leaf directly —
@@ -1732,6 +1734,7 @@ export class SelectorController {
 								customInstructions,
 								allowAskReopen: true,
 								reanswerAskResult: reanswer,
+								origin: "outside",
 							});
 						}
 

@@ -334,6 +334,7 @@ export default function (pi: ExtensionAPI) {
 - `deliverAs: "nextTurn"` — kept out of the editable pending-message UI; while streaming it waits for the next turn, and when idle without `triggerTurn` it is appended to context/history without starting a turn
 - `deliverAs: "aside"` — injected at the next agent step boundary without interrupting the current tool batch, except that it ends a running interruptible `wait` (the wait returns "Wait interrupted by message." and its job keeps running); when idle it normally starts a turn regardless of `triggerTurn`. Plan mode or user-interrupt auto-resume suppression folds it into context instead
 - `triggerTurn: true` — starts a turn when idle (also honored with `deliverAs: "nextTurn"`: idle prompts immediately; while streaming the queued message schedules an internal continuation)
+- `origin: "outside"` — the message relays input from outside the session: a person, or a harness on their behalf (for example a person's turn delivered from a chat or ticket system). Only such input ends the session's cyber-policy hold (an OpenAI `cyber_policy` refusal holds OpenAI's routes until input from outside the root session arrives). Leave it unset for messages the extension makes itself or relays from another agent. An omp without the option ignores it
 
 When idle without `triggerTurn`, ordinary `sendMessage` delivery appends the
 message without starting a turn. A `display: true` message is rendered
@@ -348,9 +349,9 @@ queues the prompt even when idle instead of starting a turn directly. `"aside"`
 injects at the next step boundary while a run is live and starts a turn when
 idle. The message is recorded with `attribution: "user"` unless you pass
 `attribution: "agent"`; use `"agent"` for text the extension generated or relayed
-from another agent.
+from another agent. `origin: "outside"` works as for `sendMessage`.
 
-`pi.sendUserInput(text, { deliverAs, tag })` runs text as if the user typed it, the way RPC mode runs a `prompt` command, and resolves with how it was handled:
+`pi.sendUserInput(text, { deliverAs, tag, origin })` runs text as if the user typed it, the way RPC mode runs a `prompt` command, and resolves with how it was handled:
 
 - Extension `input` handlers run first, as for typed input (see "External input interception"), with `source: "extension"`; one that consumes the text, or leaves no text and no images, sends nothing → `{ handled: "command" }`, and text or images it substitutes are what the steps below dispatch.
 - `/skill:<name>` is submitted as the user's skill prompt → `{ handled: "skill" }`.
@@ -359,6 +360,8 @@ from another agent.
 - A host that does not wire the action answers `{ handled: "unavailable" }`, and so does the interactive TUI while the session is joined to a collab session as a guest, where extension-initiated turns are host-only; nothing is sent or run.
 
 `deliverAs` picks how a submitted message queues while the agent is streaming (default steer, like Enter); an idle session starts a turn either way. `tag` is recorded on the message the input submits (the user message, or the skill prompt message) and so appears on its `message_start`/`message_end` events and in the session file, letting a bridge match the message to the input it forwarded. `listUserInputBuiltinCommands()` (exported from `extensibility/extensions/send-user-input-handler`) lists the built-ins with a `terminalOnly` flag, for completion. SDK embedders that build their own `ExtensionActions` can wire the optional `sendUserInput` action with `sendSessionUserInput(session, text, options, host)` from the same module, where `host` is the `SlashCommandHost` (`slash-commands/types`) their own built-in dispatch uses; without one, a built-in's output only returns to the extension.
+
+`origin: "outside"` marks the text as a person's own input that the extension relays, such as a bridge's typed Send. As with `sendMessage`, only such input ends the session's cyber-policy hold: the prompt it submits, a skill, a built-in (and the prompt a built-in submits) all carry it. Leave it unset for input the extension makes itself.
 
 Tagged input waiting in the queue is never handed back as editable text, since the editor and RPC clients carry only text and the tag would be lost. It still shows as a queue chip, but Alt+Up steps over it and RPC `remove_queued_message` does not match it, so it stays queued and is delivered with its tag. When the person interrupts (Esc, or RPC `abort_and_restore_queue`), the abort records it in the transcript without starting a turn, tag included, so the bridge can still match it.
 

@@ -1,5 +1,6 @@
 import { type Api, IMAGE_GENERATION_APIS, type ImageGenerationApi, type Model } from "@oh-my-pi/pi-catalog/types";
 import * as AIError from "../error";
+import { guardModelRequest } from "../model-call-guard";
 import { assertProviderEnabled } from "../registry/oauth";
 import { isFactoryDroidModel } from "../providers/factory-droid";
 import { generateFactoryDroidImage } from "./factory-droid";
@@ -25,7 +26,10 @@ export function isImageGenerationApi(api: Api): api is ImageGenerationApi {
 	return (IMAGE_GENERATION_APIS as readonly Api[]).includes(api);
 }
 
-/** Generate (or edit, when `request.inputImages` is set) images through the transport selected by the model's `api`. */
+/**
+ * Generate (or edit, when `request.inputImages` is set) images through the transport selected by the
+ * model's `api`. The prompt is model-written text, so the request passes the process's model-call guard.
+ */
 export async function generateImage(
 	model: Model<Api>,
 	request: ImageGenerationRequest,
@@ -33,6 +37,14 @@ export async function generateImage(
 ): Promise<ImageGenerationResult> {
 	// A provider turned off in its auth rules is never called, even with a key passed in directly.
 	assertProviderEnabled(model.provider);
+	return guardModelRequest(model, () => dispatchImage(model, request, options));
+}
+
+function dispatchImage(
+	model: Model<Api>,
+	request: ImageGenerationRequest,
+	options: ImageGenerationOptions,
+): Promise<ImageGenerationResult> {
 	if (isFactoryDroidModel(model)) return generateFactoryDroidImage(model, request, options);
 	switch (model.api) {
 		case "openai-images":

@@ -25,6 +25,7 @@ import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { ArtifactManagerApi } from "../session/artifacts";
 import type { CostGateApi } from "../session/cost-gate";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
 import { revivePersistedPlaced } from "../thread/executor-routing";
@@ -101,6 +102,7 @@ export interface PersistedReviveSpec {
 	/** Registry id of {@link root}. */
 	readonly rootAgentId: string;
 	readonly costGate: CostGateApi;
+	readonly cyberPolicyClosure: CyberPolicyClosureApi;
 	readonly asyncJobManager: AsyncJobManagerApi | undefined;
 	/** The root's artifact manager at revive time; a revived non-seance agent adopts it. */
 	readonly artifactManager: ArtifactManagerApi | undefined;
@@ -225,6 +227,7 @@ export function createPersistedSubagentReviverFactory(
 				root: ctx.session,
 				rootAgentId: ctx.session.getAgentId?.() ?? MAIN_AGENT_ID,
 				costGate: ctx.session.costGate,
+				cyberPolicyClosure: ctx.session.cyberPolicyClosure,
 				asyncJobManager: ctx.session.asyncJobManager,
 				artifactManager: ctx.session.sessionManager.getArtifactManager() ?? undefined,
 				preparedExtensions: ctx.session.preparedExtensions,
@@ -436,6 +439,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		({ session } = await createAgentSession({
 			cwd: restoredSeance?.cwd ?? spec.root.sessionManager.getCwd(),
 			costGate: spec.costGate,
+			cyberPolicyClosure: spec.cyberPolicyClosure,
 			authStorage: spec.authStorage,
 			// Revived agents join the root session tree, so their observability
 			// frames ride the same bus the RPC/collab surfaces subscribed to.

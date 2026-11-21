@@ -26,6 +26,7 @@ import type { Api, FetchImpl } from "@oh-my-pi/pi-catalog/types";
 import { $env, isRecord, parseImageMetadata } from "@oh-my-pi/pi-utils";
 import { type ApiKey, withAuth } from "../auth-retry";
 import * as AIError from "../error";
+import { guardModelRequest } from "../model-call-guard";
 import { validateImageInput } from "../images/shared";
 import { withInferenceUserAgent } from "../providers/inference-headers";
 import { redactSensitiveInObject } from "../providers/transform-messages";
@@ -198,6 +199,8 @@ export interface NativeJudgeOptions extends NativeJudgeConnection {
 	imageInput?: JudgmentImageInput;
 	/** Fields merged over every encoded request body (e.g. OpenRouter `provider` routing preferences). */
 	extraBody?: Record<string, unknown>;
+	/** The catalog model this judge asks; when set, each judgment passes the process's model-call guard. */
+	catalogModel?: Model;
 }
 
 /** Per-call options for {@link NativeJudge.judge}. */
@@ -337,6 +340,7 @@ export class NativeJudge implements Judge {
 	readonly #maxQuestions: number | undefined;
 	readonly #imageInput: JudgmentImageInput | undefined;
 	readonly #extraBody: Record<string, unknown> | undefined;
+	readonly #catalogModel: Model | undefined;
 
 	constructor(options: NativeJudgeOptions) {
 		this.#apiKey = options.apiKey;
@@ -354,12 +358,22 @@ export class NativeJudge implements Judge {
 		this.#maxQuestions = options.maxQuestions;
 		this.#imageInput = options.imageInput;
 		this.#extraBody = options.extraBody;
+		this.#catalogModel = options.catalogModel;
 		const optedIntoImages = options.supportsImages ?? this.#wire.imagesRequireOptIn !== true;
 		if (this.#wire.images !== undefined && optedIntoImages) this.supportsImages = true;
 		this.label = `${this.provider}/${this.model}`;
 	}
 
-	async judge<Q extends Questions>(
+	judge<Q extends Questions>(
+		request: JudgmentRequest<Q>,
+		options?: NativeJudgeCallOptions,
+	): Promise<JudgmentResult<Q>> {
+		// The state carries the session's text: a catalog model's judgment passes the model-call guard.
+		const model = this.#catalogModel;
+		return model ? guardModelRequest(model, () => this.#judge(request, options)) : this.#judge(request, options);
+	}
+
+	async #judge<Q extends Questions>(
 		request: JudgmentRequest<Q>,
 		options?: NativeJudgeCallOptions,
 	): Promise<JudgmentResult<Q>> {
@@ -572,6 +586,7 @@ export function createNativeJudge(model: Model, connection: NativeJudgeConnectio
 		supportsImages: nativeJudgmentSupportsImages(model),
 		imageInput: resolveJudgmentImageInput(model),
 		extraBody: openRouterDecisionsBody(model),
+		catalogModel: model,
 	});
 }
 
