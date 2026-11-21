@@ -19,10 +19,11 @@
  *   value shorter than a positive default for the login ends none, and with a
  *   longer one the default still ends it. Both run only when
  *   `OMP_TEST_SQL_POSTGRES_URL` (the store's database, on PostgreSQL directly)
- *   and `OMP_TEST_SQL_POSTGRES_ADMIN_URL` (the same database, as a login that
- *   may alter the defaults of the store's login there: that login itself or a
- *   superuser) are set. The file then reads the store's server once, when it
- *   loads, since Bun skips a case only on what it knows then. Both are skipped,
+ *   is set. `OMP_TEST_SQL_POSTGRES_ADMIN_URL`, when set, is the same database
+ *   as a login that may alter the defaults of the store's login there (a
+ *   superuser); without it the store's own login alters its own. The file
+ *   then reads the store's server once, when it loads, since Bun skips a case
+ *   only on what it knows then. Both are skipped,
  *   and the file logs why once, when the store's URL does not reach PostgreSQL
  *   directly (through a pooler such as PgBouncer a new connection can get a
  *   server connection that started with another default, and the store's
@@ -1812,6 +1813,29 @@ interface StoreServer {
 	readonly unfit?: string;
 }
 
+/**
+ * Resets the `transaction_timeout` default of the store's login in its database (`target`) when one is set. The
+ * server cases set that default and reset it in a `finally`, so a run stopped between the two leaves it, and every
+ * later connection of that login there runs under it. Returns the value it reset. The admin URL's login resets it
+ * when that URL is set, else the store's own: a login may alter its own defaults.
+ */
+async function resetLeftoverLoginDefault(sql: SQL, target: string): Promise<string | undefined> {
+	const [left] = (await sql.unsafe(
+		"SELECT setting FROM pg_catalog.pg_db_role_setting AS s, pg_catalog.unnest(s.setconfig) AS setting" +
+			" WHERE s.setrole = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = session_user)" +
+			" AND s.setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())" +
+			" AND setting LIKE 'transaction\\_timeout=%'",
+	)) as Array<{ setting: string }>;
+	if (left === undefined) return undefined;
+	const admin = ADMIN_URL ? new SQL(ADMIN_URL, { max: 1, connectionTimeout: 5 }) : sql;
+	try {
+		await admin.unsafe(`ALTER ROLE ${target} RESET transaction_timeout`);
+	} finally {
+		if (admin !== sql) await admin.close();
+	}
+	return left.setting.slice("transaction_timeout=".length);
+}
+
 async function readStoreServer(url: string): Promise<StoreServer> {
 	// A server that never answers holds the file's load 5 s at most, well under the cases' 30 s.
 	const sql = new SQL(url, { max: 1, connectionTimeout: 5 });
@@ -1824,6 +1848,10 @@ async function readStoreServer(url: string): Promise<StoreServer> {
 		if (!direct) return { target, unfit: "OMP_TEST_SQL_POSTGRES_URL does not reach PostgreSQL directly" };
 		const version = Number(where?.version);
 		if (version < 170000) return { target, unfit: `server_version_num ${version} is older than PostgreSQL 17` };
+		// Cleared before any case or other file of this run reads a connection of that login.
+		const leftover = await resetLeftoverLoginDefault(sql, target);
+		if (leftover !== undefined)
+			console.log(`transaction_timeout cases reset a login default a stopped run left: ${leftover}`);
 		return { target };
 	} finally {
 		await sql.close();
@@ -1831,20 +1859,19 @@ async function readStoreServer(url: string): Promise<StoreServer> {
 }
 
 /**
- * The store's server, read once when the file loads and only when both URLs
- * are set. A read no server answers keeps its error, which fails the two
+ * The store's server, read once when the file loads and only when the store's
+ * URL is set. A read no server answers keeps its error, which fails the two
  * server cases alone: the file still loads and every other case runs.
  */
-const storeServer: { readonly read: StoreServer } | { readonly failed: unknown } | undefined =
-	STORE_URL && ADMIN_URL
-		? await readStoreServer(STORE_URL).then(
-				read => ({ read }),
-				(failed: unknown) => ({ failed }),
-			)
-		: undefined;
+const storeServer: { readonly read: StoreServer } | { readonly failed: unknown } | undefined = STORE_URL
+	? await readStoreServer(STORE_URL).then(
+			read => ({ read }),
+			(failed: unknown) => ({ failed }),
+		)
+	: undefined;
 const unfit = storeServer && "read" in storeServer ? storeServer.read.unfit : undefined;
 if (unfit) console.log(`transaction_timeout cases skipped: ${unfit}`);
-/** Neither URL or one of them unset, or a server the cases cannot use. */
+/** The store's URL unset, or a server the cases cannot use. */
 const skipServerCases = !storeServer || unfit !== undefined;
 
 /** What a server case runs on: a store of {@link LeaseDb}'s tables that wrote {@link FILE}. */
@@ -1870,12 +1897,13 @@ async function withLeftTimeout(
 	left: string,
 	check: (setup: LeftTimeout) => Promise<void>,
 ): Promise<void> {
-	if (!storeServer) throw new Error("set OMP_TEST_SQL_POSTGRES_URL and OMP_TEST_SQL_POSTGRES_ADMIN_URL");
+	if (!storeServer) throw new Error("set OMP_TEST_SQL_POSTGRES_URL");
 	if ("failed" in storeServer) throw storeServer.failed;
 	const { target } = storeServer.read;
 	const storeUrl = STORE_URL ?? "";
 	await using db = await openLeaseDb("postgres", storeUrl);
-	const admin = new SQL(ADMIN_URL ?? "", { max: 2 });
+	// The admin URL's login, else the store's own: a login may alter its own defaults.
+	const admin = new SQL(ADMIN_URL ?? storeUrl, { max: 2 });
 	let client: SQL | undefined;
 	let storage: SqlSessionStorage | undefined;
 	const held: Array<Promise<void>> = [];
@@ -1970,6 +1998,42 @@ describe("on a PostgreSQL server", () => {
 				expect(reservations.slice(from)).toEqual([{ releases: 0, closes: 1 }]);
 				expect(await db.row(FILE)).toEqual(stored);
 			}),
+		30_000,
+	);
+
+	it.skipIf(skipServerCases)(
+		"transaction_timeout: a login default a stopped run left is reset when the file loads",
+		async () => {
+			if (!storeServer || "failed" in storeServer) throw new Error("the store's server was not read");
+			const { target } = storeServer.read;
+			const storeUrl = STORE_URL ?? "";
+			const admin = new SQL(ADMIN_URL ?? storeUrl, { max: 1 });
+			const probe = new SQL(storeUrl, { max: 1 });
+			/** `transaction_timeout` on a connection of the store's login opened now. */
+			const shown = async (): Promise<unknown> => {
+				const fresh = new SQL(storeUrl, { max: 1 });
+				try {
+					const [row] = (await fresh.unsafe("SHOW transaction_timeout")) as Array<Record<string, unknown>>;
+					return row?.transaction_timeout;
+				} finally {
+					await fresh.close();
+				}
+			};
+			try {
+				// The server's own value, which its configuration or a database or role-wide default may set.
+				const before = await shown();
+				// What a run stopped between a case's ALTER ROLE … SET and its RESET leaves.
+				await admin.unsafe(`ALTER ROLE ${target} SET transaction_timeout = '1s'`);
+				expect(await shown()).toBe("1s");
+				expect(await resetLeftoverLoginDefault(probe, target)).toBe("1s");
+				expect(await resetLeftoverLoginDefault(probe, target)).toBeUndefined();
+				expect(await shown()).toBe(before);
+			} finally {
+				await admin.unsafe(`ALTER ROLE ${target} RESET transaction_timeout`).catch(() => undefined);
+				await probe.close();
+				await admin.close();
+			}
+		},
 		30_000,
 	);
 });

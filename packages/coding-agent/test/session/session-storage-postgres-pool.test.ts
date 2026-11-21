@@ -3,6 +3,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
 import { SQL } from "bun";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { POSTGRES_TRANSACTION_POOLER } from "./sql-session-lease-fixture";
 
 const POSTGRES_DSN = process.env.OMP_TEST_POSTGRES_DSN;
 const POOL_MAX = 2;
@@ -45,7 +46,9 @@ async function waitForConnectionCount(monitor: SQL, applicationName: string, exp
 	throw new Error(`timed out waiting for ${expected} PostgreSQL connections for ${applicationName}`);
 }
 
-describe.skipIf(!POSTGRES_DSN)("SQL session storage PostgreSQL pool", () => {
+// Direct connection only: it counts the client's own server connections, which a transaction pooler replaces with
+// its own.
+describe.skipIf(!POSTGRES_DSN || POSTGRES_TRANSACTION_POOLER)("SQL session storage PostgreSQL pool", () => {
 	it("bounds connections, releases them when idle, and writes after the server terminates them", async () => {
 		const { applicationName, dsn } = connectionDsn();
 		const monitor = new SQL(POSTGRES_DSN as string, { max: 1 });

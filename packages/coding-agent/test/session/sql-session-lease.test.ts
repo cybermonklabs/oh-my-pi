@@ -30,6 +30,7 @@ import {
 	MYSQL57_URL,
 	MYSQL_ROT_URL,
 	openLeaseDb,
+	POSTGRES_TRANSACTION_POOLER,
 	ROW_LEASE_BACKENDS,
 	rejection,
 	reserveWrapped,
@@ -822,7 +823,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			30_000,
 		);
 
-		it.skipIf(adapter !== "postgres")(
+		// Direct connection only: its premise is a session-level SET on its one connection that the store's later
+		// transactions meet, which a transaction pooler does not keep, and the SET would stay on a pooled connection.
+		it.skipIf(adapter !== "postgres" || POSTGRES_TRANSACTION_POOLER)(
 			"refreshes through a pooled read-only connection without a refused heartbeat statement",
 			async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
@@ -874,7 +877,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			30_000,
 		);
 
-		it.skipIf(adapter !== "postgres")(
+		// Direct connection only: its premise is the connection's own start parameter, which a transaction pooler
+		// does not pass on.
+		it.skipIf(adapter !== "postgres" || POSTGRES_TRANSACTION_POOLER)(
 			"keeps the connection's own lock_timeout for the rest of a write after its fence",
 			async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
