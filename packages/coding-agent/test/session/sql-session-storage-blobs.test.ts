@@ -127,16 +127,26 @@ function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessio
 	};
 }
 
+/** One statement a tracked client has sent and has no answer to yet. */
+interface InFlight {
+	query: string;
+	at: number;
+	connection: number;
+}
+
 /**
- * `client` (MySQL or MariaDB), and the statement of its transactions it waits on: the last one sent whose answer has
- * not come, with the server's id of the connection it runs on. Each transaction first reads `CONNECTION_ID()`, which
- * reads no table, so it opens no read view and takes no lock.
+ * `client` (MySQL or MariaDB), and the statements of its transactions it waits on: every one sent whose answer has
+ * not come, each with the server's id of the connection it runs on. Each transaction first reads `CONNECTION_ID()`,
+ * which reads no table, so it opens no read view and takes no lock.
  */
 function inFlightClient(client: SqlSessionStorageClient): {
 	client: SqlSessionStorageClient;
+	/** The latest statement in flight, and how long it has been. */
 	waiting(): { query: string; ms: number; connection: number } | undefined;
+	/** Every statement in flight. */
+	inFlight(): InFlight[];
 } {
-	let current: { query: string; at: number; connection: number } | undefined;
+	const sent = new Set<InFlight>();
 	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => {
 		let connection: number | undefined;
 		return {
@@ -146,11 +156,11 @@ function inFlightClient(client: SqlSessionStorageClient): {
 					connection = Number(row?.id);
 				}
 				const mine = { query, at: performance.now(), connection };
-				current = mine;
+				sent.add(mine);
 				try {
 					return await executor.unsafe(query, values);
 				} finally {
-					if (current === mine) current = undefined;
+					sent.delete(mine);
 				}
 			},
 		};
@@ -163,11 +173,62 @@ function inFlightClient(client: SqlSessionStorageClient): {
 			end: () => client.end?.() ?? Promise.resolve(),
 			...reserveWrapped(client, wrap),
 		},
-		waiting: () =>
-			current
-				? { query: current.query, ms: performance.now() - current.at, connection: current.connection }
-				: undefined,
+		waiting: () => {
+			const latest = [...sent].at(-1);
+			return latest
+				? { query: latest.query, ms: performance.now() - latest.at, connection: latest.connection }
+				: undefined;
+		},
+		inFlight: () => [...sent],
 	};
+}
+
+/** What a statement of a rename or delete waits in: its locking read ("lock"), its `UPDATE`, or the statement. */
+function waitedIn(query: string): string {
+	if (/^UPDATE\b/i.test(query)) return "update";
+	if (/\bFOR UPDATE$/i.test(query)) return "lock";
+	return query.slice(0, 80);
+}
+
+/**
+ * Waits until the server reports a transaction of `tracked` in `LOCK WAIT` on its own connection, and answers the
+ * statement it waits in (see {@link waitedIn}). Once `settled` has settled first, answers "none"; once `ms` have passed
+ * first, answers "none" with what it saw: the statements in flight by connection, and every transaction on the
+ * server with its connection, state and statement.
+ */
+async function lockWaitOf(
+	db: LeaseDb,
+	tracked: ReturnType<typeof inFlightClient> | undefined,
+	settled: Promise<unknown>,
+	ms = 4000,
+): Promise<string> {
+	let done = false;
+	settled.then(
+		() => {
+			done = true;
+		},
+		() => {
+			done = true;
+		},
+	);
+	const until = Date.now() + ms;
+	let seen: Array<{ id?: unknown; state?: unknown; query?: unknown }> = [];
+	while (Date.now() < until && !done) {
+		// InnoDB answers INFORMATION_SCHEMA.INNODB_TRX from a cache it refills only when nothing read it in the last
+		// 100 ms (trx0i_s.cc, can_cache_be_updated), so reads closer than that see the same old rows: 150 ms apart.
+		await Bun.sleep(150);
+		if (done) break;
+		seen = (await db.sql(
+			"SELECT trx_mysql_thread_id AS id, trx_state AS state, LEFT(trx_query, 60) AS query FROM information_schema.INNODB_TRX",
+		)) as typeof seen;
+		const waitingThreads = seen.filter(row => row.state === "LOCK WAIT").map(row => Number(row.id));
+		const waiting = (tracked?.inFlight() ?? []).find(entry => waitingThreads.includes(entry.connection));
+		if (waiting) return waitedIn(waiting.query);
+	}
+	if (done) return "none";
+	const sent = (tracked?.inFlight() ?? []).map(entry => `${entry.connection}: ${entry.query.slice(0, 60)}`);
+	const server = seen.map(row => `${String(row.id)} ${String(row.state)}: ${String(row.query)}`);
+	return `none (in flight: ${JSON.stringify(sent)}; server: ${JSON.stringify(server)})`;
 }
 
 async function blobHashes(db: LeaseDb): Promise<string[]> {
@@ -1545,7 +1606,14 @@ describe("session blobs in the SQL session storage", () => {
 							return gate.client;
 						},
 					});
-					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
+					let trackedDeleter: ReturnType<typeof inFlightClient> | undefined;
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							trackedDeleter = inFlightClient(deadlockLog(client, deadlocks));
+							return trackedDeleter.client;
+						},
+					});
 					const [a, b, c, d] = ["a", "b-dst", "c", "d-src"].map(name =>
 						db.dir.join("sessions", `${name}.jsonl`),
 					) as [string, string, string, string];
@@ -1565,21 +1633,30 @@ describe("session blobs in the SQL session storage", () => {
 					gate?.close();
 					const renaming = renamer.rename(d, b);
 					let deleting: Promise<void> | undefined;
+					let deleteWaits = "none";
 					try {
 						await Promise.race([gate?.paused(), renaming]);
 						deleting = deleter.deleteSessionWithArtifacts(a);
-						// A real wait: the delete's scan must reach the rename's row on the server before the UPDATE runs.
-						await Promise.race([deleting, Bun.sleep(1000)]);
+						// Where the delete's lock scans, it reaches D, which the rename holds, and waits: the server reports it.
+						// Where it is a range it never reaches D and ends without waiting.
+						deleteWaits = await lockWaitOf(db, trackedDeleter, deleting);
 					} finally {
 						gate?.open();
 					}
 					await Promise.all([renaming, deleting]);
 					expect({
+						deleteWaits,
 						paths: await db.paths(),
 						b: (await db.row(b))?.content,
 						c: (await db.row(c))?.content,
 						deadlocks: deadlocks.length,
-					}).toEqual({ paths: [b, c], b: moved, c: transcript(ID, "kept apart"), deadlocks: scans ? 1 : 0 });
+					}).toEqual({
+						deleteWaits: scans ? "lock" : "none",
+						paths: [b, c],
+						b: moved,
+						c: transcript(ID, "kept apart"),
+						deadlocks: scans ? 1 : 0,
+					});
 				},
 			);
 
@@ -1659,7 +1736,8 @@ describe("session blobs in the SQL session storage", () => {
 								lockWaits = Number(row?.n ?? 0);
 								if (lockWaits > 0) break;
 							}
-							await Bun.sleep(25);
+							// INNODB_TRX's cache refills only after 100 ms without a read (see lockWaitOf).
+							await Bun.sleep(150);
 						}
 						waitedForTheDelete = !settled;
 					} finally {
@@ -1706,7 +1784,14 @@ describe("session blobs in the SQL session storage", () => {
 							return gate.client;
 						},
 					});
-					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
+					let trackedDeleter: ReturnType<typeof inFlightClient> | undefined;
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							trackedDeleter = inFlightClient(deadlockLog(client, deadlocks));
+							return trackedDeleter.client;
+						},
+					});
 					// In path order: a, then a's directory, then a7-dst (no row), then b-src, then c.
 					const [a, into, first, c] = ["a", "a7-dst", "b-src", "c"].map(name =>
 						db.dir.join("sessions", `${name}.jsonl`),
@@ -1720,21 +1805,92 @@ describe("session blobs in the SQL session storage", () => {
 					gate?.close();
 					const renaming = renamer.rename(first, into);
 					let deleting: Promise<void> | undefined;
+					let deleteWaits = "none";
 					try {
 						await Promise.race([gate?.paused(), renaming]);
 						deleting = deleter.deleteSessionWithArtifacts(a);
-						// A real wait: the delete's lock must reach the rename's source on the server before the UPDATE runs.
-						await Promise.race([deleting, Bun.sleep(1000)]);
+						// The delete's lock must reach b-src, which the rename holds, before the UPDATE runs: the server
+						// reports the delete's transaction waiting on its own connection.
+						deleteWaits = await lockWaitOf(db, trackedDeleter, deleting);
 					} finally {
 						gate?.open();
 					}
 					await Promise.all([renaming, deleting]);
 					expect({
+						deleteWaits,
 						paths: await db.paths(),
 						into: (await db.row(into))?.content,
 						c: (await db.row(c))?.content,
 						deadlocks: deadlocks.length,
-					}).toEqual({ paths: [into, c], into: moved, c: transcript(ID, "kept apart"), deadlocks: 1 });
+					}).toEqual({
+						deleteWaits: "lock",
+						paths: [into, c],
+						into: moved,
+						c: transcript(ID, "kept apart"),
+						deadlocks: 1,
+					});
+				},
+			);
+
+			// A move of a session also renames the rows inside its own artifacts directory: under SQL storage moveTo
+			// carries its subagent transcripts and its draft (moveTranscriptTree), one rename each. A delete of that
+			// session with its artifacts locks those rows too, so it waits for such a rename until it commits; then the
+			// row is outside the directory, and the delete leaves it. Here the rename a/sub → z-moved/a/sub is paused
+			// before its UPDATE, holding a/sub, and its destination sorts past every row, in no gap the delete holds:
+			// one side waits, and nothing deadlocks, on a range as on a scan.
+			it.skipIf(adapter !== "mysql")(
+				"makes a delete with artifacts wait for a rename of a row inside a deleted artifacts directory, and leaves the row where the rename put it",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					let gate: GatedClient | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								deadlockLog(client, deadlocks),
+								new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`),
+								"before",
+							);
+							return gate.client;
+						},
+					});
+					let trackedDeleter: ReturnType<typeof inFlightClient> | undefined;
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							trackedDeleter = inFlightClient(deadlockLog(client, deadlocks));
+							return trackedDeleter.client;
+						},
+					});
+					const a = db.dir.join("sessions", "a.jsonl");
+					const inside = db.dir.join("sessions", "a", "sub.jsonl");
+					const c = db.dir.join("sessions", "c.jsonl");
+					const away = db.dir.join("z-moved", "a", "sub.jsonl");
+					const sub = transcript(ID, "a subagent");
+					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
+					await renamer.writeText(inside, sub);
+					await renamer.drain();
+					await deleter.refresh();
+
+					gate?.close();
+					const renaming = renamer.renameNoReplace(inside, away);
+					let deleting: Promise<void> | undefined;
+					let deleteWaits = "none";
+					try {
+						await Promise.race([gate?.paused(), renaming]);
+						deleting = deleter.deleteSessionWithArtifacts(a);
+						deleteWaits = await lockWaitOf(db, trackedDeleter, deleting);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([renaming, deleting]);
+					expect({
+						deleteWaits,
+						paths: await db.paths(),
+						away: (await db.row(away))?.content,
+						deadlocks: deadlocks.length,
+					}).toEqual({ deleteWaits: "lock", paths: [c, away], away: sub, deadlocks: 0 });
 				},
 			);
 
