@@ -498,10 +498,21 @@ run_cargo() {
 		done <"$tmp/cargo-targets.tsv"
 	done <"$tmp/cargo-workspaces.txt"
 	[ "$n" != 0 ] || stop "$sami/rust-test-cargo-workspaces.txt names no workspace with a test target"
-	awk -F'\t' '$2 == "rust_doc_test rule" { d = $1; sub(/^\/\//, "", d); sub(/:.*/, "", d); print d }' "$rows" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
+	# The crates whose doctests run again under cargo: those with a Bazel
+	# doctest target, from this run's rows (Linux) or, when this run ran no
+	# doctest target (RUST_TEST_ONLY, the macOS job), from bazel query.
+	if [ -z "$only" ]; then
+		awk -F'\t' '$2 == "rust_doc_test rule" { d = $1; sub(/^\/\//, "", d); sub(/:.*/, "", d); print d }' "$rows" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
+	else
+		bazelisk query --output=label 'kind("rust_doc_test rule", //crates/...) - attr(tags, "manual", //crates/...)' >"$tmp/doc-targets.txt" || stop "bazel query for the doctest targets failed"
+		sed -e 's|^//||' -e 's|:.*||' "$tmp/doc-targets.txt" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
+	fi
 	while read -r dir; do
 		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc --
 	done <"$tmp/doc-dirs.txt"
+	# The #[ignore]d cargo tests run alone on Linux, where the network can be
+	# taken away (rust-test-offline.sh).
+	[ -z "$only" ] || return 0
 	for i in "${!ignored_cargo[@]}"; do
 		IFS=$'\t' read -r target test <<<"${ignored_cargo[$i]}"
 		dir="${target%%:*}"
@@ -541,8 +552,10 @@ check_results_exist() {
 	done < <(LC_ALL=C comm -23 "$tmp/test-targets.txt" "$tmp/with-result.txt")
 }
 
+# The cargo workspaces and the cargo doctests run in both jobs: on macOS,
+# that is how a cargo test or a doctest compiled only there runs.
+run_cargo
 if [ -z "$only" ]; then
-	run_cargo
 	for i in "${!ignored_cargo[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_cargo[$i]}"
 		check_alone "Ignored cargo test" "ignored-cargo-$i" "$target" "$name"
@@ -681,6 +694,13 @@ check_libtest() {
 			# Its #[ignore]d tests (and ```ignore doctests) ran nothing; they
 			# are reconciled below.
 			jq -R -r --arg target "$label" 'fromjson? | select(type == "object" and .type == "test" and .event == "ignored") | "\($target)\t\(.name)"' "$log" >>"$tmp/cargo-ignored.tsv"
+			# A crate's cargo doctests that ran, against its Bazel doctests
+			# (below).
+			case "$label" in
+				*:doc)
+					jq -R -r --arg dir "$(doc_dir "$label")" 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed")) | "\($dir)\t\(.name)"' "$log" >>"$tmp/doc-names-cargo.tsv"
+					;;
+			esac
 			;;
 		ignored-cargo-*) scan_output "$label" "$log" "$log.err" ;;
 		*) scan_output "$label" "$log" ;;
@@ -708,8 +728,9 @@ check_libtest() {
 # summary must be `test result: ok.`. A failed one ends with `failures:`,
 # each failed doctest indented four spaces, a blank line and `test result:
 # FAILED.`. No doctest may be filtered out: no list names one. An ```ignore
-# doctest runs nothing, so each `test <name> ... ignored` line fails the job,
-# and so does an ignored count with no such line.
+# block is no test: each `test <name> ... ignored` line is counted apart (an
+# ignored count whose names the log does not give fails). The doctests that
+# ran are compared with cargo's re-run of the same crate (below).
 check_doctest() {
 	local label="$1" status="$2" kind="$3" log="$4" counts header summed verdict filtered ignored names name
 	counts="$(awk '
@@ -737,6 +758,7 @@ check_doctest() {
 	if [ "$ignored" != 0 ] && [ ! -s "$tmp/doctest-ignored.txt" ]; then
 		error "Rust test skips" "$label's summary counts $ignored ignored doctests, and its log names none"
 	fi
+	awk -v dir="$(doc_dir "$label")" '/^test .* \.\.\. (ok|FAILED)$/ { sub(/^test /, ""); sub(/ \.\.\. (ok|FAILED)$/, ""); if (index($0, dir "/") == 1) $0 = substr($0, length(dir) + 2); print dir "\t" $0 }' "$log" >>"$tmp/doc-names-bazel.tsv"
 	if [ "$kind" = passed ]; then
 		if [ "$verdict" != ok ]; then
 			error "Rust tests" "$label is $status, but its log's last summary is not 'test result: ok.'"
@@ -777,7 +799,11 @@ while IFS=$'\t' read -r label name; do
 		*:doc | *:doc:*) doc_ignored cargo "$label" "$name" ;;
 		*)
 			if grep -qxF -- "$label"$'\t'"$name" "$tmp/ignored-cargo-listed.tsv"; then
-				echo "Ignored cargo test, run alone with --ignored: $label $name"
+				if [ -n "$only" ]; then
+					echo "Ignored cargo test, run alone with --ignored by the Linux job: $label $name"
+				else
+					echo "Ignored cargo test, run alone with --ignored: $label $name"
+				fi
 			else
 				error "Rust test skips" "$label $name is #[ignore]d and runs in no invocation: run it (name it in $sami/rust-test-ignored.txt)"
 			fi
@@ -790,6 +816,23 @@ while IFS=$'\t' read -r origin dir name; do
 done <"$tmp/doc-ignored.tsv"
 echo "::endgroup::"
 echo "\`\`\`ignore doc blocks, not tests, marked ignore by upstream: $(count "$tmp/doc-ignored.tsv")"
+
+# The cargo re-run reads each doctest's output, so it must have run the same
+# doctests as Bazel's doctest target of the crate (whose crate features can
+# differ from cargo's defaults): each crate's names, both ways, without the
+# crate's directory.
+if [ -z "$only" ]; then
+	touch "$tmp/doc-names-bazel.tsv" "$tmp/doc-names-cargo.tsv"
+	awk -F'\t' '{ d = $1; n = $2; if (index(n, d "/") == 1) n = substr(n, length(d) + 2); print d "\t" n }' "$tmp/doc-names-cargo.tsv" | LC_ALL=C sort -u >"$tmp/doc-cargo.tsv"
+	LC_ALL=C sort -u "$tmp/doc-names-bazel.tsv" >"$tmp/doc-bazel.tsv"
+	while IFS=$'\t' read -r dir name; do
+		error "Rust tests" "$dir $name ran in Bazel's doctest target and not in cargo's doctest run of $dir, whose output the skip scan reads: give cargo the same features"
+	done < <(LC_ALL=C comm -23 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
+	while IFS=$'\t' read -r dir name; do
+		error "Rust tests" "$dir $name ran in cargo's doctest run and not in Bazel's doctest target of $dir"
+	done < <(LC_ALL=C comm -13 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
+	echo "Doctests that ran in Bazel and in cargo's readable re-run: $(LC_ALL=C comm -12 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv" | awk 'END { print NR }')"
+fi
 
 # reconcile <found> <list> <listed> <noun> <verb> <title> <stale>: the tests
 # found (failed, skipped, printing) against a list, both ways. One found and
@@ -818,7 +861,7 @@ reconcile() {
 if [ -n "$only" ]; then
 	cut -f1,2 "$tmp/only-run.tsv" | LC_ALL=C sort -u >"$tmp/only-names.tsv"
 	for list in known-failures known-skips known-output; do
-		LC_ALL=C sort -u "$tmp/$list.tsv" | LC_ALL=C comm -12 - "$tmp/only-names.tsv" >"$tmp/$list.here"
+		{ LC_ALL=C sort -u "$tmp/$list.tsv" | LC_ALL=C comm -12 - "$tmp/only-names.tsv"; awk -F'\t' '$1 !~ /^\/\//' "$tmp/$list.tsv"; } | LC_ALL=C sort -u >"$tmp/$list.here"
 		mv "$tmp/$list.here" "$tmp/$list.tsv"
 	done
 fi

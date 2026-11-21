@@ -238,6 +238,8 @@ run() {
 	fi
 	printf '[toolchain]\nchannel = "nightly-2026-11-08"\n' >"$w/repo/rust-toolchain.toml"
 	printf '# list\n%s\n' "${CARGO_WS:-sdk/rust/demo/Cargo.toml  standalone}" >"$w/repo/.github/sami/rust-test-cargo-workspaces.txt"
+	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
+	if [ -n "${DOCQ:-}" ]; then printf '%s\n' "$DOCQ" >"$w/docquery.txt"; fi
 	cat >"$w/bin/bazelisk" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -252,6 +254,9 @@ if [ "\${args[0]}" = query ]; then
 	out=""
 	for a in "\${args[@]}"; do case "\$a" in --output=*) out="\${a#*=}" ;; esac; done
 	rc="\$(cat "\$W/query.rc" 2>/dev/null || echo 0)"
+	case "\${args[*]}" in
+		*rust_doc_test*) cat "\$W/docquery.txt" 2>/dev/null; exit "\$rc" ;;
+	esac
 	if [ "\$out" = label ]; then
 		if [ -f "\$W/query.txt" ]; then cat "\$W/query.txt"; else cat "\$W/bep.paths" | xargs cat | jq -r 'select(.id.testSummary) | .id.testSummary.label' | sort -u; fi
 	elif [ "\$out" = streamed_jsonproto ]; then
@@ -373,7 +378,9 @@ case "\$mode:\$sel" in
 	doc-skip:--doc) lt_out 'src/lib.rs - f (line 3)' 'skipped: no reference rsync\\n'; exit 0 ;;
 	doc-raw-skip:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nskipped: no reference rsync\n'; echo "a line on stderr" >&2; printf '{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "event": "started", "name": "src/lib.rs - g (line 9)" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	doc-raw-print:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nno free port: nothing to test\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
-	*:--doc) printf '{ "type": "suite", "event": "started", "test_count": 0 }\n{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
+	doc-empty:--doc) printf '{ "type": "suite", "event": "started", "test_count": 0 }\n{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
+	doc-extra:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "name": "src/lib.rs - h (line 20)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
+	*:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
 	*) lt_pass a::one a::two; exit 0 ;;
 esac
 EOF
@@ -463,7 +470,7 @@ run J35-query-empty 1 'bazel query names no test target' '' ": >\"\$W/query.txt\
 run J36-doctest-child-summary 1 'header plans 128 doctests and its last summary counts 1' '' "{ $P; dt $DOC PASSED printf 'running 128 tests\ntest a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'; } >\"\$bep\"; exit 0"
 run J37-doctest-no-header 1 'header plans -1 doctests' '' "{ $P; dt $DOC PASSED printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'; } >\"\$bep\"; exit 0"
 run J38-rust-test-text-child-summary 1 'holds no libtest record' '' "lt_cs_text() { FMT=text lt_child_summary; }; { $P; rt $D PASSED lt_cs_text; } >\"\$bep\"; exit 0"
-run J39-doctest-one-test-header 0 '' '' "{ $P; dt $DOC PASSED printf 'running 1 test\ntest a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'; } >\"\$bep\"; exit 0"
+run J39-doctest-one-test-header 0 '' '' "{ $P; dt $DOC PASSED printf 'running 1 test\ntest src/lib.rs - f (line 3) ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'; } >\"\$bep\"; exit 0"
 
 # The standalone cargo workspaces.
 run J40-cargo-ws-pass 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
@@ -597,6 +604,11 @@ CARGO_MODE=doc-raw-print run J111-doctest-raw-output 1 "crates/pi-diff:doc src/l
 run J107b-crate-doctests-run-under-cargo 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # B4: the listings the macOS job's inventory reads.
 run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# R3: cargo's readable doctest run must have run the same doctests as Bazel's
+# doctest target of the crate, both ways.
+CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=doc-extra run J114-cargo-doctest-without-bazel-counterpart 1 "crates/pi-diff src/lib.rs - h \\(line 20\\) ran in cargo's doctest run and not in Bazel's doctest target" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
@@ -610,6 +622,11 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$D m::langinfo" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="m::langinfo" run K4-only-canary-silent 1 "UNKNOWN: the canary $PR p::canary printed nothing" '' 'exit 9'
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" OWN_BODY="if [ \"\$OWN_TARGET\" = $D ]; then FMT=json rt $D FAILED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 2 }\n{ \"type\": \"test\", \"name\": \"m::langinfo\", \"event\": \"failed\", \"stdout\": \"left: 1\" }\n{ \"type\": \"test\", \"name\": \"m::strftime\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 3; fi; own_default" run K5-only-listed-test-fails 1 "$D m::langinfo failed and is not in" '' 'exit 9'
 ONLY="$ONLYT" OWN_TESTS="m::langinfo m::strftime" run K6-only-without-canary 1 'RUST_TEST_ONLY is set and RUST_TEST_CANARY is not' '' 'exit 9'
+# R2: the macOS job runs the cargo workspaces and the cargo doctests too, with
+# the same rules; the #[ignore]d cargo tests are left to the Linux job.
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" CARGO_MODE=fail-lib run K7-only-cargo-test-fails 1 "sdk/rust/demo:lib:demo demo::broken failed and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-skip run K8-only-cargo-doctest-skips 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" NOT_MSG='::error' run K9-only-cargo-ignored-left-to-linux 0 "Ignored cargo test, run alone with --ignored by the Linux job: sdk/rust/demo:test:wire a::slow" '' 'exit 9'
 
 # --- rust-test-macos-inventory.sh ------------------------------------------------
 # irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>
@@ -640,7 +657,7 @@ irun() {
 			[ -n "$label" ] || continue
 			i=$((i + 1))
 			# shellcheck disable=SC2086 # one line per test name
-			printf '%s\n' $tests | LC_ALL=C sort -u >"$w/linux/$i.txt"
+			if [ -n "$tests" ]; then printf '%s\n' $tests | LC_ALL=C sort -u >"$w/linux/$i.txt"; else : >"$w/linux/$i.txt"; fi
 			printf '%s\t%s.txt\n' "$label" "$i" >>"$w/linux/index.tsv"
 		done <<<"$linux"
 	fi
@@ -673,7 +690,17 @@ irun I3-named-test-in-no-mac-binary 1 "$T1 a::gone is in .github/sami/rust-test-
 irun I4-target-linux-did-not-list 0 "$T2 b::mac  compiled only on macOS" "$T1
 $T2" "$T1 a::one
 $T2 b::mac" "$T1 a::one" "$T1 a::one"
-irun I5-no-mac-binary 1 'UNKNOWN: no macOS test binary could be listed' "$T1" "" "$T1 a::one" ""
+irun I5-no-mac-binary 1 "$T1 has no macOS binary at .*, though bazel build passed" "$T1" "" "$T1 a::one" ""
+# R1: a macOS build failure, or one queried target without a binary, fails.
+BUILD_RC=1 irun I6-macos-build-fails 1 'bazel build of the test targets for macOS exited 1' "$T1" "$T1 a::one" "$T1 a::one" ""
+irun I7-one-target-without-mac-binary 1 "$T2 has no macOS binary at .*, though bazel build passed" "$T1
+$T2" "$T1 a::one" "$T1 a::one
+$T2 b::one" ""
+# R4: a Linux listing of no tests (a zero-byte file) is no gap.
+irun I8-zero-test-linux-listing 0 "$T2 b::mac_only  compiled only on macOS" "$T1
+$T2" "$T1 a::one
+$T2 b::mac_only" "$T1 a::one
+$T2" ""
 
 # --- fetch-verified.sh -----------------------------------------------------------
 # fetch <name> <want exit> <message regex> <url=answer>...: answer is ok (the

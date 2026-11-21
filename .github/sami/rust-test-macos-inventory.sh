@@ -9,9 +9,11 @@
 # It builds every Bazel test target under //crates for macOS, lists each
 # rust_test binary, and compares it with the Linux job's listing of the same
 # target (rust-test.sh leaves them, with index.tsv, in its listings
-# directory). It fails when the Linux listings are missing or name nothing,
-# when a test rust-test-macos.txt names is in no macOS binary's listing, and
-# when no macOS binary could be listed.
+# directory). It fails when the Linux listings are missing, when a target
+# fails to build for macOS or has no macOS binary (a compile error only macOS
+# sees would otherwise drop its tests unseen), when a test
+# rust-test-macos.txt names is in no macOS binary's listing, and when no
+# macOS binary could be listed.
 # Usage: rust-test-macos-inventory.sh <Linux listings directory> <output list>
 #   OMP_BAZEL_RC   the bazelrc fragment .github/actions/bazel-cache wrote
 set -euo pipefail
@@ -35,22 +37,18 @@ count() { awk 'END { print NR }' "$1"; }
 [ -s "$linux/index.tsv" ] || stop "UNKNOWN: $linux/index.tsv is missing or empty, so no Linux listing can be compared"
 declare -A linux_listing=()
 while IFS=$'\t' read -r label file; do
-	[ -s "$linux/$file" ] || stop "UNKNOWN: the Linux listing $linux/$file of $label is missing or empty"
+	# A binary with no tests leaves an empty listing, which is no gap.
+	[ -f "$linux/$file" ] || stop "UNKNOWN: the Linux listing $linux/$file of $label is missing"
 	linux_listing["$label"]="$linux/$file"
 done <"$linux/index.tsv"
 echo "Linux listings read: ${#linux_listing[@]}"
 
-# The rust_test targets, and a build of every test target for this host
-# (Bazel leaves out a target incompatible with it).
+# The rust_test targets, and a build of every test target for this host.
 bazelisk query --output=label 'kind("rust_test rule", //crates/...) - attr(tags, "manual", //crates/...)' | LC_ALL=C sort -u >"$tmp/targets.txt"
 [ -s "$tmp/targets.txt" ] || stop "bazel query names no rust_test target under //crates"
 code=0
 bazelisk --bazelrc="$OMP_BAZEL_RC" build --keep_going --build_tests_only -- //crates/... || code=$?
-case "$code" in
-	0) ;;
-	1) echo "::warning title=macOS inventory::some targets did not build for macOS (above); their tests are compared as unlisted" ;;
-	*) stop "bazel build exited $code" ;;
-esac
+[ "$code" = 0 ] || stop "bazel build of the test targets for macOS exited $code: a target that does not build for macOS (above) would drop its tests unseen"
 bin_root="$(bazelisk --bazelrc="$OMP_BAZEL_RC" info bazel-bin)"
 [ -d "$bin_root" ] || stop "bazel info names no bazel-bin directory"
 
@@ -61,8 +59,7 @@ while read -r label; do
 	path="${label#//}"
 	bin="$bin_root/${path%%:*}/${path#*:}"
 	if [ ! -x "$bin" ]; then
-		echo "No macOS binary of $label (not built for macOS)"
-		continue
+		stop "$label has no macOS binary at $bin, though bazel build passed: its tests cannot be listed"
 	fi
 	"$bin" --list >"$tmp/raw" || stop "$label's macOS binary $bin cannot list its tests"
 	sed -n -e 's/: test$//p' -e 's/: benchmark$//p' "$tmp/raw" | LC_ALL=C sort -u >"$tmp/mac.txt"
