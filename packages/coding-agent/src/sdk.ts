@@ -553,6 +553,30 @@ function createPendingMCPTool(name: string): Tool {
 	return tool;
 }
 
+/**
+ * Stands in for a tool a held settings change disabled: its registry entry is gone while the bound prompt keeps listing
+ * it until the rebuild. A call to it by name (the agent loop's fallback, the Cursor exec bridge) is refused with the
+ * hold's `refusal` ({@link AgentSession.heldToolRefusal}), the reason a direct call gets, instead of reported missing;
+ * its approval denies with that reason, so no gate asks the user about it.
+ */
+function createHeldToolStandIn(name: string, refusal: string): Tool {
+	return {
+		name,
+		label: name,
+		description: refusal,
+		parameters: {
+			type: "object",
+			properties: {},
+			additionalProperties: true,
+		},
+		approval: { tier: "read", policy: "deny", reason: refusal },
+		intent: "omit",
+		async execute() {
+			return { content: [{ type: "text", text: refusal }], isError: true };
+		},
+	};
+}
+
 function collectPendingMCPToolNames(explicitToolNames: readonly string[] | undefined): string[] {
 	const names = new Set<string>();
 	for (const name of explicitToolNames ?? []) {
@@ -4103,8 +4127,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// advertised while exact dispatch still answered from the snapshot.
 		// Callers with no request snapshot (the Cursor exec bridge) pass none and
 		// get device resolution only.
+		//
+		// A tool a held settings change disabled is out of the registry while the
+		// bound prompt keeps listing it until the rebuild, so its name resolves to
+		// a stand-in that refuses with the hold's reason (`createHeldToolStandIn`)
+		// on every route that comes here, not to nothing (tool not found).
+		const heldToolStandIn = (name: string): AgentTool | undefined => {
+			const refusal = toolSession.heldToolRefusal?.(name);
+			return refusal === undefined ? undefined : createHeldToolStandIn(name, refusal);
+		};
 		const resolveDeviceTool = (name: string, advertised: readonly AgentTool[] = []): AgentTool | undefined => {
 			const bareName = stripXdUrlPrefix(name);
+			// First, as the session refuses a held name before any call runs.
+			const held = heldToolStandIn(bareName);
+			if (held) return held;
 			const state = toolSession.xdev;
 			// An exact mounted name is the name itself, not a guess.
 			const exactDevice = state ? resolveMountedXdevExecutable(state, bareName) : undefined;
@@ -4124,13 +4160,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return resolveMCPToolAlias(
 				bareName,
 				candidate =>
+					heldToolStandIn(candidate) ??
 					(state ? resolveMountedXdevExecutable(state, candidate) : undefined) ??
 					advertised.find(tool => tool.name === candidate),
 			);
 		};
 		// Mounted devices are absent from the advertised tool set, so a miss on a
 		// device name has nothing to suggest unless the loop is told they exist.
-		const suggestDeviceToolNames = (): Iterable<string> => toolSession.xdev?.mountedNames ?? [];
+		// Only the devices the `xd://` listing shows: a held one (out of the
+		// registry until the rebuild) refuses every call, so naming it would send
+		// the model to a refusal.
+		const suggestDeviceToolNames = (): Iterable<string> =>
+			toolSession.xdev ? listXdevTools(toolSession.xdev).map(tool => tool.name) : [];
 		// Cursor's resource frames ask what THIS client's servers advertise; only
 		// live connections have any. Built once: the advisor bridges answer from
 		// the same connections the primary does.
