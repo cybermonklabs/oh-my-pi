@@ -409,10 +409,11 @@ func writeChainSession(t *testing.T, dir string) string {
 
 // walkChain follows the chain of tree nodes from root, each the only child of
 // the one before, checking each entry's id and parent; it returns how many
-// nodes the chain has and its last entry's id. encoding/json reads no value
-// nested 10,000 levels deep, even token by token, so it walks root's raw
-// children once as the host writes them (compact, each node's entry before
-// its children) and decodes each entry alone.
+// nodes the chain has and its last entry's id. The json v2 backend of
+// encoding/json (the one Go 1.27 builds) reads no value nested 10,000 levels
+// deep, even token by token, so it walks root's raw children once as the host
+// writes them (compact, each node's entry before its children) and decodes
+// each entry alone, which works on the v1 backend too.
 func walkChain(t *testing.T, root map[string]json.RawMessage) (int, string) {
 	t.Helper()
 	type chainEntry struct {

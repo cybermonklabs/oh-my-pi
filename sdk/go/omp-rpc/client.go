@@ -484,7 +484,8 @@ func (c *Client) dispatch(line []byte) {
 	// Not json.Unmarshal, which first checks the whole line against encoding/json's
 	// nesting limit: a get_tree answer nests deeper (see splitObject).
 	if err := frame.UnmarshalJSON(line); err != nil {
-		tag := peekTag(line, "type")
+		raw, _ := decodeObject(line, "")
+		tag := stringMember(raw, "type")
 		switch {
 		// Host requests are answered even when malformed (bad arguments or operation).
 		case tag == "host_tool_call":
@@ -494,7 +495,7 @@ func (c *Client) dispatch(line []byte) {
 			c.handleHostUriRequest(line)
 			return
 		// The call this response answers fails now instead of at its timeout.
-		case tag == "response" && c.failCall(peekTag(line, "id"), err):
+		case tag == "response" && c.failCall(stringMember(raw, "id"), err):
 			return
 		}
 		frame.Value = UnknownNotification{Type: tag, Raw: line, Err: err}

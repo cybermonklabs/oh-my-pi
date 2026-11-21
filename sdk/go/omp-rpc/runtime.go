@@ -73,11 +73,16 @@ func newUnknownNotification(tag string, data []byte) UnknownNotification {
 
 // peekTag returns the string at property in a JSON object, or "".
 func peekTag(data []byte, property string) string {
-	var tag string
-	if raw, err := decodeObject(data, ""); err == nil {
-		_ = json.Unmarshal(raw[property], &tag)
-	}
-	return tag
+	raw, _ := decodeObject(data, "")
+	return stringMember(raw, property)
+}
+
+// stringMember returns the string at key of the object members raw (nil when
+// the object did not decode), or "".
+func stringMember(raw map[string]json.RawMessage, key string) string {
+	var value string
+	_ = json.Unmarshal(raw[key], &value)
+	return value
 }
 
 // Ptr returns a pointer to a copy of v, for optional fields.

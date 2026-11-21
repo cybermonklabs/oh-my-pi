@@ -33,7 +33,6 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
-import { GOAL_COMPLETED_CUSTOM_TYPE } from "../goals/state";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import {
 	approvedPlanFileOf,
@@ -53,6 +52,7 @@ import { getReadableCompactionEntry, isRolloverRequestEntry } from "./session-co
 import {
 	type CompactionEntry,
 	type FileEntry,
+	GOAL_COMPLETED_CUSTOM_TYPE,
 	type SessionEntry,
 	TITLE_CHANGE_ENTRY_TYPE,
 	TODO_HUD_STATE_CUSTOM_TYPE,

@@ -422,6 +422,12 @@ export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
 
 /**
+ * `custom` type of the entry a completed goal appends after its `mode_change`
+ * to `none`: its `data` holds the goal's objective and the tokens and time it used.
+ */
+export const GOAL_COMPLETED_CUSTOM_TYPE = "goal-completed";
+
+/**
  * The phases a canonical to-do snapshot records, or undefined: a user's edit
  * of the list ({@link USER_TODO_EDIT_CUSTOM_TYPE}) or a successful `todo`
  * result ({@link todoResultPhases}). The to-do list restores from the newest
