@@ -2090,22 +2090,39 @@ async fn wait_accepts_last_background_process_id() {
 	assert!(!result.timed_out);
 }
 
+/// `wait -n -p` names the job that finished first. The slow job cannot
+/// finish before `wait -n` returns: it waits for the file `released`, which
+/// the script makes only after `wait -n`, so the fast job finishes first
+/// however late it starts. (A `sleep 0.2` in the slow job let a host that
+/// started the fast job more than 0.2 s after it see the slow one first, and
+/// bash 5.3 then answers with the slow job too.) A `wait -n` that waited for
+/// both would wait for itself: after 30 s, far above the milliseconds a
+/// correct run takes, the test makes the file, and the slow job's status
+/// fails the script.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_n_p_records_completed_process_id() {
+	let dir = tempfile::tempdir().expect("temp dir");
+	let released = dir.path().join("released");
+	let guard = tokio::spawn(async move {
+		tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+		let _ = std::fs::write(released, b"");
+	});
 	let options = ShellExecuteOptions {
-		command: "sh -c 'sleep 0.2; exit 42' & slow=$!; sh -c 'exit 13' & fast=$!; wait -n -p hit \
-		          \"$slow\" \"$fast\"; status=$?; wait \"$slow\"; [ \"$status\" -eq 13 ] && [ \
-		          \"$hit\" = \"$fast\" ]"
+		command: "sh -c 'until [ -e released ]; do sleep 0.01; done; exit 42' & slow=$!; sh -c \
+		          'exit 13' & fast=$!; wait -n -p hit \"$slow\" \"$fast\"; status=$?; : > released; \
+		          wait \"$slow\"; [ \"$status\" -eq 13 ] && [ \"$hit\" = \"$fast\" ]"
 			.to_string(),
+		cwd: Some(dir.path().to_string_lossy().into_owned()),
 		..Default::default()
 	};
 
 	let result = execute_shell(options, None, CancelToken::default())
 		.await
 		.expect("execute should succeed");
+	guard.abort();
 
-	assert_eq!(result.exit_code, Some(0));
+	assert_eq!(result.exit_code, Some(0), "wait -n did not name the fast job, the first to finish");
 	assert!(!result.cancelled);
 	assert!(!result.timed_out);
 }
