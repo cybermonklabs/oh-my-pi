@@ -209,7 +209,7 @@ impl Cache {
 			return;
 		}
 		let mut listing = listing.clone();
-		for record in &mut listing.records {
+		for record in listing.parts_mut().0 {
 			record.size = None;
 			record.mtime = None;
 			record.children = 0;

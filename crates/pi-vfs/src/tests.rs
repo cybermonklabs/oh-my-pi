@@ -502,6 +502,56 @@ fn creation_mask_clears_bits_from_host_creations() {
 	assert_eq!(mode(&dir.0.join("fifo")), 0o666);
 }
 
+/// A creation mask applies as well to an open that creates through `O_CREAT`
+/// among its custom flags (with `O_EXCL`, only a new file): the new file gets
+/// exactly its mode less the mask, whatever the process umask, and an existing
+/// file keeps its mode. One mask looser than any process umask and one
+/// stricter, so the process umask cannot pass for both.
+#[cfg(unix)]
+#[test]
+fn creation_mask_applies_to_a_custom_o_creat() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("mask-custom");
+	let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+	let mut creat = OpenOptions::new();
+	creat.write(true).custom_flags(libc::O_CREAT);
+	let mut excl = OpenOptions::new();
+	excl.write(true).custom_flags(libc::O_CREAT | libc::O_EXCL);
+	let mut wrong = Vec::new();
+	for (mask, want) in [(0, 0o666), (0o077, 0o600)] {
+		let fs = Fs::native().with_creation_mask(Some(mask)).blocking();
+		for (index, (label, options)) in [("O_CREAT", &creat), ("O_CREAT | O_EXCL", &excl)]
+			.into_iter()
+			.enumerate()
+		{
+			let path = dir.0.join(format!("new-{mask:o}-{index}"));
+			fs.open_with(&path, options)
+				.unwrap_or_else(|err| panic!("{label}, mask {mask:o}: {err}"));
+			let got = mode(&path);
+			if got != want {
+				wrong.push(format!("{label}, mask {mask:o}: mode {got:o}, not {want:o}"));
+			}
+		}
+	}
+	// An existing file: `O_CREAT` opens it and keeps its mode, `O_EXCL`
+	// refuses it.
+	let fs = Fs::native().with_creation_mask(Some(0o077)).blocking();
+	let existing = dir.0.join("existing");
+	std::fs::write(&existing, "").unwrap();
+	std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+	fs.open_with(&existing, &creat).unwrap();
+	assert_eq!(mode(&existing), 0o644, "O_CREAT on an existing file changed its mode");
+	assert_eq!(
+		fs.open_with(&existing, &excl)
+			.map(drop)
+			.map_err(|err| err.kind()),
+		Err(io::ErrorKind::AlreadyExists),
+		"O_CREAT | O_EXCL on an existing file"
+	);
+	assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn descriptor_overlay_shares_the_pinned_file() {
 	let dir = TempDir::new("mount");

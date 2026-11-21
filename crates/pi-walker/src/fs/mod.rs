@@ -1,15 +1,18 @@
 //! Filesystem layer every walk and search reads through: directory listings,
 //! file contents, and change stamps.
 //!
-//! [`Fs::Native`] is the host filesystem with per-platform fast paths
-//! (`native/`); [`Fs::Provider`] adapts a [`pi_vfs::Fs`] provider
-//! (`provider.rs`), such as an in-memory tree or a `scheme://` URL namespace.
-//! Walkers, ignore loading, the listing cache, and the searches only ever talk
-//! to an [`Fs`], so no tool bypasses the layer with its own I/O.
+//! [`Fs::Native`] is the host filesystem; [`Fs::Provider`] is a
+//! [`pi_vfs::Fs`] provider, such as an in-memory tree or a `scheme://` URL
+//! namespace. Both reach their directories through [`pi_vfs::DirHandle`]:
+//! a descriptor or handle on the host, with the per-platform fast paths of
+//! [`pi_vfs::dir_handle`], and the directory's path on a provider. Walkers,
+//! ignore loading, the listing cache, and the searches only ever talk to an
+//! [`Fs`], so no tool bypasses the layer with its own I/O.
 //!
-//! Work happens on a [`Session`]: per-thread scratch that makes steady-state
-//! listing and stat calls allocation-free. Walkers hold one session per
-//! worker. Directories are opened once ([`Session::open_dir`], then
+//! Work happens on a [`Session`]: per-thread listing scratch that makes
+//! steady-state listing and stat calls allocation-free (the host syscall
+//! scratch is per thread in `pi_vfs`). Walkers hold one session per worker.
+//! Directories are opened once ([`Session::open_dir`], then
 //! [`Session::open_child`] relative to the parent) and files are opened once
 //! ([`Session::open_file_at`], which also stats them) and then read into a
 //! reusable buffer ([`File::read_into`]) or streamed ([`File::read`]).
@@ -38,45 +41,22 @@
 //! }
 //! ```
 
-mod native;
-mod provider;
 mod root;
-#[cfg(any(windows, test))]
-mod wtf8;
 
 use std::{
-	borrow::Cow,
-	ffi::OsStr,
 	io,
 	path::{Path, PathBuf},
 };
 
+pub use pi_vfs::dir_handle::{
+	Detail, FileInfo, FileType, Listing, Record, Stamp, is_not_regular, is_rel_separator,
+	is_symlink_refusal,
+};
+use pi_vfs::{
+	DirHandle,
+	dir_handle::{HostFile, RegularFile, host, not_regular, os_name},
+};
 pub use root::{absolute, canonical, resolve_dir};
-
-/// Kind of a listed entry. Special files (devices, FIFOs, sockets) are never
-/// reported by listings; on Windows every reparse point is a [`Self::Symlink`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FileType {
-	/// A regular file.
-	File,
-	/// A directory.
-	Dir,
-	/// A symbolic link (never followed by a listing).
-	Symlink,
-}
-
-/// How much metadata listings collect.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Detail {
-	/// Names and entry types only: one bulk listing call per directory and no
-	/// per-entry metadata syscalls.
-	#[default]
-	Minimal,
-	/// Also modification times for every entry and sizes for regular files.
-	/// macOS and Windows return these from the bulk listing; Linux and
-	/// providers pay one metadata call per entry.
-	Full,
-}
 
 /// Identity of a file or directory, regardless of the path reaching it.
 ///
@@ -93,134 +73,9 @@ pub struct FileId {
 	pub native: bool,
 }
 
-/// One version of a file or directory.
-///
-/// Adding, removing, or renaming a directory's entries moves its mtime and
-/// ctime, and replacing it changes its inode. Listing caches compare stamps to
-/// decide whether a listing is still current.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Stamp {
-	/// Device or volume serial number.
-	pub dev:   u64,
-	/// Inode or file index (Windows path queries: creation time).
-	pub ino:   u64,
-	/// Modification time, Unix nanoseconds.
-	pub mtime: i64,
-	/// Status-change time, Unix nanoseconds.
-	pub ctime: i64,
-}
-
-impl Stamp {
-	/// The newer of the two timestamps.
-	pub const fn latest(&self) -> i64 {
-		if self.mtime > self.ctime {
-			self.mtime
-		} else {
-			self.ctime
-		}
-	}
-}
-
-/// Metadata of a file opened by [`Session::open_file_at`] or found by
-/// [`Session::stat`].
-#[derive(Clone, Copy, Debug)]
-pub struct FileInfo {
-	/// `None` for special files (devices, FIFOs, sockets).
-	pub file_type: Option<FileType>,
-	/// Byte size.
-	pub size:      u64,
-	/// Change stamp (also carries the modification time).
-	pub stamp:     Stamp,
-}
-
-/// One listing entry; its name lives in the owning [`Listing`].
-#[derive(Clone, Copy, Debug)]
-pub struct Record {
-	pub(crate) name_off: u32,
-	pub(crate) name_len: u32,
-	/// A subdirectory's entry count when the listing reports it (macOS full
-	/// listings), else 0. Passed back to [`Session::list`] for the child, it
-	/// lets the child's listing stop without a final empty read.
-	pub children:        u32,
-	/// Entry kind as listed (symlinks unresolved).
-	pub file_type:       FileType,
-	/// Regular-file size, when the listing carries it.
-	pub size:            Option<u64>,
-	/// Modification time in Unix nanoseconds, when the listing carries it.
-	pub mtime:           Option<i64>,
-}
-
-/// One directory's entries, without `.` and `..` and without special files.
-/// Names are raw bytes (`OsStr` encoded bytes: exact on Unix, WTF-8 on
-/// Windows and for provider names).
-#[derive(Clone, Debug, Default)]
-pub struct Listing {
-	pub(crate) records: Vec<Record>,
-	pub(crate) names:   Vec<u8>,
-}
-
-impl Listing {
-	/// Entries in listing order.
-	pub fn records(&self) -> &[Record] {
-		&self.records
-	}
-
-	/// The name of `record`, which must come from this listing.
-	pub fn name(&self, record: &Record) -> &[u8] {
-		let start = record.name_off as usize;
-		&self.names[start..start + record.name_len as usize]
-	}
-
-	/// Number of entries.
-	pub const fn len(&self) -> usize {
-		self.records.len()
-	}
-
-	/// The directory has no listed entries.
-	pub const fn is_empty(&self) -> bool {
-		self.records.is_empty()
-	}
-
-	/// Approximate heap footprint in bytes, for cache budgets.
-	pub const fn heap_size(&self) -> usize {
-		self.names.len() + self.records.len() * size_of::<Record>()
-	}
-
-	pub(crate) fn clear(&mut self) {
-		self.records.clear();
-		self.names.clear();
-	}
-
-	pub(crate) fn push(
-		&mut self,
-		name: &[u8],
-		file_type: FileType,
-		size: Option<u64>,
-		mtime: Option<i64>,
-		children: u32,
-	) {
-		self.push_with(|names| names.extend_from_slice(name), file_type, size, mtime, children);
-	}
-
-	/// [`Self::push`] with the name appended to the arena by `write_name`.
-	pub(crate) fn push_with(
-		&mut self,
-		write_name: impl FnOnce(&mut Vec<u8>),
-		file_type: FileType,
-		size: Option<u64>,
-		mtime: Option<i64>,
-		children: u32,
-	) {
-		let name_off = self.names.len();
-		write_name(&mut self.names);
-		self.records.push(Record {
-			name_off: name_off as u32,
-			name_len: (self.names.len() - name_off) as u32,
-			children,
-			file_type,
-			size,
-			mtime,
-		});
+impl From<pi_vfs::FileId> for FileId {
+	fn from(id: pi_vfs::FileId) -> Self {
+		Self { dev: id.dev(), ino: id.ino(), native: id.is_native() }
 	}
 }
 
@@ -259,7 +114,7 @@ impl Fs {
 	/// A fresh per-thread session. Cheap: scratch buffers grow on first use.
 	pub fn session(&self) -> Session {
 		let imp = match self {
-			Self::Native => Imp::Native(native::Scratch::default()),
+			Self::Native => Imp::Native,
 			Self::Provider(fs) => Imp::Provider(fs.clone()),
 		};
 		Session { listing: Listing::default(), imp }
@@ -270,7 +125,7 @@ impl Fs {
 	/// providers.
 	pub const fn workers(&self) -> usize {
 		match self {
-			Self::Native => native::WORKERS,
+			Self::Native => pi_vfs::dir_handle::WORKERS,
 			Self::Provider(_) => 4,
 		}
 	}
@@ -306,47 +161,18 @@ impl Fs {
 	}
 }
 
-/// `bytes` (raw `OsStr` encoded bytes: exact on Unix, WTF-8 on Windows) as an
-/// [`OsStr`]. On Windows `/` becomes `\`.
-#[cfg(unix)]
-pub(crate) fn os_name(bytes: &[u8]) -> Cow<'_, OsStr> {
-	use std::os::unix::ffi::OsStrExt;
-	Cow::Borrowed(OsStr::from_bytes(bytes))
-}
-
-/// `bytes` (raw `OsStr` encoded bytes: exact on Unix, WTF-8 on Windows) as an
-/// [`OsStr`]. On Windows `/` becomes `\`.
-#[cfg(windows)]
-pub(crate) fn os_name(bytes: &[u8]) -> Cow<'_, OsStr> {
-	use std::os::windows::ffi::OsStringExt;
-	if let Ok(name) = std::str::from_utf8(bytes)
-		&& !name.contains('/')
-	{
-		return Cow::Borrowed(OsStr::new(name));
-	}
-	let mut wide = Vec::with_capacity(bytes.len());
-	wtf8::push_wide(&mut wide, bytes);
-	Cow::Owned(std::ffi::OsString::from_wide(&wide))
-}
-
-/// An open directory. Native: a descriptor/handle closed on drop. Provider:
-/// the directory's path.
+/// An open directory: a [`pi_vfs::DirHandle`], which holds a descriptor or
+/// handle (host, closed on drop) or the directory's path (provider).
 #[derive(Debug)]
 pub struct Dir {
-	repr: DirRepr,
-}
-
-#[derive(Debug)]
-enum DirRepr {
-	Native(native::Handle),
-	Provider(PathBuf),
+	handle: DirHandle,
 }
 
 impl Dir {
 	/// Whether this directory holds an open descriptor or handle (native),
 	/// as opposed to a provider path.
 	pub(crate) const fn holds_descriptor(&self) -> bool {
-		matches!(self.repr, DirRepr::Native(_))
+		self.handle.is_native()
 	}
 }
 
@@ -354,19 +180,17 @@ impl Dir {
 /// [`File::read`]. Closed on drop.
 #[derive(Debug)]
 pub struct File {
-	repr: FileRepr,
+	repr: RegularFile,
 	size: u64,
 	/// Stream position of [`File::read`].
 	pos:  u64,
 }
 
-#[derive(Debug)]
-enum FileRepr {
-	Native(native::Handle),
-	Provider(pi_vfs::File),
-}
-
 impl File {
+	fn new((repr, info): (RegularFile, FileInfo)) -> (Self, FileInfo) {
+		(Self { repr, size: info.size, pos: 0 }, info)
+	}
+
 	/// Size reported when the file was opened.
 	pub const fn size(&self) -> u64 {
 		self.size
@@ -394,10 +218,10 @@ impl File {
 	/// size reported at open time, or at end of file.
 	pub async fn read_more(&mut self, buf: &mut Vec<u8>, limit: u64) -> io::Result<()> {
 		match &mut self.repr {
-			FileRepr::Native(handle) => {
-				fill(buf, self.size, limit, |buf, end| native::read_append(handle, buf, end))
+			RegularFile::Host(handle) => {
+				fill(buf, self.size, limit, |buf, end| handle.read_append(buf, end))
 			},
-			FileRepr::Provider(file) => {
+			RegularFile::Vfs(file) => {
 				let start = buf.len() as u64;
 				if self.pos != start {
 					file.seek_async(io::SeekFrom::Start(start)).await?;
@@ -500,13 +324,13 @@ fn try_reserve(buf: &mut Vec<u8>, additional: usize) -> io::Result<()> {
 /// Sequential reads of a native [`File`], executed inline (see
 /// [`File::native_reader`]).
 pub struct NativeReader<'a> {
-	handle: &'a native::Handle,
+	handle: &'a HostFile,
 	pos:    &'a mut u64,
 }
 
 impl io::Read for NativeReader<'_> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		let n = native::read_at(self.handle, buf, *self.pos)?;
+		let n = self.handle.read_at(buf, *self.pos)?;
 		*self.pos += n as u64;
 		Ok(n)
 	}
@@ -517,8 +341,8 @@ impl File {
 	/// end of file).
 	pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		let n = match &mut self.repr {
-			FileRepr::Native(handle) => native::read_at(handle, buf, self.pos)?,
-			FileRepr::Provider(file) => file.read_async(buf).await?,
+			RegularFile::Host(handle) => handle.read_at(buf, self.pos)?,
+			RegularFile::Vfs(file) => file.read_async(buf).await?,
 		};
 		self.pos += n as u64;
 		Ok(n)
@@ -529,8 +353,8 @@ impl File {
 	/// provider files, which are only read asynchronously.
 	pub const fn native_reader(&mut self) -> Option<NativeReader<'_>> {
 		match &self.repr {
-			FileRepr::Native(handle) => Some(NativeReader { handle, pos: &mut self.pos }),
-			FileRepr::Provider(_) => None,
+			RegularFile::Host(handle) => Some(NativeReader { handle, pos: &mut self.pos }),
+			RegularFile::Vfs(_) => None,
 		}
 	}
 
@@ -546,8 +370,8 @@ impl File {
 	/// [`File::metadata_async`].
 	pub fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
 		match &self.repr {
-			FileRepr::Native(handle) => native::handle_metadata(handle),
-			FileRepr::Provider(file) => file.metadata(),
+			RegularFile::Host(handle) => handle.metadata(),
+			RegularFile::Vfs(file) => file.metadata(),
 		}
 	}
 
@@ -556,8 +380,8 @@ impl File {
 	/// start, a provider file from where this file's reads left it.
 	pub fn into_vfs(self) -> pi_vfs::File {
 		match self.repr {
-			FileRepr::Native(handle) => pi_vfs::File::from(std::fs::File::from(handle)),
-			FileRepr::Provider(file) => file,
+			RegularFile::Host(handle) => pi_vfs::File::from(handle.into_std()),
+			RegularFile::Vfs(file) => file,
 		}
 	}
 
@@ -570,72 +394,10 @@ impl File {
 	/// As for [`File::metadata`].
 	pub async fn metadata_async(&self) -> io::Result<pi_vfs::Metadata> {
 		match &self.repr {
-			FileRepr::Native(handle) => native::handle_metadata(handle),
-			FileRepr::Provider(file) => file.metadata_async().await,
+			RegularFile::Host(handle) => handle.metadata(),
+			RegularFile::Vfs(file) => file.metadata_async().await,
 		}
 	}
-}
-
-/// Marker error behind [`is_not_regular`].
-#[derive(Debug)]
-struct NotRegular;
-
-impl std::fmt::Display for NotRegular {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("not a regular file")
-	}
-}
-
-impl std::error::Error for NotRegular {}
-
-/// The error for opening a directory or special file as a regular file.
-pub(crate) fn not_regular() -> io::Error {
-	io::Error::new(io::ErrorKind::InvalidInput, NotRegular)
-}
-
-/// Whether `err` is the error [`Session::open_file_at`],
-/// [`Session::open_file`], and [`Session::open_file_beneath`] return for
-/// directories and special files.
-pub fn is_not_regular(err: &io::Error) -> bool {
-	err.get_ref().is_some_and(|inner| inner.is::<NotRegular>())
-}
-
-/// Marker error behind a provider's refusal of a final symlink, which
-/// [`is_symlink_refusal`] recognizes.
-#[derive(Debug)]
-struct SymlinkRefused;
-
-impl std::fmt::Display for SymlinkRefused {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str("refusing to follow a symbolic link")
-	}
-}
-
-impl std::error::Error for SymlinkRefused {}
-
-/// The error for an open that does not follow a symlink it found.
-pub(crate) fn symlink_refused() -> io::Error {
-	io::Error::new(io::ErrorKind::InvalidInput, SymlinkRefused)
-}
-
-/// Whether `err` is an open's refusal of a symlink it did not follow.
-///
-/// That is `ELOOP` on Unix, `ERROR_STOPPED_ON_SYMLINK` on Windows, or a
-/// provider's refusal of a final symlink. From
-/// [`Session::open_file_beneath`] the symlink may be the file or a directory
-/// on the way; opening the file's directory below the same root tells the
-/// two apart.
-pub fn is_symlink_refusal(err: &io::Error) -> bool {
-	#[cfg(unix)]
-	let code = Some(libc::ELOOP);
-	#[cfg(windows)]
-	let code = Some(windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK as i32);
-	#[cfg(not(any(unix, windows)))]
-	let code = None;
-	(code.is_some() && err.raw_os_error() == code)
-		|| err
-			.get_ref()
-			.is_some_and(|inner| inner.is::<SymlinkRefused>())
 }
 
 /// Per-thread filesystem operations. Slices returned by a method stay valid
@@ -646,7 +408,7 @@ pub struct Session {
 }
 
 enum Imp {
-	Native(native::Scratch),
+	Native,
 	Provider(pi_vfs::Fs),
 }
 
@@ -655,39 +417,25 @@ fn foreign_dir() -> io::Error {
 	io::Error::new(io::ErrorKind::InvalidInput, "directory belongs to another filesystem")
 }
 
-/// Refuses a path that is not walk-relative: empty, or with an empty, `.`, or
-/// `..` component, each of which would reach something other than an entry a
-/// walk listed below its root.
-fn check_relative(rel: &[u8]) -> io::Result<()> {
-	if rel
-		.split(|&b| is_rel_separator(b))
-		.any(|part| matches!(part, b"" | b"." | b".."))
-	{
-		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a walk-relative path"));
-	}
-	Ok(())
-}
-
-/// Whether `byte` separates the components of a walk-relative path.
-///
-/// That is `/`, and on Windows also `\`, which no listed name contains there
-/// and which the NT namespace would otherwise resolve inside one component.
-/// A caller that splits a walk-relative path before passing its parts to a
-/// `beneath` open splits it here, so both agree on its components.
-pub const fn is_rel_separator(byte: u8) -> bool {
-	byte == b'/' || (cfg!(windows) && byte == b'\\')
-}
-
 impl Session {
+	/// `dir`'s handle when `dir` comes from this session's kind of [`Fs`].
+	fn own<'d>(&self, dir: &'d Dir) -> io::Result<&'d DirHandle> {
+		if dir.handle.is_native() == matches!(self.imp, Imp::Native) {
+			Ok(&dir.handle)
+		} else {
+			Err(foreign_dir())
+		}
+	}
+
 	/// Opens the directory at an absolute path, following symlinks.
 	pub async fn open_dir(&mut self, path: &Path) -> io::Result<Dir> {
 		#[cfg(test)]
 		seam::dir_open(seam::last(path), seam::Open::Path)?;
-		let repr = match &mut self.imp {
-			Imp::Native(s) => DirRepr::Native(native::open_dir(s, path)?),
-			Imp::Provider(fs) => DirRepr::Provider(provider::open_dir(fs, path).await?),
+		let handle = match &self.imp {
+			Imp::Native => host::open_dir(path, true)?,
+			Imp::Provider(fs) => fs.open_dir_by_path(path, true).await?,
 		};
-		Ok(Dir { repr })
+		Ok(Dir { handle })
 	}
 
 	/// Opens the directory at an absolute path without following a symlink
@@ -697,13 +445,11 @@ impl Session {
 	pub async fn open_dir_unlinked(&mut self, path: &Path) -> io::Result<Dir> {
 		#[cfg(test)]
 		seam::dir_open(seam::last(path), seam::Open::Path)?;
-		let repr = match &mut self.imp {
-			Imp::Native(s) => DirRepr::Native(native::open_dir_unlinked(s, path)?),
-			Imp::Provider(fs) => {
-				DirRepr::Provider(provider::open_dir_unlinked(fs, path.to_path_buf()).await?)
-			},
+		let handle = match &self.imp {
+			Imp::Native => host::open_dir(path, false)?,
+			Imp::Provider(fs) => fs.open_dir_by_path(path, false).await?,
 		};
-		Ok(Dir { repr })
+		Ok(Dir { handle })
 	}
 
 	/// Opens the subdirectory `name` of `parent` without following a symlink
@@ -711,30 +457,19 @@ impl Session {
 	pub async fn open_child(&mut self, parent: &Dir, name: &[u8]) -> io::Result<Dir> {
 		#[cfg(test)]
 		seam::dir_open(name, seam::Open::At)?;
-		let repr = match (&mut self.imp, &parent.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => DirRepr::Native(native::open_child(s, h, name)?),
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				DirRepr::Provider(provider::open_child(fs, path, name).await?)
-			},
-			_ => return Err(foreign_dir()),
-		};
-		Ok(Dir { repr })
+		let handle = self.own(parent)?.open_dir_at_async(&os_name(name)).await?;
+		Ok(Dir { handle })
 	}
 
 	/// Opens the directory `..` of `child`, which is its parent only while
 	/// `child` has not moved: callers check the identity of what they get.
 	/// Fails with [`io::ErrorKind::Unsupported`] where `..` cannot be opened
 	/// relative to a handle (Windows, providers).
-	pub(crate) fn open_parent(&mut self, child: &Dir) -> io::Result<Dir> {
+	pub(crate) fn open_parent(&self, child: &Dir) -> io::Result<Dir> {
 		#[cfg(test)]
 		seam::dir_open(b"..", seam::Open::Parent)?;
-		match (&mut self.imp, &child.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => {
-				Ok(Dir { repr: DirRepr::Native(native::open_parent(s, h)?) })
-			},
-			(Imp::Provider(_), DirRepr::Provider(_)) => Err(io::ErrorKind::Unsupported.into()),
-			_ => Err(foreign_dir()),
-		}
+		let handle = self.own(child)?.open_parent()?;
+		Ok(Dir { handle })
 	}
 
 	/// Lists every entry of `dir` except `.` and `..`, skipping special files
@@ -746,20 +481,23 @@ impl Session {
 	/// position (no rewind syscall), so list each [`Dir`] once; open it again
 	/// to list it again.
 	pub async fn list(&mut self, dir: &Dir, detail: Detail, children: u32) -> io::Result<&Listing> {
-		list_with(&mut self.imp, dir, detail, children, &mut self.listing).await?;
+		let handle = self.own(dir)?;
+		handle
+			.list_into_async(detail, children, &mut self.listing)
+			.await?;
 		Ok(&self.listing)
 	}
 
 	/// [`Self::list`] into a caller-owned listing (cleared first), so callers
 	/// can keep it while using the session again.
 	pub(crate) async fn list_into(
-		&mut self,
+		&self,
 		dir: &Dir,
 		detail: Detail,
 		children: u32,
 		out: &mut Listing,
 	) -> io::Result<()> {
-		list_with(&mut self.imp, dir, detail, children, out).await
+		self.own(dir)?.list_into_async(detail, children, out).await
 	}
 
 	/// Opens the regular file `name` (one component) in `dir` and describes
@@ -779,23 +517,8 @@ impl Session {
 	) -> io::Result<(File, FileInfo)> {
 		#[cfg(test)]
 		seam::fire(name, seam::Open::At);
-		let (repr, info) = match (&mut self.imp, &dir.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => {
-				let (handle, info) = native::open_file_at(s, h, name, follow)?;
-				(FileRepr::Native(handle), info)
-			},
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				let path = provider::child(path, name);
-				let (file, info) = if follow {
-					provider::open_file(fs, &path).await?
-				} else {
-					provider::open_file_unlinked(fs, &path).await?
-				};
-				(FileRepr::Provider(file), info)
-			},
-			_ => return Err(foreign_dir()),
-		};
-		Ok((File { repr, size: info.size, pos: 0 }, info))
+		let handle = self.own(dir)?;
+		Ok(File::new(handle.open_regular_at_async(&os_name(name), follow).await?))
 	}
 
 	/// Opens the regular file at the walk-relative `rel` (`/`-separated raw
@@ -803,22 +526,8 @@ impl Session {
 	/// too) below the open directory `root`, following no symlink on the way:
 	/// neither the file nor any directory between `root` and it, also one
 	/// swapped in since the listing. This is how a walk that does not follow
-	/// symlinks opens a file whose listing carries no directory handle.
-	///
-	/// Native opens resolve below `root`'s handle, never by path: on Linux
-	/// one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` where the
-	/// kernel has it; elsewhere, and where it does not, one component at a
-	/// time relative to the directory before it (`O_NOFOLLOW`; on Windows
-	/// `FILE_OPEN_REPARSE_POINT`), holding at most two handles at once. A
-	/// symlink on the way fails the open (`ELOOP` or `ENOTDIR` on Unix,
-	/// `ERROR_STOPPED_ON_SYMLINK` for any reparse point on Windows).
-	///
-	/// Providers resolve paths themselves, so they cannot hold this against a
-	/// concurrent swap: the open checks the final component with
-	/// `symlink_metadata` and refuses a symlink, then opens the path, and the
-	/// provider resolves the directories on the way. A symlink swapped in
-	/// between the check and the open, or for one of those directories, is
-	/// followed.
+	/// symlinks opens a file whose listing carries no directory handle; see
+	/// [`DirHandle::open_regular_beneath_async`] for how each side holds it.
 	///
 	/// # Errors
 	///
@@ -830,22 +539,10 @@ impl Session {
 		root: &Dir,
 		rel: &[u8],
 	) -> io::Result<(File, FileInfo)> {
-		check_relative(rel)?;
 		#[cfg(test)]
 		seam::fire(seam::last_of(rel), seam::Open::Beneath);
-		let (repr, info) = match (&mut self.imp, &root.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => {
-				let (handle, info) = native::open_file_beneath(s, h, rel)?;
-				(FileRepr::Native(handle), info)
-			},
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				let (file, info) =
-					provider::open_file_unlinked(fs, &provider::beneath(path, rel)).await?;
-				(FileRepr::Provider(file), info)
-			},
-			_ => return Err(foreign_dir()),
-		};
-		Ok((File { repr, size: info.size, pos: 0 }, info))
+		let handle = self.own(root)?;
+		Ok(File::new(handle.open_regular_beneath_async(rel).await?))
 	}
 
 	/// Opens the directory at the walk-relative `rel` below the open directory
@@ -859,43 +556,17 @@ impl Session {
 	/// As for [`Self::open_file_beneath`]; a `rel` that is not a directory
 	/// fails like [`Self::open_child`].
 	pub async fn open_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<Dir> {
-		check_relative(rel)?;
 		#[cfg(test)]
 		seam::dir_open(seam::last_of(rel), seam::Open::Beneath)?;
-		let repr = match (&mut self.imp, &root.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => {
-				DirRepr::Native(native::open_dir_beneath(s, h, rel)?)
-			},
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				DirRepr::Provider(provider::open_dir_unlinked(fs, provider::beneath(path, rel)).await?)
-			},
-			_ => return Err(foreign_dir()),
-		};
-		Ok(Dir { repr })
+		let handle = self.own(root)?.open_dir_beneath_async(rel).await?;
+		Ok(Dir { handle })
 	}
 
 	/// Replaces the contents of the regular file at the walk-relative `rel`
 	/// below the open directory `root` with `contents`, creating the file
-	/// when it is missing, and follows no symlink on the way or at the file:
-	/// the write lands on a file below `root` or nowhere, also when a
-	/// directory on the way or the file itself was replaced by a symlink
-	/// since the listing. This is how a walk that does not follow symlinks
-	/// writes back a file it listed.
-	///
-	/// The file is rewritten in place, as [`std::fs::write`] and
-	/// [`pi_vfs::Fs::write`] rewrite it: one open, truncated, then written,
-	/// so its identity, permissions, owner, and hard links stay, and a new
-	/// file gets mode `0o666` less the umask. Native writes open the file's
-	/// directory as [`Self::open_dir_beneath`] does, then the file relative
-	/// to that directory without following a symlink there (`O_NOFOLLOW`;
-	/// on Windows `FILE_OPEN_REPARSE_POINT`, refusing the reparse point it
-	/// reached), and truncate only once the open file is known to be a
-	/// regular one, so a special file is left as it was (FIFOs never block
-	/// the open).
-	///
-	/// Providers check the final component with `symlink_metadata` and
-	/// refuse a symlink or a special file there, then write by path, with
-	/// the limits [`Self::open_file_beneath`] describes.
+	/// when it is missing, and follows no symlink on the way or at the file;
+	/// see [`DirHandle::write_beneath_async`]. This is how a walk that does
+	/// not follow symlinks writes back a file it listed.
 	///
 	/// # Errors
 	///
@@ -909,14 +580,7 @@ impl Session {
 		rel: &[u8],
 		contents: &[u8],
 	) -> io::Result<()> {
-		check_relative(rel)?;
-		match (&mut self.imp, &root.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => native::write_file_beneath(s, h, rel, contents),
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				provider::write_file_unlinked(fs, &provider::beneath(path, rel), contents).await
-			},
-			_ => Err(foreign_dir()),
-		}
+		self.own(root)?.write_beneath_async(rel, contents).await
 	}
 
 	/// Removes the file, symlink, or special file at the walk-relative `rel`
@@ -927,13 +591,8 @@ impl Session {
 	/// directory symlink or junction is a directory, which this call refuses
 	/// as [`std::fs::remove_file`] refuses it there, and
 	/// [`Self::remove_dir_beneath`] removes. This is how a walk that does not
-	/// follow symlinks removes an entry it listed.
-	///
-	/// Native removals open the entry's directory as
-	/// [`Self::open_dir_beneath`] does, then remove the entry relative to it
-	/// (`unlinkat`; on Windows a delete disposition on the entry opened with
-	/// `FILE_OPEN_REPARSE_POINT`). Providers remove by path, resolving the
-	/// directories on the way themselves (see [`Self::open_file_beneath`]).
+	/// follow symlinks removes an entry it listed; see
+	/// [`DirHandle::remove_beneath_async`].
 	///
 	/// # Errors
 	///
@@ -941,7 +600,7 @@ impl Session {
 	/// the refusal of a symlink on the way, and the removal's own errors (a
 	/// directory at `rel` fails, as [`std::fs::remove_file`] fails).
 	pub async fn remove_file_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<()> {
-		self.remove_beneath(root, rel, false).await
+		self.own(root)?.remove_beneath_async(rel, false).await
 	}
 
 	/// Removes the empty directory at the walk-relative `rel` below the open
@@ -958,18 +617,7 @@ impl Session {
 	/// directory with the read-only attribute is removed too, as `rmdir`
 	/// removes one on Unix, where [`std::fs::remove_dir`] refuses it.
 	pub async fn remove_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<()> {
-		self.remove_beneath(root, rel, true).await
-	}
-
-	async fn remove_beneath(&mut self, root: &Dir, rel: &[u8], dir: bool) -> io::Result<()> {
-		check_relative(rel)?;
-		match (&mut self.imp, &root.repr) {
-			(Imp::Native(s), DirRepr::Native(h)) => native::remove_beneath(s, h, rel, dir),
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				provider::remove(fs, &provider::beneath(path, rel), dir).await
-			},
-			_ => Err(foreign_dir()),
-		}
+		self.own(root)?.remove_beneath_async(rel, true).await
 	}
 
 	/// Opens the regular file at an absolute path, following symlinks, and
@@ -977,17 +625,19 @@ impl Session {
 	pub async fn open_file(&mut self, path: &Path) -> io::Result<(File, FileInfo)> {
 		#[cfg(test)]
 		seam::fire(seam::last(path), seam::Open::Path);
-		let (repr, info) = match &mut self.imp {
-			Imp::Native(s) => {
-				let (handle, info) = native::open_file(s, path)?;
-				(FileRepr::Native(handle), info)
-			},
+		let opened = match &self.imp {
+			Imp::Native => host::open_regular(path)?,
 			Imp::Provider(fs) => {
-				let (file, info) = provider::open_file(fs, path).await?;
-				(FileRepr::Provider(file), info)
+				// The type is checked before opening so directories and
+				// special files are never opened.
+				let info = FileInfo::of(&fs.metadata(path).await?);
+				if info.file_type != Some(FileType::File) {
+					return Err(not_regular());
+				}
+				(RegularFile::Vfs(fs.open(path).await?), info)
 			},
 		};
-		Ok((File { repr, size: info.size, pos: 0 }, info))
+		Ok(File::new(opened))
 	}
 
 	/// Describes the file or directory at an absolute path, following a final
@@ -995,40 +645,37 @@ impl Session {
 	pub async fn stat(&mut self, path: &Path, follow: bool) -> io::Result<FileInfo> {
 		#[cfg(test)]
 		seam::fire(seam::last(path), seam::Open::Stat);
-		match &mut self.imp {
-			Imp::Native(s) => native::stat(s, path, follow),
-			Imp::Provider(fs) => provider::stat(fs, path, follow).await,
+		match &self.imp {
+			Imp::Native => host::file_info(path, follow),
+			Imp::Provider(fs) => {
+				let meta = if follow {
+					fs.metadata(path).await?
+				} else {
+					fs.symlink_metadata(path).await?
+				};
+				Ok(FileInfo::of(&meta))
+			},
 		}
 	}
 
 	/// Stamps an open directory.
 	pub async fn stat_dir(&mut self, dir: &Dir) -> io::Result<Stamp> {
-		match (&mut self.imp, &dir.repr) {
-			(Imp::Native(_), DirRepr::Native(h)) => native::stat_dir(h),
-			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				provider::stat(fs, path, true).await.map(|info| info.stamp)
-			},
-			_ => Err(foreign_dir()),
-		}
+		self.own(dir)?.stamp_async().await
 	}
 
 	/// Identity of the file or directory at an absolute path, following
 	/// symlinks. Walkers compare identities to stop symlink cycles and to
 	/// stay on one filesystem.
 	pub async fn identify(&mut self, path: &Path) -> io::Result<FileId> {
-		match &mut self.imp {
-			Imp::Native(s) => native::identify(s, path),
-			Imp::Provider(fs) => provider::identify(fs, path).await,
+		match &self.imp {
+			Imp::Native => host::identify(path).map(FileId::from),
+			Imp::Provider(fs) => fs.file_id(path, true).await.map(FileId::from),
 		}
 	}
 
 	/// Identity of an open directory.
 	pub async fn identify_dir(&mut self, dir: &Dir) -> io::Result<FileId> {
-		match (&mut self.imp, &dir.repr) {
-			(Imp::Native(_), DirRepr::Native(h)) => native::identify_dir(h),
-			(Imp::Provider(fs), DirRepr::Provider(path)) => provider::identify(fs, path).await,
-			_ => Err(foreign_dir()),
-		}
+		self.own(dir)?.identity_async().await.map(FileId::from)
 	}
 
 	/// Whether every change to a directory on `dir`'s filesystem (whose stamp
@@ -1037,17 +684,18 @@ impl Session {
 	/// bcachefs; NTFS, `ReFS`). Always false for providers. Listing caches rely
 	/// on it.
 	pub fn stable_stamps(&mut self, dir: &Dir, stamp: &Stamp) -> bool {
-		match (&self.imp, &dir.repr) {
-			(Imp::Native(_), DirRepr::Native(h)) => {
-				let stable = native::stable_stamps(h, stamp);
-				// The real check first: only a filesystem it refuses reaches
-				// the tests' seam ([`seam::trust_stamps`]).
-				#[cfg(test)]
-				let stable = stable || seam::trusts_stamps(stamp.dev);
-				stable
-			},
-			_ => false,
+		if !matches!(self.imp, Imp::Native) {
+			return false;
 		}
+		let Ok(dir) = self.own(dir) else {
+			return false;
+		};
+		let stable = dir.stable_stamps(stamp);
+		// The real check first: only a filesystem it refuses reaches the
+		// tests' seam ([`seam::trust_stamps`]).
+		#[cfg(test)]
+		let stable = stable || seam::trusts_stamps(stamp.dev);
+		stable
 	}
 }
 
@@ -1096,21 +744,6 @@ impl FileOpener {
 			.open_file_at(dir, name.as_encoded_bytes(), true)
 			.await
 			.map(|(file, _)| file)
-	}
-}
-
-async fn list_with(
-	imp: &mut Imp,
-	dir: &Dir,
-	detail: Detail,
-	children: u32,
-	out: &mut Listing,
-) -> io::Result<()> {
-	out.clear();
-	match (imp, &dir.repr) {
-		(Imp::Native(s), DirRepr::Native(h)) => native::list(s, h, detail, children, out),
-		(Imp::Provider(fs), DirRepr::Provider(path)) => provider::list(fs, path, detail, out).await,
-		_ => Err(foreign_dir()),
 	}
 }
 

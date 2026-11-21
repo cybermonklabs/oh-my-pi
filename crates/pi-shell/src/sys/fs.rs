@@ -1247,7 +1247,11 @@ const fn custom_flags(flags: OpenFlags) -> libc::c_int {
 
 /// Opening a FIFO in one direction blocks until the other end opens; it runs
 /// on a helper thread ([`pi_vfs::FifoOpen`], which also says what a dropped
-/// open leaves) and completes as a pending fs op.
+/// open leaves) and completes as a pending fs op. An open that may create
+/// (`>`, `>>`) opens the path itself, as `open(2)` of the path would, so the
+/// kernel's check of `O_CREAT` against the path's directory holds
+/// (`fs.protected_fifos`: another user's FIFO in a world-writable sticky
+/// directory is refused).
 #[cfg(unix)]
 mod fifo {
 	use std::{
@@ -1261,18 +1265,22 @@ mod fifo {
 	use bstr::BStr;
 	use pi_vfs::FifoOpen;
 
-	use super::{StdFile, custom_flags, host_path, options};
+	use super::{StdFile, create_with_mode, custom_flags, host_path, options};
 	use crate::bash::{File, FsPending, OpenFlags};
 
 	/// A FIFO open in flight.
 	struct Pending(FifoOpen<fs::File>);
 
 	/// `Some` when `path` is a FIFO opened for reading only or writing only
-	/// (`O_RDWR` never blocks on a FIFO).
+	/// (`O_RDWR` never blocks on a FIFO). `umask` is the process's
+	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
+	/// the path that creates a file (the FIFO was removed since the look)
+	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
 	pub fn pending(
 		path: &BStr,
 		flags: OpenFlags,
 		mode: u32,
+		umask: Option<u32>,
 	) -> Option<Box<dyn FsPending<Box<dyn File>>>> {
 		let write = flags.contains(OpenFlags::WRITE);
 		if flags.contains(OpenFlags::READ) == write {
@@ -1283,18 +1291,52 @@ mod fifo {
 		if !meta.file_type().is_fifo() {
 			return None;
 		}
-		let mut opts = options(flags, mode);
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
-		let open = FifoOpen::start(host, &meta, nofollow, move |path, pinned| {
-			// A pin is checked not to be a symbolic link already, and its
-			// `/proc/self/fd/N` always is one.
-			if pinned {
-				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+		let creates = flags.contains(OpenFlags::CREATE);
+		#[cfg(test)]
+		let name = host.to_path_buf();
+		let open = FifoOpen::start(host, &meta, nofollow, creates, move |path, pinned| {
+			#[cfg(test)]
+			{
+				ROUTES.lock().push((name.clone(), pinned));
+				let hook = {
+					let mut hooks = BEFORE_OPEN.lock();
+					let at = hooks.iter().position(|(path, _)| *path == name);
+					at.map(|at| hooks.remove(at).1)
+				};
+				if let Some(hook) = hook {
+					hook();
+				}
 			}
-			opts.open(path)
+			if pinned {
+				// A pin is checked not to be a symbolic link already, and its
+				// `/proc/self/fd/N` always is one.
+				let mut opts = options(flags, mode);
+				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+				return opts.open(path);
+			}
+			// The path, opened as the plain open of it opens it.
+			create_with_mode(path, flags, mode, umask, false)
 		});
 		Some(Box::new(Pending(open)))
 	}
+
+	/// Test record of the way each FIFO helper opened its FIFO, by the path
+	/// its open was given: through the pin's `/proc/self/fd/N` (`true`) or by
+	/// the path.
+	#[cfg(test)]
+	static ROUTES: parking_lot::Mutex<Vec<(std::path::PathBuf, bool)>> =
+		parking_lot::Mutex::new(Vec::new());
+
+	/// A test hook and the path whose next helper runs it.
+	#[cfg(test)]
+	type BeforeOpen = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+
+	/// Test hook: run once by the helper of the next open of the path it is
+	/// keyed by, after the look at the path and just before the helper's own
+	/// open.
+	#[cfg(test)]
+	static BEFORE_OPEN: parking_lot::Mutex<Vec<BeforeOpen>> = parking_lot::Mutex::new(Vec::new());
 
 	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
@@ -1377,7 +1419,8 @@ mod fifo {
 			// SAFETY: `c` is a NUL-terminated string that outlives the call.
 			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
 			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
-			let start = |p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0).unwrap();
+			let start =
+				|p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0, None).unwrap();
 
 			let mut open = start(&path);
 			// Be the writer the helper waits for, once it waits.
@@ -1400,6 +1443,274 @@ mod fifo {
 				Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
 				Ok(_) => panic!("the symbolic link was followed"),
 			}
+		}
+
+		/// A FIFO named `f` in `dir`.
+		fn make_fifo(dir: &Path) -> std::path::PathBuf {
+			let path = dir.join("f");
+			let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `c` is a NUL-terminated string that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+			path
+		}
+
+		/// An open that may create (`>`, `>>`) of a FIFO opens the path, so
+		/// the kernel checks `O_CREAT` against the path's directory as for
+		/// `open(2)` of the path (`fs.protected_fifos`); one that creates
+		/// nothing opens the pin's `/proc/self/fd/N` where procfs reaches it
+		/// (Linux). The FIFO's two ends are held, so each open completes at
+		/// once.
+		#[test]
+		fn an_open_that_may_create_opens_the_path_and_one_that_does_not_the_pin() {
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let _both = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&path)
+				.unwrap();
+			let write = OpenFlags::WRITE;
+			let cases = [
+				(
+					"> (write, create, truncate)",
+					write.with(OpenFlags::CREATE).with(OpenFlags::TRUNC),
+					true,
+				),
+				(
+					">> (write, create, append)",
+					write.with(OpenFlags::CREATE).with(OpenFlags::APPEND),
+					true,
+				),
+				("write", write, false),
+				("< (read)", OpenFlags::READ, false),
+			];
+			for (label, flags, _) in cases {
+				let mut open =
+					pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				if let Err(e) = result(&mut *open, || {}) {
+					panic!("{label}: {e}");
+				}
+			}
+			let proc = cfg!(target_os = "linux") && Path::new("/proc/self/fd").is_dir();
+			let want: Vec<_> = cases
+				.iter()
+				.map(|&(_, _, creates)| proc && !creates)
+				.collect();
+			let got: Vec<_> = ROUTES
+				.lock()
+				.iter()
+				.filter(|(name, _)| *name == path)
+				.map(|&(_, pinned)| pinned)
+				.collect();
+			assert_eq!(got, want, "through the pin, for {:?}", cases.map(|(label, ..)| label));
+		}
+
+		/// A `>` whose FIFO is removed between the shell's look at it and the
+		/// helper's open of the path creates a regular file there, as
+		/// `open(2)` of the path would, with exactly the mode the shell asks
+		/// (`0o666` less the shell's umask), as every other `>` gives a file it
+		/// creates: not that mode less the process's umask. In a process of
+		/// its own, whose umask (`0o077`) this test sets apart from the
+		/// shell's (`0o000`, so the mode asked is `0o666`); with the process's
+		/// mask known to the open and not. An open that went through the pin
+		/// instead would wait for a reader of the removed FIFO for ever: the
+		/// run of its own is bounded, and a run past the bound fails the test.
+		#[test]
+		fn a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode() {
+			use std::{
+				os::unix::fs::PermissionsExt,
+				process::Stdio,
+				time::{Duration, Instant},
+			};
+			const NAME: &str = "sys::fs::fifo::tests::a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			/// A correct run takes milliseconds.
+			const BOUND: Duration = Duration::from_secs(60);
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.stdout(Stdio::piped())
+					.stderr(Stdio::piped())
+					.spawn()
+					.unwrap();
+				let start = Instant::now();
+				while child.try_wait().unwrap().is_none() {
+					if start.elapsed() > BOUND {
+						let _ = child.kill();
+						let _ = child.wait();
+						panic!(
+							"the run of its own did not end within {BOUND:?}: the helper's open of the \
+							 removed FIFO waits for a reader, so it did not open the path"
+						);
+					}
+					thread::sleep(Duration::from_millis(5));
+				}
+				let output = child.wait_with_output().unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+			// SAFETY: `umask` has no preconditions; no other test runs in this
+			// process.
+			unsafe { libc::umask(0o077) };
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut wrong = Vec::new();
+			for (label, umask) in [("process mask known", Some(0o077)), ("process mask unknown", None)]
+			{
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let gone = path.clone();
+				BEFORE_OPEN
+					.lock()
+					.push((path.clone(), Box::new(move || fs::remove_file(&gone).unwrap())));
+				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, umask)
+					.unwrap_or_else(|| panic!("{label}: no FIFO open"));
+				if let Err(err) = result(&mut *open, || {}) {
+					panic!("{label}: {err}");
+				}
+				let meta = fs::symlink_metadata(&path).unwrap();
+				let made = (meta.file_type().is_file(), meta.permissions().mode() & 0o7777);
+				if made != (true, 0o666) {
+					wrong
+						.push(format!("{label}: made (regular file, mode) {made:?}, not (true, 0o666)"));
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// The FIFO the sticky-directory test opens: a FIFO of another user,
+		/// which any user may read and write, in a world-writable sticky
+		/// directory that user does not own. `PI_TEST_STICKY_FIFO` names one
+		/// when set (root makes it before a run as another user; a wrong one
+		/// fails the test); else, as root, one is made in `dir`. `Err` says why
+		/// there is none.
+		#[cfg(target_os = "linux")]
+		fn sticky_fifo(dir: &Path) -> Result<std::path::PathBuf, String> {
+			use std::os::unix::fs::{MetadataExt, PermissionsExt};
+			// SAFETY: `geteuid` has no preconditions.
+			let me = unsafe { libc::geteuid() };
+			if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+				let fifo = std::path::PathBuf::from(given);
+				let meta = fs::metadata(&fifo)
+					.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+				let parent = fs::metadata(fifo.parent().unwrap()).unwrap();
+				assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+				assert_eq!(
+					parent.mode() & 0o1002,
+					0o1002,
+					"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+				);
+				assert!(
+					meta.uid() != me && meta.uid() != parent.uid(),
+					"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+				);
+				assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+				return Ok(fifo);
+			}
+			if me != 0 {
+				return Err(
+					"not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned(),
+				);
+			}
+			let sticky = dir.join("sticky");
+			fs::create_dir(&sticky).unwrap();
+			fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+			let fifo = make_fifo(&sticky);
+			fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
+			std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+			Ok(fifo)
+		}
+
+		/// With `fs.protected_fifos` at 1 or more, an open that may create of
+		/// a FIFO another user owns in a world-writable sticky directory that
+		/// user does not own is refused (`EACCES`), so `echo x > fifo` never
+		/// writes into such a FIFO. The shell's open (`StdFs::open`, as the
+		/// engine opens) and the FIFO helper's (`pending`) are refused as
+		/// `open(2)` of the path is, for `>` and `>>`. The FIFO's read end is
+		/// held, so an open that goes ahead ends at once and its write reaches
+		/// that reader. As root, which can give the FIFO to another user, or as
+		/// any user given such a FIFO (`sticky_fifo`), where
+		/// `fs.protected_fifos` is 1 or more and the plain open is refused;
+		/// elsewhere it checks nothing and says so.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is() {
+			use std::io::Read;
+
+			use crate::bash::{Fs, FsPoll};
+			let protected = fs::read_to_string("/proc/sys/fs/protected_fifos")
+				.ok()
+				.and_then(|value| value.trim().parse::<u32>().ok());
+			if protected.is_none_or(|value| value < 1) {
+				eprintln!(
+					"UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked"
+				);
+				return;
+			}
+			let dir = tempfile::tempdir().unwrap();
+			let fifo = match sticky_fifo(dir.path()) {
+				Ok(fifo) => fifo,
+				Err(why) => {
+					eprintln!("UNKNOWN: {why}; nothing was checked");
+					return;
+				},
+			};
+			let mut reader = OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo)
+				.unwrap();
+			let name = BStr::new(fifo.as_os_str().as_bytes());
+			let outcome = |opened: io::Result<Box<dyn File>>| {
+				opened
+					.map(|mut file| {
+						let _ = file.poll_write(&mut Context::from_waker(Waker::noop()), b"written");
+					})
+					.map_err(|err| (err.kind(), err.raw_os_error()))
+			};
+			let write = OpenFlags::WRITE.with(OpenFlags::CREATE);
+			let mut wrong = Vec::new();
+			for (label, flags) in [
+				("echo x > fifo", write.with(OpenFlags::TRUNC)),
+				("echo x >> fifo", write.with(OpenFlags::APPEND)),
+			] {
+				let want = options(flags, 0o666)
+					.open(&fifo)
+					.map(drop)
+					.map_err(|err| (err.kind(), err.raw_os_error()));
+				if want.is_ok() {
+					eprintln!(
+						"UNKNOWN: {label}: the plain open gave {want:?}, so fs.protected_fifos does not \
+						 hold here; nothing was checked"
+					);
+					return;
+				}
+				let by_helper =
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
+					FsPoll::Ready(opened) => opened,
+					FsPoll::Pending(mut open) => result(&mut *open, || {}),
+				});
+				for (route, got) in [("the FIFO helper", by_helper), ("the shell's open", by_shell)] {
+					if got != want {
+						wrong.push(format!(
+							"{label}, {route}: {got:?} where the plain open gives {want:?}"
+						));
+					}
+				}
+			}
+			let mut leaked = Vec::new();
+			let _ = reader.read_to_end(&mut leaked);
+			assert!(
+				wrong.is_empty(),
+				"FIFO opens in a sticky directory (another user's FIFO read {} bytes): {wrong:#?}",
+				leaked.len()
+			);
 		}
 	}
 }
@@ -1704,7 +2015,7 @@ impl Fs for StdFs {
 		// reader then inside a blocking open of the FIFO returns with no writer
 		// and reads end of file, while this writer waits for a reader for ever.
 		#[cfg(unix)]
-		if let Some(pending) = fifo::pending(path, flags, mode) {
+		if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
 			return FsPoll::Pending(pending);
 		}
 		#[cfg(unix)]
@@ -1713,7 +2024,7 @@ impl Fs for StdFs {
 				// A FIFO made since the check above, with no reader yet (or no
 				// FIFO at all: `pending` tells).
 				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
-					if let Some(pending) = fifo::pending(path, flags, mode) {
+					if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
 						return FsPoll::Pending(pending);
 					}
 				},
@@ -3084,13 +3395,14 @@ mod tests {
 		}
 
 		/// Dropped opens leave no end of the FIFO behind, through
-		/// `StdFs::open` as the engine opens them: each round drops a read
-		/// and a write as soon as they start (in most rounds before their
-		/// helpers run), and a helper any round leaves behind fails a later
-		/// check, or makes a later write open complete at once. A helper the
-		/// drop came before used to enter `open(2)` afterwards and stay on the
-		/// FIFO, so the next writer's data went to it. The tests in `fifo`
-		/// hold each point of the helper's start in turn.
+		/// `StdFs::open` as the engine opens them: each round drops a read, a
+		/// write and a `>` write (whose helper opens the path, not the pin) as
+		/// soon as they start (in most rounds before their helpers run), and a
+		/// helper any round leaves behind fails a later check, or makes a later
+		/// write open complete at once. A helper the drop came before used to
+		/// enter `open(2)` afterwards and stay on the FIFO, so the next
+		/// writer's data went to it. The tests in `fifo` hold each point of the
+		/// helper's start in turn.
 		///
 		/// A process that another test of this process forks holds a copy of
 		/// every descriptor until its exec, a helper's end of this FIFO too,
@@ -3116,11 +3428,16 @@ mod tests {
 
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
+			let redirect = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
 			for round in 0..200 {
 				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0)));
 				assert!(!fifo::has_reader(&host), "round {round}: a reader is left on the FIFO");
 				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0)));
 				assert!(!fifo::has_writer(&host), "round {round}: a writer is left on the FIFO");
+				drop(pending(StdFs::default().open(path.as_bstr(), redirect, 0o666)));
+				assert!(!fifo::has_writer(&host), "round {round}: a `>` writer is left on the FIFO");
 			}
 			fs::remove_file(&host).unwrap();
 		}

@@ -46,7 +46,7 @@ pub(crate) fn file_set_permissions(file: &fs::File, permissions: Permissions) ->
 	file.set_permissions(fs::Permissions::from_mode(permissions.mode()))
 }
 
-fn timespec(time: FileTime) -> libc::timespec {
+pub(crate) fn timespec(time: FileTime) -> libc::timespec {
 	// SAFETY: `timespec` is a plain C struct (some targets add private padding
 	// fields); all-zero is a valid value and the public fields are set below.
 	let mut spec: libc::timespec = unsafe { std::mem::zeroed() };

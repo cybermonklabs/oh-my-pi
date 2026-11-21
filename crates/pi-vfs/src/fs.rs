@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	dir::{EntryBinding, ReadDir},
+	dir_handle::DirHandle,
 	error::{
 		already_exists, invalid_argument, no_provider, not_a_directory, not_permitted,
 		permission_denied, unsupported,
@@ -39,7 +40,10 @@ use crate::{
 	types::{FileId, FileTime, NodeKind, Permissions, StatFs, SymlinkKind},
 };
 #[cfg(unix)]
-use crate::{fifo::FifoOpen, file::POLL_SLICE};
+use crate::{
+	fifo::{FifoName, FifoOpen, FifoPin},
+	file::POLL_SLICE,
+};
 
 /// A path pinned to an already-open file (`/dev/stdin`, `/dev/fd/N`, ...).
 struct Mount {
@@ -152,6 +156,30 @@ fn host_mask(scope: &Scope) -> Option<u32> {
 	scope.creation_mask.filter(|_| cfg!(unix))
 }
 
+/// How an open creates a missing file: `None` when it creates none, else
+/// `Some(exclusive)`, `exclusive` when it creates only a new file. Through
+/// `create` or `create_new`, and on Unix through `O_CREAT` (with `O_EXCL`)
+/// among its custom flags, which the kernel honours alike.
+const fn creation(options: &OpenOptions) -> Option<bool> {
+	#[cfg(unix)]
+	let (custom, custom_exclusive) = {
+		let flags = options.get_custom_flags();
+		(
+			flags & libc::O_CREAT != 0,
+			flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL,
+		)
+	};
+	#[cfg(not(unix))]
+	let (custom, custom_exclusive) = (false, false);
+	if options.is_create_new() || custom_exclusive {
+		Some(true)
+	} else if options.is_create() || custom {
+		Some(false)
+	} else {
+		None
+	}
+}
+
 /// Opens a host path under the facade's creation mask: a file the open
 /// creates gets exactly its requested mode (`0o666` by default) less the
 /// mask. The mask replaces the process umask, which the kernel still applies
@@ -161,9 +189,9 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 	let Some(mask) = host_mask(scope) else {
 		return native::open(path, options);
 	};
-	if !(options.is_create() || options.is_create_new()) {
+	let Some(exclusive_only) = creation(options) else {
 		return native::open(path, options);
-	}
+	};
 	let mode = options.get_mode().unwrap_or(0o666) & !mask;
 	let mut masked = options.clone();
 	masked.mode(mode);
@@ -178,7 +206,7 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 			let _ = file.set_permissions(Permissions::from_mode(mode));
 			Ok(file)
 		},
-		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !options.is_create_new() => {
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !exclusive_only => {
 			native::open(path, &masked)
 		},
 		Err(err) => Err(err),
@@ -195,14 +223,18 @@ enum ScopedOpen {
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
 	/// the wait goes through [`FifoOpen`], which the token can interrupt.
+	/// `pin` is the FIFO at the path when the pin was taken, just after the
+	/// `stat` ([`FifoPin`]; a FIFO put there in between is the one pinned);
+	/// `None` when it was gone by then, and the open then has no release.
 	#[cfg(unix)]
-	Fifo { token: CancellationToken, meta: std::fs::Metadata },
+	Fifo { token: CancellationToken, pin: Option<FifoPin> },
 }
 
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
 /// one `stat` first. It says whether the file's reads must poll (see
 /// [`crate::reads_can_block`]) and whether the open itself can block: a
-/// FIFO's open waits for the other end. Without a token, for any other open,
+/// FIFO's open waits for the other end, unless the open never waits on a
+/// FIFO it finds ([`fifo_open_waits`]). Without a token, for any other open,
 /// or when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
 /// changes between the `stat` and the open, the file is opened as the `stat`
 /// described it.
@@ -212,21 +244,21 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 	if let Some(token) = &scope.cancel
 		&& !options.is_create_new()
 	{
-		use std::os::unix::fs::FileTypeExt;
-		let one_way = match (options.is_read(), options.is_writable()) {
-			(true, false) => !options.is_create(),
-			(false, true) => true,
-			_ => false,
-		};
-		if !one_way {
-			return ScopedOpen::Plain;
+		use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+		match (options.is_read(), options.is_writable()) {
+			(true, false) if !options.is_create() => {},
+			(false, true) => {},
+			_ => return ScopedOpen::Plain,
 		}
 		let Ok(meta) = std::fs::metadata(path) else {
 			return ScopedOpen::Plain;
 		};
-		let kind = meta.file_type();
-		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
-			return ScopedOpen::Fifo { token: token.clone(), meta };
+		if meta.file_type().is_fifo() && fifo_open_waits(options) {
+			let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
+			let pin = std::ffi::CString::new(path.as_os_str().as_bytes())
+				.ok()
+				.and_then(|path| FifoPin::at(libc::AT_FDCWD, &path, follow).ok().flatten());
+			return ScopedOpen::Fifo { token: token.clone(), pin };
 		}
 		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
 	}
@@ -245,8 +277,8 @@ fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, meta } => {
-			Ok(wait_fifo(start_fifo(scope, path, options, &meta, &token)?, &token)?
+		ScopedOpen::Fifo { token, pin } => {
+			Ok(wait_fifo(start_fifo(scope, path, options, pin, &token)?, &token)?
 				.bind_host(token, true))
 		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
@@ -271,8 +303,8 @@ async fn native_open_scoped_async(
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, meta } => {
-			Ok(wait_fifo_async(start_fifo(scope, path, options, &meta, &token)?, &token)
+		ScopedOpen::Fifo { token, pin } => {
+			Ok(wait_fifo_async(start_fifo(scope, path, options, pin, &token)?, &token)
 				.await?
 				.bind_host(token, true))
 		},
@@ -280,11 +312,66 @@ async fn native_open_scoped_async(
 	}
 }
 
-/// Starts opening one end of the FIFO at `path`, which `meta` describes, on
-/// a helper thread (see [`FifoOpen`]), so that the wait for the other end
-/// observes `token` and, for async callers, holds no runtime worker. The
-/// helper runs the ordinary blocking open, so the open returns exactly when
-/// it would without a token: once the other end connects.
+/// Whether an open with `options` waits on a FIFO it finds: a read-only open
+/// that creates nothing, or a write-only one, without `O_NONBLOCK`. Not one
+/// that never waits on a FIFO: one the plain open refuses before it looks at
+/// the entry (`EINVAL`: truncating or creating without write access, or
+/// appending with truncation, the combinations `std` refuses), and an
+/// exclusive create (`create_new`, or a custom `O_EXCL` with `create` or a
+/// custom `O_CREAT`), which fails with `EEXIST` on any entry. Those take the
+/// plain open, which gives their error.
+#[cfg(unix)]
+pub(crate) const fn fifo_open_waits(options: &OpenOptions) -> bool {
+	let custom = options.get_custom_flags();
+	let creates = options.is_create() || custom & libc::O_CREAT != 0;
+	if options.is_create_new()
+		|| (creates && custom & libc::O_EXCL != 0)
+		|| custom & libc::O_NONBLOCK != 0
+	{
+		return false;
+	}
+	let (write, append, truncate) = (options.is_write(), options.is_append(), options.is_truncate());
+	if (!write && !append && (truncate || options.is_create())) || (append && truncate) {
+		return false;
+	}
+	options.is_read() != (write || append)
+}
+
+/// Whether an open with `options` has `O_CREAT`: `create`, `create_new`, or
+/// a custom `O_CREAT`. The kernel checks such an open of an existing FIFO
+/// against the directory its name is in (`fs.protected_fifos` in a sticky
+/// directory, which `may_create_in_sticky` reads only under `O_CREAT`); a
+/// walk through `/proc/self/fd/N` ends in `/proc/self/fd`, which is never
+/// sticky. So a pinned FIFO's helper runs such an open by name with the
+/// caller's own options ([`FifoOpen`]). The checks of other flags hold
+/// through the magic link (the write permission `O_TRUNC` asks, from the
+/// flags alone; `EEXIST` needs `O_CREAT`), so every other open reopens the
+/// pin.
+#[cfg(unix)]
+pub(crate) const fn creates(options: &OpenOptions) -> bool {
+	options.is_create() || options.is_create_new() || options.get_custom_flags() & libc::O_CREAT != 0
+}
+
+/// `options`, which have no `O_CREAT` ([`creates`]), for an open of a pinned
+/// FIFO through `/proc/self/fd/N`: without `O_NOFOLLOW`, which would refuse
+/// the magic link itself. `O_TRUNC` stays, so the kernel asks the write
+/// permission it asks of the plain open.
+#[cfg(unix)]
+pub(crate) fn reopen_options(options: &OpenOptions) -> OpenOptions {
+	debug_assert!(!creates(options), "a creating open goes by name");
+	let mut reopen = options.clone();
+	reopen.custom_flags(options.get_custom_flags() & !libc::O_NOFOLLOW);
+	reopen
+}
+
+/// Starts opening one end of the FIFO at `path`, pinned as `pin`, on a helper
+/// thread (see [`FifoOpen`]), so that the wait for the other end observes
+/// `token` and, for async callers, holds no runtime worker. The helper runs
+/// the ordinary blocking open, so the open returns exactly when it would
+/// without a token: once the other end connects. It opens the pin's
+/// `/proc/self/fd/N` with [`reopen_options`], or the path with `options`
+/// when the open has `O_CREAT` ([`creates`]) or no `/proc/self/fd/N` reaches
+/// the pin.
 ///
 /// Once the token fires, the open fails with [`crate::cancelled`], and
 /// dropping it releases the helper, so it leaves no end of the FIFO behind
@@ -297,29 +384,27 @@ fn start_fifo(
 	scope: &Scope,
 	path: &Path,
 	options: &OpenOptions,
-	meta: &std::fs::Metadata,
+	pin: Option<FifoPin>,
 	token: &CancellationToken,
 ) -> io::Result<FifoOpen<File>> {
 	if token.is_cancelled() {
 		return Err(crate::cancelled());
 	}
-	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
+	let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
+	let name = FifoName::Path { path: path.to_path_buf(), follow };
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start(path, meta, nofollow, move |path, pinned| {
-		if !pinned {
-			return native_open(&scope, path, &options);
+	Ok(FifoOpen::start_pinned(pin, name, creates(&options), move |path, pinned| {
+		if pinned {
+			native_open(&scope, path, &reopen_options(&options))
+		} else {
+			native_open(&scope, path, &options)
 		}
-		// A pin is checked not to be a symbolic link already, and its
-		// `/proc/self/fd/N` always is one.
-		let mut through_pin = options;
-		through_pin.custom_flags(through_pin.get_custom_flags() & !libc::O_NOFOLLOW);
-		native_open(&scope, path, &through_pin)
 	}))
 }
 
 /// Waits for a FIFO open on this thread, checking `token` every poll slice.
 #[cfg(unix)]
-fn wait_fifo(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
+pub(crate) fn wait_fifo(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
 	loop {
 		if let Some(result) = open.wait_for(POLL_SLICE) {
 			return result;
@@ -332,13 +417,21 @@ fn wait_fifo(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<
 
 /// Awaits a FIFO open or `token`, whichever comes first.
 #[cfg(unix)]
-async fn wait_fifo_async(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
+pub(crate) async fn wait_fifo_async(
+	mut open: FifoOpen<File>,
+	token: &CancellationToken,
+) -> io::Result<File> {
 	tokio::select! {
 		biased;
 		result = std::future::poll_fn(|cx| open.poll(cx)) => result,
 		() = token.cancelled() => Err(crate::cancelled()),
 	}
 }
+
+/// The FIFO test seams ([`crate::fifo::seam`]), where the facade's tests and
+/// the directory handles' tests reach them.
+#[cfg(all(test, unix))]
+pub(crate) use crate::fifo::seam as fifo_seam;
 
 /// Reads a whole host file. Under a cancellable scope the read goes through
 /// [`File`], so it stops when the token fires instead of draining the file
@@ -663,6 +756,15 @@ impl Fs {
 			.map(|mount| &mount.file)
 	}
 
+	/// Whether a descriptor overlay is mounted below `path`, which a host
+	/// directory handle would reach past.
+	fn mounts_below(&self, path: &Path) -> bool {
+		self
+			.mounts
+			.as_ref()
+			.is_some_and(|mounts| mounts.iter().any(|mount| mount.path.starts_with(path)))
+	}
+
 	fn route(&self, path: &Path) -> io::Result<Route<'_>> {
 		if let Some(file) = self.mounted(path) {
 			return Ok(Route::Mounted(file));
@@ -833,6 +935,56 @@ impl Fs {
 		} else {
 			self.symlink_metadata(path).await
 		}
+	}
+
+	/// Opens the directory at `path` as a [`DirHandle`], below which every
+	/// call names one entry: a descriptor on the host, the path on a provider.
+	/// Earlier components are followed; with `follow` the last is too.
+	/// Without, a symlink that is the last component is refused (`ENOTDIR` on
+	/// Unix, also on a kernel that follows one despite `O_NOFOLLOW`;
+	/// `ERROR_STOPPED_ON_SYMLINK` on Windows; [`not_a_directory`] on a
+	/// provider). A host handle keeps this facade's creation mask and
+	/// cancellation for the files and directories it creates and opens. A
+	/// host directory with a descriptor overlay mounted below it opens as a
+	/// path handle on this facade ([`Self::open_dir_by_path`]), so its calls
+	/// reach the overlay, as this facade's own calls do.
+	///
+	/// # Errors
+	///
+	/// The open's errors; [`not_a_directory`] for anything else, a descriptor
+	/// overlay included.
+	pub async fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.route(path)? {
+			Route::Native if !self.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				DirHandle::open_provider(self, Handle::try_current().ok(), path, follow).await
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// Opens the directory at `path` as a handle that names its entries by
+	/// path on this facade, whatever serves them: each call joins the entry's
+	/// name to `path` and makes this facade's path call, which routes it as
+	/// the facade routes any path. Where this facade serves `path` from the
+	/// host, [`Self::open_dir`] opens a host handle instead; a walk that
+	/// started below a provider's root keeps to paths with this call. The
+	/// directory is checked to be one, a final symlink followed only with
+	/// `follow`.
+	///
+	/// # Errors
+	///
+	/// The facade's metadata errors; [`not_a_directory`] for anything else, a
+	/// descriptor overlay included.
+	pub async fn open_dir_by_path(
+		&self,
+		path: impl AsRef<Path>,
+		follow: bool,
+	) -> io::Result<DirHandle> {
+		DirHandle::open_provider(self, Handle::try_current().ok(), path.as_ref(), follow).await
 	}
 
 	pub async fn read_dir(&self, path: impl AsRef<Path>) -> io::Result<ReadDir> {
@@ -1463,6 +1615,29 @@ impl BlockingFs {
 				let read_dir = self.run(provider.read_dir(path))?;
 				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
 				Ok(read_dir.bind(self.fs.entry_binding(provider, runtime)))
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// See [`Fs::open_dir`]. The handle's synchronous provider calls are
+	/// driven as this facade drives its own.
+	///
+	/// # Errors
+	///
+	/// As for [`Fs::open_dir`].
+	pub fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.fs.route(path)? {
+			Route::Native if !self.fs.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.fs.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
+				block_on(
+					self.runtime.as_ref(),
+					DirHandle::open_provider(&self.fs, runtime, path, follow),
+				)
 			},
 			Route::Mounted(_) => Err(not_a_directory()),
 		}
