@@ -1081,13 +1081,14 @@ mod two_pollers {
 	// key, which the tool wrote with: the next run's `printf x >&3` took it,
 	// exited 0 and was never written (the file held `nohu`). A host callout
 	// writes with a key of the call's own, which goes with the call (#111's
-	// round 9): the tool's held 4 bytes, then `x`.
+	// round 9): the tool's held 4 bytes, then `x`. The kill waits for the
+	// tool's write to be held: the job reads a `gate` file, whose reads wait
+	// until a write waits on the hold.
 	#[test]
 	fn a_write_after_a_tools_dropped_held_write_is_its_own() {
 		let mut wrong = Vec::new();
-		for (how, ends, cancel) in
-			[("cancelled", "", true), ("killed", "{ sleep 0.2; kill -TERM $$; } & ", false)]
-		{
+		let killed = ": >mem://d/gate; { read -r g <mem://d/gate; kill -TERM $$; } & ";
+		for (how, ends, cancel) in [("cancelled", "", true), ("killed", killed, false)] {
 			for (tool, held) in [("nohup", b"nohu"), ("timeout", b"time")] {
 				let (status, data) = drop_a_held_write(&format!("{ends}{tool} --version >&3"), cancel);
 				let mut want = held.to_vec();
