@@ -62,7 +62,7 @@ import { buildSessionContextView } from "../../session/context-view";
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
-import type { AsyncJobSnapshotItem } from "../../session/agent-session";
+import { type AsyncJobSnapshotItem, SessionDropError } from "../../session/agent-session";
 import { buildJobTree, jobTreeGuide, jobTreeIndent } from "@oh-my-pi/pi-tui/overlays/job-tree";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
@@ -1371,7 +1371,14 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.newSession(options))) return;
+		// A refused or failed drop (`/delete`) still starts the new session: show it, then the reason instead of `label`.
+		let dropError: SessionDropError | undefined;
+		try {
+			if (!(await this.ctx.session.newSession(options))) return;
+		} catch (err) {
+			if (!(err instanceof SessionDropError)) throw err;
+			dropError = err;
+		}
 		// A focused subagent view keeps its own history: return to the main session
 		// first so the transcript below cannot rebuild from the subagent's surviving
 		// conversation, then drop any turn-scoped anchors (coalescing timers,
@@ -1387,7 +1394,11 @@ export class CommandController {
 		this.ctx.clearTransientSessionUi();
 		this.ctx.resetTranscript();
 
-		this.ctx.present([new Spacer(1), new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 1)]);
+		if (dropError) {
+			this.ctx.showError(dropError.message);
+		} else {
+			this.ctx.present([new Spacer(1), new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 1)]);
+		}
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 	}

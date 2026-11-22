@@ -11,7 +11,12 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
-import { visitEntriesFromFile } from "./session-loader";
+import {
+	extractStringProperty,
+	leadingSessionHeader,
+	visitEntriesFromFile,
+	withoutLeadingMarks,
+} from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import {
 	defaultSessionStorage,
@@ -231,55 +236,6 @@ function statusFromTailMessage(message: TailMessage): SessionStatus {
 	}
 }
 
-function decodeJsonStringFragment(value: string): string {
-	const safeValue = value.endsWith("\\") ? value.slice(0, -1) : value;
-	try {
-		return JSON.parse(`"${safeValue}"`) as string;
-	} catch {
-		return safeValue
-			.replace(/\\n/g, "\n")
-			.replace(/\\r/g, "\r")
-			.replace(/\\t/g, "\t")
-			.replace(/\\"/g, '"')
-			.replace(/\\\\/g, "\\");
-	}
-}
-
-function extractStringProperty(source: string, name: string, startIndex = 0): string | undefined {
-	const propertyIndex = source.indexOf(`"${name}"`, startIndex);
-	if (propertyIndex === -1) return undefined;
-
-	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
-	if (colonIndex === -1) return undefined;
-
-	let valueIndex = colonIndex + 1;
-	while (valueIndex < source.length) {
-		const char = source.charCodeAt(valueIndex);
-		if (char !== 32 && char !== 9 && char !== 10 && char !== 13) break;
-		valueIndex++;
-	}
-	if (source.charCodeAt(valueIndex) !== 34) return undefined;
-
-	const valueStart = valueIndex + 1;
-	let escaped = false;
-	for (let i = valueStart; i < source.length; i++) {
-		const char = source.charCodeAt(i);
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
-		if (char === 92) {
-			escaped = true;
-			continue;
-		}
-		if (char === 34) {
-			return decodeJsonStringFragment(source.slice(valueStart, i));
-		}
-	}
-
-	return decodeJsonStringFragment(source.slice(valueStart));
-}
-
 function countRoleMarkers(content: string, role: "assistant" | "user" | "message"): number {
 	const key = role === "message" ? '"type"' : '"role"';
 	const want = role === "message" ? "message" : role;
@@ -391,30 +347,19 @@ function parseSessionListHeaderLine(line: string, titleOverride?: string | null)
 	};
 }
 
+/**
+ * The listed header, read from `content`'s leading text as a delete and the loader read it ({@link leadingSessionHeader}).
+ * `entries` are the records of `withoutLeadingMarks(content)`; `content` is the text as read.
+ */
 function parseSessionListHeader(
 	content: string,
 	entries: Array<Record<string, unknown>>,
 ): SessionListHeader | undefined {
-	const firstEntry = entries[0];
-	const parsedSlotTitle = normalizeTitleOverride(
-		firstEntry?.type === "title" && typeof firstEntry.title === "string" ? firstEntry.title : undefined,
-	);
-	const parsedHeader = sessionListHeaderFromRecord(entries[firstEntry?.type === "title" ? 1 : 0], parsedSlotTitle);
-	if (parsedHeader) return parsedHeader;
-
-	let slotTitle: string | null | undefined;
-	let firstNonEmpty = true;
-	for (const rawLine of content.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line) continue;
-		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
-			slotTitle = normalizeTitleOverride(extractStringProperty(line, "title"));
-			firstNonEmpty = false;
-			continue;
-		}
-		return parseSessionListHeaderLine(line, slotTitle);
-	}
-	return undefined;
+	const header = leadingSessionHeader(content, entries);
+	if (!header) return undefined;
+	const slotTitle = normalizeTitleOverride(header.slotTitle);
+	if (header.record) return sessionListHeaderFromRecord(header.record, slotTitle);
+	return header.line === undefined ? undefined : parseSessionListHeaderLine(header.line, slotTitle);
 }
 
 function getSessionListWorkerCount(fileCount: number): number {
@@ -459,7 +404,9 @@ async function scanSessionFile(
 			withStatus ? SESSION_LIST_SUFFIX_BYTES : 0,
 		);
 		const { size, mtime } = stat;
-		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		// Parsed past the leading byte order marks, as the loader parses (withoutLeadingMarks): a mark left on the
+		// header's line makes it unreadable, and the session's first prompt would then be read as its header.
+		const entries = parseJsonlLenient<Record<string, unknown>>(withoutLeadingMarks(content));
 		const header = parseSessionListHeader(content, entries);
 		if (!header) {
 			// Cache the negative result too: an unparseable file stays unparseable

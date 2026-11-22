@@ -105,7 +105,9 @@ import {
 	readSessionHeaderId,
 	resolveBlobRefsInEntries,
 	resolveBlobRefsInEntriesSync,
+	SESSION_HEADER_READ_LIMIT,
 	type SessionLoadResult,
+	sessionHeaderIdOfHead,
 	visitEntriesFromFile,
 } from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
@@ -122,7 +124,10 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	type ListedSession,
 	MemorySessionStorage,
+	readStoredText,
+	readStoredTextSync,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
 	type SessionStorage,
@@ -230,6 +235,11 @@ function fileSafeTimestamp(iso: string): string {
 function artifactsDirectoryFor(sessionFile: string | undefined): string | null {
 	if (!sessionFile?.endsWith(".jsonl")) return null;
 	return sessionFile.slice(0, -JSONL_SUFFIX_LENGTH);
+}
+
+/** The session `id` as a delete's guard: the store compares it with the header it finds, read as the loader reads it. */
+function listedSession(id: string): ListedSession {
+	return { id, headBytes: SESSION_HEADER_READ_LIMIT, headerId: sessionHeaderIdOfHead };
 }
 
 /**
@@ -1766,19 +1776,20 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (!this.#storage.readTextSync) return undefined;
-		let content: string;
+		// The stored size of what was read (see readStoredText): the retry is checked against it.
+		let read: { text: string; size: number } | undefined;
 		try {
-			content = this.#storage.readTextSync(contested);
+			read = readStoredTextSync(this.#storage, contested);
 		} catch (readError) {
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
 			return contested;
 		}
-		const foreign = this.#foreignEntriesIn(content);
+		if (!read) return undefined;
+		const foreign = this.#foreignEntriesIn(read.text);
 		if (!foreign) return this.#moveOffSessionFile("replaced");
 		resolveBlobRefsInEntriesSync(foreign, this.#blobs);
-		this.#adoptForeignEntries(foreign, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries(foreign, read.size);
 		return contested;
 	}
 
@@ -1811,9 +1822,9 @@ export class SessionManager {
 			if (this.#sessionFile !== contested) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
-		let content: string;
+		let read: { text: string; size: number };
 		try {
-			content = await this.#storage.readText(contested);
+			read = await readStoredText(this.#storage, contested);
 		} catch (readError) {
 			// A synchronous rewrite during the read already recovered; retry against its result.
 			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
@@ -1822,11 +1833,11 @@ export class SessionManager {
 			return contested;
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		const foreign = this.#foreignEntriesIn(content);
+		const foreign = this.#foreignEntriesIn(read.text);
 		if (!foreign) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		this.#adoptForeignEntries(foreign, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries(foreign, read.size);
 		return contested;
 	}
 
@@ -3269,11 +3280,32 @@ export class SessionManager {
 		return sessionFile;
 	}
 
-	/** Delete a session file and its artifact directory. ENOENT is treated as success. */
+	/**
+	 * Delete a session file and its artifact directory. ENOENT is treated as success.
+	 *
+	 * The manager's own file is deleted only while it still holds the session
+	 * this manager owns there (`ListedSessionChangedError` otherwise, deleting
+	 * nothing): the id is read before the writer drains, as a flush can move
+	 * the manager to a sibling. Wherever the manager sets its file, it sets the
+	 * id the file's header names or writes it with that id, so the two differ
+	 * only while nothing of the manager's is written there yet; a delete then
+	 * finds no file, which is nothing of its to delete. Another session that
+	 * took the path is refused, never deleted. Any other path is deleted as
+	 * {@link deleteSessionFile} deletes it.
+	 */
 	async dropSession(sessionPath: string): Promise<void> {
+		const owned =
+			this.#sessionFile !== undefined && path.resolve(sessionPath) === path.resolve(this.#sessionFile)
+				? this.#sessionId
+				: undefined;
 		await this.#drainAndCloseWriter();
 		try {
-			await SessionManager.deleteSessionFile(sessionPath, this.#storage);
+			if (owned !== undefined && !(await this.#storage.exists(sessionPath))) return;
+			await SessionManager.deleteSessionFile(
+				sessionPath,
+				this.#storage,
+				owned === undefined ? undefined : listedSession(owned),
+			);
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
@@ -3285,31 +3317,54 @@ export class SessionManager {
 	 * that confirms claims (`acquireSessionClaim`, SQL storage) the claim is
 	 * taken before anything is deleted and held until the delete has run, so
 	 * the delete meets the write fence like any other write; a claim this
-	 * process holds already is shared. Other storages delete as before. ENOENT
-	 * propagates.
+	 * process holds already is shared. ENOENT propagates.
+	 *
+	 * The storage refuses the delete with `ListedSessionChangedError`, deleting
+	 * nothing, unless the file still holds the session when the delete runs
+	 * (see {@link SessionStorage.deleteSessionWithArtifacts}): `listed`, the
+	 * session a picker listed, else the session the file's header names when
+	 * this delete reads it. So a move of the session by another client that
+	 * holds no claim (it renames the file, then each subagent transcript)
+	 * cannot be split by a delete of the old path, on any storage. A file
+	 * whose header names no session is deleted without that check.
 	 */
 	static async deleteSessionFile(
 		sessionPath: string,
 		storage: SessionStorage = defaultSessionStorage(),
+		listed?: ListedSession,
 	): Promise<void> {
+		const sessionId = await readSessionHeaderId(sessionPath, storage);
+		const guard = listed ?? (sessionId === undefined ? undefined : listedSession(sessionId));
 		let release = (): void => {};
-		if (storage.acquireSessionClaim) {
-			const sessionId = await readSessionHeaderId(sessionPath, storage);
-			if (sessionId) {
-				const claim = await storage.acquireSessionClaim(sessionId, sessionPath);
-				if (!claim) {
-					throw new Error(
-						`Cannot delete session "${sessionPath}": another live omp process writes it. Nothing was deleted.`,
-					);
-				}
-				release = claim;
+		if (storage.acquireSessionClaim && sessionId) {
+			const claim = await storage.acquireSessionClaim(sessionId, sessionPath);
+			if (!claim) {
+				throw new Error(
+					`Cannot delete session "${sessionPath}": another live omp process writes it. Nothing was deleted.`,
+				);
 			}
+			release = claim;
 		}
 		try {
-			await storage.deleteSessionWithArtifacts(sessionPath);
+			await storage.deleteSessionWithArtifacts(sessionPath, guard);
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Delete the session `session.id` at `session.path`: {@link deleteSessionFile},
+	 * refused with `ListedSessionChangedError`, deleting nothing, unless the
+	 * file still holds that session when the delete runs. The pickers' delete
+	 * (the session a picker listed) and `/delete` (the session the manager
+	 * owned there before it detached) make it, so neither deletes another
+	 * session that took the path.
+	 */
+	static async deleteListedSession(
+		session: { path: string; id: string },
+		storage: SessionStorage = defaultSessionStorage(),
+	): Promise<void> {
+		await SessionManager.deleteSessionFile(session.path, storage, listedSession(session.id));
 	}
 
 	/**

@@ -6,6 +6,7 @@ import {
 	childKeyName,
 	SessionLeaseLostError,
 	SessionWriteConflictError,
+	type ListedSession,
 	type SessionStorage,
 	type SessionStorageStat,
 	type SessionStorageWriter,
@@ -13,7 +14,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "./session-storage";
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
-import { eexist, enoent } from "./session-storage-errors";
+import { eexist, enoent, ListedSessionChangedError } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
@@ -29,6 +30,11 @@ export interface SessionStorageIndexEntry {
 	title?: string;
 	titleSource?: SessionTitleUpdate["source"];
 	titleUpdatedAt?: string;
+}
+
+/** {@link SessionStorageBackend.remove}'s check of a listed session: the session at `path`. */
+export interface ListedSessionGuard extends ListedSession {
+	path: string;
 }
 
 export interface SessionStorageBackend {
@@ -68,9 +74,14 @@ export interface SessionStorageBackend {
 	/**
 	 * Remove `paths`, and with `dir` (a key prefix ending in `/`) every key
 	 * under it that the shared store holds when the removal runs, including
-	 * ones another client committed after this store last refreshed.
+	 * ones another client committed after this store last refreshed. With
+	 * `listed`, refuse with {@link ListedSessionChangedError}, removing
+	 * nothing, unless the key at `listed.path` holds `listed.id` when the
+	 * removal runs: checked under the removal's own locks (in its transaction,
+	 * after its row locks; in its script), so no client's write lands between
+	 * the check and the removal.
 	 */
-	remove(paths: string[], dir?: string): Promise<void>;
+	remove(paths: string[], dir?: string, listed?: ListedSessionGuard): Promise<void>;
 	/**
 	 * Move `src` to `dst`, replacing `dst`. With `noReplace` a `dst` the shared
 	 * store holds, including one another client commits while the move runs,
@@ -373,6 +384,23 @@ export class IndexedSessionStorage implements SessionStorage {
 		return title ? overlayTitleSlotContent(content, title) : content;
 	}
 
+	/**
+	 * {@link readText}'s text with the size in bytes the backend stores, from
+	 * one read (the backend's `readFrom` where it has one). SQLite and Redis
+	 * hold whatever bytes another client stored and decode them as they read,
+	 * so a byte that is not UTF-8 reads as U+FFFD (3 bytes for 1) and the
+	 * text's UTF-8 length is not the size the backend checks writes against.
+	 */
+	async readTextSized(path: string): Promise<{ text: string; size: number }> {
+		const entry = this.#index.get(path);
+		if (!entry) throw enoent(path);
+		await this.#awaitPath(path);
+		const read = await this.#readBackendFrom(path, 0, undefined);
+		if (!read) throw enoent(path);
+		const title = titleUpdateForIndex(entry);
+		return title ? { text: overlayTitleSlotContent(read.text, title), size: read.size } : read;
+	}
+
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
@@ -545,16 +573,19 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+	async deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void> {
 		// Rows another client committed under the artifacts directory (a
 		// subagent transcript, a draft) go too: the refresh brings the ones
 		// committed so far into this view, and the backend removes every key
 		// under the directory it holds when the removal runs, so one committed
-		// after the refresh goes as well.
+		// after the refresh goes as well. A listed session is checked again
+		// by the backend, under the removal's locks.
 		await this.refresh();
 		await this.#awaitPath(sessionPath);
 		const sessionEntry = this.#index.get(sessionPath);
-		if (!sessionEntry) throw enoent(sessionPath);
+		if (!sessionEntry) {
+			throw listed ? new ListedSessionChangedError(sessionPath, listed.id, undefined) : enoent(sessionPath);
+		}
 
 		const artifactsDir = sessionPath.slice(0, -6);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
@@ -576,7 +607,8 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 
 		try {
-			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
+			const guard = listed ? { ...listed, path: sessionPath } : undefined;
+			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix, guard), { trackDrain: false });
 			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
 		} catch (err) {
 			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);

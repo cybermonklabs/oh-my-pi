@@ -716,6 +716,11 @@ export interface LeaseProcessConfig {
 	/** `file`: the process runs on file storage instead, for the paths only it has; the other fields are unused. */
 	storage?: "file";
 	/**
+	 * `false`: the process's SQL store claims nothing, as an SDK host's store built as
+	 * `examples/sdk/13-sql-sessions.ts` builds it (`claims` is off by default). Default: true.
+	 */
+	claims?: boolean;
+	/**
 	 * The store answers the holder lookup (`sessionClaimHolder`) only after this many ms, as a database slow to
 	 * answer does, so an `OMP_SESSION_EXCLUSIVE=1` stop exits that much later; file storage, which names no holder,
 	 * gets one that answers nothing.
@@ -744,6 +749,10 @@ export interface LeaseProcessReport {
 	scratchId?: string;
 	/** A `defaultSessionDir`'s answer. */
 	sessionDir?: string;
+	/** A `move`'s answer: whether the move paused (false: it ended first). */
+	paused?: boolean;
+	/** A `children`'s answer: the subagent transcripts it wrote. */
+	files?: string[];
 	/** Milliseconds the command took. */
 	elapsedMs?: number;
 	/** What the command wrote to stderr. */

@@ -248,7 +248,7 @@ async function loadSessionPicker(init?: { foreign?: boolean }): Promise<SessionP
 				return query => history.matchingSessionIds(query);
 			},
 			deleteSession: async session => {
-				await storage.deleteSessionWithArtifacts(session.path);
+				await SessionManager.deleteListedSession(session, storage);
 				return true;
 			},
 			// Foreign import pickers list source-owned sessions, so rename and

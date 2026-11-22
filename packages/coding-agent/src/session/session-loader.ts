@@ -8,11 +8,9 @@ import {
 	isEisdir,
 	isEnoent,
 	isEnotdir,
-	jsonContainerEnd,
 	logger,
 	parseJsonlLenient,
 	peekFile,
-	tryParseJson,
 } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Semaphore } from "../task/parallel";
@@ -38,7 +36,7 @@ import {
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
-import { defaultSessionStorage, FileSessionStorage, type SessionStorage } from "./session-storage";
+import { defaultSessionStorage, FileSessionStorage, readStoredText, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -182,9 +180,186 @@ function applyTitleSlot(entry: FileEntry | undefined, slot: SessionTitleUpdate |
 	}
 }
 
-/** Parse session JSONL while stripping and folding the optional fixed title slot. */
-export function parseSessionContent(content: string): SessionLoadResult {
-	const { body, slot } = splitTitleSlot(content);
+function decodeJsonStringFragment(value: string): string {
+	const safeValue = value.endsWith("\\") ? value.slice(0, -1) : value;
+	try {
+		return JSON.parse(`"${safeValue}"`) as string;
+	} catch {
+		return safeValue
+			.replace(/\\n/g, "\n")
+			.replace(/\\r/g, "\r")
+			.replace(/\\t/g, "\t")
+			.replace(/\\"/g, '"')
+			.replace(/\\\\/g, "\\");
+	}
+}
+
+/**
+ * The string value of the first `"name": "..."` at or after `startIndex` in
+ * JSON text that need not parse whole (a record cut short); `undefined` when
+ * there is none or the value is not a string.
+ */
+export function extractStringProperty(source: string, name: string, startIndex = 0): string | undefined {
+	const propertyIndex = source.indexOf(`"${name}"`, startIndex);
+	if (propertyIndex === -1) return undefined;
+
+	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
+	if (colonIndex === -1) return undefined;
+
+	let valueIndex = colonIndex + 1;
+	while (valueIndex < source.length) {
+		const char = source.charCodeAt(valueIndex);
+		if (char !== 32 && char !== 9 && char !== 10 && char !== 13) break;
+		valueIndex++;
+	}
+	if (source.charCodeAt(valueIndex) !== 34) return undefined;
+
+	const valueStart = valueIndex + 1;
+	let escaped = false;
+	for (let i = valueStart; i < source.length; i++) {
+		const char = source.charCodeAt(i);
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === 92) {
+			escaped = true;
+			continue;
+		}
+		if (char === 34) {
+			return decodeJsonStringFragment(source.slice(valueStart, i));
+		}
+	}
+
+	return decodeJsonStringFragment(source.slice(valueStart));
+}
+
+/**
+ * `text` without one leading UTF-8 byte order mark (U+FEFF). Every store
+ * returns a session file's text as stored, the mark included (the file store
+ * decodes with {@link utf8KeepingMark}), and so counts it in the size the
+ * manager expects. A UTF-8 decoder drops one mark the same way. A second mark,
+ * or a mark at the start of a later line, stays: that line is then not JSON.
+ * A mark inside a line stays too.
+ */
+export function withoutByteOrderMark(text: string): string {
+	return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * `text` without its leading byte order marks: one at the start of the file
+ * ({@link withoutByteOrderMark}) and, after the written title slot, one at the
+ * start of the session's first line. The header reader
+ * ({@link leadingSessionHeader}), the listing and the loader's parse
+ * ({@link parseSessionContent}) drop them here, once each on the text as read,
+ * and the stream path drops the same two; a second mark in either place stays.
+ * omp writes no mark after the slot, but an outside edit can, and the file
+ * store's stream path opened such a session before.
+ */
+export function withoutLeadingMarks(text: string): string {
+	const content = withoutByteOrderMark(text);
+	const newline = content.indexOf("\n");
+	if (newline === -1 || content.charCodeAt(newline + 1) !== 0xfeff) return content;
+	if (!parseTitleSlotFromContent(content)) return content;
+	return content.slice(0, newline + 1) + content.slice(newline + 2);
+}
+
+/** A UTF-8 decoder that keeps a leading byte order mark, for reads that hand text to {@link withoutByteOrderMark}. */
+export const utf8KeepingMark = new TextDecoder("utf-8", { ignoreBOM: true });
+
+/** A session file's header, as {@link leadingSessionHeader} reads it from the file's leading text. */
+export interface LeadingSessionHeader {
+	readonly id: string;
+	/** The header record, parsed whole; `undefined` when only its line names the session (a header cut short). */
+	readonly record: Record<string, unknown> | undefined;
+	/** The header's line, when `record` is `undefined`: its other fields are read from it. */
+	readonly line: string | undefined;
+	/** The title slot's title as written (`""` clears it); `undefined` without a slot, or a slot with no title. */
+	readonly slotTitle: string | undefined;
+}
+
+/**
+ * The session a file's leading text names in its header. The session listing,
+ * the loader and a delete's check all read the header here, so the three name
+ * the same session: a delete accepts every session the picker lists, and the
+ * loader opens only a session whose header this returns whole.
+ *
+ * The leading marks are dropped ({@link withoutLeadingMarks}). Records that do
+ * not parse are skipped (a malformed line before the header); a leading
+ * `title` record is the title slot. The header is the next record when it is a
+ * session header (`type` `"session"`, a string `id`). Otherwise it is the first
+ * non-empty line after the title slot's, when that line names
+ * `"type": "session"` and an id: a header cut short, one longer than the window
+ * read, or a header line after a second mark. `undefined` when neither holds.
+ *
+ * `records` are the records of `withoutLeadingMarks(text)` as
+ * `parseJsonlLenient` parses them, when the caller has them already.
+ */
+export function leadingSessionHeader(
+	text: string,
+	records?: ReadonlyArray<Record<string, unknown>>,
+): LeadingSessionHeader | undefined {
+	return headerOfContent(withoutLeadingMarks(text), records);
+}
+
+/** {@link leadingSessionHeader} of text whose leading marks the caller dropped already. */
+function headerOfContent(
+	content: string,
+	records: ReadonlyArray<Record<string, unknown>> = parseJsonlLenient<Record<string, unknown>>(content),
+): LeadingSessionHeader | undefined {
+	const first = records[0];
+	const slotted = first?.type === "title";
+	const candidate = records[slotted ? 1 : 0];
+	if (candidate?.type === "session" && typeof candidate.id === "string") {
+		return {
+			id: candidate.id,
+			record: candidate,
+			line: undefined,
+			slotTitle: slotted && typeof first.title === "string" ? first.title : undefined,
+		};
+	}
+	let slotTitle: string | undefined;
+	let firstNonEmpty = true;
+	for (let start = 0; start <= content.length;) {
+		let end = content.indexOf("\n", start);
+		if (end === -1) end = content.length;
+		const line = content.slice(start, end).trim();
+		start = end + 1;
+		if (!line) continue;
+		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
+			slotTitle = extractStringProperty(line, "title");
+			firstNonEmpty = false;
+			continue;
+		}
+		if (extractStringProperty(line, "type") !== "session") return undefined;
+		const id = extractStringProperty(line, "id");
+		return id ? { id, record: undefined, line, slotTitle } : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Whether the loader opens `body` (past the leading marks and the written title slot) whose records are `entries`:
+ * only when the header reader finds the header whole as the first entry, so an opened session's id is the one the
+ * listing and a delete read. `body`'s leading marks were dropped already: a second one is not.
+ */
+function opensWithHeader(body: string, entries: readonly FileEntry[]): boolean {
+	const first: unknown = entries[0];
+	return headerOfContent(body, entries as unknown as ReadonlyArray<Record<string, unknown>>)?.record === first;
+}
+
+/**
+ * Parse session JSONL while stripping and folding the optional fixed title slot
+ * (and the leading marks, {@link withoutLeadingMarks}). `sourceSize` is the
+ * stored size in bytes of what was read; pass the store's count where the text
+ * may not hold the stored bytes as they are (invalid UTF-8 decodes to U+FFFD,
+ * 3 bytes for 1), since the manager checks its writes against that size.
+ */
+export function parseSessionContent(
+	content: string,
+	sourceSize = Buffer.byteLength(content, "utf8"),
+): SessionLoadResult {
+	const { body, slot } = splitTitleSlot(withoutLeadingMarks(content));
 	let malformedRecords = 0;
 	const entries = parseJsonlLenient<RawFileEntry>(body, {
 		onMalformedRecord: () => {
@@ -196,25 +371,27 @@ export function parseSessionContent(content: string): SessionLoadResult {
 		entries,
 		titleSlot: slot,
 		malformedRecords,
-		sourceSize: Buffer.byteLength(content, "utf8"),
-		invalidHeader: entries.length > 0 ? !isValidSessionHeader(entries[0]) : malformedRecords > 0,
+		sourceSize,
+		// The header the listing and a delete read (leadingSessionHeader), parsed whole as the first entry.
+		invalidHeader: entries.length > 0 ? !opensWithHeader(body, entries) : malformedRecords > 0,
 	};
 }
 
 /** Upper bound on the bytes read to find a header: real headers (and the title slot before them) are far smaller. */
-const SESSION_HEADER_READ_LIMIT = 1024 * 1024;
+export const SESSION_HEADER_READ_LIMIT = 1024 * 1024;
 /** First read; holds the title slot and any real header, so the full limit is read only for outliers. */
 const SESSION_HEADER_FIRST_READ = 16 * 1024;
 
-/** {@link sessionHeaderIdFromPrefix} result when the window ends inside the first record. */
+/** {@link sessionHeaderIdOfPrefix} result when more of the file can hold a whole header. */
 const HEADER_INCOMPLETE = Symbol("header-incomplete");
 
 /**
- * The session id in `filePath`'s header, or `undefined` when the storage holds
- * nothing there or it does not start with a valid session header. A file
- * backend reads {@link SESSION_HEADER_FIRST_READ} bytes, and up to
- * {@link SESSION_HEADER_READ_LIMIT} only when the first record runs past them;
- * a key-indexed backend reads the same prefix window through the storage.
+ * The session id in `filePath`'s header, as {@link leadingSessionHeader} reads
+ * it, or `undefined` when the storage holds nothing there or its leading text
+ * names no session. A file backend reads {@link SESSION_HEADER_FIRST_READ}
+ * bytes, and up to {@link SESSION_HEADER_READ_LIMIT} only when the first read
+ * holds no whole header; a key-indexed backend reads the same prefix window
+ * through the storage.
  */
 export async function readSessionHeaderId(
 	filePath: string,
@@ -223,16 +400,13 @@ export async function readSessionHeaderId(
 	try {
 		if (!(storage instanceof FileSessionStorage)) {
 			const [prefix] = await storage.readTextSlices(filePath, SESSION_HEADER_READ_LIMIT, 0);
-			const id = sessionHeaderIdFromPrefix(new TextEncoder().encode(prefix), true);
-			return id === HEADER_INCOMPLETE ? undefined : id;
+			return sessionHeaderIdOfHead(prefix);
 		}
 		const id = await peekFile(filePath, SESSION_HEADER_FIRST_READ, prefix =>
-			sessionHeaderIdFromPrefix(prefix, prefix.length < SESSION_HEADER_FIRST_READ),
+			sessionHeaderIdOfPrefix(prefix, prefix.length < SESSION_HEADER_FIRST_READ),
 		);
 		if (id !== HEADER_INCOMPLETE) return id;
-		const full = await peekFile(filePath, SESSION_HEADER_READ_LIMIT, prefix =>
-			sessionHeaderIdFromPrefix(prefix, true),
-		);
+		const full = await peekFile(filePath, SESSION_HEADER_READ_LIMIT, prefix => sessionHeaderIdOfPrefix(prefix, true));
 		return full === HEADER_INCOMPLETE ? undefined : full;
 	} catch (err) {
 		if (isEnoent(err) || isEnotdir(err) || isEisdir(err)) return undefined;
@@ -241,34 +415,21 @@ export async function readSessionHeaderId(
 }
 
 /**
- * The header id from a file's leading bytes, past the optional title slot
- * line. Parses only the first record, which may span lines (a pretty-printed
- * header). {@link HEADER_INCOMPLETE} when that record runs past `prefix` and
- * `final` is false (more of the file can be read).
+ * The session id a file's first bytes name (`head`, the file's first
+ * {@link SESSION_HEADER_READ_LIMIT} bytes or all of it), as
+ * {@link leadingSessionHeader} reads it: the same session the picker lists.
  */
-function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string | undefined | typeof HEADER_INCOMPLETE {
-	let records = prefix;
-	const newline = prefix.indexOf(0x0a);
-	if (newline !== -1) {
-		const firstLine = new TextDecoder().decode(prefix.subarray(0, newline)).trim();
-		if (firstLine && parseTitleSlotLine(firstLine)) records = prefix.subarray(newline + 1);
-	}
-	// Like the full parser, skip blank lines (and other JSON whitespace) before the first record.
-	let start = 0;
-	while (start < records.length) {
-		const byte = records[start];
-		if (byte !== 0x20 && byte !== 0x0a && byte !== 0x0d && byte !== 0x09) break;
-		start++;
-	}
-	records = records.subarray(start);
-	if (records.length === 0) return final ? undefined : HEADER_INCOMPLETE;
-	// A header is an object; anything else is not a session file.
-	if (records[0] !== 0x7b) return undefined;
-	const text = new TextDecoder().decode(records);
-	const end = jsonContainerEnd(text, 0);
-	if (end === -1) return final ? undefined : HEADER_INCOMPLETE;
-	const entry = tryParseJson<FileEntry>(text.slice(0, end)) ?? undefined;
-	return isValidSessionHeader(entry) ? entry.id : undefined;
+export function sessionHeaderIdOfHead(head: string): string | undefined {
+	return leadingSessionHeader(head)?.id;
+}
+
+/**
+ * {@link sessionHeaderIdOfHead} of a file's leading bytes; {@link HEADER_INCOMPLETE}
+ * when they hold no whole header and `whole` is false (more of the file can be read).
+ */
+function sessionHeaderIdOfPrefix(prefix: Uint8Array, whole: boolean): string | undefined | typeof HEADER_INCOMPLETE {
+	const header = leadingSessionHeader(utf8KeepingMark.decode(prefix));
+	return header?.record || whole ? header?.id : HEADER_INCOMPLETE;
 }
 
 /**
@@ -310,7 +471,10 @@ export async function visitEntriesFromFileStream(
 	// the unconsumed remainder is held (≤ one record + a chunk), so the ≥8MiB
 	// memory guard holds — the file is never fully loaded.
 	const sink = new ConcatSink();
-	const decoder = new TextDecoder();
+	// Whether the sink's first byte may start with one byte order mark to drop: true until a drain consumes a byte.
+	// The title slot is peeled before the first drain, so the sink's first byte is then the file's first byte or the
+	// first byte of the session's first line after the slot: the two places withoutLeadingMarks drops a mark.
+	let markMayLead = true;
 
 	const yieldToMacrotask = async (): Promise<void> => {
 		if (yieldEveryBytes === 0 && yieldEveryEntries === 0) return;
@@ -355,6 +519,20 @@ export async function visitEntriesFromFileStream(
 			if (recordsSeen >= maxRecords) {
 				stopped = true;
 				break;
+			}
+			// The byte parser skips a byte order mark at the start of its input, wherever that input starts (after a
+			// title slot, after a malformed line, at a chunk). The text path drops a mark only at the file's start and
+			// at the session's first line after the written slot (withoutLeadingMarks), and refuses any other line that
+			// starts with one: refuse it here too.
+			if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf && !(markMayLead && consumed === 0)) {
+				options.onMalformedRecord?.();
+				recordsSeen++;
+				advance(buffer.indexOf(0x0a) + 1);
+				if (recordsSeen >= maxRecords) {
+					stopped = true;
+					break;
+				}
+				continue;
 			}
 			let input = buffer;
 			if (window < buffer.length) {
@@ -433,6 +611,7 @@ export async function visitEntriesFromFileStream(
 			if (partial) window *= 2;
 		}
 		sink.consume(consumed);
+		if (consumed > 0) markMayLead = false;
 	};
 
 	try {
@@ -473,13 +652,14 @@ export async function visitEntriesFromFileStream(
 				const newline = buffered.indexOf(0x0a);
 				if (newline !== -1) {
 					sawFirstLine = true;
-					const firstLine = decoder.decode(buffered.subarray(0, newline)).trim();
-					if (firstLine) {
-						const slot = parseTitleSlotLine(firstLine);
-						if (slot) {
-							titleSlot = titleUpdateFromSlot(slot);
-							sink.consume(newline + 1);
-						}
+					// One leading mark is dropped, as on the text path; a second one stays, so the line is not a slot
+					// (JSON.parse refuses it) and the parser refuses it too. No trim: `trim` drops marks as well.
+					const slot = parseTitleSlotLine(
+						withoutByteOrderMark(utf8KeepingMark.decode(buffered.subarray(0, newline))),
+					);
+					if (slot) {
+						titleSlot = titleUpdateFromSlot(slot);
+						sink.consume(newline + 1);
 					}
 				}
 			}
@@ -559,12 +739,11 @@ async function loadWithKnownSize(
 		const sourceSize = loaded.sourceSize ?? 0;
 		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}
-	const content = await storage.readText(filePath);
-	const loaded = parseSessionContent(content);
-	return {
-		loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded,
-		sourceSize: Buffer.byteLength(content, "utf8"),
-	};
+	// The stored size of what was read, not the UTF-8 length of the decoded text: the manager checks its writes
+	// against it, and an invalid byte decodes to U+FFFD (3 bytes for 1).
+	const { text, size: sourceSize } = await readStoredText(storage, filePath);
+	const loaded = parseSessionContent(text, sourceSize);
+	return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 }
 
 /**

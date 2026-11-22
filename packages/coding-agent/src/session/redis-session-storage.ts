@@ -1,10 +1,11 @@
 import {
 	IndexedSessionStorage,
+	type ListedSessionGuard,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
-import { eexist } from "./session-storage-errors";
+import { eexist, ListedSessionChangedError } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -96,11 +97,23 @@ return 1`;
 // deleting their mtime and title run with no other client's command between:
 // a child set after the scan cannot survive, and a replacement written after
 // the delete keeps its metadata. ARGV[1] is the file-key prefix, ARGV[2] a
-// SCAN pattern for the directory ("" for none), ARGV[3..] explicit paths.
+// SCAN pattern for the directory ("" for none), ARGV[3] a listed session's
+// key ("" for none), ARGV[4] the index of the last byte of the head the store
+// checked and ARGV[5] the SHA-1 of that head's bytes (see HEAD_SCRIPT;
+// returns -1 when the key is gone, -2 when its head differs, deleting
+// nothing), ARGV[6..] explicit paths.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
 local prefix = ARGV[1]
+if ARGV[3] ~= "" then
+	if redis.call("EXISTS", ARGV[3]) == 0 then
+		return -1
+	end
+	if redis.sha1hex(redis.call("GETRANGE", ARGV[3], 0, ARGV[4])) ~= ARGV[5] then
+		return -2
+	end
+end
 local paths = {}
-for i = 3, #ARGV do
+for i = 6, #ARGV do
 	paths[#paths + 1] = ARGV[i]
 end
 if ARGV[2] ~= "" then
@@ -119,6 +132,32 @@ for _, path in ipairs(paths) do
 	redis.call("HDEL", KEYS[2], path)
 end
 return #paths`;
+
+// A listed session's head, bytes 0 to ARGV[1], with the SHA-1 and the count of
+// those bytes, all from one read. The client gets the head as decoded text,
+// which does not encode back to the stored bytes when they hold a byte that is
+// not UTF-8 (another client can store any bytes), so the remove script
+// compares the bytes' SHA-1 instead.
+const HEAD_SCRIPT = `-- OMP_HEAD
+local head = redis.call("GETRANGE", KEYS[1], 0, ARGV[1])
+return {head, redis.sha1hex(head), string.len(head)}`;
+
+// The text from byte ARGV[1] to byte ARGV[2] (-1: to the end; "": none) and
+// the key's length in bytes, from one read; nil when the key is gone. The
+// length is that of the stored bytes, which the decoded text does not give
+// when they hold a byte that is not UTF-8 (U+FFFD, 3 bytes for 1).
+const READ_FROM_SCRIPT = `-- OMP_READ_FROM
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local text = ""
+if ARGV[2] ~= "" then
+	text = redis.call("GETRANGE", KEYS[1], ARGV[1], ARGV[2])
+end
+return {text, redis.call("STRLEN", KEYS[1])}`;
+
+/** How many times a listed session's removal runs when its head changes between the check and the script. */
+const LISTED_REMOVE_ATTEMPTS = 5;
 
 /** A `SCAN MATCH` glob for the keys starting with `prefix`, its glob characters escaped. */
 function keysStartingWith(prefix: string): string {
@@ -222,6 +261,14 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		return Promise.all([head, tail]);
 	}
 
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+		const count = maxBytes === undefined ? undefined : Math.max(0, Math.trunc(maxBytes));
+		const last = count === undefined ? "-1" : count === 0 ? "" : String(offset + count - 1);
+		const read = await this.#client.send("EVAL", [READ_FROM_SCRIPT, "1", this.#fileKey(path), String(offset), last]);
+		if (!Array.isArray(read)) return null;
+		return { text: String(read[0]), size: Number(read[1]) };
+	}
+
 	async writeFull(
 		path: string,
 		content: string,
@@ -278,17 +325,52 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		await this.writeFull(path, "", mtimeMs);
 	}
 
-	async remove(paths: string[], dir?: string): Promise<void> {
+	async remove(paths: string[], dir?: string, listed?: ListedSessionGuard): Promise<void> {
 		if (paths.length === 0 && dir === undefined) return;
-		await this.#client.send("EVAL", [
-			REMOVE_SCRIPT,
-			"2",
-			this.#metaKey(),
-			this.#titleMetaKey(),
-			this.#fileKey(""),
-			dir === undefined ? "" : keysStartingWith(this.#fileKey(dir)),
-			...paths,
+		// A listed session's head is read and checked here, then compared again in the script by its bytes' SHA-1; a
+		// head that changed but still names the session (a rewrite) runs again with the new head.
+		for (let attempt = 1; ; attempt++) {
+			const head = listed ? await this.#listedHead(listed) : undefined;
+			const removed = Number(
+				await this.#client.send("EVAL", [
+					REMOVE_SCRIPT,
+					"2",
+					this.#metaKey(),
+					this.#titleMetaKey(),
+					this.#fileKey(""),
+					dir === undefined ? "" : keysStartingWith(this.#fileKey(dir)),
+					listed ? this.#fileKey(listed.path) : "",
+					head ? String(head.bytes - 1) : "",
+					head?.sha1 ?? "",
+					...paths,
+				]),
+			);
+			if (!listed || removed >= 0) return;
+			if (removed === -1) throw new ListedSessionChangedError(listed.path, listed.id, undefined);
+			if (attempt >= LISTED_REMOVE_ATTEMPTS) {
+				throw new Error(
+					`Cannot delete session "${listed.path}": it kept changing while the delete ran. Nothing was deleted.`,
+				);
+			}
+		}
+	}
+
+	/**
+	 * The count and SHA-1 of the listed session's first `listed.headBytes` bytes, read with their text in one
+	 * script, refusing with {@link ListedSessionChangedError} unless the text names `listed.id`. A missing key reads
+	 * as empty, which names no session, so the head returned holds at least one byte.
+	 */
+	async #listedHead(listed: ListedSessionGuard): Promise<{ bytes: number; sha1: string }> {
+		const read = await this.#client.send("EVAL", [
+			HEAD_SCRIPT,
+			"1",
+			this.#fileKey(listed.path),
+			String(listed.headBytes - 1),
 		]);
+		const [head, sha1, bytes] = Array.isArray(read) ? read : [];
+		const foundId = listed.headerId(String(head ?? ""));
+		if (foundId !== listed.id) throw new ListedSessionChangedError(listed.path, listed.id, foundId);
+		return { bytes: Number(bytes), sha1: String(sha1) };
 	}
 
 	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {

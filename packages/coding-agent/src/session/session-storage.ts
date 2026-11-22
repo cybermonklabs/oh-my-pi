@@ -24,10 +24,31 @@ import {
 	type SessionTitleUpdate,
 	serializeTitleSlot,
 } from "./session-title-slot";
+import { ListedSessionChangedError } from "./session-storage-errors";
+
+/** A file's first `bytes` bytes as UTF-8, or `undefined` when it does not exist. */
+function readHeadSync(filePath: string, bytes: number): string | undefined {
+	let fd: number;
+	try {
+		fd = fs.openSync(filePath, "r");
+	} catch (err) {
+		if (isEnoent(err)) return undefined;
+		throw err;
+	}
+	try {
+		const buffer = Buffer.alloc(bytes);
+		const read = fs.readSync(fd, buffer, 0, bytes, 0);
+		return utf8Decoder.decode(buffer.subarray(0, read));
+	} finally {
+		fs.closeSync(fd);
+	}
+}
 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
-const utf8Decoder = new TextDecoder("utf-8");
+// Keeps a leading byte order mark: a store returns a session file's text as stored, as SQL and Redis do, so the
+// manager's expected size counts the mark; the loader drops one mark itself (`withoutByteOrderMark`).
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** A listing of a directory that does not exist (or is a file): empty, not a fault. */
 function isMissingDirectory(err: unknown): boolean {
@@ -242,6 +263,20 @@ export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 	commitGuard?: () => boolean;
 }
 
+/**
+ * A delete of a session a picker listed at a path ({@link SessionStorage.deleteSessionWithArtifacts}):
+ * refused, deleting nothing, with {@link ListedSessionChangedError} unless the
+ * file at the path still holds that session when the delete runs.
+ */
+export interface ListedSession {
+	/** The id the session was listed with. */
+	id: string;
+	/** How many of the file's first bytes hold its header (the session loader's read limit). */
+	headBytes: number;
+	/** The session id a file's first bytes name, if they start with a valid header (the session loader's parser). */
+	headerId(head: string): string | undefined;
+}
+
 export interface SessionStorage {
 	/** A worker may use its own file-storage default for these same transcripts; omitted means keep runs inline. */
 	readonly crossesWorkerBoundary?: boolean;
@@ -338,6 +373,18 @@ export interface SessionStorage {
 	 * them, and reports the conflict instead on backends without it.
 	 */
 	readTextSync?(path: string): string;
+	/**
+	 * The file's bytes as stored, decoded as {@link readText} decodes them,
+	 * and their length. Optional: {@link readStoredText} uses it only to size
+	 * text that holds U+FFFD, which an invalid byte or a character cut off at
+	 * the end decodes to (3 bytes for 1). The file store reads the bytes, and
+	 * the key-indexed stores (SQL, Redis) read the size their backend stores
+	 * with the text: SQLite and Redis hold whatever bytes another client
+	 * stored. The in-memory store holds the text it was given and has none.
+	 */
+	readTextSized?(path: string): Promise<{ text: string; size: number }>;
+	/** Synchronous {@link readTextSized}. See {@link readStoredTextSync}. */
+	readTextSizedSync?(path: string): { text: string; size: number };
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
@@ -367,7 +414,22 @@ export interface SessionStorage {
 	 */
 	renameNoReplace?(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
-	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
+	/**
+	 * Delete a session file and its artifacts. With `listed`, the session the
+	 * caller expects at `sessionPath` (a picker's listed session, or the one
+	 * `SessionManager.deleteSessionFile` read in the header): refused, deleting
+	 * nothing, with {@link ListedSessionChangedError} unless the file still
+	 * holds that session when the delete runs. A move of the session by
+	 * another client that holds no claim (an SDK host's store) renames the
+	 * session's file, then each subagent transcript under its artifacts
+	 * directory; a delete of the old path between those steps would remove the
+	 * transcripts the move had not reached. A SQL store checks after the
+	 * delete's row locks (which wait for a move that holds the session's row),
+	 * a Redis store in its remove script, and the file store deletes the
+	 * session file before the artifacts, so a moved file fails the delete
+	 * first.
+	 */
+	deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void>;
 	/**
 	 * Run a synchronous session mutation under the backend's cross-process
 	 * lock. Optional because only backends with a process-shared lock can
@@ -1293,19 +1355,32 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
-	readText(path: string): Promise<string> {
-		return Bun.file(path).text();
+	// Not `Bun.file().text()` nor `readFileSync(path, "utf8")`: the first drops a leading byte order mark (see
+	// `utf8Decoder`); the size of what is read is `readStoredText`'s.
+	async readText(path: string): Promise<string> {
+		return utf8Decoder.decode(await Bun.file(path).bytes());
+	}
+
+	async readTextSized(path: string): Promise<{ text: string; size: number }> {
+		const bytes = await Bun.file(path).bytes();
+		return { text: utf8Decoder.decode(bytes), size: bytes.length };
 	}
 
 	readTextSync(path: string): string {
-		return fs.readFileSync(path, "utf8");
+		return utf8Decoder.decode(fs.readFileSync(path));
+	}
+
+	readTextSizedSync(path: string): { text: string; size: number } {
+		const bytes = fs.readFileSync(path);
+		return { text: utf8Decoder.decode(bytes), size: bytes.length };
 	}
 
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		const { size } = await fsp.stat(path);
 		if (offset >= size) return { text: "", size };
 		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-		return { text: await Bun.file(path).slice(offset, end).text(), size };
+		// Not `.text()`: it drops a byte order mark at the start of the slice (see `utf8Decoder`).
+		return { text: utf8Decoder.decode(await Bun.file(path).slice(offset, end).bytes()), size };
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
@@ -1592,10 +1667,27 @@ export class FileSessionStorage implements SessionStorage {
 	/**
 	 * Delete a session file and its artifacts directory.
 	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
+	 * With `listed`, the file's header is read and the file unlinked only when
+	 * it names `listed.id`. The order is what keeps a move whole: the file goes
+	 * before the artifacts, so a move that renamed it already fails this
+	 * unlink and nothing is deleted, and a move that comes after it fails its
+	 * own first rename. The session file's lock held here excludes only the
+	 * first durable append and the draft clean-up; no move or rewrite takes
+	 * it, so a session another client renames onto the path between the read
+	 * and the unlink is not refused.
 	 */
-	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+	async deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void> {
 		// Delete the session file itself
-		await this.unlink(sessionPath);
+		if (listed) {
+			this.withSessionFileLockSync(sessionPath, () => {
+				const found = readHeadSync(sessionPath, listed.headBytes);
+				const foundId = found === undefined ? undefined : listed.headerId(found);
+				if (foundId !== listed.id) throw new ListedSessionChangedError(sessionPath, listed.id, foundId);
+				fs.unlinkSync(sessionPath);
+			});
+		} else {
+			await this.unlink(sessionPath);
+		}
 
 		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
 		const artifactsDir = sessionPath.slice(0, -6);
@@ -1698,6 +1790,51 @@ export async function readSessionTextFrom(
 	if (offset >= bytes.length) return { text: "", size: bytes.length };
 	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
 	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+}
+
+/**
+ * `filePath`'s text, read through {@link SessionStorage.readText} (the one
+ * whole read: a subclass or a test may intercept it), and its stored size in
+ * bytes, the size `SessionManager` checks its writes against. That is the
+ * text's UTF-8 length unless the text holds U+FFFD: an invalid byte, or a
+ * character cut off at the end, decodes to it (3 bytes for 1). Then the
+ * stored bytes are read for their length ({@link SessionStorage.readTextSized}),
+ * kept when they decode to the same text. Otherwise (the file changed or
+ * vanished between the reads, or the store has no sized read) the text's
+ * length stands, and a write meets the size conflict the manager recovers from.
+ */
+export async function readStoredText(
+	storage: SessionStorage,
+	filePath: string,
+): Promise<{ text: string; size: number }> {
+	const text = await storage.readText(filePath);
+	const read = { text, size: Buffer.byteLength(text, "utf8") };
+	if (!storage.readTextSized || !text.includes("\uFFFD")) return read;
+	try {
+		const stored = await storage.readTextSized(filePath);
+		return stored.text === text ? stored : read;
+	} catch (err) {
+		if (isEnoent(err)) return read;
+		throw err;
+	}
+}
+
+/** Synchronous {@link readStoredText}; `undefined` on a backend without a synchronous read. */
+export function readStoredTextSync(
+	storage: SessionStorage,
+	filePath: string,
+): { text: string; size: number } | undefined {
+	if (!storage.readTextSync) return undefined;
+	const text = storage.readTextSync(filePath);
+	const read = { text, size: Buffer.byteLength(text, "utf8") };
+	if (!storage.readTextSizedSync || !text.includes("\uFFFD")) return read;
+	try {
+		const stored = storage.readTextSizedSync(filePath);
+		return stored.text === text ? stored : read;
+	} catch (err) {
+		if (isEnoent(err)) return read;
+		throw err;
+	}
 }
 
 function matchesPatternSegment(name: string, pattern: string): boolean {

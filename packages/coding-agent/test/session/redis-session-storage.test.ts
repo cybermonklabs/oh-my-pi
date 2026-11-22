@@ -16,10 +16,18 @@
 
 import { RedisClient } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import {
+	loadSessionFile,
+	SESSION_HEADER_READ_LIMIT,
+	sessionHeaderIdOfHead,
+} from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import type { ListedSession } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 interface FakeRedisCall {
@@ -59,6 +67,15 @@ function createFakeRedis(): FakeRedis {
 		}
 		return h;
 	};
+
+	/** `key`'s bytes `start` to `end` (negative: from the end), as GETRANGE returns them. */
+	const range = (key: string, start: number, end: number): Buffer => {
+		const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
+		const from = Math.max(0, start < 0 ? bytes.length + start : start);
+		const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
+		return to < from ? Buffer.alloc(0) : bytes.subarray(from, to + 1);
+	};
+	const sha1 = (bytes: Buffer): string => createHash("sha1").update(bytes).digest("hex");
 
 	const client: FakeRedis = {
 		calls,
@@ -123,10 +140,26 @@ function createFakeRedis(): FakeRedis {
 				else getHash(titleKey).delete(dst);
 				return 1;
 			}
+			if (script.includes("OMP_HEAD")) {
+				const head = range(keys[0], 0, Number(argv[0]));
+				return [head.toString("utf-8"), sha1(head), head.length];
+			}
+			if (script.includes("OMP_READ_FROM")) {
+				const [fileKey] = keys;
+				const [start, end] = argv;
+				if (!strings.has(fileKey)) return null;
+				const text = end === "" ? "" : range(fileKey, Number(start), Number(end)).toString("utf-8");
+				return [text, Buffer.byteLength(strings.get(fileKey) as string, "utf-8")];
+			}
 			if (script.includes("OMP_REMOVE")) {
 				checkFailure("del");
 				const [metaKey, titleKey] = keys;
-				const [filePrefix, pattern, ...paths] = argv;
+				const [filePrefix, pattern, guardKey, guardLast, guardSha1, ...paths] = argv;
+				// A listed session's key must be there and still start with the bytes of the head the store checked.
+				if (guardKey) {
+					if (!strings.has(guardKey)) return -1;
+					if (sha1(range(guardKey, 0, Number(guardLast))) !== guardSha1) return -2;
+				}
 				if (pattern) {
 					// The pattern is an escaped key prefix followed by `*`.
 					const keyPrefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
@@ -151,12 +184,7 @@ function createFakeRedis(): FakeRedis {
 		async getrange(key, start, end) {
 			record("getrange", [key, start, end]);
 			checkFailure("getrange");
-			const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
-			if (bytes.length === 0) return "";
-			const from = Math.max(0, start < 0 ? bytes.length + start : start);
-			const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-			if (to < from) return "";
-			return bytes.subarray(from, to + 1).toString("utf-8");
+			return range(key, start, end).toString("utf-8");
 		},
 		async strlen(key) {
 			record("strlen", [key]);
@@ -355,6 +383,24 @@ describe("RedisSessionStorage", () => {
 		expect(writer.getError()?.message).toBe("redis exploded");
 	});
 
+	it("loads a session that starts with a byte order mark, which the store returns as stored", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "S1",
+			timestamp: "2026-11-21T00:00:00.000Z",
+			cwd: "/w",
+		});
+		await storage.writeText(
+			"/sessions/p/bom.jsonl",
+			`\uFEFF${header}\n{"type":"custom","id":"c1","parentId":null}\n`,
+		);
+		expect((await storage.readText("/sessions/p/bom.jsonl")).charCodeAt(0)).toBe(0xfeff);
+		const loaded = await loadSessionFile("/sessions/p/bom.jsonl", storage);
+		expect([loaded.invalidHeader, loaded.entries.map(entry => entry.id)]).toEqual([false, ["S1", "c1"]]);
+	});
+
 	it("deleteSessionWithArtifacts removes JSONL plus any sidecar keys", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await storage.writeText("/sessions/p/s1.jsonl", "session\n");
@@ -462,6 +508,79 @@ describe("RedisSessionStorage", () => {
 		expect(injected).toBe(true);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1.jsonl")).toBe(false);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1/Late.jsonl")).toBe(false);
+	});
+
+	describe("deleteSessionWithArtifacts of a listed session", () => {
+		const header = (id: string) =>
+			`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w" })}\n`;
+		const listed = (id: string): ListedSession => ({
+			id,
+			headBytes: SESSION_HEADER_READ_LIMIT,
+			headerId: sessionHeaderIdOfHead,
+		});
+		const file = "omp:sessions:file:/sessions/p/s1.jsonl";
+		const child = "omp:sessions:file:/sessions/p/s1/A.jsonl";
+		/** Run `change` once, right before the next remove script, after the store checked the head. */
+		const beforeRemoveScript = (change: () => void): void => {
+			const send = redis.send.bind(redis);
+			let done = false;
+			redis.send = async (command, args) => {
+				if (!done && String(args[0]).includes("OMP_REMOVE")) {
+					done = true;
+					change();
+				}
+				return send(command, args);
+			};
+		};
+
+		it("deletes the session and its artifacts when the key still holds it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", `${header("S1")}{"type":"message"}\n`);
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+
+			await storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"));
+
+			expect([redis.strings.has(file), redis.strings.has(child)]).toEqual([false, false]);
+		});
+
+		it("refuses, removing nothing, when another session holds the key", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("OTHER"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([redis.strings.has(file), redis.strings.has(child)]).toEqual([true, true]);
+		});
+
+		it("refuses in the script, removing nothing, when the key moves away after the store checked it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("S1"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+			// Another client's move renames the session's key, not yet its subagent transcript.
+			beforeRemoveScript(() => {
+				redis.strings.set("omp:sessions:file:/sessions/q/s1.jsonl", redis.strings.get(file) as string);
+				redis.strings.delete(file);
+			});
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it moved or was deleted). Nothing was deleted.',
+			);
+			expect(redis.strings.has(child)).toBe(true);
+		});
+
+		it("refuses in the script, removing nothing, when another session takes the key after the store checked it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("S1"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+			beforeRemoveScript(() => redis.strings.set(file, header("OTHER")));
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([redis.strings.get(file), redis.strings.has(child)]).toEqual([header("OTHER"), true]);
+		});
 	});
 
 	it("refresh() reloads the metadata index from Redis after out-of-band writes", async () => {
@@ -592,5 +711,161 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await client.exists(`${prefix}file:/s/p/Late*[x].jsonl`)).toBe(false);
 		expect(await hget(client, "meta", "/s/p/Late*[x].jsonl")).toBeNull();
 		expect(await client.get(`${prefix}file:/s/p-sibling.jsonl`)).toBe("sibling\n");
+	});
+
+	// The remove script's comparison of the key's head is the only guard against deleting a session that moved away
+	// or another session that took the key after the store checked it; these run it on the server.
+	describe("deleteSessionWithArtifacts of a listed session", () => {
+		const header = (id: string, rest = "") =>
+			`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w" })}\n${rest}`;
+		const listed = (id: string): ListedSession => ({
+			id,
+			headBytes: SESSION_HEADER_READ_LIMIT,
+			headerId: sessionHeaderIdOfHead,
+		});
+		/** Run `change` once, right before `client`'s first remove script (after the store checked the head); count them. */
+		const beforeRemoveScript = (client: RedisClient, change: () => Promise<unknown>): (() => number) => {
+			const send = client.send.bind(client);
+			let scripts = 0;
+			client.send = async (command: string, args: string[]) => {
+				if (command === "EVAL" && String(args[0]).includes("OMP_REMOVE") && scripts++ === 0) await change();
+				return send(command, args);
+			};
+			return () => scripts;
+		};
+
+		it("refuses, removing nothing, when another client moves the key away after the store checked it", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1"));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			// Another client's move renames the session's key, not yet its subagent transcript.
+			beforeRemoveScript(client, () =>
+				other.client.send("RENAME", [`${prefix}file:/s/p.jsonl`, `${prefix}file:/s/q.jsonl`]),
+			);
+
+			await expect(storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/p.jsonl": the file no longer holds session S1 (it moved or was deleted). Nothing was deleted.',
+			);
+			expect([await client.get(`${prefix}file:/s/q.jsonl`), await client.get(`${prefix}file:/s/p/A.jsonl`)]).toEqual(
+				[header("S1"), header("A")],
+			);
+		});
+
+		it("refuses, removing nothing, when another session takes the key after the store checked it", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1"));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			beforeRemoveScript(client, () => other.client.send("SET", [`${prefix}file:/s/p.jsonl`, header("OTHER")]));
+
+			await expect(storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/p.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([await client.get(`${prefix}file:/s/p.jsonl`), await client.get(`${prefix}file:/s/p/A.jsonl`)]).toEqual(
+				[header("OTHER"), header("A")],
+			);
+		});
+
+		it("deletes after a rewrite of the same session changed the head the store checked, running the script again", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1", '{"type":"custom","n":1}\n'));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			const scripts = beforeRemoveScript(client, () =>
+				other.client.send("SET", [`${prefix}file:/s/p.jsonl`, header("S1", '{"type":"custom","n":2}\n')]),
+			);
+
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+
+			expect([
+				scripts(),
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([2, false, false]);
+		});
+
+		// The store reads the header as the listing does (leadingSessionHeader), so a session the picker lists is
+		// deleted as listed; the script then compares the whole head the store checked.
+		it("deletes a listed session whose header was cut short, and a cut-short head another session replaced is kept", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			const cut = header("S1").trimEnd().slice(0, -12);
+			await storage.writeText("/s/p.jsonl", cut);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+
+			await storage.writeText("/s/q.jsonl", cut);
+			beforeRemoveScript(client, () => other.client.send("SET", [`${prefix}file:/s/q.jsonl`, header("OTHER")]));
+			await expect(storage.deleteSessionWithArtifacts("/s/q.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/q.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect(await client.get(`${prefix}file:/s/q.jsonl`)).toBe(header("OTHER"));
+		});
+
+		it("deletes a listed session past a malformed line before its header", async () => {
+			const { client, storage } = await open();
+			await storage.writeText("/s/p.jsonl", `{"type":"title","title":"torn\n${header("S1")}`);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+		});
+
+		// The server returns a leading byte order mark as stored; the loader and the delete read past it alike.
+		it("loads and deletes as listed a session that starts with a byte order mark", async () => {
+			const { client, storage } = await open();
+			await storage.writeText("/s/p.jsonl", `\uFEFF${header("S1")}{"type":"custom","id":"c1","parentId":null}\n`);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			const loaded = await loadSessionFile("/s/p.jsonl", storage);
+			expect([loaded.invalidHeader, loaded.entries.map(entry => entry.id)]).toEqual([false, ["S1", "c1"]]);
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+		});
+
+		// The store returns text as stored, every leading mark included; the loader drops exactly one, so a second
+		// mark leaves the header line unreadable (not opened), and the delete still removes the session as listed.
+		it("returns two leading byte order marks as stored, does not open such a session, and deletes it as listed", async () => {
+			const { client, storage } = await open();
+			const text = `\uFEFF\uFEFF${header("S1")}{"type":"custom","id":"c1","parentId":null}\n`;
+			await storage.writeText("/s/p.jsonl", text);
+			const marks = (read: string) => read.length - read.replace(/^\uFEFF+/, "").length;
+			expect({
+				whole: marks(await storage.readText("/s/p.jsonl")),
+				head: marks((await storage.readTextSlices("/s/p.jsonl", 64, 0))[0]),
+				from: storage.readTextFrom ? marks((await storage.readTextFrom("/s/p.jsonl", 0)).text) : "no readTextFrom",
+			}).toEqual({ whole: 2, head: 2, from: 2 });
+			const loaded = await loadSessionFile("/s/p.jsonl", storage);
+			expect([loaded.invalidHeader, loaded.sourceSize]).toEqual([true, Buffer.byteLength(text)]);
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect(await client.exists(`${prefix}file:/s/p.jsonl`)).toBe(false);
+		});
+
+		// The listing parses its window as the loader does, one mark dropped: the header is its first record, so the
+		// session's first prompt is listed first and its search text holds it.
+		it("lists the first prompt of a session that starts with a byte order mark", async () => {
+			const { storage } = await open();
+			const turn = (id: string, parentId: string, role: string, text: string) =>
+				`${JSON.stringify({ type: "message", id, parentId, timestamp: "2026-11-21T00:00:01.000Z", message: { role, content: role === "user" ? text : [{ type: "text", text }], timestamp: 1 } })}\n`;
+			await storage.writeText(
+				"/s/p.jsonl",
+				`\uFEFF${header("S1")}${turn("u1", "S1", "user", "FIRST-PROMPT alpha")}${turn("a1", "u1", "assistant", "FIRST-REPLY")}${turn("u2", "a1", "user", "SECOND-PROMPT beta")}`,
+			);
+			const info = (await listSessions("/s", storage)).find(session => session.path === "/s/p.jsonl");
+			expect([info?.id, info?.firstMessage, info?.allMessagesText.includes("FIRST-PROMPT alpha")]).toEqual([
+				"S1",
+				"FIRST-PROMPT alpha",
+				true,
+			]);
+		});
 	});
 });

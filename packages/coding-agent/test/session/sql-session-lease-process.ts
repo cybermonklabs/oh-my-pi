@@ -16,6 +16,8 @@
  *   the session first, and again right before each full write, so the append and every full write meet
  *   a changed file.
  * - `{ op: "appendSubagent", text }`: the same for the held subagent transcript.
+ * - `{ op: "drop" }`, `{ op: "dropSubagent" }`: the held session's (or subagent transcript's) manager deletes its own
+ *   current file (`dropSession`); `sessionFile` names that file, `error` a refusal.
  * - `{ op: "closeHeld" }`: close the held session's manager, leaving the subagent transcript's open.
  * - `{ op: "openSubagent", file }`: close the held subagent transcript's manager, if any, and open `file` as the
  *   held subagent transcript instead.
@@ -41,6 +43,13 @@
  * - `{ op: "closeWaiting" }`: close that manager while its claim may still wait.
  * - `{ op: "settleWaiting" }`: wait for that claim to settle; `held` is whether any process, this one
  *   included, holds the session's lease then.
+ * - `{ op: "children", names }`: write one subagent transcript (a header) per name under the held session's
+ *   artifacts directory, as the task tool does; `files` are their paths.
+ * - `{ op: "move", cwd, sessionDir, pause }`: start moving the held session there (`moveTo`) and answer once
+ *   the move pauses: with `pause: "file"`, right after the session's file moved and before any subagent
+ *   transcript; with `pause: "session"` (SQL storage), inside the session file's own rename, its row locked,
+ *   right before its `UPDATE`. `paused` is false when the move ended first, with its `error` if any.
+ * - `{ op: "moveGo" }`: let the paused move go on and answer when it ends, with its `error` if any.
  *
  * It closes its sessions and exits when stdin ends.
  */
@@ -60,6 +69,7 @@ import {
 } from "../../src/session/session-storage";
 import { SqlSessionStorage } from "../../src/session/sql-session-storage";
 import { SQL } from "bun";
+import { gatedClient } from "./sql-session-lease-fixture";
 
 interface Config {
 	dsn: string;
@@ -68,18 +78,24 @@ interface Config {
 	lease?: { expiryMs: number; heartbeatMs: number };
 	/** `file`: run on file storage instead, for the paths only it has. */
 	storage?: "file";
+	/** See `LeaseProcessConfig.claims`. */
+	claims?: boolean;
 	/** See `LeaseProcessConfig.holderLookupMs`. */
 	holderLookupMs?: number;
 }
 
 const config = JSON.parse(process.argv[2] ?? "{}") as Config;
 const client = config.storage === "file" ? undefined : new SQL(config.dsn);
-const storage: SessionStorage & { refresh?: () => Promise<void> } = client
+/** Holds a transaction right before its rename's `UPDATE` while closed (the `move` op's `pause: "session"`). */
+const gate = client
+	? gatedClient(client, new RegExp(`^UPDATE \\S*\\b${config.table} SET path\\b`), "before")
+	: undefined;
+const storage: SessionStorage & { refresh?: () => Promise<void> } = gate
 	? await SqlSessionStorage.create({
-			client,
+			client: gate.client,
 			table: config.table,
 			leaseTable: config.leaseTable,
-			claims: true,
+			claims: config.claims ?? true,
 			...(config.lease ? { lease: config.lease } : {}),
 		})
 	: new FileSessionStorage();
@@ -100,6 +116,31 @@ let subagent: SessionManager | undefined;
 let notices: SessionPersistenceNotice[] = [];
 /** The claim `openWaiting` started, and the session id it claims. */
 let waitingClaim: { sessionId: string; settled: Promise<void> } | undefined;
+/** The `move` op's pause: armed until the session's file has moved. */
+let movePause:
+	| {
+			mode: "file" | "session";
+			sessionFile: string;
+			armed: boolean;
+			paused: PromiseWithResolvers<void>;
+			go: PromiseWithResolvers<void>;
+	  }
+	| undefined;
+/** What the move the `move` op started ends with. */
+let moving: Promise<{ error?: string }> | undefined;
+// The move renames the session's file, then each subagent transcript; a "file" pause follows the file's own rename.
+for (const name of ["rename", "renameNoReplace"] as const) {
+	const original = storage[name]?.bind(storage);
+	if (!original) continue;
+	(storage as unknown as Record<string, unknown>)[name] = async (from: string, to: string) => {
+		await original(from, to);
+		const pause = movePause;
+		if (!pause?.armed || path.resolve(from) !== path.resolve(pause.sessionFile)) return;
+		pause.armed = false;
+		pause.paused.resolve();
+		await pause.go.promise;
+	};
+}
 
 function report(fields: Record<string, unknown>): void {
 	process.stdout.write(`${JSON.stringify(fields)}\n`);
@@ -251,6 +292,19 @@ async function rewrite(contested: boolean): Promise<Record<string, unknown>> {
 	return { ...describe(manager), error };
 }
 
+/** `manager`'s `dropSession` of its own current file: `sessionFile` names it, `error` a refusal. */
+async function dropOwn(manager: SessionManager | undefined): Promise<Record<string, unknown>> {
+	const file = manager?.getSessionFile();
+	if (!manager || !file) throw new Error("no session is held");
+	let error: string | undefined;
+	try {
+		await manager.dropSession(file);
+	} catch (err) {
+		error = err instanceof Error ? err.message : String(err);
+	}
+	return { sessionFile: file, sessionId: manager.getSessionId(), error };
+}
+
 async function switchTo(command: Record<string, unknown>): Promise<Record<string, unknown>> {
 	const cwd = String(command.cwd);
 	const manager = adopt(SessionManager.create(cwd, String(command.scratchDir), storage));
@@ -322,6 +376,10 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 				: appendTo(held, String(command.text));
 		case "appendSubagent":
 			return appendTo(subagent, String(command.text));
+		case "drop":
+			return dropOwn(held);
+		case "dropSubagent":
+			return dropOwn(subagent);
 		case "closeHeld": {
 			await held?.close();
 			return { sessionFile: held?.getSessionFile() };
@@ -374,6 +432,61 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 			if (!waitingClaim) throw new Error("no claim is waiting");
 			await waitingClaim.settled;
 			return { held: isSessionLeaseHeld(waitingClaim.sessionId) };
+		}
+		case "children": {
+			if (!held) throw new Error("no session is held");
+			const stem = String(held.getSessionFile()).slice(0, -".jsonl".length);
+			storage.ensureDirSync(stem);
+			const names = (command.names as unknown[]).map(String);
+			const files = names.map(name => path.join(stem, `${name}.jsonl`));
+			for (const [index, file] of files.entries()) {
+				const header = {
+					type: "session",
+					version: 3,
+					id: names[index],
+					timestamp: new Date().toISOString(),
+					cwd: "/w",
+				};
+				await storage.writeText(file, `${JSON.stringify(header)}\n`);
+			}
+			await storage.drain();
+			return { files };
+		}
+		case "move": {
+			const manager = held;
+			if (!manager) throw new Error("no session is held");
+			const mode: "file" | "session" = command.pause === "session" ? "session" : "file";
+			if (mode === "session" && !gate) throw new Error("only a SQL store pauses inside a rename");
+			const current = {
+				mode,
+				sessionFile: String(manager.getSessionFile()),
+				// A "session" pause is the gate's: the session file's rename is the move's first `UPDATE`.
+				armed: mode === "file",
+				paused: Promise.withResolvers<void>(),
+				go: Promise.withResolvers<void>(),
+			};
+			movePause = current;
+			if (mode === "session") {
+				gate?.close();
+				void gate?.paused().then(() => current.paused.resolve());
+			}
+			moving = manager.moveTo(String(command.cwd), String(command.sessionDir)).then(
+				() => ({}),
+				(err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }),
+			);
+			const first = await Promise.race([current.paused.promise.then(() => "paused"), moving.then(() => "ended")]);
+			if (first === "paused") return { paused: true };
+			movePause = undefined;
+			return { paused: false, ...(await moving), ...describe(manager) };
+		}
+		case "moveGo": {
+			if (!held || !moving) throw new Error("no move is paused");
+			movePause?.go.resolve();
+			gate?.open();
+			const ended = await moving;
+			movePause = undefined;
+			moving = undefined;
+			return { ...ended, ...describe(held) };
 		}
 		default:
 			throw new Error(`unknown command ${JSON.stringify(command.op)}`);

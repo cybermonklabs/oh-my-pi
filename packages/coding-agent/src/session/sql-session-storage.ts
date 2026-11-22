@@ -6,6 +6,7 @@ import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, toError
 import type { SessionBlobSweep, SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
+	type ListedSessionGuard,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
@@ -18,7 +19,7 @@ import {
 	sessionLeaseId,
 	tryAcquireSessionLease,
 } from "./session-storage";
-import { eexist, enoent } from "./session-storage-errors";
+import { eexist, enoent, ListedSessionChangedError } from "./session-storage-errors";
 import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-title-slot";
 import { PG_CONDITIONAL_PARAMETERS, PG_REPAIR_RETRIES, pgOpening } from "./sql-session-postgres-settings";
 
@@ -724,7 +725,8 @@ function pgErrorCode(error: unknown): string | undefined {
 	const code = "code" in error ? error.code : undefined;
 	return typeof code === "string" ? code : undefined;
 }
-const utf8Decoder = new TextDecoder("utf-8");
+// Keeps a leading byte order mark, as the store's whole reads do; the loader drops one mark itself.
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
  * lengths, and no stored value reaches it (a value is at most 1 GB there).
@@ -4085,7 +4087,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.writeFull(path, "", mtimeMs);
 	}
 
-	async remove(paths: string[], dir?: string): Promise<void> {
+	async remove(paths: string[], dir?: string, listed?: ListedSessionGuard): Promise<void> {
 		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
@@ -4094,6 +4096,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
 			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
+			if (listed) await this.#assertListed(transaction, listed);
 			const ordered = [...new Set(paths)].sort();
 			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
 			for (const path of ordered) {
@@ -4104,6 +4107,39 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
 			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, ordered, under));
 		});
+	}
+
+	/**
+	 * Refuse a removal of a listed session unless its row at `listed.path` is
+	 * there and its header names `listed.id`, read after the removal's row
+	 * locks. Those locks include the session's path, so they wait for a move
+	 * that holds its row: a move of the session by a client that holds no
+	 * claim (it renames the session's row, then each subagent transcript under
+	 * its directory) either committed its row's rename before these locks, and
+	 * the row is not there, or waits for this removal. The existence read
+	 * takes the row's lock too, which this transaction holds already; the
+	 * header is in parts every writer changes only under that lock, read after
+	 * it in the same transaction.
+	 */
+	async #assertListed(transaction: SqlSessionStorageTransaction, listed: ListedSessionGuard): Promise<void> {
+		const there = await run(transaction, this.#q.lockSize, { path: listed.path });
+		if ((there as unknown[]).length === 0) throw new ListedSessionChangedError(listed.path, listed.id, undefined);
+		const rows = (await run(transaction, this.#q.readSlices, {
+			path: listed.path,
+			prefix: listed.headBytes,
+			suffix: 0,
+		})) as SliceRow[];
+		let session: SliceRow | undefined;
+		const headParts: Array<{ offset: number; bytes: Uint8Array | null }> = [];
+		for (const row of rows) {
+			const kind = rowNumber(row.kind);
+			if (kind === 0) session = row;
+			else if (kind === 1) headParts.push({ offset: rowNumber(row.start_offset), bytes: row.head });
+		}
+		const foundId = session
+			? listed.headerId(utf8Decoder.decode(joinSliceBytes(session.head, headParts)))
+			: undefined;
+		if (foundId !== listed.id) throw new ListedSessionChangedError(listed.path, listed.id, foundId);
 	}
 
 	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {

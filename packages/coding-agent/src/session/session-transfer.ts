@@ -40,7 +40,7 @@ import { replaceFileAtomically } from "../utils/atomic-file";
 import { BLOB_HASH_RE, BlobStore } from "./blob-store";
 import type { FileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { findSessionFiles } from "./session-listing";
-import { loadEntriesFromFile, parseSessionContent, readSessionHeaderId } from "./session-loader";
+import { loadEntriesFromFile, parseSessionContent, readSessionHeaderId, utf8KeepingMark } from "./session-loader";
 import { SessionManager } from "./session-manager";
 import { FileSessionStorage } from "./session-storage";
 
@@ -417,7 +417,8 @@ async function readSessionArchive(archive: string): Promise<SessionArchiveConten
 	const manifest = parseManifest(manifestBytes, archive);
 	if (!journal) throw new SessionTransferError(`Bad session archive ${archive}: no session.jsonl.`);
 
-	const parsed = parseSessionContent(TEXT_DECODER.decode(journal));
+	// The journal's text as stored: the loader drops one leading byte order mark itself.
+	const parsed = parseSessionContent(utf8KeepingMark.decode(journal));
 	const header = parsed.entries[0];
 	if (parsed.invalidHeader || header?.type !== "session") {
 		throw new SessionTransferError(`Bad session archive ${archive}: session.jsonl has no session header.`);

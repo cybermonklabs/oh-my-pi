@@ -1949,7 +1949,7 @@ export class SelectorController {
 								}
 								const storage = defaultSessionStorage();
 								try {
-									await SessionManager.deleteSessionFile(session.path, storage);
+									await SessionManager.deleteListedSession(session, storage);
 									return true;
 								} catch (error) {
 									throw new Error(
@@ -2204,6 +2204,8 @@ export class SelectorController {
 
 	async handleSessionDeleteCommand(): Promise<void> {
 		const sessionFile = this.ctx.sessionManager.getSessionFile();
+		// The session the manager owns at that file, read with it: the detach below switches the manager to a new one.
+		const sessionId = this.ctx.sessionManager.getSessionId();
 		if (!sessionFile) {
 			this.ctx.showError("No session file to delete (in-memory session)");
 			return;
@@ -2232,8 +2234,9 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory, refusing while another process holds it
-		await SessionManager.deleteSessionFile(sessionFile, storage);
+		// Delete the session file and artifacts directory, refusing while another process holds it, and refusing
+		// (deleting nothing) unless the file still holds this session: it moved, or another session took the path.
+		await SessionManager.deleteListedSession({ path: sessionFile, id: sessionId }, storage);
 
 		// Show session selector
 		this.ctx.showStatus("Session deleted");
