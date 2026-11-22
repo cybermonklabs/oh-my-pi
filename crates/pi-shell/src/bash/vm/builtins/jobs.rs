@@ -196,13 +196,13 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 /// (`delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
 	let dead = |j: &Job| j.notified && matches!(j.state, JobState::Done(_));
-	let kept: Vec<(Vpid, u32, i32)> = ctx
+	let kept: Vec<(Vpid, u32, i32, bool)> = ctx
 		.vp
 		.jobs
 		.iter()
 		.filter(|j| dead(j))
 		.filter_map(|j| match j.state {
-			JobState::Done(status) => Some((j.vpid, j.pid(), status)),
+			JobState::Done(status) => Some((j.vpid, j.pid(), status, j.inherited)),
 			_ => None,
 		})
 		.collect();
@@ -210,8 +210,24 @@ fn cleanup(ctx: &mut Ctx<'_, '_>) {
 		return;
 	}
 	ctx.vp.jobs.remove_where(dead);
-	for (vpid, pid, status) in kept {
-		state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, vpid, pid, status);
+	for (vpid, pid, status, inherited) in kept {
+		keep_status(ctx, vpid, pid, status, inherited);
+	}
+}
+
+/// Keep `status` for the job of child `vpid`, shown as `pid`, that left
+/// the table (bash `bgp_add`). The kept list answers `wait PID` for it from
+/// now on, and stops answering once it forgets the status (a plain `wait`,
+/// `disown -a`, a posix `wait PID`): so the child's own record, which would
+/// answer too, is collected. A copy of the parent's job (a command
+/// substitution's) is not this vproc's child: its record stays the
+/// parent's.
+fn keep_status(ctx: &mut Ctx<'_, '_>, vpid: Vpid, pid: u32, status: i32, inherited: bool) {
+	state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, vpid, pid, status);
+	if !inherited {
+		// A child still running keeps its record (`proc_collect` takes only
+		// an ended one's).
+		let _ = ctx.k.proc_collect(ctx.cx.store, vpid);
 	}
 }
 
@@ -618,7 +634,10 @@ fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 			JobState::Done(status) => status,
 			JobState::Running | JobState::Stopped(_) => 0,
 		};
-		state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, job.vpid, job.pid(), status);
+		keep_status(ctx, job.vpid, job.pid(), status, job.inherited);
+	} else if !job.inherited {
+		// No status is kept: an ended job's record goes too.
+		let _ = ctx.k.proc_collect(ctx.cx.store, job.vpid);
 	}
 	if matches!(job.state, JobState::Stopped(_)) && !ctx.vp.jobs.subshell {
 		ctx.diag(Diag::Warning {

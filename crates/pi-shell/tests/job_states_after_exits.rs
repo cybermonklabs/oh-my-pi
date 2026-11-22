@@ -337,3 +337,188 @@ fn the_shell_runs_beside_loops_that_start_subshells() {
 		err:    "",
 	}]);
 }
+
+/// A disowned job's end still runs the CHLD trap: bash's `waitchld` counts
+/// every child it reaps, before it looks for the job.
+#[test]
+fn a_disowned_job_s_end_runs_the_chld_trap() {
+	assert_rows(&[
+		Row {
+			name:   "chld/disown",
+			script: r"trap 'echo chld' CHLD; /bin/true & p=$!; disown; while kill -0 $p 2>/dev/null; do :; done; echo end",
+			out:    "chld\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "chld/disown-pct",
+			script: r"trap 'echo chld' CHLD; /bin/true & p=$!; disown %1; while kill -0 $p 2>/dev/null; do :; done; echo end",
+			out:    "chld\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "chld/disown-sleep",
+			script: r"trap 'echo chld' CHLD; sleep 0.3 & disown; sleep 1; echo end",
+			out:    "chld\nchld\nend\n",
+			err:    "",
+		},
+	]);
+}
+
+/// While `$p` is still `$!`, a status the list forgot is gone: a plain
+/// `wait`, `disown -a` and a posix `wait PID` forget it, and `wait $p` is
+/// then 127, also for a subshell job (whose pid is its virtual pid) and a
+/// pipeline.
+#[test]
+fn a_forgotten_status_is_gone_while_its_pid_is_still_bang() {
+	assert_rows(&[
+		Row {
+			name:   "bang/wait",
+			script: r"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "bang/wait-sub",
+			script: r"( exit 3 ) & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "bang/wait-pipe",
+			script: r"/bin/true | /bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "bang/disown-a",
+			script: r"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; disown -a; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "bang/posix",
+			script: r"set -o posix; /bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo st=$?; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=3\nst=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "bang/posix-sub",
+			script: r"set -o posix; ( exit 3 ) & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo st=$?; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=3\nst=127\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `wait $p` of a job still in the table returns its status, and so does a
+/// second `wait $p` (bash's `wait PID` only marks the job; it leaves the
+/// table later with its status kept); a posix shell and a plain `wait`
+/// forget it.
+#[test]
+fn wait_twice_returns_the_status_twice() {
+	assert_rows(&[
+		Row {
+			name:   "twice/program",
+			script: r"/bin/sh -c 'exit 3' & p=$!; wait $p; echo st=$?; wait $p; echo st=$?",
+			out:    "st=3\nst=3\n",
+			err:    "",
+		},
+		Row {
+			name:   "twice/subshell",
+			script: r"( exit 3 ) & p=$!; wait $p; echo st=$?; wait $p; echo st=$?",
+			out:    "st=3\nst=3\n",
+			err:    "",
+		},
+		Row {
+			name:   "twice/pipe",
+			script: r"/bin/true | /bin/sh -c 'exit 3' & p=$!; wait $p; echo st=$?; wait $p; echo st=$?",
+			out:    "st=3\nst=3\n",
+			err:    "",
+		},
+		Row {
+			name:   "twice/posix",
+			script: r"set -o posix; /bin/sh -c 'exit 3' & p=$!; wait $p; echo st=$?; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=3\nst=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "twice/plain-wait",
+			script: r"/bin/sh -c 'exit 3' & p=$!; wait $p; echo st=$?; wait; wait $p 2>/dev/null; echo st=$?",
+			out:    "st=3\nst=127\n",
+			err:    "",
+		},
+	]);
+}
+
+/// A job the shell has just started has not run: `jobs` takes in no exit
+/// for it and lists it `Running` (bash 5.3.20 10 of 10 for each row). A job
+/// whose first turn ends it (a builtin, a function, an assignment) shows
+/// that the take-in gives it no turn; a subshell takes more than one.
+#[test]
+fn jobs_owes_no_turn_to_a_job_the_shell_just_started() {
+	assert_rows(&[
+		Row {
+			name:   "fresh/builtin",
+			script: r": & jobs; wait; echo end",
+			out:    "[1]+  Running                    : &\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "fresh/function",
+			script: r"f() { return 3; }; f & jobs; wait; echo end",
+			out:    "[1]+  Running                    f &\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "fresh/assignment",
+			script: r"x=1 & jobs; wait; echo end",
+			out:    "[1]+  Running                    x=1 &\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "fresh/subshell",
+			script: r"( exit 3 ) & jobs; wait; echo end",
+			out:    "[1]+  Running                    ( exit 3 ) &\nend\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `kill -0 $p` of a finished job's pid finds no process once the job left
+/// the table (`jobs` reported it, `disown -a`, `wait $p`), while `$p` is
+/// still `$!`.
+#[test]
+fn kill_of_bang_finds_no_process_once_its_job_left() {
+	assert_rows(&[
+		Row {
+			name:   "kill0/after-jobs",
+			script: r"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; kill -0 $p 2>/dev/null; echo k=$?",
+			out:    "k=1\n",
+			err:    "",
+		},
+		Row {
+			name:   "kill0/after-jobs-sub",
+			script: r"( exit 3 ) & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; kill -0 $p 2>/dev/null; echo k=$?",
+			out:    "k=1\n",
+			err:    "",
+		},
+		Row {
+			name:   "kill0/after-disown-a",
+			script: r"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; disown -a; kill -0 $p 2>/dev/null; echo k=$?",
+			out:    "k=1\n",
+			err:    "",
+		},
+		Row {
+			name:   "kill0/after-wait",
+			script: r"/bin/sh -c 'exit 3' & p=$!; wait $p; kill -0 $p 2>/dev/null; echo k=$?",
+			out:    "k=1\n",
+			err:    "",
+		},
+		Row {
+			name:   "kill0/after-wait-sub",
+			script: r"( exit 3 ) & p=$!; wait $p; kill -0 $p 2>/dev/null; echo k=$?",
+			out:    "k=1\n",
+			err:    "",
+		},
+	]);
+}

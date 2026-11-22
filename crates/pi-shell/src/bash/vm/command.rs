@@ -4391,7 +4391,18 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					}
 				} else if let Some(s) = k.proc_collect(cx.store, v) {
 					last = s;
+					// bash's `wait PID` only marks a job in the table notified:
+					// it leaves later with its status kept (`delete_job`'s
+					// `bgp_add`), so a second `wait PID` returns it again; a
+					// posix shell forgets it (`bgp_delete`).
+					let kept = vp.jobs.by_vpid(v).filter(|j| !j.inherited).map(|j| j.pid());
 					forget_job(vp, v);
+					if let Some(pid) = kept
+						&& !state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+							.unwrap_or(false)
+					{
+						state::save_status(&mut k.root, cx.store, vp, v, pid, s);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))

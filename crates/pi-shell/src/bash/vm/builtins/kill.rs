@@ -222,11 +222,13 @@ pub(super) fn target(
 		.map(|p| ctx.k.pid_owner(p).unwrap_or_else(|| ctx.vp.vpid_of(p)));
 	let live = named.filter(|&v| {
 		let st = ctx.k.proc_state(ctx.cx.store, v);
-		// `$!` of a job disowned before the scheduler adopted it is known
-		// only by `$!` (as `wait`'s `is_child`).
+		// `$!` of a job the scheduler has not adopted yet (one `disown`
+		// dropped in the same turn) has no record yet. Once adopted, a
+		// child with no record is gone: its status was collected (`wait`)
+		// or kept for `wait PID` when its job left the table.
 		(ctx.vp.jobs.by_vpid(v).is_some()
 			|| st == Some(crate::bash::vm::ProcState::Running)
-			|| (st.is_none() && ctx.vp.last_bg.is(v)))
+			|| (st.is_none() && ctx.vp.last_bg.is(v) && ctx.k.spawned.iter().any(|p| p.vpid == v)))
 			&& !matches!(st, Some(crate::bash::vm::ProcState::Exited(_)))
 	});
 	match u32::try_from(pid) {

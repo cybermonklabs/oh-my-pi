@@ -709,10 +709,13 @@ impl Kernel {
 	}
 
 	/// `disown` dropped the job whose vproc is `vpid`: it is no child of the
-	/// shell any more (bash deletes the job; `wait` neither waits for it nor
-	/// finds it, unless by the status bash keeps), so its record names no
-	/// parent ([`Self::started`] is false) and keeps doing so once it ends
-	/// ([`Self::proc_exited`]); `kill` still finds the process while it runs.
+	/// shell for `wait` any more (bash deletes the job; `wait` neither waits
+	/// for it nor finds it, unless by the status bash keeps), so its record
+	/// names no parent ([`Self::started`] is false) and keeps doing so once it
+	/// ends ([`Self::proc_exited`]); `kill` still finds the process while it
+	/// runs. It is still the shell's child for its end: bash's `waitchld`
+	/// counts every child it reaps, so the end owes a `SIGCHLD` trap run as
+	/// any child's does (`Shell::reaped` takes the vproc's parent).
 	pub fn disown(&mut self, store: &mut dyn StateStore, vpid: Vpid) {
 		if self.spawned.iter().any(|p| p.vpid == vpid) {
 			self.disowned.push(vpid);
@@ -854,16 +857,16 @@ impl Kernel {
 	}
 
 	/// Child vproc `vpid` of `parent` ended with `status`; the record stays
-	/// until the status is collected ([`Self::proc_collect`]). The parent
-	/// whose child it still is: `parent`, or `None` once `disown` dropped it
-	/// ([`Self::disown`]: the record keeps naming no parent).
+	/// until the status is collected ([`Self::proc_collect`]). A record
+	/// `disown` left with no parent ([`Self::disown`]) keeps naming none:
+	/// `wait` does not find it, and `kill` of `$!` still sees the child gone.
 	pub fn proc_exited(
 		&mut self,
 		store: &mut dyn StateStore,
 		vpid: Vpid,
 		parent: Option<Vpid>,
 		status: i32,
-	) -> Option<Vpid> {
+	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
 		let parent = match store.get(Key::Proc(vpid)) {
 			Ok(Some(Record::Proc { parent: None, .. })) => None,
@@ -871,7 +874,6 @@ impl Kernel {
 		};
 		let rec = Record::Proc { parent, status: Some(status) };
 		self.root.write(store, Change::Put(Key::Proc(vpid), rec));
-		parent
 	}
 
 	/// Child vproc `vpid`'s state: `None` unknown (never started here, or
@@ -2095,11 +2097,11 @@ impl Shell {
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
-				let parent = self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
+				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
-				self.ended(p.vpid, parent);
-				self.reaped(cx, parent, p.vpid, p.status);
+				self.ended(p.vpid, p.parent);
+				self.reaped(cx, p.parent, p.vpid, p.status);
 			} else {
 				i += 1;
 			}
@@ -2143,7 +2145,9 @@ impl Shell {
 	/// the scheduler has without a take-in: only the asker waits, for at
 	/// most two turns of each of the `n` vprocs it saw (`2n`); one that runs
 	/// on parks or runs on, and is not waited for. An owed vproc that cannot
-	/// run (stopped, gone, parked again) owes nothing.
+	/// run (stopped, gone, out of work) owes nothing. An owed vproc is never
+	/// parked here: the ask wakes every parked vproc, a vproc leaves `owed`
+	/// at its turn, and the end that owes a parent its turn wakes it too.
 	fn take_in_exits(&mut self, ran: Vpid) {
 		for t in &mut self.taking_in {
 			t.owed.retain(|&v| v != ran);
@@ -2175,17 +2179,13 @@ impl Shell {
 			// Parked vprocs poll again: each owed one is runnable.
 			self.k.ctl.notify();
 		}
-		let wakes = self.k.ctl.wakes();
 		let mut answered = Vec::new();
 		let procs = &self.procs;
 		self.taking_in.retain(|t| {
 			let owing = t.owed.iter().any(|&v| {
-				procs.iter().any(|p| {
-					p.vpid == v
-						&& p.has_work()
-						&& !p.stopped
-						&& p.blocked.as_ref().is_none_or(|b| b.at != wakes)
-				})
+				procs
+					.iter()
+					.any(|p| p.vpid == v && p.has_work() && !p.stopped)
 			});
 			if !owing {
 				answered.push(t.asker);
@@ -2488,11 +2488,11 @@ impl Shell {
 			self.k.trace_unit_origins.remove(&p.vpid);
 			self.k.settle_bang(p.vpid, None);
 			self.k.forget_deferral(p.vpid);
-			let parent = self.k.proc_exited(cx.store, p.vpid, p.parent, status);
+			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
-			self.ended(p.vpid, parent);
+			self.ended(p.vpid, p.parent);
 			self.k.ctl.notify();
-			self.reaped(cx, parent, p.vpid, status);
+			self.reaped(cx, p.parent, p.vpid, status);
 		}
 	}
 
