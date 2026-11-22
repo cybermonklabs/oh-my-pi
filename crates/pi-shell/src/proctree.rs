@@ -546,6 +546,82 @@ mod platform {
 			Ok(())
 		}
 
+		/// True once every thread of the process has stopped (`T`, or `t` under
+		/// a tracer), or the process has ended. A thread stops only on its way
+		/// back to user space, so a `fork` it was making when the stop signal
+		/// came has returned by then, and its child is in [`Self::children`].
+		/// A process that ended, or whose threads cannot be read, has nothing
+		/// left to wait for.
+		pub fn stopped(&self) -> bool {
+			self.every_thread(&['T', 't', 'Z', 'X'])
+		}
+
+		/// True once every thread of the process sleeps in the kernel (`S` or
+		/// `D`), or the process has ended.
+		pub fn asleep(&self) -> bool {
+			self.every_thread(&['S', 'D', 'Z', 'X'])
+		}
+
+		/// Whether the state of every thread (`/proc/<pid>/task/*/stat`) is one
+		/// of `states`; true once the process has ended or its threads cannot
+		/// be read.
+		fn every_thread(&self, states: &[char]) -> bool {
+			if !self.live_identity() {
+				return true;
+			}
+			let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", self.pid)) else {
+				return true;
+			};
+			tasks.flatten().all(|task| {
+				// A thread that ended after the listing has no stat left to read.
+				let Ok(stat) = fs::read_to_string(task.path().join("stat")) else {
+					return true;
+				};
+				// The state follows the command name, which may itself hold `)`.
+				let state = stat
+					.rfind(')')
+					.and_then(|end| stat[end + 1..].trim_start().chars().next());
+				state.is_some_and(|state| states.contains(&state))
+			})
+		}
+
+		/// Whether every thread of the running process blocks `signal`
+		/// (`SigBlk` in `/proc/<pid>/task/*/status`). Sent to the process, a
+		/// blocked signal stays pending: the process runs on once resumed until
+		/// a thread unblocks it, and can fork meanwhile. `None` when the system
+		/// shows no masks (gVisor writes no `SigBlk` line); SIGKILL is never
+		/// blocked; an ended process blocks nothing.
+		pub fn blocks(&self, signal: i32) -> Option<bool> {
+			if signal == libc::SIGKILL {
+				return Some(false);
+			}
+			let Some(bit) = u32::try_from(signal - 1)
+				.ok()
+				.and_then(|shift| 1u64.checked_shl(shift))
+			else {
+				return Some(false);
+			};
+			let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", self.pid)) else {
+				return Some(false);
+			};
+			let mut threads = 0_usize;
+			for task in tasks.flatten() {
+				// A thread that ended after the listing blocks nothing.
+				let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+					continue;
+				};
+				let mask = status
+					.lines()
+					.find_map(|line| line.strip_prefix("SigBlk:"))?;
+				let mask = u64::from_str_radix(mask.trim(), 16).ok()?;
+				if mask & bit == 0 {
+					return Some(false);
+				}
+				threads += 1;
+			}
+			Some(threads > 0 && self.live_identity())
+		}
+
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle. The walk
 		/// goes on past a process it cannot read, and reports the first.
@@ -1235,6 +1311,23 @@ impl Process {
 	/// process group the root leads, if any (it needs no read); and the call
 	/// fails once the hard wave is sent if its walk was incomplete, since a
 	/// descendant it could not read may still run.
+	///
+	/// On Linux each wave stops the tree, top-down, before it reads it, and
+	/// resumes it once signalled, so a process cannot fork a child between the
+	/// walk and its own signal: such a child used to outlive the termination,
+	/// moved to init when its parent died. A stopped process that blocks the
+	/// wave's signal is stepped until it unblocks it, so a child it forks in
+	/// that window (dash blocks every signal around each vfork) is read too.
+	/// Where no signal masks are shown (gVisor), every stopped process gets a
+	/// few short steps instead. A process that has not stopped, or still
+	/// blocks the signal, 100 ms into the walk is read as it is.
+	///
+	/// A process that forks during the grace period and then exits (in a TERM
+	/// handler, say) leaves a child no walk can reach: it moves to the nearest
+	/// subreaper or to init before the hard wave reads the tree, and the grace
+	/// wait sees every process it knows of gone. A caller that needs that child
+	/// ended runs the tree in a process group of its own and waits for the
+	/// group to empty, or under a subreaper.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -1335,14 +1428,178 @@ impl Process {
 		walk
 	}
 
-	/// One signal wave: the group (`group`, or the one the root leads when
-	/// the walk is incomplete), every live descendant, then the root. Returns
-	/// the walk, for the wait.
-	fn signal_wave(&self, signal: i32, group: Option<i32>, protected: &HashSet<i32>) -> Walk<Self> {
+	/// The tree under this process, read for one termination wave that sends
+	/// `signal`.
+	///
+	/// Level by level from the top, each process is stopped before its
+	/// children are read, and the walk waits until it has stopped
+	/// ([`platform::Process::stopped`]): a stopped process cannot fork, so no
+	/// process joins the tree between this walk and the wave's signal.
+	///
+	/// A stopped process that blocks `signal` in every thread would not act on
+	/// it once resumed: it would run on until a thread unblocks it, and could
+	/// fork meanwhile (dash blocks every signal around each vfork). Such a
+	/// process is stepped: resumed, left to run until it sleeps in the kernel,
+	/// forks or unblocks the signal ([`Self::step`]), and stopped again, until
+	/// it no longer blocks the signal. A child it forks on the way is read with
+	/// the others. Where the system shows no signal masks (gVisor), every
+	/// stopped process gets up to [`BLIND_STEPS`] short steps instead, ending
+	/// at one in which it neither ran nor forked: no signal of the wave is
+	/// pending yet, so a step only lets it run as it would have, and a child it
+	/// forks is read.
+	///
+	/// The waits of the whole walk end at [`STOP_WAIT_LIMIT`]; a process that
+	/// has not stopped by then (one blocked in the kernel, or traced with its
+	/// stops suppressed), or still blocks the signal, is read as it is. A
+	/// protected process is neither stopped nor walked into, so its subtree is
+	/// spared. A child list that cannot be read leaves the walk incomplete, as
+	/// [`Self::signalable_descendants`] does.
+	#[cfg(target_os = "linux")]
+	async fn freeze(
+		&self,
+		signal: i32,
+		protected: &HashSet<i32>,
+		ct: &CancelToken,
+	) -> Result<Frozen> {
+		let deadline = tokio::time::Instant::now() + STOP_WAIT_LIMIT;
+		let mut frozen = Frozen { walk: Walk::default(), stopped: Vec::new() };
+		let mut visited = HashSet::from([self.pid()]);
+		let mut level = vec![self.clone()];
+		while !level.is_empty() {
+			let stopping = frozen.stopped.len();
+			for process in &level {
+				if !protected.contains(&process.pid()) && process.inner.kill(libc::SIGSTOP) {
+					frozen.stopped.push(process.clone());
+				}
+			}
+			while !frozen.stopped[stopping..]
+				.iter()
+				.all(|process| process.inner.stopped())
+				&& tokio::time::Instant::now() < deadline
+			{
+				ct.heartbeat()?;
+				tokio::time::sleep(STOP_POLL_INTERVAL).await;
+			}
+			for process in &frozen.stopped[stopping..] {
+				let mut blind_steps = 0;
+				loop {
+					let blocks = process.inner.blocks(signal);
+					if blocks == Some(false) || tokio::time::Instant::now() >= deadline {
+						break;
+					}
+					if blocks.is_some() {
+						process.step(signal, None, deadline, ct).await?;
+						continue;
+					}
+					// No masks are shown: a few short steps, until one in which the
+					// process neither ran nor forked (it sleeps in the kernel, and
+					// the wave's signal reaches it there).
+					blind_steps += 1;
+					if blind_steps > BLIND_STEPS
+						|| !process
+							.step(signal, Some(BLIND_STEP_SLICE), deadline, ct)
+							.await?
+					{
+						break;
+					}
+				}
+			}
+			let mut next = Vec::new();
+			for process in &level {
+				let children = process.inner.children();
+				if let Err(error) = children.complete {
+					frozen.walk.fail(error);
+				}
+				for child in children.processes.into_iter().map(Self::from_inner) {
+					if !protected.contains(&child.pid()) && visited.insert(child.pid()) {
+						next.push(child.clone());
+						frozen.walk.processes.push(child);
+					}
+				}
+			}
+			level = next;
+		}
+		// Level by level, reversed: every child before its parent.
+		frozen.walk.processes.reverse();
+		Ok(frozen)
+	}
+
+	/// One step of a stopped process: resume it and wait until it has left the
+	/// stopped state; then wait, for `slice` (or until `deadline` when `None`),
+	/// for it to sleep in the kernel, have another number of children, no
+	/// longer block `signal` or end; then stop it again and wait until
+	/// `deadline` for it to stop. Returns whether it ran or forked meanwhile.
+	/// The slice starts only once the process has resumed: a resume can take
+	/// effect late (gVisor), and a step whose process never ran shows nothing.
+	#[cfg(target_os = "linux")]
+	async fn step(
+		&self,
+		signal: i32,
+		slice: Option<Duration>,
+		deadline: tokio::time::Instant,
+		ct: &CancelToken,
+	) -> Result<bool> {
+		let children = self.inner.children().processes.len();
+		let _ = self.inner.kill(libc::SIGCONT);
+		while self.inner.stopped()
+			&& self.inner.children().processes.len() == children
+			&& tokio::time::Instant::now() < deadline
+		{
+			ct.heartbeat()?;
+			tokio::time::sleep(STOP_POLL_INTERVAL).await;
+		}
+		let settle =
+			slice.map_or(deadline, |slice| (tokio::time::Instant::now() + slice).min(deadline));
+		let mut ran = false;
+		while tokio::time::Instant::now() < settle {
+			if self.inner.children().processes.len() != children {
+				ran = true;
+				break;
+			}
+			if self.inner.asleep() || self.inner.blocks(signal) == Some(false) {
+				break;
+			}
+			ran |= !self.inner.stopped();
+			ct.heartbeat()?;
+			tokio::time::sleep(STOP_POLL_INTERVAL).await;
+		}
+		let _ = self.inner.kill(libc::SIGSTOP);
+		while !self.inner.stopped() && tokio::time::Instant::now() < deadline {
+			ct.heartbeat()?;
+			tokio::time::sleep(STOP_POLL_INTERVAL).await;
+		}
+		Ok(ran)
+	}
+
+	/// The tree under this process, read for one termination wave, with every
+	/// protected subtree pruned. Nothing is stopped outside Linux.
+	#[cfg(not(target_os = "linux"))]
+	fn freeze(
+		&self,
+		_signal: i32,
+		protected: &HashSet<i32>,
+		_ct: &CancelToken,
+	) -> std::future::Ready<Result<Frozen>> {
+		std::future::ready(Ok(Frozen { walk: self.signalable_descendants(protected) }))
+	}
+
+	/// One signal wave on the tree `frozen` read: the group (`group`, or the
+	/// one the root leads when the walk is incomplete), every live descendant,
+	/// then the root. Returns the walk, for the wait. The processes the walk
+	/// stopped resume once it is dropped, here, and act on the signal then.
+	fn signal_wave(
+		&self,
+		mut frozen: Frozen,
+		signal: i32,
+		group: Option<i32>,
+		protected: &HashSet<i32>,
+	) -> Walk<Self> {
+		#[cfg(all(test, target_os = "linux"))]
+		wave_hook::run(self.pid());
 		if let Some(pgid) = group {
 			let _ = kill_process_group(pgid, signal);
 		}
-		let descendants = self.signalable_descendants(protected);
+		let descendants = std::mem::take(&mut frozen.walk);
 		for child in &descendants.processes {
 			let _ = child.inner.kill(signal);
 		}
@@ -1373,7 +1630,8 @@ impl Process {
 		let protected = host_protected_pids();
 
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
-		let polite = self.signal_wave(TERM_SIGNAL, process_group, &protected);
+		let frozen = self.freeze(TERM_SIGNAL, &protected, &ct).await?;
+		let polite = self.signal_wave(frozen, TERM_SIGNAL, process_group, &protected);
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
@@ -1393,7 +1651,8 @@ impl Process {
 
 		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
 		// period — or any process re-parented to the root — is signalled too.
-		let hard = self.signal_wave(KILL_SIGNAL, process_group, &protected);
+		let frozen = self.freeze(KILL_SIGNAL, &protected, &ct).await?;
+		let hard = self.signal_wave(frozen, KILL_SIGNAL, process_group, &protected);
 		let exited = wait_for_exit(
 			self,
 			&hard.processes,
@@ -1414,6 +1673,73 @@ impl Process {
 					.into(),
 				)
 			},
+		}
+	}
+}
+
+/// How long one wave's walk waits for the processes it stopped to stop. A
+/// runnable process stops within microseconds of the signal.
+#[cfg(target_os = "linux")]
+const STOP_WAIT_LIMIT: Duration = Duration::from_millis(100);
+
+/// How often [`Process::freeze`] looks again at the processes it is waiting
+/// on to stop.
+#[cfg(target_os = "linux")]
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The most steps [`Process::freeze`] gives a stopped process whose signal
+/// mask the system does not show (gVisor). dash, stopped in the window before
+/// its vfork, needs two: one to fork, one to unblock its signals.
+#[cfg(target_os = "linux")]
+const BLIND_STEPS: usize = 4;
+
+/// How long one such step lets the process run before it is stopped again.
+#[cfg(target_os = "linux")]
+const BLIND_STEP_SLICE: Duration = Duration::from_millis(5);
+
+/// The processes one termination wave signals, read by [`Process::freeze`].
+/// Dropping it resumes the ones it stopped, so no way out of a wave, a
+/// cancelled one included, leaves a process stopped.
+struct Frozen {
+	/// Children before parents, the order the wave signals them in.
+	walk:    Walk<Process>,
+	/// Top-down, in the order they were stopped.
+	#[cfg(target_os = "linux")]
+	stopped: Vec<Process>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Frozen {
+	fn drop(&mut self) {
+		// Children first: a parent resumed later finds them already acting on
+		// the wave's signal.
+		for process in self.stopped.iter().rev() {
+			let _ = process.inner.kill(libc::SIGCONT);
+		}
+	}
+}
+
+/// Lets a test act between a wave's walk and its signal.
+#[cfg(all(test, target_os = "linux"))]
+mod wave_hook {
+	use std::{
+		collections::HashMap,
+		sync::{LazyLock, Mutex},
+	};
+
+	type Hook = Box<dyn FnOnce() + Send>;
+
+	static HOOKS: LazyLock<Mutex<HashMap<i32, Hook>>> = LazyLock::new(Mutex::default);
+
+	/// Run `hook` once, in the next wave on the tree under `root`.
+	pub fn set(root: i32, hook: Hook) {
+		HOOKS.lock().expect("wave hooks").insert(root, hook);
+	}
+
+	pub fn run(root: i32) {
+		let hook = HOOKS.lock().expect("wave hooks").remove(&root);
+		if let Some(hook) = hook {
+			hook();
 		}
 	}
 }
@@ -2746,5 +3072,285 @@ mod tests {
 		assert!(text.starts_with(&unread), "{text}");
 		assert_eq!(text.contains(&format!("and process group {pid}")), leads_group, "{text}");
 		// No status check here: `poll` itself fails with no descriptor left.
+	}
+
+	/// The state letter of `pid`'s main thread: `T` once it has stopped.
+	#[cfg(target_os = "linux")]
+	fn thread_state(pid: i32) -> Option<char> {
+		let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+		stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+	}
+
+	/// Forks a root that blocks SIGTERM, then stops itself. Once continued it
+	/// waits for a pending SIGTERM when `fork_once_term_is_pending`, forks
+	/// `/bin/sleep 1000`, writes that child's pid to the returned pipe,
+	/// unblocks SIGTERM when `unblock`, and waits for the child. Returns once
+	/// the root reads stopped. Only async-signal-safe calls run after the
+	/// fork: the test process has other threads.
+	#[cfg(target_os = "linux")]
+	fn spawn_term_blocker(
+		fork_once_term_is_pending: bool,
+		unblock: bool,
+	) -> (i32, std::os::fd::OwnedFd) {
+		use std::{ffi::CStr, os::fd::FromRawFd, ptr};
+
+		const SLEEP: &CStr = c"/bin/sleep";
+		let argv = [SLEEP.as_ptr(), c"1000".as_ptr(), ptr::null()];
+		let mut pipe = [0; 2];
+		// SAFETY: `pipe` has room for the two descriptors pipe2 writes.
+		assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0, "pipe");
+		// SAFETY: the child runs only async-signal-safe calls on memory made
+		// before the fork, and leaves by `execv` or `_exit`.
+		let root = unsafe { libc::fork() };
+		assert!(root >= 0, "fork the root");
+		if root == 0 {
+			// SAFETY: as above; every pointer names a live local of this frame.
+			unsafe {
+				// A handler the test process installed would run in this copy.
+				libc::signal(libc::SIGTERM, libc::SIG_DFL);
+				let mut term: libc::sigset_t = std::mem::zeroed();
+				libc::sigemptyset(&raw mut term);
+				libc::sigaddset(&raw mut term, libc::SIGTERM);
+				libc::sigprocmask(libc::SIG_BLOCK, &raw const term, ptr::null_mut());
+				libc::raise(libc::SIGSTOP);
+				if fork_once_term_is_pending {
+					loop {
+						let mut pending: libc::sigset_t = std::mem::zeroed();
+						libc::sigpending(&raw mut pending);
+						if libc::sigismember(&raw const pending, libc::SIGTERM) == 1 {
+							break;
+						}
+						let tick = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+						libc::nanosleep(&raw const tick, ptr::null_mut());
+					}
+				}
+				let child = libc::fork();
+				if child == 0 {
+					let mut none: libc::sigset_t = std::mem::zeroed();
+					libc::sigemptyset(&raw mut none);
+					libc::sigprocmask(libc::SIG_SETMASK, &raw const none, ptr::null_mut());
+					libc::execv(SLEEP.as_ptr(), argv.as_ptr());
+					libc::_exit(127);
+				}
+				libc::write(pipe[1], (&raw const child).cast(), size_of::<libc::pid_t>());
+				if unblock {
+					libc::sigprocmask(libc::SIG_UNBLOCK, &raw const term, ptr::null_mut());
+				}
+				let mut status = 0;
+				libc::waitpid(child, &raw mut status, 0);
+				libc::_exit(0);
+			}
+		}
+		// SAFETY: the write end is this process's own descriptor, closed once.
+		unsafe { libc::close(pipe[1]) };
+		while thread_state(root) != Some('T') {
+			std::thread::yield_now();
+		}
+		// SAFETY: the read end is this process's own descriptor, owned from here.
+		(root, unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe[0]) })
+	}
+
+	/// The child pid a [`spawn_term_blocker`] root wrote, once the root has
+	/// ended, and whether that child still runs; it is killed if so. Reaps
+	/// the root.
+	#[cfg(target_os = "linux")]
+	fn reap_term_blocker(root: i32, pipe: &std::os::fd::OwnedFd) -> bool {
+		use std::os::fd::AsRawFd;
+
+		let mut status = 0;
+		// SAFETY: `root` is this process's child, and `status` outlives the call.
+		unsafe { libc::waitpid(root, &raw mut status, 0) };
+		let mut child: libc::pid_t = 0;
+		// SAFETY: `child` has room for the bytes read.
+		let read =
+			unsafe { libc::read(pipe.as_raw_fd(), (&raw mut child).cast(), size_of::<libc::pid_t>()) };
+		assert_eq!(
+			usize::try_from(read).ok(),
+			Some(size_of::<libc::pid_t>()),
+			"the root forked its child"
+		);
+		let child = Process::from_pid(child);
+		let runs = child
+			.as_ref()
+			.is_some_and(|child| child.status() == ProcessStatus::Running);
+		if let Some(child) = &child {
+			let _ = child.signal(KILL_SIGNAL);
+		}
+		runs
+	}
+
+	/// A process stopped while it blocks the polite signal runs on once
+	/// resumed, until it unblocks the signal, and can fork on the way: dash
+	/// blocks every signal around each vfork. A child forked there was read
+	/// by no walk, and outlived the termination once its parent died of the
+	/// signal. This root stops itself inside such a window, so the wave finds
+	/// it there every run.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_steps_a_process_that_blocks_the_signal() {
+		let (root, pipe) = spawn_term_blocker(false, true);
+		let process = Process::from_pid(root).expect("pin the root");
+		let exited = process
+			.terminate_tree(false, 1000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let outlived = reap_term_blocker(root, &pipe);
+		assert!(exited, "the root must be gone");
+		assert!(!outlived, "the child forked while the signal was blocked outlived the termination");
+	}
+
+	/// A TERM handler that forks while its process keeps running: the hard
+	/// wave stops and reads the tree again, so its KILL reaches that child.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_kills_a_child_a_term_handler_forks() {
+		use std::{
+			io::{BufRead, BufReader},
+			process::{Command, Stdio},
+		};
+
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "trap 'sleep 1000 >/dev/null & echo $!' TERM; while :; do sleep 0.01; done"])
+			.stdout(Stdio::piped())
+			.spawn()
+			.expect("spawn the root");
+		let process = Process::from_pid(i32::try_from(root.id()).expect("root pid fits in i32"))
+			.expect("pin the root");
+		while process.children().unwrap_or_default().is_empty() {
+			std::thread::yield_now();
+		}
+
+		let exited = process
+			.terminate_tree(false, 300, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = root.wait();
+		let mut line = String::new();
+		BufReader::new(root.stdout.take().expect("root stdout"))
+			.read_line(&mut line)
+			.expect("read the handler's child");
+		let child = Process::from_pid(line.trim().parse().expect("the handler forked its child"));
+		let outlived = child
+			.as_ref()
+			.is_some_and(|child| child.status() == ProcessStatus::Running);
+		if let Some(child) = &child {
+			let _ = child.signal(KILL_SIGNAL);
+		}
+		assert!(exited, "the tree must be gone");
+		assert!(!outlived, "the child the TERM handler forked outlived the termination");
+	}
+
+	/// A process that blocks TERM for good, as one that reads it through a
+	/// signalfd does, and forks once a TERM is pending: stepping ends at the
+	/// walk's limit, the TERM stays pending, and the hard wave stops and reads
+	/// the tree again, so its KILL reaches the child.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_kills_a_child_forked_by_a_process_that_blocks_term() {
+		let (root, pipe) = spawn_term_blocker(true, false);
+		let process = Process::from_pid(root).expect("pin the root");
+		let exited = process
+			.terminate_tree(false, 300, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let outlived = reap_term_blocker(root, &pipe);
+		assert!(exited, "the tree must be gone");
+		assert!(!outlived, "the child forked once the TERM was pending outlived the termination");
+	}
+
+	/// A child the root forks after a wave has read the tree, but before the
+	/// root is signalled, outlived the termination: the root died of the
+	/// signal, the child moved to init, and no later walk could reach it. The
+	/// hook asks the root to fork in exactly that gap, then waits until it has
+	/// forked or reads stopped; no such child may be left running.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_leaves_no_child_forked_after_the_walk() {
+		use std::{
+			io::Write,
+			process::{Command, Stdio},
+			sync::{Arc, Mutex},
+		};
+
+		// The root forks a long-lived child only once it reads a line.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "read line; sleep 1000 & wait"])
+			.stdin(Stdio::piped())
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		let mut stdin = root.stdin.take().expect("root stdin");
+		let forked = Arc::new(Mutex::new(None::<Process>));
+		{
+			let forked = Arc::clone(&forked);
+			let watched = process.clone();
+			wave_hook::set(
+				root_pid,
+				Box::new(move || {
+					stdin.write_all(b"\n").expect("ask the root to fork");
+					// The root either forks, as it still runs, or reads stopped.
+					loop {
+						if let Some(child) = watched.children().unwrap_or_default().into_iter().next() {
+							*forked.lock().expect("forked child") = Some(child);
+							return;
+						}
+						if thread_state(root_pid) == Some('T') {
+							return;
+						}
+						std::thread::yield_now();
+					}
+				}),
+			);
+		}
+
+		let exited = process
+			.terminate_tree(false, 1000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = root.wait();
+		let child = forked.lock().expect("forked child").take();
+		let outlived = child
+			.as_ref()
+			.is_some_and(|child| child.status() == ProcessStatus::Running);
+		if let Some(child) = &child {
+			let _ = child.signal(KILL_SIGNAL);
+		}
+		assert!(exited, "the root must be gone");
+		assert!(!outlived, "the child the root forked after the walk outlived the termination");
+	}
+
+	/// A wave resumes the processes it stopped, so one that handles the signal
+	/// runs its handler at once, instead of waiting stopped for the hard
+	/// wave's kill.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_resumes_the_processes_it_stopped() {
+		use std::{os::unix::process::ExitStatusExt, process::Command};
+
+		// `wait` returns as soon as a trapped signal arrives, so the trap runs
+		// once the shell may run at all.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "trap 'exit 7' TERM; sleep 1000 & wait"])
+			.spawn()
+			.expect("spawn the root");
+		let process = Process::from_pid(i32::try_from(root.id()).expect("root pid fits in i32"))
+			.expect("pin the root");
+		while process.children().unwrap_or_default().is_empty() {
+			std::thread::yield_now();
+		}
+
+		// The grace period only bounds a failure: the trap ends the root at once.
+		let exited = process
+			.terminate_tree(false, 30_000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let status = root.wait().expect("reap the root");
+		assert!(exited, "the tree must be gone");
+		assert_eq!(
+			(status.code(), status.signal()),
+			(Some(7), None),
+			"the root must run its TERM trap, not die of the hard wave's kill",
+		);
 	}
 }
