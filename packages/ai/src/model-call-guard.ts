@@ -136,11 +136,14 @@ export function guardModelCall(
  * attempt, a transport retry after a backoff, a stream reopen, a fallback, a live steer). These sends read
  * them again, right before each one goes out: every attempt of the OpenAI and Codex HTTP transports, each
  * Codex and Responses WebSocket request, the replay-safe stream retry, the native judgment loop, Bedrock
- * and Ollama attempts, each Gemini CLI endpoint, Cursor's resends (stream retry, HTTP/1 and wire-model
- * fallbacks), each pass of the Anthropic provider's retry loop, and pi-agent's remote compaction. A transport
- * not named here reads them once, when its call starts. A send this read holds still ends the call with an
- * error that names `cyber_policy`, and {@link guardModelCall} reports that final message to its guards like
- * any other; the guards tell it apart from OpenAI's own refusal and do not record it.
+ * and Ollama attempts, each Gemini CLI endpoint attempt and empty-response resend, each Google send (the
+ * global-endpoint retry after a regional 404 and each empty-response resend), each Cursor request (the
+ * stream retry, HTTP/1 and wire-model fallbacks, after their `onPayload` hooks and proxy tunnel), each
+ * GitLab Duo workflow socket run, each pass of the Anthropic provider's retry loop, and pi-agent's remote
+ * compaction. A transport not named here reads them once, when its call starts. A send this read holds
+ * still ends the call with an error that names `cyber_policy`, keeping the output streamed before it, and
+ * {@link guardModelCall} reports that final message to its guards like any other; the guards tell it apart
+ * from OpenAI's own refusal and do not record it.
  */
 export function modelCallHoldReason(model: Model<Api>): string | undefined {
 	return guards.size === 0 ? undefined : refusal(applicable(), model);

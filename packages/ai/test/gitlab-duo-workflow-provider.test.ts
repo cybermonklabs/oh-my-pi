@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { isContextOverflow } from "@oh-my-pi/pi-ai/error";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import {
 	buildGitLabDuoWorkflowApprovalStartRequest,
 	buildGitLabDuoWorkflowCreateBody,
@@ -1229,6 +1230,91 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(createdWorkflowIds).toEqual(["workflow-1", "workflow-2"]);
 		expect(result.stopReason).not.toBe("error");
 		expect(result.errorMessage).toBeUndefined();
+	});
+
+	// The retry on a fresh workflow sends the conversation again: it reads the model-call guards right before
+	// its socket opens. A hold that begins when the first workflow fails holds the retry: one socket, and the
+	// call ends on the held error. The test above is the control: with no hold, the second socket opens.
+	it("holds the fresh-workflow retry when a model-call hold begins after the first workflow fails", async () => {
+		let createCount = 0;
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				createCount++;
+				return new Response(JSON.stringify({ id: `workflow-${createCount}` }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const index = sockets.length;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			sockets.push(socket);
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				if (index === 0) {
+					// Another call of the session meets a refusal while this workflow runs.
+					held = true;
+					socket.onmessage?.(
+						new MessageEvent("message", {
+							data: JSON.stringify({
+								status: "FAILED",
+								error: "There was an error processing your request in the Duo Agent Platform, please contact support if the issue persists.",
+							}),
+						}),
+					);
+				} else {
+					socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+				}
+			});
+			return socket;
+		};
+
+		try {
+			const result = await streamGitLabDuoWorkflow(model, context, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				fetch: fetchImpl,
+				webSocketFactory,
+			}).result();
+
+			expect(sockets).toHaveLength(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("surfaces the generic processing error after the bounded retry is exhausted", async () => {

@@ -168,12 +168,14 @@ it("resumes from the latest replay-safe checkpoint after an incomplete stream", 
 	}
 });
 
-// The retry from a checkpoint sends again after its backoff: it reads the model-call guards right before it
-// goes out, so a hold that begins during the backoff holds it and the call ends on the held error.
+// The retry from a checkpoint sends again after its backoff. Each request reads the model-call guards right
+// before it opens, after the backoff and the `onPayload` hooks, so a hold that begins in either holds the retry.
+// The held call ends with the output the first request streamed, as a failed send does.
 it.each([
-	["holds the checkpoint retry when a model-call hold begins during its backoff", true, 1],
-	["retries from the checkpoint when no hold begins (control)", false, 2],
-])("%s", async (_label, holdDuringWait, expectedRequests) => {
+	["holds the checkpoint retry when a model-call hold begins during its backoff", "backoff", 1],
+	["holds the checkpoint retry when a model-call hold begins in its onPayload hook", "onPayload", 1],
+	["retries from the checkpoint when no hold begins (control)", "none", 2],
+] as const)("%s", async (_label, holdIn, expectedRequests) => {
 	const sessions = new Set<http2.Http2Session>();
 	let requestCount = 0;
 	const server = http2.createServer();
@@ -203,6 +205,7 @@ it.each([
 	if (!address || typeof address === "string") throw new Error("expected HTTP/2 fixture server address");
 	const model = makeModel(`http://127.0.0.1:${address.port}`);
 	let held = false;
+	let payloads = 0;
 	const removeGuard = addModelCallGuard({
 		refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
 	});
@@ -211,16 +214,28 @@ it.each([
 		const result = await streamCursor(model, context, {
 			apiKey: "not-a-secret",
 			providerRetryWait: async () => {
-				held = holdDuringWait;
+				if (holdIn === "backoff") held = true;
+			},
+			onPayload: async () => {
+				payloads++;
+				// The second payload is the retry's.
+				if (payloads === 2 && holdIn === "onPayload") held = true;
+				return undefined;
 			},
 		}).result();
+		const text = result.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
 
 		expect(requestCount).toBe(expectedRequests);
-		if (holdDuringWait) {
+		if (holdIn === "none") {
+			expect(result.stopReason).toBe("stop");
+			expect(text).toBe("before after");
+		} else {
+			// The retry's hook ran before the read that held it.
+			expect(payloads).toBe(2);
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("held: cyber_policy");
-		} else {
-			expect(result.stopReason).toBe("stop");
+			// The text the first request streamed stays on the held call's message.
+			expect(text).toBe("before");
 		}
 	} finally {
 		removeGuard();

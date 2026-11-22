@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { ModelCallRefusedError, runInModelCallScope, streamSimple } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
@@ -70,5 +71,58 @@ describe("installCyberPolicyGuard", () => {
 		} finally {
 			removeGuard();
 		}
+	});
+});
+
+// Which session trees a refusal holds. Each tree's guard sees its own tree's calls and the calls made outside
+// every tree. A refusal inside one tree's scope (a session's run, its tools included) holds that tree only. A
+// refusal outside every tree's scope (a host's own call, made outside any session) cannot be tied to one tree:
+// every tree's guard sees it, so it holds every tree, and while any tree holds, the next such call is held.
+// The test runs in a child process, because a refusal made outside every scope here would also hold every
+// session tree another test file left alive in this `bun test` process.
+describe("which session trees a refusal holds", () => {
+	const REPO_ROOT = path.resolve(import.meta.dir, "../../..");
+	const CLOSURE_MODULE = path.resolve(import.meta.dir, "../src/session/cyber-policy-closure.ts");
+
+	it("a refusal inside one tree's scope holds that tree; one outside every scope holds every tree", async () => {
+		const script = [
+			'import { guardModelRequest, ModelCallRefusedError, runInModelCallScope } from "@oh-my-pi/pi-ai/model-call-guard";',
+			'import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";',
+			`import { CyberPolicyClosure, installCyberPolicyGuard } from ${JSON.stringify(CLOSURE_MODULE)};`,
+			'const { model } = createMockModel({ provider: "openai", id: "gpt-5.5", handler: { content: [] } });',
+			// OpenAI's refusal, as a direct provider call (a web search, remote compaction) meets it.
+			'const refused = () => Promise.reject({ code: "cyber_policy" });',
+			"const mine = new CyberPolicyClosure();",
+			"const other = new CyberPolicyClosure();",
+			"installCyberPolicyGuard(mine);",
+			"installCyberPolicyGuard(other);",
+			"await runInModelCallScope(mine, () => guardModelRequest(model, refused)).catch(() => {});",
+			"const inside = { mine: mine.active, other: other.active };",
+			"mine.end();",
+			"await guardModelRequest(model, refused).catch(() => {});",
+			"const outside = { mine: mine.active, other: other.active };",
+			'const next = await guardModelRequest(model, async () => "sent").catch(error =>',
+			'\terror instanceof ModelCallRefusedError ? "held" : String(error),',
+			");",
+			"console.log(JSON.stringify({ inside, outside, next }));",
+		].join("\n");
+		const child = Bun.spawn([process.execPath, "--eval", script], {
+			cwd: REPO_ROOT,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout.trim().split("\n").at(-1) ?? "null")).toEqual({
+			inside: { mine: true, other: false },
+			outside: { mine: true, other: true },
+			next: "held",
+		});
 	});
 });

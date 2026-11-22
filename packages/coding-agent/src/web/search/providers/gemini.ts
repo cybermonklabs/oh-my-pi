@@ -17,6 +17,7 @@ import {
 	withAuth,
 	withOAuthAccess,
 } from "@oh-my-pi/pi-ai";
+import { guardedRequestUrl, guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { clampThinkingLevelForModel, resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { parseCloudflareCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare";
 import { getAntigravityHeaders, getGeminiCliHeaders } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
@@ -376,6 +377,7 @@ async function finalizeGeminiSearchResult(
  * the single-flight refresh and broker round-trip.
  */
 async function callGeminiSearch(
+	guardModel: Model<Api>,
 	auth: GeminiAuth,
 	model: string,
 	baseUrl: string,
@@ -440,21 +442,25 @@ async function callGeminiSearch(
 		}
 		(requestBody.request as Record<string, unknown>).generationConfig = generationConfig;
 	}
-	const response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
-		method: "POST",
-		headers: {
-			...configuredHeaders,
-			Authorization: `Bearer ${auth.accessToken}`,
-			"Content-Type": "application/json",
-			...headers,
+	// Each attempt (the first and every retry after its backoff) reads the model-call guards first.
+	const response = await fetchWithRetry(
+		guardedRequestUrl(guardModel, `${endpoint}/v1internal:streamGenerateContent?alt=sse`),
+		{
+			method: "POST",
+			headers: {
+				...configuredHeaders,
+				Authorization: `Bearer ${auth.accessToken}`,
+				"Content-Type": "application/json",
+				...headers,
+			},
+			body: JSON.stringify(requestBody),
+			signal: withHardTimeout(signal, timeoutMs),
+			fetch: fetchImpl,
+			maxAttempts: MAX_RETRIES + 1,
+			defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+			maxDelayMs: RATE_LIMIT_BUDGET_MS,
 		},
-		body: JSON.stringify(requestBody),
-		signal: withHardTimeout(signal, timeoutMs),
-		fetch: fetchImpl,
-		maxAttempts: MAX_RETRIES + 1,
-		defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
-		maxDelayMs: RATE_LIMIT_BUDGET_MS,
-	});
+	);
 
 	if (!response.ok) {
 		const rawErrorText = await response.text();
@@ -473,6 +479,7 @@ async function callGeminiSearch(
 }
 
 async function callGeminiDeveloperSearch(
+	guardModel: Model<Api>,
 	apiKey: string,
 	endpoint: GeminiDeveloperEndpoint,
 	configuredHeaders: Record<string, string> | undefined,
@@ -513,23 +520,27 @@ async function callGeminiDeveloperSearch(
 		requestBody.generationConfig = generationConfig;
 	}
 
-	const response = await fetchWithRetry(() => `${endpoint.url}/models/${model}:streamGenerateContent?alt=sse`, {
-		method: "POST",
-		headers: {
-			...configuredHeaders,
-			...(endpoint.isCloudflareGateway
-				? { "cf-aig-authorization": `Bearer ${apiKey}` }
-				: { "x-goog-api-key": apiKey }),
-			"Content-Type": "application/json",
-			Accept: "text/event-stream",
+	// Each attempt (the first and every retry after its backoff) reads the model-call guards first.
+	const response = await fetchWithRetry(
+		guardedRequestUrl(guardModel, `${endpoint.url}/models/${model}:streamGenerateContent?alt=sse`),
+		{
+			method: "POST",
+			headers: {
+				...configuredHeaders,
+				...(endpoint.isCloudflareGateway
+					? { "cf-aig-authorization": `Bearer ${apiKey}` }
+					: { "x-goog-api-key": apiKey }),
+				"Content-Type": "application/json",
+				Accept: "text/event-stream",
+			},
+			body: JSON.stringify(requestBody),
+			signal: withHardTimeout(signal, timeoutMs),
+			fetch: fetchImpl,
+			maxAttempts: MAX_RETRIES + 1,
+			defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+			maxDelayMs: RATE_LIMIT_BUDGET_MS,
 		},
-		body: JSON.stringify(requestBody),
-		signal: withHardTimeout(signal, timeoutMs),
-		fetch: fetchImpl,
-		maxAttempts: MAX_RETRIES + 1,
-		defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
-		maxDelayMs: RATE_LIMIT_BUDGET_MS,
-	});
+	);
 
 	if (!response.ok) {
 		const rawErrorText = await response.text();
@@ -582,27 +593,32 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 				// re-resolved access may omit projectId, in which case the seed's
 				// project is still the right tenant for the credential.
 				const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
-				return callGeminiSearch(
-					{
-						accessToken: access.accessToken,
-						projectId: access.projectId ?? seed.projectId,
-						isAntigravity,
-					},
-					selectedModel,
-					params.model.baseUrl,
-					configuredHeaders,
-					searchQuery,
-					params.system_prompt,
-					params.max_output_tokens,
-					params.temperature,
-					{
-						google_search: params.google_search,
-						code_execution: params.code_execution,
-						url_context: params.url_context,
-					},
-					params.fetch,
-					params.signal,
-					params.timeoutMs,
+				// A search model's request passes pi-ai's model-call checkpoint, as the other web searches do: a held
+				// model sends nothing, and a refusal the request meets reaches the guards.
+				return guardModelRequest(params.model, () =>
+					callGeminiSearch(
+						params.model,
+						{
+							accessToken: access.accessToken,
+							projectId: access.projectId ?? seed.projectId,
+							isAntigravity,
+						},
+						selectedModel,
+						params.model.baseUrl,
+						configuredHeaders,
+						searchQuery,
+						params.system_prompt,
+						params.max_output_tokens,
+						params.temperature,
+						{
+							google_search: params.google_search,
+							code_execution: params.code_execution,
+							url_context: params.url_context,
+						},
+						params.fetch,
+						params.signal,
+						params.timeoutMs,
+					),
 				);
 			},
 			{ sessionId: params.sessionId, signal: params.signal, seed: seed.access },
@@ -618,23 +634,26 @@ export async function searchGemini(params: GeminiSearchParams): Promise<SearchRe
 				if (!apiKey) {
 					throw new SearchProviderError("gemini", "Selected Gemini credential is empty", 401);
 				}
-				return callGeminiDeveloperSearch(
-					apiKey,
-					endpoint,
-					configuredHeaders,
-					selectedModel,
-					searchQuery,
-					params.system_prompt,
-					params.max_output_tokens,
-					params.temperature,
-					{
-						google_search: params.google_search,
-						code_execution: params.code_execution,
-						url_context: params.url_context,
-					},
-					params.fetch,
-					params.signal,
-					params.timeoutMs,
+				return guardModelRequest(params.model, () =>
+					callGeminiDeveloperSearch(
+						params.model,
+						apiKey,
+						endpoint,
+						configuredHeaders,
+						selectedModel,
+						searchQuery,
+						params.system_prompt,
+						params.max_output_tokens,
+						params.temperature,
+						{
+							google_search: params.google_search,
+							code_execution: params.code_execution,
+							url_context: params.url_context,
+						},
+						params.fetch,
+						params.signal,
+						params.timeoutMs,
+					),
 				);
 			},
 			{

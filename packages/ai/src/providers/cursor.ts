@@ -184,7 +184,7 @@ import {
 import { classifyJsonPrefix } from "@oh-my-pi/pi-utils/json-parse";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
-import { heldModelCall } from "../model-call-guard";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -1204,12 +1204,6 @@ function streamCursorWithWireMode(
 	wireMode: CursorWireMode,
 	timing?: CursorStreamTiming,
 ): AssistantMessageEventStream {
-	// A resend (the stream retry after its backoff, the HTTP/1 and wire-model fallbacks) reads the model-call
-	// guards again right before it goes out; the first send read them when the call started.
-	if (timing) {
-		const held = heldModelCall(model);
-		if (held) return held;
-	}
 	// A relayed run outlives its first response: `context`, `options`, `stream`
 	// and `output` (and the response timings) belong to the request currently
 	// receiving it, and move to the request that resumes it (`CursorParkedRun`).
@@ -1533,8 +1527,14 @@ function streamCursorWithWireMode(
 				}
 				h2Client = client;
 				client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
+				// Each request (the first, the stream retry after its backoff, the HTTP/1 and wire-model fallbacks)
+				// reads the model-call guards right before it opens, after the `onPayload` hooks and the proxy
+				// tunnel. A held request fails like any other send error and ends with the output streamed so far.
+				assertModelCallAllowed(model);
 				runTransport = wrapHttp2RunTransport(client.request(requestHeaders));
 			} else {
+				// The model-call guards' read right before the request opens (see the HTTP/2 branch above).
+				assertModelCallAllowed(model);
 				runTransport = createHttp1RunTransport({
 					baseUrl,
 					headers: requestHeaders,

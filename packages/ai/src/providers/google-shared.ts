@@ -8,6 +8,7 @@ import { readSseJson, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import { ThinkingFenceStripper } from "../dialect/thinking-fence-strip";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -1089,6 +1090,9 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				};
 				let response: Response;
 				try {
+					// Each send (the first, the global-endpoint retry after a regional 404, and each empty-response
+					// resend after its backoff) reads the model-call guards right before it goes out.
+					assertModelCallAllowed(model);
 					response = await fetchImpl(requestUrl, init);
 					if (!response.ok) {
 						const errorText = await response.text().catch(() => "");

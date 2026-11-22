@@ -5,6 +5,7 @@ import {
 	type GitLabDuoWorkflowNamespaceSelection,
 } from "@oh-my-pi/pi-catalog/discovery/gitlab-duo-workflow";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -1355,6 +1356,11 @@ async function runGitLabDuoWorkflow(
 	let settledNormally = false;
 	try {
 		for (let attempt = 0; attempt < 12; attempt++) {
+			// Each socket run sends the conversation (the goal transcript) again: an approval's continuation, and
+			// a fresh workflow after an idle timeout, a step limit, a stall or a generic error. Each reads the
+			// model-call guards right before its socket opens; a held run throws out of the loop, and the
+			// `finally` below stops the workflow.
+			assertModelCallAllowed(model);
 			const ws = openGitLabDuoWorkflowSocket(workflowConnection.baseUrl ?? baseUrl, {
 				token: workflowConnection.token,
 				projectId: webSocketProjectId,

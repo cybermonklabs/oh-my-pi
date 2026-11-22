@@ -16,7 +16,7 @@ import {
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { guardedRequestUrl } from "../model-call-guard";
+import { assertModelCallAllowed, guardedRequestUrl } from "../model-call-guard";
 import { oauthAccountKey } from "../auth/types";
 import type {
 	AntigravityModelWireProfile,
@@ -1027,6 +1027,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								throw new AIError.ConfigurationError("Missing request URL");
 							}
 
+							// The empty-response resend reads the model-call guards right before it goes out, after
+							// its backoff, as each `fetchWithRetry` attempt above does.
+							assertModelCallAllowed(model);
 							currentResponse = await (options?.fetch ?? fetch)(requestUrl, {
 								method: "POST",
 								headers: requestHeaders,
