@@ -1090,6 +1090,213 @@ fn fifo_opens_through_a_cancellable_view_keep_nofollow() {
 	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
 }
 
+/// FIFO opens that create, by label: the shell's `>` and `>>`, and a write
+/// with a custom `O_CREAT`.
+#[cfg(target_os = "linux")]
+fn creating_fifo_opens() -> [(&'static str, OpenOptions); 3] {
+	let (mut redirect, mut append, mut custom) =
+		(OpenOptions::new(), OpenOptions::new(), OpenOptions::new());
+	redirect.write(true).create(true).truncate(true);
+	append.append(true).create(true);
+	custom.write(true).custom_flags(libc::O_CREAT);
+	[
+		("> (write, create, truncate)", redirect),
+		(">> (append, create)", append),
+		("write, custom O_CREAT", custom),
+	]
+}
+
+/// Through a cancellable view, the helper of a FIFO open that creates opens
+/// the path, so the kernel checks `O_CREAT` against the path's directory as
+/// for the plain open (`fs.protected_fifos`); the helper of one that creates
+/// nothing opens the pin's `/proc/self/fd/N` where procfs reaches it. Each
+/// of `>`, `>>`, a write with a custom `O_CREAT`, a plain write and a plain
+/// read, through the view's blocking open and its async open. The FIFO's
+/// two ends are held, so each open completes at once. In a process of its
+/// own, as the record of the helpers is the process's.
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_opens_through_a_cancellable_view_that_create_open_the_path() {
+	use crate::fs::fifo_seam::{Helper, take_helpers};
+	if crate::dir_handle::alone(
+		"tests::fifo_opens_through_a_cancellable_view_that_create_open_the_path",
+	) {
+		return;
+	}
+	let dir = TempDir::new("fifo-route");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let _both = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&fifo)
+		.unwrap();
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let fs = Fs::native().with_cancellation(token);
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let (mut write, mut read) = (OpenOptions::new(), OpenOptions::new());
+	write.write(true);
+	read.read(true);
+	let mut cases: Vec<_> = creating_fifo_opens()
+		.into_iter()
+		.map(|(label, options)| (label, options, true))
+		.collect();
+	cases.extend([("write", write, false), ("read", read, false)]);
+	let reopen = if Path::new("/proc/self/fd").is_dir() {
+		Helper::Reopen
+	} else {
+		Helper::ByName
+	};
+	let mut wrong = Vec::new();
+	take_helpers();
+	for (label, options, creates) in &cases {
+		let want = vec![if *creates { Helper::ByName } else { reopen }];
+		for route in ["blocking", "async"] {
+			let opened = if route == "blocking" {
+				scoped.open_with(&fifo, options)
+			} else {
+				runtime.block_on(fs.open_with(&fifo, options))
+			};
+			let helpers = take_helpers();
+			if opened.is_err() || helpers != want {
+				wrong.push(format!(
+					"{label}, {route}: {:?}, helpers {helpers:?} where {want:?} are due",
+					opened.map(drop)
+				));
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "FIFO opens under a token: {wrong:#?}");
+}
+
+/// The FIFO the sticky-directory test opens: a FIFO of another user, which
+/// any user may read and write, in a world-writable sticky directory that
+/// user does not own. `PI_TEST_STICKY_FIFO` names one when set (root makes it
+/// before a run as another user; a wrong one fails the test); else, as root,
+/// one is made in `dir`. `Err` says why there is none.
+#[cfg(target_os = "linux")]
+fn sticky_fifo(dir: &Path) -> Result<PathBuf, String> {
+	use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+	// SAFETY: `geteuid` has no preconditions.
+	let me = unsafe { libc::geteuid() };
+	if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+		let fifo = PathBuf::from(given);
+		let meta = std::fs::metadata(&fifo)
+			.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+		let parent = std::fs::metadata(fifo.parent().unwrap()).unwrap();
+		assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+		assert_eq!(
+			parent.mode() & 0o1002,
+			0o1002,
+			"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+		);
+		assert!(
+			meta.uid() != me && meta.uid() != parent.uid(),
+			"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+		);
+		assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+		return Ok(fifo);
+	}
+	if me != 0 {
+		return Err("not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned());
+	}
+	let sticky = dir.join("sticky");
+	std::fs::create_dir(&sticky).unwrap();
+	std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+	let fifo = sticky.join("report.txt");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o666)
+		.unwrap();
+	std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o666)).unwrap();
+	std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+	Ok(fifo)
+}
+
+/// With `fs.protected_fifos` at 1 or more, an open that creates of a FIFO
+/// another user owns in a world-writable sticky directory that user does
+/// not own is refused (`EACCES`), so a command that means to create a file
+/// never writes into such a FIFO. Through a cancellable view, blocking and
+/// async, such an open is refused as the plain open is: `>`, `>>` and a
+/// write with a custom `O_CREAT`. The FIFO's read end is held, so an open
+/// that goes ahead ends at once and its write reaches that reader. As root,
+/// which can give the FIFO to another user, or as any user given such a FIFO
+/// (`sticky_fifo`), where `fs.protected_fifos` is 1 or more and the plain
+/// open is refused; elsewhere it checks nothing and says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_opens_through_a_cancellable_view_that_create_are_refused_in_a_sticky_directory() {
+	use std::os::unix::fs::OpenOptionsExt;
+	let protected = std::fs::read_to_string("/proc/sys/fs/protected_fifos")
+		.ok()
+		.and_then(|value| value.trim().parse::<u32>().ok());
+	if protected.is_none_or(|value| value < 1) {
+		eprintln!("UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked");
+		return;
+	}
+	let dir = TempDir::new("fifo-sticky");
+	let fifo = match sticky_fifo(&dir.0) {
+		Ok(fifo) => fifo,
+		Err(why) => {
+			eprintln!("UNKNOWN: {why}; nothing was checked");
+			return;
+		},
+	};
+	let mut reader = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&fifo)
+		.unwrap();
+	let error = |opened: io::Result<File>| {
+		opened
+			.map(|mut file| {
+				let _ = file.write_all(b"written");
+			})
+			.map_err(|err| (err.kind(), err.raw_os_error()))
+	};
+	let plain = BlockingFs::native();
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let fs = Fs::native().with_cancellation(token);
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let mut wrong = Vec::new();
+	for (label, options) in creating_fifo_opens() {
+		let want = error(plain.open_with(&fifo, &options));
+		if want.is_ok() {
+			eprintln!(
+				"UNKNOWN: {label}: the plain open gave {want:?}, so fs.protected_fifos does not hold \
+				 here; nothing was checked"
+			);
+			return;
+		}
+		let got = [
+			("blocking", error(scoped.open_with(&fifo, &options))),
+			("async", error(runtime.block_on(fs.open_with(&fifo, &options)))),
+		];
+		for (route, result) in got {
+			if result != want {
+				wrong.push(format!("{label}, {route}: {result:?} where the plain open gives {want:?}"));
+			}
+		}
+	}
+	let mut leaked = Vec::new();
+	let _ = reader.read_to_end(&mut leaked);
+	assert!(
+		wrong.is_empty(),
+		"FIFO opens under a token in a sticky directory (another user's FIFO read {} bytes): \
+		 {wrong:#?}",
+		leaked.len()
+	);
+}
+
 /// A `>` (write, create, truncate) through a cancellable view.
 #[cfg(target_os = "linux")]
 fn redirect() -> OpenOptions {

@@ -2286,13 +2286,14 @@ mod unix {
 	/// does not reach the helper, and the drop returns without waiting for it
 	/// (a watchdog fails the test, ending the process, if it waits), while
 	/// the helper stays in its open, holding the pin (one descriptor of the
-	/// old FIFO stays open). The new FIFO's next
-	/// reader then completes the helper's open; the helper closes its end at
-	/// once, so that reader reads end of file, and the pin's descriptor is
-	/// closed. Through a handle's `open_at_async` and the facade's own open.
-	/// Linux with `/proc` only (elsewhere a release opens the name and reaches
-	/// the helper); else it checks nothing and says so. In a process of its own,
-	/// so the hooks take this test's pins, helpers and releases.
+	/// old FIFO stays open). The new FIFO's next reader then completes the
+	/// helper's open; the helper closes its end at once, so that reader reads
+	/// end of file, and the pin's descriptor is closed. Through a handle's
+	/// `open_at_async` and the facade's own open. Linux with `/proc` only
+	/// (elsewhere the release opens the name only while it names the pinned
+	/// FIFO, so the drop leaves the helper before any release); else it checks
+	/// nothing and says so. In a process of its own, so the hooks take this
+	/// test's pins, helpers and releases.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_creating_fifo_open_whose_fifo_is_replaced_before_its_helper_opens_is_not_released() {

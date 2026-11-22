@@ -322,7 +322,8 @@ pub(crate) const fn fifo_open_waits(options: &OpenOptions) -> bool {
 /// directory, which `may_create_in_sticky` reads only under `O_CREAT`); a
 /// walk through `/proc/self/fd/N` ends in `/proc/self/fd`, which is never
 /// sticky. So a pinned FIFO's helper runs such an open by name with the
-/// caller's own options ([`FifoOpen`]). The checks of other flags hold
+/// caller's own options, but for a write's `O_TRUNC`, which it applies itself
+/// ([`by_name_options`], [`FifoOpen`]). The checks of other flags hold
 /// through the magic link (the write permission `O_TRUNC` asks, from the
 /// flags alone; `EEXIST` needs `O_CREAT`), so every other open reopens the
 /// pin.
