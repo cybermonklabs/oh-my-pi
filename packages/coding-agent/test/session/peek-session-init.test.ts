@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { SubagentSpawnSpec } from "@oh-my-pi/pi-coding-agent/task/spawn-spec";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
@@ -25,6 +26,31 @@ class LargeFileSessionStorage extends FileSessionStorage {
 	override async readText(): Promise<string> {
 		throw new Error("Large sessions must stream");
 	}
+}
+
+function spawnSpec(model: string): SubagentSpawnSpec {
+	return {
+		v: 1,
+		model,
+		thinkingLevel: null,
+		perCallModel: false,
+		settings: { layers: { global: {}, overrides: {}, derived: false } },
+		tools: { mountedToolNames: [], keepTodo: false, customTools: [] },
+		policy: { cwd: "/work" },
+		identity: { agentId: "Child" },
+		prompt: {
+			id: "Child",
+			agentSystemPrompt: "agent prompt",
+			context: "",
+			planReference: "",
+			planReferencePath: "",
+			worktree: "",
+			structured: true,
+			outputSchemaOverridesAgent: false,
+			ircEnabled: false,
+		},
+		wake: { agent: { name: "task", description: "", source: "bundled" } },
+	};
 }
 
 function assistantMessage(text: string) {
@@ -76,6 +102,26 @@ describe("SessionManager.peekSessionInit", () => {
 		expect(peek?.init?.spawns).toBe("task");
 		expect(peek?.init?.readSummarize).toBe(false);
 		expect(peek?.init?.restrictToolNames).toBe(true);
+	});
+
+	it("returns the latest record's spawn spec, which a record rebased from it carries", async () => {
+		const cwd = makeTempDir("@pi-peek-spawn-spec-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+		const latest = spawnSpec("openrouter/z-ai/glm-4.7@cerebras");
+
+		manager.appendSessionInit({ systemPrompt: ["first"], task: "t", tools: ["read"], spawnSpec: spawnSpec("a/b") });
+		manager.appendSessionInit({ systemPrompt: ["second"], task: "t", tools: ["read"], spawnSpec: latest });
+		// A model call on a new base prompt appends a record copied from the latest one.
+		const init = extractSessionInit(manager.getEntries());
+		if (!init) throw new Error("Expected a session_init");
+		manager.appendSessionInit({ ...init, systemPrompt: ["rebased"] });
+		manager.appendMessage(assistantMessage("flush"));
+
+		const peek = await SessionManager.peekSessionInit(sessionFile);
+		expect(peek?.init?.systemPrompt).toEqual(["rebased"]);
+		expect(peek?.init?.spawnSpec).toEqual(latest);
 	});
 
 	it("streams large file-backed sessions without a full read", async () => {

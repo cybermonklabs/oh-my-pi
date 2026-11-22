@@ -72,9 +72,9 @@ import {
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	type ModelMatchPreferences,
+	modelNotFoundMessage,
 	parseModelPattern,
 	pickDefaultAvailableModel,
-	providerModelHint,
 	resolveAllowedModels,
 	resolveCliModel,
 	type ResolveCliModelResult,
@@ -3726,15 +3726,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				});
 			}
 			if (!model) {
-				const requested =
-					deferredModelPatterns.length === 1
-						? `"${deferredModelPatterns[0]}"`
-						: `one of ${deferredModelPatterns.map(pattern => `"${pattern}"`).join(", ")}`;
-				// A single provider-qualified selector names its closest siblings, the same
-				// hint `resolveCliModel` gives before the selector was deferred here.
-				const hint =
-					deferredModelPatterns.length === 1 ? providerModelHint(deferredModelPatterns[0], allEnabledModels) : "";
-				modelFallbackMessage = `Model ${requested} not found${hint ? `.${hint}` : ""}`;
+				modelFallbackMessage = modelNotFoundMessage(deferredModelPatterns, allEnabledModels);
 			}
 		}
 
