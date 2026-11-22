@@ -272,31 +272,79 @@ describe("omp gc disk-only phases under session.storage: sql", () => {
 		expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
 	});
 
-	// What a person runs: `omp gc --strip --apply` under each SQL backend fails
-	// with one line naming the storage and the reason, and changes no file.
-	for (const backend of LEASE_BACKENDS) {
-		test.skipIf(!backend.url)(
-			`omp gc --strip --apply on ${backend.adapter} exits 1 naming the storage and leaves session files alone`,
-			async () => {
-				const db = backend.adapter === "sqlite" ? undefined : await cliDatabase(backend.adapter, backend.url!);
-				try {
-					const dsnFile = path.join(root, "cli.dsn");
-					await Bun.write(dsnFile, `${db?.dsn ?? `sqlite:${path.join(root, "cli-sessions.db")}`}\n`);
-					const { file, bytes } = await coldLocalSession();
+	/** Keep `session:` as `storage` names it and select only the strip phase through `gc.strip`. */
+	async function selectStripBySettings(storage: "sql" | "file"): Promise<void> {
+		const session =
+			storage === "sql"
+				? ["session:", "  storage: sql", "  sql:", `    dsnFile: ${path.join(root, "session.dsn")}`]
+				: ["session:", "  storage: file"];
+		const gc = ["gc:", "  strip: true", "  stripAfterDays: 0", "  archive: false"];
+		await Bun.write(path.join(root, "config.yml"), [...session, ...gc, ""].join("\n"));
+	}
 
-					const proc = Bun.spawn(
-						[
-							process.execPath,
-							CLI_ENTRY,
-							"gc",
-							"--strip",
-							"--apply",
-							"--strip-after-days",
-							"0",
-							"--agent-dir",
-							root,
-						],
-						{
+	test("a strip gc.strip selects is reported as not run without failing", async () => {
+		await selectStripBySettings("sql");
+		const { file, bytes } = await coldLocalSession();
+
+		const result = await runGcCommand({ flags: { agentDir: root, apply: true } });
+
+		expect(result.strip).toBeUndefined();
+		expect(result.refused).toEqual([
+			{ phase: "strip", requested: false, reason: expect.stringContaining("unavailable with session.storage: sql") },
+		]);
+		expect(collectGcErrors(result)).toEqual([]);
+		expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
+	});
+
+	// The control: the same selection under file storage runs the strip.
+	test("a strip gc.strip selects runs under file storage", async () => {
+		await selectStripBySettings("file");
+		const { file } = await coldLocalSession();
+
+		const result = await runGcCommand({ flags: { agentDir: root, apply: true } });
+
+		expect(result.refused).toBeUndefined();
+		expect(result.strip).toBeDefined();
+		expect(collectGcErrors(result)).toEqual([]);
+		const after = await Bun.file(file).text();
+		expect(after).not.toContain("EqQBearly");
+		expect(after).toContain("EqQBlatest");
+	});
+
+	// What a person runs under each SQL backend. `omp gc --strip --apply` fails
+	// with one line naming the storage and the reason; `omp gc --apply` with
+	// `gc.strip` on reports the strip as not run and succeeds. Neither changes a file.
+	const runs = [
+		{
+			how: "omp gc --strip --apply",
+			args: ["--strip", "--apply", "--strip-after-days", "0"],
+			bySettings: false,
+			exitCode: 1,
+			stream: "stderr" as const,
+			line: "- strip: unavailable with session.storage: sql: stripping rewrites session files on disk",
+		},
+		{
+			how: "omp gc --apply with gc.strip on",
+			args: ["--apply"],
+			bySettings: true,
+			exitCode: 0,
+			stream: "stdout" as const,
+			line: "strip: not run, unavailable with session.storage: sql: stripping rewrites session files on disk",
+		},
+	];
+	for (const backend of LEASE_BACKENDS) {
+		for (const run of runs) {
+			test.skipIf(!backend.url)(
+				`${run.how} on ${backend.adapter} exits ${run.exitCode} naming the storage and leaves session files alone`,
+				async () => {
+					const db = backend.adapter === "sqlite" ? undefined : await cliDatabase(backend.adapter, backend.url!);
+					try {
+						if (run.bySettings) await selectStripBySettings("sql");
+						const dsnFile = path.join(root, "cli.dsn");
+						await Bun.write(dsnFile, `${db?.dsn ?? `sqlite:${path.join(root, "cli-sessions.db")}`}\n`);
+						const { file, bytes } = await coldLocalSession();
+
+						const proc = Bun.spawn([process.execPath, CLI_ENTRY, "gc", ...run.args, "--agent-dir", root], {
 							cwd: root,
 							env: {
 								...process.env,
@@ -308,24 +356,22 @@ describe("omp gc disk-only phases under session.storage: sql", () => {
 							stdin: "ignore",
 							stdout: "pipe",
 							stderr: "pipe",
-						},
-					);
-					const [exitCode, stdout, stderr] = await Promise.all([
-						proc.exited,
-						new Response(proc.stdout).text(),
-						new Response(proc.stderr).text(),
-					]);
+						});
+						const [exitCode, stdout, stderr] = await Promise.all([
+							proc.exited,
+							new Response(proc.stdout).text(),
+							new Response(proc.stderr).text(),
+						]);
 
-					expect(exitCode, `${stdout}\n${stderr}`).toBe(1);
-					expect(stderr).toContain(
-						"- strip: unavailable with session.storage: sql: stripping rewrites session files on disk",
-					);
-					expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
-				} finally {
-					await db?.[Symbol.asyncDispose]();
-				}
-			},
-			60_000,
-		);
+						expect(exitCode, `${stdout}\n${stderr}`).toBe(run.exitCode);
+						expect(run.stream === "stdout" ? stdout : stderr).toContain(run.line);
+						expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
+					} finally {
+						await db?.[Symbol.asyncDispose]();
+					}
+				},
+				60_000,
+			);
+		}
 	}
 });

@@ -26,7 +26,6 @@ import {
 	collectAgentFamily,
 	MAIN_AGENT_ID,
 	qualifyPersistedAgentId,
-	recordRefSessionStorage,
 } from "./agent-registry";
 import { getAgentTombstonePath } from "./agent-tombstone";
 
@@ -1031,7 +1030,7 @@ async function registerPersistedSubagentsFromDir(
 				if (!shouldContinue()) return;
 				// The id is reused across `/new`; refresh it to the current session's file.
 				if (existing) registry.unregister(advisorId);
-				const advisor = registry.register({
+				registry.register({
 					id: advisorId,
 					displayName,
 					kind: "advisor",
@@ -1043,8 +1042,8 @@ async function registerPersistedSubagentsFromDir(
 					lastActivity: metadata.lastActivity,
 					history: { ...metadata.history, readOnly: true },
 					status: "parked",
+					storage,
 				});
-				recordRefSessionStorage(advisor, storage);
 				owned?.set(advisorId, sessionFile);
 				transcripts.push({
 					id: advisorId,
@@ -1217,12 +1216,12 @@ async function registerPersistedSubagentsFromDir(
 					lastActivity: metadata.lastActivity,
 					history: metadata.history,
 					status: tombstoned ? ("aborted" as const) : ("parked" as const),
+					// A kill of the parked agent writes its sidecar beside the transcript this storage holds.
+					storage,
 				};
 				const vacated = stillUnclaimed || (expected !== null && registry.unregister(id, expected));
 				if (vacated && registry.registerIfAvailable(input, null)) {
 					const ref = registry.get(id);
-					// A kill of the parked agent writes its sidecar beside the transcript this storage holds.
-					if (ref) recordRefSessionStorage(ref, storage);
 					owned?.set(id, sessionFile);
 					transcripts.push({
 						id,

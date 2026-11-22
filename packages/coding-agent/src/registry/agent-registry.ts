@@ -102,18 +102,19 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 
 /**
  * The storage holding each ref's transcript, when known: the storage of the
- * session that last attached to it, or the one a persisted roster scan read it
- * from. Kept beside the ref rather than on it, because refs cross the worker
- * RPC boundary and a storage holds a database client.
+ * session that last attached to it, else the one its registration named (the
+ * session being built, a persisted roster scan, a restored worker). Kept beside
+ * the ref rather than on it, because refs cross the worker RPC boundary and a
+ * storage holds a database client.
  */
 const refStorages = new WeakMap<AgentRef, SessionStorage>();
 
 /** Record the storage holding `ref`'s transcript; `undefined` keeps what was known. */
-export function recordRefSessionStorage(ref: AgentRef, storage: SessionStorage | undefined): void {
+function recordRefSessionStorage(ref: AgentRef, storage: SessionStorage | undefined): void {
 	if (storage) refStorages.set(ref, storage);
 }
 
-/** The storage holding `ref`'s transcript, when its session or its roster scan said. */
+/** The storage holding `ref`'s transcript, when its session or its registration said. */
 export function refSessionStorage(ref: AgentRef): SessionStorage | undefined {
 	return refStorages.get(ref);
 }
@@ -191,6 +192,13 @@ export interface RegisterInput {
 	history?: AgentHistorySummary;
 	/** Run lifecycle milestones restored from persisted history, when known. */
 	lifecycle?: AgentRunLifecycle;
+	/**
+	 * Storage holding the transcript at `sessionFile`, for a ref registered
+	 * before or without a live session; a live session's own storage wins. It is
+	 * recorded before the ref is published, so a kill at any point after (even
+	 * from a `registered` listener) writes its tombstone where the transcript is.
+	 */
+	storage?: SessionStorage;
 }
 
 /** Public surface of the process-global agent registry, implemented locally on main and by a proxy in workers. */
@@ -313,8 +321,8 @@ export class AgentRegistry implements AgentRegistryApi {
 			lifecycle: input.lifecycle,
 		};
 		Object.defineProperty(ref, kMintedRef, { value: true });
-		// Test doubles and remote proxies may carry no session manager.
-		recordRefSessionStorage(ref, input.session?.sessionManager?.getStorage?.());
+		// Before the ref is published. Test doubles and remote proxies may carry no session manager.
+		recordRefSessionStorage(ref, input.session?.sessionManager?.getStorage?.() ?? input.storage);
 		this.#refs.set(ref.id, ref);
 		// A real agent under this id shadows any name bound to a live session,
 		// so the binding is stale from here on.
@@ -332,7 +340,10 @@ export class AgentRegistry implements AgentRegistryApi {
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
-		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+		if (current !== expected || current.status !== "parked" || current.session) return undefined;
+		// The reused ref keeps its generation; the session being built for it names its storage.
+		recordRefSessionStorage(current, input.storage);
+		return current;
 	}
 
 	/**
@@ -346,7 +357,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		const current = this.#refs.get(id);
 		if (current !== expected || current.status !== "aborted" || current.session) return undefined;
 		// The killed generation's ancestry, recorded while its parents were registered: they may be gone since.
-		const reopened = this.#mint(
+		return this.#mint(
 			{
 				id,
 				displayName: current.displayName,
@@ -357,11 +368,10 @@ export class AgentRegistry implements AgentRegistryApi {
 				status: "parked",
 				createdAt: current.createdAt,
 				history: current.history,
+				storage: refSessionStorage(current),
 			},
 			agentAncestors(this, current),
 		);
-		recordRefSessionStorage(reopened, refSessionStorage(current));
-		return reopened;
 	}
 
 	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
