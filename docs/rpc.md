@@ -1541,11 +1541,11 @@ person's line). It runs at once, also while a turn runs, and answers in one
 `command_output` line, which `sendUserInput` also returns as `output`:
 
 - `/live on`: `Live call open: <provider>, voice <voice>.`; while a call is
-  starting or open, `A live call is already open (since <UTC time>).`; on a
-  failure (dictation running, the session changing, no credential, the server's
-  refusal), `Live call did not start: <reason>`.
+  starting or open, `A live call is already starting|open (since <UTC time>).`;
+  on a failure (dictation running, the session changing, no credential, the
+  server's refusal), `Live call did not start: <reason>`.
 - `/live off`: `Live call ended.`, or `No live call is open.`
-- `/live status` (or a bare `/live`): `Live call open since <UTC time>:
+- `/live status` (or a bare `/live`): `Live call starting|open since <UTC time>:
   <provider>, voice <voice>, microphone on|muted.`, or `No live call is open.`
 
 The live frames below are sent as for `live_start`. The checks `live_start`
