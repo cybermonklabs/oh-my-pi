@@ -1147,8 +1147,7 @@ impl ExtProc for WinProc {
 	}
 
 	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
-		self.pumps.poll(cx, &self.tracker);
-		self.tracker.poll(cx)
+		self.pumps.poll_exit(cx, &self.tracker)
 	}
 
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {

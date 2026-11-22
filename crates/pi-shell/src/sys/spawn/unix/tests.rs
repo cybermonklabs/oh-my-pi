@@ -1010,6 +1010,135 @@ fn input_waiting_for_engine_bytes_is_dropped_with_the_child() {
 	until("the abandoned child is gone", || s.leftovers().unwrap().is_empty());
 }
 
+/// A waker that counts its wakes and unparks the test's thread.
+struct Wakes {
+	count:  std::sync::atomic::AtomicUsize,
+	thread: thread::Thread,
+}
+
+impl Wake for Wakes {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		self.thread.unpark();
+	}
+}
+
+/// A host file without an OS handle that hands the child one line; at its
+/// next read it waits until the poller's waker was woken twice, then has
+/// nothing. The two wakes are the waiter thread's report of the child's
+/// exit: `Tracker::exited` cancels the input pumps, then records the exit,
+/// waking the poller each time. So the exit is recorded while the poll of
+/// the pumps that read the cancel still runs, in every run: the child
+/// cannot exit before it has the line, which comes after that read.
+/// Counts its live copies.
+#[derive(Clone)]
+struct OneLine {
+	alive: Arc<()>,
+	wakes: Arc<Wakes>,
+	sent:  Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneLine {
+	fn new(wakes: &Arc<Wakes>) -> Self {
+		Self { alive: Arc::new(()), wakes: Arc::clone(wakes), sent: Arc::default() }
+	}
+}
+
+impl File for OneLine {
+	fn poll_read(&mut self, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		use std::sync::atomic::Ordering::SeqCst;
+		if !self.sent.swap(true, SeqCst) {
+			buf[..3].copy_from_slice(b"go\n");
+			return Poll::Ready(Ok(3));
+		}
+		let start = Instant::now();
+		while self.wakes.count.load(SeqCst) < 2 {
+			assert!(start.elapsed() < LONG, "the waiter did not report the exit");
+			thread::park_timeout(Duration::from_millis(10));
+		}
+		Poll::Pending
+	}
+
+	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+		Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+	}
+
+	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	fn kind(&self) -> FileKind {
+		FileKind::Pipe
+	}
+
+	fn os_handle(&self) -> Option<OsHandle> {
+		None
+	}
+
+	fn dup(&self) -> io::Result<Box<dyn File>> {
+		Ok(Box::new(self.clone()))
+	}
+}
+
+/// `sh -c 'read x; exit 3'` with [`OneLine`] as its stdin, under a waiter
+/// thread (`Exits::Thread`), and the waker the input polls count.
+fn reads_one_line(s: &NativeSpawner) -> (Box<dyn ExtProc>, OneLine, Arc<Wakes>) {
+	let env = EnvView::default();
+	let wakes = Arc::new(Wakes { count: 0.into(), thread: thread::current() });
+	let input = OneLine::new(&wakes);
+	let a = sh("read x; exit 3");
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::File(Box::new(input.clone())), StdioSpec::Null, StdioSpec::Null];
+	(s.spawn(sp).unwrap(), input, wakes)
+}
+
+/// The waiter can record the exit after `poll_wait` read the input pumps'
+/// cancel and before it polls the exit ([`OneLine`] makes it so). The
+/// exit is reported only once the input pump is gone, with the engine
+/// object it reads.
+#[test]
+fn an_exit_recorded_during_the_pump_poll_is_reported_without_the_input_pump() {
+	let s = NativeSpawner::default();
+	let (mut p, input, wakes) = reads_one_line(&s);
+	let waker = Waker::from(Arc::clone(&wakes));
+	let polled = p.poll_wait(&mut Context::from_waker(&waker));
+	assert_eq!(polled, Poll::Ready(ExitStatus::Exited(3)), "one poll sees the exit");
+	assert_eq!(
+		Arc::strong_count(&input.alive),
+		1,
+		"the exit was reported while the input pump held the engine object"
+	);
+}
+
+/// [`an_exit_recorded_during_the_pump_poll_is_reported_without_the_input_pump`]
+/// through `poll_event`, job control's poll.
+#[test]
+fn an_exit_event_recorded_during_the_pump_poll_comes_without_the_input_pump() {
+	use crate::bash::ProcEvent;
+	let s = NativeSpawner::default();
+	let (mut p, input, wakes) = reads_one_line(&s);
+	let waker = Waker::from(Arc::clone(&wakes));
+	let polled = p.poll_event(&mut Context::from_waker(&waker));
+	assert_eq!(
+		polled,
+		Poll::Ready(ProcEvent::Exited(ExitStatus::Exited(3))),
+		"one poll sees the exit"
+	);
+	assert_eq!(
+		Arc::strong_count(&input.alive),
+		1,
+		"the exit event came while the input pump held the engine object"
+	);
+}
+
 #[test]
 fn external_dies_of_sigpipe_when_the_engine_reader_is_gone() {
 	let env = EnvView::default();
