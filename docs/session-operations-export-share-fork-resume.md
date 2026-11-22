@@ -560,20 +560,33 @@ is an error leaves the batch's first run on a branch of its own, below the
 batch's reply; for a subagent spawned in the current conversation (its spawn
 record names a call there), a handover on such a branch counts too, also when
 the replay itself was cut off before its first result. Such a branch is known
-from both sides. It holds only error results of that reply's calls, replies
-the cut-off ended (an abort or a failed attempt, also one that made calls,
-with the error results of those calls), a reasoning-only `length` reply a
-recovery dropped, the empty-stop retry's marker, a recovery's compaction, and
-records that are no turn. The branch the conversation went on with starts one
-of that reply's calls again before any new input, or holds no turn after the
-reply at all (only records, such as the eval snapshot a restarting process
-writes, and exit recovery's closing of the reply's calls), so restore runs the
-batch again. A branch the parent's user left by their own navigation fails one
-side: it holds a turn (their prompt, a reply, a call that ran to its end), or
-the branch they went on with holds their new input first (a `/tree` move to
-the reply after an Esc) or a result with no start record (a `/tree` re-answer
-of an `ask`). It does not count: the conversation they went on with never got
-those results.
+from both sides. Its own entries are only: error results of that reply's calls,
+or of the calls of a reply dropped there; replies dropped there, with or without
+calls (one a cut-off ended, an abort or a failed attempt, or any `length` stop,
+which the length-stop recovery drops whatever it holds); the empty-stop retry's
+marker; compactions; and records that are no turn (start, job, exit and discard
+records, model and thinking changes, usage, labels, eval snapshots, also the one
+a compaction stores as a message). The branch the conversation went on with
+starts one of that reply's calls again before any new input, or `--restore`
+itself is about to run that batch again: it resumes the branch's turn, closes it
+(results for the calls left unfinished, then the interrupted-turn abort), and
+the batch's error results then follow the reply in the context, which is when
+`/retry` replays a batch. Records between them, such as a fallback revert's
+model change or an exit record, keep that; a context message between them (the
+eval snapshot a `/tree` move, a start or a compaction writes, a branch summary),
+a later reply, or a closing that gives the reply's calls no results (a session
+switch, a turn that ended on its key) makes restore ask the model again, and the
+first run is not read. A replay that wrote nothing before it was cut off leaves
+no fork at all: its move to the reply is in memory only, and the first run stays
+the selected branch. A branch the parent's user left fails one side when its
+calls neither ran again nor will: it holds a turn (their prompt, a reply, a call
+that ran to its end), or on the branch they went on with their new input comes
+before any start record (a `/tree` move to the reply after an Esc, then a
+prompt), the reply's result has no start record (a `/tree` re-answer of an
+`ask`), restore resumes no turn (a `/tree` move, then a quit, `omp -c` and a
+`/restart` before any input), or the move's eval snapshot sits between the reply
+and its results (a `/tree` move, then a kill or a `/restart`). It does not count:
+the conversation they went on with never got those results.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:

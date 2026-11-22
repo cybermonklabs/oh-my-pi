@@ -250,6 +250,26 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	return start;
 }
 
+/**
+ * The reply whose batch {@link TurnRecovery.retry} runs again from `messages` (the active context),
+ * or undefined when it runs none (it asks the model again, or finds nothing to retry). It is
+ * `retry()`'s own gate: the active context, or else the persisted display transcript
+ * (`transcript`, read only then), ends in a failed or aborted turn, and {@link toolReplayStart}
+ * finds the batch. `omp --restore` reads a batch's first run only when this names the batch's
+ * reply on the context restore builds (`task/restore.ts`, `restoreRunsBatchAgain`).
+ */
+export function toolReplayAnchor(
+	messages: readonly AgentMessage[],
+	transcript: () => readonly AgentMessage[],
+): AssistantMessage | undefined {
+	if (retryableAssistantTurnEnd(messages) === undefined && retryableAssistantTurnEnd(transcript()) === undefined) {
+		return undefined;
+	}
+	const start = toolReplayStart(messages);
+	const anchor = start === undefined ? undefined : messages[start - 1];
+	return anchor?.role === "assistant" ? anchor : undefined;
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;

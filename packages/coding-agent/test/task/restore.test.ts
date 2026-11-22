@@ -20,13 +20,19 @@ import {
 import { recordEvalAgentJobs, recordHandovers } from "@oh-my-pi/pi-coding-agent/eval/agent-job-records";
 import { EVAL_STATE_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/eval/state";
 import {
+	collectPendingToolCalls,
+	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
 	restoreSkippedCallReason,
 	type RestoreSkippedCalls,
 	SESSION_EXIT_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
-import { GENERIC_ABORT_SENTINEL, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	type CustomMessage,
+	GENERIC_ABORT_SENTINEL,
+	USER_INTERRUPT_LABEL,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -1956,12 +1962,15 @@ describe("restoreSession (omp --restore)", () => {
 	 * default the cell's cut-off error result, which says the cell got Worker's failure. A first restore then ran
 	 * the batch again from the reply (with `forkAtStart`, the branch was cut at the cell's start record instead), and
 	 * the process ended again before the replay's first result: `afterFork` writes the selected branch after the
-	 * fork, by default the replayed cell's start record. `extraEntries` join the parent's entries.
+	 * fork, by default the replayed cell's start record. With `noFork` the replay wrote nothing before it was cut off:
+	 * its move of the leaf to the reply (`branch()`) is in memory only, so the file holds no fork and the first run
+	 * stays the selected branch. `extraEntries` join the parent's entries.
 	 */
 	async function restoreAfterCutOffReplay(
 		options: {
 			firstRun?: (main: SessionManager) => void;
 			forkAtStart?: boolean;
+			noFork?: boolean;
 			afterFork?: (main: SessionManager) => void;
 			extraEntries?: readonly SessionEntry[];
 		} = {},
@@ -1980,7 +1989,7 @@ describe("restoreSession (omp --restore)", () => {
 		if (options.forkAtStart) {
 			main.branch(started);
 			appendExecutionStart(main, "call_bash", "bash");
-		} else {
+		} else if (!options.noFork) {
 			main.branch(anchor);
 			(options.afterFork ?? (() => appendExecutionStart(main, "call_eval", "eval")))(main);
 		}
@@ -2001,6 +2010,32 @@ describe("restoreSession (omp --restore)", () => {
 			errorMessage: USER_INTERRUPT_LABEL,
 			content: [{ type: "toolCall", id: "call_more", name: "bash", arguments: { command: "ls" } }],
 		});
+	}
+
+	/**
+	 * A reply that stopped on its output limit (`length`) after it made the call `call_long`, whose arguments were cut
+	 * short; the loop pairs the call with a placeholder error result.
+	 */
+	function lengthReplyWithCall(): AssistantMessage {
+		return assistant({
+			stopReason: "length",
+			content: [{ type: "toolCall", id: "call_long", name: "write", arguments: { path: "notes.md" } }],
+		});
+	}
+
+	/**
+	 * The eval snapshot a compaction stores after it (`persistEvalStateContext`): a `custom` message entry, not the
+	 * `custom_message` entry a start or a `/tree` move writes.
+	 */
+	function storedEvalSnapshot(): CustomMessage {
+		return {
+			role: "custom",
+			customType: EVAL_STATE_CONTEXT_TYPE,
+			content: "eval runtime state",
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
 	}
 
 	for (const [label, rest, relaunched] of [
@@ -2091,11 +2126,37 @@ describe("restoreSession (omp --restore)", () => {
 			false,
 		],
 		[
-			"relaunches it when that branch holds a length reply with text",
+			"leaves it when that branch also holds a recovery's compaction and the eval snapshot it stores as a message",
+			(main: SessionManager) => {
+				const kept = main.getLeafId();
+				if (!kept) throw new Error("Expected an entry to keep");
+				main.appendCompaction("S: the work so far.", undefined, kept, 10_000);
+				main.appendMessage(storedEvalSnapshot());
+			},
+			false,
+		],
+		[
+			"leaves it when that branch also holds a length reply with text that the recovery dropped with the window exhausted",
 			(main: SessionManager) =>
 				main.appendMessage(
 					assistant({ stopReason: "length", content: [{ type: "text", text: "Half an answer" }] }),
 				),
+			false,
+		],
+		[
+			"leaves it when that branch also holds a length reply that made a call, and that call's placeholder result",
+			(main: SessionManager) => {
+				main.appendMessage(lengthReplyWithCall());
+				main.appendMessage(toolResultMessage("call_long", "write", {}, true));
+			},
+			false,
+		],
+		[
+			"relaunches it when a length reply's call there has a result that is no error",
+			(main: SessionManager) => {
+				main.appendMessage(lengthReplyWithCall());
+				main.appendMessage(toolResultMessage("call_long", "write", {}));
+			},
 			true,
 		],
 		["relaunches it when that branch holds a /clear", (main: SessionManager) => main.appendResetBoundary(), true],
@@ -2193,75 +2254,233 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
-	for (const [label, afterFork] of [
+	it("leaves it when the replay was cut off before it started any call: its leaf move wrote nothing, so the first run stays selected", async () => {
+		// A replay moves the leaf to the batch's reply in memory only (`branch()`), so when its process ends before the
+		// first call starts, the file holds no fork and a reload selects the first run's tail. If this regresses, the
+		// handover on that selected branch no longer settles Worker, and it is relaunched beside the cell the batch runs
+		// again.
+		const { outcome } = await restoreAfterCutOffReplay({ noFork: true });
+
+		expect(outcome.subagents).toEqual([]);
+	});
+
+	for (const [label, afterFork, relaunched] of [
 		[
-			"leaves it when the replay was cut off before it started any call: the selected branch ends at the reply",
-			() => {},
-		],
-		[
-			"leaves it when the replay was cut off before it started any call, and the restoring process's startup wrote its eval snapshot after the reply",
-			(main: SessionManager) => main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false),
-		],
-		[
-			"leaves it when a recorded exit closed the reply's calls before the replay started any: an exit record, the calls' error results, the interrupted-turn abort, a snapshot",
+			"leaves it when a /retry replay's fallback revert wrote a model change under the reply before its first call, then the process was killed",
 			(main: SessionManager) => {
-				main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
-					reason: "dispose",
-					kind: "process_exit",
-					recordedAt: new Date().toISOString(),
-				});
-				main.appendMessage(toolResultMessage("call_eval", "eval", {}, true));
-				main.appendMessage(toolResultMessage("call_bash", "bash", {}, true));
-				const abort = createInterruptedTurnAbortMessage(main.getBranch(), undefined, { assumeExit: true });
-				if (!abort) throw new Error("Expected exit recovery to close the parent's turn");
-				main.appendMessage(abort);
+				main.appendModelChange("anthropic/claude-haiku-4-5");
+			},
+			false,
+		],
+		[
+			"relaunches it when a replay's model change was followed by a quit: restore resumes no turn",
+			(main: SessionManager) => {
+				main.appendModelChange("anthropic/claude-haiku-4-5");
+				appendDisposeExit(main);
+			},
+			true,
+		],
+		[
+			"relaunches it when the restoring process's startup wrote its eval snapshot after that model change: restore asks the model again",
+			(main: SessionManager) => {
+				main.appendModelChange("anthropic/claude-haiku-4-5");
 				main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
 			},
+			true,
+		],
+		[
+			"relaunches it when a /retry replay's compaction before its request wrote a compaction and the eval snapshot it stores as a message, then the process was killed",
+			(main: SessionManager) => {
+				const kept = main.getLeafId();
+				if (!kept) throw new Error("Expected the reply to keep");
+				main.appendCompaction("S: the work so far.", undefined, kept, 10_000);
+				main.appendMessage(storedEvalSnapshot());
+			},
+			true,
+		],
+		[
+			"relaunches it when a session switch closed the turn with the interrupted-turn abort and no results for the reply's calls",
+			(main: SessionManager) => {
+				main.appendModelChange("anthropic/claude-sonnet-4-5");
+				const abort = createInterruptedTurnAbortMessage(main.getBranch(), undefined, { assumeExit: true });
+				if (!abort) throw new Error("Expected the switch to close the parent's turn");
+				main.appendMessage(abort);
+			},
+			true,
+		],
+		[
+			"relaunches it when a replay's compaction stripped the reply's calls and the model's reply then failed on its key",
+			(main: SessionManager) => {
+				const kept = main.getLeafId();
+				if (!kept) throw new Error("Expected the reply to keep");
+				main.appendCompaction("S: the work so far.", undefined, kept, 10_000);
+				main.appendMessage(
+					assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }),
+				);
+			},
+			true,
 		],
 	] as const) {
 		it(label, async () => {
-			// If this regresses, restore asks the selected branch for a start record of the reply's calls and finds none:
-			// the process ended after the replay moved the leaf back to the reply and before it ran the first call, and
-			// only records follow the reply (a restarting process's startup snapshot, exit recovery's closing of the
-			// calls). Restore runs the batch again, but the handover the first run's cell got is not read, and Worker is
-			// relaunched beside the cell the batch runs again.
+			// What a replay or a later writer put under the reply before the batch's first call decides whether restore
+			// runs that batch again: it closes the turn and replays the batch only when the batch's results then follow the
+			// reply in the context (`toolReplayAnchor`). A record (a fallback revert's model change) keeps that; an eval
+			// snapshot or a later reply, or a closing that gives the reply's calls no results, makes restore ask the model
+			// again. If this regresses, either Worker is relaunched beside a cell the batch runs again, or it is left
+			// while no cell runs its work again.
 			const { outcome } = await restoreAfterCutOffReplay({ afterFork });
 
-			expect(outcome.subagents).toEqual([]);
+			expect(outcome.subagents).toEqual(relaunched ? ["Worker"] : []);
 		});
 	}
 
-	it("relaunches a subagent still owed when the selected branch after the fork starts only a call the reply did not make", async () => {
-		// If this regresses, any start record on the selected branch reads as the replay of the reply's batch, though no
-		// call of that reply runs again there, and the handover on the first run's branch settles a subagent the parent
-		// still waits on. Background is owed from an earlier reply, so it is relaunched unless that branch is read.
+	/** The exit record a quit or a `/restart` writes as its session is disposed: `normal`, with the branch's calls that have no result. */
+	function appendDisposeExit(main: SessionManager): void {
+		const pendingToolCalls = collectPendingToolCalls(main.getBranch());
+		main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+			...(pendingToolCalls.length > 0 ? { pendingToolCalls } : {}),
+		});
+	}
+
+	/**
+	 * What a process writes as it starts on the session (`sdk.ts`): exit recovery closes a turn the recorded exit left
+	 * unfinished (its calls' results, then the interrupted-turn abort), then the startup eval snapshot.
+	 */
+	function appendProcessStart(main: SessionManager): void {
+		const branch = main.getBranch();
+		const abort = createInterruptedTurnAbortMessage(branch);
+		if (abort) {
+			for (const result of createInterruptedToolResults(branch)) main.appendMessage(result);
+			main.appendMessage(abort);
+		}
+		main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+	}
+
+	/**
+	 * A parent whose cell `call_eval` handed it Worker's key failure and was cut off by an Esc, after which the person
+	 * moved to the cell's reply in `/tree`: `navigateTree` writes an eval snapshot under the reply, which makes the move
+	 * a fork in the file. `after` writes what followed, with no input.
+	 */
+	async function restoreAfterTreeMoveToReply(after: (main: SessionManager) => void) {
 		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 		const { main, mainFile, cwd } = openParent();
 		const records = { sessionManager: main } as unknown as ToolSession;
 		tick();
-		main.appendMessage(toolCallMessage("call_agent", "eval"));
-		await recordEvalAgentJobs(records, ["Background"], "owed");
-		tick();
-		await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true, spawnCallId: "call_agent" });
-		tick();
-		main.appendMessage(toolResultMessage("call_agent", "eval", {}));
-		tick();
-		const anchor = main.appendMessage(evalAndBashReply());
-		tick();
+		const anchor = main.appendMessage(toolCallMessage("call_eval", "eval"));
 		appendExecutionStart(main, "call_eval", "eval");
+		await recordEvalAgentJobs(records, ["Worker"], "owed", ["call_eval"]);
 		tick();
+		await writeSubagent(mainFile, cwd, "Worker", stranded, { normalExit: true, spawnCallId: "call_eval" });
+		tick();
+		appendAgentJobRecord(main, "Worker", "delivered");
 		main.appendMessage(
-			toolResultMessage("call_eval", "eval", { agentResults: [{ id: "Background", handedAt: Date.now() }] }, true),
+			toolResultMessage("call_eval", "eval", { agentResults: [{ id: "Worker", handedAt: Date.now() }] }, true),
 		);
+		main.appendMessage(assistant({ stopReason: "aborted", errorMessage: USER_INTERRUPT_LABEL }));
 		tick();
 		main.branch(anchor);
-		main.appendMessage(toolCallMessage("call_other", "bash"));
-		appendExecutionStart(main, "call_other", "bash");
+		main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+		tick();
+		after(main);
+		return restoreParent(main, mainFile);
+	}
 
-		const { outcome } = await restoreParent(main, mainFile);
+	for (const [label, after] of [
+		["relaunches it when a /tree move to the reply after an Esc was followed by a kill", () => {}],
+		[
+			"relaunches it when a /tree move to the reply after an Esc was followed by a /restart: its exit, then exit recovery's closing of the reply's call at the next start",
+			(main: SessionManager) => {
+				appendDisposeExit(main);
+				appendProcessStart(main);
+			},
+		],
+		[
+			"relaunches it when a /tree move to the reply after an Esc was followed by a quit, omp -c and a /restart with no input: restore does not resume that turn",
+			(main: SessionManager) => {
+				appendDisposeExit(main); // the quit
+				appendProcessStart(main); // omp -c
+				appendDisposeExit(main); // the /restart
+				appendProcessStart(main); // the --restore process
+			},
+		],
+		[
+			"relaunches it when a /tree move to the reply after an Esc wrote a summary of the branch it left, then a kill",
+			(main: SessionManager) => {
+				main.branchWithSummary(main.getLeafId(), "S: what the branch did.");
+			},
+		],
+	] as const) {
+		it(label, async () => {
+			// A `/tree` move to the reply leaves what a replay leaves on the branch it left (error results, an abort with
+			// no calls, start, job and exit records), but restore does not run the reply's calls again after it: the move's
+			// eval snapshot (and a summary, when it writes one) sits between the reply and the results restore's closing
+			// gives its calls, so restore asks the model again; after a normal exit it resumes no turn at all. If this
+			// regresses, that branch is read and Worker is left while no cell runs its work again.
+			const { outcome } = await restoreAfterTreeMoveToReply(after);
 
-		expect(outcome.subagents).toEqual(["Background"]);
-	});
+			expect(outcome.subagents).toEqual(["Worker"]);
+		});
+	}
+
+	for (const [label, selected] of [
+		[
+			"relaunches a subagent still owed when the selected branch after the fork starts only a call the reply did not make",
+			(main: SessionManager) => {
+				main.appendMessage(toolCallMessage("call_other", "bash"));
+				appendExecutionStart(main, "call_other", "bash");
+			},
+		],
+		[
+			"relaunches a subagent still owed when the selected branch after the closed reply holds a length reply with a call, whose placeholder batch restore would run again instead",
+			(main: SessionManager) => {
+				appendDisposeExit(main);
+				appendProcessStart(main);
+				main.appendMessage(lengthReplyWithCall());
+				main.appendMessage(toolResultMessage("call_long", "write", {}, true));
+			},
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, the selected side reads as the replay of the reply's batch though restore does not run
+			// that batch again: a start record of another call is no replay of it, and with a `length` reply's placeholder
+			// result as the turn's tail, restore's replay runs that reply's batch. The handover on the first run's branch
+			// then settles a subagent the parent still waits on: Background is owed from an earlier reply, so it is
+			// relaunched unless that branch is read.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			tick();
+			main.appendMessage(toolCallMessage("call_agent", "eval"));
+			await recordEvalAgentJobs(records, ["Background"], "owed");
+			tick();
+			await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true, spawnCallId: "call_agent" });
+			tick();
+			main.appendMessage(toolResultMessage("call_agent", "eval", {}));
+			tick();
+			const anchor = main.appendMessage(evalAndBashReply());
+			tick();
+			appendExecutionStart(main, "call_eval", "eval");
+			tick();
+			main.appendMessage(
+				toolResultMessage(
+					"call_eval",
+					"eval",
+					{ agentResults: [{ id: "Background", handedAt: Date.now() }] },
+					true,
+				),
+			);
+			tick();
+			main.branch(anchor);
+			selected(main);
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(["Background"]);
+		});
+	}
 
 	it("judges the branches off the selected one when a corrupt file holds entries whose parents run in a cycle", async () => {
 		// If this regresses, the walk from an off-branch entry to its fork follows the cycle for ever, and restore never

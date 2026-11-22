@@ -27,7 +27,7 @@ import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
 import { readEvalAgentJobRecord } from "../eval/agent-job-records";
-import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
+import { EVAL_STATE_CONTEXT_TYPE, isEvalStateContext } from "../eval/state";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { persistedVibeChildIds } from "../vibe/lifecycle";
 import { AgentRegistry, type AgentRef } from "../registry/agent-registry";
@@ -35,6 +35,8 @@ import type { AgentSession } from "../session/agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import {
 	conversationTail,
+	createInterruptedToolResults,
+	createInterruptedTurnAbortMessage,
 	endsOnCredentialUnavailableTurn,
 	hasRestorableTurn,
 	isInterruptedTurnAbort,
@@ -43,10 +45,11 @@ import {
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "../session/exit-diagnostics";
 import { isReasonlessAbort, isUserInterruptAbort } from "../session/messages";
+import { buildSessionContext } from "../session/session-context";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
 import { DISCARDED_ENTRY_BRANCH_MARKER, extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
-import { RETRY_CANCELLED } from "../session/turn-recovery";
+import { RETRY_CANCELLED, toolReplayAnchor } from "../session/turn-recovery";
 import type { EventBus } from "../utils/event-bus";
 import { yieldEndsRun } from "../tools/yield";
 import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
@@ -597,13 +600,15 @@ function settledJobResults(details: unknown, wentOn: boolean): HeldResult[] {
 
 /**
  * Whether a transcript entry is input that starts a turn: a message other than a reply or a tool
- * result, or a custom message, but for the eval runtime snapshot a process writes as it starts
- * (`EVAL_STATE_CONTEXT_TYPE`): context the resumed process adds before `omp --restore` reads the
- * transcript, not an input anyone sent.
+ * result, or a custom message, but for the eval runtime snapshot (`EVAL_STATE_CONTEXT_TYPE`): context
+ * a process adds (as it starts, on a `/tree` move, or after a compaction, which stores it as a
+ * `custom` message entry), not an input anyone sent.
  */
 function isTurnInput(entry: SessionEntry): boolean {
 	if (entry.type === "custom_message") return entry.customType !== EVAL_STATE_CONTEXT_TYPE;
-	return entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult";
+	if (entry.type !== "message") return false;
+	const { message } = entry;
+	return message.role !== "assistant" && message.role !== "toolResult" && !isEvalStateContext(message);
 }
 
 /**
@@ -811,15 +816,18 @@ function replyStreamStartedAt(
  * that forks at that reply. A branch off the selected one is a replay's when both sides say so:
  * - its own contents: it forks at a reply with tool calls, holds a result of one of them, and holds
  *   nothing else a replay does not leave ({@link leftByReplay});
- * - the selected branch after the fork ({@link replayedAfter}): a replay writes each call's start
- *   record before its result, so the selected branch starts one of the reply's calls again before
- *   any turn input, or holds no turn after the reply (a replay cut off before its first start
- *   record, which restore runs again).
- * A branch a person's own navigation left fails one side: it holds a turn the conversation took
- * there (their prompt, a reply that answered it, a call that ran to its end), or the conversation
- * they went on with holds their input first (a `/tree` move to the reply after an Esc leaves what a
- * replay leaves, and the person's next prompt follows the reply) or no start record (a `/tree`
- * re-answer of an `ask` writes the call's result with none). None of its entries is returned.
+ * - the selected branch after the fork ({@link replayedAfter}): the reply's calls ran again there
+ *   (a replay writes each call's start record before its result), or restore's own replay is about
+ *   to run them again ({@link restoreRunsBatchAgain}).
+ * A branch a person's own navigation left fails one side when its calls neither ran again nor
+ * will: it holds a turn the conversation took there (their prompt, a reply that answered it, a
+ * call that ran to its end), or on the selected branch their input comes before any start record (a
+ * `/tree` move to the reply after an Esc, then a prompt), the reply's result has no start record (a
+ * `/tree` re-answer of an `ask`), the turn is not one restore resumes (a `/tree` move, then a quit,
+ * a resume and a `/restart` before any input), or a context message sits between the reply and
+ * where its results go (the eval snapshot a `/tree` move writes, then a kill, a crash, a signal or a
+ * `/restart`; a `/tree` summary), so restore asks the model again. None of the entries of a branch
+ * that fails a side is returned.
  */
 function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): Set<string> {
 	const branchIndex = new Map(branch.map((entry, index) => [entry.id, index]));
@@ -861,11 +869,11 @@ function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly S
 		const calls = toolCallIdsOf(byId.get(forkId));
 		if (!calls) continue;
 		if (!offBranch.some(entry => isResultOf(entry, calls))) continue;
-		// The calls of a reply a cut-off ended while it streamed after the batch's results (an Esc): the model's
-		// context drops that reply with its results, so the batch is still the one a replay runs again.
+		// The calls of a reply the model's context drops before a replay (one a cut-off ended while it streamed after
+		// the batch's results, or a `length` stop the recovery dropped): the batch is still the one a replay runs again.
 		const cutOffCalls = new Set(calls);
 		for (const entry of offBranch) {
-			if (isCutOffReply(entry)) for (const id of toolCallIdsOf(entry) ?? []) cutOffCalls.add(id);
+			if (isDroppedReply(entry)) for (const id of toolCallIdsOf(entry) ?? []) cutOffCalls.add(id);
 		}
 		if (!offBranch.every(entry => leftByReplay(entry, cutOffCalls))) continue;
 		if (!replayedAfter(branch, branchIndex.get(forkId)!, calls)) continue;
@@ -875,21 +883,50 @@ function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly S
 }
 
 /**
- * Whether the selected `branch` after the entry at `forkIndex` runs one of `calls` again, or will:
+ * Whether the selected `branch` after the entry at `forkIndex` runs one of `calls` again, or restore
+ * will:
  * - it holds a start record of one of them before any turn input (a replay writes those first; call
  *   ids do not repeat, so none can follow a turn input, and the scan stops there);
- * - or nothing after the fork is a turn ({@link leftByReplay} accepts each entry): the replay was cut
- *   off before its first start record, and restore runs the batch again. Such a branch may still
- *   hold what a later process wrote there before restore read it: the startup eval snapshot, and
- *   exit recovery's closing of the reply's calls (an exit record, their error results, the
- *   interrupted-turn abort).
+ * - or restore's own replay runs that batch ({@link restoreRunsBatchAgain}).
  */
 function replayedAfter(branch: readonly SessionEntry[], forkIndex: number, calls: ReadonlySet<string>): boolean {
 	const after = branch.slice(forkIndex + 1);
 	const input = after.findIndex(isTurnInput);
 	const beforeInput = input < 0 ? after : after.slice(0, input);
 	if (beforeInput.some(entry => startsOneOf(entry, calls))) return true;
-	return input < 0 && after.every(entry => leftByReplay(entry, calls));
+	return restoreRunsBatchAgain(branch, calls);
+}
+
+/**
+ * Whether `omp --restore` runs the batch of `calls` again on a session whose selected branch is
+ * `branch`, decided by the code restore runs: it resumes the branch's turn only when one is
+ * restorable ({@link hasRestorableTurn}); `AgentSession.restoreInterruptedTurn` closes a turn left
+ * cut off (results for its unfinished calls, then the interrupted-turn abort) and rebuilds the
+ * context; and `/retry` replays a batch only when that context ends in the batch's error results
+ * right after its reply ({@link toolReplayAnchor}). So an entry that becomes a context message
+ * between the reply and those results (an eval snapshot `/tree`, a start or a compaction writes, a
+ * branch summary), a later reply, or a closing that gives the reply's calls no results, makes restore
+ * ask the model again instead, and the batch does not run again. The context is built without a
+ * model, from the newest compaction; a session whose model cannot read a provider-native compaction
+ * builds from an older one, which moves only what comes before the compaction.
+ */
+export function restoreRunsBatchAgain(branch: readonly SessionEntry[], calls: ReadonlySet<string>): boolean {
+	if (!hasRestorableTurn(branch)) return false;
+	const closed: SessionEntry[] = [...branch];
+	const abort = createInterruptedTurnAbortMessage(branch, undefined, { assumeExit: true });
+	if (abort) {
+		const timestamp = new Date().toISOString();
+		for (const message of [...createInterruptedToolResults(branch), abort]) {
+			const parentId = closed.at(-1)?.id ?? null;
+			closed.push({ type: "message", id: `restore-closing-${closed.length}`, parentId, timestamp, message });
+		}
+	}
+	const leafId = closed.at(-1)?.id ?? null;
+	const anchor = toolReplayAnchor(
+		buildSessionContext(closed, leafId).messages,
+		() => buildSessionContext(closed, leafId, undefined, { transcript: true }).messages,
+	);
+	return anchor?.content.some(part => part.type === "toolCall" && calls.has(part.id)) === true;
 }
 
 /** Whether `entry` is the start record of one of `calls`. */
@@ -918,33 +955,38 @@ function isCutOffReply(entry: SessionEntry): boolean {
 }
 
 /**
- * Whether `message` is a `length` stop with no text and no call (a reasoning-only reply), which the
- * length-stop recovery takes out of the model's context and moves the leaf past
- * (`discardAssistantTurn`); the entry stays in the file as a sibling of the next attempt.
+ * Whether `entry` is a reply the model's context no longer holds when a replay runs: one a cut-off
+ * ended ({@link isCutOffReply}), or a `length` stop, which the length-stop recovery takes out of the
+ * context and moves the leaf past whatever it holds when the window is exhausted
+ * (`discardAssistantTurn`; the entry stays in the file). A `length` reply still in the context
+ * blocks every replay (`toolReplayStart` needs an aborted or failed tail), so one on a branch a
+ * replay left was dropped.
  */
-function isDroppedLengthStop(message: AgentMessage): boolean {
-	if (message.role !== "assistant" || message.stopReason !== "length") return false;
-	return !message.content.some(part => part.type === "toolCall" || (part.type === "text" && part.text.trim() !== ""));
+function isDroppedReply(entry: SessionEntry): boolean {
+	return (
+		isCutOffReply(entry) ||
+		(entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "length")
+	);
 }
 
 /**
  * Whether `entry` is one a tool replay leaves on the branch of the batch's first run, where
- * `calls` are the calls of the batch's reply and of the replies a cut-off ended there: a result of
- * one of those calls, an error (the replay runs a batch only when every result is an error, and a
- * cut-off reply's calls are cut off too); a reply a cut-off ended (an abort, or the error a failed
- * attempt left), with or without calls; a reasoning-only `length` stop a recovery dropped; the
- * empty-stop retry's marker (the empty `branch_summary` `discardEntryDurably` writes); the
- * compaction an overflow or length-stop recovery writes there; or a record that is no turn of the
- * conversation (execution starts, job, exit and discard records, a retry's model and thinking
- * changes, usage, labels, eval snapshots). A turn input (a prompt, a delivery, an IRC message), a
- * `/clear`, another branch summary, a reply that completed, and a result that is no error or of
- * another call are turns the conversation took on that branch.
+ * `calls` are the calls of the batch's reply and of the dropped replies there: a result of one of
+ * those calls, an error (the replay runs a batch only when every result is an error, and the calls
+ * of a dropped reply have error results: a cut-off's placeholders, or a `length` stop's); a dropped
+ * reply ({@link isDroppedReply}), with or without calls; the empty-stop retry's marker (the empty
+ * `branch_summary` `discardEntryDurably` writes); a compaction (an overflow or length-stop
+ * recovery's, or a retry's before its request); or a record that is no turn of the conversation
+ * (execution starts, job, exit and discard records, a retry's model and thinking changes, usage,
+ * labels, eval snapshots). A turn input (a prompt, a delivery, an IRC message), a `/clear`, another
+ * branch summary, a reply that completed, and a result that is no error or of another call are
+ * turns the conversation took on that branch.
  */
 function leftByReplay(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
 	if (entry.type === "message") {
 		const { message } = entry;
 		if (message.role === "toolResult") return message.isError === true && calls.has(message.toolCallId);
-		if (message.role === "assistant") return isCutOffReply(entry) || isDroppedLengthStop(message);
+		if (message.role === "assistant") return isDroppedReply(entry);
 	}
 	if (entry.type === "branch_summary") {
 		return isRecord(entry.details) && entry.details.kind === DISCARDED_ENTRY_BRANCH_MARKER;
