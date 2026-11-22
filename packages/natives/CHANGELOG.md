@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it keeps only the descriptors placed for it, so another job's reader gets end of file when its writer ends, as in bash, and no other descriptor of the host process reaches such a child.
+- A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it closes the descriptors its exec would close (the shell's own, all close-on-exec) before its redirections, so another job's reader gets end of file when its writer ends, as in bash.
 
 ## [18.18.6] - 2026-11-09
 

@@ -25,13 +25,18 @@ fn shells() -> Vec<(&'static str, String)> {
 	shells
 }
 
+/// The shell leads a process group of its own, so a run that does not end
+/// can be killed with every process it started ([`run_row`]).
 fn start(shell: &str, script: &str, dir: &Path) -> Child {
+	use std::os::unix::process::CommandExt;
+
 	Command::new(shell)
 		.args(["-c", script])
 		.env("D", dir)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
+		.process_group(0)
 		.spawn()
 		.expect("start the shell")
 }
@@ -48,9 +53,13 @@ fn mkfifo(path: &Path) {
 /// gate. B must then end while A's open still waits: B's end of file must
 /// not wait for A's child, which forked while B's pipe was open in the
 /// shell. bash's parent keeps no end of B's pipe, so its child holds none.
+///
+/// A starts only once B's reader has read B's first line, so B's pipe and
+/// reader exist when A forks (else A could fork first and hold nothing).
 const HOLD: &str = r#"
-{ read -r _ < "$D/gate"; echo hi; } | /bin/cat > "$D/b.out" &
+{ echo up; read -r _ < "$D/gate"; echo hi; } | /bin/sh -c 'IFS= read -r l; echo "$l" > "$D/up"; exec cat' > "$D/b.out" &
 b=$!
+until [ -s "$D/up" ]; do sleep 0.01; done
 /bin/cat < "$D/fifo" > /dev/null &
 echo started
 wait $b
@@ -141,9 +150,9 @@ const ROWS: &[(&str, &str, &str)] = &[
 		"in-text\n",
 	),
 	(
-		"<&-",
-		r#"/bin/sh -c 'if read -r v 2>/dev/null; then echo read; else echo closed; fi' <&- > "$D/fifo" & cat "$D/fifo"; wait"#,
-		"closed\n",
+		"fd 3 opened after the FIFO open",
+		r#"/bin/sh -c 'cat <&3' > "$D/fifo" 3< "$D/in" & cat "$D/fifo"; wait"#,
+		"in-text\n",
 	),
 	(
 		">&-",
@@ -173,29 +182,55 @@ const ROWS: &[(&str, &str, &str)] = &[
 	),
 ];
 
+/// One run of `script` under `shell`: `Err` names what differs from `want`.
+/// A run that does not end within [`HANG`] is killed with its process group,
+/// so no process of it outlives the run.
+fn run_row(shell: &str, script: &str, want: &str) -> Result<(), String> {
+	let dir = tempfile::tempdir().unwrap();
+	mkfifo(&dir.path().join("fifo"));
+	std::fs::write(dir.path().join("in"), "in-text\n").unwrap();
+	let child = start(shell, script, dir.path());
+	let group = libc::pid_t::try_from(child.id()).unwrap();
+	let (tx, done) = mpsc::channel();
+	std::thread::spawn(move || tx.send(child.wait_with_output()));
+	let Ok(out) = done.recv_timeout(HANG) else {
+		// SAFETY: a signal to the run's own process group (`start`).
+		unsafe { libc::killpg(group, libc::SIGKILL) };
+		let _ = done.recv_timeout(HANG);
+		return Err(format!("no end within {HANG:?}"));
+	};
+	let out = out.unwrap();
+	let got = String::from_utf8_lossy(&out.stdout);
+	if got != want || !out.status.success() {
+		return Err(format!(
+			"{got:?} {}, want {want:?}; stderr {:?}",
+			out.status,
+			String::from_utf8_lossy(&out.stderr)
+		));
+	}
+	Ok(())
+}
+
+/// Each row runs once under obash. Under bash, the reference, a row that
+/// fails runs again, up to three times. Under gVisor, bash 5.2.21 run alone
+/// (not through this test) never ended on the process substitution row in 6
+/// of 600 runs, and the same row with no FIFO open in none of 600; on runc it
+/// never failed in 300 runs. obash passed every one of those 900 runs.
 #[test]
 fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 	let mut wrong = Vec::new();
 	for (name, shell) in shells() {
+		let tries = if name == "bash" { 3 } else { 1 };
 		for (row, script, want) in ROWS {
-			let dir = tempfile::tempdir().unwrap();
-			mkfifo(&dir.path().join("fifo"));
-			std::fs::write(dir.path().join("in"), "in-text\n").unwrap();
-			let child = start(&shell, script, dir.path());
-			let (tx, done) = mpsc::channel();
-			std::thread::spawn(move || tx.send(child.wait_with_output()));
-			let Ok(out) = done.recv_timeout(HANG) else {
-				wrong.push(format!("{name} {row}: no end within {HANG:?}"));
-				continue;
-			};
-			let out = out.unwrap();
-			let got = String::from_utf8_lossy(&out.stdout);
-			if got != *want || !out.status.success() {
-				wrong.push(format!(
-					"{name} {row}: {got:?} {}, want {want:?}; stderr {:?}",
-					out.status,
-					String::from_utf8_lossy(&out.stderr)
-				));
+			let mut last = Ok(());
+			for _ in 0..tries {
+				last = run_row(&shell, script, want);
+				if last.is_ok() {
+					break;
+				}
+			}
+			if let Err(e) = last {
+				wrong.push(format!("{name} {row}: {e}"));
 			}
 		}
 	}
@@ -203,10 +238,12 @@ fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 }
 
 /// `/dev/fd/N` names the shell's fd N, which the engine reads as a dup of
-/// N. When N is one of the host's own descriptors and no fd of the shell, a
-/// deferred spawn's dup of it fails with `EBADF`, as for a closed fd: the
-/// child keeps only its placed fds, so it never takes the host's object.
-/// obash only: bash has no host descriptors besides its own fds.
+/// N. When N is one of the host's own descriptors and no fd of the shell,
+/// a deferred spawn's redirection fails with `EBADF`, as for a closed fd
+/// (the engine refuses it, as it refuses `3<&N`), so the process never
+/// takes the host's object. obash only: bash has no host descriptors
+/// besides its own fds. The shell holds both ends of the FIFO (`7<>`), so
+/// no open waits whether or not the process is spawned.
 const DEV_FD: &str = r#"
 n=
 for f in /proc/$$/fd/*; do
@@ -219,14 +256,12 @@ for f in /proc/$$/fd/*; do
 	break
 done
 [ -n "$n" ] || { echo "no host fd"; exit 1; }
-/bin/sh -c 'cat <&3' > "$D/fifo" 2> "$D/host.err" 3< "/dev/fd/$n" &
-cat "$D/fifo"
-wait $!
-echo "host $?"
-/bin/sh -c 'cat <&3' > "$D/fifo" 2> "$D/closed.err" 3< /dev/fd/900 &
-cat "$D/fifo"
-wait $!
-echo "closed $?"
+exec 7<> "$D/fifo"
+{ /bin/sh -c 'cat <&3 > "$D/host.out"' > "$D/fifo" 3< "/dev/fd/$n" & } 2> "$D/host.err"
+wait
+{ /bin/sh -c 'cat <&3 > "$D/closed.out"' > "$D/fifo" 3< /dev/fd/900 & } 2> "$D/closed.err"
+wait
+for f in host.out closed.out; do [ -e "$D/$f" ] && echo "$f ran" || echo "$f none"; done
 sed -e "s#/dev/fd/$n#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/host.err"
 sed -e "s#/dev/fd/900#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/closed.err"
 "#;
@@ -240,12 +275,12 @@ fn a_dev_fd_redirection_naming_a_host_descriptor_fails_as_a_closed_fd() {
 	std::thread::spawn(move || tx.send(child.wait_with_output()));
 	let out = done
 		.recv_timeout(HANG)
-		.expect("the dup of a host descriptor took the host's object (no end)")
+		.expect("the redirection of a host descriptor did not end")
 		.unwrap();
 	let got = String::from_utf8_lossy(&out.stdout);
 	let lines: Vec<&str> = got.lines().collect();
 	assert!(out.status.success(), "{got:?} {:?}", String::from_utf8_lossy(&out.stderr));
-	assert_eq!(&lines[..2], ["host 1", "closed 1"], "{got:?}");
+	assert_eq!(&lines[..2], ["host.out none", "closed.out none"], "a process ran: {got:?}");
 	assert_eq!(lines.len(), 4, "{got:?}");
 	assert_eq!(lines[2], lines[3], "the same failure as a closed fd: {got:?}");
 	assert!(lines[2].ends_with("Bad file descriptor"), "{got:?}");

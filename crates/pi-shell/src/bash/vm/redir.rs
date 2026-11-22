@@ -727,7 +727,7 @@ fn collect(
 			} else if r.op == RedirKind::DupOut && matches!(r.fd, RedirFdIr::Default) {
 				// `>&file` is `&>file`.
 				let flags = open_flags(k, vp, cx, RedirKind::OutErr, target);
-				add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line));
+				add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line)?);
 			} else {
 				let d = Diag::AmbiguousRedirect { word: target.clone() };
 				return Err(fail(k, vp, cx, line, d));
@@ -735,7 +735,7 @@ fn collect(
 		},
 		RedirKind::OutErr | RedirKind::AppendErr => {
 			let flags = open_flags(k, vp, cx, r.op, target);
-			add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line));
+			add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line)?);
 		},
 		RedirKind::In
 		| RedirKind::Out
@@ -744,7 +744,7 @@ fn collect(
 		| RedirKind::ReadWrite => {
 			let fd = fd_number(k, vp, cx, r, false, line)?;
 			let flags = open_flags(k, vp, cx, r.op, target);
-			add.push(child_open(k, vp, cx, vec![fd], target, flags, line));
+			add.push(child_open(k, vp, cx, vec![fd], target, flags, line)?);
 		},
 		RedirKind::HereDoc | RedirKind::HereString => {
 			unreachable!("a here-document is never left to the process (`childable`)")
@@ -787,24 +787,32 @@ fn child_fd_open(k: &Kernel, vp: &Vproc, fd: i32) -> bool {
 }
 
 /// The open of `target` onto `fds` by the process ([`ChildRedir::Open`]),
-/// or the duplication `/dev/fd/N` (`/dev/stdin`, …) stands for.
+/// or the duplication `/dev/fd/N` (`/dev/stdin`, …) stands for. A
+/// `/dev/fd/N` that names no fd of the process (not the shell's, not set by
+/// an earlier redirection) fails as a dup of it does (`3<&N`): the process
+/// would take a descriptor of the host's own.
 fn child_open(
 	k: &mut Kernel,
-	vp: &Vproc,
+	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	fds: Vec<i32>,
 	target: &BString,
 	flags: OpenFlags,
 	line: u32,
-) -> ChildRedir {
-	let diag = diag_prefix(k, cx, vp, line, target);
-	if let Some(src) = dev_fd(target)
-		&& let [fd] = fds.as_slice()
-	{
-		return ChildRedir::Dup { fd: *fd, src, diag };
+) -> Result<ChildRedir, Halt> {
+	if let Some(src) = dev_fd(target) {
+		if !child_fd_open(k, vp, src) {
+			let err = std::io::Error::other(crate::bash::fd::BadFd);
+			return Err(fail(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
+		}
+		if let [fd] = fds.as_slice() {
+			let diag = diag_prefix(k, cx, vp, line, target);
+			return Ok(ChildRedir::Dup { fd: *fd, src, diag });
+		}
 	}
+	let diag = diag_prefix(k, cx, vp, line, target);
 	let umask = state::umask(cx.store, vp).unwrap_or(0o022);
-	ChildRedir::Open { fds, path: absolute(&vp.cwd, target), flags, mode: 0o666 & !umask, diag }
+	Ok(ChildRedir::Open { fds, path: absolute(&vp.cwd, target), flags, mode: 0o666 & !umask, diag })
 }
 
 /// Print `d` and fail the redirection.
