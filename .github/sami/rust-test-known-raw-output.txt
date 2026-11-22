@@ -1,0 +1,32 @@
+# Lines test binaries write outside libtest's record, for the rust_test jobs in
+# .github/workflows/sami-build.yml: a child process's or a thread's write to
+# the stdout or stderr it inherited, which no test's record holds. A line with
+# a skip word is a skip whatever this list says. Every other line must match an
+# entry for its target, or the job fails, since it can be a skip in other
+# words. An entry names its target, then an extended regular expression the
+# whole line must match (no two spaces in a row), then, after two spaces, what
+# prints it and why that is no skip. A target written `<target>@<anchor>`,
+# where the anchor is an extended regular expression without a space
+# (`[[:space:]]` for one), makes the entry count only in a log that also
+# holds a line the anchor matches whole: the lines of pi-natives' crash report
+# count only in a log that holds the report's first line, `pi-natives panic
+# crash`. Add an entry only after reading the test that prints the line. An
+# entry that matches no line gets a notice. Two child processes that write to
+# the same stream at once can split each other's lines (a line can reach the
+# stream in more than one write): no entry matches the pieces, and the job
+# fails. That red is real output in a broken shape, not a new line to name;
+# run the job again before adding an entry.
+# One per line: <bazel test target>[@<anchor>] <regular expression>  <who prints it; why it is no skip>.
+//crates/pi-builtins:pi-builtins_test pi-builtins_test: invalid length: '7'  b2sum's refusal of the length 7 that b2sum::tests::length_must_be_a_multiple_of_eight gives it, on the process's stderr; the test asserts the refusal
+//crates/pi-builtins:pi-builtins_test kernel [^ ]+, stack rlimit [0-9]+ \(hard [0-9]+\), sysconf\(_SC_ARG_MAX\) [0-9]+: the kernel (refused|ran) the full line of [0-9]+ (files|arguments) .+  find's and xargs's argument-limit tests report what the kernel did with the full line, after asserting it was halved or run whole
+//crates/pi-natives:pi_natives_test pi-natives panic crash  pi-natives' crash handler, on the panic catch_panic_converts_native_panics_into_backend_errors (Linux) and the release_guard tests (macOS) raise on purpose and assert caught
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash pi-natives crash report written to [^ ]+/pi-natives-test-logs-[0-9]+/native-panic-[0-9]+-[0-9]+\.log  the crash handler's report of that panic
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash (timestamp: [0-9]+ \(unix ms\)|pid: +[0-9]+|backtrace:)  the crash handler's report of that panic
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash thread: +(vcs::tests::catch_panic_converts_native_panics_into_backend_errors|desktop::macos::release_guard::tests::a_(request_waits_for_its_helper_to_exit_with_or_without_presses_open|panicking_request_leaves_its_open_presses_to_the_helper))  the crash handler's report names the test whose panic it is
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash message: +(valid name: Os \{ code: [0-9]+ \}|native code panicked while Shift was held)  the crash handler's report gives the planned panic's message
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash location: +bazel-out/[^/]+/bin/crates/pi-natives/src/(vcs|desktop/macos/release_guard)\.rs:[0-9]+:[0-9]+  the crash handler's report gives where the planned panic was raised
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash [ ]*[0-9]+: (<[A-Za-z_][A-Za-z0-9_]*::.+|<fn\(.+|<unknown>|[A-Za-z_][A-Za-z0-9_]*::.+|__rust_try|___rust_try|__pthread_cond_wait)  a frame of the crash handler's backtrace of that panic: a Rust path, or one of the runtime's symbols the trials showed
+//crates/pi-natives:pi_natives_test@pi-natives[[:space:]]panic[[:space:]]crash [ ]+at [^ ]+\.rs:[0-9]+:[0-9]+  a frame's source file and line in the crash handler's backtrace of that panic
+//crates/pi-natives:pi_natives_test (running 1 test|test desktop::control::tests::kernel_child_probe \.\.\. ok|test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s)  the libtest of kernel_child_probe, a child entry point desktop::control's tests start with this binary, on the stdout it inherited
+//crates/pi-shell:pi-shell_test (running 1 test|test shell::tests::(process_control|env_cwd)::[a-z_]+ \.\.\. ok|test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s)  the libtest of the child processes the process-control and env_cwd tests start with this binary, on the stdout they inherited
+//crates/pi-shell:pi-shell_test Terminated  a shell's report of a job ended by SIGTERM, printed beside the process-control tests' child runs (run 44922846912)
