@@ -25,12 +25,12 @@ fn shells() -> Vec<(&'static str, String)> {
 	shells
 }
 
-/// The shell leads a process group of its own, so a run that does not end
-/// can be killed with every process it started ([`run_row`]).
-fn start(shell: &str, script: &str, dir: &Path) -> Child {
+/// The shell leads a process group of its own, which the test owns
+/// ([`Owned`]).
+fn start(shell: &str, script: &str, dir: &Path) -> Owned {
 	use std::os::unix::process::CommandExt;
 
-	Command::new(shell)
+	let child = Command::new(shell)
 		.args(["-c", script])
 		.env("D", dir)
 		.stdin(Stdio::null())
@@ -38,7 +38,72 @@ fn start(shell: &str, script: &str, dir: &Path) -> Child {
 		.stderr(Stdio::piped())
 		.process_group(0)
 		.spawn()
-		.expect("start the shell")
+		.expect("start the shell");
+	let group = libc::pid_t::try_from(child.id()).unwrap();
+	Owned { child: Some(child), group }
+}
+
+/// A shell the test started ([`start`]) and its process group: everything
+/// the shell starts that stays in it. However the test leaves it (the shell
+/// ended, the test failed or timed out), the group is killed while the shell
+/// is not reaped yet, so no process of it outlives the test, and the group's
+/// number cannot name another group meanwhile.
+struct Owned {
+	child: Option<Child>,
+	group: libc::pid_t,
+}
+
+impl Owned {
+	/// Once the shell has ended (still unreaped), kill its group, reap it,
+	/// and return what it wrote to whichever of its pipes the test did not
+	/// take.
+	fn end(mut self) -> std::process::Output {
+		let mut child = self.child.take().expect("the shell is still the test's");
+		let stdout = drain(child.stdout.take());
+		let stderr = drain(child.stderr.take());
+		let pid = libc::id_t::try_from(child.id()).unwrap();
+		// SAFETY: siginfo_t is plain data; waitid with WNOWAIT waits for the
+		// child's end and leaves it unreaped.
+		unsafe {
+			let mut info = std::mem::zeroed::<libc::siginfo_t>();
+			libc::waitid(libc::P_PID, pid, &raw mut info, libc::WEXITED | libc::WNOWAIT);
+		}
+		kill_group(self.group);
+		let status = child.wait().expect("reap the shell");
+		std::process::Output {
+			status,
+			stdout: stdout.join().unwrap(),
+			stderr: stderr.join().unwrap(),
+		}
+	}
+}
+
+impl Drop for Owned {
+	fn drop(&mut self) {
+		if let Some(mut child) = self.child.take() {
+			kill_group(self.group);
+			let _ = child.wait();
+		}
+	}
+}
+
+/// SIGKILL to every process of `group`, a shell's own group ([`Owned`]).
+fn kill_group(group: libc::pid_t) {
+	// SAFETY: a signal to a process group the test owns; its leader is not
+	// reaped yet, so the number names no other group.
+	unsafe { libc::killpg(group, libc::SIGKILL) };
+}
+
+/// Everything `pipe` yields up to end of file, read on a thread of its own
+/// (nothing for a pipe the test took).
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+	std::thread::spawn(move || {
+		let mut bytes = Vec::new();
+		if let Some(mut pipe) = pipe {
+			let _ = pipe.read_to_end(&mut bytes);
+		}
+		bytes
+	})
 }
 
 fn mkfifo(path: &Path) {
@@ -74,9 +139,9 @@ fn a_child_waiting_in_a_fifo_open_holds_no_other_jobs_pipe() {
 		let dir = tempfile::tempdir().unwrap();
 		mkfifo(&dir.path().join("fifo"));
 		mkfifo(&dir.path().join("gate"));
-		let mut child = start(&shell, HOLD, dir.path());
+		let mut shell = start(&shell, HOLD, dir.path());
 		let (tx, lines) = mpsc::channel();
-		let out = child.stdout.take().unwrap();
+		let out = shell.child.as_mut().unwrap().stdout.take().unwrap();
 		std::thread::spawn(move || {
 			for line in BufReader::new(out).lines() {
 				if tx.send(line.unwrap()).is_err() {
@@ -114,7 +179,7 @@ fn a_child_waiting_in_a_fifo_open_holds_no_other_jobs_pipe() {
 			 pipe)"
 		);
 		assert_eq!(next("all done"), "all done", "{name}");
-		let status = child.wait().unwrap();
+		let status = shell.end().status;
 		assert!(status.success(), "{name}: {status}");
 	}
 }
@@ -150,6 +215,11 @@ const ROWS: &[(&str, &str, &str)] = &[
 		"in-text\n",
 	),
 	(
+		"<&-",
+		r#"/bin/sh -c 'if read -r v 2>/dev/null; then echo read; else echo closed; fi' <&- > "$D/fifo" & cat "$D/fifo"; wait"#,
+		"closed\n",
+	),
+	(
 		"fd 3 opened after the FIFO open",
 		r#"/bin/sh -c 'cat <&3' > "$D/fifo" 3< "$D/in" & cat "$D/fifo"; wait"#,
 		"in-text\n",
@@ -182,24 +252,112 @@ const ROWS: &[(&str, &str, &str)] = &[
 	),
 ];
 
-/// One run of `script` under `shell`: `Err` names what differs from `want`.
-/// A run that does not end within [`HANG`] is killed with its process group,
-/// so no process of it outlives the run.
-fn run_row(shell: &str, script: &str, want: &str) -> Result<(), String> {
+/// One run of `script` under `shell`, in a directory `$D` holding a FIFO
+/// `fifo` and a file `in`. A run that does not end within [`HANG`] is
+/// killed with its process group ([`Owned`]); its `Err` lists those
+/// processes and their fds first ([`processes`]), so the hang can be traced.
+fn run(shell: &str, script: &str) -> Result<std::process::Output, String> {
 	let dir = tempfile::tempdir().unwrap();
 	mkfifo(&dir.path().join("fifo"));
 	std::fs::write(dir.path().join("in"), "in-text\n").unwrap();
-	let child = start(shell, script, dir.path());
-	let group = libc::pid_t::try_from(child.id()).unwrap();
+	let owned = start(shell, script, dir.path());
+	let group = owned.group;
 	let (tx, done) = mpsc::channel();
-	std::thread::spawn(move || tx.send(child.wait_with_output()));
+	std::thread::spawn(move || tx.send(owned.end()));
 	let Ok(out) = done.recv_timeout(HANG) else {
-		// SAFETY: a signal to the run's own process group (`start`).
-		unsafe { libc::killpg(group, libc::SIGKILL) };
+		let held = processes(group);
+		eprintln!("{shell}: no end within {HANG:?}; its processes:\n{held}");
+		// The shell is not reaped yet: `end` waits for it.
+		kill_group(group);
 		let _ = done.recv_timeout(HANG);
-		return Err(format!("no end within {HANG:?}"));
+		return Err(format!("no end within {HANG:?}; its processes:\n{held}"));
 	};
-	let out = out.unwrap();
+	Ok(out)
+}
+
+/// The processes of process group `group`, each with its state, kernel
+/// wait channel, command line and fds (from `/proc`). `UNKNOWN` where they
+/// cannot be read, never an empty list.
+#[cfg(target_os = "linux")]
+fn processes(group: libc::pid_t) -> String {
+	use std::fmt::Write as _;
+
+	let Ok(dir) = std::fs::read_dir("/proc") else {
+		return "UNKNOWN: /proc cannot be read".to_owned();
+	};
+	let mut out = String::new();
+	for entry in dir.flatten() {
+		let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+			continue;
+		};
+		let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+			continue;
+		};
+		// After the command name's `)`: state, parent, group.
+		let Some(rest) = stat.rfind(')').map(|i| &stat[i + 2..]) else {
+			continue;
+		};
+		let fields: Vec<&str> = rest.split(' ').collect();
+		if fields.get(2).and_then(|g| g.parse::<libc::pid_t>().ok()) != Some(group) {
+			continue;
+		}
+		let read = |what: &str| {
+			std::fs::read(format!("/proc/{pid}/{what}")).map_or_else(
+				|e| format!("UNKNOWN ({e})"),
+				|b| {
+					String::from_utf8_lossy(&b)
+						.replace('\0', " ")
+						.trim()
+						.to_owned()
+				},
+			)
+		};
+		let _ = writeln!(
+			out,
+			"  pid {pid} state {} ppid {} wchan {} cmd {}",
+			fields[0],
+			fields.get(1).unwrap_or(&"?"),
+			read("wchan"),
+			read("cmdline")
+		);
+		match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+			Ok(fds) => {
+				let mut fds: Vec<(u32, String)> = fds
+					.flatten()
+					.filter_map(|fd| {
+						let n = fd.file_name().to_string_lossy().parse().ok()?;
+						let to = std::fs::read_link(fd.path())
+							.map_or_else(|e| format!("UNKNOWN ({e})"), |p| p.display().to_string());
+						Some((n, to))
+					})
+					.collect();
+				fds.sort();
+				for (n, to) in fds {
+					let _ = writeln!(out, "    fd {n} -> {to}");
+				}
+			},
+			Err(e) => {
+				let _ = writeln!(out, "    fds UNKNOWN ({e})");
+			},
+		}
+	}
+	if out.is_empty() {
+		format!("UNKNOWN: no process of group {group} in /proc")
+	} else {
+		out
+	}
+}
+
+/// Elsewhere: no `/proc` to read.
+#[cfg(not(target_os = "linux"))]
+fn processes(group: libc::pid_t) -> String {
+	format!("UNKNOWN: no /proc here to list group {group}")
+}
+
+/// One run of `script` under `shell` ([`run`]): `Err` names what differs
+/// from `want`, or the hang.
+fn run_row(shell: &str, script: &str, want: &str) -> Result<(), String> {
+	let out = run(shell, script)?;
 	let got = String::from_utf8_lossy(&out.stdout);
 	if got != want || !out.status.success() {
 		return Err(format!(
@@ -211,11 +369,14 @@ fn run_row(shell: &str, script: &str, want: &str) -> Result<(), String> {
 	Ok(())
 }
 
-/// Each row runs once under obash. Under bash, the reference, a row that
-/// fails runs again, up to three times. Under gVisor, bash 5.2.21 run alone
-/// (not through this test) never ended on the process substitution row in 6
-/// of 600 runs, and the same row with no FIFO open in none of 600; on runc it
-/// never failed in 300 runs. obash passed every one of those 900 runs.
+/// Each row runs once under obash, so an obash run that does not end fails
+/// the test. Under bash, the reference, a row that fails runs again, up to
+/// three times: under gVisor bash now and then never ends on the process
+/// substitution row (bash 5.2.21 run alone, not through this test: 6 of 600
+/// runs; the same row with no FIFO open: none of 600; on runc: none of 300).
+/// obash has hung on that row too, more rarely (on gVisor as uid 1000, once
+/// in 1,200 runs), which this test reports as a failure. A run that does not
+/// end prints its processes and their fds before they are killed ([`run`]).
 #[test]
 fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 	let mut wrong = Vec::new();
@@ -237,13 +398,74 @@ fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A redirection the child fails after its FIFO open (`> fifo` comes
+/// first): a dup of a closed fd (`3<&900`, `/dev/fd/900`, `3<&- 4<&3`) or a
+/// target that is no single word. bash's child opens the FIFO and then
+/// fails, so the FIFO's reader (`cat`, or the shell's own `exec 5<`) gets
+/// end of file, and the job's status is 1; it stops there, so no word of a
+/// redirection after it is expanded. The engine knows these are bad before
+/// the child exists; refused in the shell, the FIFO's open never happens,
+/// and its reader waits for ever. The message after `line N: ` is bash's,
+/// but for `/dev/fd/900`: bash opens the path (`No such file or
+/// directory`), and the engine reads it as a dup of fd 900 (`Bad file
+/// descriptor`), as in the foreground.
+const FAILS: &[(&str, &str, &str)] = &[
+	(
+		"3<&900",
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&900 & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		"status 1\n900: Bad file descriptor\n",
+	),
+	(
+		"3<&- 4<&3",
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&- 4<&3 & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		"status 1\n3: Bad file descriptor\n",
+	),
+	(
+		"/dev/fd/900",
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3< /dev/fd/900 & cat "$D/fifo"; wait $!; echo "status $?"; [ -s "$D/err" ] && echo said"#,
+		"status 1\nsaid\n",
+	),
+	(
+		"/dev/fd/900, the shell reads the FIFO",
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3< /dev/fd/900 & exec 5< "$D/fifo"; cat <&5; exec 5<&-; wait $!; echo "status $?""#,
+		"status 1\n",
+	),
+	(
+		"a target of two words",
+		r#"two='a b'; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3> $two & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		"status 1\n$two: ambiguous redirect\n",
+	),
+	(
+		"a word after it, not expanded",
+		r#"unset x; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&900 4> "$D/${x:?a later word was expanded}" & cat "$D/fifo"; wait $!; echo "status $?""#,
+		"status 1\n",
+	),
+	(
+		"a missing file (control)",
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3< "$D/missing" & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#$D/##" "$D/err""#,
+		"status 1\nmissing: No such file or directory\n",
+	),
+];
+
+#[test]
+fn a_redirection_the_child_fails_after_its_fifo_open_lets_the_reader_end() {
+	let mut wrong = Vec::new();
+	for (name, shell) in shells() {
+		for (row, script, want) in FAILS {
+			if let Err(e) = run_row(&shell, script, want) {
+				wrong.push(format!("{name} {row}: {e}"));
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// `/dev/fd/N` names the shell's fd N, which the engine reads as a dup of
 /// N. When N is one of the host's own descriptors and no fd of the shell,
-/// a deferred spawn's redirection fails with `EBADF`, as for a closed fd
-/// (the engine refuses it, as it refuses `3<&N`), so the process never
-/// takes the host's object. obash only: bash has no host descriptors
-/// besides its own fds. The shell holds both ends of the FIFO (`7<>`), so
-/// no open waits whether or not the process is spawned.
+/// a deferred spawn's redirection fails with `EBADF`, as for a closed fd:
+/// the process fails it after its FIFO open, so it never takes the host's
+/// object, and the FIFO's reader still gets end of file. obash only: bash
+/// has no host descriptors besides its own fds.
 const DEV_FD: &str = r#"
 n=
 for f in /proc/$$/fd/*; do
@@ -256,11 +478,14 @@ for f in /proc/$$/fd/*; do
 	break
 done
 [ -n "$n" ] || { echo "no host fd"; exit 1; }
-exec 7<> "$D/fifo"
-{ /bin/sh -c 'cat <&3 > "$D/host.out"' > "$D/fifo" 3< "/dev/fd/$n" & } 2> "$D/host.err"
-wait
-{ /bin/sh -c 'cat <&3 > "$D/closed.out"' > "$D/fifo" 3< /dev/fd/900 & } 2> "$D/closed.err"
-wait
+/bin/sh -c 'cat <&3 > "$D/host.out"' > "$D/fifo" 2> "$D/host.err" 3< "/dev/fd/$n" &
+cat "$D/fifo"
+wait $!
+echo "host $?"
+/bin/sh -c 'cat <&3 > "$D/closed.out"' > "$D/fifo" 2> "$D/closed.err" 3< /dev/fd/900 &
+cat "$D/fifo"
+wait $!
+echo "closed $?"
 for f in host.out closed.out; do [ -e "$D/$f" ] && echo "$f ran" || echo "$f none"; done
 sed -e "s#/dev/fd/$n#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/host.err"
 sed -e "s#/dev/fd/900#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/closed.err"
@@ -268,20 +493,17 @@ sed -e "s#/dev/fd/900#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/closed.err"
 
 #[test]
 fn a_dev_fd_redirection_naming_a_host_descriptor_fails_as_a_closed_fd() {
-	let dir = tempfile::tempdir().unwrap();
-	mkfifo(&dir.path().join("fifo"));
-	let child = start(env!("CARGO_BIN_EXE_obash"), DEV_FD, dir.path());
-	let (tx, done) = mpsc::channel();
-	std::thread::spawn(move || tx.send(child.wait_with_output()));
-	let out = done
-		.recv_timeout(HANG)
-		.expect("the redirection of a host descriptor did not end")
-		.unwrap();
+	let out = run(env!("CARGO_BIN_EXE_obash"), DEV_FD)
+		.unwrap_or_else(|e| panic!("the redirection of a host descriptor: {e}"));
 	let got = String::from_utf8_lossy(&out.stdout);
 	let lines: Vec<&str> = got.lines().collect();
 	assert!(out.status.success(), "{got:?} {:?}", String::from_utf8_lossy(&out.stderr));
-	assert_eq!(&lines[..2], ["host.out none", "closed.out none"], "a process ran: {got:?}");
-	assert_eq!(lines.len(), 4, "{got:?}");
-	assert_eq!(lines[2], lines[3], "the same failure as a closed fd: {got:?}");
-	assert!(lines[2].ends_with("Bad file descriptor"), "{got:?}");
+	assert_eq!(
+		lines.get(..4),
+		Some(&["host 1", "closed 1", "host.out none", "closed.out none"][..]),
+		"a process ran, or its status is not the failed redirection's: {got:?}"
+	);
+	assert_eq!(lines.len(), 6, "{got:?}");
+	assert_eq!(lines[4], lines[5], "the same failure as a closed fd: {got:?}");
+	assert!(lines[4].ends_with("Bad file descriptor"), "{got:?}");
 }

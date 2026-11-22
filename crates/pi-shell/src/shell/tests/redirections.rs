@@ -166,8 +166,9 @@ async fn a_closed_descriptor_stays_closed_in_a_script_the_kernel_refused() {
 /// close-on-exec, as bash's children and this shell's other spawns do: a
 /// make jobserver's pipe the host inherited reaches `make > out 9> fifo &`
 /// as it reaches `make`. And `/dev/fd/N` naming such a host descriptor, which
-/// is no descriptor of the script, fails as `3<&N` does: the process never
-/// takes the host's object through it.
+/// is no descriptor of the script, fails as `3<&N` does, in its place after
+/// the FIFO open: the process never takes the host's object through it, and
+/// the FIFO's reader (`cat fifo`) gets end of file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deferred_command_keeps_the_hosts_inherited_fds_but_takes_none_by_dev_fd() {
 	use std::{
@@ -198,11 +199,13 @@ async fn a_deferred_command_keeps_the_hosts_inherited_fds_but_takes_none_by_dev_
 	let host = unsafe { OwnedFd::from_raw_fd(n) };
 	drop(read);
 	let script = format!(
-		"exec 7<> fifo
-/bin/sh -c 'if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi > kept' > fifo &
+		"/bin/sh -c 'if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi > kept' > fifo &
+cat fifo
 wait
 /bin/sh -c 'cat <&3 > took' > fifo 3< /dev/fd/{n} &
-wait
+cat fifo
+wait $!
+echo \"status $?\"
 cat kept; if [ -e took ]; then echo took; cat took; else echo refused; fi"
 	);
 	let (tx, rx) = flume::unbounded::<String>();
@@ -227,7 +230,7 @@ cat kept; if [ -e took ]; then echo took; cat took; else echo refused; fi"
 		.collect();
 	assert_eq!(
 		lines,
-		["has", "refused"],
+		["status 1", "has", "refused"],
 		"an inherited fd did not reach the process, or /dev/fd/{n} took the host's object: \
 		 {output:?}"
 	);

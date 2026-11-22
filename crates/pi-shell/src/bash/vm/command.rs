@@ -5198,7 +5198,9 @@ fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 /// The fds the redirections `list` of a process close or replace (`Open`,
 /// `Dup` onto it, `Close`) before any of them reads the fd itself (as a
 /// `Dup` source, or as the `/dev/fd/N` path an `Open` of two fds names, as
-/// `&>/dev/fd/4` does): the process never uses what the shell has there.
+/// `&>/dev/fd/4` does): the process never uses what the shell has there. A
+/// step that fails ([`ChildRedir::Fail`]) ends the process: none after it
+/// reads or replaces anything.
 fn replaced_before_read(list: &[crate::bash::ChildRedir]) -> Vec<i32> {
 	use crate::bash::ChildRedir;
 	let mut read: Vec<i32> = Vec::new();
@@ -5229,6 +5231,7 @@ fn replaced_before_read(list: &[crate::bash::ChildRedir]) -> Vec<i32> {
 				write(*fd, &read, &mut replaced);
 			},
 			ChildRedir::Close { fd } => write(*fd, &read, &mut replaced),
+			ChildRedir::Fail { .. } => break,
 		}
 	}
 	replaced
