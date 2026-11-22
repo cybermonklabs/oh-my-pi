@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentIdentity } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { JsonValue, Model } from "@oh-my-pi/pi-ai";
 import { type ConfiguredThinkingLevel, modelSupportsEffortCeiling } from "@oh-my-pi/pi-tui/thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -59,6 +59,7 @@ import {
 	RevivedModels,
 	reopenParkedSubagent,
 	restoreSubagentSettings,
+	SUBAGENT_OVERLAY_SETTINGS,
 	type SubagentBuildInput,
 	type SubagentLegacyRevive,
 	type SubagentLiveInputs,
@@ -77,14 +78,16 @@ import {
 	parentModelGrantPattern,
 } from "./model-approval";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
-import { cfgTaskMaxEffort } from "./settings";
+import { cfgTaskMaxEffort, cfgTaskMaxRuntimeMs } from "./settings";
 import {
+	type JsonRecord,
 	jsonValue,
 	readSpawnSpec,
 	SPAWN_LIVE_INPUT_NAMES,
 	SPAWN_SPEC_VERSION,
 	type SpawnLiveInputName,
 	type SpawnSpecParts,
+	type SpawnSpecPolicy,
 	type SpawnSpecSettings,
 	type SubagentSpawnSpec,
 	spawnSpecSettings,
@@ -97,12 +100,12 @@ const UNAVAILABLE_CUSTOM_TOOLS_NOTICE = "unavailable-custom-tools";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is kept LIVE and read at each
- * revive rather than snapshotted. A record with no spawn spec runs in the root's current cwd, so a later
- * `/new` or cwd move is followed; a record with a spawn spec runs in the cwd its spawn stored, and a seance
- * consult in the cwd its record holds. A revive takes the artifact manager of its live parent session (the
- * root's where the parent is not live) where its spawn passed one (a spec names the live inputs its spawn
- * passed; a record with no spawn spec always takes it) and where that manager can reach the main thread; a
- * seance consult takes none. Auth/models/settings are process-stable and captured by reference.
+ * revive rather than snapshotted: a revived subagent discovers its context in the root's current cwd, so a
+ * later `/new` or cwd move is followed, and its tools run in the cwd its record's header holds; a seance
+ * consult does both in the cwd its record holds. A revive takes the artifact manager of its live parent
+ * session (the root's where the parent is not live) where its spawn passed one (a spec names the live inputs
+ * its spawn passed; a record with no spawn spec always takes it) and where that manager can reach the main
+ * thread; a seance consult takes none. Auth/models/settings are process-stable and captured by reference.
  */
 export interface PersistedSubagentReviveContext {
 	session: AgentSession;
@@ -150,13 +153,25 @@ export interface SubagentParentInputs {
 	readonly live: Omit<ParentLiveInputs, "settings" | "extensionRoots">;
 	/** Its settings, as the recipe main rebuilds them from. */
 	readonly settings: SessionSettingsSource;
+	/** Its values of the policy fields a spawn takes from its spawner. */
+	readonly policy: ParentPolicy;
 	/** The tools of the requested descriptors its kernels define now, as cross-thread views. */
 	readonly customTools: CustomTool[];
 }
 
-/** A live parent's inputs for a child's build, and the tools of the child's descriptors its kernels define now. */
+/**
+ * The policy fields a spawn takes from its spawner's tool session (`buildExecutorOptions`); a cold revive takes
+ * them from the live parent, never from the record.
+ */
+type ParentPolicy = Pick<SpawnSpecPolicy, "credentialSourceSessionId" | "additionalDirectories">;
+
+/**
+ * A live parent's inputs for a child's build, its policy fields, and the tools of the child's descriptors its
+ * kernels define now.
+ */
 interface LiveParent {
 	readonly inputs: ParentLiveInputs;
+	readonly policy: ParentPolicy;
 	readonly customTools: readonly CustomTool[];
 }
 
@@ -185,8 +200,10 @@ export interface PreparedColdRevive {
 	readonly customTools: readonly CustomTool[];
 	/** Names of the custom tools no live kernel serves. */
 	readonly unavailableTools: readonly string[];
-	/** The root session's cwd, where a record with no spawn spec runs. */
+	/** The root session's cwd, where a revived subagent discovers its context (its tools run in its header's). */
 	readonly rootCwd: string;
+	/** The live parent's policy fields a spawn takes from its spawner; undefined where no parent is live. */
+	readonly parentPolicy: ParentPolicy | undefined;
 }
 
 /**
@@ -348,11 +365,16 @@ export async function prepareColdRevive(
 	init: PersistedSessionInit,
 ): Promise<PreparedColdRevive> {
 	const root = ctx.session;
-	const { parts, rejected } = coldReviveSpecParts(target, init);
+	const { parts, rejected, unwritten } = coldReviveSpecParts(target, init);
 	if (rejected !== undefined) {
 		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
 			subagent: target.id,
 			error: rejected,
+		});
+	}
+	if (unwritten) {
+		logger.warn("Revived subagent's stored settings hold values no spawn writes; they read through to the parent", {
+			subagent: target.id,
 		});
 	}
 	const parentSession = liveParentSession(target);
@@ -437,6 +459,7 @@ export async function prepareColdRevive(
 		customTools: tools.customTools,
 		unavailableTools: tools.unavailable,
 		rootCwd: root.sessionManager.getCwd(),
+		parentPolicy: parent?.policy,
 	};
 }
 
@@ -480,12 +503,17 @@ async function liveParent(
 				settings: settingsFromSource(served.settings),
 				extensionRoots: () => parent.deref()?.effectiveExtensionRoots ?? roots,
 			},
+			policy: served.policy,
 			customTools: served.customTools,
 		};
 	}
 	const tools = session && isLocalAgentSession(session) ? session.evalToolSession : undefined;
 	if (!tools) return undefined;
-	return { inputs: parentLiveInputs(tools), customTools: await parentEvalCustomTools(id, tools, descriptors) };
+	return {
+		inputs: parentLiveInputs(tools),
+		policy: parentPolicy(tools),
+		customTools: await parentEvalCustomTools(id, tools, descriptors),
+	};
 }
 
 /**
@@ -516,6 +544,7 @@ export async function serveSubagentParentInputs(
 			subagentEventBus: mainObject(inputs.subagentEventBus),
 		},
 		settings: sessionSettingsSource(tools.settings),
+		policy: parentPolicy(tools),
 		customTools: customTools.map(tool => toWorkerCustomTool(tool)),
 	};
 }
@@ -528,6 +557,15 @@ function mainObject<T>(value: T | undefined): T | undefined {
 /** The live inputs `tools`, a live parent's tool session, holds for a child's build. */
 function parentLiveInputs(tools: ToolSession): ParentLiveInputs {
 	return { ...subagentLiveInputs(tools), eventBus: tools.eventBus, subagentEventBus: tools.subagentEventBus };
+}
+
+/** The policy fields `tools`, a live parent's tool session, gives a spawn of it. */
+function parentPolicy(tools: ToolSession): ParentPolicy {
+	const directories = tools.additionalDirectories;
+	return {
+		credentialSourceSessionId: tools.getCredentialSourceSessionId?.(),
+		additionalDirectories: directories ? [...directories] : undefined,
+	};
 }
 
 /**
@@ -554,24 +592,81 @@ async function parentEvalCustomTools(
  * The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. The stored
  * settings overlay must restore as `overlay()` checks overrides (each setting known, each value one its
  * definition accepts); an overlay that does not is a malformed part, which takes its legacy variant, and
- * `rejected` holds the check's error.
+ * `rejected` holds the check's error. Of an overlay that restores, only the settings a spawn writes
+ * ({@link SUBAGENT_OVERLAY_SETTINGS}) are kept, so a stored value never widens what the live parent allows;
+ * `unwritten` says whether it held any other.
  */
 function coldReviveSpecParts(
 	target: ColdReviveTarget,
 	init: PersistedSessionInit,
-): { parts: SpawnSpecParts; rejected?: string } {
+): { parts: SpawnSpecParts; rejected?: string; unwritten?: boolean } {
 	if (target.restoredSeance) return { parts: { stored: false } };
 	const parts = readSpawnSpec(init);
 	if (!parts.settings) return { parts };
 	try {
 		target.settings.assertOverlayLayers(parts.settings.layers);
-		return { parts };
 	} catch (error) {
 		return {
 			parts: { ...parts, settings: undefined },
 			rejected: error instanceof Error ? error.message : String(error),
 		};
 	}
+	const { global, overrides, derived } = parts.settings.layers;
+	const written = { global: spawnWrittenLayer(global), overrides: spawnWrittenLayer(overrides), derived };
+	return {
+		parts: { ...parts, settings: { ...parts.settings, layers: written } },
+		unwritten: !Bun.deepEquals(written, parts.settings.layers),
+	};
+}
+
+/** Setting paths as a tree of their segments; `true` marks a whole setting. */
+interface SettingPathTree {
+	[segment: string]: SettingPathTree | true;
+}
+
+/** `layer` (one layer of a stored overlay) holding only the settings of {@link SUBAGENT_OVERLAY_SETTINGS}. */
+function spawnWrittenLayer(layer: JsonRecord): JsonRecord {
+	const tree: SettingPathTree = {};
+	for (const id of SUBAGENT_OVERLAY_SETTINGS) {
+		const segments = id.split(".");
+		let node = tree;
+		for (const [index, segment] of segments.entries()) {
+			if (index === segments.length - 1) {
+				node[segment] = true;
+				break;
+			}
+			let next = node[segment];
+			if (next === true) break;
+			if (!next) {
+				next = {};
+				node[segment] = next;
+			}
+			node = next;
+		}
+	}
+	return pickSettings(layer, tree);
+}
+
+/** The values of `layer` at the paths `tree` names. */
+function pickSettings(layer: JsonRecord, tree: SettingPathTree): JsonRecord {
+	const picked: { [key: string]: JsonValue } = {};
+	for (const key in tree) {
+		if (!Object.hasOwn(layer, key)) continue;
+		const value = layer[key];
+		const branch = tree[key];
+		if (branch === true) {
+			picked[key] = value;
+		} else if (isJsonRecord(value)) {
+			const inner = pickSettings(value, branch);
+			if (Object.keys(inner).length > 0) picked[key] = inner;
+		}
+	}
+	return picked;
+}
+
+/** Whether `value` is a JSON object, as a stored overlay layer's settings groups are. */
+function isJsonRecord(value: JsonValue): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** What a cold revive restores the subagent's overlay over: the live parent's settings for a spec's, else the root's. */
@@ -1006,7 +1101,9 @@ async function coldReviveModel(
 /**
  * The spawn spec the build starts from: each part of the record's spec, and for each part it lacks (every
  * part of a record an older omp wrote, or of a seance consult) what the cold revive built before spawn
- * specs, with the values every spawn gives (`cacheWarming: false`) applied to a record with no spec.
+ * specs, with the values every spawn gives (`cacheWarming: false`) applied to a record with no spec. A stored
+ * value never widens what the live process allows: the fields of a stored part that select a place, an
+ * authority or a limit take the live value, or the narrower of the stored and the live one.
  */
 function coldReviveSpawnSpec(
 	spec: PersistedReviveSpec,
@@ -1061,50 +1158,94 @@ function coldReviveSpawnSpec(
 		prewalk: parts.prewalk,
 		settings: parts.settings ?? legacySubagentSettings(id, init, settingsParent),
 		tools,
-		policy: parts.policy ?? {
-			cwd: restoredSeance?.cwd ?? spec.prepared.rootCwd,
-			enableLsp: spec.prepared.live.policy.enableLsp,
-			// A constant of every spawn, applied to a record with no spec: a spec whose policy part is missing or
-			// malformed takes the legacy policy alone.
-			...(parts.stored ? {} : { cacheWarming: false }),
-			...(restricted ? { enableIrc: false, enableMCP: false } : { enableMCP: !spec.prepared.live.mcpManager }),
-			// Old files predate persisted spawns: deny re-spawning rather than let
-			// createAgentSession default to wildcard ("*").
-			spawns: init.spawns ?? "",
-			taskDepth: spec.taskDepth,
-		},
-		identity: parts.identity ?? {
+		policy: parts.policy
+			? {
+					...parts.policy,
+					// Discovery runs in the root's cwd, as for a record with no spec; the tools run in the cwd of
+					// the record's header.
+					cwd: spec.prepared.rootCwd,
+					// Never shallower than the live parent chain, so `task.maxRecursionDepth` holds.
+					taskDepth: Math.max(parts.policy.taskDepth ?? spec.taskDepth, spec.taskDepth),
+					// Where the spawn passed them, the spawner's as the live parent holds them now, never the record's;
+					// none where the parent is not live, or where the spawn passed none (a vibe worker's spawner).
+					credentialSourceSessionId:
+						parts.policy.credentialSourceSessionId === undefined
+							? undefined
+							: spec.prepared.parentPolicy?.credentialSourceSessionId,
+					additionalDirectories:
+						parts.policy.additionalDirectories === undefined
+							? undefined
+							: spec.prepared.parentPolicy?.additionalDirectories,
+				}
+			: {
+					cwd: restoredSeance?.cwd ?? spec.prepared.rootCwd,
+					enableLsp: spec.prepared.live.policy.enableLsp,
+					// A constant of every spawn, applied to a record with no spec: a spec whose policy part is missing or
+					// malformed takes the legacy policy alone.
+					...(parts.stored ? {} : { cacheWarming: false }),
+					...(restricted ? { enableIrc: false, enableMCP: false } : { enableMCP: !spec.prepared.live.mcpManager }),
+					// Old files predate persisted spawns: deny re-spawning rather than let
+					// createAgentSession default to wildcard ("*").
+					spawns: init.spawns ?? "",
+					taskDepth: spec.taskDepth,
+				},
+		identity: {
+			// The names the record stores (`agents` rule scoping keys on the durable definition name, see
+			// `persistedAgentName`); the ids are the live registry ref's, never the record's.
+			agentName: parts.identity ? parts.identity.agentName : agentName,
+			agentDisplayName: parts.identity ? parts.identity.agentDisplayName : displayName,
 			agentId: id,
-			// `agents` rule scoping keys on the durable definition name (see `persistedAgentName`).
-			agentName,
-			agentDisplayName: displayName,
 			parentAgentId: spec.parentId,
 			parentTaskPrefix: id,
 		},
-		prompt: parts.prompt ?? {
-			id,
-			agentSystemPrompt: legacyAgent.systemPrompt,
-			context: "",
-			planReference: "",
-			planReferencePath: "",
-			worktree: "",
-			structured,
-			outputSchemaOverridesAgent: false,
-			ircEnabled: false,
-		},
-		wake: parts.wake ?? {
-			agent: { name: legacyAgent.name, description: legacyAgent.description, source: legacyAgent.source },
-			completionProbe: isCompletionProbeEnabled(spec.settings, spec.taskDepth - 1),
-			...softRequestBudgetFor(agentName, spec.settings),
-			structured,
-			outputSchema: jsonValue(init.outputSchema),
-			outputSchemaMode: init.outputSchemaMode,
-			// Anchor artifacts to the revived ref's own dir (its parent's children
-			// dir), not the live root session's, matching the spawn callers (#11563).
-			artifactsDir: path.dirname(spec.sessionFile),
-		},
+		// The session drives the registry status and the wake frames of this id: the ref's, never the record's.
+		prompt: parts.prompt
+			? { ...parts.prompt, id }
+			: {
+					id,
+					agentSystemPrompt: legacyAgent.systemPrompt,
+					context: "",
+					planReference: "",
+					planReferencePath: "",
+					worktree: "",
+					structured,
+					outputSchemaOverridesAgent: false,
+					ircEnabled: false,
+				},
+		wake: parts.wake
+			? {
+					...parts.wake,
+					// The run's artifacts go to the revived ref's own dir, and its limits are never looser than the
+					// live settings'.
+					artifactsDir: path.dirname(spec.sessionFile),
+					maxRuntimeMs: tighterLimit(parts.wake.maxRuntimeMs, cfgTaskMaxRuntimeMs.get(settingsParent)),
+					softRequestBudget: tighterLimit(
+						parts.wake.softRequestBudget,
+						softRequestBudgetFor(parts.wake.agent.name, settingsParent).softRequestBudget,
+					),
+				}
+			: {
+					agent: { name: legacyAgent.name, description: legacyAgent.description, source: legacyAgent.source },
+					completionProbe: isCompletionProbeEnabled(spec.settings, spec.taskDepth - 1),
+					...softRequestBudgetFor(agentName, spec.settings),
+					structured,
+					outputSchema: jsonValue(init.outputSchema),
+					outputSchemaMode: init.outputSchemaMode,
+					// Anchor artifacts to the revived ref's own dir (its parent's children
+					// dir), not the live root session's, matching the spawn callers (#11563).
+					artifactsDir: path.dirname(spec.sessionFile),
+				},
 	};
 	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt ? legacy : undefined };
+}
+
+/**
+ * The tighter of a stored limit and the live one, where 0 (or no stored value) sets none: a stored limit never
+ * loosens what the live settings allow.
+ */
+export function tighterLimit(stored: number | undefined, live: number): number {
+	const limits = [stored ?? 0, live].filter(limit => limit > 0);
+	return limits.length > 0 ? Math.min(...limits) : 0;
 }
 
 /**

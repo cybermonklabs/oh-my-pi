@@ -1302,6 +1302,28 @@ export function createSubagentSettings(
 	return subagentSettings;
 }
 
+/**
+ * Every setting a spawn writes to a subagent's overlay that a revive restores: {@link createSubagentSettings}' own,
+ * the spawn's per-agent overrides and the retry-fallback role it installs. A cold revive restores only these from
+ * a stored overlay; any other stored value reads through to the live parent. (`workspace.additionalDirectories`
+ * is written only for an isolated run, which is never revived.)
+ */
+export const SUBAGENT_OVERLAY_SETTINGS: readonly string[] = [
+	"compaction.thresholdPercent",
+	"compaction.thresholdTokens",
+	"compaction.modelThresholdsEnabled",
+	"compaction.midTurnEnabled",
+	"defaultThinkingLevel",
+	"tier.openai",
+	"tier.anthropic",
+	"tier.google",
+	"tools.approvalMode",
+	"advisor.enabled",
+	"read.summarize.enabled",
+	"modelRoles",
+	"retry.fallbackChains",
+];
+
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
 
 /** A tool call a subagent finished, as {@link ExecutorOptions.onToolResult} reports it. */

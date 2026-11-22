@@ -23,7 +23,7 @@ import { extractSessionInit } from "../session/session-manager";
 import { collectSubSessions } from "../session/sub-sessions";
 import type { EventBus } from "../utils/event-bus";
 import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
-import { persistedAgentDefinition, persistedAgentName } from "./persisted-revive";
+import { persistedAgentDefinition, persistedAgentName, tighterLimit } from "./persisted-revive";
 import { formatTaskResultSummary } from "./result-summary";
 import { cfgTaskMaxRuntimeMs } from "./settings";
 import { readSpawnSpec } from "./spawn-spec";
@@ -84,8 +84,8 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 		const sessionFileOfRef = ref.sessionFile;
 		const agentName = persistedAgentName(ref.displayName, init);
 		const structured = init.tools.includes("yield");
-		// The spawn's own wake inputs where the record stores them; a record an older omp wrote keeps
-		// the runtime-neutral agent and the live wake limit.
+		// The spawn's own wake inputs where the record stores them, its wake limit never looser than the live
+		// setting; a record an older omp wrote keeps the runtime-neutral agent and the live wake limit.
 		const wake = readSpawnSpec(init).wake;
 		manager.register(
 			"task",
@@ -107,7 +107,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 					eventBus: options.eventBus,
 					subagentEventBus: options.subagentEventBus,
 					artifactsDir: path.dirname(sessionFileOfRef),
-					maxRuntimeMs: wake ? (wake.maxRuntimeMs ?? 0) : cfgTaskMaxRuntimeMs.get(session.settings),
+					maxRuntimeMs: tighterLimit(wake?.maxRuntimeMs, cfgTaskMaxRuntimeMs.get(session.settings)),
 					...softRequestBudgetFor(agentName, session.settings),
 				});
 				const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
