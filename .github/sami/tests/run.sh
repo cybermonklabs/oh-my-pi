@@ -892,9 +892,14 @@ fi
 # has no actions/cache step, and passes `cache: "false"` to every
 # bun-install step, which then sets cache=none and runs neither of its cache
 # steps. release_binary passes `cache: "false"` to its bun-install step too,
-# since bun-install's own save runs on main.
+# since bun-install's own save runs on main. release_binary may restore, and
+# saves only on a push to sami: cache-mode takes no expression, so each of
+# its actions/cache/save steps starts its `if:` with that condition and has
+# no `||`, and it has no actions/cache step (which saves in its post step,
+# under no condition of the job's).
 cache_lint() {
-	local wf="$1" action="$2" rc=0 job jobs steps bun n ok mode
+	local wf="$1" action="$2" rc=0 job jobs steps bun n ok mode saves ns
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\]*\}\}\\n'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -919,8 +924,18 @@ cache_lint() {
 			ok=0
 		fi
 		if [ "$job" = release_binary ]; then
+			if printf '%s\n' "$steps" | grep -qE 'uses: *actions/cache@'; then
+				echo "release_binary has an actions/cache step that saves in its post step"
+				ok=0
+			fi
+			saves="$(printf '%s\n' "$steps" | grep -E 'uses: *actions/cache/save@' || true)"
+			ns="$(printf '%s' "$saves" | grep -c . || true)"
+			if printf '%s\n' "$saves" | grep -vE -- "$push_guard" | grep -q .; then
+				echo "release_binary saves a cache on an event other than a push to sami"
+				ok=0
+			fi
 			if [ "$ok" = 1 ]; then
-				echo "release_binary: bun-install steps: $n, each with cache: \"false\""
+				echo "release_binary: save steps: $ns, each only on a push to sami; bun-install steps: $n, each with cache: \"false\""
 			fi
 		else
 			if [ -n "$mode" ] && [ "$mode" != none ]; then
@@ -960,7 +975,7 @@ wlint() {
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
-wlint W1-release-binary-bun-install-without-cache 0 'release_binary: bun-install steps: 1, each with cache: "false"' '' ''
+wlint W1-release-binary-cache-rule 0 'release_binary: save steps: 1, each only on a push to sami; bun-install steps: 1, each with cache: "false"' '' ''
 wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-install step without cache: "false"' '/^          cache: "false"$/d' ''
 wlint W3-carry-cache-step 1 'carry has an actions/cache step' 's|^        run: git fetch --no-tags https://github.com/can1357/oh-my-pi.git main:refs/remotes/upstream/main$|&\n      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
@@ -978,6 +993,13 @@ wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none
 wlint W11-carry-cache-mode-read 1 'carry has cache-mode: read' 's/^  carry:$/&\n    cache-mode: read/' ''
 wlint W12-rust-test-cache-mode-write 1 'rust_test has cache-mode: write' 's/^  rust_test:$/&\n    cache-mode: write/' ''
 wlint W13-release-github-cache-step 1 'release_github has an actions/cache step' 's|^      - uses: actions/download-artifact@v4$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
+# release_binary saves only on a push to sami; a dispatch, a pull request or
+# any other event only restores.
+wlint W14-release-binary-save-unguarded 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push' && github.ref == 'refs\/heads\/sami' && //" ''
+wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push'/github.event_name == 'workflow_dispatch'/" ''
+wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
+wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to sami' "s#github.ref == 'refs/heads/sami' &&#github.ref == 'refs/heads/sami' ||#" ''
+wlint W18-release-binary-post-save-step 1 'release_binary has an actions/cache step that saves in its post step' 's|uses: actions/cache/restore@|uses: actions/cache@|' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
