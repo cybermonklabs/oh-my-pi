@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use crate::{
 	bash::{
 		Budget, CallId, CallOutcome, ChildRedir, ChildRedirs, Cx, ExitStatus, ExtProc, Lineage,
-		OpenFlags, RunId, Script, ShellApi, Signal, SpawnSpec, Step, Vpid,
+		ModeId, OpenFlags, RunId, Script, ShellApi, ShellInit, Signal, SpawnSpec, Step, Vpid,
 	},
 	testkit::{FakeHost, Fault, MemFs, Rig, fault::skeleton_init, run::wait_runnable, run_script},
 };
@@ -135,6 +135,25 @@ impl ExtProc for Fake {
 fn run(host: FakeHost, src: &str) -> (String, i32) {
 	let out = run_script(host, src.as_bytes(), &[], Fault::None);
 	(String::from_utf8_lossy(&out.stdout).into_owned(), out.status)
+}
+
+/// Run `src` as `zsh -c src` on a fresh rig over `host`: its stdout.
+fn run_zsh(host: FakeHost, src: &str) -> String {
+	let init = ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..skeleton_init(&[]) };
+	let mut rig = Rig::new(host, init);
+	rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+	String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned()
+}
+
+/// The pid the fake spawner gave the program `argv0` (its first spawn).
+fn pid_of(world: &World, argv0: &[u8]) -> u32 {
+	let at = world
+		.redirs
+		.lock()
+		.iter()
+		.position(|(name, _)| name.as_slice() == argv0)
+		.expect("the program ran");
+	FIRST + u32::try_from(at).unwrap()
 }
 
 /// Enough work for the shell's slices to let a pipeline job start its
@@ -463,4 +482,37 @@ fn a_pipelines_last_stage_is_named_by_its_own_pid() {
 		assert_eq!(lines[0], lines[1], "{last}: `$BASHPID` in the last stage is not `$!`");
 		assert!(is_virtual(lines[1]), "{last}: {out}");
 	}
+}
+
+// Failure mode: zsh (and bash under `lastpipe`) runs a background
+// pipeline's last stage in the job's own vproc, which runs on once that
+// stage's program ended, waiting for the first stage: `kill -0 $!` finds
+// it, and `kill $!` signals the job (`wait %1` then 143). bash and zsh fork
+// every stage of an asynchronous pipeline (bash's `lastpipe` only applies
+// to a synchronous one): no such process, status 1; `wait %1` is the
+// pipeline's status, the last program's 0. Controls: under `lastpipe` the
+// last stage's `$BASHPID` is `$!`, and what it assigns stays there.
+#[test]
+fn a_background_pipelines_last_stage_runs_on_its_own() {
+	let script = "/x/sleeper | /x/true & p=$!; kill -0 $p 2>/dev/null; echo \"alive=$?\"; kill $p \
+	              2>/dev/null; echo \"k=$?\"; kill %1; wait %1; echo \"w=$?\"";
+	for zsh in [true, false] {
+		let world = World::new();
+		let out = if zsh {
+			run_zsh(world.host(), script)
+		} else {
+			run(world.host(), &format!("shopt -s lastpipe; {script}")).0
+		};
+		assert_eq!(out, "alive=1\nk=1\nw=0\n", "zsh={zsh}");
+		assert_eq!(world.got(pid_of(&world, b"/x/sleeper")), [Signal::Term], "zsh={zsh}");
+		assert!(world.got(pid_of(&world, b"/x/true")).is_empty(), "zsh={zsh}");
+	}
+	let world = World::new();
+	let (out, _) = run(
+		world.host(),
+		"shopt -s lastpipe; { :; } | { echo \"$BASHPID\"; v=1; } & p=$!; wait; echo \"$p v=$v\"",
+	);
+	let lines: Vec<&str> = out.lines().collect();
+	assert_eq!(lines.len(), 2, "{out}");
+	assert_eq!(format!("{} v=", lines[0]), lines[1], "{out}");
 }

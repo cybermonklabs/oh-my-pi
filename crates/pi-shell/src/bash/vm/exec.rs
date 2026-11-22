@@ -3957,14 +3957,28 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	(group && exec).then_some(BangStage::Exec)
 }
 
+/// Whether the `Spawn` at `pc` starts the pipeline a background job's
+/// whole command is ([`BangStage::Pipeline`]): only that job's own vproc
+/// runs the code at its entry. A timed one (`time a | b &`, its `Spawn`
+/// after the `TimeStart`) is not: bash runs `time P &` in a subshell of
+/// its own, where the pipeline is synchronous.
+fn job_pipeline(unit: &Unit, pc: u32) -> bool {
+	unit.spawns.iter().any(|s| {
+		s.kind == SpawnKind::Background
+			&& s.stages.first().is_some_and(|st| {
+				pc == st.entry && bang_stage(unit, st.entry) == Some(BangStage::Pipeline)
+			})
+	})
+}
+
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
-/// started `stages` (`(vproc, entry)`; the last one a child, or the job's
-/// own vproc under `lastpipe`): its last stage decides the job's pid as a
-/// job body of its own would (bash and zsh name the last process in `$!`),
-/// and a child one that runs no lone program is named by its virtual pid
-/// (its `$BASHPID`). While the job's `[n] pid…` line waits, every earlier
-/// stage decides the pid that line shows for it the same way (zsh names
-/// each process).
+/// started `stages` (`(vproc, entry)`; the last one a child, or under
+/// `lastpipe` the job's own vproc when the pipeline is timed): its last
+/// stage decides the job's pid as a job body of its own would (bash and
+/// zsh name the last process in `$!`), and a child one that runs no lone
+/// program is named by its virtual pid (its `$BASHPID`). While the job's
+/// `[n] pid…` line waits, every earlier stage decides the pid that line
+/// shows for it the same way (zsh names each process).
 fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, u32)]) {
 	let Some(i) = k
 		.bangs
@@ -4108,13 +4122,18 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				// `lastpipe` without job control: the last stage runs here. zsh
 				// runs it in the current shell but under sh emulation
 				// (`execcmd_exec`'s `last1 == 2 && input &&
-				// EMULATION(EMULATE_SH)`).
-				let lastpipe = if unit.mode.dialect() == Dialect::Zsh {
-					vp.mode != ModeId::ZshSh
-				} else {
-					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
-						&& !job_control(k, cx, vp)
-				};
+				// EMULATION(EMULATE_SH)`). Neither for the pipeline a
+				// background job's whole command is ([`job_pipeline`]): bash
+				// and zsh fork every stage of an asynchronous pipeline, the
+				// last one too (bash's `lastpipe` only applies to a
+				// synchronous one, `execute_cmd.c:2735`).
+				let lastpipe = !job_pipeline(unit, top_frame(vp).pc)
+					&& if unit.mode.dialect() == Dialect::Zsh {
+						vp.mode != ModeId::ZshSh
+					} else {
+						state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+							&& !job_control(k, cx, vp)
+					};
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
