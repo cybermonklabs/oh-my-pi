@@ -402,6 +402,7 @@ fn scratch_image(
 			| Live::Path(_)
 			| Live::Open(_)
 			| Live::File(_)
+			| Live::Write(_)
 			| Live::OpenDir(_)
 			| Live::Dir(_)
 			| Live::Spawn(_)
@@ -420,6 +421,7 @@ fn scratch_image(
 	match &sc.live {
 		live if live.is_idempotent_fs() => report.reissued_fs += 1,
 		Live::File(file) => report.lost.push(Lost::Pending { vpid, kind: file.kind() }),
+		Live::Write(w) => report.lost.push(Lost::Pending { vpid, kind: w.0.kind() }),
 		Live::Open(_) => report
 			.lost
 			.push(Lost::Pending { vpid, kind: FileKind::Pipe }),

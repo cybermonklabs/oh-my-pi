@@ -407,17 +407,11 @@ impl FdRef {
 		buf: &[u8],
 		unsettled: &mut Unsettled,
 	) -> Poll<io::Result<usize>> {
-		if unsettled.0.is_none() {
-			match std::task::ready!(self.poll_write_marked(cx, buf)) {
-				Ok((n, Some(mark))) => unsettled.0 = Some((n, mark)),
-				other => return Poll::Ready(other.map(|(n, _)| n)),
-			}
+		match self.0.state.lock().file() {
+			Some(f) => unsettled.poll_write_file(f, cx, buf),
+			// Closed since its chunk was taken: that chunk is the thread's.
+			None => Poll::Ready(unsettled.0.take().map(|(n, _)| n).ok_or_else(bad_fd)),
 		}
-		let (n, mark) = unsettled.0.as_ref().expect("set above");
-		let settled = std::task::ready!(self.poll_settle_marked(cx, std::slice::from_ref(mark)));
-		let n = *n;
-		unsettled.0 = None;
-		Poll::Ready(settled.map(|()| n))
 	}
 
 	/// Kind of the underlying object; `None` when closed or lost.
@@ -476,6 +470,39 @@ impl PartialEq for Unsettled {
 }
 
 impl Eq for Unsettled {}
+
+impl Unsettled {
+	/// Give up the chunk a writer thread took, with its length: the thread
+	/// still writes it, in order, before anything else handed to it, but its
+	/// result is no longer this writer's to settle. A writer that hands what
+	/// is left of its bytes to another writer drops the front this many
+	/// bytes first, which the thread has.
+	pub fn forget(&mut self) -> usize {
+		self.0.take().map_or(0, |(n, _)| n)
+	}
+
+	/// [`FdRef::poll_write_out`] for a file not in the fd table (a history
+	/// file the `history` builtin opened): the chunk `file`'s writer thread
+	/// took is settled, with its error, before it is counted.
+	pub fn poll_write_file(
+		&mut self,
+		file: &mut dyn File,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<usize>> {
+		if self.0.is_none() {
+			match std::task::ready!(file.poll_write_marked(cx, buf)) {
+				Ok((n, Some(mark))) => self.0 = Some((n, mark)),
+				other => return Poll::Ready(other.map(|(n, _)| n)),
+			}
+		}
+		let (n, mark) = self.0.as_ref().expect("set above");
+		let settled = std::task::ready!(file.poll_settle_marked(cx, std::slice::from_ref(mark)));
+		let n = *n;
+		self.0 = None;
+		Poll::Ready(settled.map(|()| n))
+	}
+}
 
 /// Trace-only forwarding descriptor. Its base is always an unwrapped
 /// visible capture, so retagging cannot build a chain of wrappers.

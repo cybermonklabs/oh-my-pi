@@ -503,10 +503,11 @@ fn creation_mask_clears_bits_from_host_creations() {
 }
 
 /// A creation mask applies as well to an open that creates through `O_CREAT`
-/// among its custom flags (with `O_EXCL`, only a new file): the new file gets
-/// exactly its mode less the mask, whatever the process umask, and an existing
-/// file keeps its mode. One mask looser than any process umask and one
-/// stricter, so the process umask cannot pass for both.
+/// among its custom flags (with `O_EXCL`, only a new file), whether it writes
+/// or only reads: the new file gets exactly its mode less the mask, whatever
+/// the process umask, and an existing file keeps its mode. One mask looser
+/// than any process umask and one stricter, so the process umask cannot pass
+/// for both.
 #[cfg(unix)]
 #[test]
 fn creation_mask_applies_to_a_custom_o_creat() {
@@ -518,19 +519,31 @@ fn creation_mask_applies_to_a_custom_o_creat() {
 	creat.write(true).custom_flags(libc::O_CREAT);
 	let mut excl = OpenOptions::new();
 	excl.write(true).custom_flags(libc::O_CREAT | libc::O_EXCL);
+	let mut read_creat = OpenOptions::new();
+	read_creat.read(true).custom_flags(libc::O_CREAT);
+	let mut read_excl = OpenOptions::new();
+	read_excl
+		.read(true)
+		.custom_flags(libc::O_CREAT | libc::O_EXCL);
+	let cases = [
+		("write, O_CREAT", &creat),
+		("write, O_CREAT | O_EXCL", &excl),
+		("read, O_CREAT", &read_creat),
+		("read, O_CREAT | O_EXCL", &read_excl),
+	];
 	let mut wrong = Vec::new();
 	for (mask, want) in [(0, 0o666), (0o077, 0o600)] {
 		let fs = Fs::native().with_creation_mask(Some(mask)).blocking();
-		for (index, (label, options)) in [("O_CREAT", &creat), ("O_CREAT | O_EXCL", &excl)]
-			.into_iter()
-			.enumerate()
-		{
+		for (index, (label, options)) in cases.into_iter().enumerate() {
 			let path = dir.0.join(format!("new-{mask:o}-{index}"));
-			fs.open_with(&path, options)
-				.unwrap_or_else(|err| panic!("{label}, mask {mask:o}: {err}"));
-			let got = mode(&path);
-			if got != want {
-				wrong.push(format!("{label}, mask {mask:o}: mode {got:o}, not {want:o}"));
+			match fs.open_with(&path, options) {
+				Ok(_) => {
+					let got = mode(&path);
+					if got != want {
+						wrong.push(format!("{label}, mask {mask:o}: mode {got:o}, not {want:o}"));
+					}
+				},
+				Err(err) => wrong.push(format!("{label}, mask {mask:o}: {err} ({:?})", err.kind())),
 			}
 		}
 	}
@@ -1075,4 +1088,197 @@ fn fifo_opens_through_a_cancellable_view_keep_nofollow() {
 	std::os::unix::fs::symlink(&fifo, &link).unwrap();
 	let err = scoped.open_with(&link, &options).unwrap_err();
 	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+}
+
+/// A `>` (write, create, truncate) through a cancellable view.
+#[cfg(target_os = "linux")]
+fn redirect() -> OpenOptions {
+	let mut options = OpenOptions::new();
+	options.write(true).create(true).truncate(true);
+	options
+}
+
+/// A helper the drop has left changes no file. A `>` through a cancellable
+/// view whose helper is held up between its last check and its open for
+/// longer than the drop waits for it, as a loaded node can hold a thread:
+/// the token fires while the helper is held, the open fails, and the drop
+/// leaves the helper at its bound. The helper then opens the path:
+/// - a regular file put there keeps its bytes: the helper's open does not
+///   truncate, and it closes what it opened at once;
+/// - where the path names nothing, it leaves at most an empty regular file (its
+///   `O_CREAT` creates one, which it closes at once; what is left, see
+///   [`FifoOpen`]), and nothing else: no bytes, no other kind of file;
+/// - where the path still names the FIFO, the helper waits there as a writer
+///   until a reader comes, which then reads end of file (what is left).
+///
+/// Every wait is bounded, so a regression fails rather than hangs.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_open_whose_helper_the_drop_left_changes_no_file() {
+	use std::{os::unix::fs::OpenOptionsExt, sync::mpsc, time::Instant};
+	const LIMIT: Duration = Duration::from_secs(10);
+	let held_for = crate::fifo::LEAVE_AFTER + Duration::from_secs(1);
+	let wait = |done: &dyn Fn() -> bool| {
+		let start = Instant::now();
+		while !done() && start.elapsed() < LIMIT {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		done()
+	};
+	let mut wrong = Vec::new();
+	for late in ["a regular file", "nothing", "the FIFO"] {
+		let dir = TempDir::new("fifo-left");
+		let fifo = dir.0.join("fifo");
+		BlockingFs::native()
+			.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+			.unwrap();
+		let (reached_tx, reached) = mpsc::channel();
+		let (moved_tx, moved) = mpsc::channel();
+		let at = fifo.clone();
+		crate::fifo::hooks::before_open(&fifo, move || {
+			let _ = reached_tx.send(());
+			std::thread::sleep(held_for);
+			match late {
+				"a regular file" => {
+					std::fs::rename(&at, at.with_extension("old")).unwrap();
+					std::fs::write(&at, "kept").unwrap();
+				},
+				"nothing" => std::fs::rename(&at, at.with_extension("old")).unwrap(),
+				_ => {},
+			}
+			let _ = moved_tx.send(());
+		});
+		let token = CancellationToken::new();
+		let scoped = BlockingFs::native().with_cancellation(token.clone());
+		let path = fifo.clone();
+		let opener = std::thread::spawn(move || scoped.open_with(&path, &redirect()).map(drop));
+		if reached.recv_timeout(LIMIT).is_err() {
+			wrong.push(format!("{late}: the helper had not reached its open after {LIMIT:?}"));
+		}
+		token.cancel();
+		if !wait(&|| opener.is_finished()) {
+			wrong.push(format!("{late}: the open had not returned {LIMIT:?} after the token fired"));
+		}
+		if moved.recv_timeout(LIMIT).is_err() {
+			wrong.push(format!("{late}: the helper's hold had not ended after {LIMIT:?}"));
+		}
+		let reader = (late == "the FIFO").then(|| {
+			std::thread::sleep(Duration::from_millis(200));
+			if crate::fifo::hooks::ended(&fifo) {
+				wrong.push(format!("{late}: the helper ended with no reader"));
+			}
+			std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo)
+				.unwrap()
+		});
+		if !wait(&|| crate::fifo::hooks::ended(&fifo)) {
+			wrong.push(format!("{late}: the helper had not ended after {LIMIT:?}"));
+		}
+		match (late, reader) {
+			("a regular file", _) => {
+				let got = std::fs::read_to_string(&fifo).unwrap();
+				if got != "kept" {
+					wrong.push(format!("{late}: the file holds {got:?}, not \"kept\""));
+				}
+			},
+			("nothing", _) => match std::fs::symlink_metadata(&fifo) {
+				Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+				Ok(m) if m.is_file() && m.len() == 0 => {},
+				other => wrong.push(format!(
+					"{late}: the path names {other:?}, not nothing or an empty regular file"
+				)),
+			},
+			(_, Some(mut reader)) => {
+				let mut got = Vec::new();
+				if !matches!(reader.read_to_end(&mut got), Ok(0)) {
+					wrong.push(format!("{late}: the reader got {got:?}, not end of file"));
+				}
+			},
+			_ => unreachable!(),
+		}
+		if opener.is_finished() && opener.join().unwrap().is_ok() {
+			wrong.push(format!("{late}: the open succeeded though its token fired"));
+		}
+	}
+	assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A `>` through a cancellable view whose FIFO is replaced by a regular file
+/// just before its helper's open, while the call still waits for it, opens
+/// that file and truncates it, as `open(2)` of the path with `O_TRUNC` does.
+/// An open that waits instead (its helper on the FIFO the path no longer
+/// names) fails the test within its bound: the token then ends the open.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_open_whose_path_names_a_regular_file_by_its_open_truncates_it() {
+	const LIMIT: Duration = Duration::from_secs(10);
+	let dir = TempDir::new("fifo-live");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let at = fifo.clone();
+	crate::fifo::hooks::before_open(&fifo, move || {
+		std::fs::rename(&at, at.with_extension("old")).unwrap();
+		std::fs::write(&at, "replaced").unwrap();
+	});
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let path = fifo.clone();
+	let opener = std::thread::spawn(move || {
+		let mut file = scoped.open_with(&path, &redirect())?;
+		file.write_all(b"new")
+	});
+	let start = std::time::Instant::now();
+	while !opener.is_finished() && start.elapsed() < LIMIT {
+		std::thread::sleep(Duration::from_millis(5));
+	}
+	let returned = opener.is_finished();
+	if !returned {
+		token.cancel();
+	}
+	let written = opener.join().unwrap();
+	assert!(
+		returned,
+		"the open had not returned after {LIMIT:?}: its helper waits on a FIFO, not the regular \
+		 file at the path"
+	);
+	written.unwrap();
+	assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "new", "the regular file was not truncated");
+}
+
+/// A read-only FIFO open that asks for `O_TRUNC` keeps it when its helper
+/// opens the path (an open that creates), so the kernel asks the write
+/// permission `O_TRUNC` asks, as of the plain open: a FIFO this process may
+/// only read is refused (`EACCES`). Root may write it, so as root both open.
+/// Both of the FIFO's ends are held, so each open ends at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_only_fifo_open_that_truncates_asks_the_write_permission_of_the_plain_open() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = TempDir::new("fifo-read-trunc");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let _both = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&fifo)
+		.unwrap();
+	std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o444)).unwrap();
+	let mut options = OpenOptions::new();
+	options
+		.read(true)
+		.custom_flags(libc::O_CREAT | libc::O_TRUNC);
+	let outcome = |opened: io::Result<File>| opened.map(drop).map_err(|err| err.raw_os_error());
+	let plain = outcome(BlockingFs::native().open_with(&fifo, &options));
+	let scoped = BlockingFs::native().with_cancellation(CancellationToken::new());
+	assert_eq!(outcome(scoped.open_with(&fifo, &options)), plain, "through a cancellable view");
+	// SAFETY: `geteuid` has no preconditions.
+	if unsafe { libc::geteuid() } != 0 {
+		assert_eq!(plain, Err(Some(libc::EACCES)), "the plain open");
+	}
 }

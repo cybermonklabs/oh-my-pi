@@ -72,7 +72,10 @@ use crate::{
 #[cfg(unix)]
 use crate::{
 	fifo::{FifoName, FifoOpen, FifoPin},
-	fs::{creates, fifo_open_waits, reopen_options, wait_fifo, wait_fifo_async},
+	fs::{
+		by_name_options, creates, fifo_open_waits, reopen_options, truncates, wait_fifo,
+		wait_fifo_async,
+	},
 };
 
 /// Parallelism past which concurrent host listing costs more than it gains:
@@ -632,10 +635,11 @@ fn host_fifo_pin(
 /// helper thread ([`FifoOpen`]). Where `/proc/self/fd` is there (Linux with
 /// `/proc`), a dropped open's release reaches the pinned FIFO through it, and
 /// so does the helper, unless the open has `O_CREAT` ([`creates`]): that
-/// helper opens `name` with the caller's options, relative to a duplicate of
-/// the directory's descriptor. Elsewhere (off Linux, and on Linux without
-/// `/proc`) the helper opens `name` there, and the release opens it while it
-/// names the pinned FIFO.
+/// helper opens `name` with the caller's options but for `O_TRUNC`, which it
+/// applies itself while the open is live ([`by_name_options`]), relative to
+/// a duplicate of the directory's descriptor. Elsewhere (off Linux, and on
+/// Linux without `/proc`) the helper opens `name` there, and the release
+/// opens it while it names the pinned FIFO.
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -652,16 +656,23 @@ fn host_fifo_open(
 	let fifo_name = FifoName::at(handle.as_fd(), name)?;
 	let dir = handle.try_clone()?;
 	let (open_name, open_options, mask) = (name.to_vec(), options.clone(), host_mask(scope));
-	Ok(FifoOpen::start_pinned(pin, fifo_name, creates(options), move |path, pinned| {
-		if pinned {
-			reopen_options(&open_options)
-				.to_std()
-				.open(path)
-				.map(File::from)
-		} else {
-			with_scratch(|s| native::open_at(s, &dir, &open_name, &open_options, mask)).map(File::from)
-		}
-	}))
+	Ok(FifoOpen::start_pinned(
+		pin,
+		fifo_name,
+		creates(options),
+		truncates(options),
+		move |path, pinned| {
+			if pinned {
+				reopen_options(&open_options)
+					.to_std()
+					.open(path)
+					.map(File::from)
+			} else {
+				let by_name = by_name_options(&open_options);
+				with_scratch(|s| native::open_at(s, &dir, &open_name, &by_name, mask)).map(File::from)
+			}
+		},
+	))
 }
 
 const fn provider_dir_options(mode: Option<u32>) -> DirOptions {

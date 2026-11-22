@@ -156,30 +156,6 @@ fn host_mask(scope: &Scope) -> Option<u32> {
 	scope.creation_mask.filter(|_| cfg!(unix))
 }
 
-/// How an open creates a missing file: `None` when it creates none, else
-/// `Some(exclusive)`, `exclusive` when it creates only a new file. Through
-/// `create` or `create_new`, and on Unix through `O_CREAT` (with `O_EXCL`)
-/// among its custom flags, which the kernel honours alike.
-const fn creation(options: &OpenOptions) -> Option<bool> {
-	#[cfg(unix)]
-	let (custom, custom_exclusive) = {
-		let flags = options.get_custom_flags();
-		(
-			flags & libc::O_CREAT != 0,
-			flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL,
-		)
-	};
-	#[cfg(not(unix))]
-	let (custom, custom_exclusive) = (false, false);
-	if options.is_create_new() || custom_exclusive {
-		Some(true)
-	} else if options.is_create() || custom {
-		Some(false)
-	} else {
-		None
-	}
-}
-
 /// Opens a host path under the facade's creation mask: a file the open
 /// creates gets exactly its requested mode (`0o666` by default) less the
 /// mask. The mask replaces the process umask, which the kernel still applies
@@ -189,15 +165,19 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 	let Some(mask) = host_mask(scope) else {
 		return native::open(path, options);
 	};
-	let Some(exclusive_only) = creation(options) else {
+	if !creates(options) {
 		return native::open(path, options);
-	};
+	}
 	let mode = options.get_mode().unwrap_or(0o666) & !mask;
 	let mut masked = options.clone();
 	masked.mode(mode);
 	// Only an exclusive create proves the file is new; an existing file keeps
-	// its mode.
+	// its mode. On Unix it is asked for as `O_CREAT | O_EXCL`, which a
+	// read-only open may carry too (`create_new` needs write access).
 	let mut exclusive = masked.clone();
+	#[cfg(unix)]
+	exclusive.custom_flags(exclusive.get_custom_flags() | libc::O_CREAT | libc::O_EXCL);
+	#[cfg(not(unix))]
 	exclusive.create_new(true);
 	match native::open(path, &exclusive) {
 		Ok(file) => {
@@ -206,9 +186,8 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 			let _ = file.set_permissions(Permissions::from_mode(mode));
 			Ok(file)
 		},
-		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !exclusive_only => {
-			native::open(path, &masked)
-		},
+		// An exclusive open (`create_new`, `O_EXCL`) is refused again here.
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists => native::open(path, &masked),
 		Err(err) => Err(err),
 	}
 }
@@ -347,9 +326,12 @@ pub(crate) const fn fifo_open_waits(options: &OpenOptions) -> bool {
 /// through the magic link (the write permission `O_TRUNC` asks, from the
 /// flags alone; `EEXIST` needs `O_CREAT`), so every other open reopens the
 /// pin.
-#[cfg(unix)]
 pub(crate) const fn creates(options: &OpenOptions) -> bool {
-	options.is_create() || options.is_create_new() || options.get_custom_flags() & libc::O_CREAT != 0
+	#[cfg(unix)]
+	let custom = options.get_custom_flags() & libc::O_CREAT != 0;
+	#[cfg(not(unix))]
+	let custom = false;
+	options.is_create() || options.is_create_new() || custom
 }
 
 /// `options`, which have no `O_CREAT` ([`creates`]), for an open of a pinned
@@ -364,14 +346,38 @@ pub(crate) fn reopen_options(options: &OpenOptions) -> OpenOptions {
 	reopen
 }
 
+/// Whether a FIFO's helper applies `O_TRUNC` itself: a write (`write` or
+/// `append`) with `truncate` or a custom `O_TRUNC`. Its open of the name
+/// leaves `O_TRUNC` out ([`by_name_options`]) and asks the write permission
+/// `O_TRUNC` asks anyway; a read-only open keeps `O_TRUNC`, so the kernel
+/// still asks that permission of it ([`FifoOpen`]).
+#[cfg(unix)]
+pub(crate) const fn truncates(options: &OpenOptions) -> bool {
+	options.is_writable()
+		&& (options.is_truncate() || options.get_custom_flags() & libc::O_TRUNC != 0)
+}
+
+/// `options` for a pinned FIFO's helper's open of the name: without
+/// `O_TRUNC` for an open whose helper applies it itself ([`truncates`]).
+#[cfg(unix)]
+pub(crate) fn by_name_options(options: &OpenOptions) -> OpenOptions {
+	let mut by_name = options.clone();
+	if truncates(options) {
+		by_name
+			.truncate(false)
+			.custom_flags(options.get_custom_flags() & !libc::O_TRUNC);
+	}
+	by_name
+}
+
 /// Starts opening one end of the FIFO at `path`, pinned as `pin`, on a helper
 /// thread (see [`FifoOpen`]), so that the wait for the other end observes
 /// `token` and, for async callers, holds no runtime worker. The helper runs
 /// the ordinary blocking open, so the open returns exactly when it would
 /// without a token: once the other end connects. It opens the pin's
-/// `/proc/self/fd/N` with [`reopen_options`], or the path with `options`
-/// when the open has `O_CREAT` ([`creates`]) or no `/proc/self/fd/N` reaches
-/// the pin.
+/// `/proc/self/fd/N` with [`reopen_options`], or the path with
+/// [`by_name_options`] when the open has `O_CREAT` ([`creates`]) or no
+/// `/proc/self/fd/N` reaches the pin.
 ///
 /// Once the token fires, the open fails with [`crate::cancelled`], and
 /// dropping it releases the helper, so it leaves no end of the FIFO behind
@@ -393,13 +399,19 @@ fn start_fifo(
 	let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
 	let name = FifoName::Path { path: path.to_path_buf(), follow };
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start_pinned(pin, name, creates(&options), move |path, pinned| {
-		if pinned {
-			native_open(&scope, path, &reopen_options(&options))
-		} else {
-			native_open(&scope, path, &options)
-		}
-	}))
+	Ok(FifoOpen::start_pinned(
+		pin,
+		name,
+		creates(&options),
+		truncates(&options),
+		move |path, pinned| {
+			if pinned {
+				native_open(&scope, path, &reopen_options(&options))
+			} else {
+				native_open(&scope, path, &by_name_options(&options))
+			}
+		},
+	))
 }
 
 /// Waits for a FIFO open on this thread, checking `token` every poll slice.

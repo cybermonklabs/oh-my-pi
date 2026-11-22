@@ -767,6 +767,7 @@ fn report(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, chunks: Ve
 			Chunk::Out(fd, bytes) => {
 				vp.out.push_back(PendingWrite::new(fd, bytes.into()));
 			},
+			Chunk::Cont(id) => vp.out.push_back(PendingWrite::then_continue(id)),
 		}
 	}
 }

@@ -8,11 +8,12 @@ use std::io::Write as _;
 
 use bstr::{BString, ByteSlice};
 
-use super::{Control, Ctx, Need, Outcome, R, Wait, dirstack, done, number, opts};
+use super::{Chunk, Control, Ctx, Need, Outcome, R, Wait, dirstack, done, number, opts};
 use crate::bash::{
 	ControlHandle, Platform,
 	diag::Diag,
 	event::{EventData, WaitKey},
+	ids::JobId,
 	signal::{SigTarget, Signal},
 	store::OptId,
 	vm::{
@@ -393,17 +394,15 @@ fn movable(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> Result<u32, i32> {
 	Ok(number)
 }
 
-/// Continue job `number` if it is stopped (bash `killpg (pgrp, SIGCONT)` and
-/// `set_job_running`).
-fn resume(ctx: &mut Ctx<'_, '_>, number: u32) {
-	let Some(job) = ctx.vp.jobs.get_mut(number) else {
-		return;
-	};
-	if matches!(job.state, JobState::Stopped(_)) {
-		job.state = JobState::Running;
-		let id = job.id;
-		ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+/// Mark job `number` running if it is stopped (bash `set_job_running`):
+/// the job to continue (bash `killpg (pgrp, SIGCONT)`), if any.
+fn set_running(ctx: &mut Ctx<'_, '_>, number: u32) -> Option<JobId> {
+	let job = ctx.vp.jobs.get_mut(number)?;
+	if !matches!(job.state, JobState::Stopped(_)) {
+		return None;
 	}
+	job.state = JobState::Running;
+	Some(job.id)
 }
 
 /// The `(wd: dir)` note bash adds when a job started elsewhere.
@@ -434,7 +433,9 @@ fn foreground(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> R {
 	line.push(b'\n');
 	ctx.out(&line);
 	jobctl::give_terminal(ctx.k, ctx.cx, vpid);
-	resume(ctx, number);
+	if let Some(id) = set_running(ctx, number) {
+		ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+	}
 	if let Some(job) = ctx.vp.jobs.get_mut(number) {
 		job.notified = true;
 	}
@@ -481,7 +482,11 @@ fn background(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> i32 {
 	line.extend_from_slice(&wd_note(ctx, &wd, b"\t").unwrap_or_default());
 	line.push(b'\n');
 	ctx.out(&line);
-	resume(ctx, number);
+	// The job line is out before the job runs on, as bash prints it and then
+	// continues the job: the continue waits behind it in the output.
+	if let Some(id) = set_running(ctx, number) {
+		ctx.chunks.push(Chunk::Cont(id));
+	}
 	if let Some(job) = ctx.vp.jobs.get_mut(number) {
 		job.notified = true;
 	}
@@ -591,4 +596,132 @@ pub fn suspend(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let vpid = ctx.vp.vpid;
 	ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Vpid(vpid), Signal::Stop);
 	done(0)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::{
+		io::Read as _,
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+	use crate::bash::{
+		Engine, EngineConfig, FdRef, MemStore,
+		fd::{FdOrigin, FdTable},
+		ids::{JobId, Vpid},
+		signal::SigSet,
+		vm::{
+			Kernel, exec,
+			proc::{PendingWrite, Vproc},
+			state,
+		},
+	};
+
+	/// A kernel, a host, its store, and the shell's vproc with a stopped
+	/// job `%1` (`sleep 100`) and fd 1 a socket (its writes go to its
+	/// writer thread); the socket's other end, to read what fd 1 got.
+	fn shell_with_a_stopped_job()
+	-> (Kernel, crate::process::NativeHost, MemStore, Vproc, std::os::unix::net::UnixStream) {
+		let mut store = MemStore::new();
+		let root = state::Root::load(&mut store).unwrap();
+		let engine = Engine::new(EngineConfig::default());
+		let k = Kernel::new(&engine, root, BString::from("bash"), std::process::id());
+		let host =
+			crate::process::NativeHost::new(None, false, Vec::new(), SigSet::default(), 0, false);
+		let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+		peer
+			.set_read_timeout(Some(Duration::from_secs(10)))
+			.unwrap();
+		let file = crate::sys::StdFile::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+		let mut vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		vp.fds
+			.set(1, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
+		let number =
+			vp.jobs
+				.add(JobId(7), Vpid(2), BString::from("sleep 100"), true, BString::from("/"));
+		vp.jobs.get_mut(number).unwrap().state = JobState::Stopped(Signal::Tstp);
+		vp.jobs.set_current(number);
+		(k, host, store, vp, peer)
+	}
+
+	/// Runs bash `bg %1` in `vp`: the builtin's output.
+	fn bg(k: &mut Kernel, cx: &mut crate::bash::vm::Cx<'_>, vp: &mut Vproc) -> Vec<Chunk> {
+		let mut ctx = Ctx {
+			k,
+			cx,
+			vp,
+			probes: &[],
+			probe_at: std::cell::Cell::new(0),
+			chunks: Vec::new(),
+			line: 0,
+			name: "bg",
+			compound: Vec::new(),
+			usage_error: false,
+			log: Vec::new(),
+			log_cursor: 0,
+			arrayref: Vec::new(),
+			resumed: 0,
+		};
+		assert_eq!(background(&mut ctx, Some(&BString::from("%1"))), 0);
+		std::mem::take(&mut ctx.chunks)
+	}
+
+	/// bash `bg` prints the job, then continues it: the builtin requests no
+	/// continue itself, before its line is written. The continue requested
+	/// inside the builtin could reach the job while the line was still in
+	/// the writer thread, so the job's output came first.
+	#[test]
+	fn bash_bg_continues_nothing_before_its_job_line_is_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::bash_bg_continues_nothing_before_its_job_line_is_out"),
+			|| {
+				let (mut k, mut host, mut store, mut vp, _peer) = shell_with_a_stopped_job();
+				let mut cx = crate::bash::vm::Cx { host: &mut host, store: &mut store };
+				let _held = crate::sys::hold_writers();
+				let _ = bg(&mut k, &mut cx, &mut vp);
+				assert_eq!(k.ctl.word(), 0, "bg continued the job before its line was written");
+			},
+		);
+	}
+
+	/// A continue queued on the shell's own output (`vp.out`) behind the
+	/// line before it, as `[[ ]]`, `test` and zsh's exit hooks queue a
+	/// builtin's chunks (`report` in `builtins/test.rs`, `zsh/cond.rs` and
+	/// `zsh/zexit.rs`), here bash `bg`'s: while the writer thread holds the
+	/// line, the job is not continued; once the line is out,
+	/// [`exec::flush_out`] takes the entry off and continues the job.
+	#[test]
+	fn a_continue_queued_on_the_shells_output_goes_once_the_line_before_it_is_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_continue_queued_on_the_shells_output_goes_once_the_line_before_it_is_out"
+			),
+			|| {
+				let (mut k, mut host, mut store, mut vp, mut peer) = shell_with_a_stopped_job();
+				let mut cx = crate::bash::vm::Cx { host: &mut host, store: &mut store };
+				let held = crate::sys::hold_writers();
+				for chunk in bg(&mut k, &mut cx, &mut vp) {
+					match chunk {
+						Chunk::Out(fd, bytes) => vp.out.push_back(PendingWrite::new(fd, bytes.into())),
+						Chunk::Cont(id) => vp.out.push_back(PendingWrite::then_continue(id)),
+						Chunk::Diag(_) => panic!("bg reported an error"),
+					}
+				}
+				assert!(exec::flush_out(&mut k, &mut vp).is_some(), "the line went out while held");
+				assert_eq!(k.ctl.word(), 0, "the job was continued while its line was not out");
+				drop(held);
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while exec::flush_out(&mut k, &mut vp).is_some() {
+					assert!(Instant::now() < deadline, "DEADLINE: the line was not out within 10 s");
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				assert_ne!(k.ctl.word(), 0, "the job was not continued once its line was out");
+				let mut got = [0u8; 16];
+				peer.read_exact(&mut got).unwrap();
+				assert_eq!(&got, b"[1]+ sleep 100 &");
+			},
+		);
+	}
 }

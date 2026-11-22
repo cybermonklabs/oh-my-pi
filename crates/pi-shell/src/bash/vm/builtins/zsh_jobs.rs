@@ -365,8 +365,9 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 					}
 					jobctl::give_terminal(ctx.k, ctx.cx, vpid);
 				}
+				// The job line is out before the job runs on.
 				if stopped {
-					ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+					jobctl::continue_job(ctx.k, id);
 				}
 				if f == JobFunc::Fg {
 					let wait = Wait {

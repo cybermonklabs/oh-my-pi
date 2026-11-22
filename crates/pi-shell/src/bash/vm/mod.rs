@@ -2039,6 +2039,10 @@ impl Shell {
 		let start = cx.host.now_ns();
 		let mut ops = 0u32;
 		loop {
+			// The shell's job notices go out as its terminal takes them, also
+			// while the shell waits for a job (zsh `notify`); the terminal's
+			// writer thread wakes the kernel when it is done with a chunk.
+			jobctl::drain_shout(&mut self.k);
 			if let Some(err) = self.k.root.take_fault() {
 				self.fail_all(cx, &err);
 			}

@@ -2280,11 +2280,13 @@ mod unix {
 	/// name is given to another FIFO (`rm p; mkfifo p`) just after the pin,
 	/// before the helper opens the name, so the helper waits on the new FIFO
 	/// while the drop's release opens the pinned one through
-	/// `/proc/self/fd/N`. The open is dropped after the helper passed its
-	/// check: the release runs and does not reach the helper, and the drop
-	/// returns without waiting for it (a watchdog fails the test, ending the
-	/// process, if it waits), while the helper stays in its open, holding the
-	/// pin (one descriptor of the old FIFO stays open). The new FIFO's next
+	/// `/proc/self/fd/N`. The open is dropped once the helper passed its last
+	/// check and is about to open the name (a drop before that check leaves a
+	/// helper that opens nothing, and so no window): the release runs and
+	/// does not reach the helper, and the drop returns without waiting for it
+	/// (a watchdog fails the test, ending the process, if it waits), while
+	/// the helper stays in its open, holding the pin (one descriptor of the
+	/// old FIFO stays open). The new FIFO's next
 	/// reader then completes the helper's open; the helper closes its end at
 	/// once, so that reader reads end of file, and the pin's descriptor is
 	/// closed. Through a handle's `open_at_async` and the facade's own open.
@@ -2330,8 +2332,16 @@ mod unix {
 			}
 			let (started_tx, started) = std::sync::mpsc::channel();
 			let helper_opened = hook_next_fifo_helper(started_tx, None);
+			// The helper's last check is passed once its hook before the open
+			// runs; the hook's key is what the helper opens by name: an
+			// entry's name for a handle, the path for the facade.
 			let (reached_tx, reached) = std::sync::mpsc::channel();
-			crate::fs::fifo_seam::after_check(reached_tx, false);
+			let key = if route == "handle" {
+				PathBuf::from(&name)
+			} else {
+				fifo.clone()
+			};
+			crate::fifo::hooks::before_open(&key, move || reached_tx.send(()).unwrap());
 			let first = attempts.lock().len();
 			let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
 			{
@@ -2359,7 +2369,7 @@ mod unix {
 					.unwrap_or_else(|_| panic!("{route}: the helper never started"));
 				reached
 					.recv_timeout(HELPER_BOUND)
-					.unwrap_or_else(|_| panic!("{route}: the helper never passed its check"));
+					.unwrap_or_else(|_| panic!("{route}: the helper never passed its last check"));
 			});
 			dropped.store(true, std::sync::atomic::Ordering::SeqCst);
 			let old = pinned

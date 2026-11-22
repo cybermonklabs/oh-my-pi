@@ -839,7 +839,24 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// and the settle. The chunk handed off last settles before the next one
 /// goes, and an entry stops at its first failed chunk; write errors on a
 /// diagnostic stream are dropped, as bash does.
-pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
+pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+	// The shell's job notices still going out to its terminal come first
+	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
+	if super::jobctl::shout_waits(k, vp) {
+		return Some(super::zle::tty::FD);
+	}
+	flush_queued(k, vp)
+}
+
+/// [`flush_out`] without waiting for the shell's job notices: for a
+/// failed compound redirection's message, which belongs on the fd 2 its
+/// redirections left. The `Redir` op restores the fds in the same step,
+/// right after this ([`clear_scratch`]), and cannot wait in between: an op
+/// that waits runs again, which would try the failed redirection again and
+/// print its message twice. The op waits for the notices and the editor's
+/// display bytes before it applies anything, so only a notice queued while
+/// it was parked mid-way can still be going out here.
+fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
@@ -849,13 +866,22 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	{
 		return Some(tty::FD);
 	}
-	let mut cx = Context::from_waker(&k.waker);
+	if vp.out.is_empty() {
+		return None;
+	}
+	let waker = k.waker.clone();
+	let mut cx = Context::from_waker(&waker);
 	while let Some(w) = vp.out.front_mut() {
 		if w.fd == tty::FD {
 			if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
 				t.put(&w.bytes[w.off..]);
-				vp.out.pop_front();
-				if t.flush(k).is_some() {
+				pop_out(k, vp);
+				if vp
+					.zle
+					.as_deref_mut()
+					.and_then(|z| z.tty.as_mut())
+					.is_some_and(|t| t.flush(k).is_some())
+				{
 					return Some(tty::FD);
 				}
 				continue;
@@ -877,12 +903,12 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			};
 			w.handed = super::proc::HandedOff::default();
 			if settled.is_err() {
-				vp.out.pop_front();
+				pop_out(k, vp);
 				continue;
 			}
 		}
 		if done {
-			vp.out.pop_front();
+			pop_out(k, vp);
 			continue;
 		}
 		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
@@ -892,12 +918,22 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
-				vp.out.pop_front();
+				pop_out(k, vp);
 			},
 			Poll::Pending => return Some(w.fd),
 		}
 	}
 	None
+}
+
+/// The front of `vp.out` is out (written and settled, or dropped): pop it,
+/// and continue the job it held back ([`PendingWrite::then_continue`]).
+fn pop_out(k: &mut Kernel, vp: &mut Vproc) {
+	if let Some(w) = vp.out.pop_front()
+		&& let Some(id) = w.cont
+	{
+		super::jobctl::continue_job(k, id);
+	}
 }
 
 /// Grammar switches from the current options (also `zpty`'s parse of its
@@ -3008,31 +3044,50 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			// The shell's output to its terminal goes first: its job notices
+			// still going out and the editor's display bytes, as zsh's
+			// blocking writes ordered them ([`flush_out`]). Waited for on the
+			// op's first entry, before any redirection is applied, so a failed
+			// redirection's message comes after them and goes to the fd 2 the
+			// redirections left; a later entry resumes the list where it
+			// parked.
+			if top_frame(vp).scratch.is_none()
+				&& let Some(fd) = flush_out(k, vp)
+			{
+				return Flow::Block(WaitKey::Write { fd });
+			}
+			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore. A notice
+					// queued while the op was parked mid-way is handed to the
+					// terminal first ([`jobctl::drain_shout`] does not wait for it
+					// to be written); the message does not wait behind it, since
+					// the restore follows in this step ([`flush_queued`]).
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {

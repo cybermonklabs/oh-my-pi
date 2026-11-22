@@ -708,6 +708,10 @@ fn sysopen(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 	} else {
 		0o666
 	};
+	// zsh hands `perms` to `open(2)`, which masks it with the umask; the
+	// open here creates exactly the mode it is given, so the shell's umask
+	// is applied first, as a redirection applies it.
+	let perms = perms & !state::umask(ctx.cx.store, ctx.vp)?;
 	let name = args.first().cloned().unwrap_or_default();
 	let path = absolute(&ctx.vp.cwd, &name);
 	let slot = explicit.map_or(FdSlot::Free(10), FdSlot::At);

@@ -84,12 +84,34 @@ use crate::file::POLL_SLICE;
 /// a release from reaching a FIFO its open did not start on is what the pin
 /// is for.
 ///
+/// The helper's open of the name never truncates for a write: the caller
+/// leaves `O_TRUNC` out of it, and the helper applies it itself, under the
+/// open's lock and only while the open has not been dropped, to a regular
+/// file the name names by then (see [`TruncateRegular`]; a FIFO ignores
+/// `O_TRUNC`). A helper whose open was dropped closes what it opened at once,
+/// unchanged. A write asks the write permission `O_TRUNC` asks anyway; a
+/// read-only open that asks for `O_TRUNC` keeps it, so the kernel still asks
+/// that permission, and so does the reopen of the pin, which opens the FIFO.
+///
 /// What is left: a FIFO this process may not open for both reading and
 /// writing keeps its helper until its other end opens; the helper then takes
 /// that connection and closes it. A FIFO that nothing pinned (gone, or no
 /// FIFO, by the pin) is never released. A helper held up for longer than the
-/// bound between its last check and its `open(2)` opens the name after the
-/// drop has gone, and stays until that FIFO's other end opens.
+/// bound between its last check and its `open(2)` (a loaded node can hold a
+/// thread that long) opens the name after the drop has gone. It writes
+/// nothing, and closes what it opened at once; until then it holds its thread
+/// and the pin. Where the name still names the FIFO, it waits there until the
+/// other end opens, which then sees end of file (a writer's first write fails
+/// with `EPIPE`). A write's helper truncates nothing; a read-only open that
+/// asks for `O_TRUNC` keeps it (above), so its helper truncates a regular file
+/// the name names by then, as that open asks.
+///
+/// Where the name names nothing by then, an open that creates leaves an empty
+/// regular file there, as the open would have, and nothing else. That cannot
+/// be avoided: the open needs `O_CREAT` so that the kernel checks
+/// `fs.protected_fifos` when the name names a FIFO, and `O_CREAT` creates a
+/// missing file in the same `open(2)`. Removing that file afterwards would
+/// remove by its name a file the helper cannot prove is the one it created.
 pub struct FifoOpen<T> {
 	shared: Arc<Shared<T>>,
 	node:   Arc<Node>,
@@ -361,13 +383,16 @@ impl FifoName {
 struct Node {
 	/// The FIFO the open started on; `None` when it was gone, or no FIFO, by
 	/// the pin: nothing identifies it, and nothing releases the open.
-	pin:     Option<FifoPin>,
+	pin:       Option<FifoPin>,
 	/// The pin's `/proc/self/fd/N`, when it reaches the pin.
-	reopen:  Option<PathBuf>,
+	reopen:    Option<PathBuf>,
 	/// The FIFO's name.
-	name:    FifoName,
+	name:      FifoName,
 	/// The helper opens through `reopen`; else it opens the name.
-	reopens: bool,
+	reopens:   bool,
+	/// The open truncates (`O_TRUNC`), which the helper applies itself to
+	/// what its open of the name returns (see [`FifoOpen`]).
+	truncates: bool,
 }
 
 impl Node {
@@ -401,7 +426,7 @@ impl Node {
 		} else {
 			seam::Helper::ByName
 		});
-		Self { pin, reopen, name, reopens }
+		Self { pin, reopen, name, reopens, truncates: false }
 	}
 
 	/// What the helper opens, and whether it is the pin's `/proc/self/fd/N`.
@@ -454,7 +479,7 @@ impl Node {
 	}
 }
 
-impl<T: Send + 'static> FifoOpen<T> {
+impl<T: TruncateRegular + Send + 'static> FifoOpen<T> {
 	/// Starts opening the FIFO at `path`, which `meta` describes, on a helper
 	/// thread, which calls `open` with the path to open and whether that path
 	/// is a pin's `/proc/self/fd/N`. That path is a symbolic link, which the
@@ -462,13 +487,22 @@ impl<T: Send + 'static> FifoOpen<T> {
 	/// `nofollow` a symbolic link at `path` is never pinned, so `open`'s own
 	/// `O_NOFOLLOW` open of the path refuses it. An open that `creates` (has
 	/// `O_CREAT`) is handed `path` itself and `false`, never the pin (see
-	/// [`FifoOpen`]). When the helper cannot be started, its error is the
-	/// open's result.
-	pub fn start<F>(path: &Path, meta: &fs::Metadata, nofollow: bool, creates: bool, open: F) -> Self
+	/// [`FifoOpen`]). For an open that `truncates` (a write with `O_TRUNC`),
+	/// `open` must leave `O_TRUNC` out when it is handed the path: the helper
+	/// truncates what it returns, while the open is live (see [`FifoOpen`]).
+	/// When the helper cannot be started, its error is the open's result.
+	pub fn start<F>(
+		path: &Path,
+		meta: &fs::Metadata,
+		nofollow: bool,
+		creates: bool,
+		truncates: bool,
+		open: F,
+	) -> Self
 	where
 		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 	{
-		Self::start_node(Node::new(path, meta, nofollow, creates), open)
+		Self::start_node(Node { truncates, ..Node::new(path, meta, nofollow, creates) }, open)
 	}
 
 	/// Starts opening the FIFO pinned as `pin` (`None`: nothing was pinned,
@@ -477,17 +511,19 @@ impl<T: Send + 'static> FifoOpen<T> {
 	/// and `true`, or, when the open `creates` (has `O_CREAT`) or no
 	/// `/proc/self/fd/N` reaches the pin, with the name's path and `false`
 	/// (an entry's name for a directory entry: `open` opens it in its own
-	/// directory).
+	/// directory), and then without `O_TRUNC`, which the helper applies for
+	/// an open that `truncates`.
 	pub(crate) fn start_pinned<F>(
 		pin: Option<FifoPin>,
 		name: FifoName,
 		creates: bool,
+		truncates: bool,
 		open: F,
 	) -> Self
 	where
 		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 	{
-		Self::start_node(Node::pinned(pin, name, creates), open)
+		Self::start_node(Node { truncates, ..Node::pinned(pin, name, creates) }, open)
 	}
 
 	fn start_node<F>(node: Node, open: F) -> Self
@@ -507,6 +543,36 @@ impl<T: Send + 'static> FifoOpen<T> {
 			},
 		};
 		Self { shared, node, helper }
+	}
+}
+
+/// What a FIFO open's `open` returns: a file its helper can truncate.
+///
+/// For a write that asks for `O_TRUNC`, the helper's open of the name leaves
+/// it out, and the helper applies it itself under the open's lock, only while
+/// the open has not been dropped, so a helper the drop has left truncates
+/// nothing (see [`FifoOpen`]).
+pub trait TruncateRegular {
+	/// Truncates the file to no bytes when it is a regular file, as
+	/// `O_TRUNC` does; anything else (the FIFO, a device) is left as it is.
+	fn truncate_regular(&self) -> io::Result<()>;
+}
+
+impl TruncateRegular for fs::File {
+	fn truncate_regular(&self) -> io::Result<()> {
+		if self.metadata()?.is_file() {
+			self.set_len(0)?;
+		}
+		Ok(())
+	}
+}
+
+impl TruncateRegular for crate::File {
+	fn truncate_regular(&self) -> io::Result<()> {
+		if self.metadata()?.is_file() {
+			self.set_len(0)?;
+		}
+		Ok(())
 	}
 }
 
@@ -555,7 +621,7 @@ fn spawn_helper<T, F>(
 	open: F,
 ) -> io::Result<thread::JoinHandle<()>>
 where
-	T: Send + 'static,
+	T: TruncateRegular + Send + 'static,
 	F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 {
 	thread::Builder::new()
@@ -563,6 +629,8 @@ where
 		.stack_size(64 << 10)
 		.spawn(move || {
 			let _exit = Exit(Arc::clone(&shared));
+			#[cfg(test)]
+			let _end = hooks::End(node.name.path().to_path_buf());
 			#[cfg(test)]
 			let after = seam::before_open();
 			{
@@ -613,6 +681,8 @@ where
 					s.in_open = true;
 				}
 			}
+			#[cfg(test)]
+			hooks::run_before_open(node.name.path());
 			let (path, pinned) = node.helper_path();
 			let opened = catch_unwind(AssertUnwindSafe(|| open(path, pinned)))
 				.unwrap_or_else(|_| Err(io::Error::other("the FIFO open panicked")));
@@ -622,8 +692,17 @@ where
 			}
 			let mut s = shared.slot.lock();
 			if s.cancelled {
+				// A helper whose open was dropped, or that the drop has left:
+				// what it opened is closed here, unchanged.
 				return;
 			}
+			// The caller's `O_TRUNC` for an open of the name, applied under
+			// the lock: a drop that comes now waits for it, and one that came
+			// first was seen above.
+			let opened = match opened {
+				Ok(file) if node.truncates && !pinned => file.truncate_regular().map(|()| file),
+				opened => opened,
+			};
 			s.result = Some(opened);
 			let waker = s.waker.take();
 			drop(s);
@@ -638,7 +717,7 @@ where
 /// names the pinned FIFO (see [`FifoOpen`]). That helper's open of the pinned
 /// FIFO ends at once, as the drop holds the FIFO's two ends; one that is
 /// still waiting when this has passed waits on another FIFO.
-const LEAVE_AFTER: Duration = Duration::from_secs(1);
+pub(crate) const LEAVE_AFTER: Duration = Duration::from_secs(1);
 
 impl<T> Drop for FifoOpen<T> {
 	/// See [`FifoOpen`]: leaves no end of the FIFO behind once it returns,
@@ -872,6 +951,56 @@ pub(crate) mod seam {
 	}
 }
 
+/// Test hooks, keyed by the path an open's name gives: one run once by its
+/// helper after its last check, just before its open (a stall, or a change
+/// of what the name names), and a record of the helpers that have ended.
+#[cfg(test)]
+pub(crate) mod hooks {
+	use std::path::{Path, PathBuf};
+
+	use parking_lot::Mutex;
+
+	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+	static BEFORE_OPEN: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+	static ENDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` once, in the next helper of an open given `name`, just
+	/// before its open.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests use it"))]
+	pub(crate) fn before_open(name: &Path, hook: impl FnOnce() + Send + 'static) {
+		BEFORE_OPEN
+			.lock()
+			.push((name.to_path_buf(), Box::new(hook)));
+	}
+
+	pub(crate) fn run_before_open(name: &Path) {
+		let hook = {
+			let mut hooks = BEFORE_OPEN.lock();
+			let at = hooks.iter().position(|(path, _)| path == name);
+			at.map(|at| hooks.remove(at).1)
+		};
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	/// Whether a helper of an open given `name` has ended.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests use it"))]
+	pub(crate) fn ended(name: &Path) -> bool {
+		ENDED.lock().iter().any(|path| path == name)
+	}
+
+	/// Records its helper as ended when dropped.
+	pub(crate) struct End(pub(crate) PathBuf);
+
+	impl Drop for End {
+		fn drop(&mut self) {
+			ENDED.lock().push(std::mem::take(&mut self.0));
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -951,7 +1080,7 @@ mod tests {
 
 	/// An open of `path` whose helper has passed its check of the cancel.
 	fn opening(path: &Path, open: Open) -> FifoOpen<fs::File> {
-		let opened = FifoOpen::start(path, &fs::metadata(path).unwrap(), false, false, open);
+		let opened = FifoOpen::start(path, &fs::metadata(path).unwrap(), false, false, false, open);
 		while !opened.shared.slot.lock().opening {
 			thread::yield_now();
 		}
@@ -1077,16 +1206,29 @@ mod tests {
 	}
 
 	/// On Linux the drop reaches the node the open started on, though its
-	/// path now names another FIFO. The old FIFO is moved aside, not
-	/// removed, so the new one cannot reuse its inode number and pass for it.
+	/// path now names another FIFO. The path never names nothing: it reaches
+	/// its FIFO through a symbolic link to a directory, which turns from the
+	/// old FIFO's directory to the new one's in one `rename(2)`, so the
+	/// helper's open of the path finds one FIFO or the other. Both FIFOs keep
+	/// their names, so neither inode number can be reused for the other. (A
+	/// hard link of a FIFO, the other way to keep the old one's name, failed
+	/// with `EOPNOTSUPP` under gVisor.)
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_releases_a_helper_whose_path_now_names_another_fifo() {
-		let (_dir, path) = new_fifo();
+		let (dir, _old) = new_fifo();
+		let other = dir.0.join("b");
+		fs::create_dir(&other).unwrap();
+		make_fifo(&other.join("f"));
+		// `l/f`, with `l` naming the directory itself: the old FIFO.
+		let link = dir.0.join("l");
+		std::os::unix::fs::symlink(".", &link).unwrap();
+		let path = link.join("f");
 		let opened = opening(&path, read_end);
 		let shared = Arc::clone(&opened.shared);
-		fs::rename(&path, path.with_extension("old")).unwrap();
-		make_fifo(&path);
+		let turned = dir.0.join("l.b");
+		std::os::unix::fs::symlink("b", &turned).unwrap();
+		fs::rename(&turned, &link).unwrap();
 		drop(opened);
 		assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
 		assert!(!has_reader(&path));

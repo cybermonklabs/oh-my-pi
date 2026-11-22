@@ -1138,12 +1138,23 @@ pub struct PendingWrite {
 	/// Where the bytes handed off so far went ([`HandedOff`]).
 	#[serde(skip)]
 	pub handed: HandedOff,
+	/// A job to continue (`SIGCONT`) once everything queued before this
+	/// entry is out (bash `bg` prints the job, then continues it): an entry
+	/// of no bytes ([`Self::then_continue`]), kept when a write to its fd
+	/// fails.
+	#[serde(default)]
+	pub cont:   Option<JobId>,
 }
 
 impl PendingWrite {
 	/// `bytes` for fd `fd`, nothing written yet.
 	pub fn new(fd: i32, bytes: BString) -> Self {
-		Self { fd, bytes, off: 0, handed: HandedOff::default() }
+		Self { fd, bytes, off: 0, handed: HandedOff::default(), cont: None }
+	}
+
+	/// Continue job `id` once what is queued before this entry is out.
+	pub fn then_continue(id: JobId) -> Self {
+		Self { cont: Some(id), ..Self::new(1, BString::default()) }
 	}
 }
 
@@ -1735,6 +1746,10 @@ pub enum Live {
 	Open(Box<dyn FsPending<Box<dyn crate::bash::fs::File>>>),
 	/// The opened file of a `Read` probe.
 	File(Box<dyn crate::bash::fs::File>),
+	/// The opened file of a `history` write, with what its writer thread
+	/// took and has not written yet
+	/// ([`Unsettled::poll_write_file`](crate::bash::Unsettled::poll_write_file)).
+	Write(Box<(Box<dyn crate::bash::fs::File>, crate::bash::Unsettled)>),
 	Task(Box<dyn Task>),
 	Ext(Box<dyn ExtProc>),
 	/// [`Host::spawn`](crate::bash::Host::spawn) of the external of a
@@ -1774,6 +1789,7 @@ impl Live {
 			Self::Fd(live) => live.is_idempotent(),
 			Self::Fs(live) => live.idempotent,
 			Self::File(file) => file.kind() == crate::bash::fs::FileKind::Regular,
+			Self::Write(w) => w.0.kind() == crate::bash::fs::FileKind::Regular,
 			// Network traffic is not asked twice.
 			Self::Task(_) | Self::Ext(_) | Self::Timer(_) | Self::Zftp(_) | Self::None => false,
 		}

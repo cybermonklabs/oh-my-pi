@@ -19,7 +19,7 @@ use bstr::{BStr, BString};
 use serde::{Deserialize, Serialize};
 
 use crate::bash::{
-	diag,
+	Unsettled, diag,
 	fs::{FsPoll, OpenFlags, SeekFrom, Stat},
 	host::Deadline,
 	vm::{
@@ -395,7 +395,9 @@ fn read(
 
 /// [`HistOp::Write`]: open, then write `data` from where the file stood
 /// once opened (kept, as 8 bytes, in the scratch's input buffer: the
-/// file's position tells how much was written).
+/// file's position tells how much was written). A chunk the file's writer
+/// thread took (a terminal or socket path) is out, or its error is the
+/// write's, before the next one goes, as with the release's `write(2)`.
 fn write(
 	tcx: &mut Context<'_>,
 	cx: &mut Cx<'_>,
@@ -410,21 +412,23 @@ fn write(
 		WriteHow::Append => OpenFlags::APPEND,
 		WriteHow::Excl => OpenFlags::EXCL,
 	});
-	// The file's position once opened, beside `sc.live` (the file).
+	// The file's position once opened, beside `sc.live` (the file, and what
+	// its writer thread took and has not written yet).
 	let input = &mut sc.io.get_or_insert_with(Box::default).input;
 	loop {
 		match &mut sc.live {
 			Live::None => match cx.host.fs().open(BStr::new(path), flags, mode) {
-				FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
+				FsPoll::Ready(Ok(f)) => sc.live = Live::Write(Box::new((f, Unsettled::default()))),
 				FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 				FsPoll::Pending(f) => sc.live = Live::Open(f),
 			},
 			Live::Open(f) => match f.poll(tcx) {
-				Poll::Ready(Ok(file)) => sc.live = Live::File(file),
+				Poll::Ready(Ok(file)) => sc.live = Live::Write(Box::new((file, Unsettled::default()))),
 				Poll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 				Poll::Pending => return Poll::Pending,
 			},
-			Live::File(f) => {
+			Live::Write(w) => {
+				let (f, unsettled) = &mut **w;
 				let known = input
 					.get(..8)
 					.map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
@@ -452,7 +456,7 @@ fn write(
 						Poll::Pending => Poll::Pending,
 					};
 				}
-				match f.poll_write(tcx, rest) {
+				match unsettled.poll_write_file(f.as_mut(), tcx, rest) {
 					Poll::Ready(Ok(0)) => {
 						let e = io::Error::from(io::ErrorKind::WriteZero);
 						return Poll::Ready(Err(HistErr::of(&e)));

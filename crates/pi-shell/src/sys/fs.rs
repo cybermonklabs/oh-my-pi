@@ -223,6 +223,8 @@ impl BlockingWriter {
 			.spawn(move || {
 				// Ends once the `StdFile` is dropped and the last chunk is done.
 				while let Ok((mark, bytes)) = queue.recv() {
+					#[cfg(all(test, target_os = "linux"))]
+					wait_while_held();
 					let result = write_all_waiting(&mut file, &bytes);
 					#[cfg(all(test, target_os = "linux"))]
 					if result.is_err() {
@@ -407,6 +409,99 @@ pub(crate) fn in_blocking_writer_process(test: &str, body: impl FnOnce()) {
 		out.status,
 		String::from_utf8_lossy(&out.stderr)
 	);
+}
+
+/// Test only: while held ([`hold_writers`]), a writer thread has taken its
+/// chunk (it is busy) but does not write it, so a test finds the thread
+/// busy for as long as it likes, without racing it.
+#[cfg(all(test, target_os = "linux"))]
+static HELD: (std::sync::Mutex<bool>, std::sync::Condvar) =
+	(std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Test only: every writer thread of this process holds the chunk it takes
+/// until the guard is dropped. Process-wide: a test that holds runs in a
+/// process of its own ([`in_blocking_writer_process`]).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn hold_writers() -> WritersHeld {
+	*HELD.0.lock().unwrap() = true;
+	WritersHeld(())
+}
+
+/// The hold of [`hold_writers`]; dropping it lets the writer threads go on.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct WritersHeld(());
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for WritersHeld {
+	fn drop(&mut self) {
+		*HELD.0.lock().unwrap() = false;
+		HELD.1.notify_all();
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn wait_while_held() {
+	let mut held = HELD.0.lock().unwrap();
+	while *held {
+		held = HELD.1.wait(held).unwrap();
+	}
+}
+
+/// Test only: socket and descriptor probes for the engine's tests, whose
+/// module forbids `unsafe`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_probe {
+	use std::os::fd::{AsRawFd, RawFd};
+
+	/// `SIOCATMARK` (Linux `asm-generic/sockios.h`).
+	const SIOCATMARK: libc::c_ulong = 0x8905;
+
+	/// Whether this system carries TCP urgent data (`MSG_OOB`) end to end: a
+	/// control on a connection of its own, whose other end must see it
+	/// (`POLLPRI`) within a second. gVisor sends it but never signals it.
+	pub(crate) fn urgent_data_is_carried() -> bool {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+		let (server, _) = listener.accept().unwrap();
+		// SAFETY: a valid one-byte buffer.
+		let sent =
+			unsafe { libc::send(client.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) == 1 };
+		sent && urgent_arrives(&server, 1_000)
+	}
+
+	/// Whether urgent data arrives at `fd` within `ms` milliseconds
+	/// (`POLLPRI`).
+	pub(crate) fn urgent_arrives(fd: &impl AsRawFd, ms: i32) -> bool {
+		let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+		// SAFETY: one `pollfd`, valid for the call.
+		let n = unsafe { libc::poll(&raw mut p, 1, ms) };
+		n == 1 && p.revents & libc::POLLPRI != 0
+	}
+
+	/// Whether `fd`'s read position is at the urgent mark (`SIOCATMARK`).
+	pub(crate) fn at_mark(fd: &impl AsRawFd) -> bool {
+		let mut at: libc::c_int = 0;
+		// SAFETY: `SIOCATMARK` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd.as_raw_fd(), SIOCATMARK, &raw mut at) };
+		assert_eq!(r, 0, "SIOCATMARK: {}", std::io::Error::last_os_error());
+		at != 0
+	}
+
+	/// The bytes queued to read at `fd` (`FIONREAD`).
+	pub(crate) fn queued(fd: RawFd) -> usize {
+		let mut n: libc::c_int = 0;
+		// SAFETY: `FIONREAD` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut n) };
+		assert_eq!(r, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+		usize::try_from(n).unwrap()
+	}
+
+	/// Make `fd` non-blocking.
+	pub(crate) fn set_nonblocking(fd: &impl AsRawFd) {
+		// SAFETY: `F_SETFL` on a valid descriptor.
+		let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+		assert_eq!(r, 0, "F_SETFL: {}", std::io::Error::last_os_error());
+	}
 }
 
 /// Reopen a Linux pipe through procfs, producing a distinct non-blocking open
@@ -1158,7 +1253,7 @@ fn create_with_mode(
 	process_umask: Option<u32>,
 	nonblock: bool,
 ) -> io::Result<fs::File> {
-	let options = || {
+	let options = |flags: OpenFlags| {
 		#[cfg_attr(not(unix), expect(unused_mut, reason = "custom flags are Unix's"))]
 		let mut o = options(flags, mode);
 		#[cfg(unix)]
@@ -1176,9 +1271,9 @@ fn create_with_mode(
 	#[cfg(unix)]
 	if flags.contains(OpenFlags::CREATE) && process_umask.is_none_or(|mask| mode & mask != 0) {
 		use std::os::unix::fs::PermissionsExt as _;
-		let mut exclusive = options();
-		exclusive.create_new(true);
-		match exclusive.open(path) {
+		// An exclusive try of a read-only open goes in as `O_EXCL`
+		// ([`options`]), which `OpenOptions::create_new` refuses there.
+		match options(flags.with(OpenFlags::EXCL)).open(path) {
 			Ok(file) => {
 				// Best effort: without it the file keeps the stricter mode
 				// the process umask left.
@@ -1190,7 +1285,7 @@ fn create_with_mode(
 			Err(err) => return Err(err),
 		}
 	}
-	options().open(path)
+	options(flags).open(path)
 }
 
 fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
@@ -1200,12 +1295,17 @@ fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
 	// a custom flag ([`custom_flags`]).
 	let append_trunc =
 		cfg!(unix) && flags.contains(OpenFlags::APPEND) && flags.contains(OpenFlags::TRUNC);
+	// It also refuses to create, create exclusively or truncate in an open
+	// that neither writes nor appends, which `open(2)` takes (zsh
+	// `sysopen -r -o creat,excl,trunc`): on Unix those go in as custom flags
+	// too.
+	let by_custom = cfg!(unix) && read_only(flags);
 	o.read(flags.contains(OpenFlags::READ))
 		.write(flags.contains(OpenFlags::WRITE) || append_trunc)
 		.append(flags.contains(OpenFlags::APPEND) && !append_trunc)
-		.truncate(flags.contains(OpenFlags::TRUNC))
-		.create(flags.contains(OpenFlags::CREATE));
-	if flags.contains(OpenFlags::EXCL) {
+		.truncate(flags.contains(OpenFlags::TRUNC) && !by_custom)
+		.create(flags.contains(OpenFlags::CREATE) && !by_custom);
+	if flags.contains(OpenFlags::EXCL) && !by_custom {
 		o.create_new(true);
 	}
 	#[cfg(unix)]
@@ -1222,12 +1322,29 @@ fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
 	o
 }
 
-/// The `open(2)` flags of `flags` that [`OpenOptions`] has no setter for.
+/// An open that neither writes nor appends.
+const fn read_only(flags: OpenFlags) -> bool {
+	!flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::APPEND)
+}
+
+/// The `open(2)` flags of `flags` that [`OpenOptions`] has no setter for,
+/// or refuses ([`options`]).
 #[cfg(unix)]
 const fn custom_flags(flags: OpenFlags) -> libc::c_int {
 	let mut custom = 0;
 	if flags.contains(OpenFlags::APPEND) && flags.contains(OpenFlags::TRUNC) {
 		custom |= libc::O_APPEND;
+	}
+	if read_only(flags) {
+		if flags.contains(OpenFlags::CREATE) {
+			custom |= libc::O_CREAT;
+		}
+		if flags.contains(OpenFlags::EXCL) {
+			custom |= libc::O_CREAT | libc::O_EXCL;
+		}
+		if flags.contains(OpenFlags::TRUNC) {
+			custom |= libc::O_TRUNC;
+		}
 	}
 	if flags.contains(OpenFlags::NOFOLLOW) {
 		custom |= libc::O_NOFOLLOW;
@@ -1276,6 +1393,9 @@ mod fifo {
 	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
 	/// the path that creates a file (the FIFO was removed since the look)
 	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
+	/// The open of the path leaves `O_TRUNC` (`>`) to the helper, which
+	/// applies it only while the open is live, so a helper a drop has left
+	/// truncates nothing ([`pi_vfs::FifoOpen`]).
 	pub fn pending(
 		path: &BStr,
 		flags: OpenFlags,
@@ -1293,9 +1413,17 @@ mod fifo {
 		}
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
 		let creates = flags.contains(OpenFlags::CREATE);
+		// A write open leaves `O_TRUNC` to the helper; it asks the write
+		// permission `O_TRUNC` asks anyway. A read-only open keeps it.
+		let truncates = flags.contains(OpenFlags::TRUNC) && write;
+		let by_path = if truncates {
+			flags.without(OpenFlags::TRUNC)
+		} else {
+			flags
+		};
 		#[cfg(test)]
 		let name = host.to_path_buf();
-		let open = FifoOpen::start(host, &meta, nofollow, creates, move |path, pinned| {
+		let open = FifoOpen::start(host, &meta, nofollow, creates, truncates, move |path, pinned| {
 			#[cfg(test)]
 			{
 				ROUTES.lock().push((name.clone(), pinned));
@@ -1308,15 +1436,20 @@ mod fifo {
 					hook();
 				}
 			}
-			if pinned {
+			let opened = if pinned {
 				// A pin is checked not to be a symbolic link already, and its
 				// `/proc/self/fd/N` always is one.
 				let mut opts = options(flags, mode);
 				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
-				return opts.open(path);
-			}
-			// The path, opened as the plain open of it opens it.
-			create_with_mode(path, flags, mode, umask, false)
+				opts.open(path)
+			} else {
+				// The path, opened as the plain open of it opens it but for
+				// a write's `O_TRUNC`, which the helper applies itself.
+				create_with_mode(path, by_path, mode, umask, false)
+			};
+			#[cfg(test)]
+			OPENED.lock().push(name);
+			opened
 		});
 		Some(Box::new(Pending(open)))
 	}
@@ -1337,6 +1470,11 @@ mod fifo {
 	/// open.
 	#[cfg(test)]
 	static BEFORE_OPEN: parking_lot::Mutex<Vec<BeforeOpen>> = parking_lot::Mutex::new(Vec::new());
+
+	/// Test record of the helpers whose open has returned, by the path their
+	/// open was given.
+	#[cfg(test)]
+	static OPENED: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
 
 	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
@@ -1505,6 +1643,59 @@ mod fifo {
 			assert_eq!(got, want, "through the pin, for {:?}", cases.map(|(label, ..)| label));
 		}
 
+		/// A read-only open that asks for `O_TRUNC` (zsh `sysopen -r -o
+		/// trunc`, with `creat` or not) keeps it, whether its helper opens
+		/// the path (an open that creates) or the pin, so the kernel asks the
+		/// write permission `O_TRUNC` asks, as of the plain open: a FIFO this
+		/// process may only read is refused (`EACCES`). Root may write it, so
+		/// as root each open goes ahead. Both of the FIFO's ends are held, so
+		/// each open ends at once.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_read_only_open_that_truncates_asks_the_write_permission_of_the_plain_open() {
+			use std::os::unix::fs::PermissionsExt;
+
+			use crate::bash::{Fs, FsPoll};
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let _both = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&path)
+				.unwrap();
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+			let name = BStr::new(path.as_os_str().as_bytes());
+			let outcome =
+				|opened: io::Result<Box<dyn File>>| opened.map(drop).map_err(|err| err.raw_os_error());
+			// SAFETY: `geteuid` has no preconditions.
+			let root = unsafe { libc::geteuid() } == 0;
+			let truncates = OpenFlags::READ.with(OpenFlags::TRUNC);
+			let mut wrong = Vec::new();
+			for (label, flags) in [
+				("sysopen -r -o trunc,creat", truncates.with(OpenFlags::CREATE)),
+				("sysopen -r -o trunc", truncates),
+			] {
+				let plain = outcome(super::super::open(name, flags, 0o666, None));
+				if !root && plain != Err(Some(libc::EACCES)) {
+					wrong.push(format!("{label}, the plain open: {plain:?}, not EACCES"));
+				}
+				let by_helper =
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
+					FsPoll::Ready(opened) => opened,
+					FsPoll::Pending(mut open) => result(&mut *open, || {}),
+				});
+				for (route, got) in [("the FIFO helper", by_helper), ("the shell's open", by_shell)] {
+					if got != plain {
+						wrong.push(format!(
+							"{label}, {route}: {got:?} where the plain open gives {plain:?}"
+						));
+					}
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
 		/// A `>` whose FIFO is removed between the shell's look at it and the
 		/// helper's open of the path creates a regular file there, as
 		/// `open(2)` of the path would, with exactly the mode the shell asks
@@ -1581,6 +1772,137 @@ mod fifo {
 				}
 			}
 			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` dropped while its helper is held up between its last check
+		/// and its open for longer than the drop waits for it, as a loaded
+		/// node can hold a thread: the drop leaves the helper at its bound,
+		/// and the helper opens the path after the call has ended. It changes
+		/// no existing file: a regular file put at the path keeps its bytes.
+		/// Where the path names nothing, it leaves at most an empty regular
+		/// file (its `O_CREAT` creates one; see [`pi_vfs::FifoOpen`]), and
+		/// nothing else. Every wait is bounded, so a regression fails rather
+		/// than hangs.
+		#[test]
+		fn a_redirect_whose_helper_the_drop_left_truncates_nothing() {
+			use std::{
+				sync::mpsc,
+				time::{Duration, Instant},
+			};
+			const LIMIT: Duration = Duration::from_secs(10);
+			let mut wrong = Vec::new();
+			for late in ["a regular file", "nothing"] {
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let (reached_tx, reached) = mpsc::channel();
+				let at = path.clone();
+				BEFORE_OPEN.lock().push((
+					path.clone(),
+					Box::new(move || {
+						let _ = reached_tx.send(());
+						thread::sleep(Duration::from_secs(2));
+						fs::rename(&at, at.with_extension("old")).unwrap();
+						if late == "a regular file" {
+							fs::write(&at, "kept").unwrap();
+						}
+					}),
+				));
+				let flags = OpenFlags::WRITE
+					.with(OpenFlags::CREATE)
+					.with(OpenFlags::TRUNC);
+				let open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				if reached.recv_timeout(LIMIT).is_err() {
+					wrong.push(format!("{late}: the helper never reached its open"));
+					continue;
+				}
+				let dropper = thread::spawn(move || drop(open));
+				let start = Instant::now();
+				while !dropper.is_finished() && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !dropper.is_finished() {
+					wrong.push(format!("{late}: the drop had not returned after {LIMIT:?}"));
+					continue;
+				}
+				let start = Instant::now();
+				while !OPENED.lock().contains(&path) && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !OPENED.lock().contains(&path) {
+					wrong.push(format!("{late}: the helper had not opened the path after {LIMIT:?}"));
+					continue;
+				}
+				match (late, fs::symlink_metadata(&path)) {
+					("a regular file", _) => {
+						let got = fs::read_to_string(&path).unwrap();
+						if got != "kept" {
+							wrong.push(format!("{late}: the file holds {got:?}, not \"kept\""));
+						}
+					},
+					(_, Err(err)) if err.kind() == io::ErrorKind::NotFound => {},
+					(_, Ok(m)) if m.is_file() && m.len() == 0 => {},
+					(_, other) => wrong.push(format!(
+						"{late}: the path names {other:?}, not nothing or an empty regular file"
+					)),
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` whose FIFO is replaced by a regular file just before its
+		/// helper's open, while the shell still waits for it, opens that file
+		/// and truncates it, as `open(2)` of the path with `O_TRUNC` does. An
+		/// open that waits instead (its helper on the FIFO the path no longer
+		/// names) fails the test within its bound; the open's drop then ends
+		/// the helper.
+		#[test]
+		fn a_redirect_whose_path_names_a_regular_file_by_its_open_truncates_it() {
+			use std::io::Read;
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let at = path.clone();
+			BEFORE_OPEN.lock().push((
+				path.clone(),
+				Box::new(move || {
+					fs::rename(&at, at.with_extension("old")).unwrap();
+					fs::write(&at, "replaced").unwrap();
+				}),
+			));
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut open =
+				pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+			let limit = std::time::Duration::from_secs(10);
+			let start = std::time::Instant::now();
+			let opened = loop {
+				if let Poll::Ready(r) = open.poll(&mut Context::from_waker(Waker::noop())) {
+					break Some(r);
+				}
+				if start.elapsed() > limit {
+					break None;
+				}
+				thread::sleep(std::time::Duration::from_millis(5));
+			};
+			drop(open);
+			let Some(opened) = opened else {
+				panic!(
+					"the open had not returned after {limit:?}: its helper waits on a FIFO, not the \
+					 regular file at the path"
+				);
+			};
+			let mut file = opened.unwrap();
+			match file.poll_write(&mut Context::from_waker(Waker::noop()), b"new") {
+				Poll::Ready(Ok(3)) => {},
+				other => panic!("write: {other:?}"),
+			}
+			drop(file);
+			let mut got = String::new();
+			fs::File::open(&path)
+				.unwrap()
+				.read_to_string(&mut got)
+				.unwrap();
+			assert_eq!(got, "new", "the regular file was not truncated");
 		}
 
 		/// The FIFO the sticky-directory test opens: a FIFO of another user,
@@ -2589,8 +2911,11 @@ mod tests {
 				let mut p = libc::pollfd { fd: writer.file.as_raw_fd(), events: 0, revents: 0 };
 				// SAFETY: one `pollfd`, valid for the call.
 				let n = unsafe { libc::poll(&raw mut p, 1, 100) };
-				assert!(n >= 0, "poll: {}", io::Error::last_os_error());
-				if p.revents & libc::POLLERR != 0 {
+				if n < 0 {
+					// A signal ended the wait: the loop waits again.
+					let e = io::Error::last_os_error();
+					assert_eq!(e.kind(), io::ErrorKind::Interrupted, "poll: {e}");
+				} else if p.revents & libc::POLLERR != 0 {
 					break;
 				}
 				assert!(Instant::now() < deadline, "DEADLINE: the read end was not gone within 10 s");
@@ -3470,6 +3795,72 @@ mod tests {
 			.unwrap();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		std::fs::remove_file(host_path(&node.path).unwrap()).unwrap();
+	}
+
+	/// A read-only open that creates, creates exclusively or truncates (zsh
+	/// `sysopen -r -o creat,excl,trunc`) gives what `open(2)` with those
+	/// flags gives, on a regular file and on a missing path: its result, and
+	/// the file's size and mode after. `OpenOptions` refuses each of them
+	/// (`EINVAL`), so they go in as custom flags.
+	#[cfg(unix)]
+	#[test]
+	fn a_read_only_open_that_creates_or_truncates_opens_as_open_2_does() {
+		use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+		/// The open's result, then the file's size and mode, if any.
+		type Outcome = (Result<(), Option<i32>>, Option<(u64, u32)>);
+		fn run(exists: bool, open: impl FnOnce(&std::path::Path) -> io::Result<()>) -> Outcome {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("f");
+			if exists {
+				fs::write(&path, "abc").unwrap();
+			}
+			let opened = open(&path).map_err(|err| err.raw_os_error());
+			let after = fs::metadata(&path)
+				.ok()
+				.map(|m| (m.len(), m.permissions().mode() & 0o7777));
+			(opened, after)
+		}
+		let read = OpenFlags::READ;
+		let mut wrong = Vec::new();
+		for (label, flags, raw) in [
+			("trunc", read.with(OpenFlags::TRUNC), libc::O_TRUNC),
+			("creat", read.with(OpenFlags::CREATE), libc::O_CREAT),
+			(
+				"trunc,creat",
+				read.with(OpenFlags::CREATE).with(OpenFlags::TRUNC),
+				libc::O_CREAT | libc::O_TRUNC,
+			),
+			(
+				"excl,creat",
+				read.with(OpenFlags::CREATE).with(OpenFlags::EXCL),
+				libc::O_CREAT | libc::O_EXCL,
+			),
+		] {
+			for (target, exists) in [("a regular file", true), ("a missing path", false)] {
+				let ours = run(exists, |path| {
+					let name = BStr::new(path.as_os_str().as_bytes());
+					ready(StdFs::default().open(name, flags, 0o600)).map(drop)
+				});
+				let plain = run(exists, |path| {
+					let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+					let how = libc::O_RDONLY | libc::O_CLOEXEC | raw;
+					// SAFETY: `c` is a NUL-terminated string that outlives the call.
+					let fd = unsafe { libc::open(c.as_ptr(), how, 0o600 as libc::c_uint) };
+					if fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					// SAFETY: `fd` was just opened here and is closed once.
+					unsafe { libc::close(fd) };
+					Ok(())
+				});
+				if ours != plain {
+					wrong
+						.push(format!("-o {label} on {target}: {ours:?} where open(2) gives {plain:?}"));
+				}
+			}
+		}
+		assert!(wrong.is_empty(), "{wrong:#?}");
 	}
 
 	/// A temp name that an earlier process with this pid left in the temp

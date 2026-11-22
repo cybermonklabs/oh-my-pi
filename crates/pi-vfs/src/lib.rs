@@ -62,7 +62,7 @@ pub use error::{
 	not_a_directory, permission_denied, read_only_filesystem, unsupported,
 };
 #[cfg(unix)]
-pub use fifo::FifoOpen;
+pub use fifo::{FifoOpen, TruncateRegular};
 pub use file::{File, FileHandle};
 #[cfg(unix)]
 pub use file::{POLL_SLICE, fd_reads_can_block, readable_within, reads_can_block, wait_readable};
