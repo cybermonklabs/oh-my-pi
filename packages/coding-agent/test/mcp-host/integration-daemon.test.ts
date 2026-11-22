@@ -154,13 +154,16 @@ describe.skipIf(process.platform === "win32")("MCP through the daemon", () => {
 	it(
 		"a session in another OS process is served by the same modern server process",
 		async () => {
+			// The host stops a modern server after `IDLE_MS` without a request, and starting the peer's
+			// process can take longer than that: never idle-stop it here, so both sessions meet one process.
+			manager = new MCPManager(harness.dir, undefined, 0);
 			await connect();
 			const modernPid = await whoami();
 			const script = path.join(harness.dir, "peer-session.ts");
 			await Bun.write(script, PEER_SCRIPT);
 
 			const child = Bun.spawn(
-				[process.execPath, script, JSON.stringify([harness.dir, IDLE_MS, { [MODERN]: CONFIGS[MODERN] }])],
+				[process.execPath, script, JSON.stringify([harness.dir, 0, { [MODERN]: CONFIGS[MODERN] }])],
 				// Explicit: the harness repointed the daemon dir after this process started.
 				{ cwd: path.join(SRC, ".."), env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "inherit" },
 			);
