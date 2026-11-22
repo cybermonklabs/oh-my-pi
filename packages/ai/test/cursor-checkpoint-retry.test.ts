@@ -1,5 +1,6 @@
 import { expect, it } from "bun:test";
 import * as http2 from "node:http2";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -162,6 +163,91 @@ it("resumes from the latest replay-safe checkpoint after an incomplete stream", 
 		expect(startEvents).toBe(1);
 		expect(originalRequestIds).toEqual(["", requestIds[0]]);
 	} finally {
+		for (const session of sessions) session.destroy();
+		server.close();
+	}
+});
+
+// The retry from a checkpoint sends again after its backoff. Each request reads the model-call guards right
+// before it opens, after the backoff and the `onPayload` hooks, so a hold that begins in either holds the retry.
+// The held call ends with the output the first request streamed, as a failed send does, and closes the text
+// block that request left open.
+it.each([
+	["holds the checkpoint retry when a model-call hold begins during its backoff", "backoff", 1],
+	["holds the checkpoint retry when a model-call hold begins in its onPayload hook", "onPayload", 1],
+	["retries from the checkpoint when no hold begins (control)", "none", 2],
+] as const)("%s", async (_label, holdIn, expectedRequests) => {
+	const sessions = new Set<http2.Http2Session>();
+	let requestCount = 0;
+	const server = http2.createServer();
+	server.on("session", session => {
+		sessions.add(session);
+		session.on("close", () => sessions.delete(session));
+	});
+	server.on("stream", (providerStream: http2.ServerHttp2Stream) => {
+		requestCount++;
+		let handled = false;
+		providerStream.on("data", () => {
+			if (handled) return;
+			handled = true;
+			providerStream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			if (requestCount === 1) {
+				providerStream.end(Buffer.concat([textDeltaFrame("before"), checkpointFrame()]));
+				return;
+			}
+			providerStream.end(Buffer.concat([textDeltaFrame(" after"), turnEndedFrame()]));
+		});
+	});
+	const listening = Promise.withResolvers<void>();
+	server.once("error", listening.reject);
+	server.listen(0, "127.0.0.1", listening.resolve);
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("expected HTTP/2 fixture server address");
+	const model = makeModel(`http://127.0.0.1:${address.port}`);
+	let held = false;
+	let payloads = 0;
+	const removeGuard = addModelCallGuard({
+		refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+	});
+
+	try {
+		const response = streamCursor(model, context, {
+			apiKey: "not-a-secret",
+			providerRetryWait: async () => {
+				if (holdIn === "backoff") held = true;
+			},
+			onPayload: async () => {
+				payloads++;
+				// The second payload is the retry's.
+				if (payloads === 2 && holdIn === "onPayload") held = true;
+				return undefined;
+			},
+		});
+		const eventTypes: string[] = [];
+		for await (const event of response) eventTypes.push(event.type);
+		const result = await response.result();
+		const text = result.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+		// Every text block the call opened is closed before it ends.
+		expect(eventTypes.filter(type => type === "text_end")).toHaveLength(
+			eventTypes.filter(type => type === "text_start").length,
+		);
+		expect(eventTypes.filter(type => type === "text_start").length).toBeGreaterThan(0);
+
+		expect(requestCount).toBe(expectedRequests);
+		if (holdIn === "none") {
+			expect(result.stopReason).toBe("stop");
+			expect(text).toBe("before after");
+		} else {
+			// The retry's hook ran before the read that held it.
+			expect(payloads).toBe(2);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+			// The text the first request streamed stays on the held call's message.
+			expect(text).toBe("before");
+		}
+	} finally {
+		removeGuard();
 		for (const session of sessions) session.destroy();
 		server.close();
 	}

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ServerWebSocket } from "bun";
 import { streamSimple } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { type as schemaType } from "@oh-my-pi/omptype";
 import { streamOpenAIResponses, type OpenAIResponsesOptions } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type {
@@ -57,6 +61,125 @@ describe("standard OpenAI Responses WebSocket opt-in", () => {
 		expect(result.content).toMatchObject([{ type: "text", text: "HTTP" }]);
 		expect(fixture.httpRequests).toHaveLength(1);
 		expect(fixture.upgrades).toHaveLength(0);
+	});
+
+	// Each WebSocket send (the first, a transient-stream retry, a fallback) reads the model-call guards before it
+	// goes out. Called past the call's own checkpoint, a held model sends nothing over WebSocket or HTTP; with no
+	// hold the same call sends one WebSocket request (the control).
+	it.each([
+		["sends nothing over the WebSocket while a model-call hold stands", true],
+		["sends the WebSocket request when no hold stands (control)", false],
+	])("%s", async (_name, held) => {
+		const fixture = endpoint();
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const result = await streamOpenAIResponses(fixture.model, fixture.context, {
+				...fixture.options,
+				preferWebsockets: true,
+			}).result();
+
+			expect(fixture.requests).toHaveLength(held ? 0 : 1);
+			expect(fixture.httpRequests).toHaveLength(0);
+			expect(result.stopReason).toBe(held ? "error" : "stop");
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A first-frame stale anchor makes the session send the request again with the complete history (see "retries
+	// explicit first-frame stale anchors" below). That resend reads the model-call guards in the same step as its
+	// frame, like every other send: a refusal another call of the session tree records while the anchored frame
+	// waits for its answer holds it. The control records no refusal and recovers on the resend.
+	it.each([
+		["holds the stale-anchor resend when another call records a refusal meanwhile", true],
+		["sends the stale-anchor resend when no refusal is recorded (control)", false],
+	])("%s", async (_name, refused) => {
+		let held = false;
+		const fixture = endpoint((socket, _body, index) => {
+			if (index === 1) {
+				send(socket, textEvents("FIRST", "resp_first"));
+				return;
+			}
+			if (index === 2) {
+				// Another call of the session tree meets a refusal while this anchored frame waits for its answer.
+				if (refused) held = true;
+				send(socket, [
+					{ type: "error", error: { code: "previous_response_not_found", message: "Response expired" } },
+				]);
+				return;
+			}
+			send(socket, textEvents("RECOVERED", "resp_recovered"));
+		});
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === fixture.model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const options = { ...fixture.options, preferWebsockets: true };
+			const first = await streamSimple(fixture.model, fixture.context, options).result();
+			expect(first.stopReason).toBe("stop");
+			const context: Context = {
+				messages: [...fixture.context.messages, first, { role: "user", content: "Next", timestamp: 2 }],
+			};
+			const second = await streamSimple(fixture.model, context, options).result();
+
+			expect(fixture.requests).toHaveLength(refused ? 2 : 3);
+			expect(fixture.httpRequests).toHaveLength(0);
+			expect(second.stopReason).toBe(refused ? "error" : "stop");
+			if (refused) expect(second.errorMessage).toContain("held: cyber_policy");
+			else expect(second.content).toMatchObject([{ type: "text", text: "RECOVERED" }]);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// With request debugging on, the frame's dump is written after the provider's read and before the frame. The
+	// read in the frame's send step holds a refusal another call records meanwhile: here it lands on the event
+	// loop's next turn after this call's first read, which the dump's file writes let run before the frame. With
+	// no dump (the control) nothing yields between the read and the frame, so the frame goes out first.
+	it.each([
+		["holds the first frame when a refusal lands while its request dump is written", true],
+		["sends the first frame when no dump separates it from the read (control)", false],
+	])("%s", async (_name, dump) => {
+		const fixture = endpoint();
+		const previousFlag = Bun.env.PI_REQ_DEBUG;
+		const previousCwd = process.cwd();
+		const dumpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ws-guard-dump-"));
+		process.chdir(dumpDir);
+		if (dump) Bun.env.PI_REQ_DEBUG = "1";
+		else delete Bun.env.PI_REQ_DEBUG;
+		let held = false;
+		let refusalScheduled = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => {
+				if (candidate.id !== fixture.model.id) return undefined;
+				if (!refusalScheduled) {
+					refusalScheduled = true;
+					// Another call of the session tree records a refusal on the event loop's next turn.
+					setImmediate(() => {
+						held = true;
+					});
+				}
+				return held ? "held: cyber_policy" : undefined;
+			},
+		});
+		try {
+			const result = await streamOpenAIResponses(fixture.model, fixture.context, {
+				...fixture.options,
+				preferWebsockets: true,
+			}).result();
+
+			expect(fixture.upgrades).toHaveLength(1);
+			expect(fixture.requests).toHaveLength(dump ? 0 : 1);
+			expect(fixture.httpRequests).toHaveLength(0);
+			expect(result.stopReason).toBe(dump ? "error" : "stop");
+			if (dump) expect(result.errorMessage).toContain("held: cyber_policy");
+		} finally {
+			removeGuard();
+			process.chdir(previousCwd);
+			if (previousFlag === undefined) delete Bun.env.PI_REQ_DEBUG;
+			else Bun.env.PI_REQ_DEBUG = previousFlag;
+			await fs.rm(dumpDir, { recursive: true, force: true });
+		}
 	});
 
 	it("runs an explicit WS payload hook for an already-aborted request without connecting", async () => {

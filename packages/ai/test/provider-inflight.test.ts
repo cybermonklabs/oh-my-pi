@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import {
 	__providerInFlightForTesting,
@@ -139,6 +140,48 @@ describe("provider in-flight request limits", () => {
 
 		expect(await second).toContain("Cost cap reached");
 		expect(mock.calls).toHaveLength(1);
+	});
+
+	// The model-call checkpoint reads its guards when a call starts and again once the call holds its slot:
+	// a hold that began while the call queued holds it, and nothing is sent.
+	test.each([
+		["holds a queued call when a model-call hold begins while it waits for its slot", true],
+		["sends a queued call when no hold begins while it waits (control)", false],
+	])("%s", async (_name, holdDuringWait) => {
+		registerMockApi();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			provider: "tests",
+			handler: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: ["reply"] };
+			},
+		});
+		let held = false;
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const first = streamSimple(mock.model, context(), { maxInFlightRequests: { tests: 1 } }).result();
+			await started.promise;
+			const waiting = nextLimiterWait();
+			const second = streamSimple(mock.model, context(), { maxInFlightRequests: { tests: 1 } })
+				.result()
+				.then(
+					message => message.errorMessage,
+					error => String(error),
+				);
+			await waiting;
+			held = holdDuringWait;
+			release.resolve();
+			await first;
+
+			if (holdDuringWait) expect(await second).toContain("held: cyber_policy");
+			else expect(await second).toBeUndefined();
+			expect(mock.calls).toHaveLength(holdDuringWait ? 1 : 2);
+		} finally {
+			removeGuard();
+		}
 	});
 
 	test("holds a completions permit until a trailing [DONE] reaches the gateway", async () => {

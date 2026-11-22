@@ -61,6 +61,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import { type CyberPolicyClosureApi, isRecordableCyberPolicyRefusal } from "./cyber-policy-closure";
 import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
@@ -331,6 +332,8 @@ export interface TurnRecoveryHost {
 	thinkingLevelCeiling(): Effort | undefined;
 	/** The session never switches to a retry fallback model (a per-call `model` subagent). */
 	modelFallbackDisabled?(): boolean;
+	/** The session tree's cyber-policy closure: fallback searches pass over the routes it closes. */
+	cyberPolicyClosure?(): CyberPolicyClosureApi;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
 	isCompacting(): boolean;
@@ -2185,17 +2188,53 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Whether a fallback entry is in cooldown: by its own string, or by the key of
-	 * `model`, the model it resolves to. A cooldown is keyed by the model that
-	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so any
-	 * other spelling that resolves to it (an alias such as `pi/<role>`, an id
-	 * without the catalog revision suffix) is in cooldown while that model is.
+	 * Whether a fallback entry is passed over: in cooldown, by its own string or by the key of
+	 * `model`, the model it resolves to, or a route a `cyber_policy` refusal closed until the next
+	 * prompt from a person (`cyber-policy-closure.ts`). A cooldown is keyed by the model that
+	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so any other spelling that
+	 * resolves to it (an alias such as `pi/<role>`, an id without the catalog revision suffix) is in
+	 * cooldown while that model is.
 	 */
 	isRetryFallbackEntrySuppressed(selector: RetryFallbackSelector, model: Model): boolean {
-		return (
+		if (
 			this.#host.modelRegistry.isSelectorSuppressed(selector.raw) ||
 			this.#host.modelRegistry.isSelectorSuppressed(formatModelStringWithRouting(model))
-		);
+		) {
+			return true;
+		}
+		const closure = this.#host.cyberPolicyClosure?.();
+		return closure?.active === true && closure.isClosed(model);
+	}
+
+	/**
+	 * Records an OpenAI `cyber_policy` refusal (a failed assistant message or a thrown error). The
+	 * refusal judges the request's content, and every copy sent again to OpenAI adds a refusal to the
+	 * organization's record, so the call is not retried (the error is not retryable) and the session
+	 * tree's closure keeps every OpenAI route, and every route whose family the catalog cannot tell,
+	 * from every fallback search until the next prompt from a person. A model of a known other family
+	 * may still take the turn.
+	 */
+	recordCyberPolicyRefusal(failure: unknown): void {
+		// A call the hold itself held names the code too; only OpenAI's own refusal is recorded.
+		if (isRecordableCyberPolicyRefusal(failure)) this.#host.cyberPolicyClosure?.().record();
+	}
+
+	/**
+	 * Switches off a route the cyber-policy closure holds closed onto the first open, keyed fallback
+	 * candidate. Unpinned: the primary comes back once a person's prompt ends the closure.
+	 */
+	async applyCyberPolicyFallback(signal: AbortSignal): Promise<boolean> {
+		if (!cfgRetryModelFallback.get(this.#host.settings) || this.#host.modelFallbackDisabled?.()) return false;
+		const currentModel = this.#host.model();
+		if (!currentModel || !this.#host.cyberPolicyClosure?.().isClosed(currentModel)) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal, undefined);
+		if (!fallback) return false;
+		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+			apiKey: fallback.apiKey,
+			signal,
+			reason: "OpenAI refused this turn's content (cyber_policy)",
+		});
 	}
 
 	/** Records the cooldown that should suppress a failing selector. */

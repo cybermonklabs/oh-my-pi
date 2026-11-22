@@ -101,6 +101,7 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import {
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
@@ -460,6 +461,8 @@ export interface ExecutorOptions {
 	cwd: string;
 	/** Cost gate of the parent session tree; the subagent's requests count toward it. */
 	costGate?: CostGateApi;
+	/** Cyber-policy closure of the parent session tree: a refusal anywhere in the tree closes OpenAI's routes to all of it. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
@@ -5215,6 +5218,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				options: {
 					cwd: effectiveCwd,
 					costGate: options.costGate,
+					cyberPolicyClosure: options.cyberPolicyClosure,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 					authStorage,
 					modelRegistry,

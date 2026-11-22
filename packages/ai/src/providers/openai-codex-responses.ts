@@ -28,6 +28,7 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
+import { assertModelCallAllowed, guardedRequestUrl, modelCallHoldReason } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -1714,7 +1715,9 @@ async function openCodexWebSocketTransport(
 		throw new CodexWebSocketBusyError("websocket request already in progress");
 	}
 	// Accepted steering belongs to whichever request ends up owning the socket,
-	// so it is only consumed once this request takes it (see `onOwned` below).
+	// so it is only consumed once this request takes it (see `onOwned` below):
+	// when its frame goes out, so a frame the model-call guards hold leaves it
+	// for the next request instead of dropping it while the socket keeps it.
 	const steered = websocketState.acceptedSteering;
 	const onOwned = () => {
 		if (websocketState.acceptedSteering === steered) websocketState.acceptedSteering = undefined;
@@ -1763,6 +1766,9 @@ async function openCodexWebSocketTransport(
 			// The server already started the successor from steering it accepted;
 			// reading it puts nothing on the wire, so it passes no hold.
 			if (plan.kind === "attach") {
+				// The model-call guards' read right before the request goes out, after the attestation and
+				// connection waits (see the frame send below).
+				assertModelCallAllowed(model);
 				recordCodexTurnRequestDiagnostics(websocketState, chainedBody, "websocket", canAppendBeforeRequest);
 				requestContext.rawRequestDump.body = chainedBody;
 				return {
@@ -1862,8 +1868,13 @@ async function openCodexWebSocketTransport(
 				retry,
 				retryBudget: CODEX_WEBSOCKET_RETRY_BUDGET,
 			});
+		// Each WebSocket request (the first, the connect loop's retries and every reopen after a recovery wait)
+		// reads the model-call guards here, after the attestation, connection and `onPayload` waits; a held one
+		// sends nothing, and the catch below releases the reservation. The connection reads them again in the same
+		// step as the frame, after its request dump.
+		assertModelCallAllowed(model);
 		const eventStream = websocketConnection.streamRequest(
-			{ send: websocketRequest, hold: options?.beforeDispatch },
+			{ send: websocketRequest, model, hold: options?.beforeDispatch },
 			timeouts,
 			requestSetup.requestSignal,
 			onSseEvent,
@@ -1922,6 +1933,7 @@ async function openCodexSseTransport(
 		// Keep the 400 dump honest: record the body actually sent on the wire.
 		requestContext.rawRequestDump.body = wireBody;
 		const { events, firstEventBudgetLeftMs } = await openCodexSseEventStream(
+			model,
 			requestContext.url,
 			requestContext.requestHeaders,
 			requestContext.accountId,
@@ -2151,7 +2163,15 @@ class CodexStreamProcessor {
 				// steers its own response.
 				const steered = await this.#retireSteering();
 				this.#stopSteeringOnNativeLaneRejection(error, steered);
-				const recovered = await this.#recoverStreamError(error);
+				let recovered: boolean;
+				try {
+					recovered = await this.#recoverStreamError(error);
+				} catch (recoveryError) {
+					// A recovery that throws (a held reopen, a transport error while reopening) ends the turn as a
+					// failed recovery does: settle the steering first, so a socket that accepted steering closes.
+					await this.#settleSteering(false);
+					throw recoveryError;
+				}
 				if (!recovered) {
 					await this.#settleSteering(false);
 					throw error;
@@ -2408,11 +2428,17 @@ class CodexStreamProcessor {
 		this.#steerConnection = connection;
 		// Each steer is new input that can start a successor response, so it
 		// passes this request's hold; an attach to that successor sends nothing.
+		// Each steer is also a send into the response in flight, so it reads the model-call guards: when it
+		// is converted, and again in the same step as its frame goes out, after the hold. A held steer is
+		// handed back (no input), so the session delivers it with its next request, which they hold.
 		this.#steerPump = new CodexSteerPump(
 			source,
 			connection,
-			messages => toSteerInputItems(convertMessages(this.model, { messages: [...messages] })),
-			{ hold: this.options?.beforeDispatch, signal: this.requestSetup.requestSignal },
+			messages =>
+				modelCallHoldReason(this.model) === undefined
+					? toSteerInputItems(convertMessages(this.model, { messages: [...messages] }))
+					: undefined,
+			{ hold: this.options?.beforeDispatch, signal: this.requestSetup.requestSignal, model: this.model },
 		);
 		this.#steerPump.start(responseId);
 	}
@@ -2709,6 +2735,10 @@ class CodexStreamProcessor {
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
+		// An OpenAI `cyber_policy` refusal judges the request's content: no recovery below may send it
+		// again (replay, reconnect, another transport or program), since each copy adds a refusal to the
+		// organization's record.
+		if (AIError.isCyberPolicyRefusal(error)) return false;
 		if (
 			error instanceof CodexSteerCommitError &&
 			this.runtime.websocketState &&
@@ -3769,11 +3799,12 @@ interface CodexWebSocketRequestTimeouts {
 /** What {@link CodexWebSocketConnection.streamRequest} puts on the wire before reading a response. */
 type CodexWebSocketExchange =
 	/**
-	 * Send this request. `hold` is the caller's dispatch hold, awaited after the
+	 * Send this request for `model`. `hold` is the caller's dispatch hold, awaited after the
 	 * handshake and the request-debug dump — the two awaits a `/pause` used to
-	 * slip through — and immediately before the payload goes out.
+	 * slip through — and immediately before the payload goes out, in the same step
+	 * as the read of `model`'s model-call guards.
 	 */
-	| { send: Record<string, unknown>; hold?: DispatchHold }
+	| { send: Record<string, unknown>; model: Model<Api>; hold?: DispatchHold }
 	/**
 	 * Read the successor the server creates from accepted steering; nothing is
 	 * sent, so nothing is held: that response is already running and paid for.
@@ -4172,6 +4203,7 @@ function withCodexAttestationAtWire(fetchImpl: FetchImpl, accountId: string | un
 }
 
 async function openCodexSseEventStream(
+	model: Model<"openai-codex-responses">,
 	url: string,
 	requestHeaders: Record<string, string> | undefined,
 	accountId: string | undefined,
@@ -4240,7 +4272,9 @@ async function openCodexSseEventStream(
 
 	let response: Response;
 	try {
-		response = await fetchWithRetry(url, {
+		// Every attempt (the first, each retry after a 408, 429 or 5xx backoff, and every reopen that calls
+		// this again) reads the model-call guards first; a held attempt leaves unretried.
+		response = await fetchWithRetry(guardedRequestUrl(model, url), {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
@@ -4257,6 +4291,9 @@ async function openCodexSseEventStream(
 			maxAttempts: resolveCodexSseMaxAttempts(codexSseMaxAttempts),
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
+			// An OpenAI `cyber_policy` refusal, even one a gateway relays as a 5xx, is never
+			// sent again: each copy adds a refusal to the organization's record.
+			shouldRetryResponse: (_response, bodyText) => !AIError.isCyberPolicyRefusal(bodyText),
 			fetch: fetchAttempt,
 			timeout: false,
 		});

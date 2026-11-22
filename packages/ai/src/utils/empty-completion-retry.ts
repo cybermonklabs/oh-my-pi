@@ -14,7 +14,8 @@
  * classifier and are separately bounded by the caller's policy.
  */
 import * as AIError from "../error";
-import type { AssistantMessage, AssistantMessageEvent, Context } from "../types";
+import { heldModelCall } from "../model-call-guard";
+import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 import { waitForRetry } from "./retry-wait";
 
@@ -88,7 +89,7 @@ class FinalizedProviderStreamError extends Error {
  * replay-safe. Buffered pre-output events from discarded attempts never reach
  * consumers.
  */
-export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
+export function withReplaySafeStreamRetry<M extends Model<Api>, O extends StreamRetryOptions>(
 	model: M,
 	context: Context,
 	options: O | undefined,
@@ -100,7 +101,7 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 	void (async () => {
 		let emptyRetries = 0;
 		let providerErrorRetries = 0;
-		while (true) {
+		for (let attemptIndex = 0; ; attemptIndex++) {
 			const buffered: AssistantMessageEvent[] = [];
 			let committed = options?.acceptEmptyResponse === true;
 			let terminal: AssistantMessageEvent | undefined;
@@ -113,7 +114,10 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				// The attempt factory can throw synchronously (e.g. a config error
 				// raised before it creates its stream); surface it on the outer stream
 				// rather than leaking an unhandled rejection that never settles.
-				inner = attempt(model, context, options);
+				// A retry sends the whole request again after a wait: it reads the model-call guards first, and a
+				// held one ends the call with the held error and sends nothing. (The first attempt was read by the
+				// call's own checkpoint just before.)
+				inner = (attemptIndex > 0 ? heldModelCall(model) : undefined) ?? attempt(model, context, options);
 				// A watchdog on `outer` must see the attempt's local work — a request
 				// parked on a dispatch hold above all — or it reads that silence as a
 				// stalled provider and aborts a request that was never sent.

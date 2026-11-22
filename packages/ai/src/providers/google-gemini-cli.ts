@@ -16,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { assertModelCallAllowed, guardedRequestUrl } from "../model-call-guard";
 import { oauthAccountKey } from "../auth/types";
 import type {
 	AntigravityModelWireProfile,
@@ -971,17 +972,22 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					const watchdog = armPreResponseTimeout(callerSignal, firstEventTimeoutMs);
 					let response: Response;
 					try {
-						response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
-							method: "POST",
-							headers: requestHeaders,
-							body: requestBodyJson,
-							signal: watchdog.signal,
-							maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
-							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
-							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
-							fetch: options?.fetch,
-							timeout: false,
-						});
+						// Each attempt (every endpoint, and each retry on the last after its backoff) reads the
+						// model-call guards first.
+						response = await fetchWithRetry(
+							guardedRequestUrl(model, `${endpoint}/v1internal:streamGenerateContent?alt=sse`),
+							{
+								method: "POST",
+								headers: requestHeaders,
+								body: requestBodyJson,
+								signal: watchdog.signal,
+								maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
+								defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+								maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+								fetch: options?.fetch,
+								timeout: false,
+							},
+						);
 					} finally {
 						watchdog.clear();
 					}
@@ -1034,6 +1040,11 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								throw new AIError.ConfigurationError("Missing request URL");
 							}
 
+							// The empty-response resend reads the model-call guards right before it goes out, after
+							// its backoff, as each `fetchWithRetry` attempt above does. The output is reset only after
+							// the read, so a held resend ends with what the first answer streamed (its usage).
+							assertModelCallAllowed(model);
+							resetOutput();
 							// The replay is a new request with its own budget, bounded
 							// before headers the same way the attempt above is.
 							const replayWatchdog = armPreResponseTimeout(callerSignal, firstEventTimeoutMs);
@@ -1081,10 +1092,6 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						// burns another full reasoning pass; let session recovery add
 						// an explicit final-output reminder instead.
 						if (thoughtOnly) break;
-
-						if (emptyAttempt < MAX_EMPTY_STREAM_RETRIES) {
-							resetOutput();
-						}
 					}
 
 					if (output.stopReason === "aborted" || output.stopReason === "error") {

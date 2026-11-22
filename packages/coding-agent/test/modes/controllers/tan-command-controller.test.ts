@@ -153,6 +153,8 @@ function createContext(overrides?: {
 		getEnabledToolNames: vi.fn(() => overrides?.enabledToolNames ?? overrides?.activeToolNames ?? ["read", "bash"]),
 		getMountedXdevToolNames: vi.fn(() => []),
 		modelRegistry: { authStorage: { marker: "auth" } },
+		// The root's cyber-policy closure: the clone must share it, not own a fresh one.
+		cyberPolicyClosure: { marker: "root-closure" },
 		preparedExtensions: overrides?.preparedExtensions,
 		effectiveExtensionRoots: overrides?.effectiveExtensionRoots,
 		extensionPaths: overrides?.extensionPaths,
@@ -515,6 +517,8 @@ describe("TanCommandController", () => {
 				providerPromptCacheKey: "parent-session",
 				parentTaskPrefix: expect.stringMatching(/^Tan-/) as unknown as string,
 				agentDisplayName: "tan",
+				// The clone forks the transcript: the root's hold holds it, and its refusal holds the root.
+				cyberPolicyClosure: { marker: "root-closure" },
 			}),
 		);
 	});

@@ -77,7 +77,11 @@ describe("empty submit with queued messages", () => {
 		await ctx.editor.onSubmit?.("[Image #1]");
 
 		expect(abort).not.toHaveBeenCalled();
-		expect(prompt).toHaveBeenCalledWith("[Image #1]", { streamingBehavior: "steer", images: [image] });
+		expect(prompt).toHaveBeenCalledWith("[Image #1]", {
+			streamingBehavior: "steer",
+			images: [image],
+			origin: "outside",
+		});
 		expect(ctx.editor.pendingImages).toEqual([]);
 		expect(ctx.editor.pendingImageLinks).toEqual([]);
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -118,7 +122,11 @@ describe("empty submit with queued messages", () => {
 		await ctx.editor.onSubmit?.("[Image #1]");
 
 		expect(abort).not.toHaveBeenCalled();
-		expect(prompt).toHaveBeenCalledWith("[Image #1]", { streamingBehavior: "steer", images: [image] });
+		expect(prompt).toHaveBeenCalledWith("[Image #1]", {
+			streamingBehavior: "steer",
+			images: [image],
+			origin: "outside",
+		});
 	});
 
 	it("drops a pending image whose marker was deleted and aborts as an empty submit", async () => {

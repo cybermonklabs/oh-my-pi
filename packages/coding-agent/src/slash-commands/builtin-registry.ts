@@ -201,6 +201,8 @@ export async function executeBuiltinSlashCommand(
 			settings: ctx.settings,
 			cwd: ctx.sessionManager.getCwd(),
 			...tuiSlashCommandHost(ctx),
+			// Typed in the TUI by a person.
+			origin: "outside",
 			notifySessionPinChanged: (sessionId: string, pinned: boolean) => ctx.applySessionPin(sessionId, pinned),
 		};
 		const result = await command.handle(parsed, adapted);

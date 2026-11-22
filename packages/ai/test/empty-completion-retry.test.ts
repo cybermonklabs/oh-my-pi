@@ -4,11 +4,13 @@
  * so output is never duplicated.
  */
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, Context, Usage } from "@oh-my-pi/pi-ai/types";
+import type { Api, AssistantMessage, AssistantMessageEvent, Context, Model, Usage } from "@oh-my-pi/pi-ai/types";
 import { MAX_EMPTY_COMPLETION_RETRIES, withReplaySafeStreamRetry } from "@oh-my-pi/pi-ai/utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 
 const CTX = {} as Context;
+/** The retry reads the model-call guards with the model before each retry; none is registered here. */
+const MODEL = {} as Model<Api>;
 
 function usage(): Usage {
 	return {
@@ -82,7 +84,7 @@ describe("withReplaySafeStreamRetry", () => {
 		let attempts = 0;
 		const waits: number[] = [];
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async ms => void waits.push(ms) },
 			() => {
@@ -108,7 +110,7 @@ describe("withReplaySafeStreamRetry", () => {
 		let attempts = 0;
 		const waits: number[] = [];
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async ms => void waits.push(ms) },
 			() => {
@@ -131,7 +133,7 @@ describe("withReplaySafeStreamRetry", () => {
 		let attempts = 0;
 		const waits: number[] = [];
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async ms => void waits.push(ms) },
 			() => {
@@ -155,7 +157,7 @@ describe("withReplaySafeStreamRetry", () => {
 		let attempts = 0;
 		const waits: number[] = [];
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async ms => void waits.push(ms) },
 			() => {
@@ -183,7 +185,7 @@ describe("withReplaySafeStreamRetry", () => {
 		let attempts = 0;
 		let waited = false;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{
 				providerRetryWait: async () => {
@@ -206,7 +208,7 @@ describe("withReplaySafeStreamRetry", () => {
 	it("commits on streamed thinking and does not retry a thinking-only stop", async () => {
 		let attempts = 0;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{},
 			() => {
@@ -229,7 +231,7 @@ describe("withReplaySafeStreamRetry", () => {
 
 	it("propagates a non-abort backoff failure instead of masking the empty result", async () => {
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{
 				providerRetryWait: async () => {
@@ -253,7 +255,7 @@ describe("withReplaySafeStreamRetry", () => {
 		const controller = new AbortController();
 		let attempts = 0;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{
 				signal: controller.signal,
@@ -280,7 +282,7 @@ describe("withReplaySafeStreamRetry", () => {
 	it("discards buffered pre-content markers from a retried empty attempt", async () => {
 		let attempts = 0;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -313,7 +315,7 @@ describe("withReplaySafeStreamRetry", () => {
 		const message = assistant(["streamed"]);
 		const inner = new AssistantMessageEventStream();
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{
 				providerRetryWait: async () => {
@@ -347,7 +349,7 @@ describe("withReplaySafeStreamRetry", () => {
 	it("retries a transient provider error before output commits", async () => {
 		let attempts = 0;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -378,7 +380,7 @@ describe("withReplaySafeStreamRetry", () => {
 		message.stopReason = "error";
 		message.errorMessage = "The socket connection was closed unexpectedly";
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -405,7 +407,7 @@ describe("withReplaySafeStreamRetry", () => {
 	it("settles the outer stream when the attempt factory throws synchronously", async () => {
 		const configError = new Error("explicit prompt caching is unsupported");
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -420,7 +422,7 @@ describe("withReplaySafeStreamRetry", () => {
 	it("retries when a tool call emits start and an empty end with no argument content before an error", async () => {
 		let attempts = 0;
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -464,7 +466,7 @@ describe("withReplaySafeStreamRetry", () => {
 		const message = assistant();
 		message.content = [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "/x" } }];
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {
@@ -492,7 +494,7 @@ describe("withReplaySafeStreamRetry", () => {
 		message.stopReason = "error";
 		message.errorMessage = "The socket connection was closed unexpectedly";
 		const stream = withReplaySafeStreamRetry(
-			{},
+			MODEL,
 			CTX,
 			{ providerRetryWait: async () => {} },
 			() => {

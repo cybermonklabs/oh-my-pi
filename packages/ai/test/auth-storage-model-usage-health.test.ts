@@ -810,13 +810,17 @@ describe("AuthStorage model usage health depletion cause", () => {
 		return storage;
 	}
 
-	/** An account-wide policy denial: rotation blocks the account under the `account-policy` scope. */
+	/**
+	 * An account-wide policy denial: rotation blocks the account under the `account-policy` scope. Anthropic's
+	 * organization OAuth denial, not a `cyber_policy` refusal: that one judges the request's content, so rotation
+	 * neither blocks nor switches for it.
+	 */
 	async function denyAccountPolicy(storage: AuthStorage): Promise<void> {
 		await storage.limits.rotate("anthropic", undefined, {
 			credentialId: 1,
-			error: new Error(
-				"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
-			),
+			error: new ProviderHttpError("OAuth authentication is currently not allowed for this organization.", 403, {
+				code: "oauth_not_allowed_for_organization",
+			}),
 		});
 	}
 

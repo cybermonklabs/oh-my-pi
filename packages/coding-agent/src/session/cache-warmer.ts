@@ -27,11 +27,15 @@ import {
 	type SimpleStreamOptions,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../extensibility/shared-events";
 
 export type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult };
+
+/** Why the warmer stopped: a replay would send content OpenAI refused for cyber policy again. */
+const CYBER_POLICY_STOP_REASON = "OpenAI refused the cached request's content (cyber_policy)";
 
 /** Warming mode: "off" disables it, "streaming" protects active runs, "idle" also covers gaps between runs. */
 export type CacheWarmingMode = "off" | "streaming" | "idle";
@@ -379,6 +383,11 @@ export interface CacheWarmerDeps {
 	getMode: () => CacheWarmingMode;
 	/** Extension override hook; failures fall back to the warmer's own decision. */
 	decide?: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
+	/**
+	 * Whether a request to `model` must not be sent now: a cyber-policy refusal holds its route closed.
+	 * A replay sends the refused request's content again, so the warmer stops instead.
+	 */
+	isRouteClosed?: (model: Model<Api>) => boolean;
 }
 
 /**
@@ -561,6 +570,16 @@ export class CacheWarmer {
 			}
 		}
 		const run = this.#run;
+		// A replay of a request OpenAI refused for cyber policy is the refused content sent again.
+		if (
+			run &&
+			message.stopReason === "error" &&
+			AIError.isCyberPolicyRefusal(message) &&
+			answers(message, run.model)
+		) {
+			this.#stop(CYBER_POLICY_STOP_REASON);
+			return;
+		}
 		if (!run || run.timer === undefined) return;
 		if (!answers(message, run.model)) return;
 		if (observed === undefined || observed === run.tier) return;
@@ -689,6 +708,10 @@ export class CacheWarmer {
 		const decision = this.#evaluate(run);
 		const action = await this.#decide(decision);
 		if (!this.#validateRun(run)) return;
+		if (this.#deps.isRouteClosed?.(run.model)) {
+			this.#stop(CYBER_POLICY_STOP_REASON);
+			return;
+		}
 		const extensionOverride = action !== decision.action;
 		if (action === "stop") {
 			const reason = extensionOverride

@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { addModelCallGuard, ModelCallRefusedError } from "@oh-my-pi/pi-ai/model-call-guard";
+import type { DispatchHold } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	ResponsesWebSocketConnection,
 	type ResponsesWebSocketConnectionOptions,
 	ResponsesWebSocketTransportError,
 } from "../src/providers/responses-websocket-connection";
+
+/** A `response.create` exchange for a model no model-call guard holds. */
+function create() {
+	return { send: { type: "response.create" }, model: getBundledModel("openai", "gpt-5-mini") };
+}
 
 const connections: ResponsesWebSocketConnection[] = [];
 let server: Bun.Server<undefined>;
@@ -129,14 +137,14 @@ describe("Responses physical WebSocket channel", () => {
 		const socket = connection();
 		await socket.connect();
 		const error = new Error("ownership hook failed");
-		const failed = socket.streamRequest({ send: { type: "response.create" } }, {}, undefined, undefined, () => {
+		const failed = socket.streamRequest(create(), {}, undefined, undefined, () => {
 			throw error;
 		});
 		await expect(failed.next()).rejects.toBe(error);
 		expect(socket.hasActiveRequest()).toBe(false);
 		expect(sent).toHaveLength(0);
 		const result: Record<string, unknown>[] = [];
-		for await (const frame of socket.streamRequest({ send: { type: "response.create" } }, {})) result.push(frame);
+		for await (const frame of socket.streamRequest(create(), {})) result.push(frame);
 		expect(result).toEqual([{ type: "response.completed", response: { id: "resp_1" } }]);
 		expect(sent).toHaveLength(1);
 	});
@@ -189,7 +197,7 @@ describe("Responses physical WebSocket channel", () => {
 		const socket = connection();
 		await socket.connect();
 		const result: Record<string, unknown>[] = [];
-		for await (const frame of socket.streamRequest({ send: { type: "response.create" } }, {})) {
+		for await (const frame of socket.streamRequest(create(), {})) {
 			result.push(frame);
 			break;
 		}
@@ -203,7 +211,7 @@ describe("Responses physical WebSocket channel", () => {
 		const closed: Error[] = [];
 		const socket = connection({ controlFrames: { consume: () => false, closed: error => closed.push(error) } });
 		await socket.connect();
-		const reader = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const reader = socket.streamRequest(create(), {});
 		const pending = reader.next();
 		await received.promise;
 		socket.close("session-reset");
@@ -222,10 +230,10 @@ describe("Responses physical WebSocket channel", () => {
 		onMessage = socket => received.resolve(socket);
 		const socket = connection();
 		await socket.connect();
-		const owner = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const owner = socket.streamRequest(create(), {});
 		const pending = owner.next();
 		const serverSocket = await received.promise;
-		const contender = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const contender = socket.streamRequest(create(), {});
 		await expect(contender.next()).rejects.toMatchObject({ reason: "busy", phase: "stream" });
 		expect(socket.hasActiveRequest()).toBe(true);
 		expect(sent).toHaveLength(1);
@@ -239,7 +247,7 @@ describe("Responses physical WebSocket channel", () => {
 		onMessage = () => {};
 		const socket = connection();
 		await socket.connect();
-		const reader = socket.streamRequest({ send: { type: "response.create" } }, { firstEventTimeoutMs: 10 });
+		const reader = socket.streamRequest(create(), { firstEventTimeoutMs: 10 });
 		await expect(reader.next()).rejects.toMatchObject({
 			reason: "timeout",
 			phase: "first-event",
@@ -293,5 +301,90 @@ describe("Responses physical WebSocket channel", () => {
 		expect(closed).toEqual([rejection]);
 		expect(sent).toHaveLength(0);
 		await expect(socket.connect()).rejects.toBe(rejection);
+	});
+});
+
+// The frame waits on the caller's dispatch hold, and a refusal another call of the session tree records while it
+// waits must hold the frame: the model-call guards are read in the same step as the frame, after the hold. The
+// control answers the hold with no refusal, and the frame goes out.
+describe("a Responses WebSocket frame behind a dispatch hold", () => {
+	it.each([
+		["sends nothing when a refusal is recorded while the hold waits", true],
+		["sends the frame when the hold answers with no refusal (control)", false],
+	])("%s", async (_name, refused) => {
+		const exchange = create();
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === exchange.model.id ? "held: cyber_policy" : undefined),
+		});
+		const hold: DispatchHold = async () => {
+			await Bun.sleep(1);
+			// Another call of the session tree meets a refusal while this frame waits.
+			if (refused) held = true;
+		};
+		try {
+			const socket = connection();
+			await socket.connect();
+			const reader = socket.streamRequest({ ...exchange, hold }, {});
+			if (refused) {
+				await expect(reader.next()).rejects.toBeInstanceOf(ModelCallRefusedError);
+				expect(sent).toHaveLength(0);
+				expect(socket.hasActiveRequest()).toBe(false);
+			} else {
+				const result: Record<string, unknown>[] = [];
+				for await (const frame of reader) result.push(frame);
+				expect(sent).toEqual([{ type: "response.create" }]);
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+});
+
+// `onOwned` hands the request what the socket holds for its next frame: Codex's accepted steering, which the
+// request carrying that frame consumes. A frame the model-call guards hold sends nothing, so it consumes nothing:
+// the request does not take the socket until its frame goes out. The control's frame goes out and takes it.
+describe("a Responses WebSocket frame the model-call guards hold", () => {
+	it.each([
+		["does not take the socket's next-frame state", true],
+		["takes it when its frame goes out (control)", false],
+	])("%s", async (_name, held) => {
+		const exchange = create();
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === exchange.model.id ? "held: cyber_policy" : undefined),
+		});
+		let owned = 0;
+		try {
+			const socket = connection();
+			await socket.connect();
+			const reader = socket.streamRequest(exchange, {}, undefined, undefined, () => {
+				owned++;
+			});
+			if (held) {
+				await expect(reader.next()).rejects.toBeInstanceOf(ModelCallRefusedError);
+				expect(sent).toHaveLength(0);
+				expect(owned).toBe(0);
+			} else {
+				for await (const _frame of reader) {
+				}
+				expect(sent).toEqual([{ type: "response.create" }]);
+				expect(owned).toBe(1);
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A read (an attach to a response the server already started) sends no frame, and owns the socket at once.
+	it("a read takes the socket's next-frame state at once", async () => {
+		let owned = 0;
+		const socket = connection();
+		await socket.connect();
+		const reader = socket.streamRequest({ receive: true }, { firstEventTimeoutMs: 10 }, undefined, undefined, () => {
+			owned++;
+		});
+		await expect(reader.next()).rejects.toBeInstanceOf(ResponsesWebSocketTransportError);
+		expect(owned).toBe(1);
+		expect(sent).toHaveLength(0);
 	});
 });

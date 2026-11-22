@@ -6,6 +6,7 @@ import {
 	resolveRequestCompression,
 } from "@oh-my-pi/pi-catalog/compat/request-compression";
 import { $flag, logger } from "@oh-my-pi/pi-utils";
+import { isCyberPolicyRefusal } from "../error/flags";
 import type { FetchImpl, Model } from "../types";
 
 const gzip = promisify(zlib.gzip);
@@ -101,7 +102,9 @@ function isJson(text: string): boolean {
  * 400/415 when none is assigned). `proxy`: a 400/403/415 whose body is not JSON,
  * empty included — provider APIs answer errors in JSON, so the body is presumed
  * to come from a proxy or TLS-inspecting gateway that may refuse a compressed
- * upload the host itself decodes.
+ * upload the host itself decodes. Never an OpenAI `cyber_policy` refusal: it
+ * judges the request's content, and sending it again uncompressed adds a second
+ * refusal to the organization's record.
  */
 async function suspectEncodingRejection(
 	response: Response,
@@ -109,7 +112,7 @@ async function suspectEncodingRejection(
 ): Promise<RejectionSuspect | undefined> {
 	if (response.status !== 400 && response.status !== 403 && response.status !== 415) return undefined;
 	const body = await bodyText(response);
-	if (body === undefined) return undefined;
+	if (body === undefined || isCyberPolicyRefusal(body)) return undefined;
 	if (!isJson(body)) return "proxy";
 	if (response.status === 403) return undefined;
 	return (policy.rejection?.test(body) ?? true) ? "host" : undefined;

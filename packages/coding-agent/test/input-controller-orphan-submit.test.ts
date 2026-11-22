@@ -154,6 +154,7 @@ describe("InputController orphaned submit", () => {
 		expect(spies.prompt).toHaveBeenCalledWith("do not lose me", {
 			streamingBehavior: "steer",
 			images: undefined,
+			origin: "outside",
 		});
 		expect(spies.steer).not.toHaveBeenCalled();
 		// Delivery protection: the prompted message is marked as locally submitted.
@@ -216,6 +217,7 @@ describe("InputController orphaned submit", () => {
 		expect(spies.prompt).toHaveBeenCalledWith("look at this [Image #1]", {
 			streamingBehavior: "steer",
 			images: [image],
+			origin: "outside",
 		});
 		expect(ctx.locallySubmittedUserSignatures.has("look at this [Image #1]\u00001")).toBe(true);
 		expect(ctx.editor.pendingImages.length).toBe(0);

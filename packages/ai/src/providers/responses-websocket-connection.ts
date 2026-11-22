@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
-import type { DispatchHold, RawSseEvent } from "../types";
+import { assertModelCallAllowed } from "../model-call-guard";
+import type { Api, DispatchHold, Model, RawSseEvent } from "../types";
 import { dispatchWhenOpen } from "../utils/dispatch-hold";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { notifyRawSseEvent } from "../utils/sse-debug";
@@ -48,11 +49,14 @@ export interface ResponsesWebSocketTimeouts {
 }
 
 /**
- * What {@link ResponsesWebSocketConnection.streamRequest} puts on the wire. `hold`
- * is the caller's dispatch hold, awaited after the request-debug dump and
- * immediately before the frame goes out, in the same synchronous step.
+ * What {@link ResponsesWebSocketConnection.streamRequest} does: put a frame on the wire for `model`, or read a
+ * response the server already started. `hold` is the caller's dispatch hold, awaited after the request-debug
+ * dump; the frame goes out in the same synchronous step as the hold's last check and the read of `model`'s
+ * model-call guards.
  */
-export type ResponsesWebSocketExchange = { send: Record<string, unknown>; hold?: DispatchHold } | { receive: true };
+export type ResponsesWebSocketExchange =
+	| { send: Record<string, unknown>; model: Model<Api>; hold?: DispatchHold }
+	| { receive: true };
 
 export interface ResponsesWebSocketControlFrames {
 	consume(frame: Record<string, unknown>): boolean | Error;
@@ -395,6 +399,12 @@ export class ResponsesWebSocketConnection {
 		if (!control) this.#push(parsed);
 	}
 
+	/**
+	 * Streams one request over the socket. `onOwned` runs when the request takes the socket: for a read (an attach),
+	 * at once; for a send, in the step its frame goes out, so a frame the model-call guards hold (or an abort or a
+	 * failed request dump before it) takes nothing the socket holds for its next frame, such as Codex's accepted
+	 * steering.
+	 */
 	async *streamRequest(
 		exchange: ResponsesWebSocketExchange,
 		timeouts: ResponsesWebSocketTimeouts,
@@ -417,7 +427,7 @@ export class ResponsesWebSocketConnection {
 				"aborted",
 			);
 		try {
-			onOwned?.();
+			if (!("send" in exchange)) onOwned?.();
 			this.#streamObserver = observer;
 			if ("send" in exchange) this.#dropStaleFrames();
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -438,9 +448,19 @@ export class ResponsesWebSocketConnection {
 				// The debug dump above outlasts a `/pause` engaged while it runs, and
 				// this frame is what the provider bills. It goes out in the same
 				// synchronous step as the hold's last check, so a pause landing after
-				// the hold answered still stops it.
+				// the hold answered still stops it. The model-call guards are read in
+				// that step too: the dump and the hold can outlast the caller's own
+				// read, and a resend (a stale anchor's complete replay) has none of its
+				// own. A held frame is not sent, and the request fails with the hold's
+				// error; it takes nothing the socket holds for its next frame
+				// (`onOwned`), which the request whose frame does go out takes.
 				const frame = exchange.send;
-				await dispatchWhenOpen(exchange.hold, signal, () => this.sendControl(frame));
+				const model = exchange.model;
+				await dispatchWhenOpen(exchange.hold, signal, () => {
+					assertModelCallAllowed(model);
+					onOwned?.();
+					this.sendControl(frame);
+				});
 			}
 			let sawFirstEvent = false;
 			let lastProgressAt = Date.now();

@@ -1,4 +1,5 @@
 import { type Api, type AuthStorage, type Model, withAuth } from "@oh-my-pi/pi-ai";
+import { guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import type { SearchCitation, SearchResponse, SearchSource, SearchUsage } from "../types";
 import { asRecord } from "@oh-my-pi/pi-utils";
 import { SearchProviderError } from "../../../web/search/types";
@@ -176,47 +177,50 @@ export async function searchOpenRouterGrounded(params: SearchParams): Promise<Se
 	const keyOrResolver = params.modelRegistry.resolver(params.model, params.sessionId);
 	const response = await withAuth(
 		keyOrResolver,
-		async apiKey => {
-			const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
-			const httpResponse = await (params.fetch ?? fetch)(
-				`${params.model.baseUrl.replace(/\/+$/, "")}/chat/completions`,
-				{
-					method: "POST",
-					headers: {
-						...configuredHeaders,
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
+		// A model call like any other: each attempt passes the model-call checkpoint, which holds it while a
+		// hold stands on this model and records a refusal it meets (the query is drawn from the conversation).
+		apiKey =>
+			guardModelRequest(params.model, async () => {
+				const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
+				const httpResponse = await (params.fetch ?? fetch)(
+					`${params.model.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+					{
+						method: "POST",
+						headers: {
+							...configuredHeaders,
+							Authorization: `Bearer ${apiKey}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							model: params.model.id,
+							plugins: [{ id: "web", max_results: numSearchResults }],
+							messages: [{ role: "user", content: params.query }],
+						}),
+						signal: withHardTimeout(params.signal, params.timeoutMs),
 					},
-					body: JSON.stringify({
-						model: params.model.id,
-						plugins: [{ id: "web", max_results: numSearchResults }],
-						messages: [{ role: "user", content: params.query }],
-					}),
-					signal: withHardTimeout(params.signal, params.timeoutMs),
-				},
-			);
-			if (!httpResponse.ok) {
-				const errorText = await httpResponse.text();
-				const classified = classifyProviderHttpError("openrouter", httpResponse.status, errorText);
-				if (classified) throw classified;
-				throw new SearchProviderError(
-					"openrouter",
-					`OpenRouter web search error (${httpResponse.status}): ${errorText}`,
-					httpResponse.status,
 				);
-			}
-			try {
-				const payload: unknown = await httpResponse.json();
-				if (!isOpenRouterResponse(payload)) {
-					throw new Error("response did not match the expected chat-completion shape");
+				if (!httpResponse.ok) {
+					const errorText = await httpResponse.text();
+					const classified = classifyProviderHttpError("openrouter", httpResponse.status, errorText);
+					if (classified) throw classified;
+					throw new SearchProviderError(
+						"openrouter",
+						`OpenRouter web search error (${httpResponse.status}): ${errorText}`,
+						httpResponse.status,
+					);
 				}
-				return parseResponse(payload, params.model.id);
-			} catch (error) {
-				if (error instanceof SearchProviderError) throw error;
-				const message = error instanceof Error ? error.message : String(error);
-				throw new SearchProviderError("openrouter", `OpenRouter returned an invalid response: ${message}`, 502);
-			}
-		},
+				try {
+					const payload: unknown = await httpResponse.json();
+					if (!isOpenRouterResponse(payload)) {
+						throw new Error("response did not match the expected chat-completion shape");
+					}
+					return parseResponse(payload, params.model.id);
+				} catch (error) {
+					if (error instanceof SearchProviderError) throw error;
+					const message = error instanceof Error ? error.message : String(error);
+					throw new SearchProviderError("openrouter", `OpenRouter returned an invalid response: ${message}`, 502);
+				}
+			}),
 		{
 			signal: params.signal,
 			missingKeyMessage: `OpenRouter credentials not found for selected provider "${params.model.provider}".`,

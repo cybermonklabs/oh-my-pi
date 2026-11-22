@@ -1331,6 +1331,7 @@ export class VibeSessionRegistry {
 		return {
 			cwd: session.cwd,
 			costGate: session.costGate,
+			cyberPolicyClosure: session.cyberPolicyClosure,
 			agent: record.agent,
 			task: message,
 			assignment: message,

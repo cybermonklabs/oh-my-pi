@@ -26,6 +26,7 @@ import type { Api, FetchImpl } from "@oh-my-pi/pi-catalog/types";
 import { $env, isRecord, parseImageMetadata } from "@oh-my-pi/pi-utils";
 import { type ApiKey, withAuth } from "../auth-retry";
 import * as AIError from "../error";
+import { assertModelCallAllowed, guardModelRequest } from "../model-call-guard";
 import { validateImageInput } from "../images/shared";
 import { withInferenceUserAgent } from "../providers/inference-headers";
 import { redactSensitiveInObject } from "../providers/transform-messages";
@@ -199,6 +200,8 @@ export interface NativeJudgeOptions extends NativeJudgeConnection {
 	imageInput?: JudgmentImageInput;
 	/** Fields merged over every encoded request body (e.g. OpenRouter `provider` routing preferences). */
 	extraBody?: Record<string, unknown>;
+	/** The catalog model this judge asks; when set, each judgment passes the process's model-call guard. */
+	catalogModel?: Model;
 }
 
 /** Per-call options for {@link NativeJudge.judge}. */
@@ -338,6 +341,7 @@ export class NativeJudge implements Judge {
 	readonly #maxQuestions: number | undefined;
 	readonly #imageInput: JudgmentImageInput | undefined;
 	readonly #extraBody: Record<string, unknown> | undefined;
+	readonly #catalogModel: Model | undefined;
 
 	constructor(options: NativeJudgeOptions) {
 		this.#apiKey = options.apiKey;
@@ -355,12 +359,22 @@ export class NativeJudge implements Judge {
 		this.#maxQuestions = options.maxQuestions;
 		this.#imageInput = options.imageInput;
 		this.#extraBody = options.extraBody;
+		this.#catalogModel = options.catalogModel;
 		const optedIntoImages = options.supportsImages ?? this.#wire.imagesRequireOptIn !== true;
 		if (this.#wire.images !== undefined && optedIntoImages) this.supportsImages = true;
 		this.label = `${this.provider}/${this.model}`;
 	}
 
-	async judge<Q extends Questions>(
+	judge<Q extends Questions>(
+		request: JudgmentRequest<Q>,
+		options?: NativeJudgeCallOptions,
+	): Promise<JudgmentResult<Q>> {
+		// The state carries the session's text: a catalog model's judgment passes the model-call guard.
+		const model = this.#catalogModel;
+		return model ? guardModelRequest(model, () => this.#judge(request, options)) : this.#judge(request, options);
+	}
+
+	async #judge<Q extends Questions>(
 		request: JudgmentRequest<Q>,
 		options?: NativeJudgeCallOptions,
 	): Promise<JudgmentResult<Q>> {
@@ -529,6 +543,7 @@ export class NativeJudge implements Judge {
 		};
 		for (let attempt = 0; ; attempt++) {
 			signal?.throwIfAborted();
+			const catalogModel = this.#catalogModel;
 			let response: Response;
 			let sent = false;
 			try {
@@ -536,8 +551,12 @@ export class NativeJudge implements Judge {
 				// the timeout bounds the endpoint, not a caller's hold (`/pause`).
 				// The fetch starts in the same synchronous step as the last read of
 				// the hold's probe, so a gate that closed after the hold answered
-				// still holds the attempt.
+				// still holds the attempt. The model-call guards are read in that
+				// step too, before `sent` is set: each attempt (the first, each retry
+				// after a 408, 429 or 5xx backoff, and each auth-retry key) reads
+				// them after the hold, and a held one sends nothing and is not retried.
 				response = await dispatchWhenOpen(hold, signal, () => {
+					if (catalogModel) assertModelCallAllowed(catalogModel);
 					sent = true;
 					const timeout = AbortSignal.timeout(this.#timeoutMs);
 					return this.#fetch(
@@ -563,7 +582,9 @@ export class NativeJudge implements Judge {
 				headers: response.headers,
 			});
 			const transient = response.status === 408 || response.status === 429 || response.status >= 500;
-			if (!transient || attempt + 1 >= MAX_ATTEMPTS) throw error;
+			// A cyber_policy refusal is never sent again, whatever its status (a gateway relays it as a 5xx): it
+			// ends here, and the model-call guard around `judge` records it.
+			if (!transient || AIError.isCyberPolicyRefusal(text) || attempt + 1 >= MAX_ATTEMPTS) throw error;
 			await Bun.sleep(backoffMs(attempt, response.headers));
 		}
 	}
@@ -593,6 +614,7 @@ export function createNativeJudge(model: Model, connection: NativeJudgeConnectio
 		supportsImages: nativeJudgmentSupportsImages(model),
 		imageInput: resolveJudgmentImageInput(model),
 		extraBody: openRouterDecisionsBody(model),
+		catalogModel: model,
 	});
 }
 

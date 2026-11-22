@@ -4224,7 +4224,7 @@ pub struct PromptError {
 	pub model: Option<String>,
 	#[serde(rename = "httpStatus", default, skip_serializing_if = "Option::is_none")]
 	pub http_status: Option<i64>,
-	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent.
+	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<PromptErrorCode>,
 }
@@ -6048,6 +6048,8 @@ pub enum PromptErrorCode {
 	CostCap,
 	#[serde(rename = "session_busy")]
 	SessionBusy,
+	#[serde(rename = "cyber_policy")]
+	CyberPolicy,
 }
 
 impl PromptErrorCode {
@@ -6056,6 +6058,7 @@ impl PromptErrorCode {
 		match self {
 			Self::CostCap => "cost_cap",
 			Self::SessionBusy => "session_busy",
+			Self::CyberPolicy => "cyber_policy",
 		}
 	}
 }

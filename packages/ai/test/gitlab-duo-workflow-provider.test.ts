@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { isContextOverflow } from "@oh-my-pi/pi-ai/error";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import {
 	buildGitLabDuoWorkflowApprovalStartRequest,
 	buildGitLabDuoWorkflowCreateBody,
@@ -31,10 +33,12 @@ import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transfor
 import type {
 	AssistantMessage,
 	Context,
+	DispatchHold,
 	FetchImpl,
 	Message,
 	Model,
 	ProviderSessionState,
+	SimpleStreamOptions,
 	Tool,
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai/types";
@@ -1931,6 +1935,362 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(result.errorMessage).toBeUndefined();
 	});
 
+	// The retry on a fresh workflow sends the conversation again: it reads the model-call guards right before
+	// its socket opens. A hold that begins when the first workflow fails holds the retry: one socket, and the
+	// call ends on the held error. The test above is the control: with no hold, the second socket opens.
+	it("holds the fresh-workflow retry when a model-call hold begins after the first workflow fails", async () => {
+		let createCount = 0;
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				createCount++;
+				return new Response(JSON.stringify({ id: `workflow-${createCount}` }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const index = sockets.length;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			sockets.push(socket);
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				if (index === 0) {
+					// Another call of the session meets a refusal while this workflow runs.
+					held = true;
+					socket.onmessage?.(
+						new MessageEvent("message", {
+							data: JSON.stringify({
+								status: "FAILED",
+								error: "There was an error processing your request in the Duo Agent Platform, please contact support if the issue persists.",
+							}),
+						}),
+					);
+				} else {
+					socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+				}
+			});
+			return socket;
+		};
+
+		try {
+			const result = await streamGitLabDuoWorkflow(model, context, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				fetch: fetchImpl,
+				webSocketFactory,
+			}).result();
+
+			expect(sockets).toHaveLength(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+		} finally {
+			removeGuard();
+		}
+	});
+
+	/** The REST side of one fresh workflow: models, direct access, create, and the stop PATCH. */
+	function freshWorkflowFetch(stops: string[]): FetchImpl {
+		return async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				stops.push(url);
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+	}
+
+	// The goal goes out when the socket opens, a handshake after the run read the model-call guards. They are read
+	// again in the same step as the goal: a refusal another call of the session records while the socket opens
+	// holds it, so nothing is sent, the socket closes, the workflow is stopped and the call ends on the held error.
+	// The control records no refusal, and the goal goes out on open.
+	it.each([
+		["holds the goal when a refusal is recorded while the socket opens", true],
+		["sends the goal when the socket opens with no refusal (control)", false],
+	] as const)("%s", async (_name, refused) => {
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		const sent: string[] = [];
+		const stops: string[] = [];
+		let closed = 0;
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+				},
+				close() {
+					closed++;
+				},
+			};
+			queueMicrotask(() => {
+				// Another call of the session meets a refusal during the handshake.
+				if (refused) held = true;
+				socket.onopen?.(new Event("open"));
+				// A goal that went out gets its answer, so a run that sent it ends instead of idling.
+				if (sent.length > 0) {
+					socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+				}
+			});
+			return socket;
+		};
+		try {
+			const result = await streamGitLabDuoWorkflow(model, context, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				fetch: freshWorkflowFetch(stops),
+				webSocketFactory,
+			}).result();
+
+			if (refused) {
+				expect(sent).toEqual([]);
+				expect(closed).toBeGreaterThan(0);
+				expect(stops).toHaveLength(1);
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain("held: cyber_policy");
+			} else {
+				expect(sent).toHaveLength(1);
+				expect(JSON.parse(sent[0] ?? "{}")).toHaveProperty("startRequest");
+				expect(result.stopReason).not.toBe("error");
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A tool result goes back on the live socket (see "resumes the preserved GitLab socket" below). A refusal another
+	// call of the session records before the result goes out holds it, at either of two reads:
+	// - while a `streamSimple` call's key resolves: the release's dispatch chokepoint reads the guards again after the
+	//   key, before the provider, so the provider is not called, nothing is sent, and the live workflow is kept for
+	//   the session's next call;
+	// - while the caller's dispatch hold (`/pause`) waits on the live socket: the provider reads them in the same step
+	//   as the frame, after the hold, so nothing is sent, the socket closes and the workflow is stopped.
+	// The control records no refusal, and the result goes out.
+	it.each([
+		["holds the tool result when a refusal is recorded while the key resolves", "key"],
+		["holds the tool result when a refusal is recorded while its dispatch hold waits", "hold"],
+		["sends the tool result when the key resolves with no refusal (control)", undefined],
+	] as const)("%s", async (_name, refusedAt) => {
+		const refused = refusedAt !== undefined;
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		const sent: string[] = [];
+		const stops: string[] = [];
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		let socket: GitLabDuoWorkflowWebSocketLike | undefined;
+		let socketCount = 0;
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketCount += 1;
+			socket = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+				},
+				close() {},
+			};
+			return socket;
+		};
+		const options = {
+			fetch: freshWorkflowFetch(stops),
+			rootNamespaceId: "gid://gitlab/Group/1",
+			sessionId: "main",
+			providerSessionState,
+			webSocketFactory,
+		};
+		try {
+			const firstStream = streamGitLabDuoWorkflow(model, context, { ...options, apiKey: "not-a-secret" });
+			for (let attempt = 0; attempt < 50 && !socket; attempt++) await Bun.sleep(1);
+			socket?.onopen?.(new Event("open"));
+			socket?.onmessage?.(
+				new MessageEvent("message", {
+					data: JSON.stringify({
+						requestID: "req-read-1",
+						runMCPTool: { name: "mcp__omp__read", args: JSON.stringify({ path: "README.md" }) },
+					}),
+				}),
+			);
+			const firstAssistant = await firstStream.result();
+			expect(sent).toHaveLength(1);
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: "req-read-1",
+				toolName: "read",
+				content: [{ type: "text", text: "README file text" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			const secondContext: Context = { messages: [...context.messages, firstAssistant, toolResult] };
+			const secondStream =
+				refusedAt === "hold"
+					? streamGitLabDuoWorkflow(model, secondContext, {
+							...options,
+							apiKey: "not-a-secret",
+							beforeDispatch: async () => {
+								await Bun.sleep(1);
+								// Another call of the session meets a refusal while this result waits on the hold.
+								held = true;
+							},
+						})
+					: streamSimple(model, secondContext, {
+							...options,
+							apiKey: async () => {
+								// Another call of the session meets a refusal while this call's key resolves.
+								if (refused) held = true;
+								return "not-a-secret";
+							},
+						} as SimpleStreamOptions);
+			// A tool result that went out gets its answer, so a call that sent it ends instead of idling.
+			for (let attempt = 0; attempt < 50 && sent.length < 2; attempt++) await Bun.sleep(1);
+			if (sent.length >= 2) {
+				socket?.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+			}
+			const second = await secondStream.result();
+
+			expect(socketCount).toBe(1);
+			if (refused) {
+				expect(sent).toHaveLength(1);
+				expect(stops).toHaveLength(refusedAt === "hold" ? 1 : 0);
+				expect(second.stopReason).toBe("error");
+				expect(second.errorMessage).toContain("held: cyber_policy");
+			} else {
+				expect(sent).toHaveLength(2);
+				expect(JSON.parse(sent[1] ?? "{}")).toEqual({
+					actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } },
+				});
+				expect(second.stopReason).not.toBe("error");
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// The goal also waits on the caller's dispatch hold (`/pause`) after the socket opens. A refusal another call of
+	// the session records while that hold waits holds the goal: the guards are read in the same step as the frame,
+	// after the hold. The control answers both holds with no refusal, and the goal goes out.
+	it.each([
+		["holds the goal when a refusal is recorded while its dispatch hold waits", true],
+		["sends the goal when its dispatch hold answers with no refusal (control)", false],
+	] as const)("%s", async (_name, refused) => {
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		let holdCalls = 0;
+		const beforeDispatch: DispatchHold = async () => {
+			holdCalls++;
+			await Bun.sleep(1);
+			// The first hold gates the socket's open, the second the goal: another call of the session meets a
+			// refusal while the goal waits.
+			if (refused && holdCalls === 2) held = true;
+		};
+		const sent: string[] = [];
+		const stops: string[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+					// A goal that went out gets its answer, so a run that sent it ends instead of idling.
+					queueMicrotask(() =>
+						socket.onmessage?.(
+							new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }),
+						),
+					);
+				},
+				close() {},
+			};
+			queueMicrotask(() => socket.onopen?.(new Event("open")));
+			return socket;
+		};
+		try {
+			const result = await streamGitLabDuoWorkflow(model, context, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				fetch: freshWorkflowFetch(stops),
+				webSocketFactory,
+				beforeDispatch,
+			}).result();
+
+			expect(holdCalls).toBe(2);
+			if (refused) {
+				expect(sent).toEqual([]);
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain("held: cyber_policy");
+			} else {
+				expect(sent).toHaveLength(1);
+				expect(JSON.parse(sent[0] ?? "{}")).toHaveProperty("startRequest");
+				expect(result.stopReason).not.toBe("error");
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
 	it("surfaces the generic processing error after the bounded retry is exhausted", async () => {
 		let createCount = 0;
 		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
@@ -2212,6 +2572,188 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		);
 		expect(result.errorMessage).toContain("prompt is too long");
 		expect(result.errorMessage).not.toContain("Internal server error");
+	});
+
+	// A goal in the jitter zone relabels a failed run as a context overflow (the test above). A model-call hold is
+	// not that: the held run sent nothing, so its own error, which names `cyber_policy`, must reach the session,
+	// which would otherwise drop the turn and start an overflow recovery for a call that never went out. The same
+	// holds for a `cyber_policy` refusal the server relays: a refusal must stay a refusal.
+	function jitterZoneFetch(onCreate: () => void): FetchImpl {
+		return async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				onCreate();
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+	}
+
+	it("keeps a model-call hold's error on a goal in the jitter zone", async () => {
+		const jitterGoal: Context = {
+			messages: [{ role: "user", content: "x".repeat(1_500_000), timestamp: Date.now() }],
+		};
+		let held = false;
+		let socketOpened = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const result = await streamGitLabDuoWorkflow(model, jitterGoal, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				// The hold begins during the setup calls, before the socket run reads the guards.
+				fetch: jitterZoneFetch(() => {
+					held = true;
+				}),
+				webSocketFactory: () => {
+					socketOpened = true;
+					throw new Error("a held run opens no socket");
+				},
+			}).result();
+
+			expect(socketOpened).toBe(false);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+			expect(result.errorMessage).not.toContain("prompt is too long");
+			expect(isContextOverflow(result)).toBe(false);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	it("keeps a relayed cyber_policy refusal's text on a goal in the jitter zone", async () => {
+		const jitterGoal: Context = {
+			messages: [{ role: "user", content: "x".repeat(1_500_000), timestamp: Date.now() }],
+		};
+		const refusal = "This content was flagged for possible cybersecurity risk (cyber_policy).";
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				socket.onmessage?.(
+					new MessageEvent("message", { data: JSON.stringify({ status: "FAILED", error: refusal }) }),
+				);
+			});
+			return socket;
+		};
+
+		const result = await streamGitLabDuoWorkflow(model, jitterGoal, {
+			apiKey: "not-a-secret",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: jitterZoneFetch(() => {}),
+			webSocketFactory,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("cyber_policy");
+		expect(result.errorMessage).not.toContain("prompt is too long");
+	});
+
+	// A run that streamed text and then ends on an error closes its text block before the error, so every block a
+	// consumer saw start also ends: when a model-call hold holds the next run (the stream's `.catch`), when a
+	// FAILED ends the run, and when the generic-error retry is exhausted.
+	it.each([
+		["a model-call hold holds the next run", "held", 1],
+		["a FAILED ends the run", "failed", 1],
+		["the generic-error retry is exhausted", "exhausted", 2],
+	] as const)("closes the open text block when %s", async (_label, ending, expectedSockets) => {
+		const runningText = JSON.stringify({
+			newCheckpoint: {
+				status: "RUNNING",
+				checkpoint: JSON.stringify({
+					channel_values: {
+						ui_chat_log: [
+							{ message_type: "agent", component_name: "context_builder", content: "Inspecting repo" },
+						],
+					},
+				}),
+			},
+		});
+		const failed = JSON.stringify(
+			ending === "failed"
+				? { status: "FAILED", error: "Internal server error processing the request" }
+				: {
+						status: "FAILED",
+						error: "There was an error processing your request in the Duo Agent Platform, please contact support if the issue persists.",
+					},
+		);
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			sockets.push(socket);
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				socket.onmessage?.(new MessageEvent("message", { data: runningText }));
+				// Another call of the session meets a refusal while this run streams.
+				if (ending === "held") held = true;
+				socket.onmessage?.(new MessageEvent("message", { data: failed }));
+			});
+			return socket;
+		};
+
+		try {
+			const response = streamGitLabDuoWorkflow(model, context, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				fetch: jitterZoneFetch(() => {}),
+				webSocketFactory,
+			});
+			const eventTypes: string[] = [];
+			for await (const event of response) eventTypes.push(event.type);
+			const result = await response.result();
+
+			expect(sockets).toHaveLength(expectedSockets);
+			expect(result.stopReason).toBe("error");
+			if (ending === "held") expect(result.errorMessage).toContain("held: cyber_policy");
+			expect(result.content.some(block => block.type === "text" && block.text.includes("Inspecting repo"))).toBe(
+				true,
+			);
+			const starts = eventTypes.filter(type => type === "text_start").length;
+			expect(starts).toBeGreaterThan(0);
+			expect(eventTypes.filter(type => type === "text_end")).toHaveLength(starts);
+			expect(eventTypes.at(-1)).toBe("error");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("surfaces the raw error verbatim when an erroring goal is within the byte budget", async () => {

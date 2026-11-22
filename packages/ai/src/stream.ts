@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env, getProviderInFlightRoot, isEnoent, isPidAlive, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
+import { guardModelCall, heldModelCall } from "./model-call-guard";
 import {
 	type ApiKeyResolution,
 	createAuthRetryKeyState,
@@ -736,7 +737,12 @@ function withProviderInFlightLimit<
 	// have been awaited after it.
 	const hold = options?.beforeDispatch;
 	const credential = resolvedCredentialOf(options);
-	if (limit === undefined && !hold && !credential) return healLeakedThinking(model, dispatch(false, options));
+	if (limit === undefined && !hold && !credential) {
+		// The guards' second read: a hold that began while this call waited (a key, its headers) holds it.
+		const held = heldModelCall(model);
+		if (held) return held;
+		return healLeakedThinking(model, dispatch(false, options));
+	}
 
 	const outer = new AssistantMessageEventStream();
 	void (async () => {
@@ -782,6 +788,12 @@ function withProviderInFlightLimit<
 				hold,
 				options?.signal,
 				() => {
+					// The guards' second read, in the same step as the dispatch: a hold that began while
+					// this call waited (its slot, its key, the dispatch hold) holds it. A held call ends on
+					// the hold's error message, as on the fast path above; nothing is sent, its key is not
+					// marked sent, and the slot is released once that message is read.
+					const held = heldModelCall(model);
+					if (held) return held;
 					let dispatched = options;
 					if (credential && options) {
 						dispatched = withCurrentCredential(options, credential);
@@ -963,8 +975,18 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	return guardModelCall(model, () => streamUnguarded(model, context, options));
+}
+
+function streamUnguarded<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: OptionsForApi<TApi>,
+): AssistantMessageEventStream {
 	if (model.resolveHeaders) {
-		return withResolvedModelHeaders(model, options?.signal, resolvedModel => stream(resolvedModel, context, options));
+		return withResolvedModelHeaders(model, options?.signal, resolvedModel =>
+			streamUnguarded(resolvedModel, context, options),
+		);
 	}
 	if (!model.requiresGlyphTokenization) {
 		return withThinkingLoopGuard(model, options, guarded =>
@@ -1220,8 +1242,7 @@ function isRetryableUpstreamError(
 	if (AIError.isAuthRetryableError(error)) return true;
 	// 401 means the credential is bad; 403 is its valid-token twin (access
 	// denied by plan, model policy, or org restriction — a sibling account may
-	// not share it). Explicit account-scoped policy errors such as Codex
-	// `cyber_policy` are likewise rotatable. The exact ChatGPT-account model
+	// not share it). The exact ChatGPT-account model
 	// denial is rotatable only when its provider and requested model match.
 	// Usage-limit phrasing (Codex's
 	// "You have hit your ChatGPT usage limit", Anthropic's "usage_limit_reached",
@@ -1308,6 +1329,14 @@ function withSupportedSamplingParams<T extends SamplingOptions>(model: Model<Api
 }
 
 export function streamSimple<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	return guardModelCall(model, () => streamSimpleUnguarded(model, context, options));
+}
+
+function streamSimpleUnguarded<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: SimpleStreamOptions,
@@ -1605,18 +1634,18 @@ function streamSimpleRequest<TApi extends Api>(
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	} else if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
 		const providerOptions = mapOptionsForApi(
 			model,
 			requestOptions,
 			typeof requestOptions.apiKey === "string" ? requestOptions.apiKey : getEnvApiKey(model.provider),
 		);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	}
 
 	// The resolver form is handled by the wrapper above; only a static string
@@ -1694,7 +1723,7 @@ function streamSimpleRequest<TApi extends Api>(
 	}
 	const providerModel = getProviderDefinition(model.provider)?.prepareModel?.(model) ?? model;
 	const providerOptions = mapOptionsForApi(providerModel, requestOptions, apiKey);
-	return stream(providerModel, context, providerOptions);
+	return streamUnguarded(providerModel, context, providerOptions);
 }
 
 export async function completeSimple<TApi extends Api>(

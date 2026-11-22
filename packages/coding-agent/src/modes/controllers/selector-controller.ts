@@ -801,9 +801,11 @@ export class SelectorController {
 			switched = true;
 			await apply();
 		};
-		// The target reads what this pass writes: no provider-native method it cannot replay.
+		// The target reads what this pass writes: no provider-native method it cannot replay. A person's model
+		// switch: input from outside the session.
 		const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction, {
 			readerModel: model,
+			origin: "outside",
 		});
 		await switchAfterCompaction(outcome);
 	}
@@ -1723,6 +1725,8 @@ export class SelectorController {
 							summarize: wantsSummary,
 							customInstructions,
 							allowAskReopen: true,
+							// A person's `/tree` pick: input from outside the session.
+							origin: "outside",
 						});
 
 						// Selecting an `ask` toolResult doesn't land the leaf directly —
@@ -1739,6 +1743,7 @@ export class SelectorController {
 								customInstructions,
 								allowAskReopen: true,
 								reanswerAskResult: reanswer,
+								origin: "outside",
 							});
 						}
 

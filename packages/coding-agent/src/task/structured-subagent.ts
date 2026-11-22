@@ -836,6 +836,7 @@ function buildExecutorOptions(
 	return {
 		cwd: session.cwd,
 		costGate: session.costGate,
+		cyberPolicyClosure: session.cyberPolicyClosure,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
 		credentialSourceSessionId: session.getCredentialSourceSessionId?.(),

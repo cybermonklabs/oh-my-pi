@@ -253,6 +253,8 @@ async function runPrintModeCore(
 		settings: session.settings,
 		cwd: session.sessionManager.getCwd(),
 		output: writeStderrLine,
+		// The CLI's command: input from outside the session.
+		origin: "outside",
 		refreshCommands: () => {},
 		reloadPlugins: () => Promise.resolve(),
 		mcpManager,
@@ -492,8 +494,9 @@ async function runPrintModeCore(
 		if (!(await prepareAgentTurn())) return;
 		admittedAgentTurn = true;
 		costCapRefusalBeforeTurn = session.costCapRefusal;
+		// The CLI's input: from outside the session.
 		await logger.time("print:prompt", () =>
-			images !== undefined ? session.prompt(text, { images }) : session.prompt(text),
+			session.prompt(text, images !== undefined ? { images, origin: "outside" } : { origin: "outside" }),
 		);
 	};
 

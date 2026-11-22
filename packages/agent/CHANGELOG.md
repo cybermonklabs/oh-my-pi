@@ -19,6 +19,7 @@
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable, and marks the message `credentialUnavailable`, so a resume can go on with the turn ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar)).
+- Remote compaction passes pi-ai's model-call checkpoint (`addModelCallGuard`): OpenAI's `/responses/compact` (V1), V2 streaming compaction (each retry after its backoff included) and a configured `compaction.remoteEndpoint` read the guards before they send, so a model a guard holds (an OpenAI route during a `cyber_policy` hold) sends nothing, and a refusal these requests meet reaches the guards. V2 compaction no longer retries a `cyber_policy` refusal, also when a gateway relays it as a 5xx.
 
 ### Breaking Changes
 

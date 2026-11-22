@@ -1,4 +1,5 @@
 import { resolveExtraCa, withExtraCaInit } from "@oh-my-pi/pi-utils";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { coworkFetch } from "../providers/cowork-fetch";
 import { withInferenceUserAgent } from "../providers/inference-headers";
 import type { Api, DispatchHold, FetchImpl, Model, TransportWrapper } from "../types";
@@ -219,6 +220,12 @@ function buildTransportFetch(
 			holds,
 			signal,
 			() => {
+				// A request that waited on a hold reads the model-call guards in the
+				// step of its send as well: the holds and the authorization above can
+				// outlast the provider's own read. A held request is not sent, and the
+				// fetch rejects with the hold's error. Unheld traffic (a workflow stop,
+				// a cancellation, a token mint) is built with no hold and goes out.
+				if (method === "POST" && holds.length > 0) assertModelCallAllowed(model);
 				// Recorded for the request that is now going out, not for one a
 				// hold still gates or an abort cancelled.
 				if (method === "POST") recordDispatchOrigin(model, input);

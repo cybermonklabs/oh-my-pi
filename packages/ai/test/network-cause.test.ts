@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { postOpenAIStream } from "@oh-my-pi/pi-ai/utils/openai-http";
+
+/** The model the request is for: `postOpenAIStream` reads the model-call guards before each resend. */
+const MODEL = createMockModel({ handler: { content: [] } });
 
 const OFFLINE_ANTHROPIC =
 	"No internet connection: couldn't reach api.anthropic.com (getaddrinfo ETIMEOUT). Check your network or proxy and try again.";
@@ -170,6 +174,7 @@ describe("postOpenAIStream transport rejection", () => {
 
 		const error = await postOpenAIStream({
 			url: "https://api.openai.com/v1/chat/completions",
+			model: MODEL,
 			headers: {},
 			body: {},
 			signal: new AbortController().signal,
@@ -199,6 +204,7 @@ describe("postOpenAIStream transport rejection", () => {
 
 		const error = await postOpenAIStream({
 			url: "http://127.0.0.1:8080/v1/chat/completions",
+			model: MODEL,
 			headers: {},
 			body: {},
 			signal: new AbortController().signal,

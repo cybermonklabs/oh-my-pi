@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
 import {
 	type OpenAICodexResponsesOptions,
@@ -292,6 +293,69 @@ describe("codex live steering", () => {
 		expect(second.content).toEqual([expect.objectContaining({ type: "text", text: "Tabs it is" })]);
 		expect(creates()).toHaveLength(1);
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
+	});
+
+	// A steer is a send into the response in flight, so it reads the model-call guards first. A hold that begins
+	// while the response streams (another call of the tree meets a refusal) hands the steer back (rejected): it goes
+	// with the next request, which the guard holds; nothing reaches the socket. The test above is the control: with
+	// no hold, the steer is sent.
+	it("hands a steer back while a model-call hold stands on the model", async () => {
+		let socketRef: ScriptedWebSocket | undefined;
+		let held = false;
+		installSocket((frame, socket) => {
+			socketRef = socket;
+			if (frame.type !== "response.create") return;
+			// The request is out; the hold begins while its response streams.
+			held = true;
+			// Stream part of an answer and wait: the response ends once the steer is settled.
+			socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Plan"));
+		});
+		let outcome: "accepted" | "rejected" | undefined;
+		let claimed = false;
+		const source: LiveSteering = {
+			// After its one claim the source idles until the pump stops.
+			wait: async signal => {
+				if (!claimed || signal.aborted) return;
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => resolve(), { once: true });
+				await promise;
+			},
+			claim: async (): Promise<LiveSteerClaim | undefined> => {
+				if (claimed) return undefined;
+				claimed = true;
+				return {
+					messages: [{ role: "user", content: "use tabs", timestamp: Date.now() }],
+					accept: () => {
+						outcome = "accepted";
+					},
+					reject: () => {
+						outcome = "rejected";
+						socketRef?.emit({
+							type: "response.completed",
+							response: { id: "resp_1", status: "completed", usage: USAGE },
+						});
+					},
+				};
+			},
+		};
+		const model = createGpt6Model();
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			const result = await streamOpenAICodexResponses(
+				model,
+				{ systemPrompt: SYSTEM, messages: [user] },
+				options(new Map(), source),
+			).result();
+
+			expect(outcome).toBe("rejected");
+			expect(steers()).toEqual([]);
+			expect(result.stopReason).toBe("stop");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("returns pending tool output without repeating steering the server already queued", async () => {
@@ -685,6 +749,133 @@ describe("codex live steering", () => {
 			{ role: "user", content: [{ type: "input_text", text: "Hello" }] },
 			{ role: "user", content: [{ type: "input_text", text: "one more thing" }] },
 		]);
+	});
+});
+
+// A transient server error on the Codex WebSocket is retried by reopening the stream after a wait. Each WebSocket
+// request reads the model-call guards first: a hold that begins while the first request is out (another call of the
+// tree meets a refusal) holds the reopened one, and nothing goes to the SSE fallback either.
+describe("codex WebSocket reopen under a model-call hold", () => {
+	it.each([
+		["holds the reopened request when a hold begins during the first", true, 1],
+		["reopens and answers when no hold begins (control)", false, 2],
+	])("%s", async (_name, holdDuringFirst, expected) => {
+		let held = false;
+		installSocket((frame, socket) => {
+			if (frame.type !== "response.create") return;
+			if (creates().length === 1) {
+				held = holdDuringFirst;
+				socket.emit(
+					{ type: "response.created", response: { id: "resp_1" } },
+					{ type: "error", code: "server_error", message: "The server is temporarily unavailable." },
+				);
+				return;
+			}
+			socket.emit({ type: "response.created", response: { id: "resp_2" } }, ...messageFrames("msg_2", "Recovered"), {
+				type: "response.completed",
+				response: { id: "resp_2", status: "completed", usage: USAGE },
+			});
+		});
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			const requestOptions = options(new Map());
+			const result = await streamOpenAICodexResponses(
+				createGpt6Model(),
+				{ systemPrompt: SYSTEM, messages: [user] },
+				requestOptions,
+			).result();
+
+			expect(creates()).toHaveLength(expected);
+			expect(requestOptions.fetch).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe(holdDuringFirst ? "error" : "stop");
+		} finally {
+			removeGuard();
+		}
+	});
+});
+
+// The WebSocket request reads the model-call guards right before the frame goes out, after its waits: the
+// attestation, the connection and the extensions' `onPayload` hooks. A hold that begins during the hook holds
+// the request; nothing reaches the socket or the SSE fallback.
+describe("codex WebSocket request read after its waits", () => {
+	it.each([
+		["holds the request when a hold begins during the onPayload hook", true, 0],
+		["sends the request when no hold begins (control)", false, 1],
+	])("%s", async (_name, holdInHook, expected) => {
+		let held = false;
+		installSocket((frame, socket) => {
+			if (frame.type !== "response.create") return;
+			socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Done"), {
+				type: "response.completed",
+				response: { id: "resp_1", status: "completed", usage: USAGE },
+			});
+		});
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			const requestOptions = {
+				...options(new Map()),
+				// Only the WebSocket frame (`type: "response.create"`) starts the hold.
+				onPayload: async (payload: unknown) => {
+					if ((payload as { type?: unknown }).type === "response.create") held = holdInHook;
+					return undefined;
+				},
+			};
+			const result = await streamOpenAICodexResponses(
+				createGpt6Model(),
+				{ systemPrompt: SYSTEM, messages: [user] },
+				requestOptions,
+			).result();
+
+			expect(creates()).toHaveLength(expected);
+			expect(requestOptions.fetch).not.toHaveBeenCalled();
+			if (holdInHook) expect(result.errorMessage).toContain("held: cyber_policy");
+			else expect(result.stopReason).toBe("stop");
+		} finally {
+			removeGuard();
+		}
+	});
+});
+
+// A reopen the guards hold throws out of the stream's recovery. The turn still settles its steering, as a
+// failed recovery does: a socket that accepted steering is closed, so no successor response it may still
+// produce streams into a later request.
+describe("codex held reopen settles steering", () => {
+	it("closes the socket that accepted steering when the reopen is held", async () => {
+		let held = false;
+		installSocket((frame, socket) => {
+			if (frame.type === "response.create") {
+				socket.emit({ type: "response.created", response: { id: `resp_${creates().length}` } });
+				return;
+			}
+			if (frame.type !== "response.steer") return;
+			// The steer is accepted; another call of the tree then meets a refusal (the hold begins), and the
+			// response fails with a transient server error, which the stream recovers by reopening.
+			held = true;
+			socket.emit(
+				{ type: "response.steer.accepted", steer: { id: "steer_1", previous_response_id: "resp_1" } },
+				{ type: "error", code: "server_error", message: "The server is temporarily unavailable." },
+			);
+		});
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const steering = oneShotSteering("use tabs");
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			const state = new Map<string, ProviderSessionState>();
+			const result = await streamOpenAICodexResponses(
+				createGpt6Model(),
+				{ systemPrompt: SYSTEM, messages: [user] },
+				options(state, steering.source),
+			).result();
+
+			expect(steering.settled()).toBe("accepted");
+			expect(creates()).toHaveLength(1);
+			expect(result.errorMessage).toContain("held: cyber_policy");
+			expect(ScriptedWebSocket.instances[0]?.readyState).toBe(ScriptedWebSocket.CLOSED);
+		} finally {
+			removeGuard();
+		}
 	});
 });
 

@@ -33,6 +33,7 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { ArtifactManagerApi } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CostGateApi } from "../session/cost-gate";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -214,6 +215,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Cost gate of the session tree, forwarded to subagents. */
 	costGate?: CostGateApi;
+	/** Cyber-policy closure of the session tree, forwarded to subagents. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */

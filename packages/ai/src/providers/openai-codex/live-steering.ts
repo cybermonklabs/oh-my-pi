@@ -25,7 +25,8 @@
  * ```
  */
 import { logger } from "@oh-my-pi/pi-utils";
-import type { DispatchHold, LiveSteering, UserMessage } from "../../types";
+import { modelCallHoldReason } from "../../model-call-guard";
+import type { Api, DispatchHold, LiveSteering, Model, UserMessage } from "../../types";
 import { dispatchWhenOpen } from "../../utils/dispatch-hold";
 import type { InputItem } from "./request-transformer";
 
@@ -35,6 +36,12 @@ export interface CodexSteerDispatch {
 	hold?: DispatchHold;
 	/** The request's signal: cancelling it stops the pump, a held submission included. */
 	signal?: AbortSignal;
+	/**
+	 * The model the request calls. Its model-call guards are read in the same step as each
+	 * submission's frame, after the hold: a held submission sends nothing, and its input stays
+	 * with the caller for its next request.
+	 */
+	model?: Model<Api>;
 }
 
 /** Server acknowledgement of one `response.steer` submission. */
@@ -158,12 +165,20 @@ export class CodexSteerPump {
 				// hold's last check, so a pause landing after the hold answered
 				// still stops it.
 				let sentAt = 0;
+				let held = false;
 				const submitted = await this.#whenOpen(responseId, signal, () => {
+					// The input's conversion read the model-call guards, but this hold can
+					// outlast that read: a refusal recorded meanwhile holds the frame.
+					const model = this.#dispatch.model;
+					if (model && modelCallHoldReason(model) !== undefined) {
+						held = true;
+						return undefined;
+					}
 					sentAt = performance.now();
 					this.#submitted = true;
 					return this.#submit(responseId, input);
 				});
-				if (!submitted) {
+				if (!submitted || held) {
 					claim.reject();
 					return;
 				}

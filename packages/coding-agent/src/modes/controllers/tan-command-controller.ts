@@ -194,6 +194,9 @@ export class TanCommandController {
 							const created = await sdk.createAgentSession({
 								cwd,
 								costGate: session.costGate,
+								// The clone forks this transcript, refused content included: the root's hold holds it too,
+								// and a refusal it meets holds the root.
+								cyberPolicyClosure: session.cyberPolicyClosure,
 								sessionManager: cloneManager,
 								model,
 								thinkingLevel,
