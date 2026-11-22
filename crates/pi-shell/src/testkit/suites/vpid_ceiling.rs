@@ -381,3 +381,64 @@ fn a_file_substitution_still_needs_a_vpid() {
 	let got = run(&mut r, "x=$(< /dev/null); print after");
 	assert_eq!(got, (String::new(), ZSH_MESSAGE.to_owned(), 1));
 }
+
+/// zsh with no vpid left ends a script by where the failed `$( )` stands,
+/// as zsh 5.9 under `ulimit -u 1` (uid 1000) does after `f` returned 3: a
+/// simple command's words keep a nonzero `$?` (zsh `execcmd`), else 1; an
+/// assignment or a subshell gives 1; a `case` word ends with 0; `(( ))`
+/// fails with 2 and the script goes on.
+#[test]
+fn a_zsh_substitution_with_no_vpid_ends_as_zsh_does() {
+	let f = "f() { return 3; }; f; ";
+	let rows = [
+		("print \"[$( )]\" $?", "", ZSH_MESSAGE, 3),
+		("typeset y=$(:)", "", ZSH_MESSAGE, 3),
+		("print $((1+$(:)))", "", ZSH_MESSAGE, 3),
+		("x=$(print hi); print after", "", ZSH_MESSAGE, 1),
+		("( : ); print after", "", ZSH_MESSAGE, 1),
+		("case $(:) in *) print in;; esac; print after", "", ZSH_MESSAGE, 0),
+		("(( $(:) )); print \"after $?\"", "after 2\n", ZSH_MESSAGE, 0),
+	];
+	let mut mismatches = Vec::new();
+	for (src, out, err, status) in rows {
+		let mut r = zsh_rig_at(Vpid::CEILING + 1);
+		let got = run(&mut r, &format!("{f}{src}"));
+		if got != (out.to_owned(), err.to_owned(), status) {
+			mismatches.push(format!("`{src}`: zsh {:?}, got {got:?}", (out, err, status)));
+		}
+	}
+	// `$?` was 0: the words give 1.
+	let mut r = zsh_rig_at(Vpid::CEILING + 1);
+	let got = run(&mut r, "true; print \"[$( )]\" $?");
+	if got != (String::new(), ZSH_MESSAGE.to_owned(), 1) {
+		mismatches.push(format!("`true; print \"[$( )]\"`: zsh 1, got {got:?}"));
+	}
+	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// An interactive zsh whose prompt has `%~` calls the `zsh_directory_name`
+/// hook once per prompt (zsh 5.9: one `d` call per prompt; an empty `RPS1`
+/// calls none). With no vpid left, what the hook runs fails inside it,
+/// once per prompt, and the line is read and run.
+#[test]
+fn a_zsh_prompt_calls_the_directory_name_hook_once() {
+	let init = || {
+		let mut init = ShellInit {
+			mode: ModeId::Zsh,
+			argv0: "zsh".into(),
+			interactive: true,
+			..skeleton_init(&[])
+		};
+		init.env.push(("PS1".into(), "$ ".into()));
+		init
+	};
+	let input = "zsh_directory_name() { print -u2 \"called $1\"; return 1 }; PS1='%~> '\nprint hi\n";
+	let (out, err, status) = interactive(init(), Vpid::BASE + 1, input);
+	assert_eq!((out.as_str(), status), ("hi\n", 0), "stderr: {err:?}");
+	assert_eq!(err.matches("called d").count(), 2, "stderr: {err:?}");
+	let input = "zsh_directory_name() { ( : ); return 1 }; PS1='%~> '\nprint hi\n";
+	let (out, err, status) = interactive(init(), Vpid::CEILING + 1, input);
+	assert_eq!((out.as_str(), status), ("hi\n", 0), "stderr: {err:?}");
+	let message = "zsh_directory_name: fork failed: resource temporarily unavailable\n";
+	assert_eq!(err.matches(message).count(), 2, "stderr: {err:?}");
+}

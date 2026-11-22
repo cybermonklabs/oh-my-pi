@@ -4090,7 +4090,8 @@ fn builtin_zsh_stop(
 		Stop::ZshSub { text, here } => {
 			// A call run here pushes its frame above the builtin's.
 			let fi = vp.frames.len() - 1;
-			let flow = exec::start_zsh_sub(k, vp, cx, &mut sc, &text, here, line);
+			let fail = exec::ZshSubFailure::Other;
+			let flow = exec::start_zsh_sub(k, vp, cx, &mut sc, &text, here, fail, line);
 			vp.frames[fi].scratch = Some(sc);
 			return Some(flow);
 		},

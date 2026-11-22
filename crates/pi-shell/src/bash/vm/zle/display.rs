@@ -21,7 +21,7 @@ use crate::bash::{
 		Cx, Kernel,
 		builtins::{
 			zsh_module,
-			zsh_print::{prompt_env_ex, prompt_subst},
+			zsh_print::{prompt_env_for, prompt_subst},
 			zsh_prompt::{self, Cap, Expansion, NearColour, TermCaps},
 		},
 		expand::{Expander, X},
@@ -177,7 +177,10 @@ pub fn expand_prompt(
 		raw.to_vec()
 	};
 	let site = ex.k.zsh_site(ex.cx, ex.vp, ex.line);
-	let mut env = prompt_env_ex(ex, site, percent, bang)?;
+	// The named directory of `$PWD` (`%~`, which may call the
+	// `zsh_directory_name` hook) only for a prompt that uses it, as zsh's
+	// `%~` looks it up where it stands: an empty `RPS1` calls no hook.
+	let mut env = prompt_env_for(ex, site, percent, bang, Some(&text))?;
 	env.lastval = lastval;
 	env.cmdstack = cmdstack.to_vec();
 	Ok(zsh_prompt::promptexpand_ns(&text, &env))

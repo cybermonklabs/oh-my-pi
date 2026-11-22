@@ -31,7 +31,9 @@ use crate::bash::{
 	syntax::zsh::tok,
 	vm::{
 		Cx, Kernel,
-		exec::{Flow, Sub, fork_message, no_vpid_for, settle_sub, start_sub, start_zsh_sub},
+		exec::{
+			Flow, Sub, ZshSubFailure, fork_message, no_vpid_for, settle_sub, start_sub, start_zsh_sub,
+		},
 		expand::{Expander, Stop},
 		jobctl, probe,
 		proc::{FrameKind, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Vproc},
@@ -427,7 +429,8 @@ impl Reader {
 				Ok(None)
 			},
 			Err(Stop::ZshSub { text, here }) => {
-				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, 0).into())
+				let fail = ZshSubFailure::Other;
+				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, fail, 0).into())
 			},
 			// A math function (`functions -M`) called from a prompt: its
 			// frame runs above, the expansion replays with its value.

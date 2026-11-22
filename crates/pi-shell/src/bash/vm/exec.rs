@@ -738,17 +738,72 @@ pub(crate) fn fork_message(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 
 /// Whether the expansion stopped at `stop` for a substitution that needs a
 /// vproc, and no vpid is left for one ([`Kernel::vpids_left`]): a `$( )`
-/// that forks, a zsh `$(…)` that is not a hook call run in the shell, or a
-/// process substitution that already found none ([`Stop::ForkFailed`]).
-/// The interactive reader fails such a prompt expansion instead of
-/// starting it ([`super::zle::reader`]).
+/// that forks, or a zsh `$(…)` that is not a hook call run in the shell (a
+/// hook runs here; what it runs fails on its own, once per prompt). The
+/// interactive reader fails such a prompt expansion instead of starting it
+/// ([`super::zle::reader`]). A prompt expands no process substitution.
 pub(crate) const fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
 	match stop {
-		Stop::ForkFailed => true,
 		Stop::Sub { form: ComsubForm::Fork, .. } | Stop::ZshSub { here: false, .. } => {
 			k.vpids_left() == 0
 		},
 		_ => false,
+	}
+}
+
+/// How a zsh command substitution that finds no vpid ends, by where it
+/// stands (zsh 5.9 under `ulimit -u 1`, after `f() { return 3; }; f`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZshSubFailure {
+	/// A simple command's words (`print "$(cmd)"`, `typeset y=$(cmd)`):
+	/// the script ends with `$?` as it was, or 1 when that is 0 (zsh
+	/// `execcmd` after a failed `prefork`: `if (!lastval) lastval = 1`).
+	Words,
+	/// `(( ))`: the command fails with 2 and the script goes on, as after
+	/// a math error.
+	Arith,
+	/// A `case` word: the script ends with 0 (zsh `execcase` sets
+	/// `lastval` to 0 before it expands the word).
+	Case,
+	/// Anything else (assignments, redirections, loop lists, `[[ ]]`, a
+	/// prompt, a builtin's own expansion): the script ends with 1.
+	Other,
+}
+
+impl ZshSubFailure {
+	/// Where the op at the top of `vp` expands `slot`.
+	fn of(vp: &Vproc, slot: Slot) -> Self {
+		let frame = vp.frames.last();
+		let code = frame
+			.and_then(|f| f.unit.as_ref().and_then(|u| u.ops.get(f.pc as usize)))
+			.map(|op| op.code);
+		match (slot, code) {
+			(Slot::Words, Some(Opcode::Exec)) => Self::Words,
+			(Slot::Words, Some(Opcode::Arith)) => Self::Arith,
+			(Slot::Words, Some(Opcode::CaseWord)) => Self::Case,
+			_ => Self::Other,
+		}
+	}
+}
+
+/// [`fork_failure`] of a zsh command substitution, by where it stands
+/// ([`ZshSubFailure`]); [`ZshSubFailure::Arith`] goes on in [`stopped`],
+/// which holds the op's scratch, and ends here as [`ZshSubFailure::Other`].
+fn zsh_sub_fork_failure(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	fail: ZshSubFailure,
+) -> Flow {
+	let status = match fail {
+		ZshSubFailure::Words if vp.status != 0 => vp.status,
+		ZshSubFailure::Case => 0,
+		_ => 1,
+	};
+	match fork_failure(k, vp, cx, line) {
+		Flow::Discard(_) => Flow::Discard(status),
+		flow => flow,
 	}
 }
 
@@ -2147,9 +2202,18 @@ fn stopped(
 ) -> Flow {
 	match stop {
 		Stop::ZshSub { text, here } => {
+			let fail = ZshSubFailure::of(vp, slot);
+			// `(( $(cmd) ))` with no vpid left fails with 2 and the script
+			// goes on (zsh 5.9 under `ulimit -u 1`); the op is over.
+			if !here && fail == ZshSubFailure::Arith && k.vpids_left() == 0 {
+				fork_message(k, vp, cx, line);
+				drop_scratch(&mut k.root, cx.store, vp, sc);
+				vp.status = 2;
+				return Flow::Next;
+			}
 			// A call run here pushes its frame above this op's.
 			let fi = vp.frames.len() - 1;
-			let flow = start_zsh_sub(k, vp, cx, &mut sc, &text, here, line);
+			let flow = start_zsh_sub(k, vp, cx, &mut sc, &text, here, fail, line);
 			vp.frames[fi].scratch = Some(sc);
 			flow
 		},
@@ -2457,7 +2521,7 @@ pub fn start_sub(
 /// `here` ([`Stop::ZshSub::here`]): a hook function call zsh makes from an
 /// expansion (`subst_string_by_func`) runs in the current shell instead,
 /// above the op's frame, its output uncaptured; the logged substitution
-/// is its status.
+/// is its status. With no vpid left the command fails as `fail` says.
 pub fn start_zsh_sub(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -2465,6 +2529,7 @@ pub fn start_zsh_sub(
 	sc: &mut Scratch,
 	text: &[u8],
 	here: bool,
+	fail: ZshSubFailure,
 	line: u32,
 ) -> Flow {
 	if here {
@@ -2472,8 +2537,8 @@ pub fn start_zsh_sub(
 		push_script(vp, text, line, ScriptKind::Hook);
 		return Flow::Call;
 	}
-	if let Some(flow) = fork_failed(k, vp, cx, 1, line) {
-		return flow;
+	if k.vpids_left() == 0 {
+		return zsh_sub_fork_failure(k, vp, cx, line, fail);
 	}
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();

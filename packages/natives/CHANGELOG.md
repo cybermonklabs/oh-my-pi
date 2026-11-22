@@ -8,6 +8,8 @@
 - A shell refuses an engine whose first virtual pid is below the system's pid limit (Linux `pid_max`, macOS 100 000): a virtual pid there would name a real process to `kill`, `wait` and the user's tools
 - A shell that has handed out its last virtual pid (2 147 483 647) no longer hands out numbers past it or wraps around to numbers an OS process can have: a command that needs one fails as when bash cannot fork (`fork: Resource temporarily unavailable`, status 254; zsh: `fork failed: …`, status 1; `zpty`: `can't create pty command`, status 1). A script then ends as it does after `exit 254` (zsh: with status 1), a failure inside a subshell ends only that subshell, and an interactive shell drops the command and reads the next one. A prompt whose command substitution needs a virtual pid then fails as an expansion: the message once, the prompt empty, and the line is read, as zsh does (bash retries the prompt every 15 s and reads nothing). An engine whose first virtual pid is the last one or above it, which leaves none for a child, is refused
 - A bash command substitution that has no command (`$()`, `$( )`, only comments) runs nothing and leaves `$?` as it was, as in bash: `false; echo "$( )" $?` printed `0`
+- With no virtual pid left, a zsh command substitution ends the script as zsh does by where it stands: in a command's words with `$?` when that is not 0 (`f() { return 3 }; f; print "$(:)"` ends with 3), in a `case` word with 0, and in `(( ))` the command fails with 2 and the script goes on; elsewhere with 1
+- A zsh prompt calls the `zsh_directory_name` hook once per `%~`, as zsh does: it was called for each prompt expansion, `RPS1` too, even when that did not use `%~`
 
 ## [18.18.6] - 2026-11-09
 
