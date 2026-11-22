@@ -103,8 +103,11 @@ function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
 	return new WeakRef(session.settings);
 }
 
-/** Observes weakly the peer roster the live session's transcript recorded (outside the test body). */
-function weakRefToRecordedRoster(id: string): WeakRef<object> {
+/**
+ * Observes weakly the peer roster the live session's transcript recorded, and returns the key of the prompt block it
+ * records (outside the test body).
+ */
+function observeRecordedRoster(id: string): { roster: WeakRef<object>; block: string } {
 	const entries = localSession(AgentRegistry.global().get(id)?.session).sessionManager.getEntries();
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== "subagent-irc-roster") continue;
@@ -114,9 +117,11 @@ function weakRefToRecordedRoster(id: string): WeakRef<object> {
 			data !== null &&
 			"roster" in data &&
 			typeof data.roster === "object" &&
-			data.roster
+			data.roster &&
+			"block" in data &&
+			typeof data.block === "string"
 		) {
-			return new WeakRef(data.roster);
+			return { roster: new WeakRef(data.roster), block: data.block };
 		}
 	}
 	throw new Error(`subagent ${id} recorded no peer roster`);
@@ -133,11 +138,14 @@ function registerPeer(id: string): void {
 	});
 }
 
-/** System prompts of the run's own model calls (those offering `yield`; the task label call does not), in order. */
+/** The run's own model calls (those offering `yield`; the task label call does not), in order. */
+function runCalls(mock: MockModel): MockModel["calls"] {
+	return mock.calls.filter(call => (call.context.tools ?? []).some(tool => tool.name === "yield"));
+}
+
+/** System prompts of the run's own model calls, in order. */
 function runPrompts(mock: MockModel): string[][] {
-	return mock.calls
-		.filter(call => (call.context.tools ?? []).some(tool => tool.name === "yield"))
-		.map(call => [...(call.context.systemPrompt ?? [])]);
+	return runCalls(mock).map(call => [...(call.context.systemPrompt ?? [])]);
 }
 
 function userTexts(context: Context): string[] {
@@ -298,7 +306,7 @@ it("revives a parked subagent that answers a follow-up from its earlier messages
 
 // If this regresses, every parked subagent keeps a copy of its peer roster for the rest of the process, or a revived
 // one sends a prompt other than the one it parked with and the provider writes its whole conversation to the
-// prompt cache again.
+// prompt cache again, or the roster its transcript recorded reaches the model as part of the conversation.
 it("revives with the peer roster its transcript recorded, keeping no copy of it while parked", async () => {
 	registerPeer("EarlyPeer");
 	const run = await runKeptAliveSubagent({ tools: ["read", "write"], enableIrc: true });
@@ -306,10 +314,10 @@ it("revives with the peer roster its transcript recorded, keeping no copy of it 
 		const parkedPrompt = runPrompts(run.mock).at(-1);
 		if (!parkedPrompt) throw new Error("Expected the run to call the model");
 		expect(parkedPrompt.join("\n")).toContain("EarlyPeer");
-		const rosterRef = weakRefToRecordedRoster(AGENT_ID);
+		const recorded = observeRecordedRoster(AGENT_ID);
 		await AgentLifecycleManager.global().park(AGENT_ID);
 		run.release();
-		expect(await collected(rosterRef, COLLECT_DEADLINE_MS)).toBe(true);
+		expect(await collected(recorded.roster, COLLECT_DEADLINE_MS)).toBe(true);
 
 		registerPeer("LatePeer");
 		const followUp = await runSubagentFollowUpTurn({
@@ -320,6 +328,15 @@ it("revives with the peer roster its transcript recorded, keeping no copy of it 
 		});
 		expect(followUp.exitCode).toBe(0);
 		expect(runPrompts(run.mock)[0]).toEqual(parkedPrompt);
+		const revivedRequest = runCalls(run.mock)[0];
+		if (!revivedRequest) throw new Error("Expected the revived subagent to call the model");
+		// The roster lives in the system prompt; its transcript entry carries neither its rows nor its data into the
+		// messages, which do carry the conversation the transcript holds.
+		const revivedMessages = JSON.stringify(revivedRequest.context.messages);
+		expect(revivedMessages).toContain("report done");
+		expect(revivedMessages).not.toContain("EarlyPeer");
+		expect(revivedMessages).not.toContain(recorded.block);
+		expect(revivedMessages).not.toContain("subagent-irc-roster");
 	} finally {
 		run.close();
 	}
