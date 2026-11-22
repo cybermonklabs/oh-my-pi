@@ -445,3 +445,22 @@ fn a_redirection_that_would_wait_is_left_to_the_process() {
 	assert!(is_virtual(out.trim()), "{out}");
 	assert!(world.redirs.lock().iter().all(|(_, r)| r.is_none()));
 }
+
+// Failure mode: a background pipeline's last stage that runs no lone
+// program (a group, a function, a builtin) is a vproc of its own, yet `$!`
+// names the job's own vproc, so `$BASHPID` in that stage is not `$!` (bash
+// 5.3: the same pid, its last process) and `kill $!` signals the job.
+#[test]
+fn a_pipelines_last_stage_is_named_by_its_own_pid() {
+	for last in ["{ echo \"$BASHPID\"; }", "f", "echo \"$BASHPID\""] {
+		let world = World::new();
+		let (out, _) = run(
+			world.host(),
+			&format!("f() {{ echo \"$BASHPID\"; }}; {{ :; }} | {last} & p=$!; wait; echo \"$p\""),
+		);
+		let lines: Vec<&str> = out.lines().collect();
+		assert_eq!(lines.len(), 2, "{last}: {out}");
+		assert_eq!(lines[0], lines[1], "{last}: `$BASHPID` in the last stage is not `$!`");
+		assert!(is_virtual(lines[1]), "{last}: {out}");
+	}
+}

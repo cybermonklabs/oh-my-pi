@@ -585,10 +585,11 @@ impl JobTable {
 }
 
 /// `$!` of a vproc ([`Vproc::last_bg`]): the last asynchronous child (a
-/// background job, a process substitution, a coprocess) and the
-/// OS pid of the program it runs, once known ([`Job::os_pid`]). Two words,
-/// zero meaning none (no vpid or OS pid is zero): an `Option` pair would
-/// grow every vproc (idle vproc ≤ 2 KiB).
+/// background job, a process substitution, a coprocess) and the pid of
+/// the process it names other than the child itself, once known
+/// ([`Job::os_pid`]: its program's OS pid, or a pipeline's last stage).
+/// Two words, zero meaning none (no vpid or OS pid is zero): an `Option`
+/// pair would grow every vproc (idle vproc ≤ 2 KiB).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastBg {
 	vpid: u32,
@@ -610,12 +611,12 @@ impl LastBg {
 		}
 	}
 
-	/// The OS pid the child is known by, once settled.
+	/// The pid the child is known by, once settled ([`Job::os_pid`]).
 	pub const fn os(self) -> Option<u32> {
 		if self.os == 0 { None } else { Some(self.os) }
 	}
 
-	/// The child runs the program with OS pid `pid`.
+	/// The child is known by `pid` ([`Job::os_pid`]).
 	pub const fn set_os(&mut self, pid: u32) {
 		self.os = pid;
 	}
@@ -650,17 +651,23 @@ impl LastBg {
 /// lone command (or `exec`'d, or a pipeline's last stage's) makes the job
 /// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
 /// (a builtin, a native task, a subshell, a non-`exec` external in a
-/// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// compound body, the vproc's end) leaves its virtual pid, and a
+/// pipeline's last stage that runs no lone program makes it known by that
+/// stage's virtual pid. Readers of the pid (`$!`, `jobs -l`/`-p`/`-x`)
+/// wait for the decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
-	/// The vproc that decides: the job's own, or the subshell a callout of
-	/// its lone command handed the job to.
+	/// The vproc that decides: the job's own, a pipeline's last stage, or
+	/// the subshell a callout of its lone command handed the job to.
 	pub vproc: Vpid,
 	/// The job's vproc (the one `$!` and the job table name).
 	pub job:   Vpid,
 	/// What may still give the job its program.
 	pub stage: BangStage,
+	/// The last stage of the pipeline the job's body is, when it is a
+	/// vproc of its own: bash and zsh name that process in `$!`, so the job
+	/// is known by its virtual pid when no program decides.
+	pub last:  Option<Vpid>,
 }
 
 /// The redirections of a background job's lone command whose open would

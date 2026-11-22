@@ -692,12 +692,15 @@ impl Kernel {
 	}
 
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
-	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
+	/// OS pid `os`, else by the virtual pid of the pipeline stage `$!`
+	/// names ([`proc::Bang::last`]), else by its own virtual pid (`None`).
+	/// Wakes the readers.
 	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
 			return;
 		};
 		let bang = self.bangs.swap_remove(i);
+		let os = os.or_else(|| bang.last.map(|v| v.0));
 		if let Some(pid) = os {
 			self.settled.push((bang.job, pid));
 			if bang.vproc != bang.job {

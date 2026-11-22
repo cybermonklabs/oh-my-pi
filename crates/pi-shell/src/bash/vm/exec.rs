@@ -3960,9 +3960,11 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
 /// started `stages` (`(vproc, entry)`; the last one a child, or the job's
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
-/// job body of its own would (bash and zsh name the last process in `$!`).
-/// While the job's `[n] pid…` line waits, every earlier stage decides the
-/// pid that line shows for it the same way (zsh names each process).
+/// job body of its own would (bash and zsh name the last process in `$!`),
+/// and a child one that runs no lone program is named by its virtual pid
+/// (its `$BASHPID`). While the job's `[n] pid…` line waits, every earlier
+/// stage decides the pid that line shows for it the same way (zsh names
+/// each process).
 fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, u32)]) {
 	let Some(i) = k
 		.bangs
@@ -3982,19 +3984,21 @@ fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, 
 			if let Some(kind) = decides
 				&& stage != last
 			{
-				k.bangs.push(Bang { vproc: stage, job: stage, stage: kind });
+				k.bangs
+					.push(Bang { vproc: stage, job: stage, stage: kind, last: None });
 			}
 			pids.push((stage, decides.is_some()));
 		}
 		super::jobctl::pipeline_started(k, job_vproc, &pids);
 	}
+	let bang = &mut k.bangs[i];
+	bang.vproc = last;
+	if last != job_vproc {
+		bang.last = Some(last);
+	}
 	match lone(last_entry) {
-		Some(stage) => {
-			let bang = &mut k.bangs[i];
-			bang.vproc = last;
-			bang.stage = stage;
-		},
-		None => k.settle_bang(job_vproc, None),
+		Some(stage) => bang.stage = stage,
+		None => k.settle_bang(last, None),
 	}
 }
 
@@ -4074,7 +4078,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// spawns it (bash's subshell `exec`s a lone simple command):
 					// readers of the pid wait for that decision.
 					if let Some(stage) = bang_stage(unit, info.stages[0].entry) {
-						k.bangs.push(Bang { vproc: vpid, job: vpid, stage });
+						k.bangs
+							.push(Bang { vproc: vpid, job: vpid, stage, last: None });
 					}
 					let job = k.job_id(cx.store);
 					// zsh `&|` / `&!`: disowned at once (no job entry).
