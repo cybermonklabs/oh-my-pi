@@ -1094,9 +1094,20 @@ type SettingsNoticeTools = Pick<
 >;
 
 /**
+ * What the notice of a held change gives beside the changes it holds: when the rebuild comes at the latest, each setting
+ * it puts right that a change which ended left as it is now, which the request's prompt and tools follow already
+ * (`releasedChanges`), and each tool it disables that the request lists nowhere (`unlistedTools`).
+ */
+interface HeldNoticeParts {
+	rebuildBy: string;
+	releasedChanges: SettingChangeView[];
+	unlistedTools: readonly string[];
+}
+
+/**
  * The hidden settings notice giving `changes` and `tools`, recording `given` as the values it gives, as notice
- * `notice` of the change `hold`; `extra` tells the prompt when the rebuild comes at the latest, or that the change was
- * released.
+ * `notice` of the change `hold`: a held change's, with its other `parts`, or without them the notice that the change
+ * it puts right was released.
  */
 function settingsNoticeMessage(
 	changes: SettingChangeView[],
@@ -1104,13 +1115,29 @@ function settingsNoticeMessage(
 	tools: SettingsNoticeTools,
 	hold: string,
 	notice: number,
-	extra: { rebuildBy: string } | { released: true },
+	parts: HeldNoticeParts | undefined,
 ): CustomMessage<SettingsNoticeDetails> {
+	const releasedChanges = parts?.releasedChanges ?? [];
+	const unlisted = parts?.unlistedTools ?? [];
 	return {
 		role: "custom",
 		customType: SETTINGS_NOTICE_MESSAGE_TYPE,
-		content: prompt.render(settingsNoticePrompt, { changes, ...tools, ...extra }),
-		details: { settings: changes.map(change => change.id), values: given, ...tools, hold, notice },
+		content: prompt.render(settingsNoticePrompt, {
+			changes,
+			releasedChanges,
+			...tools,
+			disabledTools: tools.disabledTools.filter(name => !unlisted.includes(name)),
+			unlistedDisabledTools: tools.disabledTools.filter(name => unlisted.includes(name)),
+			rebuildBy: parts?.rebuildBy,
+			released: parts === undefined,
+		}),
+		details: {
+			settings: [...changes, ...releasedChanges].map(change => change.id),
+			values: given,
+			...tools,
+			hold,
+			notice,
+		},
 		attribution: "agent",
 		display: false,
 		timestamp: Date.now(),
@@ -1837,12 +1864,15 @@ export class SessionTools {
 
 	/**
 	 * Whether the task or eval description lists the per-call models it approves. Given the session's enabled
-	 * `tools`, only the description of a tool among them counts.
+	 * `tools`, only the description of a tool among them counts. Each tool's settings are `settingsOf` it: the
+	 * session's own unless given.
 	 */
-	#perCallModelsAdvertised(tools?: readonly string[]): boolean {
-		const settings = this.#host.settings;
+	#perCallModelsAdvertised(
+		tools?: readonly string[],
+		settingsOf: (tool: string) => Settings = () => this.#host.settings,
+	): boolean {
 		return (["task", "eval"] as const).some(
-			tool => (!tools || tools.includes(tool)) && perCallModelEnabled(settings, tool),
+			tool => (!tools || tools.includes(tool)) && perCallModelEnabled(settingsOf(tool), tool),
 		);
 	}
 
@@ -3749,7 +3779,7 @@ export class SessionTools {
 				? undefined
 				: this.#xdevMountNotice(customMessagesOf(byType, XDEV_MOUNT_NOTICE_MESSAGE_TYPE), systemPrompt),
 			this.takeToolRosterNotice(customMessagesOf(byType, TOOL_ROSTER_NOTICE_MESSAGE_TYPE), systemPrompt),
-			...this.historyNotices(byType, enabledToolNames),
+			...this.historyNotices(byType, enabledToolNames, systemPrompt),
 		].filter(notice => notice !== undefined);
 	}
 
@@ -3758,11 +3788,13 @@ export class SessionTools {
 	 * ({@link takeEvalPreludeNotice}), the session's and the discovered agents ({@link takeSessionAgentNotice},
 	 * {@link takeTaskAgentNotice}), the per-call models ({@link takePerCallModelNotice}), the skills
 	 * ({@link takeSkillNotice}) and a held settings change ({@link takeSettingsNotice}), each built from the messages
-	 * of its own kind in `byType` (the agent's context unless given) and the enabled tool names.
+	 * of its own kind in `byType` (the agent's context unless given), the enabled tool names, and the request's
+	 * `systemPrompt`.
 	 */
 	historyNotices(
 		byType: CustomMessagesByType = customMessagesByType(this.#host.agent.state.messages),
 		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
+		systemPrompt: readonly string[] = this.#host.agent.state.systemPrompt,
 	): AgentMessage[] {
 		return [
 			this.takeEvalPreludeNotice(customMessagesOf(byType, EVAL_PRELUDE_NOTICE_MESSAGE_TYPE)),
@@ -3770,7 +3802,11 @@ export class SessionTools {
 			this.takeTaskAgentNotice(customMessagesOf(byType, TASK_AGENT_NOTICE_MESSAGE_TYPE), enabledToolNames),
 			this.takePerCallModelNotice(customMessagesOf(byType, PER_CALL_MODEL_NOTICE_MESSAGE_TYPE), enabledToolNames),
 			this.takeSkillNotice(customMessagesOf(byType, SKILL_NOTICE_MESSAGE_TYPE), enabledToolNames),
-			this.takeSettingsNotice(customMessagesOf(byType, SETTINGS_NOTICE_MESSAGE_TYPE)),
+			this.takeSettingsNotice(
+				customMessagesOf(byType, SETTINGS_NOTICE_MESSAGE_TYPE),
+				customMessagesOf(byType, XDEV_MOUNT_NOTICE_MESSAGE_TYPE),
+				systemPrompt,
+			),
 		].filter(notice => notice !== undefined);
 	}
 
@@ -3872,9 +3908,10 @@ export class SessionTools {
 	/**
 	 * The hidden `customType` notice of what `live` changes in the agents the model knows: `committed`, then what
 	 * every `customType` notice in `messages` listed and withdrew, in order. Both sides keep only the agents the
-	 * session may spawn now ({@link spawnableAgents}), as the task description lists them, so an agent the settings
-	 * disable is never announced. An agent whose description changed is listed again with the new one, since the
-	 * model picks agents by it. `template` renders the notice.
+	 * session may spawn now ({@link spawnableAgents}), as the task description lists them and as a call of the `task`
+	 * tool reads its settings (a held change that alters the description keeps the earlier ones,
+	 * {@link toolCallSettingsFor}), so an agent the settings disable is never announced. An agent whose description
+	 * changed is listed again with the new one, since the model picks agents by it. `template` renders the notice.
 	 */
 	#agentRosterNotice(
 		customType: string,
@@ -3883,7 +3920,7 @@ export class SessionTools {
 		live: readonly AgentDefinition[],
 		messages: readonly AgentMessage[],
 	): CustomMessage<AgentNoticeDetails> | undefined {
-		const disabledAgents = cfgTaskDisabledAgents.get(this.#host.settings);
+		const disabledAgents = cfgTaskDisabledAgents.get(this.toolCallSettingsFor("task") ?? this.#host.settings);
 		const policy = resolveSpawnPolicy(this.#host.sessionSpawns());
 		// Each agent the model knows, with the description it was given: undefined when an older notice listed it.
 		const known = new Map<string, string | undefined>(
@@ -3929,20 +3966,24 @@ export class SessionTools {
 	 * the provider cache prefix intact. The list is restated whole because roles,
 	 * allowlist and the own-model clause change together; a notice that a later
 	 * rebuild outdated costs at most one restatement of what the descriptions list.
-	 * A session with no task or eval tool that lists them gets none.
+	 * A session with no task or eval tool that lists them gets none. The approvals
+	 * are read as a call of the tool reads them: under the settings its
+	 * description was written for while a held change alters it
+	 * ({@link toolCallSettingsFor}).
 	 */
 	takePerCallModelNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
 		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
 	): CustomMessage<PerCallModelAdvertisement> | undefined {
-		const settings = this.#host.settings;
+		const settingsOf = (tool: string): Settings => this.toolCallSettingsFor(tool) ?? this.#host.settings;
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
-		if (!known || !this.#perCallModelsAdvertised(enabledToolNames)) return undefined;
+		if (!known || !this.#perCallModelsAdvertised(enabledToolNames, settingsOf)) return undefined;
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
 		}
+		const settings = this.toolCallSettingsFor("task") ?? settingsOf("eval");
 		const live = getPerCallModelAdvertisement(settings, this.#host.model(), this.#host.modelRegistry);
 		if (Bun.deepEquals(live, known)) return undefined;
 		return {
@@ -4032,23 +4073,10 @@ export class SessionTools {
 	}
 
 	/**
-	 * Builds the hidden notice reconciling the `xd://` devices the model was told of with the mounted ones: the
-	 * devices the request's system prompt lists ({@link #promptListing}), then every mount notice still in `messages`,
-	 * applied in order. A device the base prompt lists in its catalog, or in a route line with its catalog summary
-	 * (deferred MCP discovery mounts devices whose routes a rebuild renders), needs no notice line; one the bounded
-	 * route projection omits, one whose docs the prompt inlines (its route line has no summary; the notice delivers
-	 * them) and one mounted after a bound base was committed each get one. Only a net change is announced: a device
-	 * a resume or host reconnect mounts again that the context already announced, and an unmount of a device the
-	 * model was never told of, add nothing, keeping the provider prompt cache prefix byte-stable across resumes.
-	 * Derived from the context, it reaches every request that lacks it: `/tree` to a branch without the notice, a
-	 * replaced transcript (`/new`) and a compaction that summarized it each get it again.
+	 * The `xd://` devices the model was told of in a request: the devices its `systemPrompt` lists
+	 * ({@link #promptListing}), then every mount notice in its `messages`, applied in order.
 	 */
-	#xdevMountNotice(
-		messages: readonly AgentMessage[],
-		systemPrompt: readonly string[],
-	): CustomMessage<XdevMountNoticeDetails> | undefined {
-		const xdev = this.#xdev;
-		if (!xdev) return undefined;
+	#toldXdevNames(messages: readonly AgentMessage[], systemPrompt: readonly string[]): Set<string> {
 		const known = new Set(this.#promptListing(systemPrompt).xdevNames);
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== XDEV_MOUNT_NOTICE_MESSAGE_TYPE) continue;
@@ -4059,6 +4087,49 @@ export class SessionTools {
 				else known.delete(name);
 			}
 		}
+		return known;
+	}
+
+	/**
+	 * The `xd://` devices a request about to go out lists, given the mount notices in its context and its
+	 * `systemPrompt`: the mounted devices, which its mount notice reconciles the model's list with, or while a prompt
+	 * put that notice off ({@link takeXdevMountNotice}), the ones the prompt and those notices told
+	 * ({@link #toldXdevNames}).
+	 */
+	#nextRequestXdevNames(xdevNotices: readonly AgentMessage[], systemPrompt: readonly string[]): ReadonlySet<string> {
+		const xdev = this.#xdev;
+		if (!xdev) return new Set();
+		return this.#xdevMountNoticeDeferred ? this.#toldXdevNames(xdevNotices, systemPrompt) : xdev.mountedNames;
+	}
+
+	/**
+	 * Where a request lists `name` for the model to call: `"tools"` when its tool list declares it, `"devices"` when its
+	 * `xd://` listing, `xdevNames`, names it; undefined when neither does.
+	 */
+	#requestListing(name: string, xdevNames: ReadonlySet<string>): "tools" | "devices" | undefined {
+		if (this.#host.agent.state.tools.some(tool => tool.name === name)) return "tools";
+		return xdevNames.has(name) ? "devices" : undefined;
+	}
+
+	/**
+	 * Builds the hidden notice reconciling the `xd://` devices the model was told of with the mounted ones: the
+	 * devices the request's system prompt lists ({@link #promptListing}), then every mount notice still in `messages`,
+	 * applied in order ({@link #toldXdevNames}). A device the base prompt lists in its catalog, or in a route line with
+	 * its catalog summary (deferred MCP discovery mounts devices whose routes a rebuild renders), needs no notice line;
+	 * one the bounded route projection omits, one whose docs the prompt inlines (its route line has no summary; the
+	 * notice delivers them) and one mounted after a bound base was committed each get one. Only a net change is
+	 * announced: a device a resume or host reconnect mounts again that the context already announced, and an unmount
+	 * of a device the model was never told of, add nothing, keeping the provider prompt cache prefix byte-stable across
+	 * resumes. Derived from the context, it reaches every request that lacks it: `/tree` to a branch without the
+	 * notice, a replaced transcript (`/new`) and a compaction that summarized it each get it again.
+	 */
+	#xdevMountNotice(
+		messages: readonly AgentMessage[],
+		systemPrompt: readonly string[],
+	): CustomMessage<XdevMountNoticeDetails> | undefined {
+		const xdev = this.#xdev;
+		if (!xdev) return undefined;
+		const known = this.#toldXdevNames(messages, systemPrompt);
 		const mounted = xdev.mountedNames;
 		const addedNames = [...mounted].filter(name => !known.has(name));
 		const removedNames = [...known].filter(name => !mounted.has(name));
@@ -4924,20 +4995,26 @@ export class SessionTools {
 	/**
 	 * Builds the hidden notice of a held settings change: each changed setting with the value the model was told of
 	 * it and the value now set (a credential's values withheld), the tools the change disabled, whose calls are
-	 * refused, the tools it enables at the rebuild, and when the rebuild comes at the latest. Gives only what changed
-	 * since the change's last notice on the current branch, both ways: a tool that notice gave as disabled that runs
-	 * again, and one it gave as enabled that the rebuild no longer brings; a branch the change's notices are not on
-	 * (`/tree` to an earlier reply, a switch to another session) gets the whole change. The change is a held settings
-	 * rebuild's, else the settings a kept restored transcript prompt withholds ({@link #restoreTranscriptPrompt}).
-	 * What the notices of every other change in `messages` gave counts as told ({@link noticedSettingStarts}): a
-	 * setting at the value the newest of them gave it, and the tools they gave as disabled or as available after the
-	 * rebuild. So the change's first notice also puts right what they told that is no longer so, as
-	 * {@link #releasedSettingsNotice} does while no change is withheld: a setting whose value differs now (one set
-	 * back before a restart, or after a hold that ended before a notice of its last state went out), a tool they gave
-	 * as disabled that runs here, and one they gave as available after the rebuild that is not here.
+	 * refused, with whether the request still lists them, the tools it enables at the rebuild, and when the rebuild
+	 * comes at the latest. Gives only what changed since the change's last notice on the current branch, both ways: a
+	 * tool that notice gave as disabled that runs again, and one it gave as enabled that the rebuild no longer brings;
+	 * a branch the change's notices are not on (`/tree` to an earlier reply, a switch to another session) gets the
+	 * whole change. The change is a held settings rebuild's, else the settings a kept restored transcript prompt
+	 * withholds ({@link #restoreTranscriptPrompt}). What the notices of every other change in `messages` gave counts as
+	 * told ({@link noticedSettingStarts}): a setting at the value the newest of them gave it, and the tools they gave
+	 * as disabled or as available after the rebuild. So the change's first notice also puts right what they told that
+	 * is no longer so, as {@link #releasedSettingsNotice} does while no change is withheld: a setting whose value
+	 * differs now (one set back before a restart, or after a hold that ended before a notice of its last state went
+	 * out), a tool they gave as disabled that runs here, and one they gave as available after the rebuild that is not
+	 * here. Such a setting is named apart from the held ones, as in effect, unless the base prompt was built with
+	 * another value of it: the request's prompt and tools follow it already. Whether the request lists a disabled tool
+	 * is read from its tool list, and from the `xd://` listing its `systemPrompt` and the mount notices among
+	 * `xdevNotices` give it ({@link #nextRequestXdevNames}).
 	 */
 	takeSettingsNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+		xdevNotices: readonly AgentMessage[] = messages,
+		systemPrompt: readonly string[] = this.#host.agent.state.systemPrompt,
 	): CustomMessage<SettingsNoticeDetails> | undefined {
 		const rebuild = this.#heldSettingsRebuild;
 		const held = rebuild ?? this.#keptRestoredPrompt();
@@ -4945,7 +5022,18 @@ export class SessionTools {
 		if (!held) return this.#releasedSettingsNotice(earlier);
 		const told = this.#settingsNoticeTold(held, messages);
 		const values = new Map(told?.values);
-		const { changes, given } = this.#settingChanges(noticedSettingStarts(held.before, earlier), values);
+		// A setting the change holds, or one the base was built with at another value, goes out with the rebuild; the
+		// prompt and tools the request carries follow every other one already.
+		const read = this.#promptSettingsRead;
+		const waiting: [AnySetting, unknown][] = [];
+		const settled: [AnySetting, unknown][] = [];
+		for (const start of noticedSettingStarts(held.before, earlier)) {
+			const [setting] = start;
+			if (held.before.has(setting) || this.#readAtOtherValue(read, setting)) waiting.push(start);
+			else settled.push(start);
+		}
+		const heldChanges = this.#settingChanges(waiting, values);
+		const releasedChanges = this.#settingChanges(settled, values);
 		// Without a notice of its own on the branch, the change goes on from what the other changes' notices told.
 		const toldDisabled = told?.disabledTools ?? earlier.disabledTools;
 		const toldEnabled = told?.enabledTools ?? earlier.enabledTools;
@@ -4973,10 +5061,21 @@ export class SessionTools {
 			enabledTools: enabledTools.filter(name => !toldEnabled.includes(name)),
 			noLongerEnabledTools: toldEnabled.filter(name => !enabledTools.includes(name)),
 		};
-		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
+		if (
+			heldChanges.changes.length === 0 &&
+			releasedChanges.changes.length === 0 &&
+			Object.values(tools).every(names => names.length === 0)
+		) {
+			return undefined;
+		}
 		held.notices.push({ values, disabledTools, enabledTools });
-		return settingsNoticeMessage(changes, given, tools, held.id, held.notices.length - 1, {
+		const xdevNames =
+			tools.disabledTools.length > 0 ? this.#nextRequestXdevNames(xdevNotices, systemPrompt) : undefined;
+		const given = [...heldChanges.given, ...releasedChanges.given];
+		return settingsNoticeMessage(heldChanges.changes, given, tools, held.id, held.notices.length - 1, {
 			rebuildBy: withheldChangeDeadline(held),
+			releasedChanges: releasedChanges.changes,
+			unlistedTools: xdevNames ? tools.disabledTools.filter(name => !this.#requestListing(name, xdevNames)) : [],
 		});
 	}
 
@@ -5038,7 +5137,7 @@ export class SessionTools {
 			noLongerEnabledTools: earlier.enabledTools.filter(name => !enabled.has(name)),
 		};
 		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
-		return settingsNoticeMessage(changes, given, tools, newest.hold, newest.notices, { released: true });
+		return settingsNoticeMessage(changes, given, tools, newest.hold, newest.notices, undefined);
 	}
 
 	/**
@@ -5074,24 +5173,32 @@ export class SessionTools {
 	}
 
 	/**
-	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it while it
-	 * stays listed until the rebuild. It names each setting whose change disabled it as the settings notice names the
-	 * change, from the value the model was told of it before the change's notices ({@link noticedSettingStarts}), and
-	 * only while its value differs from that one, and the time the rebuild comes at the latest. Undefined for every
-	 * other tool.
+	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it. It names
+	 * each setting whose change disabled it as the settings notice names the change, from the value the model was told
+	 * of it before the change's notices ({@link noticedSettingStarts}), and only while its value differs from that one;
+	 * says where the tool stays listed until the rebuild in what the request the call answers carries (its tool list,
+	 * or the `xd://` listing its system prompt and mount notices give), and nowhere when neither lists it; and gives the
+	 * time the rebuild comes at the latest. Undefined for every other tool.
 	 */
 	heldToolRefusal(name: string): string | undefined {
 		const bareName = stripXdUrlPrefix(name);
 		const held = this.#heldSettingsRebuild;
 		const gates = held?.disabledTools.get(bareName);
 		if (!held || !gates) return undefined;
-		const earlier = this.#earlierNoticesTold(this.#host.agent.state.messages, held.id);
-		const starts = noticedSettingStarts(held.before, earlier);
+		const { messages, systemPrompt } = this.#host.agent.state;
+		const starts = noticedSettingStarts(held.before, this.#earlierNoticesTold(messages, held.id));
 		const { changes } = this.#settingChanges(
 			gates.map(setting => [setting, starts.get(setting)] as const),
 			new Map(),
 		);
-		return prompt.render(heldToolRefusalPrompt, { tool: bareName, changes, rebuildBy: withheldChangeDeadline(held) });
+		const listing = this.#requestListing(bareName, this.#toldXdevNames(messages, systemPrompt));
+		return prompt.render(heldToolRefusalPrompt, {
+			tool: bareName,
+			changes,
+			inToolList: listing === "tools",
+			inDeviceListing: listing === "devices",
+			rebuildBy: withheldChangeDeadline(held),
+		});
 	}
 
 	async #prepareBaseSystemPrompt(isCurrent?: () => boolean): Promise<SystemPromptPreparation | undefined> {

@@ -1396,6 +1396,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
+	/**
+	 * The run a user prompt started went live after the prompt sent what was due of the withheld prompt changes and
+	 * wrote its hidden notices from what stayed withheld: the run's first model call carries what those notices say,
+	 * so it releases nothing more unless the prompt cache entry lapsed since
+	 * ({@link #releaseWithheldPromptChangesIfDue}); the next call does.
+	 */
+	#promptSentWithheldChanges = false;
 	/** Claude account lane (`cred:<id>`/`key:<hash>`) that served the latest Anthropic request. */
 	#anthropicSlowModeLane: string | undefined;
 	/** `<lane>#<window>` of the wrap-up window this session already told the model about. */
@@ -3163,7 +3170,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				}
 			}),
 		);
-		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
+		this.addDisposer(
+			this.agent.addBeforeModelCallHook(() => {
+				if (this.#promptSentWithheldChanges) {
+					this.#promptSentWithheldChanges = false;
+					// What came due by its time since the prompt's notices were written waits a request, as they say;
+					// an entry that lapsed meanwhile (or that this request cannot read) is written whole anyway.
+					if (!this.#maintenance.promptCacheLapsed()) return;
+				}
+				return this.#releaseWithheldPromptChangesIfDue();
+			}),
+		);
 		// A move off a file another process writes copies the transcript into a sibling under a new id, which the
 		// conversation goes on in, as on every other copy.
 		this.addDisposer(
@@ -5919,8 +5936,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
 	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a
 	 * cut under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after
-	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before
-	 * every main request, and before a user prompt takes its hidden notices.
+	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
+	 * user prompt takes its hidden notices, and before every main request; the first of the run that prompt starts
+	 * carries those notices, so it calls this only when the entry lapsed since they were written (the request writes
+	 * the whole prompt anyway), and what came due by its time goes out at the run's next request.
 	 */
 	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
 		if (!this.#tools.withholdsPromptChange) return;
@@ -10138,6 +10157,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					// the dispatch so they admit into the run they targeted.
 					this.#wakeDispatchLiveWaiters();
 					options?.followUpBatch?.release();
+					this.#promptSentWithheldChanges = true;
 				});
 				await run;
 			} finally {
@@ -10151,6 +10171,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
+			this.#promptSentWithheldChanges = false;
 			// Client ownership is released by #prompt's bracket, which settles
 			// after this frame returns; its wake re-checks parked steers
 			// against zero.
