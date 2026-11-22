@@ -3785,11 +3785,24 @@ mod tests {
 	/// cross-device link" on Linux, and from `/dev/null`, which GNU cp tries
 	/// to clone too rather than copy (gVisor answers "Operation not
 	/// supported" to every clone, and GNU cp prints that there). An existing
-	/// `b` keeps its data, where GNU cp has truncated it.
+	/// `b` keeps its data, where GNU cp has truncated it. With a backup
+	/// (`-b`, `--backup=numbered`, `-f -b`), `b` is renamed to its backup
+	/// name before the clone, and a failed clone renames it back, as GNU's
+	/// `un_backup` does (`-v` says so). With `-f`, a socket at `b`, which
+	/// cannot be opened, is removed first and the new `b` removed after a
+	/// failed clone, as GNU removes them.
 	#[test]
 	#[cfg(target_os = "linux")]
 	fn reflink_always_reports_the_clones_own_answer() {
 		use std::os::unix::fs::MetadataExt as _;
+
+		/// What is at `b` before cp runs.
+		#[derive(Clone, Copy, PartialEq)]
+		enum Before {
+			Nothing,
+			Old,
+			Socket,
+		}
 
 		let fixture = tempdir().unwrap();
 		fs::write(fixture.path().join("a"), b"A").unwrap();
@@ -3806,6 +3819,16 @@ mod tests {
 			},
 			_ => eprintln!("skipped: /dev/shm and the temporary directory are not two filesystems"),
 		}
+		// The options, what is at `b` before, and the backup name cp makes.
+		let ways: [(&[&str], Before, Option<&str>); 7] = [
+			(&[], Before::Nothing, None),
+			(&[], Before::Old, None),
+			(&["-b"], Before::Old, Some("b~")),
+			(&["--backup=numbered"], Before::Old, Some("b.~1~")),
+			(&["-f", "-b"], Before::Old, Some("b~")),
+			(&["-v", "-b"], Before::Old, Some("b~")),
+			(&["-f"], Before::Socket, None),
+		];
 		for (case, source, data) in sources {
 			// What `FICLONE` answers for this pair, asked on a probe file.
 			let probe = fixture.path().join("probe");
@@ -3816,29 +3839,64 @@ mod tests {
 			fs::remove_file(&probe).unwrap();
 			let shown = if case == "one directory" { "a".to_owned() } else { source.display().to_string() };
 			let dest = fixture.path().join("b");
-			for existing in [None, Some(&b"old"[..])] {
-				let case = if existing.is_some() { format!("{case}, onto an existing b") } else { case.to_owned() };
-				if let Some(old) = existing {
-					fs::write(&dest, old).unwrap();
+			for (flags, before, backup) in ways {
+				// The socket row covers the stream path's `-f` removal; a
+				// regular source is cloned by path.
+				if before == Before::Socket && case != "a character device" {
+					continue;
 				}
-				let (code, capture) = run_util::<Cp>(&["--reflink=always", &shown, "b"], "", fixture.path());
+				let case = format!("{case}, cp {}", flags.join(" "));
+				match before {
+					Before::Nothing => {},
+					Before::Old => fs::write(&dest, b"old").unwrap(),
+					Before::Socket => drop(std::os::unix::net::UnixListener::bind(&dest).unwrap()),
+				}
+				let mut argv = flags.to_vec();
+				argv.extend(["--reflink=always", shown.as_str(), "b"]);
+				let (code, capture) = run_util::<Cp>(&argv, "", fixture.path());
 				eprintln!("{case}: cp exits {code}: {:?}", capture.err());
+				let backup_path = backup.map(|name| fixture.path().join(name));
+				let verbose = |tail: &str| {
+					if flags.contains(&"-v") {
+						format!("'{shown}' -> 'b' (backup: '{}'){tail}\n", backup.unwrap())
+					} else {
+						String::new()
+					}
+				};
 				match &answer {
 					Ok(()) => {
 						assert_eq!((code, capture.err()), (0, String::new()), "{case}");
+						assert_eq!(capture.out(), verbose(""), "{case}");
 						assert_eq!(fs::read(&dest).unwrap(), data, "{case}");
+						if let Some(backup_path) = &backup_path {
+							assert_eq!(fs::read(backup_path).unwrap(), b"old", "{case}: the backup");
+						}
 					},
 					Err(error) => {
 						let message =
 							format!("cp: failed to clone 'b' from '{shown}': {}\n", crate::host::strip_errno(error));
 						assert_eq!((code, capture.err()), (1, message), "{case}");
-						match existing {
-							None => assert!(!dest.exists(), "{case}: the failed clone left b"),
-							Some(old) => assert_eq!(fs::read(&dest).unwrap(), old, "{case}: b lost its data"),
+						assert_eq!(capture.out(), verbose("\n'b~' -> 'b' (unbackup)"), "{case}");
+						match before {
+							Before::Nothing | Before::Socket => assert!(
+								fs::symlink_metadata(&dest).is_err(),
+								"{case}: the failed clone left b"
+							),
+							Before::Old => assert_eq!(
+								fs::read(&dest).ok().as_deref(),
+								Some(&b"old"[..]),
+								"{case}: b lost its data"
+							),
+						}
+						if let Some(backup_path) = &backup_path {
+							assert!(!backup_path.exists(), "{case}: b is left under its backup name");
 						}
 					},
 				}
 				let _ = fs::remove_file(&dest);
+				if let Some(backup_path) = &backup_path {
+					let _ = fs::remove_file(backup_path);
+				}
 			}
 		}
 	}
