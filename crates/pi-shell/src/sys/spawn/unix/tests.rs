@@ -414,6 +414,88 @@ fn failures_left_to_the_process_are_its_own_message_and_status() {
 	std::fs::remove_file(&err).unwrap();
 }
 
+/// A process whose redirection open waits (a FIFO with no other end) holds
+/// none of the host's descriptors meanwhile: a pipe's reader in the host
+/// (here, as a pump's end, close-on-exec) gets end of file once its writer
+/// closes, while the open still waits. bash's child holds none either.
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor() {
+	use std::io::Read;
+
+	let fifo = temp_path("held-fifo");
+	let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+	// SAFETY: mkfifo with a valid C path.
+	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+	let (mut reader, writer) = std::io::pipe().unwrap();
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = argv(&["/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
+		exec_diag: BString::from("test: /bin/true: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	drop(writer);
+	let (tx, eof) = std::sync::mpsc::channel();
+	thread::spawn(move || {
+		let mut rest = Vec::new();
+		let _ = tx.send(reader.read_to_end(&mut rest).map(|_| rest));
+	});
+	// Another test's child holds a copy of the write end only until its exec:
+	// the wait names a hang, not a bound of the answer.
+	let got = eof.recv_timeout(LONG);
+	// Let the open go in any case.
+	drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	std::fs::remove_file(&fifo).unwrap();
+	assert!(
+		matches!(&got, Ok(Ok(rest)) if rest.is_empty()),
+		"the reader got no end of file while the open waited: the child held its write end"
+	);
+}
+
+/// A process that applies its own redirections keeps only the fds placed
+/// for it, as the macOS `posix_spawn` path does: no stray host fd leaks into
+/// it. An embedded host leaves the descriptors it inherited open without
+/// close-on-exec (`process::host::inherited_fds`). A spawn of the other paths
+/// still passes such a stray on where `posix_spawn` and `fork` close only
+/// close-on-exec descriptors (Linux); this one does not.
+#[test]
+fn a_process_that_applies_its_redirections_keeps_only_its_placed_fds() {
+	use std::os::fd::AsRawFd;
+
+	let out = temp_path("stray-out");
+	let err = temp_path("stray-err");
+	let (stray, _writer) = std::io::pipe().unwrap();
+	let n = stray.as_raw_fd();
+	// SAFETY: F_SETFD on a descriptor this test owns.
+	assert_eq!(unsafe { libc::fcntl(n, libc::F_SETFD, 0) }, 0, "clear close-on-exec");
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh(&format!(
+		"if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi > '{}'",
+		out.display()
+	));
+	let mut deferred = spec(&a, &env, NEW);
+	deferred.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[2], &err, WRITE)],
+		exec_diag: BString::from("test: /bin/sh: "),
+	});
+	let mut p = s.spawn(deferred).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	assert_eq!(std::fs::read_to_string(&out).unwrap(), "none\n", "the stray reached the process");
+	let mut p = s.spawn(spec(&a, &env, NEW)).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	let other = std::fs::read_to_string(&out).unwrap();
+	#[cfg(target_os = "linux")]
+	assert_eq!(other, "has\n", "the other paths pass the stray on");
+	#[cfg(not(target_os = "linux"))]
+	let _ = other;
+	std::fs::remove_file(&out).unwrap();
+	std::fs::remove_file(&err).unwrap();
+}
+
 #[test]
 fn detached_externals_lead_their_own_sessions_without_a_terminal() {
 	let env = EnvView::default();

@@ -1047,6 +1047,11 @@ fn fork_redirs(
 	let limits = limits(prog);
 	let raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
 	let closed = prog.closed;
+	// What the child keeps of the descriptors it inherits from the host
+	// ([`close_all_but`]), and the bound of its close loop, decided here: the
+	// child must not allocate.
+	let keep = kept_fds(&raw, closed);
+	let open_max = open_max();
 	// Every signal stays blocked across the fork: the child runs with the
 	// host's handlers until it resets them, and a signal delivered then (a
 	// `kill $!` right after the spawn) would run host code and be lost
@@ -1100,6 +1105,13 @@ fn fork_redirs(
 			for &target in closed {
 				libc::close(target);
 			}
+			// Before any redirection, keep only the placed fds, as the macOS
+			// posix_spawn path does: no stray host fd leaks into the child. An
+			// open that waits (a FIFO's other end) would otherwise hold every
+			// descriptor of the host until the exec, other jobs' pipe ends
+			// among them, so their readers would wait for this open (bash's
+			// parent keeps no end of another job's pipe).
+			close_all_but(&keep, open_max);
 			libc::umask(mask);
 			for (n, &ign) in ignore.iter().enumerate().skip(1) {
 				let n = n as i32;
@@ -1167,6 +1179,85 @@ fn fork_redirs(
 		other => other,
 	};
 	Ok((pid, place))
+}
+
+/// The descriptors the child of [`fork_redirs`] keeps: the placed `targets`
+/// (stdio and extra fds) but the `closed` ones. Every source a redirection
+/// may read is one of them or an fd an earlier redirection opened; a dup
+/// from any other number (`/dev/fd/N` naming one of the host's own fds)
+/// fails with `EBADF`, as for a closed fd. Sorted, unique.
+fn kept_fds(targets: &[(i32, RawFd)], closed: &[i32]) -> Vec<i32> {
+	let mut keep: Vec<i32> = targets
+		.iter()
+		.map(|&(target, _)| target)
+		.filter(|target| !closed.contains(target))
+		.collect();
+	keep.sort_unstable();
+	keep.dedup();
+	keep
+}
+
+/// The bound of [`close_span`]'s loop: the process's descriptor limit.
+fn open_max() -> i32 {
+	// SAFETY: sysconf takes a constant and reads no memory of ours.
+	let n = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+	if n <= 0 {
+		1 << 16
+	} else {
+		i32::try_from(n).unwrap_or(i32::MAX)
+	}
+}
+
+/// Close every descriptor above 2 but those in `keep` (sorted), in the
+/// forked child of [`fork_redirs`]. Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// For the forked child only: it closes descriptors other code of this
+/// process may hold.
+unsafe fn close_all_but(keep: &[i32], open_max: i32) {
+	let mut first = 3;
+	for &kept in keep {
+		if kept >= first {
+			// SAFETY: as this function's.
+			unsafe { close_span(first, kept - 1, open_max) };
+			first = kept + 1;
+		}
+	}
+	// SAFETY: as this function's.
+	unsafe { close_span(first, i32::MAX, open_max) };
+}
+
+/// Close the descriptors `first..=last`: Linux's `close_range` (5.9 and
+/// later), else a `close` of each number below `open_max` (macOS, which has
+/// no `close_range`, and an older Linux kernel).
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+unsafe fn close_span(first: i32, last: i32, open_max: i32) {
+	if first > last {
+		return;
+	}
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	// SAFETY: close_range takes scalars; it only closes descriptors.
+	if unsafe {
+		libc::syscall(
+			libc::SYS_close_range,
+			first as libc::c_uint,
+			last as libc::c_uint,
+			0 as libc::c_uint,
+		)
+	} == 0
+	{
+		return;
+	}
+	let mut fd = first;
+	while fd <= last && fd < open_max {
+		// SAFETY: close takes a scalar.
+		unsafe { libc::close(fd) };
+		fd += 1;
+	}
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
