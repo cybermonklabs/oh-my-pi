@@ -1130,6 +1130,80 @@ describe("date-cwd-reminder", () => {
 				expect(wireOf(resumed).slice(0, sent.messages.length)).toEqual(wireOf(sent));
 				expect(resumed.messages.at(-1)?.content).toBe(`${renderDateCwdReminder("2026-08-16", "/work")}\n\nnext`);
 			});
+
+			// If this regresses, a long session keeps in the date/cwd reminder injector, for as long as it runs, the
+			// turns its compactions cut (each copy sent with its reminder) and a key for each of them; or the request
+			// after a compaction resends the turns it kept with other reminders than they were sent with, or without
+			// them, so a provider re-reads them instead of continuing from its cached copy.
+			it("retainTurns drops the state of the cut turns and re-keys a conversation whose first turn was cut", () => {
+				const { journal, loads } = createJournal();
+				const injector = new DateCwdReminderInjector(journal);
+				const send = (messages: Message[], date: string) =>
+					injector.transform({ systemPrompt: ["system"], messages }, date, "/work");
+				const assistant = (text: string, timestamp: number): Message => ({
+					...createAssistantMessage(text),
+					timestamp,
+				});
+				const toolResult = (text: string, timestamp: number): Message => ({
+					role: "toolResult",
+					toolCallId: `call-${timestamp}`,
+					toolName: "read",
+					content: [{ type: "text", text }],
+					isError: false,
+					timestamp,
+				});
+				const first: Message = { role: "user", content: "first", timestamp: 1 };
+				const call = assistant("call", 2);
+				const result = toolResult("one", 3);
+				const reply = assistant("a", 4);
+				// Programmatic steering sent one turn twice in a millisecond: the compaction cuts the first copy and
+				// keeps the second, which then holds the first copy's key.
+				const twin: Message = { role: "user", content: "ok", timestamp: 5 };
+				const secondTwin = structuredClone(twin);
+				const keptCall = assistant("call again", 7);
+				const keptResult = toolResult("two", 8);
+				const history = [first, call, result, reply, twin, assistant("b", 6), secondTwin, keptCall, keptResult];
+				const reminder = (date: string) => renderDateCwdReminder(date, "/work");
+
+				send([first], "2026-08-14");
+				// Each day's reminder goes to the turn sent first that day: a developer turn behind a tool result
+				// when no user turn is new.
+				send(history.slice(0, 3), "2026-08-15");
+				const withFirstTwin = send(history.slice(0, 5), "2026-08-16");
+				send(history.slice(0, 7), "2026-08-17");
+				const beforeCompaction = send(history, "2026-08-18");
+				const keptWire = wireOf(beforeCompaction).slice(7);
+				expect(keptWire).toEqual([
+					JSON.stringify(["user", `${reminder("2026-08-17")}\n\nok`]),
+					JSON.stringify(["assistant", keptCall.content]),
+					JSON.stringify(["toolResult", keptResult.content]),
+					JSON.stringify(["developer", reminder("2026-08-18")]),
+				]);
+
+				// The compaction keeps the history from the second copy of the twin on, behind its summary.
+				const summary: Message = { role: "user", content: "summary", timestamp: 10 };
+				const kept = [summary, secondTwin, keptCall, keptResult, assistant("c", 9)];
+				injector.retainTurns(kept);
+				const loadsAtCompaction = loads();
+				const afterCompaction = send([...kept, { role: "user", content: "next", timestamp: 11 }], "2026-08-18");
+
+				// The conversation that lost its first turn is the one the next request continues, from memory: the
+				// kept turns go out as they were sent, the second twin with its own reminder, not the cut twin's.
+				expect(loads()).toBe(loadsAtCompaction);
+				expect(wireOf(afterCompaction).slice(1, 1 + keptWire.length)).toEqual(keptWire);
+				expect(afterCompaction.messages[0]?.content).toBe(`${reminder("2026-08-18")}\n\nsummary`);
+
+				// Back on the history before the compaction, the injector holds nothing of the turns it cut: it reads
+				// them from the journal, as a resumed session does, so each goes out with the reminder it was first
+				// sent with, and the new turn tells the model today's date.
+				const branchedBack = send(
+					[first, call, result, reply, { role: "user", content: "back", timestamp: 12 }],
+					"2026-08-19",
+				);
+				expect(loads()).toBe(loadsAtCompaction + 1);
+				expect(wireOf(branchedBack).slice(0, 5)).toEqual(wireOf(withFirstTwin).slice(0, 5));
+				expect(branchedBack.messages.at(-1)?.content).toBe(`${reminder("2026-08-19")}\n\nback`);
+			});
 		});
 	});
 });

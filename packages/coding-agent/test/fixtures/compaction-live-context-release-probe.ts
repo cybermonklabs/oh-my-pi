@@ -478,8 +478,9 @@ sessionManager.appendCustomEntry("compaction-live-context-release-probe");
 await session.prompt(body("PROMPT", TURNS));
 await session.waitForIdle();
 mock.reset();
-await collect(() => reachable(preCut).length === 0);
+await collect(() => reachable(preCut).length === 0 && !injectionReachable());
 const reachableAfterNextRequest = reachable(preCut);
+const dateCwdInjectionAfterNextRequest = injectionReachable();
 const afterNextRequest = readHeap(releasedStringMarkers, () => heldKeyTargets(preCutIds, preCutTurns));
 const heapStringsAfterNextRequest = afterNextRequest.markers;
 
@@ -532,6 +533,7 @@ process.stdout.write(
 		dateCwdKeysAtCompaction: ofHolder(atCompaction.keys, DATE_CWD_REMINDER),
 		dateCwdInjectionAtCompaction,
 		reachableAfterNextRequest,
+		dateCwdInjectionAfterNextRequest,
 		heapStringsAfterNextRequest,
 		persistedKeysAfterNextRequest: ofHolder(afterNextRequest.keys, PERSISTED_INDEX),
 		dateCwdKeysAfterNextRequest: ofHolder(afterNextRequest.keys, DATE_CWD_REMINDER),

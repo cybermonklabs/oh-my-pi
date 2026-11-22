@@ -18,10 +18,15 @@ const probePath = path.join(import.meta.dir, "../fixtures/parked-subagent-heap-p
 /** Subagents per batch: after 20 the process is warm, and the next 20 each add the same amount. */
 const SUBAGENTS_PER_BATCH = 20;
 /**
- * Measured per parked subagent at 20 a batch: 2.9 KB while the lifecycle keeps each run's reviver closure, 2.0 KB
- * with no closure kept, 45 KB when each run's transcript stays reachable, 389 KB when its session does.
+ * Measured per parked subagent at 20 a batch: 2.9 KB while the lifecycle kept each run's reviver closure, 2.0 KB
+ * with no closure kept, 45 KB when each run's transcript stays reachable, 389 KB when its session does. With its
+ * revive inputs in its transcript, five runs gave 696, 743, 812, 769 and 762 B; with them in memory again, 1,485
+ * and 1,541 B (the executor from before they moved to the transcript) and 1,528 and 1,592 B (each record also held
+ * in a module-level array). This probe runs with the JIT off and reads about two thirds of what the compiled
+ * build's heap check measures, so a bound of 2,000 B here would let through a parked subagent that check's 2,048 B
+ * bar fails; 1,200 B leaves the largest reading 32% below it and fails both of those.
  */
-const MAX_HEAP_BYTES_PER_PARKED_SUBAGENT = 16 * 1024;
+const MAX_HEAP_BYTES_PER_PARKED_SUBAGENT = 1_200;
 
 interface PerParkedSubagent {
 	heapSize: number;

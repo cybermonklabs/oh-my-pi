@@ -51,6 +51,7 @@ interface ProbeResult {
 	dateCwdKeysAtCompaction: string[];
 	dateCwdInjectionAtCompaction: boolean;
 	reachableAfterNextRequest: string[];
+	dateCwdInjectionAfterNextRequest: boolean;
 	heapStringsAfterNextRequest: string[];
 	persistedKeysAfterNextRequest: string[];
 	dateCwdKeysAfterNextRequest: string[];
@@ -86,6 +87,7 @@ function isProbeResult(value: unknown): value is ProbeResult {
 		typeof fields.observed === "object" &&
 		typeof fields.persistedKeyTargets === "number" &&
 		typeof fields.dateCwdKeyTargets === "number" &&
+		typeof fields.dateCwdInjectionAfterNextRequest === "boolean" &&
 		typeof fields.dateCwdInjectionAtCompaction === "boolean" &&
 		typeof fields.tokenizerChecked === "number" &&
 		typeof fields.tokenizerKeptEstimates === "number"
@@ -188,9 +190,14 @@ it("keeps nothing of the messages before a compaction's cut once the next reques
 
 // If this regresses, every lookup after a compaction (each persisted message, a new custom entry or label moving
 // the leaf first) builds the persisted-message index from the whole branch again, so a long session keeps a key
-// for every message its compactions summarized.
+// for every message its compactions summarized; or the date/cwd reminder injector keeps the turns a compaction cut
+// for as long as the session runs, its copy of them sent with their reminders and a key for each.
 it("builds the persisted-message index again from the cut on after a compaction", async () => {
 	const { output, result } = await probeOnce();
 
 	expect(result.persistedKeysAfterNextRequest, output).toEqual([]);
+	// The injector's state after the rebuild: no key of a cut turn (also read once the next request ran), and not
+	// the copy of the cut first turn it sent.
+	expect(result.dateCwdKeysAfterNextRequest, output).toEqual([]);
+	expect(result.dateCwdInjectionAfterNextRequest, output).toBe(false);
 }, 180_000);
