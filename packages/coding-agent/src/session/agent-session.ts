@@ -3133,6 +3133,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}),
 		);
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
+		// A move off a file another process writes copies the transcript into a sibling under a new id, which the
+		// conversation goes on in: so do the records of a change its prompt withholds.
+		this.addDisposer(
+			this.sessionManager.onPersistenceNotice(() => {
+				const from = this.sessionManager.getHeader()?.continuationOf;
+				if (from) this.#tools.followTranscriptCopy(from);
+			}),
+		);
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
 		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
@@ -12862,6 +12870,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The fork clones the transcript and keeps this recovery state running
 			// under a fresh id, so the work already produced is still this session's.
 			this.#recovery.reanchorServedAttribution(previousSessionId);
+			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
+			this.#tools.followTranscriptCopy(previousSessionId);
 
 			await copySessionArtifacts(forkResult.oldSessionFile, forkResult.newSessionFile);
 
@@ -14899,6 +14909,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		options?: { copyArtifacts?: boolean; requireIdleFor?: string },
 	): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
+		const previousSessionId = this.sessionManager.getSessionId();
 		const requireIdleFor = options?.requireIdleFor;
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		let skipConversationRestore = false;
@@ -14969,6 +14980,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
+			// A copy of the path goes on with the conversation, and so do the records of a change its prompt withholds.
+			if (leafId) this.#tools.followTranscriptCopy(previousSessionId);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -15105,6 +15118,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#modelMentions.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
+			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
+			this.#tools.followTranscriptCopy(sessionId);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 

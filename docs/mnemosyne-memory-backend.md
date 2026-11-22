@@ -21,7 +21,7 @@ mnemopi:
 With this backend enabled, the coding agent:
 
 1. Opens one or more local Mnemopi SQLite databases according to the configured bank scoping.
-2. Recalls relevant memories into a `<memories>` block for the first model turn of a session and refreshes the base prompt if recall happens from the `agent_start` listener.
+2. Recalls relevant memories into a `<memories>` block for the first model turn of a session and refreshes the base prompt if recall happens from the `agent_start` listener. On a model that binds its thinking to the cached prompt (such as Claude Opus 5.5) the `agent_start` listener recalls nothing, since that run's request is already on its way: the next turn recalls again, and a recall that lands after the model answered goes out as a hidden message after the turn's newest content ([memory](./memory.md)).
 3. Retains completed conversation turns into the retain bank after agent turns, no more often than `mnemopi.retainEveryNTurns`.
 4. Adds recalled memory as extra compaction context when compaction asks the memory backend for `preCompactionContext`.
 5. Uses the normal `/memory view`, `/memory stats`, `/memory diagnose`, `/memory clear`, and `/memory enqueue` commands through the shared memory backend interface.

@@ -531,9 +531,10 @@ interface WithheldChange {
 	recorded: boolean;
 	/**
 	 * The session whose transcript the prompt withholds the change from: its records are written to that session's
-	 * file alone, never to one the session switched to since.
+	 * file alone, never to one the session switched to since; a copy of the transcript the conversation goes on in
+	 * takes its place ({@link SessionTools.followTranscriptCopy}).
 	 */
-	readonly sessionId: string;
+	sessionId: string;
 }
 
 /**
@@ -977,8 +978,9 @@ interface SettingsNoticeState {
 }
 
 /**
- * What the settings notices of an earlier process's changes of a restored prompt told the model
- * ({@link HeldSettings.earlierHolds}): as {@link SettingsNoticeState}, with each setting by id.
+ * What the settings notices of changes other than the one the base withholds told the model: an earlier process's
+ * changes of a restored prompt ({@link HeldSettings.earlierHolds}), or every change while none is withheld. As
+ * {@link SettingsNoticeState}, with each setting by id.
  */
 interface EarlierNoticesTold {
 	/** The value the newest of them gave each setting it names, by id. */
@@ -2428,12 +2430,17 @@ export class SessionTools {
 	}
 
 	/**
-	 * A forced rebuild commits the live state, so it ends a held settings rebuild ({@link #applyHeldToolSet}), unless
-	 * it changes nothing of its own ({@link #takeUnchangedHeldToolSet}).
+	 * A forced rebuild commits the live state, so it ends a held settings rebuild ({@link #applyHeldToolSet}) or a kept
+	 * restored transcript prompt, unless it changes nothing of its own ({@link #takeUnchangedHeldToolSet}).
 	 */
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		const held = forcePromptRefresh ? this.#heldSettingsRebuild : undefined;
-		if (!held) return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
+		if (!held) {
+			if (forcePromptRefresh && this.#keptRestoredPrompt() && (await this.#takeUnchangedHeldToolSet(toolNames))) {
+				return;
+			}
+			return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
+		}
 		if (await this.#takeUnchangedHeldToolSet(toolNames)) return;
 		await this.#applyHeldToolSet(held, toolNames, signal);
 	}
@@ -2565,11 +2572,12 @@ export class SessionTools {
 	}
 
 	/**
-	 * Under a held settings rebuild, takes a forced tool-set apply that changes nothing of its own, such as an
-	 * extension registering a tool again with the same definition: the same tools in the same places, each declared
-	 * as now, and a system prompt that renders the build the base stands in for again. Only the tools' current
-	 * implementations are taken; the prompt, the declarations and the hold stay. False when the apply changes
-	 * something, or when this cannot tell (a tool that could move under or out of `xd://`).
+	 * Under a held settings rebuild or a kept restored transcript prompt, takes a forced tool-set apply that changes
+	 * nothing of its own, such as an extension registering a tool again with the same definition: the same tools in
+	 * the same places, each declared as now, and a system prompt that renders the build the base stands in for again.
+	 * Only the tools' current implementations are taken; the prompt, the declarations and the withheld change stay.
+	 * False when the apply changes something, or when this cannot tell (a tool that could move under or out of
+	 * `xd://`).
 	 */
 	async #takeUnchangedHeldToolSet(toolNames: string[]): Promise<boolean> {
 		const names = normalizeToolNames(toolNames);
@@ -2737,10 +2745,14 @@ export class SessionTools {
 					discoveredAgents: this.#promptSurface.discoveredAgents,
 					perCallModels: this.#promptSurface.perCallModels,
 				});
+				// A base that stands in for a build of this process's (a held settings rebuild, a kept restored
+				// transcript prompt) renders the frozen change too: that build takes it in, so a later rebuild that
+				// renders it again changes nothing of its own.
 				const freezeImplicitPromptRefresh =
 					!forcePromptRefresh &&
 					triggerSignature !== this.#lastAppliedToolSignature &&
-					this.#implicitRebuildBinding() === "frozen";
+					this.#implicitRebuildBinding() === "frozen" &&
+					this.#baseStandIn?.base !== this.#baseSystemPrompt;
 				if (freezeImplicitPromptRefresh) {
 					frozenSignature = triggerSignature;
 				} else if (forcePromptRefresh || triggerSignature !== this.#lastAppliedToolSignature) {
@@ -3449,6 +3461,28 @@ export class SessionTools {
 		restored.due = true;
 		restored.recorded = false;
 		if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
+	}
+
+	/**
+	 * The session's transcript was copied into another session file under a new id, and the conversation goes on in
+	 * the copy: a whole-session fork, a fork or branch at an entry, a `/btw` branch, a move off a file another process
+	 * writes. A withheld change of the session `fromSessionId` names (a held settings rebuild, the restored transcript
+	 * prompt, a spent hold) records itself in the copy from now on, and a recorded one records itself there at once,
+	 * since a copy cut at an earlier entry lacks the records written after it. A switch to another session, or `/new`,
+	 * copies nothing: the change keeps the session it began in.
+	 */
+	followTranscriptCopy(fromSessionId: string): void {
+		const sessionId = this.#host.sessionManager.getSessionId();
+		if (sessionId === fromSessionId) return;
+		for (const change of [this.#heldSettingsRebuild, this.#restoredPrompt, this.#spentHold]) {
+			if (change?.sessionId !== fromSessionId) continue;
+			change.sessionId = sessionId;
+			change.recordedOn = undefined;
+		}
+		const held = this.#heldSettingsRebuild;
+		if (held?.sessionId === sessionId) this.#recordWithheldChange(held);
+		const restored = this.#keptRestoredPrompt();
+		if (restored?.recorded && restored.sessionId === sessionId) this.#recordWithheldChange(restored);
 	}
 
 	/** Drops retained transcript references when the session is disposed. */
@@ -4701,14 +4735,16 @@ export class SessionTools {
 	 * the notices of an earlier process's change of that prompt gave counts as told ({@link HeldSettings.earlierHolds}):
 	 * a setting at its current value, and the tools they gave as disabled or as available after the rebuild, so a
 	 * resumed process names only what they did not or what is no longer so (a setting set back since, a tool they gave
-	 * as disabled that runs here, one they gave as available after the rebuild that is not here).
+	 * as disabled that runs here, one they gave as available after the rebuild that is not here). While no change is
+	 * withheld, it puts right what the notices in `messages` told that the live settings contradict
+	 * ({@link #releasedSettingsNotice}).
 	 */
 	takeSettingsNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
 	): CustomMessage<SettingsNoticeDetails> | undefined {
 		const rebuild = this.#heldSettingsRebuild;
 		const held = rebuild ?? this.#keptRestoredPrompt();
-		if (!held) return undefined;
+		if (!held) return this.#releasedSettingsNotice(messages);
 		const told = this.#settingsNoticeTold(held, messages);
 		const earlier = this.#earlierNoticesTold(held.earlierHolds, messages);
 		const values = new Map(told?.values);
@@ -4780,10 +4816,68 @@ export class SessionTools {
 	}
 
 	/**
-	 * What the settings notices of `holds` (an earlier process's changes) in `messages` told the model, each notice
-	 * giving what changed since the one before it ({@link SettingsNoticeDetails}): the value the newest gave each
-	 * setting it names, by id, and the tools left given as disabled and as available after the rebuild. Empty without
-	 * such holds.
+	 * The hidden notice of what the settings notices in `messages` told the model that no longer holds, while no change
+	 * is withheld: a change they described ended before a notice of its last state went out (it was set back, then its
+	 * held rebuild came due before the next request, or a resumed process did not keep the transcript's prompt). It
+	 * names each setting they gave a value the live setting no longer has, each tool they gave as disabled that is
+	 * enabled now, and each tool they gave as available after the rebuild that is not, under the newest notice's
+	 * change, so the next request counts it as told. Undefined when nothing they told is contradicted; a credential,
+	 * whose value no notice records, and a setting this process does not know are left out.
+	 */
+	#releasedSettingsNotice(messages: readonly AgentMessage[]): CustomMessage<SettingsNoticeDetails> | undefined {
+		const notices = new Map<string, number>();
+		let hold: string | undefined;
+		for (const message of messages) {
+			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details;
+			if (!isRecord(details) || typeof details.hold !== "string") continue;
+			hold = details.hold;
+			notices.set(hold, (notices.get(hold) ?? 0) + 1);
+		}
+		if (hold === undefined) return undefined;
+		const told = this.#earlierNoticesTold(new Set(notices.keys()), messages);
+		const changes: SettingChangeView[] = [];
+		const given: HeldSettingRecord[] = [];
+		for (const [id, value] of told.values) {
+			const setting = lookupSetting(id);
+			if (!setting || setting.isCredential) continue;
+			const now = setting.get(this.#host.settings);
+			if (settingValuesEqual(now, value)) continue;
+			changes.push(settingChangeView(setting, value, now));
+			given.push(heldSettingRecord(setting, now));
+		}
+		const enabled = new Set(this.getEnabledToolNames());
+		const tools = {
+			disabledTools: [],
+			// A tool a later notice gave as available after the rebuild was told to come back with it.
+			reenabledTools: told.disabledTools.filter(name => enabled.has(name) && !told.enabledTools.includes(name)),
+			enabledTools: [],
+			noLongerEnabledTools: told.enabledTools.filter(name => !enabled.has(name)),
+		};
+		if (changes.length === 0 && tools.reenabledTools.length === 0 && tools.noLongerEnabledTools.length === 0) {
+			return undefined;
+		}
+		return {
+			role: "custom",
+			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(settingsNoticePrompt, { changes, ...tools, released: true }),
+			details: {
+				settings: changes.map(change => change.id),
+				values: given,
+				...tools,
+				hold,
+				notice: notices.get(hold) ?? 0,
+			},
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * What the settings notices of `holds` in `messages` told the model, each notice giving what changed since the one
+	 * before it ({@link SettingsNoticeDetails}): the value the newest gave each setting it names, by id, and the tools
+	 * left given as disabled and as available after the rebuild. Empty without such holds.
 	 */
 	#earlierNoticesTold(holds: ReadonlySet<string>, messages: readonly AgentMessage[]): EarlierNoticesTold {
 		const values = new Map<string, unknown>();
@@ -4993,6 +5087,27 @@ export class SessionTools {
 					commit: () => {
 						if (!isCurrent() || !memory.commit()) return false;
 						this.#adoptMemoryRecall(memory, injected);
+						return true;
+					},
+				};
+			}
+			// A reused recall the branch delivered as a system block is in the kept restored transcript prompt already:
+			// that prompt goes out as stored, held changes stay held, and the recall is adopted as the prompt carries
+			// it. The memory instructions render it from now on, so the build the restored prompt stands in for takes
+			// it in, and goes out with it ({@link refreshBaseSystemPrompt} with `joinsHeldChange`).
+			if (memory.reused && this.#keptRestoredPrompt()) {
+				return {
+					systemPrompt: this.#baseSystemPrompt,
+					memoryNotice: memory.notice,
+					commit: () => {
+						if (!isCurrent() || !memory.commit()) return false;
+						this.#adoptMemoryRecall(memory, undefined);
+						void this.refreshBaseSystemPrompt(undefined, { joinsHeldChange: true }).catch(error => {
+							logger.debug("Prompt rebuild after a reused recall failed", {
+								backend: backend.id,
+								error: String(error),
+							});
+						});
 						return true;
 					},
 				};

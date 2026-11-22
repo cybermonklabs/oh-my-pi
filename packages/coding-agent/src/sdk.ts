@@ -5639,11 +5639,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					});
 				}
 			};
-			cfgExtensionSources.listen(session, () => {
+			// The skill rediscovery takes the change in, so a bound prompt holds the skill list it finds (a `skill:`
+			// entry in `disabledExtensions` hides that skill) as it holds any other settings change.
+			cfgExtensionSources.listenChanges(session, settingsChange => {
 				const next = extensionReconcile
 					.catch(() => {})
 					.then(reconcileExtensionSources)
-					.then(() => session.refreshSkillsAndCommands());
+					.then(() => session.refreshSkillsAndCommands({ settingsChange }));
 				extensionReconcile = next;
 				return next;
 			});

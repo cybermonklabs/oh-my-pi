@@ -951,6 +951,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
+		// On a model that binds thinking to its prompt the run's request is on its way, and a recall landing now would
+		// rebuild the cached prompt: the next turn's prompt preparation recalls again, and a recall that lands after
+		// the model answered goes out as a hidden message after the newest content (`beforeAgentStartPrompt`).
+		if (this.session.model?.thinking?.prefixBinding === true) return;
 		const generation = this.#recallGeneration;
 		// No message can join a turn already started, so a reused recall's changes wait for
 		// the next resume to be reported.
