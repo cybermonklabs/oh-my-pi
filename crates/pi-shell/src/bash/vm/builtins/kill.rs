@@ -205,10 +205,12 @@ pub(super) fn target(
 	let live = named.filter(|&v| {
 		let st = ctx.k.proc_state(ctx.cx.store, v);
 		// `$!` of a job disowned before the scheduler adopted it is known
-		// only by `$!` (as `wait`'s `is_child`).
+		// only by `$!` (as `wait`'s `is_child`) while it is not yet adopted;
+		// once `wait` collected a job, its pid names no process (`kill(2)`
+		// gets `ESRCH` in bash and zsh, which reaped it).
 		(ctx.vp.jobs.by_vpid(v).is_some()
 			|| st == Some(crate::bash::vm::ProcState::Running)
-			|| (st.is_none() && ctx.vp.last_bg.is(v)))
+			|| (st.is_none() && ctx.vp.last_bg.is(v) && ctx.k.unadopted(v)))
 			&& !matches!(st, Some(crate::bash::vm::ProcState::Exited(_)))
 	});
 	match u32::try_from(pid) {

@@ -844,6 +844,13 @@ impl Kernel {
 		}
 	}
 
+	/// Whether child vproc `vpid` is started but not yet adopted by the
+	/// scheduler ([`Self::spawned`]): it has no process record yet, so only
+	/// its parent's `$!` knows it.
+	pub fn unadopted(&self, vpid: Vpid) -> bool {
+		self.spawned.iter().any(|p| p.vpid == vpid)
+	}
+
 	/// Whether `vp` started child vproc `vpid` (its record names `vp` as
 	/// parent): a subshell copies `$!`, not its parent's children.
 	pub fn started(&mut self, store: &mut dyn StateStore, vp: Vpid, vpid: Vpid) -> bool {
