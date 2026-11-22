@@ -70,14 +70,17 @@ describe("auth-broker logout provider picker", () => {
 		// The picker is mocked, so its interface reads a stream of its own: closing an interface on the
 		// process's stdin pauses that stdin for every later test file in the same process.
 		const createInterface = readline.createInterface;
-		vi.spyOn(readline, "createInterface").mockImplementation(() =>
-			createInterface({ input: new PassThrough(), output: new PassThrough() }),
-		);
+		const createInterfaceSpy = vi
+			.spyOn(readline, "createInterface")
+			.mockImplementation(() => createInterface({ input: new PassThrough(), output: new PassThrough() }));
 		const stdinFlowing = process.stdin.readableFlowing;
 
 		await runAuthBrokerCommand({ action: "logout", flags: {} });
 		write.mockRestore();
 
+		// The flow check sees a change only from the state stdin was in; the spy's count holds whatever
+		// ran before: a picker that reads the process's stdin any other way never calls it.
+		expect(createInterfaceSpy).toHaveBeenCalledTimes(1);
 		expect(process.stdin.readableFlowing).toBe(stdinFlowing);
 		expect(offered).toEqual([["anthropic"]]);
 		expect(stdout).toContain("Logged out of anthropic");
