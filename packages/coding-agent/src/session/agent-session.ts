@@ -4641,7 +4641,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// JSON-compared every entry per turn message, which on long sessions
 		// turned each `onTurnEnd` into a seconds-long sync block (the
 		// `ui.loop-blocked` warnings tagged `subagent:*` in the bug report).
-		const branchKeys = this.#ensurePersistedMessageKeys();
+		const branchIndex = this.#ensurePersistedMessageKeys();
 		const turnKeys = turnMessages.map(sessionMessagePersistenceKey);
 		const persistedKeys = new Set<string>();
 		for (let index = 0; index < turnMessages.length; index++) {
@@ -4651,7 +4651,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// variant (for example, redacted/deobfuscated content) must still count;
 			// otherwise the assistant can look missing while later tool results are
 			// present, producing a false out-of-order skip.
-			if (this.#persistedKeyOnBranch(branchKeys, key, turnMessages[index])) {
+			if (this.#persistedKeyOnBranch(branchIndex, key, turnMessages[index])) {
 				persistedKeys.add(key);
 			}
 		}

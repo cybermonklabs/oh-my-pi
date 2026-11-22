@@ -8,7 +8,8 @@
  * functions that stopped running at the next collection instead of seconds later. With the JIT on, tier-ups and
  * aged-out code moved the heap by up to 1 MB between two readings (up to 25 KB per subagent at 40 a batch); with
  * the JIT off alone, code that ran only in the first batch was still counted in its reading in a fast run, and the
- * growth per subagent ranged from -115 to +4 KB. With both, three runs gave 2.92 to 2.97 KB.
+ * growth per subagent ranged from -115 to +4 KB. With both, five runs gave 696, 743, 812, 769 and 762 B (see
+ * {@link MAX_HEAP_BYTES_PER_PARKED_SUBAGENT}).
  */
 import { expect, it } from "bun:test";
 import * as path from "node:path";

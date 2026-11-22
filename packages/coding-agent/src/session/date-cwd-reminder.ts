@@ -295,10 +295,7 @@ export class DateCwdReminderInjector {
 				states.set(root, state);
 				continue;
 			}
-			const key = `${CUT_ROOT_PREFIX}${this.#cutRoots++}`;
-			// Its journal name is the cut first turn's key, read only while a request continues it as its own.
-			state.conversation = key;
-			states.set(key, state);
+			states.set(`${CUT_ROOT_PREFIX}${this.#cutRoots++}`, state);
 		}
 		this.#states = states;
 	}
