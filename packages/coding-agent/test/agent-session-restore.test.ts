@@ -13,6 +13,7 @@ import {
 	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
 	INTERRUPTED_TURN_ERROR,
+	isRestoreSkippedCallResult,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -227,6 +228,19 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 			} else {
 				expect(text).not.toContain("is not run again");
 			}
+			// The skip is marked in its details, which a later `--restore` reads, in memory and in the transcript.
+			const isSkip = ("relaunched" in skipped && "call_1" in skipped.relaunched) || "ran" in skipped;
+			expect(first !== undefined && isRestoreSkippedCallResult(first)).toBe(isSkip);
+			await session.sessionManager.flush();
+			const persisted = session.sessionManager
+				.getBranch()
+				.findLast(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "toolResult" &&
+						entry.message.toolCallId === "call_1",
+				);
+			expect(persisted?.type === "message" && isRestoreSkippedCallResult(persisted.message)).toBe(isSkip);
 		});
 	}
 

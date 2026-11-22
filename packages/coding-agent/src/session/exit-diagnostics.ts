@@ -370,6 +370,13 @@ export interface RestoreSkippedCalls {
 const RESTORE_SKIPPED_CALL_PREFIX = "This call was cut off when the previous process ended and is not run again:";
 
 /**
+ * The flag a skip result's `details` carry (`{ [RESTORE_SKIPPED_CALL_DETAIL]: true }`): the session
+ * sets it on the result of a call it did not run again, and {@link isRestoreSkippedCallResult}
+ * reads only it, so no result text, which a tool or the model can write, reads as a skip.
+ */
+export const RESTORE_SKIPPED_CALL_DETAIL = "restoreSkippedCall";
+
+/**
  * The result text of a cut-off call `omp --restore` does not run again because it started
  * subagents: those restore relaunched (`relaunched`), whose results arrive when they are done, and
  * those that ran before (`ran`), whose results did not reach the session. The call's other work
@@ -399,11 +406,19 @@ export function restoreSkippedCallReason(relaunched: readonly string[], ran: rea
 	return `${RESTORE_SKIPPED_CALL_PREFIX} ${parts.join(" ")} Do not start that work again. Any of this call's work that had not started when it was cut off did not run either: start that again if it is still needed.`;
 }
 
-/** Whether `message` is the result {@link restoreSkippedCallReason} gave a call `omp --restore` did not run again. */
+/**
+ * Whether `message` is the result a call `omp --restore` did not run again got: an error tool
+ * result whose `details` carry {@link RESTORE_SKIPPED_CALL_DETAIL}. Its text
+ * ({@link restoreSkippedCallReason}) is for the model and is not read.
+ */
 export function isRestoreSkippedCallResult(message: AgentMessage): boolean {
 	if (message.role !== "toolResult" || !message.isError) return false;
-	const first = message.content[0];
-	return first?.type === "text" && first.text.startsWith(RESTORE_SKIPPED_CALL_PREFIX);
+	const { details } = message;
+	return (
+		typeof details === "object" &&
+		details !== null &&
+		(details as Record<string, unknown>)[RESTORE_SKIPPED_CALL_DETAIL] === true
+	);
 }
 
 /** Pairs unresolved calls at the end of an interrupted turn with result messages. */

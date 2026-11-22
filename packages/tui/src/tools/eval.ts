@@ -121,9 +121,10 @@ export interface EvalHeldAgentResult {
 	aborted?: boolean;
 	workerLost?: boolean;
 	/**
-	 * When the call handed the result to the cell, in epoch ms. The eval result is written when the
-	 * cell ends, later; `omp --restore` judges which turn of the subagent the handover settled by
-	 * this time, so a turn the cell started after the handover stays unsettled.
+	 * When the result was handed over, in epoch ms: when a call handed it to the cell, or when a work
+	 * pool drained (its job's report). The eval result, or the entry that returns the pool's result,
+	 * is written later; `omp --restore` judges which turn of the subagent the handover settled by
+	 * this time, so a turn begun after the handover stays unsettled.
 	 */
 	handedAt?: number;
 }

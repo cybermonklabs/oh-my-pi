@@ -121,15 +121,21 @@ const DELIVERY_OUTPUT_LIMIT = 6_000;
  * The workers whose latest batch settled, among `batches` (in the order they ran): the results a
  * pool hands over when it shows the cell a batch's output (`peek()`) or delivers its aggregate
  * result. A worker whose latest batch still runs owes that turn, so a handover of its earlier batch
- * settles nothing; a cancelled batch is an aborted run.
+ * settles nothing; a cancelled batch is an aborted run. `handedAt`, when given, is when the pool
+ * drained (epoch ms): the aggregate result holds each worker's output as of then, so `omp
+ * --restore` settles only the turns that began before it, wherever the result is later taken.
  */
-export function settledWorkerResults(batches: WorkPoolPeekResult["batches"]): EvalHeldAgentResult[] {
+export function settledWorkerResults(batches: WorkPoolPeekResult["batches"], handedAt?: number): EvalHeldAgentResult[] {
 	const latest = new Map<string, WorkPoolPeekResult["batches"][number]>();
 	for (const batch of batches) latest.set(batch.agent, batch);
 	const results: EvalHeldAgentResult[] = [];
 	for (const [id, batch] of latest) {
 		if (batch.status === "running") continue;
-		results.push(batch.status === "cancelled" ? { id, aborted: true } : { id });
+		results.push({
+			id,
+			...(batch.status === "cancelled" ? { aborted: true } : {}),
+			...(handedAt === undefined ? {} : { handedAt }),
+		});
 	}
 	return results;
 }
@@ -262,10 +268,14 @@ export class WorkPool {
 					// The aggregate result hands the owner every worker's output as of now. It reaches the owner only
 					// as the job's delivery, a `wait` or a kill of the job, so the job's report names those workers
 					// (`agentResults`) and `omp --restore` reads each such handover there: a process end before the
-					// owner takes the result leaves the workers owed, and a worker whose key failed goes on.
+					// owner takes the result leaves the workers owed, and a worker whose key failed goes on. The
+					// report carries the time it drained (`handedAt`), not the time of the entry that later returns
+					// it: a turn a kept-alive worker begins after the drain (an IRC message woke it) is not in the
+					// result, and stays owed.
+					const drainedAt = Date.now();
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
 					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
-					await reportProgress(summary, { agentResults: settledWorkerResults(this.peek().batches) });
+					await reportProgress(summary, { agentResults: settledWorkerResults(this.peek().batches, drainedAt) });
 					return this.#renderAggregateResult();
 				} finally {
 					signal.removeEventListener("abort", onAbort);

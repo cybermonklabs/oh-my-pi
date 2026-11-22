@@ -394,6 +394,7 @@ import {
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
+	RESTORE_SKIPPED_CALL_DETAIL,
 	restoreSkippedCallReason,
 	type RestoreSkippedCalls,
 	plainTurnAbortReason,
@@ -1105,6 +1106,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Cleared when the continuation's run ends.
 	 */
 	#restoreSkippedCalls: Map<string, { relaunched: readonly string[]; ran: readonly string[] }> | undefined;
+	/**
+	 * The calls {@link #beforeToolCall} blocked as restore skips, until {@link #afterToolCall} marks
+	 * each one's result with {@link RESTORE_SKIPPED_CALL_DETAIL}.
+	 */
+	readonly #restoreSkippedResults = new Set<string>();
 	/** Last observed `workspace.additionalDirectories`, diffed on change to add/remove only settings-seeded roots. */
 	#settingsWorkspaceDirectories: readonly string[] = [];
 	/** Last observed auto-QA gate; the system prompt advertises `xd://report_issue` only while it holds. */
@@ -5039,6 +5045,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "agent_end") {
 			// The calls a restored turn skips are its first batch's; nothing later can repeat their ids.
 			this.#restoreSkippedCalls = undefined;
+			this.#restoreSkippedResults.clear();
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -5827,7 +5834,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
-		return this.#ttsr.afterToolCall(ctx);
+		const after = this.#ttsr.afterToolCall(ctx);
+		if (!this.#restoreSkippedResults.delete(ctx.toolCall.id)) return after;
+		// The skip's result is read by its flag, not its text: `omp --restore` keeps a later restore from
+		// running the call again only on it (isRestoreSkippedCallResult).
+		const details = after?.details ?? ctx.result.details;
+		return {
+			...after,
+			details: {
+				...(typeof details === "object" && details !== null ? details : {}),
+				[RESTORE_SKIPPED_CALL_DETAIL]: true,
+			},
+		};
 	}
 	/**
 	 * Emits the extension `tool_call` event for a loop-dispatched call at
@@ -5843,6 +5861,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const skipped = this.#restoreSkippedCalls?.get(ctx.toolCall.id);
 		if (skipped) {
 			this.#restoreSkippedCalls?.delete(ctx.toolCall.id);
+			this.#restoreSkippedResults.add(ctx.toolCall.id);
 			return { block: true, reason: restoreSkippedCallReason(skipped.relaunched, skipped.ran) };
 		}
 		const runner = this.#extensionRunner;

@@ -190,6 +190,9 @@ function appendTaskSpawn(main: SessionManager, id: string): void {
 
 const KEY_ERROR = "Retry budget exhausted after 2 retries: No API key for provider: anthropic";
 
+/** The key a skip result's details carry on disk (`RESTORE_SKIPPED_CALL_DETAIL`), as a transcript holds it. */
+const SKIP_FLAG = "restoreSkippedCall";
+
 /** When subagent FollowedUp's first turn ran, in the follow-up cases. */
 const FOLLOW_UP_START = Date.parse("2026-11-17T12:00:00.000Z");
 
@@ -1320,6 +1323,173 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
+	/**
+	 * Opens pool worker PoolWorker's transcript under `mainFile`, spawned under `call_pool`, with a first batch that
+	 * finished; the caller writes the rest and closes it.
+	 */
+	async function openPoolWorker(mainFile: string, cwd: string): Promise<SessionManager> {
+		const worker = await SessionManager.open(
+			path.join(mainFile.slice(0, -6), "PoolWorker.jsonl"),
+			undefined,
+			undefined,
+			{ initialCwd: cwd, parentSession: mainFile, suppressBreadcrumb: true },
+		);
+		worker.appendSessionInit({
+			systemPrompt: ["sub prompt"],
+			task: "PoolWorker task",
+			tools: ["read", "yield"],
+			spawnCallId: "call_pool",
+		});
+		worker.appendMessage({ role: "user", content: "item one", timestamp: Date.now() });
+		worker.appendMessage(assistant({ content: [{ type: "text", text: "item one done" }] }));
+		return worker;
+	}
+
+	/** Ends `worker`'s turn on a key that could not be resolved, records its normal exit, and closes it. */
+	async function endOnKey(worker: SessionManager): Promise<void> {
+		worker.appendMessage(assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }));
+		worker.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+		});
+		await worker.close();
+	}
+
+	for (const [label, stopped] of [
+		[
+			"leaves a reused pool worker whose later batch failed on its key, when a peek handed over its earlier batch and the parent then stopped the pool",
+			true,
+		],
+		["control: relaunches it when the parent did not stop the pool, which still owes the later batch", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, restore reads the peek's handover of the worker's earlier batch before the discard the
+			// stop wrote: that handover is older than the later batch's turn, so the parent reads as waiting on that
+			// turn, and a worker of a pool its owner stopped runs the later batch's items again.
+			const start = Date.parse("2026-11-17T12:00:00.000Z");
+			setSystemTime(new Date(start));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			main.appendMessage(toolCallMessage("call_pool", "eval"));
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed");
+			const worker = await openPoolWorker(mainFile, cwd);
+			setSystemTime(new Date(start + 60_000));
+			// The cell's peek showed the first batch settled while another worker kept the pool from draining.
+			appendAgentJobRecord(main, "PoolWorker", "delivered");
+			setSystemTime(new Date(start + 120_000));
+			// A later push went to the idle worker: the pool wrote it owed again, and its second batch ended because
+			// its key could not be resolved.
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed", ["call_pool"]);
+			worker.appendMessage({ role: "user", content: "item two", timestamp: Date.now() });
+			await endOnKey(worker);
+			setSystemTime(new Date(start + 180_000));
+			// The cell killed the pool, whose stop recorded its workers discarded, and the cell ended.
+			if (stopped) main.appendCustomEntry(TASK_LAUNCH_DISCARDED_CUSTOM_TYPE, { agentId: "PoolWorker" });
+			main.appendMessage(toolResultMessage("call_pool", "eval", {}));
+			main.appendMessage(
+				assistant({ content: [{ type: "text", text: stopped ? "Stopped the pool." : "Waiting on the pool." }] }),
+			);
+			setSystemTime();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(stopped ? [] : ["PoolWorker"]);
+		});
+	}
+
+	for (const [label, drained] of [
+		[
+			"relaunches a kept-alive pool worker whose turn began after the pool drained, though the owner took the pool's result later",
+			true,
+		],
+		["control: leaves it when the pool's report gives no drain time, so the delivery's time counts", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, restore settles the pool's workers at the time its result reached the owner, not when
+			// the pool drained: a turn a kept-alive worker began in between (an IRC message woke it), which the result
+			// does not hold, reads as handed over and is lost when it ends on its key.
+			const start = Date.parse("2026-11-17T12:00:00.000Z");
+			setSystemTime(new Date(start));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			main.appendMessage(toolCallMessage("call_pool", "eval"));
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed");
+			const worker = await openPoolWorker(mainFile, cwd);
+			main.appendMessage(toolResultMessage("call_pool", "eval", {}));
+			const drainedAt = start + 60_000;
+			setSystemTime(new Date(start + 120_000));
+			// An IRC message woke the kept-alive worker after the pool drained; that turn ended on its key.
+			worker.appendCustomMessageEntry("irc:incoming", "One more thing.", true, {
+				from: MAIN_AGENT_ID,
+				message: "One more thing.",
+			});
+			await endOnKey(worker);
+			setSystemTime(new Date(start + 180_000));
+			// The owner took the pool's result only now.
+			const details: AsyncResultDetails = {
+				jobs: [
+					{
+						jobId: "pool",
+						type: "task",
+						status: "completed",
+						agentResults: [drained ? { id: "PoolWorker", handedAt: drainedAt } : { id: "PoolWorker" }],
+					},
+				],
+			};
+			main.appendCustomMessageEntry(ASYNC_RESULT_MESSAGE_TYPE, "Background job pool completed.", true, details);
+			main.appendMessage(assistant({ content: [{ type: "text", text: "The pool finished." }] }));
+			setSystemTime();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(drained ? ["PoolWorker"] : []);
+		});
+	}
+
+	for (const [label, wentBack] of [
+		[
+			"relaunches a subagent the current conversation still waits on, though a branch the user left by their own navigation holds its handover",
+			true,
+		],
+		["control: leaves it when that handover is on the selected branch", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, restore reads the handovers on every branch the parent left, not only on the branches a
+			// tool replay left: after the user went back and on another way, a handover the conversation they went on
+			// with never got settles a subagent its `owed` record still waits on, and it is left.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			tick();
+			main.appendMessage(toolCallMessage("call_agent", "eval"));
+			await recordEvalAgentJobs(records, ["Background"], "owed");
+			tick();
+			await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true, spawnCallId: "call_agent" });
+			tick();
+			const started = main.appendMessage(toolResultMessage("call_agent", "eval", {}));
+			tick();
+			main.appendMessage({ role: "user", content: "Is it done?", timestamp: Date.now() });
+			main.appendMessage(toolCallMessage("call_wait", "eval"));
+			appendAgentJobRecord(main, "Background", "delivered");
+			main.appendMessage(
+				toolResultMessage("call_wait", "eval", { agentResults: [{ id: "Background", handedAt: Date.now() }] }),
+			);
+			main.appendMessage(assistant({ content: [{ type: "text", text: "Background could not run." }] }));
+			tick();
+			if (wentBack) {
+				// The user went back to the cell's result and on another way.
+				main.branch(started);
+				main.appendMessage({ role: "user", content: "Do something else meanwhile.", timestamp: Date.now() });
+				main.appendMessage(assistant({ content: [{ type: "text", text: "Doing it." }] }));
+			}
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(wentBack ? ["Background"] : []);
+		});
+	}
+
 	it("relaunches a work pool's key-stranded worker whose cancelled batch the pool's delivery names as aborted", async () => {
 		// If this regresses, an aborted run the pool reports settles the worker: the owner never read a result of it.
 		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
@@ -1493,13 +1663,13 @@ describe("restoreSession (omp --restore)", () => {
 	 * A parent whose reply `call_eval` (an eval cell) and `call_bash` its process ended inside, after the cell's
 	 * subagent `Worker` (spawned under `call_eval`) ended its turn with `workerTurn`, and the cell's cut-off error
 	 * result named `firstHandovers` as handed over to the cell then. A first restore then ran the batch again from
-	 * the reply, giving `call_eval` an error result (with `replayedText`, when given), and the process ended again
-	 * while the replayed `bash` ran.
+	 * the reply, giving `call_eval` an error result (with `replayed`'s text and details, when given), and the
+	 * process ended again while the replayed `bash` ran.
 	 */
 	async function replayedEvalBatch(
 		workerTurn: Message[],
 		firstHandovers: Array<{ id: string; aborted?: boolean }>,
-		replayedText?: string,
+		replayed?: { text: string; details: Record<string, unknown> },
 	) {
 		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 		const { main, mainFile, cwd } = openParent();
@@ -1528,9 +1698,9 @@ describe("restoreSession (omp --restore)", () => {
 		tick();
 		main.branch(anchor);
 		appendExecutionStart(main, "call_eval", "eval");
-		const replayed = toolResultMessage("call_eval", "eval", {}, true);
+		const result = toolResultMessage("call_eval", "eval", replayed?.details ?? {}, true);
 		main.appendMessage(
-			replayedText === undefined ? replayed : { ...replayed, content: [{ type: "text", text: replayedText }] },
+			replayed === undefined ? result : { ...result, content: [{ type: "text", text: replayed.text }] },
 		);
 		appendExecutionStart(main, "call_bash", "bash");
 		return restoreParent(main, mainFile);
@@ -1556,26 +1726,32 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
-	for (const [label, skipped] of [
+	for (const [label, replayed] of [
 		[
 			"does not run a cut-off call again whose skip an earlier restore wrote, though its relaunched subagent has finished since",
-			true,
+			"skip",
 		],
-		["control: runs it again when the replayed call's result was no skip", false],
+		["control: runs it again when the replayed call's result was no skip", "none"],
+		[
+			"control: runs it again when the replayed call's result only reads like a skip, without the skip's details flag",
+			"text",
+		],
 	] as const) {
 		it(label, async () => {
 			// If this regresses, the second restore names a call only for a subagent it relaunches now: the subagent the
 			// first restore relaunched finished before the second process end, so the call runs again and starts it
-			// a second time.
+			// a second time. Or a result whose text only begins as a skip's does (a tool or the model wrote it), and a
+			// call that should run again does not.
+			const text = restoreSkippedCallReason(["Worker"]);
 			const { outcome, restoreTurn } = await replayedEvalBatch(
 				finished,
 				[{ id: "Worker", aborted: true }],
-				skipped ? restoreSkippedCallReason(["Worker"]) : undefined,
+				replayed === "none" ? undefined : { text, details: replayed === "skip" ? { [SKIP_FLAG]: true } : {} },
 			);
 
 			expect(outcome.subagents).toEqual([]);
 			expect(restoreTurn).toHaveBeenCalledWith(
-				skipped ? { relaunched: {}, ran: { call_eval: ["Worker"] } } : { relaunched: {} },
+				replayed === "skip" ? { relaunched: {}, ran: { call_eval: ["Worker"] } } : { relaunched: {} },
 			);
 		});
 	}

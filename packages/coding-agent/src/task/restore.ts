@@ -401,12 +401,14 @@ interface SpawnedSubagents {
 	 */
 	settled: Map<string, number>;
 	/**
-	 * The handovers the parent's transcript holds off the selected branch, as `settled` reads them,
-	 * but a run handed over only as aborted (or lost with its worker) settles nothing here: the
-	 * parent took no turn on that branch's result. Read only for a subagent placed by the call its
-	 * spawn record names ({@link spawnedInCurrentConversation}): a restored turn that runs its
-	 * cut-off calls again leaves their first results, and the handovers they held, on a branch of
-	 * their own, and a parent that got the subagent's failure there acts on it.
+	 * The handovers the parent's transcript holds on the branches a tool replay left
+	 * ({@link replayLeftEntryIds}), as `settled` reads them, but a run handed over only as aborted
+	 * (or lost with its worker) settles nothing here: the parent took no turn on that branch's
+	 * result. Read only for a subagent placed by the call its spawn record names
+	 * ({@link spawnedInCurrentConversation}): a restored turn that runs its cut-off calls again
+	 * leaves their first results, and the handovers they held, on a branch of their own, and a parent
+	 * that got the subagent's failure there acts on it. A branch a person left by their own
+	 * navigation is not read: the conversation they went on with never got those results.
 	 */
 	settledElsewhere: Map<string, number>;
 	/** Eval jobs (an `agent()` job, a bridged `tool.task` background spawn) whose latest record in the current conversation is `owed`: a result still owed to the parent. */
@@ -494,8 +496,9 @@ interface HeldResult {
  * crashed while the parent ran on. When the parent's process goes away inside the call, the
  * agent loop still records such a result, but the parent takes no turn after it, and the
  * subagent's turn stays as its transcript left it (a stop of the run left an aborted record
- * there, which `--restore` leaves anyway). Only an `eval` result says when its handovers
- * happened (`agentResults[].handedAt`): it is written when the cell ends.
+ * there, which `--restore` leaves anyway). An `eval` result and a work pool's report say when their
+ * handovers happened (`agentResults[].handedAt`): a cell's handovers, and the pool's drain, come
+ * before the entry that holds them (the cell ends later; the owner takes the pool's result later).
  */
 function heldResults(entry: SessionEntry, wentOn: boolean): HeldResult[] {
 	if (entry.type === "custom_message") {
@@ -796,6 +799,68 @@ function replyStreamStartedAt(
 	return next ? Date.parse(next.timestamp) : undefined;
 }
 
+/**
+ * The entries off the selected `branch` that a tool replay left there. A replay (a restored turn's,
+ * or `/retry`'s, of a batch whose calls were all cut off) moves the leaf back to the batch's
+ * assistant message and runs its calls again, so their first results lie on a branch of their own
+ * below that message. Such a branch forks from the selected branch at an assistant message with
+ * tool calls, holds a result of one of them, and the selected branch after that message holds one
+ * too (the replay's). A branch a person's own navigation left (a branch from a user message, a
+ * `/tree` move, a fork) forks elsewhere, or the selected branch holds no result of that message's
+ * calls there, and none of its entries is returned.
+ */
+function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): Set<string> {
+	const branchIndex = new Map(branch.map((entry, index) => [entry.id, index]));
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const callsOf = (entry: SessionEntry | undefined): Set<string> | undefined => {
+		if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+		const ids = new Set<string>();
+		for (const part of entry.message.content) if (part.type === "toolCall") ids.add(part.id);
+		return ids.size > 0 ? ids : undefined;
+	};
+	const answers = (entry: SessionEntry, calls: ReadonlySet<string>): boolean =>
+		entry.type === "message" && entry.message.role === "toolResult" && calls.has(entry.message.toolCallId);
+	// Each off-branch entry's fork point: its nearest ancestor on the selected branch (null: none).
+	const forkOf = new Map<string, string | null>();
+	const forkPoint = (entry: SessionEntry): string | null => {
+		const path: string[] = [];
+		let fork: string | null = null;
+		for (let current: SessionEntry | undefined = entry; current;) {
+			if (branchIndex.has(current.id)) {
+				fork = current.id;
+				break;
+			}
+			const known = forkOf.get(current.id);
+			if (known !== undefined) {
+				fork = known;
+				break;
+			}
+			path.push(current.id);
+			current = current.parentId ? byId.get(current.parentId) : undefined;
+		}
+		for (const id of path) forkOf.set(id, fork);
+		return fork;
+	};
+	const offBranchAt = new Map<string, SessionEntry[]>();
+	for (const entry of entries) {
+		if (branchIndex.has(entry.id)) continue;
+		const fork = forkPoint(entry);
+		if (fork === null) continue;
+		const group = offBranchAt.get(fork);
+		if (group) group.push(entry);
+		else offBranchAt.set(fork, [entry]);
+	}
+	const left = new Set<string>();
+	for (const [fork, offBranch] of offBranchAt) {
+		const index = branchIndex.get(fork)!;
+		const calls = callsOf(branch[index]);
+		if (!calls || !offBranch.some(entry => answers(entry, calls))) continue;
+		if (!branch.slice(index + 1).some(entry => answers(entry, calls))) continue;
+		for (const entry of offBranch) left.add(entry.id);
+	}
+	return left;
+}
+
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
 	const named = new Set<string>();
 	for (const entry of entries) for (const id of recordedAgentIds(entry)) named.add(id);
@@ -847,11 +912,11 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 	// restored turn's replay leaves the records of its cut-off batch on a branch of their own, and call ids
 	// do not repeat.
 	const owedCalls = new Map<string, string[]>();
-	const onBranch = new Set(branch.map(entry => entry.id));
+	const replayLeft = replayLeftEntryIds(entries, branch);
 	for (const entry of entries) {
 		const job = readEvalAgentJobRecord(entry);
 		if (job?.state === "owed" && job.spawnCallIds) owedCalls.set(job.agentId, job.spawnCallIds);
-		if (onBranch.has(entry.id)) continue;
+		if (!replayLeft.has(entry.id)) continue;
 		const writtenAt = Date.parse(entry.timestamp);
 		if (job?.state === "delivered") settle(settledElsewhere, job.agentId, writtenAt);
 		for (const held of heldResults(entry, false)) settle(settledElsewhere, held.id, held.handedAt ?? writtenAt);
@@ -967,14 +1032,15 @@ class SpawnRecords {
 	/**
 	 * Whether `sub`'s own parent records that it still waits on `sub`'s turn that began at
 	 * `turnStartedAt` (epoch ms), read in this order:
-	 * - a result of `sub`'s run handed over (`settled`, and for a subagent placed by the call its
-	 *   spawn record names, `settledElsewhere` too): written since the turn began, it settles the
-	 *   turn; written before, it answered an earlier turn, and this one is a turn the parent
-	 *   messaged `sub` for, so the parent waits (an unreadable or unknown time judges nothing, and
-	 *   the result stands);
-	 * - else a discard of `sub`'s spawn ({@link SpawnedSubagents.discardedAt}: a streamed launch
-	 *   nobody adopted, or a worker of a work pool the parent stopped, written after `sub`'s
-	 *   transcript began): the parent does not wait;
+	 * - a discard of `sub`'s spawn ({@link SpawnedSubagents.discardedAt}: a streamed launch nobody
+	 *   adopted, or a worker of a work pool the parent stopped, written after `sub`'s transcript
+	 *   began): the parent does not wait, whatever it was handed before (a `peek` that handed over
+	 *   an earlier batch of a reused pool worker settles nothing of the turn the stop then left);
+	 * - else a result of `sub`'s run handed over (`settled`, and for a subagent placed by the call
+	 *   its spawn record names, `settledElsewhere` too): handed over since the turn began, it settles
+	 *   the turn; before, it answered an earlier turn, and this one is a turn the parent messaged
+	 *   `sub` for, so the parent waits (an unreadable or unknown time judges nothing, and the result
+	 *   stands);
 	 * - else a `task` result that names the run and settles none of it (`current`: a background
 	 *   spawn's "started" result, or a sync call's result the process exit cut off), or an eval
 	 *   `agent()` job still `owed`: the parent waits;
@@ -986,6 +1052,7 @@ class SpawnRecords {
 	parentStillWaits(sub: SubSession, turnStartedAt: number | undefined): boolean {
 		const parent = this.#ofParent(sub.parent);
 		if (!parent) return false;
+		if (this.discardedByParent(sub)) return false;
 		const spawnCallId = extractSessionInit(sub.entries)?.spawnCallId;
 		let settledAt = parent.settled.get(sub.agentId);
 		const elsewhere =
@@ -1001,7 +1068,6 @@ class SpawnRecords {
 		}
 		if (settledAt !== undefined) return turnStartedAt !== undefined && settledAt < turnStartedAt;
 		const spawnedAt = sub.header ? Date.parse(sub.header.timestamp) : Number.NaN;
-		if (this.discardedByParent(sub)) return false;
 		if (parent.current.has(sub.agentId) || parent.owedJobs.has(sub.agentId)) return true;
 		if (!Number.isFinite(spawnedAt)) return false;
 		const leftOut = (window: CutOffWindow): boolean => {

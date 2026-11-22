@@ -200,10 +200,11 @@ describe("workpool model validation", () => {
 		expect(log).toEqual(["append eval-agent-job owed", "flushed", "worker started"]);
 	});
 
-	it("records a peek's handover of a worker's settled batch, and names every worker in the drained pool's report instead of a record", async () => {
+	it("records a peek's handover of a worker's settled batch, and names every worker in the drained pool's report, with the time it drained, instead of a record", async () => {
 		// If this regresses, the drained pool writes each worker's handover before its aggregate result reaches the
 		// owner (which holds it in memory until a step boundary), so a process end in between leaves a worker whose
-		// failure the owner never got, and `omp --restore` does not relaunch it.
+		// failure the owner never got, and `omp --restore` does not relaunch it. Or the report gives no drain time,
+		// and a turn a kept-alive worker begins after the drain reads as handed over when the owner takes the result.
 		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
 		const log: string[] = [];
 		const calls: Array<string | undefined> = [];
@@ -247,15 +248,27 @@ describe("workpool model validation", () => {
 		expect(log.filter(line => line.includes("delivered"))).toEqual([`eval-agent-job delivered ${failed}`]);
 
 		const poolJob = session.asyncJobManager!.getJob("handed")!;
+		const releasedAt = Date.now();
 		second.resolve();
 		await poolJob.promise.catch(() => {});
+		const settledAt = Date.now();
 
 		expect(log).toEqual([
 			expect.stringMatching(/^eval-agent-job owed /),
 			expect.stringMatching(/^eval-agent-job owed /),
 			`eval-agent-job delivered ${failed}`,
 		]);
-		expect(poolJob.latestDetails?.agentResults).toEqual([{ id: failed }, { id: running }]);
+		// The report gives each worker the time the pool drained: restore settles only the turns begun before it,
+		// wherever the result is taken later.
+		const agentResults = poolJob.latestDetails?.agentResults;
+		expect(agentResults).toEqual([
+			{ id: failed, handedAt: expect.any(Number) },
+			{ id: running, handedAt: expect.any(Number) },
+		]);
+		for (const result of agentResults ?? []) {
+			expect(result.handedAt).toBeGreaterThanOrEqual(releasedAt);
+			expect(result.handedAt).toBeLessThanOrEqual(settledAt);
+		}
 		// Each worker records the `eval` call that pushed its item as the call it was spawned under.
 		expect(calls).toEqual(["call_pool_eval", "call_pool_eval"]);
 	});
