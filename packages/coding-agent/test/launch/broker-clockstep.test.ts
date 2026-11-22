@@ -12,14 +12,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { type DaemonBrokerStartOptions, startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
-import {
-	DAEMON_IDLE_GRACE_ENV,
-	DAEMON_PROJECT_DIR_ENV,
-	DAEMON_RUNTIME_DIR_ENV,
-	type DaemonRpcResult,
-} from "../../src/launch/protocol";
+import type { DaemonRpcResult } from "../../src/launch/protocol";
+import { startBroker } from "./helpers";
 
 const NAME = "clockstep";
 const STEP_MS = 5_000;
@@ -36,21 +31,6 @@ function signalReaches(pid: number): boolean {
 /** Until signal 0 no longer reaches `pid`: the daemon ended and was reaped. */
 async function ended(pid: number): Promise<void> {
 	while (signalReaches(pid)) await Bun.sleep(20);
-}
-
-function startBroker(projectDir: string, runtimeDir: string, options: DaemonBrokerStartOptions = {}): Promise<void> {
-	const saved = [DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV, DAEMON_IDLE_GRACE_ENV].map(
-		name => [name, process.env[name]] as const,
-	);
-	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
-	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
-	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
-	const broker = startDaemonBrokerFromEnvironment(options);
-	for (const [name, value] of saved) {
-		if (value === undefined) delete process.env[name];
-		else process.env[name] = value;
-	}
-	return broker;
 }
 
 async function snapshotOf(client: DaemonBrokerClient): Promise<DaemonSnapshot | undefined> {
@@ -100,7 +80,7 @@ describe("daemon broker after a forward step of the wall clock", () => {
 			const runtimeDir = path.join(tempDir.path(), "runtime");
 			await fs.mkdir(projectDir);
 			const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-			const broker = startBroker(projectDir, runtimeDir);
+			const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 			let pid: number | undefined;
 			try {
 				pid = await startSleep(client, projectDir, detached);
@@ -138,7 +118,7 @@ describe("daemon broker after a forward step of the wall clock", () => {
 		await fs.mkdir(projectDir);
 		let pid: number | undefined;
 		const first = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const firstBroker = startBroker(projectDir, runtimeDir);
+		const { finished: firstBroker } = await startBroker(first, projectDir, runtimeDir);
 		try {
 			pid = await startSleep(first, projectDir, true);
 		} finally {
@@ -148,7 +128,7 @@ describe("daemon broker after a forward step of the wall clock", () => {
 		}
 		const stepped = stepTheWallClock();
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 		try {
 			const recovered = (await snapshotOf(client))?.state;
 			const aliveAfterRecovery = signalReaches(pid);
@@ -172,7 +152,7 @@ describe("daemon broker and client after a backward step of the wall clock", () 
 		await fs.mkdir(projectDir);
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 		let stepped: { undo(): void } | undefined;
 		let pid: number | undefined;
 		try {
@@ -207,7 +187,9 @@ describe("daemon broker and client after a backward step of the wall clock", () 
 		await fs.mkdir(projectDir);
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir, { restartBackoffBaseMs: BACKOFF_BASE_MS });
+		const { finished: broker } = await startBroker(client, projectDir, runtimeDir, {
+			restartBackoffBaseMs: BACKOFF_BASE_MS,
+		});
 		try {
 			// The wall clock reads 60 s behind while the daemon starts (a VM restored from a
 			// snapshot), and is right again before it exits (NTP steps it forward).
