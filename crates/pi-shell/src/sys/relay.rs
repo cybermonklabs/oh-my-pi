@@ -647,8 +647,29 @@ mod tests {
 
 	/// A character the program ended inside is released at the end of its
 	/// stream, ahead of the next command's output.
+	///
+	/// The stream ends once every copy of the pipe's write end is closed, and
+	/// the drain waits for that only the short hold grace. A process that
+	/// another test of this process forks holds a copy of every descriptor
+	/// until its exec, so `X` came before `c` whenever such a copy outlived
+	/// the grace. So the test runs in a process of its own, where no other
+	/// test runs.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn held_bytes_are_flushed_before_the_next_command() {
+		const NAME: &str = "sys::relay::tests::held_bytes_are_flushed_before_the_next_command";
+		const ALONE: &str = "PI_SHELL_TEST_ALONE";
+		if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+			let output = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+				.env(ALONE, NAME)
+				.output()
+				.unwrap();
+			let (out, err) =
+				(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+			assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+			assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+			return;
+		}
 		let out = run(&mut session(true), "/bin/sh -c 'printf abc'; printf X", true).await;
 		assert_eq!(out, b"abcX");
 	}
