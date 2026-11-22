@@ -98,6 +98,9 @@ pub fn tapped_pipe(mirror: Arc<dyn PipeMirror>) -> (PipeReader, PipeWriter) {
 	(PipeReader(Arc::clone(&state)), PipeWriter(state))
 }
 
+/// The live feeds of a pipe ([`PipeReader::feeds`]).
+pub(crate) type Feeds = smallvec::SmallVec<[Arc<dyn FeedRead>; 2]>;
+
 impl PipeReader {
 	/// Push `bytes` back ahead of the buffered data (beyond the capacity if
 	/// need be) and wake the waiters
@@ -112,15 +115,18 @@ impl PipeReader {
 
 	/// The host fills an OS pipe from this pipe for externals through
 	/// `feed`, for as long as `feed` lives ([`FeedRead`]).
-	pub fn attach_feed(&self, feed: Weak<dyn FeedRead>) {
+	pub(crate) fn attach_feed(&self, feed: Weak<dyn FeedRead>) {
 		let mut s = self.0.lock();
 		s.feeds.retain(|f| f.strong_count() > 0);
 		s.feeds.push(feed);
 	}
 
-	/// The feeds of this pipe that still live.
-	pub fn feeds(&self) -> Vec<Arc<dyn FeedRead>> {
+	/// The feeds of this pipe that still live; no allocation for up to two.
+	pub(crate) fn feeds(&self) -> Feeds {
 		let mut s = self.0.lock();
+		if s.feeds.is_empty() {
+			return Feeds::new();
+		}
 		s.feeds.retain(|f| f.strong_count() > 0);
 		s.feeds.iter().filter_map(Weak::upgrade).collect()
 	}

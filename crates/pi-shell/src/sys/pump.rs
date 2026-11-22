@@ -428,20 +428,25 @@ impl Drop for Pumps {
 /// that polled it, so whichever runs next moves the bytes. When the last
 /// holder is dropped, the drop gives back what no child consumed at once,
 /// on the dropping thread, without waiting for any task: it closes our write
-/// end (the pipe's only one) first, so reading the child's end ends at end
-/// of file, then puts the bytes still in the OS pipe, followed by those the
-/// pump took from the engine object but had not written yet, in front of the
-/// object's unread data ([`FdRef::unread`]). `f(){ date; cat "$1"; }; f <(echo
-/// x)` and `exec 4< <(echo x); /bin/echo; read v <&4` then see `x`, as with
-/// bash's one kernel pipe. (A grandchild still holding the read end may race
-/// the drain for bytes, as two readers of one pipe do.)
+/// end (the pipe's only one), then puts the bytes still in the OS pipe,
+/// followed by those the pump took from the engine object but had not
+/// written yet, in front of the object's unread data ([`FdRef::unread`]).
+/// With the feed's drain the pipe is emptied through it without waiting
+/// (a process another thread forked can hold a copy of our write end until
+/// its exec, so end of file may not come yet); without one, the child's end
+/// is read to end of file ([`os::reclaim`]). `f(){ date; cat "$1"; }; f
+/// <(echo x)` and `exec 4< <(echo x); /bin/echo; read v <&4` then see `x`,
+/// as with bash's one kernel pipe. (A grandchild still holding the read end
+/// may race the drain for bytes, as two readers of one pipe do.)
 ///
-/// While holders live, the shell's own reads of the object come through the
-/// feed ([`FeedRead`]): through its [`os::Drain`], a private non-blocking
-/// read description of the pipe, they take what the pipe holds first, then
-/// the object's bytes the pump has not taken, as readers of one kernel pipe
-/// do. Where the feed has no drain (Windows, Linux without `/proc`) they take
-/// the object's bytes only, and what the pump moved comes back at the drop.
+/// While holders live, the shell's own reads of the object come through a
+/// feed with a drain ([`FeedRead`]): through its [`os::Drain`], a private
+/// non-blocking read description of the pipe, they take what the pipe holds
+/// first, then what the pump holds, then the object's next bytes, as
+/// readers of one kernel pipe do. A feed without a drain (Windows, Linux
+/// without `/proc`, macOS where the FIFO cannot be made) is not read through:
+/// the shell takes the object's bytes only, and what the pump moved comes
+/// back at the drop.
 pub struct Feed {
 	/// The child's end.
 	read:   fs::File,
@@ -500,6 +505,12 @@ impl Feed {
 		self.read.try_clone()
 	}
 
+	/// Whether the shell's own reads can come through this feed: it has a
+	/// drain ([`os::Drain`]).
+	pub const fn reads_through(&self) -> bool {
+		self.drain.is_some()
+	}
+
 	/// Advance the pump; `cx`'s task, waiting by its holder's `key`, is woken
 	/// when it can go on.
 	fn poll(&self, cx: &Context<'_>, key: &mut WaitKey) {
@@ -528,38 +539,47 @@ impl FeedRead for Feed {
 		&self,
 		cx: &mut Context<'_>,
 		buf: &mut [u8],
-	) -> Option<Poll<io::Result<usize>>> {
-		let drain = self.drain.as_ref()?;
+		next: &mut crate::bash::ReadOn<'_>,
+	) -> Poll<io::Result<usize>> {
+		let Some(drain) = self.drain.as_ref() else {
+			return next(cx, buf);
+		};
 		let mut st = self.state.lock();
 		if buf.is_empty() {
-			// Readiness (`read -t 0`): ready while the pipe holds bytes.
-			if drain.available() > 0 {
-				return Some(Poll::Ready(Ok(0)));
+			// Readiness (`read -t 0`, `zselect`, a zle watch): ready while the
+			// pipe or the pump holds bytes, as one kernel pipe holding them is.
+			if drain.available() == 0 && !st.chunk.pending().is_empty() {
+				self.advance(&mut st);
 			}
-		} else {
-			match drain.poll_read(cx, buf) {
-				// Empty now, or every writer gone: what comes next is not in the
-				// pipe.
-				Poll::Pending | Poll::Ready(Ok(0)) => {},
-				read => return Some(read),
+			if drain.available() > 0 || !st.chunk.pending().is_empty() {
+				return Poll::Ready(Ok(0));
 			}
+			// The feed holds nothing: the object's own check answers, and
+			// registers `cx` where it says not ready.
+			return next(cx, buf);
+		}
+		// What the pipe holds, without a readiness wait: a read that finds the
+		// feed empty goes on to `next`, whose own wait wakes it.
+		match drain.read_now(buf) {
+			Ok(0) => {},
+			Ok(n) => return Poll::Ready(Ok(n)),
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+			Err(e) => return Poll::Ready(Err(e)),
 		}
 		if st.chunk.pending().is_empty() {
-			// The pump holds nothing: the object's next bytes are its own.
-			return None;
+			// The pump holds nothing: the object's next bytes are its own, read
+			// under this lock, so no holder's poll of the pump, on any thread,
+			// moves them first.
+			return next(cx, buf);
 		}
 		// The pump took bytes it has not written (a write in hand, or one the
 		// pipe had no room for): they come before the object's. Its write
-		// lands in the pipe, which the drain's wait (registered above) or the
-		// next read finds.
+		// lands in the pipe, which this read or the drain's wait finds.
 		self.advance(&mut st);
-		if !buf.is_empty()
-			&& let Poll::Ready(read) = drain.poll_read(cx, buf)
-			&& !matches!(read, Ok(0))
-		{
-			return Some(Poll::Ready(read));
+		match drain.poll_read(cx, buf) {
+			Poll::Ready(Ok(0)) | Poll::Pending => Poll::Pending,
+			read => read,
 		}
-		Some(Poll::Pending)
 	}
 }
 
@@ -761,6 +781,152 @@ mod tests {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		crate::sys::room::no_thread_on_this_thread(false);
 		assert_eq!(got.len(), bytes.len(), "every byte");
+		let first_wrong = got
+			.chunks(4)
+			.zip(0u32..)
+			.find(|(w, i)| *w != i.to_be_bytes());
+		assert!(first_wrong.is_none(), "out of order at word {:?}", first_wrong.map(|(_, i)| i));
+	}
+
+	/// A feed with a drain of a new engine pipe, attached to its read end:
+	/// the read end, the write end and the feed.
+	fn fed_engine_pipe() -> (FdRef, FdRef, Arc<Feed>) {
+		let (read, write) = FdRef::engine_pipe();
+		let feed = Arc::new(Feed::new(read.clone()).expect("a feed"));
+		assert!(feed.reads_through(), "Linux with /proc and macOS give a feed its drain");
+		let weak: std::sync::Weak<dyn FeedRead> = Arc::downgrade(&feed) as _;
+		read.attach_feed(weak);
+		(read, write, feed)
+	}
+
+	// Failure mode: a zero-length read (`read -t 0`, `zselect`, a zle watch)
+	// says "not ready" while the pump holds bytes it took and the OS pipe is
+	// empty (its child emptied it before the feed was polled again), where
+	// bash's one pipe holds those bytes and answers ready; and with nothing
+	// held anywhere it must say "not ready" and wake the reader once bytes
+	// come.
+	#[test]
+	fn a_zero_length_read_is_ready_while_the_pump_holds_bytes() {
+		let (read, write, feed) = fed_engine_pipe();
+		let woken = Arc::new(Woken::default());
+		let waker = Waker::from(Arc::clone(&woken));
+		let mut cx = Context::from_waker(&waker);
+		assert!(read.poll_read(&mut cx, &mut []).is_pending(), "nothing anywhere: not ready");
+		assert!(matches!(write.poll_write(&mut cx, b"x"), Poll::Ready(Ok(1))));
+		assert!(
+			woken.0.load(std::sync::atomic::Ordering::SeqCst),
+			"a byte in the engine pipe wakes the reader"
+		);
+		let mut one = [0u8; 1];
+		assert!(matches!(read.poll_read(&mut cx, &mut one), Poll::Ready(Ok(1))));
+		// The pump fills the OS pipe and holds what does not fit; the room's
+		// thread is refused, so the held write stays the pump's own.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		crate::sys::room::no_thread_on_this_thread(true);
+		let chunk = vec![b'y'; 16 << 10];
+		let mut key = WaitKey::default();
+		for _ in 0..16 {
+			let _ = write.poll_write(&mut cx, &chunk);
+			feed.poll(&cx, &mut key);
+		}
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		crate::sys::room::no_thread_on_this_thread(false);
+		assert!(
+			!feed.state.lock().chunk.pending().is_empty(),
+			"the pump holds bytes the pipe had no room for"
+		);
+		// The engine pipe's own bytes are taken past the feed (its writer stays
+		// open, so it is empty, not at end of file; a zero-length read of a
+		// pipe holding bytes is ready whatever the feed holds), and the
+		// children empty the OS pipe: only the pump holds bytes.
+		let mut big = vec![0u8; 64 << 10];
+		while let Poll::Ready(Ok(n)) = read.poll_read_direct(&mut cx, &mut big) {
+			assert!(n > 0, "the engine pipe's writer is open");
+		}
+		assert!(
+			read.poll_read_direct(&mut cx, &mut []).is_pending(),
+			"the engine pipe is empty: not ready by itself"
+		);
+		let drain = feed.drain.as_ref().expect("a drain");
+		let mut child = feed.child_end().unwrap();
+		let mut emptied = vec![0u8; drain.available()];
+		child.read_exact(&mut emptied).unwrap();
+		assert_eq!(drain.available(), 0, "the OS pipe is empty");
+		assert!(!feed.state.lock().chunk.pending().is_empty(), "the pump still holds bytes");
+		assert!(
+			matches!(read.poll_read(&mut cx, &mut []), Poll::Ready(Ok(0))),
+			"the pump holds bytes: ready"
+		);
+	}
+
+	// Failure mode: a read that finds the feed empty reads the engine pipe
+	// after letting the feed's lock go, so a holder's poll of the pump on
+	// another thread (the pi bash tool's extras read on tokio tasks of their
+	// own) moves the engine pipe's next bytes into the OS pipe in between, and
+	// the read takes the bytes after them. A hook runs such a poll at that
+	// point, then more bytes arrive in the engine pipe: the read must still
+	// take the first bytes, and every byte must come once, in order.
+	#[test]
+	fn a_holders_poll_on_another_thread_moves_no_byte_past_a_read_of_the_engine_pipe() {
+		const WORDS: u32 = 4 << 10;
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let bytes: Vec<u8> = (0..WORDS).flat_map(u32::to_be_bytes).collect();
+		let half = bytes.len() / 2;
+		assert!(matches!(write.poll_write(&mut cx, &bytes[..half]), Poll::Ready(Ok(n)) if n == half));
+		// The other holder: one poll of the pump on its own thread, when asked.
+		let (go, polls) = std::sync::mpsc::channel::<()>();
+		let (polled, done) = std::sync::mpsc::channel::<()>();
+		let holder = {
+			let feed = Arc::clone(&feed);
+			std::thread::spawn(move || {
+				let cx = Context::from_waker(Waker::noop());
+				let mut key = WaitKey::default();
+				while polls.recv().is_ok() {
+					feed.poll(&cx, &mut key);
+					let _ = polled.send(());
+				}
+			})
+		};
+		let more = write.clone();
+		let rest = bytes[half..].to_vec();
+		let mut fired = false;
+		crate::bash::BEFORE_DIRECT_READ.with_borrow_mut(|hook| {
+			*hook = Some(Box::new(move || {
+				if std::mem::replace(&mut fired, true) {
+					return;
+				}
+				go.send(()).unwrap();
+				// Done at once where nothing holds the feed's lock; where this
+				// read holds it, the poll waits for the read.
+				let _ = done.recv_timeout(std::time::Duration::from_secs(2));
+				let mut cx = Context::from_waker(Waker::noop());
+				assert!(
+					matches!(more.poll_write(&mut cx, &rest), Poll::Ready(Ok(n)) if n == rest.len())
+				);
+			}));
+		});
+		let mut got = Vec::with_capacity(bytes.len());
+		let mut buf = [0u8; 4096];
+		let mut key = WaitKey::default();
+		let mut idle = 0;
+		while got.len() < bytes.len() {
+			match read.poll_read(&mut cx, &mut buf) {
+				Poll::Ready(Ok(n)) if n > 0 => {
+					got.extend_from_slice(&buf[..n]);
+					idle = 0;
+				},
+				Poll::Ready(other) => panic!("read: {other:?}"),
+				Poll::Pending => {
+					feed.poll(&cx, &mut key);
+					idle += 1;
+					assert!(idle < 10_000, "no progress at {} of {} bytes", got.len(), bytes.len());
+				},
+			}
+		}
+		// Dropping the hook drops `go`: the holder's thread ends.
+		crate::bash::BEFORE_DIRECT_READ.with_borrow_mut(|hook| *hook = None);
+		holder.join().unwrap();
 		let first_wrong = got
 			.chunks(4)
 			.zip(0u32..)

@@ -62,6 +62,9 @@ pub mod zshopt;
 pub mod pattern;
 pub mod syntax;
 
+#[cfg(test)]
+pub(crate) use crate::bash::fd::BEFORE_DIRECT_READ;
+pub(crate) use crate::bash::host::{FeedRead, ReadOn};
 /// zsh/newuser's startup check: the `newuser` scripts an interactive zsh
 /// sources after `/etc/zshenv` when the user has no startup files.
 pub use crate::bash::vm::newuser_startup_scripts;
@@ -76,10 +79,10 @@ pub use crate::bash::{
 	fd::{BadFd, FdFlags, FdRef},
 	fs::{DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, OpenFlags, Stat},
 	host::{
-		ChildRedir, ChildRedirs, CpuTimes, Deadline, EnvView, ExitStatus, ExtProc, FeedRead, Host,
-		Invocation, Lineage, Login, Logins, OsHandle, PgroupSpec, PipeMirror, PipeTap, ProcEvent,
-		ResolveCtx, Resolved, Rlimit, SpawnFuture, SpawnSpec, StdFd, StdioSpec, SystemTimeLike, Task,
-		Timer, TtyInfo, UserInfo, Verdict, Via,
+		ChildRedir, ChildRedirs, CpuTimes, Deadline, EnvView, ExitStatus, ExtProc, Host, Invocation,
+		Lineage, Login, Logins, OsHandle, PgroupSpec, PipeMirror, PipeTap, ProcEvent, ResolveCtx,
+		Resolved, Rlimit, SpawnFuture, SpawnSpec, StdFd, StdioSpec, SystemTimeLike, Task, Timer,
+		TtyInfo, UserInfo, Verdict, Via,
 	},
 	ids::{
 		AstNodeId, CallId, CmdTag, Dialect, IntrinsicId, JobId, ModeId, NativeRef, Platform, RunId,

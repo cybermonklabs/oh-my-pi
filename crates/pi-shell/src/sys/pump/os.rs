@@ -230,6 +230,18 @@ mod imp {
 			poll_io(cx, file.as_raw_fd(), ready::READ, &mut watch, || (&*file).read(buf))
 		}
 
+		/// Read what the pipe holds now, without a readiness wait:
+		/// `WouldBlock` while it holds nothing and a writer may still write,
+		/// `Ok(0)` at end of file.
+		pub fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
+			loop {
+				match (&self.file).read(buf) {
+					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+					read => return read,
+				}
+			}
+		}
+
 		/// How many bytes the pipe holds now.
 		pub fn available(&self) -> usize {
 			let mut n: libc::c_int = 0;
@@ -1070,12 +1082,11 @@ mod imp {
 	}
 
 	impl Drain {
-		/// Never one: see the type.
-		pub const fn of(_read: &fs::File) -> Option<Self> {
-			None
+		pub const fn poll_read(&self, _cx: &Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			match *self {}
 		}
 
-		pub const fn poll_read(&self, _cx: &Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		pub const fn read_now(&self, _buf: &mut [u8]) -> io::Result<usize> {
 			match *self {}
 		}
 

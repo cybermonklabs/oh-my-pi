@@ -652,20 +652,26 @@ pub trait PipeMirror: Send + Sync {
 /// moves the engine pipe's bytes into an OS pipe for the children, and the
 /// shell's own reads of the pipe come through the feed first, so they take
 /// the bytes in the order the pump took them, whoever reads first.
-pub trait FeedRead: Send + Sync {
+pub(crate) trait FeedRead: Send + Sync {
 	/// The shell reads the pipe this feed fills: what the feed's OS pipe
 	/// holds, or `Pending` while the pump holds bytes it took from the
 	/// engine pipe and has not written yet (it is advanced, and `cx` woken
-	/// once they can be read). `None` when the feed holds nothing: the caller
-	/// reads the engine pipe itself, whose next bytes the pump has not taken.
-	/// Called on the engine's thread, as the pump is polled, so nothing takes
-	/// the engine pipe's bytes between this answer and the caller's read.
+	/// once they can be read). When the feed holds nothing, `next` reads on
+	/// (the pipe's next feed, then the engine pipe itself) under this feed's
+	/// lock, so no holder's poll of the pump, on any thread, moves the
+	/// engine pipe's bytes before `next` has read them. An empty `buf` asks
+	/// readiness: `Ok(0)` while the feed holds bytes, else `next`'s answer.
 	fn poll_read_through(
 		&self,
 		cx: &mut Context<'_>,
 		buf: &mut [u8],
-	) -> Option<Poll<io::Result<usize>>>;
+		next: &mut ReadOn<'_>,
+	) -> Poll<io::Result<usize>>;
 }
+
+/// The rest of a read ([`FeedRead::poll_read_through`]): into the buffer,
+/// `Ok(0)` at end of file.
+pub(crate) type ReadOn<'a> = dyn FnMut(&mut Context<'_>, &mut [u8]) -> Poll<io::Result<usize>> + 'a;
 
 /// How an external process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

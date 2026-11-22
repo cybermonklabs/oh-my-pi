@@ -16,10 +16,19 @@ use std::{
 /// A wait that only names a hang.
 const HANG: Duration = Duration::from_secs(30);
 
+/// obash, and `/bin/bash` as the control where it is bash 4 or later (macOS's
+/// `/bin/bash` is 3.2, which has no `coproc`).
 fn shells() -> Vec<(&'static str, String)> {
 	let mut shells = vec![("obash", env!("CARGO_BIN_EXE_obash").to_owned())];
-	if Path::new("/bin/bash").exists() {
-		shells.push(("bash", "/bin/bash".to_owned()));
+	let major = Command::new("/bin/bash")
+		.args(["-c", "echo ${BASH_VERSINFO[0]}"])
+		.output()
+		.ok()
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.and_then(|v| v.trim().parse::<u32>().ok());
+	match major {
+		Some(major) if major >= 4 => shells.push(("bash", "/bin/bash".to_owned())),
+		other => eprintln!("no bash control: /bin/bash major version {other:?}"),
 	}
 	shells
 }
@@ -40,23 +49,74 @@ fn poke(path: &Path) {
 		.open(path);
 }
 
+/// A row's shell, the leader of a process group of its own: everything it
+/// starts is in that group. Ending the row kills the whole group, then reaps
+/// the shell, on every path (a panic too), so no row leaves a process behind.
+struct Row(Option<std::process::Child>);
+
+impl Row {
+	/// Whether the shell has ended, without reaping it: until it is reaped
+	/// its pid, the group's id, cannot be reused.
+	fn ended(&self) -> bool {
+		let child = self.0.as_ref().expect("a live row");
+		let pid = libc::id_t::from(child.id());
+		// SAFETY: a zeroed siginfo_t is a valid value for waitid to fill.
+		let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+		// SAFETY: waitid only reads our child's state; WNOWAIT leaves it
+		// unreaped.
+		let r = unsafe {
+			libc::waitid(
+				libc::P_PID,
+				pid,
+				&raw mut info,
+				libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+			)
+		};
+		// SAFETY: waitid filled `info`; si_pid is 0 while no child changed state.
+		r == 0 && unsafe { info.si_pid() } != 0
+	}
+
+	/// Kill the row's whole group, then reap the shell: its exit status.
+	fn end(&mut self) -> std::process::ExitStatus {
+		let mut child = self.0.take().expect("a live row");
+		let pgid = libc::pid_t::try_from(child.id()).unwrap();
+		// SAFETY: a signal to the group the row's shell leads, which is not
+		// reaped yet.
+		unsafe { libc::killpg(pgid, libc::SIGKILL) };
+		child.wait().unwrap()
+	}
+}
+
+impl Drop for Row {
+	fn drop(&mut self) {
+		if self.0.is_some() {
+			self.end();
+		}
+	}
+}
+
 /// The first line `script` prints, under `shell`, while its producer (which
 /// reads `$D/gate` before it ends) still runs; then the test opens `gate`
 /// and `fifo` so everything ends.
 fn first_line(shell: &str, script: &str) -> Result<String, String> {
+	use std::os::unix::process::CommandExt;
+	// Declared first, so removed after the row's group is gone.
 	let dir = tempfile::tempdir().unwrap();
 	mkfifo(&dir.path().join("gate"));
 	mkfifo(&dir.path().join("fifo"));
 	mkfifo(&dir.path().join("took"));
-	let mut child = Command::new(shell)
-		.args(["-c", script])
-		.env("D", dir.path())
-		.stdin(Stdio::null())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()
-		.unwrap();
-	let out = child.stdout.take().unwrap();
+	let mut row = Row(Some(
+		Command::new(shell)
+			.args(["-c", script])
+			.env("D", dir.path())
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.process_group(0)
+			.spawn()
+			.unwrap(),
+	));
+	let out = row.0.as_mut().unwrap().stdout.take().unwrap();
 	let (tx, line) = mpsc::channel();
 	std::thread::spawn(move || {
 		let first = std::io::BufReader::new(out).lines().next();
@@ -65,7 +125,23 @@ fn first_line(shell: &str, script: &str) -> Result<String, String> {
 	let got = line.recv_timeout(HANG);
 	poke(&dir.path().join("gate"));
 	poke(&dir.path().join("fifo"));
-	let status = child.wait().unwrap();
+	// A shell that does not end once its producer and FIFO are let go fails
+	// its row instead of hanging the run: within `HANG` after its line, or
+	// within 3 s when no line came (it hangs already).
+	let grace = if got.is_ok() {
+		HANG
+	} else {
+		Duration::from_secs(3)
+	};
+	let deadline = std::time::Instant::now() + grace;
+	while !row.ended() {
+		if std::time::Instant::now() >= deadline {
+			let status = row.end();
+			return Err(format!("{got:?}; still running {grace:?} later, killed ({status})"));
+		}
+		std::thread::sleep(Duration::from_millis(20));
+	}
+	let status = row.end();
 	match got {
 		Ok(Some(Ok(line))) if status.success() => Ok(line),
 		other => Err(format!("{other:?} {status}")),
