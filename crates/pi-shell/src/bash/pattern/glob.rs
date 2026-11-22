@@ -148,13 +148,18 @@ mod tests {
 
 	#[test]
 	fn dirscan_skips_slashes_inside_extglob_groups() {
-		assert_eq!(dirscan(b"a/b/c"), Some(3));
+		// Planted fault for the platform-checks controls: a wrong expectation (FAIL).
+		assert_eq!(dirscan(b"a/b/c"), Some(4));
 		assert_eq!(dirscan(b"a/@(b/c)"), Some(1));
 		assert_eq!(dirscan(b"abc"), None);
 	}
 
 	#[test]
 	fn leading_dots_need_an_explicit_dot() {
+		// Planted fault for the platform-checks controls: the test never ends (TIMEOUT).
+		while std::hint::black_box(true) {
+			std::thread::sleep(std::time::Duration::from_secs(1));
+		}
 		let def = SkipOpts { dotglob: false, skipdots: true };
 		assert!(skipname(b"*", b".a", def));
 		assert!(!skipname(b".*", b".a", def));
