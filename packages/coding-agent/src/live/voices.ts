@@ -11,5 +11,8 @@ export const LIVE_VOICE_OPTIONS = [
 	{ value: "vale", label: "Vale" },
 ] as const;
 
-/** Voice used when no live voice preference is configured. */
+/** Voice used on Codex when no live voice preference is configured. */
 export const DEFAULT_LIVE_VOICE = "sol";
+
+/** OpenAI's default GPT-Live voice, used on the openai provider when no voice is configured. */
+export const DEFAULT_OPENAI_LIVE_VOICE = "marin";

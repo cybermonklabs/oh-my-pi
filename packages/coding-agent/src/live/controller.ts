@@ -1,27 +1,51 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { prompt, toError } from "@oh-my-pi/pi-utils";
+import { expandTilde, logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
+import { LiveCallTranscript, type TranscriptLine } from "./call-transcript";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
+import liveSpokenRequestTemplate from "./prompts/live-spoken-request.md" with { type: "text" };
 import {
-	buildDelegationContextAppend,
 	buildSessionClose,
+	CODEX_LIVE_WIRE,
 	chunkLiveContext,
 	type LiveClientMessage,
 	type LiveServerEvent,
+	type LiveWire,
+	OPENAI_LIVE_WIRE,
 } from "./protocol";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
-import { type LiveEndpoint, LiveTransport, resolveLiveEndpoint } from "./transport";
+import { cfgLiveInstructionsFile, cfgLiveProvider, cfgLivePulseServer } from "./settings";
+import {
+	type LiveEndpoint,
+	LiveTransport,
+	type OpenAILiveRoute,
+	resolveLiveEndpoint,
+	resolveOpenAILiveRoute,
+} from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
+/** How long a GPT-Live delegation waits for the transcript to reach its offset before it is sent anyway. */
+const DELEGATION_TRANSCRIPT_WAIT_MS = 3_000;
+/** A GPT-Live call ends by itself after this long with no speech from the user. */
+const QUIET_LIMIT_MS = 15 * 60_000;
+/** How long omp waits for GPT-Live's `session.closed` after `session.close` before it closes the sideband. */
+const SESSION_CLOSED_WAIT_MS = 5_000;
+/** Request text of a delegation that no transcript reached before it was sent. */
+const NO_WORDS_REQUEST = "(no words reached omp for this request)";
+
+/** Custom message the session gets when a GPT-Live call ends: the call's start, end and transcript file. */
+export const LIVE_CALL_END_MESSAGE_TYPE = "live-call-end";
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -137,6 +161,20 @@ export class LiveSessionController {
 			if (!this.#activeDelegationId) this.#refreshAudioPhase();
 		}),
 	);
+	/** How a delegation's progress and result reach the voice: Codex's context appends or GPT-Live's. */
+	#wire: LiveWire = CODEX_LIVE_WIRE;
+	/** The words of a GPT-Live call (`live.provider: openai`); unset on Codex, which sends request text itself. */
+	#callTranscript: LiveCallTranscript | undefined;
+	/** GPT-Live delegations waiting for the transcript to reach their offset, oldest first. */
+	#pendingDelegations: { id: string; offsetMs: number; expired: boolean; timer: NodeJS.Timeout }[] = [];
+	#quietTimer: NodeJS.Timeout | undefined;
+	/** Resolves when GPT-Live reports `session.closed`. */
+	readonly #sessionClosed = Promise.withResolvers<void>();
+	#sessionClosedReceived = false;
+	#callStartedAt: Date | undefined;
+	/** Why a GPT-Live call ended, for the end message, when something other than a stop request ended it. */
+	#endReason: string | undefined;
+	#usageSeconds: number | undefined;
 
 	constructor(options: LiveSessionControllerOptions) {
 		this.#session = options.session;
@@ -181,21 +219,41 @@ export class LiveSessionController {
 		}
 
 		try {
-			this.#endpoint = await resolveLiveEndpoint(this.#session.settings);
+			const settings = this.#session.settings;
+			this.#endpoint = await resolveLiveEndpoint(settings);
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while starting.");
 			}
-			const user = currentUser();
-			const instructions = prompt.render(this.#instructionsTemplate, user);
+			const viaOpenAI = cfgLiveProvider.get(settings) === "openai";
+			if (viaOpenAI && this.#endpoint) {
+				throw new Error(
+					"live.endpoint and live.provider: openai cannot both be set: live.endpoint names a Realtime server, live.provider: openai the openai provider's GPT-Live API",
+				);
+			}
+			const instructions = await this.#renderInstructions();
+			let openai: OpenAILiveRoute | undefined;
+			if (viaOpenAI) {
+				openai = await resolveOpenAILiveRoute(this.#session.modelRegistry, settings, this.#session.sessionId);
+				this.#callTranscript = new LiveCallTranscript(await this.#createTranscriptFile(), (line, final) =>
+					this.#showTranscriptLine(line, final),
+				);
+				this.#wire = OPENAI_LIVE_WIRE;
+			}
+			if (this.#stopped) {
+				throw this.#failure ?? new Error("The live session stopped while starting.");
+			}
+			const pulseServer = cfgLivePulseServer.get(settings)?.trim() || undefined;
 			const transport = new LiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
 				endpoint: this.#endpoint,
+				openai,
+				pulseServer,
 				sessionId: this.#session.sessionId,
 				instructions,
 				voice: this.#voice,
 				sdpOffer: this.#sdpOffer,
 				callbacks: {
-					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
+					onEvent: event => this.#receiveLiveEvent(event),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
 				},
 			});
@@ -203,6 +261,10 @@ export class LiveSessionController {
 			await transport.connect();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
+			}
+			if (this.#callTranscript) {
+				this.#callStartedAt = new Date();
+				this.#armQuietLimit();
 			}
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
@@ -215,13 +277,17 @@ export class LiveSessionController {
 				this.#refreshAudioPhase();
 				return;
 			}
-			const recorder = new AudioCapture(16_000, (error, samples) => {
-				if (error) {
-					this.#reportFailure(error);
-					return;
-				}
-				this.#handleMicrophoneAudio(samples);
-			});
+			const recorder = new AudioCapture(
+				16_000,
+				(error, samples) => {
+					if (error) {
+						this.#reportFailure(error);
+						return;
+					}
+					this.#handleMicrophoneAudio(samples);
+				},
+				pulseServer,
+			);
 			if (this.#stopped) {
 				try {
 					recorder.stop();
@@ -263,7 +329,12 @@ export class LiveSessionController {
 	}
 
 	async #stop(): Promise<void> {
+		const endedAt = new Date();
 		this.#stopped = true;
+		clearTimeout(this.#quietTimer);
+		// No delegation is dropped: one still waiting for its transcript becomes a turn now.
+		for (const pending of this.#pendingDelegations) pending.expired = true;
+		this.#flushDelegations();
 		this.#outputActivity.dispose();
 		this.#unsubscribeSession?.();
 		this.#unsubscribeSession = undefined;
@@ -282,11 +353,16 @@ export class LiveSessionController {
 		await this.#sendChain;
 		const transport = this.#transport;
 		this.#transport = undefined;
+		let closeConfirmed = this.#sessionClosedReceived;
 		if (transport) {
-			try {
-				await transport.send(buildSessionClose());
-			} catch (cause) {
-				cleanupError ??= toError(cause);
+			if (!this.#sessionClosedReceived) {
+				try {
+					await transport.send(buildSessionClose());
+					// GPT-Live finalizes the call (its usage) only once `session.closed` arrives.
+					if (this.#callTranscript) closeConfirmed = await this.#waitForSessionClosed();
+				} catch (cause) {
+					cleanupError ??= toError(cause);
+				}
 			}
 			try {
 				await transport.close();
@@ -294,9 +370,46 @@ export class LiveSessionController {
 				cleanupError ??= toError(cause);
 			}
 		}
+		await this.#reportCallEnd(endedAt, closeConfirmed);
 
 		if (cleanupError) this.#emitPhaseSafely("error");
 		this.#emitTerminal(cleanupError);
+	}
+
+	/** Waits up to {@link SESSION_CLOSED_WAIT_MS} for `session.closed`; true when it came. */
+	async #waitForSessionClosed(): Promise<boolean> {
+		const timedOut = Promise.withResolvers<false>();
+		const timer = setTimeout(() => timedOut.resolve(false), SESSION_CLOSED_WAIT_MS);
+		const closed = await Promise.race([this.#sessionClosed.promise.then(() => true as const), timedOut.promise]);
+		clearTimeout(timer);
+		return closed;
+	}
+
+	/** Finishes a GPT-Live call's transcript file and tells the session where it is and when the call ran. */
+	async #reportCallEnd(endedAt: Date, closeConfirmed: boolean): Promise<void> {
+		const transcript = this.#callTranscript;
+		const startedAt = this.#callStartedAt;
+		if (!transcript || !startedAt) return;
+		await transcript.finish();
+		const reason = this.#endReason ?? (this.#failure ? `it failed: ${this.#failure.message}` : "it was stopped");
+		const usage = this.#usageSeconds === undefined ? "" : `, ${this.#usageSeconds} s of voice time`;
+		const notes = [
+			transcript.writeFailed ? "Some lines could not be written to it." : "",
+			closeConfirmed
+				? ""
+				: `GPT-Live sent no session.closed within ${SESSION_CLOSED_WAIT_MS / 1000} s, so its final usage is unconfirmed.`,
+		].filter(Boolean);
+		const content = [
+			`The live voice call ended: ${reason}. It ran from ${startedAt.toISOString()} to ${endedAt.toISOString()}${usage}.`,
+			`Its transcript, each line with its UTC time, is in ${transcript.path}.`,
+			...notes,
+		].join(" ");
+		await this.#session
+			.sendCustomMessage(
+				{ customType: LIVE_CALL_END_MESSAGE_TYPE, content, display: true, attribution: "agent" },
+				{ deliverAs: "nextTurn" },
+			)
+			.catch(cause => logger.warn("Live call end message was not delivered", { error: toError(cause).message }));
 	}
 
 	#guardEvent(handler: () => void): void {
@@ -306,6 +419,22 @@ export class LiveSessionController {
 		} catch (cause) {
 			this.#reportFailure(toError(cause));
 		}
+	}
+
+	/**
+	 * Every transport event lands here. `session.closed` is noted even while the call stops (the stop
+	 * waits for it), and words the voice still says while it closes go to the transcript file.
+	 */
+	#receiveLiveEvent(event: LiveServerEvent): void {
+		if (event.type === "session.closed") {
+			this.#sessionClosedReceived = true;
+			this.#sessionClosed.resolve();
+		}
+		if (this.#stopped) {
+			if (event.type === "transcript.delta") this.#callTranscript?.add(event);
+			return;
+		}
+		this.#guardEvent(() => this.#handleLiveEvent(event));
 	}
 
 	#handleLiveEvent(event: LiveServerEvent): void {
@@ -333,6 +462,26 @@ export class LiveSessionController {
 			case "error":
 				this.#reportFailure(new Error(event.message));
 				break;
+			case "transcript.delta":
+				this.#callTranscript?.add(event);
+				if (event.role === "user") this.#armQuietLimit();
+				this.#flushDelegations();
+				break;
+			case "delegation.requested":
+				this.#queueDelegation(event.id, event.offsetMs);
+				break;
+			case "usage.updated":
+				this.#usageSeconds = event.seconds;
+				break;
+			case "session.closed": {
+				const reason = event.reason ?? "no reason given";
+				this.#endReason = `GPT-Live closed it (${reason})`;
+				this.#reportFailure(new Error(`GPT-Live closed the live call: ${reason}`));
+				break;
+			}
+			case "warning":
+				logger.warn("GPT-Live rejected a command or cut its speech", { message: event.message });
+				break;
 		}
 	}
 
@@ -344,7 +493,47 @@ export class LiveSessionController {
 		}
 		request = request.trim();
 		if (!request) return;
-		this.#activeDelegationId = event.item.id;
+		this.#startDelegatedTurn(event.item.id, request);
+	}
+
+	/**
+	 * A GPT-Live delegation names only its offset on the session timeline, and the transcript of the
+	 * words before it can still be on its way; it waits until the transcript reaches the offset, or
+	 * {@link DELEGATION_TRANSCRIPT_WAIT_MS}, and becomes a turn either way.
+	 */
+	#queueDelegation(id: string, offsetMs: number): void {
+		this.#callTranscript?.endLine();
+		const pending = {
+			id,
+			offsetMs,
+			expired: false,
+			timer: setTimeout(() => {
+				pending.expired = true;
+				this.#guardEvent(() => this.#flushDelegations());
+			}, DELEGATION_TRANSCRIPT_WAIT_MS),
+		};
+		this.#pendingDelegations.push(pending);
+		this.#flushDelegations();
+	}
+
+	/** Sends, oldest first, each waiting delegation whose transcript has arrived or whose wait is over. */
+	#flushDelegations(): void {
+		const transcript = this.#callTranscript;
+		if (!transcript) return;
+		for (let next = this.#pendingDelegations[0]; next; next = this.#pendingDelegations[0]) {
+			if (!next.expired && !transcript.reached(next.offsetMs)) return;
+			this.#pendingDelegations.shift();
+			clearTimeout(next.timer);
+			const lines = transcript.takeRequest(next.offsetMs);
+			const request = prompt.render(liveSpokenRequestTemplate, {
+				transcript: lines.length > 0 ? lines.join("\n") : NO_WORDS_REQUEST,
+			});
+			this.#startDelegatedTurn(next.id, request);
+		}
+	}
+
+	#startDelegatedTurn(delegationId: string, request: string): void {
+		this.#activeDelegationId = delegationId;
 		this.#refreshAudioPhase();
 		void this.#session
 			.sendCustomMessage(
@@ -357,6 +546,46 @@ export class LiveSessionController {
 				{ triggerTurn: true },
 			)
 			.catch(cause => this.#reportFailure(toError(cause)));
+	}
+
+	/** (Re)starts the quiet limit: a GPT-Live call with no speech from the user for {@link QUIET_LIMIT_MS} ends. */
+	#armQuietLimit(): void {
+		clearTimeout(this.#quietTimer);
+		this.#quietTimer = setTimeout(() => {
+			if (this.#stopped) return;
+			this.#endReason = `${QUIET_LIMIT_MS / 60_000} minutes passed with no speech from the user`;
+			void this.stop();
+		}, QUIET_LIMIT_MS);
+	}
+
+	/** Shows a GPT-Live transcript line in the live UI: growing while the speaker talks, final once it ends. */
+	#showTranscriptLine(line: TranscriptLine, final: boolean): void {
+		if (this.#stopped) return;
+		if (final) this.#finishTranscript(line.role, line.text);
+		else this.#addTranscript(line.role, line.text);
+	}
+
+	/** The voice model's instructions: the template rendered for the user, then `live.instructionsFile`'s text. */
+	async #renderInstructions(): Promise<string> {
+		const instructions = prompt.render(this.#instructionsTemplate, currentUser());
+		const file = cfgLiveInstructionsFile.get(this.#session.settings)?.trim();
+		if (!file) return instructions;
+		let extra: string;
+		try {
+			extra = (await Bun.file(path.resolve(expandTilde(file))).text()).trim();
+		} catch (cause) {
+			throw new Error(`live.instructionsFile ${file} could not be read: ${toError(cause).message}`);
+		}
+		return extra ? `${instructions}\n\n${extra}` : instructions;
+	}
+
+	/** Creates the call's transcript file among the session's artifacts, or in the temp dir for an unsaved session. */
+	async #createTranscriptFile(): Promise<string> {
+		const allocated = await this.#session.sessionManager.allocateArtifactPath("live-transcript");
+		const file =
+			allocated.path ?? path.join(os.tmpdir(), `omp-live-transcript-${this.#session.sessionId}-${Date.now()}.log`);
+		await fs.appendFile(file, "");
+		return file;
 	}
 
 	#handleSessionEvent(event: AgentSessionEvent): void {
@@ -374,7 +603,7 @@ export class LiveSessionController {
 		const progress = this.#extractAssistantText(message).trim();
 		if (!progress) return;
 		for (const chunk of chunkLiveContext(progress)) {
-			this.#queueSend(buildDelegationContextAppend(delegationId, chunk, "commentary"));
+			this.#queueSend(this.#wire.progress(delegationId, chunk));
 		}
 	}
 
@@ -388,7 +617,7 @@ export class LiveSessionController {
 			if (!text) continue;
 			const finalContext = prompt.render(agentFinalMessageTemplate, { message: text });
 			for (const chunk of chunkLiveContext(finalContext)) {
-				this.#queueSend(buildDelegationContextAppend(delegationId, chunk));
+				this.#queueSend(this.#wire.result(delegationId, chunk));
 			}
 			break;
 		}
