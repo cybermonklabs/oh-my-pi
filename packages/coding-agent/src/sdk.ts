@@ -68,13 +68,14 @@ import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mo
 import { isAuthenticated, kNoAuth, ModelRegistry, probeModelApiKey } from "./config/model-registry";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	type ModelMatchPreferences,
+	modelNotFoundMessage,
 	parseModelPattern,
 	pickDefaultAvailableModel,
-	providerModelHint,
 	resolveAllowedModels,
 	resolveCliModel,
 	type ResolveCliModelResult,
@@ -837,7 +838,7 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Root-scoped bus carrying `task:subagent:*` observability frames for this
 	 * session and every subagent it spawns. Default: creates a new bus per
-	 * root session; `buildSubagentSessionOptions` inherits the spawner's.
+	 * root session; `buildSubagentSession` inherits the spawner's.
 	 */
 	subagentEventBus?: EventBus;
 
@@ -3310,14 +3311,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allEnabledModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAll()
-					: modelRegistry.getAll().filter(candidate => !disabledProviders.has(candidate.provider));
-			const availableModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAvailable()
-					: modelRegistry.getAvailable().filter(candidate => !disabledProviders.has(candidate.provider));
+			const allEnabledModels = enabledProviderModels(modelRegistry.getAll(), disabledProviders);
+			const availableModels = enabledProviderModels(modelRegistry.getAvailable(), disabledProviders);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -3726,15 +3721,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				});
 			}
 			if (!model) {
-				const requested =
-					deferredModelPatterns.length === 1
-						? `"${deferredModelPatterns[0]}"`
-						: `one of ${deferredModelPatterns.map(pattern => `"${pattern}"`).join(", ")}`;
-				// A single provider-qualified selector names its closest siblings, the same
-				// hint `resolveCliModel` gives before the selector was deferred here.
-				const hint =
-					deferredModelPatterns.length === 1 ? providerModelHint(deferredModelPatterns[0], allEnabledModels) : "";
-				modelFallbackMessage = `Model ${requested} not found${hint ? `.${hint}` : ""}`;
+				modelFallbackMessage = modelNotFoundMessage(deferredModelPatterns, allEnabledModels);
 			}
 		}
 
