@@ -8,8 +8,8 @@
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
 #   - rust-test-tmpdir.sh.
-#   - sami-build.yml's release_binary and .github/actions/bun-install: the
-#     release restores no GitHub cache (cache_lint).
+#   - sami-build.yml's release_binary, rust_test and rust_test_macos, and
+#     .github/actions/bun-install: they restore no GitHub cache (cache_lint).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -880,27 +880,42 @@ if [ -z "$only" ] || [[ T1-each-action-its-own-tmpdir =~ $only ]]; then
 	verdict T1-each-action-its-own-tmpdir 0 "$rc" '' "$a $b"
 fi
 
-# --- the release's caches ---------------------------------------------------------
-# cache_lint <workflow> <bun-install action>: release_binary restores no GitHub
-# Actions cache. rust_test and rust_test_macos run test code with sudo on the
-# release's ref; such code can read the runner's token and save any key for
-# that ref, and a ref's own entries come before main's. So release_binary has
-# no actions/cache step, and passes `cache: "false"` to every bun-install
-# step, which then sets cache=none and runs neither of its cache steps.
+# --- the jobs' caches -------------------------------------------------------------
+# cache_lint <workflow> <bun-install action>: release_binary, rust_test and
+# rust_test_macos restore and save no GitHub Actions cache. rust_test and
+# rust_test_macos run test code on runners whose user has passwordless sudo,
+# on the release's ref; such code could save an entry for that ref (one no
+# run has written yet, or one a ref's own lookup takes before main's) that
+# the release's build, or a later gate run's tools, would restore. So none of
+# the three jobs has an actions/cache step, and each passes `cache: "false"`
+# to every bun-install step, which then sets cache=none and runs neither of
+# its cache steps; release_binary must have one.
 cache_lint() {
-	local wf="$1" action="$2" rc=0 steps
-	awk '/^  release_binary:$/ { on = 1; next } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { exit } on' "$wf" >"$scratch/release-binary.yml"
-	[ -s "$scratch/release-binary.yml" ] || { echo "UNKNOWN: $wf has no release_binary job"; return 1; }
-	if grep -nE 'uses: *actions/cache' "$scratch/release-binary.yml"; then
-		echo "release_binary has an actions/cache step (above)"
-		rc=1
-	fi
-	steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$scratch/release-binary.yml" | grep -F 'uses: ./.github/actions/bun-install')"
-	[ -n "$steps" ] || { echo "UNKNOWN: release_binary has no bun-install step"; return 1; }
-	if printf '%s\n' "$steps" | grep -vF 'cache: "false"' | grep -q .; then
-		echo "release_binary has a bun-install step without cache: \"false\""
-		rc=1
-	fi
+	local wf="$1" action="$2" rc=0 job steps n ok
+	for job in release_binary rust_test rust_test_macos; do
+		ok=1
+		awk -v j="  $job:" '$0 == j { on = 1; next } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { exit } on' "$wf" >"$scratch/job.yml"
+		[ -s "$scratch/job.yml" ] || { echo "UNKNOWN: $wf has no $job job"; return 1; }
+		if grep -nE 'uses: *actions/cache' "$scratch/job.yml"; then
+			echo "$job has an actions/cache step (above)"
+			ok=0
+		fi
+		steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$scratch/job.yml" | grep -F 'uses: ./.github/actions/bun-install' || true)"
+		n="$(printf '%s' "$steps" | grep -c . || true)"
+		if [ "$job" = release_binary ] && [ "$n" = 0 ]; then
+			echo "UNKNOWN: release_binary has no bun-install step"
+			return 1
+		fi
+		if printf '%s\n' "$steps" | grep -vF 'cache: "false"' | grep -q .; then
+			echo "$job has a bun-install step without cache: \"false\""
+			ok=0
+		fi
+		if [ "$ok" = 1 ]; then
+			echo "$job: no actions/cache step; bun-install steps: $n, each with cache: \"false\""
+		else
+			rc=1
+		fi
+	done
 	if ! grep -qF 'CACHE_INPUT: ${{ inputs.cache }}' "$action" || ! awk '/elif \[ "\$CACHE_INPUT" = false \]; then/ { getline; if ($0 ~ /echo "cache=none"/) found = 1 } END { exit !found }' "$action"; then
 		echo "$action does not set cache=none for cache: \"false\""
 		rc=1
@@ -909,7 +924,6 @@ cache_lint() {
 		echo "$action has a cache step that does not need cache=gha"
 		rc=1
 	fi
-	[ "$rc" = 0 ] && echo "release_binary: $(printf '%s\n' "$steps" | grep -c .) bun-install steps, each with cache: \"false\"; no actions/cache step"
 	return "$rc"
 }
 # wlint <name> <want> <message regex> <sed for the workflow> <sed for the
@@ -925,11 +939,17 @@ wlint() {
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
-wlint W1-release-binary-restores-no-cache 0 'release_binary: 1 bun-install steps, each with cache: "false"; no actions/cache step' '' ''
+wlint W1-release-binary-restores-no-cache 0 'release_binary: no actions/cache step; bun-install steps: 1, each with cache: "false"' '' ''
 wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-install step without cache: "false"' '/^          cache: "false"$/d' ''
 wlint W3-release-binary-cache-step 1 'release_binary has an actions/cache step' 's|^        uses: ./.github/actions/bazel-cache$|        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
 wlint W5-action-cache-step-ungated 1 'has a cache step that does not need cache=gha' '' 's/if: steps.env.outputs.cache == .gha. && github.ref/if: github.ref/'
+# The gate's own jobs: their tools (the reference rsync, zsh and bash, the
+# macOS step bash) and bun's packages come from the build, not a cache.
+wlint W6-gate-jobs-restore-no-cache 0 'rust_test_macos: no actions/cache step; bun-install steps: 0, each with cache: "false"' '' ''
+wlint W7-rust-test-cache-step 1 'rust_test has an actions/cache step' 's|^      - name: Libraries of the reference rsync$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+wlint W8-rust-test-macos-cache-step 1 'rust_test_macos has an actions/cache step' 's|^      - name: The tests only macOS can run$|      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+wlint W9-rust-test-bun-install-with-cache 1 'rust_test has a bun-install step without cache: "false"' '/^  rust_test:$/,/^  rust_test_macos:$/{/^          cache: "false"$/d;}' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

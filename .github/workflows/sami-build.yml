@@ -169,49 +169,26 @@ jobs:
       - id: bazel
         uses: ./.github/actions/bazel-cache
       # The reference rsync, zsh and bash below are built from pinned
-      # tarballs and cached under a key that names the runner image's version
-      # ($ImageOS-$ImageVersion), so a new image builds them again rather than
-      # restoring a binary built against another image's libraries. A cached
-      # build that still fails its check step fails every run until its entry
-      # is gone: `gh cache delete <key> --repo <this repository>` (the key is
-      # in the restore step's log), then run the job again, which rebuilds and
-      # saves it.
-      - id: image
-        name: The runner image's version, for the cache keys
-        shell: bash
-        run: |
-          if [ -z "${ImageOS:-}" ] || [ -z "${ImageVersion:-}" ]; then
-            echo "::error title=Runner image::ImageOS or ImageVersion is not set, so the cache keys cannot name the image"
-            exit 1
-          fi
-          echo "version=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
-          echo "runner image: $ImageOS-$ImageVersion"
+      # tarballs on every run, never restored from a GitHub Actions cache: the
+      # tests run in this job, on a runner whose user has passwordless sudo,
+      # and code they run could save a cache entry for this ref (one no run
+      # has written yet, such as the next runner image's) that a later run
+      # would restore and judge the tests with. The three builds take about
+      # 2 min 15 s (run 44987520746). A harness case (W6) keeps the gate's
+      # jobs off the cache.
       # pi-builtins' rsync conformance and daemon tests compare the builtin
       # byte for byte with rsync 3.5.1 built with every checksum and
       # compressor the builtin offers, and skip without one; the runner's
       # rsync is 3.2.7, so they ran nowhere. The test step puts this build
       # first on the tests' PATH and sets RSYNC_REFERENCE_REQUIRED, with which
       # a missing or incomplete reference fails them instead.
-      # Restore and save are separate steps: actions/cache saves only when
-      # the whole job succeeds, so every red run rebuilt rsync (run
-      # 44757840012). The save follows the check, so a broken build is never
-      # cached, and a later test failure no longer loses the build.
-      - id: rsync-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/rsync-ref
-          # The tarball's sha256 and the runner image: the build is a function
-          # of them.
-          key: rsync-3.5.1-c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef-${{ steps.image.outputs.version }}
-      # The -dev packages are needed only to build; the cached binary's
-      # shared libraries are on the image (the check step proves it loads).
+      # The -dev packages are needed only to build; the built binary's shared
+      # libraries are on the image (the check step proves it loads).
       - name: Libraries of the reference rsync
-        if: steps.rsync-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get -q -o Acquire::Retries=5 update
           sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
       - name: Build the reference rsync 3.5.1
-        if: steps.rsync-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           # download.samba.org has timed out or answered 504 for hours at a
@@ -246,12 +223,6 @@ jobs:
           for need in zstd lz4; do
             case " $compressors " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need compressor"; exit 1 ;; esac
           done
-      - name: Save the reference rsync
-        if: steps.rsync-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/rsync-ref
-          key: ${{ steps.rsync-cache.outputs.cache-primary-key }}
       # pi-shell's zsh completion and zsh-oracle tests compare obash with zsh
       # 5.9: its own completion functions (/usr/share/zsh/5.9/functions, or
       # the real zsh's $fpath) and /bin/zsh itself, which must print
@@ -260,13 +231,7 @@ jobs:
       # agree on, into ~/zsh-ref, and linked in as /usr/bin/zsh (/bin is
       # /usr/bin) and /usr/share/zsh/5.9. A test that still skips fails the
       # job (the skip scan in the test step).
-      - id: zsh-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/zsh-ref
-          key: zsh-5.9-9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5-${{ steps.image.outputs.version }}
       - name: Build zsh 5.9
-        if: steps.zsh-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           sudo apt-get -q -o Acquire::Retries=5 update
@@ -300,12 +265,6 @@ jobs:
             [ -f "/usr/share/zsh/5.9/functions/$f" ] || { echo "::error title=zsh 5.9::no $f in /usr/share/zsh/5.9/functions"; exit 1; }
           done
           /bin/zsh -f -c 'print -rl -- $fpath'
-      - name: Save zsh 5.9
-        if: steps.zsh-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/zsh-ref
-          key: ${{ steps.zsh-cache.outputs.cache-primary-key }}
       # pi-shell's bash-oracle tests compare obash with bash 5.2 or later
       # (they were measured with 5.2.21), and report a bash older than that
       # as uncompared, which the skip scan fails; the runner's /bin/bash is
@@ -314,13 +273,7 @@ jobs:
       # signed by its maintainer's key 7C0135FB088AAF6C66C650B9BB5869F064EA74AB),
       # into ~/bash-ref, and the tests get it as PI_TEST_REAL_BASH; the
       # runner's own bash, which runs every step, stays as it is.
-      - id: bash-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/bash-ref
-          key: bash-5.2.21-c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8-${{ steps.image.outputs.version }}
       - name: Build bash 5.2.21
-        if: steps.bash-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           bash .github/sami/fetch-verified.sh "bash 5.2.21" "$RUNNER_TEMP/bash-5.2.21.tar.gz" \
@@ -344,12 +297,6 @@ jobs:
             ;;
           esac
           echo "the runner's bash: $(/bin/bash --version | sed -n 1p)"
-      - name: Save bash 5.2.21
-        if: steps.bash-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/bash-ref
-          key: ${{ steps.bash-cache.outputs.cache-primary-key }}
       # pi-vcs's jj tests compare its jj-lib with the jj CLI, and return
       # without a word where there is no `jj`. jj 0.46.0, the jj-lib version
       # Cargo.lock pins (checked here), is the release's static Linux build,
@@ -469,7 +416,10 @@ jobs:
       # instead: the release zip whose sha256 is pinned here (the release's
       # own digest and its SHASUMS256.txt give the same). bun-install then
       # finds a bun that meets the floor on PATH and runs no installer, and
-      # the addon step checks the version it runs.
+      # the addon step checks the version it runs. Its packages, which run
+      # in this job before the test step, come from the registry, not from a
+      # GitHub Actions cache another job of this ref could have written
+      # (cache: "false"; W6).
       - name: bun 1.4.5
         shell: bash
         run: |
@@ -481,6 +431,8 @@ jobs:
           install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" "$HOME/.bun/bin/bun"
           echo "$HOME/.bun/bin" >>"$GITHUB_PATH"
       - uses: ./.github/actions/bun-install
+        with:
+          cache: "false"
       - name: The native addon the smoke tests' server loads
         shell: bash
         env:
@@ -561,27 +513,11 @@ jobs:
       # The test step and its harness need bash 4 or later (associative
       # arrays), and macOS's /bin/bash is 3.2 (run 44875114140). bash 5.2.21
       # is built from the GNU tarball whose sha256 rust_test pins for its
-      # reference bash, cached under a key that names it and the runner
-      # image, and goes first on PATH for every later step; the tests' own
-      # bash stays /bin/bash. The step runs here on macOS's own awk, sed and
-      # sort.
-      - id: image
-        name: The runner image's version, for the cache key
-        shell: bash
-        run: |
-          if [ -z "${ImageOS:-}" ] || [ -z "${ImageVersion:-}" ]; then
-            echo "::error title=Runner image::ImageOS or ImageVersion is not set, so the cache key cannot name the image"
-            exit 1
-          fi
-          echo "version=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
-          echo "runner image: $ImageOS-$ImageVersion"
-      - id: bash-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/bash-ref
-          key: bash-5.2.21-c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8-${{ steps.image.outputs.version }}
+      # reference bash, on every run and never from a GitHub Actions cache
+      # (as rust_test's tools: about 51 s, run 44987520746), and goes first
+      # on PATH for every later step; the tests' own bash stays /bin/bash.
+      # The step runs here on macOS's own awk, sed and sort.
       - name: Build bash 5.2.21
-        if: steps.bash-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           bash .github/sami/fetch-verified.sh "bash 5.2.21" "$RUNNER_TEMP/bash-5.2.21.tar.gz" \
@@ -605,12 +541,6 @@ jobs:
             ;;
           esac
           echo "$HOME/bash-ref/bin" >>"$GITHUB_PATH"
-      - name: Save bash 5.2.21
-        if: steps.bash-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/bash-ref
-          key: ${{ steps.bash-cache.outputs.cache-primary-key }}
       - name: The gate's own regression tests
         shell: bash
         run: bash .github/sami/tests/run.sh
