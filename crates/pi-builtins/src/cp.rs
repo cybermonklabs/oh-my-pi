@@ -4057,6 +4057,162 @@ mod tests {
 		assert_eq!(fs::read(dir.path().join("b~")).unwrap(), b"old", "b~ keeps the data");
 	}
 
+	/// A backup that leaves the destination's name in place, as GNU 9.4 and
+	/// 9.7 answer it as uid 1000 and as root: a copy backup (pi backs up by
+	/// copy where the source leads to the destination's own file) keeps the
+	/// file there to be replaced, so `cp -P -f -b l a`, `l` a link to `a`,
+	/// makes `a` the link and `a~` the data, with `-R` and with
+	/// `--remove-destination` too, and without `-f` (`-P -b`, `-R -b`). A
+	/// backup renamed onto another link of the same file does nothing on
+	/// Linux, and GNU still takes the name as new: the link replaces it only
+	/// under `-f`, and without `-f` the copy fails with "File exists" and keeps
+	/// both names. Where the kernel's rename removes the name instead (gVisor
+	/// on its overlay root), GNU makes the link in every case, so the rows
+	/// expect what the kernel's rename does, probed first.
+	#[test]
+	#[cfg(unix)]
+	fn a_backup_that_leaves_the_name_is_replaced_as_gnu_does() {
+		let shown = |dir: &std::path::Path| {
+			let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+			names.sort();
+			names
+				.iter()
+				.map(|name| {
+					let path = dir.join(name);
+					let name = name.to_string_lossy();
+					match fs::read_link(&path) {
+						Ok(target) => format!("{name}=link:{}", target.display()),
+						Err(_) => {
+							use std::os::unix::fs::MetadataExt as _;
+							let links = fs::metadata(&path).unwrap().nlink();
+							format!("{name}={}#{links}", fs::read_to_string(&path).unwrap())
+						},
+					}
+				})
+				.collect::<Vec<_>>()
+				.join(" ")
+		};
+		// Whether a rename onto another link of the same file removes the old
+		// name here (it does nothing on Linux; gVisor's overlay removes it).
+		let probe = tempdir().unwrap();
+		fs::write(probe.path().join("x"), b"x").unwrap();
+		fs::hard_link(probe.path().join("x"), probe.path().join("y")).unwrap();
+		fs::rename(probe.path().join("x"), probe.path().join("y")).unwrap();
+		let rename_removes = !probe.path().join("x").exists();
+		// (arguments, setup with `dest~` another link of `dest`, exit, stderr, entries after)
+		let rows: [(&[&str], bool, i32, &str, &str); 10] = [
+			(&["-P", "-f", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-P", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-R", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-R", "-f", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-P", "--remove-destination", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-P", "-f", "--remove-destination", "-b", "l", "a"], false, 0, "", "a=link:a a~=A#1 l=link:a"),
+			(&["-P", "-fb", "l", "dest"], true, 0, "", "a=A#1 dest=link:a dest~=old#1 l=link:a"),
+			(&["-R", "-fb", "l", "dest"], true, 0, "", "a=A#1 dest=link:a dest~=old#1 l=link:a"),
+			(
+				&["-P", "-b", "l", "dest"],
+				true,
+				1,
+				"cp: cannot create symbolic link 'dest': File exists\n",
+				"a=A#1 dest=old#2 dest~=old#2 l=link:a",
+			),
+			(
+				&["-P", "--remove-destination", "-b", "l", "dest"],
+				true,
+				1,
+				"cp: cannot create symbolic link 'dest': File exists\n",
+				"a=A#1 dest=old#2 dest~=old#2 l=link:a",
+			),
+		];
+		for (args, linked_backup, code, err, after) in rows {
+			let (code, err, after) = if linked_backup && rename_removes {
+				(0, "", "a=A#1 dest=link:a dest~=old#1 l=link:a")
+			} else {
+				(code, err, after)
+			};
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), b"A").unwrap();
+			std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+			if linked_backup {
+				fs::write(dir.path().join("dest"), b"old").unwrap();
+				fs::hard_link(dir.path().join("dest"), dir.path().join("dest~")).unwrap();
+			}
+			let (got, capture) = run_util::<Cp>(args, "", dir.path());
+			let case = args.join(" ");
+			assert_eq!((got, capture.err()), (code, err.to_owned()), "cp {case}");
+			assert_eq!(shown(dir.path()), after, "cp {case}");
+		}
+	}
+
+	/// A name that appears at the destination while cp copies is kept, as GNU
+	/// 9.4 and 9.7 keep it as uid 1000 and as root. With `-f -b p b`, `p` a
+	/// FIFO and `b` holding `old`, cp renames `b` to `b~` and then waits for
+	/// the FIFO's writer; a file or a link to nothing is made at `b` meanwhile.
+	/// The exclusive create fails on it: "File exists", or "not writing
+	/// through dangling symlink" for the link, `-f` or not (its
+	/// remove-and-retry is only for a destination cp found), and the backup
+	/// is put back over it. Under POSIXLY_CORRECT cp writes through the link.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_name_that_appears_during_the_copy_is_kept() {
+		// (what appears, POSIXLY_CORRECT, exit, stderr, the entries after)
+		let rows = [
+			("file", false, 1, "cp: cannot create regular file 'b': File exists\n", "b=old"),
+			("link", false, 1, "cp: not writing through dangling symlink 'b'\n", "b=old"),
+			("link", true, 0, "", "b=link:none b~=old none=F"),
+		];
+		for (kind, posix, code, err, after) in rows {
+			let dir = tempdir().unwrap();
+			let fifo = dir.path().join("p");
+			let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+			// SAFETY: `name` is NUL-terminated and outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+			fs::write(dir.path().join("b"), b"old").unwrap();
+			let cwd = dir.path().to_owned();
+			let copy = std::thread::spawn(move || {
+				use crate::host::{Host, Utility as _};
+				let (mut host, capture) = Host::for_test(Cp::NAME, "", &cwd);
+				if posix {
+					host.set_test_var("POSIXLY_CORRECT", "1");
+				}
+				let parsed = <Cp as clap::Parser>::try_parse_from(["cp", "-f", "-b", "p", "b"]).unwrap();
+				let code = parsed.run(&mut host);
+				(code, capture.err())
+			});
+			// cp backs `b` up before it opens the FIFO, whose open waits for a
+			// writer; none is opened until the name is made.
+			while !dir.path().join("b~").exists() {
+				assert!(!copy.is_finished(), "cp ended before it backed b up");
+				std::thread::yield_now();
+			}
+			let case = format!("a {kind} appears{}", if posix { ", POSIXLY_CORRECT" } else { "" });
+			match kind {
+				"file" => fs::write(dir.path().join("b"), b"new").unwrap(),
+				_ => std::os::unix::fs::symlink("none", dir.path().join("b")).unwrap(),
+			}
+			// cp may fail at `b` and close the FIFO before the write lands.
+			let _ = fs::write(&fifo, b"F");
+			let (got, got_err) = copy.join().unwrap();
+			assert_eq!((got, got_err.as_str()), (code, err), "{case}");
+			let mut names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+			names.sort();
+			let found = names
+				.iter()
+				.filter(|name| name.to_str() != Some("p"))
+				.map(|name| {
+					let path = dir.path().join(name);
+					let name = name.to_string_lossy();
+					match fs::read_link(&path) {
+						Ok(target) => format!("{name}=link:{}", target.display()),
+						Err(_) => format!("{name}={}", fs::read_to_string(&path).unwrap()),
+					}
+				})
+				.collect::<Vec<_>>()
+				.join(" ");
+			assert_eq!(found, after, "{case}");
+		}
+	}
+
 	#[test]
 	fn recursive_copy_creates_missing_target_then_nests_into_existing_one() {
 		let fixture = tempdir().unwrap();
