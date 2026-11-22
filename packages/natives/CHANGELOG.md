@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the embedded shell losing a command's last output on a loaded machine (`status 0`, no output): once a command ended, the run cancelled its output reader after 250 ms of quiet and dropped what the pipe still held. A cancelled reader now reads what the pipe holds before it stops (on Windows, once it has ended its read in flight), and the run waits for it
+- Fixed `execute_shell_streams` holding a runtime thread while a bounded sink was full: its readers now wait for the consumer as the text readers do
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

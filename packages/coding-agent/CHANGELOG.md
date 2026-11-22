@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bash tool: on a loaded machine, a command's last output could be lost (`status 0`, no output): once the command ended, the shell waited 250 ms for its output reader and then dropped what the reader had not yet read. Output the command wrote before it ended is now always kept; only a background job's later output is still cut, once the pipe is quiet or 2 s after the command ended
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
