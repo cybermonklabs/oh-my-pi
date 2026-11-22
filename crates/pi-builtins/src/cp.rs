@@ -2037,6 +2037,28 @@ fn handle_existing_dest(
 	Ok(backup)
 }
 
+/// Puts the backup `handle_existing_dest` made (`backup`, a filesystem path)
+/// back under the destination's name after cp failed to create the
+/// destination, as GNU's `un_backup` does (`copy.c`): `b` keeps its name and
+/// its data, and a file the failed copy left at `b` is replaced.
+fn un_backup(host: &mut Host, options: &Options, dest: &Path, backup: &Path) {
+	let dest_fs = host.resolve(dest);
+	let renamed = host.fs().rename(backup, &dest_fs);
+	match renamed {
+		Ok(_) => {
+			if options.verbose {
+				let _ = writeln!(
+					host.stdout,
+					"{} -> {} (unbackup)",
+					backup_display(dest, backup).quote(),
+					dest.quote()
+				);
+			}
+		},
+		Err(error) => show_error(host, CpError::IoErrContext(error, format!("cannot un-backup {}", dest.quote()))),
+	}
+}
+
 /// Deletes `dest` when it has to go before the copy can proceed and the
 /// options allow it.
 fn delete_dest_if_needed_and_allowed(
@@ -2498,14 +2520,16 @@ fn copy_file(
 		// A matching identity in the source tree becomes a hard link between
 		// the corresponding names in the destination tree.
 		let new_source = new_source.clone();
-		filesystem
-			.hard_link(host.resolve(&new_source), &dest_fs)
-			.map_err(|e| {
-				CpError::IoErrContext(
-					e,
-					format!("cannot create hard link {} to {}", dest.quote(), new_source.quote()),
-				)
-			})?;
+		let linked = filesystem.hard_link(host.resolve(&new_source), &dest_fs);
+		if let Err(e) = linked {
+			if let Some(backup) = &backup {
+				un_backup(host, options, dest, backup);
+			}
+			return Err(CpError::IoErrContext(
+				e,
+				format!("cannot create hard link {} to {}", dest.quote(), new_source.quote()),
+			));
+		}
 
 		if report {
 			print_verbose_output(host, state, options, source, dest, backup.as_deref());
@@ -2539,7 +2563,7 @@ fn copy_file(
 		print_verbose_output(host, state, options, source, dest, backup.as_deref());
 	}
 
-	let fate = handle_copy_mode(
+	let fate = match handle_copy_mode(
 		host,
 		state,
 		source,
@@ -2549,7 +2573,15 @@ fn copy_file(
 		dest_metadata.as_ref(),
 		source_in_command_line,
 		backup.is_some(),
-	)?;
+	) {
+		Ok(fate) => fate,
+		Err(error) => {
+			if let Some(backup) = &backup {
+				un_backup(host, options, dest, backup);
+			}
+			return Err(error);
+		},
+	};
 
 	// A file this copy created has a known mode and maybe owner.
 	let (mut created_mode, owner) = match fate {
