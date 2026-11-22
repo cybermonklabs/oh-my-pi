@@ -13,7 +13,11 @@ import {
 } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
-import type { RecallChangesReport } from "../memory-backend/recall-entry";
+import {
+	type ConversationRecall,
+	type RecallChangesReport,
+	recallsIntoConversation,
+} from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendId, MemoryBackendStartOptions } from "../memory-backend/types";
 import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
@@ -45,12 +49,12 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 
 /**
  * What a transcript leaves in the session's memory state ({@link SessionMemory.conversationTracking}): the base prompt
- * captured before a per-turn memory promotion, the recall the conversation carries as hidden messages, and each memory
- * backend's tracking of the transcript.
+ * captured before a per-turn memory promotion, the recall the conversation carries, and each memory backend's tracking
+ * of the transcript.
  */
 export interface ConversationTracking {
 	readonly promotionSnapshot: string[] | undefined;
-	readonly hiddenRecall: string | undefined;
+	readonly recall: ConversationRecall | undefined;
 	readonly recallChanges: readonly RecallChangesReport[];
 	readonly hindsight: HindsightConversationTracking | undefined;
 	readonly mnemopi: MnemopiConversationTracking | undefined;
@@ -92,10 +96,11 @@ export class SessionMemory {
 	#localMemoryStartupAbort: AbortController | undefined;
 	#baseSystemPromptBeforeMemoryPromotion: string[] | undefined;
 	/**
-	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
-	 * instead of a system block (`MEMORY_RECALL_MESSAGE_TYPE`); each request sends it where its context lacks it.
+	 * The recall the memory backend adopted that the conversation carries itself, as a hidden `memory-recall` message
+	 * (`MEMORY_RECALL_MESSAGE_TYPE`), which each request sends where its context lacks it, or as the system prompt's own
+	 * last block, which each prompt build appends.
 	 */
-	#hiddenRecall: string | undefined;
+	#recall: ConversationRecall | undefined;
 	/**
 	 * The reports of what changed in a reused recall's memories that the conversation carries as hidden
 	 * `memory-recall-changes` messages, oldest first; each request sends one again where its context lacks it.
@@ -128,8 +133,8 @@ export class SessionMemory {
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
 			createMemoryTools?: () => Promise<AgentTool[]>;
-			/** Reads the recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
-			hiddenRecall?: () => string | undefined;
+			/** Reads the recall the loaded transcript's branch leaves the conversation carrying (`findConversationRecall`). */
+			recall?: () => ConversationRecall | undefined;
 			/** Reads the reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
 			recallChanges?: () => readonly RecallChangesReport[];
 		},
@@ -142,8 +147,8 @@ export class SessionMemory {
 		// transcript's recall is history the session does not send again, and its branch is not read for it.
 		const backend = cfgMemoryBackend.get(host.settings);
 		this.#runningBackend = backend;
-		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
-			this.adoptRecall(options.hiddenRecall?.(), options.recallChanges?.() ?? []);
+		if (options.memoryEnabled !== false && recallsIntoConversation(backend)) {
+			this.adoptRecall(options.recall?.(), options.recallChanges?.() ?? []);
 		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
@@ -243,16 +248,22 @@ export class SessionMemory {
 
 	/** The recall the conversation carries as a hidden message; undefined when its recall, if any, is a system block. */
 	get hiddenRecall(): string | undefined {
-		return this.#hiddenRecall;
+		return this.#recall?.hidden ? this.#recall.text : undefined;
+	}
+
+	/** The recall the conversation carries, as a hidden message or as the system prompt's own last block. */
+	get recall(): ConversationRecall | undefined {
+		return this.#recall;
 	}
 
 	/**
-	 * Records what the recall the backend just adopted leaves the conversation carrying: `hidden` rides the messages
-	 * (undefined when it does not), with the reports of what changed in a reused recall's memories (none for a fresh
-	 * one). `adoptRecall(undefined, [])` withdraws the conversation's recall, which no later request sends.
+	 * Records what the recall the backend just adopted leaves the conversation carrying: `recall`, as a hidden message
+	 * or as the system prompt's own last block (undefined when it carries none), with the reports of what changed in a
+	 * reused recall's memories (none for a fresh one). `adoptRecall(undefined, [])` withdraws the conversation's recall,
+	 * which no later request or prompt build sends.
 	 */
-	adoptRecall(hidden: string | undefined, changes: readonly RecallChangesReport[]): void {
-		this.#hiddenRecall = hidden;
+	adoptRecall(recall: ConversationRecall | undefined, changes: readonly RecallChangesReport[]): void {
+		this.#recall = recall;
 		this.#recallChanges = changes;
 	}
 
@@ -321,7 +332,7 @@ export class SessionMemory {
 		const mnemopi = this.#host.getMnemopiSessionState();
 		return {
 			promotionSnapshot: this.#baseSystemPromptBeforeMemoryPromotion,
-			hiddenRecall: this.#hiddenRecall,
+			recall: this.#recall,
 			recallChanges: this.#recallChanges,
 			hindsight: hindsight && !hindsight.aliasOf ? hindsight.conversationTracking() : undefined,
 			mnemopi: mnemopi && !mnemopi.aliasOf ? mnemopi.conversationTracking() : undefined,
@@ -331,7 +342,7 @@ export class SessionMemory {
 	/** Puts back the state {@link conversationTracking} took, while rolling back a failed session switch. */
 	restoreConversationTracking(tracking: ConversationTracking): void {
 		this.#baseSystemPromptBeforeMemoryPromotion = tracking.promotionSnapshot;
-		this.adoptRecall(tracking.hiddenRecall, tracking.recallChanges);
+		this.adoptRecall(tracking.recall, tracking.recallChanges);
 		if (tracking.hindsight) this.#host.getHindsightSessionState()?.restoreConversationTracking(tracking.hindsight);
 		if (tracking.mnemopi) this.#host.getMnemopiSessionState()?.restoreConversationTracking(tracking.mnemopi);
 	}

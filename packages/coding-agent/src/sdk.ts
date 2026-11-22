@@ -169,7 +169,13 @@ import { mapPromptArguments } from "./mcp/prompt-args";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
-import { findDeliveredRecall, withoutDeliveredRecall } from "./memory-backend/recall-entry";
+import {
+	appendRecallBlock,
+	findConversationRecall,
+	recallsIntoConversation,
+	withoutDeliveredRecall,
+} from "./memory-backend/recall-entry";
+import { cfgMemoryBackend } from "./memory-backend/settings";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
@@ -4605,21 +4611,35 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				agent.pruneToolDescriptions = resolveInlineToolDescriptors(source);
 				agent.intentTracing = cfgToolsIntentTracing.get(source);
 			}
+			// The recall the conversation carries itself (`AgentSession.memoryRecall`): the session's, or, for the
+			// startup build made before the session exists, the one the loaded branch leaves it carrying, which the
+			// session adopts under Hindsight or Mnemopi (`SessionMemory`). One it carries as the system prompt's own last
+			// block goes out after the prompt as that block, as the conversation's first request sent it, so every build
+			// lays the prompt out as that request did.
+			const memoryRecall = hasSession
+				? session.memoryRecall
+				: !restrictToolNames && recallsIntoConversation(cfgMemoryBackend.get(settings))
+					? findConversationRecall(sessionManager.getBranchView())
+					: undefined;
+			const recallBlock = memoryRecall && !memoryRecall.hidden ? memoryRecall.text : undefined;
+			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
+			// revived task its stored one) carries it as the conversation sent it.
+			const withRecallBlock = (blocks: string[]): string[] =>
+				recallBlock === undefined ? blocks : appendRecallBlock(blocks, recallBlock);
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.
 			if (options.systemPrompt !== undefined && typeof options.systemPrompt !== "function") {
 				return {
-					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
+					systemPrompt: withRecallBlock(
+						typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
+					),
 				};
 			}
-			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message, on every
-			// branch: a request whose context lacks that message sends it again (`AgentSession.hiddenMemoryRecall`).
+			// Advisors keep the recall; the prompt leaves out the one the conversation carries itself, on every branch:
+			// a request whose context lacks a hidden one sends it again, and a block one follows the prompt.
 			let memoryInstructions = backendInstructions;
-			const hiddenRecall = hasSession
-				? session.hiddenMemoryRecall
-				: findDeliveredRecall(sessionManager.getBranchView());
-			if (memoryBackend && hiddenRecall !== undefined) {
+			if (memoryBackend && memoryRecall !== undefined) {
 				const instructions = await memoryBackend.buildDeveloperInstructions(
 					agentDir,
 					sessionManager.getCwd(),
@@ -4627,7 +4647,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					session,
 					{ recallDelivered: true },
 				);
-				memoryInstructions = withoutDeliveredRecall(instructions, hiddenRecall);
+				memoryInstructions = withoutDeliveredRecall(instructions, memoryRecall.text);
 			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance
@@ -4773,11 +4793,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 
 			if (typeof options.systemPrompt !== "function") {
-				return defaultPrompt;
+				return recallBlock === undefined
+					? defaultPrompt
+					: { ...defaultPrompt, systemPrompt: withRecallBlock(defaultPrompt.systemPrompt) };
 			}
 			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt);
+			const blocks = typeof customPrompt === "string" ? [customPrompt] : customPrompt;
+			// A prompt that keeps the default prompt's first block (a subagent's wraps the default prompt) lists the
+			// `xd://` devices that block's catalog renders, as the default prompt does; one that drops it lists none.
+			const catalogBlock = defaultPrompt.systemPrompt[0];
+			const keepsCatalog = catalogBlock !== undefined && blocks.some(block => block.includes(catalogBlock));
 			return {
-				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
+				systemPrompt: withRecallBlock(blocks),
+				xdevCatalogNames: keepsCatalog ? defaultPrompt.xdevCatalogNames : undefined,
 			};
 		};
 		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of

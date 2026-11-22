@@ -60,6 +60,7 @@ import {
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
 	resolveOpenAIEffortControlState,
+	sendsConfigurationUpdates,
 } from "./openai-configuration-update";
 import {
 	applyOpenAIReasoningEffortFallback,
@@ -1999,7 +2000,7 @@ function applyResponsesStableEffort(
 	options: OpenAIResponsesOptions | undefined,
 	providerSessionState: OpenAIResponsesProviderSessionState | undefined,
 ): void {
-	if (!model.compat.supportsConfigurationUpdate || model.reasoningMode === "pro" || !providerSessionState) return;
+	if (!sendsConfigurationUpdates(model) || !providerSessionState) return;
 	const reasoning = params.reasoning;
 	if (!reasoning || !("effort" in reasoning)) return;
 	const effort = reasoning.effort;
@@ -2055,7 +2056,11 @@ function responsesToolNaming(
 	return { prefix, maxLength: typeof maxLength === "number" ? maxLength : undefined };
 }
 
-/** @internal Exported for tests. */
+/**
+ * The `tool_choice` a Responses request to `model` sends for `choice` with `tools` offered, as the provider maps it:
+ * undefined where the host takes no `tool_choice` or the chosen tool is not offered, and `auto` for a forced choice the
+ * host takes none of.
+ */
 export function mapOpenAIResponsesToolChoiceForTools(
 	choice: ToolChoice | undefined,
 	tools: Tool[],

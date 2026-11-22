@@ -212,6 +212,31 @@ export function mockGatewayFetch(reply: (turn: number) => Response): GatewayFetc
 }
 
 /**
+ * Spies on `fetch` as the gateway and a Hindsight server: each `/v1/messages` request is recorded and answered with
+ * {@link answer} of its 1-based number and 100 cache-write tokens; the server answers a recall with `results`, a bank
+ * lookup with the bank's id, and any other request with `{}`. With `origin`, the server's, a request to any other URL
+ * throws.
+ */
+export function mockHindsightGatewayFetch(results: unknown[], { origin }: { origin?: string } = {}): GatewayFetch {
+	const requests: MessagesRequest[] = [];
+	const spy = vi.spyOn(globalThis, "fetch").mockImplementation(
+		asGlobalFetch(async (input, init) => {
+			const url = new URL(String(input));
+			if (url.href === `${GATEWAY}/v1/messages`) {
+				requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
+				return answer(requests.length, { cacheWriteTokens: 100 });
+			}
+			if (origin !== undefined && url.origin !== origin) throw new Error(`Unexpected request to ${url.href}`);
+			if (url.pathname.endsWith("/memories/recall")) return Response.json({ results });
+			const bank = /^\/v1\/default\/banks\/([^/]+)$/.exec(url.pathname);
+			if (bank) return Response.json({ bank_id: decodeURIComponent(bank[1]) });
+			return Response.json({});
+		}),
+	);
+	return { requests, restore: () => spy.mockRestore() };
+}
+
+/**
  * The `createAgentSession` options every gateway test passes: `tempDir` as its working and agent directory, and no
  * extension discovery, prompt templates, slash commands, MCP, LSP or Python preflight. A process the test spawns passes
  * the test's directory as `{ path }`.

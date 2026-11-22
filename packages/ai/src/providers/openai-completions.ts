@@ -56,7 +56,11 @@ import {
 	StreamMarkupHealing,
 	type StreamMarkupHealingEvent,
 } from "../utils/stream-markup-healing";
-import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
+import {
+	isForcedToolChoice,
+	mapToOpenAICompletionsToolChoice,
+	type OpenAICompletionsToolChoice,
+} from "../utils/tool-choice";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -1923,7 +1927,7 @@ function createRequestSetup(
 
 function resolveOpenAICompatForRequest(
 	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
 	hasTools: boolean,
 ): OpenAICompatPolicy {
 	return resolveOpenAICompatPolicy(model, {
@@ -2031,6 +2035,44 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
 }
 
+/** The `tool_choice` a request with `toolChoice` asks of a host under `compat`: none where the host takes none. */
+function requestedToolChoice(
+	compat: Pick<ResolvedOpenAICompat, "supportsToolChoice">,
+	toolChoice: ToolChoice | undefined,
+): OpenAICompletionsToolChoice {
+	return compat.supportsToolChoice ? mapToOpenAICompletionsToolChoice(toolChoice) : undefined;
+}
+
+/**
+ * Whether a request with `toolChoice` sends a `tool_choice` other than the default `auto` under `compat`, the compat it
+ * resolves; {@link buildParams} decides the request's `tool_choice` by it: a host that takes no `tool_choice` gets
+ * none, and a forced choice (`any`, `required`, a named tool) goes out as `auto` where the host takes no forced one; a
+ * named choice a host takes only as a string goes out as `required`, still forced.
+ */
+function sendsNonDefaultToolChoice(
+	compat: Pick<ResolvedOpenAICompat, "supportsToolChoice" | "supportsForcedToolChoice">,
+	toolChoice: ToolChoice | undefined,
+): boolean {
+	const requested = requestedToolChoice(compat, toolChoice);
+	if (requested === undefined || requested === "auto") return false;
+	return !isForcedToolChoice(requested) || compat.supportsForcedToolChoice;
+}
+
+/**
+ * Whether a chat-completions request to `model` with `options`, offering tools when `hasTools`, sends a `tool_choice`
+ * other than the default `auto`, by the rule {@link buildParams} applies under the compat it resolves for the request:
+ * the `whenThinking` view on a request with thinking on. `options` are the ones the provider gets, its reasoning as
+ * `openAICompletionsReasoningOptions` (`stream.ts`) maps a request's.
+ */
+export function openAICompletionsSendsNonDefaultToolChoice(
+	model: Model<"openai-completions">,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
+	hasTools: boolean,
+): boolean {
+	const { compat } = resolveOpenAICompatForRequest(model, options, hasTools);
+	return sendsNonDefaultToolChoice(compat as ResolvedOpenAICompat, options?.toolChoice);
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -2109,9 +2151,8 @@ function buildParams(
 		params.tools = [];
 	}
 
-	if (options?.toolChoice && initialCompat.supportsToolChoice) {
-		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
-	}
+	const requestedChoice = requestedToolChoice(initialCompat, options?.toolChoice);
+	if (requestedChoice !== undefined) params.tool_choice = requestedChoice;
 	const forcedToolName =
 		typeof params.tool_choice === "object" && params.tool_choice !== null && "function" in params.tool_choice
 			? params.tool_choice.function.name
@@ -2148,7 +2189,11 @@ function buildParams(
 		// Preserve the hard tool-use contract while letting K3 choose among tools.
 		params.tool_choice = "required";
 	}
-	if (isForcedToolChoice(params.tool_choice) && !initialCompat.supportsForcedToolChoice) {
+	if (
+		params.tool_choice !== undefined &&
+		params.tool_choice !== "auto" &&
+		!sendsNonDefaultToolChoice(initialCompat, options?.toolChoice)
+	) {
 		// Some thinking-required OpenAI-compatible models reject forced
 		// `tool_choice` while still accepting tools with the default auto
 		// selector. Keep the tool available and let the model choose it.

@@ -618,8 +618,8 @@ interface SnapcompactRefusals {
 /**
  * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal on the branch current then, after
  * the leaf the archive was weighed on, and into a copy of the branch up to that leaf
- * (`SessionMaintenance.followBranchCopy`): a process that resumes the session finds the figures among the entries of
- * every branch and weighs them on any branch that carries that leaf before it starts another pass.
+ * (`SessionMaintenance.followTranscriptCopy`): a process that resumes the session finds the figures among the entries
+ * of every branch and weighs them on any branch that carries that leaf before it starts another pass.
  */
 const SNAPCOMPACT_REFUSAL_ENTRY_TYPE = "snapcompact-refusal";
 
@@ -654,10 +654,10 @@ interface CompactionWait {
  * Custom session entry holding a {@link CompactionWait}, written when the cut rule answers "waits" for an automatic
  * model-summary compaction and the session's newest record does not hold that wait already, on the branch current
  * then (`SessionMaintenance.#writeCompactionWait`): once for each cache entry the rule waits on, again only once a
- * request touched the entry after the recorded figures would have lapsed, and into a copy of the branch up to its
- * newest message (`SessionMaintenance.followBranchCopy`). A process that reads the session's entries in whole (from
- * its file, or a copy of it) holds the wait of the newest record while it still applies, as the process that wrote it
- * did.
+ * request touched the entry after the recorded figures would have lapsed, and into a copy of the session that lacks it
+ * (`SessionMaintenance.followTranscriptCopy`; `/fork` at the branch's newest message carries it with the records after
+ * that message). A process that reads the session's entries in whole (from its file, or a copy of it) holds the wait of
+ * the newest record while it still applies, as the process that wrote it did.
  */
 const COMPACTION_WAIT_ENTRY_TYPE = "compaction-wait";
 
@@ -1143,13 +1143,14 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Writes into a copy of the session's branch up to one of its entries, just made (`/fork <entry>`, `/branch`), the
-	 * wait on a model-summary compaction and the snapcompact refusal this process holds where they apply there and the
-	 * copy holds no record of them. Their records sit after the branch's newest message when they were written, so a
-	 * copy up to that message leaves them out; with them, a process that resumes the copy holds them as this process
-	 * does.
+	 * Writes into a copy of the session, just made (`/fork`, `/fork <entry>`, `/branch`, a `/btw` branch, a move off a
+	 * contested file), the wait on a model-summary compaction and the snapcompact refusal this process holds where they
+	 * apply there and the copy holds no record of them. Their records sit after the branch's newest message when they
+	 * were written: `/fork` at that message, while it is the branch's newest, copies them with it, but a copy that
+	 * leaves them out (later entries branch off that message, a `/btw` branch after `/tree` to it) gets them here; with
+	 * them, a process that resumes the copy holds them as this process does.
 	 */
-	followBranchCopy(): void {
+	followTranscriptCopy(): void {
 		const records = this.#sessionCompactionWaits();
 		// The copy carries the wait this process held while it applies there, as a maintenance point takes it in.
 		if (records.copied && !records.taken && this.#compactionWait) {
@@ -5974,7 +5975,7 @@ export class SessionMaintenance {
 	 * process may have refused a pass on a branch that carries this one's leaf since). A copy of the session this
 	 * process made (another session id at the same revision: a `/fork`, a branch into a new file, a move off a contested
 	 * file) holds this process's history, so it keeps the refusal the process remembers, which a branch copied up to
-	 * the refused leaf holds no record of until {@link followBranchCopy} writes one there.
+	 * the refused leaf holds no record of until {@link followTranscriptCopy} writes one there.
 	 */
 	#sessionSnapcompactRefusals(): SnapcompactRefusals {
 		const sessionManager = this.#host.sessionManager;

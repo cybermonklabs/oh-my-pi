@@ -89,6 +89,7 @@ import type {
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
+import { sendsConfigurationUpdates } from "@oh-my-pi/pi-ai/providers/openai-configuration-update";
 import { onProviderFallback } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -192,7 +193,8 @@ import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import {
-	findDeliveredRecall,
+	type ConversationRecall,
+	findConversationRecall,
 	findDeliveredRecallChanges,
 	MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
 	MEMORY_RECALL_MESSAGE_TYPE,
@@ -548,6 +550,7 @@ import {
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ProviderFallbackRecord } from "./provider-fallback-record";
+import { carryImageDrops, type RecordedImageDrop, recordedImageDrops } from "./provider-image-budget";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
@@ -677,6 +680,19 @@ export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
 /** Marks work running inside the deferred extension load so it never waits on itself. */
 const deferredExtensionLoadScope = new AsyncLocalStorage<true>();
+/**
+ * Entries an entry fork at a branch's newest message carries when they follow it ({@link AgentSession.fork}): records
+ * outside the model context that change no model, mode or thinking state, which the session writes after a reply
+ * (warm refreshes and other usage, the cut rule's wait and refusal, hold and image-drop records, titles, labels,
+ * credential pins).
+ */
+const FORK_TRAILING_RECORD_TYPES: Partial<Record<SessionEntry["type"], true>> = {
+	custom: true,
+	model_usage: true,
+	label: true,
+	title_change: true,
+	credential_pin: true,
+};
 /**
  * One session transition in its session's tree of transitions. Transitions it starts itself queue
  * on its `childTail`; it hands its parent's queue on once it and every one in `nested` settled.
@@ -834,19 +850,15 @@ interface PromptCacheShape {
 
 /**
  * `level` as the cached prefix tells thinking levels apart on `model`: where the model takes the level per message
- * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, outside Responses'
- * `pro` reasoning mode), a change between two levels other than off goes out after the newest content and keeps the
- * request-level effort, so those levels share one key; off changes the request's thinking and keeps its own.
+ * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, which only the
+ * Responses and Codex providers send, {@link sendsConfigurationUpdates}), a change between two levels other than off
+ * goes out after the newest content and keeps the request-level effort, so those levels share one key; off changes
+ * the request's thinking and keeps its own. Every other API (Azure Responses among them) sends the level as the
+ * request's own effort, ahead of every cached message.
  */
 function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
-	const { compat } = model;
-	const configurationUpdate =
-		compat !== undefined &&
-		"supportsConfigurationUpdate" in compat &&
-		compat.supportsConfigurationUpdate === true &&
-		!(model.api === "openai-responses" && model.reasoningMode === "pro");
-	return configurationUpdate || takesPerMessageEffort(model) ? "effort" : level;
+	return sendsConfigurationUpdates(model) || takesPerMessageEffort(model) ? "effort" : level;
 }
 
 /** The newest main-loop request: its transcript, model, active tools, shape and messages. */
@@ -3082,7 +3094,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
-			hiddenRecall: () => findDeliveredRecall(this.sessionManager.getBranchView()),
+			recall: () => findConversationRecall(this.sessionManager.getBranchView()),
 			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
@@ -3299,7 +3311,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
-			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
+			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -3717,11 +3729,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
 		// A move off a file another process writes copies the transcript into a sibling under a new id, which the
-		// conversation goes on in: so do the records of a change its prompt withholds.
+		// conversation goes on in, as on every other copy.
 		this.addDisposer(
 			this.sessionManager.onPersistenceNotice(() => {
 				const from = this.sessionManager.getHeader()?.continuationOf;
-				if (from) this.#tools.followTranscriptCopy(from);
+				if (from) this.#followSessionCopy(from);
 			}),
 		);
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
@@ -6884,7 +6896,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// A copy: `/clear` truncates the live array in place, which an alias would follow.
 			messages: this.messages.slice(),
 		};
-		if (!sendsNonDefaultToolChoice(model, options.toolChoice)) this.#lastRequestArm = arm;
+		if (!sendsNonDefaultToolChoice({ model, context, options })) this.#lastRequestArm = arm;
 		const warmer = this.#cacheWarmer;
 		if (!warmer) return;
 		// The warmer keeps its confirmed entry across requests until a response
@@ -8642,15 +8654,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
-	 * instead of a system block; a prompt rebuild leaves it out of the memory instructions.
+	 * The recall the memory backend adopted that the conversation carries itself: as a hidden `memory-recall` message
+	 * (each request sends it where its context lacks it), or as the system prompt's own last block (each prompt build
+	 * appends it). A prompt build leaves it out of the memory instructions.
 	 */
-	get hiddenMemoryRecall(): string | undefined {
-		return this.#memory.hiddenRecall;
+	get memoryRecall(): ConversationRecall | undefined {
+		return this.#memory.recall;
 	}
 
 	/**
-	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
+	 * Withdraws the recall the conversation carries and the reports of what changed in a reused
 	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state), then
 	 * rebuilds the base prompt: no later request sends them again, and the rebuild asks the backend for its whole
 	 * memory instructions. A rebuild for the memory settings a rebuilt state took in is held on a bound prompt
@@ -8662,7 +8675,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * The hidden messages a model call must carry that its context lacks, decided from the call's own context:
-	 * - the conversation's hidden recall ({@link hiddenMemoryRecall}) where neither the system prompt nor a
+	 * - the conversation's hidden recall ({@link memoryRecall}) where neither the system prompt nor a
 	 *   `memory-recall` message holds it: a branch the delivered message is not on (`/tree` to before it), a
 	 *   compaction that summarized it (before the turn or between its tool calls) and an older recall the context
 	 *   holds in its place each leave it out;
@@ -13822,8 +13835,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The fork clones the transcript and keeps this recovery state running
 			// under a fresh id, so the work already produced is still this session's.
 			this.#recovery.reanchorServedAttribution(previousSessionId);
-			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
-			this.#tools.followTranscriptCopy(previousSessionId);
+			// The conversation goes on in the copy, which holds every record of the session.
+			this.#followSessionCopy(previousSessionId);
 
 			await copySessionArtifacts(
 				forkResult.oldSessionFile,
@@ -13860,6 +13873,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * results that answer the assistant tool-call batch it sits in, so a fork never ends on
 	 * tool calls whose results exist in the source session. Non-message entries between
 	 * results (labels, custom entries) are kept only when a later result follows them.
+	 * When the kept message is the newest of its branch, the cut goes on through the records
+	 * written after it ({@link FORK_TRAILING_RECORD_TYPES}: warm refreshes, the cut rule's
+	 * wait and refusal, hold records), each the only child of the one before up to the
+	 * branch's end, so the copy reads what the source holds after that message.
 	 */
 	#resolveForkLeaf(entryId: string): string {
 		const answered = new Set<string>();
@@ -13897,7 +13914,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (children.length !== 1 || children[0].type === "message") break;
 			cursor = children[0].id;
 		}
-		return leafId;
+		// The newest message of its branch: keep the records after it, which a process that reads the copy takes in.
+		let tail = leafId;
+		for (;;) {
+			const children = this.sessionManager.getChildren(tail);
+			if (children.length === 0) return tail;
+			if (children.length !== 1 || !FORK_TRAILING_RECORD_TYPES[children[0].type]) return leafId;
+			tail = children[0].id;
+		}
 	}
 
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
@@ -15907,6 +15931,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * The session's transcript was copied into another session file under a new id, which the conversation goes on in
+	 * (a whole-session fork, a fork or branch at an entry, a `/btw` branch, a move off a file another process writes):
+	 * every copy path follows it the same way. The records of a change the prompt withholds follow it
+	 * ({@link SessionTools.followTranscriptCopy}), so do the cut rule's wait and refusal
+	 * ({@link SessionMaintenance.followTranscriptCopy}), and, where `imageDrops` holds the image drops the session
+	 * recorded before a copy of part of it, those of the conversations the copy holds ({@link carryImageDrops}).
+	 */
+	#followSessionCopy(fromSessionId: string, imageDrops?: ReadonlyMap<string, RecordedImageDrop>): void {
+		this.#tools.followTranscriptCopy(fromSessionId);
+		this.#maintenance.followTranscriptCopy();
+		if (imageDrops && imageDrops.size > 0) {
+			const messages = this.#providerBoundary.buildDisplaySessionContext(this.model).messages;
+			carryImageDrops(this.sessionManager, imageDrops, convertToLlm(messages));
+		}
+	}
+
+	/**
 	 * Shared {@link branch}/{@link fork}(entryId) transition: moves the live session onto a
 	 * new session file holding the root-to-`leafId` path (an empty one when `leafId` is
 	 * null), emitting `session_before_branch`/`session_branch` with `reason` for `entryId`.
@@ -15963,6 +16004,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
+		// The image drops the session records before the copy, which may sit off the copied path.
+		let imageDrops: ReadonlyMap<string, RecordedImageDrop> | undefined;
 		try {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
@@ -15976,6 +16019,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					await this.sessionManager.newSession({ parentSession: previousSessionFile });
 					if (title) await this.sessionManager.setSessionName(title, titleSource);
 				} else {
+					imageDrops = recordedImageDrops(this.sessionManager.getEntries());
 					this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
 				}
 				this.#bash.markSessionTransition(bashTransition);
@@ -15992,12 +16036,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
-			// A copy of the path goes on with the conversation, and so do the records of a change its prompt withholds,
-			// and those of the cut rule's wait and refusal, which sat after the copied path's newest message.
-			if (leafId) {
-				this.#tools.followTranscriptCopy(previousSessionId);
-				this.#maintenance.followBranchCopy();
-			}
+			// A copy of the path goes on with the conversation, and so do the session's records that sat off it: those of
+			// a change its prompt withholds, the cut rule's wait and refusal, and the image drops of the conversations it
+			// holds.
+			if (leafId) this.#followSessionCopy(previousSessionId, imageDrops);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -16101,6 +16143,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
+		// The image drops the session records before the copy, which may sit off the copied path.
+		let imageDrops: ReadonlyMap<string, RecordedImageDrop> | undefined;
 		try {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
@@ -16111,6 +16155,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// A prompt may have been admitted during the flush/drain awaits
 				// after the idle check. It still belongs to the pre-branch context.
 				this.#promptGeneration++;
+				imageDrops = recordedImageDrops(this.sessionManager.getEntries());
 				this.sessionManager.createBranchedSession(leafId);
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
@@ -16134,8 +16179,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#modelMentions.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
-			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
-			this.#tools.followTranscriptCopy(sessionId);
+			// The conversation goes on in the copy, and so do the session's records that sat off the copied path, as on
+			// a fork at an entry.
+			this.#followSessionCopy(sessionId, imageDrops);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
