@@ -15,6 +15,8 @@ import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
 import { configCache, getServersForFile, type LspConfig, loadConfig } from "@oh-my-pi/pi-coding-agent/lsp/config";
 import { waitForDiagnostics } from "@oh-my-pi/pi-coding-agent/lsp/diagnostics";
+import * as lspEdits from "@oh-my-pi/pi-coding-agent/lsp/edits";
+import * as lspServers from "@oh-my-pi/pi-coding-agent/lsp/servers";
 import {
 	applyTextEditsToString,
 	applyWorkspaceEdit,
@@ -302,6 +304,64 @@ function installHandshakeLsp(): FakeLspServer {
 			server.exit(0);
 		}
 	});
+}
+
+/**
+ * LSP fake that answers every request (with `answer`'s result, null by default) except `silent`,
+ * which it never answers: it runs `onSilent` when that request arrives. It reports its project
+ * loaded right after `initialize`, so no call waits for the load.
+ */
+function installSilentLsp(
+	silent: string,
+	onSilent: () => void,
+	answer: (message: RpcMessage) => unknown = () => null,
+): FakeLspServer {
+	return installFakeLsp((message, server) => {
+		if (message.method === "exit") {
+			server.exit(0);
+		} else if (message.method === silent) {
+			onSilent();
+		} else if (message.method !== undefined && message.id !== undefined) {
+			const result =
+				message.method === "initialize"
+					? { capabilities: { hoverProvider: true, workspaceSymbolProvider: true } }
+					: answer(message);
+			server.send({ jsonrpc: "2.0", id: message.id, result });
+			if (message.method === "initialize") {
+				server.send({ jsonrpc: "2.0", method: "$/progress", params: { token: "load", value: { kind: "end" } } });
+			}
+		}
+	});
+}
+
+type Ending = "deadline" | "cancel";
+
+/**
+ * How a call made with `timeout: 5` ends, fired by the test: its deadline passes (the call's
+ * `AbortSignal.timeout(5_000)` is a signal the test aborts) or its caller cancels `signal`.
+ */
+function callEnding(ending: Ending): { signal: AbortSignal; end: () => void } {
+	const deadline = new AbortController();
+	const caller = new AbortController();
+	const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+	vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => (ms === 5_000 ? deadline.signal : realTimeout(ms)));
+	return {
+		signal: caller.signal,
+		end: () => {
+			if (ending === "deadline") deadline.abort(new DOMException("The operation timed out.", "TimeoutError"));
+			else caller.abort();
+		},
+	};
+}
+
+/**
+ * A deadline gives the timeout `message`; a cancel stays "Operation aborted". The outcome is
+ * compared as "<class>: <message>", so a failure shows what the call ended with.
+ */
+function expectCallEnded(outcome: unknown, ending: Ending, message: string): void {
+	const seen = outcome instanceof Error ? `${outcome.constructor.name}: ${outcome.message}` : JSON.stringify(outcome);
+	expect(seen).toBe(ending === "deadline" ? `ToolError: ${message}` : "ToolAbortError: Operation aborted");
+	expect(outcome).toBeInstanceOf(ending === "deadline" ? ToolError : ToolAbortError);
 }
 
 /** Read `textDocument.uri` out of a document notification the fake server received. */
@@ -4497,6 +4557,213 @@ describe("lsp regressions", () => {
 			expect(fs.existsSync(path.join(tempDir.path(), "new", "sub.moved", "s.ts"))).toBe(true);
 		} finally {
 			tempDir.removeSync();
+		}
+	});
+
+	describe("the call's deadline while a language server does not answer", () => {
+		const endings = ["deadline", "cancel"] as const;
+
+		/** Runs `run` in a fresh checkout whose only language server is the fake `fake-lsp`. */
+		async function inCheckout(run: (cwd: string, server: ServerConfig) => Promise<void>): Promise<void> {
+			const tempDir = TempDir.createSync("@omp-lsp-call-deadline-");
+			const server: ServerConfig = { command: "fake-lsp", fileTypes: [".ts"], rootMarkers: [] };
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+				servers: { "fake-lsp": server },
+				idleTimeoutMs: undefined,
+			});
+			try {
+				await run(tempDir.path(), server);
+			} finally {
+				await lspClient.shutdownAll();
+				vi.restoreAllMocks();
+				configCache.delete(tempDir.path());
+				tempDir.removeSync();
+			}
+		}
+
+		/** `rename_file` of `old.ts` to `new.ts` under `cwd`, as a call with `timeout: 5`; settles to its result or error. */
+		function renameOldTs(cwd: string, signal: AbortSignal): Promise<unknown> {
+			fs.writeFileSync(path.join(cwd, "old.ts"), "export const a = 1;\n");
+			return new LspTool(makeLspSession(cwd))
+				.execute(
+					"rename-silent-server",
+					{
+						action: "rename_file",
+						file: path.join(cwd, "old.ts"),
+						new_name: path.join(cwd, "new.ts"),
+						timeout: 5,
+					},
+					signal,
+				)
+				.then(
+					result => result,
+					(error: unknown) => error,
+				);
+		}
+
+		function expectNothingRenamed(cwd: string): void {
+			expect(fs.existsSync(path.join(cwd, "old.ts"))).toBe(true);
+			expect(fs.existsSync(path.join(cwd, "new.ts"))).toBe(false);
+		}
+
+		/** The rename reported done, with `note` as the server note that ends the result. */
+		function expectRenamedWithNote(outcome: unknown, cwd: string, note: string): void {
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			const text = textResult(outcome as AgentToolResult<LspToolDetails>);
+			expect(text.startsWith("Renamed old.ts → new.ts\n")).toBe(true);
+			expect(text.endsWith(`\n  Server notes:\n  fake-lsp: ${note}`)).toBe(true);
+			expect(fs.existsSync(path.join(cwd, "old.ts"))).toBe(false);
+			expect(fs.existsSync(path.join(cwd, "new.ts"))).toBe(true);
+		}
+
+		const endedBy = (ending: Ending): string =>
+			ending === "deadline" ? "the call's 5s deadline passed" : "the call was cancelled";
+
+		/** willRenameFiles answered with an edit that points `consumer`'s import at `./new`. */
+		function consumerEdit(consumer: string): (message: RpcMessage) => unknown {
+			return message =>
+				message.method === "workspace/willRenameFiles"
+					? {
+							changes: {
+								[fileToUri(consumer)]: [
+									{
+										range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } },
+										newText: 'import { a } from "./new";\n',
+									},
+								],
+							},
+						}
+					: null;
+		}
+
+		for (const silent of ["initialize", "workspace/willRenameFiles"]) {
+			for (const ending of endings) {
+				it(`rename_file whose server has not answered ${silent} reports the call's ${ending}, and moves nothing`, async () => {
+					await inCheckout(async cwd => {
+						const call = callEnding(ending);
+						installSilentLsp(silent, call.end);
+
+						const outcome = await renameOldTs(cwd, call.signal);
+
+						expectCallEnded(
+							outcome,
+							ending,
+							"LSP rename_file timed out after 5s on fake-lsp. Nothing was renamed; try again or pass timeout=<larger>.",
+						);
+						expectNothingRenamed(cwd);
+					});
+				});
+			}
+		}
+
+		for (const ending of endings) {
+			it(`rename_file reports the call's ${ending} that comes before it asks a server, and moves nothing`, async () => {
+				await inCheckout(async cwd => {
+					const call = callEnding(ending);
+					const server = installSilentLsp("(none)", () => {});
+					// The call ends as it picks the servers for the rename: after the listing, before it asks one.
+					const getLspServers = lspServers.getLspServers;
+					vi.spyOn(lspServers, "getLspServers").mockImplementation(config => {
+						const servers = getLspServers(config);
+						call.end();
+						return servers;
+					});
+
+					const outcome = await renameOldTs(cwd, call.signal);
+
+					expectCallEnded(
+						outcome,
+						ending,
+						"LSP rename_file timed out after 5s. Nothing was renamed; try again or pass timeout=<larger>.",
+					);
+					expectNothingRenamed(cwd);
+					expect(server.spawnCount).toBe(0);
+				});
+			});
+
+			it(`rename_file reports the call's ${ending} that comes after the server's edits arrive, and moves nothing`, async () => {
+				await inCheckout(async cwd => {
+					const consumer = path.join(cwd, "consumer.ts");
+					fs.writeFileSync(consumer, 'import { a } from "./old";\n');
+					const call = callEnding(ending);
+					installSilentLsp("(none)", () => {}, consumerEdit(consumer));
+					// The call ends as it checks the server's edits: after the last answer, before the move.
+					const sortAndValidate = lspEdits.sortAndValidateTextEdits;
+					vi.spyOn(lspEdits, "sortAndValidateTextEdits").mockImplementation(edits => {
+						const sorted = sortAndValidate(edits);
+						call.end();
+						return sorted;
+					});
+
+					const outcome = await renameOldTs(cwd, call.signal);
+
+					expectCallEnded(
+						outcome,
+						ending,
+						"LSP rename_file timed out after 5s. Nothing was renamed; try again or pass timeout=<larger>.",
+					);
+					expectNothingRenamed(cwd);
+					expect(fs.readFileSync(consumer, "utf-8")).toBe('import { a } from "./old";\n');
+				});
+			});
+
+			it(`rename_file reports the rename done when the call's ${ending} comes as the move ends, and names the server it did not tell`, async () => {
+				await inCheckout(async cwd => {
+					const consumer = path.join(cwd, "consumer.ts");
+					fs.writeFileSync(consumer, 'import { a } from "./old";\n');
+					const call = callEnding(ending);
+					const server = installSilentLsp("(none)", () => {}, consumerEdit(consumer));
+					// The call ends once the edit is written and the file moved, before any server is told.
+					const applyEditsThenRename = lspEdits.applyEditsThenRename;
+					vi.spyOn(lspEdits, "applyEditsThenRename").mockImplementation(async (...args) => {
+						await applyEditsThenRename(...args);
+						call.end();
+					});
+
+					const outcome = await renameOldTs(cwd, call.signal);
+
+					expectRenamedWithNote(
+						outcome,
+						cwd,
+						`not told of the rename (didRenameFiles not sent): ${endedBy(ending)}`,
+					);
+					expect(fs.readFileSync(consumer, "utf-8")).toBe('import { a } from "./new";\n');
+					expect(server.received.map(message => message.method)).not.toContain("workspace/didRenameFiles");
+				});
+			});
+
+			it(`rename_file reports the rename done when the call's ${ending} comes while it tells the server, and names that server`, async () => {
+				await inCheckout(async (cwd, serverConfig) => {
+					const call = callEnding(ending);
+					installSilentLsp("(none)", () => {});
+					// The server stops reading once the rename's notice is written to it, and the call ends
+					// while that write waits.
+					const client = await lspClient.getOrCreateClient(serverConfig, cwd, 1_000);
+					const stdin = client.proc.stdin;
+					const write = stdin.write.bind(stdin);
+					const flush = stdin.flush.bind(stdin);
+					let noticeWritten = false;
+					vi.spyOn(stdin, "write").mockImplementation((chunk: string | Uint8Array) => {
+						const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+						if (text.includes("workspace/didRenameFiles")) noticeWritten = true;
+						return write(chunk);
+					});
+					vi.spyOn(stdin, "flush").mockImplementation(() => {
+						if (!noticeWritten) return flush();
+						// Ended once the write is waiting on this flush, as a deadline or cancel would.
+						queueMicrotask(call.end);
+						return Promise.withResolvers<number>().promise;
+					});
+
+					const outcome = await renameOldTs(cwd, call.signal);
+
+					expectRenamedWithNote(
+						outcome,
+						cwd,
+						`may not have been told of the rename (didRenameFiles cut off): ${endedBy(ending)}`,
+					);
+				});
+			});
 		}
 	});
 

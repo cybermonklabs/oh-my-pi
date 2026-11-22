@@ -319,6 +319,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		const callerSignal = signal;
 		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 		throwIfAborted(signal);
+		/** Whether the call's own deadline, not the caller, stopped the call. */
+		const deadlinePassed = (): boolean => timeoutSignal.aborted && !callerSignal?.aborted;
 		/**
 		 * Rethrow an abort; return for any other error. A caller cancel stays a
 		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
@@ -331,7 +333,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			note = "The server may still be indexing; try again or pass timeout=<larger>.",
 		): void => {
 			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
-			if (timeoutSignal.aborted && !callerSignal?.aborted) {
+			if (deadlinePassed()) {
 				const server = serverName ? ` on ${serverName}` : "";
 				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}. ${note}`);
 			}
@@ -734,9 +736,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// — moving the path without those edits leaves dangling references
 			// (issue #8380).
 			const hardFailures: string[] = [];
+			// The call's deadline before the move: nothing has been moved or edited yet.
+			const notRenamed = "Nothing was renamed; try again or pass timeout=<larger>.";
 
 			for (const [serverName, serverConfig] of servers) {
-				throwIfAborted(signal);
+				if (signal?.aborted) rethrowAbort(signal.reason, undefined, notRenamed);
 				let client: LspClient;
 				// A server that never received the rename's checkouts answers without them.
 				let folderError: unknown;
@@ -760,9 +764,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						await waitForProjectLoaded(client, signal);
 					}
 				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
-					}
+					rethrowAbort(err, serverName, notRenamed);
 					// Could not reach the server at all; note it but don't block —
 					// this is not a willRenameFiles failure.
 					const msg = err instanceof Error ? err.message : String(err);
@@ -787,9 +789,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						perServerEdits.push({ serverName, edit: result });
 					}
 				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
-					}
+					rethrowAbort(err, serverName, notRenamed);
 					// method-not-found means the server doesn't implement the request;
 					// skip it silently. Any other error is a genuine failure from a
 					// server that supports willRenameFiles.
@@ -945,13 +945,25 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// A deadline or cancel that came while the edits were gathered ends the call
+			// before anything moves.
+			if (signal?.aborted) rethrowAbort(signal.reason, undefined, notRenamed);
 			// Apply the reference edits and move as one unit: a failed move rolls
 			// the reference edits back so the source, destination, and every
 			// reference file are left unchanged.
 			await applyEditsThenRename(referenceEdits, source, dest);
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
+			// The move is done. A deadline or cancel from here on leaves servers without the
+			// news, and the call still reports the rename it made, naming each server it did
+			// not tell.
+			const endedBy = (): string =>
+				deadlinePassed() ? `the call's ${timeoutSec}s deadline passed` : "the call was cancelled";
 			for (const [serverName, serverConfig] of servers) {
+				if (signal?.aborted) {
+					serverNotes.push(`  ${serverName}: not told of the rename (didRenameFiles not sent): ${endedBy()}`);
+					continue;
+				}
 				try {
 					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
 					for (const { oldUri } of pairs) {
@@ -963,10 +975,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					await sendNotification(client, "workspace/didRenameFiles", lspParams, signal);
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
+						serverNotes.push(
+							`  ${serverName}: may not have been told of the rename (didRenameFiles cut off): ${endedBy()}`,
+						);
+					} else {
+						const msg = err instanceof Error ? err.message : String(err);
+						serverNotes.push(`  ${serverName}: ${msg}`);
 					}
-					const msg = err instanceof Error ? err.message : String(err);
-					serverNotes.push(`  ${serverName}: ${msg}`);
 				}
 			}
 
