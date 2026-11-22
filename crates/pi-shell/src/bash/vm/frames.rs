@@ -722,6 +722,7 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			turn_to: None,
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;

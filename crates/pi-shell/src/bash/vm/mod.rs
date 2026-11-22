@@ -395,6 +395,12 @@ pub struct Shell {
 	/// Orphaned job trees still watched for in-engine work (see the
 	/// `orphans` module); empty unless [`Self::gone`] ever had entries.
 	orphans: Vec<Vpid>,
+	/// The parent of the child vproc reaped last: the next turn goes to it,
+	/// so the end climbs the child's job (a pipeline's job vproc, the
+	/// subshell `( … )` is) before anything else runs, as bash marks a job
+	/// done in the `waitchld` that reaps its last process. Not imaged, as
+	/// [`Self::slice`].
+	turn_to: Option<Vpid>,
 }
 
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
@@ -521,6 +527,14 @@ pub struct Kernel {
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// Vprocs whose builtin is about to report job state and asked first to
+	/// take in the exits already available ([`Kernel::ask_exits`]); the
+	/// scheduler answers after the turn (`Shell::take_in_exits`). Not
+	/// imaged: a restored builtin runs again and asks again.
+	pub exits_asked:        Vec<Vpid>,
+	/// Vprocs whose ask the scheduler answered: their builtin, run again,
+	/// reports now ([`Kernel::exits_taken`]). Not imaged.
+	pub exits_taken:        Vec<Vpid>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
 	/// without an overlay, with the [`state::Root::opts_gen`] and mode they
 	/// were read under: every `(( ))` asks.
@@ -631,6 +645,8 @@ impl Kernel {
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
+			exits_asked: Vec::new(),
+			exits_taken: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
@@ -648,6 +664,25 @@ impl Kernel {
 		if !self.deferrals.is_empty() {
 			self.deferrals.retain(|d| d.vproc != vproc);
 		}
+	}
+
+	/// `vpid`'s builtin is about to report job state: the scheduler first
+	/// takes in the exits already available ([`Kernel::exits_asked`]), then
+	/// the builtin runs again.
+	pub fn ask_exits(&mut self, vpid: Vpid) {
+		if !self.exits_asked.contains(&vpid) {
+			self.exits_asked.push(vpid);
+		}
+	}
+
+	/// Whether the scheduler answered `vpid`'s [`Kernel::ask_exits`]; the
+	/// answer is used up.
+	pub fn exits_taken(&mut self, vpid: Vpid) -> bool {
+		let Some(i) = self.exits_taken.iter().position(|&v| v == vpid) else {
+			return false;
+		};
+		self.exits_taken.swap_remove(i);
+		true
 	}
 
 	/// The pid of background job `job` is still to be settled
@@ -1715,6 +1750,7 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			turn_to: None,
 		})
 	}
 
@@ -1950,6 +1986,16 @@ impl Shell {
 				return Step::Idle;
 			}
 			let wakes = self.k.ctl.wakes();
+			// The parent of the child reaped last goes first ([`Self::turn_to`]),
+			// before a slice it did not have is continued.
+			if let Some(i) = self
+				.turn_to
+				.take()
+				.and_then(|v| self.procs.iter().position(|p| p.vpid == v))
+			{
+				self.rr = i;
+				self.slice = None;
+			}
 			let cont = self.slice.and_then(|(vpid, left)| {
 				let i = self.procs.iter().position(|p| p.vpid == vpid)?;
 				self.runnable(i, wakes).then_some((i, left))
@@ -1977,6 +2023,9 @@ impl Shell {
 			self.adopt(cx);
 			self.end_orphans(cx, Some(ran));
 			self.job_events(cx);
+			if !self.k.exits_asked.is_empty() {
+				self.take_in_exits();
+			}
 		}
 	}
 
@@ -2004,6 +2053,7 @@ impl Shell {
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
+				self.turn_to = p.parent;
 				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
@@ -2029,6 +2079,30 @@ impl Shell {
 				}
 			}
 		}
+	}
+
+	/// Builtins about to report job state asked to take in the exits
+	/// already available first ([`Kernel::exits_asked`]): bash's job states
+	/// follow its children's exits at once (`waitchld`, run by its
+	/// `SIGCHLD` handler), before a builtin reads them. An asker parked at
+	/// the end of its own turn, so waking every parked vproc makes each one
+	/// that waits for an exited program or for ended children poll again
+	/// and run before the asker does (the round goes on from the vproc after
+	/// it), and an end climbs its job first ([`Self::turn_to`]). Nothing
+	/// waits for a running job: one still running parks again, and the
+	/// askers run again ([`Kernel::exits_taken`]).
+	fn take_in_exits(&mut self) {
+		let askers = std::mem::take(&mut self.k.exits_asked);
+		self
+			.k
+			.exits_taken
+			.retain(|&v| self.procs.iter().any(|p| p.vpid == v));
+		for vpid in askers {
+			if self.procs.iter().any(|p| p.vpid == vpid) {
+				self.k.exits_taken.push(vpid);
+			}
+		}
+		self.k.ctl.notify();
 	}
 
 	/// A background job's lone command was a host callout

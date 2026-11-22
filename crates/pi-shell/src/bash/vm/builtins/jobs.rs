@@ -31,6 +31,32 @@ pub fn active(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
 	Ok(!ctx.vp.jobs.subshell && ctx.option(OptId::Monitor)?)
 }
 
+/// Take in the exits already available before a builtin reports or
+/// decides by the state of this vproc's jobs, as bash's job states follow
+/// its children's exits at once (its `SIGCHLD` handler's `waitchld`): with
+/// a job of its own still running here, the builtin parks and asks
+/// ([`crate::bash::vm::Kernel::ask_exits`]); the scheduler then wakes every
+/// parked vproc, so the job's vprocs that wait for an exited program or for
+/// ended children take it in and end before the builtin runs again. It
+/// waits for no running job. A job a command substitution lists is its
+/// parent's, copied when it started.
+pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
+	if ctx.k.exits_taken(ctx.vp.vpid) {
+		return Ok(());
+	}
+	let Some(job) = ctx
+		.vp
+		.jobs
+		.iter()
+		.find(|j| !j.inherited && !matches!(j.state, JobState::Done(_)))
+	else {
+		return Ok(());
+	};
+	let vpid = job.vpid;
+	ctx.k.ask_exits(ctx.vp.vpid);
+	Err(Need::Park(WaitKey::Proc(vpid)))
+}
+
 /// Why a job spec named no job.
 pub enum Bad {
 	/// No such job; the caller reports it (bash `sh_badjob`).
@@ -203,6 +229,7 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if execute {
 		return execute_with_pids(ctx, o.rest);
 	}
+	take_in_exits(ctx)?;
 	let home = ctx.scalar(b"HOME")?;
 	let show = Show {
 		posix:    ctx.option(OptId::Posix)?,
@@ -337,6 +364,7 @@ pub fn fg_bg(ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 			Err(st) => return done(st),
 		}
 	};
+	take_in_exits(ctx)?;
 	if fg {
 		// `fg %1 &` (and `%1 &`) puts the job in the background.
 		if args.last().is_some_and(|a| a.as_slice() == b"&") {
@@ -497,6 +525,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		Ok(o) => o,
 		Err(st) => return done(st),
 	};
+	take_in_exits(ctx)?;
 	let nohup = o.has(b'h');
 	let running_only = o.has(b'r');
 	if o.rest.is_empty() && (o.has(b'a') || running_only) {

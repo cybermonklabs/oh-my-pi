@@ -218,6 +218,11 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		Ok(n) => Signal::from_number(n, platform).map(Send::Signal),
 		Err(_) => None,
 	};
+	// The job a `%n` names is judged by its state: the exits already
+	// available count.
+	if rest.iter().any(|a| a.first() == Some(&b'%')) {
+		super::jobs::take_in_exits(ctx)?;
+	}
 	let mut status: i32 = 0;
 	for arg in rest {
 		let is_job = arg.first() == Some(&b'%');
@@ -276,9 +281,12 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			},
 			Err(TargetError::Host(e)) => Some(errtext(&e)),
 			// `ESRCH`.
-			Err(TargetError::NoSuchJob | TargetError::NoSuchProcess | TargetError::NotAnId) => {
-				Some("no such process".to_owned())
-			},
+			Err(
+				TargetError::NoSuchJob
+				| TargetError::GroupGone(_)
+				| TargetError::NoSuchProcess
+				| TargetError::NotAnId,
+			) => Some("no such process".to_owned()),
 		};
 		if let Some(msg) = failed {
 			ctx.usage(format!("kill {} failed: {msg}", arg.as_bstr()));

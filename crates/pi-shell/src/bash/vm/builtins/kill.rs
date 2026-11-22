@@ -40,8 +40,12 @@ fn parse_signal(spec: &[u8], platform: Platform) -> Option<Send> {
 
 /// Why a target could not be signalled.
 pub(super) enum TargetError {
-	/// `%n` names no live job.
+	/// `%n` names no live job (zsh), or no job (bash).
 	NoSuchJob,
+	/// bash: `%n` names a finished job started under job control, whose
+	/// process group (this pid) is gone (bash's `killpg` fails with
+	/// `ESRCH`).
+	GroupGone(u32),
 	/// zsh `getjob` already reported the bad spec.
 	Reported,
 	/// Neither a number nor a job spec.
@@ -108,6 +112,11 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return done(2);
 	}
 	let mut status = 0;
+	// The job a `%n` names is judged by its state: the exits already
+	// available count.
+	if args[i..].iter().any(|a| a.starts_with(b"%")) {
+		super::jobs::take_in_exits(ctx)?;
+	}
 	for arg in &args[i..] {
 		match target(ctx, arg, send, None) {
 			Ok(Some(target)) => {
@@ -128,6 +137,7 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 						format!("`{}': not a pid or valid job spec", arg.as_bstr())
 					},
 					TargetError::NoSuchProcess => format!("({}) - No such process", arg.as_bstr()),
+					TargetError::GroupGone(pid) => format!("({pid}) - No such process"),
 					TargetError::Host(e) => {
 						format!("({}) - {}", arg.as_bstr(), crate::bash::diag::strerror(&e))
 					},
@@ -160,7 +170,17 @@ pub(super) fn target(
 				ctx.k.proc_state(ctx.cx.store, job.vpid),
 				Some(crate::bash::vm::ProcState::Exited(_))
 			) {
-			return Err(TargetError::NoSuchJob);
+			if zsh.is_some() {
+				return Err(TargetError::NoSuchJob);
+			}
+			// bash 5.3 `kill_pid` of a finished job still listed: without job
+			// control it signals none of its processes (all gone) and
+			// succeeds; with it `killpg` finds no process group.
+			return if job.control {
+				Err(TargetError::GroupGone(job.pid()))
+			} else {
+				Ok(None)
+			};
 		}
 		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
 		// (the job runs, the current job stays).

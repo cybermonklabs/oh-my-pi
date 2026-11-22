@@ -244,6 +244,7 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 		ctx.usage("no job control in this shell.");
 		return done(1);
 	}
+	super::jobs::take_in_exits(ctx)?;
 	scanjobs(ctx, jobbing)?;
 	setcurjob(ctx.vp);
 	if func == JobFunc::Jobs {
