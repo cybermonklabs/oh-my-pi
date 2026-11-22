@@ -30,8 +30,11 @@ const LIVE_ROUTE = { provider: "openai-codex", id: "live" } as const;
 /**
  * Why the live call may send nothing now, or `undefined` when it may. The call runs on OpenAI (Codex realtime)
  * and carries the session's text, so while the session tree's cyber-policy closure is active (OpenAI refused the
- * tree's content) no call starts and none of the session's text goes out. Every send of the session's content in
- * this module reads it right before it goes out.
+ * tree's content) none of the session's text goes out and no call opens. It is read where each of those sends
+ * happens: the transport reads it (`LiveTransportOptions.holdReason`) in the same synchronous step as the
+ * signaling POST that opens the call (it carries the instructions) and as each frame of the session's text; the
+ * controller reads it before it builds the transport and again once the call has connected, before any audio or
+ * text, and closes a held call. The frame that only closes the call (`session.close`) is not held.
  */
 export function liveCallHoldReason(session: Pick<AgentSession, "cyberPolicyClosure">): string | undefined {
 	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(LIVE_ROUTE) : undefined;
@@ -208,12 +211,18 @@ export class LiveSessionController {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
 				},
+				// Read by the transport in the step of the signaling POST and of each frame of the session's text.
+				holdReason: () => liveCallHoldReason(this.#session),
 			});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
+			// A refusal recorded while the call connected (after the POST went out) closes it before any audio
+			// or session text: the catch below stops the call and closes the transport.
+			const heldOnConnect = liveCallHoldReason(this.#session);
+			if (heldOnConnect) throw new Error(heldOnConnect);
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
@@ -500,13 +509,8 @@ export class LiveSessionController {
 		this.#sendChain = this.#sendChain
 			.then(async () => {
 				if (this.#stopped) return;
-				// The session's text goes to OpenAI: while a refusal holds the session's OpenAI routes, none
-				// goes out, and the call ends on the hold, since the session's answer can no longer reach it.
-				const held = liveCallHoldReason(this.#session);
-				if (held) {
-					this.#reportFailure(new Error(held));
-					return;
-				}
+				// The transport reads the hold in the step of the write and rejects a held frame; the catch below
+				// then ends the call, since the session's answer can no longer reach it.
 				await transport.send(message);
 			})
 			.catch(cause => this.#reportFailure(toError(cause)));
