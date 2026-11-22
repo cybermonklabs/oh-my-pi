@@ -27,13 +27,14 @@
 
 use std::{
 	fs, io,
+	sync::Arc,
 	task::{Context, Poll},
 	time::{Duration, Instant},
 };
 
 #[cfg(unix)]
 pub use self::imp::socket_pair;
-pub use self::imp::{OsPipe, Timer, reclaim};
+pub use self::imp::{Drain, OsPipe, Timer, feed_pipe, reclaim};
 
 /// A pipe between a pump and a child: our end, and the child's end (`true`
 /// = the child reads).
@@ -82,24 +83,26 @@ impl OsPipe {
 	}
 
 	/// Our end of a feed's pipe, which [`reclaim`] reads back through the
-	/// child's end `read`. Linux: a write that would wait is made by the end's
-	/// room thread only where a non-blocking description of `read` can be
-	/// opened now, through which [`reclaim`] drains the pipe while it finishes
-	/// that write; else the write waits for the pipe to poll writable.
+	/// feed's `drain` ([`Drain`]), or through the child's end where it has
+	/// none. Linux: a write that would wait is made by the end's room thread
+	/// only where the feed has a drain, through which [`reclaim`] empties the
+	/// pipe while it finishes that write; else the write waits for the pipe to
+	/// poll writable.
 	#[cfg_attr(
 		not(any(target_os = "linux", target_os = "android")),
 		allow(
 			clippy::unused_self,
 			clippy::missing_const_for_fn,
 			clippy::needless_pass_by_ref_mut,
+			clippy::needless_pass_by_value,
 			reason = "only Linux makes a room thread"
 		)
 	)]
-	pub fn for_reclaim(&mut self, read: &fs::File) {
+	pub fn for_reclaim(&mut self, drain: Option<Arc<Drain>>) {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		self.0.for_reclaim(read);
+		self.0.for_reclaim(drain);
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
-		let _ = read;
+		let _ = drain;
 	}
 
 	/// Our end of a [`named_pipe`] the child reads, before there is data
@@ -160,6 +163,8 @@ impl Timer {
 
 #[cfg(unix)]
 mod imp {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	use std::sync::Arc;
 	use std::{
 		fs,
 		io::{self, Read, Write},
@@ -168,6 +173,8 @@ mod imp {
 		task::{Context, Poll},
 		time::{Duration, Instant},
 	};
+
+	use parking_lot::Mutex;
 
 	use crate::sys::ready;
 	#[cfg(any(target_os = "linux", target_os = "android"))]
@@ -178,6 +185,78 @@ mod imp {
 
 	/// A one-shot timer.
 	pub struct Timer(pub(super) TimerImp);
+
+	/// A feed's private read description of its pipe: non-blocking, the
+	/// shell's alone (the children's description stays blocking, as
+	/// `O_NONBLOCK` belongs to the description), close-on-exec. The shell's
+	/// own reads of the engine object take what the pipe holds through it, and
+	/// [`reclaim`] empties the pipe through it without waiting for end of file.
+	pub struct Drain {
+		/// Declared first: forgotten by the readiness thread before the
+		/// descriptor closes.
+		watch: Mutex<Option<ready::Watch>>,
+		file:  fs::File,
+	}
+
+	impl Drain {
+		/// Linux: the child's end `read` opened again through
+		/// `/proc/self/fd/N`, which makes a new open file description of the
+		/// same pipe. `None` where it cannot be (no `/proc` mounted), and on
+		/// other systems, where `/dev/fd/N` shares the description.
+		pub fn of(read: &fs::File) -> Option<Self> {
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+					.open(format!("/proc/self/fd/{}", read.as_raw_fd()))
+					.ok()
+					.map(|file| Self { watch: Mutex::new(None), file })
+			}
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			{
+				let _ = read;
+				None
+			}
+		}
+
+		/// Read what the pipe holds; `Pending` while it holds nothing and a
+		/// writer may still write (`cx` woken once it does), `Ok(0)` at end of
+		/// file.
+		pub fn poll_read(&self, cx: &Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			let mut watch = self.watch.lock();
+			let file = &self.file;
+			poll_io(cx, file.as_raw_fd(), ready::READ, &mut watch, || (&*file).read(buf))
+		}
+
+		/// How many bytes the pipe holds now.
+		pub fn available(&self) -> usize {
+			let mut n: libc::c_int = 0;
+			// SAFETY: FIONREAD stores the byte count into `n` for our open
+			// descriptor.
+			if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD as _, &raw mut n) } < 0 {
+				return 0;
+			}
+			usize::try_from(n).unwrap_or(0)
+		}
+
+		/// Append what the pipe holds now to `back`, without waiting; how
+		/// many bytes that was.
+		fn take_now(&self, back: &mut Vec<u8>, buf: &mut [u8]) -> usize {
+			let mut took = 0;
+			loop {
+				match (&self.file).read(buf) {
+					Ok(n) if n > 0 => {
+						back.extend_from_slice(&buf[..n]);
+						took += n;
+					},
+					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+					_ => return took,
+				}
+			}
+		}
+	}
 
 	pub struct UnixEnd {
 		/// Readiness waits, one per direction (a socket pair end is pumped
@@ -192,11 +271,11 @@ mod imp {
 		/// Linux: the pump's wait on its room, the end's only writer's.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		room_key:    crate::sys::WaitKey,
-		/// Linux, a feed's end: a non-blocking description of the child's
-		/// end, through which [`reclaim`] drains the pipe while the room
-		/// thread finishes its write.
+		/// Linux, a feed's end: the feed's [`Drain`], through which
+		/// [`reclaim`] empties the pipe while the room thread finishes its
+		/// write.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		drain:       Option<fs::File>,
+		drain:       Option<Arc<Drain>>,
 		file:        fs::File,
 	}
 
@@ -219,6 +298,36 @@ mod imp {
 			(OwnedFd::from(r), OwnedFd::from(w))
 		};
 		Ok((OsPipe(UnixEnd::new(ours)?), fs::File::from(theirs)))
+	}
+
+	/// A feed's pipe: our write end, the children's read end and, where one
+	/// can be made, the feed's private read description ([`Drain`]).
+	///
+	/// - Linux: an anonymous pipe; the drain is the children's end opened again
+	///   ([`Drain::of`]).
+	/// - macOS: `/dev/fd/N` shares the description, so the pipe is a FIFO made
+	///   in a private directory under the temporary directory and opened four
+	///   times ([`fifo_descriptions`]): the pump writes through the shell's
+	///   write description, the children read the externals' read one, the drain
+	///   is the shell's read one, and the externals' write one is closed. The
+	///   FIFO and its directory are removed before any end is handed out, so
+	///   neither a drop nor a crash leaves anything behind. Where it cannot be
+	///   made, an anonymous pipe without a drain.
+	///
+	/// [`fifo_descriptions`]: crate::sys::fifo_pair::fifo_descriptions
+	pub fn feed_pipe() -> io::Result<(OsPipe, fs::File, Option<Drain>)> {
+		#[cfg(target_os = "macos")]
+		if let Ok([ours_read, ours_write, theirs_read, theirs_write]) =
+			crate::sys::fifo_pair::fifo_descriptions(&std::env::temp_dir())
+		{
+			drop(theirs_write);
+			let ours = OsPipe(UnixEnd::new(OwnedFd::from(ours_write))?);
+			let drain = Drain { watch: Mutex::new(None), file: ours_read };
+			return Ok((ours, theirs_read, Some(drain)));
+		}
+		let (ours, read) = pipe(true)?;
+		let drain = Drain::of(&read);
+		Ok((ours, read, drain))
 	}
 
 	/// A socket pair for a duplex pump: our end, and the child's.
@@ -313,16 +422,11 @@ mod imp {
 
 		/// See [`super::OsPipe::for_reclaim`].
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		pub fn for_reclaim(&mut self, read: &fs::File) {
-			use std::os::unix::fs::OpenOptionsExt;
-			self.drain = fs::OpenOptions::new()
-				.read(true)
-				.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-				.open(format!("/proc/self/fd/{}", read.as_raw_fd()))
-				.ok();
-			if self.drain.is_none() {
+		pub fn for_reclaim(&mut self, drain: Option<Arc<Drain>>) {
+			if drain.is_none() {
 				self.room = RoomSlot::None;
 			}
+			self.drain = drain;
 		}
 
 		/// Linux: finish the write of `held` the room thread may have in
@@ -337,7 +441,7 @@ mod imp {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		fn settle(&mut self, held: &[u8], back: &mut Vec<u8>) -> usize {
 			let Self { room, drain, room_key, .. } = self;
-			let (RoomSlot::Made(room), Some(mut drain)) = (&*room, drain.as_ref()) else {
+			let (RoomSlot::Made(room), Some(drain)) = (&*room, drain.as_ref()) else {
 				return 0;
 			};
 			if held.is_empty() {
@@ -352,18 +456,7 @@ mod imp {
 					Some(Poll::Pending) => {},
 					None => return 0,
 				}
-				let mut took = false;
-				loop {
-					match drain.read(&mut buf) {
-						Ok(n) if n > 0 => {
-							back.extend_from_slice(&buf[..n]);
-							took = true;
-						},
-						Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
-						_ => break,
-					}
-				}
-				if !took {
+				if drain.take_now(back, &mut buf) == 0 {
 					// Woken by the thread once the write is made.
 					std::thread::park_timeout(Duration::from_millis(10));
 				}
@@ -390,21 +483,36 @@ mod imp {
 		}
 	}
 
-	/// What a feed's pipe still holds, read through the child's end `read`
-	/// once our write end `pipe` is closed (the pipe's only writer gone, the
-	/// read ends at end of file instead of waiting), then the bytes of `held`
-	/// (taken from the engine object for the pipe) the pipe never took.
-	/// Linux: a write of `held` the end's room thread may have in hand is
-	/// finished first ([`UnixEnd::settle`]), so the bytes it made come back
-	/// from the pipe, once and in order.
-	pub fn reclaim(mut pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
+	/// What a feed's pipe still holds once our write end `pipe` is closed,
+	/// then the bytes of `held` (taken from the engine object for the pipe)
+	/// the pipe never took. Linux: a write of `held` the end's room thread may
+	/// have in hand is finished first ([`UnixEnd::settle`]), so the bytes it
+	/// made come back from the pipe, once and in order. With the feed's
+	/// `drain`, the pipe is emptied without waiting: once our write end, its
+	/// only writer, is closed and the write in hand is made, nothing more
+	/// comes, while its end of file may (a process another thread forked holds
+	/// a copy of the write end until its exec). Without one, the child's end
+	/// `read` is read to end of file.
+	pub fn reclaim(
+		mut pipe: Option<OsPipe>,
+		mut read: &fs::File,
+		held: &[u8],
+		drain: Option<&Drain>,
+	) -> Vec<u8> {
 		let mut back = Vec::new();
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		let made = pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back));
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		let made = 0;
 		drop(pipe);
-		let _ = read.read_to_end(&mut back);
+		match drain {
+			Some(drain) => {
+				drain.take_now(&mut back, &mut vec![0u8; 64 << 10]);
+			},
+			None => {
+				let _ = read.read_to_end(&mut back);
+			},
+		}
 		back.extend_from_slice(&held[made..]);
 		back
 	}
@@ -942,13 +1050,46 @@ mod imp {
 		}
 	}
 
+	/// A feed's private read description of its pipe: Windows has none (a
+	/// feed's pipe is a single-instance named pipe, whose child end refuses a
+	/// second opening), so a feed there has no drain and the shell's reads take
+	/// the engine object only.
+	pub enum Drain {}
+
+	/// A feed's pipe: our write end and the children's read end; no drain
+	/// (see [`Drain`]).
+	pub fn feed_pipe() -> io::Result<(OsPipe, fs::File, Option<Drain>)> {
+		let (ours, read) = pipe(true)?;
+		Ok((ours, read, None))
+	}
+
+	impl Drain {
+		/// Never one: see the type.
+		pub const fn of(_read: &fs::File) -> Option<Self> {
+			None
+		}
+
+		pub const fn poll_read(&self, _cx: &Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			match *self {}
+		}
+
+		pub const fn available(&self) -> usize {
+			match *self {}
+		}
+	}
+
 	/// What a feed's pipe still holds, read through the child's end `read`
 	/// once our write end `pipe` is closed (at once: its write in flight is
 	/// cancelled, see [`WinEnd::close`]), followed by the part of that write
 	/// the pipe never took, then the bytes of `held` (taken from the engine
 	/// object for the pipe, never written). With our end closed the read ends
 	/// at end of file instead of waiting.
-	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
+	pub fn reclaim(
+		pipe: Option<OsPipe>,
+		mut read: &fs::File,
+		held: &[u8],
+		_drain: Option<&Drain>,
+	) -> Vec<u8> {
 		let unsent = pipe.map_or_else(Vec::new, |p| p.0.close());
 		let mut back = Vec::new();
 		let _ = read.read_to_end(&mut back);
@@ -1530,7 +1671,7 @@ mod write_wait_tests {
 		time::{Duration, Instant},
 	};
 
-	use super::{pipe, reclaim};
+	use super::{Drain, pipe, reclaim};
 
 	/// A waker that counts its wakes.
 	#[derive(Default)]
@@ -1593,7 +1734,8 @@ mod write_wait_tests {
 	#[test]
 	fn a_feed_given_back_with_a_write_in_hand_gives_each_byte_back_once() {
 		let (mut ours, theirs) = pipe(true).expect("a pump pipe the child reads");
-		ours.for_reclaim(&theirs);
+		let drain = Drain::of(&theirs).map(Arc::new);
+		ours.for_reclaim(drain.clone());
 		let count = Arc::new(Count::default());
 		let waker = Waker::from(Arc::clone(&count));
 		let cx = Context::from_waker(&waker);
@@ -1615,10 +1757,60 @@ mod write_wait_tests {
 		let held = held.expect("the pipe filled");
 		std::thread::sleep(Duration::from_millis(100));
 		assert_eq!(count.0.load(Ordering::SeqCst), 0, "the page was made with the pipe full");
-		let back = reclaim(Some(ours), &theirs, &held);
+		let back = reclaim(Some(ours), &theirs, &held, drain.as_deref());
 		expected.extend_from_slice(&held);
 		assert_eq!(back.len(), expected.len(), "each byte once");
 		assert!(back == expected, "in order");
+	}
+
+	// Failure mode: the give-back reads the pipe to end of file, which a
+	// process another thread forked holds off until its exec (or its end):
+	// the dropping thread waits that long, the shell's own thread when the
+	// last holder's `ExtProc` is dropped there. It must take what the pipe
+	// holds and return while such a copy of the write end lives.
+	#[test]
+	fn a_feed_given_back_while_a_forked_copy_of_its_write_end_lives_returns_with_every_byte() {
+		let (mut ours, theirs) = pipe(true).expect("a pump pipe the child reads");
+		let drain = Drain::of(&theirs).map(Arc::new);
+		assert!(drain.is_some(), "Linux with /proc gives a feed its drain");
+		ours.for_reclaim(drain.clone());
+		let cx = Context::from_waker(Waker::noop());
+		assert!(matches!(ours.poll_write(&cx, b"held line\n"), Poll::Ready(Ok(10))));
+		// A process forked now holds a copy of every descriptor, our write end
+		// among them, until it reads a byte from `hold` (or `hold` closes).
+		let (hold_r, mut hold_w) = std::io::pipe().unwrap();
+		// SAFETY: the child only reads one byte and exits, both
+		// async-signal-safe.
+		let pid = unsafe { libc::fork() };
+		if pid == 0 {
+			let mut byte = 0u8;
+			// SAFETY: reads one byte into a local from a descriptor it holds.
+			unsafe {
+				libc::read(hold_r.as_raw_fd(), (&raw mut byte).cast(), 1);
+				libc::_exit(0);
+			}
+		}
+		assert!(pid > 0, "fork: {}", std::io::Error::last_os_error());
+		drop(hold_r);
+		let (tx, done) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let _ = tx.send(reclaim(Some(ours), &theirs, b"", drain.as_deref()));
+		});
+		// The wait only names a hang: the give-back returns at once or never.
+		let back = done.recv_timeout(Duration::from_secs(30));
+		let mut status = 0;
+		// SAFETY: a non-blocking wait for our own child.
+		let gone = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+		std::io::Write::write_all(&mut hold_w, b"x").unwrap();
+		drop(hold_w);
+		// SAFETY: as above, now waiting for it to end.
+		unsafe { libc::waitpid(pid, &raw mut status, 0) };
+		assert_eq!(gone, 0, "the forked copy was still open when the give-back returned");
+		assert_eq!(
+			back.as_deref(),
+			Ok(&b"held line\n"[..]),
+			"every byte, without waiting for the copy"
+		);
 	}
 
 	// Failure mode: where no room thread can be made (`pthread_create` at

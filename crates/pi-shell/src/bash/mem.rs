@@ -14,7 +14,7 @@
 use std::{
 	collections::VecDeque,
 	io,
-	sync::Arc,
+	sync::{Arc, Weak},
 	task::{Context, Poll, Waker},
 };
 
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash::{
 	fs::{File, FileKind, SeekFrom},
-	host::{OsHandle, PipeMirror},
+	host::{FeedRead, OsHandle, PipeMirror},
 };
 
 /// Capacity of a [`pipe`] in bytes (bash and Linux use 64 KiB).
@@ -41,6 +41,10 @@ pub struct PipeState {
 	/// dropped once the last writer or the last reader is gone. Not imaged:
 	/// a restored pipe is untapped.
 	mirror:  Option<Arc<dyn PipeMirror>>,
+	/// The host's feeds of this pipe into OS pipes that externals read
+	/// ([`PipeReader::attach_feed`]); the shell's reads come through them
+	/// first. Not imaged: a restored pipe feeds no external.
+	feeds:   Vec<Weak<dyn FeedRead>>,
 }
 
 impl PipeState {
@@ -104,6 +108,21 @@ impl PipeReader {
 			s.buf.push_front(b);
 		}
 		s.wake_all();
+	}
+
+	/// The host fills an OS pipe from this pipe for externals through
+	/// `feed`, for as long as `feed` lives ([`FeedRead`]).
+	pub fn attach_feed(&self, feed: Weak<dyn FeedRead>) {
+		let mut s = self.0.lock();
+		s.feeds.retain(|f| f.strong_count() > 0);
+		s.feeds.push(feed);
+	}
+
+	/// The feeds of this pipe that still live.
+	pub fn feeds(&self) -> Vec<Arc<dyn FeedRead>> {
+		let mut s = self.0.lock();
+		s.feeds.retain(|f| f.strong_count() > 0);
+		s.feeds.iter().filter_map(Weak::upgrade).collect()
 	}
 }
 

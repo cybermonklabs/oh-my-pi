@@ -143,6 +143,14 @@ impl FdRef {
 		}))
 	}
 
+	/// Tests elsewhere in the crate: the read and write ends of a new engine
+	/// pipe, as fds.
+	#[cfg(test)]
+	pub(crate) fn engine_pipe() -> (Self, Self) {
+		let (r, w) = crate::bash::mem::pipe();
+		(Self::mem(r), Self::mem(w))
+	}
+
 	/// Identity of the fd object (shared by every slot holding this handle).
 	pub(crate) fn key(&self) -> usize {
 		if self.is_tagged() {
@@ -264,11 +272,43 @@ impl FdRef {
 	}
 
 	/// Read into `buf`; `Ok(0)` at end of file (also for closed or lost fds).
+	///
+	/// A pipe's read end that the host feeds to externals is read through
+	/// its feeds first ([`FeedRead`](crate::bash::FeedRead)), so the shell
+	/// and those externals take its bytes in one order, as readers of bash's
+	/// one kernel pipe do.
 	pub fn poll_read(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		let feeds = self
+			.with_mem(|m| match m {
+				MemFile::PipeRead(r) => r.feeds(),
+				_ => Vec::new(),
+			})
+			.unwrap_or_default();
+		for feed in feeds {
+			if let Some(read) = feed.poll_read_through(cx, buf) {
+				return read;
+			}
+		}
+		self.poll_read_direct(cx, buf)
+	}
+
+	/// Read into `buf` from the object itself, past any feed: the host's
+	/// pump filling a feed reads this way.
+	pub fn poll_read_direct(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_read(cx, buf),
 			None => Poll::Ready(Ok(0)),
 		}
+	}
+
+	/// The host fills an OS pipe from this pipe read end for externals
+	/// through `feed`, while `feed` lives; any other object is left alone.
+	pub fn attach_feed(&self, feed: std::sync::Weak<dyn crate::bash::FeedRead>) {
+		let _ = self.with_mem(|m| {
+			if let MemFile::PipeRead(r) = m {
+				r.attach_feed(feed);
+			}
+		});
 	}
 
 	/// Write a prefix of `buf`; closed and lost fds fail with "Bad file

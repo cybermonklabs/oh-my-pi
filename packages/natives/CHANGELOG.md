@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- On Linux and macOS the bash and zsh shells' own reads of a process substitution or coprocess pipe that a program also holds take the next bytes, as bash's shell and its children read one pipe: `exec 4< <(…); prog <&4 & read v <&4` no longer waits for `prog` to end before it sees the bytes `prog` left unread. Windows keeps the earlier behaviour.
 - On Linux under gVisor, the bash and zsh shells no longer spin a CPU while they feed a slow reader through their pump (a process substitution, a here-document, a pipe the bash tool mirrors as a pipe stream): a write the pipe cannot take now is made by a thread of the pipe's own, which the kernel wakes once the write fits, where the pump retried it each time the pipe had room for any byte.
 
 ## [18.18.6] - 2026-11-09

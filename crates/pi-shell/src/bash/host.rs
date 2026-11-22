@@ -645,6 +645,28 @@ pub trait PipeMirror: Send + Sync {
 	fn close(&self);
 }
 
+/// A host's feed of an engine pipe's read end into an OS pipe that
+/// externals read ([`FdRef::attach_feed`](crate::bash::FdRef::attach_feed)).
+///
+/// bash's shell and its children read one kernel pipe; here the feed's pump
+/// moves the engine pipe's bytes into an OS pipe for the children, and the
+/// shell's own reads of the pipe come through the feed first, so they take
+/// the bytes in the order the pump took them, whoever reads first.
+pub trait FeedRead: Send + Sync {
+	/// The shell reads the pipe this feed fills: what the feed's OS pipe
+	/// holds, or `Pending` while the pump holds bytes it took from the
+	/// engine pipe and has not written yet (it is advanced, and `cx` woken
+	/// once they can be read). `None` when the feed holds nothing: the caller
+	/// reads the engine pipe itself, whose next bytes the pump has not taken.
+	/// Called on the engine's thread, as the pump is polled, so nothing takes
+	/// the engine pipe's bytes between this answer and the caller's read.
+	fn poll_read_through(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+	) -> Option<Poll<io::Result<usize>>>;
+}
+
 /// How an external process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExitStatus {
