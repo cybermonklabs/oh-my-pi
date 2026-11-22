@@ -70,11 +70,12 @@ function isViewOf<TParams extends TSchema, TDetails>(
 }
 
 /**
- * Main side: the cross-thread form of a custom tool — its data fields plus `execute`/`onSession`
- * running on this thread, with the synchronous approval hooks marked {@link rpcSync}. Render and
- * describe hooks are dropped: only the main-thread UI renders tool calls. Cached on the tool, so
- * repeated sends export the same functions. `parameters` must be structured-clone data (JSON
- * schema); TypeBox symbol metadata does not cross.
+ * The cross-thread form of a custom tool — its data fields plus `execute`/`onSession` running on this
+ * thread, with the synchronous approval hooks marked {@link rpcSync}: built on main for a worker child's
+ * tools, and on a worker for the kernel tools of a parent homed there, which a cold revive on main takes.
+ * Render and describe hooks are dropped: only the main-thread UI renders tool calls. Cached on the tool,
+ * so repeated sends export the same functions. `parameters` must be structured-clone data (JSON schema);
+ * TypeBox symbol metadata does not cross.
  */
 export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
 	tool: CustomTool<TParams, TDetails>,

@@ -164,6 +164,24 @@ export function createEvalCustomTools(session: ToolSession, descriptors: EvalToo
 }
 
 /**
+ * The tools of `descriptors` that a kernel of `session` defines now, by name and language, built over it as
+ * {@link createEvalCustomTools} builds them; a descriptor no kernel defines is left out. Runs on the thread
+ * whose kernels `session` owns.
+ */
+export async function definedEvalCustomTools(
+	session: ToolSession,
+	descriptors: readonly EvalToolDescriptor[],
+): Promise<CustomTool[]> {
+	if (descriptors.length === 0) return [];
+	// `listEvalTools`, not `describeEvalTools`, which throws on a name no kernel defines.
+	const defined = new Map((await listEvalTools(session)).map(tool => [tool.name, tool.language]));
+	return createEvalCustomTools(
+		session,
+		descriptors.filter(descriptor => defined.get(descriptor.name) === descriptor.language),
+	);
+}
+
+/**
  * A kernel-defined tool a cold-revived child keeps from its spawn spec although no live kernel can serve
  * it (the defining session is gone, its kernel no longer defines it, or eval tools are off there): the tool
  * {@link createEvalCustomTools} makes from `descriptor`, so the child's tool list keeps its bytes, and a call

@@ -57,6 +57,21 @@ const LOOKUP_ROWS: EvalToolDescriptor = {
 	parameters: { type: "object", properties: { key: { type: "string" } } },
 	language: "python",
 };
+/** A task whose run defines {@link PARENT_LOOKUP} in its session's JavaScript kernel through an `eval` call. */
+const DEFINE_TOOL_TASK = `omp-test-scripted-define-tool-${SCRIPT_ID}`;
+/** A message whose turn calls {@link PARENT_LOOKUP} with key `a`. */
+const CALL_TOOL_TASK = `omp-test-scripted-call-tool-${SCRIPT_ID}`;
+/** What the kernel-defined {@link PARENT_LOOKUP} answers, before `:<key>`. */
+const KERNEL_ANSWER = `omp-test-kernel-answer-${SCRIPT_ID}`;
+/** A tool a parent's JavaScript kernel defines ({@link DEFINE_TOOL_CODE}). */
+const PARENT_LOOKUP: EvalToolDescriptor = {
+	name: "parent_lookup",
+	description: "Looks up rows by key in the parent's kernel.",
+	parameters: { type: "object", properties: { key: { type: "string" } } },
+	language: "js",
+};
+/** The JavaScript cell that defines {@link PARENT_LOOKUP}; `tool()` reads the name, description and parameters. */
+const DEFINE_TOOL_CODE = `tool(({ key }) => ${JSON.stringify(`${KERNEL_ANSWER}:`)} + key, ${JSON.stringify(PARENT_LOOKUP)});`;
 
 interface ChatMessage {
 	role: string;
@@ -104,9 +119,11 @@ function chunks(reply: Reply): string {
 /**
  * Scripted model. Only the routed agent's own turns (their system prompt carries
  * {@link AGENT_MARKER}) are scripted, by their last user message: containing
- * {@link BG_JOB_TASK} → an async `bash` call; containing {@link HANG_TASK} → no answer until
- * the request is aborted. A tool result is answered with `tool said: …`; everything else
- * (the job's completion notice, side requests) → `pong`.
+ * {@link BG_JOB_TASK} → an async `bash` call; containing {@link DEFINE_TOOL_TASK} → an `eval`
+ * call running {@link DEFINE_TOOL_CODE}; containing {@link CALL_TOOL_TASK} → a
+ * {@link PARENT_LOOKUP} call; containing {@link HANG_TASK} → no answer until the request is
+ * aborted. A tool result is answered with `tool said: …`; everything else (the job's
+ * completion notice, side requests) → `pong`.
  */
 class FakeModelServer {
 	readonly #server: Bun.Server<undefined>;
@@ -114,6 +131,8 @@ class FakeModelServer {
 	#hungRequest = Promise.withResolvers<void>();
 	/** The model and tool names of each of the routed agent's own requests, in order. */
 	readonly runRequests: Array<{ model: string; toolNames: string[] }> = [];
+	/** The text of each tool result the routed agent's own requests end on, in order. */
+	readonly toolResults: string[] = [];
 
 	constructor() {
 		this.#server = Bun.serve({
@@ -190,9 +209,15 @@ class FakeModelServer {
 		}
 		let reply: Reply = { text: "pong" };
 		if (runTurn && last?.role === "tool") {
-			reply = { text: `tool said: ${messageText(last.content)}` };
+			const result = messageText(last.content);
+			this.toolResults.push(result);
+			reply = { text: `tool said: ${result}` };
 		} else if (runTurn && userText.includes(BG_JOB_TASK)) {
 			reply = { tool: "bash", args: { command: "echo bg-done", async: true } };
+		} else if (runTurn && userText.includes(DEFINE_TOOL_TASK)) {
+			reply = { tool: "eval", args: { language: "js", code: DEFINE_TOOL_CODE } };
+		} else if (runTurn && userText.includes(CALL_TOOL_TASK)) {
+			reply = { tool: PARENT_LOOKUP.name, args: { key: "a" } };
 		} else if (runTurn && userText.includes(HANG_TASK)) {
 			const held = Promise.withResolvers<void>();
 			this.#hangs.push(held.resolve);
@@ -650,6 +675,61 @@ describe("subagent runs routed into pooled workers", () => {
 			expect(wake?.model).toBe("fake-model");
 			expect(wake?.toolNames).toContain(LOOKUP_ROWS.name);
 			expect(wake?.toolNames).not.toContain("lsp");
+			// Let the wake turn settle before teardown.
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive of a subagent whose live parent is homed in a worker serves the tools the parent's kernel defines",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			// The parent runs in a worker and defines `parent_lookup` in its JavaScript kernel; it stays live there.
+			const parentAgent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "eval"] };
+			const parentRun = await runSubprocess(runOptions("KernelParent", DEFINE_TOOL_TASK, { agent: parentAgent }));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("KernelParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			// Its child carries the tool's descriptor in its spawn spec.
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [PARENT_LOOKUP]);
+			const childRun = await runSubprocess(
+				runOptions("KernelChild", "ping", { customTools, parentAgentId: "KernelParent" }),
+			);
+			expect(childRun.output).toBe("pong");
+			expect(server.runRequests.at(-1)?.toolNames).toContain(PARENT_LOOKUP.name);
+			const child = mirrorOf(AgentRegistry.global().get("KernelChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			// Killed, the child has no warm reviver; its parent lives on in its worker.
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("KernelChild", undefined, { tombstone: true })).toBe(true);
+			expect(AgentRegistry.global().get("KernelChild")?.status).toBe("aborted");
+			expect(AgentRegistry.global().get("KernelParent")?.session).toBe(parent);
+			expect(pool.forThread(parent.home)?.alive).toBe(true);
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const resultsBefore = server.toolResults.length;
+			const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "KernelChild", body: CALL_TOOL_TASK });
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("KernelChild")?.session);
+			await waitFor(() => server.toolResults.length > resultsBefore);
+			// The revived child's call reached the parent's kernel, which answered it.
+			expect(server.toolResults.slice(resultsBefore).join("\n")).toContain(`${KERNEL_ANSWER}:a`);
+			expect(warnings.filter(message => message.includes("no live kernel defines"))).toEqual([]);
 			// Let the wake turn settle before teardown.
 			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},

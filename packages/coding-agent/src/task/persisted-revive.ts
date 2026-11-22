@@ -36,12 +36,16 @@ import {
 } from "../session/retry-fallback-chains";
 import { extractSessionInit, type PersistedSessionInit, SessionManager } from "../session/session-manager";
 import { revivePersistedPlaced } from "../thread/executor-routing";
+import { RemoteAgentSession } from "../thread/remote-agent-session";
+import { isRpcProxy } from "../thread/rpc";
+import { type SessionSettingsSource, sessionSettingsSource, settingsFromSource } from "../thread/session-mirror";
+import { toWorkerCustomTool } from "../thread/services/integrations";
 import { subagentWorkerPool } from "../thread/subagent-worker";
 import type { ToolSession } from "../tools";
 import type { EventBus } from "../utils/event-bus";
 import { isCompletionProbeEnabled } from "./completion-probe";
 import { discoverAgents, getAgent } from "./discovery";
-import { createEvalCustomTools, listEvalTools, unavailableEvalCustomTool } from "./eval-tools";
+import { definedEvalCustomTools, unavailableEvalCustomTool } from "./eval-tools";
 import {
 	buildSubagentSession,
 	captureSubagentSettings,
@@ -57,6 +61,7 @@ import {
 	type SubagentLegacyRevive,
 	type SubagentLiveInputs,
 	type SubagentLivePolicy,
+	type SubagentSpawnerLiveInputs,
 	softRequestBudgetFor,
 	spawnerLiveInputs,
 	subagentRetryFallbackRole,
@@ -115,6 +120,39 @@ export type ColdReviveLiveInputs = Omit<
 	SubagentLiveInputs,
 	"assertDispatchModel" | "customTools" | "oauthAccountPools" | "seance"
 >;
+
+/**
+ * A live parent session's inputs for a child's build, as a spawn of it reads them from its tool session
+ * ({@link subagentLiveInputs}), with the event buses that tool session carries.
+ */
+interface ParentLiveInputs extends SubagentSpawnerLiveInputs {
+	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
+}
+
+/**
+ * What a live parent homed on another thread sends for a cold revive of its child
+ * (`SessionHostProtocol.subagentParentInputs`, answered by {@link serveSubagentParentInputs}).
+ */
+export interface SubagentParentInputs {
+	/**
+	 * Its live inputs in the forms that reach the main thread: plain data, codec values, functions, and the
+	 * main-thread objects its home imported, which arrive as themselves. An object local to its home is left
+	 * out, and so is the extension-roots provider, which a build calls synchronously: main reads the parent's
+	 * mirrored roots instead.
+	 */
+	readonly live: Omit<ParentLiveInputs, "settings" | "extensionRoots">;
+	/** Its settings, as the recipe main rebuilds them from. */
+	readonly settings: SessionSettingsSource;
+	/** The tools of the requested descriptors its kernels define now, as cross-thread views. */
+	readonly customTools: CustomTool[];
+}
+
+/** A live parent's inputs for a child's build, and the tools of the child's descriptors its kernels define now. */
+interface LiveParent {
+	readonly inputs: ParentLiveInputs;
+	readonly customTools: readonly CustomTool[];
+}
 
 /** The model a cold revive builds on: never the patterns of a spawn's deferred model resolution. */
 type ColdReviveBuildModel = ExplicitBuildModel | LegacyBuildModel;
@@ -290,9 +328,10 @@ export function createPersistedSubagentReviverFactory(
 
 /**
  * The main thread's part of one cold revive, at the start of each reviver call and before anything is
- * reopened: the live parent session's inputs, the model the record's spawn spec starts on as the registry
- * holds it now (a per-call worker: its saved model, held to the grants as they are now), and the spec's
- * custom tools over the live parent's eval kernels. `init` is the `session_init` the factory read.
+ * reopened: the live parent session's inputs (from its home where it is homed in a worker), the model the
+ * record's spawn spec starts on as the registry holds it now (a per-call worker: its saved model, held to
+ * the grants as they are now), and the spec's custom tools over the live parent's eval kernels. `init` is
+ * the `session_init` the factory read.
  */
 export async function prepareColdRevive(
 	ctx: PersistedSubagentReviveContext,
@@ -302,11 +341,12 @@ export async function prepareColdRevive(
 	const root = ctx.session;
 	const parts = coldReviveSpecParts(target, init);
 	const parentSession = liveParentSession(target);
-	const localParent = parentSession && isLocalAgentSession(parentSession) ? parentSession : undefined;
+	const descriptors = parts.tools?.customTools ?? [];
+	const parent = await liveParent(target.id, parentSession, descriptors);
 	const agentName = persistedAgentName(target.displayName, init);
 	const live = coldReviveLiveInputs(
 		ctx,
-		localParent?.evalToolSession ? localParent : root,
+		parent?.inputs,
 		{
 			id: target.id,
 			name: parts.wake?.agent.name ?? agentName,
@@ -373,7 +413,7 @@ export async function prepareColdRevive(
 			});
 		}
 	}
-	const tools = await coldReviveCustomTools(target.id, parts.tools?.customTools ?? [], localParent?.evalToolSession);
+	const tools = coldReviveCustomTools(target.id, descriptors, parent?.customTools ?? []);
 	return {
 		live,
 		model,
@@ -393,6 +433,107 @@ export async function prepareColdRevive(
 function liveParentSession(target: ColdReviveTarget): AgentSessionHandle | undefined {
 	if (target.parentId === target.rootAgentId) return target.root;
 	return AgentRegistry.global().get(target.parentId ?? "")?.session ?? undefined;
+}
+
+/**
+ * What `session`, the live parent of subagent `id`, gives its cold revive: read from its tool session where it
+ * is homed on this thread, and from its home where it is the mirror of a worker-homed session. Undefined where
+ * it holds no tool session or its home cannot answer; the revive then takes the root's inputs.
+ */
+async function liveParent(
+	id: string,
+	session: AgentSessionHandle | undefined,
+	descriptors: readonly EvalToolDescriptor[],
+): Promise<LiveParent | undefined> {
+	if (session instanceof RemoteAgentSession) {
+		let served: SubagentParentInputs | null;
+		try {
+			served = await session.subagentParentInputs(id, descriptors);
+		} catch (error) {
+			logger.warn("Revived subagent could not read its live parent's inputs; it takes the root's", {
+				subagent: id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
+		if (!served) return undefined;
+		// Owner policy, read from the parent's mirror while it lives; held weakly, as a spawn holds the provider.
+		const parent = new WeakRef(session);
+		const roots = session.effectiveExtensionRoots;
+		return {
+			inputs: {
+				...served.live,
+				settings: settingsFromSource(served.settings),
+				extensionRoots: () => parent.deref()?.effectiveExtensionRoots ?? roots,
+			},
+			customTools: served.customTools,
+		};
+	}
+	const tools = session && isLocalAgentSession(session) ? session.evalToolSession : undefined;
+	if (!tools) return undefined;
+	return { inputs: parentLiveInputs(tools), customTools: await parentEvalCustomTools(id, tools, descriptors) };
+}
+
+/**
+ * The home thread's answer to `SessionHostProtocol.subagentParentInputs`: what a cold revive of subagent `id`
+ * takes from `session`, its live parent homed on this thread; null where the session holds no tool session.
+ */
+export async function serveSubagentParentInputs(
+	session: AgentSession,
+	id: string,
+	descriptors: readonly EvalToolDescriptor[],
+): Promise<SubagentParentInputs | null> {
+	const tools = session.evalToolSession;
+	if (!tools) return null;
+	const { settings: _settings, extensionRoots: _extensionRoots, ...inputs } = parentLiveInputs(tools);
+	const customTools = await parentEvalCustomTools(id, tools, descriptors);
+	return {
+		live: {
+			...inputs,
+			costGate: mainObject(inputs.costGate),
+			authStorage: mainObject(inputs.authStorage),
+			modelRegistry: mainObject(inputs.modelRegistry),
+			asyncJobManager: mainObject(inputs.asyncJobManager),
+			mcpManager: mainObject(inputs.mcpManager),
+			parentArtifactManager: mainObject(inputs.parentArtifactManager),
+			parentHindsightSessionState: mainObject(inputs.parentHindsightSessionState),
+			parentMnemopiSessionState: mainObject(inputs.parentMnemopiSessionState),
+			eventBus: mainObject(inputs.eventBus),
+			subagentEventBus: mainObject(inputs.subagentEventBus),
+		},
+		settings: sessionSettingsSource(tools.settings),
+		customTools: customTools.map(tool => toWorkerCustomTool(tool)),
+	};
+}
+
+/** `value` where it is a main-thread object this thread imported, which reaches main as itself; else undefined. */
+function mainObject<T>(value: T | undefined): T | undefined {
+	return isRpcProxy(value) ? value : undefined;
+}
+
+/** The live inputs `tools`, a live parent's tool session, holds for a child's build. */
+function parentLiveInputs(tools: ToolSession): ParentLiveInputs {
+	return { ...subagentLiveInputs(tools), eventBus: tools.eventBus, subagentEventBus: tools.subagentEventBus };
+}
+
+/**
+ * The tools of `descriptors` the kernels of `tools`, a live parent's tool session, define now; none, with a
+ * warning, where they cannot be read.
+ */
+async function parentEvalCustomTools(
+	id: string,
+	tools: ToolSession,
+	descriptors: readonly EvalToolDescriptor[],
+): Promise<CustomTool[]> {
+	try {
+		return await definedEvalCustomTools(tools, descriptors);
+	} catch (error) {
+		logger.warn("Revived subagent could not read its parent's eval tools", {
+			subagent: id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return [];
+	}
 }
 
 /**
@@ -431,52 +572,52 @@ function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boo
 }
 
 /**
- * The live inputs `session` holds for a subagent build, as a spawn of it reads them, limited to those the
- * spawn passed where its spec names them. A session built without a tool session (a host's root) gives
- * its own objects, as cold revives took them before spawn specs.
+ * The live inputs of a subagent build: the live parent's (`parent`), else the root tool session's, as a spawn
+ * of either reads them, limited to those the spawn passed where its spec names them. A root built without a
+ * tool session (a host's root) gives its own objects, as cold revives took them before spawn specs.
  */
 function coldReviveLiveInputs(
 	ctx: PersistedSubagentReviveContext,
-	session: AgentSession,
+	parent: ParentLiveInputs | undefined,
 	agent: AgentIdentity,
 	names: readonly SpawnLiveInputName[] | undefined,
 ): ColdReviveLiveInputs {
+	const root = ctx.session;
 	// What the process allows: the root's policy, whichever session the other inputs come from.
-	const rootTools = ctx.session.evalToolSession;
+	const rootTools = root.evalToolSession;
 	const policy: SubagentLivePolicy = {
 		enableLsp: ctx.enableLsp,
 		enableIrc: rootTools?.enableIrc,
 		enableMCP: rootTools?.enableMCP,
 	};
-	const tools = session.evalToolSession;
+	const inputs = parent ?? (rootTools ? parentLiveInputs(rootTools) : undefined);
 	let live: ColdReviveLiveInputs;
-	if (tools) {
-		const inputs = subagentLiveInputs(tools);
+	if (inputs) {
 		live = {
 			...spawnerLiveInputs(inputs, agent),
 			authStorage: inputs.authStorage ?? ctx.authStorage,
 			modelRegistry: inputs.modelRegistry ?? ctx.modelRegistry,
-			subagentEventBus: tools.subagentEventBus ?? ctx.subagentEventBus,
+			subagentEventBus: inputs.subagentEventBus ?? ctx.subagentEventBus,
 			mcpManager: inputs.mcpManager ?? MCPManager.instance(),
 			settingsParent: inputs.settings ?? ctx.settings,
-			eventBus: tools.eventBus ?? ctx.eventBus,
+			eventBus: inputs.eventBus ?? ctx.eventBus,
 			parentArtifactManager: inputs.parentArtifactManager,
 			policy,
 		};
 	} else {
 		live = {
-			costGate: session.costGate,
+			costGate: root.costGate,
 			authStorage: ctx.authStorage,
 			modelRegistry: ctx.modelRegistry,
-			asyncJobManager: session.asyncJobManager,
+			asyncJobManager: root.asyncJobManager,
 			// Owner policy, read when the session asks, never extension authority from a transcript.
-			extensionRoots: () => session.effectiveExtensionRoots,
-			preloadedPreparedExtensions: session.preparedExtensions,
+			extensionRoots: () => root.effectiveExtensionRoots,
+			preloadedPreparedExtensions: root.preparedExtensions,
 			mcpManager: MCPManager.instance(),
 			subagentEventBus: ctx.subagentEventBus,
 			settingsParent: ctx.settings,
 			eventBus: ctx.eventBus,
-			parentArtifactManager: session.sessionManager.getArtifactManager() ?? undefined,
+			parentArtifactManager: root.sessionManager.getArtifactManager() ?? undefined,
 			policy,
 		};
 	}
@@ -490,33 +631,22 @@ function coldReviveLiveInputs(
 }
 
 /**
- * The custom tools `descriptors` name, each built from its stored descriptor: over `kernelSession` (the live
- * parent's tool session) where one of its kernels defines that tool, else as an unavailable tool, which
- * is named in a warning. No tool is dropped.
+ * The custom tools `descriptors` name: each the tool the live parent's kernel serves (one of `served`) where a
+ * kernel defines it, else built from its stored descriptor as an unavailable tool, which is named in a
+ * warning. No tool is dropped.
  */
-async function coldReviveCustomTools(
+function coldReviveCustomTools(
 	id: string,
 	descriptors: readonly EvalToolDescriptor[],
-	kernelSession: ToolSession | undefined,
-): Promise<{ customTools: CustomTool[]; unavailable: string[] }> {
+	served: readonly CustomTool[],
+): { customTools: CustomTool[]; unavailable: string[] } {
+	const byName = new Map(served.map(tool => [tool.name, tool]));
 	const customTools: CustomTool[] = [];
 	const unavailable: string[] = [];
-	if (descriptors.length === 0) return { customTools, unavailable };
-	// `listEvalTools`, not `describeEvalTools`, which throws on a name no kernel defines.
-	let defined = new Map<string, string>();
-	if (kernelSession) {
-		try {
-			defined = new Map((await listEvalTools(kernelSession)).map(tool => [tool.name, tool.language]));
-		} catch (error) {
-			logger.warn("Revived subagent could not read its parent's eval tools", {
-				subagent: id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	}
 	for (const descriptor of descriptors) {
-		if (kernelSession && defined.get(descriptor.name) === descriptor.language) {
-			customTools.push(...createEvalCustomTools(kernelSession, [descriptor]));
+		const tool = byName.get(descriptor.name);
+		if (tool) {
+			customTools.push(tool);
 			continue;
 		}
 		customTools.push(unavailableEvalCustomTool(descriptor));
