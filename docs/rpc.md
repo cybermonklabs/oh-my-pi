@@ -1532,6 +1532,70 @@ Live frames are not session events: `set_event_filter` never drops them.
 Closing stdin, or `pi.shutdown()`, stops an active live session before the
 process exits.
 
+### `/live` as typed input
+
+A `prompt` whose text is `/live on`, `/live off` or `/live status` drives the
+same session as `live_start` (host audio) and `live_stop`, and so does an
+extension's `sendUserInput` with that text (the way a chat bridge relays a
+person's line). It runs at once, also while a turn runs, and answers in one
+`command_output` line, which `sendUserInput` also returns as `output`:
+
+- `/live on`: `Live call open: <provider>, voice <voice>.`; while a call is
+  starting or open, `A live call is already open (since <UTC time>).`; on a
+  failure (dictation running, the session changing, no credential, the server's
+  refusal), `Live call did not start: <reason>`.
+- `/live off`: `Live call ended.`, or `No live call is open.`
+- `/live status` (or a bare `/live`): `Live call open since <UTC time>:
+  <provider>, voice <voice>, microphone on|muted.`, or `No live call is open.`
+
+The live frames below are sent as for `live_start`. The checks `live_start`
+makes (dictation, a session change or shutdown) apply to `/live on` too. ACP,
+print mode and subagents run no live session and answer `/live` as not
+available; the interactive terminal's `/live` opens its own live view.
+
+### GPT-Live through the `openai` provider
+
+`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`) sends each live session
+to GPT-Live's public API at the `openai` provider of `models.yml`, with that
+provider's `baseUrl` and key, for example a model gateway:
+
+1. `POST {base}/live/sessions` with `Authorization: Bearer <provider key>` and
+   `{ "session": { "model": <live.model>, "instructions", "audio": { "output": { "voice" } }, "delegation": { "type": "client" }, "idle_timeout_s": 60, "wake_policy": { "type": "speech" } }, "transport": { "type": "webrtc", "sdp": <offer> } }`.
+   The answer is `201 { "session": { "id" }, "transport": { "sdp" } }`. No Codex
+   header is sent and no redirect is followed.
+2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
+   bearer. Events whose `event_id` came before (the attach replays 3 s) are
+   dropped.
+
+GPT-Live's delegation names no task text, only its offset on the call's
+timeline, so omp builds each delegation's turn from the transcript: both
+speakers' words since the previous delegation, up to the delegation's
+`offset_ms`. It waits up to 3 s for the transcript to reach that offset and
+sends the turn either way; no delegation is dropped. The turn says that its text
+is recognized speech that may hold errors and asks for a short spoken reply.
+Progress goes to the call as `session.thinking.append` (not spoken) and the
+turn's final reply as `session.commentary.append` (spoken). A turn no delegation
+started is not spoken.
+
+Each call's transcript is written among the session's artifacts as
+`<n>.live-transcript.log`, one `<UTC time> User|Voice: <text>` line per run of a
+speaker, ended by a change of speaker, a delegation, or 1.5 s of the call's
+timeline without new words. When the call ends, the session gets a message
+(for its next turn) naming that file and the call's start and end. On stop omp
+sends `session.close` and waits up to 5 s for `session.closed` before it closes
+the sideband. A call ends by itself after 15 minutes in which the user says
+nothing; while nobody speaks, the 60 s `idle_timeout_s` under a speech wake
+policy puts the call on OpenAI's standby rate. `live.endpoint` and
+`live.provider: openai` cannot both be set.
+
+`live.pulseServer` names the PulseAudio server for the call's microphone and
+speaker (for example `tcp:127.0.0.1:4713`); it wins over `PULSE_SERVER`, the
+stream gets the buffer sizes of a network round trip as with `PULSE_SERVER`
+(`PULSE_LATENCY_MSEC` still wins), and when that server cannot be opened, or
+libpulse is missing, the call fails instead of falling back to ALSA.
+`live.instructionsFile` names a file whose text is appended to the voice
+model's instructions at the start of each call (Codex and openai alike).
+
 ### Custom live endpoint
 
 Live sessions signal Codex with the session's ChatGPT (Codex) sign-in. Set

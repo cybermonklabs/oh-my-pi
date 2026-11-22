@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AudioCapture` takes an optional third argument, `server`, and `LiveWebRtcPeer` an optional fourth, `pulseServerName`: a PulseAudio server (`tcp:host:port`) to open the microphone or the speaker on. A named server is used instead of `PULSE_SERVER`, gets the buffer sizes of a network round trip (`PULSE_LATENCY_MSEC` still wins), and when it cannot be opened, or libpulse is missing, the open fails instead of falling back to ALSA
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
