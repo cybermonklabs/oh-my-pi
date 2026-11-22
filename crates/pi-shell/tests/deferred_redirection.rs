@@ -391,3 +391,18 @@ async fn the_tools_shell_runs_a_deferred_functions_absolute_command() {
 		assert_eq!((result.exit_code, output.as_str()), (Some(0), want), "`{script}`");
 	}
 }
+
+/// zsh mode: a `<&` word that is not a file number (`<&$fd-`, which zsh
+/// does not take, among them) fails with zsh 5.9's message, which names no
+/// word.
+#[test]
+fn a_zsh_dup_of_no_file_number_says_so_as_zsh_does() {
+	let rows: Vec<_> = ["cat <&abc", "cat <&10-", "cat <&3x", "cat <&\"\""]
+		.into_iter()
+		.map(|text| {
+			let script = format!("{text}; echo \"s=$?\"");
+			(text.to_owned(), script, "s=1\n".to_owned(), "file number expected\n".to_owned())
+		})
+		.collect();
+	check(true, &rows);
+}

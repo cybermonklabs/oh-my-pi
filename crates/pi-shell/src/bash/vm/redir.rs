@@ -1165,7 +1165,8 @@ fn zsh_install(
 					place_on(k, vp, cx, 1, h.clone(), true)?;
 					return place_on(k, vp, cx, 2, h, true);
 				}
-				let d = zsh_msg(format!("file number expected: {}", target.as_bstr()));
+				// zsh `xpandredir`: the message names no word.
+				let d = zsh_msg("file number expected".into());
 				return Err(fail(k, vp, cx, line, d));
 			};
 			let Some(h) = vp.fds.get(src).cloned().filter(FdRef::is_open) else {
