@@ -466,10 +466,10 @@ interface SystemPromptHoldEnd {
 /**
  * Custom entry naming the settings a change the base prompt a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names
  * withholds holds ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}), each with the value that prompt was built with, and the
- * change whose settings notices tell the model of them ({@link SettingsNoticeDetails.hold}): what a resumed process
- * that restores that prompt tells the model of where those notices did not ({@link SessionTools.takeSettingsNotice}).
- * Each names the settings no such record of the same change names since the branch last recorded another prompt or
- * ended a hold on this one.
+ * change ({@link SettingsNoticeDetails.hold}): what a resumed process that restores that prompt tells the model of
+ * where the settings notices in its context did not ({@link SessionTools.takeSettingsNotice}). Each names the
+ * settings no such record of the same change names since the branch last recorded another prompt or ended a hold on
+ * this one.
  */
 const SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE = "system-prompt-held-settings";
 
@@ -500,8 +500,6 @@ interface RecordedHold {
 	since: number;
 	/** Each setting a {@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE} record names, by id: the earliest record of it. */
 	settings: ReadonlyMap<string, HeldSettingRecord>;
-	/** The changes those records name ({@link SystemPromptHeldSettings.hold}). */
-	holds: ReadonlySet<string>;
 }
 
 /**
@@ -954,11 +952,6 @@ interface HeldSettings {
 	readonly before: Map<AnySetting, unknown>;
 	/** What the change's settings notices told the model, each with the ones before it on its branch, by number. */
 	readonly notices: SettingsNoticeState[];
-	/**
-	 * Changes of an earlier process the session records as held from the same prompt
-	 * ({@link SystemPromptHeldSettings.hold}): what their notices in the context gave each setting counts as told.
-	 */
-	readonly earlierHolds: ReadonlySet<string>;
 }
 
 /**
@@ -1006,9 +999,9 @@ interface SettingsNoticeState {
 }
 
 /**
- * What the settings notices of changes other than the one the base withholds told the model: an earlier process's
- * changes of a restored prompt ({@link HeldSettings.earlierHolds}), or every change while none is withheld. As
- * {@link SettingsNoticeState}, with each setting by id.
+ * What the settings notices in a context told the model of every change but the one the base withholds, if any: an
+ * earlier process's change of a restored prompt, and a change whose hold ended (released, or spent across a restart),
+ * whether or not a notice of its last state went out. As {@link SettingsNoticeState}, with each setting by id.
  */
 interface EarlierNoticesTold {
 	/** The value the newest of them gave each setting it names, by id. */
@@ -1017,6 +1010,31 @@ interface EarlierNoticesTold {
 	readonly disabledTools: readonly string[];
 	/** The tools given as enabled, available after the rebuild. */
 	readonly enabledTools: readonly string[];
+	/** The change the newest of them describes, and how many of them describe it; undefined without them. */
+	readonly newest: { readonly hold: string; readonly notices: number } | undefined;
+}
+
+/**
+ * Where each setting a settings notice may name starts, as the model was told of it before the notices of the change
+ * the base withholds, if any, which holds each setting of `before` with the value the withholding prompt was built
+ * with: each setting it holds at the value the newest notice of another change in the context gave it (`earlier`),
+ * else at the value the prompt was built with; then each other setting those notices gave a value, at that value, but
+ * a credential, whose value no notice records, and a setting this process does not know. The settings notice and the
+ * held-tool refusal name each change from here, so both give a setting the same value before the change.
+ */
+function noticedSettingStarts(
+	before: ReadonlyMap<AnySetting, unknown>,
+	earlier: EarlierNoticesTold,
+): Map<AnySetting, unknown> {
+	const starts = new Map<AnySetting, unknown>();
+	for (const [setting, value] of before) {
+		starts.set(setting, earlier.values.has(setting.id) ? earlier.values.get(setting.id) : value);
+	}
+	for (const [id, value] of earlier.values) {
+		const setting = lookupSetting(id);
+		if (setting && !setting.isCredential && !starts.has(setting)) starts.set(setting, value);
+	}
+	return starts;
 }
 
 /**
@@ -3311,23 +3329,20 @@ export class SessionTools {
 		const entries = this.#host.sessionManager.getEntries();
 		let since: number | undefined;
 		let settings = new Map<string, HeldSettingRecord>();
-		const holds = new Set<string>();
 		for (let index = other < 0 ? 0 : entries.indexOf(branch[other]) + 1; index < entries.length; index++) {
 			const entry = entries[index];
 			if (promptHoldEndOfEntry(entry) === digest) {
 				since = undefined;
 				settings = new Map();
-				holds.clear();
 				continue;
 			}
 			const withheld = promptHoldOfEntry(entry);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
 			const named = heldSettingsOfEntry(entry);
 			if (named?.digest !== digest) continue;
-			holds.add(named.hold);
 			for (const record of named.settings) if (!settings.has(record.id)) settings.set(record.id, record);
 		}
-		return since === undefined ? undefined : { since, settings, holds };
+		return since === undefined ? undefined : { since, settings };
 	}
 
 	/**
@@ -3420,7 +3435,6 @@ export class SessionTools {
 			id: crypto.randomUUID(),
 			before,
 			notices: [],
-			earlierHolds: recorded?.holds ?? new Set(),
 		};
 		// The change the stored prompt would withhold is due already: this process's own build goes out.
 		if (withheldChangeDue(restoredPrompt, false)) return false;
@@ -4475,10 +4489,11 @@ export class SessionTools {
 	 * ({@link recordReplyPrompt}), and so is each setting it holds, so a resumed process that restores the bound
 	 * prompt keeps the change waiting no longer and tells the model of it ({@link #restoreTranscriptPrompt}). A hold
 	 * on a restored transcript prompt holds the settings the session records as held from it too, with the values that
-	 * prompt was built with, and goes on from the notices that told the model of them. Returns the hold to extend, or
-	 * undefined when the rebuild runs now: no settings change started it, or nothing is bound. Unlike
-	 * {@link #implicitRebuildBinding}, the prompt the session was created with binds as soon as a reply was produced
-	 * under it or a call sent with it, before any rebuild committed.
+	 * prompt was built with, and goes on from the notices that told the model of them; it goes out when that prompt
+	 * does ({@link replaceRestoredPromptIfDue}), so it is dated from the change that prompt withholds, and its notice
+	 * and its refusals give that time. Returns the hold to extend, or undefined when the rebuild runs now: no settings
+	 * change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was
+	 * created with binds as soon as a reply was produced under it or a call sent with it, before any rebuild committed.
 	 */
 	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
 		if (!settingsChange || !this.#promptBound) return undefined;
@@ -4488,10 +4503,10 @@ export class SessionTools {
 			const before = new Map(restored?.before);
 			held = {
 				id: restored?.id ?? crypto.randomUUID(),
-				...this.#withheldChange(this.currentPromptDigest(), Date.now(), false),
+				// A kept restored prompt goes out with the change: it is as old as the change that prompt withholds.
+				...this.#withheldChange(this.currentPromptDigest(), restored?.since ?? Date.now(), false),
 				before,
 				notices: restored?.notices ?? [],
-				earlierHolds: restored?.earlierHolds ?? new Set(),
 				disabledTools: new Map(),
 				enabledTools: new Set(),
 				reconcile: false,
@@ -4907,52 +4922,39 @@ export class SessionTools {
 	}
 
 	/**
-	 * Builds the hidden notice of a held settings change: each changed setting with the value the prompt was built
-	 * with and the value now set (a credential's values withheld), the tools the change disabled, whose calls are
+	 * Builds the hidden notice of a held settings change: each changed setting with the value the model was told of
+	 * it and the value now set (a credential's values withheld), the tools the change disabled, whose calls are
 	 * refused, the tools it enables at the rebuild, and when the rebuild comes at the latest. Gives only what changed
 	 * since the change's last notice on the current branch, both ways: a tool that notice gave as disabled that runs
 	 * again, and one it gave as enabled that the rebuild no longer brings; a branch the change's notices are not on
 	 * (`/tree` to an earlier reply, a switch to another session) gets the whole change. The change is a held settings
-	 * rebuild's, else the settings a kept restored transcript prompt withholds ({@link #restoreTranscriptPrompt}). What
-	 * the notices of an earlier process's change of that prompt gave counts as told ({@link HeldSettings.earlierHolds}):
-	 * a setting at its current value, and the tools they gave as disabled or as available after the rebuild, so a
-	 * resumed process names only what they did not or what is no longer so (a setting set back since, a tool they gave
-	 * as disabled that runs here, one they gave as available after the rebuild that is not here). While no change is
-	 * withheld, it puts right what the notices in `messages` told that the live settings contradict
-	 * ({@link #releasedSettingsNotice}).
+	 * rebuild's, else the settings a kept restored transcript prompt withholds ({@link #restoreTranscriptPrompt}).
+	 * What the notices of every other change in `messages` gave counts as told ({@link noticedSettingStarts}): a
+	 * setting at the value the newest of them gave it, and the tools they gave as disabled or as available after the
+	 * rebuild. So the change's first notice also puts right what they told that is no longer so, as
+	 * {@link #releasedSettingsNotice} does while no change is withheld: a setting whose value differs now (one set
+	 * back before a restart, or after a hold that ended before a notice of its last state went out), a tool they gave
+	 * as disabled that runs here, and one they gave as available after the rebuild that is not here.
 	 */
 	takeSettingsNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
 	): CustomMessage<SettingsNoticeDetails> | undefined {
 		const rebuild = this.#heldSettingsRebuild;
 		const held = rebuild ?? this.#keptRestoredPrompt();
-		if (!held) return this.#releasedSettingsNotice(messages);
+		const earlier = this.#earlierNoticesTold(messages, held?.id);
+		if (!held) return this.#releasedSettingsNotice(earlier);
 		const told = this.#settingsNoticeTold(held, messages);
-		const earlier = this.#earlierNoticesTold(held.earlierHolds, messages);
 		const values = new Map(told?.values);
-		const changes: SettingChangeView[] = [];
-		const given: HeldSettingRecord[] = [];
-		for (const [setting, before] of held.before) {
-			const known = values.has(setting)
-				? values.get(setting)
-				: earlier.values.has(setting.id)
-					? earlier.values.get(setting.id)
-					: before;
-			const value = setting.get(this.#host.settings);
-			if (settingValuesEqual(value, known)) continue;
-			changes.push(settingChangeView(setting, known, value));
-			if (!setting.isCredential) given.push(heldSettingRecord(setting, value));
-			values.set(setting, value);
-		}
-		// Without a notice of its own on the branch, the change goes on from what the earlier process's notices told.
+		const { changes, given } = this.#settingChanges(noticedSettingStarts(held.before, earlier), values);
+		// Without a notice of its own on the branch, the change goes on from what the other changes' notices told.
 		const toldDisabled = told?.disabledTools ?? earlier.disabledTools;
 		const toldEnabled = told?.enabledTools ?? earlier.enabledTools;
 		let disabledTools: readonly string[];
 		let enabledTools: readonly string[];
 		if (rebuild) {
-			// What the notices told that the rebuild still does stays told (a hold begun on a kept restored prompt goes
-			// on from what that prompt's notices told): a tool given as disabled it does not bring back, and one given as
-			// available after the rebuild that it brings.
+			// What the notices told that the rebuild still does stays told (a hold without a notice of its own goes on
+			// from what the other changes' notices told): a tool given as disabled it does not bring back, and one given
+			// as available after the rebuild that it brings.
 			const after = this.#enabledAfterHold(rebuild);
 			disabledTools = [
 				...new Set([...rebuild.disabledTools.keys(), ...toldDisabled.filter(name => !after.has(name))]),
@@ -4992,89 +4994,102 @@ export class SessionTools {
 	}
 
 	/**
-	 * The hidden notice of what the settings notices in `messages` told the model that no longer holds, while no change
-	 * is withheld: a change they described ended before a notice of its last state went out (it was set back, then its
-	 * held rebuild came due before the next request, or a resumed process did not keep the transcript's prompt). It
-	 * names each setting they gave a value the live setting no longer has, each tool they gave as disabled that is
-	 * enabled now, and each tool they gave as available after the rebuild that is not, under the newest notice's
-	 * change, so the next request counts it as told. Undefined when nothing they told is contradicted; a credential,
-	 * whose value no notice records, and a setting this process does not know are left out.
+	 * Each setting of `starts` whose value differs now from the one the model was told of it, as a settings notice
+	 * and the held-tool refusal name it: from the value `told` gives it, else from its start
+	 * ({@link noticedSettingStarts}). Gives each but a credential with its value now too, as the notice records it,
+	 * and sets that value in `told`.
 	 */
-	#releasedSettingsNotice(messages: readonly AgentMessage[]): CustomMessage<SettingsNoticeDetails> | undefined {
-		// What they told, as #earlierNoticesTold reads it for the changes they name, read on this walk.
-		const values = new Map<string, unknown>();
-		const toldDisabled = new Set<string>();
-		const toldEnabled = new Set<string>();
-		const notices = new Map<string, number>();
-		let hold: string | undefined;
-		let notice = 0;
-		for (const message of messages) {
-			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
-			const details = message.details;
-			if (!isRecord(details) || typeof details.hold !== "string") continue;
-			hold = details.hold;
-			notice = (notices.get(hold) ?? 0) + 1;
-			notices.set(hold, notice);
-			if (!isHeldSettingRecords(details.values)) continue;
-			for (const { id, value } of details.values) values.set(id, value);
-			applyNoticeToolLists(toldDisabled, toldEnabled, details);
-		}
-		if (hold === undefined) return undefined;
+	#settingChanges(
+		starts: Iterable<readonly [AnySetting, unknown]>,
+		told: Map<AnySetting, unknown>,
+	): { changes: SettingChangeView[]; given: HeldSettingRecord[] } {
 		const changes: SettingChangeView[] = [];
 		const given: HeldSettingRecord[] = [];
-		for (const [id, value] of values) {
-			const setting = lookupSetting(id);
-			if (!setting || setting.isCredential) continue;
-			const now = setting.get(this.#host.settings);
-			if (settingValuesEqual(now, value)) continue;
-			changes.push(settingChangeView(setting, value, now));
-			given.push(heldSettingRecord(setting, now));
+		for (const [setting, start] of starts) {
+			const known = told.has(setting) ? told.get(setting) : start;
+			const value = setting.get(this.#host.settings);
+			if (settingValuesEqual(value, known)) continue;
+			changes.push(settingChangeView(setting, known, value));
+			if (!setting.isCredential) given.push(heldSettingRecord(setting, value));
+			told.set(setting, value);
 		}
+		return { changes, given };
+	}
+
+	/**
+	 * The hidden notice of what the settings notices in the context told the model that no longer holds, while no
+	 * change is withheld (`earlier`, the notices of every change): a change they described ended before a notice of
+	 * its last state went out (it was set back, then its held rebuild came due before the next request, or a resumed
+	 * process did not keep the transcript's prompt). It names each setting they gave a value the live setting no longer
+	 * has, each tool they gave as disabled that is enabled now, and each tool they gave as available after the rebuild
+	 * that is not, under the newest notice's change, so the next request counts it as told. Undefined when nothing
+	 * they told is contradicted; a credential, whose value no notice records, and a setting this process does not know
+	 * are left out ({@link noticedSettingStarts}).
+	 */
+	#releasedSettingsNotice(earlier: EarlierNoticesTold): CustomMessage<SettingsNoticeDetails> | undefined {
+		const { newest } = earlier;
+		if (!newest) return undefined;
+		const { changes, given } = this.#settingChanges(noticedSettingStarts(NO_SETTINGS, earlier), new Map());
 		const enabled = new Set(this.getEnabledToolNames());
 		const tools = {
 			disabledTools: [],
-			reenabledTools: [...toldDisabled].filter(name => enabled.has(name)),
+			reenabledTools: earlier.disabledTools.filter(name => enabled.has(name)),
 			enabledTools: [],
-			noLongerEnabledTools: [...toldEnabled].filter(name => !enabled.has(name)),
+			noLongerEnabledTools: earlier.enabledTools.filter(name => !enabled.has(name)),
 		};
 		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
-		return settingsNoticeMessage(changes, given, tools, hold, notice, { released: true });
+		return settingsNoticeMessage(changes, given, tools, newest.hold, newest.notices, { released: true });
 	}
 
 	/**
-	 * What the settings notices of `holds` in `messages` told the model, each notice giving what changed since the one
-	 * before it ({@link SettingsNoticeDetails}): the value the newest gave each setting it names, by id, and the tools
-	 * left given as disabled and as available after the rebuild, the newest notice that names a tool deciding which
-	 * ({@link applyNoticeToolLists}). Empty without such holds.
+	 * What the settings notices in `messages` of every change but `except` told the model, each notice giving what
+	 * changed since the one before it ({@link SettingsNoticeDetails}): the value the newest gave each setting it names,
+	 * by id, the tools left given as disabled and as available after the rebuild, the newest notice that names a tool
+	 * deciding which ({@link applyNoticeToolLists}), and the change the newest notice describes.
 	 */
-	#earlierNoticesTold(holds: ReadonlySet<string>, messages: readonly AgentMessage[]): EarlierNoticesTold {
+	#earlierNoticesTold(messages: readonly AgentMessage[], except?: string): EarlierNoticesTold {
 		const values = new Map<string, unknown>();
 		const disabledTools = new Set<string>();
 		const enabledTools = new Set<string>();
-		if (holds.size > 0) {
-			for (const message of messages) {
-				if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
-				const details = message.details;
-				if (!isRecord(details) || typeof details.hold !== "string" || !holds.has(details.hold)) continue;
-				if (!isHeldSettingRecords(details.values)) continue;
-				for (const { id, value } of details.values) values.set(id, value);
-				applyNoticeToolLists(disabledTools, enabledTools, details);
-			}
+		const counts = new Map<string, number>();
+		let hold: string | undefined;
+		let notices = 0;
+		for (const message of messages) {
+			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details;
+			if (!isRecord(details) || typeof details.hold !== "string" || details.hold === except) continue;
+			hold = details.hold;
+			notices = (counts.get(hold) ?? 0) + 1;
+			counts.set(hold, notices);
+			if (!isHeldSettingRecords(details.values)) continue;
+			for (const { id, value } of details.values) values.set(id, value);
+			applyNoticeToolLists(disabledTools, enabledTools, details);
 		}
-		return { values, disabledTools: [...disabledTools], enabledTools: [...enabledTools] };
+		return {
+			values,
+			disabledTools: [...disabledTools],
+			enabledTools: [...enabledTools],
+			newest: hold === undefined ? undefined : { hold, notices },
+		};
 	}
 
 	/**
-	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it while its
-	 * definition stays in the bound prompt until the rebuild. Undefined for every other tool.
+	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it while it
+	 * stays listed until the rebuild. It names each setting whose change disabled it as the settings notice names the
+	 * change, from the value the model was told of it before the change's notices ({@link noticedSettingStarts}), and
+	 * only while its value differs from that one, and the time the rebuild comes at the latest. Undefined for every
+	 * other tool.
 	 */
 	heldToolRefusal(name: string): string | undefined {
 		const bareName = stripXdUrlPrefix(name);
 		const held = this.#heldSettingsRebuild;
 		const gates = held?.disabledTools.get(bareName);
 		if (!held || !gates) return undefined;
-		const changes = gates.map(setting =>
-			settingChangeView(setting, held.before.get(setting), setting.get(this.#host.settings)),
+		const earlier = this.#earlierNoticesTold(this.#host.agent.state.messages, held.id);
+		const starts = noticedSettingStarts(held.before, earlier);
+		const { changes } = this.#settingChanges(
+			gates.map(setting => [setting, starts.get(setting)] as const),
+			new Map(),
 		);
 		return prompt.render(heldToolRefusalPrompt, { tool: bareName, changes, rebuildBy: withheldChangeDeadline(held) });
 	}
