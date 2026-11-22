@@ -283,4 +283,22 @@ f"
 	time ! a > /dev/null
 }function f () time ! af () {
 	time ! a
-}
+}>g f() time af () {
+	time a
+} > gf >g () time af () {
+	time a
+} > g>g function f () a | bf () {
+	a | b
+} > g>g function f () time af () {
+	time a
+} > g>g f() >h time af () {
+	time a > h
+} > g<g f() time a | bf () {
+	time a | b
+} < g2>g f() time af () {
+	time a
+} 2> g>g function f () ! af () {
+	! a
+} > g>g f() { time a }f () {
+	time a
+} > g

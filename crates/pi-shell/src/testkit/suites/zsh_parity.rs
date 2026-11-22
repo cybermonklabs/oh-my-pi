@@ -371,6 +371,28 @@ fn functions_value_shows_no_group_around_time() {
 	assert_eq!((err.as_str(), st), ("", 0));
 }
 
+/// Redirections written on a definition (before the name, between the name
+/// and `()`, before `function`) stay outside the body: a group around a
+/// body the parser made a group for, as zsh 5.9 prints it.
+#[test]
+fn functions_value_keeps_definition_redirections_outside_the_body() {
+	for (src, text) in [
+		(">g f() time a", "{\n\ttime a\n} > g\n"),
+		("f >g () time a", "{\n\ttime a\n} > g\n"),
+		(">g function f () a | b", "{\n\ta | b\n} > g\n"),
+		(">g f() >h time a", "{\n\ttime a > h\n} > g\n"),
+		("<g f() time a | b", "{\n\ttime a | b\n} < g\n"),
+		("2>g f() time a", "{\n\ttime a\n} 2> g\n"),
+		(">g function f () ! a", "{\n\t! a\n} > g\n"),
+	] {
+		let (out, err, st) = zsh(&format!("{src}; print -r -- \"$functions[f]\""));
+		assert_eq!(out, text, "{src}");
+		assert_eq!((err.as_str(), st), ("", 0), "{src}");
+	}
+	let (out, ..) = zsh(">g f() time a; functions f");
+	assert_eq!(out, "f () {\n\ttime a\n} > g\n");
+}
+
 #[test]
 fn redirkill_equals_substitution_is_a_temporary_file() {
 	let (out, err, st) = zsh(

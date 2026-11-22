@@ -7,7 +7,9 @@
 //! compound commands on their own lines, here-document bodies after the
 //! line that opens them. The engine stores it as a zsh function's source;
 //! parsing it again with the zsh grammar gives back the same tree, so
-//! printing that tree gives back the same text.
+//! printing that tree gives back the same text, as zsh's own text does.
+//! Where zsh's text is not such a fixpoint (an empty `time` after a
+//! redirection, `>f time !`), neither is this.
 //!
 //! Ported from zsh 5.9 (MIT-style licence, Copyright (c) 1992-1997 Paul
 //! Falstad and the zsh development group).

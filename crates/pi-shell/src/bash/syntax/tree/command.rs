@@ -61,8 +61,9 @@ const ANON_ARGS: usize = 1;
 const ARITH_TEXT: usize = 0;
 
 const PIPE_STDERR: u8 = 1;
-/// A group [`Tree::pipeline_command`] made around a pipeline that is not
-/// one stage; the source has no braces there.
+/// A group [`Tree::pipeline_command`] made where one command stands for a
+/// pipeline of several stages, or with a `!` or a `time`; the source has no
+/// braces there.
 const MADE_GROUP: u8 = 2;
 const TYPESET: u8 = 1;
 const HAS_ELSE: u8 = 1;
@@ -450,7 +451,9 @@ impl Tree {
 
 	/// zsh keeps redirections written on a function definition with the
 	/// function (`execfuncdef`'s `redir_prog`): they move onto the body, a
-	/// group around it if it is not one. The command with them moved.
+	/// group around it if it is not one written as one (a group the parser
+	/// made around a pipeline gets a group around it too). The command with
+	/// them moved.
 	pub fn attach_function_redirs(&mut self, cmd: Id<CommandS>) -> Id<CommandS> {
 		let c = Command::of(self, cmd);
 		let (Payload::FuncDef(fd), false) = (c.payload(), c.redirs().is_empty()) else {
@@ -458,8 +461,12 @@ impl Tree {
 		};
 		let span = c.span();
 		let body = FuncDef::of(self, fd).body();
-		let (body_span, body) = (body.span(), body.handle());
-		let body = if let Payload::Brace(_) = Payload::of(self, body.index()) {
+		let (body_span, written_group, body) = (
+			body.span(),
+			matches!(body.kind(), CommandKind::Brace(_)) && !body.made_group(),
+			body.handle(),
+		);
+		let body = if written_group {
 			body
 		} else {
 			let p = self.pipeline(body_span, false, None, &[body]);
@@ -499,9 +506,10 @@ impl<'t> Command<'t> {
 	}
 
 	/// A group [`Tree::pipeline_command`] made around a pipeline (zsh `!
-	/// time P`, `coproc time P`, `coproc P | Q`, `P | time Q`, `>f time P`):
-	/// zsh's text shows the pipeline there, not a group. Only the printer
-	/// reads it.
+	/// time P`, `coproc time P`, `coproc P | Q`, `P | time Q`, `>f time P`,
+	/// a function body such as `f() time P`): zsh's text shows the pipeline
+	/// there, not a group. Only the printer and
+	/// [`Tree::attach_function_redirs`] read it.
 	pub fn made_group(self) -> bool {
 		self.0.flag(MADE_GROUP)
 	}

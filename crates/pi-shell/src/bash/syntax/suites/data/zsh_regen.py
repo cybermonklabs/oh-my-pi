@@ -57,6 +57,15 @@ TEXT = [
     "f() { ! { time a }; { time a } >f; ! ( time a ); time coproc a }",
     "f() >/dev/null time ! a",
     "function f () time ! a",
+    ">g f() time a",
+    "f >g () time a",
+    ">g function f () a | b",
+    ">g function f () time a",
+    ">g f() >h time a",
+    "<g f() time a | b",
+    "2>g f() time a",
+    ">g function f () ! a",
+    ">g f() { time a }",
 ]
 
 ERRORS = [
