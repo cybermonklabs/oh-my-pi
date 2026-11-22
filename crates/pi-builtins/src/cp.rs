@@ -131,14 +131,14 @@ enum TargetType {
 	File,
 }
 
-/// Copy action to perform
+/// Copy action to perform. `-u`/`--update` is not one: it decides, in every
+/// mode, whether an existing destination is replaced at all (`Options.update`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 enum CopyMode {
 	Link,
 	SymLink,
 	#[default]
 	Copy,
-	Update,
 	AttrOnly,
 }
 
@@ -204,7 +204,7 @@ struct Options {
 	copy_contents:          bool,
 	/// `-H`
 	cli_dereference:        bool,
-	/// `-l`, `-s`, `-u`, `--attributes-only`, or a plain copy.
+	/// `-l`, `-s`, `--attributes-only`, or a plain copy.
 	copy_mode:              CopyMode,
 	/// `-L`, `--dereference`
 	dereference:            bool,
@@ -804,14 +804,10 @@ impl CopyMode {
 			Self::Link
 		} else if matches.get_flag(options::SYMBOLIC_LINK) {
 			Self::SymLink
-		} else if matches
-			.get_one::<String>(update_control::arguments::OPT_UPDATE)
-			.is_some()
-			|| matches.get_flag(update_control::arguments::OPT_UPDATE_NO_ARG)
-		{
-			Self::Update
 		} else if matches.get_flag(options::ATTRIBUTES_ONLY) {
-			if matches.get_flag(options::REMOVE_DESTINATION) { Self::Copy } else { Self::AttrOnly }
+			// GNU copies no data with `--attributes-only` (`data_copy_required`),
+			// whatever else it does to the destination first.
+			Self::AttrOnly
 		} else {
 			Self::Copy
 		}
@@ -2107,7 +2103,10 @@ fn copy_into_backup(
 	let create = |at: &Path| filesystem.open_with(at, OpenOptions::new().write(true).create_new(true).mode(mode));
 	let existing = filesystem.symlink_metadata(backup);
 	let (file, temp) = match &existing {
-		Ok(metadata) if metadata.is_symlink() => {
+		// With `--attributes-only` no data is written, so the link at `a~` is
+		// followed as GNU follows it (its target's data stays); otherwise the
+		// link is replaced, where GNU writes the source's data into its target.
+		Ok(metadata) if metadata.is_symlink() && !options.attributes_only => {
 			match filesystem.metadata(backup) {
 				Ok(target) if target.is_dir() => return Err(overwrite_directory(&shown, source)),
 				// GNU refuses a link that leads nowhere, and reports any other
@@ -2143,11 +2142,26 @@ fn copy_into_backup(
 			// looked at it, before cp opens it.
 			#[cfg(test)]
 			crate::host::run_hook(backup);
-			if existing.is_ok() {
+			if existing.is_ok() && options.remove_destination() {
+				// `--remove-destination` removes the backup name before the
+				// converted copy writes it, as GNU's does
+				// (`unlink_dest_before_opening`): `--attributes-only` then
+				// leaves it empty, and its other links keep their data.
+				match filesystem.remove_file(backup) {
+					Ok(()) => {},
+					Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+					Err(error) => {
+						return Err(CpError::IoErrContext(error, format!("cannot remove {}", shown.quote())));
+					},
+				}
+				(create(backup).map_err(cannot_create)?, None)
+			} else if existing.is_ok() {
 				let mut open = OpenOptions::new();
 				open.write(true).truncate(!options.attributes_only);
+				// No link is written through here, but under `--attributes-only`,
+				// whose open writes no data (see above).
 				#[cfg(unix)]
-				if filesystem.is_native_local(backup) {
+				if filesystem.is_native_local(backup) && !options.attributes_only {
 					open.custom_flags(libc::O_NOFOLLOW);
 				}
 				match filesystem.open_with(backup, &open) {
@@ -2227,7 +2241,7 @@ fn create_refused(
 		CopyMode::Link => link(format!("cannot create hard link {} to {}", dest.quote(), source.quote())),
 		CopyMode::SymLink => link(format!("cannot create symbolic link {} to {}", dest.quote(), source.quote())),
 		CopyMode::AttrOnly => exists(format!("cannot create regular file {}", dest.quote())),
-		CopyMode::Copy | CopyMode::Update => {
+		CopyMode::Copy => {
 			let read = if options.dereference(source_in_command_line) {
 				filesystem.metadata(source_fs)
 			} else {
@@ -2344,7 +2358,6 @@ fn renames_the_followed_source(
 ) -> bool {
 	(options.backup != BackupMode::None && !converts_to_backup(filesystem, source, dest, dest_fs, options)
 		|| options.backup == BackupMode::None && options.remove_destination())
-		&& options.copy_mode != CopyMode::AttrOnly
 		&& options.dereference(source_in_command_line)
 		&& filesystem.is_symlink(source_fs)
 		&& same_entry(filesystem, source_fs, dest_fs)
@@ -2565,16 +2578,13 @@ fn handle_existing_dest(
 		{
 			if !options.unlink_after_failed_open() {
 				// Without `-f` GNU backs the destination up by renaming it,
-				// which renames the source: a source it follows it then
-				// cannot open, and it renames the backup back; one it reads
-				// as a link, or in another mode, it refuses first.
-				let follows = matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
-					&& options.dereference(source_in_command_line);
-				return Err(CpError::Error(if follows {
-					format!("cannot open {} for reading: No such file or directory", source.quote())
-				} else {
-					format!("{} and {} are the same file", source.quote(), dest.quote())
-				}));
+				// which renames the source it follows: it then cannot open it,
+				// and renames the backup back. A source read as a link, or in
+				// another mode, `copy_file` refused first (`refuses_own_entry`).
+				return Err(CpError::Error(format!(
+					"cannot open {} for reading: No such file or directory",
+					source.quote()
+				)));
 			}
 			// `cp -fb a a`: the destination is the source's own entry, so
 			// its backup is a copy, and the copy is all there is to do. `-v`
@@ -2624,7 +2634,9 @@ fn delete_dest_if_needed_and_allowed(
 	let filesystem = host.fs().clone();
 	let delete_dest = match options.overwrite {
 		OverwriteMode::Clobber(clobber) | OverwriteMode::Interactive(clobber) => {
-			if clobber.remove_destination {
+			if clobber.remove_destination
+				|| removed_before_written(host, source, dest, options, source_in_command_line)
+			{
 				true
 			} else if clobber.force {
 				// Removed only once opening it fails (see `copy_data`).
@@ -2646,6 +2658,52 @@ fn delete_dest_if_needed_and_allowed(
 	};
 
 	if delete_dest { delete_path(host, state, dest, options) } else { Ok(()) }
+}
+
+/// Whether GNU removes an existing destination before it writes the copy
+/// (`copy.c`): where data is copied, the destination is not a directory, and
+/// either links are preserved (`-a`, `-d`, `--preserve=links`) and the
+/// destination has another name, or cp never follows links (`-R`, `-P`, `-a`)
+/// and the source is not a regular file. The destination's other names, and a
+/// file a link there leads to, then keep their data. The destination is read
+/// as GNU's `use_lstat` reads it: through a link only where a regular file is
+/// written through it.
+fn removed_before_written(
+	host: &Host,
+	source: &Path,
+	dest: &Path,
+	options: &Options,
+	source_in_command_line: bool,
+) -> bool {
+	if options.attributes_only || options.move_mode {
+		return false;
+	}
+	let filesystem = host.fs();
+	let source_fs = host.resolve(source);
+	let dest_fs = host.resolve(dest);
+	let source_metadata = if options.dereference(source_in_command_line) {
+		filesystem.metadata(&source_fs)
+	} else {
+		filesystem.symlink_metadata(&source_fs)
+	};
+	let Ok(source_metadata) = source_metadata else {
+		return false;
+	};
+	let source_is_regular = source_metadata.is_file();
+	let copy_as_regular = !options.recursive || options.copy_contents;
+	let use_lstat = (!source_is_regular
+		&& (!copy_as_regular || source_metadata.is_dir() || source_metadata.is_symlink()))
+		|| matches!(options.copy_mode, CopyMode::Link | CopyMode::SymLink)
+		|| options.backup != BackupMode::None
+		|| options.remove_destination();
+	let dest_metadata = if use_lstat { filesystem.symlink_metadata(&dest_fs) } else { filesystem.metadata(&dest_fs) };
+	let Ok(dest_metadata) = dest_metadata else {
+		return false;
+	};
+	let never_follows = !options.dereference && !options.cli_dereference;
+	!dest_metadata.is_dir()
+		&& (options.preserve_hard_links() && dest_metadata.nlink().is_some_and(|links| links > 1)
+			|| never_follows && !source_is_regular)
 }
 
 fn delete_path(host: &mut Host, state: &CopyState, path: &Path, options: &Options) -> CopyResult<()> {
@@ -2779,6 +2837,38 @@ fn relative_link_refused(host: &Host, source: &Path, dest: &Path) -> Option<CpEr
 	})
 }
 
+/// `-u`/`--update` on an existing destination, read as `existing` (stat or
+/// lstat, as GNU's `use_lstat` reads it), as GNU's `copy.c` decides it in every
+/// mode, before anything is backed up, removed or replaced: `Ok(true)` keeps
+/// the destination (`-u` where it is not older than the source,
+/// `--update=none`), `--update=none-fail` fails, and `Ok(false)` goes on, after
+/// `-i` asks where `-u` compared.
+fn update_keeps(
+	host: &mut Host,
+	options: &Options,
+	source_metadata: &Metadata,
+	existing: &Metadata,
+	shown: &Path,
+) -> CopyResult<bool> {
+	match options.update {
+		UpdateMode::All => Ok(false),
+		UpdateMode::None => {
+			if options.debug {
+				let _ = writeln!(host.stdout, "skipped {}", shown.quote());
+			}
+			Ok(true)
+		},
+		UpdateMode::NoneFail => Err(CpError::Error(format!("not replacing {}", shown.quote()))),
+		UpdateMode::IfOlder => {
+			if source_metadata.modified()? <= existing.modified()? {
+				return Ok(true);
+			}
+			options.overwrite.verify(host, shown, options.debug)?;
+			Ok(false)
+		},
+	}
+}
+
 /// Handles the copy mode for a file copy operation: hard linking, copying
 /// (`-u` already decided to), symbolic linking, or attribute-only copying.
 fn handle_copy_mode(
@@ -2824,7 +2914,7 @@ fn handle_copy_mode(
 				)
 			})?;
 		},
-		CopyMode::Copy | CopyMode::Update => {
+		CopyMode::Copy => {
 			return copy_helper(host, state, source, dest, options, source_metadata, dest_metadata);
 		},
 		CopyMode::SymLink => {
@@ -2988,28 +3078,25 @@ fn copy_file(
 	// two are the same file either way (`same_file_ok`).
 	let check_existing_dest = initial_dest_metadata.is_some()
 		&& (!options.attributes_only || options.remove_destination() || options.backup != BackupMode::None);
-	if initial_dest_metadata.is_some() {
+	if let Some(existing) = &initial_dest_metadata {
 		if paths_refer_to_same_file(&filesystem, &source_fs, &dest_fs, true)
 			&& options.copy_mode == CopyMode::Link
 		{
-			if source_is_symlink {
-				if !dest_is_symlink || !options.dereference {
-					return Ok(());
-				}
-			} else if options.backup != BackupMode::None && !dest_is_symlink {
-				// Unless GNU turns this into a copy to the backup name, the link
-				// is already there: GNU asks under `-i`, then does nothing.
-				if !converts_to_backup(&filesystem, source, dest, &dest_fs, options) {
-					if matches!(options.overwrite, OverwriteMode::Interactive(_)) {
-						options.overwrite.verify(host, dest, options.debug)?;
-					}
-					return Ok(());
-				}
-			} else if options.backup == BackupMode::None && !dest_is_symlink {
-				// The destination is the source's file, already linked: GNU
-				// asks under `-i`, then does nothing (`copy.c`, `same_file_ok`),
-				// so `--remove-destination` removes nothing here.
-				if matches!(options.overwrite, OverwriteMode::Interactive(_)) {
+			if source_is_symlink && !options.dereference {
+				return Ok(());
+			}
+			if !dest_is_symlink
+				&& (options.backup == BackupMode::None
+					|| !converts_to_backup(&filesystem, source, dest, &dest_fs, options))
+			{
+				// The destination is the source's file (or the file a source
+				// link cp follows leads to), already linked, unless GNU turns
+				// this into a copy to the backup name: GNU compares under `-u`
+				// and asks under `-i`, then does nothing (`copy.c`,
+				// `same_file_ok`), so `--remove-destination` removes nothing here.
+				if !update_keeps(host, options, &source_metadata, existing, dest)?
+					&& matches!(options.overwrite, OverwriteMode::Interactive(_))
+				{
 					options.overwrite.verify(host, dest, options.debug)?;
 				}
 				return Ok(());
@@ -3054,28 +3141,28 @@ fn copy_file(
 	} else {
 		filesystem.metadata(&update_fs)
 	};
-	// `-u`/`--update` decides before anything is backed up or removed.
-	if options.copy_mode == CopyMode::Update
-		&& let Ok(update_dest) = update_dest
+	// Without `-f`, GNU's `same_file_ok` refuses the source's own entry as the
+	// destination of a backup where cp reads the source as a link, or copies in
+	// another mode than a copy it follows, before `-u` compares or `-i` asks
+	// (`copy.c`). A followed source is backed up by renaming and then cannot be
+	// opened (`handle_existing_dest`).
+	if check_existing_dest
+		&& options.backup != BackupMode::None
+		&& !options.unlink_after_failed_open()
+		&& !(matches!(options.copy_mode, CopyMode::Copy | CopyMode::AttrOnly)
+			&& options.dereference(source_in_command_line))
+		&& same_entry(&filesystem, &source_fs, &dest_fs)
+		&& !renames_the_followed_source(&filesystem, source, dest, &source_fs, &dest_fs, options, source_in_command_line)
 	{
-		match options.update {
-			UpdateMode::All => {},
-			UpdateMode::None => {
-				if options.debug {
-					let _ = writeln!(host.stdout, "skipped {}", update_shown.quote());
-				}
-				return Ok(());
-			},
-			UpdateMode::NoneFail => {
-				return Err(CpError::Error(format!("not replacing {}", update_shown.quote())));
-			},
-			UpdateMode::IfOlder => {
-				if source_metadata.modified()? <= update_dest.modified()? {
-					return Ok(());
-				}
-				options.overwrite.verify(host, &update_shown, options.debug)?;
-			},
-		}
+		return Err(CpError::Error(format!("{} and {} are the same file", source.quote(), dest.quote())));
+	}
+	// `-u`/`--update` decides in every mode (`-l`, `-s`, `--attributes-only`
+	// and a copy alike) before anything is backed up or removed, and `-i`
+	// asks after it.
+	if let Ok(update_dest) = update_dest
+		&& update_keeps(host, options, &source_metadata, &update_dest, &update_shown)?
+	{
+		return Ok(());
 	}
 
 	let mut backup = None;
@@ -3097,7 +3184,7 @@ fn copy_file(
 		}
 	}
 
-	if options.attributes_only && source_is_symlink && !options.remove_destination() {
+	if options.attributes_only && source_metadata.is_symlink() {
 		return Err(CpError::Error(format!(
 			"cannot change attribute {}: Source file is a non regular file",
 			dest.quote()
@@ -3142,7 +3229,7 @@ fn copy_file(
 	// A copied symlink replaces the destination, which GNU removes before
 	// reporting the copy.
 	if source_metadata.is_symlink()
-		&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
+		&& options.copy_mode == CopyMode::Copy
 		&& dest_metadata
 			.as_ref()
 			.is_some_and(|metadata| metadata.is_symlink() || metadata.is_file())
@@ -3202,8 +3289,8 @@ fn copy_file(
 	// symlink was written through.
 	let dest_facts = DestFacts {
 		symlink: match options.copy_mode {
-			CopyMode::Copy | CopyMode::Update if source_metadata.is_symlink() => Some(true),
-			CopyMode::Copy | CopyMode::Update
+			CopyMode::Copy if source_metadata.is_symlink() => Some(true),
+			CopyMode::Copy
 				if !dest_metadata.as_ref().is_some_and(Metadata::is_symlink) =>
 			{
 				Some(false)
