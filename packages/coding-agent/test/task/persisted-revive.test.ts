@@ -13,7 +13,7 @@ import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capabili
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { cfgCompaction, cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
@@ -51,7 +51,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { localSession } from "../helpers/local-session";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
@@ -2298,6 +2298,92 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 		const { warm } = await parkAndRevive(registerPeer);
 		expect(warm.requests[0]!.join("\n")).toContain("`Peer`");
+	});
+
+	/** Data of each revive-input record the parked subagent's transcript file holds, oldest first. */
+	async function reviveRecords(cwd: string): Promise<unknown[]> {
+		const entries = Bun.JSONL.parse(await Bun.file(path.join(cwd, "prompt-blocks.jsonl")).text());
+		return entries.flatMap(entry =>
+			isRecord(entry) && entry.type === "custom" && entry.customType === "subagent-revive-state" ? [entry.data] : [],
+		);
+	}
+
+	// If this regresses, a parked subagent keeps the inputs of its finished run in memory for as long as it stays
+	// parked, or comes back from its transcript with a prompt other than the one it was sent with, and the provider
+	// writes the whole conversation to its prompt cache again; or its transcript gains another copy of its prompt
+	// inputs every time it parks.
+	it("parks with its revive inputs in its transcript and warm-revives from them to the request it sent", async () => {
+		const cwd = makeTempDir("@pi-revive-recorded-inputs-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		expect(await reviveRecords(cwd)).toHaveLength(1);
+
+		const { live, warm } = await parkAndRevive(() => {});
+		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
+		expect(warm.toolRequests[0]).toBe(spawned.toolRequests.at(-1)!);
+		// A park after a run that changed none of the inputs records nothing new; the next revive reads the same entry.
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		expect(live.isDisposed).toBe(true);
+		expect(await reviveRecords(cwd)).toHaveLength(1);
+		const { warm: again } = await parkAndRevive(() => {});
+		expect(again.requests[0]).toEqual(spawned.requests.at(-1)!);
+		expect(again.toolRequests[0]).toBe(spawned.toolRequests.at(-1)!);
+	});
+
+	// If this regresses, a parked subagent whose run changed its settings comes back under the settings of an earlier
+	// park.
+	it("records the revive inputs again when a run changed its settings, and revives from the newest", async () => {
+		const cwd = makeTempDir("@pi-revive-changed-inputs-");
+		await spawn(cwd, subagentPrompt, spawnResponses());
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		const { live } = await parkAndRevive(() => {});
+		const written = !cfgContextPromotionEnabled.get(live);
+		cfgContextPromotionEnabled.set(live, written);
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		expect(await reviveRecords(cwd)).toHaveLength(2);
+
+		let revivedSettings: Settings | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			revivedSettings = options!.settings;
+			const revived = createRecordingSession(options!.sessionManager!, names => subagentPrompt(names, options), [
+				{ content: ["next"] },
+			]);
+			return { session: revived.session } as CreateAgentSessionResult;
+		});
+		await AgentLifecycleManager.global().ensureLive("prompt-blocks");
+		if (!revivedSettings) throw new Error("Expected a warm revive through the lifecycle");
+		expect(cfgContextPromotionEnabled.get(revivedSettings)).toBe(written);
+	});
+
+	// If this regresses, a parked subagent whose transcript records no revive inputs (written before they were
+	// recorded, or parked by a write that failed) can no longer be messaged: its revive fails instead of going cold.
+	it("revives cold when its transcript records no revive inputs", async () => {
+		const cwd = makeTempDir("@pi-revive-unrecorded-inputs-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const lifecycle = AgentLifecycleManager.global();
+		lifecycle.setPersistedSubagentReviverFactory(createFactory(cwd), () => 0);
+		await lifecycle.park("prompt-blocks");
+		// Rename the record rather than drop it, so the transcript's entry tree stays whole.
+		const sessionFile = path.join(cwd, "prompt-blocks.jsonl");
+		const recorded = await Bun.file(sessionFile).text();
+		const unrecorded = recorded.replaceAll('"customType":"subagent-revive-state"', '"customType":"older-version"');
+		expect(unrecorded).not.toBe(recorded);
+		await Bun.write(sessionFile, unrecorded);
+
+		let cold: RecordingSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			const build = options!.systemPrompt;
+			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
+			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
+			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
+			return { session: cold.session } as CreateAgentSessionResult;
+		});
+		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
+		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
+		await live.prompt("follow-up");
+		await live.waitForIdle();
+		// A cold revive replays the system prompt the parked session's last request sent.
+		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
 	});
 
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {
