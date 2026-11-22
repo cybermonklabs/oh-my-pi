@@ -414,6 +414,29 @@ fn failures_left_to_the_process_are_its_own_message_and_status() {
 	std::fs::remove_file(&err).unwrap();
 }
 
+/// A failure the engine found while it handed the list over
+/// ([`ChildRedir::Fail`]) is the process's, after the entries before it:
+/// its text on the stderr they left, its status, and no exec.
+#[test]
+fn a_failure_handed_to_the_process_follows_the_entries_before_it() {
+	let err = temp_path("child-fail");
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh("echo ran >&2");
+	let mut sp = spec(&a, &env, NEW);
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[2], &err, WRITE), ChildRedir::Fail {
+			text:   BString::from("test: 7: Bad file descriptor\n"),
+			status: 127,
+		}],
+		exec_diag: BString::from("test: /bin/sh: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(127));
+	assert_eq!(std::fs::read_to_string(&err).unwrap(), "test: 7: Bad file descriptor\n");
+	std::fs::remove_file(&err).unwrap();
+}
+
 #[test]
 fn detached_externals_lead_their_own_sessions_without_a_terminal() {
 	let env = EnvView::default();
