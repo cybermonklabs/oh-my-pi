@@ -629,7 +629,9 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// Leave the shell with `status` (`exit`, `set -e`): unwind every frame;
 /// a subshell runs its EXIT trap here, the root at the run boundary. An
 /// `exit` inside a function runs the root's trap first, above the
-/// function's frames: bash's trap sees its `FUNCNAME` and locals.
+/// function's frames: bash's trap sees its `FUNCNAME` and locals. So does
+/// a zsh `exit` inside a loop: zsh's `zexit` runs the trap with `loops`
+/// still counting, so a `break` there ends the trap ([`zsh_break`]).
 fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	// zsh `zexit` while its hooks run: the hook calls end, the status is the
 	// new one.
@@ -650,10 +652,11 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		k.exited = Some(run.id);
 	}
 	if !in_exit_trap
-		&& vp
+		&& (vp
 			.frames
 			.iter()
 			.any(|f| matches!(f.kind, FrameKind::Function { .. }))
+			|| (vp.mode.dialect() == Dialect::Zsh && zsh_loop_count(vp) > 0))
 		&& match vp.runs.front() {
 			Some(r) => r.started && !r.exit_trap_started,
 			// A forked subshell has no run: it is its own exit, and its
@@ -1944,15 +1947,113 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 }
 
 /// Whether a bash `break`/`continue` reaches through a frame of `kind` to
-/// the loops below it in the same vproc: `eval`, `${ ;}` and a `lastpipe`
-/// stage run inside their caller's loops. Any other frame stops it (a
-/// function call: bash zeroes `loop_level` there), as does a vproc's first
-/// frame, below which come the forking shell's loops.
+/// the loops below it in the same vproc: `eval`, `${ ;}`, a `lastpipe`
+/// stage and a trap action ([`loop_trap`]) run inside the loops around
+/// them. Any other frame stops it (a function call: bash zeroes
+/// `loop_level` there), as does a vproc's first frame, below which come
+/// the forking shell's loops.
 const fn bash_loop_frame(kind: &FrameKind) -> bool {
 	matches!(
 		kind,
 		FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
+	) || loop_trap(kind)
+}
+
+/// Whether `kind` is a trap action that runs inside the loops of the code
+/// it interrupted: any but EXIT's (its shell has left its loops). bash runs
+/// it through `parse_and_execute`, which keeps `loop_level`; zsh keeps
+/// `loops`. A `break` there leaves the trap ([`leave_trap`]), then the
+/// loop.
+const fn loop_trap(kind: &FrameKind) -> bool {
+	matches!(
+		kind,
+		FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if !matches!(key, TrapKey::Exit)
 	)
+}
+
+/// Whether `kind` is an EXIT trap action. zsh counts the loops below it
+/// (its `exit` runs the trap above them), and a `break` there ends the
+/// trap; bash's exit trap starts with no loop level.
+const fn exit_trap(kind: &FrameKind) -> bool {
+	matches!(kind, FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, .. }, .. })
+}
+
+/// How trap action frame `kind` ends: what [`leave_trap`] needs once a
+/// `break` has popped it.
+#[derive(Clone, Copy)]
+struct TrapEnd {
+	/// The trap's key: a DEBUG trap's end puts zsh's `ERR_EXIT` back.
+	key:           TrapKey,
+	/// The interrupted command's status, restored.
+	status:        i32,
+	/// An ERR trap run by `set -e`: the shell exits with `status`.
+	exit:          bool,
+	/// The trap a cancellation runs as its last action: the vproc ends
+	/// with this status.
+	cancel:        Option<i32>,
+	/// A RETURN trap: the frame of the function or `.` file it ends, which
+	/// returns once the trap ends.
+	return_target: Option<usize>,
+}
+
+/// [`TrapEnd`] of `kind`, if it is a trap action.
+const fn trap_end(kind: &FrameKind) -> Option<TrapEnd> {
+	match kind {
+		FrameKind::Script {
+			what: ScriptKind::Trap { key, status, exit, cancel, return_target, .. },
+			..
+		} => Some(TrapEnd {
+			key:           *key,
+			status:        *status,
+			exit:          *exit,
+			cancel:        *cancel,
+			return_target: *return_target,
+		}),
+		_ => None,
+	}
+}
+
+/// Where a `break`/`continue` that has left a trap action goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrapLeft {
+	/// On to the loops below.
+	Goes,
+	/// Nowhere: the shell exits, or a cancellation ends the vproc.
+	Ends,
+	/// On past the function or `.` file the RETURN trap ended, which has
+	/// returned: bash's `breaking` outlives the return and skips its
+	/// caller's commands up to the next loop.
+	Returned,
+}
+
+/// A `break`/`continue` has left a trap action (`end`): as at the action's
+/// end ([`next_command`]), a DEBUG trap puts zsh's `ERR_EXIT` back, the
+/// interrupted command's status comes back, an ERR trap `set -e` ran still
+/// ends the shell with it, a cancellation's trap still ends the vproc, and
+/// the function or `.` file a RETURN trap ends returns.
+fn leave_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, end: Option<TrapEnd>) -> TrapLeft {
+	let Some(TrapEnd { key, status, exit, cancel, return_target }) = end else {
+		return TrapLeft::Goes;
+	};
+	if key == TrapKey::Debug && !vp.frames.is_empty() {
+		zsh_debug_done(k, vp, cx);
+	}
+	if let Some(cancel) = cancel {
+		finish_cancel(&mut k.root, cx.store, vp, cancel);
+		return TrapLeft::Ends;
+	}
+	vp.status = status;
+	if exit {
+		exit_shell(k, vp, cx, status);
+		return TrapLeft::Ends;
+	}
+	match return_target {
+		Some(target) => {
+			unwind(&mut k.root, cx.store, vp, target);
+			TrapLeft::Returned
+		},
+		None => TrapLeft::Goes,
+	}
 }
 
 /// The loops a bash `break`/`continue` in `vp` may leave (bash's
@@ -2028,14 +2129,17 @@ fn leave_outer_loop(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, zsh: bool) 
 
 /// bash `break N` / `continue N`: leave N - 1 loops, at most as many as
 /// [`bash_loop_count`] reaches (bash caps N at `loop_level`), then break
-/// or continue the next; an `eval`, `${ ;}` or `lastpipe` stage in the way
-/// is left with them, and past the vproc's own loops it ends
-/// ([`leave_outer_loop`]). The builtin answers a `break` with no loop in
-/// reach itself and transfers nothing, so a loop is always in reach here.
+/// or continue the next; an `eval`, `${ ;}`, `lastpipe` stage or trap
+/// action in the way is left with them, and past the vproc's own loops it
+/// ends ([`leave_outer_loop`]). The builtin answers a `break` with no loop
+/// in reach itself and transfers nothing, so a loop is always in reach
+/// here.
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {
 	let reach = bash_loop_count(vp);
 	debug_assert!(reach > 0, "`break_` transfers only with a loop in reach");
 	let mut remaining = n.min(reach).max(1);
+	// Past a RETURN trap's return, every frame up to the next loop is left.
+	let mut returned = false;
 	loop {
 		let f = top_frame(vp);
 		if let Some(rec) = f.loops.last().cloned() {
@@ -2060,11 +2164,21 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			f.pc = if cont { rec.cont } else { rec.exit };
 			return;
 		}
-		let passes = bash_loop_frame(&f.kind);
+		let passes = returned || bash_loop_frame(&f.kind);
+		let end = trap_end(&f.kind);
 		if passes && vp.frames.len() > 1 {
 			pop_frame(&mut k.root, cx.store, vp);
-			// The caller's op (`eval`) is abandoned with the loop.
+			// The caller's op (`eval`, a trapped command, a call) is
+			// abandoned with the loop.
 			clear_scratch(&mut k.root, cx.store, vp);
+			match leave_trap(k, vp, cx, end) {
+				TrapLeft::Goes => {},
+				TrapLeft::Ends => return,
+				TrapLeft::Returned => {
+					clear_scratch(&mut k.root, cx.store, vp);
+					returned = true;
+				},
+			}
 			continue;
 		}
 		break;
@@ -5327,10 +5441,11 @@ fn restore_local_specials(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 }
 
 /// The loops a zsh `break`/`continue` may leave (zsh's `loops`): every
-/// loop running in this vproc, across function calls and `eval`, up to the
-/// `.` file, trap action or script that runs them (which start at zero),
-/// and, when that reaches the vproc's first frame, its forking shell's
-/// ([`Vproc::outer_loops`]: a zsh fork keeps `loops`).
+/// loop running in this vproc, across function calls, `eval` and trap
+/// actions ([`loop_trap`], and an EXIT trap: [`exit_trap`]), up to the `.`
+/// file or script that runs them
+/// (which start at zero), and, when that reaches the vproc's first frame,
+/// its forking shell's ([`Vproc::outer_loops`]: a zsh fork keeps `loops`).
 pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 	let mut n = 0u32;
 	for (i, f) in vp.frames.iter().enumerate().rev() {
@@ -5343,13 +5458,15 @@ pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 		if i == 0 {
 			return n.saturating_add(vp.outer_loops);
 		}
-		if !matches!(
+		let passes = matches!(
 			f.kind,
 			FrameKind::Function { .. }
 				| FrameKind::NoFork
 				| FrameKind::Stage
 				| FrameKind::Script { what: ScriptKind::Eval, .. }
-		) {
+		) || loop_trap(&f.kind)
+			|| exit_trap(&f.kind);
+		if !passes {
 			break;
 		}
 	}
@@ -5407,11 +5524,24 @@ fn zsh_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool
 			|| matches!(
 				f.kind,
 				FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
-			);
+			)
+			|| loop_trap(&f.kind);
+		let end = trap_end(&f.kind);
+		// zsh's EXIT trap during `exit` (run above the loops it exits from,
+		// [`exit_shell`]): `breaks` skips the rest of the action, and the
+		// exit goes on.
+		if exit_trap(&f.kind) && vp.frames.len() > 1 {
+			pop_frame(&mut k.root, cx.store, vp);
+			leave_trap(k, vp, cx, end);
+			return;
+		}
 		if !crossable || vp.frames.len() < 2 {
 			break;
 		}
 		pop_frame(&mut k.root, cx.store, vp);
+		if leave_trap(k, vp, cx, end) == TrapLeft::Ends {
+			return;
+		}
 		// zsh `doshfunc`: with `localloops` (as restored on return) the
 		// break ends with the function; the call completes.
 		if function

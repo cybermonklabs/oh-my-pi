@@ -6,6 +6,7 @@
 
 - `break` and `continue` in a forked pipeline element, a command or process substitution or a background simple command now act as bash and zsh run them: inside a loop they end that child without the `only meaningful in a loop` message (bash: a simple command, `$( )` and `<( )`; zsh: every fork), a count reaches loops past `eval`, and outside a loop the message is printed under the command's redirections, before its count is read, without dropping the rest of a `${ ;}` or `lastpipe` stage
 - The ERR trap (zsh: ZERR) runs once per failed command: a loop, group, `if` or `case` whose status comes from a command already reported no longer runs it a second time when it ends; zsh's `ERR_EXIT` now ends the shell on a failing `{ } always { }`, as zsh judges it like a command
+- `break` and `continue` in a trap action leave the loop the trap interrupted, as bash and zsh run them: a signal, ERR, DEBUG or RETURN trap no longer prints `only meaningful in a loop` there; the interrupted command's status comes back, zsh's `ERR_EXIT` comes back after a DEBUG trap, a function a RETURN trap ends still returns, a cancellation's trap still ends the shell, and in zsh an EXIT trap run by `exit` inside a loop ends at the `break` while the exit goes on
 
 ## [18.18.6] - 2026-11-09
 

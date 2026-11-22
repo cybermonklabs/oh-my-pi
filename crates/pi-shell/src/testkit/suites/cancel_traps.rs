@@ -111,3 +111,18 @@ fn cancel_term_without_a_term_trap_still_runs_the_exit_trap() {
 		assert_eq!((status, out.as_str()), (143, "exiting\n"), "cancel at op {at}");
 	}
 }
+
+/// A `break` in the TERM trap that a cancel runs does not keep the shell
+/// going: the cancel's trap is its last action, whatever loop it
+/// interrupted (bash would leave the loop and carry on after a real
+/// TERM; `cancel` ends the shell after its traps). The `break` leaves the
+/// action, and the status is a TERM death's. From op 97 on, `f3`'s loop is
+/// running.
+#[test]
+fn cancel_term_ends_the_shell_when_the_term_trap_breaks_its_loop() {
+	for at in AT.into_iter().filter(|&at| at >= 97) {
+		let (status, out, _) =
+			cancel_at(b"trap 'echo trapped; break; echo after' TERM", Signal::Term, at);
+		assert_eq!((status, out.as_str()), (143, "trapped\n"), "cancel at op {at}");
+	}
+}
