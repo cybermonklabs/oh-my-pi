@@ -371,29 +371,50 @@ function normalizeCandidateArgs(args: string[]): string[] {
 	return split;
 }
 
+/** Whether process `pid` runs as `uid`, real and effective, by `/proc/<pid>/status` (Linux). */
+async function runsAsUid(pid: number, uid: number): Promise<boolean> {
+	const status = await fs.readFile(`/proc/${pid}/status`, "utf8").catch(() => null);
+	const ids = status ? /^Uid:\s+(\d+)\s+(\d+)/m.exec(status) : null;
+	return ids !== null && Number(ids[1]) === uid && Number(ids[2]) === uid;
+}
+
 /**
  * The live Chromium-family browser holding a profile, whatever executable it
  * runs: a compiled launcher (Arch's /usr/bin/chromium) execs a binary whose
  * path neither realpath nor {@link resolveWrapperTarget} can derive. POSIX
  * Chromium links `<profile>/SingletonLock` to `<hostname>-<pid>`; the owner must
  * still name the profile in its argv, so a stale lock whose pid was recycled is ignored.
+ *
+ * Only a browser of this user is adopted: the lock must be a symlink this user
+ * owns, the owner process must run as this user (real and effective uid), and
+ * its executable is the one `/proc/<pid>/exe` names, not its argv[0]. Without
+ * these checks another user's browser, on a profile in a shared directory, gives
+ * this user (or root) its CDP port. Linux only, since all three come from
+ * `/proc` and `lstat`; elsewhere no profile lock is adopted.
  */
 async function findProfileLockOwner(
 	normalizedUserDataDir: string,
 ): Promise<{ owner: Process; executable: string } | null> {
-	const lock = await fs.readlink(path.join(normalizedUserDataDir, "SingletonLock")).catch(() => null);
+	const uid = process.getuid?.();
+	if (process.platform !== "linux" || uid === undefined) return null;
+	const lockPath = path.join(normalizedUserDataDir, "SingletonLock");
+	const lockStat = await fs.lstat(lockPath).catch(() => null);
+	if (!lockStat?.isSymbolicLink() || lockStat.uid !== uid) return null;
+	const lock = await fs.readlink(lockPath).catch(() => null);
 	const match = lock ? /^(.+)-(\d+)$/.exec(lock) : null;
 	if (!match || match[1] !== os.hostname()) return null;
-	const owner = Process.fromPid(Number(match[2]));
+	const pid = Number(match[2]);
+	const owner = Process.fromPid(pid);
 	if (!owner || owner.status() !== ProcessStatus.Running) return null;
+	if (!(await runsAsUid(pid, uid))) return null;
+	const executable = await fs.readlink(`/proc/${pid}/exe`).catch(() => null);
+	if (!executable || !isChromiumBrowserExecutable(executable)) return null;
 	let args: string[];
 	try {
 		args = normalizeCandidateArgs(owner.args());
 	} catch {
 		return null;
 	}
-	const executable = args[0];
-	if (!executable || !isChromiumBrowserExecutable(executable)) return null;
 	const profile = findUserDataDirInArgs(args);
 	return profile !== null && path.isAbsolute(profile) && normalizeUserDataDir(profile) === normalizedUserDataDir
 		? { owner, executable }
