@@ -1,0 +1,204 @@
+{"id":"alias/CLD","script":"TRAPCLD() { echo got:$1; }; sleep 0 & wait; echo after:$?","stdout":"got:17\nafter:0\n","stderr":"","status":0}
+{"id":"alias/ERR","script":"TRAPERR() { echo got:$1; }; false; echo after:$?","stdout":"got:32\nafter:1\n","stderr":"","status":0}
+{"id":"alias/IOT","script":"TRAPIOT() { echo got:$1; }; kill -6 $$; echo after:$?","stdout":"got:6\nafter:0\n","stderr":"","status":0}
+{"id":"alias/POLL","script":"TRAPPOLL() { echo got:$1; }; kill -IO $$; echo after:$?","stdout":"got:29\nafter:0\n","stderr":"","status":0}
+{"id":"alrm/tmout-script","script":"TMOUT=1; TRAPALRM() { echo alrm; }; sleep 2; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"args/funcstack","script":"TRAPUSR1() { echo ${(j:,:)funcstack}; }; f() { kill -USR1 $$; }; f","stdout":"TRAPUSR1,f\n","stderr":"","status":0}
+{"id":"args/local","script":"x=out; TRAPUSR1() { local x=in; echo $x; y=set; }; kill -USR1 $$; echo $x:$y","stdout":"in\nout:set\n","stderr":"","status":0}
+{"id":"args/positional","script":"set -- a b c; TRAPUSR1() { echo in:$#:$1:$0; }; kill -USR1 $$; echo out:$#:$1:${0:t}","stdout":"in:1:10:TRAPUSR1\nout:3:a:zsh\n","stderr":"","status":0}
+{"id":"chld/basic","script":"TRAPCHLD() { echo chld:$1; }; sleep 0 & wait; echo after:$?","stdout":"chld:17\nafter:0\n","stderr":"","status":0}
+{"id":"chld/unfunction","script":"TRAPCHLD() { echo chld; }; unfunction TRAPCHLD; sleep 0 & wait; echo after","stdout":"after\n","stderr":"","status":0}
+{"id":"debug/basic","script":"TRAPDEBUG() { echo dbg:$1; }; echo a; echo b","stdout":"dbg:33\na\ndbg:33\nb\n","stderr":"","status":0}
+{"id":"debug/return-1","script":"TRAPDEBUG() { echo dbg; return 1; }; echo a; echo b","stdout":"dbg\n","stderr":"","status":1}
+{"id":"debug/unfunction","script":"TRAPDEBUG() { echo dbg; }; echo a; unfunction TRAPDEBUG; echo b","stdout":"dbg\na\ndbg\nb\n","stderr":"","status":0}
+{"id":"def/ALRM","script":"TRAPALRM() { echo got:$0:$1:$#; }; kill -ALRM $$; echo after:$?","stdout":"got:TRAPALRM:14:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/BUS","script":"TRAPBUS() { echo got:$0:$1:$#; }; kill -BUS $$; echo after:$?","stdout":"got:TRAPBUS:7:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/CHLD","script":"TRAPCHLD() { echo got:$0:$1:$#; }; kill -CHLD $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"def/CONT","script":"TRAPCONT() { echo got:$0:$1:$#; }; kill -CONT $$; echo after:$?","stdout":"got:TRAPCONT:18:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/FPE","script":"TRAPFPE() { echo got:$0:$1:$#; }; kill -FPE $$; echo after:$?","stdout":"got:TRAPFPE:8:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/HUP","script":"TRAPHUP() { echo got:$0:$1:$#; }; kill -HUP $$; echo after:$?","stdout":"got:TRAPHUP:1:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/ILL","script":"TRAPILL() { echo got:$0:$1:$#; }; kill -ILL $$; echo after:$?","stdout":"got:TRAPILL:4:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/INT","script":"TRAPINT() { echo got:$0:$1:$#; }; kill -INT $$; echo after:$?","stdout":"got:TRAPINT:2:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/IO","script":"TRAPIO() { echo got:$0:$1:$#; }; kill -IO $$; echo after:$?","stdout":"got:TRAPIO:29:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/PIPE","script":"TRAPPIPE() { echo got:$0:$1:$#; }; kill -PIPE $$; echo after:$?","stdout":"got:TRAPPIPE:13:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/PROF","script":"TRAPPROF() { echo got:$0:$1:$#; }; kill -PROF $$; echo after:$?","stdout":"got:TRAPPROF:27:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/PWR","script":"TRAPPWR() { echo got:$0:$1:$#; }; kill -PWR $$; echo after:$?","stdout":"got:TRAPPWR:30:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/QUIT","script":"TRAPQUIT() { echo got:$0:$1:$#; }; kill -QUIT $$; echo after:$?","stdout":"got:TRAPQUIT:3:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/SEGV","script":"TRAPSEGV() { echo got:$0:$1:$#; }; kill -SEGV $$; echo after:$?","stdout":"got:TRAPSEGV:11:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/STKFLT","script":"TRAPSTKFLT() { echo got:$0:$1:$#; }; kill -STKFLT $$; echo after:$?","stdout":"got:TRAPSTKFLT:16:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/SYS","script":"TRAPSYS() { echo got:$0:$1:$#; }; kill -SYS $$; echo after:$?","stdout":"got:TRAPSYS:31:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/TERM","script":"TRAPTERM() { echo got:$0:$1:$#; }; kill -TERM $$; echo after:$?","stdout":"got:TRAPTERM:15:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/TRAP","script":"TRAPTRAP() { echo got:$0:$1:$#; }; kill -TRAP $$; echo after:$?","stdout":"got:TRAPTRAP:5:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/TSTP","script":"TRAPTSTP() { echo got:$0:$1:$#; }; kill -TSTP $$; echo after:$?","stdout":"got:TRAPTSTP:20:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/TTIN","script":"TRAPTTIN() { echo got:$0:$1:$#; }; kill -TTIN $$; echo after:$?","stdout":"got:TRAPTTIN:21:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/TTOU","script":"TRAPTTOU() { echo got:$0:$1:$#; }; kill -TTOU $$; echo after:$?","stdout":"got:TRAPTTOU:22:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/URG","script":"TRAPURG() { echo got:$0:$1:$#; }; kill -URG $$; echo after:$?","stdout":"got:TRAPURG:23:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/USR1","script":"TRAPUSR1() { echo got:$0:$1:$#; }; kill -USR1 $$; echo after:$?","stdout":"got:TRAPUSR1:10:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/USR2","script":"TRAPUSR2() { echo got:$0:$1:$#; }; kill -USR2 $$; echo after:$?","stdout":"got:TRAPUSR2:12:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/VTALRM","script":"TRAPVTALRM() { echo got:$0:$1:$#; }; kill -VTALRM $$; echo after:$?","stdout":"got:TRAPVTALRM:26:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/WINCH","script":"TRAPWINCH() { echo got:$0:$1:$#; }; kill -WINCH $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"def/XCPU","script":"TRAPXCPU() { echo got:$0:$1:$#; }; kill -XCPU $$; echo after:$?","stdout":"got:TRAPXCPU:24:1\nafter:0\n","stderr":"","status":0}
+{"id":"def/XFSZ","script":"TRAPXFSZ() { echo got:$0:$1:$#; }; kill -XFSZ $$; echo after:$?","stdout":"got:TRAPXFSZ:25:1\nafter:0\n","stderr":"","status":0}
+{"id":"direct/then-signal","script":"TRAPUSR1() { echo F:$1; }; TRAPUSR1 7; kill -USR1 $$; echo after:$?","stdout":"F:7\nF:10\nafter:0\n","stderr":"","status":0}
+{"id":"direct/usr1","script":"TRAPUSR1() { echo F:$1:$#; return 3; }; TRAPUSR1 x y; echo after:$?","stdout":"F:x:2\nafter:3\n","stderr":"","status":0}
+{"id":"direct/zerr","script":"TRAPZERR() { echo Z:$#; }; TRAPZERR; echo after:$?","stdout":"Z:0\nafter:0\n","stderr":"","status":0}
+{"id":"exit/end","script":"TRAPEXIT() { echo bye:$?; }; echo main; false","stdout":"main\nbye:1\n","stderr":"","status":1}
+{"id":"exit/exit-n","script":"TRAPEXIT() { echo bye:$1:$?; }; exit 3","stdout":"bye:0:3\n","stderr":"","status":3}
+{"id":"exit/function","script":"f() { TRAPEXIT() { echo fexit:$?; }; return 4; }; f; echo top:$?","stdout":"fexit:4\ntop:4\n","stderr":"","status":0}
+{"id":"exit/function-return","script":"f() { TRAPEXIT() { echo fx:$?; return 9; }; return 4; }; f; echo top:$?","stdout":"fx:4\n","stderr":"","status":9}
+{"id":"exit/killed","script":"TRAPEXIT() { echo bye:$?; }; kill -USR2 $$; echo after","stdout":"","stderr":"","status":-12}
+{"id":"exit/list-return","script":"trap 'echo bye; return 7' EXIT; exit 3","stdout":"bye\n","stderr":"","status":7}
+{"id":"exit/replaces-list","script":"trap 'echo list' EXIT; TRAPEXIT() { echo fn; }; echo main","stdout":"main\nfn\n","stderr":"","status":0}
+{"id":"exit/return-status","script":"TRAPEXIT() { echo bye; return 7; }; exit 3","stdout":"bye\n","stderr":"","status":3}
+{"id":"exit/signal","script":"TRAPEXIT() { echo bye:$?; }; TRAPUSR1() { echo F; }; kill -USR1 $$; echo after","stdout":"F\nafter\nbye:0\n","stderr":"","status":0}
+{"id":"exit/subshell","script":"TRAPEXIT() { echo bye; }; ( echo sub ); echo top","stdout":"sub\ntop\nbye\n","stderr":"","status":0}
+{"id":"exit/trap-dash","script":"TRAPEXIT() { echo bye; }; trap - EXIT; echo main","stdout":"main\n","stderr":"","status":0}
+{"id":"exit/unfunction","script":"TRAPEXIT() { echo bye; }; unfunction TRAPEXIT; echo main","stdout":"main\n","stderr":"","status":0}
+{"id":"fn/child-default","script":"TRAPUSR1() { echo F; }; sh -c 'kill -USR1 $$; echo child'; echo top:$?","stdout":"top:138\n","stderr":"","status":0}
+{"id":"fn/defined-in-function","script":"f() { TRAPUSR1() { echo inner; }; }; f; kill -USR1 $$; echo after:$?","stdout":"inner\nafter:0\n","stderr":"","status":0}
+{"id":"fn/fires-in-function","script":"TRAPUSR1() { echo F; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"F\nf:0\ntop:0\n","stderr":"","status":0}
+{"id":"fn/localtraps","script":"TRAPUSR1() { echo outer; }; f() { setopt localtraps; TRAPUSR1() { echo inner; }; kill -USR1 $$; }; f; kill -USR1 $$; echo after:$?","stdout":"inner\nouter\nafter:0\n","stderr":"","status":0}
+{"id":"fn/localtraps-new","script":"f() { setopt localtraps; TRAPUSR1() { echo inner; }; kill -USR1 $$; echo f:$?; }; f; echo top; kill -USR1 $$; echo after:$?","stdout":"inner\nf:0\ntop\n","stderr":"","status":-10}
+{"id":"fn/localtraps-unfunction","script":"TRAPUSR1() { echo outer; }; f() { setopt localtraps; unfunction TRAPUSR1; trap 'echo list' USR1; kill -USR1 $$; }; f; kill -USR1 $$; echo after:$?","stdout":"list\nouter\nafter:0\n","stderr":"","status":0}
+{"id":"kill/INT-return","script":"TRAPINT() { return 5; }; kill -INT $$; echo after:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/INT-return-in-fn","script":"TRAPINT() { return 5; }; f() { kill -INT $$; echo f; }; f; echo top:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/INT-return-outside","script":"TRAPINT() { return 5; }; sh -c 'kill -INT $PPID'; echo after:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/QUIT-return","script":"TRAPQUIT() { return 5; }; kill -QUIT $$; echo after:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/QUIT-return-in-fn","script":"TRAPQUIT() { return 5; }; f() { kill -QUIT $$; echo f; }; f; echo top:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/QUIT-return-outside","script":"TRAPQUIT() { return 5; }; sh -c 'kill -QUIT $PPID'; echo after:$?","stdout":"","stderr":"","status":5}
+{"id":"kill/again","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -USR1 $$; (exit 4); kill -USR1 $$; echo after:$?","stdout":"in:3\nin:4\nafter:0\n","stderr":"","status":0}
+{"id":"kill/always","script":"TRAPUSR1() { return 3; }; { kill -USR1 $$; echo in-group; } always { echo always:$?; }; echo after","stdout":"always:0\n","stderr":"","status":1}
+{"id":"kill/dash-s","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -s USR1 $$; echo after:$?","stdout":"in:3\nafter:0\n","stderr":"","status":0}
+{"id":"kill/fn-return-in-fn","script":"TRAPUSR1() { echo in:$?; return 3; }; f() { (exit 5); kill -USR1 $$; echo f:$?; return 6; }; f; echo top:$?","stdout":"in:5\n","stderr":"","status":0}
+{"id":"kill/fn-return-outside","script":"TRAPUSR1() { echo in:$?; return 3; }; (exit 5); sh -c 'kill -USR1 $PPID'; echo after:$?; echo more","stdout":"in:0\n","stderr":"","status":3}
+{"id":"kill/group","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -USR1 0; echo after:$?","stdout":"in:3\nafter:0\n","stderr":"","status":0}
+{"id":"kill/list-return-in-fn","script":"trap 'return 3' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"top:0\n","stderr":"","status":0}
+{"id":"kill/list-return-outside","script":"trap 'return 3' USR1; f() { sh -c 'kill -USR1 $PPID'; echo f:$?; }; f; echo top:$?","stdout":"top:3\n","stderr":"","status":0}
+{"id":"kill/list-status","script":"trap 'echo in:$?' USR1; (exit 3); kill -USR1 $$; echo after:$?","stdout":"in:3\nafter:0\n","stderr":"","status":0}
+{"id":"kill/no-such-pid","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -USR1 $$ 999999 2>/dev/null; echo after:$?","stdout":"in:3\nafter:1\n","stderr":"","status":0}
+{"id":"kill/subshell","script":"zmodload zsh/system; TRAPUSR1() { echo in:$?; return 4; }; ( (exit 3); kill -USR1 $sysparams[pid]; echo sub:$? ); echo top:$?","stdout":"in:3\ntop:0\n","stderr":"","status":0}
+{"id":"kill/then-outside","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -USR1 $$; (exit 4); sh -c 'kill -USR1 $PPID'; echo after:$?","stdout":"in:3\nin:0\nafter:0\n","stderr":"","status":0}
+{"id":"kill/twice","script":"TRAPUSR1() { echo in:$?; }; (exit 3); kill -USR1 $$ $$; echo after:$?","stdout":"in:3\nin:3\nafter:0\n","stderr":"","status":0}
+{"id":"kill/twice-list","script":"trap 'echo in:$?' USR1; (exit 3); kill -USR1 $$ $$; echo after:$?","stdout":"in:3\nin:3\nafter:0\n","stderr":"","status":0}
+{"id":"list/ABRT","script":"trap 'echo got' 6; kill -6 $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/ALRM","script":"trap 'echo got' ALRM; kill -ALRM $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/BUS","script":"trap 'echo got' BUS; kill -BUS $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/CHLD","script":"trap 'echo got' CHLD; kill -CHLD $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"list/CONT","script":"trap 'echo got' CONT; kill -CONT $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/FPE","script":"trap 'echo got' FPE; kill -FPE $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/HUP","script":"trap 'echo got' HUP; kill -HUP $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/ILL","script":"trap 'echo got' ILL; kill -ILL $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/INT","script":"trap 'echo got' INT; kill -INT $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/IO","script":"trap 'echo got' IO; kill -IO $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/PIPE","script":"trap 'echo got' PIPE; kill -PIPE $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/PROF","script":"trap 'echo got' PROF; kill -PROF $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/PWR","script":"trap 'echo got' PWR; kill -PWR $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/QUIT","script":"trap 'echo got' QUIT; kill -QUIT $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/SEGV","script":"trap 'echo got' SEGV; kill -SEGV $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/STKFLT","script":"trap 'echo got' STKFLT; kill -STKFLT $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/SYS","script":"trap 'echo got' SYS; kill -SYS $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/TERM","script":"trap 'echo got' TERM; kill -TERM $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/TRAP","script":"trap 'echo got' TRAP; kill -TRAP $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/TSTP","script":"trap 'echo got' TSTP; kill -TSTP $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/TTIN","script":"trap 'echo got' TTIN; kill -TTIN $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/TTOU","script":"trap 'echo got' TTOU; kill -TTOU $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/URG","script":"trap 'echo got' URG; kill -URG $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/USR1","script":"trap 'echo got' USR1; kill -USR1 $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/USR2","script":"trap 'echo got' USR2; kill -USR2 $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/VTALRM","script":"trap 'echo got' VTALRM; kill -VTALRM $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/WINCH","script":"trap 'echo got' WINCH; kill -WINCH $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"list/XCPU","script":"trap 'echo got' XCPU; kill -XCPU $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"list/XFSZ","script":"trap 'echo got' XFSZ; kill -XFSZ $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}
+{"id":"nest/list-same","script":"n=0; trap 'echo L$((++n)); (( n < 3 )) && kill -USR1 $$; echo L2' USR1; kill -USR1 $$; echo after:$?","stdout":"L1\nL2\nL2\nL2\nL3\nL2\nafter:0\n","stderr":"","status":0}
+{"id":"nest/other","script":"TRAPUSR1() { echo U1; kill -USR2 $$; echo U1b; }; TRAPUSR2() { echo U2; }; kill -USR1 $$; echo after:$?","stdout":"U1\nU2\nU1b\nafter:0\n","stderr":"","status":0}
+{"id":"nest/same","script":"n=0; TRAPUSR1() { echo F$((++n)); (( n < 3 )) && kill -USR1 $$; echo end$n; }; kill -USR1 $$; echo after:$?","stdout":"F1\nend1\nF2\nend2\nF3\nend3\nafter:0\n","stderr":"","status":0}
+{"id":"null/child","script":"TRAPUSR1() {}; sh -c 'kill -USR1 $$; echo child'; echo top:$?","stdout":"top:138\n","stderr":"","status":0}
+{"id":"null/self","script":"TRAPUSR1() {}; kill -USR1 $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"repl/fn-list-fn","script":"TRAPUSR1() { echo one; }; trap 'echo list' USR1; TRAPUSR1() { echo two; }; kill -USR1 $$; echo after:$?","stdout":"two\nafter:0\n","stderr":"","status":0}
+{"id":"repl/fn-then-fn","script":"TRAPUSR1() { echo one; }; TRAPUSR1() { echo two; }; kill -USR1 $$; echo after:$?","stdout":"two\nafter:0\n","stderr":"","status":0}
+{"id":"repl/fn-then-ignored","script":"TRAPUSR1() { echo fn; }; trap '' USR1; whence -w TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1: none\nafter:0\n","stderr":"","status":0}
+{"id":"repl/fn-then-list","script":"TRAPUSR1() { echo fn; }; trap 'echo list' USR1; whence -w TRAPUSR1; trap; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1: none\ntrap -- 'echo list' USR1\nlist\nafter:0\n","stderr":"","status":0}
+{"id":"repl/functions","script":"TRAPUSR1() { echo F; }; functions TRAPUSR1; echo st:$?","stdout":"TRAPUSR1 () {\n\techo F\n}\nst:0\n","stderr":"","status":0}
+{"id":"repl/ignored-then-fn","script":"trap '' USR1; TRAPUSR1() { echo fn; }; kill -USR1 $$; echo after:$?","stdout":"fn\nafter:0\n","stderr":"","status":0}
+{"id":"repl/list-then-fn","script":"trap 'echo list' USR1; TRAPUSR1() { echo fn; }; trap; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1 () {\n\techo fn\n}\nfn\nafter:0\n","stderr":"","status":0}
+{"id":"repl/listing","script":"TRAPUSR1() { echo F; }; TRAPZERR() { echo Z }; trap; echo st:$?","stdout":"TRAPUSR1 () {\n\techo F\n}\nTRAPZERR () {\n\techo Z\n}\nst:0\n","stderr":"","status":0}
+{"id":"ret-fn/false;_return","script":"TRAPUSR1() { false; return; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-fn/return","script":"TRAPUSR1() { return; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
+{"id":"ret-fn/return_0","script":"TRAPUSR1() { return 0; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
+{"id":"ret-fn/return_1","script":"TRAPUSR1() { return 1; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-fn/return_128plus","script":"TRAPUSR1() { return $((128+$1)); }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-fn/return_3","script":"TRAPUSR1() { return 3; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-fn/true","script":"TRAPUSR1() { true; }; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
+{"id":"ret-loop/false;_return","script":"TRAPUSR1() { false; return; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-loop/return","script":"TRAPUSR1() { return; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"it1:0\nit2:0\nend:0\n","stderr":"","status":0}
+{"id":"ret-loop/return_0","script":"TRAPUSR1() { return 0; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"it1:0\nit2:0\nend:0\n","stderr":"","status":0}
+{"id":"ret-loop/return_1","script":"TRAPUSR1() { return 1; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-loop/return_128plus","script":"TRAPUSR1() { return $((128+$1)); }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-loop/return_3","script":"TRAPUSR1() { return 3; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"","stderr":"","status":0}
+{"id":"ret-loop/true","script":"TRAPUSR1() { true; }; for i in 1 2; do kill -USR1 $$; echo it$i:$?; done; echo end:$?","stdout":"it1:0\nit2:0\nend:0\n","stderr":"","status":0}
+{"id":"ret/errexit","script":"setopt errexit; TRAPUSR1() { echo F; return 1; }; kill -USR1 $$; echo after:$?","stdout":"F\n","stderr":"","status":1}
+{"id":"ret/errexit-false","script":"setopt errexit; TRAPUSR1() { echo F; false; }; kill -USR1 $$; echo after:$?","stdout":"F\n","stderr":"","status":1}
+{"id":"ret/false;_return","script":"TRAPUSR1() { echo in:$?; false; return; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\n","stderr":"","status":0}
+{"id":"ret/int-128plus","script":"TRAPINT() { echo int:$1; return $((128+$1)); }; kill -INT $$; echo after:$?","stdout":"int:2\n","stderr":"","status":130}
+{"id":"ret/nested-return","script":"g() { return 5; }; TRAPUSR1() { g; echo g:$?; }; kill -USR1 $$; echo after:$?","stdout":"g:5\nafter:0\n","stderr":"","status":0}
+{"id":"ret/return","script":"TRAPUSR1() { echo in:$?; return; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\nafter:0\nmore\n","stderr":"","status":0}
+{"id":"ret/return_0","script":"TRAPUSR1() { echo in:$?; return 0; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\nafter:0\nmore\n","stderr":"","status":0}
+{"id":"ret/return_1","script":"TRAPUSR1() { echo in:$?; return 1; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\n","stderr":"","status":0}
+{"id":"ret/return_128plus","script":"TRAPUSR1() { echo in:$?; return $((128+$1)); }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\n","stderr":"","status":0}
+{"id":"ret/return_3","script":"TRAPUSR1() { echo in:$?; return 3; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\n","stderr":"","status":0}
+{"id":"ret/term-128plus","script":"TRAPTERM() { echo term:$1; return $((128+$1)); }; kill -TERM $$; echo after:$?","stdout":"term:15\n","stderr":"","status":0}
+{"id":"ret/true","script":"TRAPUSR1() { echo in:$?; true; }; (exit 3); kill -USR1 $$; echo after:$?; echo more","stdout":"in:3\nafter:0\nmore\n","stderr":"","status":0}
+{"id":"rm/disable-enable","script":"TRAPUSR1() { echo fn; }; disable -f TRAPUSR1; enable -f TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"fn\nafter:0\n","stderr":"","status":0}
+{"id":"rm/disable-enable-outside","script":"TRAPUSR1() { echo fn; }; disable -f TRAPUSR1; enable -f TRAPUSR1; sh -c 'kill -USR1 $PPID'; echo after:$?","stdout":"fn\nafter:0\n","stderr":"","status":0}
+{"id":"rm/disable-f","script":"TRAPUSR1() { echo fn; }; disable -f TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/disable-list-trap","script":"trap 'echo list' USR1; TRAPUSR1() { echo fn; }; disable -f TRAPUSR1; enable -f TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"fn\nafter:0\n","stderr":"","status":0}
+{"id":"rm/disable-listing","script":"TRAPUSR1() { echo fn; }; TRAPUSR2() { echo two; }; disable -f TRAPUSR1; trap; whence -w TRAPUSR1; enable -f TRAPUSR1; trap","stdout":"TRAPUSR2 () {\n\techo two\n}\nTRAPUSR1: none\nTRAPUSR1 () {\n\techo fn\n}\nTRAPUSR2 () {\n\techo two\n}\n","stderr":"","status":0}
+{"id":"rm/disable-outside","script":"TRAPUSR1() { echo fn; }; disable -f TRAPUSR1; sh -c 'kill -USR1 $PPID'; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/ignore-kept-after-unfunction","script":"trap '' USR1; TRAPUSR1() { echo fn; }; unfunction TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/inside-trap","script":"TRAPUSR1() { echo fn; unfunction TRAPUSR1; }; kill -USR1 $$; echo mid:$?; kill -USR1 $$; echo after:$?","stdout":"fn\nmid:0\n","stderr":"","status":-10}
+{"id":"rm/trap-all","script":"TRAPUSR1() { echo fn; }; trap -; whence -w TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1: none\n","stderr":"","status":-10}
+{"id":"rm/trap-dash","script":"TRAPUSR1() { echo fn; }; trap - USR1; whence -w TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1: none\n","stderr":"","status":-10}
+{"id":"rm/trap-sig","script":"TRAPUSR1() { echo fn; }; trap USR1; whence -w TRAPUSR1; kill -USR1 $$; echo after:$?","stdout":"TRAPUSR1: none\n","stderr":"","status":-10}
+{"id":"rm/unfunction","script":"TRAPUSR1() { echo fn; }; unfunction TRAPUSR1; trap; kill -USR1 $$; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/unfunction-localtraps","script":"TRAPUSR1() { echo outer; }; f() { setopt localtraps; unfunction TRAPUSR1; }; f; kill -USR1 $$; echo after:$?","stdout":"outer\nafter:0\n","stderr":"","status":0}
+{"id":"rm/unfunction-outside","script":"TRAPUSR1() { echo fn; }; unfunction TRAPUSR1; sh -c 'kill -USR1 $PPID'; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/unfunction-then-list","script":"TRAPUSR1() { echo fn; }; unfunction TRAPUSR1; trap 'echo list' USR1; kill -USR1 $$; echo after:$?","stdout":"list\nafter:0\n","stderr":"","status":0}
+{"id":"rm/unset-f","script":"TRAPUSR1() { echo fn; }; unset -f TRAPUSR1; trap; kill -USR1 $$; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"rm/unset-f-localtraps","script":"TRAPUSR1() { echo outer; }; f() { setopt localtraps; unset -f TRAPUSR1; }; f; kill -USR1 $$; echo after:$?","stdout":"outer\nafter:0\n","stderr":"","status":0}
+{"id":"rm/unset-f-outside","script":"TRAPUSR1() { echo fn; }; unset -f TRAPUSR1; sh -c 'kill -USR1 $PPID'; echo after:$?","stdout":"","stderr":"","status":-10}
+{"id":"sub/background","script":"zmodload zsh/system; TRAPUSR1() { echo F; }; { kill -USR1 $sysparams[pid]; echo bg; } & wait $!; echo st:$?","stdout":"F\nbg\nst:0\n","stderr":"","status":0}
+{"id":"sub/cmdsub","script":"zmodload zsh/system; TRAPUSR1() { echo F; }; x=$( kill -USR1 $sysparams[pid]; echo in ); echo \"x=$x:$?\"","stdout":"x=F\nin:0\n","stderr":"","status":0}
+{"id":"sub/define-in-subshell","script":"zmodload zsh/system; ( TRAPUSR1() { echo F; }; kill -USR1 $sysparams[pid]; echo sub:$? ); echo top:$?; kill -USR1 $$; echo after:$?","stdout":"F\nsub:0\ntop:0\n","stderr":"","status":-10}
+{"id":"sub/fn-kept","script":"zmodload zsh/system; TRAPUSR1() { echo F:$1; }; ( kill -USR1 $sysparams[pid]; echo sub:$? ); echo top:$?","stdout":"F:10\nsub:0\ntop:0\n","stderr":"","status":0}
+{"id":"sub/list-reset","script":"zmodload zsh/system; trap 'echo L' USR1; ( kill -USR1 $sysparams[pid]; echo sub:$? ); echo top:$?","stdout":"top:138\n","stderr":"","status":0}
+{"id":"sub/parent-from-external","script":"TRAPUSR1() { echo F; }; sh -c 'kill -USR1 $PPID'; echo top:$?","stdout":"F\ntop:0\n","stderr":"","status":0}
+{"id":"sub/parent-from-subshell","script":"TRAPUSR1() { echo F; }; ( kill -USR1 $$; echo sub ); echo top:$?","stdout":"sub\nF\ntop:0\n","stderr":"","status":0}
+{"id":"sub/pipeline","script":"zmodload zsh/system; TRAPUSR1() { echo F; }; { kill -USR1 $sysparams[pid]; echo el; } | cat; echo st:$?","stdout":"F\nel\nst:0\n","stderr":"","status":0}
+{"id":"sub/unfunction-in-subshell","script":"zmodload zsh/system; TRAPUSR1() { echo F; }; ( unfunction TRAPUSR1; kill -USR1 $sysparams[pid]; echo sub ); echo top:$?; kill -USR1 $$; echo after:$?","stdout":"top:138\nF\nafter:0\n","stderr":"","status":0}
+{"id":"winch/after-builtin-only","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; echo a; echo b; read -r x < /dev/null; echo after","stdout":"a\nb\nafter\n","stderr":"","status":0}
+{"id":"winch/after-function","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; echo a; f() { echo f; }; f; echo after","stdout":"a\nf\nafter\n","stderr":"","status":0}
+{"id":"winch/after-pipeline","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; echo a; echo p | (sleep 0.1; cat); echo after","stdout":"a\np\ngot\nafter\n","stderr":"","status":0}
+{"id":"winch/after-program","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; echo a; /bin/sleep 0.1; echo after","stdout":"a\ngot\nafter\n","stderr":"","status":0}
+{"id":"winch/after-program-list","script":"trap 'echo got' WINCH; kill -WINCH $$; /bin/sleep 0.1; echo after","stdout":"got\nafter\n","stderr":"","status":0}
+{"id":"winch/after-subshell","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; echo a; (sleep 0.1; echo sub); echo after","stdout":"a\nsub\ngot\nafter\n","stderr":"","status":0}
+{"id":"winch/during-program","script":"TRAPWINCH() { echo got; }; sh -c 'kill -WINCH $PPID; sleep 0.2'; echo after","stdout":"got\nafter\n","stderr":"","status":0}
+{"id":"winch/once","script":"TRAPWINCH() { echo got; }; kill -WINCH $$; /bin/sleep 0.1; echo a; /bin/sleep 0.1; echo after","stdout":"got\na\nafter\n","stderr":"","status":0}
+{"id":"winch/wait-fn","script":"TRAPWINCH() { echo got; }; sleep 0.3 & kill -WINCH $$; wait $!; echo st:$?","stdout":"got\nst:156\n","stderr":"","status":0}
+{"id":"winch/wait-list","script":"trap 'echo got' WINCH; sleep 0.3 & kill -WINCH $$; wait $!; echo st:$?","stdout":"got\nst:156\n","stderr":"","status":0}
+{"id":"zerr-call/fn/errexit","script":"setopt errexit; TRAPZERR() { echo T$?; }; f() { false; return 2; }; f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-call/list/errexit","script":"setopt errexit; trap 'echo T$?' ZERR; f() { false; return 2; }; f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-callret0/fn/errexit","script":"setopt errexit; TRAPZERR() { echo T$?; }; f() { false; return 0; }; f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-callret0/fn/none","script":"TRAPZERR() { echo T$?; }; f() { false; return 0; }; f; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"zerr-callret0/list/errexit","script":"setopt errexit; trap 'echo T$?' ZERR; f() { false; return 0; }; f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-callret0/list/none","script":"trap 'echo T$?' ZERR; f() { false; return 0; }; f; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"zerr-pipe/fn/errexit","script":"setopt errexit; TRAPZERR() { echo T$?; }; true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-pipe/list/errexit","script":"setopt errexit; trap 'echo T$?' ZERR; true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-pipe3/fn/errexit","script":"setopt errexit; TRAPZERR() { echo T$?; }; false | true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr-pipe3/list/errexit","script":"setopt errexit; trap 'echo T$?' ZERR; false | true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"zerr/andor","script":"TRAPZERR() { echo Z; }; false && true; false || true; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"zerr/basic","script":"TRAPZERR() { echo zerr:$1:$?; }; false; echo after:$?","stdout":"zerr:32:1\nafter:1\n","stderr":"","status":0}
+{"id":"zerr/in-function","script":"TRAPZERR() { echo Z; }; f() { false; echo f; }; f; echo top:$?","stdout":"Z\nf\ntop:0\n","stderr":"","status":0}
+{"id":"zerr/return-0","script":"TRAPZERR() { echo Z; return 0; }; false; echo after:$?","stdout":"Z\nafter:1\n","stderr":"","status":0}
+{"id":"zerr/return-1","script":"TRAPZERR() { echo Z; return 1; }; false; echo after:$?","stdout":"Z\n","stderr":"","status":1}
+{"id":"zerr/subshell","script":"TRAPZERR() { echo Z; }; ( false ); echo after:$?","stdout":"Z\nZ\nafter:1\n","stderr":"","status":0}
+{"id":"zerr/unfunction","script":"TRAPZERR() { echo Z; }; unfunction TRAPZERR; false; echo after:$?","stdout":"after:1\n","stderr":"","status":0}

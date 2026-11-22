@@ -2935,21 +2935,11 @@ impl Shell {
 			let trap = if matches!(sig, Signal::Kill | Signal::Stop) {
 				None
 			} else {
-				let key = crate::bash::store::TrapKey::Signal(sig);
-				let p = &self.procs[own];
-				let recorded = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
-					Ok(Some(Record::Trap { action, .. })) => Ok(Some(action.is_empty())),
-					Ok(_) => Ok(None),
-					Err(err) => Err(err),
-				};
-				// zsh: a `TRAPNAL` function is the trap (`ZSIG_FUNC`).
-				let found = recorded.and_then(|trap| match trap {
-					None if p.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
-						builtins::trap::find_func_trap(cx.store, p, key, platform, |_, _| false)
-					},
-					trap => Ok(trap),
-				});
-				match found {
+				match builtins::trap::signal_trap(cx.store, &self.procs[own], sig, platform) {
+					// A `CHLD` that comes as a signal (`kill -CHLD`) runs no trap:
+					// bash's and zsh's handlers only reap, and the trap runs once
+					// per child that changed ([`owe_chld`]).
+					Ok(Some(_)) if sig == Signal::Chld => Some(true),
 					Ok(trap) => trap,
 					Err(err) => {
 						self.k.fail(err);
@@ -3213,20 +3203,16 @@ pub fn imported_function(k: &Kernel, name: &[u8], value: &[u8]) -> Option<Record
 /// trap that many times). Called by the scheduler for child vprocs and by
 /// `Exec` for externals `p` ran itself; `background`: the child was one of
 /// `p`'s background jobs. zsh (`update_job`) runs the trap (a `trap` action
-/// or the `TRAPCHLD` function) only for those, not for the foreground job.
+/// or the `TRAPCHLD` function, also as `TRAPCLD`) only for those, not for
+/// the foreground job.
 pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool) {
 	let zsh = p.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	if zsh && !background {
 		return;
 	}
-	let key = crate::bash::store::Key::Trap(crate::bash::store::TrapKey::Signal(Signal::Chld));
-	let trapped = match state::record(cx.store, p, key) {
-		Ok(Some(Record::Trap { action, .. })) => !action.is_empty(),
-		Ok(None) if zsh => matches!(
-			state::record(cx.store, p, crate::bash::store::Key::Func(bstr::BStr::new(b"TRAPCHLD"))),
-			Ok(Some(Record::Func { .. }))
-		),
-		Ok(_) => false,
+	let platform = k.engine.config().platform;
+	let trapped = match builtins::trap::signal_trap(cx.store, p, Signal::Chld, platform) {
+		Ok(trap) => trap == Some(false),
 		Err(err) => {
 			k.fail(err);
 			false
@@ -3265,9 +3251,15 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 /// `trap_handler`): the trap is due, at once unless `p` waits for its
 /// foreground command (bash runs it once the command has ended), and a
 /// `wait` builtin `p` is in ends with 128 + the signal's number (then the
-/// trap runs); `SIGCHLD` ends none.
+/// trap runs); `SIGCHLD` ends none. A zsh shell holds `WINCH`
+/// ([`exec::zsh_holds`]): the trap is owed and nothing wakes here; the
+/// signal's wake makes a parked shell park again, and it lets the signal
+/// in there when it waits for a process or its line editor reads.
 fn trapped(p: &mut Vproc, sig: Signal, platform: crate::bash::ids::Platform) {
 	p.pending_traps = p.pending_traps.with(sig);
+	if exec::zsh_holds(p, sig) {
+		return;
+	}
 	if !p.waiting_foreground() {
 		p.blocked = None;
 	}

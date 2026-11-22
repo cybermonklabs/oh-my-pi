@@ -98,8 +98,9 @@ pub fn remove_trap_funcs(
 }
 
 /// zsh `gettrapnode`: the function that is the trap for `key` in `vp`,
-/// the first of [`func_names`] defined, passed to `found` with its name;
-/// `None` when there is none.
+/// the first of [`func_names`] defined and not turned off by `disable -f`
+/// (zsh's `getnode` skips a `DISABLED` node), passed to `found` with its
+/// name; `None` when there is none.
 ///
 /// # Errors
 ///
@@ -112,6 +113,13 @@ pub fn find_func_trap<T>(
 	found: impl FnOnce(BString, &Record) -> T,
 ) -> Result<Option<T>, StoreError> {
 	for name in func_names(key, platform) {
+		let defined = matches!(
+			state::record(store, vp, Key::Func(BStr::new(&name)))?,
+			Some(Record::Func { .. })
+		);
+		if !defined || func_disabled(store, vp, &name)? {
+			continue;
+		}
 		if let Some(rec @ Record::Func { .. }) =
 			state::record(store, vp, Key::Func(BStr::new(&name)))?
 		{
@@ -119,6 +127,39 @@ pub fn find_func_trap<T>(
 		}
 	}
 	Ok(None)
+}
+
+/// Whether zsh's `disable -f` turned function `name` off
+/// ([`MiscKey::ZshDisabledFuncs`]).
+fn func_disabled(store: &mut dyn StateStore, vp: &Vproc, name: &[u8]) -> Result<bool, StoreError> {
+	Ok(matches!(
+		state::record(store, vp, Key::Misc(MiscKey::ZshDisabledFuncs))?,
+		Some(Record::Words(names)) if names.iter().any(|n| n.as_slice() == name)
+	))
+}
+
+/// How `vp` takes signal `sig` (the trap a delivered signal finds):
+/// `Some(false)` a trap with an action (a `trap` action, or in zsh a
+/// `TRAPNAL` function, [`find_func_trap`]), `Some(true)` an ignoring one,
+/// `None` no trap.
+///
+/// # Errors
+///
+/// A store failure reading the trap or the functions.
+pub fn signal_trap(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	sig: Signal,
+	platform: crate::bash::ids::Platform,
+) -> Result<Option<bool>, StoreError> {
+	let key = TrapKey::Signal(sig);
+	match state::record(store, vp, Key::Trap(key))? {
+		Some(Record::Trap { action, .. }) => Ok(Some(action.is_empty())),
+		_ if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
+			find_func_trap(store, vp, key, platform, |_, _| false)
+		},
+		_ => Ok(None),
+	}
 }
 
 /// The trap key a zsh function name makes a trap of (`TRAPINT` → `INT`,
@@ -135,18 +176,18 @@ pub fn func_key(name: &[u8], platform: crate::bash::ids::Platform) -> Option<Tra
 }
 
 /// zsh's signal number of `key` (`$1` of a `TRAPNAL` function): `EXIT` is
-/// 0, `ZERR` and `DEBUG` follow the real signals.
+/// 0; `ZERR` and `DEBUG` follow zsh's `sigs` table (zsh `SIGZERR` is
+/// `SIGCOUNT + 1`, `SIGDEBUG` `SIGCOUNT + 2`), which ends at 31 on Linux
+/// (`SYS`) and macOS (`USR2`): zsh 5.9 has no real-time signals
+/// ([`Signal::from_zsh_name`]). So 32 and 33 on both.
 pub fn zsh_number(key: TrapKey, platform: crate::bash::ids::Platform) -> i32 {
-	let count = if platform == crate::bash::Platform::MacOs {
-		31
-	} else {
-		64
-	};
+	/// zsh 5.9's `SIGCOUNT`.
+	const SIGCOUNT: i32 = 31;
 	match key {
 		TrapKey::Signal(sig) => i32::from(sig.number(platform)),
 		TrapKey::Exit | TrapKey::Return => 0,
-		TrapKey::Err => count + 1,
-		TrapKey::Debug => count + 2,
+		TrapKey::Err => SIGCOUNT + 1,
+		TrapKey::Debug => SIGCOUNT + 2,
 	}
 }
 
@@ -386,6 +427,12 @@ pub enum FuncChange {
 	Autoloaded,
 	/// Removed (`unfunction`, `unset -f`).
 	Removed,
+	/// Turned off by `disable -f` (zsh `disableshfuncnode`): the trap goes,
+	/// the function stays.
+	Disabled,
+	/// Turned on again by `enable -f` (zsh `enableshfuncnode`): it is the
+	/// trap again, in place of a `trap` action.
+	Enabled,
 }
 
 /// A zsh `TRAPNAL` function named `name` is about to change (`how`): zsh's
@@ -442,11 +489,16 @@ fn zsh_settrap(
 	let (keep, os_action, defined) = match &change {
 		ZshTrap::Trap(action) => (None, action.as_ref().map(|a| a.as_bstr()), false),
 		ZshTrap::Func(name, how) => {
-			let live = *how != FuncChange::Removed;
-			(live.then_some(*name), live.then(|| BStr::new(*name)), *how == FuncChange::Defined)
+			let live =
+				matches!(how, FuncChange::Defined | FuncChange::Autoloaded | FuncChange::Enabled);
+			let replaces = matches!(how, FuncChange::Defined | FuncChange::Enabled);
+			(live.then_some(*name), live.then(|| BStr::new(*name)), replaces)
 		},
 	};
-	remove_trap_funcs(&mut k.root, cx.store, vp, key, keep);
+	// zsh `unsettrap` after `disable -f` leaves the function table alone.
+	if !matches!(change, ZshTrap::Func(_, FuncChange::Disabled)) {
+		remove_trap_funcs(&mut k.root, cx.store, vp, key, keep);
+	}
 	if let TrapKey::Signal(sig) = key {
 		untrapped::release(&mut k.root, cx.store, vp, sig)?;
 	}
@@ -530,8 +582,8 @@ fn zsh_quote(text: &[u8]) -> Vec<u8> {
 	out
 }
 
-/// Every trap set (records and `TRAPNAL` functions), with zsh's number for
-/// ordering.
+/// Every trap set (records and `TRAPNAL` functions `disable -f` has not
+/// turned off), with zsh's number for ordering.
 fn zsh_traps(ctx: &mut Ctx<'_, '_>) -> Result<Vec<(TrapKey, Record)>, super::Need> {
 	let platform = ctx.k.engine.config().platform;
 	let mut all = Vec::new();
@@ -545,6 +597,7 @@ fn zsh_traps(ctx: &mut Ctx<'_, '_>) -> Result<Vec<(TrapKey, Record)>, super::Nee
 	for (key, rec) in state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, Table::Func)? {
 		if let (KeyBuf::Func(name), rec @ Record::Func { .. }) = (key, rec)
 			&& let Some(key) = func_key(&name, platform)
+			&& !func_disabled(ctx.cx.store, ctx.vp, &name)?
 		{
 			all.push((key, rec));
 		}

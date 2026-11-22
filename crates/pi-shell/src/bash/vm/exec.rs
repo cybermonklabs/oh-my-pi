@@ -89,15 +89,29 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		}
 		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
 			let pending = vp.pending_traps.iter().find(|sig| {
-				!vp.frames.iter().any(|frame| {
-					matches!(frame.kind, FrameKind::Script {
-						what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
-						..
-					} if active == *sig)
-				})
+				!zsh_holds(vp, *sig)
+					&& !vp.frames.iter().any(|frame| {
+						matches!(frame.kind, FrameKind::Script {
+							what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
+							..
+						} if active == *sig)
+					})
 			});
 			if let Some(sig) = pending {
 				vp.pending_traps = vp.pending_traps.without(sig);
+				if sig == crate::bash::signal::Signal::Winch
+					&& let Some(z) = vp.zsh.as_deref_mut()
+				{
+					z.winch_due = false;
+				}
+				// zsh's handler reads the new size (`adjustwinsize`) before it
+				// runs the trap: `$LINES` and `$COLUMNS` there are the new ones.
+				if sig == crate::bash::signal::Signal::Winch
+					&& vp.mode.dialect() == Dialect::Zsh
+					&& vp.zle.is_some()
+				{
+					super::zle::reader::adjust_winsize(k, cx, vp, true);
+				}
 				// One run per finished child (bash `run_sigchld_trap`): the next
 				// waits until this one is done.
 				if sig == crate::bash::signal::Signal::Chld {
@@ -515,6 +529,7 @@ fn zsh_return_flow(
 	} else if run_always(k, vp, cx, target.unwrap_or(0), TryEnd::Return(status)) {
 		// The always-list runs first; it resumes the return.
 	} else if let Some(i) = target {
+		vp.status = kill_status(vp, i, status);
 		zsh_leave(k, vp, cx, i);
 	} else if let Some(i) = vp
 		.frames
@@ -543,6 +558,27 @@ fn zsh_return_flow(
 		// zsh `bin_break`: `return` outside a function or `.` file leaves
 		// a non-interactive shell (`zexit`).
 		exit_shell(k, vp, cx, status);
+	}
+}
+
+/// zsh: a `return` from a list trap that runs inside the shell's `kill` to
+/// itself ([`super::proc::SelfKill`]) leaves the function with the `kill`'s
+/// status, which the trap's frame above function frame `target` holds.
+fn kill_status(vp: &Vproc, target: usize, status: i32) -> i32 {
+	let Some(at) = vp
+		.zsh
+		.as_ref()
+		.and_then(|z| z.self_kill)
+		.and_then(|s| s.frame)
+	else {
+		return status;
+	};
+	match vp.frames.get(at as usize) {
+		Some(Frame {
+			kind: FrameKind::Script { what: ScriptKind::Trap { status: kill, .. }, .. },
+			..
+		}) if at as usize > target => *kill,
+		_ => status,
 	}
 }
 
@@ -867,6 +903,9 @@ fn park(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, key: WaitKey, at: u64) 
 		k.emit(cx, (vp.vpid, vp.mode), vp.runs.front(), EventData::Blocked { key: &key });
 	}
 	vp.blocked = Some(super::proc::Blocked { key, at });
+	if vp.zsh.is_some() || vp.mode.dialect() == Dialect::Zsh {
+		let_winch_in(k, vp);
+	}
 }
 
 /// Clear the park of `vp` (emitting `Unblocked`). After every op: the
@@ -1158,6 +1197,10 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
 			..
 		});
+		let exit_key = matches!(frame.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: TrapKey::Exit, .. },
+			..
+		});
 		let eval = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Eval, .. });
 		// zsh `execode` of empty code (`zstyle -e`, `zregexparse`) leaves 0.
 		let code = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Code(_), .. });
@@ -1166,6 +1209,17 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		let func_trap = status.is_some() && empty_src;
 		let trap_status = vp.status;
 		let top = vp.frames.len() - 1;
+		// zsh's EXIT trap as the shell exits (no frame below it): `zexit`
+		// exits with the status it was given, whatever a `TRAPEXIT`
+		// function `return`s.
+		let shell_exit = exit_key && top == 0;
+		// The trap of a signal the shell's `kill` sent itself ends that
+		// `kill` ([`super::proc::SelfKill`]); `pop_frame` ends the record.
+		let in_kill = vp
+			.zsh
+			.as_ref()
+			.and_then(|z| z.self_kill)
+			.filter(|s| s.frame.is_some() && s.frame == u32::try_from(top).ok());
 		// The text of a zsh command substitution (`child_text`) ends its
 		// child: the child's own EXIT trap runs.
 		let sub_end = eval && top == 0 && vp.parent.is_some() && mode.dialect() == Dialect::Zsh;
@@ -1189,12 +1243,27 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			&& exit
 		{
 			exit_shell(k, vp, cx, status);
-		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
+		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh && !shell_exit {
 			// zsh `dotrapargs`: a function trap returning non-zero forces
 			// a return from the interrupted code, with the error flag set.
-			zsh_discard(k, vp, cx, trap_status);
+			// Run inside a `kill`, the `kill`'s status replaces the trap's,
+			// but for `INT` and `QUIT`, whose flag is the interrupt one
+			// (`exec.c` keeps a builtin's status only without it).
+			let interrupt = in_kill.is_some_and(|s| {
+				matches!(s.sig, crate::bash::signal::Signal::Int | crate::bash::signal::Signal::Quit)
+			});
+			let status = status
+				.filter(|_| in_kill.is_some() && !interrupt)
+				.unwrap_or(trap_status);
+			zsh_discard(k, vp, cx, status);
 		} else if let Some(status) = status {
 			vp.status = status;
+			// The same `kill` sent the signal again: its trap runs again.
+			if let Some(more @ super::proc::SelfKill { more: 1.., sig, .. }) = in_kill {
+				vp.zsh_state().self_kill =
+					Some(super::proc::SelfKill { more: more.more - 1, frame: None, ..more });
+				vp.pending_traps = vp.pending_traps.with(sig);
+			}
 			if let Some(target) = return_target {
 				unwind(&mut k.root, cx.store, vp, target);
 			} else if debug
@@ -1699,6 +1768,15 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	};
 	if matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
 		vp.trap_frames = vp.trap_frames.saturating_sub(1);
+		// However its trap ends, a `kill` to itself is over with it.
+		let at = u32::try_from(vp.frames.len()).ok();
+		if let Some(z) = vp.zsh.as_deref_mut()
+			&& z
+				.self_kill
+				.is_some_and(|s| s.frame.is_some() && s.frame == at)
+		{
+			z.self_kill = None;
+		}
 	}
 	if let Some(sc) = f.scratch.take() {
 		drop_scratch(root, store, vp, sc);
@@ -4746,6 +4824,74 @@ fn zsh_debug_done(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 	}
 }
 
+/// Whether zsh holds signal `sig` from `vp` for now: `WINCH`, which zsh
+/// keeps blocked (`init.c` `init_signals`: `winch_block()`) except while
+/// its line editor reads a line (`zle_main.c` `zleread`) and while it
+/// waits for a process (`signal_suspend`'s mask lets every signal in). So
+/// a zsh shell's `WINCH` trap runs at its prompt, after the next command
+/// it waits for (a program, `( … )`, `$( … )`, a pipeline), or as `wait`
+/// ends; a shell that does none of those never runs it. The signal stays
+/// owed till then ([`VprocZsh::winch_due`](super::proc::VprocZsh)).
+pub fn zsh_holds(vp: &Vproc, sig: crate::bash::signal::Signal) -> bool {
+	sig == crate::bash::signal::Signal::Winch
+		&& vp.mode.dialect() == Dialect::Zsh
+		&& !super::zle::active(vp)
+		&& !vp.zsh.as_ref().is_some_and(|z| z.winch_due)
+}
+
+/// Whether `vp` waits for a process: a program, a child vproc (`( … )`, a
+/// pipeline's stages), a command substitution, or the `wait` builtin's
+/// jobs. zsh waits for each in `signal_suspend`, which lets a held
+/// `WINCH` in ([`zsh_holds`]); a builtin or function it runs itself is no
+/// such wait.
+fn waits_for_process(vp: &Vproc) -> bool {
+	use super::proc::Awaited;
+	vp.frames.iter().any(|frame| {
+		frame.scratch.as_ref().is_some_and(|sc| {
+			!sc.children.is_empty()
+				|| sc.sub.is_some()
+				|| matches!(
+					sc.exec.as_ref().and_then(|e| e.waiting),
+					Some(
+						Awaited::Ext { .. } | Awaited::Jobs { .. } | Awaited::AllJobs | Awaited::AnyJob
+					)
+				)
+		})
+	})
+}
+
+/// zsh lets the `WINCH` it holds from `vp` in as `vp` parks: waiting for a
+/// process ([`waits_for_process`]), the trap is due, after the command (it
+/// waits for its foreground command) or at once, ending a `wait` builtin
+/// with 128 + the signal's number; reading with the line editor, it runs
+/// now (the park is undone, unless its own trap runs already).
+fn let_winch_in(k: &Kernel, vp: &mut Vproc) {
+	let winch = crate::bash::signal::Signal::Winch;
+	if !vp.pending_traps.contains(winch) || vp.mode.dialect() != Dialect::Zsh {
+		return;
+	}
+	if super::zle::active(vp) {
+		let running = vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script {
+				what: ScriptKind::Trap { key: TrapKey::Signal(crate::bash::signal::Signal::Winch), .. },
+				..
+			})
+		});
+		if !running {
+			vp.blocked = None;
+		}
+		return;
+	}
+	if !zsh_holds(vp, winch) || !waits_for_process(vp) {
+		return;
+	}
+	vp.zsh_state().winch_due = true;
+	if !vp.waiting_foreground() {
+		vp.blocked = None;
+	}
+	super::interrupt_wait(vp, winch.exit_status(k.engine.config().platform));
+}
+
 /// Run a configured trap in the interrupted shell, without re-entering it.
 pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey) -> bool {
 	// A subshell lists its parent's EXIT trap but runs only its own.
@@ -4884,6 +5030,16 @@ fn push_trap(
 		return_target: None,
 		exit: false,
 	});
+	// A signal the shell's own `kill` sent itself: its trap runs as inside
+	// that `kill`, with `$?` from before it ([`super::proc::SelfKill`]).
+	if let TrapKey::Signal(sig) = key
+		&& let Some(s) = vp.zsh.as_deref_mut().and_then(|z| z.self_kill.as_mut())
+		&& s.sig == sig
+		&& s.frame.is_none()
+	{
+		s.frame = u32::try_from(vp.frames.len() - 1).ok();
+		vp.status = s.before;
+	}
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);
 		vp.push_restore(*saved);

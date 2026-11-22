@@ -1,0 +1,4 @@
+{"id":"chld/kill-self","script":"trap 'echo got' CHLD; kill -CHLD $$; echo after:$?","stdout":"after:0\n","stderr":"","status":0}
+{"id":"chld/kill-self-then-child","script":"trap 'echo got' CHLD; sleep 30 & p=$!; kill -CHLD $$; echo after:$?; kill $p; wait; echo w","stdout":"after:0\ngot\nw\n","stderr":"","status":0}
+{"id":"chld/kill-subshell","script":"trap 'echo got' CHLD; (kill -CHLD $BASHPID; echo sub); echo top","stdout":"sub\ngot\ntop\n","stderr":"","status":0}
+{"id":"winch/kill-self","script":"trap 'echo got' WINCH; kill -WINCH $$; echo after:$?","stdout":"got\nafter:0\n","stderr":"","status":0}

@@ -1893,6 +1893,7 @@ pub fn enable(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: Func) ->
 		(MiscKey::DisabledBuiltins, b)
 	};
 	let mut disabled = words(ctx, key)?;
+	let before = (key == MiscKey::ZshDisabledFuncs).then(|| disabled.clone());
 	if args.is_empty() {
 		let mut out = Vec::new();
 		let mut list = universe;
@@ -1925,7 +1926,7 @@ pub fn enable(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: Func) ->
 				matched += 1;
 			}
 		}
-		set_words(ctx, key, disabled);
+		store_disabled(ctx, key, before.as_deref(), disabled)?;
 		return done(if matched == 0 { 1 } else { returnval });
 	}
 	for a in args {
@@ -1936,8 +1937,37 @@ pub fn enable(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: Func) ->
 			returnval = 1;
 		}
 	}
-	set_words(ctx, key, disabled);
+	store_disabled(ctx, key, before.as_deref(), disabled)?;
 	done(returnval)
+}
+
+/// Store `disabled` as the names `key` turns off. For functions (`before`:
+/// the names off until now) a `TRAPNAL` function's trap follows, as zsh's
+/// `disableshfuncnode` and `enableshfuncnode` have it: one turned off is
+/// no trap any more (the function stays), one turned on is the trap again.
+fn store_disabled(
+	ctx: &mut Ctx<'_, '_>,
+	key: MiscKey,
+	before: Option<&[BString]>,
+	disabled: Vec<BString>,
+) -> Result<(), Need> {
+	let Some(before) = before else {
+		set_words(ctx, key, disabled);
+		return Ok(());
+	};
+	for name in disabled.iter().filter(|n| !before.contains(n)) {
+		super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, super::trap::FuncChange::Disabled)?;
+	}
+	let enabled: Vec<BString> = before
+		.iter()
+		.filter(|n| !disabled.contains(n))
+		.cloned()
+		.collect();
+	set_words(ctx, key, disabled);
+	for name in &enabled {
+		super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, super::trap::FuncChange::Enabled)?;
+	}
+	Ok(())
 }
 
 /// zsh `pat_enables`: `enable -p`/`disable -p` over the pattern

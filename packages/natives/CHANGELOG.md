@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- zsh mode runs trap functions (`TRAPNAL() { … }`) and the traps around them as zsh 5.9 does: `$1` of `TRAPZERR` and `TRAPDEBUG` is 32 and 33; `TRAPCLD` is the `CHLD` trap; `disable -f` of a `TRAPNAL` function removes its trap and `enable -f` sets it again; a `WINCH` trap runs only at the prompt or once the shell waits for a process (a program, `( … )`, a pipeline, `wait`), with the new `$LINES` and `$COLUMNS`; the trap of a signal the shell's `kill` sends itself sees `$?` from before the `kill`, runs once per signal sent, and a `return N` there leaves the `kill`'s status (except for `INT` and `QUIT`); `TRAPEXIT`'s `return N` as the shell exits leaves the exit status alone. In bash and zsh mode a `CHLD` sent as a signal (`kill -CHLD $$`) runs no trap.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

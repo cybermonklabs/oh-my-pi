@@ -14,7 +14,9 @@ use super::{
 	zsh_args::isset,
 };
 use crate::bash::{
-	ControlHandle, Platform, SigTarget, Signal, diag, vm::proc::JobState, zshopt::ZshOpt,
+	ControlHandle, Platform, SigTarget, Signal, diag,
+	vm::proc::{JobState, SelfKill},
+	zshopt::ZshOpt,
 };
 
 /// zsh `SIGCOUNT`: the signals `kill -l` lists (`$signals[2,32]`).
@@ -117,6 +119,29 @@ fn list(ctx: &mut Ctx<'_, '_>, args: &[BString], platform: Platform) -> R {
 		}
 	}
 	done(status)
+}
+
+/// zsh runs the trap of a signal its `kill` sends its own shell inside
+/// that `kill` ([`SelfKill`]): note the send, with `$?` from before the
+/// `kill`, for the trap's start. Only a signal the shell runs a trap for
+/// now (not `CHLD`, whose trap runs per child, nor a `WINCH` zsh holds); a
+/// second send of it runs the trap again.
+fn note_self_kill(ctx: &mut Ctx<'_, '_>, sig: Signal) -> Result<(), super::Need> {
+	let platform = ctx.k.engine.config().platform;
+	if sig == Signal::Chld
+		|| crate::bash::vm::exec::zsh_holds(ctx.vp, sig)
+		|| super::trap::signal_trap(ctx.cx.store, ctx.vp, sig, platform)? != Some(false)
+	{
+		return Ok(());
+	}
+	let before = ctx.vp.status;
+	let z = ctx.vp.zsh_state();
+	match &mut z.self_kill {
+		Some(s) if s.sig == sig && s.frame.is_none() => s.more += 1,
+		Some(_) => {},
+		None => z.self_kill = Some(SelfKill { sig, before, more: 0, frame: None }),
+	}
+	Ok(())
 }
 
 /// zsh `bin_kill`: `kill [-sig | -s name | -n num] pid|%job…`, `kill -l
@@ -233,6 +258,9 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				if let Some(s) = send.signal() {
 					let ctl = ControlHandle(ctx.k.ctl.clone());
 					ctl.signal(t, s);
+					if t == SigTarget::Vpid(ctx.vp.vpid) {
+						note_self_kill(ctx, s)?;
+					}
 					// A stopped job is continued after a signal that does
 					// not stop it.
 					if let SigTarget::Job(id) = t
@@ -255,7 +283,16 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				}
 				None
 			},
-			Ok(None) => None,
+			Ok(None) => {
+				// `kill 0`: the root's process group, the shell's process in it.
+				if let Some(s) = send.signal()
+					&& operand.as_slice() == b"0"
+					&& ctx.vp.parent.is_none()
+				{
+					note_self_kill(ctx, s)?;
+				}
+				None
+			},
 			Err(TargetError::Reported) => {
 				status += 1;
 				continue;

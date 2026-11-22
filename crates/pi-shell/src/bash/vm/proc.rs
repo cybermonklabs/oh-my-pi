@@ -219,6 +219,15 @@ pub struct VprocZsh {
 	/// been that command, so its parent dies of it too.
 	#[serde(default)]
 	pub died_of:            Option<i32>,
+	/// A signal this vproc's own `kill` sent itself, whose trap runs as
+	/// zsh runs it inside that `kill` ([`SelfKill`]).
+	#[serde(default)]
+	pub self_kill:          Option<SelfKill>,
+	/// zsh let the `WINCH` it holds in: it waited for a process since the
+	/// signal came (`signal_suspend` unblocks it), so the trap is due as
+	/// any other's ([`crate::bash::vm::exec::zsh_holds`]).
+	#[serde(default)]
+	pub winch_due:          bool,
 }
 
 /// A number as zsh's `lastmathval` keeps it ([`VprocZsh::last_math`]); a
@@ -229,6 +238,24 @@ pub enum LastMath {
 	Int(i64),
 	/// A double, `f64::to_bits`.
 	Float(u64),
+}
+
+/// zsh runs the trap of a signal the shell's `kill` sends itself inside
+/// that `kill`: its handler runs at the `kill(2)` (`signals.c` `zhandler`,
+/// `dotrap`), before `kill` has a status. So the trap sees `$?` from
+/// before the `kill`, a `return N` in it (from a `TRAPNAL` function, or a
+/// list trap leaving a function) gives way to the `kill`'s status, and
+/// each such send runs the trap once ([`VprocZsh::self_kill`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfKill {
+	/// The signal.
+	pub sig:    crate::bash::signal::Signal,
+	/// `$?` before the `kill`: what the trap sees.
+	pub before: i32,
+	/// Sends of `sig` to itself whose trap runs after this one.
+	pub more:   u32,
+	/// The trap frame running it, once it started.
+	pub frame:  Option<u32>,
 }
 
 impl VprocZsh {
@@ -250,6 +277,8 @@ impl VprocZsh {
 			&& self.glob_hook.is_none()
 			&& !self.in_place
 			&& self.died_of.is_none()
+			&& self.self_kill.is_none()
+			&& !self.winch_due
 	}
 }
 
