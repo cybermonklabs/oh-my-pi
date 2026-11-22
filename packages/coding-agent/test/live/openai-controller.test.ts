@@ -32,10 +32,23 @@ class FakeTransport {
 	readonly log: string[] = [];
 	readonly sdpAnswer = "v=0 answer";
 	closed = false;
+	connected = false;
 	/** Called after each send, so a test can answer a `session.close`. */
 	onSend: ((message: LiveClientMessage) => void) | undefined;
-	constructor(readonly options: LiveTransportOptions) {}
-	async connect(): Promise<void> {}
+	constructor(
+		readonly options: LiveTransportOptions,
+		/** Connect only when the controller aborts the connect, as a server that never answers. */
+		readonly connectUntilAborted = false,
+	) {}
+	async connect(): Promise<void> {
+		if (this.connectUntilAborted) {
+			const { signal } = this.options;
+			const { promise, reject } = Promise.withResolvers<never>();
+			signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			await promise;
+		}
+		this.connected = true;
+	}
 	async setMuted(): Promise<void> {}
 	async send(message: LiveClientMessage): Promise<void> {
 		this.sent.push(message);
@@ -44,6 +57,7 @@ class FakeTransport {
 	}
 	async close(): Promise<void> {
 		this.closed = true;
+		this.connected = false;
 		this.log.push("close");
 	}
 	emit(event: LiveServerEvent): void {
@@ -87,6 +101,8 @@ interface CallOptions {
 	settings?: Record<string, unknown>;
 	/** Answer `session.close` with `session.closed` after this many ms; unset never answers. */
 	closedAfterMs?: number;
+	/** The connect never ends unless the controller aborts it. */
+	connectUntilAborted?: boolean;
 }
 
 function call(options: CallOptions = {}) {
@@ -95,7 +111,7 @@ function call(options: CallOptions = {}) {
 		mockImplementation(implementation: (options: LiveTransportOptions) => object): void;
 	};
 	transportSpy.mockImplementation(function (transportOptions: LiveTransportOptions) {
-		const transport = new FakeTransport(transportOptions);
+		const transport = new FakeTransport(transportOptions, options.connectUntilAborted);
 		if (options.closedAfterMs !== undefined) {
 			const delay = options.closedAfterMs;
 			transport.onSend = message => {
@@ -323,6 +339,25 @@ describe("GPT-Live call lifecycle", () => {
 		await advance(1);
 		await stopping;
 		expect(live.transport().log).toEqual(["send session.close", "event session.closed", "close"]);
+	});
+
+	test("a stop while the call connects aborts the connect and sends nothing on the sideband", async () => {
+		const live = call({ connectUntilAborted: true });
+		const starting = live.controller.start().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		// The start can wait on file I/O before it builds the transport; each stat lets that I/O finish.
+		for (let i = 0; i < 200 && live.transports.length === 0; i++) await fs.stat(tempDir);
+		const transport = live.transport();
+		expect(transport.options.signal?.aborted).toBe(false);
+		const stopping = live.controller.stop();
+		await advance(0);
+		expect(transport.options.signal?.aborted).toBe(true);
+		await stopping;
+		expect(String(await starting)).toMatch(/stopped while it connected/);
+		expect(transport.log).toEqual(["close"]);
+		expect(live.ends()).toEqual([]);
 	});
 
 	test("omp closes the sideband 5 s after session.close when session.closed never comes", async () => {

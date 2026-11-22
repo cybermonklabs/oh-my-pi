@@ -1563,10 +1563,19 @@ person's line). It runs at once, also while a turn runs, and answers in one
 - `/live on`: `Live call open: <provider>, voice <voice>.`; while a call is
   starting or open, `A live call is already starting|open (since <UTC time>).`;
   on a failure (dictation running, the session changing, no credential, the
-  server's refusal), `Live call did not start: <reason>`.
+  server's refusal, a stop while it connects), `Live call did not start: <reason>`.
 - `/live off`: `Live call ended.`, or `No live call is open.`
 - `/live status` (or a bare `/live`): `Live call starting|open since <UTC time>:
   <provider>, voice <voice>, microphone on|muted.`, or `No live call is open.`
+
+A call can take a minute to connect (the session request, the media channel,
+and up to five attempts at the sideband). A `prompt` frame's `/live on`
+therefore runs in the background: its response comes at once, and the one-line
+answer follows as a `command_output` when the start ends, so the input queue
+stays free meanwhile. `/live off` or `abort` sent while the call connects
+cancels the connect (the pending session request and the sideband attempts),
+and the start answers `Live call did not start: …`. Through `sendUserInput`
+the call `/live on` returns when the start ends, with that line as `output`.
 
 The live frames below are sent as for `live_start`. The checks `live_start`
 makes (dictation, a session change or shutdown) apply to `/live on` too. ACP,

@@ -175,6 +175,8 @@ export class LiveSessionController {
 	/** Why a GPT-Live call ended, for the end message, when something other than a stop request ended it. */
 	#endReason: string | undefined;
 	#usageSeconds: number | undefined;
+	/** Aborted by {@link stop}: cancels a connect still in progress (the session request, the sideband's attempts). */
+	readonly #connectAbort = new AbortController();
 
 	constructor(options: LiveSessionControllerOptions) {
 		this.#session = options.session;
@@ -252,6 +254,7 @@ export class LiveSessionController {
 				instructions,
 				voice: this.#voice,
 				sdpOffer: this.#sdpOffer,
+				signal: this.#connectAbort.signal,
 				callbacks: {
 					onEvent: event => this.#receiveLiveEvent(event),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
@@ -331,6 +334,8 @@ export class LiveSessionController {
 	async #stop(): Promise<void> {
 		const endedAt = new Date();
 		this.#stopped = true;
+		// A stop during the start cancels the connect: no session request or sideband attempt goes on after it.
+		this.#connectAbort.abort(new Error("The live call was stopped while it connected"));
 		clearTimeout(this.#quietTimer);
 		// No delegation is dropped: one still waiting for its transcript becomes a turn now.
 		for (const pending of this.#pendingDelegations) pending.expired = true;
@@ -355,7 +360,8 @@ export class LiveSessionController {
 		this.#transport = undefined;
 		let closeConfirmed = this.#sessionClosedReceived;
 		if (transport) {
-			if (!this.#sessionClosedReceived) {
+			// Only a call that is up can be told to close; a connect the stop cancelled has no sideband.
+			if (transport.connected && !this.#sessionClosedReceived) {
 				try {
 					await transport.send(buildSessionClose());
 					// GPT-Live finalizes the call (its usage) only once `session.closed` arrives.

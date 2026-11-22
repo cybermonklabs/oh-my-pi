@@ -33,15 +33,19 @@ const REFUSED_KEY = "other";
 
 interface LiveApiServerOptions {
 	/** Response to `POST /v1/live/sessions`; defaults to a 201 with session `live_123`. */
-	answer?: () => Response;
+	answer?: () => Response | Promise<Response>;
 	/** Frames the sideband sends once attached. */
 	events?: unknown[];
+	/** Runs when the sideband's upgrade request arrives, before the server answers it. */
+	onAttach?: () => void;
 }
 
 /** A local server speaking GPT-Live's public API (`/v1/live/sessions`), recording what it receives. */
 function liveApiServer(options: LiveApiServerOptions = {}) {
 	const posts: { request: Request; body: unknown }[] = [];
 	const upgrades: Request[] = [];
+	/** Resolves when a sideband the server accepted closes. */
+	const sidebandClosed = Promise.withResolvers<void>();
 	const received: unknown[] = [];
 	const nextMessage = { resolve: (_: unknown) => {} };
 	const server = Bun.serve({
@@ -59,7 +63,9 @@ function liveApiServer(options: LiveApiServerOptions = {}) {
 					)
 				);
 			}
-			if (url.pathname === "/v1/live/sessions/live_123/attach" && srv.upgrade(request)) {
+			if (url.pathname === "/v1/live/sessions/live_123/attach") {
+				options.onAttach?.();
+				if (!srv.upgrade(request)) return new Response("upgrade failed", { status: 400 });
 				upgrades.push(request);
 				return undefined;
 			}
@@ -74,6 +80,9 @@ function liveApiServer(options: LiveApiServerOptions = {}) {
 				received.push(message);
 				nextMessage.resolve(message);
 			},
+			close() {
+				sidebandClosed.resolve();
+			},
 		},
 	});
 	const message = (): Promise<unknown> => {
@@ -81,10 +90,22 @@ function liveApiServer(options: LiveApiServerOptions = {}) {
 		nextMessage.resolve = resolve;
 		return promise;
 	};
-	return { server, posts, upgrades, received, message, base: `http://127.0.0.1:${server.port}/v1` };
+	return {
+		server,
+		posts,
+		upgrades,
+		received,
+		message,
+		sidebandClosed: sidebandClosed.promise,
+		base: `http://127.0.0.1:${server.port}/v1`,
+	};
 }
 
-function openaiTransport(route: OpenAILiveRoute, onEvent: (event: LiveServerEvent) => void = () => {}): LiveTransport {
+function openaiTransport(
+	route: OpenAILiveRoute,
+	onEvent: (event: LiveServerEvent) => void = () => {},
+	signal?: AbortSignal,
+): LiveTransport {
 	return new LiveTransport({
 		authStorage: noCodexLogin,
 		openai: route,
@@ -93,6 +114,7 @@ function openaiTransport(route: OpenAILiveRoute, onEvent: (event: LiveServerEven
 		voice: "marin",
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },
+		signal,
 	});
 }
 
@@ -284,6 +306,65 @@ describe("GPT-Live transport", () => {
 			await transport.close();
 			redirecting.stop(true);
 			elsewhere.server.stop(true);
+		}
+	});
+
+	test("a sideband that opens after the transport closed is closed at once", async () => {
+		// The stop lands between the sideband's upgrade request and its answer.
+		const api = liveApiServer({ onAttach: () => void transport.close() });
+		const transport = openaiTransport({ baseUrl: api.base, apiKey: "gw-key", model: "gpt-live-1.1" });
+		try {
+			await expect(transport.connect()).rejects.toThrow();
+			expect(api.upgrades).toHaveLength(1);
+			// A sideband kept open after the close never ends this wait, and the test times out.
+			await api.sidebandClosed;
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("an abort cancels a connect, and leaves a call that is up for its owner to close", async () => {
+		const api = liveApiServer();
+		const abort = new AbortController();
+		const route = { baseUrl: api.base, apiKey: "gw-key", model: "gpt-live-1.1" };
+		const transport = openaiTransport(route, () => {}, abort.signal);
+		try {
+			await transport.connect();
+			abort.abort(new Error("stopped"));
+			const sent = api.message();
+			await transport.send(OPENAI_LIVE_WIRE.progress("item_1", "Still here."));
+			expect(await sent).toMatchObject({ type: "session.thinking.append", content: "Still here." });
+			expect(transport.connected).toBe(true);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+
+		const held = Promise.withResolvers<Response>();
+		const posted = Promise.withResolvers<void>();
+		const slow = liveApiServer({
+			answer: () => {
+				posted.resolve();
+				return held.promise;
+			},
+		});
+		const connecting = new AbortController();
+		const cancelled = openaiTransport(
+			{ baseUrl: slow.base, apiKey: "gw-key", model: "gpt-live-1.1" },
+			() => {},
+			connecting.signal,
+		);
+		try {
+			const connect = cancelled.connect();
+			await posted.promise;
+			connecting.abort(new Error("stopped while connecting"));
+			await expect(connect).rejects.toThrow(/stopped while connecting/);
+			expect(slow.upgrades).toEqual([]);
+		} finally {
+			held.resolve(new Response(null, { status: 499 }));
+			await cancelled.close();
+			slow.server.stop(true);
 		}
 	});
 });

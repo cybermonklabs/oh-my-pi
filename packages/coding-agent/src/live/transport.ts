@@ -7,7 +7,7 @@ import {
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
 import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
-import { isRecord, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, sleepLong, toError } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { kNoAuth } from "../config/model-provider-discovery";
 import type { ScopeLike } from "../config/registry";
@@ -148,6 +148,11 @@ export interface LiveTransportOptions {
 	instructions: string;
 	voice: string;
 	callbacks: LiveTransportCallbacks;
+	/**
+	 * Cancels the connect: an abort while the transport connects cancels the session request and the
+	 * sideband's attempts and closes the transport. Once it has connected an abort does nothing; the
+	 * caller ends the call (`session.close`) and then {@link LiveTransport.close}s it.
+	 */
 	signal?: AbortSignal;
 	/**
 	 * SDP offer from a caller-owned WebRTC peer (one Opus audio track plus an `oai-events`
@@ -274,7 +279,7 @@ export class LiveTransport {
 		this.#options = options;
 		this.#label = options.openai ? "GPT-Live" : options.endpoint ? "Live endpoint" : "Codex live";
 		this.#abortListener = () => {
-			void this.close();
+			if (this.#state === "idle" || this.#state === "connecting") void this.close();
 		};
 		if (!options.signal?.aborted) options.signal?.addEventListener("abort", this.#abortListener, { once: true });
 	}
@@ -282,6 +287,11 @@ export class LiveTransport {
 	/** SDP answer for the caller's peer once a {@link LiveTransportOptions.sdpOffer} call has been signaled. */
 	get sdpAnswer(): string | undefined {
 		return this.#sdpAnswer;
+	}
+
+	/** Whether the call is up: signaled, its media channel open and its sideband attached. */
+	get connected(): boolean {
+		return this.#state === "connected";
 	}
 
 	/** Establish the media peer, signal the call, and wait for the data channel or sideband. */
@@ -521,8 +531,8 @@ export class LiveTransport {
 				return;
 			} catch (cause) {
 				failure = toError(cause);
-				if (this.#options.signal?.aborted) throw abortReason(this.#options.signal);
-				if (attempt + 1 < SIDEBAND_CONNECT_ATTEMPTS) await Bun.sleep(200 * 2 ** attempt);
+				if (this.#state !== "connecting") throw abortReason(this.#options.signal);
+				if (attempt + 1 < SIDEBAND_CONNECT_ATTEMPTS) await sleepLong(200 * 2 ** attempt, this.#options.signal);
 			}
 		}
 		throw failure;
@@ -557,8 +567,10 @@ export class LiveTransport {
 			rejectConnect(abortReason(this.#options.signal));
 		};
 		socket.onopen = () => {
-			if (settled) {
+			// A socket that opens after a stop (the transport is closing) is closed, never kept.
+			if (settled || this.#state !== "connecting") {
 				socket.close(1000, "stale");
+				rejectConnect(abortReason(this.#options.signal));
 				return;
 			}
 			opened = true;
