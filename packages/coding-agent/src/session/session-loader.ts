@@ -234,6 +234,18 @@ export function extractStringProperty(source: string, name: string, startIndex =
 	return decodeJsonStringFragment(source.slice(valueStart));
 }
 
+/**
+ * `text` without a leading UTF-8 byte order mark (U+FEFF). The file store
+ * decodes a session file with `TextDecoder` and `Bun.file().text()`, which drop
+ * it, and its stream path parses bytes, where the JSONL parser skips it; a SQL
+ * or Redis store returns the text as stored, the mark included. The listing,
+ * the loader and a delete's header read skip it here, so a file that starts
+ * with one reads the same on every store.
+ */
+export function withoutByteOrderMark(text: string): string {
+	return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
 /** A session file's header, as {@link leadingSessionHeader} reads it from the file's leading text. */
 export interface LeadingSessionHeader {
 	readonly id: string;
@@ -251,20 +263,26 @@ export interface LeadingSessionHeader {
  * the same session: a delete accepts every session the picker lists, and the
  * loader opens only a session whose header this returns whole.
  *
- * Records that do not parse are skipped (a malformed line before the header);
- * a leading `title` record is the title slot. The header is the next record
- * when it is a session header (`type` `"session"`, a string `id`). Otherwise it
- * is the first non-empty line after the title slot's, when that line names
+ * A leading byte order mark is skipped ({@link withoutByteOrderMark}). Records
+ * that do not parse are skipped (a malformed line before the header); a leading
+ * `title` record is the title slot. The header is the next record when it is a
+ * session header (`type` `"session"`, a string `id`). Otherwise it is the first
+ * non-empty line after the title slot's, when that line names
  * `"type": "session"` and an id: a header cut short, or one longer than the
  * window read. `undefined` when neither holds.
  *
- * `records` are `content`'s records as `parseJsonlLenient` parses them, when
- * the caller has them already.
+ * `records` are `text`'s records as `parseJsonlLenient` parses them, when the
+ * caller has them already; they are parsed again when `text` starts with a
+ * byte order mark.
  */
 export function leadingSessionHeader(
-	content: string,
-	records: ReadonlyArray<Record<string, unknown>> = parseJsonlLenient<Record<string, unknown>>(content),
+	text: string,
+	records?: ReadonlyArray<Record<string, unknown>>,
 ): LeadingSessionHeader | undefined {
+	const content = withoutByteOrderMark(text);
+	if (records === undefined || content.length !== text.length) {
+		records = parseJsonlLenient<Record<string, unknown>>(content);
+	}
 	const first = records[0];
 	const slotted = first?.type === "title";
 	const candidate = records[slotted ? 1 : 0];
@@ -306,9 +324,9 @@ function opensWithHeader(body: string, entries: readonly FileEntry[]): boolean {
 	return leadingSessionHeader(body, entries as unknown as ReadonlyArray<Record<string, unknown>>)?.record === first;
 }
 
-/** Parse session JSONL while stripping and folding the optional fixed title slot. */
+/** Parse session JSONL while stripping and folding the optional fixed title slot (and a leading byte order mark). */
 export function parseSessionContent(content: string): SessionLoadResult {
-	const { body, slot } = splitTitleSlot(content);
+	const { body, slot } = splitTitleSlot(withoutByteOrderMark(content));
 	let malformedRecords = 0;
 	const entries = parseJsonlLenient<RawFileEntry>(body, {
 		onMalformedRecord: () => {

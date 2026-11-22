@@ -580,5 +580,35 @@ for (const { adapter, url } of BACKENDS) {
 				await manager.close();
 			}
 		}, 60_000);
+
+		// A SQL or Redis store returns a leading byte order mark as stored, where the file store's decoder drops it.
+		it("opens, writes, reopens and deletes a session that starts with a byte order mark, as the file store does", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const file = await listedFile(backend, "bom.jsonl", `\uFEFF${transcript(id, "a turn")}`, id);
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				expect([manager.getSessionId(), manager.getEntries().length]).toEqual([id, 1]);
+				manager.appendMessage(userTurn("a second turn"));
+				manager.appendMessage(createAssistantMessage("a reply"));
+				await manager.flush();
+				expect([manager.getSessionFile(), manager.getSessionId()]).toEqual([file, id]);
+			} finally {
+				await manager.close();
+			}
+			await backend.picker.refresh?.();
+			const reopened = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				expect([reopened.getSessionId(), reopened.getEntries().length]).toEqual([id, 3]);
+				const deleted = await outcome(reopened.dropSession(file));
+				expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [] });
+			} finally {
+				await reopened.close();
+			}
+		}, 60_000);
 	});
 }

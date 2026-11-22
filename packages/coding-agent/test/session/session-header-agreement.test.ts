@@ -3,7 +3,8 @@
  * (`leadingSessionHeader`), so they name the same session: a delete accepts every session the picker lists, and the
  * loader opens a session only when that function finds its header whole (and then names the same id). A header that
  * is listed but not opened (cut short, or after a `title` record that is not the written slot) is still deleted as
- * listed. Each shape below runs through the three.
+ * listed. Each shape below runs through the three, read through the file store (which decodes the file) and the
+ * in-memory store (which returns the text as stored, a leading byte order mark included, as SQL and Redis do).
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -13,7 +14,11 @@ import {
 	readSessionHeaderId,
 	sessionHeaderIdOfHead,
 } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type SessionStorage,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -47,6 +52,14 @@ const SHAPES: Record<string, Shape> = {
 		opens: false,
 	},
 	"blank lines, then a whole header": { content: `\n\n${header()}\n${turn}`, id: ID, opens: true },
+	// A SQL or Redis store returns a leading byte order mark as stored; the file store's decoder drops it.
+	"a byte order mark, then a whole header": { content: `\uFEFF${header()}\n${turn}`, id: ID, opens: true },
+	"a byte order mark, the written title slot, then a whole header": {
+		content: `\uFEFF${writtenSlot}${header()}\n${turn}`,
+		id: ID,
+		opens: true,
+	},
+	"a byte order mark, then a header cut short": { content: `\uFEFF${header().slice(0, -12)}`, id: ID, opens: false },
 	"a pretty-printed header": {
 		content: `${JSON.stringify(JSON.parse(header()), null, 2)}\n${turn}`,
 		id: ID,
@@ -87,12 +100,21 @@ describe("the listing, the loader and a delete read a session's header the same 
 	for (const [name, shape] of Object.entries(SHAPES)) {
 		it(name, async () => {
 			using dir = TempDir.createSync("@omp-header-agreement-");
-			const storage = new FileSessionStorage();
 			const file = path.join(dir.path(), "s.jsonl");
 			await Bun.write(file, shape.content);
+			// The file store decodes the file (a leading byte order mark dropped); the in-memory store returns the
+			// text as stored, as a SQL or Redis store does.
+			const memory = new MemorySessionStorage();
+			memory.writeTextSync(file, shape.content);
 
-			const listed = (await listSessions(dir.path(), storage)).find(info => info.path === file)?.id;
-			const deleteReads = [await readSessionHeaderId(file, storage), sessionHeaderIdOfHead(shape.content)];
+			const listedBy = async (storage: SessionStorage) =>
+				(await listSessions(dir.path(), storage)).find(info => info.path === file)?.id;
+			const listed = [await listedBy(new FileSessionStorage()), await listedBy(memory)];
+			const deleteReads = [
+				await readSessionHeaderId(file, new FileSessionStorage()),
+				await readSessionHeaderId(file, memory),
+				sessionHeaderIdOfHead(shape.content),
+			];
 			const loaded = parseSessionContent(shape.content);
 			const opens = !loaded.invalidHeader && loaded.entries.length > 0;
 
@@ -102,8 +124,8 @@ describe("the listing, the loader and a delete read a session's header the same 
 				opens,
 				openedId: opens ? (loaded.entries[0] as { id?: string }).id : undefined,
 			}).toEqual({
-				listed: shape.id,
-				deleteReads: [shape.id, shape.id],
+				listed: [shape.id, shape.id],
+				deleteReads: [shape.id, shape.id, shape.id],
 				opens: shape.opens,
 				openedId: shape.opens ? shape.id : undefined,
 			});

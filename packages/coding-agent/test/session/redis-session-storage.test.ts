@@ -20,7 +20,11 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
-import { SESSION_HEADER_READ_LIMIT, sessionHeaderIdOfHead } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import {
+	loadSessionFile,
+	SESSION_HEADER_READ_LIMIT,
+	sessionHeaderIdOfHead,
+} from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import type { ListedSession } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
@@ -361,6 +365,24 @@ describe("RedisSessionStorage", () => {
 
 		await expect(storage.drain()).rejects.toThrow("redis exploded");
 		expect(writer.getError()?.message).toBe("redis exploded");
+	});
+
+	it("loads a session that starts with a byte order mark, which the store returns as stored", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "S1",
+			timestamp: "2026-11-21T00:00:00.000Z",
+			cwd: "/w",
+		});
+		await storage.writeText(
+			"/sessions/p/bom.jsonl",
+			`\uFEFF${header}\n{"type":"custom","id":"c1","parentId":null}\n`,
+		);
+		expect((await storage.readText("/sessions/p/bom.jsonl")).charCodeAt(0)).toBe(0xfeff);
+		const loaded = await loadSessionFile("/sessions/p/bom.jsonl", storage);
+		expect([loaded.invalidHeader, loaded.entries.map(entry => entry.id)]).toEqual([false, ["S1", "c1"]]);
 	});
 
 	it("deleteSessionWithArtifacts removes JSONL plus any sidecar keys", async () => {
@@ -773,6 +795,20 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			const { client, storage } = await open();
 			await storage.writeText("/s/p.jsonl", `{"type":"title","title":"torn\n${header("S1")}`);
 			await storage.writeText("/s/p/A.jsonl", header("A"));
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+		});
+
+		// The server returns a leading byte order mark as stored; the loader and the delete read past it alike.
+		it("loads and deletes as listed a session that starts with a byte order mark", async () => {
+			const { client, storage } = await open();
+			await storage.writeText("/s/p.jsonl", `\uFEFF${header("S1")}{"type":"custom","id":"c1","parentId":null}\n`);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			const loaded = await loadSessionFile("/s/p.jsonl", storage);
+			expect([loaded.invalidHeader, loaded.entries.map(entry => entry.id)]).toEqual([false, ["S1", "c1"]]);
 			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
 			expect([
 				await client.exists(`${prefix}file:/s/p.jsonl`),

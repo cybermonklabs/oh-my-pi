@@ -11,7 +11,12 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
-import { extractStringProperty, leadingSessionHeader, visitEntriesFromFile } from "./session-loader";
+import {
+	extractStringProperty,
+	leadingSessionHeader,
+	visitEntriesFromFile,
+	withoutByteOrderMark,
+} from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import {
 	defaultSessionStorage,
@@ -390,11 +395,13 @@ async function scanSessionFile(
 		return cached.info ? { ...cached.info } : undefined;
 	}
 	try {
-		const [content, suffix] = await storage.readTextSlices(
+		const [prefix, suffix] = await storage.readTextSlices(
 			file,
 			SESSION_LIST_PREFIX_BYTES,
 			withStatus ? SESSION_LIST_SUFFIX_BYTES : 0,
 		);
+		// A SQL or Redis store returns a leading byte order mark the file store's decoder drops: read past it alike.
+		const content = withoutByteOrderMark(prefix);
 		const { size, mtime } = stat;
 		const entries = parseJsonlLenient<Record<string, unknown>>(content);
 		const header = parseSessionListHeader(content, entries);
