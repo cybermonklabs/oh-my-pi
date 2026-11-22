@@ -1,5 +1,6 @@
 //! How obash takes signals as a process, compared with the real zsh
-//! ([`zsh_oracle`]) and the real bash ([`process_support::real_bash`]):
+//! ([`zsh_oracle`]) and the real bash ([`process_support::real_bash`]), or
+//! with goldens measured with bash 5.3.20 ([`process_support::BASH_GOLDEN`]):
 //! trap functions, a signal that kills the shell or the command it waits
 //! for, `INT` and `HUP` held or acted on, a program the shell runs in place
 //! of itself, and what outlives the shell.
@@ -11,15 +12,21 @@ mod pty_support;
 mod zsh_oracle;
 
 use std::{
-	ffi::{OsStr, OsString},
-	fs, io,
-	os::unix::{ffi::OsStringExt, process::ExitStatusExt},
+	ffi::{CStr, CString, OsStr, OsString},
+	fs,
+	io::{self, Write as _},
+	os::unix::{
+		ffi::{OsStrExt as _, OsStringExt},
+		fs::OpenOptionsExt as _,
+		process::ExitStatusExt,
+	},
 	path::Path,
+	time::{Duration, Instant},
 };
 
 use process_support::{
 	End::{self, Exit, Signal},
-	Outcome, Run, have_zsh, real, real_bash,
+	Outcome, Run, have_zsh, real, real_bash, real_bash_golden,
 };
 use pty_support::{Spawn, TIMEOUT};
 
@@ -110,9 +117,10 @@ struct SignalCase<'a> {
 }
 
 /// `err` with the pid after each `NAME: line N: ` (bash's notice of a
-/// killed command) replaced by `PID`: each shell prints its own child's.
-/// The pid's field is checked to be bash's `%5ld`: at least five columns,
-/// padded with spaces on the left only up to five.
+/// killed command or job) replaced by `PID`: each shell prints its own
+/// child's. The pid's field is checked to be bash's `%5ld`: at least five
+/// columns, padded with spaces on the left only up to five. A line whose
+/// text there starts with no digit is another diagnostic, kept as it is.
 fn mask_pids(err: &[u8]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(err.len());
 	for line in err.split_inclusive(|&b| b == b'\n') {
@@ -131,8 +139,12 @@ fn mask_pids(err: &[u8]) -> Vec<u8> {
 			.iter()
 			.take_while(|b| b.is_ascii_digit())
 			.count();
+		if digits == 0 {
+			out.extend_from_slice(line);
+			continue;
+		}
 		assert!(
-			digits > 0 && spaces + digits >= 5 && (spaces == 0 || spaces + digits == 5),
+			spaces + digits >= 5 && (spaces == 0 || spaces + digits == 5),
 			"the pid is printed as `%5ld`: {:?}",
 			String::from_utf8_lossy(line)
 		);
@@ -160,10 +172,38 @@ fn mask_names(err: &[u8]) -> Vec<u8> {
 	out
 }
 
-/// bash's long notice: `bash: line N: PID `, the description padded to 24
-/// columns, the command.
-fn long_notice(line: u32, desc: &str, text: &[u8]) -> Vec<u8> {
-	let mut out = format!("bash: line {line}: PID {desc:<24}").into_bytes();
+/// The C library's `strsignal` text for `sig`: the description bash prints
+/// in a job notice (bash 5.3 `j_strsignal`), and obash on that platform
+/// (glibc's `Killed`, Darwin's `Killed: 9`).
+fn desc(sig: libc::c_int) -> String {
+	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	let _held = LOCK
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	// SAFETY: strsignal returns null or a NUL-terminated string, which the
+	// next call may overwrite (Darwin formats into a buffer): it is copied
+	// out under the lock, and nothing else in this process calls it.
+	let text = unsafe { libc::strsignal(sig) };
+	assert!(!text.is_null(), "strsignal({sig}) returned null");
+	// SAFETY: a NUL-terminated string, read before the lock is released.
+	unsafe { CStr::from_ptr(text) }
+		.to_string_lossy()
+		.into_owned()
+}
+
+/// bash 5.3's long notice: `bash: line N: PID `, the description of `sig`
+/// ([`desc`]) padded to 27 columns (`LONGEST_SIGNAL_DESC`), the command.
+fn long_notice(line: u32, sig: libc::c_int, text: &[u8]) -> Vec<u8> {
+	let mut out = format!("bash: line {line}: PID {:<27}", desc(sig)).into_bytes();
+	out.extend_from_slice(text);
+	out.push(b'\n');
+	out
+}
+
+/// bash 5.3's short notice (`print_pipeline`): the description of `sig`
+/// ([`desc`]) padded to 27 columns, the command.
+fn short_notice(sig: libc::c_int, text: &[u8]) -> Vec<u8> {
+	let mut out = format!("{:<27}", desc(sig)).into_bytes();
 	out.extend_from_slice(text);
 	out.push(b'\n');
 	out
@@ -179,40 +219,43 @@ struct NoticeCase {
 }
 
 /// A non-interactive bash reports a foreground command a signal killed
-/// (`notify_of_job_status`), on its own standard error: `TERM`, or a signal
-/// the shell traps (`trap ''` too), prints its description; `INT`, `PIPE`,
+/// (`notify_of_job_status`), on its own standard error, as bash 5.3.20
+/// prints it (checked-in goldens; compared live only with a bash 5.3 or
+/// later, [`real_bash_golden`]): `TERM`, or a signal the shell traps
+/// (`trap ''` too), prints its description (the C library's, [`desc`])
+/// padded to 27 columns and the command (`print_pipeline`); `INT`, `PIPE`,
 /// a command substitution and a posix shell print nothing; any other
-/// signal prints `NAME: line N: `, the pid, the description padded to 24
+/// signal prints `NAME: line N: `, the pid, the description padded to 27
 /// columns and the command as bash prints it, here-documents and its bytes
 /// as they are. `N` is bash's line when it waits: the end of the complete
 /// command, a `for` header, a function body's first line. The last command
 /// of the `-c` string bash runs with `exec` and no fork, so it prints
 /// nothing and the shell's process dies of the signal; zsh does the same
-/// (`last1`, which it passes on into the body of an `if`, a `{ }`, a `;;` arm
-/// of a `case`, a `try`'s always-list and a `for` body on its last word, and
-/// which a trap with an action or a trap function takes away, an empty trap
-/// not), and prints no notice anywhere.
+/// (`last1`, which it passes on into the body of an `if`, a `{ }`, a `;;`
+/// arm of a `case`, a `try`'s always-list and a `for` body on its last
+/// word, and which a trap with an action or a trap function takes away, an
+/// empty trap not), and prints no notice anywhere.
 #[test]
 fn bash_reports_a_foreground_command_killed_by_a_signal() {
 	const K: &[u8] = b"/bin/sh -c 'kill -KILL $$'";
+	const T: &[u8] = b"/bin/sh -c 'kill -TERM $$'";
 	const KILLED: End = Signal(libc::SIGKILL);
 	let cat = |parts: &[&[u8]]| parts.concat();
-	let killed = |line| long_notice(line, "Killed", K);
+	let killed = |line| long_notice(line, libc::SIGKILL, K);
 	let case =
 		|shell, script: Vec<u8>, stderr: Vec<u8>, end| NoticeCase { shell, script, stderr, end };
 	let bash = |script, stderr, end| case("bash", script, stderr, end);
 	let zsh = |script, end| case("zsh", script, Vec::new(), end);
 	let cases: Vec<NoticeCase> = vec![
-		bash(b"/bin/sh -c 'kill -TERM $$'; echo st=$?".to_vec(), b"Terminated\n".to_vec(), Exit(0)),
-		bash(cat(&[K, b"; echo st=$?"]), killed(1), Exit(0)),
+		bash(cat(&[T, b"; echo st=$?"]), short_notice(libc::SIGTERM, T), Exit(0)),
 		bash(
-			b"/bin/sh -c 'kill -QUIT $$'; echo st=$?".to_vec(),
-			long_notice(1, "Quit", b"/bin/sh -c 'kill -QUIT $$'"),
+			cat(&[T, b" 2>/dev/null; echo st=$?"]),
+			short_notice(libc::SIGTERM, &cat(&[T, b" 2> /dev/null"])),
 			Exit(0),
 		),
 		bash(
 			b"/bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
-			long_notice(1, "User defined signal 1", b"/bin/sh -c 'kill -USR1 $$'"),
+			long_notice(1, libc::SIGUSR1, b"/bin/sh -c 'kill -USR1 $$'"),
 			Exit(0),
 		),
 		bash(
@@ -222,14 +265,14 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		),
 		bash(
 			b"trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
-			b"User defined signal 1\n".to_vec(),
+			short_notice(libc::SIGUSR1, b"/bin/sh -c 'kill -USR1 $$'"),
 			Exit(0),
 		),
-		bash(cat(&[b"trap '' KILL; ", K, b"; echo st=$?"]), b"Killed\n".to_vec(), Exit(0)),
+		bash(cat(&[b"trap '' KILL; ", K, b"; echo st=$?"]), short_notice(libc::SIGKILL, K), Exit(0)),
 		bash(cat(&[b"x=$(", K, b"); echo st=$?"]), Vec::new(), Exit(0)),
 		bash(
 			b"true\n/bin/sh   -c 'kill -HUP $$'   ; echo st=$?".to_vec(),
-			long_notice(2, "Hangup", b"/bin/sh -c 'kill -HUP $$'"),
+			long_notice(2, libc::SIGHUP, b"/bin/sh -c 'kill -HUP $$'"),
 			Exit(0),
 		),
 		bash(b"exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?".to_vec(), Vec::new(), Exit(0)),
@@ -244,12 +287,12 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		// Through the shell's own standard error, not the command's.
 		bash(
 			cat(&[K, b" 2>/dev/null; echo st=$?"]),
-			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
+			long_notice(1, libc::SIGKILL, &cat(&[K, b" 2> /dev/null"])),
 			Exit(0),
 		),
 		bash(
 			cat(&[K, b" 2>/dev/null"]),
-			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
+			long_notice(1, libc::SIGKILL, &cat(&[K, b" 2> /dev/null"])),
 			Exit(137),
 		),
 		bash(cat(&[b"set -o posix; ", K, b"; echo st=$?"]), Vec::new(), Exit(0)),
@@ -261,12 +304,12 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		bash(b"/bin/sh -c \\\n'kill -KILL $$'; echo st=$?".to_vec(), killed(2), Exit(0)),
 		bash(
 			cat(&[K, b" <<EOF\nx\nEOF\necho st=$?"]),
-			long_notice(3, "Killed", &cat(&[K, b" <<EOF\nx\nEOF\n"])),
+			long_notice(3, libc::SIGKILL, &cat(&[K, b" <<EOF\nx\nEOF\n"])),
 			Exit(0),
 		),
 		bash(
 			cat(&[K, b" \xe9x; echo st=$?"]),
-			long_notice(1, "Killed", &cat(&[K, b" \xe9x"])),
+			long_notice(1, libc::SIGKILL, &cat(&[K, b" \xe9x"])),
 			Exit(0),
 		),
 		// bash forks the last command of an `if` or a `{ }`.
@@ -325,19 +368,26 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		zsh(cat(&[b"x=1; ( ", K, b" ); print after"]), Exit(0)),
 		zsh(cat(&[b"( trap 'print x' EXIT; ", K, b" )"]), Exit(137)),
 	];
+	let mut wrong = Vec::new();
 	for NoticeCase { shell, script, stderr, end } in cases {
 		let script = OsString::from_vec(script);
 		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), shell, &script).go();
 		let shown = format!("{shell}: {script:?}");
-		assert_eq!(
-			(String::from_utf8_lossy(&mask_pids(&ours.stderr)), ours.end()),
-			(String::from_utf8_lossy(&stderr), Some(end)),
-			"{shown}"
-		);
-		if let Some(real) = real(shell) {
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stderr)).into_owned(), ours.end());
+		let want = (String::from_utf8_lossy(&stderr).into_owned(), Some(end));
+		if got != want {
+			wrong.push(format!("{shown}\n  got:  {got:?}\n  want: {want:?}"));
+		}
+		let real = if shell == "zsh" {
+			real(shell)
+		} else {
+			real_bash_golden()
+		};
+		if let Some(real) = real {
 			assert_eq!(masked(&ours), masked(&Run::script(real, shell, &script).go()), "{shown}");
 		}
 	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 /// `o` with the pids and shell names of both streams masked ([`mask_pids`],
@@ -345,6 +395,451 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 fn masked(o: &Outcome) -> Outcome {
 	let mask = |b: &[u8]| mask_names(&mask_pids(b));
 	Outcome { stdout: mask(&o.stdout), stderr: mask(&o.stderr), ..o.clone() }
+}
+
+/// bash 5.3's notice of a background job a signal killed, in a
+/// non-interactive shell (`notify_of_job_status`), as checked-in goldens
+/// measured with bash 5.3.20 (compared live only with a bash 5.3 or later,
+/// [`real_bash_golden`]): `NAME: line N: `, the pid, the description
+/// ([`desc`]) padded to 27 columns and the job's command, with
+/// `  (wd: DIR)` when the shell's directory is no longer the one the job
+/// started in. bash prints it when it waits for that job (`wait`,
+/// `wait ID`, `wait -n`; through `wait`'s own redirections), or before it
+/// reads its next line of input (`shell_getc`), naming that line: of a
+/// `-c` string, an `eval`'s or a trap's text (not at its end), a script
+/// file or standard input (at its end too). It also reads through
+/// `shell_getc` each `$( )`, `${ ;}` and `<( )` it expands (`xparse_dolparen`;
+/// backquotes not), naming the command's line plus one plus the newlines
+/// in the substitution's source, before the command's redirections; and
+/// `jobs` reports at its end, through its own redirections. Nothing
+/// reports while a trap runs that bash runs with the job list frozen
+/// (`jobs_list_frozen`): a `CHLD` trap `wait` runs, an `INT` trap run as
+/// the foreground command it waited for ends; `wait` reports after it. A
+/// `wait` without operands drops a job that had ended unreported, `jobs`
+/// reports it instead, and `INT`, `TERM`, `PIPE`, a signal the shell
+/// traps, an exit (137 too), a posix `-c` shell, a command substitution
+/// and a subshell print nothing. Each script starts with `exec 2>&1`:
+/// where a notice comes in the output shows. A job is known to have ended
+/// once `kill -0` fails on it ([`GONE`]): the shell has reaped it then.
+/// [`KILLER`]'s job dies once the shell blocks, in `wait`.
+#[test]
+fn bash_reports_a_background_job_killed_by_a_signal() {
+	/// Wait, in the foreground, for the shell to reap job `$!`.
+	const GONE: &str = "while kill -0 $! 2>/dev/null; do /bin/sleep 0.01; done";
+	const S: &str = "/bin/sleep 30 & kill -KILL $!";
+	let w = format!("{S}; {GONE}");
+	let notice = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let killed = |line| notice(line, libc::SIGKILL, "/bin/sleep 30");
+	// A job that dies once the shell waits for it ([`KILLER`]).
+	let ks = format!("/bin/sh -c '{KILLER}'");
+	let by_ks = |line| notice(line, libc::SIGKILL, &ks);
+	let cases: Vec<(String, String)> = vec![
+		// When `wait` waits for it.
+		(format!("{S}; wait $!; echo st=$?"), format!("{}st=137\n", killed(1))),
+		(format!("{S}; wait; echo st=$?"), format!("{}st=0\n", killed(1))),
+		(
+			"/bin/sh -c 'sleep 0.2; kill -KILL $$' & wait; echo st=$?".into(),
+			format!("{}st=0\n", notice(1, libc::SIGKILL, "/bin/sh -c 'sleep 0.2; kill -KILL $$'")),
+		),
+		(format!("{w}; wait; echo st=$?"), "st=0\n".into()),
+		(format!("{w}; wait $!; echo st=$?"), format!("{}st=137\n", killed(1))),
+		(format!("{w}; wait %1; echo st=$?"), format!("{}st=137\n", killed(1))),
+		(format!("{w}; wait -n; echo st=$?"), format!("{}st=137\n", killed(1))),
+		(format!("{S}; wait $! 2>/dev/null; echo st=$?"), "st=137\n".into()),
+		// Before the next line is read, naming it.
+		(format!("{S}\n{GONE}\necho next"), format!("{}next\n", killed(3))),
+		(format!("{w}; echo same\necho next"), format!("same\n{}next\n", killed(2))),
+		(format!("{w}\n\n# comment\necho next"), format!("{}next\n", killed(2))),
+		(format!("{w}; cat <<EOF\nbody\nEOF\necho next"), format!("body\n{}next\n", killed(4))),
+		(format!("{w}\nfor i in 1 2\ndo echo $i\ndone"), format!("{}1\n2\n", killed(2))),
+		(format!("{w}; eval 'echo a'\necho b"), format!("{}a\nb\n", killed(1))),
+		(
+			format!("trap 'echo t' USR1; {w}; kill -USR1 $$; echo after"),
+			format!("{}t\nafter\n", killed(1)),
+		),
+		(format!("{w}\nwait $!; echo st=$?"), format!("{}st=137\n", killed(2))),
+		(
+			format!("{w}\nwait %1; echo st=$?"),
+			format!("{}bash: line 2: wait: %1: no such job\nst=127\n", killed(2)),
+		),
+		// No line left to read in the `-c` string.
+		(format!("{w}; echo x\n"), "x\n".into()),
+		(format!("{w}; echo a &&\necho b"), "a\nb\n".into()),
+		(format!("{w}; exit\necho no"), String::new()),
+		// `jobs` reports it instead.
+		(
+			format!("{w}; jobs\necho next"),
+			format!("[1]+  {:<27}/bin/sleep 30\nnext\n", desc(libc::SIGKILL)),
+		),
+		// The job, its text and its directory.
+		(
+			format!("/bin/sh -c 'kill -KILL $$' & {GONE}\necho next"),
+			format!("{}next\n", notice(2, libc::SIGKILL, "/bin/sh -c 'kill -KILL $$'")),
+		),
+		(
+			format!("/bin/sleep 30 & kill -HUP $!; {GONE}\necho next"),
+			format!("{}next\n", notice(2, libc::SIGHUP, "/bin/sleep 30")),
+		),
+		(
+			"/bin/sleep 30 & a=$!; /bin/sleep 31 & kill -KILL $a $!; while kill -0 $a 2>/dev/null || \
+			 kill -0 $! 2>/dev/null; do /bin/sleep 0.01; done\necho next"
+				.into(),
+			format!(
+				"{}{}next\n",
+				notice(2, libc::SIGKILL, "/bin/sleep 30"),
+				notice(2, libc::SIGKILL, "/bin/sleep 31")
+			),
+		),
+		(
+			"{ /bin/sleep 30; } & kill -KILL $!; wait $!; echo st=$?".into(),
+			format!("{}st=137\n", notice(1, libc::SIGKILL, "{ /bin/sleep 30; }")),
+		),
+		(
+			"/bin/sleep 30 2>/dev/null & kill -KILL $!; wait $!; echo st=$?".into(),
+			format!("{}st=137\n", notice(1, libc::SIGKILL, "/bin/sleep 30 2> /dev/null")),
+		),
+		(
+			format!("cd /; {S}; cd /tmp; {GONE}\necho next"),
+			format!("{}next\n", notice(2, libc::SIGKILL, "/bin/sleep 30  (wd: /)")),
+		),
+		(format!("( {S}; wait $!; echo st=$? )"), format!("{}st=137\n", killed(1))),
+		(format!("f() {{\n{S}\nwait $!\n}}\nf; echo st=$?"), format!("{}st=137\n", killed(3))),
+		// Nothing to report.
+		(format!("/bin/sh -c 'exit 137' & {GONE}\necho next"), "next\n".into()),
+		(
+			format!("/bin/sleep 30 & kill -TERM $!; {GONE}\njobs\necho next"),
+			format!("[1]+  {:<27}/bin/sleep 30\nnext\n", desc(libc::SIGTERM)),
+		),
+		(
+			format!("trap 'echo t' USR1; /bin/sleep 30 & kill -USR1 $!; {GONE}\necho next"),
+			"next\n".into(),
+		),
+		(format!("set -o posix; {w}\necho next"), "next\n".into()),
+		(format!("x=$({S}; wait $!; echo st=$?); echo \"$x\""), "st=137\n".into()),
+		// A `CHLD` trap `wait` runs reports nothing; `wait` does after it,
+		// naming its own line. So does the line after an `INT` trap run as
+		// the foreground command ends (dead of `INT`, or exited).
+		(
+			format!("trap 'echo chld' CHLD; {ks} & wait $!; echo st=$?"),
+			format!("chld\n{}st=137\n", by_ks(1)),
+		),
+		(
+			format!("trap 'echo chld' CHLD; {ks} & wait; echo st=$?"),
+			format!("chld\n{}st=0\n", by_ks(1)),
+		),
+		(
+			format!("trap 'echo chld' CHLD; {ks} & wait -n; echo st=$?"),
+			format!("chld\n{}st=137\n", by_ks(1)),
+		),
+		(
+			format!("trap 'echo chld' CHLD\n{ks} &\nwait $!; echo st=$?"),
+			format!("chld\n{}st=137\n", by_ks(3)),
+		),
+		(
+			format!("trap 'echo int' INT; {w}; /bin/sh -c 'kill -INT $PPID; kill -INT $$'\necho next"),
+			format!("int\n{}next\n", killed(2)),
+		),
+		(
+			format!(
+				"trap 'echo int' INT; {w}; /bin/sh -c 'kill -INT $PPID; exit 0'; echo same\necho next"
+			),
+			format!("int\nsame\n{}next\n", killed(2)),
+		),
+		// A substitution the shell expands: the command's line, plus one,
+		// plus the newlines in its source; before its redirections.
+		(format!("{S}\ntrue\n{GONE}; x=$(echo in); echo \"$x\""), format!("{}in\n", killed(4))),
+		(format!("f() {{ {w}; x=$(echo in); echo \"$x\"; }}\nf"), format!("{}in\n", killed(2))),
+		(format!("f() {{\n{w}\nx=$(echo in); echo \"$x\"\n}}\nf"), format!("{}in\n", killed(4))),
+		(format!("{w}; cat <(echo in)"), format!("{}in\n", killed(2))),
+		(format!("{w}; cat < <(echo in)"), format!("{}in\n", killed(2))),
+		(format!("{w}; x=${{ echo in; }}; echo \"$x\""), format!("{}in\n", killed(2))),
+		(format!("{w}; x=$(echo in); echo \"$x\"\necho next"), format!("{}in\nnext\n", killed(2))),
+		(format!("{w}; x=$(echo in\necho two); echo \"$x\""), format!("{}in\ntwo\n", killed(3))),
+		(
+			format!("{w}; x=$(echo in\n# comment\n\necho two); echo \"$x\""),
+			format!("{}in\ntwo\n", killed(5)),
+		),
+		(format!("{w}; x=$(\necho in); echo \"$x\""), format!("{}in\n", killed(3))),
+		(format!("{w}; echo a \\\n$(echo in)"), format!("{}a in\n", killed(2))),
+		(format!("{w}; x=$(y=$(echo in); echo $y); echo \"$x\""), format!("{}in\n", killed(2))),
+		(format!("{w}; echo $(echo in) 2>/dev/null"), format!("{}in\n", killed(2))),
+		(format!("{w}; {{ x=$(echo in); }} 2>/dev/null; echo \"$x\""), "in\n".into()),
+		(format!("{w}; echo hi 2>/dev/null >$(echo /dev/stdout)"), "hi\n".into()),
+		(format!("{w}; x=`echo in`; echo \"$x\""), "in\n".into()),
+		(format!("{w}; (x=$(echo in); echo \"$x\")"), "in\n".into()),
+		(format!("set -o posix; {w}; x=$(echo in); echo \"$x\""), "in\n".into()),
+		// `jobs`, at its end, through its redirections.
+		(format!("{w}; jobs -p >/dev/null; echo next"), format!("{}next\n", killed(1))),
+		(format!("{w}; jobs -p 2>/dev/null >/dev/null; echo next"), "next\n".into()),
+		(
+			format!("{w}; /bin/sleep 30 & jobs %2; kill $!; echo next"),
+			format!("[2]+  {:<27}/bin/sleep 30 &\n{}next\n", "Running", killed(1)),
+		),
+	];
+	let mut wrong = Vec::new();
+	for (script, out) in cases {
+		let script = format!("exec 2>&1; {script}");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script).go();
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked(&ours), masked(&Run::script(bash, "bash", &script).go()), "{script:?}");
+		}
+	}
+	// A script file and standard input: before their next line, and before
+	// the read that finds their end too; each line 2 here.
+	let dir = tempfile::tempdir().expect("a directory for the script");
+	let path = dir.path().join("s.sh");
+	let file = path.display().to_string();
+	let obash = || Run::new(env!("CARGO_BIN_EXE_obash"), "bash", &[&path]);
+	let obash_in = || Run::new(env!("CARGO_BIN_EXE_obash"), "bash", &[] as &[&str]).input(&path);
+	for (script, before, after) in [
+		(w.clone(), "", ""),
+		(format!("{w}; echo x"), "x\n", ""),
+		(format!("{w}\necho next"), "", "next\n"),
+	] {
+		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
+		for (ours, name) in [(obash().go(), file.as_str()), (obash_in().go(), "bash")] {
+			let out = format!(
+				"{before}{name}: line 2: PID {:<27}/bin/sleep 30\n{after}",
+				desc(libc::SIGKILL)
+			);
+			let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+			if got != (out.clone(), Some(Exit(0))) {
+				wrong.push(format!("{name} reads {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+			}
+		}
+		if let Some(bash) = real_bash_golden() {
+			let theirs = Run::new(&bash, "bash", &[&path]).go();
+			assert_eq!(masked(&obash().go()), masked(&theirs), "file: {script:?}");
+			let theirs = Run::new(&bash, "bash", &[] as &[&str]).input(&path).go();
+			assert_eq!(masked(&obash_in().go()), masked(&theirs), "stdin: {script:?}");
+		}
+	}
+	// A substitution and `jobs` in a script file.
+	for (script, line, out) in [
+		(format!("{w}; x=$(echo in); echo \"$x\""), 2, "in\n"),
+		(format!("{w}; x=$(echo in\necho two); echo \"$x\""), 3, "in\ntwo\n"),
+		(format!("{w}; jobs -p >/dev/null; echo next"), 1, "next\n"),
+	] {
+		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
+		let ours = obash().go();
+		let want =
+			format!("{file}: line {line}: PID {:<27}/bin/sleep 30\n{out}", desc(libc::SIGKILL));
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (want.clone(), Some(Exit(0))) {
+			wrong.push(format!("file {script:?}\n  got:  {got:?}\n  want: {want:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			let theirs = Run::new(&bash, "bash", &[&path]).go();
+			assert_eq!(masked(&ours), masked(&theirs), "file: {script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// What job `a` of
+/// [`bash_writes_a_waited_jobs_notice_before_it_waits_for_the_next`]
+/// runs (`/bin/sh -c "$KILLER"`): it kills itself with `SIGKILL` once its
+/// parent, the shell, has blocked (its state, `ps -o stat`, starts with
+/// `S`) or is gone. The shell then waits for it already: a plain `wait`
+/// skips a job that ended before it looked.
+const KILLER: &str = "until case $(ps -o stat= -p $PPID 2>/dev/null | tr -d \" \") in S*|\"\") \
+                      true;; *) false;; esac; do sleep 0.01; done; kill -KILL $$";
+
+/// How long a row of
+/// [`bash_writes_a_waited_jobs_notice_before_it_waits_for_the_next`]
+/// waits for each event it needs (the notice, the FIFO's reader, the
+/// shell's end) before it fails.
+const EVENT_LIMIT: Duration = Duration::from_secs(30);
+
+/// bash 5.3 writes a job's notice as soon as `wait` has reaped the job
+/// (`wait_for`'s `notify_and_cleanup`), through `wait`'s own redirections,
+/// then waits for its next job: with `wait $a $b`, and with a plain `wait`,
+/// which waits for the first job still running, again and again
+/// (checked-in goldens measured with bash 5.3.20; compared live only with a
+/// bash 5.3 or later, [`real_bash_golden`]). Job `a` dies of `SIGKILL` once
+/// the shell waits ([`KILLER`]); job `b` reads a FIFO whose write end the
+/// test opens only once the notice is in the file it goes to (`$F.out`,
+/// which the shell's standard output and error write, or `wait`'s own
+/// `2>"$F.err"`), and writes `released` into it. Without the notice there
+/// after [`EVENT_LIMIT`] it writes `no-notice`, which fails the row: a
+/// shell that holds the notice until `b` has ended.
+#[test]
+fn bash_writes_a_waited_jobs_notice_before_it_waits_for_the_next() {
+	let notice =
+		String::from_utf8(long_notice(1, libc::SIGKILL, b"/bin/sh -c \"$KILLER\"")).expect("ASCII");
+	let jobs = "exec >\"$F.out\" 2>&1; /bin/sh -c \"$KILLER\" & a=$!; { read -r x < \"$F.fifo\"; \
+	            echo \"second $x\"; } & b=$!";
+	let rest = "second released\nafter\n";
+	let rows = [
+		(format!("{jobs}; wait $a $b; echo after"), "out", format!("{notice}{rest}"), String::new()),
+		(format!("{jobs}; wait; echo after"), "out", format!("{notice}{rest}"), String::new()),
+		(format!("{jobs}; wait $a $b 2>\"$F.err\"; echo after"), "err", rest.to_owned(), notice),
+	];
+	let mut wrong = Vec::new();
+	for (script, watched, out, err) in rows {
+		let want = (out, err, Some(Exit(0)));
+		let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+		let mut shells = vec![("obash", obash.to_owned())];
+		if let Some(bash) = real_bash_golden() {
+			shells.push(("bash", bash.into_os_string()));
+		}
+		for (name, program) in shells {
+			let got = released_after_notice(&program, &script, watched);
+			if got != want {
+				wrong.push(format!("{name}: {script}\n  got:  {got:?}\n  want: {want:?}"));
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the runs differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// One row of
+/// [`bash_writes_a_waited_jobs_notice_before_it_waits_for_the_next`]: `program`
+/// as bash runs `script` with `F` and [`KILLER`] set and the FIFO
+/// `$F.fifo` made. Once `$F.<watched>` holds the notice ([`desc`] of
+/// `SIGKILL`) the FIFO gets `released`, or after [`EVENT_LIMIT`]
+/// `no-notice`. What `$F.out` and `$F.err` hold at the shell's end (pids
+/// masked, [`mask_pids`]), and how it ended.
+fn released_after_notice(
+	program: &OsStr,
+	script: &str,
+	watched: &str,
+) -> (String, String, Option<End>) {
+	let dir = tempfile::tempdir().expect("a directory for the shell's files");
+	let f = dir.path().join("f");
+	let fifo = f.with_extension("fifo");
+	let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("a path without NUL");
+	// SAFETY: a NUL-terminated path, alive for the call.
+	let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+	assert_eq!(made, 0, "mkfifo: {}", io::Error::last_os_error());
+	let shell = Run::script(program, "bash", script)
+		.env("F", &f)
+		.env("KILLER", KILLER)
+		.own_group()
+		.spawn();
+	let read = |ext: &str| fs::read(f.with_extension(ext)).unwrap_or_default();
+	let killed = desc(libc::SIGKILL);
+	let noticed = || String::from_utf8_lossy(&read(watched)).contains(&killed);
+	let deadline = Instant::now() + EVENT_LIMIT;
+	while !noticed() && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(5));
+	}
+	let word: &[u8] = if noticed() {
+		b"released\n"
+	} else {
+		b"no-notice\n"
+	};
+	// Job `b` holds the FIFO open for reading by now or soon; until it does,
+	// an open of the write end that does not block fails with `ENXIO`.
+	let deadline = Instant::now() + EVENT_LIMIT;
+	let mut writer = loop {
+		match fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+		{
+			Ok(writer) => break writer,
+			Err(e) if e.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline => {
+				std::thread::sleep(Duration::from_millis(5));
+			},
+			Err(e) => {
+				let why = format!("{script}: no reader opened the FIFO ({e})");
+				let ended = shell.end_within(Duration::ZERO, &why);
+				panic!("{why}; the shell had ended: {ended:?}");
+			},
+		}
+	};
+	writer.write_all(word).expect("write to the FIFO");
+	drop(writer);
+	let ended = shell.end_within(EVENT_LIMIT, script);
+	assert!(
+		ended.stdout.is_empty() && ended.stderr.is_empty(),
+		"{script}: output outside its files: {ended:?}"
+	);
+	let masked = |ext: &str| String::from_utf8_lossy(&mask_pids(&read(ext))).into_owned();
+	(masked("out"), masked("err"), ended.end())
+}
+
+/// A command or process substitution reports no background job a signal
+/// killed, as bash 5.3's does not (`command_substitute` and
+/// `process_substitute` set `SUBSHELL_COMSUB`), nor does what runs in it
+/// without a fork (a function, `eval`); each fork of it does
+/// (`execute_in_subshell` and `execute_simple_command`'s child start a new
+/// `subshell_environment`): a `( … )`, a `&` job, a pipeline stage. Both
+/// also set `startup_state` to 2, as a `-c` shell's, which a fork keeps:
+/// in posix mode a fork of a substitution reports nothing, in a script file
+/// too, whose own `( … )` does. Checked-in goldens measured with bash
+/// 5.3.20 (compared live only with a bash 5.3 or later,
+/// [`real_bash_golden`]); each script starts with `exec 2>&1`.
+#[test]
+fn bash_reports_a_job_killed_in_a_fork_of_a_substitution() {
+	const K: &str = "/bin/sleep 30 & kill -KILL $!; wait $!; echo st=$?";
+	let out = |name: &str, reports: bool| {
+		let notice = format!("{name}: line 1: PID {:<27}/bin/sleep 30\n", desc(libc::SIGKILL));
+		format!("{}st=137\n", if reports { notice.as_str() } else { "" })
+	};
+	let mut wrong = Vec::new();
+	let mut check = |shown: String, ours: &Outcome, want: String| {
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (want.clone(), Some(Exit(0))) {
+			wrong.push(format!("{shown}\n  got:  {got:?}\n  want: {want:?}"));
+		}
+	};
+	let c_rows = [
+		(format!("x=$( ( {K} ) ); echo \"$x\""), true),
+		(format!("x=$( {{ {K}; }} & wait $! ); echo \"$x\""), true),
+		(format!("x=$( {K} ); echo \"$x\""), false),
+		(format!("x=$( {{ {K}; }} | cat ); echo \"$x\""), true),
+		(format!("x=$( true | {{ {K}; }} ); echo \"$x\""), true),
+		(format!("f() {{ {K}; }}; x=$(f); echo \"$x\""), false),
+		(format!("f() {{ {K}; }}; x=$( f & wait $! ); echo \"$x\""), true),
+		(format!("f() {{ {K}; }}; x=$( f | cat ); echo \"$x\""), true),
+		(format!("x=$( eval '{K}' ); echo \"$x\""), false),
+		(format!("x=$( cat <( {K} ) ); echo \"$x\""), false),
+		(format!("cat <( {K} )"), false),
+		(format!("cat <( ( {K} ) )"), true),
+		(format!("x=$( y=$( ( {K} ) ); echo \"$y\" ); echo \"$x\""), true),
+		(format!("x=` ( {K} ) `; echo \"$x\""), true),
+		(format!("( x=$( ( {K} ) ); echo \"$x\" )"), true),
+		(format!("set -o posix; x=$( ( {K} ) ); echo \"$x\""), false),
+	];
+	for (script, reports) in c_rows {
+		let script = format!("exec 2>&1; {script}");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script).go();
+		check(format!("{script:?}"), &ours, out("bash", reports));
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked(&ours), masked(&Run::script(bash, "bash", &script).go()), "{script:?}");
+		}
+	}
+	// A script file: `startup_state` 0 but in the substitutions.
+	let dir = tempfile::tempdir().expect("a directory for the script");
+	let path = dir.path().join("s.sh");
+	let file = path.display().to_string();
+	let file_rows = [
+		(format!("x=$( {K} ); echo \"$x\""), false),
+		(format!("x=$( ( {K} ) ); echo \"$x\""), true),
+		(format!("cat <( {K} )"), false),
+		(format!("cat <( ( {K} ) )"), true),
+		(format!("set -o posix; x=$( ( {K} ) ); echo \"$x\""), false),
+		(format!("set -o posix; cat <( ( {K} ) )"), false),
+		(format!("set -o posix; ( {K} )"), true),
+	];
+	for (script, reports) in file_rows {
+		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
+		let ours = Run::new(env!("CARGO_BIN_EXE_obash"), "bash", &[&path]).go();
+		check(format!("file {script:?}"), &ours, out(&file, reports));
+		if let Some(bash) = real_bash_golden() {
+			let theirs = Run::new(&bash, "bash", &[&path]).go();
+			assert_eq!(masked(&ours), masked(&theirs), "file: {script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 /// A `/bin/sh` script, run as `sh -c SHELL_ONLY sh SIG PID [FILE]`: it
@@ -481,35 +976,45 @@ setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posi
 /// (`init_signals`) ignore `QUIT` in the shell's own process: one sent by
 /// another process (`/bin/kill`) or by the shell itself does nothing, and
 /// the commands the shell runs get it at its default (the `sh` below dies
-/// of it). A zsh trap removed for it gives it its default
-/// (`removetrap`); bash keeps ignoring it.
+/// of it, and bash prints its notice, as bash 5.3.20 does: a golden,
+/// compared live only with a bash 5.3 or later, [`real_bash_golden`]). A
+/// zsh trap removed for it gives it its default (`removetrap`); bash keeps
+/// ignoring it.
 #[test]
 fn the_shell_ignores_quit_and_its_commands_get_it_at_its_default() {
+	let quit = long_notice(1, libc::SIGQUIT, b"/bin/sh -c 'kill -QUIT $$; echo child-alive'");
 	let cases = [
-		("zsh", SignalCase {
+		("zsh", Vec::new(), SignalCase {
 			script: "/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
 			         child-alive'; print st=$?",
 			stdout: b"alive\nst=131\n",
 			end:    Exit(0),
 		}),
-		("zsh", SignalCase {
+		("zsh", Vec::new(), SignalCase {
 			script: "trap - QUIT; /bin/kill -QUIT $$; print not-reached",
 			stdout: b"",
 			end:    Signal(libc::SIGQUIT),
 		}),
-		("bash", SignalCase {
+		("bash", quit, SignalCase {
 			script: "/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
 			         child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
 			stdout: b"alive\nst=131\nafter-reset\n",
 			end:    Exit(0),
 		}),
 	];
-	for (name, SignalCase { script, stdout, end }) in cases {
+	for (name, stderr, SignalCase { script, stdout, end }) in cases {
 		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), name, script).go();
-		assert_eq!((ours.stdout.as_slice(), ours.end()), (stdout, Some(end)), "{name}: {script}");
-		// bash also prints its notice of the `sh` that died of `QUIT`
-		// ([`bash_reports_a_foreground_command_killed_by_a_signal`]).
-		if let Some(real) = real(name) {
+		assert_eq!(
+			(ours.stdout.as_slice(), mask_pids(&ours.stderr), ours.end()),
+			(stdout, stderr, Some(end)),
+			"{name}: {script}"
+		);
+		let real = if name == "zsh" {
+			real(name)
+		} else {
+			real_bash_golden()
+		};
+		if let Some(real) = real {
 			assert_eq!(
 				masked(&ours),
 				masked(&Run::script(real, name, script).go()),

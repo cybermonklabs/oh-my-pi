@@ -1423,6 +1423,15 @@ impl Lower {
 		Ok(idx)
 	}
 
+	/// The newlines in the unit's source that `span` covers (0 out of
+	/// range: a substitution in alias text).
+	fn newlines(&self, span: syn::Span) -> u32 {
+		let text = span.rebase(self.base).slice(&self.unit.source);
+		#[allow(clippy::naive_bytecount, reason = "short substitution sources")]
+		let n = text.iter().filter(|&&b| b == b'\n').count();
+		u32::try_from(n).unwrap_or(u32::MAX)
+	}
+
 	/// bash has no limit on a brace expansion's words; this engine refuses
 	/// one over [`super::brace::MAX_WORDS`] rather than run the word as
 	/// written or cut short. The refusal is a syntax error where the word
@@ -1605,12 +1614,18 @@ impl Lower {
 				if kind == ComsubForm::Fork {
 					self.mark_cat(entry);
 				}
-				out.push(Part::Comsub { entry, kind, quoted, text });
+				let lines = if ck == syn::ComsubKind::Backtick {
+					0
+				} else {
+					self.newlines(c.span())
+				};
+				out.push(Part::Comsub { entry, kind, quoted, text, lines });
 			},
 			st::Part::Arith(a) => out.push(Part::Arith { text: a.src().into(), quoted }),
 			st::Part::ProcSub(p) => {
 				let entry = self.block(p.body())?;
-				out.push(Part::ProcSub { entry, output: p.output() });
+				let lines = self.newlines(p.span());
+				out.push(Part::ProcSub { entry, output: p.output(), lines });
 			},
 			st::Part::Compound(elems) => out.push(Part::Compound(self.elems(elems)?)),
 			st::Part::BadSubst(text) => out.push(Part::BadSubst(text.into())),

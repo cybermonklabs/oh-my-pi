@@ -3061,7 +3061,9 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 /// Write the root job table's changes since the last sync: each job is
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted.
+/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
+/// written with the job's record when it changes (they change only with
+/// its state).
 fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
 	let same_ids =
@@ -3070,6 +3072,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		for id in &ids {
 			if !jobs.list.iter().any(|j| j.id == *id) {
 				root.write(store, Change::Del(Key::Job(*id)));
+				root.write(store, Change::Del(Key::JobFacts(*id)));
 			}
 		}
 		ids.clear();
@@ -3078,7 +3081,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_ids = ids;
 	for job in &jobs.list {
 		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => have == job,
+			Ok(Some(Record::Job(have))) => job.same_record(have),
 			Ok(_) => false,
 			Err(err) => {
 				root.fail(err);
@@ -3086,7 +3089,16 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 			},
 		};
 		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.clone())));
+			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
+			let facts = job.facts();
+			root.write(
+				store,
+				if facts.is_empty() {
+					Change::Del(Key::JobFacts(job.id))
+				} else {
+					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+				},
+			);
 		}
 	}
 	let (current, previous, chld) = root.synced.job_marks;
@@ -3194,6 +3206,13 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	store.scan(Table::JobFacts, &mut |key, rec| {
+		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
+			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+		{
+			job.set_facts(facts);
+		}
+	})?;
 	list.sort_by_key(|j| j.number);
 	vp.jobs = JobTable {
 		list,
@@ -3203,6 +3222,7 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		comsub: super::proc::Comsub::No,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
 	vp.rlimits = decode_rlimits(&words(store, MiscKey::Rlimits)?);

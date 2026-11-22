@@ -187,6 +187,9 @@ pub enum Table {
 	/// [`Record::Alias`]); regular aliases are [`Table::Alias`] in every
 	/// dialect.
 	ZshAlias,
+	/// What a root job holds outside its [`Record::Job`]'s layout
+	/// ([`Key::JobFacts`], [`Record::JobFacts`]).
+	JobFacts,
 }
 
 crate::bash::packed_names::packed_names!(Table, Display);
@@ -234,6 +237,8 @@ pub enum Key<'a> {
 		/// Alias name or suffix.
 		name:   &'a BStr,
 	},
+	/// The [`JobFact`]s of root job [`Key::Job`] `id`, when it has any.
+	JobFacts(JobId),
 }
 
 impl Key<'_> {
@@ -254,6 +259,7 @@ impl Key<'_> {
 			Self::Local { .. } => Table::Local,
 			Self::ZshOpt(_) => Table::ZshOpt,
 			Self::ZshAlias { .. } => Table::ZshAlias,
+			Self::JobFacts(_) => Table::JobFacts,
 		}
 	}
 
@@ -274,6 +280,7 @@ impl Key<'_> {
 			Self::Local { depth, name } => KeyBuf::Local { depth, name: name.into() },
 			Self::ZshOpt(o) => KeyBuf::ZshOpt(o),
 			Self::ZshAlias { suffix, name } => KeyBuf::ZshAlias { suffix, name: name.into() },
+			Self::JobFacts(j) => KeyBuf::JobFacts(j),
 		}
 	}
 }
@@ -329,6 +336,8 @@ pub enum KeyBuf {
 		/// Alias name or suffix.
 		name:   BString,
 	},
+	/// See [`Key::JobFacts`].
+	JobFacts(JobId),
 }
 
 impl KeyBuf {
@@ -351,6 +360,7 @@ impl KeyBuf {
 			Self::ZshAlias { suffix, name } => {
 				Key::ZshAlias { suffix: *suffix, name: BStr::new(name) }
 			},
+			Self::JobFacts(j) => Key::JobFacts(*j),
 		}
 	}
 }
@@ -431,6 +441,9 @@ pub enum Record {
 	/// A list-valued [`MiscKey`] value (positional parameters, `enable`
 	/// lists, history, …).
 	Words(Vec<BString>),
+	/// A root job's [`JobFact`]s ([`Key::JobFacts`]): a record of their
+	/// own, so that [`Record::Job`] keeps its layout.
+	JobFacts(Vec<JobFact>),
 }
 
 /// zsh sticky emulation (zsh `struct emulation_options`): the emulation
@@ -556,6 +569,16 @@ pub struct Job {
 	/// and `disown` accept it). `None` for a compound job, a builtin, a
 	/// function, a failed spawn, and while the job has not decided yet.
 	pub os_pid:    Option<u32>,
+	/// The signal that ended the job's process (bash `WIFSIGNALED`), set
+	/// with [`JobState::Done`]: `None` for one that exited, with 137 too,
+	/// and for a pipeline, whose job process waits for its stages (bash
+	/// reports such a job's processes one by one: obash does not). Not part
+	/// of this record's layout, which a store written before it was kept
+	/// must still decode: the store keeps it in the job's
+	/// [`Record::JobFacts`] ([`Job::facts`]), the frames image next to a
+	/// subshell's job table.
+	#[serde(skip)]
+	pub signal:    Option<Signal>,
 }
 
 impl Job {
@@ -572,6 +595,70 @@ impl Job {
 	pub const fn named_by(&self, pid: u32) -> bool {
 		self.vpid.0 == pid || matches!(self.os_pid, Some(os) if os == pid)
 	}
+
+	/// What the job holds outside its record's layout ([`JobFact`]), in
+	/// order; empty for most jobs.
+	pub fn facts(&self) -> Vec<JobFact> {
+		self.signal.map(JobFact::Signal).into_iter().collect()
+	}
+
+	/// Take `facts` ([`Job::facts`]) back; what they do not name is unset.
+	pub fn set_facts(&mut self, facts: &[JobFact]) {
+		self.signal = None;
+		for fact in facts {
+			match *fact {
+				JobFact::Signal(sig) => self.signal = Some(sig),
+			}
+		}
+	}
+
+	/// The job as its [`Record::Job`] holds it: without its facts.
+	pub fn record(&self) -> Self {
+		Self { signal: None, ..self.clone() }
+	}
+
+	/// Whether `have`, a [`Record::Job`], is this job's record
+	/// ([`Job::record`]), compared in place.
+	pub fn same_record(&self, have: &Self) -> bool {
+		let Self {
+			id,
+			number,
+			vpid,
+			text,
+			state,
+			control,
+			notified,
+			nohup,
+			inherited,
+			wd,
+			os_pid,
+			signal: _,
+		} = self;
+		have.signal.is_none()
+			&& *id == have.id
+			&& *number == have.number
+			&& *vpid == have.vpid
+			&& *text == have.text
+			&& *state == have.state
+			&& *control == have.control
+			&& *notified == have.notified
+			&& *nohup == have.nohup
+			&& *inherited == have.inherited
+			&& *wd == have.wd
+			&& *os_pid == have.os_pid
+	}
+}
+
+/// A fact about a job that [`Job`]'s record layout does not hold.
+///
+/// It is kept in a record of its own ([`Record::JobFacts`] under
+/// [`Key::JobFacts`]) so that a store written before the fact existed still
+/// decodes. A later fact is a new variant at the end: an older store has
+/// none of it, and postcard numbers the variants in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobFact {
+	/// [`Job::signal`].
+	Signal(Signal),
 }
 
 /// A variable's value.
@@ -1655,6 +1742,7 @@ mod tests {
 			Key::Local { depth: 1, name: BStr::new("x") },
 			Key::ZshOpt(ZshOpt::Extendedglob),
 			Key::ZshAlias { suffix: true, name: BStr::new("txt") },
+			Key::JobFacts(JobId(3)),
 		];
 		for key in keys {
 			assert_eq!(s.hash_one(key), s.hash_one(key.to_buf()), "{key:?}");

@@ -95,8 +95,9 @@ use crate::bash::{
 	ids::{AstNodeId, ModeId, UnitId},
 };
 
-/// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+/// IR version; part of the frames header. Raised with every change to a
+/// serialized IR type.
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
@@ -607,6 +608,10 @@ pub enum Part {
 		/// `$( )`: `strs` index of the body's source text, re-parsed with
 		/// the aliases in effect when it runs (outside posix mode).
 		text:   Option<u32>,
+		/// The newlines in its source (bash's parser passes them as it
+		/// re-parses the text, `xparse_dolparen`: the line a job notice
+		/// names then, `vm::killed`); 0 for a backquote.
+		lines:  u32,
 	},
 	/// `$((…))`: arithmetic text, expanded then evaluated.
 	Arith {
@@ -621,6 +626,8 @@ pub enum Part {
 		entry:  u32,
 		/// `>(…)`.
 		output: bool,
+		/// The newlines in its source (as [`Part::Comsub`]'s `lines`).
+		lines:  u32,
 	},
 	/// `(…)` of a declaration-builtin argument (`declare -a a=(1 2)`).
 	Compound(Vec<ElemIr>),

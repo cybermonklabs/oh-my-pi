@@ -1,38 +1,67 @@
-//! bash's notice of a foreground command that a signal killed (`jobs.c`
-//! `notify_of_job_status`), for a non-interactive bash-mode shell, and the
-//! commands the real shell runs in place of itself ([`in_place`]): the last
-//! command of a `-c` string, run with `exec` and no fork (bash
-//! `CMD_NO_FORK`, zsh `execcmd_exec`'s `last1`). Such a command prints no
-//! notice: the shell's own process is the command, and dies of the signal
-//! with it.
+//! bash's notices of a command or a job that a signal killed (`jobs.c`
+//! `notify_of_job_status`), for a non-interactive bash-mode shell, as bash
+//! 5.3 prints them, and the commands the real shell runs in place of itself
+//! ([`in_place`]): the last command of a `-c` string, run with `exec` and no
+//! fork (bash `CMD_NO_FORK`, zsh `execcmd_exec`'s `last1`). Such a command
+//! prints no notice: the shell's own process is the command, and dies of
+//! the signal with it.
 //!
-//! bash 5.2.21 is built with `DONT_REPORT_SIGTERM` and `DONT_REPORT_SIGPIPE`
-//! (`config-top.h`): `INT` and `PIPE` say nothing; `TERM`, or a signal the
-//! shell traps (`trap '' SIG` too), prints the signal's description; any
-//! other prints `NAME: line N: `, the pid, the description padded to
-//! `LONGEST_SIGNAL_DESC` (24) columns and the command as bash prints it.
-//! bash writes it to its own standard error, never through the command's
-//! redirections, and names the line it has reached when it waits. A posix
-//! `-c` shell prints nothing. zsh prints nothing in any of these cases.
+//! bash 5.3 is built with `DONT_REPORT_SIGTERM` and `DONT_REPORT_SIGPIPE`
+//! (`config-top.h`): `INT` and `PIPE` say nothing. A foreground command
+//! ([`killed`]) that `TERM`, or a signal the shell traps (`trap '' SIG`
+//! too), killed prints the signal's description padded to
+//! [`LONGEST_SIGNAL_DESC`] columns and the command (`print_pipeline`); any
+//! other signal prints `NAME: line N: `, the pid, the description padded so
+//! and the command as bash prints it. bash writes it to its own standard
+//! error, never through the command's redirections, and names the line it
+//! has reached when it waits. A background job that such another signal
+//! killed gets that long notice, with `  (wd: DIR)` when the shell's
+//! directory changed since the job started, wherever bash calls
+//! `notify_and_cleanup`: when `wait` waits for it ([`waited`]: through
+//! `wait`'s own redirections, naming its line, as soon as it has reaped
+//! that job, before it waits for the next); before the shell reads its
+//! next line of input ([`line_read`], naming that line); as it expands a
+//! `$( )`, `${ ;}`, `<( )` or `>( )`, whose text bash re-parses through
+//! the same reader ([`expanded`], naming the command's line plus one plus
+//! the newlines of the substitution's source; a backquote not); and at the
+//! end of `jobs`, for the jobs it did not list ([`jobs_ended`], through its
+//! redirections). Nothing reports while the job list is frozen: in a
+//! `CHLD` trap the `wait` builtin runs, and an `INT` trap bash runs as the
+//! forked foreground command it waited for ends ([`Vproc::jobs_frozen`]).
+//! `TERM` and a trapped signal there say nothing. A posix `-c` shell prints
+//! neither notice. No job notice comes from a command or process
+//! substitution's own process (one comes from a `( … )`, `&` or pipeline
+//! stage forked from it), nor from a posix shell's fork of a substitution
+//! ([`Comsub`]). zsh prints nothing in any of these cases.
 
 use bstr::BString;
 use strum::IntoEnumIterator as _;
 
 use super::{
 	Cx, Kernel,
-	builtins::trap,
+	builtins::{dirstack, trap},
 	exec, nested,
-	proc::{FrameKind, LoopKind, LoopRec, ScriptKind, Vproc},
+	proc::{Comsub, FrameKind, JobState, LoopKind, LoopRec, PendingWrite, ScriptKind, Vproc},
 	state,
 };
 use crate::bash::{
 	diag::Diag,
 	event::NodeKind,
-	ids::Dialect,
+	ids::{Dialect, Vpid},
 	ir::{Op, RedirTargetIr, Unit},
 	signal::Signal,
 	store::{Key, KeyBuf, MiscKey, OptId, Record, StoreError, TrapKey},
 };
+
+/// bash's `LONGEST_SIGNAL_DESC` (`jobs.h`; 27 in bash 5.3): the column a
+/// notice pads a signal's description to. C's `%*s` with a negative width
+/// pads to its absolute value: a longer description gets the difference.
+const LONGEST_SIGNAL_DESC: usize = 27;
+
+/// The spaces after the description `desc` ([`LONGEST_SIGNAL_DESC`]).
+const fn padding(desc: &str) -> usize {
+	LONGEST_SIGNAL_DESC.abs_diff(desc.len())
+}
 
 /// What the end of a foreground external command that `sig` killed means
 /// for the shell.
@@ -73,29 +102,194 @@ pub(super) fn killed(
 	{
 		return quiet;
 	}
-	let desc = sig.description(k.engine.config().platform);
-	if sig == Signal::Term || trapped(cx, vp, sig) {
-		return Killed { notice: Some(BString::from(format!("{desc}\n"))), no_fork: false };
-	}
 	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
 		return quiet;
 	};
+	let desc = sig.description(k.engine.config().platform);
 	let text = command_text(k, cx, vp, &unit, op);
-	// C's `%*s` with a negative width pads to its absolute value.
-	let pad = (24 - i64::try_from(desc.len()).unwrap_or(24)).unsigned_abs();
-	let msg = format!("{pid:>5} {desc}{:w$}", "", w = usize::try_from(pad).unwrap_or(0));
-	let line = wait_line(vp, op.node);
+	let bytes = if sig == Signal::Term || trapped(cx, vp, sig) {
+		// `print_pipeline` of the job, `JLIST_STANDARD`.
+		let mut bytes = format!("{desc}{:w$}", "", w = padding(&desc)).into_bytes();
+		bytes.extend_from_slice(&text);
+		bytes.push(b'\n');
+		bytes
+	} else {
+		long_notice(k, cx, vp, wait_line(vp, op.node), pid, &desc, &text)
+	};
+	Killed { notice: Some(BString::from(bytes)), no_fork: false }
+}
+
+/// bash's long notice: `NAME: line N: ` at script line `line`, then
+/// `pretty_print_job`'s `JLIST_NONINTERACTIVE` line: `pid` as `%5ld`, the
+/// description `desc` padded ([`padding`]) and `tail` (the command, as
+/// bytes: a diagnostic's text is UTF-8). The `Diag` event carries the whole
+/// notice, the command too.
+fn long_notice(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	line: u32,
+	pid: u32,
+	desc: &str,
+	tail: &[u8],
+) -> Vec<u8> {
+	let msg = format!("{pid:>5} {desc}{:w$}", "", w = padding(desc));
 	let diag = Diag::Warning { msg: msg.into() };
 	let mut bytes = k.render_quiet(cx, vp, line, &diag);
-	// The command text goes in as bytes: a diagnostic's text is UTF-8. The
-	// `Diag` event carries the whole notice, the command too.
 	if bytes.last() == Some(&b'\n') {
 		bytes.pop();
 	}
-	bytes.extend_from_slice(&text);
+	bytes.extend_from_slice(tail);
 	bytes.push(b'\n');
-	k.diag_event(cx, vp, &diag, &text);
-	Killed { notice: Some(BString::from(bytes)), no_fork: false }
+	k.diag_event(cx, vp, &diag, tail);
+	bytes
+}
+
+/// Whether `vp` reports the background jobs a signal killed (bash
+/// `notify_of_job_status` for a dead job not in the foreground): a
+/// non-interactive bash, outside a command or process substitution's own
+/// process (`SUBSHELL_COMSUB`), and not in posix mode where bash's
+/// `startup_state` is 2: a `-c` shell, or a fork of a substitution
+/// ([`Comsub::Fork`]). Those mark the job reported instead. Nor while the
+/// job list is frozen ([`Vproc::jobs_frozen`]: bash's `notify_and_cleanup`
+/// returns at once then).
+fn reports_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	vp.mode.dialect() == Dialect::Bash
+		&& vp.jobs.comsub != Comsub::Own
+		&& !vp.jobs_frozen()
+		&& !misc_is(cx, vp, MiscKey::Interactive, b"1")
+		&& ((vp.jobs.comsub == Comsub::No && !misc_is(cx, vp, MiscKey::RunOrigin, b"c"))
+			|| !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false))
+}
+
+/// The signal that killed job `number` of `vp`, if bash reports it and has
+/// not yet: the job is this shell's own, done, by a signal other than
+/// `INT`, `TERM` and `PIPE` that the shell does not trap. bash leaves a job
+/// another signal killed unreported, for `jobs`.
+fn unreported(cx: &mut Cx<'_>, vp: &Vproc, number: u32) -> Option<Signal> {
+	let job = vp.jobs.get(number)?;
+	if job.inherited || job.notified || !matches!(job.state, JobState::Done(_)) {
+		return None;
+	}
+	let sig = job.signal?;
+	(!matches!(sig, Signal::Int | Signal::Term | Signal::Pipe) && !trapped(cx, vp, sig))
+		.then_some(sig)
+}
+
+/// The long notice of job `number` of `vp`, which `sig` killed, at script
+/// line `line`: the job's pid and command, `  (wd: DIR)` when the shell's
+/// directory is not the one the job started in (bash
+/// `polite_directory_format`). The job is reported now (`J_NOTIFIED`).
+fn job_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	number: u32,
+	sig: Signal,
+	line: u32,
+) -> Option<Vec<u8>> {
+	let job = vp.jobs.get(number)?;
+	let (pid, mut tail) = (job.pid(), job.text.to_vec());
+	if job.wd != vp.cwd {
+		let home = state::lookup(&k.root, cx.store, vp, b"HOME")
+			.ok()
+			.flatten()
+			.and_then(|v| v.as_scalar().map(BString::from));
+		tail.extend_from_slice(b"  (wd: ");
+		let home = home.as_ref().map(|h| h.as_slice());
+		tail.extend_from_slice(&dirstack::polite(home, &job.wd, false));
+		tail.push(b')');
+	}
+	let desc = sig.description(k.engine.config().platform);
+	let bytes = long_notice(k, cx, vp, line, pid, &desc, &tail);
+	if let Some(job) = vp.jobs.get_mut(number) {
+		job.notified = true;
+	}
+	Some(bytes)
+}
+
+/// `wait` (`wait`, `wait ID`, `wait -n`) waited for the job of vproc `vpid`
+/// at script line `line` (bash `wait_for`'s `notify_and_cleanup (job)`,
+/// `wait_for_any_job`): its notice, for the `wait` command's standard
+/// error, when a signal bash reports killed it ([`unreported`]).
+pub(super) fn waited(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	vpid: Vpid,
+	line: u32,
+) -> Option<Vec<u8>> {
+	let number = vp.jobs.by_vpid(vpid)?.number;
+	let sig = unreported(cx, vp, number)?;
+	if !reports_jobs(k, cx, vp) {
+		return None;
+	}
+	job_line(k, cx, vp, number, sig, line)
+}
+
+/// `vp` reads line `line` of its input next (bash `shell_getc`, which
+/// first calls `notify_and_cleanup (-1)`): each background job a signal
+/// bash reports killed ([`unreported`]) gets its notice on the shell's
+/// standard error, in job order, and goes from the table
+/// (`cleanup_dead_jobs`; `wait $!` still finds its status).
+pub(super) fn line_read(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) {
+	if let Some(bytes) = report_all(k, cx, vp, line) {
+		vp.out
+			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	}
+}
+
+/// The shell expands a `$( )`, `${ ;}`, `<( )` or `>( )` (not a
+/// backquote) of the command at script line `line`, whose source holds
+/// `lines` newlines: bash re-parses its text through `shell_getc`
+/// (`xparse_dolparen`) and reports as [`line_read`] does, naming the line
+/// its parser has reached by then, `line + 1 + lines`. Written at once,
+/// before the substitution runs and before the command's redirections
+/// move standard error (what would block waits in `vp.out`).
+pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, lines: u32) {
+	line_read(k, cx, vp, line.saturating_add(1).saturating_add(lines));
+	if !vp.out.is_empty() {
+		let _ = exec::flush_out(k, vp);
+	}
+}
+
+/// `jobs` ends at script line `line` (bash's `notify_and_cleanup (-1)` at
+/// the end of `jobs_builtin`): the notices of the background jobs a signal
+/// killed that it did not list, for its own standard error, in job order;
+/// those jobs go from the table.
+pub(super) fn jobs_ended(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	line: u32,
+) -> Option<Vec<u8>> {
+	report_all(k, cx, vp, line)
+}
+
+/// bash's `notify_and_cleanup (-1)` at script line `line`: the notices of
+/// the background jobs a signal bash reports killed ([`unreported`]), in
+/// job order, which go from the table; `None` when nothing is reported.
+fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Option<Vec<u8>> {
+	let done: Vec<u32> = vp
+		.jobs
+		.iter()
+		.filter(|j| j.signal.is_some() && !j.notified && !j.inherited)
+		.map(|j| j.number)
+		.collect();
+	if done.is_empty() || !reports_jobs(k, cx, vp) {
+		return None;
+	}
+	let mut out = Vec::new();
+	for number in done {
+		let Some(sig) = unreported(cx, vp, number) else {
+			continue;
+		};
+		if let Some(bytes) = job_line(k, cx, vp, number, sig, line) {
+			out.extend_from_slice(&bytes);
+		}
+		vp.jobs.remove(number);
+	}
+	(!out.is_empty()).then_some(out)
 }
 
 /// Whether the real shell runs the command of `op`, an external `vp`

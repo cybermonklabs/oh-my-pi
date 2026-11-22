@@ -713,7 +713,8 @@ impl<'s> Parser<'s> {
 		}
 		let body = super::sub_parse_list(&mut self.t, &code, self.feat, text_lo, self.depth)
 			.ok_or_else(|| self.too_deep())?;
-		Ok(self.t.comsub(ComsubKind::Backtick, body, &text))
+		let span = Span::new(text_lo.saturating_sub(1), self.off());
+		Ok(self.t.comsub(ComsubKind::Backtick, body, &text, span))
 	}
 
 	/// Parts up to the terminator of `stop`.
@@ -1043,32 +1044,38 @@ impl<'s> Parser<'s> {
 		}
 		let body = super::sub_parse_list(&mut self.t, &text, self.feat, lo, self.depth)
 			.ok_or_else(|| self.too_deep())?;
-		Ok(self.t.comsub(ComsubKind::Dollar, body, &text))
+		let span = Span::new(lo.saturating_sub(2), self.off());
+		Ok(self.t.comsub(ComsubKind::Dollar, body, &text, span))
 	}
 
 	/// `$(` seen: parse the command substitution.
 	fn dollar_paren(&mut self) -> PResult<Id<Part>> {
+		let lo = self.off().saturating_sub(2);
 		let (body, text) = self.comsub(b')', false)?;
-		Ok(self.t.comsub(ComsubKind::Dollar, body, &text))
+		Ok(self
+			.t
+			.comsub(ComsubKind::Dollar, body, &text, Span::new(lo, self.off())))
 	}
 
-	/// `${ ` / `${|` seen: a nofork command substitution.
+	/// `${ ` / `${|` seen (`value`: `${|`): a nofork command substitution.
 	fn funsub(&mut self, value: bool) -> PResult<Id<Part>> {
+		let lo = self.off().saturating_sub(if value { 3 } else { 2 });
 		let (body, text) = self.comsub(b'}', value)?;
 		let kind = if value {
 			ComsubKind::ValueSub
 		} else {
 			ComsubKind::NoFork
 		};
-		Ok(self.t.comsub(kind, body, &text))
+		Ok(self.t.comsub(kind, body, &text, Span::new(lo, self.off())))
 	}
 
 	/// `<(` / `>(` at the cursor.
 	fn procsub(&mut self, output: bool) -> PResult<Id<Part>> {
+		let lo = self.off();
 		self.bump();
 		self.bump();
 		let (body, _) = self.comsub(b')', false)?;
-		Ok(self.t.procsub(output, body))
+		Ok(self.t.procsub(output, body, Span::new(lo, self.off())))
 	}
 
 	/// `"${a+'$('\'}"`: between the literal quotes of a `${…}` word inside

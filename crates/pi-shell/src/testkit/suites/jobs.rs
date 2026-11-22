@@ -4,7 +4,15 @@
 //! learns of a stop asynchronously its run had a short `sleep` after the
 //! `kill -STOP`, which the engine does not need.
 
-use crate::testkit::{FakeHost, Fault, run_script};
+use crate::{
+	bash::{Budget, EngineConfig, Script, Signal},
+	testkit::{
+		FakeHost, Fault, Rig,
+		fault::skeleton_init,
+		run::{Stop, advance},
+		run_script,
+	},
+};
 
 fn run(src: &str) -> (String, String, i32) {
 	let out = run_script(FakeHost::new(), src.as_bytes(), &[], Fault::None);
@@ -175,4 +183,63 @@ fn reported_and_waited_jobs_leave_the_table() {
 fn a_process_substitution_sets_the_last_background_pid() {
 	let (out, ..) = run("read x < <(exit 123); wait $!; echo $?");
 	assert_eq!(out, "123\n");
+}
+
+/// `wait` writes a job's notice as soon as it has reaped the job, before
+/// it waits for its next one (bash `wait_for`'s `notify_and_cleanup`;
+/// `process_signals`'
+/// `bash_writes_a_waited_jobs_notice_before_it_waits_for_the_next`
+/// measures that against bash): job `b` loops until `/tmp/go` exists, which
+/// the test makes only once the whole notice is on standard error. Under a
+/// write storm (writes `Pending` at random, at most 7 bytes each) a write
+/// that blocked partway goes on where it stopped: the notice comes out
+/// whole, once, before `b`'s line.
+#[test]
+fn wait_writes_a_killed_jobs_notice_before_it_waits_for_the_next() {
+	// One line: the notice names line 1, and the job's text as bash prints
+	// it ([`LOOP`]).
+	let src = "exec 1>&2; { while :; do :; done; } & a=$!; { until [ -e /tmp/go ]; do :; done; \
+	           echo second; } & b=$!; kill -KILL $a; wait $a $b; echo after";
+	let desc = Signal::Kill.description(EngineConfig::default().platform);
+	let tail = format!("{desc:<27}{{ {LOOP}; }}\n");
+	for storm in [None, Some(0.5)] {
+		let host = match storm {
+			Some(p) => FakeHost::new().with_write_storm(11, p),
+			None => FakeHost::new(),
+		};
+		let mut rig = Rig::new(host, skeleton_init(&[]));
+		let run = rig.shell().submit(Script::command(src.as_bytes().to_vec()));
+		let (shell, host, store) = rig.parts();
+		let one_op = Budget { max_ops: 1, max_ns: u64::MAX };
+		let mut steps = 0u32;
+		let status = loop {
+			match advance(shell, host, store, run, one_op) {
+				Stop::Done(status) => break status,
+				Stop::Yield => {},
+				other => panic!("storm {storm:?}: {other:?}"),
+			}
+			if host.fs.read("/tmp/go").is_none() && host.stderr.bytes().ends_with(tail.as_bytes()) {
+				host.fs.add_file("/tmp/go", b"", 0o644);
+			}
+			steps += 1;
+			assert!(
+				steps < 200_000,
+				"storm {storm:?}: no whole notice before `b` ended, after {steps} ops: {:?}",
+				String::from_utf8_lossy(&host.stderr.bytes())
+			);
+		};
+		// The notice, once: `bash: line 1: `, the pid as `%5ld`, the tail.
+		let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+		let rest = format!("{tail}second\nafter\n");
+		let pid = err
+			.strip_prefix("bash: line 1: ")
+			.and_then(|e| e.strip_suffix(rest.as_str()));
+		assert!(
+			status == 0
+				&& pid.is_some_and(|p| {
+					p.len() >= 6 && p.ends_with(' ') && p.trim().parse::<u32>().is_ok()
+				}),
+			"storm {storm:?}: status {status}, {err:?}"
+		);
+	}
 }

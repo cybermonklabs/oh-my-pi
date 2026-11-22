@@ -172,6 +172,16 @@ fn cleanup(ctx: &mut Ctx<'_, '_>) {
 		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
 }
 
+/// bash's `notify_and_cleanup (-1)` as `jobs` ends: the background jobs a
+/// signal killed that it did not list are reported through its own
+/// standard error, and go (`killed::jobs_ended`).
+fn ended(ctx: &mut Ctx<'_, '_>) {
+	let line = ctx.line;
+	if let Some(bytes) = super::super::killed::jobs_ended(ctx.k, ctx.cx, ctx.vp, line) {
+		ctx.out_fd(2, &bytes);
+	}
+}
+
 /// `jobs [-lnprs] [jobspec …]`, `jobs -x command [args]`: list jobs as
 /// `[N]±  Status  command`; finished jobs are listed once, then forgotten.
 pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
@@ -231,6 +241,7 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		if state.is_none() {
 			cleanup(ctx);
 		}
+		ended(ctx);
 		return done(0);
 	}
 	if matches!(form, Form::Long | Form::Pids) {
@@ -261,6 +272,7 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 	}
 	cleanup(ctx);
+	ended(ctx);
 	done(status)
 }
 

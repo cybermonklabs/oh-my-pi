@@ -106,7 +106,12 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 						vp.pending_traps = vp.pending_traps.with(sig);
 					}
 				}
-				if start_trap(k, vp, cx, TrapKey::Signal(sig)) {
+				let started = start_trap(k, vp, cx, TrapKey::Signal(sig));
+				// The mark is the trap run's (it took it if it started).
+				if sig == crate::bash::signal::Signal::Int {
+					k.frozen_ints.retain(|v| *v != vp.vpid);
+				}
+				if started {
 					continue;
 				}
 			}
@@ -989,6 +994,11 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		} else if vp.frames.last().is_some_and(|frame| matches!(&frame.kind, FrameKind::Script { pos, what: ScriptKind::Eval, .. } if pos.0 == 0))
 			&& let Some(origins) = k.trace_sources.get_mut(&vp.vpid) { origins.remove(&depth); }
 	}
+	// bash reads its next line (`shell_getc`): it reports the background
+	// jobs a signal killed first.
+	if let Some(line) = line_to_read(cx, vp) {
+		super::killed::line_read(k, cx, vp, line);
+	}
 	let source_origin = observed
 		.then(|| {
 			k.trace_sources
@@ -1126,6 +1136,12 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 				return Some(WaitKey::Proc(job));
 			}
 			super::jobctl::notices_before_prompt(k, cx, vp);
+		}
+		// So does bash before each line it reads, once per line.
+		if top_frame(vp).scratch.is_none()
+			&& let Some(line) = stdin_line_to_read(vp)
+		{
+			super::killed::line_read(k, cx, vp, line);
 		}
 		return read_script_line(k, vp, cx, zhist);
 	}
@@ -1341,6 +1357,60 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 	}
 	announce_at(k, cx, vp.vpid, vp.runs.front(), &unit, line, source_origin.as_ref());
 	None
+}
+
+/// The line bash's `shell_getc` reads next as the top script frame of `vp`
+/// needs its next command, if it reads one (not standard input, which
+/// [`stdin_line_to_read`] counts as it reads it): the frame is at the start
+/// of a line, nothing pushed back (`aux.pending`), with text left; or a
+/// script file at its end (bash's `reader_loop` reads until it finds the
+/// end, where `parse_and_execute`, which runs a `-c` string, an `eval`'s, a
+/// trap's or a sourced file's text, stops before).
+fn line_to_read(cx: &mut Cx<'_>, vp: &Vproc) -> Option<u32> {
+	if vp.mode.dialect() != Dialect::Bash || vp.jobs.is_empty() {
+		return None;
+	}
+	let Some(Frame { kind: FrameKind::Script { src, pos, aux, what, stdin: false }, .. }) =
+		vp.frames.last()
+	else {
+		return None;
+	};
+	if aux.as_ref().is_some_and(|a| a.pending.is_some()) {
+		return None;
+	}
+	let at = pos.0 as usize;
+	let start = at == 0 || src.get(at - 1) == Some(&b'\n');
+	if at < src.len() {
+		return start.then_some(pos.1);
+	}
+	let file = matches!(what, ScriptKind::Run)
+		&& !matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if matches!(origin.as_slice(), b"c" | b"s")
+		);
+	// Its last line read without a newline: bash's count is past it.
+	file.then_some(if start { pos.1 } else { pos.1 + 1 })
+}
+
+/// The line a stdin script frame of `vp` reads next, bash's `shell_getc`
+/// count: the line after the text read so far, when that ends a line.
+fn stdin_line_to_read(vp: &Vproc) -> Option<u32> {
+	if vp.mode.dialect() != Dialect::Bash || vp.jobs.is_empty() {
+		return None;
+	}
+	let Some(Frame { kind: FrameKind::Script { src, pos, .. }, .. }) = vp.frames.last() else {
+		return None;
+	};
+	let rest = src.get(pos.0 as usize..).unwrap_or_default();
+	if !(src.is_empty() || src.ends_with(b"\n")) {
+		return None;
+	}
+	#[expect(
+		clippy::naive_bytecount,
+		reason = "the stdin text read so far; no bytecount dependency"
+	)]
+	let lines = rest.iter().filter(|&&c| c == b'\n').count();
+	Some(pos.1 + u32::try_from(lines).unwrap_or(u32::MAX))
 }
 
 /// The literal argument that actually entered a native script. IR word ids
@@ -2385,6 +2455,7 @@ pub fn start_sub(
 			// bash keeps job control and the job list in `$( )`: `jobs`
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+			child.jobs.comsub = super::proc::Comsub::Own;
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -2658,6 +2729,9 @@ pub fn start_procsub(
 		}
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash's `process_substitute` sets `SUBSHELL_COMSUB` too: it reports no
+	// job a signal killed ([`super::killed`]).
+	child.jobs.comsub = super::proc::Comsub::Own;
 	zsh_subshell_traps(k, cx, &mut child, false);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
@@ -4877,12 +4951,23 @@ fn push_trap(
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let status = vp.status;
 	vp.blocked = None;
+	// bash runs a `CHLD` trap `wait` runs from `waitchld`, and an `INT`
+	// trap from its `wait_for`, with the job list frozen.
+	let frozen = match key {
+		TrapKey::Signal(crate::bash::signal::Signal::Chld) => vp.in_wait_builtin(),
+		TrapKey::Signal(crate::bash::signal::Signal::Int) => {
+			let at = k.frozen_ints.iter().position(|v| *v == vp.vpid);
+			at.map(|i| k.frozen_ints.swap_remove(i)).is_some()
+		},
+		_ => false,
+	};
 	push_script(vp, action, 1, ScriptKind::Trap {
 		key,
 		status,
 		cancel: None,
 		return_target: None,
 		exit: false,
+		frozen,
 	});
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);

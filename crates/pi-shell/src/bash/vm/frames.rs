@@ -54,9 +54,10 @@ use crate::bash::{
 };
 
 /// Version of the [`Image`] layout; part of the header and the build id.
-/// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
-/// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+/// Raised with every change to it (a field of a serialized type, an enum
+/// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
+/// a variant: an exec target holds it by index.
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -286,6 +287,10 @@ struct Fields {
 	pipestatus: Vec<i32>,
 	overlay:    Overlay,
 	jobs:       super::proc::JobTable,
+	/// The facts of `jobs`' jobs ([`crate::bash::store::Job::facts`]),
+	/// which their serialized form leaves out: by job id, those that have
+	/// any.
+	job_facts:  Vec<(crate::bash::ids::JobId, Vec<crate::bash::store::JobFact>)>,
 	last_bg:    super::proc::LastBg,
 	getopts:    super::proc::GetoptsState,
 	rlimits:    Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
@@ -593,6 +598,12 @@ impl Shell {
 				pipestatus: p.pipestatus.clone(),
 				overlay:    overlay.clone(),
 				jobs:       p.jobs.clone(),
+				job_facts:  p
+					.jobs
+					.iter()
+					.map(|j| (j.id, j.facts()))
+					.filter(|(_, facts)| !facts.is_empty())
+					.collect(),
 				last_bg:    p.last_bg,
 				getopts:    p.getopts.clone(),
 				rlimits:    p.rlimits.clone(),
@@ -830,6 +841,11 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
+				for (id, facts) in &f.job_facts {
+					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
+						job.set_facts(facts);
+					}
+				}
 				vp.last_bg = f.last_bg;
 				vp.getopts = f.getopts;
 				vp.rlimits = f.rlimits;
@@ -1322,8 +1338,27 @@ fn valid(u: &Unit) -> bool {
 mod tests {
 	use std::task::{Context, Poll, Waker};
 
-	use super::{FdImager, FdRebuild};
-	use crate::bash::{fd::FdRef, mem::MemObj};
+	use super::{FRAMES_VERSION, FdImager, FdRebuild, Header, IR_VERSION, MAGIC, check};
+	use crate::bash::{engine::Engine, error::Incompatibility, fd::FdRef, mem::MemObj};
+
+	/// A blob of this IR but another frames layout is refused as another
+	/// build's; one of another IR names both versions.
+	#[test]
+	fn the_header_check_refuses_another_layout() {
+		let header = |ir, frames| Header {
+			magic: MAGIC,
+			ir,
+			frames,
+			build: Engine::build_id(),
+			runs: Vec::new(),
+		};
+		assert_eq!(check(&header(IR_VERSION, FRAMES_VERSION)), Ok(()));
+		assert_eq!(check(&header(IR_VERSION, FRAMES_VERSION - 1)), Err(Incompatibility::Build));
+		assert_eq!(
+			check(&header(IR_VERSION - 1, FRAMES_VERSION)),
+			Err(Incompatibility::IrVersion { found: IR_VERSION - 1, expected: IR_VERSION })
+		);
+	}
 
 	#[test]
 	fn a_pipe_and_its_shared_ends_survive_an_image() {

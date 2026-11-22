@@ -206,7 +206,8 @@ fn events_assign_preview_cuts_on_a_char_boundary() {
 }
 
 /// bash's notice of a command a signal killed is a `Diag` event that holds
-/// the whole notice, the command too, as standard error does.
+/// the whole notice, the command too, as standard error does (bash 5.3: the
+/// C library's description padded to 27 columns).
 #[test]
 fn events_diag_of_a_killed_command_holds_the_command() {
 	use std::task::{Context, Poll};
@@ -241,7 +242,23 @@ fn events_diag_of_a_killed_command_holds_the_command() {
 	let mut rig = Rig::new(host, skeleton_init(&[]));
 	rig.shell().set_event_mask(EventMask::of(EventKind::Diag));
 	assert_eq!(rig.run(Script::command(&b"/x/k one; echo st=$?"[..]), Fault::None), 0);
-	let notice = "   77 Killed                  /x/k one";
+	// The description is the C library's `strsignal` text, as bash prints it
+	// (`j_strsignal`) and obash on this platform: glibc's `Killed`, Darwin's
+	// `Killed: 9`. Windows has no `strsignal`: obash prints glibc's there.
+	#[cfg(unix)]
+	let desc = {
+		// SAFETY: strsignal returns null or a NUL-terminated string, copied
+		// out at once; nothing else in this process calls it.
+		let desc = unsafe { libc::strsignal(libc::SIGKILL) };
+		assert!(!desc.is_null(), "strsignal(SIGKILL) returned null");
+		// SAFETY: a NUL-terminated string, read before any other call.
+		unsafe { std::ffi::CStr::from_ptr(desc) }
+			.to_string_lossy()
+			.into_owned()
+	};
+	#[cfg(not(unix))]
+	let desc = "Killed";
+	let notice = format!("   77 {desc:<27}/x/k one");
 	assert_eq!(
 		String::from_utf8_lossy(&rig.host.stderr.bytes()),
 		format!("bash: line 1: {notice}\n")

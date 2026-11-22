@@ -3,7 +3,7 @@
 use crate::{
 	bash::{
 		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		Script, Shell, SigTarget, Signal, StateStore, Step, store::BlobSlot,
+		RunId, Script, Shell, SigTarget, Signal, StateStore, Step, ir::IR_VERSION, store::BlobSlot,
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -171,4 +171,121 @@ fn restore_drop_frames_abandons_the_running_script_with_255() {
 		shell.step(&mut Cx { host: &mut host, store: &mut store }, Budget::default()),
 		Step::Done { run, status: 255 } if run == id
 	));
+}
+
+/// A store (`MemStore::to_bytes`) whose frames blob the engine of `c55f78f6`
+/// (IR version 17, frames layout 31: no `Job::signal`, no
+/// `JobTable::comsub`) externalized while run 1, `x=kept; ( { while :; do
+/// :; done; } & jobs; wait $! ); echo after`, had its `( … )` waiting for
+/// its running background job.
+const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_subshell_job.store");
+
+/// The IR version of the engine that wrote the `c55f78f6` fixtures.
+const OLD_IR: u32 = 17;
+
+/// Frames of an older engine are refused (the IR and layout versions are in
+/// the header, and the build id), never decoded as this one's; with
+/// `drop_frames` the store they came with restores, its run abandoned and
+/// the root's state kept. (A blob of this IR but an older layout is
+/// refused as another build's: `frames.rs`'
+/// `the_header_check_refuses_another_layout`.)
+#[test]
+fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_some(), "the old store holds frames");
+	let err = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.err();
+	let older = Incompatibility::IrVersion { found: OLD_IR, expected: IR_VERSION };
+	assert!(
+		matches!(err, Some(RestoreError::Incompatible { why }) if why == older),
+		"an older engine's frames are refused: {err:?}"
+	);
+
+	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
+			drop_frames: true,
+			..RestoreOpts::default()
+		})
+		.unwrap();
+	assert_eq!(report.abandoned, [RunId(1)]);
+	let next = shell.submit(Script::command(&b"echo \"$x\"; jobs; echo end"[..]));
+	let budget = Budget::default();
+	assert_eq!(advance(&mut shell, &mut host, &mut store, RunId(1), budget), Stop::Done(255));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
+	assert_eq!(host.stdout.bytes(), b"kept\nend\n");
+}
+
+/// A store the engine of `c55f78f6` (`store::Job` as it was before the
+/// job's signal was kept) wrote while run 1, `x=kept; { while :; do :;
+/// done; } & { while :; do :; done; } & kill -KILL $!; wait %1; echo
+/// after`, waited for job 1: the root's job table holds job 1 running and
+/// job 2, which `KILL` ended, done with 137.
+const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_root_jobs.store");
+
+/// A store from before the job's signal was kept decodes: its root's jobs
+/// are in the store's own records, which keep their layout (what came later
+/// is a record of its own, [`crate::bash::store::Record::JobFacts`]). Its
+/// frames are refused; with `drop_frames` it restores, the run abandoned,
+/// the variable kept, job 1 lost (137) and job 2 listed as `KILL` ended it.
+#[test]
+fn an_older_store_whose_root_has_jobs_restores() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let err = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.err();
+	let older = Incompatibility::IrVersion { found: OLD_IR, expected: IR_VERSION };
+	assert!(
+		matches!(err, Some(RestoreError::Incompatible { why }) if why == older),
+		"an older engine's frames are refused: {err:?}"
+	);
+	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
+			drop_frames: true,
+			..RestoreOpts::default()
+		})
+		.unwrap();
+	assert_eq!(report.abandoned, [RunId(1)]);
+	let next = shell.submit(Script::command(&b"echo \"$x\"; jobs; echo end"[..]));
+	let budget = Budget::default();
+	assert_eq!(advance(&mut shell, &mut host, &mut store, RunId(1), budget), Stop::Done(255));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let text = "{ while :; do\n    :;\ndone; }";
+	assert_eq!(
+		String::from_utf8_lossy(&host.stdout.bytes()),
+		format!("kept\n[1]-  {killed:<27}{text}\n[2]+  {killed:<27}{text}\nend\n")
+	);
+}
+
+/// The signal that ended a root job outlives a store image
+/// (`MemStore::to_bytes`, `from_bytes`) and a restore: the next run's first
+/// line reports the job as the shell would have.
+#[test]
+fn a_root_jobs_signal_outlives_a_store_image() {
+	let mut r = rig();
+	r.run(Script::command(&b"{ while :; do :; done; } & kill -KILL $!"[..]), Fault::None);
+	assert_eq!(r.host.stderr.bytes(), b"", "nothing reports in the first run");
+	r.snapshot();
+	assert_eq!(r.run(Script::command(&b"echo next"[..]), Fault::None), 0);
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let err = String::from_utf8_lossy(&r.host.stderr.bytes()).into_owned();
+	let tail = format!(" {killed:<27}{{ while :; do\n    :;\ndone; }}\n");
+	let pid = err
+		.strip_prefix("bash: line 1: ")
+		.and_then(|e| e.strip_suffix(tail.as_str()));
+	assert!(pid.is_some_and(|p| p.trim().parse::<u32>().is_ok()), "{err:?}");
+	assert_eq!(r.host.stdout.bytes(), b"next\n");
 }

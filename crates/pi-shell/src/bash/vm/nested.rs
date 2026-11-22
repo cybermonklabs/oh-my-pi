@@ -318,7 +318,9 @@ fn fresh_shell(
 			ov.vars.insert(name, None);
 		}
 	}
-	for table in [Table::Func, Table::Alias, Table::CmdHash, Table::DirStack, Table::Job] {
+	for table in
+		[Table::Func, Table::Alias, Table::CmdHash, Table::DirStack, Table::Job, Table::JobFacts]
+	{
 		for (key, _) in state::scan(&k.root, cx.store, vp, table)? {
 			ov.records.insert(key, None);
 		}

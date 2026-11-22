@@ -23,8 +23,8 @@ use crate::{
 		Script, Shell, ShellApi, SigTarget, Signal, StateStore, Step, StoreError, UnitId, VarValue,
 		Vpid,
 		store::{
-			BlobSlot, Change, Elem, Job, JobState, Key, KeyBuf, LossyKind, MiscKey, OptId, Record,
-			Sticky, Table, TrapKey, Var, ZshScope,
+			BlobSlot, Change, Elem, Job, JobFact, JobState, Key, KeyBuf, LossyKind, MiscKey, OptId,
+			Record, Sticky, Table, TrapKey, Var, ZshScope,
 		},
 		zshopt::{ZshOpt, ZshOpts},
 	},
@@ -284,6 +284,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				inherited: false,
 				wd:        bytes(b"/t\xffmp"),
 				os_pid:    Some(4242),
+				signal:    None,
 			}),
 		),
 		(
@@ -300,8 +301,10 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				inherited: false,
 				wd:        bytes(b"/"),
 				os_pid:    None,
+				signal:    None,
 			}),
 		),
+		(KeyBuf::JobFacts(JobId(2)), Record::JobFacts(vec![JobFact::Signal(Signal::Kill)])),
 		(KeyBuf::Proc(Vpid(Vpid::BASE + 1)), Record::Proc {
 			parent: Some(Vpid(Vpid::BASE)),
 			status: None,
@@ -686,7 +689,7 @@ fn deleting_a_scope_drops_its_locals(store: &mut dyn StateStore) {
 }
 
 /// Every table, `Scope` and `Local` included.
-const TABLES: [Table; 14] = [
+const TABLES: [Table; 15] = [
 	Table::Var,
 	Table::Func,
 	Table::Alias,
@@ -701,6 +704,7 @@ const TABLES: [Table; 14] = [
 	Table::Local,
 	Table::ZshOpt,
 	Table::ZshAlias,
+	Table::JobFacts,
 ];
 
 /// A scan of each table visits exactly that table's records, once each.

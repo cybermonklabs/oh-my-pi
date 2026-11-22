@@ -294,18 +294,33 @@ impl Tree {
 		Id::new(self.push_with(Node { x: Pk::Arith.code(), ..Node::new(K::Part) }, &k))
 	}
 
-	pub fn comsub(&mut self, kind: ComsubKind, body: Id<ListS>, text: &[u8]) -> Id<PartS> {
+	/// A command substitution part over `span`, its source from the `$` (or
+	/// `` ` ``) to the closing delimiter.
+	pub fn comsub(
+		&mut self,
+		kind: ComsubKind,
+		body: Id<ListS>,
+		text: &[u8],
+		span: Span,
+	) -> Id<PartS> {
 		let mut k = [NONE; 2];
 		k[COMSUB_BODY] = body.index();
 		k[COMSUB_TEXT] = self.text(text).index();
-		let n = Node { x: Pk::Comsub.code(), c: u32::from(kind.code()), ..Node::new(K::Part) };
+		let n =
+			Node { x: Pk::Comsub.code(), c: u32::from(kind.code()), ..Node::spanning(K::Part, span) };
 		Id::new(self.push_with(n, &k))
 	}
 
-	pub fn procsub(&mut self, output: bool, body: Id<ListS>) -> Id<PartS> {
+	/// A process substitution part over `span`, its source from the `<`
+	/// (or `>`) to the closing `)`.
+	pub fn procsub(&mut self, output: bool, body: Id<ListS>, span: Span) -> Id<PartS> {
 		let mut k = [NONE; 1];
 		k[PROCSUB_BODY] = body.index();
-		let n = Node { x: Pk::ProcSub.code(), flags: flag(output, OUTPUT), ..Node::new(K::Part) };
+		let n = Node {
+			x: Pk::ProcSub.code(),
+			flags: flag(output, OUTPUT),
+			..Node::spanning(K::Part, span)
+		};
 		Id::new(self.push_with(n, &k))
 	}
 
@@ -628,6 +643,11 @@ impl<'t> Comsub<'t> {
 		super::List(self.0.must(COMSUB_BODY, "body"))
 	}
 
+	/// Its source, from the `$` (or `` ` ``) to the closing delimiter.
+	pub fn span(self) -> Span {
+		self.0.span()
+	}
+
 	/// Source text between the delimiters.
 	pub fn text(self) -> &'t [u8] {
 		self.0.must(COMSUB_TEXT, "text").bytes()
@@ -641,6 +661,11 @@ impl<'t> ProcSub<'t> {
 
 	pub fn body(self) -> super::List<'t> {
 		super::List(self.0.must(PROCSUB_BODY, "body"))
+	}
+
+	/// Its source, from the `<` (or `>`) to the closing `)`.
+	pub fn span(self) -> Span {
+		self.0.span()
 	}
 }
 

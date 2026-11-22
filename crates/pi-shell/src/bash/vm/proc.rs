@@ -396,6 +396,41 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// Where a command or process substitution leaves this shell: which
+	/// background jobs a signal killed it reports ([`super::killed`]).
+	pub comsub:   Comsub,
+}
+
+/// A shell's place under a command or process substitution (bash
+/// `SUBSHELL_COMSUB` and `startup_state`), for its notices of the
+/// background jobs a signal killed ([`super::killed`]). bash's
+/// `command_substitute` and `process_substitute` set both in the
+/// substitution's process (`startup_state` to 2, as a `-c` shell's); each
+/// fork of it starts a new `subshell_environment` without the flag
+/// (`execute_in_subshell` for a `( … )`, a compound command that is a
+/// pipeline stage or runs with `&`; `execute_simple_command`'s child for a
+/// simple one) and keeps `startup_state`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Comsub {
+	/// Neither, nor a fork of one.
+	#[default]
+	No,
+	/// The substitution's own process, with what it runs without a fork
+	/// (a function, `eval`, `.`): it reports none.
+	Own,
+	/// A fork of one: it reports them, but in posix mode none, as a posix
+	/// `-c` shell does not (`startup_state` 2).
+	Fork,
+}
+
+impl Comsub {
+	/// Where a fork of a shell in `self` is.
+	pub const fn forked(self) -> Self {
+		match self {
+			Self::No => Self::No,
+			Self::Own | Self::Fork => Self::Fork,
+		}
+	}
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -469,6 +504,7 @@ impl JobTable {
 			inherited: false,
 			wd,
 			os_pid: None,
+			signal: None,
 		});
 		self.reset_current();
 		number
@@ -807,6 +843,50 @@ impl Vproc {
 			})
 		})
 	}
+
+	/// Whether it waits for a forked foreground command: a subshell, a
+	/// pipeline stage, a command substitution, an external (bash's
+	/// `wait_for`), not a builtin's callout or task.
+	pub fn waiting_for_a_fork(&self) -> bool {
+		self.frames.iter().any(|frame| {
+			frame.scratch.as_ref().is_some_and(|scratch| {
+				!scratch.children.is_empty()
+					|| scratch.sub.is_some()
+					|| matches!(
+						scratch.exec.as_ref().and_then(|exec| exec.waiting),
+						Some(Awaited::Ext { .. })
+					)
+			})
+		})
+	}
+
+	/// Whether the `wait` builtin is waiting for its jobs (bash's
+	/// `this_shell_builtin == wait_builtin` while it waits).
+	pub fn in_wait_builtin(&self) -> bool {
+		self.frames.iter().any(|frame| {
+			frame
+				.scratch
+				.as_ref()
+				.and_then(|s| s.exec.as_ref())
+				.is_some_and(|e| {
+					e.target == Some(Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait))
+						&& matches!(
+							e.waiting,
+							Some(Awaited::Jobs { .. } | Awaited::AllJobs | Awaited::AnyJob)
+						)
+						&& !e.wait_for.is_empty()
+				})
+		})
+	}
+
+	/// Whether a trap runs that bash runs with the job list frozen
+	/// ([`ScriptKind::Trap`]'s `frozen`): no job is reported meanwhile.
+	pub fn jobs_frozen(&self) -> bool {
+		self.trap_frames != 0
+			&& self.frames.iter().any(|f| {
+				matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. })
+			})
+	}
 }
 
 /// Why a vproc is parked, and the wake count it parked at.
@@ -935,6 +1015,11 @@ pub enum ScriptKind {
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// bash runs it with the job list frozen (`jobs_list_frozen`): a
+		/// `CHLD` trap the `wait` builtin runs, an `INT` trap its wait for
+		/// a forked foreground command runs. Nothing reports a job while it
+		/// runs ([`super::killed`]).
+		frozen:        bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and

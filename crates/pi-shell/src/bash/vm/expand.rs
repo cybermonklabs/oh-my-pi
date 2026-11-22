@@ -966,8 +966,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Lit(b) => Self::lit_text(sink, b, rhs),
 			Part::Quoted(b) => sink.lit(b, true),
 			Part::Param(p) => self.param(unit, p, sink, inq || p.quoted, rhs)?,
-			Part::Comsub { entry, kind, quoted, text } => {
-				let out = self.comsub(unit, *entry, *kind, *text)?;
+			Part::Comsub { entry, kind, quoted, text, lines } => {
+				let out = self.comsub(unit, *entry, *kind, *text, *lines)?;
 				sink.value(&out, inq || *quoted);
 			},
 			Part::Arith { text, quoted } => {
@@ -983,12 +983,13 @@ impl<'e, 'c> Expander<'e, 'c> {
 				};
 				sink.value(v.format_into(&mut NumBuffer::new()).as_bytes(), inq || *quoted);
 			},
-			Part::ProcSub { entry, output } => {
+			Part::ProcSub { entry, output, lines } => {
 				// Logged, so a replay after a command substitution parks does
 				// not start it twice.
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line, *lines);
 					let p = super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output);
 					self.note(|| Atom::Str(Some(p.clone())));
 					p
@@ -1022,12 +1023,19 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(())
 	}
 
+	/// A command substitution: its finished output on a replay, else
+	/// [`Stop::Sub`] to start it. `text` (`None` for a backquote) is what
+	/// bash re-parses in the shell first, through `shell_getc`
+	/// (`xparse_dolparen`), passing the `lines` newlines of its source: the
+	/// background jobs a signal killed are reported then
+	/// ([`super::killed::expanded`]).
 	fn comsub(
 		&mut self,
 		unit: &Arc<Unit>,
 		entry: u32,
 		form: ComsubForm,
 		text: Option<u32>,
+		lines: u32,
 	) -> X<BString> {
 		// A word compiled as unable to park (no replay log) can still meet
 		// a command substitution in run-time text (a nameref's subscript,
@@ -1041,13 +1049,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 			self.cursor += usize::from(atom.is_some());
 			atom
 		};
-		match atom {
-			Some(Atom::Sub { out, status }) => {
-				self.sub_status = Some(status);
-				self.vp.status = status;
-				Ok(out)
-			},
-			_ => Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text }),
+		if let Some(Atom::Sub { out, status }) = atom {
+			self.sub_status = Some(status);
+			self.vp.status = status;
+			Ok(out)
+		} else {
+			if text.is_some() {
+				super::killed::expanded(self.k, self.cx, self.vp, self.line, lines);
+			}
+			Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text })
 		}
 	}
 

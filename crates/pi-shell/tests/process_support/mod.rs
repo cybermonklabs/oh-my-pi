@@ -1,7 +1,8 @@
 //! Run obash, bash and zsh as processes and compare how they end: the
 //! signals they start with, their core size limit, the real bash the
-//! comparisons need ([`real_bash`]), and a signal sent from outside once the
-//! command a shell waits for has started ([`Run::go_signalled`]).
+//! comparisons need ([`real_bash`], [`real_bash_golden`]), and a signal sent
+//! from outside once the command a shell waits for has started
+//! ([`Run::go_signalled`]).
 
 #![allow(dead_code, reason = "each test crate uses a subset")]
 
@@ -11,7 +12,7 @@ use std::{
 	os::unix::process::{CommandExt, ExitStatusExt},
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use crate::{pty_support::wait_blocked, zsh_oracle};
@@ -97,6 +98,8 @@ pub struct Run {
 	/// [`Self::go_signalled`] signals only once the shell has blocked
 	/// ([`Self::when_blocked`]).
 	blocked: bool,
+	/// The file its standard input reads ([`Self::input`]); else the test's.
+	input:   Option<PathBuf>,
 }
 
 impl Run {
@@ -112,6 +115,7 @@ impl Run {
 			env: Vec::new(),
 			group: false,
 			blocked: false,
+			input: None,
 		}
 	}
 
@@ -191,6 +195,13 @@ impl Run {
 		self
 	}
 
+	/// Read standard input from the file `path`.
+	#[must_use]
+	pub fn input(mut self, path: &Path) -> Self {
+		self.input = Some(path.to_owned());
+		self
+	}
+
 	/// The command, and the directory of the shell's link it needs alive.
 	fn command(&self) -> (Command, tempfile::TempDir) {
 		let link_dir = tempfile::tempdir().expect("a directory for the shell's link");
@@ -206,6 +217,9 @@ impl Run {
 			cmd
 		};
 		cmd.args(&self.args).env_remove("ZDOTDIR");
+		if let Some(path) = &self.input {
+			cmd.stdin(std::fs::File::open(path).expect("open the shell's input"));
+		}
 		for (key, value) in &self.env {
 			match value {
 				Some(value) => cmd.env(key, value),
@@ -281,6 +295,54 @@ impl Run {
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
 		outcome(child.wait_with_output().expect("wait for the shell"))
+	}
+
+	/// Start it with its standard output and error piped, for a caller that
+	/// acts on it while it runs ([`Started`]).
+	pub fn spawn(&self) -> Started {
+		let (mut cmd, link_dir) = self.command();
+		let child = cmd
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("start the shell");
+		Started { child, group: self.group, _link_dir: link_dir }
+	}
+}
+
+/// A shell [`Run::spawn`] started, still running.
+pub struct Started {
+	/// The shell's process.
+	pub child: std::process::Child,
+	/// In a process group of its own ([`Run::own_group`]).
+	group:     bool,
+	/// The directory of the shell's link, alive while it runs.
+	_link_dir: tempfile::TempDir,
+}
+
+impl Started {
+	/// Wait for the shell to end, for at most `limit`: then kill it (its
+	/// process group, with [`Run::own_group`]) with `SIGKILL` and fail,
+	/// naming `what`. For a shell that writes little to its standard
+	/// output and error, which are read once it has ended.
+	pub fn end_within(mut self, limit: Duration, what: &str) -> Outcome {
+		let deadline = Instant::now() + limit;
+		while self.child.try_wait().expect("look at the shell").is_none() {
+			if Instant::now() >= deadline {
+				let pid = libc::pid_t::try_from(self.child.id()).expect("a pid");
+				// SAFETY: kill takes integer ids; the child is not reaped yet.
+				unsafe { libc::kill(if self.group { -pid } else { pid }, libc::SIGKILL) };
+				let out = outcome(self.child.wait_with_output().expect("wait for the shell"));
+				panic!("{what}: the shell still ran after {limit:?}, killed: {out:?}");
+			}
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		outcome(
+			self
+				.child
+				.wait_with_output()
+				.expect("read the shell's output"),
+		)
 	}
 }
 
@@ -367,12 +429,34 @@ pub fn bash_at(path: PathBuf) -> Result<PathBuf, String> {
 /// or later ([`bash_at`]); else `None`, and the test reported
 /// [`zsh_oracle::uncompared`] with the refusal.
 pub fn real_bash() -> Option<PathBuf> {
-	let path = std::env::var_os("PI_TEST_REAL_BASH")
-		.filter(|p| !p.is_empty())
-		.map_or_else(|| PathBuf::from("/bin/bash"), PathBuf::from);
-	bash_at(path)
+	bash_at(real_bash_path())
 		.map_err(|refusal| zsh_oracle::uncompared(&refusal))
 		.ok()
+}
+
+/// `$PI_TEST_REAL_BASH`, or `/bin/bash`.
+fn real_bash_path() -> PathBuf {
+	std::env::var_os("PI_TEST_REAL_BASH")
+		.filter(|p| !p.is_empty())
+		.map_or_else(|| PathBuf::from("/bin/bash"), PathBuf::from)
+}
+
+/// The bash the checked-in goldens of bash's job notices were measured
+/// with: 5.3.20, the version obash declares (`BASH_VERSION`).
+pub const BASH_GOLDEN: (u32, u32) = (5, 3);
+
+/// The real bash ([`real_bash_path`]) when it is bash [`BASH_GOLDEN`] or
+/// later: an extra local check of a case whose expected output is a
+/// checked-in golden. `None` for any other bash, or none, and nothing is
+/// reported: the golden is the comparison, so nothing goes uncompared.
+pub fn real_bash_golden() -> Option<PathBuf> {
+	let path = real_bash_path();
+	let out = Command::new(&path).arg("--version").output().ok()?;
+	let first = String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.next()?
+		.to_owned();
+	(bash_version(&first)? >= BASH_GOLDEN).then_some(path)
 }
 
 /// The real shell `name` (`zsh` or `bash`) the case compares with, or

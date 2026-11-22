@@ -383,10 +383,7 @@ pub fn exec(
 				}
 			},
 			Stage::Output => {
-				if let Some(fd) = exec::flush_out(k, vp) {
-					return Flow::Block(WaitKey::Write { fd });
-				}
-				if let Some(flow) = output(k, vp, cx, line) {
+				if let Some(flow) = write_out(k, vp, cx, line) {
 					return flow;
 				}
 				st(vp).stage = Stage::Finish;
@@ -4418,6 +4415,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				let shown = vp.shown_pid(v);
 				if let Some(s) = k.proc_collect(cx.store, v) {
 					last = s;
+					waited_notice(k, vp, cx, v, line);
 					forget_job(vp, v);
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
@@ -4426,6 +4424,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					// bash with job control: a stop ends the wait for that job.
 					last = sig.exit_status(platform);
 				} else {
+					// bash writes each job's notice as it reaps it (`wait_for`'s
+					// `notify_and_cleanup`), before it waits for the next.
+					if let Some(flow) = write_out(k, vp, cx, line) {
+						return Some(flow);
+					}
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				waited = Some(shown);
@@ -4437,13 +4440,27 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			last
 		},
 		Some(Awaited::AllJobs) => {
+			// bash waits for the first job still running, again and again
+			// (`wait_for_background_pids`): it reports that one, and drops a
+			// later one that ended meanwhile unreported, as it drops one that
+			// ended while it wrote a notice (still queued here: the write, not
+			// the job, woke this pass).
+			let mut first = st(vp).writes.is_empty();
 			while let Some(&v) = st(vp).wait_for.first() {
 				if k.proc_collect(cx.store, v).is_some() {
+					if first {
+						waited_notice(k, vp, cx, v, line);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if !matches!(vp.jobs.by_vpid(v).map(|j| j.state), Some(JobState::Stopped(_))) {
-					// A job stopped meanwhile is skipped (job control).
+					// A job stopped meanwhile is skipped (job control). The
+					// notices so far are out before the wait for this one.
+					if let Some(flow) = write_out(k, vp, cx, line) {
+						return Some(flow);
+					}
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
+				first = false;
 				st(vp).wait_for.remove(0);
 			}
 			// bash: `wait` forgets every finished job, except the one `$!`
@@ -4489,6 +4506,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			};
 			let shown = vp.shown_pid(v);
 			k.proc_collect(cx.store, v);
+			waited_notice(k, vp, cx, v, line);
 			forget_job(vp, v);
 			st(vp).wait_for.clear();
 			exec::reap_coproc(k, vp, cx, v);
@@ -4636,6 +4654,24 @@ fn forget_job(vp: &mut Vproc, v: crate::bash::ids::Vpid) {
 	}
 }
 
+/// `wait` waited for job vproc `v`: bash's notice of the job when a signal
+/// killed it ([`super::killed::waited`]), queued for the command's own
+/// standard error; `wait` writes it ([`write_out`]) before it blocks on its
+/// next job.
+fn waited_notice(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	v: crate::bash::ids::Vpid,
+	line: u32,
+) {
+	if let Some(bytes) = super::killed::waited(k, cx, vp, v, line) {
+		st(vp)
+			.writes
+			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	}
+}
+
 /// `wait -p var`: assign the waited child's pid (as `$!` showed it).
 fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: u32) {
 	let Some(name) = st(vp).wait_into.take() else {
@@ -4647,6 +4683,17 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 	if let Err(d) = builtins::set_value(k, cx, vp, lhs, value, Level::Dynamic) {
 		k.diag(cx, vp, line, d);
 	}
+}
+
+/// What is queued, out in order: the shell's own diagnostics
+/// ([`exec::flush_out`]), then the command's output ([`output`]). The flow
+/// to return while a write would block; a write that blocked partway keeps
+/// its progress (`PendingWrite::off`) for the next call.
+fn write_out(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
+	if let Some(fd) = exec::flush_out(k, vp) {
+		return Some(Flow::Block(WaitKey::Write { fd }));
+	}
+	output(k, vp, cx, line)
 }
 
 /// Write the command's own output in order (pollable).
