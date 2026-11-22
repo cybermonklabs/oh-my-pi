@@ -145,7 +145,11 @@ function isUntyped(entry: fs.Dirent): boolean {
  *
  * The walk follows no symbolic link: it reads each directory with `readdir(…, { withFileTypes:
  * true })` and goes into directory entries only (an entry with no type is a directory only if
- * `lstat` says so). A link moves with the directory as itself, and nothing behind it is listed.
+ * `lstat` says so), and just before it reads a directory under `source` it checks with `lstat`
+ * that a directory is still at that path, so one swapped for a link since its parent was read
+ * is not read through. A link moves with the directory as itself, and nothing behind it is
+ * listed. (A swap between that check and the read can still list a link's target as paths under
+ * `source`; that only names, and the rename itself moves the one directory entry `source`.)
  * Without links the walk cannot loop (an entry has one parent, a directory cannot be hard-linked,
  * and mounts nest as a finite tree), so it reads each directory of the tree once, and it stops
  * once it has more files than it may list. It checks `signal` before each directory it reads.
@@ -169,7 +173,9 @@ async function enumerateRenamePairs(
 	for (let next = 0; next < directories.length; next++) {
 		throwIfAborted(signal);
 		const relative = directories[next];
-		for (const entry of await fs.promises.readdir(path.join(source, relative), { withFileTypes: true })) {
+		const absolute = path.join(source, relative);
+		if (relative !== "" && !(await fs.promises.lstat(absolute)).isDirectory()) continue;
+		for (const entry of await fs.promises.readdir(absolute, { withFileTypes: true })) {
 			const rel = path.join(relative, entry.name);
 			const kind = isUntyped(entry) ? await fs.promises.lstat(path.join(source, rel)) : entry;
 			if (kind.isDirectory()) {
