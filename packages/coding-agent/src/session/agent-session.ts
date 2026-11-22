@@ -529,7 +529,7 @@ import {
 	type SettingsChangeOptions,
 	toolsDigestOfEntry,
 } from "./session-tools";
-import { resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
+import { promptCacheModelKey, resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ProviderFallbackRecord } from "./provider-fallback-record";
 import { carryImageDrops, type RecordedImageDrop, recordedImageDrops } from "./provider-image-budget";
@@ -819,9 +819,11 @@ type PostPromptSkipReason = "aborted" | "stale-generation";
 
 /** Request inputs outside the transcript that are part of the prompt cache key. */
 interface PromptCacheShape {
-	/** `provider/id`. */
+	/** The model the request goes out as ({@link promptCacheModelKey}). */
 	model: string;
 	modelName: string;
+	/** The API the request goes out on. */
+	api: string;
 	thinkingLevel: ThinkingLevel | undefined;
 	/** {@link thinkingLevel} as the cached prefix tells levels apart ({@link promptCacheThinkingKey}). */
 	thinkingKey: string;
@@ -848,6 +850,39 @@ function promptCacheThinkingKey(
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
 	const wire = wireModel(model, { kimiApiFormat });
 	return sendsConfigurationUpdates(wire) || takesPerMessageEffort(wire) ? "effort" : level;
+}
+
+/** The Kimi Code API formats a request can name ({@link wireModel}); without one it goes out in its catalog's. */
+const KIMI_API_FORMATS = ["openai", "anthropic"] as const satisfies readonly SimpleStreamOptions["kimiApiFormat"][];
+
+/**
+ * Whether a reply on `model` recorded on the API `api` went out as another wire model than a request on `model` in the
+ * Kimi Code API format `kimiApiFormat` goes out as ({@link wireModel}): `api` is not the API that request goes out on,
+ * but one a format sends `model` on. A reply on an API no format sends `model` on (a wrapper transport whose replies
+ * name its inner client's API, as Factory Droid's Gemini route) tells nothing of the wire it went out as.
+ */
+function repliedOnOtherWire(
+	model: Model,
+	api: Model["api"],
+	kimiApiFormat: SimpleStreamOptions["kimiApiFormat"],
+): boolean {
+	return (
+		api !== wireModel(model, { kimiApiFormat }).api &&
+		KIMI_API_FORMATS.some(format => wireModel(model, { kimiApiFormat: format }).api === api)
+	);
+}
+
+/**
+ * The change of the model the requests go out as from `from` to `to`, each named with the API it goes out on when
+ * only that differs (a Kimi Code API format switch keeps the model's name).
+ */
+function modelCacheChange(
+	from: Pick<PromptCacheShape, "modelName" | "api">,
+	to: Pick<PromptCacheShape, "modelName" | "api">,
+): { kind: "model"; from: string; to: string } {
+	return from.modelName === to.modelName && from.api !== to.api
+		? { kind: "model", from: `${from.modelName} (${from.api})`, to: `${to.modelName} (${to.api})` }
+		: { kind: "model", from: from.modelName, to: to.modelName };
 }
 
 /** The main-loop request the prompt cache warmer was armed with last, and what it was armed with. */
@@ -6335,7 +6370,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#promptCacheChange(arm: PromptCacheShape, armMessages: readonly AgentMessage[]): PromptCacheChange | undefined {
 		const next = this.#promptCacheShape(this.model);
-		if (next.model !== arm.model) return { kind: "model", from: arm.modelName, to: next.modelName };
+		if (next.model !== arm.model) return modelCacheChange(arm, next);
 		if (next.thinkingKey !== arm.thinkingKey) {
 			return { kind: "thinking", from: arm.thinkingLevel ?? "off", to: next.thinkingLevel ?? "off" };
 		}
@@ -6376,8 +6411,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return memo.shape;
 		}
 		const shape: PromptCacheShape = {
-			model: model ? `${model.provider}/${model.id}` : "",
+			model: model ? promptCacheModelKey(model, kimiApiFormat) : "",
 			modelName: model?.name ?? "no model",
+			api: model ? wireModel(model, { kimiApiFormat }).api : "",
 			thinkingLevel,
 			thinkingKey: promptCacheThinkingKey(model, thinkingLevel, kimiApiFormat),
 			tools,
@@ -6441,8 +6477,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
 	 * model declares for the tier the reply wrote. Thinking level and
-	 * credential at the time are unknown; model, compaction and the digests of
-	 * the tool definitions and system prompt recorded for that reply are not,
+	 * credential at the time are unknown; model, the API the reply went out
+	 * on (a Kimi Code API format switch since moves it to another endpoint
+	 * and its cache), compaction and the digests of the tool definitions and
+	 * system prompt recorded for that reply are not,
 	 * and the next request is taken to send the current tool definitions and
 	 * base prompt. `promptDigest` names another base prompt for it, the one a
 	 * resumed process may restore while its tools are not all in yet (tools
@@ -6473,9 +6511,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (tier === undefined) return undefined;
 		const seconds = model.promptCache?.[tier];
 		const current = this.model;
+		const kimiApiFormat = resolveKimiApiFormat(this.settings);
 		let change: ObservedPromptCacheEntry["change"];
-		if (current?.provider !== model.provider || current.id !== model.id) {
-			change = { kind: "model", from: model.name, to: current?.name ?? "no model" };
+		if (
+			current?.provider !== model.provider ||
+			current.id !== model.id ||
+			repliedOnOtherWire(current, reply.api, kimiApiFormat)
+		) {
+			change = modelCacheChange(
+				{ modelName: model.name, api: reply.api },
+				{
+					modelName: current?.name ?? "no model",
+					api: current ? wireModel(current, { kimiApiFormat }).api : "",
+				},
+			);
 		} else if (requestedTier !== tier) {
 			// The next request asks for another tier, or for no caching at all.
 			change = { kind: "retention" };

@@ -10,6 +10,7 @@ import type {
 } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
+import { BankManager } from "@oh-my-pi/pi-mnemopi/core/banks";
 import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
@@ -45,7 +46,10 @@ interface RecallBlock {
 }
 
 // The mnemopi package pulls the embeddings stack; keep it off the CLI startup
-// module graph by loading it lazily at the async boundaries that need it.
+// module graph by loading it lazily at the async boundaries that need it. The
+// bank layout (`core/banks`) pulls none of it: a recall's scope names its banks'
+// databases wherever the scope is read, a session built over a transcript
+// before anything loaded the core module (`omp render`) included.
 let mnemopiMod: typeof MnemopiNs | undefined;
 let mnemopiCoreMod: typeof MnemopiCoreNs | undefined;
 
@@ -1301,7 +1305,6 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
 	return new BankManager(dirname(config.dbPath)).getBankDbPath(bank);
 }
 

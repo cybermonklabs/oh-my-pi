@@ -15,7 +15,7 @@ import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation 
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, computeBankScope, type HindsightBankSet } from "./bank";
-import { createHindsightClient } from "./client";
+import { createHindsightClient, hindsightBaseUrl } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
 import { type HindsightMessage, hasSubstantiveContent } from "./content";
 import { HindsightSessionState } from "./state";
@@ -368,7 +368,7 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 	// A confirmed bank includes its mission metadata, not just its server/id.
 	// Reuse confirmations only while the effective PUT payload is unchanged.
 	const sameBankConfig =
-		current.config.hindsightApiUrl === config.hindsightApiUrl &&
+		sameServer(current.config, config) &&
 		current.config.bankMission.trim() === config.bankMission.trim() &&
 		(current.config.retainMission?.trim() || "") === (config.retainMission?.trim() || "");
 	const state = await installPrimaryState(session, settings, sameBankConfig ? current.banksSet : new Set());
@@ -383,9 +383,12 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
  * Structural compare of two resolved Hindsight configs. Both sides come from
  * `loadHindsightConfig`, so iterating one side's keys covers the whole shape
  * and a newly added config field is picked up without touching this compare.
+ * The server and token compare as the client sends them ({@link sameServer}).
  */
 function hindsightConfigsEqual(a: HindsightConfig, b: HindsightConfig): boolean {
+	if (!sameServer(a, b) || (a.hindsightApiToken ?? "").trim() !== (b.hindsightApiToken ?? "").trim()) return false;
 	for (const key of Object.keys(a) as (keyof HindsightConfig)[]) {
+		if (key === "hindsightApiUrl" || key === "hindsightApiToken") continue;
 		const left = a[key];
 		const right = b[key];
 		if (Array.isArray(left) || Array.isArray(right)) {
@@ -395,6 +398,17 @@ function hindsightConfigsEqual(a: HindsightConfig, b: HindsightConfig): boolean 
 		if (left !== right) return false;
 	}
 	return true;
+}
+
+/**
+ * Whether `a` and `b` name the same server as the client reaches it ({@link hindsightBaseUrl}): a scheme or host in
+ * capitals, a default port or a trailing slash does not make another one.
+ */
+function sameServer(a: HindsightConfig, b: HindsightConfig): boolean {
+	return (
+		(a.hindsightApiUrl === null ? null : hindsightBaseUrl(a.hindsightApiUrl)) ===
+		(b.hindsightApiUrl === null ? null : hindsightBaseUrl(b.hindsightApiUrl))
+	);
 }
 
 /** Tag-array equality: order matters because we never reorder on the way in. */

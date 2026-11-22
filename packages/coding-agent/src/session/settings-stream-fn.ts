@@ -13,6 +13,7 @@
 import { fitOutputTokensToContextWindow, type StreamFn, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import type { Settings } from "../config/settings";
 import { type AnthropicSlowModeLanes, anthropicSlowModeLanes } from "./anthropic-slow-mode";
@@ -69,6 +70,17 @@ export function resolveKimiApiFormat(
 	if (requestFormat !== undefined) return requestFormat;
 	const setting = cfgProvidersKimiApiFormat.get(settings);
 	return setting === "auto" ? undefined : setting;
+}
+
+/**
+ * The model a main request on `model` goes out as in the Kimi Code API format `kimiApiFormat` ({@link wireModel}), as
+ * the prompt cache keys it: the catalog entry with the API and endpoint of that wire model. Each endpoint keeps a cache
+ * of its own, so a request in another API format (Kimi Code's, Synthetic's) or on another route of a wrapper transport
+ * (Factory Droid's) changes the key as a switch to another model does.
+ */
+export function promptCacheModelKey(model: Model, kimiApiFormat: SimpleStreamOptions["kimiApiFormat"]): string {
+	const wire = wireModel(model, { kimiApiFormat });
+	return JSON.stringify([model.provider, model.id, wire.api, wire.baseUrl]);
 }
 
 function timeoutSecondsToMs(value: number): number | undefined {

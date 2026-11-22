@@ -172,13 +172,12 @@ import {
 	appendRecallBlock,
 	type ConversationRecall,
 	findConversationRecall,
-	MEMORY_RECALL_ENTRY_TYPE,
 	recallsIntoConversation,
 	withoutDeliveredRecall,
 } from "./memory-backend/recall-entry";
 import { cfgMemoryBackend } from "./memory-backend/settings";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
-import { loadMnemopiCore, type MnemopiSessionStateApi } from "./mnemopi/state";
+import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
@@ -4371,24 +4370,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			let memoryRecall: ConversationRecall | undefined;
 			if (hasSession) {
 				memoryRecall = session.memoryRecall;
-			} else if (!restrictToolNames) {
-				const backend = cfgMemoryBackend.get(settings);
-				if (recallsIntoConversation(backend)) {
-					// Mnemopi's scope names its banks' databases, which its core module resolves; the backend's start
-					// loads it too, and the session reads the same scope when it adopts the recall. Only a branch that
-					// records a recall has the scope read.
-					if (
-						backend === "mnemopi" &&
-						sessionManager
-							.getBranchView()
-							.some(entry => entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
-					) {
-						await loadMnemopiCore();
-					}
-					memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
-						memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
-					);
-				}
+			} else if (!restrictToolNames && recallsIntoConversation(cfgMemoryBackend.get(settings))) {
+				memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
+					memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
+				);
 			}
 			const recallBlock = memoryRecall && !memoryRecall.hidden ? memoryRecall.text : undefined;
 			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
