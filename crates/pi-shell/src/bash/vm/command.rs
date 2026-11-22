@@ -2406,7 +2406,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				Some(d) if d.phase == DeferPhase::Collect => Some(d.list.clone()),
 				_ => None,
 			};
-			let redirs = redirs.map(|list| {
+			let mut extra = extra_fds(vp);
+			let redirs = redirs.map(|mut list| {
+				super::redir::place_cloexec_sources(vp, &mut list, &mut extra);
 				let name = argv0(vp);
 				ChildRedirs { list, exec_diag: super::redir::diag_prefix(k, cx, vp, line, &name) }
 			});
@@ -2421,7 +2423,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					stdio_spec(&vp.fds.handle(1), true),
 					stdio_spec(&vp.fds.handle(2), true),
 				],
-				extra_fds: extra_fds(vp)
+				extra_fds: extra
 					.iter()
 					.map(|(fd, h)| (*fd, stdio_spec(h, false)))
 					.collect(),
@@ -5172,7 +5174,8 @@ fn stdio_spec(h: &FdRef, output: bool) -> StdioSpec {
 
 fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 	// A close-on-exec fd (`sysopen -o cloexec`, a `zsystem flock` lock) is
-	// not inherited, nor is one the script closed.
+	// not inherited, nor is one the script closed. (Redirections left to the
+	// process may still read one: `redir::place_cloexec_sources`.)
 	vp.fds
 		.iter()
 		.filter(|(fd, h)| {

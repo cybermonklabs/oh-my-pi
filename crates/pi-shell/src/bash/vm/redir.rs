@@ -35,7 +35,7 @@ use super::{
 use crate::bash::{
 	diag::Diag,
 	event::{EventData, RedirInfo, RedirKind, WaitKey},
-	fd::{FdOrigin, FdRef},
+	fd::{FdFlags, FdOrigin, FdRef},
 	fs::{File, FileKind, FsOp, FsPoll, OpenFlags, SeekFrom, StatKind},
 	host::{ChildRedir, OsHandle},
 	ids::{CmdTag, Dialect},
@@ -785,6 +785,58 @@ fn child_fd_open(k: &Kernel, vp: &Vproc, fd: i32) -> bool {
 		ChildRedir::Close { fd: closed } if *closed == fd => false,
 		_ => open,
 	})
+}
+
+/// The close-on-exec fds of `vp` (`sysopen -o cloexec`, a `zsystem flock`
+/// lock) that a duplication of `list` reads (`<&N`, `/dev/fd/N`) before an
+/// entry of it sets or closes them: added to `extra`, the fds the process
+/// is handed, which leave close-on-exec fds out. The process then copies
+/// the vproc's fd, as the child of bash or zsh holds every fd of the shell
+/// until it execs, and not whatever its own `N` is. A `Close` of each ends
+/// `list`, unless an entry set that fd since: the program gets no fd it
+/// would not get had the shell applied the redirections.
+pub(super) fn place_cloexec_sources(
+	vp: &Vproc,
+	list: &mut Vec<ChildRedir>,
+	extra: &mut Vec<(i32, FdRef)>,
+) {
+	let cloexec = |fd: i32| {
+		vp.fds.get(fd).filter(|h| {
+			fd > 2
+				&& h.is_open()
+				&& h.origin() != FdOrigin::Closed
+				&& h.flags().contains(FdFlags::CLOEXEC)
+		})
+	};
+	if !list
+		.iter()
+		.any(|r| matches!(r, ChildRedir::Dup { src, .. } if cloexec(*src).is_some()))
+	{
+		return;
+	}
+	// The fds an entry has set or closed so far (no longer the vproc's),
+	// and those placed here that no entry has set since.
+	let mut set = Vec::new();
+	let mut placed = Vec::new();
+	for r in list.iter() {
+		if let ChildRedir::Dup { src, .. } = r
+			&& !set.contains(src)
+			&& !placed.contains(src)
+			&& let Some(h) = cloexec(*src)
+		{
+			extra.push((*src, h.clone()));
+			placed.push(*src);
+		}
+		let targets: &[i32] = match r {
+			ChildRedir::Open { fds, .. } => fds,
+			ChildRedir::Dup { fd, .. } | ChildRedir::Close { fd } => std::slice::from_ref(fd),
+		};
+		for fd in targets {
+			placed.retain(|p| p != fd);
+			set.push(*fd);
+		}
+	}
+	list.extend(placed.into_iter().map(|fd| ChildRedir::Close { fd }));
 }
 
 /// The open of `target` onto `fds` by the process ([`ChildRedir::Open`]),

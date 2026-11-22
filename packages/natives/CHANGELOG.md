@@ -5,6 +5,7 @@
 ### Fixed
 
 - A background function, `eval` or sourced file whose redirection waits on a FIFO now runs its own commands as bash does: one named by a path (`/bin/cat`, `./prog`), or with an assignment or a redirection of its own, was "command not found" (127).
+- A background command whose redirection waits on a FIFO now reads a close-on-exec descriptor of the shell (`sysopen -o cloexec`) in a later redirection (`> fifo <&$fd`), as zsh does: its process copied an unrelated descriptor of its own.
 
 ## [18.18.6] - 2026-11-09
 

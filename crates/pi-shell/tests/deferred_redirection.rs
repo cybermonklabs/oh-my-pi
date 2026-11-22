@@ -1,12 +1,17 @@
 //! A background job's lone command whose redirection open would wait (a
 //! FIFO without its other end) leaves that open, and the redirections after
 //! it, to the process it spawns, as bash's forked child makes them: the job
-//! has its pid at once. A fault of that path, each row measured against
+//! has its pid at once. Two faults of that path, each row measured against
 //! bash 5.2.21 and 5.3.20 (`bash -c`; the two agree on every row) and zsh
-//! 5.9 (`zsh -f -c`): a command that another runs on the job's vproc (a
-//! function's body, `eval`'s code, a sourced file's) took the job's deferral
-//! for its own. It skipped its name's lookup, so a name with a slash, or one
-//! with an assignment or a redirection of its own, was "command not found".
+//! 5.9 (`zsh -f -c`):
+//!
+//! - A command that another runs on the job's vproc (a function's body,
+//!   `eval`'s code, a sourced file's) took the job's deferral for its own: it
+//!   skipped its name's lookup, so a name with a slash, or one with an
+//!   assignment or a redirection of its own, was "command not found".
+//! - A close-on-exec fd of the shell (`sysopen -o cloexec`) that a redirection
+//!   left to the process reads (`> fifo <&$fd`) was not handed to it, so it
+//!   copied whatever its own fd of that number was.
 //!
 //! Each row runs in a fresh directory ([`files`]) and reads the FIFO with a
 //! `cat` of the shell's into a file, so its output has one order.
@@ -126,11 +131,12 @@ fn wanted(zsh: bool, form: &str, name: &str) -> (String, String) {
 	}
 }
 
-/// The directory a row runs in: `in`, the FIFO `fifo`, `prog` and
+/// The directory a row runs in: `in`, `in2`, the FIFO `fifo`, `prog` and
 /// `sub/prog` (`exec /bin/cat`), `lnk` (a link to `sub/prog`), `lnkdir` (a
 /// link to `sub`) and `noexec` (a script without its execute bits).
 fn files(dir: &Path) {
 	fs::write(dir.join("in"), "hello\n").unwrap();
+	fs::write(dir.join("in2"), "other\n").unwrap();
 	let fifo =
 		std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
 	// SAFETY: `fifo` is a NUL-terminated path that outlives the call.
@@ -261,6 +267,97 @@ fn a_command_run_by_a_deferred_job_resolves_its_own_name() {
 #[test]
 fn a_command_run_by_a_zsh_job_resolves_its_own_name() {
 	check(true, &grid(true));
+}
+
+/// The redirections after the open that waits, each with a close-on-exec
+/// fd as its source, and what zsh 5.9 prints for each.
+const CLOEXEC: [(&str, &str, &str); 9] = [
+	("dup-bg", bg!("/bin/cat > fifo <&$fd"), "s=0\nhello\n"),
+	// The dup first: the shell makes it before the open waits.
+	("dup-first-bg", bg!("/bin/cat <&$fd > fifo"), "s=0\nhello\n"),
+	(
+		"dup-fg",
+		"cat fifo > got & /bin/cat > fifo <&$fd; echo \"s=$?\"; wait; cat got",
+		"s=0\nhello\n",
+	),
+	("dup-file-bg", "/bin/cat > plain <&$fd & wait $!; echo \"s=$?\"; cat plain", "s=0\nhello\n"),
+	("devfd-bg", bg!("/bin/cat > fifo < /dev/fd/$fd"), "s=0\nhello\n"),
+	// The program does not keep the fd (it is close-on-exec).
+	(
+		"kept-bg",
+		bg!(
+			"/bin/sh -c \"cat; if [ -e /dev/fd/$fd ]; then echo kept; else echo gone; fi\" > fifo \
+			 <&$fd"
+		),
+		"s=0\nhello\ngone\n",
+	),
+	// Moved onto stdin (bash's `<&N-`; zsh has none: what bash prints for a
+	// fd that is not close-on-exec).
+	("move-bg", bg!("/bin/cat > fifo <&$fd-"), "s=0\nhello\n"),
+	// A later redirection sets the fd (9): the program keeps that one.
+	("reset-bg", bg!("/bin/sh -c \"cat; cat <&9\" > fifo <&9 9<in2"), "s=0\nhello\nother\n"),
+	// An earlier one sets it: the dup reads that, and the program keeps it.
+	("set-first-bg", bg!("/bin/sh -c \"cat; cat <&9\" > fifo 9<in2 <&9"), "s=0\nother\n"),
+];
+
+/// `CLOEXEC`'s rows, each after `open` makes the fd (`$fd`, or 9 for
+/// the rows that name it), wrapped by `wrap`.
+fn cloexec_rows(
+	open: impl Fn(&str) -> String,
+	wrap: impl Fn(&str) -> String,
+	skip: &[&str],
+) -> Vec<(String, String, String, String)> {
+	CLOEXEC
+		.iter()
+		.filter(|(id, ..)| !skip.contains(id))
+		.map(|&(id, text, out)| {
+			let fd = if text.contains("&9") { "9" } else { "fd" };
+			(id.to_owned(), format!("{}{}", open(fd), wrap(text)), out.to_owned(), String::new())
+		})
+		.collect()
+}
+
+/// A close-on-exec fd (`sysopen -o cloexec`, opened through `emulate zsh`)
+/// that a redirection left to the process reads is the process's to read,
+/// and the program does not keep it, as zsh's child dups it before its exec.
+#[test]
+fn a_deferred_redirection_reads_a_close_on_exec_fd_of_the_shell() {
+	let open = |fd: &str| {
+		format!("emulate zsh -c 'zmodload zsh/system; sysopen -r -o cloexec -u {fd} in'; ")
+	};
+	check(false, &cloexec_rows(open, str::to_owned, &[]));
+}
+
+/// zsh mode: zsh code makes its redirections itself (as zsh 5.9 does, but
+/// `<&$fd-`, which zsh does not take); bash code (`emulate bash`) leaves
+/// them to the process, and reads the fd as zsh's code does.
+#[test]
+fn a_zsh_shell_reads_its_close_on_exec_fd_in_bash_and_zsh_code() {
+	let open = |fd: &str| format!("zmodload zsh/system; sysopen -r -o cloexec -u {fd} in; ");
+	check(true, &cloexec_rows(open, str::to_owned, &["move-bg"]));
+	check(true, &cloexec_rows(open, |text| format!("emulate bash -c '{text}'"), &[]));
+}
+
+/// A fd that is not close-on-exec (`exec {fd}<in`, the same in bash and
+/// zsh) is the program's too.
+#[test]
+#[expect(
+	clippy::literal_string_with_formatting_args,
+	reason = "`exec {fd}<in` is the shell's fd-variable redirection, not Rust formatting."
+)]
+fn a_deferred_redirection_reads_an_inherited_fd_and_the_program_keeps_it() {
+	let open = |fd: &str| {
+		if fd == "9" {
+			"exec 9<in; ".to_owned()
+		} else {
+			"exec {fd}<in; ".to_owned()
+		}
+	};
+	let mut rows = cloexec_rows(open, str::to_owned, &[]);
+	for row in &mut rows {
+		row.2 = row.2.replace("gone", "kept");
+	}
+	check(false, &rows);
 }
 
 /// The bash tool's own shell: a background function's absolute command
