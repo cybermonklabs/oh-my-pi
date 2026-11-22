@@ -2019,6 +2019,13 @@ mod tests {
 	/// chunk at a time. The run must finish within [`STUCK`] with status 0
 	/// and stdout must hold exactly `expect` (byte, count).
 	fn two_writers_finish(command: &str, events: bool, expect: &[(u8, usize)]) {
+		let got = two_writers_read(command, events);
+		assert_eq!(got, expect, "stdout (byte, count) from `{command}`");
+	}
+
+	/// [`two_writers_finish`]'s run; the (byte, count) of each byte on
+	/// stdout.
+	fn two_writers_read(command: &str, events: bool) -> Vec<(u8, usize)> {
 		use std::{io::Write, os::fd::AsRawFd, sync::atomic::AtomicUsize};
 		let command = command
 			.replace("{EXTRA}", &EXTRA.to_string())
@@ -2095,13 +2102,12 @@ mod tests {
 			// A stuck extra's thread waits forever: leave it.
 			runtime.shutdown_background();
 			panic!(
-				"the run never ended ({reached}): stdout held (byte, count) {got:?} of {expect:?} \
-				 from `{command}`"
+				"the run never ended ({reached}): stdout held (byte, count) {got:?} from `{command}`"
 			);
 		};
 		assert_eq!(outcome.unwrap().status, 0);
 		reader.join().unwrap();
-		assert_eq!(counts(&read), expect, "stdout (byte, count) from `{command}`");
+		counts(&read)
 	}
 
 	// Failure mode (review of #111 at bd60965e): a zsh multios tee kept one
@@ -2141,6 +2147,39 @@ mod tests {
 			 >/dev/null'",
 			true,
 			&[(b'0', EXTRA + BUILTIN)],
+		);
+	}
+
+	// Failure mode: a fast-path builtin (`write_now`, bash mode) wrote its
+	// first bytes through a tee with no key and the rest with its vproc's
+	// key, so the tee kept two progresses for one write and wrote the first
+	// bytes again. The tee is the shell's stdout, made in zsh mode by `exec`.
+	#[test]
+	fn fast_path_builtins_through_a_tee_on_the_shells_stdout_write_their_bytes_once() {
+		two_writers_finish(
+			"emulate zsh -c 'exec >&1 >/dev/null'\n{ printf %{EXTRA}s '' & read -r go; printf \
+			 %0{BUILTIN}d 0; wait; }",
+			false,
+			&[(b' ', EXTRA), (b'0', BUILTIN)],
+		);
+	}
+
+	// Failure mode: two vprocs' diagnostics (`flush_out`) through a tee
+	// with no key were one writer to it: each went on from where the other
+	// stopped. The tee is the shell's stderr, made in zsh mode by `exec`;
+	// each diagnostic names a command of `EXTRA` '0's or `BUILTIN` 'Z's.
+	#[test]
+	fn two_vprocs_diagnostics_through_a_tee_on_the_shells_stderr_are_each_written_once() {
+		let got = two_writers_read(
+			"emulate zsh -c 'exec 2>&1 2>/dev/null'\np=$(printf %0{EXTRA}d 0)\nq=$(printf \
+			 %0{BUILTIN}d 0)\n{ \"$p\" & read -r go; \"${q//0/Z}\"; wait; }",
+			false,
+		);
+		let count = |c: u8| got.iter().find(|&&(b, _)| b == c).map_or(0, |&(_, n)| n);
+		assert_eq!(
+			(count(b'0'), count(b'Z'), count(b'\n')),
+			(EXTRA, BUILTIN, 2),
+			"stdout (byte, count): {got:?}"
 		);
 	}
 
