@@ -488,8 +488,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 }
 
 /// `Flow::Return` of an op of a zsh unit: zsh `bin_break` with `retflag`
-/// and `execlist`'s `errexit` handling. Out of line: the bash `run_slice`
-/// path does not carry it.
+/// and `execlist`'s handling of the return as a command: a `!` around it
+/// inverts its status (`execpline`), and a non-zero one runs the ZERR trap
+/// inside the function, then the return goes on (or, under `errexit`, the
+/// shell exits). Out of line: the bash `run_slice` path does not carry it.
 #[inline(never)]
 fn zsh_return_flow(
 	k: &mut Kernel,
@@ -499,7 +501,9 @@ fn zsh_return_flow(
 	status: i32,
 	ignore_errexit: bool,
 ) {
+	let status = (0..zsh_negations(vp)).fold(status, |s, _| i32::from(s == 0));
 	vp.status = status;
+	let before = vp.frames.len();
 	// `${ ;}` ends like a function.
 	let target = vp.frames.iter().rposition(|f| {
 		matches!(
@@ -509,7 +513,14 @@ fn zsh_return_flow(
 				| FrameKind::Script { what: ScriptKind::Source, .. }
 		)
 	});
-	if status != 0 && !ignore_errexit && errexit_on(k, cx, vp) {
+	// Not outside any function or `.` file (zsh exits there at once), nor
+	// after a command since that ran the trap (`donetrap`: the always-list
+	// before a resumed return).
+	let judged = status != 0
+		&& !ignore_errexit
+		&& target.is_some()
+		&& !vp.frames.last().is_some_and(|f| f.err_reported);
+	if judged && errexit_on(k, cx, vp) {
 		// zsh `execlist` after `return N` (N ≠ 0) under `errexit`: the ZERR
 		// trap runs inside the function, then the shell exits.
 		if start_trap(k, vp, cx, TrapKey::Err) {
@@ -517,6 +528,15 @@ fn zsh_return_flow(
 			mark_trap_exit(vp);
 		} else {
 			exit_shell(k, vp, cx, status);
+		}
+	} else if judged && start_trap(k, vp, cx, TrapKey::Err) {
+		// The ZERR trap runs inside the function; the return resumes when
+		// it ends ([`zsh_return`]). The call that ends does not run it
+		// again.
+		set_trap_line(vp, line_of(vp, op.node));
+		mark_return(vp, target.unwrap_or(0));
+		for frame in &mut vp.frames[..before] {
+			frame.err_reported = true;
 		}
 	} else if run_always(k, vp, cx, target.unwrap_or(0), TryEnd::Return(status)) {
 		// The always-list runs first; it resumes the return.
@@ -550,6 +570,35 @@ fn zsh_return_flow(
 		// a non-interactive shell (`zexit`).
 		exit_shell(k, vp, cx, status);
 	}
+}
+
+/// zsh `execpline`'s `WC_SUBLIST_NOT`: how many `!` pipelines the return at
+/// the top frame's pc ends, each of which inverts its status as it ends
+/// (the `Not` ops later in its unit whose pipeline spans the return).
+fn zsh_negations(vp: &Vproc) -> usize {
+	let Some(f) = vp.frames.last() else {
+		return 0;
+	};
+	let Some(unit) = f.unit.as_deref() else {
+		return 0;
+	};
+	let Some(at) = unit
+		.ops
+		.get(f.pc as usize)
+		.and_then(|op| unit.nodes.get(op.node as usize))
+	else {
+		return 0;
+	};
+	unit.ops[f.pc as usize + 1..]
+		.iter()
+		.filter(|o| {
+			o.code == Opcode::Not
+				&& unit
+					.nodes
+					.get(o.node as usize)
+					.is_some_and(|p| p.kind == NodeKind::Pipeline && p.lo <= at.lo && at.hi <= p.hi)
+		})
+		.count()
 }
 
 /// The trap just started exits the shell when it ends (`set -e` after the
@@ -1109,6 +1158,11 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
 			..
 		});
+		// A ZERR trap that a zsh `return N` ran ([`zsh_return_flow`]).
+		let err = matches!(frame.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: TrapKey::Err, .. },
+			..
+		});
 		let eval = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Eval, .. });
 		// zsh `execode` of empty code (`zstyle -e`, `zregexparse`) leaves 0.
 		let code = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Code(_), .. });
@@ -1147,7 +1201,14 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		} else if let Some(status) = status {
 			vp.status = status;
 			if let Some(target) = return_target {
-				unwind(&mut k.root, cx.store, vp, target);
+				// The function or `.` file returns: a RETURN trap's has its
+				// frames left; a zsh `return N` that ran the ZERR trap goes
+				// on ([`zsh_return`]: always-lists, the function's scope).
+				if err {
+					zsh_return(k, vp, cx, status);
+				} else {
+					unwind(&mut k.root, cx.store, vp, target);
+				}
 			} else if debug
 				&& trap_status != 0
 				&& state::option(&mut k.root, cx.store, vp, OptId::Extdebug).unwrap_or(false)
@@ -1991,8 +2052,8 @@ struct TrapEnd {
 	/// The trap a cancellation runs as its last action: the vproc ends
 	/// with this status.
 	cancel:        Option<i32>,
-	/// A RETURN trap: the frame of the function or `.` file it ends, which
-	/// returns once the trap ends.
+	/// A RETURN trap, or the ZERR trap a zsh `return N` ran: the frame of the
+	/// function or `.` file that returns once the trap ends.
 	return_target: Option<usize>,
 }
 
@@ -2018,7 +2079,9 @@ const fn trap_end(kind: &FrameKind) -> Option<TrapEnd> {
 enum TrapLeft {
 	/// On to the loops below.
 	Goes,
-	/// Nowhere: the shell exits, or a cancellation ends the vproc.
+	/// Nowhere: the shell exits, a cancellation ends the vproc, or a zsh
+	/// `return N` that ran the ZERR trap goes on (zsh's return drops the
+	/// `breaks` its trap set).
 	Ends,
 	/// On past the function or `.` file the RETURN trap ended, which has
 	/// returned: bash's `breaking` outlives the return and skips its
@@ -2029,8 +2092,9 @@ enum TrapLeft {
 /// A `break`/`continue` has left a trap action (`end`): as at the action's
 /// end ([`next_command`]), a DEBUG trap puts zsh's `ERR_EXIT` back, the
 /// interrupted command's status comes back, an ERR trap `set -e` ran still
-/// ends the shell with it, a cancellation's trap still ends the vproc, and
-/// the function or `.` file a RETURN trap ends returns.
+/// ends the shell with it, a cancellation's trap still ends the vproc, the
+/// function or `.` file a RETURN trap ends returns, and so does a zsh
+/// `return N` whose ZERR trap it was.
 fn leave_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, end: Option<TrapEnd>) -> TrapLeft {
 	let Some(TrapEnd { key, status, exit, cancel, return_target }) = end else {
 		return TrapLeft::Goes;
@@ -2048,6 +2112,10 @@ fn leave_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, end: Option<TrapE
 		return TrapLeft::Ends;
 	}
 	match return_target {
+		Some(_) if key == TrapKey::Err => {
+			zsh_return(k, vp, cx, status);
+			TrapLeft::Ends
+		},
 		Some(target) => {
 			unwind(&mut k.root, cx.store, vp, target);
 			TrapLeft::Returned
@@ -5100,12 +5168,16 @@ fn return_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, target: usize) -
 	true
 }
 
+/// The trap just started ends frame `target` when it ends: a RETURN trap's
+/// function or `.` file, or the one a zsh `return N` that ran the ZERR trap
+/// leaves. Its frame is the innermost trap frame (a zsh `TRAPZERR`
+/// function runs above it).
 fn mark_return(vp: &mut Vproc, target: usize) {
-	if let Some(Frame {
-		kind: FrameKind::Script { what: ScriptKind::Trap { return_target, .. }, .. },
-		..
-	}) = vp.frames.last_mut()
-	{
+	let trap = vp.frames.iter_mut().rev().find_map(|f| match &mut f.kind {
+		FrameKind::Script { what: ScriptKind::Trap { return_target, .. }, .. } => Some(return_target),
+		_ => None,
+	});
+	if let Some(return_target) = trap {
 		*return_target = Some(target);
 	}
 }

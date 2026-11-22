@@ -419,8 +419,9 @@ const BASH_TRAP_SHAPES: &[(&str, &str)] = &[
 ];
 
 /// The trap shapes only zsh has, `trap/own/<name>`: a DEBUG trap's `break`
-/// puts `ERR_EXIT` back (zsh turns it off while the trap runs), and a
-/// `TRAPZERR` function's `break` leaves the loop.
+/// puts `ERR_EXIT` back (zsh turns it off while the trap runs), a
+/// `TRAPZERR` function's `break` leaves the loop, and the `break` of the
+/// ZERR trap a `return N` runs is dropped by the return.
 const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 	(
 		"debug-errexit-break",
@@ -445,6 +446,12 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 	(
 		"trapzerr-break-errexit",
 		"setopt errexit; TRAPZERR() { echo t; break; }; for i in 1 2; do echo a$i; false; echo b$i; \
+		 done; echo e:$?",
+	),
+	// The ZERR trap a `return N` runs: the return drops the `break`.
+	(
+		"zerr-break-on-return",
+		"trap 'echo t; break' ZERR; f() { return 2; }; for i in 1 2; do echo a$i; f; echo b$i; \
 		 done; echo e:$?",
 	),
 ];
@@ -538,25 +545,43 @@ const ERR_SHAPES: &[(&str, &str)] = &[
 	("for-and-first-false", "for i in 1; do false && true; done"),
 	("case-and-first-false", "case x in x) false && true;; esac"),
 	("function-and-first-false", "f() { false && true; }; f"),
-];
-
-/// The ERR shapes only bash runs here. zsh runs ZERR for the status a
-/// function returns, and once for a pipeline whose last element fails;
-/// obash in zsh mode does neither (older than these rows, not this cause).
-const BASH_ERR_SHAPES: &[(&str, &str)] = &[
 	("function-false-then-return", "f() { false; return 2; }; f"),
-	("pipeline-last-false", "true | false"),
 ];
 
-/// The ERR shapes only zsh has: `{ } always { }` is judged at its end like a
-/// command, unless a command since ran the trap (the always-list's own
-/// failure).
+/// The ERR shapes only bash runs here. zsh runs ZERR once for a pipeline
+/// whose last element fails; obash in zsh mode runs it twice (older than
+/// these rows, not this cause).
+const BASH_ERR_SHAPES: &[(&str, &str)] = &[("pipeline-last-false", "true | false")];
+
+/// The ERR shapes only zsh has. `{ } always { }` is judged at its end like
+/// a command, unless a command since ran the trap (the always-list's own
+/// failure). `return N` (N ≠ 0) is a failed command: the ZERR trap runs
+/// inside the function, then the call is not judged again; a `!` around
+/// the return inverts its status.
 const ZSH_ERR_SHAPES: &[(&str, &str)] = &[
 	("always-false-true", "{ false } always { true }"),
 	("always-false-false", "{ false } always { false }"),
 	("always-true-false", "{ true } always { false }"),
 	("always-and-first-false", "{ false && true } always { true }"),
 	("always-in-function", "f() { { false } always { echo al } }; f"),
+	("false-then-return-noarg", "f() { false; return; }; f"),
+	("or-return", "f() { false || return 2; }; f"),
+	("return-in-condition", "f() { return 2; }; if f; then :; fi"),
+	("return-in-or-list", "f() { return 2; }; f || echo or"),
+	("return-in-loop", "f() { for i in 1; do return 3; done; }; f"),
+	("false-then-return-0", "f() { false; return 0; }; f"),
+	("always-return", "f() { { return 2 } always { echo al } }; f"),
+	("always-return-false", "f() { { return 2 } always { false } }; f"),
+	("return-sees-local", "trap 'echo T$?:$v' ZERR; f() { local v=in; return 2; }; f"),
+	("not-return", "f() { ! return 2; }; f"),
+	("not-return-0", "f() { ! return 0; }; f"),
+	("not-group-return", "f() { ! { return 2; }; }; f"),
+	("not-if-return", "f() { ! if true; then return 2; fi; }; f"),
+	("and-not-return", "f() { true && ! return 2; }; f"),
+	("return-in-pipeline", "f() { true | return 2; echo no; }; f"),
+	("return-top-level", "return 2"),
+	("function-trap-false-then-return", "TRAPZERR() { echo F$?; }; f() { false; return 2; }; f"),
+	("source-false-then-return", ". =(print 'false; return 4')"),
 ];
 
 /// The ERR rows, `err/<n|e>/<name>`: each shape after `trap 'echo T$?'
