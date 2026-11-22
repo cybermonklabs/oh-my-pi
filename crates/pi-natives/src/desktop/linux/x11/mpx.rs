@@ -1137,10 +1137,17 @@ fn start_ticks(stat: &str) -> Option<u64> {
 }
 
 /// Start time of process `pid`. A zombie counts as gone: it owns nothing
-/// anymore, and one its parent never reaps would pin its masters forever.
+/// anymore, and one its parent never reaps would pin its masters forever. A
+/// leader that reads `Z` while the thread count (`num_threads`, field 20) is
+/// above one is no zombie: it exited before another thread of its process,
+/// which still runs (or is exiting) and owns its masters. The count includes
+/// the exited leader and every thread not yet released, on Linux and under
+/// gVisor alike.
 fn process_start(pid: u32) -> io::Result<u64> {
 	let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-	if matches!(stat_fields(&stat).and_then(|mut fields| fields.next()), Some("Z" | "X")) {
+	let state = stat_fields(&stat).and_then(|mut fields| fields.next());
+	let threads = stat_fields(&stat).and_then(|mut fields| fields.nth(17)?.parse::<u32>().ok());
+	if state == Some("X") || (state == Some("Z") && threads.is_none_or(|count| count <= 1)) {
 		return Err(io::ErrorKind::NotFound.into());
 	}
 	start_ticks(&stat)
@@ -1175,6 +1182,141 @@ mod tests {
 		assert!(peer(OWNER.pid, 1).is_stale_for(&OWNER, gone), "earlier incarnation of our pid");
 		let foreign = Owner { domain: 1, ..peer(99, 5) };
 		assert!(!foreign.is_stale_for(&OWNER, gone), "other machine or namespace");
+	}
+
+	/// Set by [`LeaderGone::start`] for its child: `leader_exits_first` does
+	/// nothing without it, so `--include-ignored` cannot end the leader of
+	/// the test runner itself.
+	const HELPER: &str = "PI_NATIVES_LEADER_EXIT_HELPER";
+
+	/// The child process of [`LeaderGone`]: its leader thread exits, from a
+	/// SIGUSR1 handler this test body sends it, while this thread runs on.
+	/// libtest runs the body on a thread of its own, so the leader is free.
+	#[test]
+	#[ignore = "run in a child process by LeaderGone::start"]
+	fn leader_exits_first() {
+		extern "C" fn end_this_thread(_: libc::c_int) {
+			// SAFETY: ends the calling thread alone; the process runs on.
+			unsafe { libc::syscall(libc::SYS_exit, 0) };
+		}
+		if std::env::var_os(HELPER).is_none() {
+			return;
+		}
+		// SAFETY: a handler for a signal only this process sends itself.
+		unsafe { libc::signal(libc::SIGUSR1, end_this_thread as libc::sighandler_t) };
+		let me = std::process::id() as i32;
+		// SAFETY: plain syscall; the leader's thread id is the process id.
+		unsafe { libc::syscall(libc::SYS_tgkill, me, me, libc::SIGUSR1) };
+		loop {
+			std::thread::park();
+		}
+	}
+
+	/// A child process whose leader thread has exited while another thread
+	/// runs; killed and reaped on drop.
+	struct LeaderGone(std::process::Child);
+
+	impl LeaderGone {
+		fn start() -> Self {
+			let child = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--ignored", "--exact", "desktop::linux::x11::mpx::tests::leader_exits_first"])
+				.env(HELPER, "1")
+				.stdout(std::process::Stdio::null())
+				.stderr(std::process::Stdio::null())
+				.spawn()
+				.unwrap();
+			let gone = Self(child);
+			// The helper's leader exits within milliseconds of its start; the
+			// bound only keeps a broken helper from hanging the suite.
+			wait_for_zombie_line(gone.pid(), "the helper's leader exits");
+			let status = fs::read_to_string(format!("/proc/{}/status", gone.pid())).unwrap();
+			assert!(
+				status.lines().any(|l| l
+					.strip_prefix("Threads:")
+					.is_some_and(|n| n.trim().parse::<u32>().is_ok_and(|n| n > 1))),
+				"the helper kept no live thread (did --exact select leader_exits_first?): {status}"
+			);
+			gone
+		}
+
+		fn pid(&self) -> u32 {
+			self.0.id()
+		}
+
+		/// Kills the child without reaping it, and returns once every thread
+		/// of it has exited: its pidfd turns readable then.
+		fn kill_unreaped(&mut self) {
+			self.0.kill().unwrap();
+			// SAFETY: pidfd_open takes scalar arguments; the child is unreaped,
+			// so its pid names it.
+			let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid(), 0) } as libc::c_int;
+			assert!(fd >= 0, "pidfd_open: {}", io::Error::last_os_error());
+			let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+			// SAFETY: one valid pollfd for the call; 30 s only bounds a hang.
+			let ready = unsafe { libc::poll(&raw mut poll, 1, 30_000) };
+			// SAFETY: the pidfd is ours to close.
+			unsafe { libc::close(fd) };
+			assert_eq!(ready, 1, "the killed child's threads did not all exit in 30 s");
+		}
+	}
+
+	impl Drop for LeaderGone {
+		fn drop(&mut self) {
+			let _ = self.0.kill();
+			let _ = self.0.wait();
+		}
+	}
+
+	/// Waits until `/proc/<pid>/stat` shows `Z`.
+	fn wait_for_zombie_line(pid: u32, what: &str) {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		while fs::read_to_string(format!("/proc/{pid}/stat"))
+			.ok()
+			.and_then(|stat| stat_fields(&stat)?.next().map(str::to_owned))
+			.as_deref()
+			!= Some("Z")
+		{
+			assert!(std::time::Instant::now() < deadline, "{what}: no Z line in 30 s");
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+	}
+
+	/// The current owner in these tests: no process can hold its pid, so a
+	/// child judged against it is never taken for this process.
+	const CURRENT: Owner = Owner { pid: u32::MAX, ..OWNER };
+
+	fn owner_of(pid: u32) -> Owner {
+		let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+		Owner { pid, start: start_ticks(&stat).unwrap(), ..OWNER }
+	}
+
+	#[test]
+	fn a_live_owner_whose_leader_has_exited_keeps_its_masters() {
+		let gone = LeaderGone::start();
+		let owner = owner_of(gone.pid());
+		assert!(
+			!owner.is_stale_for(&CURRENT, process_start),
+			"reap_orphans would remove a live owner's masters"
+		);
+	}
+
+	/// The controls: an owner with nothing but its exited leader left is
+	/// gone, whether it had one thread or several.
+	#[test]
+	fn an_owner_with_only_its_exited_leader_left_is_stale() {
+		let mut child = std::process::Command::new("/bin/sleep")
+			.arg("0.2")
+			.spawn()
+			.unwrap();
+		let owner = owner_of(child.id());
+		wait_for_zombie_line(owner.pid, "sleep exits");
+		assert!(owner.is_stale_for(&CURRENT, process_start), "a zombie owner's masters are removed");
+		assert!(child.wait().unwrap().success());
+
+		let mut gone = LeaderGone::start();
+		let owner = owner_of(gone.pid());
+		gone.kill_unreaped();
+		assert!(owner.is_stale_for(&CURRENT, process_start), "after every thread exited");
 	}
 
 	#[test]
