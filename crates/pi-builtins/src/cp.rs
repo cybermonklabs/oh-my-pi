@@ -5409,13 +5409,16 @@ mod tests {
 	/// The probe matrix: `cp` across its operand forms (the source's own entry
 	/// by several names, a directory target, `-t`), the options that decide
 	/// what happens to an existing destination (`-f`, `-i`, `-u`, `-b`,
-	/// `--backup=numbered`, `-l`, `-s`, `-P`, `-L`, `-R`,
-	/// `--remove-destination`, alone and together) and the destination's kind
-	/// (none, a file, another link of the source, a link to the source, to
-	/// another file or to nothing, a directory; a directory copied into
-	/// itself). Each row of `cp-gnu-matrix.txt` is what GNU cp 9.7 does on a
-	/// Linux kernel, the same as uid 1000 and as root: its exit status,
-	/// standard error, and every entry on disk after it. GNU 9.4 gives the same
+	/// `--backup=numbered`, `-l`, `-s`, `-P`, `-L`, `-R`, `-a`, `-d`,
+	/// `--preserve=links`, `--attributes-only`, `--remove-destination`, alone and
+	/// together, `-u` with `-l`, `-s`, `-i`, `-R` and `--attributes-only`) and
+	/// the destination's kind (none, a file, another link of the source,
+	/// another link of a third file, a link to the source, to another file or
+	/// to nothing, a directory; a directory copied into itself). Each row of
+	/// `cp-gnu-matrix.txt` is what GNU cp 9.7 does on a Linux kernel, the same
+	/// as uid 1000 and as root: its exit status, standard error, and every
+	/// entry on disk after it. `cp-gnu-matrix.sh`, next to it, makes the rows
+	/// again from a GNU build (its header says how). GNU 9.4 gives the same
 	/// rows, but for leaving the source's name out of "cannot overwrite
 	/// directory 'a~' with non-directory". A row in `STATED` differs from GNU,
 	/// as the CHANGELOG states, with GNU's message, where GNU loses data and
@@ -5445,45 +5448,101 @@ mod tests {
 		// GNU loses data.
 		#[rustfmt::skip]
 		const STATED: &[(&str, i32, &str, &str)] = &[
+			("into-dir-ex/s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/un-s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/un-s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/un-s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
 			("src-l-same/rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/L-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/L-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/L-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-rd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-rdf", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-frd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/iy-rd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/iy-rdf", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/iy-frd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/un-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/un-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-same/un-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-same/l-rd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-same/l-rdf", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-same/l-frd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-rd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-rdf", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-frd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/ao-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/ao-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/ao-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-ao-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-ao-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-ao-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-iy-rd", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-iy-rdf", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-iy-frd", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-iy-rd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-iy-rdf", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-iy-frd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-iy-rd", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-iy-rdf", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-l-iy-frd", 1, "cp: overwrite 'l'? cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/pl-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/pl-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/pl-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-R-l-rd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-R-l-rdf", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-R-l-frd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/L-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/L-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/L-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-rd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-rdf", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-frd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/iy-rd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/iy-rdf", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/iy-frd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/un-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/un-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
 			("src-l-dot/un-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-dot/l-rd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-dot/l-rdf", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
-			("src-l-dot/l-frd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-rd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-rdf", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-frd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/ao-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/ao-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/ao-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-ao-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-ao-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-ao-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-iy-rd", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-iy-rdf", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-iy-frd", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-iy-rd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-iy-rdf", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-iy-frd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-iy-rd", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-iy-rdf", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-l-iy-frd", 1, "cp: overwrite './l'? cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/pl-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/pl-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/pl-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-R-l-rd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-R-l-rdf", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-R-l-frd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
 			("own-same-bk-link/fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
 			("own-same-bk-link/P-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
 			("own-same-bk-link/L-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
 			("own-same-bk-link/R-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
 			("own-same-bk-link/iy-fb", 0, "cp: overwrite 'a~'? ", " a=A#1 a~=A#1 o=O#1"),
 			("own-same-bk-link/un-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
-			("into-dir-ex/s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
-			("into-dir-ex/s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
-			("into-dir-ex/s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("own-same-bk-link/un-iy-fb", 0, "cp: overwrite 'a~'? ", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/un-R-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/a-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/d-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/pl-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
 			("dir-self/R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self/R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self/R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
@@ -5496,6 +5555,42 @@ mod tests {
 			("dir-self/R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self/R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self/R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/a-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/u-R-l-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self-t/R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self-t/R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self-t/R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
@@ -5508,6 +5603,48 @@ mod tests {
 			("dir-self-t/R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self-t/R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
 			("dir-self-t/R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/a-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/u-R-l-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("hard-other-in-dir/s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
+			("hard-other-in-dir/s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
+			("hard-other-in-dir/s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
+			("hard-other-in-dir/un-s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
+			("hard-other-in-dir/un-s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
+			("hard-other-in-dir/un-s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 c=B#2 d=dir d/a=B#2"),
 		];
 		let set_time = |path: &Path, secs: i64, follow: bool| {
 			let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -5688,6 +5825,176 @@ mod tests {
 			assert_eq!((code, capture.err()), (1, err), "cp {}", args.join(" "));
 			assert_eq!(fs::read_to_string(root.path().join("b")).unwrap(), "B", "cp {}: the destination", args.join(" "));
 		}
+	}
+
+	/// A FIFO or a device as the source, copied onto an existing destination,
+	/// as GNU cp 9.4 and 9.7 copy it (the same as uid 1000 and as root): where
+	/// cp never follows links (`-R`, `-a`) and the source is not a regular
+	/// file, GNU removes the destination before it writes (`copy.c`), so another
+	/// link of it, and a file a link there leads to, keep their data; without
+	/// `-R` it writes into the destination. While a row runs, the test opens and
+	/// closes the FIFO's write end, so a cp that opens it for reading reads
+	/// end-of-file.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_special_source_replaces_the_destination_where_gnu_removes_it_first() {
+		use std::{
+			os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _},
+			path::Path,
+		};
+		// Source (`fifo`, a FIFO `p`; `null`, `/dev/null`), destination (`link`,
+		// a link to `b`; `other-link`, another link of `b`; `dir-link`, a link to
+		// `../b` in the target directory `d`; `regular`; `none`), the options,
+		// and GNU's exit status and entries after it (standard error is empty).
+		#[rustfmt::skip]
+		let cases: [(&str, &str, &[&str], i32, &str); 30] = [
+			("fifo", "link", &["-R", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "link", &["--copy-contents"], 0, " b=#1 p=fifo p.dst=link:b"),
+			("fifo", "link", &["-a", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "link", &["-R"], 0, " b=B#1 p=fifo p.dst=fifo"),
+			("fifo", "other-link", &["-R", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "other-link", &["--copy-contents"], 0, " b=#2 p=fifo p.dst=#2"),
+			("fifo", "other-link", &["-a", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "other-link", &["-R"], 0, " b=B#1 p=fifo p.dst=fifo"),
+			("fifo", "dir-link", &["-R", "--copy-contents"], 0, " b=B#1 d=dir d/p=#1 p=fifo"),
+			("fifo", "dir-link", &["--copy-contents"], 0, " b=#1 d=dir d/p=link:../b p=fifo"),
+			("fifo", "dir-link", &["-a", "--copy-contents"], 0, " b=B#1 d=dir d/p=#1 p=fifo"),
+			("fifo", "dir-link", &["-R"], 0, " b=B#1 d=dir d/p=fifo p=fifo"),
+			("fifo", "regular", &["-R", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "regular", &["--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "regular", &["-a", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "regular", &["-R"], 0, " b=B#1 p=fifo p.dst=fifo"),
+			("fifo", "none", &["-R", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "none", &["--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "none", &["-a", "--copy-contents"], 0, " b=B#1 p=fifo p.dst=#1"),
+			("fifo", "none", &["-R"], 0, " b=B#1 p=fifo p.dst=fifo"),
+			("null", "link", &["-R", "--copy-contents"], 0, " b=B#1 null.dst=#1"),
+			("null", "link", &["--copy-contents"], 0, " b=#1 null.dst=link:b"),
+			("null", "other-link", &["-R", "--copy-contents"], 0, " b=B#1 null.dst=#1"),
+			("null", "other-link", &["--copy-contents"], 0, " b=#2 null.dst=#2"),
+			("null", "dir-link", &["-R", "--copy-contents"], 0, " b=B#1 d=dir d/null=#1"),
+			("null", "dir-link", &["--copy-contents"], 0, " b=#1 d=dir d/null=link:../b"),
+			("null", "regular", &["-R", "--copy-contents"], 0, " b=B#1 null.dst=#1"),
+			("null", "regular", &["--copy-contents"], 0, " b=B#1 null.dst=#1"),
+			("null", "none", &["-R", "--copy-contents"], 0, " b=B#1 null.dst=#1"),
+			("null", "none", &["--copy-contents"], 0, " b=B#1 null.dst=#1"),
+		];
+		// Every entry below `dir`, as `find | sort` names it.
+		fn listing(dir: &Path) -> String {
+			fn walk(dir: &Path, rel: &Path, out: &mut Vec<std::path::PathBuf>) {
+				for entry in fs::read_dir(dir.join(rel)).unwrap() {
+					let name = rel.join(entry.unwrap().file_name());
+					let is_dir = fs::symlink_metadata(dir.join(&name)).unwrap().is_dir();
+					out.push(name.clone());
+					if is_dir {
+						walk(dir, &name, out);
+					}
+				}
+			}
+			let mut names = Vec::new();
+			walk(dir, Path::new(""), &mut names);
+			names.sort();
+			names
+				.iter()
+				.map(|name| {
+					let path = dir.join(name);
+					let metadata = fs::symlink_metadata(&path).unwrap();
+					let shown = name.display();
+					if metadata.is_symlink() {
+						format!(" {shown}=link:{}", fs::read_link(&path).unwrap().display())
+					} else if metadata.file_type().is_fifo() {
+						format!(" {shown}=fifo")
+					} else if metadata.is_dir() {
+						format!(" {shown}=dir")
+					} else {
+						format!(" {shown}={}#{}", fs::read_to_string(&path).unwrap(), metadata.nlink())
+					}
+				})
+				.collect()
+		}
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (source, kind, flags, code, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("b"), "B").unwrap();
+			let (operand, name) = match source {
+				"fifo" => {
+					let path = std::ffi::CString::new(dir.join("p").into_os_string().into_encoded_bytes()).unwrap();
+					// SAFETY: `path` is a NUL-terminated path that outlives the call.
+					assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "mkfifo");
+					("p", "p")
+				},
+				_ => ("/dev/null", "null"),
+			};
+			let dst = format!("{name}.dst");
+			let target = match kind {
+				"link" => {
+					std::os::unix::fs::symlink("b", dir.join(&dst)).unwrap();
+					dst
+				},
+				"other-link" => {
+					fs::hard_link(dir.join("b"), dir.join(&dst)).unwrap();
+					dst
+				},
+				"dir-link" => {
+					fs::create_dir(dir.join("d")).unwrap();
+					std::os::unix::fs::symlink("../b", dir.join("d").join(name)).unwrap();
+					"d".to_owned()
+				},
+				"regular" => {
+					fs::write(dir.join(&dst), "R").unwrap();
+					dst
+				},
+				_ => dst,
+			};
+			let args: Vec<&str> = flags.iter().copied().chain([operand, target.as_str()]).collect();
+			let (row_done, done) = std::sync::mpsc::channel::<()>();
+			let fifo = dir.join("p");
+			let guard = (source == "fifo").then(|| {
+				std::thread::spawn(move || {
+					while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+						done.recv_timeout(std::time::Duration::from_millis(10))
+					{
+						// Opens without waiting only once cp has the FIFO open
+						// for reading; closing it at once gives cp end-of-file.
+						let _ = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo);
+					}
+				})
+			});
+			let (got, capture) = run_util::<Cp>(&args, "", &dir);
+			drop(row_done);
+			if let Some(guard) = guard {
+				guard.join().unwrap();
+			}
+			let found = (got, capture.err(), listing(&dir));
+			if found != (code, String::new(), after.to_owned()) {
+				failures.push(format!("{source} {kind}: cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
+	/// `link_over` makes the new link at a fresh name and renames it over the
+	/// destination. Where the destination is already a link of the same file,
+	/// Linux's rename does nothing and leaves the fresh name, which `link_over`
+	/// then removes, as GNU's `force_linkat` does. cp does nothing before it
+	/// links a source onto its own file, so the test calls `link_over` itself.
+	#[cfg(unix)]
+	#[test]
+	fn link_over_leaves_no_fresh_name_where_the_rename_does_nothing() {
+		let dir = tempdir().unwrap();
+		let original = dir.path().join("a");
+		let dest = dir.path().join("b");
+		fs::write(&original, "A").unwrap();
+		fs::hard_link(&original, &dest).unwrap();
+		let filesystem = pi_vfs::BlockingFs::native();
+		super::link_over(&filesystem, &dest, true, |at| filesystem.hard_link(&original, at)).unwrap();
+		let mut names: Vec<_> =
+			fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+		names.sort();
+		assert_eq!(names, ["a", "b"], "the entries after link_over");
+		assert_eq!(fs::metadata(&dest).unwrap().len(), 1, "b");
 	}
 
 	/// The backup copy of `cp -fb a a` never writes through a symbolic link
