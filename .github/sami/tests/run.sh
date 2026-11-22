@@ -211,8 +211,9 @@ own_default() {
 # and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY, IGN_ROOT_BODY, STICKY_BODY
 # and STICKY_ROOT_BODY (the stub's answer to those invocations), OWN_TESTS and
 # OWN_PRINTS (for own_default), MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS,
-# STICKY_FIFO (`none`: RUST_TEST_STICKY_FIFO names no FIFO), NOT_MSG (a regex
-# the output must not match).
+# STICKY_FIFO (`none`: RUST_TEST_STICKY_FIFO names no FIFO), JQ_FAIL (jq exits
+# 5 after any run whose arguments hold this text), NOT_MSG (a regex the output
+# must not match).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -411,6 +412,13 @@ EOF
 	mkdir -p "$w/sticky"
 	mkfifo "$fifo"
 	[ "${STICKY_FIFO:-}" != none ] || fifo=""
+	if [ -n "${JQ_FAIL:-}" ]; then
+		local real_jq
+		real_jq="$(PATH="${TOOLBIN:+$TOOLBIN:}$PATH" command -v jq)"
+		printf '%s' "$JQ_FAIL" >"$w/jq-fail"
+		printf '#!/bin/sh\n"%s" "$@"; rc=$?\ncase "$*" in *"$(cat "%s")"*) exit 5 ;; esac\nexit $rc\n' "$real_jq" "$w/jq-fail" >"$w/bin/jq"
+		chmod +x "$w/bin/jq"
+	fi
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
 		RUST_TEST_STICKY_FIFO="$fifo" \
@@ -701,6 +709,11 @@ CARGO_MODE=doc-typed-suite run J136-doctest-prints-typed-suite-object 1 "crates/
 run J137-bench-typed-object-is-output 1 "$D wrote 1 lines outside libtest's record" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"type\": \"bench\", \"name\": \"x\", \"note\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
 run J138-array-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: \\[\"no free port: nothing to test\"\\]" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '[\"no free port: nothing to test\"]'; } >\"\$bep\"; exit 0"
 run J139-number-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: 42" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '42'; } >\"\$bep\"; exit 0"
+# A log jq cannot read to its end (jq fails on outside_record's filter): the
+# step fails, and says so in the job log, for a Bazel log and for a cargo log
+# (the cargo workspaces' and the doctest run's), not inside a raw-output error.
+JQ_FAIL='else $l end' NOT_MSG="lines outside libtest's record that" run J140-jq-error-on-a-bazel-log-fails-in-the-job-log 1 "^::error title=Rust tests::jq could not read .*/logs/[0-9]+\\.log to its end" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+JQ_FAIL='else $l end' NOT_MSG="lines outside libtest's record that" run J141-jq-error-on-a-cargo-log-fails-in-the-job-log 1 "^::error title=Rust tests::jq could not read .*/logs/cargo-[0-9]+\\.log to its end" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
