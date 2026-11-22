@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -7,6 +8,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 const probePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-probe.ts");
 const healthProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-health-probe.ts");
 const cjsProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cjs-cache-probe.ts");
+const lockProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-lock-probe.ts");
 const tempDirs: TempDir[] = [];
 
 async function runProbe(cacheRoot: string, script: string = probePath, args: string[] = []): Promise<string> {
@@ -162,3 +164,20 @@ test("oversized-cache eviction keeps the parse cache usable when a concurrent pr
 		concurrent.close();
 	}
 });
+
+// The lock shim (issue #15586) exists only on Linux, and `/proc/locks` is how the test reads lock kinds;
+// gVisor has no `/proc/locks`, so the test is skipped there.
+test.skipIf(process.platform !== "linux" || !existsSync("/proc/locks"))(
+	"the parse cache takes open-file-description locks in a process that did not start through the CLI",
+	async () => {
+		const tempDir = TempDir.createSync("@legacy-pi-extension-cache-locks-");
+		tempDirs.push(tempDir);
+		const cacheRoot = tempDir.path();
+		await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
+
+		// A CLI process holds this cache with open-file-description locks; POSIX locks here on the same
+		// file do not see those everywhere (gVisor), and each statement then waits out SQLite's protocol.
+		const { kinds } = JSON.parse(await runProbe(cacheRoot, lockProbePath)) as { kinds: string[] };
+		expect(kinds).toEqual(["OFDLCK"]);
+	},
+);
