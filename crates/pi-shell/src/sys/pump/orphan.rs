@@ -60,7 +60,8 @@ pub fn poll(cx: &Context<'_>) {
 	if work.is_empty() {
 		return;
 	}
-	orphans.wakers.add(cx.waker());
+	// Whether the set was empty does not matter: the work is polled below.
+	let _ = orphans.wakers.add(cx.waker());
 	// Polled outside the lock: work finishing here may adopt more.
 	let mut ocx = Context::from_waker(&orphans.waker);
 	work.retain_mut(|w| w.as_mut().poll(&mut ocx).is_pending());

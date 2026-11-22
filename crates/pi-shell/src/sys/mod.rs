@@ -47,6 +47,8 @@ mod ready;
 pub mod regex;
 mod relay;
 pub mod rlimit;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod room;
 pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
@@ -56,6 +58,7 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;

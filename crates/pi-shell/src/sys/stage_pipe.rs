@@ -6,14 +6,20 @@
 //! the externals inherit them. The shell never reads or writes through them:
 //! when the pipe is made it opens a second, non-blocking open file
 //! description of each end, and every engine handle of an end shares that
-//! description. A stage of shell code then takes what the pipe holds or has
-//! room for and is woken by the readiness thread for the rest, never waiting
-//! in the kernel, while the descriptions the externals share stay blocking
-//! (`O_NONBLOCK` belongs to the description). All the tasks waiting on an end
-//! (the engine's vprocs, which share one waker, an extra's fd, a host feed)
-//! share one readiness wait, which wakes them all once the end is ready, as
-//! the memory pipe wakes all its waiters; a waiting task is only ever
-//! forgotten by waking it.
+//! description. A stage of shell code reads what the pipe holds and is woken
+//! by the readiness thread for the rest, never waiting in the kernel on the
+//! engine's thread, while the descriptions the externals share stay blocking
+//! (`O_NONBLOCK` belongs to the description). All the tasks waiting for an
+//! end to poll ready (the engine's vprocs, which share one waker, an extra's
+//! fd, a host feed) are woken together, as the memory pipe wakes all its
+//! waiters, and a waiting task is only ever forgotten by waking it. On Linux
+//! a write the pipe cannot take now is made by the write end's own thread
+//! through a blocking description, which the kernel wakes only once the
+//! write fits (`sys::room`): polling writable does not mean that under
+//! gVisor, and waking for each byte a slow reader frees costs a CPU there.
+//! macOS has no such thread (no second description of its unlinked FIFO can
+//! be opened): there a write the pipe cannot take now waits for the end to
+//! select writable.
 //!
 //! - Linux: an anonymous pipe, whose ends are reopened once through
 //!   `/proc/self/fd/N`. Where they cannot be (no `/proc` mounted) no OS pipe is
@@ -70,12 +76,14 @@ mod imp {
 		},
 		ptr,
 		sync::Arc,
-		task::{Context, Poll, Wake, Waker},
+		task::{Context, Poll, Waker},
 	};
 
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	use crate::sys::room::Room;
 	use crate::{
 		bash::{File, FileKind, OsHandle, Stat},
-		sys::ready,
+		sys::{ready, wakers::Wakers},
 	};
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
@@ -384,68 +392,52 @@ mod imp {
 		}
 	}
 
-	/// Most wakers one end keeps waiting at once. Past it, every stored waker
-	/// is woken and forgotten: a live task polls again and waits anew, and the
-	/// waker of a task dropped while it waited goes. However many wait, an end
-	/// holds one registration on the readiness thread.
-	const MAX_WAITERS: usize = 64;
-
-	/// The tasks waiting on one private end, all woken together, as the memory
-	/// pipe wakes all its waiters. Every engine vproc polls with the engine's
-	/// one waker, so one stored waker can stand for several vprocs: a waker is
-	/// only ever removed by waking it.
-	#[derive(Default)]
-	struct Waiters {
-		wakers: Vec<Waker>,
-		/// The readiness thread holds a watch with this set's waker. It
-		/// forgets the watch when it fires, which clears this.
-		armed:  bool,
-	}
-
-	/// The waker the readiness thread holds for one private end: it wakes
-	/// every task waiting on the end.
-	#[derive(Default)]
-	struct Fanout(parking_lot::Mutex<Waiters>);
-
-	impl Wake for Fanout {
-		fn wake(self: Arc<Self>) {
-			self.wake_by_ref();
-		}
-
-		fn wake_by_ref(self: &Arc<Self>) {
-			let wakers = {
-				let mut w = self.0.lock();
-				w.armed = false;
-				std::mem::take(&mut w.wakers)
-			};
-			for w in wakers {
-				w.wake();
-			}
-		}
-	}
-
-	/// A private non-blocking description of one end. Its I/O takes what is
-	/// there and returns `Pending` for the rest, with the polling task's waker
-	/// stored until the readiness thread finds the end ready.
+	/// A private non-blocking description of one end. Its reads take what is
+	/// there and return `Pending` for the rest, with the polling task's waker
+	/// stored until the end is readable; on Linux a write that would wait is
+	/// made by the end's `Room` thread, which the kernel wakes once it fits,
+	/// and on macOS it waits for the end to select writable.
 	struct Private {
-		/// Declared first: forgotten by the readiness thread before the
+		/// Declared first: the readiness thread forgets its watch before the
 		/// descriptor closes.
-		watch:   Option<ready::Watch>,
-		waiters: Arc<Fanout>,
-		file:    fs::File,
-		write:   bool,
+		ready: Ready,
+		/// A write end's thread for writes that would wait; `None` on a read
+		/// end, or where none could be made (the write then waits for the end
+		/// to poll writable).
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		room:  Option<Room>,
+		file:  fs::File,
+		write: bool,
 		/// macOS: a read of this end met end of file. A FIFO there stops
 		/// selecting readable once one has (measured), and no writer can come
 		/// back to an unlinked FIFO whose writers are all gone.
 		#[cfg(target_os = "macos")]
-		ended:   bool,
+		ended: bool,
+	}
+
+	/// The tasks waiting for a private end to poll ready, all woken together,
+	/// as the memory pipe wakes all its waiters ([`Wakers`]: a task is only
+	/// ever forgotten by being woken, so the engine's one waker, which stands
+	/// for every engine vproc, never loses one of their waits). One readiness
+	/// watch, registered when the first task is stored, wakes them.
+	#[derive(Default)]
+	struct Ready {
+		tasks: Arc<Wakers>,
+		watch: Option<ready::Watch>,
 	}
 
 	impl Private {
 		fn new(file: fs::File, write: bool) -> Self {
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			let room = if write {
+				Room::new(file.as_raw_fd()).ok()
+			} else {
+				None
+			};
 			Self {
-				watch: None,
-				waiters: Arc::default(),
+				ready: Ready::default(),
+				#[cfg(any(target_os = "linux", target_os = "android"))]
+				room,
 				file,
 				write,
 				#[cfg(target_os = "macos")]
@@ -453,37 +445,27 @@ mod imp {
 			}
 		}
 
-		/// Store `waker` among the tasks waiting on this end (once: an equal
-		/// waker is not repeated) and have the readiness thread wake them all
-		/// once the end is ready for `events`. Nothing is removed here except
-		/// by waking it (the cap), so a waker that stands for several vprocs
-		/// never loses one of their waits.
-		fn wait(&mut self, waker: &Waker, events: i16) -> io::Result<()> {
-			let (evicted, arm) = {
-				let mut w = self.waiters.0.lock();
-				let mut evicted = Vec::new();
-				if !w.wakers.iter().any(|stored| stored.will_wake(waker)) {
-					if w.wakers.len() >= MAX_WAITERS {
-						evicted = std::mem::take(&mut w.wakers);
-					}
-					w.wakers.push(waker.clone());
-				}
-				let arm = !w.armed;
-				w.armed = true;
-				(evicted, arm)
-			};
-			for stored in evicted {
-				stored.wake();
-			}
-			if arm {
-				// The readiness thread fired and forgot the last watch, or
-				// there was none.
-				self.watch = None;
-				let fanout = Waker::from(Arc::clone(&self.waiters));
-				match ready::watch(self.file.as_raw_fd(), events, &fanout) {
-					Ok(watch) => self.watch = Some(watch),
+		/// Store `waker` among the tasks waiting for this end to poll ready:
+		/// readable, or writable (or no reader left) on the write end.
+		fn wait(&mut self, waker: &Waker) -> io::Result<()> {
+			let Ready { tasks, watch } = &mut self.ready;
+			if tasks.add(waker) {
+				// Nothing watches the end: the last watch fired, or there was
+				// none.
+				*watch = None;
+				let events = if self.write {
+					ready::WRITE
+				} else {
+					ready::READ
+				};
+				match ready::watch(self.file.as_raw_fd(), events, &Waker::from(Arc::clone(tasks))) {
+					Ok(w) => *watch = Some(w),
 					Err(e) => {
-						self.waiters.0.lock().armed = false;
+						// No wait can be registered: every stored task polls
+						// again and meets the error itself.
+						for w in tasks.take() {
+							w.wake();
+						}
 						return Err(e);
 					},
 				}
@@ -492,14 +474,12 @@ mod imp {
 		}
 
 		/// `op` on the non-blocking descriptor; on `WouldBlock` the task's
-		/// waker is stored for `events` and `op` tried once more, as readiness
-		/// may have come before the registration. Success removes no waiter:
-		/// the readiness thread wakes them when the end is ready, and a task
-		/// that waited and then went on gets one spurious wake.
+		/// waker is stored and `op` tried once more, as the end may have become
+		/// ready before the wait was registered. Success removes no waiter: a
+		/// task that waited and then went on gets one spurious wake.
 		fn poll_io(
 			&mut self,
 			cx: &Context<'_>,
-			events: i16,
 			mut op: impl FnMut(&fs::File) -> io::Result<usize>,
 		) -> Poll<io::Result<usize>> {
 			let mut registered = false;
@@ -512,7 +492,7 @@ mod imp {
 				if registered {
 					return Poll::Pending;
 				}
-				if let Err(e) = self.wait(cx.waker(), events) {
+				if let Err(e) = self.wait(cx.waker()) {
 					return Poll::Ready(Err(e));
 				}
 				registered = true;
@@ -526,11 +506,16 @@ mod imp {
 		/// as the memory pipe does: `Ok(0)` when ready, `Pending` (the task's
 		/// waker stored) when not, and on the write end `BrokenPipe` once no
 		/// reader is left (`POLLERR`).
-		fn poll_ready(&mut self, cx: &Context<'_>, events: i16) -> Poll<io::Result<usize>> {
+		fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
 			#[cfg(target_os = "macos")]
 			if self.ended {
 				return Poll::Ready(Ok(0));
 			}
+			let events = if self.write {
+				ready::WRITE
+			} else {
+				ready::READ
+			};
 			let mut registered = false;
 			loop {
 				let revents = match revents(self.file.as_raw_fd(), events) {
@@ -546,7 +531,7 @@ mod imp {
 				if registered {
 					return Poll::Pending;
 				}
-				if let Err(e) = self.wait(cx.waker(), events) {
+				if let Err(e) = self.wait(cx.waker()) {
 					return Poll::Ready(Err(e));
 				}
 				registered = true;
@@ -560,9 +545,9 @@ mod imp {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				return self.poll_ready(cx, ready::READ);
+				return self.poll_ready(cx);
 			}
-			let read = self.poll_io(cx, ready::READ, |mut f| f.read(buf));
+			let read = self.poll_io(cx, |mut f| f.read(buf));
 			#[cfg(target_os = "macos")]
 			if matches!(read, Poll::Ready(Ok(0))) {
 				self.ended = true;
@@ -575,9 +560,17 @@ mod imp {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				return self.poll_ready(cx, ready::WRITE);
+				return self.poll_ready(cx);
 			}
-			self.poll_io(cx, ready::WRITE, |f| write_quietly(f, buf))
+			// A write that would wait is made by the end's thread, which the
+			// kernel wakes once it fits (`sys::room`); on macOS it waits for
+			// the end to select writable.
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			if let Some(room) = &self.room {
+				let file = &self.file;
+				return room.poll_write(cx, buf, |b| write_quietly(file, b));
+			}
+			self.poll_io(cx, |f| write_quietly(f, buf))
 		}
 
 		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -668,9 +661,31 @@ mod imp {
 			assert!(put > 0);
 			assert!(!nonblocking(r.as_ref()) && !nonblocking(w.as_ref()));
 			// An external's read of the same pipe sees what the shell wrote.
-			let mut got = vec![0u8; put];
+			// On Linux the write that waited is made by the end's thread once
+			// the reader takes the rest, so the reader sees it here too; on
+			// macOS it waits for the shell to poll again, and the reader takes
+			// it after that.
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			let waited = chunk.len();
+			#[cfg(target_os = "macos")]
+			let waited = 0;
+			let mut got = vec![0u8; put + waited];
 			external(r.as_ref()).read_exact(&mut got).unwrap();
 			assert!(got.iter().all(|&b| b == 7));
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			loop {
+				match wd.poll_write(&mut noop(), &chunk) {
+					Poll::Ready(Ok(n)) => break assert_eq!(n, chunk.len()),
+					Poll::Ready(Err(e)) => panic!("the write that waited: {e}"),
+					Poll::Pending => {
+						assert!(std::time::Instant::now() < deadline, "its result not within 30 s");
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+				}
+			}
+			let mut rest = vec![0u8; chunk.len() - waited];
+			external(r.as_ref()).read_exact(&mut rest).unwrap();
+			assert!(rest.iter().all(|&b| b == 7));
 			// And the shell's read end sees what an external writes.
 			external(w.as_ref()).write_all(b"from outside").unwrap();
 			let mut buf = [0u8; 64];
@@ -724,10 +739,12 @@ mod imp {
 		// with the engine's one waker. Vproc V1 parks on a full pipe; vproc
 		// V2 then writes a little, with the same waker, and that success
 		// dropped V1's wait without waking anyone, so V1 was never woken once
-		// the pipe had room. Linux pipes make this deterministic: with every
-		// page of the pipe in use and the last one partly full, a 4096-byte
-		// write waits (and the pipe does not poll writable) while a 1-byte
-		// write still fits in the last page.
+		// the pipe had room. With every page of the pipe in use and the last
+		// one partly full, a 4096-byte write waits while a 1-byte write would
+		// still fit. V1's page is now made by the end's thread, and V2 waits
+		// for it, so the end's writes keep their order; once the reader
+		// empties the pipe the engine is woken, V1 learns its page was
+		// written, and V2 writes. Linux: `F_GETPIPE_SZ`, and the end's thread.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		#[test]
 		fn a_vproc_that_writes_keeps_the_wait_of_another_vproc_with_its_waker() {
@@ -747,28 +764,37 @@ mod imp {
 			assert!(matches!(w.poll_write(&mut cx, &[2u8; 100]), Poll::Ready(Ok(100))));
 			// V1 parks.
 			assert!(w.poll_write(&mut cx, &full_page).is_pending(), "a page does not fit");
-			// V2, same waker, writes one byte into the last page.
-			assert!(matches!(w.poll_write(&mut cx, b"3"), Poll::Ready(Ok(1))), "a byte still fits");
-			// The reader empties the pipe: V1 must be woken to write its page.
-			let mut all = vec![0u8; (size / page - 1) * page + 101];
+			// V2, same waker, waits for V1's page.
+			assert!(w.poll_write(&mut cx, b"3").is_pending(), "V2 waits for the write in hand");
+			// The reader empties the pipe: the engine must be woken.
+			let mut all = vec![0u8; (size / page - 1) * page + 100];
 			external(r.as_ref()).read_exact(&mut all).unwrap();
 			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 			while !engine.0.load(Ordering::SeqCst) {
 				assert!(
 					std::time::Instant::now() < deadline,
-					"the parked vproc was not woken within 30 s of the pipe having room"
+					"the parked vprocs were not woken within 30 s of the pipe having room"
 				);
 				std::thread::sleep(std::time::Duration::from_millis(1));
 			}
+			assert!(matches!(w.poll_write(&mut cx, &full_page), Poll::Ready(Ok(n)) if n == page));
+			assert!(matches!(w.poll_write(&mut cx, b"3"), Poll::Ready(Ok(1))));
+			let mut rest = vec![0u8; page + 1];
+			external(r.as_ref()).read_exact(&mut rest).unwrap();
+			assert!(
+				rest[..page].iter().all(|&b| b == 1) && rest[page] == b'3',
+				"V1's page, then V2's byte"
+			);
 		}
 
 		// Failure mode (review round 2, finding 3): a task dropped while it
 		// waited on an idle end kept its own registration on the readiness
 		// thread, so each short-lived extra cancelled there added one
-		// descriptor to the thread's poll set; or a cap forgets a waiter
-		// without waking it.
+		// descriptor to the thread's poll set; or a full set forgets a waiter
+		// without waking it. (That live tasks past the cap settle is
+		// `wakers::tests::live_tasks_past_the_cap_settle`.)
 		#[test]
-		fn tasks_waiting_on_an_idle_end_share_one_wait_and_stay_bounded() {
+		fn two_hundred_tasks_waiting_on_an_idle_end_are_all_woken() {
 			let (r, w) = io::pipe().unwrap();
 			// macOS's `private` shares the description: make it non-blocking,
 			// as Linux's own reopening is.
@@ -786,14 +812,9 @@ mod imp {
 					end.poll_read(&mut Context::from_waker(&waker), &mut buf)
 						.is_pending()
 				);
-				assert!(
-					end.waiters.0.lock().wakers.len() <= MAX_WAITERS,
-					"the stored wakers stay bounded"
-				);
 			}
-			assert!(end.watch.is_some(), "one registration on the readiness thread");
-			// Every waiter a cap forgot was woken; the rest wake once a byte
-			// comes.
+			// A waiter the full set forgot was woken then; the rest wake once
+			// a byte comes.
 			(&w).write_all(b"x").unwrap();
 			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 			while !flags.iter().all(|f| f.0.load(Ordering::SeqCst)) {
