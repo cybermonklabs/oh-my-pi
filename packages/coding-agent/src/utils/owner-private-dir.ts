@@ -43,6 +43,10 @@ export function ownerPrivateDirError(stat: OwnerPrivateDirStat, expectedUid: num
  * directory the fd holds: an `lstat` of it that shows a symlink, or another
  * device and inode, is refused. That lookup only refuses; it never admits what
  * the fd's own checks would not.
+ *
+ * Callers go on to use the name, not the fd, after this returns. So the result
+ * holds only while no other user can rename entries in the parent directory:
+ * a sticky directory such as `/tmp`, or one only this user can write.
  * POSIX only: Windows lacks `O_NOFOLLOW`/`O_DIRECTORY`.
  *
  * @param label Human-readable directory role prefixed to the thrown message.
@@ -76,21 +80,19 @@ export function assertOwnerPrivateDir(dir: string, label: string): void {
 		if (named.dev !== pinned.dev || named.ino !== pinned.ino) {
 			throw new Error(`${label} ${dir} was replaced while it was checked`);
 		}
-		let st = fs.fstatSync(fd);
+		let mode = Number(pinned.mode);
+		const owner = Number(pinned.uid);
 		// Normalize perms on the pinned inode only when it is ours; never fchmod a
 		// directory another user owns.
-		if ((uid === undefined || st.uid === uid) && (st.mode & 0o777) !== 0o700) {
+		if ((uid === undefined || owner === uid) && (mode & 0o777) !== 0o700) {
 			try {
 				fs.fchmodSync(fd, 0o700);
-				st = fs.fstatSync(fd);
+				mode = fs.fstatSync(fd).mode;
 			} catch (err) {
 				logger.debug("Owner-private dir chmod failed", { path: dir, error: String(err) });
 			}
 		}
-		const reason = ownerPrivateDirError(
-			{ isSymlink: false, isDir: st.isDirectory(), uid: st.uid, mode: st.mode },
-			uid,
-		);
+		const reason = ownerPrivateDirError({ isSymlink: false, isDir: pinned.isDirectory(), uid: owner, mode }, uid);
 		if (reason) {
 			throw new Error(`${label} ${dir} ${reason}`);
 		}
