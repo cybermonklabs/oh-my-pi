@@ -14,9 +14,13 @@
 //! other signal prints `NAME: line N: `, the pid, the description padded so
 //! and the command as bash prints it. bash writes it to its own standard
 //! error, never through the command's redirections, and names the line it
-//! has reached when it waits; a subshell, an asynchronous one or a
-//! pipeline's stage reports its own foreground commands, and a foreground
-//! subshell a signal killed is reported as a command ([`subshell_ended`]).
+//! has reached when it waits ([`wait_line`]: in a forked process, the line
+//! bash had when it forked it). Who reports follows the processes bash
+//! forks: a subshell, an asynchronous one or a pipeline's stage reports its
+//! own foreground commands but the one it runs with `exec`
+//! ([`subshell_exec`]); a `( … )`, job or stage whose whole command is a
+//! `( … )` is one process with it; a foreground subshell a signal killed is
+//! reported as a command ([`subshell_ended`]).
 //! A background job that such another signal
 //! killed gets that long notice, with `  (wd: DIR)` when the shell's
 //! directory changed since the job started, at these points of bash 5.3.20
@@ -25,28 +29,34 @@
 //!   naming its line, as soon as it has reaped that job, before it waits for
 //!   the next);
 //! - before the shell reads its next line of input ([`line_read`], naming that
-//!   line);
+//!   line), and once a DEBUG trap ran (`run_debug_trap`, naming the line of the
+//!   command it ran for; no other trap ends with one);
 //! - as it expands a `$( )`, `${ ;}`, `<( )` or `>( )`, which bash re-parses
-//!   through the same reader (`xparse_dolparen`; a backquote not), also one in
-//!   the operand of a `${x:-…}`, `${x:=…}`, `${x:+…}` or `${x:?…}` it does not
-//!   expand ([`expanded`]): naming the command's line plus one, plus the
-//!   newlines of the substitution's source in an assignment's value or a `[[
-//!   ]]` operand;
+//!   through the same reader (`xparse_dolparen`; a backquote not), also one of
+//!   a `${ … }` it does not expand, in `$(( ))` text too ([`expanded`]): naming
+//!   the line where the command's first word ends (for `[[ ]]` and `(( ))` the
+//!   line the construct ends on) plus one;
 //! - as it expands a compound array assignment, `a=( … )`, `a+=( … )` or a
 //!   declaration builtin's (`parse_string_to_word_list`), naming the command's
 //!   line ([`reparsed`]);
 //! - at the end of `jobs` without `-r`, `-s` or `-x`, for the jobs it did not
 //!   list ([`jobs_ended`], through its redirections).
 //!
-//! Nothing reports while the job list is frozen: in a `CHLD` trap the
-//! `wait` builtin runs (not in posix mode, where the trap ends the `wait`),
-//! and an `INT` trap bash runs as the forked foreground job it waited for
-//! ends ([`Vproc::jobs_frozen`]); a finished job stays in the table then.
-//! `TERM` and a trapped signal there say nothing. A posix `-c` shell prints
-//! neither notice. No notice comes from a command or process substitution's
-//! own process (one comes from a `( … )`, `&` or pipeline stage forked from
-//! it), nor from a posix shell's fork of a substitution ([`Comsub`]). zsh
-//! prints nothing in any of these cases.
+//! Each of these points, the end of a `wait`, each fork (`stop_pipeline`) and
+//! each loop iteration (`REAP`: also when `break` or `continue` ends the
+//! body; not at a `return`) deletes the finished jobs already reported
+//! ([`cleanup_dead_jobs`]). Nothing reports and nothing is deleted while the
+//! job list is frozen: in a `CHLD` trap the `wait` builtin runs (not in posix
+//! mode, where the trap ends the `wait`), in an `INT` trap bash runs as the
+//! forked foreground job it waited for ends, and in a pipeline's last stage
+//! the shell runs itself (`lastpipe`) ([`Vproc::jobs_frozen`]); in a function
+//! substitution (`${ …; }`) jobs are reported but none deleted
+//! ([`Vproc::jobs_kept`]). The next cleanup point outside deletes what was
+//! reported meanwhile. `TERM` and a trapped signal there say nothing. A posix
+//! `-c` shell prints neither notice. No notice comes from a command or process
+//! substitution's own process (one comes from a `( … )`, `&` or pipeline
+//! stage forked from it), nor from a posix shell's fork of a substitution
+//! ([`Comsub`]). zsh prints nothing in any of these cases.
 
 use bstr::BString;
 use strum::IntoEnumIterator as _;
@@ -62,7 +72,7 @@ use crate::bash::{
 	diag::Diag,
 	event::NodeKind,
 	ids::{Dialect, Vpid},
-	ir::{Op, RedirTargetIr, Unit},
+	ir::{Op, Opcode, RedirTargetIr, SpawnIr, SpawnKind, Unit},
 	signal::Signal,
 	store::{Key, KeyBuf, MiscKey, OptId, Record, StoreError, TrapKey},
 };
@@ -102,41 +112,40 @@ pub(super) fn killed(
 	if in_place {
 		return Killed { notice: None, no_fork: true };
 	}
-	// bash runs a subshell's last simple command with `exec` and no fork
-	// (`execute_in_subshell`'s `CMD_NO_FORK`): the subshell's process dies
-	// of the signal, and its parent reports the subshell ([`subshell_ended`]).
-	if subshell_tail(k, cx, vp, op, sig) {
-		return Killed { notice: None, no_fork: true };
-	}
-	// A subshell whose process is the external (`cmd &`, `( cmd )`, a
-	// stage): the external's end is the subshell's, which its parent
-	// reports.
+	// A subshell whose process is the external (bash `exec`ed it,
+	// [`subshell_exec`]): the external's end is the subshell's, which its
+	// parent reports ([`super::external_ended`]).
 	if vp.parent.is_some() && super::transparent(vp, false) == Some(true) {
 		return quiet;
 	}
 	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
 		return quiet;
 	};
-	Killed { notice: notice(k, cx, vp, &unit, op, pid, sig).map(BString::from), no_fork: false }
+	let redirs = unit.cmds.get(op.a as usize).and_then(|c| c.redirs);
+	let text = command_text(k, cx, vp, &unit, op.node, redirs);
+	Killed {
+		notice:  notice(k, cx, vp, &text, op.node, pid, sig).map(BString::from),
+		no_fork: false,
+	}
 }
 
-/// The notice of the foreground command of `op` in `unit`, process `pid`,
-/// that `sig` killed in `vp` (bash `notify_of_job_status` for a foreground
-/// job): `TERM` and a trapped signal print the description and the command,
-/// any other signal but `INT` and `PIPE` the long notice ([`long_notice`]).
-/// From any bash process, a subshell, an asynchronous one or a pipeline's
-/// stage too (bash 5.3.20: `( sh -c 'kill -KILL $$'; echo after )`), on its
-/// own standard error, but as for a background job ([`reports_jobs`]) not
-/// from a command or process substitution's own process, nor in posix mode
-/// from a `-c` shell or a fork of a substitution (`startup_state` 2). None
-/// either in an interactive shell, for the stage a pipeline runs in the
-/// shell itself, and in zsh.
+/// The notice of the foreground command `text` (syntax node `node`),
+/// process `pid`, that `sig` killed in `vp` (bash `notify_of_job_status` for
+/// a foreground job): `TERM` and a trapped signal print the description and
+/// the command, any other signal but `INT` and `PIPE` the long notice
+/// ([`long_notice`]). From any bash process, a subshell, an asynchronous one
+/// or a pipeline's stage too (bash 5.3.20: `( sh -c 'kill -KILL $$'; echo
+/// after )`), on its own standard error, but as for a background job
+/// ([`reports_jobs`]) not from a command or process substitution's own
+/// process, nor in posix mode from a `-c` shell or a fork of a substitution
+/// (`startup_state` 2). None either in an interactive shell, for the stage a
+/// pipeline runs in the shell itself, and in zsh.
 fn notice(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &Vproc,
-	unit: &Unit,
-	op: Op,
+	text: &[u8],
+	node: u32,
 	pid: u32,
 	sig: Signal,
 ) -> Option<Vec<u8>> {
@@ -155,46 +164,97 @@ fn notice(
 		return None;
 	}
 	let desc = sig.description(k.engine.config().platform);
-	let text = command_text(k, cx, vp, unit, op);
 	Some(if sig == Signal::Term || trapped(cx, vp, sig) {
 		// `print_pipeline` of the job, `JLIST_STANDARD`.
 		let mut bytes = format!("{desc}{:w$}", "", w = padding(&desc)).into_bytes();
-		bytes.extend_from_slice(&text);
+		bytes.extend_from_slice(text);
 		bytes.push(b'\n');
 		bytes
 	} else {
-		long_notice(k, cx, vp, wait_line(vp, op.node), pid, &desc, &text)
+		long_notice(k, cx, vp, wait_line(vp, node), pid, &desc, text)
 	})
 }
 
-/// Whether bash runs the command of `op`, an external a subshell `vp`
-/// starts, with `exec` in the subshell's process: its last simple command
-/// ([`Unit::tails`]) at the subshell's top level, while no trap that counts
-/// is set ([`counts_a_trap`]).
-fn subshell_tail(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op, sig: Signal) -> bool {
+/// Whether bash runs the external of `op` (an `Exec` in `vp`'s base frame
+/// that ends the code of a subshell, a job or a pipeline stage) with `exec`
+/// in that process, so that the process dies with it (`CMD_NO_FORK`): the
+/// whole command of a `( … )` (whatever its redirections,
+/// `execute_in_subshell`), of a background job or of a stage (bash forks
+/// such a simple command as the process itself); or the simple command with
+/// no redirection that ends a `( … )`'s `;`, `&&` or `||` list
+/// ([`Unit::tails`]) while no trap counts (`optimize_subshell_command`,
+/// `should_optimize_fork`: a signal trap with an action, an EXIT trap of the
+/// subshell's own, an ERR trap it runs, or in a function a RETURN trap it
+/// runs). A job's or a stage's list (`a && cmd &`) forks it. The last
+/// command of a substitution's or a coprocess's own code keeps the rule it
+/// had (it ends the code). Decided as the external starts
+/// ([`super::proc::ExecState`]'s `subshell_exec`). bash only.
+pub(super) fn subshell_exec(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 	let [f] = vp.frames.as_slice() else {
 		return false;
 	};
-	// `INT` and `PIPE` print no notice, and the held `INT` keeps its rules.
-	!matches!(sig, Signal::Int | Signal::Pipe)
-		&& vp.mode.dialect() == Dialect::Bash
-		&& vp.parent.is_some()
-		&& vp.jobs.comsub != Comsub::Own
-		&& f.kind == FrameKind::Subshell
-		&& f
-			.unit
-			.as_ref()
-			.is_some_and(|u| u.tails.binary_search(&op.node).is_ok())
-		&& !counts_a_trap(k, cx, vp, true).unwrap_or(true)
+	let Some(u) = f.unit.as_deref() else {
+		return false;
+	};
+	let code = |pc: u32| u.ops.get(pc as usize).map(|o| o.code);
+	if vp.mode.dialect() != Dialect::Bash
+		|| vp.parent.is_none()
+		|| f.kind != FrameKind::Subshell
+		|| code(f.pc + 1) != Some(Opcode::SubExit)
+	{
+		return false;
+	}
+	match base_spawn(u, f.pc) {
+		_ if vp.jobs.comsub == Comsub::Own => true,
+		Some((s, _)) if s.kind == SpawnKind::Subshell => {
+			s.stages[0].entry == f.pc
+				|| (u.tails.binary_search(&op.node).is_ok()
+					&& !forks_for_traps(k, cx, vp).unwrap_or(true))
+		},
+		Some((s, i)) if matches!(s.kind, SpawnKind::Background | SpawnKind::Pipeline) => {
+			s.stages[i].entry == f.pc
+		},
+		_ => true,
+	}
+}
+
+/// Whether a trap makes bash fork a `( … )`'s last command
+/// (`should_optimize_fork`): a signal trap with an action set in the
+/// subshell (an inherited one is reset there, an ignoring one does not
+/// count), its own EXIT trap, the ERR trap if it set it or `errtrace` is on,
+/// and in a function the RETURN trap if it set it or `functrace` is on.
+fn forks_for_traps(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<bool, StoreError> {
+	let set = |cx: &mut Cx<'_>, key| -> Result<bool, StoreError> {
+		Ok(matches!(
+			state::record(cx.store, vp, Key::Trap(key))?,
+			Some(Record::Trap { action, .. }) if !action.is_empty()
+		))
+	};
+	let runs = |k: &mut Kernel, cx: &mut Cx<'_>, key, opt| -> Result<bool, StoreError> {
+		Ok(set(cx, key)? && (vp.own_traps.has(key) || state::option(&mut k.root, cx.store, vp, opt)?))
+	};
+	if (vp.own_traps.has(TrapKey::Exit) && set(cx, TrapKey::Exit)?)
+		|| runs(k, cx, TrapKey::Err, OptId::Errtrace)?
+		|| (!vp.calls.is_empty() && runs(k, cx, TrapKey::Return, OptId::Functrace)?)
+	{
+		return Ok(true);
+	}
+	for sig in Signal::iter() {
+		if set(cx, TrapKey::Signal(sig))? {
+			return Ok(true);
+		}
+	}
+	Ok(false)
 }
 
 /// A foreground subshell (`( … )`) of `vp`, vproc `child`, died of `sig`:
 /// bash reports it as it reports a foreground command ([`notice`]), naming
-/// the subshell's text, from a subshell too (bash 5.3.20:
-/// `( ( kill -QUIT $BASHPID ); : )` prints the inner one's notice); queued
-/// for the shell's own standard error. A pipeline's stage and a
-/// substitution are no such child, and a substitution's own process says
-/// nothing.
+/// the subshell's text (with its `!`), from a subshell too (bash 5.3.20:
+/// `( ( kill -QUIT $BASHPID ); : )` prints the inner one's notice), on the
+/// shell's own standard error: once the `( … )`'s own redirections are
+/// undone ([`Kernel::held_notices`], written by its `PopRedir`), at once
+/// without any. A pipeline's stage and a substitution are no such child,
+/// and a substitution's own process says nothing.
 pub(super) fn subshell_ended(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -211,20 +271,75 @@ pub(super) fn subshell_ended(
 	let (true, Some(unit)) = (only, f.unit.clone()) else {
 		return;
 	};
-	let Some(&op) = unit.ops.get(f.pc as usize) else {
+	let pc = f.pc;
+	let Some(&op) = unit.ops.get(pc as usize) else {
 		return;
 	};
 	// The `Spawn` of a `( … )`, not of a pipeline whose stage it was.
-	if unit
+	let Some(spawn) = unit
 		.spawns
 		.get(op.a as usize)
-		.is_none_or(|s| s.kind != crate::bash::ir::SpawnKind::Subshell)
-	{
+		.filter(|s| s.kind == crate::bash::ir::SpawnKind::Subshell)
+	else {
 		return;
+	};
+	// `Redir; Enter; Spawn`: the `( … )`'s own redirections.
+	let at = |pc: Option<u32>| {
+		pc.and_then(|pc| unit.ops.get(pc as usize))
+			.filter(|o| o.node == op.node)
+	};
+	let redir = at(pc.checked_sub(2)).filter(|o| {
+		o.code == Opcode::Redir && at(pc.checked_sub(1)).is_some_and(|e| e.code == Opcode::Enter)
+	});
+	// After its `Leave` (and `PopRedir`), a `Not` names the `!` pipeline,
+	// but not one that is the whole command of a subshell `vp` is: bash runs
+	// that `!` as the subshell's own (`execute_in_subshell` takes
+	// `CMD_INVERT_RETURN` off the command it runs).
+	let mut end = spawn.end + 1;
+	if redir.is_some() {
+		end += 1;
 	}
-	if let Some(bytes) = notice(k, cx, vp, &unit, op, child.0, sig) {
+	let whole = vp.frames.len() == 1
+		&& vp.parent.is_some()
+		&& unit
+			.ops
+			.get(end as usize + 1)
+			.is_some_and(|o| o.code == Opcode::SubExit);
+	let node = unit
+		.ops
+		.get(end as usize)
+		.filter(|o| o.code == Opcode::Not && !whole)
+		.map_or(op.node, |o| o.node);
+	let text = command_text(k, cx, vp, &unit, node, redir.map(|r| r.a));
+	let Some(bytes) = notice(k, cx, vp, &text, op.node, child.0, sig) else {
+		return;
+	};
+	if redir.is_some() {
+		let depth = u32::try_from(vp.frames.len()).unwrap_or(u32::MAX);
+		k.held_notices.push((vp.vpid, depth, BString::from(bytes)));
+	} else {
 		vp.out
 			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	}
+}
+
+/// `vp` undid the redirections of a command of its frame at depth `depth`
+/// (`PopRedir`): a notice [`subshell_ended`] held for it goes to the
+/// shell's own standard error now.
+pub(super) fn redirections_undone(k: &mut Kernel, vp: &mut Vproc, depth: u32) {
+	if k.held_notices.is_empty() {
+		return;
+	}
+	let vpid = vp.vpid;
+	let mut i = 0;
+	while i < k.held_notices.len() {
+		let (v, d, _) = &k.held_notices[i];
+		if *v == vpid && *d == depth {
+			let (_, _, bytes) = k.held_notices.remove(i);
+			vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		} else {
+			i += 1;
+		}
 	}
 }
 
@@ -361,12 +476,84 @@ pub(super) fn reparsed(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u3
 }
 
 /// The shell expands a `$( )`, `${ ;}`, `<( )` or `>( )` (not a
-/// backquote) of the command at script line `line`, or one in an operand
-/// it does not expand: [`reparsed`] naming `line + 1 + lines` (`lines`: the
-/// newlines of its source in an assignment's value or a `[[ ]]` operand,
-/// else 0; [`crate::bash::ir::Part::Comsub`]).
-pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, lines: u32) {
-	reparsed(k, cx, vp, line.saturating_add(1).saturating_add(lines));
+/// backquote) of the command at script line `line` (where its syntax node
+/// starts), or one of a `${ … }` it does not expand: bash re-parses its text
+/// ([`reparsed`]) with its parser at the line after the command's first
+/// word, or after a `[[ ]]` or `(( ))` (bash's `line_number` at
+/// `make_simple_command`, `make_cond_command`, `make_arith_command`), what
+/// the notice names ([`reparse_lines`]).
+pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) {
+	if reports_due(vp) {
+		let line = line.saturating_add(1).saturating_add(reparse_lines(vp));
+		reparsed(k, cx, vp, line);
+	}
+}
+
+/// Whether a report point has work in `vp`: a finished job to report, or a
+/// reported one to delete ([`report_all`]).
+pub(super) fn reports_due(vp: &Vproc) -> bool {
+	vp.jobs
+		.iter()
+		.any(|j| matches!(j.state, JobState::Done(_)) && (j.notified || j.signal.is_some()))
+}
+
+/// The newlines bash's parser passed after the start of the command `vp`
+/// runs (its top frame's op) before it re-parses a substitution of it: to
+/// the end of a simple command's first word (an assignment, a word or a
+/// redirection), to the end of a `[[ ]]` or `(( ))`; none for any other
+/// command (`for`, `case`: their own line).
+fn reparse_lines(vp: &Vproc) -> u32 {
+	let Some(f) = vp.frames.last() else {
+		return 0;
+	};
+	let Some(u) = f.unit.as_deref() else {
+		return 0;
+	};
+	let Some(op) = u.ops.get(f.pc as usize) else {
+		return 0;
+	};
+	let Some(cmd) = u.nodes.get(op.node as usize) else {
+		return 0;
+	};
+	let end = match cmd.kind {
+		NodeKind::Cond | NodeKind::Arith => cmd.hi,
+		NodeKind::Simple if op.code == Opcode::Exec => {
+			let Some(c) = u.cmds.get(op.a as usize) else {
+				return 0;
+			};
+			let words = u.lists.get(c.words as usize).into_iter().flatten();
+			let targets = c
+				.redirs
+				.and_then(|r| u.redirs.get(r as usize))
+				.into_iter()
+				.flatten()
+				.filter_map(|r| match r.target {
+					RedirTargetIr::Word(w) => Some(w),
+					RedirTargetIr::HereDoc { .. } => None,
+				});
+			let nodes = c.assigns.iter().map(|a| a.node).chain(
+				words
+					.copied()
+					.chain(targets)
+					.filter_map(|w| u.words.get(w as usize).map(|w| w.node)),
+			);
+			match nodes
+				.filter_map(|n| u.nodes.get(n as usize))
+				.filter(|n| n.lo >= cmd.lo && n.hi <= cmd.hi)
+				.min_by_key(|n| n.lo)
+			{
+				Some(first) => first.hi,
+				None => return 0,
+			}
+		},
+		_ => return 0,
+	};
+	#[expect(clippy::naive_bytecount, reason = "a command's first word")]
+	let newlines = u
+		.source
+		.get(cmd.lo as usize..end as usize)
+		.map_or(0, |s| s.iter().filter(|&&b| b == b'\n').count());
+	u32::try_from(newlines).unwrap_or(u32::MAX)
 }
 
 /// `jobs` ends at script line `line` (bash's `notify_and_cleanup (-1)` at
@@ -384,7 +571,8 @@ pub(super) fn jobs_ended(
 
 /// bash's `notify_and_cleanup (-1)` at script line `line`: the notices of
 /// the background jobs a signal bash reports killed ([`unreported`]), in
-/// job order, which go from the table; `None` when nothing is reported.
+/// job order, marked reported, then the finished jobs reported go
+/// ([`cleanup_dead_jobs`]); `None` when nothing is reported.
 fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Option<Vec<u8>> {
 	let done: Vec<u32> = vp
 		.jobs
@@ -392,20 +580,36 @@ fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Opt
 		.filter(|j| j.signal.is_some() && !j.notified && !j.inherited)
 		.map(|j| j.number)
 		.collect();
-	if done.is_empty() || !reports_jobs(k, cx, vp) {
-		return None;
-	}
 	let mut out = Vec::new();
-	for number in done {
-		let Some(sig) = unreported(cx, vp, number) else {
-			continue;
-		};
-		if let Some(bytes) = job_line(k, cx, vp, number, sig, line) {
-			out.extend_from_slice(&bytes);
+	if !done.is_empty() && reports_jobs(k, cx, vp) {
+		for number in done {
+			let Some(sig) = unreported(cx, vp, number) else {
+				continue;
+			};
+			if let Some(bytes) = job_line(k, cx, vp, number, sig, line) {
+				out.extend_from_slice(&bytes);
+			}
 		}
-		vp.jobs.remove(number);
 	}
+	cleanup_dead_jobs(vp);
 	(!out.is_empty()).then_some(out)
+}
+
+/// bash's `cleanup_dead_jobs`: the finished jobs of `vp` already reported
+/// (`J_NOTIFIED`: listed, waited for while the job list was frozen) go from
+/// the table, but none while no job may be deleted ([`Vproc::jobs_kept`]:
+/// `jobs.c:1310`). A `wait PID` still finds a status `wait` collected
+/// ([`super::proc::JobTable::bgp`]) or the process's own. bash only: zsh
+/// deletes a job as it reports it. bash calls it at each of its cleanup
+/// points: the report points ([`report_all`]), `jobs`, the end of a `wait`,
+/// each fork (`stop_pipeline`, `jobs.c:572`) and each loop iteration (`REAP`,
+/// `execute_cmd.c:3105`, `3267`, `3606`, `3838`, also as `break` or
+/// `continue` ends the body: `exec::break_loops`).
+pub(super) fn cleanup_dead_jobs(vp: &mut Vproc) {
+	let reported = |j: &super::proc::Job| j.notified && matches!(j.state, JobState::Done(_));
+	if vp.jobs.iter().any(reported) && vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() {
+		vp.jobs.remove_where(reported);
+	}
 }
 
 /// Whether the real shell runs the command of `op`, an external `vp`
@@ -516,11 +720,13 @@ fn counts_a_trap(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, bash: bool) -> Result<
 
 /// bash's `line_number` when it waits for the command
 /// (`execute_command_internal` puts it back before `wait_for`): the header line
-/// of the innermost `for`, `select`, `case` or arithmetic `for` around it;
-/// else, in a function, the line its body starts on; else the line the parser
-/// reached reading the complete command (its last line, after any here-document
+/// of the innermost `for`, `select`, `case` or arithmetic `for` around it
+/// (in a forked process's own code); else, in a function, the line its body
+/// starts on; in a forked process, the line bash had as it forked it
+/// ([`super::proc::Frame::fork_line`]); else the line the parser reached
+/// reading the complete command (its last line, after any here-document
 /// bodies).
-fn wait_line(vp: &Vproc, node: u32) -> u32 {
+pub(super) fn wait_line(vp: &Vproc, node: u32) -> u32 {
 	let Some(fi) = vp.frames.len().checked_sub(1) else {
 		return 0;
 	};
@@ -528,7 +734,12 @@ fn wait_line(vp: &Vproc, node: u32) -> u32 {
 	let Some(u) = f.unit.as_ref() else {
 		return exec::line_of(vp, node);
 	};
-	if let Some(header) = header_around(u, node) {
+	let within = if f.kind == FrameKind::Subshell {
+		base_spawn(u, f.pc).and_then(|(s, i)| fork_node(u, s, i))
+	} else {
+		None
+	};
+	if let Some(header) = header_around(u, node, within) {
 		return exec::line_in(vp, fi, header);
 	}
 	match &f.kind {
@@ -542,30 +753,37 @@ fn wait_line(vp: &Vproc, node: u32) -> u32 {
 			let ended_line = at >= src.len() || (at > 0 && src.get(at - 1) == Some(&b'\n'));
 			(pos.1 - u32::from(ended_line)).saturating_sub(f.line_shift)
 		},
-		// A subshell keeps the line its parent's parser reached when it
-		// forked: the last line of its outermost `( … )`.
-		FrameKind::Subshell => {
-			let Some(n) = u.nodes.get(node as usize) else {
-				return exec::line_of(vp, node);
-			};
-			let outer = u
-				.nodes
-				.iter()
-				.filter(|m| m.kind == NodeKind::Subshell && m.lo <= n.lo && n.hi <= m.hi)
-				.max_by_key(|m| m.hi - m.lo);
-			let Some(m) = outer else {
-				return exec::line_of(vp, node);
-			};
-			#[expect(clippy::naive_bytecount, reason = "a short command's text")]
-			let newlines = u
-				.source
-				.get(m.lo as usize..m.hi as usize)
-				.map_or(0, |s| s.iter().filter(|&&b| b == b'\n').count());
-			(u.line + m.line + u32::try_from(newlines).unwrap_or(u32::MAX))
-				.saturating_sub(f.line_shift)
-		},
+		FrameKind::Subshell => f.fork_line.unwrap_or_else(|| exec::line_of(vp, node)),
 		_ => exec::line_of(vp, node),
 	}
+}
+
+/// The subshell, background job, pipeline stage or coprocess whose code
+/// holds `pc`, the innermost one (a child vproc's base frame runs its own
+/// code, not that of a nested one), with the stage's index.
+pub(super) fn base_spawn(u: &Unit, pc: u32) -> Option<(&SpawnIr, usize)> {
+	u.spawns
+		.iter()
+		.flat_map(|s| {
+			s.stages.iter().enumerate().filter_map(move |(i, st)| {
+				let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
+				(st.entry <= pc && pc < end).then_some((s, i, st.entry))
+			})
+		})
+		.max_by_key(|&(.., entry)| entry)
+		.map(|(s, i, _)| (s, i))
+}
+
+/// The syntax node of stage `i` of `s`: a pipeline's stage (the node of the
+/// `SubExit` ending its code), else the whole command (the `Spawn`'s: the
+/// `( … )`, the job's list).
+pub(super) fn fork_node(u: &Unit, s: &SpawnIr, i: usize) -> Option<u32> {
+	let pc = if s.kind == SpawnKind::Pipeline {
+		s.stages.get(i + 1).map_or(s.end, |next| next.entry)
+	} else {
+		s.stages.first()?.entry
+	};
+	Some(u.ops.get(pc.checked_sub(1)? as usize)?.node)
 }
 
 /// The node of a function's body: bash's `function_line_number` is the
@@ -589,9 +807,12 @@ fn body_start(u: &Unit) -> Option<u32> {
 }
 
 /// The innermost `for`, `select`, `case` or arithmetic `for` of `u` around
-/// `node`.
-fn header_around(u: &Unit, node: u32) -> Option<u32> {
+/// `node`, inside node `within` when given (a forked process's command).
+fn header_around(u: &Unit, node: u32, within: Option<u32>) -> Option<u32> {
 	let n = u.nodes.get(node as usize)?;
+	let (lo, hi) = within
+		.and_then(|w| u.nodes.get(w as usize))
+		.map_or((0, u32::MAX), |w| (w.lo, w.hi));
 	u.nodes
 		.iter()
 		.enumerate()
@@ -599,30 +820,38 @@ fn header_around(u: &Unit, node: u32) -> Option<u32> {
 			matches!(m.kind, NodeKind::For | NodeKind::Select | NodeKind::Case | NodeKind::ArithFor)
 				&& m.lo <= n.lo
 				&& n.hi <= m.hi
+				&& lo <= m.lo
+				&& m.hi <= hi
 		})
 		.max_by_key(|(_, m)| m.lo)
 		.and_then(|(i, _)| u32::try_from(i).ok())
 }
 
-/// The command as bash prints it in the notice, here-document bodies
+/// The command of node `node` as bash prints it in the notice, the bodies
+/// of the here-documents of its redirections `redirs` (a `redirs` index)
 /// included. The node's text holds none (they follow its line), so
 /// [`exec::job_text`] prints each document empty: its delimiter lines end
 /// the text, and the bodies the IR keeps go before them.
-fn command_text(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, u: &Unit, op: Op) -> Vec<u8> {
-	let printed = exec::job_text(k, cx, vp, u, op.node);
-	let bodies: Vec<&[u8]> = u
-		.cmds
-		.get(op.a as usize)
-		.and_then(|c| c.redirs)
-		.and_then(|i| u.redirs.get(i as usize))
-		.map_or_else(Vec::new, |rs| {
-			rs.iter()
-				.filter_map(|r| match &r.target {
-					RedirTargetIr::HereDoc { text, .. } => Some(text.as_slice()),
-					RedirTargetIr::Word(_) => None,
-				})
-				.collect()
-		});
+fn command_text(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	u: &Unit,
+	node: u32,
+	redirs: Option<u32>,
+) -> Vec<u8> {
+	let printed = exec::job_text(k, cx, vp, u, node);
+	let bodies: Vec<&[u8]> =
+		redirs
+			.and_then(|i| u.redirs.get(i as usize))
+			.map_or_else(Vec::new, |rs| {
+				rs.iter()
+					.filter_map(|r| match &r.target {
+						RedirTargetIr::HereDoc { text, .. } => Some(text.as_slice()),
+						RedirTargetIr::Word(_) => None,
+					})
+					.collect()
+			});
 	let lines: Vec<&[u8]> = printed.split_inclusive(|&b| b == b'\n').collect();
 	if bodies.is_empty() || lines.len() <= bodies.len() {
 		return printed.into();

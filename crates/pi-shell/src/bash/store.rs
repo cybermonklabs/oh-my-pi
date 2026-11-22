@@ -190,6 +190,9 @@ pub enum Table {
 	/// What a root job holds outside its [`Record::Job`]'s layout
 	/// ([`Key::JobFacts`], [`Record::JobFacts`]).
 	JobFacts,
+	/// The statuses the root shell's `wait` collected, kept after their jobs
+	/// left the table (bash's bgp list; [`Key::BgPid`]).
+	BgPid,
 }
 
 crate::bash::packed_names::packed_names!(Table, Display);
@@ -239,6 +242,11 @@ pub enum Key<'a> {
 	},
 	/// The [`JobFact`]s of root job [`Key::Job`] `id`, when it has any.
 	JobFacts(JobId),
+	/// A status the root shell's `wait` collected for its child vproc,
+	/// `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed it;
+	/// `SEQ` its place in the kept order, oldest first): `wait PID` finds it
+	/// once the job left the table (bash `bgp_search`).
+	BgPid(Vpid),
 }
 
 impl Key<'_> {
@@ -260,6 +268,7 @@ impl Key<'_> {
 			Self::ZshOpt(_) => Table::ZshOpt,
 			Self::ZshAlias { .. } => Table::ZshAlias,
 			Self::JobFacts(_) => Table::JobFacts,
+			Self::BgPid(_) => Table::BgPid,
 		}
 	}
 
@@ -281,6 +290,7 @@ impl Key<'_> {
 			Self::ZshOpt(o) => KeyBuf::ZshOpt(o),
 			Self::ZshAlias { suffix, name } => KeyBuf::ZshAlias { suffix, name: name.into() },
 			Self::JobFacts(j) => KeyBuf::JobFacts(j),
+			Self::BgPid(p) => KeyBuf::BgPid(p),
 		}
 	}
 }
@@ -338,6 +348,8 @@ pub enum KeyBuf {
 	},
 	/// See [`Key::JobFacts`].
 	JobFacts(JobId),
+	/// See [`Key::BgPid`].
+	BgPid(Vpid),
 }
 
 impl KeyBuf {
@@ -361,6 +373,7 @@ impl KeyBuf {
 				Key::ZshAlias { suffix: *suffix, name: BStr::new(name) }
 			},
 			Self::JobFacts(j) => Key::JobFacts(*j),
+			Self::BgPid(p) => Key::BgPid(*p),
 		}
 	}
 }
@@ -1752,6 +1765,7 @@ mod tests {
 			Key::ZshOpt(ZshOpt::Extendedglob),
 			Key::ZshAlias { suffix: true, name: BStr::new("txt") },
 			Key::JobFacts(JobId(3)),
+			Key::BgPid(Vpid(9)),
 		];
 		for key in keys {
 			assert_eq!(s.hash_one(key), s.hash_one(key.to_buf()), "{key:?}");

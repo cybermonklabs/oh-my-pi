@@ -148,7 +148,10 @@ fn lower_command(
 /// that ends its and-or list, not run in the background; after an earlier
 /// item only when `;` or a newline ends that one and the command is its
 /// and-or list alone (`connection(earlier, this, ';')`). bash forks a
-/// compound command's last command. Node ids into `out`.
+/// compound command's last command, but for a `( … )`'s: the same rule picks
+/// the command that may run in the subshell's process (`evalstring.c`
+/// `optimize_subshell_command`, `optimize_connection_fork`), there with no
+/// trap that counts when it runs. Node ids into `out`.
 fn bash_tails(list: st::List<'_>, out: &mut Vec<u32>) {
 	let items = list.items();
 	let Some(item) = items.last() else {
@@ -532,11 +535,6 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
-	/// Lowering an assignment's value or a `[[ ]]` operand: a substitution
-	/// there names the line after its own newlines when it reports a job
-	/// ([`Part::Comsub`]'s `lines`); elsewhere bash names the line after
-	/// the command's.
-	sub_lines:     bool,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -606,7 +604,6 @@ impl Lower {
 			cond: 0,
 			features,
 			text: false,
-			sub_lines: false,
 		}
 	}
 
@@ -812,6 +809,17 @@ impl Lower {
 			},
 			st::CommandKind::Subshell(body) => {
 				self.node(cid, NodeKind::Subshell, cspan);
+				// bash may run the simple command that ends the list with
+				// `exec` in the subshell's process ([`Unit::tails`]).
+				if self.unit.mode.dialect() == crate::bash::ids::Dialect::Bash {
+					let mut tail = Vec::new();
+					bash_tails(body, &mut tail);
+					for node in tail {
+						if let Err(at) = self.unit.tails.binary_search(&node) {
+							self.unit.tails.insert(at, node);
+						}
+					}
+				}
 				self.emit(Opcode::Enter, 0, 0, id);
 				let spawn = self.unit.spawns.len() as u32;
 				self.unit.spawns.push(SpawnIr {
@@ -1014,10 +1022,7 @@ impl Lower {
 			st::CommandKind::Cond(e) => {
 				self.node(cid, NodeKind::Cond, cspan);
 				self.emit(Opcode::Enter, 0, 0, id);
-				let outer = std::mem::replace(&mut self.sub_lines, true);
-				let res = self.cond_expr(e, id);
-				self.sub_lines = outer;
-				res?;
+				self.cond_expr(e, id)?;
 				self.emit(Opcode::Leave, 0, 0, id);
 			},
 			st::CommandKind::Repeat(r) => {
@@ -1142,7 +1147,6 @@ impl Lower {
 			cond:          0,
 			features:      self.features,
 			text:          false,
-			sub_lines:     false,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);
@@ -1273,12 +1277,7 @@ impl Lower {
 			self.node(a.id(), NodeKind::Assign, a.span());
 			let index = a.index().map(|i| self.word(i)).transpose()?;
 			let value = match a.value() {
-				st::AssignValue::Scalar(w) => {
-					let outer = std::mem::replace(&mut self.sub_lines, true);
-					let value = self.word_as(w, WordKind::Assign);
-					self.sub_lines = outer;
-					AssignVal::Scalar(value?)
-				},
+				st::AssignValue::Scalar(w) => AssignVal::Scalar(self.word_as(w, WordKind::Assign)?),
 				st::AssignValue::Array(elems) => AssignVal::Array(self.elems(elems)?),
 			};
 			assigns.push(AssignOp {
@@ -1436,15 +1435,6 @@ impl Lower {
 			Err(count) => self.brace_limit(w, count),
 		}
 		Ok(idx)
-	}
-
-	/// The newlines in the unit's source that `span` covers (0 out of
-	/// range: a substitution in alias text).
-	fn newlines(&self, span: syn::Span) -> u32 {
-		let text = span.rebase(self.base).slice(&self.unit.source);
-		#[allow(clippy::naive_bytecount, reason = "short substitution sources")]
-		let n = text.iter().filter(|&&b| b == b'\n').count();
-		u32::try_from(n).unwrap_or(u32::MAX)
 	}
 
 	/// bash has no limit on a brace expansion's words; this engine refuses
@@ -1616,11 +1606,7 @@ impl Lower {
 			},
 			st::Part::Param(p) => out.push(Part::Param(Box::new(self.param(p, quoted)?))),
 			st::Part::Comsub(c) => {
-				// Its body's words are not the assignment's.
-				let outer = std::mem::replace(&mut self.sub_lines, false);
-				let entry = self.block(c.body());
-				self.sub_lines = outer;
-				let entry = entry?;
+				let entry = self.block(c.body())?;
 				let ck = c.kind();
 				let kind = match ck {
 					syn::ComsubKind::Dollar | syn::ComsubKind::Backtick => ComsubForm::Fork,
@@ -1633,25 +1619,12 @@ impl Lower {
 				if kind == ComsubForm::Fork {
 					self.mark_cat(entry);
 				}
-				let lines = if ck == syn::ComsubKind::Backtick || !self.sub_lines {
-					0
-				} else {
-					self.newlines(c.span())
-				};
-				out.push(Part::Comsub { entry, kind, quoted, text, lines });
+				out.push(Part::Comsub { entry, kind, quoted, text });
 			},
 			st::Part::Arith(a) => out.push(Part::Arith { text: a.src().into(), quoted }),
 			st::Part::ProcSub(p) => {
-				let outer = std::mem::replace(&mut self.sub_lines, false);
-				let entry = self.block(p.body());
-				self.sub_lines = outer;
-				let entry = entry?;
-				let lines = if self.sub_lines {
-					self.newlines(p.span())
-				} else {
-					0
-				};
-				out.push(Part::ProcSub { entry, output: p.output(), lines });
+				let entry = self.block(p.body())?;
+				out.push(Part::ProcSub { entry, output: p.output() });
 			},
 			st::Part::Compound(elems) => out.push(Part::Compound(self.elems(elems)?)),
 			st::Part::BadSubst(text) => out.push(Part::BadSubst(text.into())),

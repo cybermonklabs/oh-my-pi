@@ -165,11 +165,15 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 }
 
 /// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`).
+/// `cleanup_dead_jobs`, which deletes none while the job list is frozen).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
-	ctx.vp
-		.jobs
-		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+		super::super::killed::cleanup_dead_jobs(ctx.vp);
+	} else {
+		ctx.vp
+			.jobs
+			.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+	}
 }
 
 /// bash's `notify_and_cleanup (-1)` as `jobs` ends: the background jobs a
@@ -561,12 +565,16 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 }
 
 /// `disown`'s effect on one job: `nohup` marks it, else it is deleted
-/// (bash warns when that drops a stopped job).
+/// (bash warns when that drops a stopped job), but not while no job may be
+/// deleted (bash `delete_job` returns at once, `jobs.c:1492`).
 fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool) {
 	if nohup {
 		if let Some(job) = ctx.vp.jobs.get_mut(number) {
 			job.nohup = true;
 		}
+		return;
+	}
+	if ctx.vp.jobs_kept() {
 		return;
 	}
 	if let Some(job) = ctx.vp.jobs.remove(number)

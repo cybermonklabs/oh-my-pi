@@ -97,7 +97,7 @@ use crate::bash::{
 
 /// IR version; part of the frames header. Raised with every change to a
 /// serialized IR type.
-pub const IR_VERSION: u32 = 18;
+pub const IR_VERSION: u32 = 19;
 
 /// Opcodes.
 #[derive(
@@ -294,13 +294,16 @@ pub struct Unit {
 	pub conds:               Vec<CondIr>,
 	/// Function definitions.
 	pub funcs:               Vec<FuncIr>,
-	/// The syntax node ids, sorted, of the commands the real shell runs in
-	/// place of itself when this complete command is the last of its `-c`
-	/// string: bash's one simple command with no redirection it runs with
-	/// `exec` and no fork (`lower::bash_tails`); zsh's, with `last1`
-	/// (`lower::zsh_tails`): simple commands it runs with `exec` and no fork,
-	/// and `( … )` subshells it runs in place, one in a `for` body only on the
-	/// loop's last word, which the run decides.
+	/// The syntax node ids, sorted, of the commands the real shell may run
+	/// with `exec` and no fork. bash: when this complete command is the last
+	/// of its `-c` string, its one simple command with no redirection
+	/// (`lower::bash_tails`); and the simple command with no redirection that
+	/// ends a `( … )`'s `;`, `&&` or `||` list, which bash runs so in the
+	/// subshell's process while no trap counts (`optimize_subshell_command`,
+	/// `vm::killed::subshell_exec`). zsh's, with `last1` (`lower::zsh_tails`):
+	/// simple commands it runs with `exec` and no fork, and `( … )` subshells
+	/// it runs in place, one in a `for` body only on the loop's last word,
+	/// which the run decides.
 	#[serde(default)]
 	pub tails:               Vec<u32>,
 }
@@ -605,14 +608,12 @@ pub enum Part {
 		kind:   ComsubForm,
 		/// Inside double quotes.
 		quoted: bool,
-		/// `$( )`: `strs` index of the body's source text, re-parsed with
-		/// the aliases in effect when it runs (outside posix mode).
+		/// `$( )`, `${ ;}`, `${| ;}`: `strs` index of the body's source text,
+		/// re-parsed with the aliases in effect when it runs (outside posix
+		/// mode); bash re-parses it through its reader as it expands it, which
+		/// reports finished jobs (`vm::killed::expanded`). `None` for a
+		/// backquote.
 		text:   Option<u32>,
-		/// In an assignment's value or a `[[ ]]` operand, the newlines in
-		/// its source: bash 5.3.20 names the line after them when it reports
-		/// a job there (`vm::killed`); 0 elsewhere, where it names the line
-		/// after the command's, and for a backquote.
-		lines:  u32,
 	},
 	/// `$((…))`: arithmetic text, expanded then evaluated.
 	Arith {
@@ -627,8 +628,6 @@ pub enum Part {
 		entry:  u32,
 		/// `>(…)`.
 		output: bool,
-		/// The newlines in its source (as [`Part::Comsub`]'s `lines`).
-		lines:  u32,
 	},
 	/// `(…)` of a declaration-builtin argument (`declare -a a=(1 2)`).
 	Compound(Vec<ElemIr>),

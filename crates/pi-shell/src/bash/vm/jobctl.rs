@@ -1102,10 +1102,17 @@ fn settle_report(vp: &mut Vproc, number: u32) {
 
 /// zsh `deletejob` after a report: the current job falls back to the
 /// previous one (`curjob = prevjob; prevjob = job`, then `setprevjob`);
-/// bash `cleanup_dead_jobs`.
+/// bash `cleanup_dead_jobs`, which deletes none while no job may be deleted
+/// (the job stays, reported: [`Vproc::jobs_kept`]).
 fn forget(vp: &mut Vproc, number: u32) {
 	if vp.mode.dialect() != Dialect::Zsh {
-		vp.jobs.remove(number);
+		if vp.jobs_kept() {
+			if let Some(job) = vp.jobs.get_mut(number) {
+				job.notified = true;
+			}
+		} else {
+			vp.jobs.remove(number);
+		}
 		return;
 	}
 	let Some(i) = vp.jobs.list.iter().position(|j| j.number == number) else {

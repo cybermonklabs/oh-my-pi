@@ -310,3 +310,81 @@ fn a_subshells_killed_job_keeps_its_signal_across_snapshots() {
 	);
 	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
 }
+
+/// An external that a `KILL` has ended by the time it is waited for.
+struct KilledAtOnce;
+
+impl crate::bash::ExtProc for KilledAtOnce {
+	fn pid(&self) -> u32 {
+		77
+	}
+
+	fn poll_wait(
+		&mut self,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<crate::bash::ExitStatus> {
+		std::task::Poll::Ready(crate::bash::ExitStatus::Signaled(Signal::Kill))
+	}
+
+	fn signal(&mut self, _: Signal) -> std::io::Result<()> {
+		Ok(())
+	}
+
+	fn stop(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+
+	fn cont(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
+/// A subshell vproc that dies of the signal its external died of (bash ran
+/// the external with `exec` in the subshell's process: the last command of a
+/// `( … )`, a background job's) is reaped after its external ended: the
+/// signal waits for the reap in [`crate::bash::vm::Kernel::deaths`], which the
+/// frames image holds. Under `Fault::Snapshot { every: 1 }` each run prints
+/// the notice and status of the run without a snapshot: an external killed
+/// in a foreground subshell, in a background job, and in a subshell's job.
+#[test]
+fn a_killed_externals_death_outlives_every_snapshot() {
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	for (src, stdout) in [
+		(&b"( : ; /x/k ); echo st=$?"[..], &b"st=137\n"[..]),
+		(b"/x/k & wait $!; echo st=$?", b"st=137\n"),
+		(b"( /x/k & wait $!; echo st=$? )", b"st=137\n"),
+	] {
+		let run = |fault| {
+			let host = FakeHost::new().with_spawner(Box::new(|_: crate::bash::SpawnSpec<'_>| {
+				Ok(Box::new(KilledAtOnce) as Box<dyn crate::bash::ExtProc>)
+			}));
+			let mut r = Rig::new(host, skeleton_init(&[]));
+			let status = r.run(Script::command(src), fault);
+			(status, r.host.stdout.bytes(), r.host.stderr.bytes())
+		};
+		let plain = run(Fault::None);
+		let shown = String::from_utf8_lossy(src);
+		assert!(
+			plain.1 == stdout && String::from_utf8_lossy(&plain.2).contains(&*killed),
+			"{shown}: the uninterrupted run: {plain:?}"
+		);
+		assert_eq!(run(Fault::Snapshot { every: 1 }), plain, "{shown}");
+	}
+}
+
+/// The status a `wait` collected outlives the job's entry and a store image
+/// (bash's bgp list): a later run's `wait PID` returns it, with and without
+/// a snapshot between the runs.
+#[test]
+fn a_waited_status_outlives_a_store_image() {
+	for snapshot in [false, true] {
+		let mut r = rig();
+		r.run(Script::command(&b"{ exit 3; } & p=$!; wait $p; echo a=$?"[..]), Fault::None);
+		if snapshot {
+			r.snapshot();
+		}
+		assert_eq!(r.run(Script::command(&b"wait $p; echo b=$?"[..]), Fault::None), 0);
+		assert_eq!(r.host.stdout.bytes(), b"a=3\nb=3\n", "snapshot: {snapshot}");
+		assert_eq!(r.host.stderr.bytes(), b"", "snapshot: {snapshot}");
+	}
+}

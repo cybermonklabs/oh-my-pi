@@ -966,15 +966,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Lit(b) => Self::lit_text(sink, b, rhs),
 			Part::Quoted(b) => sink.lit(b, true),
 			Part::Param(p) => {
-				// bash's `extract_dollar_brace_string` parses a `$( )` of the
-				// operand even where it does not expand it (`xparse_dolparen`).
-				if let Some(lines) = operand_comsub(unit, p) {
-					super::killed::expanded(self.k, self.cx, self.vp, self.line, lines);
+				// bash's `extract_dollar_brace_string` re-parses what the
+				// `${ … }` holds even where it does not expand it.
+				if super::killed::reports_due(self.vp) && param_reparsed(unit, p) {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
 				}
 				self.param(unit, p, sink, inq || p.quoted, rhs)?;
 			},
-			Part::Comsub { entry, kind, quoted, text, lines } => {
-				let out = self.comsub(unit, *entry, *kind, *text, *lines)?;
+			Part::Comsub { entry, kind, quoted, text } => {
+				let out = self.comsub(unit, *entry, *kind, *text)?;
 				sink.value(&out, inq || *quoted);
 			},
 			Part::Arith { text, quoted } => {
@@ -990,13 +990,13 @@ impl<'e, 'c> Expander<'e, 'c> {
 				};
 				sink.value(v.format_into(&mut NumBuffer::new()).as_bytes(), inq || *quoted);
 			},
-			Part::ProcSub { entry, output, lines } => {
+			Part::ProcSub { entry, output } => {
 				// Logged, so a replay after a command substitution parks does
 				// not start it twice.
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
-					super::killed::expanded(self.k, self.cx, self.vp, self.line, *lines);
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
 					let p = super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output);
 					self.note(|| Atom::Str(Some(p.clone())));
 					p
@@ -1033,16 +1033,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 	/// A command substitution: its finished output on a replay, else
 	/// [`Stop::Sub`] to start it. `text` (`None` for a backquote) is what
 	/// bash re-parses in the shell first, through `shell_getc`
-	/// (`xparse_dolparen`), passing the `lines` newlines of its source: the
-	/// background jobs a signal killed are reported then
-	/// ([`super::killed::expanded`]).
+	/// (`xparse_dolparen`): the background jobs a signal killed are reported
+	/// then ([`super::killed::expanded`]).
 	fn comsub(
 		&mut self,
 		unit: &Arc<Unit>,
 		entry: u32,
 		form: ComsubForm,
 		text: Option<u32>,
-		lines: u32,
 	) -> X<BString> {
 		// A word compiled as unable to park (no replay log) can still meet
 		// a command substitution in run-time text (a nameref's subscript,
@@ -1062,7 +1060,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Ok(out)
 		} else {
 			if text.is_some() {
-				super::killed::expanded(self.k, self.cx, self.vp, self.line, lines);
+				super::killed::expanded(self.k, self.cx, self.vp, self.line);
 			}
 			Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text })
 		}
@@ -3387,26 +3385,81 @@ pub struct CompoundElem {
 	pub value:  BString,
 }
 
-/// The first `$( )`, `${ ;}` or `${| ;}` (not a backquote) in the word
-/// operand of `p` (`${x:-…}`, `${x:=…}`, `${x:+…}`, `${x:?…}`), at any depth
-/// of nested operands: its `lines` ([`Part::Comsub`]). bash parses it when
-/// it expands `p`, whether or not it expands the operand.
-fn operand_comsub(unit: &Unit, p: &ParamIr) -> Option<u32> {
-	let w = match &p.op {
-		OpIr::Default { word, .. } | OpIr::Assign { word, .. } | OpIr::Alt { word, .. } => *word,
-		OpIr::Error { word: Some(word), .. } => *word,
-		_ => return None,
+/// Whether bash re-parses text of `p` through its reader as it expands it,
+/// whether or not it expands that text: `extract_dollar_brace_string` hands
+/// each `$( )`, `${ ;}`, `${| ;}`, `<( )` and `>( )` of the `${ … }` to
+/// `xparse_dolparen`, and each `$( )` of `$(( ))` text through
+/// `extract_delimited_string`, at any depth of nested parameters; a
+/// backquote and `$(( ))` text without one are not ([`Part::Comsub`]'s
+/// `text`). So a job is reported before an operand bash does not expand
+/// (`${x:-$( )}` with `x` set).
+fn param_reparsed(unit: &Unit, p: &ParamIr) -> bool {
+	let index = match p.index {
+		Some(SubIr::Expr(w)) => Some(w),
+		_ => None,
 	};
-	unit
-		.words
-		.get(w as usize)?
-		.parts
-		.iter()
-		.find_map(|part| match part {
-			Part::Comsub { text: Some(_), lines, .. } => Some(*lines),
-			Part::Param(inner) => operand_comsub(unit, inner),
-			_ => None,
+	let words: [Option<u32>; 2] = match &p.op {
+		OpIr::Default { word, .. } | OpIr::Assign { word, .. } | OpIr::Alt { word, .. } => {
+			[Some(*word), None]
+		},
+		OpIr::Error { word, .. } => [*word, None],
+		OpIr::Trim { pat, .. } => [Some(*pat), None],
+		OpIr::Replace { pat, rep, .. } => [Some(*pat), *rep],
+		OpIr::Case { pat, .. } => [*pat, None],
+		OpIr::None
+		| OpIr::Length
+		| OpIr::Indirect
+		| OpIr::PrefixNames { .. }
+		| OpIr::Substr { .. }
+		| OpIr::Transform(_) => [None, None],
+	};
+	std::iter::once(index)
+		.chain(words)
+		.flatten()
+		.any(|w| word_reparsed(unit, w))
+}
+
+/// Whether word `w` of `unit` holds text bash re-parses ([`param_reparsed`]).
+fn word_reparsed(unit: &Unit, w: u32) -> bool {
+	unit.words.get(w as usize).is_some_and(|word| {
+		word.parts.iter().any(|part| match part {
+			Part::Comsub { text: Some(_), .. } | Part::ProcSub { .. } => true,
+			Part::Arith { text, .. } => arith_reparsed(text),
+			Part::Param(inner) => param_reparsed(unit, inner),
+			_ => false,
 		})
+	})
+}
+
+/// Whether `$(( ))` text `text` holds a `$( )`, `${ ;}` or `${| ;}`, which
+/// bash re-parses as it extracts the text (`extract_delimited_string`'s
+/// `SX_COMMAND` case); a backslash quotes the next byte, single quotes their
+/// text.
+fn arith_reparsed(text: &[u8]) -> bool {
+	let mut i = 0;
+	while let Some(&c) = text.get(i) {
+		match c {
+			b'\\' => i += 2,
+			b'\'' => {
+				i += 1
+					+ text[i + 1..]
+						.iter()
+						.position(|&b| b == b'\'')
+						.map_or(text.len(), |n| n + 1);
+			},
+			b'$' => {
+				match (text.get(i + 1), text.get(i + 2)) {
+					(Some(b'('), Some(b'(')) => {},
+					(Some(b'('), _) => return true,
+					(Some(b'{'), Some(b' ' | b'\t' | b'\n' | b'|')) => return true,
+					_ => {},
+				}
+				i += 1;
+			},
+			_ => i += 1,
+		}
+	}
+	false
 }
 
 /// The `(…)` text a declaration builtin re-reads: each value (and key)

@@ -350,11 +350,16 @@ const fn trim(path: &[u8]) -> &[u8] {
 	}
 }
 
-/// A `Pending` answer that becomes ready on a timer thread.
+/// A `Pending` answer that becomes ready on a timer thread. Its first poll
+/// is `Pending` even when the timer already fired (it wakes the caller at
+/// once then): whether a 0 ms timer thread runs before the first poll is the
+/// OS scheduler's choice, and a `Pending` answer must stay one an engine
+/// path cannot take as a synchronous answer.
 struct Delayed<T> {
-	res:   Option<io::Result<T>>,
-	ready: Arc<AtomicBool>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	res:    Option<io::Result<T>>,
+	ready:  Arc<AtomicBool>,
+	waker:  Arc<Mutex<Option<Waker>>>,
+	polled: bool,
 }
 
 impl<T> Delayed<T> {
@@ -370,12 +375,19 @@ impl<T> Delayed<T> {
 				waker.wake();
 			}
 		});
-		Self { res: Some(res), ready, waker }
+		Self { res: Some(res), ready, waker, polled: false }
 	}
 }
 
 impl<T: Send> FsPending<T> for Delayed<T> {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+		if !std::mem::replace(&mut self.polled, true) {
+			*self.waker.lock() = Some(cx.waker().clone());
+			if self.ready.load(Ordering::Acquire) {
+				cx.waker().wake_by_ref();
+			}
+			return Poll::Pending;
+		}
 		if !self.ready.load(Ordering::Acquire) {
 			*self.waker.lock() = Some(cx.waker().clone());
 			if !self.ready.load(Ordering::Acquire) {
@@ -869,6 +881,38 @@ mod tests {
 				}
 			},
 		}
+	}
+
+	/// Counts its wakes.
+	struct Wakes(AtomicU64);
+
+	impl Wake for Wakes {
+		fn wake(self: Arc<Self>) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	// Failure mode: a 0 ms timer thread that ran before the first poll made a
+	// `Pending` answer ready at once, which an engine path took for a
+	// synchronous one (bang_pid's FIFO test on macOS).
+	#[test]
+	fn a_pending_answer_is_pending_at_its_first_poll_even_once_its_timer_fired() {
+		let mut answer = Delayed::start(Ok(7u8), 0);
+		let deadline = std::time::Instant::now() + Duration::from_secs(30);
+		while !answer.ready.load(Ordering::Acquire) {
+			assert!(std::time::Instant::now() < deadline, "the 0 ms timer did not fire in 30 s");
+			thread::yield_now();
+		}
+		let wakes = Arc::new(Wakes(AtomicU64::new(0)));
+		let waker = Waker::from(Arc::clone(&wakes));
+		let mut cx = Context::from_waker(&waker);
+		assert!(answer.poll(&mut cx).is_pending(), "its first poll");
+		assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "woken at once");
+		assert!(matches!(answer.poll(&mut cx), Poll::Ready(Ok(7))), "its second poll");
 	}
 
 	#[test]

@@ -305,6 +305,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 			}),
 		),
 		(KeyBuf::JobFacts(JobId(2)), Record::JobFacts(vec![JobFact::Signal(Signal::Kill)])),
+		(KeyBuf::BgPid(Vpid(Vpid::BASE + 3)), Record::Misc(bytes(b"137:4243:0"))),
 		(KeyBuf::Proc(Vpid(Vpid::BASE + 1)), Record::Proc {
 			parent: Some(Vpid(Vpid::BASE)),
 			status: None,
@@ -689,7 +690,7 @@ fn deleting_a_scope_drops_its_locals(store: &mut dyn StateStore) {
 }
 
 /// Every table, `Scope` and `Local` included.
-const TABLES: [Table; 15] = [
+const TABLES: [Table; 16] = [
 	Table::Var,
 	Table::Func,
 	Table::Alias,
@@ -705,6 +706,7 @@ const TABLES: [Table; 15] = [
 	Table::ZshOpt,
 	Table::ZshAlias,
 	Table::JobFacts,
+	Table::BgPid,
 ];
 
 /// A scan of each table visits exactly that table's records, once each.

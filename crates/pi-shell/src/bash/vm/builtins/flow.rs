@@ -632,10 +632,23 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
-/// finished child whose status is kept (bash's `bgpids`), or the running
-/// process substitution or coprocess `$!` names.
+/// finished child whose status is kept (its process's, or one `wait`
+/// collected, bash's bgp list), or the running process substitution or
+/// coprocess `$!` names. zsh 5.9: not the job whose end runs the `CHLD`
+/// trap, while it runs ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its
+/// status reaches zsh's list of background statuses once the trap is over);
+/// another finished job is one.
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
+		&& ctx.vp.zsh.as_ref().is_some_and(|z| z.chld_own == Some(pid))
+		&& in_chld_trap(ctx.vp)
+	{
+		return false;
+	}
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
+		return true;
+	}
+	if ctx.vp.jobs.bgp_search(pid).is_some() {
 		return true;
 	}
 	// A subshell copies `$!`, not its parent's children.
@@ -647,6 +660,16 @@ fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 		Some(crate::bash::vm::ProcState::Running) => ctx.vp.last_bg.is(pid),
 		None => false,
 	}
+}
+
+/// Whether `vp` runs a `CHLD` trap (its action or a `TRAPCHLD` function).
+fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
+	use crate::bash::vm::proc::{FrameKind, ScriptKind};
+	let chld = crate::bash::store::TrapKey::Signal(crate::bash::signal::Signal::Chld);
+	vp.trap_frames != 0
+		&& vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
+		})
 }
 
 /// `wait` without operands: every running job (bash
@@ -698,19 +721,20 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R {
 	let mut list = Vec::new();
 	if args.is_empty() {
+		// bash `wait_for_any_job` takes a finished job already reported only
+		// once it waited for a child (`Awaited::AnyJob`).
 		list.extend(ctx.vp.jobs.iter().filter(|j| !j.inherited).map(|j| j.vpid));
 	} else {
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
 			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
-			(ctx.vp.jobs.by_vpid(pid).is_none()
-				&& matches!(
+			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
+				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
 					Some(crate::bash::vm::ProcState::Exited(_))
-				)
-				&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid))
-			.then_some(pid)
+				) && ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid));
+			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
 			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };

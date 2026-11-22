@@ -476,14 +476,20 @@ pub struct Kernel {
 	pub int_notes:          Vec<(Vpid, IntNote)>,
 	/// The subshell vprocs that die of a signal, not reaped yet, with the
 	/// signal: by their own end at its default action (`Shell`'s `kill`), as
-	/// the program they are ([`external_ended`]), or through their own EXIT
-	/// trap (bash `termsig_handler` kills the subshell with the signal once
-	/// the trap has run). Their parent reads it at the reap
+	/// the program they are ([`external_ended`]), as the one `( … )` they
+	/// wait for ([`Shell::reaped`]: one process in bash), or through their
+	/// own EXIT trap (bash `termsig_handler` kills the subshell with the
+	/// signal once the trap has run). Their parent reads it at the reap
 	/// ([`Shell::reaped`]): a hold of `INT` for its foreground job, and the
 	/// job of a background one (bash `WIFSIGNALED`). Apart from
-	/// [`Self::int_notes`]: a wait the EXIT trap begins rewrites those. Not
-	/// imaged.
+	/// [`Self::int_notes`]: a wait the EXIT trap begins rewrites those. In
+	/// the frames image: a snapshot between the death and the reap keeps it.
 	pub deaths:             Vec<(Vpid, Signal)>,
+	/// Notices of foreground subshells a signal killed
+	/// ([`killed::subshell_ended`]) held until the `( … )`'s own
+	/// redirections are undone: the vproc, the depth of its frame, the
+	/// notice. An entry goes when its vproc ends. In the frames image.
+	pub held_notices:       Vec<(Vpid, u32, BString)>,
 	/// The vprocs whose pending `INT` trap bash runs with the job list
 	/// frozen ([`proc::ScriptKind::Trap`]'s `frozen`): the `INT` came while
 	/// the vproc waited for a forked foreground command (bash's `wait_for`
@@ -700,6 +706,7 @@ impl Kernel {
 			pseudo_traps: exec::PseudoTraps::default(),
 			int_notes: Vec::new(),
 			deaths: Vec::new(),
+			held_notices: Vec::new(),
 			frozen_ints: Vec::new(),
 			forward: crate::bash::SigSet::EMPTY,
 			program_in_place: false,
@@ -2165,6 +2172,7 @@ impl Shell {
 				let died = self.k.died_of(p.vpid);
 				self.k.set_int_note(p.vpid, None);
 				self.k.frozen_ints.retain(|v| *v != p.vpid);
+				self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 				self.reaped(cx, p.parent, p.vpid, p.status, died, false);
 			} else {
 				i += 1;
@@ -2252,15 +2260,19 @@ impl Shell {
 				.k
 				.set_int_note(parent, Some(IntNote::Held(HeldInt::Job { caught })));
 		}
-		// bash reports a foreground subshell that died of a signal; not from
-		// a pipeline's stage, which in bash is the subshell's own process.
-		if let (false, false, Some(sig)) = (background, pipeline, died_of)
-			&& !self.pipeline_stage(parent)
-		{
-			killed::subshell_ended(&mut self.k, cx, &mut self.procs[i], vpid, sig);
+		if let (false, Some(sig)) = (background, died_of) {
+			// bash runs a `( … )` that is the whole command of a `( … )`, a
+			// job or a stage in that process (`CMD_NO_FORK`): the process dies
+			// of the signal too, and its own parent reports it.
+			if waits_for_its_subshell(&self.procs[i]) {
+				self.k.dies_of(parent, sig);
+			} else if !pipeline {
+				// A foreground subshell that died of a signal gets a notice.
+				killed::subshell_ended(&mut self.k, cx, &mut self.procs[i], vpid, sig);
+			}
 		}
 		jobctl::job_done(&mut self.k, cx, &mut self.procs[i], vpid);
-		owe_chld(&mut self.k, cx, &mut self.procs[i], background);
+		owe_chld(&mut self.k, cx, &mut self.procs[i], background.then_some(vpid));
 	}
 
 	/// Vproc `vpid` stopped (`Some(signal)`) or continued (`None`). If it
@@ -2509,6 +2521,7 @@ impl Shell {
 			self.rr = 0;
 			self.k.set_int_note(p.vpid, None);
 			self.k.frozen_ints.retain(|v| *v != p.vpid);
+			self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 			let died = self.k.died_of(p.vpid);
 			self.reaped(cx, p.parent, p.vpid, status, died, pipeline);
 		}
@@ -3258,24 +3271,25 @@ pub fn imported_function(k: &Kernel, name: &[u8], value: &[u8]) -> Option<Record
 /// A child of `p` finished: if `p` traps `SIGCHLD`, it owes one more run of
 /// the trap (bash's `waitchld` counts the children it reaped and runs the
 /// trap that many times). Called by the scheduler for child vprocs and by
-/// `Exec` for externals `p` ran itself; `background`: the child was one of
+/// `Exec` for externals `p` ran itself; `job`: the child was this one of
 /// `p`'s background jobs. zsh (`update_job`) runs the trap (a `trap` action
-/// or the `TRAPCHLD` function) only for those, not for the foreground job.
-/// bash queues the trap for a child reaped while its `CHLD` trap runs and
-/// then drops it (`run_pending_traps` finds the trap's slot busy and warns
-/// `bad value in trap_list[17]`): the trap runs once, even when it starts
-/// children of its own (a `$( )`, a program).
-pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool) {
+/// or the `TRAPCHLD` function) only for those, not for the foreground job,
+/// one run per job ([`proc::VprocZsh::chld_jobs`]). A child reaped while
+/// the `CHLD` trap runs owes none: bash queues the trap and then drops it
+/// (`run_pending_traps` finds the trap's slot busy and warns `bad value in
+/// trap_list[17]`), and zsh 5.9 runs it once too, even for a job the trap's
+/// `wait` waited for, or one of its own children (a `$( )`, a program).
+pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, job: Option<Vpid>) {
 	let zsh = p.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-	if zsh && !background {
+	if zsh && job.is_none() {
 		return;
 	}
 	let chld = crate::bash::store::TrapKey::Signal(Signal::Chld);
-	if !zsh
-		&& p.trap_frames != 0
+	if p.trap_frames != 0
 		&& p.frames.iter().any(|f| {
 			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
-		}) {
+		})
+	{
 		return;
 	}
 	let key = crate::bash::store::Key::Trap(crate::bash::store::TrapKey::Signal(Signal::Chld));
@@ -3294,6 +3308,9 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
+		if let (true, Some(job)) = (zsh, job) {
+			p.zsh_state().chld_jobs.push_back(job);
+		}
 		if !p.waiting_foreground() {
 			p.blocked = None;
 		}
@@ -3314,7 +3331,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 		};
 		let waiting = matches!(
 			e.waiting,
-			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob)
+			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob { .. })
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
 			e.waiting = Some(proc::Awaited::Jobs { force: true });
@@ -3512,13 +3529,16 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 }
 
 /// Whether a terminating signal to `p` is the business of what `p` runs
-/// rather than of `p` itself, as when bash `exec`s a subshell's last
-/// command: `Some(true)` when `p` is a subshell vproc (no `EXIT` trap of its
-/// own) whose one frame awaits the external that is its last command (`cmd
-/// &`, a pipeline stage, `( cmd )`) or one it `exec`s; `Some(false)` when it
-/// only waits for the stages of its pipeline or its `( … )` before it exits
-/// (the job vproc of `a | b &`), and the signal reaches those too
-/// (`children`: a job, label or broadcast target); `None` otherwise.
+/// rather than of `p` itself, as when bash runs it in `p`'s own process:
+/// `Some(true)` when `p` is a subshell vproc (no `EXIT` trap of its own)
+/// whose one frame awaits the external bash runs with `exec` there (bash:
+/// [`killed::subshell_exec`], decided as it started; zsh: its last command,
+/// `cmd &`, a pipeline stage, `( cmd )`) or one it `exec`s; `Some(false)`
+/// when it only waits for the stages of its pipeline or its `( … )` before it
+/// exits (the job vproc of `a | b &`; bash: only a pipeline or a `( … )` that
+/// is its whole command, which bash runs in that process, `( ( … ) )`), and
+/// the signal reaches those too (`children`: a job, label or broadcast
+/// target); `None` otherwise.
 pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
@@ -3530,50 +3550,62 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	let sc = frame.scratch.as_ref()?;
 	let op = unit.ops.get(frame.pc as usize)?;
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+	let bash = p.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	match (&sc.live, op.code) {
 		(Live::Ext(_), ir::Opcode::Exec) => {
 			let exec = sc.exec.as_ref().is_some_and(|e| e.exec_as.is_some());
-			(exec || code_at(frame.pc + 1) == Some(ir::Opcode::SubExit)).then_some(true)
+			let last = if bash {
+				sc.exec.as_ref().is_some_and(|e| e.subshell_exec)
+			} else {
+				code_at(frame.pc + 1) == Some(ir::Opcode::SubExit)
+			};
+			(exec || last).then_some(true)
 		},
 		(_, ir::Opcode::Spawn) if children && !sc.children.is_empty() => {
 			let spawn = unit.spawns.get(op.a as usize)?;
-			let end = match (spawn.kind, code_at(spawn.end)) {
+			let mut end = match (spawn.kind, code_at(spawn.end)) {
 				// `( … )`: its `Leave` follows.
 				(ir::SpawnKind::Subshell, Some(ir::Opcode::Leave)) => spawn.end + 1,
 				(ir::SpawnKind::Subshell | ir::SpawnKind::Pipeline, _) => spawn.end,
 				_ => return None,
 			};
+			if bash {
+				// `[Redir] Enter Spawn … Leave [PopRedir]` for a `( … )`, the
+				// whole code of `p`'s own command.
+				let mut start = frame.pc;
+				if spawn.kind == ir::SpawnKind::Subshell {
+					start = start.checked_sub(1)?;
+					if start > 0 && code_at(start - 1) == Some(ir::Opcode::Redir) {
+						start -= 1;
+						end += u32::from(code_at(end) == Some(ir::Opcode::PopRedir));
+					}
+				}
+				let whole =
+					killed::base_spawn(unit, frame.pc).is_some_and(|(s, i)| s.stages[i].entry == start);
+				if !whole {
+					return None;
+				}
+			}
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
 		_ => None,
 	}
 }
 
-impl Shell {
-	/// Whether vproc `v` is a stage its parent's pipeline waits for: in bash
-	/// a `( … )` stage is the subshell's own process.
-	fn pipeline_stage(&self, v: Vpid) -> bool {
-		let Some(g) = self
-			.procs
-			.iter()
-			.find(|p| p.vpid == v)
-			.and_then(|p| p.parent)
-			.and_then(|g| self.procs.iter().find(|q| q.vpid == g))
-		else {
-			return false;
-		};
-		g.frames.iter().any(|f| {
-			f.scratch
-				.as_ref()
-				.is_some_and(|s| s.children.iter().any(|(c, _)| *c == v))
-				&& f.unit.as_ref().is_some_and(|u| {
-					u.ops
-						.get(f.pc as usize)
-						.and_then(|op| u.spawns.get(op.a as usize))
-						.is_some_and(|s| s.kind == ir::SpawnKind::Pipeline)
-				})
+/// Whether `p` only waits for the one `( … )` that is its whole command
+/// ([`transparent`]'s `Some(false)` for a `( … )`): bash runs that
+/// subshell in `p`'s own process (`execute_in_subshell`'s `CMD_NO_FORK`).
+fn waits_for_its_subshell(p: &Vproc) -> bool {
+	p.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& transparent(p, true) == Some(false)
+		&& p.frames.first().is_some_and(|f| {
+			f.unit.as_ref().is_some_and(|u| {
+				u.ops
+					.get(f.pc as usize)
+					.and_then(|op| u.spawns.get(op.a as usize))
+					.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
+			})
 		})
-	}
 }
 
 /// Whether `p` is just the job process of a pipeline (`a | b &`): its one
@@ -3677,8 +3709,10 @@ impl Vproc {
 		fds: FdTable,
 	) -> Self {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
-		// A `( … )` body follows its `Spawn` op.
-		let subshell_line = entry
+		// bash's `line_number` as it forks: a `( … )`'s own line, the last
+		// (`Subshell->line`; its body follows its `Spawn` op), else the line
+		// the parent has reached ([`killed::wait_line`]).
+		let fork_line = entry
 			.checked_sub(1)
 			.and_then(|pc| unit.ops.get(pc as usize))
 			.filter(|op| {
@@ -3688,11 +3722,21 @@ impl Vproc {
 						.get(op.a as usize)
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
-			.map(|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift));
+			.map_or_else(
+				|| {
+					let node = self
+						.frames
+						.last()
+						.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize))
+						.map_or(0, |op| op.node);
+					killed::wait_line(self, node)
+				},
+				|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
+			);
 		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
-		frame.subshell_line = subshell_line;
+		frame.fork_line = Some(fork_line);
 		self.child_running(k, store, fds, frame)
 	}
 

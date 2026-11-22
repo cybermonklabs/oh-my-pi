@@ -99,11 +99,14 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			if let Some(sig) = pending {
 				vp.pending_traps = vp.pending_traps.without(sig);
 				// One run per finished child (bash `run_sigchld_trap`): the next
-				// waits until this one is done.
+				// waits until this one is done. zsh's run is its job's.
 				if sig == crate::bash::signal::Signal::Chld {
 					vp.jobs.chld = vp.jobs.chld.saturating_sub(1);
 					if vp.jobs.chld > 0 {
 						vp.pending_traps = vp.pending_traps.with(sig);
+					}
+					if let Some(z) = vp.zsh.as_mut() {
+						z.chld_own = z.chld_jobs.pop_front();
 					}
 				}
 				let started = start_trap(k, vp, cx, TrapKey::Signal(sig));
@@ -1177,6 +1180,16 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		let eval = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Eval, .. });
 		// zsh `execode` of empty code (`zstyle -e`, `zregexparse`) leaves 0.
 		let code = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Code(_), .. });
+		// bash's `wait_for` goes on to `notify_and_cleanup` once the `INT`
+		// trap it ran with the job list frozen is over.
+		let frozen_int = matches!(frame.kind, FrameKind::Script {
+			what: ScriptKind::Trap {
+				key: TrapKey::Signal(crate::bash::signal::Signal::Int),
+				frozen: true,
+				..
+			},
+			..
+		});
 		// A zsh function trap (`TRAPZERR`, …) runs above a trap frame
 		// without text.
 		let func_trap = status.is_some() && empty_src;
@@ -1189,8 +1202,21 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			return None;
 		}
 		pop_frame(&mut k.root, cx.store, vp);
+		if frozen_int {
+			super::killed::cleanup_dead_jobs(vp);
+		}
 		if debug && !vp.frames.is_empty() {
 			zsh_debug_done(k, vp, cx);
+			// bash's `run_debug_trap` ends with `notify_and_cleanup (-1)`
+			// (`trap.c:1304`), naming the line of the command it ran for.
+			if mode.dialect() == Dialect::Bash {
+				let node = vp
+					.frames
+					.last()
+					.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize).map(|o| o.node));
+				let line = node.map_or(0, |node| line_of(vp, node));
+				super::killed::line_read(k, cx, vp, line);
+			}
 		}
 		if (source || eval || code) && no_command {
 			vp.status = 0;
@@ -2036,11 +2062,20 @@ pub fn end_line(unit: &Unit, node: u32) -> u32 {
 
 /// The line bash reports for an error of a compound command (a failed
 /// redirection, a rejected function definition): in the base frame of a
-/// `( … )` child the subshell's last line, else `line`.
+/// `( … )` child the subshell's last line ([`Frame::fork_line`]), else
+/// `line`.
 fn compound_line(vp: &Vproc, line: u32) -> u32 {
 	vp.frames
 		.last()
-		.and_then(|f| f.subshell_line)
+		.filter(|f| {
+			f.kind == FrameKind::Subshell
+				&& vp.jobs.comsub != super::proc::Comsub::Own
+				&& f.unit.as_deref().is_some_and(|u| {
+					super::killed::base_spawn(u, f.pc)
+						.is_some_and(|(s, _)| s.kind == SpawnKind::Subshell)
+				})
+		})
+		.and_then(|f| f.fork_line)
 		.unwrap_or(line)
 }
 
@@ -2070,9 +2105,15 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
 	let mut remaining = n.max(1);
+	// bash's `REAP` as the body of a loop it leaves or continues ends.
+	let mut reap = false;
 	loop {
 		let f = top_frame(vp);
 		if let Some(rec) = f.loops.last().cloned() {
+			reap |= f
+				.unit
+				.as_deref()
+				.is_some_and(|u| reaps_on_break(u, &rec, f.pc));
 			// More levels than loops: the outermost loop ends.
 			if remaining > 1 && f.loops.len() > 1 {
 				f.loops.pop();
@@ -2091,6 +2132,9 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 				r.status = status;
 			}
 			f.pc = if cont { rec.cont } else { rec.exit };
+			if reap {
+				super::killed::cleanup_dead_jobs(vp);
+			}
 			return;
 		}
 		let crossable = matches!(
@@ -2114,6 +2158,33 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 	}
 	vp.status = 0;
 	top_frame(vp).pc += 1;
+}
+
+/// Whether bash runs `REAP` as `break` or `continue` at `pc` ends the body
+/// of loop `rec` (`execute_for_command`, `execute_select_command`,
+/// `execute_while_or_until` reap before they look at `breaking`): a `for`,
+/// `select` or `while` loop's body, or its condition (a `while` whose
+/// condition `break` ends runs the rest of its body as nothing, then
+/// reaps); an `until` loop's body, not its condition (`break` succeeds, so
+/// the loop ends at once). An arithmetic `for` reaps only after its test.
+fn reaps_on_break(unit: &Unit, rec: &super::proc::LoopRec, pc: u32) -> bool {
+	let Some(node) = unit.ops.get(rec.exit as usize).map(|o| o.node) else {
+		return false;
+	};
+	match unit.nodes.get(node as usize).map(|n| n.kind) {
+		Some(NodeKind::For | NodeKind::Select | NodeKind::While) => true,
+		Some(NodeKind::Until) => {
+			// The condition runs from `rec.cont` to the `BrOk` that ends it.
+			let test_end = (rec.cont..rec.exit).find(|&at| {
+				unit
+					.ops
+					.get(at as usize)
+					.is_some_and(|o| o.code == Opcode::BrOk && o.node == node)
+			});
+			!test_end.is_some_and(|end| rec.cont <= pc && pc < end)
+		},
+		_ => false,
+	}
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2899,6 +2970,7 @@ fn control_flow(
 		Opcode::Nop => Some(Flow::Next),
 		Opcode::Jmp => Some(Flow::Jump(op.a)),
 		Opcode::BrOk | Opcode::BrFail if !k.mask.any_op(op.ev) => {
+			reap_after_arith_test(vp, unit, op);
 			Some(branch(op, (vp.status == 0) == (op.code == Opcode::BrOk)))
 		},
 		Opcode::LoopNote | Opcode::LoopBack => Some(loop_note(vp, op)),
@@ -3022,7 +3094,9 @@ const fn branch(op: Op, jump: bool) -> Flow {
 }
 
 /// `LoopNote`/`LoopBack`: the innermost loop's status and iteration count;
-/// `LoopBack` jumps back to the loop's test.
+/// `LoopBack` jumps back to the loop's test, after bash's `REAP` (the body
+/// of a `for`, `select`, `while` or `until` loop ended: the finished jobs
+/// reported go, `execute_cmd.c:3105`, `3606`, `3838`).
 fn loop_note(vp: &mut Vproc, op: Op) -> Flow {
 	let status = vp.status;
 	if let Some(rec) = top_frame(vp).loops.last_mut() {
@@ -3030,9 +3104,25 @@ fn loop_note(vp: &mut Vproc, op: Op) -> Flow {
 		rec.iterations += 1;
 	}
 	if op.code == Opcode::LoopBack {
+		super::killed::cleanup_dead_jobs(vp);
 		Flow::Jump(op.a)
 	} else {
 		Flow::Next
+	}
+}
+
+/// bash's `REAP` once an arithmetic `for` loop evaluated its test
+/// (`execute_cmd.c:3267`), the `BrFail` after it: the finished jobs reported
+/// go.
+fn reap_after_arith_test(vp: &mut Vproc, unit: &Unit, op: Op) {
+	if op.code == Opcode::BrFail
+		&& !vp.jobs.list.is_empty()
+		&& unit
+			.nodes
+			.get(op.node as usize)
+			.is_some_and(|n| n.kind == NodeKind::ArithFor)
+	{
+		super::killed::cleanup_dead_jobs(vp);
 	}
 }
 
@@ -3051,6 +3141,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					EventData::Branch { construct: Construct::from_u32(op.b), taken: !jump, status };
 				k.emit_op(cx, vp, op.node, data);
 			}
+			reap_after_arith_test(vp, unit, op);
 			branch(op, jump)
 		},
 		Opcode::Not => {
@@ -3158,6 +3249,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			if let Some(saves) = top_frame(vp).redirs.pop() {
 				restore(vp, saves);
 			}
+			// A subshell's notice waited for its redirections to go.
+			let depth = u32::try_from(vp.frames.len()).unwrap_or(u32::MAX);
+			super::killed::redirections_undone(k, vp, depth);
 			Flow::Next
 		},
 		Opcode::Spawn => spawn(k, vp, cx, unit, op),
@@ -4208,6 +4302,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			k.settle_bang(vp.vpid, None);
 		}
 		let mut children = Vec::with_capacity(info.stages.len());
+		// bash's `stop_pipeline` (each fork it makes a job of) first deletes
+		// the finished jobs reported (`jobs.c:572`); for a `lastpipe`
+		// pipeline it runs with the job list frozen (`execute_pipeline`),
+		// deleting none.
+		if info.kind != SpawnKind::Pipeline {
+			super::killed::cleanup_dead_jobs(vp);
+		}
 		match info.kind {
 			SpawnKind::Subshell | SpawnKind::Background => {
 				let mut fds = vp.fds.clone();
@@ -4302,6 +4403,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
 						&& !job_control(k, cx, vp)
 				};
+				if !lastpipe {
+					super::killed::cleanup_dead_jobs(vp);
+				}
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
@@ -4577,15 +4681,23 @@ pub(super) fn fork_async_ignored(
 
 /// The job table a child that lists its parent's jobs starts with (a
 /// command substitution, a `jobs` pipeline stage): copies of them, which
-/// are not its children; `subshell` turns job control off.
+/// are not its children, and none of the statuses its parent's `wait`
+/// collected; `subshell` turns job control off.
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
-	let mut jobs = vp.jobs.clone();
-	jobs.chld = 0;
-	jobs.subshell = subshell;
-	for job in &mut jobs.list {
+	let parent = &vp.jobs;
+	let mut list = parent.list.clone();
+	for job in &mut list {
 		job.inherited = true;
 	}
-	jobs
+	super::proc::JobTable {
+		list,
+		current: parent.current,
+		previous: parent.previous,
+		chld: 0,
+		subshell,
+		comsub: parent.comsub,
+		bgp: None,
+	}
 }
 
 /// Whether the pipeline stage starting at `entry` is a simple command
@@ -5034,14 +5146,17 @@ fn push_trap(
 	// bash runs a `CHLD` trap `wait` runs from `waitchld`, and an `INT`
 	// trap from its `wait_for`, with the job list frozen; in posix mode the
 	// `CHLD` trap ends the `wait` and runs after it (`jobs.c:4240-4250`).
+	// zsh freezes nothing: the finished job is out of its table already.
+	let bash = vp.mode.dialect() == Dialect::Bash;
 	let frozen = match key {
 		TrapKey::Signal(crate::bash::signal::Signal::Chld) => {
-			vp.in_wait_builtin()
+			bash
+				&& vp.in_wait_builtin()
 				&& !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
 		},
 		TrapKey::Signal(crate::bash::signal::Signal::Int) => {
 			let at = k.frozen_ints.iter().position(|v| *v == vp.vpid);
-			at.map(|i| k.frozen_ints.swap_remove(i)).is_some()
+			at.map(|i| k.frozen_ints.swap_remove(i)).is_some() && bash
 		},
 		_ => false,
 	};
