@@ -14088,12 +14088,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
 			// Take its lease before the manager takes its id, waiting out another
-			// holder's (SQL storage only): while it waits, the manager still reports
-			// the session it had, and one another live omp process still holds
-			// moves to a minted id in the same step, before any hook hears of it.
+			// holder's (SQL storage only, for one of its lease expiries and 5 s):
+			// while it waits, the manager still reports the session it had, and one
+			// another live omp process still holds moves to a minted id in the same
+			// step, before any hook hears of it.
 			await this.sessionManager.setSessionFile(sessionPath, {
 				claim: {
-					waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+					waitMs: this.sessionManager.getStorage().openClaimWaitMs ?? SESSION_OPEN_CLAIM_WAIT_MS,
 					onWait: holder =>
 						logger.warn("Session switch waits for another omp process's lease", {
 							sessionPath,

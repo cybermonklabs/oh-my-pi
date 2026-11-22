@@ -31,8 +31,9 @@
  * - `{ op: "switch", via, cwd, scratchDir, file?, dir? }`: start an agent session on a new session in
  *   `scratchDir`, then open `file` with `switchSession` (`via: "switch"`), or the newest session of
  *   `dir` as RPC `open_session` does (`via: "rpc"`), recording every `session_start` and
- *   `session_switch` with the id it saw and when, and the manager's id once a second while it
- *   switches (as an extension's heartbeat reads it), then write one turn.
+ *   `session_switch` with the id it saw and when, the manager's id once a second while it switches
+ *   (as an extension's heartbeat reads it) and when its claim hears that it must wait for another
+ *   holder (`waitedOn`), then write one turn.
  * - `{ op: "openWaiting", file, sessionDir, waitMs, closeOnWait? }`: open the session file and start the claim an
  *   explicit resume takes (`claimOpenedSession` with `waitMs`); answer once the claim says it waits for another
  *   holder (`waiting: true`), or once it settled without waiting (`waiting: false`). With `closeOnWait`, the
@@ -66,6 +67,8 @@ interface Config {
 	table: string;
 	leaseTable: string;
 	lease?: { expiryMs: number; heartbeatMs: number };
+	/** See `LeaseProcessConfig.openClaimWaitMs`. */
+	openClaimWaitMs?: number;
 	/** `file`: run on file storage instead, for the paths only it has. */
 	storage?: "file";
 	/** See `LeaseProcessConfig.holderLookupMs`. */
@@ -81,6 +84,7 @@ const storage: SessionStorage & { refresh?: () => Promise<void> } = client
 			leaseTable: config.leaseTable,
 			claims: true,
 			...(config.lease ? { lease: config.lease } : {}),
+			...(config.openClaimWaitMs !== undefined ? { openClaimWaitMs: config.openClaimWaitMs } : {}),
 		})
 	: new FileSessionStorage();
 setDefaultSessionStorage(storage);
@@ -260,11 +264,30 @@ async function switchTo(command: Record<string, unknown>): Promise<Record<string
 	// As an extension's heartbeat does: read the manager's id once a second, with no session event.
 	const polled = new Set<string>();
 	const poll = setInterval(() => polled.add(session.sessionManager.getSessionId()), 1000);
+	// And at the moment the switch's claim starts to wait, whenever that is: the id a reader sees while it waits;
+	// and the wait the switch gave that claim.
+	let waitedOn: string | undefined;
+	let claimWaitMs: number | undefined;
+	const acquire = storage.acquireSessionClaim?.bind(storage);
+	const claims = storage as { acquireSessionClaim?: SessionStorage["acquireSessionClaim"] };
+	if (acquire) {
+		claims.acquireSessionClaim = (sessionId, sessionPath, options) => {
+			claimWaitMs ??= options?.waitMs;
+			return acquire(sessionId, sessionPath, {
+				...options,
+				onWait: holder => {
+					waitedOn ??= session.sessionManager.getSessionId();
+					options?.onWait?.(holder);
+				},
+			});
+		};
+	}
 	try {
 		if (command.via === "rpc") await openRpcSession(session, String(command.dir));
 		else await session.switchSession(String(command.file));
 	} finally {
 		clearInterval(poll);
+		if (acquire) claims.acquireSessionClaim = acquire;
 	}
 	const elapsedMs = Date.now() - started;
 	await writeTurn(session.sessionManager, `switched by ${process.pid}`);
@@ -272,6 +295,8 @@ async function switchTo(command: Record<string, unknown>): Promise<Record<string
 		...describe(session.sessionManager),
 		events: events.map(event => ({ type: event.type, id: event.id, afterSwitchStartMs: event.at - started })),
 		polled: [...polled],
+		waitedOn,
+		claimWaitMs,
 		scratchId,
 		elapsedMs,
 	};

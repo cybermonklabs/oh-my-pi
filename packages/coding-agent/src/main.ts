@@ -1460,27 +1460,30 @@ async function forkIfMovedAwayUnlessExclusive(manager: SessionManager, sessionDi
  * Claim the session `manager` opened before anything else sees it, on a
  * storage that can tell at once (SQL storage; see
  * `SessionManager.claimOpenedSession`). An explicit resume (`--resume`, the
- * session `--continue` picks, the picker's pick) first waits up to
- * {@link SESSION_OPEN_CLAIM_WAIT_MS} for another holder's lease to go or
- * expire, telling the person on stderr, so a resume after its holder was
- * killed keeps the id; the automatic resume (`wait: false`) does not. One
- * still held then moves to a minted id, or, under `OMP_SESSION_EXCLUSIVE=1`,
- * ends the process non-zero naming the holder. On file storage only a
- * launcher-named session (`OMP_SESSION_EXCLUSIVE=1`) waits, for a holder that
- * is still ending; a file lease does not name its holder.
+ * session `--continue` picks, the picker's pick) first waits up to the
+ * storage's `openClaimWaitMs` (one lease expiry and 5 s:
+ * {@link SESSION_OPEN_CLAIM_WAIT_MS} under the default lease timings and on
+ * file storage) for another holder's lease to go or expire, telling the
+ * person on stderr, so a resume after its holder was killed keeps the id; the
+ * automatic resume (`wait: false`) does not. One still held then moves to a
+ * minted id, or, under `OMP_SESSION_EXCLUSIVE=1`, ends the process non-zero
+ * naming the holder. On file storage only a launcher-named session
+ * (`OMP_SESSION_EXCLUSIVE=1`) waits, for a holder that is still ending; a
+ * file lease does not name its holder.
  */
 async function claimOpenedSession(manager: SessionManager, options: { wait?: boolean } = {}): Promise<SessionManager> {
 	if (options.wait === false) {
 		await manager.claimOpenedSession();
 		return manager;
 	}
+	const waitMs = manager.getStorage().openClaimWaitMs ?? SESSION_OPEN_CLAIM_WAIT_MS;
 	await manager.claimOpenedSession({
-		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+		waitMs,
 		onWait: holder => {
 			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
 			process.stderr.write(
 				`Session ${manager.getSessionId()} is held by another omp process${by}; ` +
-					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
+					`waiting up to ${waitMs / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
 			);
 		},
 	});

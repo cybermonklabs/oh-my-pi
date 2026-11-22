@@ -72,7 +72,9 @@ export interface LeaseDb extends AsyncDisposable {
 	/**
 	 * A new store on its own client. `dsn` overrides the URL (a proxy's);
 	 * `wrap` wraps the client the store sends its statements through;
-	 * `leaseTable` names the fixture's lease table another way (its spelling).
+	 * `leaseTable` names the fixture's lease table another way (its spelling);
+	 * `sqliteBusyTimeoutMs` sets the SQLite client's own busy wait before the
+	 * store opens, which the store then keeps.
 	 */
 	open(
 		options?: Partial<
@@ -80,6 +82,7 @@ export interface LeaseDb extends AsyncDisposable {
 		> & {
 			dsn?: string;
 			wrap?: (client: SqlSessionStorageClient) => SqlSessionStorageClient;
+			sqliteBusyTimeoutMs?: number;
 		},
 	): Promise<SqlSessionStorage>;
 	/** Run `query` on the fixture's own client; `@1`, `@2` … are the dialect's placeholders. */
@@ -127,8 +130,9 @@ export async function openLeaseDb(adapter: SqlSessionStorageAdapter, url: string
 		dir,
 		sql,
 		async open(options = {}) {
-			const { dsn: storeDsn, wrap, ...storeOptions } = options;
+			const { dsn: storeDsn, wrap, sqliteBusyTimeoutMs, ...storeOptions } = options;
 			const client = new SQL(storeDsn ?? dsn);
+			if (sqliteBusyTimeoutMs !== undefined) await client.unsafe(`PRAGMA busy_timeout = ${sqliteBusyTimeoutMs}`);
 			const storage = await SqlSessionStorage.create({
 				client: wrap ? wrap(client) : client,
 				table,
@@ -308,12 +312,12 @@ export async function rejection(promise: Promise<unknown>): Promise<unknown> {
 }
 
 /**
- * Wait until `check` holds, polling every `pollMs`; fails after `ms`, naming
- * `what` when given.
+ * Wait until `check` holds, polling every `pollMs`. With no `ms` only the row's own timeout bounds the wait, so no
+ * clock decides what it waits for; with `ms` it fails after that long, naming `what` when given.
  */
 export async function until(
 	check: () => Promise<boolean> | boolean,
-	ms = 10_000,
+	ms = Number.POSITIVE_INFINITY,
 	{ what, pollMs = 25 }: { what?: string; pollMs?: number } = {},
 ): Promise<void> {
 	const deadline = Date.now() + ms;
@@ -713,6 +717,11 @@ export interface LeaseProcessConfig {
 	table: string;
 	leaseTable: string;
 	lease?: { expiryMs: number; heartbeatMs: number };
+	/**
+	 * How long the process's opens and switches wait for another holder's lease (the store's `openClaimWaitMs`), so
+	 * a test that needs a wait to run out does not spend one lease expiry and 5 s on it.
+	 */
+	openClaimWaitMs?: number;
 	/** `file`: the process runs on file storage instead, for the paths only it has; the other fields are unused. */
 	storage?: "file";
 	/**
@@ -741,6 +750,10 @@ export interface LeaseProcessReport {
 	events?: Array<{ type: string; id: string; afterSwitchStartMs: number }>;
 	/** The manager ids a `switch` read once a second while it switched, and the session it switched from. */
 	polled?: string[];
+	/** The manager id a `switch` reported when its claim started to wait for another holder; unset when it never waited. */
+	waitedOn?: string;
+	/** The `waitMs` a `switch` gave its claim. */
+	claimWaitMs?: number;
 	scratchId?: string;
 	/** A `defaultSessionDir`'s answer. */
 	sessionDir?: string;
