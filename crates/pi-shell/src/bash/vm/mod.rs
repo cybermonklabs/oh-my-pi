@@ -556,6 +556,18 @@ impl ProcState {
 /// of the file they were read from.
 type DumpFuncs = ((i64, u64), Arc<std::collections::HashSet<BString>>);
 
+/// The simple command running on top of `vp`'s frames, by its tag: what
+/// owns a [`proc::Deferral`]. `None` between commands.
+fn running_cmd(vp: &Vproc) -> Option<CmdTag> {
+	vp.frames
+		.last()?
+		.scratch
+		.as_ref()?
+		.exec
+		.as_ref()
+		.map(|e| e.tag)
+}
+
 impl Kernel {
 	/// The functions (metafied names) of the digest `path` as this shell
 	/// last read it, while its modification time and size are `stamp`.
@@ -637,16 +649,41 @@ impl Kernel {
 		}
 	}
 
-	/// The redirections `vproc`'s command leaves to the process it spawns,
-	/// while it decides ([`proc::Deferral`]).
-	pub fn deferral(&mut self, vproc: Vpid) -> Option<&mut proc::Deferral> {
-		self.deferrals.iter_mut().find(|d| d.vproc == vproc)
+	/// The redirections the command running on top of `vp` leaves to the
+	/// process it spawns, while it decides ([`proc::Deferral`]). Only that
+	/// command's: one it runs on the same vproc (its function's body,
+	/// `eval`'s code) finds none.
+	pub fn deferral(&mut self, vp: &Vproc) -> Option<&mut proc::Deferral> {
+		if self.deferrals.is_empty() {
+			return None;
+		}
+		let cmd = running_cmd(vp)?;
+		self.deferrals.iter_mut().find(|d| d.cmd == cmd)
 	}
 
-	/// `vproc` ended, or its command did: forget what it was deciding.
+	/// [`Self::deferral`], read only.
+	pub fn deferral_of(&self, vp: &Vproc) -> Option<&proc::Deferral> {
+		if self.deferrals.is_empty() {
+			return None;
+		}
+		let cmd = running_cmd(vp)?;
+		self.deferrals.iter().find(|d| d.cmd == cmd)
+	}
+
+	/// The command running on top of `vp` ended, or its process started:
+	/// forget what it was deciding.
+	pub fn end_deferral(&mut self, vp: &Vproc) {
+		if !self.deferrals.is_empty()
+			&& let Some(cmd) = running_cmd(vp)
+		{
+			self.deferrals.retain(|d| d.cmd != cmd);
+		}
+	}
+
+	/// `vproc` ended: forget what its commands were deciding.
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {
-			self.deferrals.retain(|d| d.vproc != vproc);
+			self.deferrals.retain(|d| d.cmd.vpid != vproc);
 		}
 	}
 

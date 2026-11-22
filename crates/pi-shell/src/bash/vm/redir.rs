@@ -38,7 +38,7 @@ use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	fs::{File, FileKind, FsOp, FsPoll, OpenFlags, SeekFrom, StatKind},
 	host::{ChildRedir, OsHandle},
-	ids::Dialect,
+	ids::{CmdTag, Dialect},
 	ir::{RedirFdIr, RedirIr, RedirTargetIr, SpawnKind, Unit},
 	mem::MemBuf,
 	store::{OptId, VarValue},
@@ -125,9 +125,8 @@ pub fn apply(
 		if zsh {
 			zsh_install(k, vp, cx, r, &target, line, multios)?;
 		} else if k
-			.deferrals
-			.iter()
-			.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect)
+			.deferral_of(vp)
+			.is_some_and(|d| d.phase == DeferPhase::Collect)
 		{
 			collect(k, vp, cx, r, &target, line)?;
 		} else {
@@ -137,8 +136,8 @@ pub fn apply(
 			// writer then sees its reader vanish).
 			if !k.bangs.is_empty() && waits_on_fifo(cx, vp, r, &target) {
 				let path = absolute(&vp.cwd, &target);
-				if deferrable(k, vp, cx, &redirs[done..], &path) {
-					start_deferral(vp, k);
+				if let Some(cmd) = deferrable(k, vp, cx, &redirs[done..], &path) {
+					start_deferral(vp, k, cmd);
 					return Ok(());
 				}
 			}
@@ -619,13 +618,13 @@ fn defer(
 	rest: &[RedirIr],
 	path: &BString,
 ) -> bool {
-	if !deferrable(k, vp, cx, rest, path) {
+	let Some(cmd) = deferrable(k, vp, cx, rest, path) else {
 		k.settle_bang(vp.vpid, None);
 		return false;
-	}
+	};
 	// The pending open is dropped here; the process repeats it.
 	io(vp).redir.opening = None;
-	start_deferral(vp, k);
+	start_deferral(vp, k, cmd);
 	true
 }
 
@@ -649,30 +648,36 @@ fn waits_on_fifo(cx: &mut Cx<'_>, vp: &Vproc, r: &RedirIr, target: &BString) -> 
 	matches!(cx.host.fs().stat(BStr::new(&path), true), FsPoll::Ready(Ok(st)) if st.kind == StatKind::Fifo)
 }
 
-/// Whether the job's lone external may leave the open of `path` and the
-/// redirections after it (`rest`) to the process it spawns.
-fn deferrable(k: &Kernel, vp: &Vproc, cx: &mut Cx<'_>, rest: &[RedirIr], path: &BString) -> bool {
-	let Some(bang) = k.bangs.iter().find(|b| b.vproc == vp.vpid) else {
-		return false;
-	};
+/// The command (its tag, which names the [`Deferral`]) that may leave the
+/// open of `path` and the redirections after it (`rest`) to the process it
+/// spawns: the job's lone external.
+fn deferrable(
+	k: &Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	rest: &[RedirIr],
+	path: &BString,
+) -> Option<CmdTag> {
+	let bang = k.bangs.iter().find(|b| b.vproc == vp.vpid)?;
 	let command = vp
 		.frames
 		.last()
 		.and_then(|f| f.scratch.as_ref())
 		.and_then(|s| s.exec.as_ref())
-		.is_some_and(|e| e.stage == Stage::Redirect && !e.argv.is_empty());
-	bang.stage == BangStage::Lone
-		&& command
-		&& !k.deferrals.iter().any(|d| d.vproc == vp.vpid)
+		.filter(|e| e.stage == Stage::Redirect && !e.argv.is_empty())?;
+	(bang.stage == BangStage::Lone
+		&& !k.deferrals.iter().any(|d| d.cmd.vpid == vp.vpid)
 		&& rest.iter().all(childable)
-		&& cx.host.child_opens(BStr::new(path))
+		&& cx.host.child_opens(BStr::new(path)))
+	.then_some(command.tag)
 }
 
-/// Hand the current redirection and those after it to the spawned process.
-fn start_deferral(vp: &mut Vproc, k: &mut Kernel) {
+/// Hand the current redirection of command `cmd` and those after it to the
+/// spawned process.
+fn start_deferral(vp: &mut Vproc, k: &mut Kernel, cmd: CmdTag) {
 	let from = io(vp).redir.done;
 	k.deferrals
-		.push(Deferral { vproc: vp.vpid, from, phase: DeferPhase::Lookup, list: Vec::new() });
+		.push(Deferral { cmd, from, phase: DeferPhase::Lookup, list: Vec::new() });
 }
 
 /// What a spawned process prints before an error's description for `what`
@@ -750,7 +755,7 @@ fn collect(
 			unreachable!("a here-document is never left to the process (`childable`)")
 		},
 	}
-	if let Some(d) = k.deferral(vp.vpid) {
+	if let Some(d) = k.deferral(vp) {
 		d.list.extend(add);
 	}
 	Ok(())
@@ -773,11 +778,7 @@ fn fd_number(
 /// collected before, and not closed since.
 fn child_fd_open(k: &Kernel, vp: &Vproc, fd: i32) -> bool {
 	let inherited = vp.fds.get(fd).is_some_and(FdRef::is_open);
-	let list = k
-		.deferrals
-		.iter()
-		.find(|d| d.vproc == vp.vpid)
-		.map_or(&[][..], |d| d.list.as_slice());
+	let list = k.deferral_of(vp).map_or(&[][..], |d| d.list.as_slice());
 	list.iter().fold(inherited, |open, redir| match redir {
 		ChildRedir::Open { fds, .. } if fds.contains(&fd) => true,
 		ChildRedir::Dup { fd: set, .. } if *set == fd => true,

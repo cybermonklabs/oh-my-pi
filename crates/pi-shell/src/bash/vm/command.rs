@@ -333,12 +333,11 @@ pub fn exec(
 				{
 					return flow;
 				}
-				// The rest of a deferred list ran (or was collected) after the
-				// name resolved: the command dispatches.
+				// The rest of this command's deferred list ran (or was
+				// collected) after its name resolved: the command dispatches.
 				let resolved = k
-					.deferrals
-					.iter()
-					.any(|d| d.vproc == vp.vpid && d.phase != DeferPhase::Lookup);
+					.deferral_of(vp)
+					.is_some_and(|d| d.phase != DeferPhase::Lookup);
 				let s = st(vp);
 				s.stage = if s.argv.is_empty() {
 					Stage::Finish
@@ -355,9 +354,8 @@ pub fn exec(
 			},
 			Stage::Dispatch
 				if k
-					.deferrals
-					.iter()
-					.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Lookup) =>
+					.deferral_of(vp)
+					.is_some_and(|d| d.phase == DeferPhase::Lookup) =>
 			{
 				deferred_resolved(k, vp);
 			},
@@ -386,7 +384,7 @@ pub fn exec(
 				st(vp).stage = Stage::Finish;
 			},
 			Stage::Finish => {
-				k.forget_deferral(vp.vpid);
+				k.end_deferral(vp);
 				return finish(k, vp, cx, op);
 			},
 		}
@@ -699,7 +697,7 @@ fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) {
 	if !external {
 		k.settle_bang(vp.vpid, None);
 	}
-	if let Some(d) = k.deferral(vp.vpid) {
+	if let Some(d) = k.deferral(vp) {
 		d.phase = if external {
 			DeferPhase::Collect
 		} else {
@@ -2344,7 +2342,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 						let s = st(vp);
 						let argv = spawn_argv(&s.argv, s.exec_as.as_deref());
 						let child_redirs = k
-							.deferral(vp.vpid)
+							.deferral_of(vp)
 							.is_some_and(|d| d.phase == DeferPhase::Collect);
 						spawned_external(k, vp, cx, op, line, spawned, Spawned {
 							path,
@@ -2404,7 +2402,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			// The redirections left to the process (`deferred_resolved`). Copied,
 			// not taken: a spawn dropped before it finished (a suspend) is asked
 			// for again with the same list.
-			let redirs = match k.deferral(vp.vpid) {
+			let redirs = match k.deferral_of(vp) {
 				Some(d) if d.phase == DeferPhase::Collect => Some(d.list.clone()),
 				_ => None,
 			};
@@ -2534,7 +2532,7 @@ fn spawned_external(
 		Err(_) if child_redirs => {
 			// The redirections are applied here after all, then the spawn
 			// is tried again (and fails as it would have).
-			if let Some(d) = k.deferral(vp.vpid) {
+			if let Some(d) = k.deferral(vp) {
 				d.phase = DeferPhase::Resume;
 				d.list.clear();
 				let from = d.from;
@@ -2543,7 +2541,7 @@ fn spawned_external(
 			st(vp).stage = Stage::Redirect;
 		},
 		Ok(child) => {
-			k.forget_deferral(vp.vpid);
+			k.end_deferral(vp);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
 			// The job this vproc may still settle is known by its program

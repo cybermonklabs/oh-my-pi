@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A background function, `eval` or sourced file whose redirection waits on a FIFO now runs its own commands as bash does: one named by a path (`/bin/cat`, `./prog`), or with an assignment or a redirection of its own, was "command not found" (127).
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

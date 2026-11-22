@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -792,7 +792,7 @@ impl Shell {
 		k.deferrals = img
 			.deferrals
 			.into_iter()
-			.filter(|d| img.procs.iter().any(|p| p.vpid == d.vproc))
+			.filter(|d| img.procs.iter().any(|p| p.vpid == d.cmd.vpid))
 			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
