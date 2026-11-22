@@ -17,7 +17,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
+import { expectNoExitPass } from "./helpers/postmortem-exit-pass";
 
 class ProcessExitSignal extends Error {
 	constructor(readonly code: number) {
@@ -29,6 +30,7 @@ class ProcessExitSignal extends Error {
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
+	expectNoExitPass();
 });
 
 describe("runRootCommand — startup --resume picker cancellation", () => {
@@ -75,6 +77,14 @@ describe("runRootCommand — startup --resume picker cancellation", () => {
 			exitCodes.push(code ?? 0);
 			throw new ProcessExitSignal(code ?? 0);
 		}) as typeof process.exit);
+		// The launch exits through postmortem.exitAfterCleanup, whose real exit pass would leave every later
+		// registration in this process running at once (helpers/postmortem-exit-pass.ts): stop it there too.
+		const cleanupExits: number[] = [];
+		vi.spyOn(postmortem, "exitAfterCleanup").mockImplementation(async (code: number) => {
+			cleanupExits.push(code);
+			exitCodes.push(code);
+			throw new ProcessExitSignal(code);
+		});
 		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
 		let pickerCalled = false;
@@ -100,5 +110,6 @@ describe("runRootCommand — startup --resume picker cancellation", () => {
 		// Exactly one clean exit — proves the cancel branch terminates instead of
 		// falling through to session creation or returning into a hang.
 		expect(exitCodes).toEqual([0]);
+		expect(cleanupExits).toEqual([0]);
 	}, 15_000);
 });
