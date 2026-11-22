@@ -2443,8 +2443,6 @@ PATH="${PATH#*:}" exec git "$@"
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn status_poll_retries_after_an_optional_lock_skip() -> TestResult {
-		use std::os::unix::fs::PermissionsExt;
-
 		if let Some(root) = env::var_os(ENV_LOCK_SKIP_REPO) {
 			let root = PathBuf::from(root);
 			let repo = GitRepo::require(&root)?;
@@ -2496,8 +2494,10 @@ PATH="${PATH#*:}" exec git "$@"
 		let bin = git_dir.join("test-bin");
 		fs::create_dir(&bin)?;
 		let wrapper = bin.join("git");
-		fs::write(&wrapper, LOCK_SKIP_GIT_WRAPPER)?;
-		fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+		// A child writes the wrapper (`testprog`): this process never holds
+		// it open for writing, so no fork by another test's thread can keep
+		// it busy ("Text file busy") when the re-executed test runs git.
+		crate::testprog::write(&wrapper, LOCK_SKIP_GIT_WRAPPER);
 		let mut path = vec![bin];
 		path.extend(env::split_paths(&env::var_os("PATH").ok_or("PATH must be set")?));
 		let path = env::join_paths(path)?;
