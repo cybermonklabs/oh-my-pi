@@ -14,14 +14,16 @@
 //!
 //! Each case runs in a child process: this test binary again, running the
 //! one test with [`CASE`] set. The child starts the shell
-//! ([`pi_shell::process::main`]) on a `-c` string that sets an EXIT trap,
-//! makes the file [`MARK`] names, then waits; a thread of the child faults
-//! once the file exists: a write to an unmapped address, or (`syscall`) a
-//! system call its seccomp filter traps.
+//! ([`pi_shell::process::main`]) on a `-c` string that sends its output to
+//! a file of the test's, sets an EXIT trap, makes the file [`MARK`] names,
+//! then waits; a thread of the child faults once the file exists: a write
+//! to an unmapped address, or (`syscall`) a system call its seccomp filter
+//! traps.
 
 #![cfg(unix)]
 
 use std::{
+	fs,
 	io::Read as _,
 	os::unix::process::ExitStatusExt,
 	path::PathBuf,
@@ -36,10 +38,13 @@ const CASE: &str = "PI_SHELL_FAULT_CASE";
 const MARK: &str = "PI_SHELL_FAULT_MARK";
 /// The status the embedding runtime's fault handler exits with.
 const RUNTIME_HANDLED: i32 = 42;
-/// The script: an EXIT trap that would print `x`, the file, then a wait
-/// the fault cuts short (the `sleep` left over holds no pipe of the test).
-const SCRIPT: &str =
-	"trap 'echo x' EXIT; : > \"$PI_SHELL_FAULT_MARK\"; /bin/sleep 5 >/dev/null 2>&1";
+/// The script: its output to the mark's `.out` file, an EXIT trap that
+/// would print `x` there, the mark, then a wait the fault cuts short (the
+/// `sleep` left over holds no pipe of the test). Not to the child's stdout:
+/// libtest running one test thread prints `test NAME ... ` with no newline
+/// before the test runs, and the trap's `x` would end that line.
+const SCRIPT: &str = "exec >\"$PI_SHELL_FAULT_MARK.out\"; trap 'echo x' EXIT; : > \
+                      \"$PI_SHELL_FAULT_MARK\"; /bin/sleep 5 >/dev/null 2>&1";
 
 /// The embedding runtime's fault handler.
 extern "C" fn runtime_handler(_: libc::c_int) {
@@ -133,12 +138,13 @@ fn trapped_syscall() {
 	unreachable!("the syscall case runs on Linux only");
 }
 
-/// Run test `test` again as the child of `case`: how it ended and what it
-/// printed. The fault comes as soon as the mark exists; a handler that
-/// returns repeats it forever, so a child still running `AFTER_MARK` after
-/// the mark appeared fails the test (nextest's own timeout bounds a child
-/// that never gets that far).
-fn run_child(test: &str, case: &str) -> (ExitStatus, String) {
+/// Run test `test` again as the child of `case`: how it ended, what its
+/// script wrote (the mark's `.out` file: the trap's `x`, if it ran) and
+/// what it printed. The fault comes as soon as the mark exists; a handler
+/// that returns repeats it forever, so a child still running `AFTER_MARK`
+/// after the mark appeared fails the test (nextest's own timeout bounds a
+/// child that never gets that far).
+fn run_child(test: &str, case: &str) -> (ExitStatus, String, String) {
 	const AFTER_MARK: Duration = Duration::from_secs(30);
 	let dir = tempfile::tempdir().expect("a directory for the mark");
 	let mark = dir.path().join("set");
@@ -172,7 +178,12 @@ fn run_child(test: &str, case: &str) -> (ExitStatus, String) {
 		}
 		thread::sleep(Duration::from_millis(10));
 	};
-	(status, reader.join().expect("the child's output"))
+	let printed = reader.join().expect("the child's output");
+	let out = mark.with_extension("out");
+	let out = fs::read_to_string(&out).unwrap_or_else(|err| {
+		panic!("{status}: the script's output {}: {err}: {printed}", out.display())
+	});
+	(status, out, printed)
 }
 
 /// The case this process runs as a child, if it is one.
@@ -182,27 +193,22 @@ fn as_child() {
 	}
 }
 
-/// Whether the EXIT trap ran (it prints `x`).
-fn trap_ran(out: &str) -> bool {
-	out.lines().any(|line| line == "x")
-}
-
 #[test]
 fn a_real_fault_ends_a_standalone_shell_with_an_exit_trap() {
 	as_child();
-	let (status, out) =
+	let (status, out, printed) =
 		run_child("a_real_fault_ends_a_standalone_shell_with_an_exit_trap", "standalone");
-	assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}: {out}");
-	assert!(!trap_ran(&out), "the process ran on after the fault: {out}");
+	assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}: {printed}");
+	assert_eq!(out, "", "the process ran on after the fault: {printed}");
 }
 
 #[test]
 fn a_real_fault_in_an_embedded_shell_reaches_the_runtimes_handler() {
 	as_child();
-	let (status, out) =
+	let (status, out, printed) =
 		run_child("a_real_fault_in_an_embedded_shell_reaches_the_runtimes_handler", "embedded");
-	assert_eq!(status.code(), Some(RUNTIME_HANDLED), "{status}: {out}");
-	assert!(!trap_ran(&out), "the shell's handler took the fault first: {out}");
+	assert_eq!(status.code(), Some(RUNTIME_HANDLED), "{status}: {printed}");
+	assert_eq!(out, "", "the shell's handler took the fault first: {printed}");
 }
 
 /// A fault that does not repeat (`SIGSYS` from a trapped system call) is
@@ -212,8 +218,8 @@ fn a_real_fault_in_an_embedded_shell_reaches_the_runtimes_handler() {
 #[test]
 fn a_trapped_system_call_runs_the_exit_trap_then_ends_the_shell() {
 	as_child();
-	let (status, out) =
+	let (status, out, printed) =
 		run_child("a_trapped_system_call_runs_the_exit_trap_then_ends_the_shell", "syscall");
-	assert_eq!(status.signal(), Some(libc::SIGSYS), "{status}: {out}");
-	assert!(trap_ran(&out), "the EXIT trap did not run: {out}");
+	assert_eq!(status.signal(), Some(libc::SIGSYS), "{status}: {printed}");
+	assert_eq!(out, "x\n", "the EXIT trap's output: {printed}");
 }
