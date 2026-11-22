@@ -15,6 +15,9 @@ class FakeLiveSession implements RpcLiveSession {
 	/** What the controller reports once started; `undefined` models a session that ended first. */
 	sdpAnswer: string | undefined;
 	readonly started = Promise.withResolvers<void>();
+	/** While set, a stop waits for {@link releaseStop}, as one waiting for the server's close does. */
+	holdStop = false;
+	readonly releaseStop = Promise.withResolvers<void>();
 	#stopped: Promise<void> | undefined;
 	constructor(readonly options: LiveSessionControllerOptions) {}
 
@@ -33,15 +36,23 @@ class FakeLiveSession implements RpcLiveSession {
 
 	stop(): Promise<void> {
 		this.stopCalls += 1;
-		this.#stopped ??= Promise.resolve().then(() => this.callbacks.onTerminal());
+		this.#stopped ??= (this.holdStop ? this.releaseStop.promise : Promise.resolve()).then(() =>
+			this.callbacks.onTerminal(),
+		);
 		return this.#stopped;
 	}
 }
 
-function harness(levelsIntervalMs = 40, startRefusal?: () => string | undefined) {
+function harness(
+	levelsIntervalMs = 40,
+	startRefusal?: () => string | undefined,
+	settings: Record<string, unknown> = {},
+) {
 	const frames: RpcLiveFrame[] = [];
 	const sessions: FakeLiveSession[] = [];
-	const agentSession = { settings: Settings.isolated({ "live.voice": "sol" }) } as unknown as AgentSession;
+	const agentSession = {
+		settings: Settings.isolated({ "live.voice": "sol", ...settings }),
+	} as unknown as AgentSession;
 	const bridge = new RpcLiveBridge(agentSession, frame => frames.push(frame), {
 		createSession: options => {
 			const fake = new FakeLiveSession(options);
@@ -146,6 +157,24 @@ describe("RpcLiveBridge", () => {
 		bridge.setMuted(true);
 		expect(bridge.status()).toMatchObject({ muted: true });
 		await bridge.stop();
+		expect(bridge.status()).toEqual({ state: "off" });
+	});
+
+	test("status says closing while a call ends, and names a live.endpoint server by its origin", async () => {
+		const { bridge, sessions } = harness(40, undefined, {
+			"live.endpoint": "https://voice.example:8443/v1?token=not-for-status",
+		});
+		const starting = bridge.start();
+		const live = sessions[0]!;
+		expect(bridge.status()).toMatchObject({ state: "starting", provider: "endpoint https://voice.example:8443" });
+		live.started.resolve();
+		await starting;
+		live.holdStop = true;
+		const stopping = bridge.stop();
+		expect(bridge.status()).toMatchObject({ state: "closing", provider: "endpoint https://voice.example:8443" });
+		await expect(bridge.start()).rejects.toThrow("A live session is already active");
+		live.releaseStop.resolve();
+		await stopping;
 		expect(bridge.status()).toEqual({ state: "off" });
 	});
 

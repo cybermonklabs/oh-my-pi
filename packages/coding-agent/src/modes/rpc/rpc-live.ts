@@ -6,7 +6,7 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { toError } from "@oh-my-pi/pi-utils";
 import { LiveSessionController, type LiveSessionControllerOptions } from "../../live/controller";
-import { cfgLiveProvider, resolveLiveVoice } from "../../live/settings";
+import { cfgLiveEndpoint, cfgLiveProvider, resolveLiveVoice } from "../../live/settings";
 import type { AgentSession } from "../../session/agent-session";
 import type { LiveCallStatus, SlashCommandLiveHost } from "../../slash-commands/types";
 import type { RpcLiveFrame } from "./rpc-types";
@@ -125,7 +125,7 @@ export class RpcLiveBridge implements SlashCommandLiveHost {
 			},
 		});
 		this.#controller = controller;
-		const call = { provider: cfgLiveProvider.get(this.#session.settings), voice, since: new Date(), open: false };
+		const call = { provider: liveProviderLabel(this.#session), voice, since: new Date(), open: false };
 		this.#call = call;
 		try {
 			await controller.start();
@@ -162,9 +162,9 @@ export class RpcLiveBridge implements SlashCommandLiveHost {
 	status(): LiveCallStatus {
 		const controller = this.#controller;
 		const call = this.#call;
-		if (!controller || !call || this.#closing) return { state: "off" };
+		if (!controller || !call) return { state: "off" };
 		return {
-			state: call.open ? "open" : "starting",
+			state: this.#closing ? "closing" : call.open ? "open" : "starting",
 			provider: call.provider,
 			voice: call.voice,
 			since: call.since,
@@ -212,5 +212,19 @@ export class RpcLiveBridge implements SlashCommandLiveHost {
 		this.#pendingLevels = undefined;
 		this.#lastLevelsAt = Date.now();
 		this.#output({ type: "live_levels", input: levels.input, output: levels.output });
+	}
+}
+
+/**
+ * Where a call goes, as `/live status` names it: `codex`, `openai`, or `endpoint <origin>` for a
+ * `live.endpoint` server (its origin only: the path or query can carry what is not for a status line).
+ */
+function liveProviderLabel(session: AgentSession): string {
+	const endpoint = cfgLiveEndpoint.get(session.settings)?.trim();
+	if (!endpoint) return cfgLiveProvider.get(session.settings);
+	try {
+		return `endpoint ${new URL(endpoint).origin}`;
+	} catch {
+		return "endpoint";
 	}
 }

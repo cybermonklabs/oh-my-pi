@@ -153,7 +153,9 @@ export interface SlashCommandRuntime {
 export type LiveCallStatus =
 	| { state: "off" }
 	| {
-			state: "starting" | "open";
+			/** `closing`: the call is ending (waiting for the server's close); a new one cannot start yet. */
+			state: "starting" | "open" | "closing";
+			/** Where the call goes: `codex`, `openai`, or `endpoint <origin>`. */
 			provider: string;
 			voice: string;
 			/** When the call was asked for. */

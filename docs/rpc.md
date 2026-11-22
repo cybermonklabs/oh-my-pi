@@ -1561,12 +1561,14 @@ person's line). It runs at once, also while a turn runs, and answers in one
 `command_output` line, which `sendUserInput` also returns as `output`:
 
 - `/live on`: `Live call open: <provider>, voice <voice>.`; while a call is
-  starting or open, `A live call is already starting|open (since <UTC time>).`;
+  starting, open or closing, `A live call is already starting|open|closing (since <UTC time>).`;
   on a failure (dictation running, the session changing, no credential, the
   server's refusal, a stop while it connects), `Live call did not start: <reason>`.
 - `/live off`: `Live call ended.`, or `No live call is open.`
-- `/live status` (or a bare `/live`): `Live call starting|open since <UTC time>:
+- `/live status` (or a bare `/live`): `Live call starting|open|closing since <UTC time>:
   <provider>, voice <voice>, microphone on|muted.`, or `No live call is open.`
+  `<provider>` is `codex`, `openai`, or `endpoint <origin>` for a `live.endpoint`
+  server. `closing` lasts while omp waits for GPT-Live's `session.closed` (up to 5 s).
 
 A call can take a minute to connect (the session request, the media channel,
 and up to five attempts at the sideband). A `prompt` frame's `/live on`
