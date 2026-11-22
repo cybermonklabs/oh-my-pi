@@ -2050,8 +2050,11 @@ mod tests {
 	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
 	/// while a job notice is still going out to the terminal: its message
 	/// goes to the fd 2 its redirections left (the file), not to the fd 2
-	/// they restore. Waiting behind the notice at the failure sent it to the
-	/// restored one.
+	/// they restore. The op waits for the notice before it applies its list,
+	/// so no notice is pending at the failure here: this test fails only
+	/// when both that wait and the failure's write without the notice gate
+	/// (`flush_queued`) are taken out, as round 2 of the landing merge had
+	/// it. The editor, order and mid-way tests below pin the wait itself.
 	#[test]
 	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_a_notice_waits() {
 		crate::sys::in_blocking_writer_process(
@@ -2177,6 +2180,27 @@ mod tests {
 		}
 	}
 
+	/// [`bash_shell`] whose terminal (zsh `SHTTY`) is the terminal side of a
+	/// new pty, with the root vproc as job control's root and fd `fd` that
+	/// terminal [`WrittenAtOnce`]; and the pty's other side.
+	fn shell_with_fd_on_its_terminal_written_at_once(
+		fd: i32,
+	) -> (crate::bash::Shell, crate::testkit::FakeHost, MemStore, std::fs::File) {
+		let (mut shell, host, store) = bash_shell();
+		let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
+		let slave = std::fs::File::from(slave);
+		let at_once = WrittenAtOnce(slave.try_clone().unwrap());
+		let tty = crate::sys::StdFile::new(slave);
+		shell.k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
+		shell.k.jobctl.root = Some(shell.procs[0].vpid);
+		shell.procs[0]
+			.fds
+			.set(fd, Some(FdRef::open(Box::new(at_once), FdOrigin::Host)));
+		let master = std::fs::File::from(master);
+		crate::sys::test_probe::set_nonblocking(&master);
+		(shell, host, store, master)
+	}
+
 	/// A compound command whose redirection fails (`{ :; } >/no/f`) with
 	/// fd 2 on the terminal, while a job notice is still going out there:
 	/// the message comes after the notice, as zsh writes the notice with
@@ -2190,18 +2214,8 @@ mod tests {
 				"::a_failed_redirections_message_reaches_the_terminal_after_a_job_notice"
 			),
 			|| {
-				let (mut shell, mut host, mut store) = bash_shell();
-				let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
-				let slave = std::fs::File::from(slave);
-				let stderr = WrittenAtOnce(slave.try_clone().unwrap());
-				let tty = crate::sys::StdFile::new(slave);
-				shell.k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
-				shell.k.jobctl.root = Some(shell.procs[0].vpid);
-				shell.procs[0]
-					.fds
-					.set(2, Some(FdRef::open(Box::new(stderr), FdOrigin::Host)));
-				let mut master = std::fs::File::from(master);
-				crate::sys::test_probe::set_nonblocking(&master);
+				let (mut shell, mut host, mut store, mut master) =
+					shell_with_fd_on_its_terminal_written_at_once(2);
 				let held = crate::sys::hold_writers();
 				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
 				shell.submit(crate::bash::Script::command(b"{ :; } >/no/such/dir/f".to_vec()));
@@ -2217,13 +2231,71 @@ mod tests {
 		);
 	}
 
+	/// Run `script` in `shell` one op per step. Once fd 2 is not the fd 2 the
+	/// shell started with (the `Redir` op applied a redirection of fd 2 and
+	/// parked mid-way, on a substitution in a later target), hold the writer
+	/// threads and queue a job notice, as the scheduler reports a job between
+	/// steps. The first time the shell blocks after that, it must be waiting
+	/// for the terminal with the notice still going out and fd 2 still
+	/// redirected: the op waits for the notice mid-way. The hold is dropped
+	/// there. Whether the shell so waited before its run ended.
+	fn run_with_a_notice_queued_mid_way(
+		shell: &mut crate::bash::Shell,
+		host: &mut crate::testkit::FakeHost,
+		store: &mut MemStore,
+		script: &[u8],
+	) -> bool {
+		let stderr = shell.procs[0].fds.handle(2);
+		shell.submit(crate::bash::Script::command(script.to_vec()));
+		let one_op = crate::bash::Budget { max_ops: 1, max_ns: u64::MAX };
+		let mut held = None;
+		let mut queued = false;
+		let mut waited = false;
+		for _ in 0..100_000 {
+			match shell.step(&mut Cx { host, store }, one_op) {
+				crate::bash::Step::Done { .. } => {
+					assert!(
+						queued,
+						"the op applied its redirections in one step: no notice came mid-way"
+					);
+					return waited;
+				},
+				crate::bash::Step::Blocked if held.is_some() => {
+					let key = shell.procs[0].blocked.as_ref().map(|b| &b.key);
+					assert!(
+						matches!(key, Some(crate::bash::event::WaitKey::Write { fd })
+							if *fd == super::super::zle::tty::FD),
+						"the shell blocked on {key:?}, not on the terminal"
+					);
+					assert!(
+						!shell.k.jobctl.shout.items.is_empty(),
+						"the shell waited on the terminal with the notice already out"
+					);
+					assert!(
+						!shell.procs[0].fds.handle(2).same(&stderr),
+						"the shell waited for the notice with its redirections undone"
+					);
+					waited = true;
+					held = None;
+				},
+				crate::bash::Step::Blocked => std::thread::sleep(Duration::from_millis(1)),
+				_ => {},
+			}
+			if !queued && !shell.procs[0].fds.handle(2).same(&stderr) {
+				held = Some(crate::sys::hold_writers());
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				queued = true;
+			}
+		}
+		panic!("the run did not end within 100,000 steps");
+	}
+
 	/// A compound command whose redirection fails after the op applied an
 	/// earlier one and parked (`{ :; } 2>err >/no/$(echo f)`, on the
 	/// substitution), with a job notice queued while it was parked, as the
-	/// scheduler reports a job between steps: the message still goes to the
-	/// fd 2 the redirections left (the file). The op waits for the notices
-	/// only before it applies anything; at the failure it cannot wait, since
-	/// the restore follows in the same step.
+	/// scheduler reports a job between steps: the op waits for the notice
+	/// when it goes on with its list, and the message goes to the fd 2 the
+	/// redirections left (the file).
 	#[test]
 	fn a_failed_redirections_message_goes_to_its_redirected_stderr_past_a_notice_queued_mid_way() {
 		crate::sys::in_blocking_writer_process(
@@ -2233,36 +2305,13 @@ mod tests {
 			),
 			|| {
 				let (mut shell, mut host, mut store, _master) = shell_with_a_terminal();
-				let stderr = shell.procs[0].fds.handle(2);
-				shell.submit(crate::bash::Script::command(
-					b"{ :; } 2>/tmp/err.log >/no/such/dir/$(echo f)".to_vec(),
-				));
-				let one_op = crate::bash::Budget { max_ops: 1, max_ns: u64::MAX };
-				let mut held = None;
-				let mut queued = false;
-				let mut done = false;
-				for _ in 0..100_000 {
-					match shell.step(&mut Cx { host: &mut host, store: &mut store }, one_op) {
-						crate::bash::Step::Done { .. } => {
-							done = true;
-							break;
-						},
-						// The shell waits for the notice: it may go now.
-						crate::bash::Step::Blocked => {
-							held = None;
-							std::thread::sleep(Duration::from_millis(1));
-						},
-						_ => {},
-					}
-					if !queued && !shell.procs[0].fds.handle(2).same(&stderr) {
-						held = Some(crate::sys::hold_writers());
-						notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
-						queued = true;
-					}
-				}
-				drop(held);
-				assert!(queued, "the op applied its redirections in one step: no notice came mid-way");
-				assert!(done, "the run did not end within 100,000 steps");
+				let waited = run_with_a_notice_queued_mid_way(
+					&mut shell,
+					&mut host,
+					&mut store,
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/$(echo f)",
+				);
+				assert!(waited, "the op did not wait for the notice queued while it was parked");
 				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
 					.into_owned();
 				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
@@ -2275,6 +2324,36 @@ mod tests {
 					!stderr.contains("No such file or directory"),
 					"the message went to the restored stderr"
 				);
+			},
+		);
+	}
+
+	/// A compound command whose redirection fails after the op applied an
+	/// earlier one and parked on a substitution, with fd 2 made the terminal
+	/// by then (`{ :; } 2>&4 >/no/$(echo f)`), and a job notice queued while
+	/// it was parked: the message comes after the notice on the terminal, as
+	/// zsh prints the notice first. Handed off only at the failure, the
+	/// notice came after the message.
+	#[test]
+	fn a_failed_redirections_message_reaches_the_terminal_after_a_notice_queued_mid_way() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_reaches_the_terminal_after_a_notice_queued_mid_way"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) =
+					shell_with_fd_on_its_terminal_written_at_once(4);
+				let waited = run_with_a_notice_queued_mid_way(
+					&mut shell,
+					&mut host,
+					&mut store,
+					b"{ :; } 2>&4 >/no/such/dir/$(echo f)",
+				);
+				let want = "[1]  + continued  sleep 100\r\nbash: line 1: /no/such/dir/f: No such file \
+				            or directory\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want, "the op waited: {waited}");
+				assert!(waited, "the op did not wait for the notice queued while it was parked");
 			},
 		);
 	}
