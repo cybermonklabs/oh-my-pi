@@ -59,7 +59,8 @@ import {
 } from "../config/service-tier";
 import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
-import { type OverlayLayers, type RawSettings, Settings } from "../config/settings";
+import { all as allSettings, lookup as lookupSetting } from "../config/registry";
+import { deleteByPath, getByPath, type OverlayLayers, type RawSettings, Settings, setByPath } from "../config/settings";
 
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -4415,7 +4416,8 @@ interface SettingsLayerWrites {
 
 /**
  * Settings writes a subagent's runs made to its overlay's own layers. JSON data, as the settings
- * layers are, so a {@link SUBAGENT_REVIVE_ENTRY} holds them.
+ * layers are, so a {@link SUBAGENT_REVIVE_ENTRY} holds them, except the values of credential
+ * settings ({@link SubagentCredentialWrites}).
  */
 interface SubagentSettingsWrites {
 	readonly global?: SettingsLayerWrites;
@@ -4445,6 +4447,66 @@ function withLayerWrites(layer: RawSettings, writes: SettingsLayerWrites | undef
 		if (value !== undefined) written[key] = value;
 	}
 	return written;
+}
+
+/**
+ * Values of credential settings (`Setting.isCredential`: an API key, a token, a password) a
+ * subagent's runs wrote to its overlay's layers, by setting id. They stay out of its
+ * {@link SUBAGENT_REVIVE_ENTRY}: the transcript file stores what it is given, unmasked unless the
+ * session store is masked. The parked subagent keeps them in its {@link WarmReviveState}, and its
+ * warm revive puts them back into the writes the entry holds.
+ */
+interface SubagentCredentialWrites {
+	readonly global?: Readonly<Record<string, unknown>>;
+	readonly overrides?: Readonly<Record<string, unknown>>;
+}
+
+/** `writes` without the values of credential settings, and those values by setting id. */
+function splitCredentialWrites(writes: SettingsLayerWrites | undefined): {
+	writes: SettingsLayerWrites | undefined;
+	credentials: Record<string, unknown> | undefined;
+} {
+	if (!writes?.set) return { writes, credentials: undefined };
+	let set: RawSettings | undefined;
+	let credentials: Record<string, unknown> | undefined;
+	for (const setting of allSettings()) {
+		if (!setting.isCredential) continue;
+		const value = getByPath(set ?? writes.set, setting.segments);
+		if (value === undefined) continue;
+		(credentials ??= {})[setting.id] = value;
+		// A copy: the writes' records are the live overlay's layers.
+		set ??= { ...writes.set };
+		deleteByPath(set, setting.segments);
+	}
+	if (!set) return { writes, credentials };
+	const { removed } = writes;
+	const kept = Object.keys(set).length > 0 ? set : undefined;
+	return { writes: kept || removed ? { set: kept, removed } : undefined, credentials };
+}
+
+/** `writes` with the credential values {@link splitCredentialWrites} took out of each layer put back. */
+function withCredentialWrites(
+	writes: SubagentSettingsWrites | undefined,
+	credentials: SubagentCredentialWrites | undefined,
+): SubagentSettingsWrites | undefined {
+	if (!credentials) return writes;
+	const restore = (
+		layer: SettingsLayerWrites | undefined,
+		values: Readonly<Record<string, unknown>> | undefined,
+	): SettingsLayerWrites | undefined => {
+		if (!values) return layer;
+		// A copy: the writes' records are the reopened transcript's entry.
+		const set: RawSettings = structuredClone(layer?.set ?? {});
+		for (const [id, value] of Object.entries(values)) {
+			const setting = lookupSetting(id);
+			if (setting) setByPath(set, setting.segments, value);
+		}
+		return { set, removed: layer?.removed };
+	};
+	return {
+		global: restore(writes?.global, credentials.global),
+		overrides: restore(writes?.overrides, credentials.overrides),
+	};
 }
 
 /**
@@ -4587,7 +4649,7 @@ interface SubagentReviveRecord {
 	/**
 	 * The options {@link RECORDED_SPEC_OPTION_KEYS} names; the output schema, unless the
 	 * {@link WarmReviveState} references it; the model, when it is a copy of the subagent's own that
-	 * JSON keeps whole.
+	 * JSON keeps whole and that can carry no secret ({@link modelMayCarrySecret}).
 	 */
 	readonly options: Partial<SubagentSpecOptions>;
 	/** The prompt inputs {@link RECORDED_PROMPT_KEYS} names, and the output schema as the options hold it. */
@@ -4647,13 +4709,14 @@ type SharedSpecOptions = Omit<SubagentSpecOptions, (typeof RECORDED_SPEC_OPTION_
  * What a parked kept-alive subagent keeps in memory for its warm revive, revived by the module-level
  * {@link reviveWarmSubagent}, in this one object: references to objects the live process holds (the
  * parent's settings and artifact manager, and the spec options that name registries, managers, buses
- * or the parent's tools, context and extensions), and the few inputs JSON cannot hold (functions, a
- * prewalk target's model, telemetry hooks, and a model, output schema or agent definition JSON would
- * not keep whole). The model is set when the live session is disposed, to the model registry's own
- * object when the subagent's agrees with it in every field. Its plain inputs are in its transcript's
- * newest {@link SUBAGENT_REVIVE_ENTRY} and the peer roster its prompt showed in an
- * {@link IRC_ROSTER_ENTRY}; its session file is the one its registry record names, which the
- * lifecycle hands each revive.
+ * or the parent's tools, context and extensions), and the few inputs its transcript does not hold:
+ * functions, a prewalk target's model, telemetry hooks, a model, output schema or agent definition
+ * JSON would not keep whole, a model that may carry a secret, and the credential settings its runs
+ * wrote. The model is set when the live session is disposed, to the model registry's own object
+ * when the subagent's agrees with it in every field, and so are the credential settings. Its plain
+ * inputs are in its transcript's newest {@link SUBAGENT_REVIVE_ENTRY} and the peer roster its prompt
+ * showed in an {@link IRC_ROSTER_ENTRY}; its session file is the one its registry record names,
+ * which the lifecycle hands each revive.
  */
 interface WarmReviveState extends SharedSpecOptions {
 	/** Settings the subagent's overlay reads through to; each revive rebuilds the overlay over them. */
@@ -4667,6 +4730,8 @@ interface WarmReviveState extends SharedSpecOptions {
 	readonly wakeEventBus?: EventBus;
 	/** The wake-turn monitor's agent definition, when JSON would not keep it whole. */
 	readonly wakeAgent?: AgentDefinition;
+	/** Credential settings the subagent's runs wrote, which its {@link SUBAGENT_REVIVE_ENTRY} leaves out. */
+	credentialWrites?: SubagentCredentialWrites;
 }
 
 /** Whether `value` parsed back from its JSON is strictly equal to it: JSON loses none of its fields. */
@@ -4678,6 +4743,32 @@ function jsonKeepsWhole(value: unknown): boolean {
 		// A cycle or a BigInt.
 		return false;
 	}
+}
+
+/** Whether `url` may hold a key: userinfo or a query string, or a text that is no absolute URL. */
+function urlMayCarrySecret(url: string): boolean {
+	const parsed = URL.parse(url);
+	return parsed === null || parsed.username !== "" || parsed.password !== "" || parsed.search !== "";
+}
+
+/**
+ * Whether `model` may carry a secret a provider is called with: request headers, static or resolved
+ * (an `Authorization` or `x-api-key` a models.yml provider sets), extra request body fields, or an
+ * endpoint URL with userinfo or a query string (a key a provider takes in the URL). Its other fields
+ * name, route, price and describe the model.
+ */
+function modelMayCarrySecret(model: Model<Api>): boolean {
+	if (model.headers !== undefined || model.resolveHeaders !== undefined) return true;
+	for (const compat of [model.compat, model.compatConfig] as unknown[]) {
+		if (isRecord(compat) && compat.extraBody !== undefined) return true;
+	}
+	const { remoteCompaction } = model;
+	return [
+		model.baseUrl,
+		remoteCompaction?.endpoint,
+		remoteCompaction?.v2Endpoint,
+		remoteCompaction?.streamingEndpoint,
+	].some(url => url !== undefined && urlMayCarrySecret(url));
 }
 
 /** The fields of `fields` that `keys` names, without those whose value is `undefined`. */
@@ -4726,15 +4817,16 @@ function createWarmReviveState(
 
 /**
  * When `session` is disposed, writes its {@link SUBAGENT_REVIVE_ENTRY}: the plain parts of `inputs`,
- * the writes its settings overlay holds beyond `baseline` and its manager's pending cache candidate,
- * both final once disposal begins, while the transcript's writer is still open. A disposal that
- * would write what the transcript's newest entry already holds writes nothing: the spawn's inputs
- * are fixed, and the settings writes and pending candidate rarely change, so each park would
- * otherwise add another copy of the prompt inputs. The model goes to the entry when it is a copy of
- * the subagent's own that JSON keeps whole; otherwise `state` references it, as the model registry's
- * object when the two agree in every field: a catalog rebuild replaces the registry's model objects
- * with equal copies, so a parked subagent would otherwise hold the copy its spawn resolved, which
- * nothing else holds.
+ * the writes its settings overlay holds beyond `baseline` but the credential settings' values, which
+ * `state` keeps, and its manager's pending cache candidate, all final once disposal begins, while
+ * the transcript's writer is still open. A disposal that would write what the transcript's newest
+ * entry already holds writes nothing: the spawn's inputs are fixed, and the settings writes and
+ * pending candidate rarely change, so each park would otherwise add another copy of the prompt
+ * inputs. The model goes to the entry when it is a copy of the subagent's own that JSON keeps
+ * whole and that can carry no secret ({@link modelMayCarrySecret}); otherwise `state` references
+ * it, as the model registry's object when the two agree in every field: a catalog rebuild replaces
+ * the registry's model objects with equal copies, so a parked subagent would otherwise hold the
+ * copy its spawn resolved, which nothing else holds.
  */
 function trackSubagentReviveRecord(
 	session: AgentSession,
@@ -4748,12 +4840,18 @@ function trackSubagentReviveRecord(
 		const registered = model && options.modelRegistry?.find(model.provider, model.id);
 		const registryModel =
 			registered && (registered === model || Bun.deepEquals(registered, model, true)) ? registered : undefined;
-		const recordedModel = model && !registryModel && jsonKeepsWhole(model) ? model : undefined;
+		const recordedModel =
+			model && !registryModel && !modelMayCarrySecret(model) && jsonKeepsWhole(model) ? model : undefined;
 		const keptModel = recordedModel ? undefined : (registryModel ?? model);
 		if (state.model !== keptModel) state.model = keptModel;
 		const layers = session.settings.overlayLayers();
-		const global = layerWrites(baseline.global, layers.global);
-		const overrides = layerWrites(baseline.overrides, layers.overrides);
+		const global = splitCredentialWrites(layerWrites(baseline.global, layers.global));
+		const overrides = splitCredentialWrites(layerWrites(baseline.overrides, layers.overrides));
+		const credentialWrites =
+			global.credentials || overrides.credentials
+				? withoutUndefinedFields({ global: global.credentials, overrides: overrides.credentials })
+				: undefined;
+		if (state.credentialWrites !== credentialWrites) state.credentialWrites = credentialWrites;
 		const manager = session.sessionManager;
 		// An output schema JSON would not keep whole stays referenced in `state`; the prompt's is then the same object.
 		const recordsSchema = state.outputSchema === undefined;
@@ -4769,7 +4867,8 @@ function trackSubagentReviveRecord(
 			},
 			settingsInputs: inputs.settingsInputs,
 			retryFallback: inputs.retryFallback,
-			settingsWrites: global || overrides ? { global, overrides } : undefined,
+			settingsWrites:
+				global.writes || overrides.writes ? { global: global.writes, overrides: overrides.writes } : undefined,
 			keepTodo: inputs.keepTodo,
 			wake: {
 				...pickFields(inputs.wake, RECORDED_WAKE_KEYS),
@@ -4830,8 +4929,16 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 		);
 	}
 	const record = latestSubagentReviveRecord(entries);
-	const { parentSettings, parentArtifactManager, preparedSession, perCall, wakeEventBus, wakeAgent, ...shared } =
-		state;
+	const {
+		parentSettings,
+		parentArtifactManager,
+		preparedSession,
+		perCall,
+		wakeEventBus,
+		wakeAgent,
+		credentialWrites,
+		...shared
+	} = state;
 	const agent = wakeAgent ?? record?.wake.agent;
 	if (!record || !agent) {
 		await reopened.close();
@@ -4896,7 +5003,11 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 		try {
 			// The prompt the parked session sent shows this roster; rendering it again keeps the cached prefix.
 			if (spec.prompt.ircEnabled) spec.prompt.revivalIrcRoster = revivalIrcRoster(entries);
-			const revivedSettings = reviveSubagentSettings(parentSettings, inputs, record.settingsWrites);
+			const revivedSettings = reviveSubagentSettings(
+				parentSettings,
+				inputs,
+				withCredentialWrites(record.settingsWrites, credentialWrites),
+			);
 			settingsBaseline = revivedSettings.baseline;
 			const sessionOptions = buildSubagentSessionOptions(
 				spec,
