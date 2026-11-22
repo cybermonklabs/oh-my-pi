@@ -2039,9 +2039,12 @@ fn handle_existing_dest(
 
 /// Puts the backup `handle_existing_dest` made (`backup`, a filesystem path)
 /// back under the destination's name after cp failed to create the
-/// destination, as GNU's `un_backup` does (`copy.c`): `b` keeps its name and
-/// its data, and a file the failed copy left at `b` is replaced.
-fn un_backup(host: &mut Host, options: &Options, dest: &Path, backup: &Path) {
+/// destination with `error`, as GNU's `un_backup` does (`copy.c`): `b` keeps
+/// its name and its data, and a file the failed copy left at `b` is replaced.
+/// Returns the error to report. Where the rename back fails too, GNU reports
+/// the copy's error first and then `cannot un-backup`, so both are reported
+/// here, in that order, and an already reported failure is returned.
+fn un_backup(host: &mut Host, options: &Options, dest: &Path, backup: &Path, error: CpError) -> CpError {
 	let dest_fs = host.resolve(dest);
 	let renamed = host.fs().rename(backup, &dest_fs);
 	match renamed {
@@ -2054,8 +2057,13 @@ fn un_backup(host: &mut Host, options: &Options, dest: &Path, backup: &Path) {
 					dest.quote()
 				);
 			}
+			error
 		},
-		Err(error) => show_error(host, CpError::IoErrContext(error, format!("cannot un-backup {}", dest.quote()))),
+		Err(rename_error) => {
+			show_error_if_needed(host, &error);
+			show_error(host, CpError::IoErrContext(rename_error, format!("cannot un-backup {}", dest.quote())));
+			CpError::NotAllFilesCopied
+		},
 	}
 }
 
@@ -2522,13 +2530,14 @@ fn copy_file(
 		let new_source = new_source.clone();
 		let linked = filesystem.hard_link(host.resolve(&new_source), &dest_fs);
 		if let Err(e) = linked {
-			if let Some(backup) = &backup {
-				un_backup(host, options, dest, backup);
-			}
-			return Err(CpError::IoErrContext(
+			let error = CpError::IoErrContext(
 				e,
 				format!("cannot create hard link {} to {}", dest.quote(), new_source.quote()),
-			));
+			);
+			return Err(match &backup {
+				Some(backup) => un_backup(host, options, dest, backup, error),
+				None => error,
+			});
 		}
 
 		if report {
@@ -2538,7 +2547,12 @@ fn copy_file(
 		return Ok(());
 	}
 
-	let mut dest_metadata = if dest_replaced {
+	let mut dest_metadata = if backup.is_some() {
+		// The name was renamed to its backup, so the destination is new, as
+		// GNU's `new_dst` makes it: it is created with O_EXCL whatever appears
+		// at the name before the create.
+		None
+	} else if dest_replaced {
 		filesystem.symlink_metadata(&dest_fs).ok()
 	} else {
 		initial_dest_metadata
@@ -2576,10 +2590,10 @@ fn copy_file(
 	) {
 		Ok(fate) => fate,
 		Err(error) => {
-			if let Some(backup) = &backup {
-				un_backup(host, options, dest, backup);
-			}
-			return Err(error);
+			return Err(match &backup {
+				Some(backup) => un_backup(host, options, dest, backup, error),
+				None => error,
+			});
 		},
 	};
 
@@ -2937,11 +2951,15 @@ fn copy_data(
 	let create_mode =
 		if source_is_stream { 0o622 } else { (source_metadata.permissions().mode() & 0o777) | 0o200 };
 	let mut dest_options = OpenOptions::new();
-	dest_options
-		.write(true)
-		.create(true)
-		.truncate(!source_is_stream)
-		.mode(create_mode);
+	dest_options.write(true).mode(create_mode);
+	// A destination cp found nothing at, or backed up, is created with
+	// O_EXCL and nothing to truncate, as GNU creates a new one (`copy_reg`):
+	// whatever appeared there meanwhile is not written through or over.
+	if dest_metadata.is_none() {
+		dest_options.create_new(true);
+	} else {
+		dest_options.create(true).truncate(!source_is_stream);
+	}
 	let cannot_create =
 		|e| CpError::IoErrContext(e, format!("cannot create regular file {}", dest.quote()));
 	let (dest_file, fate) = match filesystem.open_with(&dest_fs, &dest_options) {
