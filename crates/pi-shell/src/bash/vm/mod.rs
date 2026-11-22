@@ -2761,7 +2761,13 @@ impl Shell {
 			let trap = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
 				Ok(Some(Record::Trap { action, .. })) if action.is_empty() => Some(true),
 				Ok(Some(Record::Trap { .. })) if p.own_traps.has(key) => Some(false),
-				Ok(_) => None,
+				Ok(_) => match exec::async_ignored(cx.store, p, Signal::Int, false) {
+					Ok(ignored) => ignored.then_some(true),
+					Err(err) => {
+						self.k.fail(err);
+						return;
+					},
+				},
 				Err(err) => {
 					self.k.fail(err);
 					return;
@@ -2971,6 +2977,15 @@ impl Shell {
 				let found = recorded.and_then(|trap| match trap {
 					None if p.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
 						builtins::trap::find_func_trap(cx.store, p, key, platform, |_, _| false)
+					},
+					trap => Ok(trap),
+				});
+				// bash: an asynchronous command ignores `INT` and `QUIT` sent
+				// to it while it has no trap for them ([`exec::async_ignored`]).
+				let found = found.and_then(|trap| match trap {
+					None if matches!(sig, Signal::Int | Signal::Quit) => {
+						exec::async_ignored(cx.store, p, sig, false)
+							.map(|ignored| ignored.then_some(true))
 					},
 					trap => Ok(trap),
 				});
@@ -3724,6 +3739,9 @@ impl Vproc {
 		// substitution sets its own process's ([`exec::start_sub`],
 		// [`exec::start_procsub`]).
 		vp.jobs.comsub = self.jobs.comsub.forked();
+		// bash: a fork of an asynchronous command that trapped a signal it
+		// ignored with an action starts with that signal at its default.
+		exec::fork_async_ignored(k, store, self, &mut vp);
 		vp.calls = callstack::inherited(self);
 		vp.trace_base = xtrace::level(self) - 1;
 		// Started from a context where `set -e` is ignored (the parent's op

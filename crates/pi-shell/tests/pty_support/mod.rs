@@ -61,6 +61,41 @@ use pi_shell::{
 
 pub use self::vt::Screen;
 
+/// Set every signal but `KILL` and `STOP` to its default in the child
+/// about to exec, whatever the test runner left ignored: a terminal,
+/// `nohup`, a CI runner or a container starts children with some ignored,
+/// a shell keeps a signal it was started with ignored, and the tests'
+/// expected output (`trap` listings, `SigIgn`, deaths) assumes none is.
+/// On Linux through the system call, which also reaches glibc's own
+/// signals 32 and 33 that its `sigaction` refuses (a builds pod starts
+/// every process with them ignored). Async-signal-safe; allocates nothing.
+pub fn every_signal_at_its_default() {
+	#[cfg(target_os = "linux")]
+	{
+		// The kernel's `struct sigaction`, zeroed: `SIG_DFL` (0), no flags,
+		// an empty mask; larger than every architecture's layout.
+		let dfl = [0u64; 4];
+		for sig in 1..=64 {
+			if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+				// SAFETY: a valid action pointer and no old action; the
+				// kernel's sigset size is 8 bytes.
+				unsafe {
+					libc::syscall(libc::SYS_rt_sigaction, sig, dfl.as_ptr(), std::ptr::null::<u64>(), 8);
+				}
+			}
+		}
+	}
+	#[cfg(not(target_os = "linux"))]
+	for sig in 1..32 {
+		if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+			// SAFETY: signal is async-signal-safe.
+			unsafe {
+				libc::signal(sig, libc::SIG_DFL);
+			}
+		}
+	}
+}
+
 /// The default bound of every wait.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -315,10 +350,11 @@ impl Spawn {
 		cmd.stdin(Stdio::from(slave.try_clone()?))
 			.stdout(Stdio::from(slave.try_clone()?))
 			.stderr(Stdio::from(slave));
-		// SAFETY: the hook only makes async-signal-safe calls (setsid,
-		// ioctl) between fork and exec.
+		// SAFETY: the hook only makes async-signal-safe calls (the signal
+		// reset, setsid, ioctl) between fork and exec.
 		unsafe {
 			cmd.pre_exec(|| {
+				every_signal_at_its_default();
 				if libc::setsid() == -1 {
 					return Err(io::Error::last_os_error());
 				}

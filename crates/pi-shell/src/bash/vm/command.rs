@@ -2405,6 +2405,18 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					sigmask_ign = sigmask_ign.with(sig);
 				}
 			}
+			// bash: what an asynchronous command starts inherits its
+			// ignored `INT` and `QUIT` ([`exec::async_ignored`]).
+			for sig in [crate::bash::signal::Signal::Int, crate::bash::signal::Signal::Quit] {
+				match exec::async_ignored(cx.store, vp, sig, true) {
+					Ok(true) => sigmask_ign = sigmask_ign.with(sig),
+					Ok(false) => {},
+					Err(err) => {
+						k.fail(err);
+						return Some(Flow::Discard(1));
+					},
+				}
+			}
 			let job = k.job_id(cx.store);
 			let pgroup = super::jobctl::pgroup(k, cx, vp, job);
 			let argv = spawn_argv(&st(vp).argv, exec_as.as_deref());

@@ -842,6 +842,163 @@ fn bash_reports_a_job_killed_in_a_fork_of_a_substitution() {
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+/// An asynchronous command without job control starts with `INT` and
+/// `QUIT` ignored, as bash 5.3's does (`setup_async_signals`, which sets
+/// them `SIG_IGN` with `set_signal_async_ignored`): its programs inherit
+/// the ignore (`SigIgn` 6 in `/proc/PID/status`), and so do its forks; a
+/// signal sent to the subshell itself does nothing; `trap` lists neither.
+/// Such a job's `INT` is ignored when it starts, yet bash 5.3.20 does
+/// reset it with `trap - INT` (Posix interpretation 751, `trap.c`'s
+/// `restore_default_signal`), unlike a signal ignored when a shell starts,
+/// which a non-interactive bash cannot reset: a `trap - INT` before any
+/// trap for it gives the subshell and what it starts `INT` at its default
+/// (`SigIgn` 4). After a `trap '' INT` or `trap CMD INT`, `trap - INT`
+/// puts the ignore back for what it starts, while the subshell itself acts
+/// on `INT`. A trap with an action replaces the ignore while it is set,
+/// and a `( … )` forked under it starts with `INT` at its default. A trap
+/// the parent shell set is no trap in the job. Under `set -m` (job control)
+/// nothing is ignored. Checked-in goldens measured with bash 5.3.20
+/// (compared live only with a bash 5.3 or later, [`real_bash_golden`]);
+/// each script starts with `exec 2>&1`. `SigIgn` is read where the
+/// system's `/proc/PID/status` shows it (Linux does; gVisor's has no
+/// `SigIgn` line, so its rows run on runc and on hosts, not under gVisor);
+/// each run starts with every signal at its default, whatever the machine
+/// ignored (`pty_support::every_signal_at_its_default`), and the
+/// comparisons leave out glibc's own signals 32 and 33
+/// ([`without_glibc_signals`]).
+#[test]
+fn an_asynchronous_command_ignores_int_and_quit() {
+	const G: &str = "/bin/grep -E '^SigIgn' /proc/self/status";
+	let sig_ign_shown = fs::read_to_string("/proc/self/status")
+		.is_ok_and(|s| s.lines().any(|l| l.starts_with("SigIgn:")));
+	let mut rows: Vec<(String, String)> = [
+		("/bin/sh -c 'kill -QUIT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
+		("/bin/sh -c 'kill -INT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
+		("( kill -INT $BASHPID; echo alive ) & wait; echo st=$?", "alive\nst=0\n"),
+		("( kill -QUIT $BASHPID; echo alive ) & wait; echo st=$?", "alive\nst=0\n"),
+		("( trap 'echo got' INT; kill -INT $BASHPID; echo after ) & wait", "got\nafter\n"),
+		("( trap; trap -p INT ) & wait; echo done", "done\n"),
+		("( trap '' INT; trap ) & wait", "trap -- '' SIGINT\n"),
+		("( trap - INT; kill -INT $BASHPID; echo alive ) & wait; echo st=$?", "st=0\n"),
+		("( trap - INT; ( kill -INT $BASHPID; echo no ); echo st=$? ) & wait", "st=130\n"),
+		("( trap '' INT; trap - INT; kill -INT $BASHPID; echo alive ) & wait; echo st=$?", "st=0\n"),
+	]
+	.into_iter()
+	.map(|(script, out)| (script.to_owned(), out.to_owned()))
+	.collect();
+	if sig_ign_shown {
+		for (script, mask) in [
+			(G.to_owned(), 0u8),
+			(format!("{G} & wait"), 6),
+			(format!("( {G} ) & wait"), 6),
+			(format!("{{ {G}; }} & wait"), 6),
+			(format!("{G} | cat & wait"), 6),
+			(format!("cat <({G})"), 6),
+			(format!("( ( {G} ) ) & wait"), 6),
+			(format!("set -m; {G} & wait"), 0),
+			(format!("( trap - INT; {G} ) & wait"), 4),
+			(format!("( trap - QUIT; {G} ) & wait"), 2),
+			(format!("( trap - INT QUIT; {G} ) & wait"), 0),
+			(format!("( trap '' INT; {G} ) & wait"), 6),
+			(format!("( trap '' INT; trap - INT; {G} ) & wait"), 6),
+			(format!("( trap 'echo x' INT; {G} ) & wait"), 4),
+			(format!("( trap 'echo x' INT; trap - INT; {G} ) & wait"), 6),
+			(format!("( trap 'echo x' INT; ( {G} ) ) & wait"), 4),
+			(format!("trap 'echo t' INT; ( {G} ) & wait"), 6),
+			(format!("trap '' INT; ( trap - INT; {G} ) & wait"), 6),
+		] {
+			rows.push((script, format!("SigIgn:\t{mask:016x}\n")));
+		}
+	}
+	let mut wrong = Vec::new();
+	for (script, out) in rows {
+		let script = format!("exec 2>&1; {script}");
+		let ours =
+			without_glibc_signals(&Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script).go());
+		let got = (String::from_utf8_lossy(&ours.stdout).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			let real = without_glibc_signals(&Run::script(bash, "bash", &script).go());
+			assert_eq!(masked(&ours), masked(&real), "{script:?}");
+		}
+	}
+	// zsh 5.9 (`entersubsh` with `ESUB_ASYNC`), on every platform: `''`
+	// traps it lists, which `trap -` removes (`SigIgn` 4 after `trap ''
+	// INT; trap - INT` too); a `( … )` inside the job starts with them
+	// unset (`SigIgn` 0). Checked-in goldens measured with zsh 5.9, compared
+	// live only with a zsh 5.9 (as `zsh_oracle::version_is_5_9`, which
+	// reports nothing).
+	let mut zsh_rows: Vec<(String, String)> = [
+		("/bin/sh -c 'kill -QUIT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
+		("/bin/sh -c 'kill -INT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
+		("( trap; trap -p INT ) & wait; echo done", "trap -- '' INT\ntrap -- '' QUIT\ndone\n"),
+	]
+	.into_iter()
+	.map(|(script, out)| (script.to_owned(), out.to_owned()))
+	.collect();
+	if sig_ign_shown {
+		for (script, mask) in [
+			(format!("{G} & wait"), 6u8),
+			(format!("( {G} ) & wait"), 6),
+			(format!("{{ {G}; }} & wait"), 6),
+			(format!("{G} | cat & wait"), 6),
+			(format!("cat <({G})"), 6),
+			(format!("( trap - INT; {G} ) & wait"), 4),
+			(format!("( trap - INT QUIT; {G} ) & wait"), 0),
+			(format!("( ( {G} ) ) & wait"), 0),
+			(format!("( trap '' INT; trap - INT; {G} ) & wait"), 4),
+		] {
+			zsh_rows.push((script, format!("SigIgn:\t{mask:016x}\n")));
+		}
+	}
+	let zsh_5_9 = zsh_oracle::version_is_5_9();
+	for (script, out) in zsh_rows {
+		let script = format!("exec 2>&1; {script}");
+		let ours =
+			without_glibc_signals(&Run::script(env!("CARGO_BIN_EXE_obash"), "zsh", &script).go());
+		let got = (String::from_utf8_lossy(&ours.stdout).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("zsh: {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if zsh_5_9 {
+			let real = without_glibc_signals(&Run::script(zsh_oracle::path(), "zsh", &script).go());
+			assert_eq!(ours, real, "zsh: {script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `o` with signals 32 and 33 cleared from each `SigIgn:\t<hex>` line of
+/// its stdout. glibc keeps them for itself (`SIGCANCEL`, `SIGSETXID`; its
+/// `sigaction` refuses them), and its `posix_spawn` child, which is how
+/// obash starts a program, sets them by its own rules: in builds pods
+/// obash's programs had them ignored though obash started with every signal
+/// at its default, while zsh's and bash's programs, started by `fork`, had
+/// neither. A shell script cannot name them, so they are no part of what a
+/// shell decides.
+fn without_glibc_signals(o: &Outcome) -> Outcome {
+	let keep = !((1u64 << 31) | (1u64 << 32));
+	let text = String::from_utf8_lossy(&o.stdout);
+	let mut out = String::with_capacity(text.len());
+	for line in text.split_inclusive('\n') {
+		let bits = line
+			.strip_prefix("SigIgn:\t")
+			.and_then(|rest| u64::from_str_radix(rest.trim_end_matches('\n'), 16).ok());
+		match bits {
+			Some(bits) => {
+				out.push_str(&format!("SigIgn:\t{:016x}", bits & keep));
+				if line.ends_with('\n') {
+					out.push('\n');
+				}
+			},
+			None => out.push_str(line),
+		}
+	}
+	Outcome { stdout: out.into_bytes(), ..o.clone() }
+}
+
 /// A `/bin/sh` script, run as `sh -c SHELL_ONLY sh SIG PID [FILE]`: it
 /// makes `FILE` (when given), sends `SIG` to the shell `PID` from outside
 /// (`0`: none) and waits for that shell to end (to be gone or a zombie),

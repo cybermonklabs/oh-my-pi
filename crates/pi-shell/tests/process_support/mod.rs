@@ -15,7 +15,10 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use crate::{pty_support::wait_blocked, zsh_oracle};
+use crate::{
+	pty_support::{every_signal_at_its_default, wait_blocked},
+	zsh_oracle,
+};
 
 /// What a shell run gave.
 #[derive(Clone, PartialEq, Eq)]
@@ -63,27 +66,13 @@ pub enum End {
 	Signal(i32),
 }
 
-/// The signals the tests send. Each run starts with them at their
-/// defaults, whatever the test runner's are (a terminal, `nohup` or a CI
-/// runner starts children with some ignored).
-const SENT: [libc::c_int; 8] = [
-	libc::SIGHUP,
-	libc::SIGINT,
-	libc::SIGQUIT,
-	libc::SIGTERM,
-	libc::SIGUSR1,
-	libc::SIGUSR2,
-	libc::SIGALRM,
-	libc::SIGPIPE,
-];
-
 /// One run of a shell: `program` named `name` (`argv[0]`; through a link
 /// named so under a wrapper, which runs it by its path), with `ZDOTDIR`
-/// unset, the signals in [`SENT`] at their defaults and a core size limit
-/// of 1 byte on entry, unless set otherwise. A pipe `core_pattern`
-/// (systemd-coredump, apport) ignores a limit of 0 and dumps anyway (the
-/// kernel's `fs/coredump.c` refuses a pipe dump only at 1), and a file dump
-/// needs more than 1 byte: no command a run starts dumps a core.
+/// unset, every signal at its default ([`every_signal_at_its_default`]) and a
+/// core size limit of 1 byte on entry, unless set otherwise. A pipe
+/// `core_pattern` (systemd-coredump, apport) ignores a limit of 0 and dumps
+/// anyway (the kernel's `fs/coredump.c` refuses a pipe dump only at 1), and a
+/// file dump needs more than 1 byte: no command a run starts dumps a core.
 pub struct Run {
 	program: PathBuf,
 	name:    &'static str,
@@ -234,9 +223,7 @@ impl Run {
 		// async-signal-safe and change only the child; nothing here allocates.
 		unsafe {
 			cmd.pre_exec(move || {
-				for sig in SENT {
-					libc::signal(sig, libc::SIG_DFL);
-				}
+				every_signal_at_its_default();
 				for &sig in &ignored {
 					libc::signal(sig, libc::SIG_IGN);
 				}
