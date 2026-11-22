@@ -547,6 +547,8 @@ pub(crate) fn run(host: &mut Host, argv: Vec<OsString>) -> i32 {
 			err.code
 		}
 		Ok(Parsed::Run(opts)) => {
+			#[cfg(test)]
+			let opts = generator::with_test_receiver_timing(opts);
 			if opts.am_server {
 				server_main(&io, *opts, None)
 			} else {

@@ -28,6 +28,17 @@
 //! many runs and distinct outcomes each client had and diffs the first of
 //! each.
 //!
+//! One of those races ours does not sample, because its generator takes one
+//! side of it on purpose (see the `generator` module): whether a subdirectory's
+//! file list reaches the generator before its output pass at the end of the
+//! list before it (a `--delete` run's `*deleting   sub/…` before the top-level
+//! items) or after it (that line after them, and 4 bytes more received). The
+//! reference took the first side in 85 of 100 runs on a Linux host and the
+//! second in most runs under gVisor, where its receiver process starts late.
+//! So each attempt runs ours both in its own order and with its receiver
+//! starting late, and [`check`] accepts the late side only where no reference
+//! run shows the early side; wherever one does, ours' own order must match.
+//!
 //! Both clients run with the same empty environment (plus `TZ` when set, so
 //! local-time output uses one zone on both sides) and the same `LC_ALL`: the
 //! locale decides which bytes of a file name either side escapes, so a
@@ -46,6 +57,7 @@
 mod cases;
 pub(super) mod daemon;
 mod fixture;
+mod late;
 mod normalize;
 mod snapshot;
 
@@ -63,7 +75,7 @@ use self::daemon::Daemon;
 use self::normalize::normalize;
 use self::snapshot::Snapshot;
 use crate::host::run_util_env;
-use crate::rsync::Rsync;
+use crate::rsync::{Rsync, generator};
 
 /// How many extra runs of ours a mismatch gets.
 const RETRIES: usize = 8;
@@ -84,21 +96,29 @@ struct Case {
 	locale: &'static str,
 	/// Compare stdout as a sorted multiset of lines.
 	unordered: bool,
+	/// Its output shows the list-arrival race (see [`check`]).
+	list_race: bool,
 }
 
 /// A table row.
 const fn c(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: false }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: false, list_race: false }
 }
 
 /// A table row run in the C locale instead of [`UTF8_LOCALE`].
 const fn cc(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, locale: C_LOCALE, unordered: false }
+	Case { name, exit, tweaks, args, locale: C_LOCALE, unordered: false, list_race: false }
 }
 
 /// A table row whose stdout order is racy in the reference.
 const fn u(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: true }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: true, list_race: false }
+}
+
+/// A table row whose output shows the list-arrival race: a message about
+/// `sub/` or the byte totals differ with the side the reference takes.
+const fn l(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: false, list_race: true }
 }
 
 /// How the scenario reaches its peer.
@@ -115,6 +135,8 @@ enum Mode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Client {
 	Ours,
+	/// Ours with its receiver starting late (`generator::receiver_starting_late`).
+	OursLate,
 	Reference,
 }
 
@@ -235,9 +257,12 @@ impl Bench {
 		let argv = self.argv(case, daemon.as_ref().map_or(0, |d| d.port));
 		let start = now_ns();
 		let (code, out, err) = match client {
-			Client::Ours => {
+			Client::Ours | Client::OursLate => {
 				let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-				let (code, cap) = run_util_env::<Rsync>(&refs, "", &w, &[("LC_ALL", self.locale)]);
+				let late = client == Client::OursLate;
+				let (code, cap) = generator::receiver_starting_late(late, || {
+					run_util_env::<Rsync>(&refs, "", &w, &[("LC_ALL", self.locale)])
+				});
 				(code, cap.stdout(), cap.stderr())
 			}
 			Client::Reference => {
@@ -274,27 +299,151 @@ fn sorted_lines(data: &[u8]) -> Vec<&[u8]> {
 	lines
 }
 
+/// Whether an outcome of ours in its own order (`own`) differs from one with a
+/// late receiver (`late`) exactly as the list-arrival race makes them differ.
+/// With a summary: the same bytes sent, 4 (one frame header) fewer received,
+/// and otherwise [`messages_earlier`]. Without one, only moved messages show
+/// the race: [`moved_earlier`].
+fn race_only(own: &Outcome, late: &Outcome) -> bool {
+	match (split_summary(&own.out).0, split_summary(&late.out).0) {
+		(Some((sent, received)), Some((late_sent, late_received))) => {
+			sent == late_sent && received + 4 == late_received && messages_earlier(own, late)
+		}
+		(None, None) => moved_earlier(own, late),
+		_ => false,
+	}
+}
+
+/// Whether `own` is [`messages_earlier`] than `late` with at least one line
+/// moved: the early side of the race, where it shows in the lines.
+fn moved_earlier(own: &Outcome, late: &Outcome) -> bool {
+	messages_earlier(own, late) && split_summary(&own.out).1 != split_summary(&late.out).1
+}
+
+/// Whether no reference outcome (`seen`) of a [`l`] scenario shows the early
+/// side of the list-arrival race: none is [`moved_earlier`] than an outcome of
+/// ours with a late receiver. The byte counts do not tell the sides apart: a
+/// second race, of the sender's frames, moves them in both clients.
+fn late_side_only(case: &Case, late: &[Outcome], seen: &[Outcome]) -> bool {
+	case.list_race && !seen.iter().any(|theirs| late.iter().any(|ours| moved_earlier(theirs, ours)))
+}
+
+/// The outcome of ours with a late receiver that the late-side fallback of
+/// [`check`] accepts: one a reference outcome equals, with an outcome of ours
+/// in its own order that is its early side ([`race_only`]). Only where
+/// [`late_side_only`].
+fn late_side_match<'a>(case: &Case, mine: &[Outcome], late: &'a [Outcome], seen: &[Outcome]) -> Option<&'a Outcome> {
+	if !late_side_only(case, late, seen) {
+		return None;
+	}
+	late.iter().find(|late| seen.contains(late) && mine.iter().any(|own| race_only(own, late)))
+}
+
+/// Whether `own` and `late` have the same exit code, stderr and tree, and the
+/// same stdout lines but the byte-count summary and one block of the
+/// generator's messages ([`generator_message`]) that comes earlier in `own`,
+/// ahead of data lines it overtook. Messages keep their order among
+/// themselves: the generator writes them through one queue.
+fn messages_earlier(own: &Outcome, late: &Outcome) -> bool {
+	if own.code != late.code || own.err != late.err || own.tree != late.tree {
+		return false;
+	}
+	let (a, b) = (split_summary(&own.out).1, split_summary(&late.out).1);
+	if a.len() != b.len() {
+		return false;
+	}
+	let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+	if head == a.len() {
+		return true;
+	}
+	let tail = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
+	let (a, b) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+	// `own`'s rest is `late`'s rest with a block of messages from its end moved
+	// to the front, over data lines only.
+	(1..b.len()).any(|cut| {
+		a[..b.len() - cut] == b[cut..]
+			&& a[b.len() - cut..] == b[..cut]
+			&& b[cut..].iter().all(|line| generator_message(line))
+			&& !b[..cut].iter().any(|line| generator_message(line))
+	})
+}
+
+/// A line the generator of a [`l`] scenario sends as a message when it starts
+/// `sub/`'s file list.
+fn generator_message(line: &[u8]) -> bool {
+	line.starts_with(b"*deleting ") || line.starts_with(b"deleting ") || line.starts_with(b"ignoring unsafe symlink ")
+}
+
+/// stdout's `sent N bytes  received M bytes` summary as (N, M), and its other
+/// lines.
+fn split_summary(out: &[u8]) -> (Option<(u64, u64)>, Vec<&[u8]>) {
+	let count = |text: &[u8]| -> Option<u64> {
+		let digits: Vec<u8> = text.iter().copied().filter(|byte| *byte != b',').collect();
+		std::str::from_utf8(&digits).ok()?.parse().ok()
+	};
+	let find = |text: &[u8], needle: &[u8]| text.windows(needle.len()).position(|w| w == needle);
+	let parse = |line: &[u8]| -> Option<(u64, u64)> {
+		const RECEIVED: &[u8] = b" bytes  received ";
+		let rest = line.strip_prefix(b"sent ")?;
+		let at = find(rest, RECEIVED)?;
+		let sent = count(&rest[..at])?;
+		let rest = &rest[at + RECEIVED.len()..];
+		Some((sent, count(&rest[..find(rest, b" bytes")?])?))
+	};
+	let mut summary = None;
+	let mut lines = Vec::new();
+	for line in out.split(|&byte| byte == b'\n') {
+		match parse(line) {
+			Some(numbers) if summary.is_none() => summary = Some(numbers),
+			_ => lines.push(line),
+		}
+	}
+	(summary, lines)
+}
+
 /// Runs one scenario; `Err` carries the report. `tamper` edits each outcome of
 /// ours before it is compared (the negative controls; [`run_table`] passes
 /// one that changes nothing).
+///
+/// Each attempt of a [`l`] scenario runs ours both in its own order and with its
+/// receiver starting late. It passes when an outcome in its own order equals a
+/// reference outcome. Failing that, it passes only when no reference outcome
+/// shows the early side of the list-arrival race ([`moved_earlier`] than a late
+/// outcome of ours), an outcome of ours with a late receiver equals a reference
+/// outcome, and an outcome in its own order is that one with nothing but the
+/// race's difference ([`race_only`]): ours' own order is sampled as the
+/// comparison samples it everywhere, some run must be right. So wherever the
+/// reference shows the early side even once, ours' own order must match it. The
+/// sides are told apart by the lines, not the byte counts, which a second race
+/// of the sender's frames also moves in both clients. Every other scenario runs
+/// ours in its own order only.
 fn check(reference: &Path, mode: Mode, case: &Case, tamper: &dyn Fn(&mut Outcome)) -> Result<(), String> {
 	let dir = tempfile::tempdir().unwrap();
 	// Canonical, so the paths both clients print agree with what `getcwd`
 	// reports to the reference (macOS: /var → /private/var).
 	let base = fs::canonicalize(dir.path()).unwrap();
 	let bench = Bench::new(&base, reference, mode, case.locale);
-	// Distinct outcomes per client so far, first run first.
+	// Distinct outcomes so far, first run first: ours in its own order, ours with
+	// a late receiver, and the reference.
 	let mut mine: Vec<Outcome> = Vec::new();
+	let mut late: Vec<Outcome> = Vec::new();
 	let mut seen: Vec<Outcome> = Vec::new();
 	let mut runs = (0_usize, 0_usize);
 	let mut matched = None;
 	for attempt in 0..=REFERENCE_RETRIES {
 		if attempt <= RETRIES {
-			let mut outcome = bench.run(case, &format!("ours{attempt}"), Client::Ours);
-			tamper(&mut outcome);
-			runs.0 += 1;
-			if !mine.contains(&outcome) {
-				mine.push(outcome);
+			let mut clients = vec![(Client::Ours, format!("ours{attempt}"))];
+			if case.list_race {
+				clients.push((Client::OursLate, format!("late{attempt}")));
+			}
+			for (client, side) in clients {
+				let outcomes = if client == Client::OursLate { &mut late } else { &mut mine };
+				let mut outcome = bench.run(case, &side, client);
+				tamper(&mut outcome);
+				runs.0 += 1;
+				if !outcomes.contains(&outcome) {
+					outcomes.push(outcome);
+				}
 			}
 		}
 		let outcome = bench.run(case, &format!("theirs{attempt}"), Client::Reference);
@@ -307,6 +456,9 @@ fn check(reference: &Path, mode: Mode, case: &Case, tamper: &dyn Fn(&mut Outcome
 			break;
 		}
 	}
+	if matched.is_none() {
+		matched = late_side_match(case, &mine, &late, &seen);
+	}
 	let (ours, theirs) = match matched {
 		Some(outcome) if outcome.code == case.exit => return Ok(()),
 		Some(outcome) => (outcome, outcome),
@@ -316,11 +468,16 @@ fn check(reference: &Path, mode: Mode, case: &Case, tamper: &dyn Fn(&mut Outcome
 		format!("ours matched one of {} distinct reference outcome(s)", seen.len())
 	} else {
 		format!(
-			"none of {} distinct outcome(s) of ours ({} runs) matched any of {} distinct reference outcome(s) ({} runs); diff of the first of each",
-			mine.len(),
+			"none of {} distinct outcome(s) of ours ({} runs) matched any of {} distinct reference outcome(s) ({} runs){}; diff of the first of each",
+			mine.len() + late.len(),
 			runs.0,
 			seen.len(),
-			runs.1
+			runs.1,
+			match (case.list_race, late_side_only(case, &late, &seen)) {
+				(false, _) => "",
+				(true, true) => " (no reference outcome shows the early side of the list-arrival race, and no outcome of ours in its own order is the early side of a late one that matched)",
+				(true, false) => " (a reference outcome shows the early side of the list-arrival race)",
+			}
 		)
 	};
 	let mut report = format!("{} {:?}\n  {verdict}\n", case.name, bench.argv(case, 0));
@@ -404,12 +561,13 @@ fn unchanged(_: &mut Outcome) {}
 
 /// Runs `case` with each outcome of ours edited by `tamper` into one the
 /// reference never produces, and requires it to fail only after every run of
-/// both clients: no rerun lets a wrong outcome of ours through.
+/// both clients: no rerun lets a wrong outcome of ours through. A [`l`]
+/// scenario runs ours twice per attempt (its own order and a late receiver).
 fn assert_never_matches(table: &[Case], name: &str, tamper: &dyn Fn(&mut Outcome)) {
 	let Some(reference) = reference() else { return };
 	let case = table.iter().find(|c| c.name == name).expect("the control's scenario");
 	let report = check(&reference, Mode::Local, case, tamper).expect_err("a tampered outcome of ours matched the reference");
-	let runs = format!("of ours ({} runs)", RETRIES + 1);
+	let runs = format!("of ours ({} runs)", (RETRIES + 1) * if case.list_race { 2 } else { 1 });
 	let reference_runs = format!("reference outcome(s) ({} runs)", REFERENCE_RETRIES + 1);
 	assert!(report.contains(&runs) && report.contains(&reference_runs), "{report}");
 }

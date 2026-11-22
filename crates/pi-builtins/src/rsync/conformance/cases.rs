@@ -18,7 +18,7 @@
 //! Every scenario here was run against rsync 3.5.1 repeatedly to confirm its
 //! normalized output and resulting trees are deterministic.
 
-use super::{Case, c, cc, u};
+use super::{Case, c, cc, l, u};
 
 /// Local transfers: both halves in one invocation.
 pub(super) const LOCAL: &[Case] = &[
@@ -37,7 +37,7 @@ pub(super) const LOCAL: &[Case] = &[
 	c("recursive_verbose", 0, "", &["-rv", "--no-inc-recursive", "src/", "dst/"]),
 	c("rlt", 0, "", &["-rlti", "src/", "dst/"]),
 	c("archive_verbose", 0, "", &["-av", "src/", "dst/"]),
-	c("archive_vv_stale", 0, "stale", &["-avv", "src/", "dst/"]),
+	l("archive_vv_stale", 0, "stale", &["-avv", "src/", "dst/"]),
 	c("archive_v_rerun", 0, "copy", &["-av", "src/", "dst/"]),
 	c("single_file", 0, "", &["-ai", "src/big.bin", "dst/"]),
 	c("single_file_rename", 0, "", &["-ai", "src/small.txt", "renamed.txt"]),
@@ -54,20 +54,20 @@ pub(super) const LOCAL: &[Case] = &[
 	c("out_format_v", 0, "", &["-av", "--out-format=[%o] %n%L %l", "src/", "dst/"]),
 	c("log_file", 0, "stale", &["-ai", "--log-file=rsync.log", "src/", "dst/"]),
 	// Dry runs and listings.
-	c("dry_run", 0, "stale", &["-ain", "--delete", "src/", "dst/"]),
+	l("dry_run", 0, "stale", &["-ain", "--delete", "src/", "dst/"]),
 	c("dry_run_stats", 0, "stale", &["-an", "--stats", "src/", "dst/"]),
 	c("list_only_file", 0, "", &["--list-only", "src/small.txt"]),
 	c("list_only_dir", 0, "", &["--list-only", "src/"]),
 	c("list_only_r", 0, "", &["--list-only", "-r", "src"]),
 	c("list_implied", 0, "", &["-a", "src/"]),
 	// Deletion.
-	c("delete", 0, "stale", &["-ai", "--delete", "src/", "dst/"]),
+	l("delete", 0, "stale", &["-ai", "--delete", "src/", "dst/"]),
 	c("delete_before", 0, "stale", &["-ai", "--delete-before", "src/", "dst/"]),
 	u("delete_during", 0, "stale", &["-ai", "--delete-during", "src/", "dst/"]),
 	c("delete_delay", 0, "stale", &["-ai", "--delete-delay", "src/", "dst/"]),
 	c("delete_after", 0, "stale", &["-ai", "--delete-after", "src/", "dst/"]),
-	c("delete_v", 0, "stale", &["-av", "--delete", "src/", "dst/"]),
-	c("delete_excluded", 0, "stale", &["-ai", "--delete-excluded", "--exclude=*.o", "src/", "dst/"]),
+	l("delete_v", 0, "stale", &["-av", "--delete", "src/", "dst/"]),
+	l("delete_excluded", 0, "stale", &["-ai", "--delete-excluded", "--exclude=*.o", "src/", "dst/"]),
 	// --delete uses delete-during: MSG_DELETED can overtake buffered itemization,
 	// just as in delete_during above; exclusion rules do not constrain that order.
 	u("delete_keeps_excluded", 0, "stale", &["-ai", "--delete", "--exclude=*.o", "src/", "dst/"]),
@@ -152,7 +152,7 @@ pub(super) const LOCAL: &[Case] = &[
 	c("keep_dirlinks_outside", 23, "keepdir_out", &["-aiK", "src/", "dst/"]),
 	c("copy_unsafe_links", 23, "", &["-ai", "--copy-unsafe-links", "src/", "dst/"]),
 	c("safe_links", 0, "", &["-ai", "--safe-links", "src/", "dst/"]),
-	c("safe_links_v", 0, "", &["-av", "--safe-links", "src/", "dst/"]),
+	l("safe_links_v", 0, "", &["-av", "--safe-links", "src/", "dst/"]),
 	c("munge_links", 0, "", &["-ai", "--munge-links", "src/", "dst/"]),
 	u("devices_specials", 0, "", &["-rDi", "src/", "dst/"]),
 	c("no_specials", 0, "", &["-rlti", "--no-D", "src/", "dst/"]),
