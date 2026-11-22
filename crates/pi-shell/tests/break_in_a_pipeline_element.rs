@@ -213,6 +213,24 @@ const COMMON_FORKS: &[(&str, &str)] = &[
 	("count0-alone", "break 0"),
 	("countx-element", "break x | :"),
 	("procsub", "cat <(break; echo s)"),
+	// A word's substitution body is lowered ahead of the command's own op:
+	// the forked simple command still keeps the level, for a `$( )`,
+	// backtick or `<( )` word or assignment (`$(( ))` has no body: the
+	// control), and a `break` inside the substitution ends only it.
+	("element-cmdsub-word", ": | break $(echo 1)"),
+	("element-arith-word", ": | break $((1))"),
+	("first-element-cmdsub-word", "break $(echo 1) | :"),
+	("middle-element-cmdsub-word", ": | break $(:) | :"),
+	("element-backtick-word", ": | break `echo 1`"),
+	("element-assign-cmdsub-word", ": | v=$(:) break"),
+	("element-cmdsub-break-inside", ": | echo \"[$(break; echo s)]\" | cat"),
+	("element-backtick-break-inside", ": | echo \"[`break; echo s`]\" | cat"),
+	("element-procsub-break-inside", ": | cat <(break; echo s)"),
+	("bg-cmdsub-word", "break $(echo 1) & wait"),
+	("bg-arith-word", "break $((1)) & wait"),
+	("bg-backtick-word", "break `echo 1` & wait"),
+	("bg-assign-cmdsub-word", "v=$(:) break & wait"),
+	("bg-cmdsub-break-inside", "echo \"[$(break; echo s)]\" & wait"),
 ];
 
 /// The fork shapes only bash runs.
@@ -226,6 +244,10 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("lastpipe-element", "shopt -s lastpipe; : | break"),
 	("posix-element", "set -o posix; : | break"),
 	("posix-alone", "set -o posix; break"),
+	("element-procsub-word", ": | x=<(:) break"),
+	("bg-procsub-word", "x=<(:) break & wait"),
+	// The element's `$BASH_SUBSHELL` is its parent's (a simple command).
+	("element-subshell-level-cmdsub-word", "echo $BASH_SUBSHELL $(:) | cat"),
 ];
 
 /// The fork shapes only zsh runs.
@@ -248,8 +270,9 @@ const ZSH_FORKS: &[(&str, &str)] = &[
 ];
 
 /// The fork rows, `fork/x<loops>/<name>`: each shape at top level, in a
-/// loop and in two loops; then two whole scripts whose substitution bash
-/// re-parses (a line before the end of the top-level command).
+/// loop and in two loops; bash's `jobs` element at top level; then two
+/// whole scripts whose substitution bash re-parses (a line before the end
+/// of the top-level command).
 fn forks(dialect: Dialect) -> Vec<Row> {
 	let own = if dialect == Dialect::Bash {
 		BASH_FORKS
@@ -273,6 +296,15 @@ fn forks(dialect: Dialect) -> Vec<Row> {
 				"for o in X Y; do echo o$o; for i in 1 2; do echo a$i; {x}; echo b$i:$?; done; echo \
 				 e:$?; echo c$o:$?; done; echo E:$?"
 			),
+		));
+	}
+	// A `jobs` element with a substitution word keeps the job list (one
+	// level only: bash 5.3.20 also lists the job the first iteration
+	// killed).
+	if dialect == Dialect::Bash {
+		rows.push((
+			"fork/x0/element-jobs-cmdsub-word".to_owned(),
+			"sleep 5 & jobs -p $(:) | wc -l; kill $!; echo top:$?".to_owned(),
 		));
 	}
 	rows.push((
