@@ -387,7 +387,7 @@ fn scratch_image(
 		let mut state = ExecState::clone(e);
 		match &mut sc.live {
 			Live::Task(task) => {
-				state.checkpoint = task.checkpoint();
+				state.checkpoint = task.checkpoint().map(Vec::into_boxed_slice);
 				if state.checkpoint.is_none()
 					&& let Some(Awaited::Task(native)) = state.waiting
 				{
@@ -945,7 +945,9 @@ impl Shell {
 								)
 								| None => {},
 							}
-							if state.stage == Stage::Lookup && state.target == Some(Target::Search) {
+							if matches!(state.stage, Stage::Lookup | Stage::FailedLookup)
+								&& state.target == Some(Target::Search)
+							{
 								report.reissued_fs += 1;
 							}
 							state

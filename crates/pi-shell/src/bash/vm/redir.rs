@@ -29,7 +29,7 @@ use super::{
 	probe::{absolute, dev_fd},
 	proc::{
 		AssignValue, BangStage, DeferPhase, Deferral, FrameKind, Probe, ProbeResult, Saved, Slot,
-		Stage, Vproc,
+		Stage, VarFd, Vproc,
 	},
 	state::{self, Level},
 };
@@ -411,7 +411,8 @@ fn target_fd(
 	}
 }
 
-/// Store `fd` in the `{var}` named `name`.
+/// Store `fd` in the `{var}` named `name`, noting a simple command's
+/// variable binding before ([`super::proc::ExecState::var_fds`]).
 fn assign_fd_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -420,6 +421,11 @@ fn assign_fd_var(
 	fd: i32,
 	line: u32,
 ) -> Result<(), Diag> {
+	let before = if super::exec::scratch(vp).exec.is_some() {
+		var_before(k, vp, cx, name)
+	} else {
+		None
+	};
 	let (base, index) = builtins::split_subscript(name);
 	let lhs = Lhs { name: base, index, append: false };
 	let value = AssignValue::Scalar(BString::from(fd.to_string()));
@@ -440,7 +446,53 @@ fn assign_fd_var(
 		let msg = format!("{}: cannot assign fd to variable", name.as_bstr()).into();
 		return Err(Diag::Usage { msg });
 	}
+	if let Some(var) = before
+		&& let Some(e) = super::exec::scratch(vp).exec.as_mut()
+	{
+		e.var_fds
+			.get_or_insert_with(Box::default)
+			.push(VarFd { fd, ..var });
+	}
 	Ok(())
+}
+
+/// The variable a `{var}` named `name` assigns (through namerefs; the
+/// whole array for an element) and its declared binding now (`None`:
+/// unbound), as a [`VarFd`] whose fd is still to be set; `None` for a
+/// circular reference or a positional parameter.
+fn var_before(k: &Kernel, vp: &Vproc, cx: &mut Cx<'_>, name: &[u8]) -> Option<VarFd> {
+	let (base, _) = builtins::split_subscript(name);
+	let base: BString = match state::deref(&k.root, cx.store, vp, base).ok()? {
+		state::Deref::Plain => base.into(),
+		state::Deref::To { name, .. } => name,
+		state::Deref::Circular => return None,
+	};
+	if base.is_empty() || base.iter().all(u8::is_ascii_digit) {
+		return None;
+	}
+	let prior = state::lookup_declared(&k.root, cx.store, vp, &base)
+		.ok()?
+		.cloned();
+	Some(VarFd { fd: -1, name: base, prior })
+}
+
+/// Undo the `{var}` redirections made so far for a command bash forks for
+/// before its redirections (an external, a null command that forks) when
+/// they fail: bash makes them in that fork, so neither the fd nor the
+/// variable reaches the shell. Each fd is closed and each variable gets
+/// its binding back.
+pub(super) fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	let Some(vars) = super::exec::scratch(vp)
+		.exec
+		.as_mut()
+		.and_then(|e| e.var_fds.take())
+	else {
+		return;
+	};
+	for VarFd { fd, name, prior } in vars.into_iter().rev() {
+		vp.fds.set(fd, None);
+		state::store_var(&mut k.root, cx.store, vp, &name, prior, Level::Dynamic);
+	}
 }
 
 /// The fd number a `{var}` holds, if it holds one (through namerefs).

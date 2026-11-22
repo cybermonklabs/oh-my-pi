@@ -1573,8 +1573,9 @@ pub struct ExecState {
 	pub scoped:      bool,
 	/// Control transfer to perform once the output is written.
 	pub control:     Option<Transfer>,
-	/// `Task::checkpoint` bytes taken at externalize.
-	pub checkpoint:  Option<Vec<u8>>,
+	/// `Task::checkpoint` bytes taken at externalize (a boxed slice: the
+	/// size guard below counts every byte of this state).
+	pub checkpoint:  Option<Box<[u8]>>,
 	/// Command output still to be written.
 	pub writes:      VecDeque<PendingWrite>,
 	pub status:      i32,
@@ -1594,6 +1595,24 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// The command's `{var}` redirections made so far. A command bash
+	/// makes them for in its fork leaves neither the fd nor the value in
+	/// the shell when they fail ([`super::redir::forget_var_fds`]). Boxed:
+	/// few commands have one.
+	#[expect(
+		clippy::box_collection,
+		reason = "8 B where a Vec is 24: the size guard below counts every byte"
+	)]
+	pub var_fds:     Option<Box<Vec<VarFd>>>,
+}
+
+/// A `{var}` redirection a simple command made: the fd, and the variable's
+/// name and declared binding before it took the fd (`None`: unbound).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VarFd {
+	pub fd:    i32,
+	pub name:  BString,
+	pub prior: Option<crate::bash::store::Var>,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1649,6 +1668,10 @@ pub enum Stage {
 	Output,
 	/// Report and finish.
 	Finish,
+	/// The redirections of a command bash forks for failed (its `status` is
+	/// the fork's): resolve the name, as bash does in the shell before it
+	/// forks (hashing it), then finish; the command runs no further.
+	FailedLookup,
 }
 
 /// What a command name resolved to.

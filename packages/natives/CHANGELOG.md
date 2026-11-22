@@ -4,7 +4,8 @@
 
 ### Fixed
 
-- A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in the redirections of a command bash runs in a process of its own (an external, a name not found, `command X`, a null command that redirects standard input) now fails only that command, with bash's status (127 under `-c`, 1 from a script or after an arithmetic error), and the shell goes on; it ended the shell. An asynchronous simple command's or a pipeline stage's fatal error now exits 127 under `-c` (1 under `set -e`), as bash's does.
+- A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in the redirections of a command bash runs in a process of its own (an external, a name not found, `command X`, a null command that redirects standard input, a `( … )`) now fails only that command, with bash's status (127 under `-c`, 1 from a script or after an arithmetic error; a null command 1 under `-c` too, as bash 5.3 does), and the shell goes on; it ended the shell. Such a command leaves no `{var}` descriptor or value behind when its redirections fail, and its name is still looked up and hashed, as bash does before it forks.
+- An asynchronous simple command's or a pipeline stage's fatal error in its words, its redirections or a function it calls now exits 127 under `-c`, as bash's does (a `{ }` stage still exits 1); a builtin the job or stage runs exits 1 on a fatal error it meets (`eval 'echo ${x:?}' &`), as in bash. Under `set -e` the shell's own fatal error under `-c` (`set -e; echo < ${x:?}`) now exits 1, as bash's does; it exited 127.
 - A redirection that duplicates a descriptor that is not open now names it as bash does (`<&07` names `7`, `3<&$fd` names `3`, `<&$fd-` names `0`), and a move the shell undoes, or a `{var}` copy, first prints bash's `redirection error: cannot duplicate fd: Bad file descriptor`.
 
 ## [18.18.6] - 2026-11-09

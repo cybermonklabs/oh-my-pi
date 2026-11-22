@@ -73,6 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			var_fds: None,
 		}
 	}
 
@@ -104,6 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			var_fds,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*var_fds = None;
 	}
 }
 
@@ -291,9 +294,16 @@ pub fn exec(
 								forks_for(k, cx, vp)
 							} =>
 						{
+							super::redir::forget_var_fds(k, vp, cx);
 							let s = st(vp);
 							s.status = if null { 1 } else { code };
-							s.stage = Stage::Finish;
+							// bash looks the name up (and hashes it) in the shell
+							// before it forks; a null command has none.
+							s.stage = if null {
+								Stage::Finish
+							} else {
+								Stage::FailedLookup
+							};
 							// The message goes to stderr as the redirections so far
 							// left it (`2>/dev/null < ${x:?}` prints none).
 							if let Some(fd) = exec::flush_out(k, vp) {
@@ -323,9 +333,20 @@ pub fn exec(
 									)
 									.unwrap_or(false)
 								};
+							// A command bash forks for fails in its fork (bash's
+							// `execute_disk_command`, `execute_null_command`'s
+							// `forcefork`), after the shell looked its name up.
+							let forks = !null && forks_for(k, cx, vp);
+							if forks || null_forks {
+								super::redir::forget_var_fds(k, vp, cx);
+							}
 							let s = st(vp);
 							s.status = 1;
-							s.stage = Stage::Finish;
+							s.stage = if forks {
+								Stage::FailedLookup
+							} else {
+								Stage::Finish
+							};
 							if fatal {
 								s.control = Some(Transfer::Exit(1));
 							}
@@ -375,7 +396,7 @@ pub fn exec(
 					Stage::Lookup
 				};
 			},
-			Stage::Lookup => {
+			Stage::Lookup | Stage::FailedLookup => {
 				if let Some(flow) = lookup(k, vp, cx, op, cmd.typeset) {
 					return flow;
 				}
@@ -389,6 +410,9 @@ pub fn exec(
 				deferred_resolved(k, vp);
 			},
 			Stage::Dispatch => {
+				if matches!(st(vp).target, Some(Target::Intrinsic(_))) {
+					catch_builtin(vp);
+				}
 				// A builtin, task or external runs: what follows reads the
 				// clock again (a function's `FuncEnter` shares the call's).
 				if k.clock.is_some() && !matches!(st(vp).target, Some(Target::Function(_))) {
@@ -613,6 +637,7 @@ fn plain_statement(
 			return Some(exec(k, vp, cx, unit, op, line));
 		},
 	};
+	catch_builtin(vp);
 	// The temporary scope the staged command gives a builtin.
 	let scope =
 		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
@@ -1846,6 +1871,19 @@ fn resolve(
 	})
 }
 
+/// A builtin about to run as the command a fork was made for (an async
+/// command, a pipeline stage): bash's fork sets its catcher once the
+/// command's redirections are made, before the builtin runs
+/// (`execute_subshell_builtin_or_function`), so a fatal error the builtin
+/// meets (`eval 'echo ${x:?}' &`) ends only the fork, with the failure
+/// status. A function gets none: its body's fatal errors reach what the
+/// fork's words and redirections reach ([`super::proc::Fork::entry`]).
+const fn catch_builtin(vp: &mut Vproc) {
+	if vp.frames.len() == 1 && vp.fork().at_entry() {
+		vp.set_fork(super::proc::Fork::CHILD);
+	}
+}
+
 /// Whether bash runs the simple command on top of `vp` (its words
 /// expanded, its name not yet looked up) in a fork that makes its
 /// redirections itself (`execute_disk_command`): a name that is not a
@@ -2179,8 +2217,15 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			return flow;
 		}
 	}
-	st(vp).stage = Stage::Dispatch;
-	if k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
+	// A command whose redirections failed in its fork runs nothing more.
+	let failed = st(vp).stage == Stage::FailedLookup;
+	st(vp).stage = if failed {
+		Stage::Finish
+	} else {
+		Stage::Dispatch
+	};
+	if !failed
+		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
 	{
 		// Borrowed from the command's state, stamped with its start when

@@ -1,6 +1,6 @@
-//! Two older differences from bash in a redirection's failure, each row as
-//! bash 5.2.21 and 5.3.20 both run it (`bash -c` and `bash ./s.sh`; the
-//! rows where the two bashes differ are left out):
+//! Older differences from bash in a redirection's failure, each row as bash
+//! 5.2.21 and 5.3.20 both run it (`bash -c` and `bash ./s.sh`), or as 5.3.20
+//! runs it where 5.2.21 differs ([`ROWS53`]):
 //!
 //! - (h) A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in the
 //!   redirections of a command bash runs in a fork of its own (an external, a
@@ -16,6 +16,15 @@
 //!   else the fd it sets (`3<&$fd` is `3`, a move `<&$fd-` is `0`); and a move
 //!   the shell will undo, or a `{var}` copy, first prints `redirection error:
 //!   cannot duplicate fd: Bad file descriptor`.
+//! - A builtin run as the command of a fork (an async command, a pipeline
+//!   stage) gets a catcher of its own once its redirections are made (bash's
+//!   `execute_subshell_builtin_or_function`): a fatal error it meets exits 1
+//!   (`eval 'echo ${x:?u}' &`); a function gets none (127 under `-c`).
+//! - A `( … )`'s own redirections are made in its fork: a fatal error in them
+//!   fails the subshell (127 under `-c`, else 1), and the shell goes on.
+//! - A command bash forks for before its redirections leaves no `{var}` fd and
+//!   no `{var}` value in the shell when they fail, and its name is still looked
+//!   up (and hashed) in the shell.
 //!
 //! Each row runs in a fresh directory holding `in` ("hello") and a FIFO
 //! `fifo`, its program named `bash` (as bash names itself in messages).
@@ -30,6 +39,10 @@ use obash_support::{obash, output};
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
+	// 226 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
+	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
+	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c, r2-null-c/c
 	("h-ext", false, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
 	("h-ext", true, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
 	("h-notfound", false, "nosuch < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
@@ -1192,6 +1205,601 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"s=1\n",
 		"./s.sh: line 1: x: u\n",
 	),
+	(
+		"r2-bg-eval",
+		false,
+		"eval 'echo ${x:?u}' & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval",
+		true,
+		"eval 'echo ${x:?u}' & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-command-eval",
+		false,
+		"command eval 'echo ${x:?u}' & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-command-eval",
+		true,
+		"command eval 'echo ${x:?u}' & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-dot",
+		false,
+		"echo 'echo ${x:?u}' > f; { . ./f & wait $!; echo \"s=$?\"; } 2>/dev/null",
+		0,
+		"s=1\n",
+		"",
+	),
+	(
+		"r2-bg-dot",
+		true,
+		"echo 'echo ${x:?u}' > f; { . ./f & wait $!; echo \"s=$?\"; } 2>/dev/null",
+		0,
+		"s=1\n",
+		"",
+	),
+	(
+		"r2-bg-mapfile",
+		false,
+		"mapfile -c 1 -C 'echo ${x:?u}' a < in & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-mapfile",
+		true,
+		"mapfile -c 1 -C 'echo ${x:?u}' a < in & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-inner",
+		false,
+		"eval '/bin/cat < ${x:?u}; echo \"in=$?\"' & wait $!; echo \"s=$?\"",
+		0,
+		"in=1\ns=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-inner",
+		true,
+		"eval '/bin/cat < ${x:?u}; echo \"in=$?\"' & wait $!; echo \"s=$?\"",
+		0,
+		"in=1\ns=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-pipe-eval",
+		false,
+		"eval 'echo ${x:?u}' | cat; echo \"s=${PIPESTATUS[0]}\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-pipe-eval",
+		true,
+		"eval 'echo ${x:?u}' | cat; echo \"s=${PIPESTATUS[0]}\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-pipe-eval-last",
+		false,
+		"echo a | eval 'echo ${x:?u}'; echo \"s=${PIPESTATUS[1]}\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-pipe-eval-last",
+		true,
+		"echo a | eval 'echo ${x:?u}'; echo \"s=${PIPESTATUS[1]}\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-word",
+		false,
+		"eval ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-word",
+		true,
+		"eval ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-builtin-redir",
+		false,
+		"echo < ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-builtin-redir",
+		true,
+		"echo < ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-redir",
+		false,
+		"eval 'echo b' < ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-redir",
+		true,
+		"eval 'echo b' < ${x:?u} & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-fn-eval",
+		true,
+		"f() { eval 'echo ${x:?u}'; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-in",
+		false,
+		"eval 'echo ${x:?u}' < in & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-bg-eval-in",
+		true,
+		"eval 'echo ${x:?u}' < in & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir",
+		false,
+		"( echo g ) < ${x:?u}; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir",
+		true,
+		"( echo g ) < ${x:?u}; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-or",
+		false,
+		"( echo g ) < ${x:?u} || echo \"or=$?\"; echo \"s=$?\"",
+		0,
+		"or=127\ns=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-or",
+		true,
+		"( echo g ) < ${x:?u} || echo \"or=$?\"; echo \"s=$?\"",
+		0,
+		"or=1\ns=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-fn",
+		true,
+		"f() { ( echo g ) < ${x:?u}; echo \"in=$?\"; }; f; echo \"s=$?\"",
+		0,
+		"in=1\ns=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-quiet",
+		false,
+		"( echo g ) 2>/dev/null < ${x:?u}; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"",
+	),
+	("r2-sub-redir-quiet", true, "( echo g ) 2>/dev/null < ${x:?u}; echo \"s=$?\"", 0, "s=1\n", ""),
+	(
+		"r2-sub-redir-e",
+		false,
+		"set -e; ( echo g ) < ${x:?u}; echo \"s=$?\"",
+		1,
+		"",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-e",
+		true,
+		"set -e; ( echo g ) < ${x:?u}; echo \"s=$?\"",
+		1,
+		"",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-nested",
+		false,
+		"( ( echo g ) < ${x:?u}; echo \"in=$?\" ); echo \"s=$?\"",
+		0,
+		"in=1\ns=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-nested",
+		true,
+		"( ( echo g ) < ${x:?u}; echo \"in=$?\" ); echo \"s=$?\"",
+		0,
+		"in=1\ns=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-arith",
+		false,
+		"( echo g ) < $((1/0)); echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r2-sub-redir-arith",
+		true,
+		"( echo g ) < $((1/0)); echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r2-sub-redir-unset",
+		false,
+		"set -u; ( echo g ) < $nosuch; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: nosuch: unbound variable\n",
+	),
+	(
+		"r2-sub-redir-unset",
+		true,
+		"set -u; ( echo g ) < $nosuch; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: nosuch: unbound variable\n",
+	),
+	(
+		"r2-var-fatal",
+		false,
+		"/bin/cat {v}<in < ${x:?u}; echo \"v=$v\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=\ns=1\n",
+		"bash: line 1: x: u\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r2-var-fatal",
+		true,
+		"/bin/cat {v}<in < ${x:?u}; echo \"v=$v\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=\ns=1\n",
+		"./s.sh: line 1: x: u\n./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r2-var-fail",
+		false,
+		"/bin/cat {v}<in < nonexist; echo \"v=$v\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=\ns=1\n",
+		"bash: line 1: nonexist: No such file or directory\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r2-var-fail",
+		true,
+		"/bin/cat {v}<in < nonexist; echo \"v=$v\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=\ns=1\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: 10: Bad file \
+		 descriptor\n",
+	),
+	(
+		"r2-var-kept",
+		false,
+		"v=x; /bin/cat {v}<in < ${x:?u}; echo \"v=$v\"",
+		0,
+		"v=x\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-var-kept",
+		true,
+		"v=x; /bin/cat {v}<in < ${x:?u}; echo \"v=$v\"",
+		0,
+		"v=x\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-var-local",
+		true,
+		"f() { local v=y; /bin/cat {v}<in < nonexist; echo \"v=$v\"; }; f; echo \"v=${v-unset}\"",
+		0,
+		"v=y\nv=unset\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-var-null-fail",
+		false,
+		"{v}<in < nonexist; echo \"v=${v-unset}\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=unset\ns=1\n",
+		"bash: line 1: nonexist: No such file or directory\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r2-var-null-fail",
+		true,
+		"{v}<in < nonexist; echo \"v=${v-unset}\"; /bin/cat <&10; echo \"s=$?\"",
+		0,
+		"v=unset\ns=1\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: 10: Bad file \
+		 descriptor\n",
+	),
+	(
+		"r2-var-array",
+		false,
+		"a=(p q); /bin/cat {a[1]}<in < nonexist; echo \"a=${a[*]}\"",
+		0,
+		"a=p q\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-var-array",
+		true,
+		"a=(p q); /bin/cat {a[1]}<in < nonexist; echo \"a=${a[*]}\"",
+		0,
+		"a=p q\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-var-builtin",
+		false,
+		"echo {v}<in < nonexist; echo \"v=$v\"",
+		0,
+		"v=10\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-var-builtin",
+		true,
+		"echo {v}<in < nonexist; echo \"v=$v\"",
+		0,
+		"v=10\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-hash-fatal",
+		false,
+		"cat < ${x:?u}; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-hash-fatal",
+		true,
+		"cat < ${x:?u}; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r2-hash-fail",
+		false,
+		"cat < nonexist; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-hash-fail",
+		true,
+		"cat < nonexist; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-hash-notfound",
+		false,
+		"nosuch < nonexist; hash; echo \"s=$?\"",
+		0,
+		"hash: hash table empty\ns=0\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-hash-notfound",
+		true,
+		"nosuch < nonexist; hash; echo \"s=$?\"",
+		0,
+		"hash: hash table empty\ns=0\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r2-hash-twice",
+		false,
+		"cat < nonexist; cat < nonexist; hash",
+		0,
+		"hits	command\n   2	/usr/bin/cat\n",
+		"bash: line 1: nonexist: No such file or directory\nbash: line 1: nonexist: No such file or \
+		 directory\n",
+	),
+	(
+		"r2-hash-twice",
+		true,
+		"cat < nonexist; cat < nonexist; hash",
+		0,
+		"hits	command\n   2	/usr/bin/cat\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: nonexist: No such \
+		 file or directory\n",
+	),
+	(
+		"g-fn-group-move-bg",
+		true,
+		"f() { { :; } <&7-; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: redirection error: cannot duplicate fd: Bad file descriptor\n./s.sh: line 1: 7: \
+		 Bad file descriptor\n",
+	),
+	(
+		"r2-subshell-depth",
+		false,
+		"( echo \"a=$BASH_SUBSHELL\" ); echo \"b=$BASH_SUBSHELL\" & wait; echo x | { echo \
+		 \"c=$BASH_SUBSHELL\"; cat > /dev/null; }; ( ( echo \"d=$BASH_SUBSHELL\" ) )",
+		0,
+		"a=1\nb=1\nc=1\nd=2\n",
+		"",
+	),
+	(
+		"r2-subshell-depth",
+		true,
+		"( echo \"a=$BASH_SUBSHELL\" ); echo \"b=$BASH_SUBSHELL\" & wait; echo x | { echo \
+		 \"c=$BASH_SUBSHELL\"; cat > /dev/null; }; ( ( echo \"d=$BASH_SUBSHELL\" ) )",
+		0,
+		"a=1\nb=1\nc=1\nd=2\n",
+		"",
+	),
+	("r2-null-c", true, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
+];
+
+/// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this
+/// library follows bash 5.3), in the form of [`ROWS`].
+const ROWS53: &[(&str, bool, &str, i32, &str, &str)] = &[
+	// 14 rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them
+	(
+		"h-in-fn",
+		false,
+		"f() { /bin/cat < ${x:?u}; }; f; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"h-bg-fn",
+		false,
+		"f() { echo ${x:?u}; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	("h-null", false, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "bash: line 1: x: u\n"),
+	(
+		"g-null-move",
+		false,
+		"<&7-; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: 7: Bad file descriptor\n",
+	),
+	(
+		"g-null-move",
+		true,
+		"<&7-; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: 7: Bad file descriptor\n",
+	),
+	(
+		"g-assign-move",
+		false,
+		"x=1 <&7-; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: line 1: 7: Bad file descriptor\n",
+	),
+	(
+		"g-assign-move",
+		true,
+		"x=1 <&7-; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: 7: Bad file descriptor\n",
+	),
+	(
+		"x-fn",
+		false,
+		"f() { /bin/cat < ${x:?u}; echo \"in=$?\"; }; f; echo \"s=$?\"",
+		0,
+		"in=127\ns=0\n",
+		"bash: line 1: x: u\n",
+	),
+	("x-null-var", false, "{v}< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "bash: line 1: x: u\n"),
+	(
+		"r2-bg-fn-eval",
+		false,
+		"f() { eval 'echo ${x:?u}'; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-sub-redir-fn",
+		false,
+		"f() { ( echo g ) < ${x:?u}; echo \"in=$?\"; }; f; echo \"s=$?\"",
+		0,
+		"in=127\ns=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r2-var-local",
+		false,
+		"f() { local v=y; /bin/cat {v}<in < nonexist; echo \"v=$v\"; }; f; echo \"v=${v-unset}\"",
+		0,
+		"v=y\nv=unset\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"g-fn-group-move-bg",
+		false,
+		"f() { { :; } <&7-; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"bash: redirection error: cannot duplicate fd: Bad file descriptor\nbash: line 1: 7: Bad \
+		 file descriptor\n",
+	),
+	("r2-null-c", false, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "bash: line 1: x: u\n"),
 ];
 
 /// The directory a row runs in: `in` and the FIFO `fifo`.
@@ -1291,4 +1899,12 @@ fn a_duplication_of_a_closed_fd_is_named_as_bash_names_it() {
 		.collect();
 	assert!(rows.len() > 40, "{} (g) rows", rows.len());
 	check(&rows);
+}
+
+/// The rows bash 5.2.21 runs otherwise (a null command's fatal redirection,
+/// a function's fatal error under `-c`), as bash 5.3.20 runs them.
+#[test]
+fn rows_bash_5_2_runs_otherwise_are_as_bash_5_3_runs_them() {
+	assert!(ROWS53.len() > 10, "{} rows", ROWS53.len());
+	check(ROWS53);
 }

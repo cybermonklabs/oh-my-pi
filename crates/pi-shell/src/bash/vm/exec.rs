@@ -3019,6 +3019,21 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					top_frame(vp).redirs.push(saves);
 					Flow::Next
 				},
+				// A fatal expansion error in a `( … )`'s own redirections ends
+				// its fork, which bash makes them in before the subshell's
+				// catcher (`execute_in_subshell`): the subshell fails with the
+				// status the fork exits with (127 from a `-c` string, else 1)
+				// and the shell goes on. (zsh code keeps its own rule.)
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+					if subshell && !forked && unit.mode.dialect() != Dialect::Zsh =>
+				{
+					// The message goes to stderr as the redirections so far
+					// left it (`2>/dev/null < ${x:?}` prints none).
+					let _ = flush_out(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = code;
+					Flow::Jump(op.b)
+				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
 					// The message goes to stderr as the redirections so far left
