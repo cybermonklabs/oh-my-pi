@@ -1702,7 +1702,9 @@ async function openCodexWebSocketTransport(
 		throw new CodexWebSocketBusyError("websocket request already in progress");
 	}
 	// Accepted steering belongs to whichever request ends up owning the socket,
-	// so it is only consumed once this request takes it (see `onOwned` below).
+	// so it is only consumed once this request takes it (see `onOwned` below):
+	// when its frame goes out, so a frame the model-call guards hold leaves it
+	// for the next request instead of dropping it while the socket keeps it.
 	const steered = websocketState.acceptedSteering;
 	const onOwned = () => {
 		if (websocketState.acceptedSteering === steered) websocketState.acceptedSteering = undefined;

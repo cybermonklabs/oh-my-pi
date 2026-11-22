@@ -4,6 +4,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { cyberPolicyHoldMessage } from "../session/cyber-policy-closure";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
@@ -22,6 +23,19 @@ import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
+
+/** The live call's route, as a cyber-policy hold names it. */
+const LIVE_ROUTE = { provider: "openai-codex", id: "live" } as const;
+
+/**
+ * Why the live call may send nothing now, or `undefined` when it may. The call runs on OpenAI (Codex realtime)
+ * and carries the session's text, so while the session tree's cyber-policy closure is active (OpenAI refused the
+ * tree's content) no call starts and none of the session's text goes out. Every send of the session's content in
+ * this module reads it right before it goes out.
+ */
+export function liveCallHoldReason(session: Pick<AgentSession, "cyberPolicyClosure">): string | undefined {
+	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(LIVE_ROUTE) : undefined;
+}
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -179,6 +193,9 @@ export class LiveSessionController {
 		}
 
 		try {
+			// The call itself goes to OpenAI: none starts while a refusal holds the session's OpenAI routes.
+			const held = liveCallHoldReason(this.#session);
+			if (held) throw new Error(held);
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
 			const transport = new CodexLiveTransport({
@@ -482,7 +499,15 @@ export class LiveSessionController {
 		if (!transport || this.#stopped) return;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (!this.#stopped) await transport.send(message);
+				if (this.#stopped) return;
+				// The session's text goes to OpenAI: while a refusal holds the session's OpenAI routes, none
+				// goes out, and the call ends on the hold, since the session's answer can no longer reach it.
+				const held = liveCallHoldReason(this.#session);
+				if (held) {
+					this.#reportFailure(new Error(held));
+					return;
+				}
+				await transport.send(message);
 			})
 			.catch(cause => this.#reportFailure(toError(cause)));
 	}

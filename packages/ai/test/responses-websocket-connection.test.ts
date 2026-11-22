@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { addModelCallGuard, ModelCallRefusedError } from "@oh-my-pi/pi-ai/model-call-guard";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	ResponsesWebSocketConnection,
@@ -299,5 +300,53 @@ describe("Responses physical WebSocket channel", () => {
 		expect(closed).toEqual([rejection]);
 		expect(sent).toHaveLength(0);
 		await expect(socket.connect()).rejects.toBe(rejection);
+	});
+});
+
+// `onOwned` hands the request what the socket holds for its next frame: Codex's accepted steering, which the
+// request carrying that frame consumes. A frame the model-call guards hold sends nothing, so it consumes nothing:
+// the request does not take the socket until its frame goes out. The control's frame goes out and takes it.
+describe("a Responses WebSocket frame the model-call guards hold", () => {
+	it.each([
+		["does not take the socket's next-frame state", true],
+		["takes it when its frame goes out (control)", false],
+	])("%s", async (_name, held) => {
+		const exchange = create();
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === exchange.model.id ? "held: cyber_policy" : undefined),
+		});
+		let owned = 0;
+		try {
+			const socket = connection();
+			await socket.connect();
+			const reader = socket.streamRequest(exchange, {}, undefined, undefined, () => {
+				owned++;
+			});
+			if (held) {
+				await expect(reader.next()).rejects.toBeInstanceOf(ModelCallRefusedError);
+				expect(sent).toHaveLength(0);
+				expect(owned).toBe(0);
+			} else {
+				for await (const _frame of reader) {
+				}
+				expect(sent).toEqual([{ type: "response.create" }]);
+				expect(owned).toBe(1);
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A read (an attach to a response the server already started) sends no frame, and owns the socket at once.
+	it("a read takes the socket's next-frame state at once", async () => {
+		let owned = 0;
+		const socket = connection();
+		await socket.connect();
+		const reader = socket.streamRequest({ receive: true }, { firstEventTimeoutMs: 10 }, undefined, undefined, () => {
+			owned++;
+		});
+		await expect(reader.next()).rejects.toBeInstanceOf(ResponsesWebSocketTransportError);
+		expect(owned).toBe(1);
+		expect(sent).toHaveLength(0);
 	});
 });

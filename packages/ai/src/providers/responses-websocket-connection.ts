@@ -389,6 +389,12 @@ export class ResponsesWebSocketConnection {
 		if (!control) this.#push(parsed);
 	}
 
+	/**
+	 * Streams one request over the socket. `onOwned` runs when the request takes the socket: for a read (an attach),
+	 * at once; for a send, in the step its frame goes out, so a frame the model-call guards hold (or an abort or a
+	 * failed request dump before it) takes nothing the socket holds for its next frame, such as Codex's accepted
+	 * steering.
+	 */
 	async *streamRequest(
 		exchange: ResponsesWebSocketExchange,
 		timeouts: ResponsesWebSocketTimeouts,
@@ -411,7 +417,7 @@ export class ResponsesWebSocketConnection {
 				"aborted",
 			);
 		try {
-			onOwned?.();
+			if (!("send" in exchange)) onOwned?.();
 			this.#streamObserver = observer;
 			if ("send" in exchange) this.#dropStaleFrames();
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -431,8 +437,10 @@ export class ResponsesWebSocketConnection {
 					: undefined;
 				// The model-call guards are read in the same step as the frame: the dump above can outlast the
 				// caller's own read, and a resend (a stale anchor's complete replay) has none of its own. A held
-				// frame is not sent, and the request fails with the hold's error.
+				// frame is not sent, and the request fails with the hold's error; it takes nothing the socket holds
+				// for its next frame (`onOwned`), which the request whose frame does go out takes.
 				assertModelCallAllowed(exchange.model);
+				onOwned?.();
 				this.sendControl(exchange.send);
 			}
 			let sawFirstEvent = false;
