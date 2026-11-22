@@ -2332,8 +2332,10 @@ mod tests {
 	/// earlier one and parked on a substitution, with fd 2 made the terminal
 	/// by then (`{ :; } 2>&4 >/no/$(echo f)`), and a job notice queued while
 	/// it was parked: the message comes after the notice on the terminal, as
-	/// zsh prints the notice first. Handed off only at the failure, the
-	/// notice came after the message.
+	/// zsh prints the notice first. When the op waited only on its first
+	/// entry, the notice went to the terminal's writer thread as it was
+	/// queued ([`notice`]), and the message, written at once at the failure,
+	/// reached the terminal before the notice the thread still held.
 	#[test]
 	fn a_failed_redirections_message_reaches_the_terminal_after_a_notice_queued_mid_way() {
 		crate::sys::in_blocking_writer_process(
