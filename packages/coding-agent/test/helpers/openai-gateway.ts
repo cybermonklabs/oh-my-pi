@@ -61,7 +61,7 @@ export interface GatewayRequest {
 }
 
 /** A streamed text reply, `seen <turn>`, that read 100 of its request's 110 prompt tokens from the cache. */
-function answer(api: OpenAIGatewayApi, turn: number): Response {
+export function answer(api: OpenAIGatewayApi, turn: number): Response {
 	const text = `seen ${turn}`;
 	const events =
 		api === "openai-responses"

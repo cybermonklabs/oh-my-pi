@@ -8,6 +8,7 @@ import { normalizeTools } from "../src/agent-loop";
 import { toolSpecsFingerprint } from "../src/append-only-context";
 import type { AgentTool } from "../src/types";
 import type { DialectSwitchRun } from "./fixtures/declared-tools-dialect-process";
+import { runUnderNoStrict } from "./helpers";
 
 /**
  * A process that resumes a transcript an earlier release wrote compares that release's declared-tools fingerprint
@@ -88,24 +89,7 @@ const DIALECT_SWITCH_PROCESS = path.join(import.meta.dir, "fixtures/declared-too
  */
 describe("Agent.declaredToolsFingerprint when the owned dialect changes under PI_NO_STRICT", () => {
 	it("is the fingerprint a fresh agent takes where the tools now go out", async () => {
-		const child = Bun.spawn([process.execPath, DIALECT_SWITCH_PROCESS], {
-			env: {
-				...process.env,
-				PI_NO_STRICT: "1",
-				PI_DIALECT: undefined,
-				CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: undefined,
-			},
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		if (exitCode !== 0) throw new Error(`The process exited with ${exitCode}: ${stderr}`);
-		const run = JSON.parse(stdout) as DialectSwitchRun;
+		const run = JSON.parse(await runUnderNoStrict(DIALECT_SWITCH_PROCESS)) as DialectSwitchRun;
 		// Precondition: under PI_NO_STRICT the messages API and the dialect declare other tool bytes.
 		expect(run.fresh[0]).not.toBe(run.fresh[1]);
 

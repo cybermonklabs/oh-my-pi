@@ -7,8 +7,17 @@ Settings changed after the system prompt and tool definitions above were written
 {{#each changes}}
 - `{{id}}`: {{#if secret}}changed (value withheld){{else}}`{{previous}}` → `{{next}}`{{/if}}
 {{/each}}
+{{#if releasedChanges.length}}
+These settings changed after a settings notice above, and the change it described is no longer held: the system prompt and tool definitions above follow their current values.
+{{#each releasedChanges}}
+- `{{id}}`: {{#if secret}}changed (value withheld){{else}}`{{previous}}` → `{{next}}`{{/if}}
+{{/each}}
+{{/if}}
 {{#if disabledTools.length}}
 Disabled by this change; they stay listed until the rebuild, and calls to them are refused from now on: {{#list disabledTools join=", "}}`{{this}}`{{/list}}
+{{/if}}
+{{#if unlistedDisabledTools.length}}
+Disabled by this change; calls to them are refused from now on: {{#list unlistedDisabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 {{#if reenabledTools.length}}
 No longer disabled; calls to them run again from now on: {{#list reenabledTools join=", "}}`{{this}}`{{/list}}

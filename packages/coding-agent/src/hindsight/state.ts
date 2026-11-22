@@ -5,7 +5,7 @@ import { findPersistedRecall, persistRecall } from "../memory-backend/recall-ent
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
 import type { BasePromptRebuildOptions } from "../session/session-tools";
-import { type BankScope, ensureBankExists, type HindsightBankSet } from "./bank";
+import { type BankScope, ensureBankExists, type HindsightBankSet, hindsightRecallScope } from "./bank";
 import type { HindsightClientApi } from "./client";
 import type { HindsightConfig } from "./config";
 import {
@@ -587,7 +587,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const generation = ++this.#recallGeneration;
 		// Reuse this transcript's recall so a resumed session sends the same prompt. Hindsight
 		// memories cannot be looked up by id, so changes since are not reported.
-		const persisted = findPersistedRecall(this.session.sessionManager, this.#recallScope());
+		const persisted = findPersistedRecall(this.session.sessionManager, hindsightRecallScope(this.config, this));
 		if (persisted !== undefined) {
 			return {
 				context: persisted.text || undefined,
@@ -616,23 +616,13 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		if (this.#recallGeneration !== generation) return false;
 		this.hasRecalledForFirstTurn = true;
 		if (context) this.lastRecallSnippet = context;
-		if (persist) persistRecall(this.session.sessionManager, this.#recallScope(), { text: context, memories: [] });
+		if (persist) {
+			persistRecall(this.session.sessionManager, hindsightRecallScope(this.config, this), {
+				text: context,
+				memories: [],
+			});
+		}
 		return true;
-	}
-
-	/**
-	 * Identifies the server, account, bank and tag filter a recall reads, so a persisted
-	 * recall is only reused for the same ones. The account is a hash of the API token.
-	 */
-	#recallScope(): string {
-		return JSON.stringify([
-			"hindsight",
-			this.config.hindsightApiUrl,
-			Bun.hash(this.config.hindsightApiToken ?? "").toString(16),
-			this.bankId,
-			this.recallTags ?? [],
-			this.recallTagsMatch ?? null,
-		]);
 	}
 
 	async recallForCompaction(messages: HindsightMessage[], signal?: AbortSignal): Promise<string | undefined> {

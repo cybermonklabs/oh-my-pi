@@ -27,6 +27,7 @@ import {
 	cfgProvidersAnthropicSlowMode,
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersCacheRetention,
+	cfgProvidersKimiApiFormat,
 	cfgProvidersMaxInFlightRequests,
 	cfgProvidersMuseCodeStoreResponses,
 	cfgProvidersOpenaiCodexDaybreak,
@@ -88,6 +89,19 @@ function configuredServerSideFallbackModels(configured: readonly unknown[], warn
 		}
 	}
 	return models.slice(0, ANTHROPIC_MAX_FALLBACK_MODELS);
+}
+
+/**
+ * The Kimi Code API format a main request goes out in: the request's own, else `providers.kimiApiFormat`; undefined
+ * under `auto`, which leaves the model's catalog format.
+ */
+export function resolveKimiApiFormat(
+	settings: Settings,
+	requestFormat?: SimpleStreamOptions["kimiApiFormat"],
+): SimpleStreamOptions["kimiApiFormat"] {
+	if (requestFormat !== undefined) return requestFormat;
+	const setting = cfgProvidersKimiApiFormat.get(settings);
+	return setting === "auto" ? undefined : setting;
 }
 
 function timeoutSecondsToMs(value: number): number | undefined {

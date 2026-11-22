@@ -131,7 +131,7 @@ import {
 	getReadableCompactionEntry,
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
-import type { SessionManager } from "./session-manager";
+import { newestCopiedEntryId, type SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 import { TOOL_RESULT_PRUNE_CUSTOM_TYPE, toToolResultPruneData } from "./tool-result-prunes";
@@ -593,7 +593,10 @@ function mayHoldArchive(message: CompactionSummaryMessage): boolean {
 interface RefusedSnapcompact {
 	/** The context the pass would have left, the tools and system prompt included (the cut's `afterTokens`). */
 	afterTokens: number;
-	/** The branch leaf the pass was weighed on: a later point weighs the history that grew from it. */
+	/**
+	 * The newest entry of the branch the pass was weighed on, labels aside (a copy re-creates them under new ids): a
+	 * later point weighs the history that grew from it.
+	 */
 	leafId: string;
 	/**
 	 * The newest compaction, model and method settings the archive was rendered for. It names no session: a copy of the
@@ -646,7 +649,10 @@ interface CompactionWait {
 	entry: NonNullable<ContextCutSession["cacheEntry"]>;
 	/** Id of the branch's newest compaction when the rule answered, null with none: another one ends the wait. */
 	compactionId: string | null;
-	/** The branch leaf the rule answered at: a branch that does not carry it holds another history. */
+	/**
+	 * The newest entry of the branch the rule answered at, labels aside (a copy re-creates them under new ids): a branch
+	 * that does not carry it holds another history.
+	 */
 	leafId: string;
 }
 
@@ -1040,9 +1046,10 @@ export class SessionMaintenance {
 		const records = this.#sessionCompactionWaits();
 		records.taken = true;
 		this.#compactionAnswerRead = records;
-		const leafId = sessionManager.getLeafId();
+		// Labels carry no history, and a copy of the branch re-creates them under new ids.
+		const leafId = newestCopiedEntryId(sessionManager.getBranchView());
 		const wait: CompactionWait | undefined =
-			!model || !entry || leafId === null
+			!model || !entry || leafId === undefined
 				? undefined
 				: {
 						modelKey: `${model.provider}/${model.id}`,
@@ -7060,7 +7067,8 @@ export class SessionMaintenance {
 					weighsSnapcompact &&
 					!this.admitsContextCut(this.#compactionCut(`compaction-${method}`, reason, projectedAfter, options))
 				) {
-					const leafId = pathEntriesForCompaction.at(-1)?.id;
+					// Labels carry no history, and a copy of the branch re-creates them under new ids.
+					const leafId = newestCopiedEntryId(pathEntriesForCompaction);
 					// A refusal with no leaf to weigh a later branch against is not kept.
 					if (leafId === undefined) {
 						this.#forgetSnapcompactRefusal();

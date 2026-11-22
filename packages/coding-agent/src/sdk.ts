@@ -171,13 +171,15 @@ import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import {
 	appendRecallBlock,
+	type ConversationRecall,
 	findConversationRecall,
+	MEMORY_RECALL_ENTRY_TYPE,
 	recallsIntoConversation,
 	withoutDeliveredRecall,
 } from "./memory-backend/recall-entry";
 import { cfgMemoryBackend } from "./memory-backend/settings";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
-import type { MnemopiSessionStateApi } from "./mnemopi/state";
+import { loadMnemopiCore, type MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
@@ -252,6 +254,7 @@ import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { kUsageLimitRequestProvider } from "./session/turn-recovery";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
+import { memoryRecallScope } from "./session/session-memory";
 import { SHAPE_RULE } from "./spotlight/shape";
 import { buildCallContext } from "./spotlight/context";
 import { type CalledToolShaper, shapeCalledTool } from "./spotlight";
@@ -265,7 +268,7 @@ import {
 } from "./session/session-tools";
 import { anthropicSlowModeHasNoSiblingHeadroom } from "./session/anthropic-slow-mode";
 import { CacheWarmer } from "./session/cache-warmer";
-import { createSettingsAwareStreamFn } from "./session/settings-stream-fn";
+import { createSettingsAwareStreamFn, resolveKimiApiFormat } from "./session/settings-stream-fn";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
 import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
 import { createSpeculativeToolExecutionConfig } from "./speculation/host";
@@ -395,7 +398,6 @@ import {
 	cfgPersonality,
 	cfgProviderAppendOnlyContext,
 	cfgProvidersCacheWarming,
-	cfgProvidersKimiApiFormat,
 	cfgRetryFallbackChains,
 	cfgRetryModelFallback,
 	cfgRetryUsageAwareFallback,
@@ -4613,28 +4615,49 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 			// The recall the conversation carries itself (`AgentSession.memoryRecall`): the session's, or, for the
 			// startup build made before the session exists, the one the loaded branch leaves it carrying, which the
-			// session adopts under Hindsight or Mnemopi (`SessionMemory`). One it carries as the system prompt's own last
+			// session adopts under Hindsight or Mnemopi (`SessionMemory`): a recall of the scope the live backend's
+			// recall reads, never another backend's, bank's or server's. One it carries as the system prompt's own last
 			// block goes out after the prompt as that block, as the conversation's first request sent it, so every build
 			// lays the prompt out as that request did.
-			const memoryRecall = hasSession
-				? session.memoryRecall
-				: !restrictToolNames && recallsIntoConversation(cfgMemoryBackend.get(settings))
-					? findConversationRecall(sessionManager.getBranchView())
-					: undefined;
+			let memoryRecall: ConversationRecall | undefined;
+			if (hasSession) {
+				memoryRecall = session.memoryRecall;
+			} else if (!restrictToolNames) {
+				const backend = cfgMemoryBackend.get(settings);
+				if (recallsIntoConversation(backend)) {
+					// Mnemopi's scope names its banks' databases, which its core module resolves; the backend's start
+					// loads it too, and the session reads the same scope when it adopts the recall. Only a branch that
+					// records a recall has the scope read.
+					if (
+						backend === "mnemopi" &&
+						sessionManager
+							.getBranchView()
+							.some(entry => entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
+					) {
+						await loadMnemopiCore();
+					}
+					memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
+						memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
+					);
+				}
+			}
 			const recallBlock = memoryRecall && !memoryRecall.hidden ? memoryRecall.text : undefined;
 			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
 			// revived task its stored one) carries it as the conversation sent it.
 			const withRecallBlock = (blocks: string[]): string[] =>
 				recallBlock === undefined ? blocks : appendRecallBlock(blocks, recallBlock);
+			// A prompt that is not this build's own render (a fixed one, or a caller's that drops the default prompt's
+			// first block, such as a revived task's stored prompt rendered before a device or skill change) but carries
+			// `xd://` text lists the devices the caller hands over as mounted (`mountedToolNames`: a `/tan` clone's
+			// parent's, a revived task's own); one without that text lists none.
+			const handedXdevCatalogNames = (blocks: readonly string[]): readonly string[] | undefined =>
+				blocks.some(block => block.includes("xd://")) ? options.mountedToolNames : undefined;
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.
 			if (options.systemPrompt !== undefined && typeof options.systemPrompt !== "function") {
-				return {
-					systemPrompt: withRecallBlock(
-						typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
-					),
-				};
+				const blocks = typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt;
+				return { systemPrompt: withRecallBlock(blocks), xdevCatalogNames: handedXdevCatalogNames(blocks) };
 			}
 			// Advisors keep the recall; the prompt leaves out the one the conversation carries itself, on every branch:
 			// a request whose context lacks a hidden one sends it again, and a block one follows the prompt.
@@ -4800,12 +4823,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt);
 			const blocks = typeof customPrompt === "string" ? [customPrompt] : customPrompt;
 			// A prompt that keeps the default prompt's first block (a subagent's wraps the default prompt) lists the
-			// `xd://` devices that block's catalog renders, as the default prompt does; one that drops it lists none.
+			// `xd://` devices that block's catalog renders, as the default prompt does; one that drops it lists what a
+			// fixed prompt lists.
 			const catalogBlock = defaultPrompt.systemPrompt[0];
 			const keepsCatalog = catalogBlock !== undefined && blocks.some(block => block.includes(catalogBlock));
 			return {
 				systemPrompt: withRecallBlock(blocks),
-				xdevCatalogNames: keepsCatalog ? defaultPrompt.xdevCatalogNames : undefined,
+				xdevCatalogNames: keepsCatalog ? defaultPrompt.xdevCatalogNames : handedXdevCatalogNames(blocks),
 			};
 		};
 		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
@@ -5185,14 +5209,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Primary-agent (and its auto-learn capture twin) provider options read per
 		// request, so `/settings` changes to budgets, Kimi format, or the Codex
 		// websocket policy reach the next call without a session recreate.
-		const primaryStreamFn: StreamFn = (streamModel, context, streamOptions) => {
-			const kimiApiFormat = cfgProvidersKimiApiFormat.get(settings);
-			return settingsAwareStreamFn(streamModel, context, {
+		const primaryStreamFn: StreamFn = (streamModel, context, streamOptions) =>
+			settingsAwareStreamFn(streamModel, context, {
 				...streamOptions,
 				thinkingBudgets: streamOptions?.thinkingBudgets ?? cfgThinkingBudgets.get(settings),
-				kimiApiFormat: streamOptions?.kimiApiFormat ?? (kimiApiFormat === "auto" ? undefined : kimiApiFormat),
+				kimiApiFormat: resolveKimiApiFormat(settings, streamOptions?.kimiApiFormat),
 			});
-		};
 		// Prompt-cache warmer for the main agent loop only: replays the last
 		// request through the same primary wrapper just before the entry would
 		// expire, so idle gaps do not force a full-prefix cache re-write.
@@ -5243,6 +5265,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// namespace/project discovery on the original repo's git remote. Re-read it
 			// per turn from the SessionManager.
 			cwdResolver: () => sessionManager.getCwd(),
+			// The Kimi Code format the requests go out in, read per call as `primaryStreamFn` adds it: the strict
+			// hash, the fallback lookup and the declared tools read the model the request goes out as in it.
+			kimiApiFormatResolver: () => resolveKimiApiFormat(settings),
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,
@@ -5288,6 +5313,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
+					// The warmer's tool-choice rule reads the model the request goes out as in this format.
+					kimiApiFormat: resolveKimiApiFormat(settings, streamOptions?.kimiApiFormat),
 				};
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.

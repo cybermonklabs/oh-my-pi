@@ -641,6 +641,15 @@ export function conversationTip(
 }
 
 /**
+ * The id of the newest entry of `path` that is not a label, `undefined` when there is none. A copy of the path
+ * ({@link SessionManager.createBranchedSession}) re-creates every label under a new id, so a record or event that
+ * names where a branch stands for a copy to find names this entry.
+ */
+export function newestCopiedEntryId(path: readonly SessionEntry[]): string | undefined {
+	return path.findLast(entry => entry.type !== "label")?.id;
+}
+
+/**
  * Maintains the derived views over a session's entry list: id lookup, the
  * parent→children adjacency, the resolved label map, the active leaf, and the
  * running usage totals. Kept in lockstep with the manager's `#entries` so reads
@@ -5416,6 +5425,10 @@ export class SessionManager {
 
 	/**
 	 * Create a new session file containing only the path from root to `leafId`.
+	 * Label entries are left out and the labels of kept entries re-created after the
+	 * last one under new ids; an entry that followed a left-out label hangs from that
+	 * label's parent, so every kept entry points at one the copy holds
+	 * ({@link newestCopiedEntryId} names the newest entry kept under its own id).
 	 * With `copyArtifacts`, the source artifact directory is copied in the background;
 	 * the new artifact manager waits for it before allocating ids or resolving
 	 * `artifact://`, so kept references stay valid and new ids cannot collide.
@@ -5431,12 +5444,22 @@ export class SessionManager {
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 
 		// Drop label entries from the path; recreate them fresh from the resolved map.
+		// An entry after a dropped label takes the label's own (kept) parent.
 		// Every kept entry lies on the forked path, so a late-usage or off-branch leaf
 		// marker no longer applies.
 		const entriesToKeep: SessionEntry[] = [];
+		const droppedLabelParents = new Map<string, string | null>();
 		for (const entry of branchPath) {
-			if (entry.type === "label") continue;
-			entriesToKeep.push(entry.activeLeafId === undefined ? entry : { ...entry, activeLeafId: undefined });
+			const parentId =
+				entry.parentId !== null && droppedLabelParents.has(entry.parentId)
+					? (droppedLabelParents.get(entry.parentId) ?? null)
+					: entry.parentId;
+			if (entry.type === "label") {
+				droppedLabelParents.set(entry.id, parentId);
+				continue;
+			}
+			const kept = parentId === entry.parentId ? entry : { ...entry, parentId };
+			entriesToKeep.push(kept.activeLeafId === undefined ? kept : { ...kept, activeLeafId: undefined });
 		}
 		const keptIds = new Set(entriesToKeep.map(entry => entry.id));
 		const labelsToCarry: Array<{ targetId: string; label: string }> = [];

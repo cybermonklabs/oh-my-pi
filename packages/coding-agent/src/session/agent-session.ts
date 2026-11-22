@@ -92,6 +92,7 @@ import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/provider
 import { sendsConfigurationUpdates } from "@oh-my-pi/pi-ai/providers/openai-configuration-update";
 import { onProviderFallback } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
@@ -529,6 +530,7 @@ import {
 	cleanupEmptyMoveSession,
 	copySessionArtifacts,
 	extractSessionInit,
+	newestCopiedEntryId,
 	type PersistedSessionInit,
 	type SessionManager,
 } from "./session-manager";
@@ -547,7 +549,7 @@ import {
 	type SettingsChangeOptions,
 	toolsDigestOfEntry,
 } from "./session-tools";
-import { resolveWebsocketPreference } from "./settings-stream-fn";
+import { resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ProviderFallbackRecord } from "./provider-fallback-record";
 import { carryImageDrops, type RecordedImageDrop, recordedImageDrops } from "./provider-image-budget";
@@ -849,16 +851,23 @@ interface PromptCacheShape {
 }
 
 /**
- * `level` as the cached prefix tells thinking levels apart on `model`: where the model takes the level per message
- * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, which only the
- * Responses and Codex providers send, {@link sendsConfigurationUpdates}), a change between two levels other than off
- * goes out after the newest content and keeps the request-level effort, so those levels share one key; off changes
- * the request's thinking and keeps its own. Every other API (Azure Responses among them) sends the level as the
- * request's own effort, ahead of every cached message.
+ * `level` as the cached prefix tells thinking levels apart on `model`, read on the model its requests go out as
+ * ({@link wireModel}, in the Kimi Code API format `kimiApiFormat` they go out in: a wrapper transport's inner model, as
+ * Factory Droid's Responses route for its GPT models): where that model takes the level per message (Anthropic's
+ * per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, which only the Responses and
+ * Codex providers send, {@link sendsConfigurationUpdates}), a change between two levels other than off goes out after
+ * the newest content and keeps the request-level effort, so those levels share one key; off changes the request's
+ * thinking and keeps its own. Every other API (Azure Responses among them) sends the level as the request's own effort,
+ * ahead of every cached message.
  */
-function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
+function promptCacheThinkingKey(
+	model: Model | undefined,
+	level: ThinkingLevel | undefined,
+	kimiApiFormat: SimpleStreamOptions["kimiApiFormat"],
+): string {
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
-	return sendsConfigurationUpdates(model) || takesPerMessageEffort(model) ? "effort" : level;
+	const wire = wireModel(model, { kimiApiFormat });
+	return sendsConfigurationUpdates(wire) || takesPerMessageEffort(wire) ? "effort" : level;
 }
 
 /** The newest main-loop request: its transcript, model, active tools, shape and messages. */
@@ -1485,6 +1494,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
+	/**
+	 * The run a user prompt started went live after the prompt sent what was due of the withheld prompt changes and
+	 * wrote its hidden notices from what stayed withheld: the run's first model call carries what those notices say,
+	 * so it releases nothing more unless the prompt cache entry lapsed since
+	 * ({@link #releaseWithheldPromptChangesIfDue}); the next call does.
+	 */
+	#promptSentWithheldChanges = false;
 	/** Claude account lane (`cred:<id>`/`key:<hash>`) that served the latest Anthropic request. */
 	#anthropicSlowModeLane: string | undefined;
 	/** `<lane>#<window>` of the wrap-up window this session already told the model about. */
@@ -1701,7 +1717,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#lastRequestArm: PromptCacheArm | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
-	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
+	#promptCacheShapeMemo:
+		| {
+				model: Model | undefined;
+				systemPrompt: unknown;
+				kimiApiFormat: SimpleStreamOptions["kimiApiFormat"];
+				shape: PromptCacheShape;
+		  }
+		| undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -3094,8 +3117,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
-			recall: () => findConversationRecall(this.sessionManager.getBranchView()),
-			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
+			recall: scope => findConversationRecall(this.sessionManager.getBranchView(), scope),
+			recallChanges: scope => findDeliveredRecallChanges(this.sessionManager.getBranchView(), scope),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -3312,6 +3335,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
+			memoryRecall: () => this.#memory.recall,
+			memoryRecallScope: () => this.#memory.recallScope(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -3727,7 +3752,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				}
 			}),
 		);
-		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
+		this.addDisposer(
+			this.agent.addBeforeModelCallHook(() => {
+				if (this.#promptSentWithheldChanges) {
+					this.#promptSentWithheldChanges = false;
+					// What came due by its time since the prompt's notices were written waits a request, as they say;
+					// an entry that lapsed meanwhile (or that this request cannot read) is written whole anyway.
+					// Nothing withheld, nothing to release: the lapse check is skipped.
+					if (!this.#tools.withholdsPromptChange || !this.#maintenance.promptCacheLapsed()) return;
+				}
+				return this.#releaseWithheldPromptChangesIfDue();
+			}),
+		);
 		// A move off a file another process writes copies the transcript into a sibling under a new id, which the
 		// conversation goes on in, as on every other copy.
 		this.addDisposer(
@@ -6523,8 +6559,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
 	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a
 	 * cut under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after
-	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before
-	 * every main request, and before a user prompt takes its hidden notices.
+	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
+	 * user prompt takes its hidden notices, and before every main request; the first of the run that prompt starts
+	 * carries those notices, so it calls this only when the entry lapsed since they were written (the request writes
+	 * the whole prompt anyway), and what came due by its time goes out at the run's next request.
 	 */
 	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
 		if (!this.#tools.withholdsPromptChange) return;
@@ -6969,6 +7007,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const { systemPrompt } = this.agent.state;
 		const thinkingLevel = this.thinkingLevel;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
+		const kimiApiFormat = resolveKimiApiFormat(this.settings);
 		// The definitions as the wire declares them: a refreshed MCP tool keeps its name, and a tool taken off the
 		// roster that the request keeps declared changes nothing.
 		const tools = this.agent.declaredToolsFingerprint(model);
@@ -6977,6 +7016,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memo !== undefined &&
 			memo.model === model &&
 			memo.systemPrompt === systemPrompt &&
+			memo.kimiApiFormat === kimiApiFormat &&
 			memo.shape.tools === tools &&
 			memo.shape.thinkingLevel === thinkingLevel &&
 			memo.shape.retention === retention
@@ -6987,12 +7027,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
-			thinkingKey: promptCacheThinkingKey(model, thinkingLevel),
+			thinkingKey: promptCacheThinkingKey(model, thinkingLevel, kimiApiFormat),
 			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
 		};
-		this.#promptCacheShapeMemo = { model, systemPrompt, shape };
+		this.#promptCacheShapeMemo = { model, systemPrompt, kimiApiFormat, shape };
 		return shape;
 	}
 
@@ -10889,6 +10929,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					// the dispatch so they admit into the run they targeted.
 					this.#wakeDispatchLiveWaiters();
 					options?.followUpBatch?.release();
+					this.#promptSentWithheldChanges = true;
 				});
 				await run;
 			} finally {
@@ -10902,6 +10943,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
+			this.#promptSentWithheldChanges = false;
 			// Client ownership is released by #prompt's bracket, which settles
 			// after this frame returns; its wake re-checks parked steers
 			// against zero.
@@ -13765,7 +13807,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * {@link branch} (`session_before_branch`/`session_branch` hooks with reason `"fork"`,
 	 * agent messages rebuilt from the cut). A cut inside an assistant tool-call batch is
 	 * extended through the batch's recorded tool results (see {@link #resolveForkLeaf}), and
-	 * the hook's `entryId` is that last kept entry. An entry fork always requires an idle
+	 * the hook's `entryId` is the last entry the copy keeps under its own id (a label it
+	 * re-creates is not, {@link newestCopiedEntryId}). An entry fork always requires an idle
 	 * session; `options.requireIdle` applies the same rule to the whole-session fork.
 	 * Either refusal throws {@link SessionBusyError} before any session state is discarded.
 	 * @returns true if completed, false if cancelled by hook or not persisting
@@ -13783,10 +13826,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const leafId = this.#resolveForkLeaf(entryId);
 			// Await inside the `using` scope so the transition stays open until it settles.
 			// Kept tool results may cite `artifact://N`, so the fork carries the artifacts too.
-			return await this.#branchIntoNewSession("fork", leafId, leafId, {
-				copyArtifacts: true,
-				requireIdleFor,
-			});
+			return await this.#branchIntoNewSession(
+				"fork",
+				newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? leafId,
+				leafId,
+				{
+					copyArtifacts: true,
+					requireIdleFor,
+				},
+			);
 		}
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		const previousSessionFile = this.sessionFile;
@@ -16103,7 +16151,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_branch",
 				reason: "btw",
-				entryId: leafId,
+				// The newest entry the copy keeps under its own id: a label at the leaf is re-created under a new one.
+				entryId: newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? leafId,
 			})) as SessionBeforeBranchResult | undefined;
 
 			if (result?.cancel) {

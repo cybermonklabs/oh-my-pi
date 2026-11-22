@@ -9,6 +9,7 @@
  * the block holds, so a resume can report what changed since as a new message
  * rather than rewriting the block.
  */
+import { once } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { MemoryBackendId } from "./types";
@@ -125,6 +126,58 @@ function isMemoryRecallChangesDetails(details: unknown): details is MemoryRecall
 	);
 }
 
+/** The recall `entry` records ({@link MEMORY_RECALL_ENTRY_TYPE}) with the scope it read; undefined for any other entry. */
+function recordedRecall(entry: SessionEntry): MemoryRecallEntryData | undefined {
+	return entry.type === "custom" &&
+		entry.customType === MEMORY_RECALL_ENTRY_TYPE &&
+		isMemoryRecallEntryData(entry.data)
+		? entry.data
+		: undefined;
+}
+
+/**
+ * The newest recall `branch` recorded with the text `text` at or before `from`, since its last context reset;
+ * undefined without one.
+ */
+function newestRecordedRecall(
+	branch: readonly SessionEntry[],
+	text: string,
+	from: number,
+): MemoryRecallEntryData | undefined {
+	for (let index = from; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "reset_boundary") return undefined;
+		const recall = recordedRecall(entry);
+		if (recall?.text === text) return recall;
+	}
+	return undefined;
+}
+
+/**
+ * The recall the hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message at `index` of `branch` carries, unless it is
+ * another scope's than `scope` (any is taken without it): the newest recall recorded before it with its text, since
+ * the last context reset, read another scope. Undefined for any other entry. The message names no scope; the backend
+ * records the recall it carries, with the scope it read, when it adopts it, and one no record names (a backend that
+ * records none) is not another scope's.
+ */
+function hiddenRecallOf(
+	branch: readonly SessionEntry[],
+	index: number,
+	scope: (() => string | undefined) | undefined,
+): string | undefined {
+	const message = branch[index];
+	if (
+		message.type !== "custom_message" ||
+		message.customType !== MEMORY_RECALL_MESSAGE_TYPE ||
+		typeof message.content !== "string"
+	) {
+		return undefined;
+	}
+	if (!scope) return message.content;
+	const recorded = newestRecordedRecall(branch, message.content, index - 1);
+	return recorded === undefined || recorded.scope === scope() ? message.content : undefined;
+}
+
 /**
  * The latest recall for `scope` on the current branch that a turn followed, with the
  * memories still current per the latest change report delivered after it. Undefined
@@ -148,14 +201,9 @@ export function findPersistedRecall(
 			if (reported === undefined && isMemoryRecallChangesDetails(entry.details) && entry.details.scope === scope) {
 				reported = entry.details.memories;
 			}
-		} else if (
-			turnFollowed &&
-			entry.type === "custom" &&
-			entry.customType === MEMORY_RECALL_ENTRY_TYPE &&
-			isMemoryRecallEntryData(entry.data) &&
-			entry.data.scope === scope
-		) {
-			return { text: entry.data.text, memories: reported ?? entry.data.memories };
+		} else if (turnFollowed) {
+			const recall = recordedRecall(entry);
+			if (recall?.scope === scope) return { text: recall.text, memories: reported ?? recall.memories };
 		}
 	}
 	return undefined;
@@ -176,21 +224,19 @@ export function persistRecall(
 }
 
 /**
- * The recall the branch delivered as a hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message since its
- * last context reset: the newest one. The sign that a recall the backend reuses went out as a hidden
- * message.
+ * The recall the branch delivered as a hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message since its last context reset:
+ * the newest one, or with `scope`, the scope the live backend's recall reads (read once, only when the branch holds a
+ * hidden recall), the newest one of that scope. The sign that a recall the backend reuses went out as a hidden message.
  */
-export function findDeliveredRecall(branch: readonly SessionEntry[]): string | undefined {
+export function findDeliveredRecall(
+	branch: readonly SessionEntry[],
+	scope?: () => string | undefined,
+): string | undefined {
+	const live = scope && once(scope);
 	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry.type === "reset_boundary") return undefined;
-		if (
-			entry.type === "custom_message" &&
-			entry.customType === MEMORY_RECALL_MESSAGE_TYPE &&
-			typeof entry.content === "string"
-		) {
-			return entry.content;
-		}
+		if (branch[index].type === "reset_boundary") return undefined;
+		const hidden = hiddenRecallOf(branch, index, live);
+		if (hidden !== undefined) return hidden;
 	}
 	return undefined;
 }
@@ -215,48 +261,51 @@ export function appendRecallBlock(blocks: string[], recall: string): string[] {
 }
 
 /**
- * The recall a loaded transcript's branch leaves the conversation carrying ({@link ConversationRecall}):
- * the newest one it delivered as a hidden message since its last context reset, else the newest recall
- * it recorded since then that a turn followed, whose request sent it as the system prompt's last block.
- * Undefined without one, and when that recall found nothing.
+ * The recall a loaded transcript's branch leaves the conversation carrying ({@link ConversationRecall}), of `scope`, the
+ * scope the live backend's recall reads (read once, only when the branch holds a recall): the newest one of that scope
+ * it delivered as a hidden message since its last context reset, else the newest recall of that scope it recorded since
+ * then that a turn followed, whose request sent it as the system prompt's last block. Undefined without one, and when
+ * that recall found nothing. Another backend's, bank's or server's recall is not the conversation's: that backend
+ * recalls afresh.
  */
-export function findConversationRecall(branch: readonly SessionEntry[]): ConversationRecall | undefined {
+export function findConversationRecall(
+	branch: readonly SessionEntry[],
+	scope: () => string | undefined,
+): ConversationRecall | undefined {
+	const live = once(scope);
 	let turnFollowed = false;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type === "reset_boundary") return undefined;
 		if (entry.type === "message") {
 			turnFollowed = true;
-		} else if (
-			entry.type === "custom_message" &&
-			entry.customType === MEMORY_RECALL_MESSAGE_TYPE &&
-			typeof entry.content === "string"
-		) {
-			return { text: entry.content, hidden: true };
-		} else if (
-			turnFollowed &&
-			entry.type === "custom" &&
-			entry.customType === MEMORY_RECALL_ENTRY_TYPE &&
-			isMemoryRecallEntryData(entry.data)
-		) {
-			return entry.data.text ? { text: entry.data.text, hidden: false } : undefined;
+			continue;
 		}
+		const hidden = hiddenRecallOf(branch, index, live);
+		if (hidden !== undefined) return { text: hidden, hidden: true };
+		const recall = turnFollowed ? recordedRecall(entry) : undefined;
+		if (recall && recall.scope === live()) return recall.text ? { text: recall.text, hidden: false } : undefined;
 	}
 	return undefined;
 }
 
 /**
- * The {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} reports the branch delivered for the recall it
- * reuses: every one since the newest recall it recorded or its last context reset, oldest first,
- * each text once. A loaded transcript's reports, and those before a reused recall's new one.
+ * The {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} reports of `scope`, the scope the live backend's recall reads (read
+ * once, only when the branch holds a recall or a report), the branch delivered for the recall it reuses: every one
+ * since the newest recall of that scope it recorded or its last context reset, oldest first, each text once. A loaded
+ * transcript's reports, and those before a reused recall's new one; another scope's reports report on another recall.
  */
-export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): RecallChangesReport[] {
+export function findDeliveredRecallChanges(
+	branch: readonly SessionEntry[],
+	scope: () => string | undefined,
+): RecallChangesReport[] {
+	const live = once(scope);
 	const start =
-		branch.findLastIndex(
-			entry =>
-				entry.type === "reset_boundary" ||
-				(entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE),
-		) + 1;
+		branch.findLastIndex(entry => {
+			if (entry.type === "reset_boundary") return true;
+			const recall = recordedRecall(entry);
+			return recall !== undefined && recall.scope === live();
+		}) + 1;
 	const reports: RecallChangesReport[] = [];
 	const seen = new Set<string>();
 	for (let index = start; index < branch.length; index++) {
@@ -265,7 +314,9 @@ export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): Rec
 			entry.type !== "custom_message" ||
 			entry.customType !== MEMORY_RECALL_CHANGES_MESSAGE_TYPE ||
 			typeof entry.content !== "string" ||
-			seen.has(entry.content)
+			seen.has(entry.content) ||
+			!isMemoryRecallChangesDetails(entry.details) ||
+			entry.details.scope !== live()
 		) {
 			continue;
 		}
@@ -273,6 +324,14 @@ export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): Rec
 		reports.push({ content: entry.content, details: entry.details });
 	}
 	return reports;
+}
+
+/**
+ * Whether `text` is a recall the branch recorded since its last context reset, of whichever scope: a stored prompt
+ * whose last block it is carries that recall as its own block.
+ */
+export function isRecordedRecall(branch: readonly SessionEntry[], text: string): boolean {
+	return newestRecordedRecall(branch, text, branch.length - 1) !== undefined;
 }
 
 /**

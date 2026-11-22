@@ -35,7 +35,7 @@ import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
-import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
+import { type MnemopiBackendConfig, type MnemopiBankConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
 
@@ -1204,7 +1204,7 @@ function createScopedResources(config: MnemopiBackendConfig, beforeDispatch: Dis
 	};
 }
 
-function resolveScopedBanks(config: MnemopiBackendConfig): {
+function resolveScopedBanks(config: MnemopiBankConfig): {
 	scoping: MnemopiScoping;
 	globalBank: string;
 	retainBank: string;
@@ -1230,7 +1230,7 @@ export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly st
 }
 
 /** Identifies the banks and databases a first-turn recall reads, so a persisted recall is only reused for the same ones. */
-export function getMnemopiRecallScope(config: MnemopiBackendConfig): string {
+export function getMnemopiRecallScope(config: MnemopiBankConfig): string {
 	const { recallBanks } = resolveScopedBanks(config);
 	return JSON.stringify(["mnemopi", recallBanks.map(bank => [bank, resolveBankDbPath(config, bank)])]);
 }
@@ -1318,7 +1318,7 @@ function createMemory(config: MnemopiBackendConfig, bank: string, beforeDispatch
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
+function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
 	const { BankManager } = requireMnemopiCore();

@@ -901,4 +901,36 @@ describe("cache warmer lifecycle", () => {
 			h.warmer.cancel();
 		},
 	);
+
+	// A wrapper transport sends the request as a model of its own: Factory Droid's Claude route as an Anthropic model,
+	// whose provider sends a forced choice the model line takes none of as `auto`.
+	test("arms a forced tool choice Factory Droid's Claude Opus 5.5 route sends as auto", () => {
+		const h = harness();
+		const model = { ...factoryModel("claude-opus-5-5"), promptCache: { short: 300, long: 3600 } };
+		// Precondition: the model line takes no forced tool choice on any host.
+		expect(getBundledModel("anthropic", "claude-opus-5-5").compat).toMatchObject({ supportsForcedToolChoice: false });
+		const toolChoice: ToolChoice = { type: "tool", name: "write" };
+		const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () => change(h));
+		expect(dispatched).toBeDefined();
+		h.warmer.cancel();
+	});
+
+	// An `openrouter` model goes out on Responses, which sends no `tool_choice` to a model that takes none.
+	test.each([
+		{ choice: "a forced tool", toolChoice: { type: "tool", name: "write" } },
+		{ choice: "no tool", toolChoice: "none" },
+	] satisfies { choice: string; toolChoice: ToolChoice }[])(
+		"arms a request whose tool choice is $choice on an OpenRouter model that takes no tool_choice",
+		({ toolChoice }) => {
+			const h = harness();
+			const model = { ...getBundledModel("openrouter", "meta/muse-spark-1.3"), promptCache: { short: 300 } };
+			// Precondition: the model takes no `tool_choice`, though a forced one would be taken were it sent.
+			expect(model.compat).toMatchObject({ supportsToolChoice: false, supportsForcedToolChoice: true });
+			const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () =>
+				change(h),
+			);
+			expect(dispatched).toBeDefined();
+			h.warmer.cancel();
+		},
+	);
 });
