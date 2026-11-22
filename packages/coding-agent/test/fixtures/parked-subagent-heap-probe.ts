@@ -1,10 +1,11 @@
 /**
  * Child process for test/task/parked-subagent-heap.test.ts. Under one root session, with the persisted reviver
- * factory installed as main.ts installs it, runs two batches of `argv[3]` real kept-alive task subagents
+ * factory installed as main.ts installs it, runs `argv[4]` batches of `argv[3]` real kept-alive task subagents
  * (`runSubprocess` against a mock model that answers `yield`), parks each one through the lifecycle manager, and
- * reads the JS heap after forced collections. The first batch pays every once-per-process cost; the second batch's
- * growth, divided by its size, is what the process keeps for each parked subagent. Prints one JSON line. The parent
- * runs this with the JIT off and HOME and PI_CODING_AGENT_DIR under a temp dir.
+ * reads the JS heap after forced collections at the end of each batch. The first batch pays every once-per-process
+ * cost; each later batch's growth, divided by its size, is what the process keeps for each parked subagent plus
+ * whatever the heap did once during that batch. Prints one JSON line with every reading and each later batch's
+ * growth per subagent. The parent runs this with the JIT off and HOME and PI_CODING_AGENT_DIR under a temp dir.
  */
 import { heapStats } from "bun:jsc";
 import * as fs from "node:fs/promises";
@@ -21,10 +22,11 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
-const [root, countArg] = process.argv.slice(2);
+const [root, countArg, batchesArg] = process.argv.slice(2);
 const count = Number(countArg);
-if (!root || !Number.isInteger(count) || count < 1) {
-	throw new Error("usage: parked-subagent-heap-probe.ts <root> <subagents per batch>");
+const batches = Number(batchesArg);
+if (!root || !Number.isInteger(count) || count < 1 || !Number.isInteger(batches) || batches < 2) {
+	throw new Error("usage: parked-subagent-heap-probe.ts <root> <subagents per batch> <batches, at least 2>");
 }
 /** Shortest time each reading polls for the heap to stop falling; see {@link settledHeap}. */
 const SETTLE_MS = 2_000;
@@ -191,10 +193,24 @@ function perSubagent(after: number | undefined, before: number | undefined): num
 	return after === undefined || before === undefined ? undefined : (after - before) / count;
 }
 
-await runBatch();
-const afterFirstBatch = await settledHeap();
-await runBatch();
-const afterSecondBatch = await settledHeap();
+/** What the process gained, per subagent of the batch, from reading `before` to reading `after`. */
+function growthPerSubagent(after: HeapReading, before: HeapReading) {
+	return {
+		heapSize: perSubagent(after.heapSize, before.heapSize),
+		Map: perSubagent(after.Map, before.Map),
+		Function: perSubagent(after.Function, before.Function),
+		AsyncFunction: perSubagent(after.AsyncFunction, before.AsyncFunction),
+		JSLexicalEnvironment: perSubagent(after.JSLexicalEnvironment, before.JSLexicalEnvironment),
+		ModuleRecord: perSubagent(after.ModuleRecord, before.ModuleRecord),
+		CommonJSModule: perSubagent(after.CommonJSModule, before.CommonJSModule),
+	};
+}
+
+const readings: HeapReading[] = [];
+for (let batch = 0; batch < batches; batch++) {
+	await runBatch();
+	readings.push(await settledHeap());
+}
 
 await AgentLifecycleManager.global().dispose();
 await session.dispose();
@@ -203,16 +219,8 @@ authStorage.close();
 process.stdout.write(
 	`${JSON.stringify({
 		count,
-		afterFirstBatch,
-		afterSecondBatch,
-		perParkedSubagent: {
-			heapSize: perSubagent(afterSecondBatch.heapSize, afterFirstBatch.heapSize),
-			Map: perSubagent(afterSecondBatch.Map, afterFirstBatch.Map),
-			Function: perSubagent(afterSecondBatch.Function, afterFirstBatch.Function),
-			AsyncFunction: perSubagent(afterSecondBatch.AsyncFunction, afterFirstBatch.AsyncFunction),
-			JSLexicalEnvironment: perSubagent(afterSecondBatch.JSLexicalEnvironment, afterFirstBatch.JSLexicalEnvironment),
-			ModuleRecord: perSubagent(afterSecondBatch.ModuleRecord, afterFirstBatch.ModuleRecord),
-			CommonJSModule: perSubagent(afterSecondBatch.CommonJSModule, afterFirstBatch.CommonJSModule),
-		},
+		readings,
+		// One entry for each batch after the first, against the reading before it.
+		perParkedSubagent: readings.slice(1).map((after, index) => growthPerSubagent(after, readings[index])),
 	})}\n`,
 );
