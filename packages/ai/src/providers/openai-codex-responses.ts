@@ -112,6 +112,7 @@ import {
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
 	resolveOpenAIEffortControlState,
+	sendsConfigurationUpdates,
 } from "./openai-configuration-update";
 import type {
 	ResponseComputerToolCall,
@@ -1444,7 +1445,7 @@ function applyCodexStableEffort(
 	body: RequestBody,
 	options: OpenAICodexResponsesOptions | undefined,
 ): void {
-	if (!model.compat.supportsConfigurationUpdate || options?.codexCompaction) return;
+	if (!sendsConfigurationUpdates(model) || options?.codexCompaction) return;
 	const effort = body.reasoning?.effort;
 	if (effort === undefined || effort === "none" || !body.input) return;
 	const providerState = getCodexProviderSessionState(options?.providerSessionState);

@@ -23,6 +23,7 @@ import { capFrameDataBytes, frameDataBytesBudget, providerImageBudget } from "@o
 import { supportsRemoteImageUrls } from "../blob-broker/context-images";
 import { declaredTools } from "../utils/tool-declarations";
 import { imageDecodeFailureReason } from "@oh-my-pi/pi-tui/chat/image-loading";
+import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 const IMAGE_OMISSION: TextContent = {
@@ -444,30 +445,40 @@ function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { versi
 }
 
 /**
+ * The newest drop `entries` record for each conversation and image budget, by {@link conversationKey}, on every
+ * branch ({@link IMAGE_DROP_ENTRY_TYPE}).
+ */
+export function recordedImageDrops(entries: readonly SessionEntry[]): Map<string, RecordedImageDrop> {
+	const drops = new Map<string, RecordedImageDrop>();
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === IMAGE_DROP_ENTRY_TYPE && isRecordedImageDrop(entry.data)) {
+			drops.set(conversationKey(entry.data.turn, entry.data.budget), entry.data);
+		}
+	}
+	return drops;
+}
+
+/**
  * The {@link ImageDropRecord} of the session `sessionManager` holds: an {@link IMAGE_DROP_ENTRY_TYPE} entry, on the
  * branch current then, at each drop the clamp keeps. A process that resumes the session reads the entries of every
  * branch, as the process that wrote them remembered them on every branch: a `/tree` move to a branch that went on from
  * before a forced drop still drops that drop's images. They are read once for each session the manager holds and each
  * time it reads the session's file ({@link SessionManager.loadRevision}: a switch back to a session another process
- * continued meanwhile); the record's own writes keep them current.
+ * continued meanwhile); the record's own writes keep them current. A copy of a branch into another file carries the
+ * drops of the conversations it holds ({@link carryImageDrops}).
  */
 export function sessionImageDropRecord(
 	sessionManager: Pick<SessionManager, "getEntries" | "getSessionId" | "appendCustomEntry" | "loadRevision">,
 ): ImageDropRecord {
 	let session: string | undefined;
 	let loadRevision: number | undefined;
-	const drops = new Map<string, RecordedImageDrop>();
+	let drops = new Map<string, RecordedImageDrop>();
 	const read = (): ReadonlyMap<string, RecordedImageDrop> => {
 		const id = sessionManager.getSessionId();
 		if (id === session && sessionManager.loadRevision === loadRevision) return drops;
 		session = id;
 		loadRevision = sessionManager.loadRevision;
-		drops.clear();
-		for (const entry of sessionManager.getEntries()) {
-			if (entry.type === "custom" && entry.customType === IMAGE_DROP_ENTRY_TYPE && isRecordedImageDrop(entry.data)) {
-				drops.set(conversationKey(entry.data.turn, entry.data.budget), entry.data);
-			}
-		}
+		drops = recordedImageDrops(sessionManager.getEntries());
 		return drops;
 	};
 	return {
@@ -479,6 +490,37 @@ export function sessionImageDropRecord(
 			drops.set(conversationKey(drop.turn, drop.budget), drop);
 		},
 	};
+}
+
+/**
+ * Writes into a copy of a branch of the session, just made (a fork or branch at an entry, a `/btw` branch), each drop
+ * `source` held before the copy ({@link recordedImageDrops} of the session's entries then) whose turn `messages`, the
+ * copy's context, carries, where the copy records other drops for that conversation or none. Such a record may sit on
+ * another branch than the copied one, after the copy point, or in a file this process read and has sent nothing from
+ * yet; with it, the copy's requests, and those of a process that resumes it, drop what the session's requests
+ * dropped instead of sending those images again or making a forced drop of another set.
+ */
+export function carryImageDrops(
+	sessionManager: Pick<SessionManager, "getEntries" | "appendCustomEntry">,
+	source: ReadonlyMap<string, RecordedImageDrop>,
+	messages: readonly Message[],
+): void {
+	if (source.size === 0) return;
+	const copied = recordedImageDrops(sessionManager.getEntries());
+	const turns = new Set(messages.map(turnOf));
+	for (const [key, drop] of source) {
+		if (!turns.has(drop.turn)) continue;
+		const held = copied.get(key);
+		if (
+			held &&
+			held.dropped.length === drop.dropped.length &&
+			held.dropped.every(name => drop.dropped.includes(name))
+		) {
+			continue;
+		}
+		const carried: RecordedImageDrop = { turn: drop.turn, budget: drop.budget, dropped: drop.dropped };
+		sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...carried });
+	}
 }
 
 /**
@@ -510,8 +552,9 @@ export function sessionImageDropRecord(
  * no record was written by a process that recorded none (the base release, whose clamp dropped in each request the
  * oldest images past the budget, {@link clampProviderContextImages}): a conversation of it takes the drops that
  * clamp made in its last request, the history before the newest reply of the same model, and keeps and records them,
- * so the first request after the resume sends what that request sent. Where the session file lacks drops the clamp
- * remembers (a branch copied into another file), the next request that uses them records them there. When the
+ * so the first request after the resume sends what that request sent. A copy of part of the session carries the drops
+ * of the conversations it holds as it is made ({@link carryImageDrops}); where the session file still lacks drops the
+ * clamp remembers, the next request that uses them records them there. When the
  * session's file is read again (a `/resume` back to a session another process continued meanwhile), the clamp
  * forgets what it remembers and follows the record read then, as a process that resumed the session does: the other
  * process's drops are the ones its last request sent.

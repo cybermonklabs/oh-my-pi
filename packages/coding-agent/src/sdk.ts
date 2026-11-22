@@ -4535,7 +4535,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: { ...defaultPrompt, systemPrompt: withRecallBlock(defaultPrompt.systemPrompt) };
 			}
 			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt);
-			return { systemPrompt: withRecallBlock(typeof customPrompt === "string" ? [customPrompt] : customPrompt) };
+			const blocks = typeof customPrompt === "string" ? [customPrompt] : customPrompt;
+			// A prompt that keeps the default prompt's first block (a subagent's wraps the default prompt) lists the
+			// `xd://` devices that block's catalog renders, as the default prompt does; one that drops it lists none.
+			const catalogBlock = defaultPrompt.systemPrompt[0];
+			const keepsCatalog = catalogBlock !== undefined && blocks.some(block => block.includes(catalogBlock));
+			return {
+				systemPrompt: withRecallBlock(blocks),
+				xdevCatalogNames: keepsCatalog ? defaultPrompt.xdevCatalogNames : undefined,
+			};
 		};
 		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
 		// them, whether or not a listener rebuilds the prompt for it (`SessionTools.holdToolDeclarationChange`).

@@ -17,9 +17,9 @@
  * providers whose replay behavior is unvalidated are never touched.
  *
  * A request whose `tool_choice` on the wire is another than the default (a
- * forced tool its model takes, or `none`) is neither tracked nor warmed
- * ({@link sendsNonDefaultToolChoice}): Anthropic keys the cached messages on
- * `tool_choice`, so it writes messages the next request, back on the default
+ * forced tool its provider sends as given, or `none`) is neither tracked nor
+ * warmed ({@link sendsNonDefaultToolChoice}): Anthropic keys the cached messages
+ * on `tool_choice`, so it writes messages the next request, back on the default
  * choice, does not read, and refreshes none of the entry the request before it
  * left, which stays the one tracked and kept warm. The agent loop forces a
  * tool for one turn when the model skips a soft tool requirement.
@@ -32,9 +32,11 @@ import {
 	type Model,
 	resolveCacheRetention,
 	type SimpleStreamOptions,
-	type ToolChoice,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { bedrockSendsForcedToolChoice } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import { openAICompletionsSendsNonDefaultToolChoice } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { mapOpenAIResponsesToolChoiceForTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { isForcedToolChoice } from "@oh-my-pi/pi-ai/utils/tool-choice";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
@@ -196,14 +198,37 @@ export function isReplayable(model: Model<Api>, options: SimpleStreamOptions | u
 	return true;
 }
 
+/** Whether `model` goes out on `api`, so its compat is that API's. */
+function isApiModel<TApi extends Api>(model: Model<Api>, api: TApi): model is Model<TApi> {
+	return model.api === api;
+}
+
 /**
- * Whether a request with `toolChoice` sends another `tool_choice` than the default (`auto`) on `model`: `none`, or a
- * forced choice the model's compat takes. Each provider sends a forced choice as `auto` where the compat says
- * `supportsForcedToolChoice` is off; a forced choice it sends also drops thinking on Anthropic.
+ * Whether `request` sends another `tool_choice` than the default (`auto`) on its model: `none`, or a forced choice the
+ * provider sends as given, by the provider's own rule. Bedrock sends `auto` for a model that takes no forced tool use
+ * and for a prefix-bound line thinking on the request ({@link bedrockSendsForcedToolChoice}); chat completions and
+ * Responses send no `tool_choice` to a host that takes none, and `auto` for a forced choice a host does not take
+ * ({@link openAICompletionsSendsNonDefaultToolChoice}, {@link mapOpenAIResponsesToolChoiceForTools}); elsewhere a
+ * forced choice goes out as `auto` where the compat says `supportsForcedToolChoice` is off. A forced choice Anthropic
+ * sends also drops thinking.
  */
-export function sendsNonDefaultToolChoice(model: Model<Api>, toolChoice: ToolChoice | undefined): boolean {
+export function sendsNonDefaultToolChoice(request: Pick<CacheWarmRequest, "model" | "context" | "options">): boolean {
+	const { model, context, options } = request;
+	const toolChoice = options.toolChoice;
 	if (toolChoice === undefined || toolChoice === "auto") return false;
+	if (isApiModel(model, "openai-completions")) {
+		return openAICompletionsSendsNonDefaultToolChoice(model.compat, toolChoice);
+	}
+	if (isApiModel(model, "openai-responses")) {
+		const sent = mapOpenAIResponsesToolChoiceForTools(toolChoice, context.tools ?? [], model);
+		return sent !== undefined && sent !== "auto";
+	}
 	if (!isForcedToolChoice(toolChoice)) return true;
+	if (isApiModel(model, "bedrock-converse-stream")) {
+		// The reasoning the stream hands the provider: none once the request turns it off.
+		const reasoning = options.disableReasoning || options.forceReasoningOff ? undefined : options.reasoning;
+		return bedrockSendsForcedToolChoice(model, reasoning);
+	}
 	const { compat } = model;
 	return !(compat !== undefined && "supportsForcedToolChoice" in compat && !compat.supportsForcedToolChoice);
 }
@@ -497,7 +522,7 @@ export class CacheWarmer {
 	 * entry and run of the request before it stay.
 	 */
 	start(request: CacheWarmRequest, change: () => PromptCacheChange | undefined): (() => void) | undefined {
-		if (sendsNonDefaultToolChoice(request.model, request.options.toolChoice)) return undefined;
+		if (sendsNonDefaultToolChoice(request)) return undefined;
 		this.#clearRun();
 		// A string key is classified up front. Resolver keys (rotating
 		// credentials) cannot be inspected without consuming them; they start on

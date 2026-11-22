@@ -1137,11 +1137,12 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Writes into a copy of the session's branch up to one of its entries, just made (`/fork <entry>`, `/branch`), the
-	 * wait on a model-summary compaction and the snapcompact refusal this process holds where they apply there and the
-	 * copy holds no record of them. Their records sit after the branch's newest message when they were written, so a
-	 * copy up to that message leaves them out; with them, a process that resumes the copy holds them as this process
-	 * does.
+	 * Writes into a copy of the session, just made (`/fork`, `/fork <entry>`, `/branch`, a `/btw` branch, a move off a
+	 * contested file), the wait on a model-summary compaction and the snapcompact refusal this process holds where they
+	 * apply there and the copy holds no record of them. Their records sit after the branch's newest message when they
+	 * were written: `/fork` at that message, while it is the branch's newest, copies them with it, but a copy that
+	 * leaves them out (later entries branch off that message, a `/btw` branch after `/tree` to it) gets them here; with
+	 * them, a process that resumes the copy holds them as this process does.
 	 */
 	followBranchCopy(): void {
 		const records = this.#sessionCompactionWaits();

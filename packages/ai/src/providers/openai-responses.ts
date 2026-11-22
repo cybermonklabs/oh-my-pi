@@ -57,6 +57,7 @@ import {
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
 	resolveOpenAIEffortControlState,
+	sendsConfigurationUpdates,
 } from "./openai-configuration-update";
 import {
 	applyOpenAIReasoningEffortFallback,
@@ -1937,7 +1938,7 @@ function applyResponsesStableEffort(
 	options: OpenAIResponsesOptions | undefined,
 	providerSessionState: OpenAIResponsesProviderSessionState | undefined,
 ): void {
-	if (!model.compat.supportsConfigurationUpdate || model.reasoningMode === "pro" || !providerSessionState) return;
+	if (!sendsConfigurationUpdates(model) || !providerSessionState) return;
 	const reasoning = params.reasoning;
 	if (!reasoning || !("effort" in reasoning)) return;
 	const effort = reasoning.effort;

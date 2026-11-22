@@ -3550,13 +3550,17 @@ export class SessionTools {
 	 * the copy: a whole-session fork, a fork or branch at an entry, a `/btw` branch, a move off a file another process
 	 * writes. A withheld change of the session `fromSessionId` names (a held settings rebuild, the restored transcript
 	 * prompt, a spent hold) records itself in the copy from now on, and a recorded one records itself there at once,
-	 * since a copy cut at an earlier entry lacks the records written after it. A switch to another session, or `/new`,
-	 * copies nothing: the change keeps the session it began in.
+	 * since a copy cut at an earlier entry lacks the records written after it. So does the end of one: a copy that
+	 * records a hold on the base prompt, which a bound process holds no change for, lacks the end record written after
+	 * the copy point, so the hold ends there too ({@link #endWithheldChange}); without it, a process that resumes the
+	 * copy dates the change from that hold and sends its own build once it is due. A switch to another session, or
+	 * `/new`, copies nothing: the change keeps the session it began in.
 	 */
 	followTranscriptCopy(fromSessionId: string): void {
 		const sessionId = this.#host.sessionManager.getSessionId();
 		if (sessionId === fromSessionId) return;
-		for (const change of [this.#heldSettingsRebuild, this.#restoredPrompt, this.#spentHold]) {
+		const changes = [this.#heldSettingsRebuild, this.#restoredPrompt, this.#spentHold];
+		for (const change of changes) {
 			if (change?.sessionId !== fromSessionId) continue;
 			change.sessionId = sessionId;
 			change.recordedOn = undefined;
@@ -3565,6 +3569,13 @@ export class SessionTools {
 		if (held?.sessionId === sessionId) this.#recordWithheldChange(held);
 		const restored = this.#keptRestoredPrompt();
 		if (restored?.recorded && restored.sessionId === sessionId) this.#recordWithheldChange(restored);
+		// A bound process takes in every hold on its base prompt when it restores the transcript, and holds each one it
+		// begins until it ends: one it holds nothing for withholds nothing from the base any more.
+		if (this.#host.model()?.thinking?.prefixBinding !== true) return;
+		const digest = systemPromptDigest(this.#baseSystemPrompt);
+		if (changes.some(change => change?.digest === digest)) return;
+		const recorded = this.#recordedHold(digest);
+		if (recorded) this.#endWithheldChange(this.#withheldChange(digest, recorded.since, true));
 	}
 
 	/** Drops retained transcript references when the session is disposed. */
