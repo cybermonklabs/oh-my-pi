@@ -313,6 +313,65 @@ test("a bridged tool.wait records each subagent result it hands the cell before 
 	await manager.dispose();
 });
 
+for (const [label, toolName] of [
+	["a bridged tool.wait on a drained work pool records each worker's handover at the time the pool drained", "wait"],
+	["a cell's kill of a drained work pool records each worker's handover at the time the pool drained", "write"],
+] as const) {
+	test(label, async () => {
+		// If this regresses, the cell's own wait or kill of a drained pool records each worker's `delivered` at the
+		// cell's time, after the drain, and the eval result names that time: `omp --restore` reads a turn an IRC
+		// message started on a kept-alive worker after the drain as handed over, and leaves it when it ends on its key.
+		const drainedAt = Date.parse("2026-11-17T12:00:00.000Z");
+		const pool = {
+			id: "pool",
+			type: "task",
+			status: "completed",
+			label: "pool",
+			durationMs: 5,
+			agentResults: [
+				{ id: "WorkerA", handedAt: drainedAt },
+				{ id: "WorkerB", aborted: true, handedAt: drainedAt },
+			],
+		};
+		const log: string[] = [];
+		const tool: AgentTool = {
+			name: toolName,
+			label: toolName,
+			description: "Takes a settled job's result",
+			parameters: type({}),
+			async execute() {
+				log.push(`${toolName} ran`);
+				return {
+					content: [{ type: "text", text: "The pool drained." }],
+					details: toolName === "wait" ? { op: "wait", jobs: [pool] } : { proc: { op: "cancel", jobs: [pool] } },
+				};
+			},
+		};
+		const session = {
+			getAgentId: () => "Main",
+			sessionManager: loggingSessionManager(log),
+			getToolByName: (name: string) => (name === toolName ? tool : undefined),
+		} as unknown as ToolSession;
+		const held: Array<{ id: string; aborted?: boolean; handedAt?: number }> = [];
+		setSystemTime(new Date(drainedAt + 60_000));
+		try {
+			await callSessionTool(toolName, {}, { session, onAgentResults: results => held.push(...results) });
+		} finally {
+			setSystemTime();
+		}
+
+		expect(log).toEqual([
+			`${toolName} ran`,
+			`append eval-agent-job ${JSON.stringify({ agentId: "WorkerA", state: "delivered", handedAt: drainedAt })}`,
+			"flushed",
+		]);
+		expect(held).toEqual([
+			{ id: "WorkerA", handedAt: drainedAt },
+			{ id: "WorkerB", aborted: true, handedAt: drainedAt },
+		]);
+	});
+}
+
 test("each awaited batch job reports its own agent's progress (issue #18393)", async () => {
 	const manager = new AsyncJobManager({});
 	// A batch `task` call shares one progress array across its jobs.

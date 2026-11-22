@@ -18,6 +18,7 @@ import {
 	ASYNC_RESULT_MESSAGE_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { recordEvalAgentJobs, recordHandovers } from "@oh-my-pi/pi-coding-agent/eval/agent-job-records";
+import { EVAL_STATE_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/eval/state";
 import {
 	createInterruptedTurnAbortMessage,
 	restoreSkippedCallReason,
@@ -1447,6 +1448,104 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
+	for (const [label, stopped] of [
+		[
+			"leaves a reused pool worker whose later batch failed on its key, when the cell that stopped the pool names the worker's earlier batch in its eval result",
+			true,
+		],
+		["control: relaunches it when that cell did not stop the pool", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, the stopping cell's `eval` result, written after the stop's discard, decides as the
+			// worker's latest record: it names the worker for the earlier batch the cell's bridged `tool.wait` got, the
+			// discard is never read, and the worker runs the later batch's items again for a pool its owner stopped.
+			const start = Date.parse("2026-11-17T12:00:00.000Z");
+			setSystemTime(new Date(start));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			main.appendMessage(toolCallMessage("call_pool", "eval"));
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed");
+			const worker = await openPoolWorker(mainFile, cwd);
+			const firstHandedAt = start + 60_000;
+			setSystemTime(new Date(firstHandedAt));
+			// The cell's bridged `tool.wait` on the worker's first batch job wrote its handover.
+			appendAgentJobRecord(main, "PoolWorker", "delivered");
+			setSystemTime(new Date(start + 120_000));
+			// The cell pushed more items to the idle worker, whose second batch ended because its key could not be
+			// resolved.
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed", ["call_pool"]);
+			worker.appendMessage({ role: "user", content: "item two", timestamp: Date.now() });
+			await endOnKey(worker);
+			setSystemTime(new Date(start + 180_000));
+			// The same cell killed the pool, whose stop recorded its workers discarded.
+			if (stopped) main.appendCustomEntry(TASK_LAUNCH_DISCARDED_CUSTOM_TYPE, { agentId: "PoolWorker" });
+			setSystemTime(new Date(start + 190_000));
+			// The cell ended: its result names the worker for the first batch it got.
+			main.appendMessage(
+				toolResultMessage("call_pool", "eval", { agentResults: [{ id: "PoolWorker", handedAt: firstHandedAt }] }),
+			);
+			main.appendMessage(
+				assistant({ content: [{ type: "text", text: stopped ? "Stopped the pool." : "Waiting on the pool." }] }),
+			);
+			setSystemTime();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(stopped ? [] : ["PoolWorker"]);
+		});
+	}
+
+	for (const [label, drained] of [
+		[
+			"relaunches a kept-alive pool worker whose turn began after the pool drained, though a cell's bridged wait took the pool's result later",
+			true,
+		],
+		["control: leaves it when the wait's handover record gives no drain time, so the record's time counts", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, restore settles a worker whose pool's result a cell took through a bridged `tool.wait`
+			// (or a kill) at the time of the `delivered` record the wait wrote, not when the pool drained: a turn an IRC
+			// message started on the kept-alive worker in between reads as handed over and is lost when it ends on its
+			// key.
+			const start = Date.parse("2026-11-17T12:00:00.000Z");
+			setSystemTime(new Date(start));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			main.appendMessage(toolCallMessage("call_pool", "eval"));
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed");
+			const worker = await openPoolWorker(mainFile, cwd);
+			main.appendMessage(toolResultMessage("call_pool", "eval", {}));
+			const drainedAt = start + 60_000;
+			setSystemTime(new Date(start + 120_000));
+			// An IRC message woke the kept-alive worker after the pool drained; that turn ended on its key.
+			worker.appendCustomMessageEntry("irc:incoming", "One more thing.", true, {
+				from: MAIN_AGENT_ID,
+				message: "One more thing.",
+			});
+			await endOnKey(worker);
+			setSystemTime(new Date(start + 180_000));
+			// A later cell's bridged `tool.wait` took the pool's result only now.
+			main.appendMessage(toolCallMessage("call_wait", "eval"));
+			main.appendCustomEntry(
+				"eval-agent-job",
+				drained
+					? { agentId: "PoolWorker", state: "delivered", handedAt: drainedAt }
+					: { agentId: "PoolWorker", state: "delivered" },
+			);
+			main.appendMessage(
+				toolResultMessage("call_wait", "eval", {
+					agentResults: [{ id: "PoolWorker", handedAt: drained ? drainedAt : Date.now() }],
+				}),
+			);
+			main.appendMessage(assistant({ content: [{ type: "text", text: "The pool finished." }] }));
+			setSystemTime();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(drained ? ["PoolWorker"] : []);
+		});
+	}
+
 	for (const [label, wentBack] of [
 		[
 			"relaunches a subagent the current conversation still waits on, though a branch the user left by their own navigation holds its handover",
@@ -1526,11 +1625,23 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
-	function appendExecutionStart(main: SessionManager, toolCallId: string, toolName: string): void {
-		main.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+	/** Appends the start record of the parent's call `toolCallId`, and returns its entry id. */
+	function appendExecutionStart(main: SessionManager, toolCallId: string, toolName: string): string {
+		return main.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
 			toolCallId,
 			toolName,
 			startedAt: new Date().toISOString(),
+		});
+	}
+
+	/** The parent's reply that calls an eval cell (`call_eval`) and `bash` (`call_bash`). */
+	function evalAndBashReply(): AssistantMessage {
+		return assistant({
+			content: [
+				{ type: "toolCall", id: "call_eval", name: "eval", arguments: { language: "js", code: "tool.task(...)" } },
+				{ type: "toolCall", id: "call_bash", name: "bash", arguments: { command: "bun test" } },
+			],
+			stopReason: "toolUse",
 		});
 	}
 
@@ -1674,20 +1785,7 @@ describe("restoreSession (omp --restore)", () => {
 		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 		const { main, mainFile, cwd } = openParent();
 		tick();
-		const anchor = main.appendMessage(
-			assistant({
-				content: [
-					{
-						type: "toolCall",
-						id: "call_eval",
-						name: "eval",
-						arguments: { language: "js", code: "tool.task(...)" },
-					},
-					{ type: "toolCall", id: "call_bash", name: "bash", arguments: { command: "bun test" } },
-				],
-				stopReason: "toolUse",
-			}),
-		);
+		const anchor = main.appendMessage(evalAndBashReply());
 		tick();
 		appendExecutionStart(main, "call_eval", "eval");
 		tick();
@@ -1755,6 +1853,209 @@ describe("restoreSession (omp --restore)", () => {
 			);
 		});
 	}
+
+	/**
+	 * A parent whose process ended inside its reply's `call_eval` and `call_bash`, after the cell's subagent `Worker`
+	 * (spawned under `call_eval`) ended its turn on its key and `firstRun` wrote what the batch's first run left: by
+	 * default the cell's cut-off error result, which says the cell got Worker's failure. A first restore then ran
+	 * the batch again from the reply (with `forkAtStart`, the branch was cut at the cell's start record instead), and
+	 * the process ended again before the replay's first result: the selected branch holds only a start record there.
+	 */
+	async function restoreAfterCutOffReplay(
+		options: { firstRun?: (main: SessionManager) => void; forkAtStart?: boolean } = {},
+	) {
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		const anchor = main.appendMessage(evalAndBashReply());
+		tick();
+		const started = appendExecutionStart(main, "call_eval", "eval");
+		tick();
+		await writeSubagent(mainFile, cwd, "Worker", stranded, { spawnCallId: "call_eval", normalExit: true });
+		tick();
+		(options.firstRun ?? cellGotWorkersFailure)(main);
+		tick();
+		if (options.forkAtStart) {
+			main.branch(started);
+			appendExecutionStart(main, "call_bash", "bash");
+		} else {
+			main.branch(anchor);
+			appendExecutionStart(main, "call_eval", "eval");
+		}
+		return restoreParent(main, mainFile);
+	}
+
+	/** The cell's cut-off error result, which says the cell got Worker's failure. */
+	function cellGotWorkersFailure(main: SessionManager): void {
+		main.appendMessage(
+			toolResultMessage("call_eval", "eval", { agentResults: [{ id: "Worker", handedAt: Date.now() }] }, true),
+		);
+	}
+
+	for (const [label, rest, relaunched] of [
+		[
+			"leaves a key-stranded subagent whose failure the cell got, when the replay of its batch was cut off before its first result",
+			undefined,
+			false,
+		],
+		[
+			"leaves it when the first run's branch holds only what a cut-off batch leaves besides: the other call's error result, the turn's abort, an exit record, a retry's model and thinking changes, an eval snapshot",
+			(main: SessionManager) => {
+				appendExecutionStart(main, "call_bash", "bash");
+				main.appendMessage(toolResultMessage("call_bash", "bash", {}, true));
+				main.appendModelChange("anthropic/claude-haiku-4-5");
+				main.appendThinkingLevelChange("low");
+				main.appendMessage(assistant({ stopReason: "aborted", errorMessage: "Request was aborted" }));
+				main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+					reason: "dispose",
+					kind: "process_exit",
+					recordedAt: new Date().toISOString(),
+				});
+				main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+			},
+			false,
+		],
+		[
+			"relaunches it when that branch holds a prompt: a turn the conversation took there",
+			(main: SessionManager) => main.appendMessage({ role: "user", content: "Go on.", timestamp: Date.now() }),
+			true,
+		],
+		[
+			"relaunches it when that branch holds an IRC message, which the conversation takes as a turn",
+			(main: SessionManager) =>
+				main.appendCustomMessageEntry("irc:incoming", "Status?", true, { from: MAIN_AGENT_ID, message: "Status?" }),
+			true,
+		],
+		[
+			"relaunches it when that branch holds a reply that makes a call",
+			(main: SessionManager) =>
+				main.appendMessage(
+					assistant({
+						stopReason: "aborted",
+						content: [{ type: "toolCall", id: "call_more", name: "bash", arguments: { command: "ls" } }],
+					}),
+				),
+			true,
+		],
+		[
+			"relaunches it when that branch holds a reply that completed",
+			(main: SessionManager) => main.appendMessage(assistant({ content: [{ type: "text", text: "Done." }] })),
+			true,
+		],
+		[
+			"relaunches it when that branch holds a result that is no error: a call that ran to its end",
+			(main: SessionManager) => main.appendMessage(toolResultMessage("call_bash", "bash", {})),
+			true,
+		],
+		[
+			"relaunches it when that branch holds a result of a call the reply did not make",
+			(main: SessionManager) => main.appendMessage(toolResultMessage("call_other", "bash", {}, true)),
+			true,
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, restore judges the branch the batch's first run lies on by what the selected branch
+			// wrote after the fork: a replay cut off before its first result wrote only a start record, the branch is not
+			// read, and the subagent whose failure the cell got is relaunched beside the replayed cell's own. Or it reads a
+			// branch that holds a turn the conversation took there as a replay's, and settles a subagent from it.
+			const { outcome } = await restoreAfterCutOffReplay({
+				firstRun: main => {
+					cellGotWorkersFailure(main);
+					rest?.(main);
+				},
+			});
+
+			expect(outcome.subagents).toEqual(relaunched ? ["Worker"] : []);
+		});
+	}
+
+	for (const [label, options] of [
+		[
+			"relaunches it when the first run's branch holds no result of the reply's calls, which no replay leaves",
+			{ firstRun: (main: SessionManager) => appendAgentJobRecord(main, "Worker", "delivered") },
+		],
+		[
+			"relaunches it when that branch forks below the reply, at the cell's start record, as a re-answer's does",
+			{ forkAtStart: true },
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, a branch that no replay left (it holds none of the reply's results, or it forks below
+			// the reply) reads as the batch's first run, and its handover settles a subagent the conversation the parent
+			// went on with never got.
+			const { outcome } = await restoreAfterCutOffReplay(options);
+
+			expect(outcome.subagents).toEqual(["Worker"]);
+		});
+	}
+
+	it("relaunches a subagent the current conversation still waits on, when its handover is only on the branch a /tree re-answer of an ask left", async () => {
+		// If this regresses, the branch a person left by re-answering an `ask` (the reply's only call, which got its
+		// result with no start record) reads as a replay's, and the handover on it settles a subagent the conversation
+		// they went on with never got.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const records = { sessionManager: main } as unknown as ToolSession;
+		tick();
+		main.appendMessage(toolCallMessage("call_agent", "eval"));
+		await recordEvalAgentJobs(records, ["Background"], "owed");
+		tick();
+		await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true, spawnCallId: "call_agent" });
+		tick();
+		main.appendMessage(toolResultMessage("call_agent", "eval", {}));
+		tick();
+		main.appendMessage({ role: "user", content: "Which way?", timestamp: Date.now() });
+		const askReply = main.appendMessage(toolCallMessage("call_ask", "ask"));
+		main.appendMessage(toolResultMessage("call_ask", "ask", {}));
+		main.appendMessage(toolCallMessage("call_wait", "eval"));
+		appendAgentJobRecord(main, "Background", "delivered");
+		main.appendMessage(
+			toolResultMessage("call_wait", "eval", { agentResults: [{ id: "Background", handedAt: Date.now() }] }),
+		);
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Background could not run." }] }));
+		tick();
+		// The person re-answered the ask in `/tree`: a sibling result under the reply, and the conversation went on.
+		main.branch(askReply);
+		main.appendMessage(toolResultMessage("call_ask", "ask", {}));
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Going the other way." }] }));
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toEqual(["Background"]);
+	});
+
+	it("leaves a subagent an earlier reply spawned, whose handover the first run of a replayed cell held", async () => {
+		// The rule covers every subagent spawned in the current conversation, not only one the replayed reply's calls
+		// spawned: the first restore read this handover on the selected branch and left the subagent, so the second
+		// must too. If this regresses, the second restore relaunches a subagent whose failure the cell got.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const records = { sessionManager: main } as unknown as ToolSession;
+		tick();
+		main.appendMessage(toolCallMessage("call_agent", "eval"));
+		await recordEvalAgentJobs(records, ["Background"], "owed");
+		tick();
+		await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true, spawnCallId: "call_agent" });
+		tick();
+		main.appendMessage(toolResultMessage("call_agent", "eval", {}));
+		tick();
+		const anchor = main.appendMessage(evalAndBashReply());
+		tick();
+		appendExecutionStart(main, "call_eval", "eval");
+		tick();
+		main.appendMessage(
+			toolResultMessage("call_eval", "eval", { agentResults: [{ id: "Background", handedAt: Date.now() }] }, true),
+		);
+		tick();
+		main.branch(anchor);
+		appendExecutionStart(main, "call_eval", "eval");
+		main.appendMessage(toolResultMessage("call_eval", "eval", {}, true));
+		appendExecutionStart(main, "call_bash", "bash");
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toEqual([]);
+	});
 
 	it("relaunches only the streamed reply's spawn when the replaced reply forked after the input, from a summary both branches share", async () => {
 		// If this regresses, the replacement window opens at the first entry after the input, which here is the

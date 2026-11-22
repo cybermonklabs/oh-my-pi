@@ -10,7 +10,8 @@
  * leaves `delivered`, and restore never runs that run again; a background `task` spawn's result
  * a bridged `tool.wait` or a cell's kill of a settled job hands a cell is recorded the same way,
  * and so is each worker whose latest batch a `peek` hands over, and each worker a work pool's
- * aggregate result names (its job report's `agentResults`) when such a call returns that result.
+ * aggregate result names (its job report's `agentResults`) when such a call returns that result,
+ * with the time the pool drained, when the handover happened.
  * A handle's `status()`, `done()` and `attempts()` hand the cell no result and write nothing. A
  * result the session receives as an `async-result` message, a `wait` result or a kill's needs no
  * marker: that entry is the handover and its record at once, and names a pool's workers too.
@@ -35,6 +36,13 @@ export interface EvalAgentJobRecord {
 	 * pushed). `omp --restore` matches the run to a cut-off call by its latest `owed` record's calls.
 	 */
 	spawnCallIds?: string[];
+	/**
+	 * With `delivered`: when the result was handed over (epoch ms), when that was earlier than the
+	 * record: a work pool's drain, whose aggregate result a bridged `tool.wait` or kill takes later.
+	 * `omp --restore` settles the run at this time, so a turn a kept-alive worker began after the
+	 * drain stays owed.
+	 */
+	handedAt?: number;
 }
 
 /**
@@ -49,16 +57,21 @@ export async function recordEvalAgentJobs(
 	state: EvalAgentJobState,
 	spawnCallIds?: readonly string[],
 ): Promise<string[]> {
-	const manager = session.sessionManager;
-	if (!manager || agentIds.length === 0) return [];
-	const entryIds: string[] = [];
-	for (const agentId of agentIds) {
-		const record: EvalAgentJobRecord =
+	return appendJobRecords(
+		session,
+		agentIds.map(agentId =>
 			state === "owed" && spawnCallIds?.length
 				? { agentId, state, spawnCallIds: [...spawnCallIds] }
-				: { agentId, state };
-		entryIds.push(manager.appendCustomEntry(EVAL_AGENT_JOB_CUSTOM_TYPE, record));
-	}
+				: { agentId, state },
+		),
+	);
+}
+
+/** Appends `records` to `session`'s transcript and waits until they are on disk; returns the entries' ids. */
+async function appendJobRecords(session: ToolSession, records: readonly EvalAgentJobRecord[]): Promise<string[]> {
+	const manager = session.sessionManager;
+	if (!manager || records.length === 0) return [];
+	const entryIds = records.map(record => manager.appendCustomEntry(EVAL_AGENT_JOB_CUSTOM_TYPE, record));
 	await manager.flush();
 	return entryIds;
 }
@@ -88,18 +101,23 @@ function runKey(run: { agentId: string; jobId: string }): string {
  * recorded once: a later `wait()` on the settled handle writes nothing. A caller that finds the
  * record still being written waits for it to reach the disk too, so no concurrent `wait()` hands
  * the result over first. A failed write is forgotten, and the next handover of that run writes
- * it again.
+ * it again. A run that says when its result was handed over (`handedAt`: a work pool's drain,
+ * whose aggregate result the cell takes later) records that time when it is the earlier.
  *
- * Returns, for each of `runs` in order, when its result first reached the cell (epoch ms): the
- * time the eval result names it with, so a turn the cell messaged the subagent for after that
- * stays unsettled, however often or late the cell waits again.
+ * Returns, for each of `runs` in order, when its result first reached the cell (epoch ms), or the
+ * run's own earlier `handedAt`: the time the eval result names it with, so a turn the cell, or an
+ * IRC message, started on the subagent after that stays unsettled, however often or late the
+ * cell waits again.
  */
 export async function recordHandovers(
 	session: ToolSession,
-	runs: ReadonlyArray<{ agentId: string; jobId: string }>,
+	runs: ReadonlyArray<{ agentId: string; jobId: string; handedAt?: number }>,
 ): Promise<number[]> {
 	const manager = session.sessionManager;
-	if (!manager) return runs.map(() => Date.now());
+	if (!manager) {
+		const now = Date.now();
+		return runs.map(run => handoverTime(run, now));
+	}
 	let byRun = handovers.get(manager);
 	if (!byRun) {
 		byRun = new Map();
@@ -107,14 +125,19 @@ export async function recordHandovers(
 	}
 	const fresh = runs.filter(run => !byRun.has(runKey(run)));
 	if (fresh.length > 0) {
-		const at = Date.now();
+		const now = Date.now();
+		const times = fresh.map(run => handoverTime(run, now));
 		// Appended synchronously in this call, before any other caller can look the run up.
-		const written = recordEvalAgentJobs(
+		const written = appendJobRecords(
 			session,
-			fresh.map(run => run.agentId),
-			"delivered",
+			fresh.map((run, index): EvalAgentJobRecord => {
+				const at = times[index]!;
+				return at < now
+					? { agentId: run.agentId, state: "delivered", handedAt: at }
+					: { agentId: run.agentId, state: "delivered" };
+			}),
 		).then(() => {});
-		for (const run of fresh) byRun.set(runKey(run), { at, written });
+		fresh.forEach((run, index) => byRun.set(runKey(run), { at: times[index]!, written }));
 		written.catch(() => {
 			for (const run of fresh) if (byRun.get(runKey(run))?.written === written) byRun.delete(runKey(run));
 		});
@@ -124,12 +147,21 @@ export async function recordHandovers(
 	return recorded.map(handover => handover.at);
 }
 
-/** A subagent run a job report hands its caller, keyed for {@link recordHandovers}, with the run-end flags it records. */
+/** When `run`'s result was handed over: its own earlier time (a work pool's drain) when it gives one, else `now`. */
+function handoverTime(run: { handedAt?: number }, now: number): number {
+	return run.handedAt !== undefined && Number.isFinite(run.handedAt) && run.handedAt < now ? run.handedAt : now;
+}
+
+/**
+ * A subagent run a job report hands its caller, keyed for {@link recordHandovers}, with the run-end
+ * flags it records and, for a work pool's worker, when the pool drained (`handedAt`).
+ */
 export interface HandedRun {
 	agentId: string;
 	jobId: string;
 	aborted?: boolean;
 	workerLost?: boolean;
+	handedAt?: number;
 }
 
 /**
@@ -137,7 +169,7 @@ export interface HandedRun {
  * (`write proc://<id>/kill` of a job that had settled, whose report lists the jobs as a `wait`
  * does). Each listed job that is no longer running and has a subagent (`agentUrlId`), with its job
  * id, and the subagents such a job's result hands over (its `agentResults`: a work pool's workers),
- * each keyed by the job and with its run-end flags.
+ * each keyed by the job, with its run-end flags and the time the report gives it (the drain's).
  */
 export function waitHandedSubagents(details: unknown): HandedRun[] {
 	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
@@ -157,6 +189,9 @@ export function waitHandedSubagents(details: unknown): HandedRun[] {
 				jobId,
 				...(result.aborted === true ? { aborted: true } : {}),
 				...(result.workerLost === true ? { workerLost: true } : {}),
+				...(typeof result.handedAt === "number" && Number.isFinite(result.handedAt)
+					? { handedAt: result.handedAt }
+					: {}),
 			});
 		}
 	}
@@ -169,10 +204,13 @@ export function readEvalAgentJobRecord(entry: SessionEntry): EvalAgentJobRecord 
 	const { data } = entry;
 	if (!isRecord(data) || typeof data.agentId !== "string") return undefined;
 	if (data.state !== "owed" && data.state !== "delivered") return undefined;
+	const record: EvalAgentJobRecord = { agentId: data.agentId, state: data.state };
 	const calls = Array.isArray(data.spawnCallIds)
 		? data.spawnCallIds.filter((call): call is string => typeof call === "string")
 		: [];
-	return calls.length > 0
-		? { agentId: data.agentId, state: data.state, spawnCallIds: calls }
-		: { agentId: data.agentId, state: data.state };
+	if (calls.length > 0) record.spawnCallIds = calls;
+	if (data.state === "delivered" && typeof data.handedAt === "number" && Number.isFinite(data.handedAt)) {
+		record.handedAt = data.handedAt;
+	}
+	return record;
 }

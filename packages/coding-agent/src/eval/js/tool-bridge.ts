@@ -404,19 +404,21 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		// handover: record each subagent's before the cell gets it, and name it in the eval result. A kill
 		// (`tool.write` to `proc://<id>/kill`; the prelude's `write()` rejects protocol paths) of a job that had
 		// settled does the same, and its result is the same job report. Each settled job's report names the
-		// subagents its result hands over too (a work pool's workers). An aborted run is named, not recorded.
+		// subagents its result hands over too (a work pool's workers, with the time the pool drained, which the
+		// record and the eval result keep). An aborted run is named, not recorded.
 		const jobReport = name === "wait" ? result.details : killJobReport(name, result.details);
 		const handed = waitHandedSubagents(jobReport);
 		if (handed.length > 0) {
 			const settled = handed.filter(run => !run.aborted && !run.workerLost);
 			const handedAt = await recordHandovers(options.session, settled);
 			const at = new Map(settled.map((run, index) => [run, handedAt[index]!]));
+			const now = Date.now();
 			options.onAgentResults?.(
 				handed.map(run => ({
 					id: run.agentId,
 					...(run.aborted ? { aborted: true } : {}),
 					...(run.workerLost ? { workerLost: true } : {}),
-					handedAt: at.get(run) ?? Date.now(),
+					handedAt: at.get(run) ?? Math.min(run.handedAt ?? now, now),
 				})),
 			);
 		}

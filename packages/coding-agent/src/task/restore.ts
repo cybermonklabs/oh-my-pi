@@ -384,12 +384,14 @@ interface SpawnedSubagents {
 	/**
 	 * Spawns the parent discarded, each with when its discard record was written (epoch ms): a
 	 * streamed launch nobody adopted, and each worker of a work pool the parent stopped (a kill, the
-	 * user's stop), whose failed batch the stop cannot cancel. The ids whose latest record of any
-	 * kind on the selected branch, read from the leaf back, is a discard record
-	 * ({@link readDiscardedLaunch}). A record that names the id after the discard (a later spawn's
-	 * job record, a result) is a later spawn of a reused id. Never the parent's work, but only for a
-	 * subagent whose transcript began by the discard: a later process can allocate the id of a
-	 * launch discarded before it wrote a transcript again, and that spawn may have written no
+	 * user's stop), whose failed batch the stop cannot cancel. Read on the selected branch from the
+	 * root on: a discard record ({@link readDiscardedLaunch}) stands until a later record takes the
+	 * run up again (a `task` result or an `owed` record that names the id: a later spawn of a reused
+	 * id) or hands over a run of it that was not aborted at or after the discard. A handover from
+	 * before the discard does not: the `eval` result of the cell that stopped a pool is written after
+	 * the stop and names the workers the cell got results of earlier. Never the parent's work, but
+	 * only for a subagent whose transcript began by the discard: a later process can allocate the id
+	 * of a launch discarded before it wrote a transcript again, and that spawn may have written no
 	 * record yet.
 	 */
 	discardedAt: Map<string, number>;
@@ -397,7 +399,9 @@ interface SpawnedSubagents {
 	 * Those whose result the current conversation holds ({@link heldResults}) or whose eval job
 	 * has a `delivered` record, each with when its latest handover happened, in epoch ms
 	 * ({@link settle}). `delivered` is written before the result reaches the cell, so a process
-	 * that went away between the two leaves it.
+	 * that went away between the two leaves it; it says when the handover happened when that was
+	 * earlier than the record (a work pool's drain, whose result a bridged `tool.wait` or kill
+	 * takes later).
 	 */
 	settled: Map<string, number>;
 	/**
@@ -405,10 +409,10 @@ interface SpawnedSubagents {
 	 * ({@link replayLeftEntryIds}), as `settled` reads them, but a run handed over only as aborted
 	 * (or lost with its worker) settles nothing here: the parent took no turn on that branch's
 	 * result. Read only for a subagent placed by the call its spawn record names
-	 * ({@link spawnedInCurrentConversation}): a restored turn that runs its cut-off calls again
-	 * leaves their first results, and the handovers they held, on a branch of their own, and a parent
-	 * that got the subagent's failure there acts on it. A branch a person left by their own
-	 * navigation is not read: the conversation they went on with never got those results.
+	 * ({@link spawnedInCurrentConversation}): a restored turn, or `/retry`, that runs its cut-off
+	 * calls again leaves their first results, and the handovers they held, on a branch of their
+	 * own, and a parent that got the subagent's failure there acts on it. A branch a person left by
+	 * their own navigation is not read: the conversation they went on with never got those results.
 	 */
 	settledElsewhere: Map<string, number>;
 	/** Eval jobs (an `agent()` job, a bridged `tool.task` background spawn) whose latest record in the current conversation is `owed`: a result still owed to the parent. */
@@ -800,65 +804,97 @@ function replyStreamStartedAt(
 }
 
 /**
- * The entries off the selected `branch` that a tool replay left there. A replay (a restored turn's,
- * or `/retry`'s, of a batch whose calls were all cut off) moves the leaf back to the batch's
- * assistant message and runs its calls again, so their first results lie on a branch of their own
- * below that message. Such a branch forks from the selected branch at an assistant message with
- * tool calls, holds a result of one of them, and the selected branch after that message holds one
- * too (the replay's). A branch a person's own navigation left (a branch from a user message, a
- * `/tree` move, a fork) forks elsewhere, or the selected branch holds no result of that message's
- * calls there, and none of its entries is returned.
+ * The entries off the selected `branch` that a tool replay left there. A replay (a restored
+ * turn's, or `/retry`'s, of a batch whose every call was cut off) moves the leaf back to the
+ * batch's reply and runs its calls again, so the batch's first run lies on a branch of its own
+ * that forks at that reply. Each branch off the selected one is judged by its own contents, not by
+ * what the selected branch wrote after the fork (a replay cut off before its first result wrote
+ * only start records there): it is a replay's when it forks at a reply with tool calls, holds a
+ * result of one of them, and holds nothing else a replay does not leave ({@link leftByReplay}). A
+ * branch a person's own navigation left holds a turn the conversation took there (their prompt, a
+ * reply that answered it, a call that ran to its end), or forks elsewhere (a `/tree` re-answer of
+ * an `ask` forks at the call's start record), and none of its entries is returned.
  */
 function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): Set<string> {
-	const branchIndex = new Map(branch.map((entry, index) => [entry.id, index]));
+	const onBranch = new Set(branch.map(entry => entry.id));
 	const byId = new Map(entries.map(entry => [entry.id, entry]));
-	const callsOf = (entry: SessionEntry | undefined): Set<string> | undefined => {
-		if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
-		const ids = new Set<string>();
-		for (const part of entry.message.content) if (part.type === "toolCall") ids.add(part.id);
-		return ids.size > 0 ? ids : undefined;
-	};
-	const answers = (entry: SessionEntry, calls: ReadonlySet<string>): boolean =>
-		entry.type === "message" && entry.message.role === "toolResult" && calls.has(entry.message.toolCallId);
-	// Each off-branch entry's fork point: its nearest ancestor on the selected branch (null: none).
-	const forkOf = new Map<string, string | null>();
-	const forkPoint = (entry: SessionEntry): string | null => {
-		const path: string[] = [];
-		let fork: string | null = null;
-		for (let current: SessionEntry | undefined = entry; current;) {
-			if (branchIndex.has(current.id)) {
-				fork = current.id;
-				break;
-			}
-			const known = forkOf.get(current.id);
+	// Each off-branch entry's branch: the off-branch entry whose parent is on the selected branch (null: none, as
+	// for an entry whose parents run in a cycle, which a corrupt file can hold).
+	const rootOf = new Map<string, string | null>();
+	const branchRoot = (entry: SessionEntry): string | null => {
+		const path = new Set<string>();
+		let root: string | null = null;
+		for (let current: SessionEntry | undefined = entry; current && !path.has(current.id);) {
+			const known = rootOf.get(current.id);
 			if (known !== undefined) {
-				fork = known;
+				root = known;
 				break;
 			}
-			path.push(current.id);
-			current = current.parentId ? byId.get(current.parentId) : undefined;
+			path.add(current.id);
+			if (current.parentId !== null && onBranch.has(current.parentId)) {
+				root = current.id;
+				break;
+			}
+			current = current.parentId === null ? undefined : byId.get(current.parentId);
 		}
-		for (const id of path) forkOf.set(id, fork);
-		return fork;
+		for (const id of path) rootOf.set(id, root);
+		return root;
 	};
-	const offBranchAt = new Map<string, SessionEntry[]>();
+	const branches = new Map<string, SessionEntry[]>();
 	for (const entry of entries) {
-		if (branchIndex.has(entry.id)) continue;
-		const fork = forkPoint(entry);
-		if (fork === null) continue;
-		const group = offBranchAt.get(fork);
+		if (onBranch.has(entry.id)) continue;
+		const root = branchRoot(entry);
+		if (root === null) continue;
+		const group = branches.get(root);
 		if (group) group.push(entry);
-		else offBranchAt.set(fork, [entry]);
+		else branches.set(root, [entry]);
 	}
 	const left = new Set<string>();
-	for (const [fork, offBranch] of offBranchAt) {
-		const index = branchIndex.get(fork)!;
-		const calls = callsOf(branch[index]);
-		if (!calls || !offBranch.some(entry => answers(entry, calls))) continue;
-		if (!branch.slice(index + 1).some(entry => answers(entry, calls))) continue;
+	for (const [root, offBranch] of branches) {
+		const fork = byId.get(byId.get(root)?.parentId ?? "");
+		const calls = toolCallIdsOf(fork);
+		if (!calls) continue;
+		if (!offBranch.some(entry => isResultOf(entry, calls))) continue;
+		if (!offBranch.every(entry => leftByReplay(entry, calls))) continue;
 		for (const entry of offBranch) left.add(entry.id);
 	}
 	return left;
+}
+
+/** The ids of the tool calls `entry` makes, when it is a reply that makes any. */
+function toolCallIdsOf(entry: SessionEntry | undefined): Set<string> | undefined {
+	if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+	const ids = new Set<string>();
+	for (const part of entry.message.content) if (part.type === "toolCall") ids.add(part.id);
+	return ids.size > 0 ? ids : undefined;
+}
+
+/** Whether `entry` is a result of one of `calls`. */
+function isResultOf(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
+	return entry.type === "message" && entry.message.role === "toolResult" && calls.has(entry.message.toolCallId);
+}
+
+/**
+ * Whether `entry` is one a tool replay leaves on the branch of the batch's first run, for the
+ * reply that makes `calls`: a result of one of those calls, an error (the replay runs a batch
+ * only when every call was cut off); a reply the cut-off ended the turn with, which makes no call
+ * (an abort, or the error a failed attempt left); or a record that is no turn of the
+ * conversation (execution starts, job, exit and discard records, a retry's model and thinking
+ * changes, usage, labels). A turn input (a prompt, a delivery, an IRC message), a `/clear`, a
+ * compaction or a branch summary, a reply that makes calls or that completed, and a result that is
+ * no error or of another call are turns the conversation took on that branch.
+ */
+function leftByReplay(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
+	if (entry.type === "message") {
+		const { message } = entry;
+		if (message.role === "toolResult") return message.isError === true && calls.has(message.toolCallId);
+		if (message.role === "assistant") {
+			const cutOff = message.stopReason === "aborted" || message.stopReason === "error";
+			return cutOff && !message.content.some(part => part.type === "toolCall");
+		}
+	}
+	if (isTurnInput(entry)) return false;
+	return entry.type !== "reset_boundary" && entry.type !== "compaction" && entry.type !== "branch_summary";
 }
 
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
@@ -866,16 +902,30 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 	for (const entry of entries) for (const id of recordedAgentIds(entry)) named.add(id);
 	const branch = activeBranch(entries, leafId);
 	const discardedAt = new Map<string, number>();
-	// Read from the leaf back: an id's latest record, of any kind, decides whether its spawn was discarded.
-	const decided = new Set<string>();
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index]!;
+	// From the root on: a discard of an id's spawn stands until a later record takes the run up again (a `task`
+	// result or an `owed` record that names it) or hands over a run of it that was not aborted, at or after the
+	// discard (by when the handover happened, not when its entry was written). A handover from before the
+	// discard leaves it standing: the `eval` result of the cell that stopped a work pool is written after the
+	// stop's discards and names the workers the cell got results of earlier.
+	for (const entry of branch) {
+		const writtenAt = Date.parse(entry.timestamp);
 		const launch = readDiscardedLaunch(entry);
-		if (launch !== undefined && !decided.has(launch)) {
-			decided.add(launch);
-			discardedAt.set(launch, Date.parse(entry.timestamp));
+		if (launch !== undefined) {
+			discardedAt.set(launch, writtenAt);
+			continue;
 		}
-		for (const id of recordedAgentIds(entry)) decided.add(id);
+		if (discardedAt.size === 0) continue;
+		for (const id of taskResultAgentIds(entry)) discardedAt.delete(id);
+		const job = readEvalAgentJobRecord(entry);
+		if (job?.state === "owed") discardedAt.delete(job.agentId);
+		const handed = heldResults(entry, false);
+		if (job?.state === "delivered") {
+			handed.push(job.handedAt === undefined ? { id: job.agentId } : { id: job.agentId, handedAt: job.handedAt });
+		}
+		for (const held of handed) {
+			const discarded = discardedAt.get(held.id);
+			if (discarded !== undefined && !((held.handedAt ?? writtenAt) < discarded)) discardedAt.delete(held.id);
+		}
 	}
 	const current = new Set<string>();
 	const inConversation = new Set<string>();
@@ -903,7 +953,7 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 			seenJobs.add(job.agentId);
 			if (job.state === "owed") owedJobs.add(job.agentId);
 		}
-		if (job?.state === "delivered") settle(settled, job.agentId, writtenAt);
+		if (job?.state === "delivered") settle(settled, job.agentId, job.handedAt ?? writtenAt);
 		for (const held of heldResults(entry, wentOn)) settle(settled, held.id, held.handedAt ?? writtenAt);
 		if (parentWentOn(entry)) wentOn = true;
 	}
@@ -918,7 +968,7 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		if (job?.state === "owed" && job.spawnCallIds) owedCalls.set(job.agentId, job.spawnCallIds);
 		if (!replayLeft.has(entry.id)) continue;
 		const writtenAt = Date.parse(entry.timestamp);
-		if (job?.state === "delivered") settle(settledElsewhere, job.agentId, writtenAt);
+		if (job?.state === "delivered") settle(settledElsewhere, job.agentId, job.handedAt ?? writtenAt);
 		for (const held of heldResults(entry, false)) settle(settledElsewhere, held.id, held.handedAt ?? writtenAt);
 	}
 	const conversation = branch.slice(conversationStart);

@@ -555,11 +555,16 @@ The `task` result that only started a background job settles nothing, nor does
 a result written before the subagent's last turn began (its task prompt, or the
 message that woke it again): that result answered an earlier turn, and the
 parent waits on this one. A parent that holds the failed result acts on it
-itself. A restored turn that runs its cut-off batch again leaves the batch's
-first results on a branch of their own, below the batch's reply; for a subagent
-whose spawn names one of that reply's calls, a handover on such a branch counts
-too. A branch the parent's user left by their own navigation does not count:
-the conversation they went on with never got those results.
+itself. A restored turn, or `/retry`, that runs a batch again whose every call
+was cut off leaves the batch's first run on a branch of its own, below the
+batch's reply; for a subagent spawned in the current conversation (its spawn
+record names a call there), a handover on such a branch counts too, also when
+the replay itself was cut off before its first result. Such a branch is known
+by what it holds: error results of that reply's calls, a reply the cut-off
+ended without calls, and records that are no turn. A branch the parent's user
+left by their own navigation holds a turn (their prompt, a reply, a call that
+ran to its end) and does not count: the conversation they went on with never
+got those results.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:
