@@ -214,6 +214,11 @@ pub struct VprocZsh {
 	/// here ([`super::exec::zsh_in_trap`]).
 	#[serde(default)]
 	pub in_trap:            bool,
+	/// zsh `errflag` left set by a `.` file an error ended
+	/// ([`super::exec`]'s `zsh_discard`) until the next command: the `.`
+	/// command runs no ZERR trap (zsh `dotrapargs`).
+	#[serde(default)]
+	pub errflag:            bool,
 	/// The code (and line) of a glob's shell-code qualifier to run above
 	/// the op that returned [`Flow::Call`](super::exec::Flow::Call) for it
 	/// (zsh `qualsheval`); pushed by the run loop, which drops it when the
@@ -249,6 +254,7 @@ impl VprocZsh {
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
 			&& !self.in_trap
+			&& !self.errflag
 			&& self.glob_hook.is_none()
 	}
 }

@@ -14,6 +14,7 @@
 - zsh: no ZERR trap runs while another trap's action runs (a signal, DEBUG or EXIT trap and the functions it calls), and neither a ZERR nor a DEBUG trap runs in a subshell, command substitution or job started inside a trap action, as zsh keeps `intrap` across a fork
 - bash: `break` and `continue` in a `.` file (a file or a process substitution) and in its RETURN trap leave the loop around the `.` command, as bash's `source` keeps the loop level, instead of printing `only meaningful in a loop`
 - zsh: an error that ends a DEBUG trap's action (a `break` with no loop, an unset parameter, a math error) puts `ERR_EXIT` back, as the trap's normal end does, so `setopt errexit` still ends the shell on the next failed command
+- zsh: a `.` file that an error ends (a `break` with no loop, a math syntax error) returns 126, as zsh's `.` does, instead of 1
 
 ## [18.18.6] - 2026-11-09
 

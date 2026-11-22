@@ -926,8 +926,85 @@ const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
 	),
 ];
 
-/// [`SOURCE_SHAPES`] only zsh has.
-const ZSH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[];
+/// [`SOURCE_SHAPES`] only zsh has: its `.` does not count the caller's
+/// loops, so a `break` there is an error, which ends the file; an error
+/// that ends a `.` file makes it return 126 (`bin_dot`'s `128 -
+/// SOURCE_ERROR`), at any depth below it; a math error inside `(( ))` is
+/// no such error, nor are a failure or a `return` (the controls).
+const ZSH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
+	(
+		"file-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-continue",
+		"echo s; continue; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-source-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; source ./s.sh; echo b$i:$?; done",
+	),
+	("file-break-top", "echo s; break; echo x", ". ./s.sh; echo top:$?"),
+	(
+		"file-break-in-function",
+		"echo s; break; echo x",
+		"f() { . ./s.sh; echo f:$?; }; for i in 1 2; do echo a$i; f; echo b$i:$?; done",
+	),
+	(
+		"file-nested-break",
+		"printf \"%s\\n\" break > t.sh; . ./t.sh; echo in:$?",
+		". ./s.sh; echo top:$?",
+	),
+	("file-math-syntax-error", "echo s; echo $(( 1 + )); echo x", ". ./s.sh; echo top:$?"),
+	("file-unset-error", "echo s; : ${x?unset}; echo x", "( . ./s.sh ); echo top:$?"),
+	("file-break-errexit", "echo s; break; echo x", "setopt errexit; . ./s.sh; echo top:$?"),
+	("file-math-division-error", "echo s; (( 1/0 )); echo x", ". ./s.sh; echo top:$?"),
+	("file-false", "echo s; false", ". ./s.sh; echo top:$?"),
+	("file-return", "echo s; return 3; echo x", ". ./s.sh; echo top:$?"),
+	// Under `ERR_EXIT` zsh exits inside the file with the error's status,
+	// unless the `.` runs in a condition; `ERR_RETURN` judges the `.`'s
+	// 126; the error's `errflag` keeps the ZERR trap from running for the
+	// `.` command, not for the next one.
+	(
+		"file-break-errexit-condition",
+		"echo s; break; echo x",
+		"setopt errexit; if . ./s.sh; then echo t; else echo f:$?; fi; echo top:$?",
+	),
+	(
+		"file-break-errexit-or",
+		"echo s; break; echo x",
+		"setopt errexit; . ./s.sh || echo or:$?; echo top:$?",
+	),
+	(
+		"file-break-errexit-function",
+		"echo s; break; echo x",
+		"setopt errexit; f() { . ./s.sh; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"file-break-errreturn-function",
+		"echo s; break; echo x",
+		"setopt err_return; f() { . ./s.sh; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"file-break-errreturn-top",
+		"echo s; break; echo x",
+		"setopt err_return; . ./s.sh; echo top:$?",
+	),
+	("file-break-zerr", "echo s; break; echo x", "trap 'echo Z$?' ZERR; . ./s.sh; echo top:$?"),
+	(
+		"file-break-zerr-errexit",
+		"echo s; break; echo x",
+		"setopt errexit; trap 'echo Z$?' ZERR; . ./s.sh; echo top:$?",
+	),
+	(
+		"file-break-zerr-then-false",
+		"echo s; break; echo x",
+		"trap 'echo Z$?' ZERR; . ./s.sh; false; echo top:$?",
+	),
+];
 
 /// The `.` file rows, `source/<name>`.
 fn sources(dialect: Dialect) -> Vec<Row> {

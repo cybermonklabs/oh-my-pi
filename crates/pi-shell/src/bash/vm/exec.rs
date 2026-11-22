@@ -234,6 +234,14 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		}
 		if fresh && starts {
 			vp.frames[fi].err_reported = false;
+			// zsh's `errflag` from a `.` file an error ended ([`zsh_discard`])
+			// lasts until the next command.
+			if let Some(z) = vp.zsh.as_deref_mut()
+				&& z.errflag
+			{
+				z.errflag = false;
+				vp.trim_zsh();
+			}
 		}
 		// A cancel trap is a trap frame: none on the stack, no scan.
 		let cancellation = if vp.trap_frames == 0 {
@@ -5125,8 +5133,14 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		}) {
 		return false;
 	}
-	// zsh `dotrap`: no ZERR trap runs while any trap does (`intrap`).
-	if key == TrapKey::Err && vp.mode.dialect() == Dialect::Zsh && zsh_in_trap(vp) {
+	// zsh `dotrap`: no ZERR trap runs while any trap does (`intrap`), nor
+	// while `errflag` is set ([`VprocZsh::errflag`]).
+	//
+	// [`VprocZsh::errflag`]: super::proc::VprocZsh::errflag
+	if key == TrapKey::Err
+		&& vp.mode.dialect() == Dialect::Zsh
+		&& (zsh_in_trap(vp) || vp.zsh.as_deref().is_some_and(|z| z.errflag))
+	{
 		return false;
 	}
 	let (action, trap_mode) = match state::record(cx.store, vp, Key::Trap(key)) {
@@ -5881,6 +5895,10 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
 			..
 		});
+		let source = matches!(vp.frames[i].kind, FrameKind::Script { what: ScriptKind::Source, .. });
+		// zsh's `ERR_EXIT` ends the shell inside the file, with the error's
+		// status, unless the `.` command runs in a condition.
+		let exits_inside = source && !vp.frames[i].ignore_errexit && errexit_on(k, cx, vp);
 		unwind(&mut k.root, cx.store, vp, i);
 		// A DEBUG trap the error ended ends as at its end ([`next_command`]):
 		// `ERR_EXIT`, off while it ran, comes back.
@@ -5896,7 +5914,17 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 				Some(Record::Misc(BString::from("1"))),
 			);
 		}
-		vp.status = status;
+		if source {
+			// zsh `bin_dot`: a `.` file an error ended returns `128 -
+			// SOURCE_ERROR`, 126 (under `ERR_EXIT` zsh exits inside the file
+			// first, with the error's status). `errflag`, still set as the
+			// `.` command ends, keeps the ZERR trap from running for it
+			// (`dotrapargs`); `ERR_EXIT` and `ERR_RETURN` still judge it.
+			vp.status = if exits_inside { status } else { 126 };
+			vp.zsh.get_or_insert_with(Box::default).errflag = true;
+		} else {
+			vp.status = status;
+		}
 	} else if let Some(i) = run
 		&& (state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Continueonerror).unwrap_or(false)
 			|| super::zle::reader::input_frame(cx, vp, i))
