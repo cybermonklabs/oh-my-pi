@@ -869,9 +869,11 @@ export function buildOpenAiNativeHistory(
 // ============================================================================
 /**
  * POSTs the history to OpenAI's `/responses/compact` (V1 remote compaction). It passes pi-ai's model-call
- * checkpoint: a model a guard holds sends nothing (the call rejects with `ModelCallRefusedError`), the guards
- * are read again right before the POST, after the Bedrock credential and attestation waits, and an error
- * the request meets (a `cyber_policy` refusal included) reaches them before the caller sees it.
+ * checkpoint: a model a guard holds sends nothing (the call rejects with `ModelCallRefusedError`), and an
+ * error the request meets (a `cyber_policy` refusal included) reaches the guards before the caller sees it.
+ * The guards are read again right before the POST, after its waits: `prepareBedrockCompactionRequest`'s
+ * header wait and a Codex model's attestation. A Bedrock Mantle route resolves its credentials and signs
+ * inside the prepared fetch, after that read.
  */
 export function requestOpenAiRemoteCompaction(
 	model: Model,

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import { streamOllama } from "@oh-my-pi/pi-ai/providers/ollama";
 import type { Api, AssistantMessage, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
@@ -170,6 +171,78 @@ describe("Gemini CLI: each endpoint attempt reads the model-call guards", () => 
 		});
 
 		expect(endpoints).toHaveLength(expectedRequests);
+		if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
+		else expect(result.stopReason).toBe("stop");
+	});
+
+	// An endpoint that answers 200 with an empty stop is asked again, after a backoff, with the same body. That
+	// resend reads the guards right before it goes out: a hold that begins after the empty answer holds it.
+	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
+		const urls: string[] = [];
+		const result = await withHold(model, hold => {
+			const fetch: FetchImpl = async input => {
+				const url = input instanceof Request ? input.url : input.toString();
+				urls.push(url);
+				const parts = urls.length === 1 ? [] : [{ text: "ok" }];
+				if (urls.length === 1 && holdAfterFirst) hold();
+				const body = `data: ${JSON.stringify({
+					response: { candidates: [{ content: { parts }, finishReason: "STOP" }] },
+				})}\n\n`;
+				const response = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+				// The resend goes to the URL the first response came from.
+				Object.defineProperty(response, "url", { value: url });
+				return response;
+			};
+			return streamGoogleGeminiCli(model, context, {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				antigravityEndpointMode: "production",
+				fetch,
+			}).result();
+		});
+
+		expect(urls).toHaveLength(expectedRequests);
+		if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
+		else {
+			expect(result.stopReason).toBe("stop");
+			// The control's resend went to the same endpoint as the first request.
+			expect(urls[1]).toBe(urls[0]);
+		}
+	});
+});
+
+describe("Google (public API and Vertex): each send reads the model-call guards", () => {
+	const model: Model<"google-generative-ai"> = buildModel({
+		id: "gemini-3-flash",
+		name: "Gemini 3 Flash",
+		api: "google-generative-ai",
+		provider: "google",
+		baseUrl: "",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 32_000,
+	});
+
+	// A STOP with no content is asked again after a backoff: that resend reads the guards right before it goes
+	// out, so a hold that begins after the empty answer holds it.
+	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
+		let requests = 0;
+		const result = await withHold(model, hold => {
+			const fetch: FetchImpl = async () => {
+				requests++;
+				if (requests === 1 && holdAfterFirst) hold();
+				const text = requests === 1 ? "" : "Hello!";
+				const body = `data: ${JSON.stringify({
+					candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }],
+					usageMetadata: { promptTokenCount: 10, candidatesTokenCount: text ? 5 : 0, totalTokenCount: 15 },
+				})}\n\n`;
+				return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+			};
+			return streamGoogle(model, context, { apiKey: "k", fetch }).result();
+		});
+
+		expect(requests).toBe(expectedRequests);
 		if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
 		else expect(result.stopReason).toBe("stop");
 	});

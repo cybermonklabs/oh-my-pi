@@ -2,10 +2,12 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { AuthStorage, type FetchImpl, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard, ModelCallRefusedError, runInModelCallScope } from "@oh-my-pi/pi-ai/model-call-guard";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { serializeCloudflareCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { CyberPolicyClosure, installCyberPolicyGuard } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 import { GeminiProvider, searchGemini } from "@oh-my-pi/pi-coding-agent/web/search/providers/gemini";
 
 const SSE_RESPONSE =
@@ -423,5 +425,113 @@ describe("searchGemini tools serialization", () => {
 
 		expect(capturedRequest?.body?.userAgent).toBe("antigravity");
 		expect(capturedRequest?.body?.requestType).toBeUndefined();
+	});
+
+	// A Gemini search sends the query to the search model: it passes pi-ai's model-call checkpoint. A held model
+	// sends nothing, and a hold that begins after a 503 holds the retry. Synthetic responses only.
+	it.each([
+		["sends nothing while a hold stands", "start", 0],
+		["holds the retry when a hold begins after a 503", "after503", 1],
+		["retries after a 503 when no hold begins (control)", "none", 2],
+	] as const)("model-call checkpoint: %s", async (_label, holdFrom, expectedRequests) => {
+		let held = holdFrom === "start";
+		let requests = 0;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === developerModel.id ? "held: cyber_policy" : undefined),
+		});
+		const fetchMock: FetchImpl = () => {
+			requests++;
+			if (requests === 1 && holdFrom !== "start") {
+				if (holdFrom === "after503") held = true;
+				return Promise.resolve(new Response("unavailable", { status: 503, headers: { "retry-after-ms": "1" } }));
+			}
+			return Promise.resolve(
+				new Response(DEVELOPER_SSE_RESPONSE, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+			);
+		};
+		try {
+			const outcome = await searchGemini({
+				...makeParams("held search", developerModel, apiKeyRegistry),
+				fetch: fetchMock,
+			}).then(
+				response => response.answer,
+				(error: unknown) => error,
+			);
+
+			expect(requests).toBe(expectedRequests);
+			if (holdFrom === "none") expect(outcome).toBe("Developer answer");
+			else expect(outcome).toBeInstanceOf(ModelCallRefusedError);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// The search's outcome reaches the guards. The error is an ordinary rejection, not a `cyber_policy` refusal:
+	// this test calls the search outside every session, and a refusal made outside every session holds every
+	// session tree alive in the process, here every tree an earlier test file left open. The test below covers
+	// the refusal as a session's tool meets it; `cyber-policy-closure.test.ts` covers the outside case in a
+	// child process.
+	it("model-call checkpoint: reports the search request's outcome to the guards", async () => {
+		const outcomes: unknown[] = [];
+		const removeGuard = addModelCallGuard({
+			refuse: () => undefined,
+			settled: (model, outcome) => {
+				if (model.id === developerModel.id) outcomes.push(outcome);
+			},
+		});
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({
+						error: { message: "Invalid request.", type: "invalid_request_error", code: "invalid_value" },
+					}),
+					{ status: 400 },
+				),
+			);
+		try {
+			const error = await searchGemini({
+				...makeParams("refused search", developerModel, apiKeyRegistry),
+				fetch: fetchMock,
+			}).catch((cause: unknown) => cause);
+
+			expect(error).toBeInstanceOf(Error);
+			expect(outcomes).toEqual([error]);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A session's web search runs as its agent's tool, inside the agent's run and so in its tree's model-call
+	// scope. A `cyber_policy` refusal that search meets holds that tree, and no other tree in the process.
+	it("model-call checkpoint: a refused search inside one session tree's scope holds that tree only", async () => {
+		const mine = new CyberPolicyClosure();
+		const other = new CyberPolicyClosure();
+		const releaseMine = installCyberPolicyGuard(mine);
+		const releaseOther = installCyberPolicyGuard(other);
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({
+						error: {
+							message: "This content was flagged for possible cybersecurity risk.",
+							type: "invalid_request_error",
+							code: "cyber_policy",
+						},
+					}),
+					{ status: 400 },
+				),
+			);
+		try {
+			const error = await runInModelCallScope(mine, () =>
+				searchGemini({ ...makeParams("refused search", developerModel, apiKeyRegistry), fetch: fetchMock }),
+			).catch((cause: unknown) => cause);
+
+			expect(error).toBeInstanceOf(Error);
+			expect(mine.active).toBe(true);
+			expect(other.active).toBe(false);
+		} finally {
+			releaseMine();
+			releaseOther();
+		}
 	});
 });

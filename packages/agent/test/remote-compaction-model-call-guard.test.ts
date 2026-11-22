@@ -7,6 +7,7 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction/openai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { addModelCallGuard, ModelCallRefusedError } from "@oh-my-pi/pi-ai/model-call-guard";
+import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
@@ -27,6 +28,10 @@ const REFUSAL = {
 };
 const USER_ITEM = { type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] };
 const COMPACTION_ITEM = { type: "compaction", encrypted_content: "enc_123" };
+/** A ChatGPT-OAuth-shaped access token: its account id claim makes V1 wait for a Codex attestation. */
+const CODEX_ACCOUNT_TOKEN = `header.${Buffer.from(
+	JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" } }),
+).toString("base64url")}.signature`;
 
 function makeOpenAiModel(overrides: Partial<ModelSpec<"openai-responses">> = {}): Model<"openai-responses"> {
 	return buildModel({
@@ -144,6 +149,50 @@ describe("remote compaction passes the model-call checkpoint", () => {
 			expect(outcome).toBeInstanceOf(ModelCallRefusedError);
 		} finally {
 			remove();
+		}
+	});
+
+	// The second read sits after V1's waits. A Codex model waits for its attestation before the POST: a hold
+	// that begins during that wait holds the POST. The control is the same call with no hold.
+	test.each([
+		["V1 holds a POST whose hold begins during the Codex attestation wait", true, 0],
+		["V1 sends after the Codex attestation wait when no hold begins (control)", false, 1],
+	])("%s", async (_label, holdInAttestation, expectedRequests) => {
+		const model = makeOpenAiModel({ provider: "openai-codex" });
+		let held = false;
+		let attestations = 0;
+		let requests = 0;
+		const guard = guardFor(model, () => held);
+		setCodexAttestationProvider(async () => {
+			attestations++;
+			held = holdInAttestation;
+			return "attestation";
+		});
+		try {
+			const outcome = await requestOpenAiRemoteCompaction(
+				model,
+				CODEX_ACCOUNT_TOKEN,
+				[USER_ITEM],
+				"instructions",
+				undefined,
+				{
+					fetch: (async () => {
+						requests++;
+						return Response.json({ output: [COMPACTION_ITEM] });
+					}) as FetchImpl,
+				},
+			).then(
+				() => "sent",
+				(error: unknown) => error,
+			);
+
+			expect(attestations).toBe(1);
+			expect(requests).toBe(expectedRequests);
+			if (holdInAttestation) expect(outcome).toBeInstanceOf(ModelCallRefusedError);
+			else expect(outcome).toBe("sent");
+		} finally {
+			setCodexAttestationProvider(undefined);
+			guard.remove();
 		}
 	});
 
