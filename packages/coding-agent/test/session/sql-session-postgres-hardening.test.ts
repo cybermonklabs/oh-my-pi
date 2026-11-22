@@ -398,10 +398,10 @@ function urlAs(db: LeaseDb, role: string): string {
 }
 
 /**
- * The statements that make login `role` and give its privileges to the test's own login, so the clean-up may
- * end the role's connections and drop what it owns: a login with CREATEROLE and no superuser holds only ADMIN
- * OPTION on a role it makes (PostgreSQL 16 and later), and pg_terminate_backend and DROP OWNED BY need the
- * role's privileges.
+ * The statements that make login `role` and make the test's own login a member of it, so the test may act as
+ * the role with SET ROLE and the clean-up may end the role's connections and drop what it owns: a login with
+ * CREATEROLE and no superuser holds only ADMIN OPTION on a role it makes (PostgreSQL 16 and later), and SET
+ * ROLE, pg_terminate_backend and DROP OWNED BY need membership in the role.
  */
 function createLogin(role: string): string[] {
 	return [`CREATE ROLE ${role} LOGIN`, `GRANT ${role} TO CURRENT_USER`];
@@ -960,7 +960,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 			statements: (db, log) => [
 				plantedLogger(log),
 				`GRANT EXECUTE ON FUNCTION public.planted_logged_${process.pid}(text) TO PUBLIC`,
-				`CREATE ROLE ${planter}`,
+				...createLogin(planter),
 				`GRANT USAGE, CREATE ON SCHEMA public TO ${planter}`,
 				`GRANT REFERENCES ON ${db.table} TO ${planter}`,
 				`SET ROLE ${planter}; CREATE TABLE public.planted_fkref_${process.pid} (path text REFERENCES ${db.table} (path) ON DELETE CASCADE); CREATE FUNCTION public.planted_fkref_trg_${process.pid}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM public.planted_logged_${process.pid}('referencing table trigger'); RETURN OLD; END $$; CREATE TRIGGER planted BEFORE DELETE ON public.planted_fkref_${process.pid} FOR EACH ROW EXECUTE FUNCTION public.planted_fkref_trg_${process.pid}(); RESET ROLE`,
