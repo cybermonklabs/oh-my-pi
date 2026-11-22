@@ -117,6 +117,17 @@ count() {
 	awk 'END { print NR }' "$1"
 }
 
+# The one test of a libtest event, for jq: a test event (started, ok,
+# failed, ignored or timeout) with a name, a suite event (started, ok or
+# failed), or a bench result with a name, a median and a deviation. A line in
+# no such shape was written outside the record, whatever type it names.
+libtest_event='def libtest_event:
+	type == "object"
+	and ((.type == "test" and (.name | type) == "string"
+			and (.event == "started" or .event == "ok" or .event == "failed" or .event == "ignored" or .event == "timeout"))
+		or (.type == "suite" and (.event == "started" or .event == "ok" or .event == "failed"))
+		or (.type == "bench" and (.name | type) == "string" and (.median | type) == "number" and (.deviation | type) == "number"));'
+
 # list_entries <list file> <fields>: each entry of a list, as tab-separated
 # fields. An entry line is `<first> <second>  <why>` (fields 2) or
 # `<first>  <why>` (fields 1): the first field is the first word, and the
@@ -536,10 +547,10 @@ ncargo=0
 # its result, as libtest's record with that output as the result's stdout. A
 # line outside every test stays as it is.
 doc_attribute() {
-	jq -R -r -n '
+	jq -R -r -n "$libtest_event"'
 		reduce inputs as $l ({cur: null, buf: "", out: []};
 			(try ($l | fromjson) catch null) as $o
-			| if ($o | type) == "object" and ($o.type == "test" or $o.type == "suite") then
+			| if ($o | libtest_event) then
 				if $o.type == "test" and $o.event == "started" then .cur = $o.name | .buf = "" | .out += [$l]
 				elif $o.type == "test" and $o.name == .cur then
 					. as $s | .out += [($o | .stdout = ((.stdout // "") + $s.buf) | tojson)] | .cur = null | .buf = ""
@@ -692,38 +703,34 @@ raw_output="$tmp/raw-output.tsv"
 
 # outside_record <log>: the log's lines that are no libtest event: what was
 # written outside the record. A line is judged by parsing it, not by its first
-# character, and is an event only in the shape this script's readers use: a
-# test event (started, ok, failed, ignored or timeout) with a name, a suite
-# event (started, ok or failed), or a bench result with a name. A child's own
-# JSON line, `{ no free port: nothing to test }`, or an object that only says
-# `"type": "test"`, is output. (untangle above knows an event by libtest's
-# one text shape; in every trial log the two agree.)
+# character, against libtest_event (above), which doc_attribute uses too. A
+# child's own JSON line, `{ no free port: nothing to test }`, or an object
+# that only says `"type": "test"`, is output. (untangle above knows an event
+# by libtest's one text shape; in every trial log the two agree.)
 outside_record() {
-	jq -R -r '. as $l | (try fromjson catch null) as $o
-		| if ($o | type) == "object"
-			and (($o.type == "test" and ($o.name | type) == "string"
-					and ($o.event == "started" or $o.event == "ok" or $o.event == "failed" or $o.event == "ignored" or $o.event == "timeout"))
-				or ($o.type == "suite" and ($o.event == "started" or $o.event == "ok" or $o.event == "failed"))
-				or ($o.type == "bench" and ($o.name | type) == "string"))
-		then empty else $l end' "$1"
+	jq -R -r "$libtest_event"' . as $l | (try fromjson catch null) as $o
+		| if ($o | libtest_event) then empty else $l end' "$1"
 }
 
-# raw_lines <log> [<cargo stderr>]: what a test binary wrote outside
-# libtest's record: the log's lines that are no libtest event, and, from
-# cargo's stderr, the lines after its first `Running` line (before it,
-# cargo's own build output). Bazel's own lines in a test.log (its banner, and
-# its line for a test it timed out, which fails anyway), cargo's line after a
-# failed test, and blank lines are left out, each matched whole. A log jq
-# cannot read to its end is an error: a shorter read could look clean.
+# raw_lines <out> <log> [<cargo stderr>]: into <out>, what a test binary
+# wrote outside libtest's record: the log's lines that are no libtest event,
+# and, from cargo's stderr, the lines after its first `Running` line (before
+# it, cargo's own build output). Bazel's own lines in a test.log (its banner,
+# and its line for a test it timed out, which fails anyway), cargo's line
+# after a failed test, and blank lines are left out, each matched whole. A log
+# jq cannot read to its end is an error (in the job log): a shorter read
+# could look clean.
 # shellcheck disable=SC2016 # the patterns name a literal $0, ${PAGER...} and backquotes
 raw_lines() {
+	local out="$1"
+	shift
 	if ! outside_record "$1" >"$tmp/outside-record.txt"; then
 		error "Rust tests" "jq could not read $1 to its end, so what its test binary wrote outside libtest's record is unknown"
 	fi
 	{
 		cat -- "$tmp/outside-record.txt"
 		if [ -n "${2:-}" ] && [ -f "$2" ]; then awk 'p; /^ +Running /{ p = 1 }' "$2"; fi
-	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //[^ ]+$|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass `[^`]*`$' || true
+	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //[^ ]+$|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass `[^`]*`$' >"$out" || true
 }
 
 # scan_output <target> <log> [<cargo stderr>]: the skips and the passing
@@ -745,7 +752,7 @@ scan_output() {
 	jq -R -r --arg target "$label" --arg log "$1" '
 		fromjson? | select(type == "object" and .type == "test" and .event == "ok" and (.stdout // "") != "")
 		| "\($target)\t\(.name)\t\($log)"' "$1" >>"$outputs"
-	raw_lines "$@" >"$tmp/raw-here.txt"
+	raw_lines "$tmp/raw-here.txt" "$@"
 	while IFS= read -r line; do
 		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED)[\ :] ]]; then
 			printf '%s\t%s\n' "$label" "${BASH_REMATCH[1]}" >>"$skips"
