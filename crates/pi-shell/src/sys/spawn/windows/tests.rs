@@ -640,10 +640,10 @@ mod exit_order {
 				buf[..4].copy_from_slice(b"go\r\n");
 				return Poll::Ready(Ok(4));
 			}
-			let start = Instant::now();
+			// Each wake unparks this thread, which polls the pumps: the test's
+			// own thread. Only the runner bounds a waiter that never reports.
 			while self.wakes.count.load(SeqCst) < 2 {
-				assert!(start.elapsed() < LONG, "the waiter did not report the exit");
-				thread::park_timeout(Duration::from_millis(10));
+				thread::park();
 			}
 			Poll::Pending
 		}
