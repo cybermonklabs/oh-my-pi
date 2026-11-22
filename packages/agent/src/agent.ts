@@ -461,7 +461,8 @@ export class Agent {
 	/**
 	 * {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from, the tools
 	 * by their per-tool keys ({@link toolKeyForPrefix}): a tool that renders its definition from live settings changes
-	 * it under the same array.
+	 * it under the same array. `strictWire` is the model where the tools go out on Anthropic's messages API or an
+	 * OpenAI API, undefined under an owned dialect, which is resolved per request.
 	 */
 	#declaredToolsMemo:
 		| {
@@ -472,6 +473,7 @@ export class Agent {
 				pruneDescriptions: boolean;
 				declaration: RecordedToolDeclaration | undefined;
 				sentRevision: number;
+				strictWire: Model | undefined;
 				betasDisabled: boolean;
 				strictFallback: boolean;
 				fingerprint: string;
@@ -773,6 +775,7 @@ export class Agent {
 			memo.pruneDescriptions === pruneDescriptions &&
 			memo.declaration === declaration &&
 			memo.sentRevision === sentRevision &&
+			memo.strictWire === strictWire &&
 			memo.betasDisabled === betasDisabled &&
 			memo.strictFallback === strictFallback
 		) {
@@ -796,6 +799,7 @@ export class Agent {
 				pruneDescriptions,
 				declaration,
 				sentRevision,
+				strictWire,
 				betasDisabled,
 				strictFallback,
 				fingerprint,

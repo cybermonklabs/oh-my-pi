@@ -12,7 +12,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, personalityOverlay, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -21,11 +21,6 @@ import {
 	mockGatewayFetch,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-
-/** A `--config` overlay with one-hour cache entries and `personality`. */
-function overlayWith(personality: "default" | "pragmatic"): string {
-	return `providers:\n  cacheRetention: long\npersonality: ${personality}\n`;
-}
 
 /** Takes `bash` off the roster as plan mode does: a tool-set apply that is no forced rebuild. */
 function dropBash(session: AgentSession): Promise<void> {
@@ -95,12 +90,12 @@ describe("a roster change frozen while the base prompt withholds a change", () =
 		await Bun.write(dir.join("models.yml"), gatewayModelsYml());
 		const { requests } = await runProcess(
 			dir,
-			overlayWith("default"),
+			personalityOverlay("default"),
 			"Build with make.",
 			undefined,
 			async (session, settings, overlay) => {
 				await session.prompt("first");
-				await reloadOverlay({ session, settings, overlay }, overlayWith("pragmatic"));
+				await reloadOverlay({ session, settings, overlay }, personalityOverlay("pragmatic"));
 				await dropBash(session);
 				await session.refreshBaseSystemPrompt();
 				await session.prompt("second");
@@ -117,13 +112,19 @@ describe("a roster change frozen while the base prompt withholds a change", () =
 	it("keeps a resumed transcript's stored prompt through a rebuild that brings nothing of its own", async () => {
 		using dir = TempDir.createSync("@pi-settings-hold-frozen-roster-");
 		await Bun.write(dir.join("models.yml"), gatewayModelsYml());
-		const live = await runProcess(dir, overlayWith("default"), "Build with make.", undefined, async session => {
-			await session.prompt("first");
-		});
+		const live = await runProcess(
+			dir,
+			personalityOverlay("default"),
+			"Build with make.",
+			undefined,
+			async session => {
+				await session.prompt("first");
+			},
+		);
 		// The context file changed while no process ran: the resumed process keeps the stored prompt.
 		const resumed = await runProcess(
 			dir,
-			overlayWith("default"),
+			personalityOverlay("default"),
 			"Build with ninja.",
 			live.sessionFile,
 			async session => {

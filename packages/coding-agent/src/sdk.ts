@@ -250,6 +250,7 @@ import { SPOTLIGHT_INTENT_DESCRIPTION, SPOTLIGHT_INTENT_GUIDANCE, startSpotlight
 import {
 	collectMountedMCPToolRoutes,
 	projectMountedMCPXdevGuidance,
+	type SettingsChangeOptions,
 	type SettingsGatedToolDelta,
 	type SystemPromptRebuilder,
 } from "./session/session-tools";
@@ -5458,8 +5459,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// extension), which holds the reapply on a bound prompt.
 		const scheduleToolRegistration = (
 			registered: RegisteredTool,
-			signal?: AbortSignal,
-			settingsChange?: readonly SettingChange[],
+			{ signal, settingsChange }: { signal?: AbortSignal } & SettingsChangeOptions = {},
 		): Promise<void> => {
 			const scheduled = scheduledToolRegistrations.get(registered);
 			if (scheduled) return scheduled;
@@ -5554,7 +5554,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return activation;
 		};
 		if (!restrictToolNames) {
-			const unsubscribeToolRegistrations = extensionRunner.onToolRegistered(scheduleToolRegistration);
+			const unsubscribeToolRegistrations = extensionRunner.onToolRegistered((registered, signal) =>
+				scheduleToolRegistration(registered, { signal }),
+			);
 			disposeCallbacks.add(unsubscribeToolRegistrations);
 
 			// Close the construction race: a background registration can land after
@@ -5625,7 +5627,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					if (effective) {
 						// Re-run activation for the surviving registrant, bypassing the once-per-tool cache.
 						scheduledToolRegistrations.delete(effective);
-						await scheduleToolRegistration(effective, undefined, settingsChange);
+						await scheduleToolRegistration(effective, { settingsChange });
 						continue;
 					}
 					if (!suspendedToolNames.has(name)) continue;

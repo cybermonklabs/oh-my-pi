@@ -1041,6 +1041,36 @@ function settingChangeView(setting: AnySetting, previous: unknown, next: unknown
 	};
 }
 
+/** The tool lists of a settings notice ({@link SettingsNoticeDetails}). */
+type SettingsNoticeTools = Pick<
+	SettingsNoticeDetails,
+	"disabledTools" | "reenabledTools" | "enabledTools" | "noLongerEnabledTools"
+>;
+
+/**
+ * The hidden settings notice giving `changes` and `tools`, recording `given` as the values it gives, as notice
+ * `notice` of the change `hold`; `extra` tells the prompt when the rebuild comes at the latest, or that the change was
+ * released.
+ */
+function settingsNoticeMessage(
+	changes: SettingChangeView[],
+	given: HeldSettingRecord[],
+	tools: SettingsNoticeTools,
+	hold: string,
+	notice: number,
+	extra: { rebuildBy: string } | { released: true },
+): CustomMessage<SettingsNoticeDetails> {
+	return {
+		role: "custom",
+		customType: SETTINGS_NOTICE_MESSAGE_TYPE,
+		content: prompt.render(settingsNoticePrompt, { changes, ...tools, ...extra }),
+		details: { settings: changes.map(change => change.id), values: given, ...tools, hold, notice },
+		attribution: "agent",
+		display: false,
+		timestamp: Date.now(),
+	};
+}
+
 /**
  * Prompt-affecting state frozen at each base rebuild. Tools render their
  * provider-visible text from this snapshot instead of live settings, so
@@ -2435,13 +2465,8 @@ export class SessionTools {
 	 */
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		const held = forcePromptRefresh ? this.#heldSettingsRebuild : undefined;
-		if (!held) {
-			if (forcePromptRefresh && this.#keptRestoredPrompt() && (await this.#takeUnchangedHeldToolSet(toolNames))) {
-				return;
-			}
-			return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
-		}
-		if (await this.#takeUnchangedHeldToolSet(toolNames)) return;
+		if (forcePromptRefresh && this.withholdsPromptChange && (await this.#takeUnchangedHeldToolSet(toolNames))) return;
+		if (!held) return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
 		await this.#applyHeldToolSet(held, toolNames, signal);
 	}
 
@@ -2593,12 +2618,21 @@ export class SessionTools {
 		const base = this.#baseSystemPrompt;
 		const prepared = await this.#prepareBaseSystemPrompt();
 		if (prepared?.systemPrompt !== base || this.#baseSystemPrompt !== base) return false;
-		this.#setAgentTools(
-			declared.map((tool, index) =>
-				current[index] === tool ? tool : this.#wrapToolForAcpPermission(current[index]),
-			),
-		);
+		this.#setAgentTools(this.#withCurrentImplementations(declared, current));
 		return true;
+	}
+
+	/**
+	 * `declared`, the agent's tools by their declared owners, each replaced by the registry's entry for it where that
+	 * is another tool (`current`, index-aligned, looked up now unless given), wrapped for ACP permission.
+	 */
+	#withCurrentImplementations(
+		declared: readonly AgentTool[],
+		current: readonly AgentTool[] = declared.map(tool => this.#toolRegistry.get(tool.name) ?? tool),
+	): AgentTool[] {
+		return declared.map((tool, index) =>
+			current[index] === tool ? tool : this.#wrapToolForAcpPermission(current[index]),
+		);
 	}
 
 	async #applyToolSet(toolNames: string[], forcePromptRefresh: boolean, signal?: AbortSignal): Promise<void> {
@@ -4068,9 +4102,7 @@ export class SessionTools {
 				normalized,
 				new Set(normalizeToolNames(mountedToolNames)),
 				normalized.includes("write"),
-				forcePromptRefresh,
-				signal,
-				settingsChange,
+				{ forcePromptRefresh, signal, settingsChange },
 			);
 		}, signal);
 	}
@@ -4108,9 +4140,11 @@ export class SessionTools {
 		normalized: string[],
 		mounted: ReadonlySet<string>,
 		writeSelected: boolean,
-		forcePromptRefresh = false,
-		signal?: AbortSignal,
-		settingsChange?: readonly SettingChange[],
+		{
+			forcePromptRefresh = false,
+			signal,
+			settingsChange,
+		}: { forcePromptRefresh?: boolean; signal?: AbortSignal } & SettingsChangeOptions = {},
 	): Promise<void> {
 		const retainedMountedDevice = [...mounted].some(name => normalized.includes(name));
 		const retainedDeferrableTool = normalized.some(name => this.#toolRegistry.get(name)?.deferrable === true);
@@ -4146,21 +4180,27 @@ export class SessionTools {
 	 * ({@link #declaredAs}). False when nothing is held and the caller applies the set now.
 	 */
 	async #holdToolSetChange(toolNames: readonly string[], settingsChange: readonly SettingChange[]): Promise<boolean> {
-		const held = this.#heldSettingsRebuild;
-		const wasEnabled = new Set(this.getEnabledToolNames().filter(name => !held?.disabledTools.has(name)));
-		for (const name of held?.enabledTools ?? []) wasEnabled.add(name);
+		const wasEnabled = this.#enabledAfterHold(this.#heldSettingsRebuild);
 		const names = new Set(toolNames);
 		const removed = [...wasEnabled].filter(name => !names.has(name));
 		const added = toolNames.filter(name => !wasEnabled.has(name)).map(name => ({ name, activate: true }));
 		if (!(await this.#holdRosterChange(settingsChange, wasEnabled, removed, added))) return false;
 		this.#setAgentTools(
-			this.#host.agent.state.tools.map(tool => {
-				const own = this.#declaredOwners.get(tool) ?? tool;
-				const current = this.#toolRegistry.get(own.name);
-				return !current || current === own ? own : this.#wrapToolForAcpPermission(current);
-			}),
+			this.#withCurrentImplementations(
+				this.#host.agent.state.tools.map(tool => this.#declaredOwners.get(tool) ?? tool),
+			),
 		);
 		return true;
+	}
+
+	/**
+	 * The tools enabled once `held` rebuilds: the enabled tools but the ones it disables, then the ones it enables; the
+	 * enabled tools without a hold.
+	 */
+	#enabledAfterHold(held: HeldSettingsRebuild | undefined): Set<string> {
+		const enabled = new Set(this.getEnabledToolNames().filter(name => !held?.disabledTools.has(name)));
+		for (const name of held?.enabledTools ?? []) enabled.add(name);
+		return enabled;
 	}
 
 	/**
@@ -4749,10 +4789,8 @@ export class SessionTools {
 		this.#baseStandIn = undefined;
 		if (held.reconcile) {
 			// The forced apply ends the hold and activates the tools it enables.
-			await this.#applyHeldToolSet(
-				held,
-				this.getEnabledToolNames().filter(name => !held.disabledTools.has(name)),
-			);
+			const toolNames = [...this.#enabledAfterHold(held)];
+			await this.#runReleasingHold(held, () => this.#applyToolSet(toolNames, true));
 			return;
 		}
 		await this.#runReleasingHold(held, async () => {
@@ -4822,21 +4860,9 @@ export class SessionTools {
 		};
 		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
 		held.notices.push({ values, disabledTools, enabledTools });
-		return {
-			role: "custom",
-			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
-			content: prompt.render(settingsNoticePrompt, { changes, ...tools, rebuildBy: withheldChangeDeadline(held) }),
-			details: {
-				settings: changes.map(change => change.id),
-				values: given,
-				...tools,
-				hold: held.id,
-				notice: held.notices.length - 1,
-			},
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		};
+		return settingsNoticeMessage(changes, given, tools, held.id, held.notices.length - 1, {
+			rebuildBy: withheldChangeDeadline(held),
+		});
 	}
 
 	/** What `held`'s newest settings notice in `messages` told the model; undefined when none is there. */
@@ -4862,20 +4888,29 @@ export class SessionTools {
 	 * whose value no notice records, and a setting this process does not know are left out.
 	 */
 	#releasedSettingsNotice(messages: readonly AgentMessage[]): CustomMessage<SettingsNoticeDetails> | undefined {
+		// What they told, as #earlierNoticesTold reads it for the changes they name, read on this walk.
+		const values = new Map<string, unknown>();
+		const toldDisabled = new Set<string>();
+		const toldEnabled = new Set<string>();
 		const notices = new Map<string, number>();
 		let hold: string | undefined;
+		let notice = 0;
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
 			const details = message.details;
 			if (!isRecord(details) || typeof details.hold !== "string") continue;
 			hold = details.hold;
-			notices.set(hold, (notices.get(hold) ?? 0) + 1);
+			notice = (notices.get(hold) ?? 0) + 1;
+			notices.set(hold, notice);
+			if (!isHeldSettingRecords(details.values)) continue;
+			for (const { id, value } of details.values) values.set(id, value);
+			applyToolLists(toldDisabled, details.disabledTools, details.reenabledTools);
+			applyToolLists(toldEnabled, details.enabledTools, details.noLongerEnabledTools);
 		}
 		if (hold === undefined) return undefined;
-		const told = this.#earlierNoticesTold(new Set(notices.keys()), messages);
 		const changes: SettingChangeView[] = [];
 		const given: HeldSettingRecord[] = [];
-		for (const [id, value] of told.values) {
+		for (const [id, value] of values) {
 			const setting = lookupSetting(id);
 			if (!setting || setting.isCredential) continue;
 			const now = setting.get(this.#host.settings);
@@ -4887,28 +4922,12 @@ export class SessionTools {
 		const tools = {
 			disabledTools: [],
 			// A tool a later notice gave as available after the rebuild was told to come back with it.
-			reenabledTools: told.disabledTools.filter(name => enabled.has(name) && !told.enabledTools.includes(name)),
+			reenabledTools: [...toldDisabled].filter(name => enabled.has(name) && !toldEnabled.has(name)),
 			enabledTools: [],
-			noLongerEnabledTools: told.enabledTools.filter(name => !enabled.has(name)),
+			noLongerEnabledTools: [...toldEnabled].filter(name => !enabled.has(name)),
 		};
-		if (changes.length === 0 && tools.reenabledTools.length === 0 && tools.noLongerEnabledTools.length === 0) {
-			return undefined;
-		}
-		return {
-			role: "custom",
-			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
-			content: prompt.render(settingsNoticePrompt, { changes, ...tools, released: true }),
-			details: {
-				settings: changes.map(change => change.id),
-				values: given,
-				...tools,
-				hold,
-				notice: notices.get(hold) ?? 0,
-			},
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		};
+		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
+		return settingsNoticeMessage(changes, given, tools, hold, notice, { released: true });
 	}
 
 	/**

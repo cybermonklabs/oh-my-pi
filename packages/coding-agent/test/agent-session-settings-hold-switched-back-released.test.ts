@@ -12,7 +12,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -32,14 +32,6 @@ const LOCAL_MEMORY = `${LEARNING}memory:\n  backend: local\n`;
 const MEMORY_OFF = `${LEARNING}memory:\n  backend: off\n`;
 
 const MINUTE_MS = 60_000;
-
-/** The real clock, read before any test moves it. */
-const realNow = Date.now.bind(Date);
-
-/** Moves the clock `offsetMs` ahead of real time from now on. */
-function setClock(offsetMs: number): void {
-	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-}
 
 describe("a held memory switch whose notice went out, switched back, ended before a notice of it", () => {
 	const cleanups: (() => void)[] = [];

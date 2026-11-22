@@ -10,9 +10,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, sessionContextTokens } from "./helpers/agent-session-setup";
 import { continuesCachedPrompt, gatewayModelsYml, gatewaySessionOptions } from "./helpers/anthropic-gateway";
 import { processSettings, recordGateway, SUMMARY_COMPACTION_WAITS, transcript } from "./helpers/compaction-wait";
 
@@ -53,9 +52,7 @@ describe("a model-summary compaction the cut rule waits on, across /fork at the 
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: processSettings(CONTEXT_WINDOW / 2),
 		});
-		const contextTokens =
-			computeNonMessageTokens(sizing, sizing.agent.tokenizer, sizing.settings.revision) +
-			sizing.agent.tokenizer.countMessages(messages, { excludeEncryptedReasoning: true });
+		const contextTokens = sessionContextTokens(sizing, messages);
 		await sizing.dispose();
 
 		// The process before the restart: its prompt's reply writes the whole context to a one-hour entry, and the rule

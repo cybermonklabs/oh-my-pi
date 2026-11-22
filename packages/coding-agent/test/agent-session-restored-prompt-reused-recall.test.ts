@@ -14,7 +14,12 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	personalityOverlay,
+	RELOAD_CALLS,
+	reloadOverlay,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
@@ -56,11 +61,6 @@ function recallingBackend(reused: boolean): MemoryBackend {
 	};
 }
 
-/** A `--config` overlay with one-hour cache entries and `personality`. */
-function overlayWith(personality: "default" | "pragmatic"): string {
-	return `providers:\n  cacheRetention: long\npersonality: ${personality}\n`;
-}
-
 describe("a resumed session's first prompt that reuses the transcript's first-turn recall", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -74,7 +74,7 @@ describe("a resumed session's first prompt that reuses the transcript's first-tu
 		steps: (session: AgentSession, settings: Settings, overlay: string) => Promise<void>,
 	): Promise<{ requests: MessagesRequest[]; sessionFile: string }> {
 		const overlay = dir.join("overlay.yml");
-		await Bun.write(overlay, overlayWith("default"));
+		await Bun.write(overlay, personalityOverlay("default"));
 		const settings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.path(), configFiles: [overlay] });
 		const { requests, restore } = mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
 		const backendSpy = vi.spyOn(memoryBackendResolve, "resolveMemoryBackend").mockResolvedValue(backend);
@@ -141,7 +141,7 @@ describe("a resumed session's first prompt that reuses the transcript's first-tu
 			recallingBackend(true),
 			live.sessionFile,
 			async (session, settings, overlay) => {
-				await reloadOverlay({ session, settings, overlay }, overlayWith("pragmatic"), RELOAD_CALLS);
+				await reloadOverlay({ session, settings, overlay }, personalityOverlay("pragmatic"), RELOAD_CALLS);
 				await session.prompt("second");
 			},
 		);

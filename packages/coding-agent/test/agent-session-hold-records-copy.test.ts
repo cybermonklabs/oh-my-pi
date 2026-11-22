@@ -12,9 +12,14 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	OwnedElsewhereStorage,
+	RELOAD_CALLS,
+	reloadOverlay,
+	setClock,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -28,28 +33,6 @@ import {
 const LONG_ENTRIES = "providers:\n  cacheRetention: long\n";
 
 const MINUTE_MS = 60_000;
-
-/** The real clock, read before any test moves it. */
-const realNow = Date.now.bind(Date);
-
-/** Moves the clock `offsetMs` ahead of real time from now on. */
-function setClock(offsetMs: number): void {
-	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-}
-
-/** Session storage of a process that may not write the session another omp process owns. */
-class OwnedElsewhereStorage extends FileSessionStorage {
-	readonly #ownedId: string;
-
-	constructor(ownedId: string) {
-		super();
-		this.#ownedId = ownedId;
-	}
-
-	override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
-		return sessionId === this.#ownedId ? null : super.claimSession(sessionId, sessionPath);
-	}
-}
 
 interface ProcessInputs {
 	/** The overlay's text. */

@@ -1069,7 +1069,7 @@ export class SessionMaintenance {
 			newest.entry.tier === wait.entry.tier &&
 			newest.entry.ttlMs === wait.entry.ttlMs &&
 			!promptCacheEntryLapsed(newest.entry, wait.entry.touchedAt) &&
-			sessionManager.getBranchView().findLastIndex(entry => entry.id === newest.leafId) >= 0
+			this.#branchCarries(newest.leafId)
 		) {
 			return;
 		}
@@ -1125,8 +1125,7 @@ export class SessionMaintenance {
 		if (
 			!candidate ||
 			!entry ||
-			this.#host.sessionManager.getBranchView().findLastIndex(branchEntry => branchEntry.id === candidate.leafId) <
-				0 ||
+			!this.#branchCarries(candidate.leafId) ||
 			!this.#compactionWaitHolds(candidate, entry)
 		) {
 			this.#compactionWait = undefined;
@@ -1145,7 +1144,6 @@ export class SessionMaintenance {
 	 * does.
 	 */
 	followBranchCopy(): void {
-		const sessionManager = this.#host.sessionManager;
 		const records = this.#sessionCompactionWaits();
 		// The copy carries the wait this process held while it applies there, as a maintenance point takes it in.
 		if (records.copied && !records.taken && this.#compactionWait) {
@@ -1157,7 +1155,7 @@ export class SessionMaintenance {
 		const refused = refusals.remembered;
 		if (
 			refused &&
-			sessionManager.getBranchView().findLastIndex(entry => entry.id === refused.leafId) >= 0 &&
+			this.#branchCarries(refused.leafId) &&
 			!refusals.refusals.some(
 				recorded =>
 					recorded.leafId === refused.leafId &&
@@ -1165,9 +1163,22 @@ export class SessionMaintenance {
 					recorded.afterTokens === refused.afterTokens,
 			)
 		) {
-			sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, { version: 1, ...refused });
-			refusals.refusals.push(refused);
+			this.#recordSnapcompactRefusal(refusals, refused);
 		}
+	}
+
+	/** Whether the current branch carries the entry `id`. */
+	#branchCarries(id: string): boolean {
+		return this.#host.sessionManager.getBranchView().findLastIndex(entry => entry.id === id) >= 0;
+	}
+
+	/**
+	 * Writes `refused` to the session as a {@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE} record and adds it to `records`, the
+	 * session's refusals as this process read them.
+	 */
+	#recordSnapcompactRefusal(records: SnapcompactRefusals, refused: RefusedSnapcompact): void {
+		this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, { version: 1, ...refused });
+		records.refusals.push(refused);
 	}
 
 	/**
@@ -1298,9 +1309,7 @@ export class SessionMaintenance {
 		if (!offer || offer.withheld) return true;
 		const sessionManager = this.#host.sessionManager;
 		if (offer.sessionId !== sessionManager.getSessionId()) return true;
-		return (
-			offer.leafId !== null && sessionManager.getBranchView().findLastIndex(entry => entry.id === offer.leafId) < 0
-		);
+		return offer.leafId !== null && !this.#branchCarries(offer.leafId);
 	}
 
 	/**
@@ -5937,7 +5946,7 @@ export class SessionMaintenance {
 		const applies = (candidate: RefusedSnapcompact | undefined): candidate is RefusedSnapcompact =>
 			candidate !== undefined &&
 			candidate.contextKey === (contextKey ??= this.#snapcompactContextKey(branch, settings)) &&
-			branch.findLastIndex(entry => entry.id === candidate.leafId) >= 0;
+			this.#branchCarries(candidate.leafId);
 		const recorded = this.#sessionSnapcompactRefusals();
 		let refused = recorded.remembered;
 		if (!applies(refused)) {
@@ -7061,11 +7070,7 @@ export class SessionMaintenance {
 						const recorded = this.#sessionSnapcompactRefusals();
 						recorded.remembered = refused;
 						// Kept in the session, so a process that resumes it weighs these figures before it starts.
-						this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, {
-							version: 1,
-							...refused,
-						});
-						recorded.refusals.push(refused);
+						this.#recordSnapcompactRefusal(recorded, refused);
 					}
 					await this.#emitLifecycleEvent(
 						{

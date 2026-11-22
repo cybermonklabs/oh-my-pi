@@ -126,9 +126,9 @@ export function strictToolsFallbackHolds(
 	if (isAnthropicMessagesModel(model)) {
 		for (const [key, state] of providerSessionState) {
 			if (
-				parseAnthropicProviderSessionStateKey(key)?.modelId === model.id &&
 				"strictToolsDisabled" in state &&
-				state.strictToolsDisabled === true
+				state.strictToolsDisabled === true &&
+				parseAnthropicProviderSessionStateKey(key)?.modelId === model.id
 			) {
 				return true;
 			}

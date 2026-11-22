@@ -12,7 +12,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, personalityOverlay, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -20,11 +20,6 @@ import {
 	mockGatewayFetch,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-
-/** A `--config` overlay with one-hour cache entries and `personality` as given. */
-function overlay(personality: string): string {
-	return `providers:\n  cacheRetention: long\npersonality: ${personality}\n`;
-}
 
 describe("a thinking level change on a model that takes effort per message", () => {
 	const cleanups: Array<() => Promise<void>> = [];
@@ -40,7 +35,7 @@ describe("a thinking level change on a model that takes effort per message", () 
 		cleanups.push(() => dir.remove());
 		await Bun.write(dir.join("models.yml"), gatewayModelsYml());
 		const overlayPath = dir.join("overlay.yml");
-		await Bun.write(overlayPath, overlay("default"));
+		await Bun.write(overlayPath, personalityOverlay("default"));
 		const settings = await Settings.loadIsolated({
 			cwd: dir.path(),
 			agentDir: dir.path(),
@@ -73,7 +68,7 @@ describe("a thinking level change on a model that takes effort per message", () 
 
 		await session.prompt("first");
 		// A personality change on the bound prompt is held while the cache entry stays readable.
-		await reloadOverlay({ session, settings, overlay: overlayPath }, overlay("pragmatic"));
+		await reloadOverlay({ session, settings, overlay: overlayPath }, personalityOverlay("pragmatic"));
 		session.setThinkingLevel(ThinkingLevel.Low);
 		const status = session.getPromptCacheStatus();
 		await session.prompt("second");

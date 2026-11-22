@@ -14,7 +14,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, setClock } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -60,14 +60,6 @@ const GUARD_EXTENSION = `export default function (pi) {
 `;
 
 const MINUTE_MS = 60_000;
-
-/** The real clock, read before any test moves it. */
-const realNow = Date.now.bind(Date);
-
-/** Moves the clock `offsetMs` ahead of real time from now on. */
-function setClock(offsetMs: number): void {
-	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-}
 
 describe("an extension-sources edit that brings back the built-in an extension replaced", () => {
 	const cleanups: (() => void)[] = [];

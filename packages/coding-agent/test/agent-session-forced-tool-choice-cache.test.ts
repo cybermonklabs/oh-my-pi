@@ -14,25 +14,15 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { PromptCacheStatus } from "@oh-my-pi/pi-tui/status-line/host";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
-import { answer, GATEWAY, gatewaySessionOptions, mockGatewayFetch, toolCallAnswer } from "./helpers/anthropic-gateway";
+import {
+	answer,
+	gatewayModelsYml,
+	gatewaySessionOptions,
+	mockGatewayFetch,
+	toolCallAnswer,
+} from "./helpers/anthropic-gateway";
 
 const MINUTE_MS = 60_000;
-
-/** The gateway's `models.yml` with `id` on its card. */
-function modelsYml(id: string, name: string): string {
-	return `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: ${id}, name: ${name}, reasoning: true, input: [text, image], contextWindow: 1000000, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
-}
 
 describe("a turn the agent loop forces to resolve a staged preview", () => {
 	afterEach(() => {
@@ -56,7 +46,11 @@ describe("a turn the agent loop forces to resolve a staged preview", () => {
 		"$row",
 		async ({ id, name, forced }) => {
 			using tempDir = TempDir.createSync("@pi-forced-tool-choice-cache-");
-			await Bun.write(tempDir.join("models.yml"), modelsYml(id, name));
+			// The gateway's `models.yml` with `id` on its card.
+			await Bun.write(
+				tempDir.join("models.yml"),
+				gatewayModelsYml().replace("id: claude-opus-5-5, name: Claude Opus 5.5", `id: ${id}, name: ${name}`),
+			);
 			let now = Date.now();
 			vi.spyOn(Date, "now").mockImplementation(() => now);
 			// When each request went out; the clock moves a minute after each.

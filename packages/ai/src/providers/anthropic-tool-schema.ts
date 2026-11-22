@@ -96,18 +96,14 @@ export type AnthropicHashedTool = StrictnessHashedTool & { eagerInputStreaming?:
 export function anthropicStrictnessHashedTools(
 	model: Model<"anthropic-messages">,
 	tools: readonly Tool[],
-	settings: { disableStrictTools?: boolean; noStrict?: boolean } = {},
+	settings: { disableStrictTools?: boolean } = {},
 ): readonly AnthropicHashedTool[] {
-	const noStrict = settings.noStrict ?? NO_STRICT;
 	const disableStrictTools = settings.disableStrictTools === true;
 	const sentModel = withoutDisabledExperimentalBetas(model);
-	if (!noStrict && !disableStrictTools && sentModel === model) return tools;
+	if (!NO_STRICT && !disableStrictTools && sentModel === model) return tools;
 	const baseUrl = resolveAnthropicBaseUrl(model);
-	const sent = anthropicWireToolFields(
-		{ ...anthropicToolsRequest(sentModel, baseUrl, disableStrictTools), noStrict },
-		tools,
-	);
-	const byDefault = anthropicWireToolFields({ ...anthropicToolsRequest(model, baseUrl), noStrict: false }, tools);
+	const sent = anthropicWireToolFlags(anthropicToolsRequest(sentModel, baseUrl, disableStrictTools), tools);
+	const byDefault = anthropicWireToolFlags({ ...anthropicToolsRequest(model, baseUrl), noStrict: false }, tools);
 	return tools.map((tool, index) => {
 		const { strict, eagerInputStreaming } = sent[index];
 		const strictChanged = strict !== byDefault[index].strict;
@@ -731,7 +727,48 @@ export function anthropicWireToolFields(
 		strict: false,
 		eagerInputStreaming: eager ? !ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name) : undefined,
 	}));
-	if ((request.noStrict ?? NO_STRICT) || request.disableStrictTools) return fields;
+	const strictSchemas = anthropicStrictSchemas(
+		request,
+		tools,
+		index => fields[index].inputSchema as Record<string, unknown>,
+	);
+	for (const [index, schema] of strictSchemas) {
+		fields[index] = { ...fields[index], inputSchema: schema as AnthropicToolInputSchema, strict: true };
+	}
+	return fields;
+}
+
+/**
+ * The `strict` and `eager_input_streaming` flags {@link anthropicWireToolFields} gives each of `tools`, index-aligned,
+ * with no schema built for a tool that cannot go out strict, and none at all where no tool can.
+ */
+function anthropicWireToolFlags(
+	request: AnthropicToolsRequest,
+	tools: readonly Tool[],
+): Pick<AnthropicWireToolFields, "strict" | "eagerInputStreaming">[] {
+	const eager = request.eagerInputStreaming === true;
+	const strictSchemas = anthropicStrictSchemas(request, tools, index =>
+		buildAnthropicBaseToolInputSchema(tools[index]),
+	);
+	return tools.map((tool, index) => ({
+		strict: strictSchemas.has(index),
+		eagerInputStreaming: eager ? !ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name) : undefined,
+	}));
+}
+
+/**
+ * The strict `input_schema` of each of `tools` that `request` declares strict, by index in wire order: a tool on the
+ * strict allowlist, not marked `strict: false`, whose schema uses no keyword strict decoding rejects and whose base
+ * schema (`baseSchema`, built only for such a tool) has a strict form within what is left of the request-wide strict
+ * budgets (tools, optional and union parameters); none under `PI_NO_STRICT` or `request.disableStrictTools`.
+ */
+function anthropicStrictSchemas(
+	request: AnthropicToolsRequest,
+	tools: readonly Tool[],
+	baseSchema: (index: number) => Record<string, unknown>,
+): Map<number, Record<string, unknown>> {
+	const strictSchemas = new Map<number, Record<string, unknown>>();
+	if ((request.noStrict ?? NO_STRICT) || request.disableStrictTools) return strictSchemas;
 
 	const candidateIndexes = tools.flatMap((tool, index) => {
 		if (!ANTHROPIC_STRICT_TOOL_ALLOWLIST.has(tool.name)) return [];
@@ -747,21 +784,17 @@ export function anthropicWireToolFields(
 		if (strictToolCount >= MAX_ANTHROPIC_STRICT_TOOLS) break;
 
 		const strictResult = normalizeAnthropicStrictSchema(
-			fields[index].inputSchema as Record<string, unknown>,
+			baseSchema(index),
 			MAX_ANTHROPIC_STRICT_OPTIONAL_PARAMETERS - strictOptionalParameterCount,
 			MAX_ANTHROPIC_STRICT_UNION_PARAMETERS - strictUnionParameterCount,
 		);
 		if (!strictResult) continue;
 
-		fields[index] = {
-			...fields[index],
-			inputSchema: strictResult.schema as AnthropicToolInputSchema,
-			strict: true,
-		};
+		strictSchemas.set(index, strictResult.schema);
 		strictToolCount++;
 		strictOptionalParameterCount += strictResult.optionalCount;
 		strictUnionParameterCount += strictResult.unionCount;
 	}
 
-	return fields;
+	return strictSchemas;
 }

@@ -8,6 +8,7 @@ import { Agent } from "../src/agent";
 import { normalizeTools } from "../src/agent-loop";
 import { toolSpecsFingerprint } from "../src/append-only-context";
 import type { AgentTool } from "../src/types";
+import { withNativeDialectEnv } from "./helpers";
 
 function agentTool(name: string): AgentTool {
 	return {
@@ -101,9 +102,7 @@ describe("Agent — inactive tool definitions", () => {
 
 describe("Agent — a refused request's tool declaration", () => {
 	it("is not read: the declared tools follow the request before it, as the replay sends no refusal", async () => {
-		const previousDialect = Bun.env.PI_DIALECT;
-		delete Bun.env.PI_DIALECT;
-		try {
+		await withNativeDialectEnv(async () => {
 			// A model whose requests keep their tool declaration across the conversation.
 			const model = getBundledModel("anthropic", "claude-opus-5-5");
 			if (!model) throw new Error("expected the bundled claude-opus-5-5");
@@ -150,9 +149,6 @@ describe("Agent — a refused request's tool declaration", () => {
 			expect(agent.declaredToolsFingerprint(model)).toBe(
 				toolSpecsFingerprint(normalizeTools([read], { injectIntent: false }) ?? []),
 			);
-		} finally {
-			if (previousDialect === undefined) delete Bun.env.PI_DIALECT;
-			else Bun.env.PI_DIALECT = previousDialect;
-		}
+		});
 	});
 });

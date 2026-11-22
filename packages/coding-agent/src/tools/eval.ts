@@ -427,8 +427,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		},
 	];
 	get examples(): readonly ToolExample<typeof evalSchema.infer>[] {
-		const langs = new Set(this.#enabledLanguages());
-		return EvalTool.#examples.filter(ex => "call" in ex && langs.has(ex.call.language));
+		const langs = this.#enabledLanguages();
+		const key = langs.join(",");
+		if (this.#examplesKey !== key) {
+			const enabled = new Set(langs);
+			this.#cachedExamples = EvalTool.#examples.filter(ex => "call" in ex && enabled.has(ex.call.language));
+			this.#examplesKey = key;
+		}
+		return this.#cachedExamples;
 	}
 	get parameters(): typeof evalSchema {
 		const langs = this.#enabledLanguages();
@@ -478,6 +484,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 	#paramsKey?: string;
 	#cachedParams?: typeof evalSchema;
+	// The examples by the enabled languages they were filtered for: one array per list, so the tool's per-tool key
+	// (and with it the declared-tools memo) stays the same while the list does.
+	#examplesKey?: string;
+	#cachedExamples: readonly ToolExample<typeof evalSchema.infer>[] = [];
 	readonly #shadowCells = new Map<string, EvalShadowCellSession>();
 	readonly #environmentModes: Partial<Record<EvalLanguage, "managed" | "project">> = {};
 

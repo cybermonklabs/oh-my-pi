@@ -210,6 +210,7 @@ import {
 import {
 	ANTHROPIC_BUFFERED_INPUT_TOOLS,
 	anthropicEagerInputStreaming,
+	anthropicToolsRequest,
 	anthropicWireToolFields,
 } from "./anthropic-tool-schema";
 import { ANTHROPIC_FALLBACK_FLAGS, type AnthropicFallback, reportProviderFallback } from "./provider-fallbacks";
@@ -1955,7 +1956,6 @@ const streamAnthropicOnce = (
 				output.usage.premiumRequests = copilotDynamicHeaders.premiumRequests;
 			}
 			const baseUrl = copilotBaseUrl ?? resolveAnthropicBaseUrl(model, apiKey) ?? "https://api.anthropic.com";
-			const supportsEagerToolInputStreaming = anthropicEagerInputStreaming(model, baseUrl);
 			// A caller-owned client decides the endpoint itself (its `baseURL`, or an
 			// explicit opt-in); it receives the compaction beta per request. A transport
 			// exists only to compact, so its endpoint supports the beta.
@@ -1970,8 +1970,9 @@ const streamAnthropicOnce = (
 				baseUrl,
 				model.id,
 			);
-			let disableStrictTools =
-				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
+			const toolsRequest = anthropicToolsRequest(model, baseUrl, providerSessionState?.strictToolsDisabled ?? false);
+			const supportsEagerToolInputStreaming = toolsRequest.eagerInputStreaming === true;
+			let disableStrictTools = toolsRequest.disableStrictTools === true;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let forceDemoteUnsignedThinking = providerSessionState?.replayUnsignedThinkingDisabled ?? false;
 			let droppedAllThinkingForSignature = providerSessionState?.thinkingReplayDisabled ?? false;

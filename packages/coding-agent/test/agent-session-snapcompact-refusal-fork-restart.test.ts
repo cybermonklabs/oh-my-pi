@@ -13,9 +13,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { sessionContextTokens } from "./helpers/agent-session-setup";
 
 /** A 400,000-token window: its prompt budget is 340,000 tokens, far above the configured threshold. */
 const CONTEXT_WINDOW = 400_000;
@@ -121,9 +121,7 @@ describe("an automatic snapcompact pass the cut rule refused, across /fork at th
 			// before it grew GROWTH tokens each.
 			const sizing = open(SessionManager.inMemory());
 			sizing.agent.replaceMessages(transcript);
-			const before =
-				computeNonMessageTokens(sizing, sizing.agent.tokenizer, sizing.settings.revision) +
-				sizing.agent.tokenizer.countMessages(transcript, { excludeEncryptedReasoning: true });
+			const before = sessionContextTokens(sizing, transcript);
 			await sizing.dispose();
 			sessions.splice(sessions.indexOf(sizing), 1);
 			final.usage.cacheRead = before;

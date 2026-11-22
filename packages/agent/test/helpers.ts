@@ -17,6 +17,21 @@ export function createHarmonyMitigationModel(): Model<"openai-codex-responses"> 
 	});
 }
 
+/** Runs `fn` with `PI_DIALECT` unset, so the agent calls tools natively, and puts the variable back after it. */
+export async function withNativeDialectEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+	const previous = Bun.env.PI_DIALECT;
+	delete Bun.env.PI_DIALECT;
+	try {
+		return await fn();
+	} finally {
+		if (previous === undefined) {
+			delete Bun.env.PI_DIALECT;
+		} else {
+			Bun.env.PI_DIALECT = previous;
+		}
+	}
+}
+
 /** Creates a timestamped user message for agent-loop tests. */
 export function createUserMessage(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
