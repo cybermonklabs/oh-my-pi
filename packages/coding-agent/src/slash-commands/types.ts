@@ -142,14 +142,40 @@ export interface SlashCommandRuntime {
 	 * (RPC) ignore the flag and always push.
 	 */
 	notifyConfigChanged?: (options?: { handledBySessionEvent?: boolean }) => Promise<void> | void;
+	/**
+	 * The host's live voice call, which `/live on|off|status` drives. RPC mode provides it (its
+	 * `RpcLiveBridge`); hosts without one (ACP, print mode, subagents) answer `/live` as not available.
+	 */
+	live?: SlashCommandLiveHost;
+}
+
+/** State of a host's live voice call, as `/live status` reports it. */
+export type LiveCallStatus =
+	| { state: "off" }
+	| {
+			state: "starting" | "open";
+			provider: string;
+			voice: string;
+			/** When the call was asked for. */
+			since: Date;
+			muted: boolean;
+	  };
+
+/** One live voice call at a time on the host's audio (microphone and speaker). */
+export interface SlashCommandLiveHost {
+	/** Starts a call; resolves once it records, rejects with the reason it cannot start. */
+	start(): Promise<{ voice: string }>;
+	/** Ends the call, if one is open; resolves once it has ended. */
+	stop(): Promise<void>;
+	status(): LiveCallStatus;
 }
 
 /**
  * The host side of {@link SlashCommandRuntime}: where a built-in's output goes, how the host's
- * client hears about command-list, plugin, title and config changes, and the host's live MCP
- * manager. A host builds it once and passes the same hooks to its own typed-input dispatch and to
- * extension `sendUserInput`, so a built-in reaches the client, and `/mcp` the same servers, from
- * either. Hooks scoped to one host request (`signal`, `keepTurnOpenUntilIdle`,
+ * client hears about command-list, plugin, title and config changes, the host's live MCP
+ * manager, and its live voice call. A host builds it once and passes the same hooks to its own
+ * typed-input dispatch and to extension `sendUserInput`, so a built-in reaches the client, and `/mcp`
+ * the same servers, from either. Hooks scoped to one host request (`signal`, `keepTurnOpenUntilIdle`,
  * `runCommandInBackground`) stay with that request.
  */
 export type SlashCommandHost = Pick<
@@ -161,6 +187,7 @@ export type SlashCommandHost = Pick<
 	| "notifyConfigChanged"
 	| "mcpManager"
 	| "reconnectMcpServer"
+	| "live"
 >;
 
 /**

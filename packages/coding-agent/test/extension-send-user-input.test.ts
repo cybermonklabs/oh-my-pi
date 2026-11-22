@@ -346,6 +346,17 @@ describe("pi.sendUserInput", () => {
 		expect(session.sessionId).toBe(sessionId);
 	});
 
+	it("answers /live as not available on a host with no live call, and starts nothing", async () => {
+		const { api, session, started } = await start();
+
+		expect(await api.sendUserInput("/live on")).toEqual({
+			handled: "command",
+			output: "Live voice is not available here: only RPC mode and the interactive terminal run /live.",
+		});
+		await session.waitForIdle();
+		expect(userTurns(started)).toHaveLength(0);
+	});
+
 	it("sends slash text that names no command to the model, as typed input does", async () => {
 		const { api, session, started } = await start();
 		// Both shapes: a bare `/name` word, and prose that starts with an absolute path.
