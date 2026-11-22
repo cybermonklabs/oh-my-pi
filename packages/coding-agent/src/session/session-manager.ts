@@ -898,6 +898,12 @@ interface DiskQueueOptions {
 	epoch?: number;
 }
 
+/** What a write-conflict recovery read back: the stored journal, and the ids of the entries it adopted from it. */
+interface ReadBack {
+	content: string;
+	adopted: ReadonlySet<string>;
+}
+
 interface AtomicEntryBatch {
 	collecting: boolean;
 	entryIds: Set<string>;
@@ -1079,6 +1085,22 @@ export class SessionManager {
 	 * transcript once its drain settles.
 	 */
 	#closeOwesPublish = false;
+	/** The latest recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
+	#queuedConflictRecovery: Promise<void> | undefined;
+	/**
+	 * Set from the moment a queued write's conflict is taken over until that recovery's own work ends: while it is set,
+	 * another conflict joins it and no full write starts (the recovery publishes every entry memory holds).
+	 */
+	#queuedConflictPending = false;
+	/**
+	 * Publishes refused because another writer changed the file, since the last publish that landed; at the bound the
+	 * session moves off as contested.
+	 */
+	#queuedConflictRecoveries = 0;
+	/** The files this manager moved off, so a conflict a write to one reports retries at the sibling it went on in. */
+	readonly #movedOffFrom = new Set<string>();
+	/** Write conflicts a recovery took over: the store's drain reports them again, and they are no failure. */
+	readonly #takenOverConflicts = new WeakSet<Error>();
 	/** Lazy gate crossed (ensureOnDisk / loaded file): every entry must persist from now on. */
 	#forceFileCreation = false;
 	/**
@@ -1168,14 +1190,6 @@ export class SessionManager {
 	#closes = 0;
 	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
 	#parentMoveFollow: Promise<void> | undefined;
-	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
-	#queuedConflictRecovery: Promise<void> | undefined;
-	/** Queued-write conflicts recovered since the last confirmed publish; past the bound the session moves off as contested. */
-	#queuedConflictRecoveries = 0;
-	/** The files this manager moved off, so a conflict a write to one reports retries at the sibling it went on in. */
-	readonly #movedOffFrom = new Set<string>();
-	/** Write conflicts a recovery took over: the store's drain reports them again, and they are no failure. */
-	readonly #takenOverConflicts = new WeakSet<Error>();
 	/**
 	 * The background artifact copy a move or branch to `sessionFile` started (see
 	 * {@link #moveOffSessionFile}, {@link createBranchedSession}). Never rejects.
@@ -1682,20 +1696,22 @@ export class SessionManager {
 	 * racing its own unconfirmed publish, not another writer, and a rewrite
 	 * computed from a stale view rejects so its caller retries from a fresh
 	 * load. The one exception is a write this manager queued (`queued`) on a
-	 * store that recovers queued conflicts (see {@link #recoversQueuedConflicts}).
+	 * store that recovers queued conflicts (see {@link #recoversQueuedConflicts}),
+	 * also after {@link seal}: the close's owed publish is such a write.
 	 */
 	#conflictedSessionFile(error: unknown, queued = false): string | undefined {
 		const sessionFile = this.#sessionFile;
+		const recoversQueued = queued && this.#recoversQueuedConflicts();
 		if (
 			!(error instanceof SessionWriteConflictError) ||
 			error.expectedSize === null ||
 			!sessionFile ||
 			path.resolve(error.path) !== path.resolve(sessionFile) ||
 			!this.#persist ||
-			this.#released ||
+			(this.#released && !recoversQueued) ||
 			this.#sessionFileRelocating ||
 			this.#exclusiveStopping ||
-			(this.#storage.defersSyncPublish && !(queued && this.#recoversQueuedConflicts()))
+			(this.#storage.defersSyncPublish && !recoversQueued)
 		) {
 			return undefined;
 		}
@@ -1705,11 +1721,11 @@ export class SessionManager {
 	/**
 	 * Whether a write conflict the store reports for a write this manager
 	 * queued is recovered (see {@link #recoverQueuedConflict}) rather than
-	 * reported: only on SQL storage that claims sessions, the one deferring
-	 * store whose appends are checked against the size this manager expects.
+	 * reported: on every store that defers sync publishes (SQL, Redis), where
+	 * such a conflict left unrecovered fails every later write.
 	 */
 	#recoversQueuedConflicts(): boolean {
-		return this.#storage.defersSyncPublish === true && this.#storage.acquireSessionClaim !== undefined;
+		return this.#storage.defersSyncPublish === true;
 	}
 
 	/** The entries `content` holds that this manager does not, or `undefined` when it is not this session's journal. */
@@ -1785,13 +1801,19 @@ export class SessionManager {
 	/**
 	 * Asynchronous {@link #recoverFromWriteConflictSync}. For a write this
 	 * manager queued (`queued`, see {@link #recoverQueuedConflict}) on a
-	 * backend that defers publishes it first lets this manager's own queued
-	 * writes to the file settle and reloads the store's index, so the content
-	 * it reads back, and the size the retry is checked against, are the
-	 * store's, never a write of this manager still in flight; a conflict on a
-	 * file this manager already moved off retries at the sibling it went on in.
+	 * backend that defers publishes it reads the file back as the store holds
+	 * it (see {@link #readBack}); a read that fails there is no evidence the
+	 * file holds another session, so it is thrown for the caller to report,
+	 * and the file and the id stay. A conflict on a file this manager already
+	 * moved off retries at the sibling it went on in. `onReadBack` receives
+	 * the journal read back and the ids of the entries it adopted from it.
 	 */
-	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
+	async #recoverFromWriteConflict(
+		error: unknown,
+		recoveries: number,
+		queued = false,
+		onReadBack?: (back: ReadBack) => void,
+	): Promise<string | undefined> {
 		if (
 			queued &&
 			error instanceof SessionWriteConflictError &&
@@ -1805,21 +1827,26 @@ export class SessionManager {
 		// Every path from here retries or moves off: the conflict is this recovery's, not a failure.
 		if (error instanceof Error) this.#takenOverConflicts.add(error);
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (this.#storage.defersSyncPublish) {
-			await this.#storage.confirmWrites?.(contested).catch(() => undefined);
-			await this.#storage.refresh?.();
-			if (this.#sessionFile !== contested) return this.#sessionFile;
-		}
 		const epoch = this.#diskEpoch;
 		let content: string;
-		try {
-			content = await this.#storage.readText(contested);
-		} catch (readError) {
-			// A synchronous rewrite during the read already recovered; retry against its result.
+		if (this.#storage.defersSyncPublish) {
+			const stored = await this.#readBack(contested);
 			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			return contested;
+			if (stored === null) {
+				this.#expectedDiskSize = null;
+				return contested;
+			}
+			content = stored;
+		} else {
+			try {
+				content = await this.#storage.readText(contested);
+			} catch (readError) {
+				// A synchronous rewrite during the read already recovered; retry against its result.
+				if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				return contested;
+			}
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		const foreign = this.#foreignEntriesIn(content);
@@ -1827,56 +1854,33 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		this.#adoptForeignEntries(foreign, Buffer.byteLength(content, "utf8"));
+		onReadBack?.({ content, adopted: new Set(foreign.map(entry => entry.id)) });
 		return contested;
 	}
 
 	/**
-	 * A write a deferred-publish store (SQL storage) queued for `sessionFile`
-	 * was refused at confirmation with a write conflict: another writer that
-	 * claims nothing (an older omp) changed the file, or it now holds another
-	 * session. Take the error over (`true`) and recover as a write-time
-	 * conflict does, once this manager's own queued writes have settled:
-	 * keep the other writer's new entries and publish the whole transcript
-	 * again, or move to a sibling (`replaced`; `contested` once
-	 * {@link MAX_WRITE_CONFLICT_RECOVERIES} recoveries in a row did not hold),
-	 * which under `OMP_SESSION_EXCLUSIVE=1` ends the process instead. Without
-	 * this the store's journal and this session diverge: the next publish,
-	 * checked against a realigned size, would erase the other writer's
-	 * entries or write this session over another one.
+	 * `sessionFile` as a store that defers publishes holds it, read after the
+	 * store's index is reloaded, so the content and the size a retry is
+	 * checked against are the store's. The read waits for this manager's own
+	 * queued writes to the file (none starts while a recovery is pending, see
+	 * {@link #rewriteSynchronously}); a write conflict it reports is one of
+	 * them, refused while the read waited: read again, up to
+	 * {@link MAX_WRITE_CONFLICT_RECOVERIES} times. `null` when the file is
+	 * gone; any other read error is thrown.
 	 */
-	#recoverQueuedConflict(error: unknown, sessionFile: string): boolean {
-		if (!this.#recoversQueuedConflicts() || !(error instanceof SessionWriteConflictError)) return false;
-		if (sessionFile !== this.#sessionFile || !this.#conflictedSessionFile(error, true)) return false;
-		this.#takenOverConflicts.add(error);
-		this.#fileIsCurrent = false;
-		this.#rewriteRequired = true;
-		if (this.#queuedConflictRecovery) return true;
-		const recoveries = this.#queuedConflictRecoveries++;
-		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true)
-			.then(async retryPath => {
-				if (this.#exclusiveStopping || this.#entriesReleased) return;
-				if (!retryPath) {
-					this.#takenOverConflicts.delete(error);
-					this.#noteDiskFailure(error);
-					return;
+	async #readBack(sessionFile: string): Promise<string | null> {
+		for (let attempt = 1; ; attempt++) {
+			await this.#storage.refresh?.();
+			try {
+				return await this.#storage.readText(sessionFile);
+			} catch (readError) {
+				if (isEnoent(readError)) return null;
+				if (!(readError instanceof SessionWriteConflictError) || attempt >= MAX_WRITE_CONFLICT_RECOVERIES) {
+					throw readError;
 				}
-				this.#fileIsCurrent = false;
-				this.#rewriteRequired = true;
-				if (this.#released) {
-					this.#closeOwesPublish = true;
-					return;
-				}
-				// Awaited, so a flush that waits for this recovery sees the transcript durable.
-				await this.#rewriteAtomically(true);
-			})
-			.catch((err: unknown) => {
-				this.#noteDiskFailure(err);
-			})
-			.finally(() => {
-				if (this.#queuedConflictRecovery === recovery) this.#queuedConflictRecovery = undefined;
-			});
-		this.#queuedConflictRecovery = recovery;
-		return true;
+				this.#takenOverConflicts.add(readError);
+			}
+		}
 	}
 
 	/**
@@ -2132,7 +2136,10 @@ export class SessionManager {
 	 * landed anyway: a readback matching the intended body still counts as
 	 * durable. Callers own serialization (the disk queue) and any
 	 * `#released`/epoch guard; this only writes and repairs
-	 * `#expectedDiskSize` bookkeeping via {@link #recordFullRewrite}.
+	 * `#expectedDiskSize` bookkeeping via {@link #recordFullRewrite}. The body
+	 * is this manager's own transcript, so a conflict with another writer's
+	 * change recovers as a queued publish's does, also on a store that defers
+	 * publishes and after {@link seal} (the close's owed publish).
 	 */
 	async #publishAuthoritativeBody(
 		sessionFile: string,
@@ -2174,7 +2181,7 @@ export class SessionManager {
 				if (!sibling) throw error;
 				return this.#publishAuthoritativeBody(sibling, operationError, commitGuard, recoveries + 1);
 			}
-			const retryPath = await this.#recoverFromWriteConflict(error, recoveries);
+			const retryPath = await this.#recoverFromWriteConflict(error, recoveries, this.#recoversQueuedConflicts());
 			if (retryPath) return this.#publishAuthoritativeBody(retryPath, operationError, commitGuard, recoveries + 1);
 			const recoveryErrors = [toError(error)];
 			try {
@@ -2222,6 +2229,153 @@ export class SessionManager {
 
 	#recordFullRewrite(bytes: number): void {
 		this.#expectedDiskSize = bytes;
+	}
+
+	/**
+	 * A write a deferred-publish store (SQL, Redis) queued for `sessionFile`
+	 * was refused with a write conflict, at confirmation or by the size check
+	 * when it was queued: another writer (a second omp process on the session)
+	 * changed the file, or it now holds another session. Take the error over
+	 * (`true`) and recover on the disk queue, one recovery at a time: a
+	 * conflict reported while one is pending joins it, and no full write
+	 * starts meanwhile (see {@link #rewriteSynchronously}), so the recovery's
+	 * publish carries every entry recorded until it runs. Without this the
+	 * failure latched and every later write failed with it.
+	 */
+	#recoverQueuedConflict(error: unknown, sessionFile: string): boolean {
+		if (!this.#recoversQueuedConflicts() || !(error instanceof SessionWriteConflictError)) return false;
+		if (sessionFile !== this.#sessionFile || !this.#conflictedSessionFile(error, true)) return false;
+		this.#takenOverConflicts.add(error);
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = true;
+		if (this.#queuedConflictPending) return true;
+		this.#queuedConflictPending = true;
+		const recovery: Promise<void> = this.#scheduleDiskWork(() => this.#runQueuedConflictRecovery(error), {
+			ignorePriorError: true,
+			ignoreEpoch: true,
+		})
+			// The disk queue reported any failure; a flush or close that waits for the recovery reads the latch.
+			.catch(() => undefined)
+			.finally(() => {
+				if (this.#queuedConflictRecovery === recovery) this.#queuedConflictRecovery = undefined;
+			});
+		this.#queuedConflictRecovery = recovery;
+		return true;
+	}
+
+	/**
+	 * The recovery {@link #recoverQueuedConflict} queues. It reads the file
+	 * back as the store holds it (see {@link #readBack}), keeps the other
+	 * writer's new entries and publishes what the store lacks (see
+	 * {@link #publishRecovered}), or moves to a sibling: `replaced` when the
+	 * file holds another session, `contested` once
+	 * {@link MAX_WRITE_CONFLICT_RECOVERIES} publishes since the last one that
+	 * landed met another writer's change. A read that fails is reported, does
+	 * not count, and leaves the file and the id: the next entry's write starts
+	 * the next recovery.
+	 */
+	async #runQueuedConflictRecovery(error: SessionWriteConflictError): Promise<void> {
+		try {
+			if (this.#entriesReleased) return;
+			const recoveries = this.#queuedConflictRecoveries++;
+			let back: ReadBack | undefined;
+			let retryPath: string | undefined;
+			try {
+				retryPath = await this.#recoverFromWriteConflict(error, recoveries, true, read => {
+					back = read;
+				});
+			} catch (readError) {
+				this.#queuedConflictRecoveries = recoveries;
+				this.#noteDiskFailure(readError);
+				return;
+			}
+			// A session that stops under OMP_SESSION_EXCLUSIVE=1 (see #stopExclusive) publishes nothing more.
+			if (this.#exclusiveStopping || this.#entriesReleased) return;
+			if (!retryPath) {
+				this.#takenOverConflicts.delete(error);
+				this.#noteDiskFailure(error);
+				return;
+			}
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			if (this.#released) {
+				this.#closeOwesPublish = true;
+				return;
+			}
+			if (await this.#publishRecovered(back)) this.#queuedConflictRecoveries = 0;
+		} finally {
+			this.#queuedConflictPending = false;
+		}
+	}
+
+	/**
+	 * Publish what memory holds once a recovery read the file back (`back`;
+	 * none when the file was gone or the session moved to a sibling): append
+	 * the entries the store lacks when its journal allows it (see
+	 * {@link #appendMissingEntries}), else the whole transcript against the
+	 * size read back. True once it landed or its appends are queued.
+	 */
+	async #publishRecovered(back: ReadBack | undefined): Promise<boolean> {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return false;
+		if (back && (await this.#appendMissingEntries(sessionFile, back))) return true;
+		return this.#runFencedAtomicRewrite(this.#diskEpoch, true);
+	}
+
+	/**
+	 * After a recovery read the stored journal back (`back`), append the
+	 * entries memory holds and the store lacks, when the journal is clean: its
+	 * title slot and header as memory writes them (or the header alone, as an
+	 * older omp or another tool writes a session), every line whole and
+	 * parsed, and each entry it shares with memory stored as memory writes it.
+	 * The store then holds every entry of both writers, as a full publish of
+	 * the transcript would leave it, and the appends carry no size, so another
+	 * writer appending meanwhile cannot refuse them, as it can refuse a full
+	 * publish. False, with nothing written, when a full publish is needed: a
+	 * record the loader skips, a torn last line, an entry changed in place, a
+	 * title or header the store does not hold.
+	 */
+	async #appendMissingEntries(sessionFile: string, back: ReadBack): Promise<boolean> {
+		// The refused write's writer keeps its error; the appends go through a fresh one.
+		try {
+			await this.#closeWriterHandle();
+		} catch {
+			// Reported when the write failed; the entries it held are appended below.
+		}
+		if (this.#sessionFile !== sessionFile || this.#released || this.#atomicEntryBatch) return false;
+		if (!back.content.endsWith("\n")) return false;
+		const stored = back.content.split("\n");
+		stored.pop();
+		const body = this.#serializeBody();
+		const [titleLine, headerLine] = body.lines;
+		let first: number;
+		if (`${stored[0]}\n` === headerLine) first = 1;
+		else if (`${stored[0]}\n` === titleLine && `${stored[1]}\n` === headerLine) first = 2;
+		else return false;
+		const lineOf = new Map<string, string>();
+		for (let i = 0; i < this.#entries.length; i++) lineOf.set(this.#entries[i]!.id, body.lines[i + 2]!);
+		const storedIds = new Set<string>();
+		for (let i = first; i < stored.length; i++) {
+			let value: unknown;
+			try {
+				value = JSON.parse(stored[i]!);
+			} catch {
+				return false;
+			}
+			const id = value && typeof value === "object" && "id" in value ? value.id : undefined;
+			if (typeof id !== "string") return false;
+			storedIds.add(id);
+			if (!back.adopted.has(id) && lineOf.get(id) !== `${stored[i]}\n`) return false;
+		}
+		this.#fileIsCurrent = true;
+		this.#rewriteRequired = false;
+		// A title change rewrites a journal without the slot rather than update a slot it lacks.
+		this.#hasTitleSlot = first === 2;
+		this.#clearDiskError();
+		for (const entry of this.#entries) {
+			if (!storedIds.has(entry.id)) this.#appendToCurrentSessionFile(entry);
+		}
+		return true;
 	}
 
 	/**
@@ -2346,6 +2500,9 @@ export class SessionManager {
 		// This manager's own publish of the path is still unconfirmed: its
 		// confirmation re-issues the transcript (see #unconfirmedPublishPath).
 		if (targetPath === this.#unconfirmedPublishPath) return;
+		// A queued write's conflict is being recovered: its publish carries
+		// every entry recorded until it runs (see #recoverQueuedConflict).
+		if (this.#queuedConflictPending) return;
 
 		// A subagent transcript whose parent's lease it cannot hold publishes under the parent's sibling, once it exists.
 		if (this.#holdForParentMove()) return;
@@ -2437,7 +2594,9 @@ export class SessionManager {
 				this.#hasTitleSlot = true;
 			}
 		} catch (err) {
-			this.#noteDiskFailure(err);
+			// A size check that refused the publish as it was queued: recovered as
+			// a refusal at confirmation is, instead of failing every later write.
+			if (!this.#recoverQueuedConflict(err, targetPath)) this.#noteDiskFailure(err);
 		}
 	}
 
@@ -2449,37 +2608,49 @@ export class SessionManager {
 	 * cannot open a fresh writer that the pending replacement would then detach
 	 * from the current JSONL path. A `commitGuard` also prevents a superseding
 	 * synchronous rewrite from being overwritten by the stale body serialized
-	 * before it ran. `queuedRecovery` marks the publish of a queued write's
-	 * conflict recovery (see {@link #recoverQueuedConflict}), whose own
-	 * conflicts recover the same way; any other rewrite that meets a file
-	 * changed on a deferring store rejects.
+	 * before it ran. A rewrite that meets a file another writer changed on a
+	 * store that defers publishes rejects with `SessionWriteConflictError` and
+	 * changes no entry, the file or the id; nothing latches, and the session's
+	 * next entry reads the file back and publishes (see
+	 * {@link #recoverQueuedConflict}).
 	 */
-	async #rewriteAtomically(queuedRecovery = false): Promise<void> {
+	async #rewriteAtomically(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
 
 		const startEpoch = this.#diskEpoch;
+		const outcome: { refused?: SessionWriteConflictError } = {};
 		await this.#scheduleDiskWork(
 			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
-					this.#fileIsCurrent = true;
-					this.#materializeBreadcrumb();
-					this.#rewriteRequired = false;
-					this.#hasTitleSlot = true;
+				try {
+					await this.#runFencedAtomicRewrite(startEpoch);
+				} catch (error) {
+					if (!(error instanceof SessionWriteConflictError) || !this.#recoversQueuedConflicts()) throw error;
+					this.#fileIsCurrent = false;
+					this.#rewriteRequired = true;
+					outcome.refused = error;
 				}
 			},
 			{ epoch: startEpoch },
 		);
+		if (outcome.refused) throw outcome.refused;
 	}
 
 	/**
-	 * Shared fenced atomic-rewrite loop used by `#rewriteAtomically` and the
-	 * `#persistTitleChangeEntry` fallback. Holds `#atomicRewriteActive` across
+	 * Shared fenced atomic-rewrite loop used by `#rewriteAtomically`, the
+	 * `#persistTitleChangeEntry` fallback and a queued write's conflict
+	 * recovery (`queuedRecovery`, see {@link #publishRecovered}), whose own
+	 * conflicts recover the same way. Holds `#atomicRewriteActive` across
 	 * the writer close and the full-file replace, and loops on
 	 * `#atomicRewriteDirty` so any fenced append that lands during the rewrite
-	 * is captured before the task resolves. Returns `false` when the disk epoch
-	 * moved so callers skip current-marking updates; a body that landed before
-	 * that change still advances the durable byte record after readback.
+	 * is captured before the task resolves. Once the last body landed it marks
+	 * the file current while the fence still holds, so an entry recorded after
+	 * the fence ends takes the append path: marked by the caller after its
+	 * await, it fell in a gap where a queued recovery held its write back
+	 * (see {@link #rewriteSynchronously}) and nothing stored it. Returns
+	 * `false` when the disk epoch moved, with the file not marked; a body that
+	 * landed before that change still advances the durable byte record after
+	 * readback.
 	 */
 	async #runFencedAtomicRewrite(epoch: number, queuedRecovery = false): Promise<boolean> {
 		if (this.#released) return false;
@@ -2550,6 +2721,12 @@ export class SessionManager {
 				}
 				this.#recordFullRewrite(body.bytes);
 			} while (this.#atomicRewriteDirty);
+			this.#fileIsCurrent = true;
+			this.#materializeBreadcrumb();
+			this.#rewriteRequired = false;
+			this.#hasTitleSlot = true;
+			// A recovery's publish holds every entry: the failure it recovered from is over.
+			if (queuedRecovery) this.#clearDiskError();
 			return true;
 		} finally {
 			// Only relinquish the fence if we still own it. A superseding
@@ -2722,11 +2899,8 @@ export class SessionManager {
 					await this.#storage.updateSessionTitle(sessionFile, update);
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
-					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
-					this.#clearDiskError();
-					this.#fileIsCurrent = true;
-					this.#rewriteRequired = false;
-					this.#hasTitleSlot = true;
+					// The rewrite marks the file current inside its fence (see #runFencedAtomicRewrite).
+					if (await this.#runFencedAtomicRewrite(epoch)) this.#clearDiskError();
 				}
 			},
 			{ epoch },
@@ -3751,7 +3925,9 @@ export class SessionManager {
 	async flush(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		// A refused write found while draining may start a parent follow (see
-		// #followParentMove); its publish in the parent's sibling is flushed too.
+		// #followParentMove), whose publish in the parent's sibling is flushed
+		// too, or a queued write's recovery (see #recoverQueuedConflict), whose
+		// publish is flushed too.
 		for (let pass = 0; pass < 4; pass++) {
 			await this.#scheduleDiskWork(async () => {
 				if (this.#writer?.isOpen()) await this.#writer.flush();
@@ -3868,12 +4044,15 @@ export class SessionManager {
 				},
 				{ ignorePriorError: true },
 			);
-			// A parent follow publishes this transcript in the parent's sibling before the claim goes.
+			// A parent follow publishes this transcript in the parent's sibling before the claim goes. A queued
+			// write's conflict recovery publishes the transcript before the close does; the entries it appends go
+			// through a writer of its own.
 			for (let pass = 0; (this.#parentMoveFollow || this.#queuedConflictRecovery) && pass < 4; pass++) {
 				await this.#parentMoveFollow;
 				await this.#queuedConflictRecovery;
 				await this.#scheduleDiskWork(
 					async () => {
+						await this.#closeWriterHandle();
 						await this.#storage.drain();
 					},
 					{ ignorePriorError: true },
