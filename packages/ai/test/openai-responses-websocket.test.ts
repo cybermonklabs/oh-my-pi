@@ -1354,8 +1354,8 @@ describe("standard OpenAI Responses WebSocket opt-in", () => {
 				const socket = fixture.sockets.get(1)!;
 				const frame = JSON.stringify({ type: "response.created", response: { id: "overflow" } });
 				// Fill the actual 4096-frame channel before a reader owns the exchange. Cork the burst so the
-				// 4097 frames go out as one write: on gVisor's loopback TCP, 4097 separate tiny writes stall
-				// after about 1500, the queue never overflows, and the client never closes.
+				// 4097 frames go out in a few large writes: under gVisor, 4097 separate small writes on loopback
+				// TCP arrive too slowly for the queue to overflow before the test times out.
 				socket.cork(() => {
 					for (let index = 0; index <= 4096; index++) socket.send(frame);
 				});
