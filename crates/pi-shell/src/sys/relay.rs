@@ -201,7 +201,7 @@ impl Relay {
 					self.phase = Phase::Flush;
 				},
 				Phase::Flush => {
-					let _ = std::task::ready!(self.sink.poll_flush(cx));
+					let _ = std::task::ready!(self.sink.poll_flush(cx, &mut self.key));
 					self.phase = Phase::Done;
 				},
 				Phase::Done => return Poll::Ready(()),
@@ -740,5 +740,25 @@ mod tests {
 		drain(&mut reader);
 		relayed.wait("the relay, waiting for room, woken by the drain");
 		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
+	}
+
+	// Failure mode: a relay flushed its sink at the end with no key, as the
+	// engine: on a provider file its waker replaced the engine's.
+	#[test]
+	fn a_relay_flushes_its_sink_with_its_key() {
+		use crate::bash::fs::test_files::FlushProbe;
+		let probe = FlushProbe::default();
+		let (pipe, program) = os::pipe(false).unwrap();
+		drop(program);
+		let sink = crate::bash::FdRef::from_file(Box::new(probe.clone()));
+		let mut relay = Relay::new(pipe, None, End::Fd(sink));
+		assert!(
+			relay
+				.poll(&mut Context::from_waker(Waker::noop()))
+				.is_ready(),
+			"the stream ended"
+		);
+		assert!(probe.reached_by(&relay.key), "the sink was flushed without the relay's key");
+		assert_eq!(probe.keyless(), 0);
 	}
 }

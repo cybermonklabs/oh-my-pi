@@ -826,10 +826,7 @@ fn rerun(ctx: &mut Ctx<'_, '_>, h: Hist, text: BString, editor: &[u8]) -> R {
 		},
 	};
 	// zsh `stuff`: the file goes to standard error first.
-	let unwritten = super::write_now(&*ctx, 2, &contents).to_vec();
-	if !unwritten.is_empty() {
-		ctx.out_fd(2, &unwritten);
-	}
+	super::echo_first(ctx, contents.clone())?;
 	let event = contents
 		.strip_suffix(b"\n")
 		.unwrap_or(contents.as_slice())

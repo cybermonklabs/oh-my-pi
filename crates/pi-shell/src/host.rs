@@ -281,6 +281,14 @@ impl File for StreamFile {
 		self.with(Poll::Ready(Ok(())), |f| f.poll_flush(cx))
 	}
 
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_flush_keyed(cx, key))
+	}
+
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
 		self.with(Err(io::ErrorKind::Unsupported.into()), |f| f.seek(pos))
 	}
@@ -966,5 +974,34 @@ impl Timer for RuntimeTimer {
 impl Drop for RuntimeTimer {
 	fn drop(&mut self) {
 		self.task.abort();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{bash::fs::test_files::FlushProbe, sys::WaitKey};
+
+	// Failure mode: a native extra closing its handle of the run's stdout
+	// flushed with its key, and the stream flushed the run's file without it,
+	// as the engine.
+	#[test]
+	fn a_stream_file_flushes_with_the_callers_key() {
+		let probe = FlushProbe::default();
+		let out: Box<dyn File> = Box::new(probe.clone());
+		let slots = Arc::new([Mutex::new(None), Mutex::new(Some(out)), Mutex::new(None)]);
+		let mut stdout = StreamFile {
+			slots,
+			index: 1,
+			merged: false,
+			write_order: None,
+			events: None,
+			start: Instant::now(),
+		};
+		let mut key = WaitKey::default();
+		let cx = &mut Context::from_waker(Waker::noop());
+		assert!(matches!(stdout.poll_flush_keyed(cx, &mut key), Poll::Ready(Ok(()))));
+		assert!(probe.reached_by(&key), "the run's file was flushed without the caller's key");
+		assert_eq!(probe.keyless(), 0);
 	}
 }

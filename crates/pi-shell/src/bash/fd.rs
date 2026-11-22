@@ -400,6 +400,19 @@ impl FdRef {
 		}
 	}
 
+	/// [`Self::poll_flush`] for a host task that may wait beside others, as
+	/// [`Self::poll_read_keyed`] ([`File::poll_flush_keyed`]).
+	pub fn poll_flush_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_flush_keyed(cx, key),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
 	/// Kind of the underlying object; `None` when closed or lost.
 	pub fn kind(&self) -> Option<FileKind> {
 		self.0.state.lock().file_ref().map(File::kind)
@@ -493,6 +506,14 @@ impl File for TaggedOutput {
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.base.poll_flush(cx)
+	}
+
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<()>> {
+		self.base.poll_flush_keyed(cx, key)
 	}
 
 	fn seek(&mut self, pos: crate::bash::fs::SeekFrom) -> io::Result<u64> {
@@ -618,5 +639,28 @@ impl FdTable {
 			.iter()
 			.enumerate()
 			.filter_map(|(i, s)| s.as_ref().map(|r| (i as i32, r)))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{bash::fs::test_files::FlushProbe, sys::WaitKey};
+
+	// Failure mode: a native extra closing its handle of a traced run's
+	// output flushed with its key, and the trace wrapper flushed its base
+	// without it, as the engine.
+	#[test]
+	fn a_tagged_output_flushes_with_the_callers_key() {
+		use crate::bash::ids::{RunId, Vpid};
+		let probe = FlushProbe::default();
+		let base = FdRef::from_file(Box::new(probe.clone()));
+		let tag = crate::bash::ids::CmdTag { run: RunId(1), vpid: Vpid(1), seq: 1 };
+		let mut tagged = TaggedOutput { base, tag };
+		let mut key = WaitKey::default();
+		let cx = &mut Context::from_waker(std::task::Waker::noop());
+		assert!(matches!(tagged.poll_flush_keyed(cx, &mut key), Poll::Ready(Ok(()))));
+		assert!(probe.reached_by(&key), "the base was flushed without the caller's key");
+		assert_eq!(probe.keyless(), 0);
 	}
 }

@@ -98,7 +98,7 @@ pub(super) trait PollIo {
 		buf: &[u8],
 		key: &mut WaitKey,
 	) -> Poll<io::Result<usize>>;
-	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+	fn poll_flush(&mut self, cx: &mut Context<'_>, key: &mut WaitKey) -> Poll<io::Result<()>>;
 }
 
 impl PollIo for End {
@@ -126,10 +126,10 @@ impl PollIo for End {
 		}
 	}
 
-	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+	fn poll_flush(&mut self, cx: &mut Context<'_>, key: &mut WaitKey) -> Poll<io::Result<()>> {
 		match self {
-			Self::Fd(f) => f.poll_flush(cx),
-			Self::File(f) => f.poll_flush(cx),
+			Self::Fd(f) => f.poll_flush_keyed(cx, key),
+			Self::File(f) => f.poll_flush_keyed(cx, key),
 		}
 	}
 }
@@ -153,7 +153,7 @@ impl PollIo for OsPipe {
 		Self::poll_write(self, cx, buf)
 	}
 
-	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+	fn poll_flush(&mut self, cx: &mut Context<'_>, _key: &mut WaitKey) -> Poll<io::Result<()>> {
 		Self::poll_flush(self, cx)
 	}
 }
@@ -202,7 +202,7 @@ impl Chunk {
 		for _ in 0..BURST {
 			if self.start == self.end {
 				if self.eof {
-					let _ = std::task::ready!(dst.poll_flush(cx));
+					let _ = std::task::ready!(dst.poll_flush(cx, &mut self.key));
 					return Poll::Ready(());
 				}
 				match std::task::ready!(src.poll_read(cx, &mut self.buf, &mut self.key)) {
@@ -726,6 +726,26 @@ mod tests {
 		drain(&mut reader);
 		pump.wait("the pump, waiting for room, woken by the drain");
 		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
+	}
+
+	// Failure mode: a pump flushed its engine-side object at the end with no
+	// key, as the engine: on a provider file its waker replaced the engine's.
+	#[test]
+	fn a_pump_flushes_with_its_copys_key() {
+		use crate::bash::fs::test_files::FlushProbe;
+		let probe = FlushProbe::default();
+		let (mut ours, child) = os::pipe(false).unwrap();
+		drop(child);
+		let mut dst = End::Fd(FdRef::from_file(Box::new(probe.clone())));
+		let mut chunk = Chunk::new();
+		assert!(
+			chunk
+				.poll_copy(&mut Context::from_waker(Waker::noop()), &mut ours, &mut dst)
+				.is_ready(),
+			"the source ended"
+		);
+		assert!(probe.reached_by(&chunk.key), "the flush was made without the copy's key");
+		assert_eq!(probe.keyless(), 0);
 	}
 
 	#[derive(Default)]
