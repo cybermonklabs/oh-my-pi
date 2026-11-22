@@ -100,6 +100,10 @@ pub const AWAIT_GATE: &str = "while read -r _; do :; done <&3";
 pub struct Gate {
 	reader: std::fs::File,
 	writer: Option<std::io::PipeWriter>,
+	/// Not Linux: a copy of the read end without close-on-exec, made by the
+	/// first [`Gate::link`] from this gate's read end.
+	#[cfg(not(target_os = "linux"))]
+	linked: std::sync::OnceLock<std::os::fd::OwnedFd>,
 }
 
 #[cfg(unix)]
@@ -107,19 +111,43 @@ impl Gate {
 	/// A closed gate.
 	pub fn new() -> Self {
 		let (reader, writer) = std::io::pipe().expect("the gate's pipe");
-		Self { reader: std::fs::File::from(std::os::fd::OwnedFd::from(reader)), writer: Some(writer) }
+		Self {
+			reader: std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
+			writer: Some(writer),
+			#[cfg(not(target_os = "linux"))]
+			linked: std::sync::OnceLock::new(),
+		}
 	}
 
-	/// A symlink at `path` to the read end (`/dev/fd/N` of this process),
-	/// for a redirection opened by this process, or by a child the shell
-	/// forks from it before its `exec`, which still holds fd `N`:
-	/// `sh x.sh 3< gate`, also as a background job. The shell takes
-	/// `/dev/fd/N` itself for its own fd `N`, but opens the symlink on the
-	/// host.
+	/// A symlink at `path` to the read end, for a redirection such as `sh
+	/// x.sh 3< gate`, also as a background job. A background job whose
+	/// redirection open would wait opens it in the child the shell forks,
+	/// which first closes this process's close-on-exec descriptors, as its
+	/// `exec` would. The shell takes `/dev/fd/N` itself for its own fd `N`,
+	/// but opens the symlink on the host.
+	///
+	/// Linux: `/proc/<pid>/fd/N`, this process's read end, which any process
+	/// of the same user opens. Elsewhere `/dev/fd/N`, which names the opener's
+	/// own fd `N`: a copy of the read end without close-on-exec, so such a
+	/// child keeps it.
 	pub fn link(&self, path: &std::path::Path) {
 		use std::os::fd::AsRawFd as _;
-		std::os::unix::fs::symlink(format!("/dev/fd/{}", self.reader.as_raw_fd()), path)
-			.expect("the gate's symlink");
+		#[cfg(target_os = "linux")]
+		let target = format!("/proc/{}/fd/{}", std::process::id(), self.reader.as_raw_fd());
+		#[cfg(not(target_os = "linux"))]
+		let target = {
+			use std::os::fd::FromRawFd as _;
+			let linked = self.linked.get_or_init(|| {
+				// SAFETY: F_DUPFD makes a new descriptor of the read end, without
+				// close-on-exec, which nothing else owns.
+				let fd = unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_DUPFD, 3) };
+				assert!(fd >= 0, "a copy of the gate's read end: {}", std::io::Error::last_os_error());
+				// SAFETY: `fd` is new and owned here.
+				unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+			});
+			format!("/dev/fd/{}", linked.as_raw_fd())
+		};
+		std::os::unix::fs::symlink(target, path).expect("the gate's symlink");
 	}
 
 	/// A copy of the read end, for a child's stdin.
