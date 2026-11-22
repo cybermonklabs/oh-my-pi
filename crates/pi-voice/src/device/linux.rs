@@ -12,7 +12,7 @@ use std::{
 	time::Duration,
 };
 
-use super::{CaptureSink, DeviceConfig, PlaybackFill};
+use super::{CaptureSink, DeviceConfig, PlaybackFill, PulseServer};
 use crate::VoiceResult;
 
 const PA_STREAM_PLAYBACK: c_int = 1;
@@ -286,11 +286,13 @@ impl PulseStream {
 			channels: 1,
 		};
 		let mut error = 0;
+		// A named server is the only one libpulse may use; `None` keeps its own lookup.
+		let server = config.server.map(PulseServer::name);
 		// SAFETY: all pointers reference valid values for the duration of
 		// pa_simple_new.
 		let stream = unsafe {
 			(api.simple_new)(
-				ptr::null(),
+				server.as_ref().map_or(ptr::null(), |server| server.as_ptr()),
 				c"omp".as_ptr(),
 				direction,
 				ptr::null(),
@@ -392,22 +394,28 @@ impl AlsaOpenError {
 	}
 }
 
-/// Network-safe playback target when `PULSE_SERVER` points at a remote
-/// server: deep enough to ride SSH/VPN jitter, shallow enough for
+/// Network-safe playback target for a remote server (a named one, or
+/// `PULSE_SERVER`): deep enough to ride SSH/VPN jitter, shallow enough for
 /// conversation-grade latency.
 const REMOTE_PULSE_LATENCY_MS: u32 = 200;
 
 /// Latency target for pulse streams. `PULSE_LATENCY_MSEC` wins when set to a
 /// positive integer (the `pacat`/`paplay` convention); otherwise a remote
-/// `PULSE_SERVER` gets the network-safe default and local servers keep the
+/// server gets the network-safe default and local servers keep the
 /// low-latency callback period.
-fn pulse_latency_ms(period_ms: u32) -> u32 {
+fn pulse_latency_ms(config: DeviceConfig) -> u32 {
 	let latency_override = std::env::var("PULSE_LATENCY_MSEC")
 		.ok()
 		.and_then(|raw| parse_latency_msec(&raw));
-	let pulse_server_configured = latency_override.is_none()
-		&& std::env::var_os("PULSE_SERVER").is_some_and(|server| !server.is_empty());
-	select_pulse_latency_ms(period_ms, latency_override, pulse_server_configured)
+	let remote =
+		latency_override.is_none() && remote_pulse_server(config, std::env::var_os("PULSE_SERVER"));
+	select_pulse_latency_ms(config.period_ms, latency_override, remote)
+}
+
+/// Whether the stream goes to a remote server: one the config names, or a
+/// non-empty `PULSE_SERVER` (`env_server`, read by the caller).
+fn remote_pulse_server(config: DeviceConfig, env_server: Option<std::ffi::OsString>) -> bool {
+	config.server.is_some() || env_server.is_some_and(|server| !server.is_empty())
 }
 
 fn select_pulse_latency_ms(
@@ -489,7 +497,7 @@ fn pulse_attr(
 /// unavailable) never widens beyond the base period, so this stays a safe
 /// upper bound even if the stream falls back.
 pub(crate) fn playback_drain_periods(config: DeviceConfig) -> u32 {
-	drain_periods_for_latency(config.period_ms, pulse_latency_ms(config.period_ms))
+	drain_periods_for_latency(config.period_ms, pulse_latency_ms(config))
 }
 
 fn drain_periods_for_latency(period_ms: u32, latency_ms: u32) -> u32 {
@@ -888,7 +896,7 @@ impl Device {
 	) -> VoiceResult<Self> {
 		let &Direction { name, pulse, alsa, pulse_loop, alsa_loop } = direction;
 		let samples = config.period_samples();
-		let attr = pulse_attr(config, pulse, pulse_latency_ms(config.period_ms))?;
+		let attr = pulse_attr(config, pulse, pulse_latency_ms(config))?;
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
@@ -926,6 +934,15 @@ impl Device {
 					},
 					Err(error) => error,
 				};
+				// A named server is the call's audio: the default ALSA device is someone else's.
+				if let Some(server) = config.server {
+					let _ = opened_tx.send(Err(format!(
+						"PulseAudio {name} on server {} failed: {pulse_error}; a named server never falls \
+						 back to ALSA",
+						server.name().to_string_lossy()
+					)));
+					return;
+				}
 				match AlsaApi::get()
 					.and_then(|api| AlsaStream::open(api, config, alsa).map(|stream| (api, stream)))
 				{
@@ -983,7 +1000,80 @@ mod tests {
 	use super::*;
 
 	fn config(sample_rate: u32, period_ms: u32) -> DeviceConfig {
-		DeviceConfig { sample_rate, period_ms }
+		DeviceConfig { sample_rate, period_ms, server: None }
+	}
+
+	fn named(server: &str) -> DeviceConfig {
+		DeviceConfig {
+			server: super::super::pulse_server(Some(server)).unwrap(),
+			..config(16_000, 20)
+		}
+	}
+
+	/// The network buffer sizes follow a named server as they follow
+	/// `PULSE_SERVER`; a local stream with neither keeps the period.
+	#[test]
+	fn a_named_server_is_remote_like_pulse_server() {
+		assert!(remote_pulse_server(named("tcp:127.0.0.1:4713"), None));
+		assert!(remote_pulse_server(config(16_000, 20), Some("tcp:host:4713".into())));
+		assert!(!remote_pulse_server(config(16_000, 20), Some("".into())));
+		assert!(!remote_pulse_server(config(16_000, 20), None));
+	}
+
+	/// libpulse loaded, or `None` with the test reported as skipped.
+	fn pulse_or_skip(test: &str) -> Option<&'static PulseApi> {
+		match PulseApi::get() {
+			Ok(api) => Some(api),
+			Err(error) => {
+				eprintln!("{test}: skipped: libpulse is not loadable: {error}");
+				None
+			},
+		}
+	}
+
+	/// The named server reaches `pa_simple_new`: libpulse connects to the
+	/// listener the config names, not to its default server.
+	#[test]
+	fn a_named_server_reaches_pa_simple_new() {
+		if pulse_or_skip("a_named_server_reaches_pa_simple_new").is_none() {
+			return;
+		}
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let accepted = thread::spawn(move || {
+			// Take the connection and drop it at once: libpulse's handshake then fails.
+			listener.set_nonblocking(true).unwrap();
+			let deadline = std::time::Instant::now() + Duration::from_secs(10);
+			while std::time::Instant::now() < deadline {
+				if listener.accept().is_ok() {
+					return true;
+				}
+				thread::sleep(Duration::from_millis(10));
+			}
+			false
+		});
+		let opened = Device::start_capture(named(&format!("tcp:127.0.0.1:{port}")), Box::new(|_| {}));
+		assert!(accepted.join().unwrap(), "libpulse never connected to the named server");
+		let error = opened.err().expect("a server that hangs up opens no stream");
+		assert!(error.contains("PulseAudio capture on server tcp:127.0.0.1:"), "{error}");
+		assert!(!error.contains("ALSA:"), "a named server must not fall back to ALSA: {error}");
+	}
+
+	/// A named server that is down (or libpulse missing) fails the open; ALSA
+	/// is never tried, whatever the machine's default device is.
+	#[test]
+	fn a_named_server_never_falls_back_to_alsa() {
+		let port = {
+			let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			listener.local_addr().unwrap().port()
+		};
+		let error = Device::start_playback(named(&format!("tcp:127.0.0.1:{port}")), Box::new(|_| {}))
+			.err()
+			.expect("a server nobody listens on opens no stream");
+		// Shows which failure it was: the server's refusal, or libpulse missing.
+		eprintln!("named server refused: {error}");
+		assert!(error.starts_with("PulseAudio playback on server"), "{error}");
+		assert!(!error.contains("ALSA:"), "{error}");
 	}
 
 	/// Regression guard: the remote-server support must not change the local

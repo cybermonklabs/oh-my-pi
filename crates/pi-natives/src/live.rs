@@ -12,7 +12,10 @@ use napi::{
 	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
 };
 use napi_derive::napi;
-use pi_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
+use pi_voice::{
+	audio::pulse_server,
+	live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore},
+};
 
 type StringCallback = ThreadsafeFunction<String, UnknownReturnValue>;
 type LevelCallback = ThreadsafeFunction<f64, UnknownReturnValue>;
@@ -26,7 +29,9 @@ pub struct LiveWebRtcPeer {
 #[napi]
 impl LiveWebRtcPeer {
 	/// Create an idle peer and register its event, output-level, and failure
-	/// callbacks.
+	/// callbacks. `pulse_server_name` names a `PulseAudio` server for the
+	/// speaker (`tcp:host:port`); then playback gets network-sized buffers and
+	/// never falls back to ALSA.
 	#[napi(constructor)]
 	pub fn new(
 		#[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
@@ -34,20 +39,21 @@ impl LiveWebRtcPeer {
 		#[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
 		#[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
 		on_failure: StringCallback,
-	) -> Self {
-		Self {
-			inner: Arc::new(LivePeerCore::new(LiveCallbacks {
-				event:   Box::new(move |payload| {
-					on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-				level:   Box::new(move |level| {
-					on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-				failure: Box::new(move |message| {
-					on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
-				}),
-			})),
-		}
+		pulse_server_name: Option<String>,
+	) -> Result<Self> {
+		let server = pulse_server(pulse_server_name.as_deref()).map_err(napi::Error::from_reason)?;
+		let callbacks = LiveCallbacks {
+			event:   Box::new(move |payload| {
+				on_event.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+			}),
+			level:   Box::new(move |level| {
+				on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
+			}),
+			failure: Box::new(move |message| {
+				on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
+			}),
+		};
+		Ok(Self { inner: Arc::new(LivePeerCore::new(callbacks, server)) })
 	}
 
 	/// Start the native media peer and return its SDP offer.

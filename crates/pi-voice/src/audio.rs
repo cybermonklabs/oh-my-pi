@@ -14,6 +14,7 @@ use std::sync::{
 use flume::TryRecvError;
 use tokio::sync::Notify;
 
+pub use crate::device::{PulseServer, pulse_server};
 use crate::{
 	VoiceResult,
 	device::{CaptureDevice, DeviceConfig, PlaybackDevice, playback_drain_periods},
@@ -136,7 +137,8 @@ pub struct PlaybackStream {
 }
 
 impl PlaybackStream {
-	/// Open and start the default speaker at the requested logical sample rate.
+	/// Open and start the speaker at the requested logical sample rate: the
+	/// default device, or the default sink of `server`.
 	///
 	/// `jitter_buffer_ms` of audio is held back before playback starts and
 	/// again after every underrun, so a network-paced producer survives
@@ -145,11 +147,15 @@ impl PlaybackStream {
 	/// callbacks even while the producer remains connected. Zero plays
 	/// samples as soon as they are queued. Either way, output fades out when
 	/// the queue runs dry and fades back in when audio resumes.
-	pub fn start(sample_rate: u32, jitter_buffer_ms: u32) -> VoiceResult<Self> {
+	pub fn start(
+		sample_rate: u32,
+		jitter_buffer_ms: u32,
+		server: Option<PulseServer>,
+	) -> VoiceResult<Self> {
 		let sample_rate = audio_sample_rate(sample_rate)?;
 		let state = Arc::new(PlaybackState::new());
 		let (tx, rx) = flume::unbounded::<Vec<f32>>();
-		let config = DeviceConfig { sample_rate, period_ms: PLAYBACK_PERIOD_MS };
+		let config = DeviceConfig { sample_rate, period_ms: PLAYBACK_PERIOD_MS, server };
 		let mut renderer = Renderer::new(
 			rx,
 			Arc::clone(&state),
@@ -158,7 +164,7 @@ impl PlaybackStream {
 			sample_rate as usize * PLAYBACK_FADE_MS / 1000,
 		);
 		let device = PlaybackDevice::start(config, Box::new(move |output| renderer.fill(output)))
-			.map_err(|error| format!("Failed to open the default speaker: {error}"))?;
+			.map_err(|error| format!("Failed to open the speaker: {error}"))?;
 
 		Ok(Self {
 			device: Some(device),
@@ -417,14 +423,15 @@ pub struct CaptureStream {
 }
 
 impl CaptureStream {
-	/// Open the default microphone at the requested sample rate. `on_audio`
-	/// runs on the realtime audio thread — it must not block.
-	pub fn start<C>(sample_rate: u32, mut on_audio: C) -> VoiceResult<Self>
+	/// Open the microphone at the requested sample rate: the default device,
+	/// or the default source of `server`. `on_audio` runs on the realtime
+	/// audio thread — it must not block.
+	pub fn start<C>(sample_rate: u32, server: Option<PulseServer>, mut on_audio: C) -> VoiceResult<Self>
 	where
 		C: FnMut(&[f32]) + Send + 'static,
 	{
 		let sample_rate = audio_sample_rate(sample_rate)?;
-		let config = DeviceConfig { sample_rate, period_ms: CAPTURE_PERIOD_MS };
+		let config = DeviceConfig { sample_rate, period_ms: CAPTURE_PERIOD_MS, server };
 		let device = CaptureDevice::start(
 			config,
 			Box::new(move |samples| {
@@ -433,7 +440,7 @@ impl CaptureStream {
 				}
 			}),
 		)
-		.map_err(|error| format!("Failed to open the default microphone: {error}"))?;
+		.map_err(|error| format!("Failed to open the microphone: {error}"))?;
 		Ok(Self { device: Some(device) })
 	}
 
@@ -729,7 +736,7 @@ mod tests {
 			return;
 		}
 
-		let mut stream = PlaybackStream::start(16_000, 0).expect("default playback device starts");
+		let mut stream = PlaybackStream::start(16_000, 0, None).expect("default playback device starts");
 		stream.stop().expect("default playback device stops");
 	}
 
@@ -741,7 +748,7 @@ mod tests {
 
 		let callbacks = Arc::new(AtomicUsize::new(0));
 		let callback_count = Arc::clone(&callbacks);
-		let mut stream = CaptureStream::start(16_000, move |_samples| {
+		let mut stream = CaptureStream::start(16_000, None, move |_samples| {
 			callback_count.fetch_add(1, Ordering::Relaxed);
 		})
 		.expect("default capture device starts");

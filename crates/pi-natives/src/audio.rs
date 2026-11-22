@@ -12,12 +12,12 @@ use napi::{
 };
 use napi_derive::napi;
 use parking_lot::Mutex;
-use pi_voice::audio::{CaptureStream, PlaybackState, PlaybackStream};
+use pi_voice::audio::{CaptureStream, PlaybackState, PlaybackStream, pulse_server};
 
 type CaptureCallback = ThreadsafeFunction<Float32Array, UnknownReturnValue>;
 
-/// Default-microphone capture converted to mono `f32` at the requested sample
-/// rate.
+/// Microphone capture (the default device, or a named `PulseAudio` server's)
+/// converted to mono `f32` at the requested sample rate.
 #[napi]
 pub struct AudioCapture {
 	stream: Mutex<Option<CaptureStream>>,
@@ -25,14 +25,18 @@ pub struct AudioCapture {
 
 #[napi]
 impl AudioCapture {
-	/// Open the default microphone and deliver low-latency mono PCM chunks.
+	/// Open the microphone and deliver low-latency mono PCM chunks. `server`
+	/// names a `PulseAudio` server (`tcp:host:port`); then the stream gets
+	/// network-sized buffers and never falls back to ALSA.
 	#[napi(constructor)]
 	pub fn new(
 		sample_rate: u32,
 		#[napi(ts_arg_type = "(error: Error | null, samples: Float32Array) => void")]
 		on_audio: CaptureCallback,
+		server: Option<String>,
 	) -> Result<Self> {
-		let stream = CaptureStream::start(sample_rate, move |samples| {
+		let server = pulse_server(server.as_deref()).map_err(napi::Error::from_reason)?;
+		let stream = CaptureStream::start(sample_rate, server, move |samples| {
 			on_audio
 				.call(Ok(Float32Array::new(samples.to_vec())), ThreadsafeFunctionCallMode::NonBlocking);
 		})
@@ -65,7 +69,7 @@ impl AudioPlayback {
 	pub fn new(sample_rate: u32) -> Result<Self> {
 		// Local producers queue whole chunks ahead of playback; no jitter
 		// reserve.
-		let stream = PlaybackStream::start(sample_rate, 0).map_err(napi::Error::from_reason)?;
+		let stream = PlaybackStream::start(sample_rate, 0, None).map_err(napi::Error::from_reason)?;
 		let state = stream.state();
 		Ok(Self { stream: Mutex::new(Some(stream)), state })
 	}
