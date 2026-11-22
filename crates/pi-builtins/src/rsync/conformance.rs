@@ -20,11 +20,13 @@
 //! those values, the comparison stays exact and samples both clients: ours
 //! races the same way (its sender, generator, and receiver are threads), so
 //! when the outcomes differ in any way, each client is rerun on a fresh
-//! fixture up to [`RETRIES`] times, and the scenario passes once some outcome
-//! of ours exactly equals (exit code, normalized stdout and stderr, tree) some
+//! fixture, ours up to [`RETRIES`] times and the reference up to
+//! [`REFERENCE_RETRIES`] times, and the scenario passes once some outcome of
+//! ours exactly equals (exit code, normalized stdout and stderr, tree) some
 //! reference outcome. A real bug still fails because no outcome of ours
-//! matches; the failure report names how many distinct outcomes each client
-//! produced and diffs the first of each.
+//! matches any outcome the reference produced; the failure report names how
+//! many runs and distinct outcomes each client had and diffs the first of
+//! each.
 //!
 //! Both clients run with the same empty environment (plus `TZ` when set, so
 //! local-time output uses one zone on both sides) and the same `LC_ALL`: the
@@ -63,8 +65,14 @@ use self::snapshot::Snapshot;
 use crate::host::run_util_env;
 use crate::rsync::Rsync;
 
-/// How many extra runs of each client a mismatch gets.
+/// How many extra runs of ours a mismatch gets.
 const RETRIES: usize = 8;
+
+/// How many extra runs of the reference a mismatch gets. The reference varies
+/// more than ours: under load, 15 of the 150 local scenarios gave more than
+/// one reference outcome in 30 runs, and in some the outcome ours gives came
+/// in only 1 to 5 of them, which [`RETRIES`] runs can miss.
+const REFERENCE_RETRIES: usize = 30;
 
 /// One scenario: see [`cases`] for the field conventions.
 struct Case {
@@ -157,6 +165,7 @@ pub(super) fn reference() -> Option<PathBuf> {
 	let Some((path, version)) = found else {
 		let required = std::env::var_os("RSYNC_REFERENCE_REQUIRED").is_some_and(|v| !v.is_empty());
 		assert!(!required, "no rsync 3.5.1 on PATH, and RSYNC_REFERENCE_REQUIRED is set");
+		eprintln!("skipped: no rsync 3.5.1 on PATH");
 		return None;
 	};
 	let missing: Vec<&str> = ["xxh128", "lz4", "zstd"].into_iter().filter(|name| !version.contains(name)).collect();
@@ -265,8 +274,10 @@ fn sorted_lines(data: &[u8]) -> Vec<&[u8]> {
 	lines
 }
 
-/// Runs one scenario; `Err` carries the report.
-fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
+/// Runs one scenario; `Err` carries the report. `tamper` edits each outcome of
+/// ours before it is compared (the negative controls; [`run_table`] passes
+/// one that changes nothing).
+fn check(reference: &Path, mode: Mode, case: &Case, tamper: &dyn Fn(&mut Outcome)) -> Result<(), String> {
 	let dir = tempfile::tempdir().unwrap();
 	// Canonical, so the paths both clients print agree with what `getcwd`
 	// reports to the reference (macOS: /var → /private/var).
@@ -275,16 +286,21 @@ fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
 	// Distinct outcomes per client so far, first run first.
 	let mut mine: Vec<Outcome> = Vec::new();
 	let mut seen: Vec<Outcome> = Vec::new();
+	let mut runs = (0_usize, 0_usize);
 	let mut matched = None;
-	for attempt in 0..=RETRIES {
-		for (client, side, outcomes) in [
-			(Client::Ours, format!("ours{attempt}"), &mut mine),
-			(Client::Reference, format!("theirs{attempt}"), &mut seen),
-		] {
-			let outcome = bench.run(case, &side, client);
-			if !outcomes.contains(&outcome) {
-				outcomes.push(outcome);
+	for attempt in 0..=REFERENCE_RETRIES {
+		if attempt <= RETRIES {
+			let mut outcome = bench.run(case, &format!("ours{attempt}"), Client::Ours);
+			tamper(&mut outcome);
+			runs.0 += 1;
+			if !mine.contains(&outcome) {
+				mine.push(outcome);
 			}
+		}
+		let outcome = bench.run(case, &format!("theirs{attempt}"), Client::Reference);
+		runs.1 += 1;
+		if !seen.contains(&outcome) {
+			seen.push(outcome);
 		}
 		matched = mine.iter().find(|outcome| seen.contains(outcome));
 		if matched.is_some() {
@@ -300,9 +316,11 @@ fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
 		format!("ours matched one of {} distinct reference outcome(s)", seen.len())
 	} else {
 		format!(
-			"none of {} distinct outcome(s) of ours matched any of {} distinct reference outcome(s); diff of the first of each",
+			"none of {} distinct outcome(s) of ours ({} runs) matched any of {} distinct reference outcome(s) ({} runs); diff of the first of each",
 			mine.len(),
-			seen.len()
+			runs.0,
+			seen.len(),
+			runs.1
 		)
 	};
 	let mut report = format!("{} {:?}\n  {verdict}\n", case.name, bench.argv(case, 0));
@@ -339,7 +357,7 @@ fn run_table(mode: Mode, table: &[Case]) {
 		for _ in 0..workers {
 			scope.spawn(|| {
 				while let Some(case) = cases.get(next.fetch_add(1, Ordering::Relaxed)) {
-					let result = std::panic::catch_unwind(|| check(&reference, mode, case))
+					let result = std::panic::catch_unwind(|| check(&reference, mode, case, &unchanged))
 						.unwrap_or_else(|panic| {
 							let text = panic
 								.downcast_ref::<String>()
@@ -379,4 +397,58 @@ fn remote_shell_transfers_match_reference() {
 #[test]
 fn daemon_transfers_match_reference() {
 	run_table(Mode::Daemon, cases::DAEMON);
+}
+
+/// The tamper of a real comparison: the outcome as it came.
+fn unchanged(_: &mut Outcome) {}
+
+/// Runs `case` with each outcome of ours edited by `tamper` into one the
+/// reference never produces, and requires it to fail only after every run of
+/// both clients: no rerun lets a wrong outcome of ours through.
+fn assert_never_matches(table: &[Case], name: &str, tamper: &dyn Fn(&mut Outcome)) {
+	let Some(reference) = reference() else { return };
+	let case = table.iter().find(|c| c.name == name).expect("the control's scenario");
+	let report = check(&reference, Mode::Local, case, tamper).expect_err("a tampered outcome of ours matched the reference");
+	let runs = format!("of ours ({} runs)", RETRIES + 1);
+	let reference_runs = format!("reference outcome(s) ({} runs)", REFERENCE_RETRIES + 1);
+	assert!(report.contains(&runs) && report.contains(&reference_runs), "{report}");
+}
+
+/// The summary's `received N bytes`, with N one more.
+fn one_more_byte_received(outcome: &mut Outcome) {
+	let text = String::from_utf8(outcome.out.clone()).unwrap();
+	let (head, tail) = text.split_once("  received ").expect("a `sent … received …` summary");
+	let (count, rest) = tail.split_once(" bytes").unwrap();
+	let count: u64 = count.replace(',', "").parse().unwrap();
+	let digits = (count + 1).to_string();
+	let mut grouped = String::new();
+	for (i, digit) in digits.chars().enumerate() {
+		if i > 0 && (digits.len() - i) % 3 == 0 {
+			grouped.push(',');
+		}
+		grouped.push(digit);
+	}
+	outcome.out = format!("{head}  received {grouped} bytes{rest}").into_bytes();
+}
+
+/// `junk.o` deleted after `extra.txt`: rsync deletes a directory's extra
+/// entries in reverse name order, so the reference never prints these two
+/// deletions this way round.
+fn junk_deleted_after_extra(outcome: &mut Outcome) {
+	let mut lines: Vec<&[u8]> = outcome.out.split(|&byte| byte == b'\n').collect();
+	let junk = lines.iter().position(|line| *line == b"*deleting   junk.o").expect("junk.o's deletion");
+	let extra = lines.iter().position(|line| *line == b"*deleting   extra.txt").expect("extra.txt's deletion");
+	assert!(junk < extra, "the deletions came in the other order already");
+	lines.swap(junk, extra);
+	outcome.out = lines.join(&b'\n');
+}
+
+#[test]
+fn a_byte_total_of_ours_the_reference_never_gives_fails_every_rerun() {
+	assert_never_matches(cases::LOCAL, "archive_vv_stale", &one_more_byte_received);
+}
+
+#[test]
+fn a_deletion_order_of_ours_the_reference_never_gives_fails_every_rerun() {
+	assert_never_matches(cases::LOCAL, "dry_run", &junk_deleted_after_extra);
 }
