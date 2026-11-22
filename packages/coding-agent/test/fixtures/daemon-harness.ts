@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import { closeDaemonClient, probeDaemon } from "../../src/daemon/client";
 import { daemonLockPath } from "../../src/daemon/paths";
-import { DAEMON_DIR_ENV, DAEMON_TCP_ENV } from "../../src/daemon/protocol";
+import { DAEMON_DIR_ENV, DAEMON_TCP_ENV, DAEMON_WORKER_ARG } from "../../src/daemon/protocol";
 
 const TEARDOWN_TIMEOUT_MS = 10_000;
 
@@ -44,6 +44,29 @@ export function isAlive(pid: number): boolean {
 /** Whether a daemon currently holds this runtime dir's single-instance lock. */
 export function daemonLockHeld(): boolean {
 	return FileLock.isHeld(daemonLockPath());
+}
+
+/**
+ * SIGKILL every daemon process started for `dir`, tracked or not. A client that cannot dial spawns
+ * another daemon every second until one answers, so under load a test leaves daemons nobody tracked;
+ * one that starts after `dir` is removed makes it again and takes its lock. Each was given `dir` in
+ * its environment, which Linux shows under /proc; elsewhere this finds none.
+ */
+async function killDaemonsOf(dir: string): Promise<void> {
+	const entries = await fs.readdir("/proc").catch(() => [] as string[]);
+	const marker = `${DAEMON_DIR_ENV}=${dir}`;
+	for (const entry of entries) {
+		const pid = Number(entry);
+		if (!Number.isInteger(pid) || pid === process.pid) continue;
+		try {
+			const args = (await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
+			if (!args.includes(DAEMON_WORKER_ARG)) continue;
+			const env = (await fs.readFile(`/proc/${pid}/environ`, "utf8")).split("\0");
+			if (env.includes(marker)) process.kill(pid, "SIGKILL");
+		} catch {
+			// Gone meanwhile, or not ours to read.
+		}
+	}
 }
 
 export class IsolatedDaemon {
@@ -109,6 +132,7 @@ export class IsolatedDaemon {
 				else process.env[DAEMON_DIR_ENV] = this.#previousDir;
 				if (this.#previousTcp !== undefined) process.env[DAEMON_TCP_ENV] = this.#previousTcp;
 			}
+			await killDaemonsOf(this.dir);
 			await fs.rm(this.dir, { recursive: true, force: true });
 		}
 	}
