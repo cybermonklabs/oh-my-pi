@@ -5019,8 +5019,8 @@ interface SubagentReviveRecord {
 	readonly pendingCacheCandidate?: string;
 	/**
 	 * The {@link WarmReviveState.generation} of the park that wrote it. A revive pairs the state only with the entry
-	 * of the same generation, so never with an entry another state wrote, which a fork copies with the rest of its
-	 * transcript.
+	 * of the same generation, so with an entry another state wrote, which a fork copies with the rest of its
+	 * transcript, only by chance, at odds of about 2^-52 a park.
 	 */
 	readonly generation: number;
 }

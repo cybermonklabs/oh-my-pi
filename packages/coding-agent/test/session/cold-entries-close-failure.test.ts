@@ -5,17 +5,16 @@
  * close, not left open until a collection.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { descriptorsUnder, HAS_PROC_FD } from "../helpers/open-descriptors";
 
 /** Larger than any value an entry before the cut keeps in memory. */
 const BODY = "x".repeat(4096);
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
 /** The file a session writes beside a draft that made its file, and removes when real entries follow. */
 const DRAFT_ONLY_MARKER = ".draft-only-session";
 
@@ -54,20 +53,6 @@ class MarkerUnlinkFails extends FileSessionStorage {
 			Object.assign(new Error(`EACCES: permission denied, unlink '${file}'`), { code: "EACCES" }),
 		);
 	}
-}
-
-/** Descriptors of this process open on a file under `dir`. */
-function descriptorsUnder(dir: string): string[] {
-	const found: string[] = [];
-	for (const fd of fs.readdirSync("/proc/self/fd")) {
-		try {
-			const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
-			if (target.startsWith(`${dir}${path.sep}`)) found.push(target);
-		} catch {
-			// Closed between the listing and the read.
-		}
-	}
-	return found;
 }
 
 describe("the store of older entries when a close fails", () => {

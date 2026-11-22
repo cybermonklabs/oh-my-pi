@@ -32,12 +32,12 @@ import {
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { descriptorsUnder, HAS_PROC_FD } from "../helpers/open-descriptors";
 import { rejectionOf } from "../helpers/rejection";
 import { fillDiskUnder, pathUnderRegularFile, spoolWarnings } from "../helpers/spool-unusable";
 
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
 const ID = "01a1f000-0000-7000-8000-00000000f001";
 const TIMESTAMP = "2026-11-19T00:00:00.000Z";
 const SYNC_FILE = `/sessions/-project-/2026-11-19T00-00-00-000Z_${ID}.jsonl`;
@@ -103,15 +103,6 @@ async function rewriteBothWays(storage: SqlSessionStorage): Promise<{ stored: st
 		stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
 		written: [syncLines.join(""), atomicLines.join("")],
 	};
-}
-
-/** Whether descriptor `fd` of this process is open on a file under `dir`. */
-function isUnder(fd: number, dir: string): boolean {
-	try {
-		return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${dir}${path.sep}`);
-	} catch {
-		return false;
-	}
 }
 
 /**
@@ -206,12 +197,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 				expect(stored).toEqual(written);
 				// Both rewrites tried the spool, and the partly written files are closed and gone.
 				expect(disk.refused()).toBe(2);
-				expect(
-					fs
-						.readdirSync("/proc/self/fd")
-						.map(Number)
-						.filter(fd => isUnder(fd, tmp.path())),
-				).toEqual([]);
+				expect(descriptorsUnder(tmp.path())).toEqual([]);
 				expect(fs.readdirSync(path.join(tmp.path(), `omp-spool-${process.getuid?.()}`))).toEqual([]);
 				expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
 			});

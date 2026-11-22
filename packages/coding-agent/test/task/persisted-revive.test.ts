@@ -21,7 +21,7 @@ import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentRegistry, qualifyPersistedAgentId } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
@@ -2480,6 +2480,44 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		);
 	}
 
+	/**
+	 * Installs `cwd`'s persisted reviver factory as `lifecycle`'s cold-revive factory, counting the revivers asked of
+	 * it: `count` is how many cold revives the lifecycle began.
+	 */
+	function countColdRevivers(lifecycle: AgentLifecycleApi, cwd: string): { count: number } {
+		const factory = createFactory(cwd);
+		const coldRevivers = { count: 0 };
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				coldRevivers.count++;
+				return factory(ref);
+			},
+			() => 0,
+		);
+		return coldRevivers;
+	}
+
+	/** Makes `manager` drop each revive-input record a park appends, as a disk failure the manager only notes would. */
+	function dropReviveRecords(manager: SessionManager): void {
+		const append = manager.appendCustomEntry.bind(manager);
+		vi.spyOn(manager, "appendCustomEntry").mockImplementation((customType, data) =>
+			customType === "subagent-revive-state" ? "dropped" : append(customType, data),
+		);
+	}
+
+	/**
+	 * Checks that `live`, the session the lifecycle revived, is the one `revive` stubbed, sends it a follow-up and
+	 * expects that request to replay the system prompt of `spawned`'s last request.
+	 */
+	async function expectColdReplay(revive: ColdRevive, live: AgentSession, spawned: RecordingSession): Promise<void> {
+		const cold = revive.recording;
+		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
+		await live.prompt("follow-up");
+		await live.waitForIdle();
+		// A cold revive replays the system prompt the parked session's last request sent.
+		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+	}
+
 	// If this regresses, a parked subagent keeps the inputs of its finished run in memory for as long as it stays
 	// parked, or comes back from its transcript with a prompt other than the one it was sent with, and the provider
 	// writes the whole conversation to its prompt cache again; or its transcript gains another copy of its prompt
@@ -2544,12 +2582,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 		const revive = stubColdRevive();
 		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
-		const cold = revive.recording;
-		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
-		await live.prompt("follow-up");
-		await live.waitForIdle();
-		// A cold revive replays the system prompt the parked session's last request sent.
-		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+		await expectColdReplay(revive, live, spawned);
 	});
 
 	// If this regresses, a host that hands each call its own cold reviver instead of installing one for the process
@@ -2569,11 +2602,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const revive = stubColdRevive();
 		// No factory for the process, as under ACP: the call brings its own.
 		const live = localSession(await lifecycle.ensureLive("prompt-blocks", { reviverFactory: createFactory(cwd) }));
-		const cold = revive.recording;
-		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
-		await live.prompt("follow-up");
-		await live.waitForIdle();
-		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+		await expectColdReplay(revive, live, spawned);
 	});
 
 	// If this regresses, a warm revive that fails before it builds the session (a `task.agentAccountPools` that does
@@ -2626,33 +2655,17 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const cwd = makeTempDir("@pi-revive-dropped-inputs-");
 		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
 		const lifecycle = AgentLifecycleManager.global();
-		const factory = createFactory(cwd);
-		let coldRevivers = 0;
-		lifecycle.setPersistedSubagentReviverFactory(
-			async ref => {
-				coldRevivers++;
-				return factory(ref);
-			},
-			() => 0,
-		);
+		const coldRevivers = countColdRevivers(lifecycle, cwd);
 		const { live } = await parkAndRevive(() => {});
 		cfgContextPromotionEnabled.set(live, !cfgContextPromotionEnabled.get(live));
-		const manager = live.sessionManager;
-		const append = manager.appendCustomEntry.bind(manager);
-		vi.spyOn(manager, "appendCustomEntry").mockImplementation((customType, data) =>
-			customType === "subagent-revive-state" ? "dropped" : append(customType, data),
-		);
+		dropReviveRecords(live.sessionManager);
 		await lifecycle.park("prompt-blocks");
 		expect(await reviveRecords(cwd)).toHaveLength(1);
 
 		const revive = stubColdRevive();
 		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
-		const cold = revive.recording;
-		if (!cold || revived !== cold.session) throw new Error("Expected a revive through the lifecycle");
-		expect(coldRevivers).toBe(1);
-		await revived.prompt("follow-up");
-		await revived.waitForIdle();
-		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+		await expectColdReplay(revive, revived, spawned);
+		expect(coldRevivers.count).toBe(1);
 	});
 
 	// If this regresses, a subagent whose transcript holds another subagent's revive inputs (a seance consult's
@@ -2670,34 +2683,19 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const cwd = makeTempDir("@pi-revive-foreign-inputs-");
 		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
 		const lifecycle = AgentLifecycleManager.global();
-		const factory = createFactory(cwd);
-		let coldRevivers = 0;
-		lifecycle.setPersistedSubagentReviverFactory(
-			async ref => {
-				coldRevivers++;
-				return factory(ref);
-			},
-			() => 0,
-		);
+		const coldRevivers = countColdRevivers(lifecycle, cwd);
 		// The source's record, copied in as a fork of its transcript copies it; this subagent's own never lands.
 		const manager = spawned.session.sessionManager;
 		manager.appendCustomEntry("subagent-revive-state", sourceRecord);
-		const append = manager.appendCustomEntry.bind(manager);
-		vi.spyOn(manager, "appendCustomEntry").mockImplementation((customType, data) =>
-			customType === "subagent-revive-state" ? "dropped" : append(customType, data),
-		);
+		dropReviveRecords(manager);
 		await lifecycle.park("prompt-blocks");
 		expect(await reviveRecords(cwd)).toEqual([sourceRecord]);
 
 		const revive = stubColdRevive();
 		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
-		const cold = revive.recording;
-		if (!cold || revived !== cold.session) throw new Error("Expected a revive through the lifecycle");
-		await revived.prompt("follow-up");
-		await revived.waitForIdle();
-		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+		await expectColdReplay(revive, revived, spawned);
 		expect(revive.cwd).toBe(cwd);
-		expect(coldRevivers).toBe(1);
+		expect(coldRevivers.count).toBe(1);
 	});
 
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {

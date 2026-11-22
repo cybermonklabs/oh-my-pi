@@ -14,6 +14,7 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getBlobsDir, getConfigRootDir, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { HAS_PROC_FD } from "../helpers/open-descriptors";
 
 /** Larger than any value a cold entry keeps in memory. */
 const BODY = "x".repeat(4096);
@@ -425,7 +426,7 @@ describe("cold entry store", () => {
 		expect(textOf(entry(clone, "a1"))).toBe(`a1 ${BODY}`);
 	});
 
-	it.skipIf(!fs.existsSync("/proc/self/fd"))(
+	it.skipIf(!HAS_PROC_FD)(
 		"leaves no store file in the directory and closes its descriptor once the last cold entry is gone",
 		async () => {
 			using dir = TempDir.createSync("@omp-cold-entries-");
@@ -451,7 +452,7 @@ describe("cold entry store", () => {
 		},
 	);
 
-	it.skipIf(!fs.existsSync("/proc/self/fd"))(
+	it.skipIf(!HAS_PROC_FD)(
 		"opens its store in a directory of the account's own that no other account can enter",
 		async () => {
 			using dir = TempDir.createSync("@omp-cold-entries-");
@@ -511,7 +512,7 @@ describe("cold entry store", () => {
 	});
 
 	// bash detach on /delete keeps a clone of the dropped session; closing both must free the store's disk now.
-	it.skipIf(!fs.existsSync("/proc/self/fd"))(
+	it.skipIf(!HAS_PROC_FD)(
 		"closes the store once the manager and a clone made without persistence are both closed",
 		async () => {
 			using dir = TempDir.createSync("@omp-cold-entries-");
