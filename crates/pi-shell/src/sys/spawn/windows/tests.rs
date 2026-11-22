@@ -593,3 +593,127 @@ fn term_kills_a_released_external_at_once() {
 	assert_eq!(wait(&mut p), ExitStatus::Signaled(Signal::Kill));
 	assert!(t0.elapsed() < LONG / 2, "TERM waited for the grace");
 }
+
+/// An exit the waiter records while `poll_wait` polls the input pumps is
+/// reported only once the input pump is gone (the Unix tests' `OneLine`,
+/// here with `cmd /c "set /p x= & exit 3"`).
+mod exit_order {
+	use std::{
+		io,
+		sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+	};
+
+	use super::*;
+	use crate::bash::{File, FileKind, OsHandle};
+
+	/// A waker that counts its wakes and unparks the test's thread.
+	struct Wakes {
+		count:  AtomicUsize,
+		thread: thread::Thread,
+	}
+
+	impl Wake for Wakes {
+		fn wake(self: Arc<Self>) {
+			self.wake_by_ref();
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.count.fetch_add(1, SeqCst);
+			self.thread.unpark();
+		}
+	}
+
+	/// A host file without an OS handle that hands the child one line; at
+	/// its next read it waits until the poller's waker was woken twice (the
+	/// waiter's cancel of the input pumps and its record of the exit), then
+	/// has nothing. Counts its live copies.
+	#[derive(Clone)]
+	struct OneLine {
+		alive: Arc<()>,
+		wakes: Arc<Wakes>,
+		sent:  Arc<AtomicBool>,
+	}
+
+	impl File for OneLine {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			if !self.sent.swap(true, SeqCst) {
+				buf[..4].copy_from_slice(b"go\r\n");
+				return Poll::Ready(Ok(4));
+			}
+			// Each wake unparks this thread, which polls the pumps: the test's
+			// own thread. Only the runner bounds a waiter that never reports.
+			while self.wakes.count.load(SeqCst) < 2 {
+				thread::park();
+			}
+			Poll::Pending
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> io::Result<Box<dyn File>> {
+			Ok(Box::new(self.clone()))
+		}
+	}
+
+	#[test]
+	fn an_exit_recorded_during_the_pump_poll_is_reported_without_the_input_pump() {
+		let s = NativeSpawner::default();
+		let wakes = Arc::new(Wakes { count: AtomicUsize::new(0), thread: thread::current() });
+		let input = OneLine { alive: Arc::new(()), wakes: Arc::clone(&wakes), sent: Arc::default() };
+		let argv = cmd("set /p x= & exit 3");
+		let root = system_root();
+		let env = EnvView::new(vec![
+			(BString::from("SystemRoot"), BString::from(root.as_str())),
+			(BString::from("PATH"), BString::from(format!(r"{root}\System32"))),
+		]);
+		let mut p = s
+			.spawn(SpawnSpec {
+				path:        argv[0].as_bstr(),
+				argv:        &argv,
+				env:         &env,
+				cwd:         root.as_bytes().as_bstr(),
+				stdio:       [
+					StdioSpec::File(Box::new(input.clone())),
+					StdioSpec::Null,
+					StdioSpec::Null,
+				],
+				extra_fds:   Vec::new(),
+				pgroup:      NEW,
+				tag:         CmdTag { run: RunId(1), vpid: Vpid(Vpid::BASE), seq: 1 },
+				vpid:        Vpid(Vpid::BASE),
+				umask:       0,
+				sigmask_ign: SigSet::EMPTY,
+				rlimits:     &[],
+				lineage:     Lineage::default(),
+				redirs:      None,
+				ctty:        None,
+			})
+			.unwrap();
+		let waker = Waker::from(Arc::clone(&wakes));
+		let polled = p.poll_wait(&mut Context::from_waker(&waker));
+		assert_eq!(polled, Poll::Ready(ExitStatus::Exited(3)), "one poll sees the exit");
+		assert_eq!(
+			Arc::strong_count(&input.alive),
+			1,
+			"the exit was reported while the input pump held the engine object"
+		);
+	}
+}
