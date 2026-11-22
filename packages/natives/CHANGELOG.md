@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- The bash tool's `cp --reflink=always` reports the clone's own error, as GNU cp does (`Invalid cross-device link` across filesystems, `Operation not supported` on an overlayfs), where it said `source and destination are on different devices`. From a source that is not a regular file, such as `/dev/null`, it now tries the clone and fails as GNU cp does, where it copied the data and exited 0.
+- The bash tool's `cp --reflink=always` reports the clone's own error, as GNU cp does (`Invalid cross-device link` across filesystems, `Operation not supported` on an overlayfs), where it said `source and destination are on different devices`. From a source that is not a regular file, such as `/dev/null`, it now tries the clone and fails as GNU cp does, where it copied the data and exited 0. With a backup (`-b`, `--backup=numbered`), a copy that fails renames the backup back, as GNU cp does, where the destination was left only under its backup name.
 
 ## [18.18.6] - 2026-11-09
 
