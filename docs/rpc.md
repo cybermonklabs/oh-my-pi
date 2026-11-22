@@ -1609,9 +1609,12 @@ turn's final reply as `session.commentary.append` (spoken). A turn no delegation
 started is not spoken.
 
 Each call's transcript is written among the session's artifacts as
-`<n>.live-transcript.log`, one `<UTC time> User|Voice: <text>` line per run of a
-speaker, ended by a change of speaker, a delegation, or 1.5 s of the call's
-timeline without new words. When the call ends, the session gets a message
+`<n>.live-transcript.log` (an unsaved session's goes to the temp dir), one
+`<UTC time> User|Voice: <text>` line per run of a speaker, ended by a change of
+speaker, a delegation, or 1.5 s of the call's timeline without new words. The
+file is made when the call has words or ends, never at a start that fails, and
+only its owner can read it (mode 0600; an existing file at that path is refused).
+When the call ends, the session gets a message
 (for its next turn) naming that file and the call's start and end. On stop omp
 sends `session.close` and waits up to 5 s for `session.closed` before it closes
 the sideband. A call ends by itself after 15 minutes in which the user says

@@ -26,6 +26,8 @@ const noCodexLogin = {
 	},
 } as unknown as AuthStorage;
 
+type ConnectMode = "ok" | "untilAborted" | "fail";
+
 /** Transport double: records what the controller sends and lets the test play the server's events. */
 class FakeTransport {
 	readonly sent: LiveClientMessage[] = [];
@@ -37,11 +39,12 @@ class FakeTransport {
 	onSend: ((message: LiveClientMessage) => void) | undefined;
 	constructor(
 		readonly options: LiveTransportOptions,
-		/** Connect only when the controller aborts the connect, as a server that never answers. */
-		readonly connectUntilAborted = false,
+		/** `untilAborted`: the connect ends only when the controller aborts it, as a server that never answers. */
+		readonly connectMode: ConnectMode = "ok",
 	) {}
 	async connect(): Promise<void> {
-		if (this.connectUntilAborted) {
+		if (this.connectMode === "fail") throw new Error("GPT-Live session failed (503): upstream unavailable");
+		if (this.connectMode === "untilAborted") {
 			const { signal } = this.options;
 			const { promise, reject } = Promise.withResolvers<never>();
 			signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -101,8 +104,8 @@ interface CallOptions {
 	settings?: Record<string, unknown>;
 	/** Answer `session.close` with `session.closed` after this many ms; unset never answers. */
 	closedAfterMs?: number;
-	/** The connect never ends unless the controller aborts it. */
-	connectUntilAborted?: boolean;
+	/** How the transport's connect ends; `ok` by default. */
+	connect?: ConnectMode;
 }
 
 function call(options: CallOptions = {}) {
@@ -111,7 +114,7 @@ function call(options: CallOptions = {}) {
 		mockImplementation(implementation: (options: LiveTransportOptions) => object): void;
 	};
 	transportSpy.mockImplementation(function (transportOptions: LiveTransportOptions) {
-		const transport = new FakeTransport(transportOptions, options.connectUntilAborted);
+		const transport = new FakeTransport(transportOptions, options.connect);
 		if (options.closedAfterMs !== undefined) {
 			const delay = options.closedAfterMs;
 			transport.onSend = message => {
@@ -342,7 +345,7 @@ describe("GPT-Live call lifecycle", () => {
 	});
 
 	test("a stop while the call connects aborts the connect and sends nothing on the sideband", async () => {
-		const live = call({ connectUntilAborted: true });
+		const live = call({ connect: "untilAborted" });
 		const starting = live.controller.start().then(
 			() => undefined,
 			(error: unknown) => error,
@@ -448,6 +451,23 @@ describe("GPT-Live call lifecycle", () => {
 		const stamps = content.match(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g) ?? [];
 		expect(stamps).toHaveLength(2);
 		expect(new Date(stamps[1]!).getTime() - new Date(stamps[0]!).getTime()).toBe(2_000);
+	});
+
+	test("the transcript file is its owner's alone, and a call that never starts leaves none", async () => {
+		const failed = call({ connect: "fail" });
+		await expect(failed.controller.start()).rejects.toThrow(/503/);
+		expect(await Bun.file(failed.transcriptPath).exists()).toBe(false);
+		vi.restoreAllMocks();
+
+		const live = call({ closedAfterMs: 0 });
+		await live.controller.start();
+		live.transport().emit(userSaid("private words", 0, 900));
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+		const { mode } = await fs.stat(live.transcriptPath);
+		expect((mode & 0o777).toString(8)).toBe("600");
+		expect(await Bun.file(live.transcriptPath).text()).toContain("User: private words");
 	});
 });
 

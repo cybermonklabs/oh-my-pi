@@ -48,10 +48,13 @@ export class LiveCallTranscript {
 	#userReachedMs = Number.NEGATIVE_INFINITY;
 	#line: OpenLine | undefined;
 	#writes: Promise<void> = Promise.resolve();
+	/** The file's creation, once: see {@link #write}. */
+	#created: Promise<void> | undefined;
 	#writeFailed = false;
 
 	/**
-	 * @param path the transcript file; lines are appended as they end.
+	 * @param path the transcript file. Nothing is written there until the first line ends or
+	 *   {@link finish} runs, so a call that never starts leaves no file.
 	 * @param onLine called with the open line as it grows (`final: false`) and once it ends (`final: true`).
 	 */
 	constructor(path: string, onLine: (line: TranscriptLine, final: boolean) => void = () => {}) {
@@ -121,18 +124,31 @@ export class LiveCallTranscript {
 		const text = line.text.trim();
 		if (!text) return;
 		this.#onLine({ role: line.role, text, at: line.at }, true);
-		const entry = `${line.at.toISOString()} ${SPEAKER_LABEL[line.role]}: ${text}\n`;
-		this.#writes = this.#writes.then(() =>
-			fs.appendFile(this.#path, entry).catch(error => {
-				this.#writeFailed = true;
-				logger.warn("Live call transcript line was not written", { path: this.#path, error: String(error) });
-			}),
-		);
+		this.#write(`${line.at.toISOString()} ${SPEAKER_LABEL[line.role]}: ${text}\n`);
 	}
 
-	/** Ends the open line and waits until every line is in the file. */
+	/**
+	 * Queues `text` for the file. The first write creates it for this call alone: exclusively (an
+	 * existing file or link at the path is refused, not written through) and readable by its owner only,
+	 * since it holds the call's words and may sit in the shared temp dir.
+	 */
+	#write(text: string): void {
+		this.#writes = this.#writes.then(async () => {
+			try {
+				this.#created ??= fs.writeFile(this.#path, "", { flag: "wx", mode: 0o600 });
+				await this.#created;
+				if (text) await fs.appendFile(this.#path, text);
+			} catch (error) {
+				this.#writeFailed = true;
+				logger.warn("Live call transcript line was not written", { path: this.#path, error: String(error) });
+			}
+		});
+	}
+
+	/** Ends the open line and waits until every line is in the file, which exists then even for a quiet call. */
 	async finish(): Promise<void> {
 		this.endLine();
+		this.#write("");
 		await this.#writes;
 	}
 }

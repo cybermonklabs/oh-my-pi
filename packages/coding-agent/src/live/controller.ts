@@ -1,4 +1,3 @@
-import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -236,7 +235,7 @@ export class LiveSessionController {
 			let openai: OpenAILiveRoute | undefined;
 			if (viaOpenAI) {
 				openai = await resolveOpenAILiveRoute(this.#session.modelRegistry, settings, this.#session.sessionId);
-				this.#callTranscript = new LiveCallTranscript(await this.#createTranscriptFile(), (line, final) =>
+				this.#callTranscript = new LiveCallTranscript(await this.#transcriptPath(), (line, final) =>
 					this.#showTranscriptLine(line, final),
 				);
 				this.#wire = OPENAI_LIVE_WIRE;
@@ -585,13 +584,15 @@ export class LiveSessionController {
 		return extra ? `${instructions}\n\n${extra}` : instructions;
 	}
 
-	/** Creates the call's transcript file among the session's artifacts, or in the temp dir for an unsaved session. */
-	async #createTranscriptFile(): Promise<string> {
+	/**
+	 * Where the call's transcript goes: among the session's artifacts, or in the temp dir for an unsaved
+	 * session. {@link LiveCallTranscript} creates the file, owner-readable only, once the call has words.
+	 */
+	async #transcriptPath(): Promise<string> {
 		const allocated = await this.#session.sessionManager.allocateArtifactPath("live-transcript");
-		const file =
-			allocated.path ?? path.join(os.tmpdir(), `omp-live-transcript-${this.#session.sessionId}-${Date.now()}.log`);
-		await fs.appendFile(file, "");
-		return file;
+		return (
+			allocated.path ?? path.join(os.tmpdir(), `omp-live-transcript-${this.#session.sessionId}-${Date.now()}.log`)
+		);
 	}
 
 	#handleSessionEvent(event: AgentSessionEvent): void {
