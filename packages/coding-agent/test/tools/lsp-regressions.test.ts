@@ -4822,29 +4822,80 @@ describe("lsp regressions", () => {
 			});
 		}
 
-		it("rename_file whose second reference file cannot be edited undoes the first edit, and moves nothing", async () => {
+		const importOld = 'import { a } from "./old";\n';
+		const importNew = 'import { a } from "./new";\n';
+		const undone = ". Its reference edits were undone, and nothing was renamed.";
+
+		/**
+		 * Makes each Bun.write to a path whose file name `fails` names fail with `message` once it has
+		 * written `keep` of its bytes (0: none).
+		 */
+		function failWrites(fails: (name: string) => boolean, message: string, keep = 0): void {
+			const realWrite = Bun.write;
+			vi.spyOn(Bun, "write").mockImplementation((async (dest: unknown, data: unknown, ...rest: unknown[]) => {
+				const write = realWrite as (...args: unknown[]) => Promise<number>;
+				if (typeof dest !== "string" || !fails(path.basename(dest))) return write(dest, data, ...rest);
+				if (keep > 0) {
+					const bytes = typeof data === "string" ? Buffer.from(data) : Buffer.from(data as Uint8Array);
+					await write(dest, bytes.subarray(0, Math.floor(bytes.length * keep)));
+				}
+				throw Object.assign(new Error(message), { code: message.split(":")[0] });
+			}) as typeof Bun.write);
+		}
+
+		/** Leftover files of an undo (`.<name>.<uuid>.undo`) in `dir`. */
+		const undoLeftovers = (dir: string): string[] => fs.readdirSync(dir).filter(name => name.endsWith(".undo"));
+
+		it("rename_file whose second reference file cannot be written names that file, undoes the first edit, and leaves the second as it was", async () => {
 			await inCheckout(async cwd => {
 				const first = path.join(cwd, "first.ts");
-				fs.writeFileSync(first, 'import { a } from "./old";\n');
-				// A directory where the server names a file: reading it for the edit fails.
 				const second = path.join(cwd, "second.ts");
-				fs.mkdirSync(second);
+				fs.writeFileSync(first, importOld);
+				fs.writeFileSync(second, importOld);
 				installSilentLsp("(none)", () => {}, consumersEdit([first, second]));
+				// Every write to second.ts, or beside it under its name, fails as for a read-only file.
+				failWrites(name => name.includes("second.ts"), "EACCES: permission denied");
 
 				const outcome = await renameOldTs(cwd, new AbortController().signal);
 
-				const seen = described(outcome);
-				expect(seen.startsWith("ToolError: LSP rename_file could not move old.ts to new.ts: ")).toBe(true);
-				expect(seen.endsWith(". Its reference edits were undone, and nothing was renamed.")).toBe(true);
+				expect(described(outcome)).toBe(
+					`ToolError: LSP rename_file could not edit second.ts for the rename of old.ts to new.ts: EACCES: permission denied${undone}`,
+				);
 				expectNothingRenamed(cwd);
-				expect(fs.readFileSync(first, "utf-8")).toBe('import { a } from "./old";\n');
+				expect(fs.readFileSync(first, "utf-8")).toBe(importOld);
+				expect(fs.readFileSync(second, "utf-8")).toBe(importOld);
 			});
 		});
+
+		for (const [kind, make] of [
+			["a directory", (file: string) => fs.mkdirSync(file)],
+			["a FIFO", (file: string) => expect(Bun.spawnSync(["mkfifo", file]).exitCode).toBe(0)],
+		] as const) {
+			it(`rename_file whose second reference file is ${kind} names that file, undoes the first edit, and moves nothing`, async () => {
+				await inCheckout(async cwd => {
+					const first = path.join(cwd, "first.ts");
+					fs.writeFileSync(first, importOld);
+					// Where the server names a file: reading it for the edit fails.
+					const second = path.join(cwd, "second.ts");
+					make(second);
+					installSilentLsp("(none)", () => {}, consumersEdit([first, second]));
+
+					const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+					// The error's own closing period does not double the sentence's.
+					expect(described(outcome)).toMatch(
+						/^ToolError: LSP rename_file could not edit second\.ts for the rename of old\.ts to new\.ts: [^\n]*[^.]\. Its reference edits were undone, and nothing was renamed\.$/,
+					);
+					expectNothingRenamed(cwd);
+					expect(fs.readFileSync(first, "utf-8")).toBe(importOld);
+				});
+			});
+		}
 
 		it("rename_file whose move fails and whose undo fails names the file it could not restore", async () => {
 			await inCheckout(async cwd => {
 				const consumer = path.join(cwd, "consumer.ts");
-				fs.writeFileSync(consumer, 'import { a } from "./old";\n');
+				fs.writeFileSync(consumer, importOld);
 				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
 				// The edited file is swapped for a directory before the move fails, so it cannot be restored.
 				failTheMove(() => {
@@ -4854,13 +4905,126 @@ describe("lsp regressions", () => {
 
 				const outcome = await renameOldTs(cwd, new AbortController().signal);
 
-				const seen = described(outcome);
-				expect(
-					seen.startsWith(
-						"ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted. Nothing was moved, but undoing its reference edits failed for: consumer.ts (",
-					),
-				).toBe(true);
+				expect(described(outcome)).toMatch(
+					/^ToolError: LSP rename_file could not move old\.ts to new\.ts: EXDEV: cross-device link not permitted\. Nothing was moved, but undoing its reference edits failed for: consumer\.ts \([^\n]*[^.]\)\.$/,
+				);
 				expectNothingRenamed(cwd);
+				expect(undoLeftovers(cwd)).toEqual([]);
+			});
+		});
+
+		it("rename_file whose undo fails partway leaves the file with its edit, not cut short", async () => {
+			await inCheckout(async cwd => {
+				const consumer = path.join(cwd, "consumer.ts");
+				fs.writeFileSync(consumer, importOld);
+				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+				// The edit's own write goes through; the undo's write of consumer.ts stops halfway, as at a
+				// file size limit.
+				let writes = 0;
+				failWrites(name => name.includes("consumer.ts") && ++writes > 1, "EFBIG: file too large", 0.5);
+				failTheMove(() => {});
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				expect(described(outcome)).toBe(
+					"ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted. Nothing was moved, but undoing its reference edits failed for: consumer.ts (EFBIG: file too large).",
+				);
+				expectNothingRenamed(cwd);
+				expect(fs.readFileSync(consumer, "utf-8")).toBe(importNew);
+				expect(undoLeftovers(cwd)).toEqual([]);
+			});
+		});
+
+		it("rename_file whose move fails puts back each reference file's bytes, mode and owner", async () => {
+			await inCheckout(async cwd => {
+				const consumer = path.join(cwd, "consumer.ts");
+				// A byte-order mark, and a byte that is not UTF-8.
+				const original = Buffer.concat([
+					Buffer.from([0xef, 0xbb, 0xbf]),
+					Buffer.from(importOld),
+					Buffer.from([0xff, 0x0a]),
+				]);
+				fs.writeFileSync(consumer, original);
+				fs.chmodSync(consumer, 0o640);
+				// As root, the file belongs to another user, whose it must stay.
+				if (process.getuid?.() === 0) fs.chownSync(consumer, 1000, 1000);
+				const { uid: owner, gid: group } = fs.statSync(consumer);
+				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+				failTheMove(() => {});
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				expect(described(outcome)).toBe(
+					`ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted${undone}`,
+				);
+				expect(fs.readFileSync(consumer).equals(original)).toBe(true);
+				const stat = fs.statSync(consumer);
+				expect((stat.mode & 0o7777).toString(8)).toBe("640");
+				expect([stat.uid, stat.gid]).toEqual([owner, group]);
+				expect(undoLeftovers(cwd)).toEqual([]);
+			});
+		});
+
+		it("rename_file whose move fails puts back a reference file reached through a link, and keeps the link", async () => {
+			await inCheckout(async cwd => {
+				fs.mkdirSync(path.join(cwd, "lib"));
+				const real = path.join(cwd, "lib", "real.ts");
+				fs.writeFileSync(real, importOld);
+				const link = path.join(cwd, "linked.ts");
+				fs.symlinkSync(path.join("lib", "real.ts"), link);
+				installSilentLsp("(none)", () => {}, consumersEdit([link]));
+				failTheMove(() => {});
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				expect(described(outcome)).toBe(
+					`ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted${undone}`,
+				);
+				expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+				expect(fs.readFileSync(real, "utf-8")).toBe(importOld);
+			});
+		});
+
+		it("rename_file whose move fails puts back a reference file with two names under both", async () => {
+			await inCheckout(async cwd => {
+				const consumer = path.join(cwd, "consumer.ts");
+				fs.writeFileSync(consumer, importOld);
+				const other = path.join(cwd, "other-name.ts");
+				fs.linkSync(consumer, other);
+				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+				failTheMove(() => {});
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				expect(described(outcome)).toBe(
+					`ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted${undone}`,
+				);
+				expect(fs.readFileSync(consumer, "utf-8")).toBe(importOld);
+				expect(fs.readFileSync(other, "utf-8")).toBe(importOld);
+				expect(fs.statSync(consumer).ino).toBe(fs.statSync(other).ino);
+			});
+		});
+
+		it("rename_file whose move fails puts back a reference file whose folder takes no new file", async () => {
+			await inCheckout(async cwd => {
+				const lib = path.join(cwd, "lib");
+				fs.mkdirSync(lib);
+				const consumer = path.join(lib, "consumer.ts");
+				fs.writeFileSync(consumer, importOld);
+				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+				failTheMove(() => {});
+				// The file can be written, but its folder cannot be (for any user but root).
+				fs.chmodSync(lib, 0o555);
+				try {
+					const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+					expect(described(outcome)).toBe(
+						`ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted${undone}`,
+					);
+					expect(fs.readFileSync(consumer, "utf-8")).toBe(importOld);
+				} finally {
+					fs.chmodSync(lib, 0o755);
+				}
 			});
 		});
 

@@ -58,8 +58,8 @@ import {
 import {
 	applyEditsThenRename,
 	flattenWorkspaceTextEdits,
+	RenameFailedError,
 	type RenameReferenceEdit,
-	RenameRollbackError,
 	rangesOverlap,
 	sortAndValidateTextEdits,
 } from "./edits";
@@ -988,21 +988,24 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			try {
 				await applyEditsThenRename(referenceEdits, source, dest);
 			} catch (err) {
-				const moveFailed = `LSP rename_file could not move ${sourceLabel} to ${destLabel}`;
-				const reason = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-				if (err instanceof RenameRollbackError) {
+				if (!(err instanceof RenameFailedError)) throw err;
+				// An error's own closing period would double the sentence's.
+				const reason = (error: unknown): string =>
+					(error instanceof Error ? error.message : String(error)).replace(/[.\s]+$/, "");
+				const relative = (filePath: string): string => formatPathRelativeToCwd(filePath, this.session.cwd);
+				const failed = err.editFile
+					? `LSP rename_file could not edit ${relative(err.editFile)} for the rename of ${sourceLabel} to ${destLabel}`
+					: `LSP rename_file could not move ${sourceLabel} to ${destLabel}`;
+				if (err.unrestored.length > 0) {
 					const files = err.unrestored
-						.map(
-							({ filePath, error }) =>
-								`${formatPathRelativeToCwd(filePath, this.session.cwd)} (${reason(error)})`,
-						)
+						.map(({ filePath, error }) => `${relative(filePath)} (${reason(error)})`)
 						.join(", ");
 					throw new ToolError(
-						`${moveFailed}: ${reason(err.failure)}. Nothing was moved, but undoing its reference edits failed for: ${files}.`,
+						`${failed}: ${reason(err.failure)}. Nothing was moved, but undoing its reference edits failed for: ${files}.`,
 					);
 				}
 				throw new ToolError(
-					`${moveFailed}: ${reason(err)}. Its reference edits were undone, and nothing was renamed.`,
+					`${failed}: ${reason(err.failure)}. Its reference edits were undone, and nothing was renamed.`,
 				);
 			}
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
