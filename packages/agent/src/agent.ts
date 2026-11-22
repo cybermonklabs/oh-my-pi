@@ -449,8 +449,12 @@ export class Agent {
 		next: number;
 		additional: readonly AgentMessage[];
 	}>();
-	/** Messages {@link withdrawUndeliveredQueuedMessages} took back, keyed to the run that must not record them. */
-	#withdrawnMessages = new WeakMap<AgentMessage, AbortController>();
+	/**
+	 * Per run, the messages {@link withdrawUndeliveredQueuedMessages} took back that it must not record. Keyed
+	 * by the run, not the message: a withdrawn message an interrupt records later can live on as a session
+	 * entry, behind a compaction's cut too, and must not keep the aborted run's controller with it.
+	 */
+	#withdrawnMessages = new WeakMap<AbortController, WeakSet<AgentMessage>>();
 	#steeringWaiters = new Set<() => void>();
 	#queuedMessageGrouping?: (previous: AgentMessage, next: AgentMessage) => boolean;
 
@@ -1191,7 +1195,13 @@ export class Agent {
 	withdrawUndeliveredQueuedMessages(): { steering: AgentMessage[]; followUp: AgentMessage[] } {
 		const withdrawn: Record<QueuedMessageQueue, AgentMessage[]> = { steering: [], followUp: [] };
 		const suppress = (message: AgentMessage, controller: AbortController | undefined) => {
-			if (controller) this.#withdrawnMessages.set(message, controller);
+			if (!controller) return;
+			let withdrawnFromRun = this.#withdrawnMessages.get(controller);
+			if (!withdrawnFromRun) {
+				withdrawnFromRun = new WeakSet();
+				this.#withdrawnMessages.set(controller, withdrawnFromRun);
+			}
+			withdrawnFromRun.add(message);
 		};
 		for (const { message, controller, additional } of this.#liveSteered) {
 			withdrawn.steering.push(message);
@@ -1365,9 +1375,15 @@ export class Agent {
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
+		const previous = this.#state.messages;
 		// New array assignment is intentional: caller-owned `ms` may be mutated
 		// after handoff; snapshot it so external mutations cannot leak in.
 		this.#state.messages = ms.slice();
+		// A message the new history drops (a compaction's summarized turns) can
+		// outlive it as a session entry whose body moved to a store; the
+		// tokenizer's memo must not keep its count for the session's life.
+		const kept = new Set(this.#state.messages);
+		for (const message of previous) if (!kept.has(message)) this.#tokenizer.forget(message);
 	}
 
 	/** Signal after a queue transition has settled its pending, claim, and
@@ -2150,14 +2166,12 @@ export class Agent {
 			for await (let event of stream) {
 				if (this.#abortController !== loopAbortController) return;
 				// Withdrawn input the loop already holds for this run never reaches the transcript.
-				if (
-					(event.type === "message_start" || event.type === "message_end") &&
-					this.#withdrawnMessages.get(event.message) === loopAbortController
-				) {
+				const withdrawn = this.#withdrawnMessages.get(loopAbortController);
+				if ((event.type === "message_start" || event.type === "message_end") && withdrawn?.has(event.message)) {
 					continue;
 				}
-				if (event.type === "agent_end") {
-					const messages = event.messages.filter(m => this.#withdrawnMessages.get(m) !== loopAbortController);
+				if (event.type === "agent_end" && withdrawn) {
+					const messages = event.messages.filter(m => !withdrawn.has(m));
 					if (messages.length < event.messages.length) event = { ...event, messages };
 				}
 				if (event.type === "turn_start") turnOpen = true;

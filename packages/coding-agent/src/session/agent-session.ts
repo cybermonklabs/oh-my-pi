@@ -11414,8 +11414,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
-	/** {@link SteerOptions.onTaken}: a run took `message`, a queued steer, into its context. */
+	/**
+	 * {@link SteerOptions.onTaken}: a run took `message`, a queued steer, into its context. Taken, it is no
+	 * longer queued, so what only matched it in the queue goes too: its session entry keeps the message object
+	 * for the session's life, and a raw text kept for it would hold its body after the entry moved the body to
+	 * the cold store, behind a compaction.
+	 */
 	#reportQueuedMessageTaken(message: AgentMessage): void {
+		this.#queuedMessageRawText.delete(message);
+		this.#queuedMessageIds.delete(message);
 		const onTaken = this.#queuedMessageTaken.get(message);
 		if (!onTaken) return;
 		this.#queuedMessageTaken.delete(message);
