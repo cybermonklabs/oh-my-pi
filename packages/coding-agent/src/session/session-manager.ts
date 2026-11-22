@@ -1705,11 +1705,14 @@ export class SessionManager {
 	/**
 	 * Whether a write conflict the store reports for a write this manager
 	 * queued is recovered (see {@link #recoverQueuedConflict}) rather than
-	 * reported: only on SQL storage that claims sessions, the one deferring
-	 * store whose appends are checked against the size this manager expects.
+	 * reported: on every store that defers sync publishes. SQL storage that
+	 * claims sessions checks appends against the size this manager expects;
+	 * every deferring store (SQL with or without claims, Redis) checks a full
+	 * publish this manager queued (a `flushSync` rewrite it confirms later),
+	 * and such a conflict left unrecovered failed every later write.
 	 */
 	#recoversQueuedConflicts(): boolean {
-		return this.#storage.defersSyncPublish === true && this.#storage.acquireSessionClaim !== undefined;
+		return this.#storage.defersSyncPublish === true;
 	}
 
 	/** The entries `content` holds that this manager does not, or `undefined` when it is not this session's journal. */
