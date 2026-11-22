@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- zsh mode: `functions`, `$functions` and a job's text now print `time ! false`, `! time false`, `time true > /dev/null`, `coproc time true` and `false | time true` as zsh does: no `{ }` group the parser made around a pipeline, and `time` before `!`.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

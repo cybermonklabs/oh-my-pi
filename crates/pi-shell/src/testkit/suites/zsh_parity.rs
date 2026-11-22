@@ -358,6 +358,19 @@ fn redirkill_functions_value_shows_redirections_and_heredocs() {
 	assert_eq!((err.as_str(), st), ("", 0));
 }
 
+/// The group the parser makes around `time` (a definition's body, `!
+/// time`, a redirection before `time`) is not in zsh's text, and `time
+/// ! P` keeps its order.
+#[test]
+fn functions_value_shows_no_group_around_time() {
+	let (out, err, st) = zsh(
+		"f() >/dev/null time ! true; print -r -- \"$functions[f]\"; g() { ! time true }; print -r \
+		 -- \"$functions[g]\"; h() { >/dev/null time true; }; print -r -- \"$functions[h]\"",
+	);
+	assert_eq!(out, "\ttime ! true > /dev/null\n\t! time true\n\ttime true > /dev/null\n");
+	assert_eq!((err.as_str(), st), ("", 0));
+}
+
 #[test]
 fn redirkill_equals_substitution_is_a_temporary_file() {
 	let (out, err, st) = zsh(

@@ -2,7 +2,7 @@
 //!
 //! | kind       | children                                   | fields                            |
 //! |------------|--------------------------------------------|-----------------------------------|
-//! | `Command`  | `[payload, redirs…]`                       | span; `x`: [`Ck`]; flag `PIPE_STDERR` |
+//! | `Command`  | `[payload, redirs…]`                       | span; `x`: [`Ck`]; flags `PIPE_STDERR`, `MADE_GROUP` |
 //! | `Simple`   | `[assigns…, words…]`                       | `c`: assignment count; flag `TYPESET` |
 //! | `If`       | `[cond, body]` per arm, then `else` body   | flag `HAS_ELSE`                   |
 //! | `While`    | `[cond, body]`                             | flag `UNTIL`                      |
@@ -61,6 +61,9 @@ const ANON_ARGS: usize = 1;
 const ARITH_TEXT: usize = 0;
 
 const PIPE_STDERR: u8 = 1;
+/// A group [`Tree::pipeline_command`] made around a pipeline that is not
+/// one stage; the source has no braces there.
+const MADE_GROUP: u8 = 2;
 const TYPESET: u8 = 1;
 const HAS_ELSE: u8 = 1;
 const UNTIL: u8 = 1;
@@ -392,14 +395,17 @@ impl Tree {
 		self.command(span, Payload::Brace(l), &[])
 	}
 
-	/// Pipeline `p` as one command: its lone stage, or a group around it.
+	/// Pipeline `p` as one command: its lone stage, or a group around it,
+	/// marked as made ([`Command::made_group`]).
 	pub fn pipeline_command(&mut self, p: Id<shape::Pipeline>) -> Id<CommandS> {
 		if let Some(stage) = self.lone_stage(p) {
 			return stage;
 		}
 		let span = self.span_of(p.index());
 		let l = self.pipeline_list(p);
-		self.group(span, l)
+		let g = self.group(span, l);
+		self.nodes[g.index() as usize].flags |= MADE_GROUP;
+		g
 	}
 
 	/// List `l` as one command: its lone pipeline as a command, or a group.
@@ -424,8 +430,8 @@ impl Tree {
 		})
 	}
 
-	/// Command `c` rebuilt over `span` with its own redirections, then the
-	/// ones `more` collects.
+	/// Command `c` rebuilt over `span` with its flags and its own
+	/// redirections, then the ones `more` collects.
 	fn with_more_redirs(
 		&mut self,
 		c: Id<CommandS>,
@@ -433,10 +439,13 @@ impl Tree {
 		more: impl FnOnce(&mut Self, Mark<RedirS>),
 	) -> Id<CommandS> {
 		let payload = Payload::of(self, c.index());
+		let flags = self.nodes[c.index() as usize].flags;
 		let mark = self.open::<RedirS>();
 		self.kid_children(mark, c.index(), CMD_REDIRS);
 		more(self, mark);
-		self.command_at(span, payload, mark)
+		let n = self.command_at(span, payload, mark);
+		self.nodes[n.index() as usize].flags = flags;
+		n
 	}
 
 	/// zsh keeps redirections written on a function definition with the
@@ -487,6 +496,14 @@ impl<'t> Command<'t> {
 	/// Connected to the next stage with `|&`.
 	pub fn pipe_stderr(self) -> bool {
 		self.0.flag(PIPE_STDERR)
+	}
+
+	/// A group [`Tree::pipeline_command`] made around a pipeline (zsh `!
+	/// time P`, `coproc time P`, `coproc P | Q`, `P | time Q`, `>f time P`):
+	/// zsh's text shows the pipeline there, not a group. Only the printer
+	/// reads it.
+	pub fn made_group(self) -> bool {
+		self.0.flag(MADE_GROUP)
 	}
 
 	pub fn redirs(self) -> Seq<'t, super::Redir<'t>> {

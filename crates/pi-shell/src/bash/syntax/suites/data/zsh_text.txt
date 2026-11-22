@@ -240,4 +240,47 @@ f" }f () {
 	echo ab 'c
 d' "e
 f"
+}f() { time ! false; ! time false; ! time ! false; time ! a | b; if ! time a; then b; fi; a && ! time b }f () {
+	time ! false
+	! time false
+	! time ! false
+	time ! a | b
+	if ! time a
+	then
+		b
+	fi
+	a && ! time b
+}f() { >/dev/null time true; 2>/dev/null time ! a | b; ! >f time c; >f time a |& b }f () {
+	time true > /dev/null
+	time ! a | b 2> /dev/null
+	! time c > f
+	time a 2>&1 | b > f
+}f() { coproc time a; coproc a | b; coproc >f time ! a; a | time b; a | time ! b; a | >f time b }f () {
+	coproc time a
+	coproc a | b
+	coproc time ! a > f
+	a | time b
+	a | time ! b
+	a | time b > f
+}f() { time !; ! time; ! time !; coproc time !; ! time >f }f () {
+	time !
+	! time
+	! time !
+	coproc time !
+	! time  > f
+}f() { ! { time a }; { time a } >f; ! ( time a ); time coproc a }f () {
+	! {
+		time a
+	}
+	{
+		time a
+	} > f
+	! (
+		time a
+	)
+	time coproc a
+}f() >/dev/null time ! af () {
+	time ! a > /dev/null
+}function f () time ! af () {
+	time ! a
 }

@@ -50,6 +50,13 @@ TEXT = [
     "f() { for i; do echo; done; while true; do break; done }",
     "f() { if a; then; else b; fi; print -r -- \"${(j: :)@}\" }",
     "f() { echo a\\\nb 'c\nd' \"e\nf\" }",
+    "f() { time ! false; ! time false; ! time ! false; time ! a | b; if ! time a; then b; fi; a && ! time b }",
+    "f() { >/dev/null time true; 2>/dev/null time ! a | b; ! >f time c; >f time a |& b }",
+    "f() { coproc time a; coproc a | b; coproc >f time ! a; a | time b; a | time ! b; a | >f time b }",
+    "f() { time !; ! time; ! time !; coproc time !; ! time >f }",
+    "f() { ! { time a }; { time a } >f; ! ( time a ); time coproc a }",
+    "f() >/dev/null time ! a",
+    "function f () time ! a",
 ]
 
 ERRORS = [

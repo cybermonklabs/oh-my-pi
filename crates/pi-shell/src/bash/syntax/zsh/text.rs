@@ -451,24 +451,22 @@ impl Text {
 		}
 	}
 
-	/// The `WC_SUBLIST` flags, `WC_TIMED` and `WC_PIPE` cases.
+	/// The `WC_SUBLIST` flags, `WC_TIMED` and `WC_PIPE` cases: a pipeline
+	/// both timed and negated is zsh's `time ! P` (`! time P` is a negated
+	/// group around the timed pipeline).
 	fn pipeline(&mut self, p: Pipeline<'_>) {
 		let stages = p.stages();
 		let empty = stages.len() == 1 && stages.first().is_some_and(is_empty);
-		if p.bang() {
-			self.s(if empty && p.time().is_none() {
-				b"!"
-			} else {
-				b"! "
-			});
-		}
 		if p.time().is_some() {
 			self.s(b"time");
-			if empty {
+			if empty && !p.bang() {
 				return;
 			}
 			self.c(b' ');
 			self.indent += 1;
+		}
+		if p.bang() {
+			self.s(if empty { b"!" } else { b"! " });
 		}
 		if !empty {
 			for (i, st) in stages.iter().enumerate() {
@@ -486,12 +484,15 @@ impl Text {
 	/// A function body: a group's list (its redirections are returned for
 	/// after the `}`), or the command.
 	fn func_body<'a>(&mut self, body: Command<'a>) -> Option<Seq<'a, Redir<'a>>> {
-		if let CommandKind::Brace(l) = body.kind() {
-			self.list(l);
-			Some(body.redirs())
-		} else {
-			self.command(body, false);
-			None
+		match body.kind() {
+			CommandKind::Brace(l) if !body.made_group() => {
+				self.list(l);
+				Some(body.redirs())
+			},
+			_ => {
+				self.command(body, false);
+				None
+			},
 		}
 	}
 
@@ -502,6 +503,8 @@ impl Text {
 		match cmd.kind() {
 			CommandKind::Simple(s) => self.simple(s),
 			CommandKind::Subshell(l) => self.group(b"(", l, b")"),
+			// zsh has no group there: the pipeline, then the redirections.
+			CommandKind::Brace(l) if cmd.made_group() => self.list(l),
 			CommandKind::Brace(l) => self.group(b"{", l, b"}"),
 			CommandKind::Try(t) => {
 				self.s(b"{");

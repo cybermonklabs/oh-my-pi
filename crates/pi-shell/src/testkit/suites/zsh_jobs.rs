@@ -185,6 +185,27 @@ fn job_texts_are_zsh_getjobtext() {
 	assert_eq!(out, "[1]  + running    f\n");
 }
 
+/// zsh's text of a job shows no group where the parser made one around a
+/// timed pipeline, and `time ! P` keeps its order (`$jobtexts`: `jobs`
+/// lists each process of a pipeline on a line of its own in zsh).
+#[test]
+fn job_texts_show_no_group_around_time() {
+	for (src, text) in [
+		(format!("time ! {LOOP}"), format!("time ! {LOOP_TEXT}")),
+		(format!(">/dev/null time {LOOP}"), format!("time {LOOP_TEXT} > /dev/null")),
+		(format!("true | time {LOOP}"), format!("true | time {LOOP_TEXT}")),
+		(
+			format!("true | >/dev/null time ! {LOOP}"),
+			format!("true | time ! {LOOP_TEXT} > /dev/null"),
+		),
+		(format!("time ! {LOOP} | {LOOP}"), format!("time ! {LOOP_TEXT} | {LOOP_TEXT}")),
+		(format!("{{ time {LOOP} }} > /dev/null"), format!("{{ time {LOOP_TEXT}; }} > /dev/null")),
+	] {
+		let (out, ..) = zsh(&format!("{src} & print -r -- \"${{jobtexts[1]}}\"; kill -9 %1"));
+		assert_eq!(out, format!("{text}\n"), "{src}");
+	}
+}
+
 #[test]
 fn kill_resolves_job_specs_with_getjob() {
 	let (out, err, _) =
