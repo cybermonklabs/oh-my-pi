@@ -75,11 +75,12 @@ pub enum ProcState {
 	Sleeping,
 	/// Stopped by a signal or traced.
 	Stopped,
-	/// Exited, not yet reaped.
+	/// Exited: not yet reaped (`Z`), or being released (`X`, dead). Every
+	/// caller asks whether the process has exited, which both answer.
 	Zombie,
-	/// Anything else (idle kernel threads, being created, dead), and on
-	/// Linux a process whose leader thread has exited while another thread
-	/// of it has not (see [`info`]).
+	/// Anything else (idle kernel threads, being created), and on Linux a
+	/// process whose leader thread has exited while another thread of it has
+	/// not (see [`info`]).
 	Other,
 }
 
@@ -307,7 +308,12 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
 		b'R' => ProcState::Running,
 		b'S' | b'D' => ProcState::Sleeping,
 		b'T' | b't' => ProcState::Stopped,
-		b'Z' => ProcState::Zombie,
+		// `X` (dead): the zombie was taken by its parent's wait, or nobody
+		// waits for it, and it is being released; it no longer runs and its
+		// pid is about to be freed (`task_state_array` in fs/proc/array.c;
+		// `wait_task_zombie` and `exit_notify` in kernel/exit.c). gVisor writes
+		// `X (dead)` for its dead tasks too (pkg/sentry/kernel/task_sched.go).
+		b'Z' | b'X' => ProcState::Zombie,
 		_ => ProcState::Other,
 	};
 	Some(ProcInfo {
@@ -322,25 +328,26 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
 }
 
 /// `p`, parsed from the stat `line`, unless that shows the leader thread
-/// exited (`Z`) while another thread of the process has not: the line shows
-/// `Z` until the last thread is gone, so such a process reads as
-/// [`ProcState::Other`]. The thread count (`num_threads`, field 20) counts
-/// the exited leader and every thread not yet released, on Linux and under
-/// gVisor alike, so a count above one means a thread that runs, is exiting,
-/// or is held by a tracer. (`/proc/<pid>/task` would name the threads, but
-/// gVisor stops listing it once the leader has exited.)
+/// exited (`Z`; not `X`, which is dead) while another thread of the process
+/// has not: the line shows `Z` until the last thread is gone, so such a
+/// process reads as [`ProcState::Other`]. The thread count (`num_threads`,
+/// field 20) counts the exited leader and every thread not yet released, on
+/// Linux and under gVisor alike, so a count above one means a thread that runs,
+/// is exiting, or is held by a tracer. (`/proc/<pid>/task` would name the
+/// threads, but gVisor stops listing it once the leader has exited.)
 #[cfg_attr(
 	not(target_os = "linux"),
 	allow(dead_code, reason = "Linux-only outside tests; the rule is tested everywhere")
 )]
 fn live_leader(mut p: ProcInfo, line: &[u8]) -> ProcInfo {
-	let threads = split_stat(line).and_then(|(_, mut fields)| {
-		std::str::from_utf8(fields.nth(17)?)
-			.ok()?
-			.parse::<u32>()
-			.ok()
-	});
-	if p.state == ProcState::Zombie && threads.is_some_and(|count| count > 1) {
+	let Some((_, mut fields)) = split_stat(line) else {
+		return p;
+	};
+	let zombie_letter = fields.next().and_then(<[u8]>::first) == Some(&b'Z');
+	let threads = fields
+		.nth(16)
+		.and_then(|count| std::str::from_utf8(count).ok()?.parse::<u32>().ok());
+	if zombie_letter && threads.is_some_and(|count| count > 1) {
 		p.state = ProcState::Other;
 	}
 	p
@@ -661,6 +668,25 @@ mod tests {
 		assert!(parse_stat(1, b"1 (init) Z 0").is_none(), "truncated line");
 	}
 
+	/// A process read between its parent's wait and its release shows `X`
+	/// (dead). It has exited, as a zombie has: every caller that asks
+	/// whether a process still runs checks for [`ProcState::Zombie`].
+	#[test]
+	fn a_dead_process_reads_as_exited() {
+		let line = |state: &str| {
+			format!(
+				"4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n"
+			)
+		};
+		for state in ["X", "Z"] {
+			let p = parse_stat(4242, line(state).as_bytes()).expect("parses");
+			assert_eq!(p.state, ProcState::Zombie, "state {state}");
+			assert_eq!(p.start, 987654);
+		}
+		let p = parse_stat(4242, line("R").as_bytes()).expect("parses");
+		assert_eq!(p.state, ProcState::Running, "the control: a running process");
+	}
+
 	#[test]
 	fn the_scan_sees_this_process_and_its_session() {
 		let me = std::process::id() as i32;
@@ -708,6 +734,7 @@ mod tests {
 		assert_eq!(read("Z", 2), ProcState::Other, "the leader exited, a thread runs");
 		assert_eq!(read("Z", 3), ProcState::Other);
 		assert_eq!(read("Z", 1), ProcState::Zombie, "only the exited leader is left");
+		assert_eq!(read("X", 2), ProcState::Zombie, "X (dead) has exited whatever the count");
 		assert_eq!(read("S", 2), ProcState::Sleeping, "a running leader keeps its state");
 	}
 

@@ -441,12 +441,7 @@ mod proc_snapshot {
 		/// holds.
 		pub fn status(&self) -> ProcessStatus {
 			match read_stat(self.pid) {
-				Some(stat)
-					if stat.start_time == self.stat.start_time
-						&& (stat.state != 'Z' || stat.threads > 1) =>
-				{
-					ProcessStatus::Running
-				},
+				Some(stat) if still_runs(&stat, self.stat.start_time) => ProcessStatus::Running,
 				_ => ProcessStatus::Exited,
 			}
 		}
@@ -573,6 +568,24 @@ mod proc_snapshot {
 		})
 	}
 
+	/// Whether `stat`, a fresh read of a process, is still the process that
+	/// started at `start_time` and has not exited. A zombie (`Z`) has exited,
+	/// and so has a process in state `X` (dead): its parent's wait took the
+	/// zombie, or nobody waits for it, and it is being released
+	/// (`task_state_array` in fs/proc/array.c; `wait_task_zombie` and
+	/// `exit_notify` in kernel/exit.c). gVisor writes `X (dead)` for its dead
+	/// tasks too (pkg/sentry/kernel/task_sched.go). A leader that reads `Z`
+	/// while the thread count is above one has not exited: another thread of
+	/// its process still runs (see `status`).
+	fn still_runs(stat: &Stat, start_time: u64) -> bool {
+		stat.start_time == start_time
+			&& match stat.state {
+				'X' => false,
+				'Z' => stat.threads > 1,
+				_ => true,
+			}
+	}
+
 	fn status_ids(pid: i32, prefix: &str) -> Option<(u32, u32)> {
 		let content = sys::read_lossy(&format!("/proc/{pid}/status"))?;
 		let mut ids = content
@@ -604,6 +617,44 @@ mod proc_snapshot {
 		u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
 			.ok()
 			.filter(|v| *v > 0)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::{parse_stat, still_runs};
+
+		fn stat_line(state: &str) -> String {
+			format!("4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n")
+		}
+
+		/// A process read between its parent's wait and its release shows `X`
+		/// (dead). It has exited, as a zombie has, so `status` reports it
+		/// `Exited`, not `Running`.
+		#[test]
+		fn a_dead_process_has_exited() {
+			for state in ["X", "Z"] {
+				let stat = parse_stat(&stat_line(state)).expect("parses");
+				assert!(!still_runs(&stat, 987_654), "state {state} reads as running");
+			}
+			let running = parse_stat(&stat_line("R")).expect("parses");
+			assert!(still_runs(&running, 987_654), "the control: a running process");
+			assert!(!still_runs(&running, 987_655), "the control: another process at the pid");
+		}
+
+		/// A leader that reads `Z` with another thread of its process left
+		/// still runs; `X` (dead) has exited whatever the thread count.
+		#[test]
+		fn a_zombie_leader_with_another_thread_still_runs() {
+			let runs = |state: &str, threads: u32| {
+				let line = format!(
+					"4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 987654 0 0\n"
+				);
+				still_runs(&parse_stat(&line).expect("parses"), 987_654)
+			};
+			assert!(runs("Z", 2), "the leader exited, a thread runs");
+			assert!(!runs("Z", 1), "only the exited leader is left");
+			assert!(!runs("X", 2), "X (dead) has exited");
+		}
 	}
 }
 
