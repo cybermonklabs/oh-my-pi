@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	ResponsesWebSocketConnection,
 	type ResponsesWebSocketConnectionOptions,
 	ResponsesWebSocketTransportError,
 } from "../src/providers/responses-websocket-connection";
+
+/** A `response.create` exchange for a model no model-call guard holds. */
+function create() {
+	return { send: { type: "response.create" }, model: getBundledModel("openai", "gpt-5-mini") };
+}
 
 const connections: ResponsesWebSocketConnection[] = [];
 let server: Bun.Server<undefined>;
@@ -129,14 +135,14 @@ describe("Responses physical WebSocket channel", () => {
 		const socket = connection();
 		await socket.connect();
 		const error = new Error("ownership hook failed");
-		const failed = socket.streamRequest({ send: { type: "response.create" } }, {}, undefined, undefined, () => {
+		const failed = socket.streamRequest(create(), {}, undefined, undefined, () => {
 			throw error;
 		});
 		await expect(failed.next()).rejects.toBe(error);
 		expect(socket.hasActiveRequest()).toBe(false);
 		expect(sent).toHaveLength(0);
 		const result: Record<string, unknown>[] = [];
-		for await (const frame of socket.streamRequest({ send: { type: "response.create" } }, {})) result.push(frame);
+		for await (const frame of socket.streamRequest(create(), {})) result.push(frame);
 		expect(result).toEqual([{ type: "response.completed", response: { id: "resp_1" } }]);
 		expect(sent).toHaveLength(1);
 	});
@@ -189,7 +195,7 @@ describe("Responses physical WebSocket channel", () => {
 		const socket = connection();
 		await socket.connect();
 		const result: Record<string, unknown>[] = [];
-		for await (const frame of socket.streamRequest({ send: { type: "response.create" } }, {})) {
+		for await (const frame of socket.streamRequest(create(), {})) {
 			result.push(frame);
 			break;
 		}
@@ -203,7 +209,7 @@ describe("Responses physical WebSocket channel", () => {
 		const closed: Error[] = [];
 		const socket = connection({ controlFrames: { consume: () => false, closed: error => closed.push(error) } });
 		await socket.connect();
-		const reader = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const reader = socket.streamRequest(create(), {});
 		const pending = reader.next();
 		await received.promise;
 		socket.close("session-reset");
@@ -222,10 +228,10 @@ describe("Responses physical WebSocket channel", () => {
 		onMessage = socket => received.resolve(socket);
 		const socket = connection();
 		await socket.connect();
-		const owner = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const owner = socket.streamRequest(create(), {});
 		const pending = owner.next();
 		const serverSocket = await received.promise;
-		const contender = socket.streamRequest({ send: { type: "response.create" } }, {});
+		const contender = socket.streamRequest(create(), {});
 		await expect(contender.next()).rejects.toMatchObject({ reason: "busy", phase: "stream" });
 		expect(socket.hasActiveRequest()).toBe(true);
 		expect(sent).toHaveLength(1);
@@ -239,7 +245,7 @@ describe("Responses physical WebSocket channel", () => {
 		onMessage = () => {};
 		const socket = connection();
 		await socket.connect();
-		const reader = socket.streamRequest({ send: { type: "response.create" } }, { firstEventTimeoutMs: 10 });
+		const reader = socket.streamRequest(create(), { firstEventTimeoutMs: 10 });
 		await expect(reader.next()).rejects.toMatchObject({
 			reason: "timeout",
 			phase: "first-event",

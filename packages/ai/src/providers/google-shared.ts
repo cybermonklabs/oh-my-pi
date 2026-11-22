@@ -1174,12 +1174,13 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				} catch {
 					throw new AIError.AbortError();
 				}
-				// Read the model-call guards before the output is reset for the resend: a held resend then ends
-				// with what the first answer streamed (its thinking and usage), as any held send does. The send
-				// itself reads them again right before it goes out (`openStreamAt`).
-				assertModelCallAllowed(model);
+				// Open the resend before the output is reset for it: `openStreamAt` reads the model-call guards
+				// right before each request (the regional URL, and the global URL after a regional 404), so a
+				// resend held at either one, or one that fails, ends with the answer before the resend (its
+				// thinking and usage) as any held send does.
+				const nextBody = await openStream();
 				resetGoogleStreamOutputForRetry(output);
-				body = await openStream();
+				body = nextBody;
 			}
 
 			output.duration = performance.now() - startTime;

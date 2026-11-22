@@ -397,6 +397,11 @@ export interface GitLabDuoWorkflowStreamState {
 	// error so `isContextOverflow` recognizes it and the agent loop auto-compacts. Left
 	// undefined for a goal within budget, so ordinary errors surface verbatim.
 	goalOverflowMessage?: string;
+	/**
+	 * The model this call runs: the socket reads its model-call guards in the same step as each send, the goal on
+	 * open and each tool result on resume. Unset (a socket driven on its own), the socket reads none.
+	 */
+	guardedModel?: Model<"gitlab-duo-agent">;
 }
 
 type GitLabDuoWorkflowSocketResult =
@@ -430,7 +435,7 @@ export const streamGitLabDuoWorkflow: StreamFunction<"gitlab-duo-agent"> = (
 	const stream = new AssistantMessageEventStream();
 	const output = createAssistantMessage(model);
 	stream.push({ type: "start", partial: output });
-	const state: GitLabDuoWorkflowStreamState = { stream, output, started: true };
+	const state: GitLabDuoWorkflowStreamState = { stream, output, started: true, guardedModel: model };
 
 	void runGitLabDuoWorkflow(model, context, options, state).catch(error => {
 		const errorText = gitLabDuoWorkflowErrorText(error);
@@ -442,7 +447,7 @@ export const streamGitLabDuoWorkflow: StreamFunction<"gitlab-duo-agent"> = (
 			// A held run (`ModelCallRefusedError`) and a `cyber_policy` refusal keep their own text: the hold
 			// sent nothing, and a refusal must stay a refusal, never become an overflow the session recovers from.
 			output.errorMessage = keepsOwnErrorText(error) ? errorText : (state.goalOverflowMessage ?? errorText);
-			stream.push({ type: "error", reason: "error", error: output });
+			pushGitLabDuoWorkflowError(state);
 		}
 	});
 
@@ -1338,7 +1343,7 @@ async function runGitLabDuoWorkflow(
 		if (!state.stream.done) {
 			state.output.stopReason = "error";
 			state.output.errorMessage = buildGitLabDuoWorkflowGoalOverflowMessage(renderedGoalBytes);
-			state.stream.push({ type: "error", reason: "error", error: state.output });
+			pushGitLabDuoWorkflowError(state);
 		}
 		// Stop the freshly created server-side workflow so it is not stranded, then
 		// return without opening the socket — the request is never spent.
@@ -1365,8 +1370,8 @@ async function runGitLabDuoWorkflow(
 		for (let attempt = 0; attempt < 12; attempt++) {
 			// Each socket run sends the conversation (the goal transcript) again: an approval's continuation, and
 			// a fresh workflow after an idle timeout, a step limit, a stall or a generic error. Each reads the
-			// model-call guards right before its socket opens; a held run throws out of the loop, and the
-			// `finally` below stops the workflow.
+			// model-call guards right before its socket opens, and the socket reads them again on open, in the same
+			// step as the goal; a held run throws out of the loop, and the `finally` below stops the workflow.
 			assertModelCallAllowed(model);
 			const ws = openGitLabDuoWorkflowSocket(workflowConnection.baseUrl ?? baseUrl, {
 				token: workflowConnection.token,
@@ -1522,7 +1527,7 @@ async function runGitLabDuoWorkflow(
 				// the byte size, not a transient fault — surface it as a context-overflow so
 				// the session auto-compacts instead of hard-failing.
 				if (state.goalOverflowMessage) state.output.errorMessage = state.goalOverflowMessage;
-				state.stream.push({ type: "error", reason: "error", error: state.output });
+				pushGitLabDuoWorkflowError(state);
 			}
 			// A stall that exhausted its fresh-workflow restarts is a persistent failure to
 			// progress; surface it as a real error so the run does not stop silently.
@@ -1530,7 +1535,7 @@ async function runGitLabDuoWorkflow(
 				state.output.stopReason = "error";
 				state.output.errorMessage =
 					state.goalOverflowMessage ?? state.output.errorMessage ?? GITLAB_DUO_WORKFLOW_STALL_ERROR_MESSAGE;
-				state.stream.push({ type: "error", reason: "error", error: state.output });
+				pushGitLabDuoWorkflowError(state);
 			}
 			break;
 		}
@@ -1970,6 +1975,19 @@ export function runGitLabDuoWorkflowSocket(
 		close();
 		settle("closed", new AIError.AbortError("GitLab Duo Workflow request aborted"));
 	};
+	// The model-call guards' read in the same step as a send (the goal on open, a tool result on resume). A held
+	// send goes nowhere: the socket closes and the run settles on the hold's error (`ModelCallRefusedError`).
+	const holdsSend = (): boolean => {
+		if (!state.guardedModel) return false;
+		try {
+			assertModelCallAllowed(state.guardedModel);
+			return false;
+		} catch (error) {
+			close();
+			settle("closed", error);
+			return true;
+		}
+	};
 	if (options.signal?.aborted) {
 		abort();
 		return promise;
@@ -2099,8 +2117,11 @@ export function runGitLabDuoWorkflowSocket(
 		// inline flow only ever has one.) DWS matches it by requestID to the awaiting
 		// outbox future and the workflow continues on the same connection.
 		const responses = Array.isArray(resumeResponse) ? resumeResponse : [resumeResponse];
-		for (const response of responses) {
-			ws.send(JSON.stringify(response));
+		// The tool results reach the model, after the call's own read and its key and header waits.
+		if (!holdsSend()) {
+			for (const response of responses) {
+				ws.send(JSON.stringify(response));
+			}
 		}
 	} else {
 		ws.onopen = () => {
@@ -2113,6 +2134,8 @@ export function runGitLabDuoWorkflowSocket(
 				mcpTools: startPayload.mcpTools.length,
 				preapprovedTools: startPayload.preapproved_tools.length,
 			});
+			// The goal reaches the model a handshake after the run read the guards.
+			if (holdsSend()) return;
 			ws.send(JSON.stringify({ startRequest: startPayload }));
 		};
 	}
@@ -2231,7 +2254,7 @@ async function handleGitLabDuoWorkflowSocketMessage(
 		// size — surface it as a context-overflow so the session auto-compacts. A `cyber_policy`
 		// refusal keeps its own text.
 		state.output.errorMessage = keepsOwnErrorText(message) ? message : (state.goalOverflowMessage ?? message);
-		state.stream.push({ type: "error", reason: "error", error: state.output });
+		pushGitLabDuoWorkflowError(state);
 		return "terminal";
 	}
 	const action = extractGitLabDuoWorkflowAction(event);
@@ -2537,6 +2560,17 @@ function endGitLabDuoWorkflowThinking(state: GitLabDuoWorkflowStreamState): void
 		});
 	}
 	state.activeThinkingIndex = undefined;
+}
+
+/**
+ * Ends the stream on an error, its `stopReason` and `errorMessage` already set. A text or thinking block a run
+ * left open (a socket run that streamed text, then a held next run, a FAILED, an exhausted retry or a stall)
+ * is closed first, so every block a consumer saw start also ends.
+ */
+function pushGitLabDuoWorkflowError(state: GitLabDuoWorkflowStreamState): void {
+	endGitLabDuoWorkflowText(state);
+	endGitLabDuoWorkflowThinking(state);
+	state.stream.push({ type: "error", reason: "error", error: state.output });
 }
 
 function finishGitLabDuoWorkflowStream(

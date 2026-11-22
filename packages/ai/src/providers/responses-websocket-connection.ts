@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
-import type { RawSseEvent } from "../types";
+import { assertModelCallAllowed } from "../model-call-guard";
+import type { Api, Model, RawSseEvent } from "../types";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { notifyRawSseEvent } from "../utils/sse-debug";
 import {
@@ -46,7 +47,11 @@ export interface ResponsesWebSocketTimeouts {
 	idleTimeoutMs?: number;
 }
 
-export type ResponsesWebSocketExchange = { send: Record<string, unknown> } | { receive: true };
+/**
+ * What {@link ResponsesWebSocketConnection.streamRequest} does: put a frame on the wire for `model`, whose
+ * model-call guards it reads in the same step as the frame, or read a response the server already started.
+ */
+export type ResponsesWebSocketExchange = { send: Record<string, unknown>; model: Model<Api> } | { receive: true };
 
 export interface ResponsesWebSocketControlFrames {
 	consume(frame: Record<string, unknown>): boolean | Error;
@@ -424,6 +429,10 @@ export class ResponsesWebSocketConnection {
 				this.#debugResponseLog = debugSession
 					? await debugSession.openResponseLog("WebSocket 101 Switching Protocols", this.#handshakeHeaders)
 					: undefined;
+				// The model-call guards are read in the same step as the frame: the dump above can outlast the
+				// caller's own read, and a resend (a stale anchor's complete replay) has none of its own. A held
+				// frame is not sent, and the request fails with the hold's error.
+				assertModelCallAllowed(exchange.model);
 				this.sendControl(exchange.send);
 			}
 			let sawFirstEvent = false;
