@@ -5,17 +5,19 @@
  * and runs one more turn. Before the compaction it takes weak references to what the live context holds for
  * each of those messages: the bodies, the Agent's own message objects, the fragments `convertToLlm` keeps,
  * the steering wrappers `wrapSteeringForModel` keeps, the `convertToLlm` output it keeps for the messages
- * array, the append-only log's entries and the messages of the last request. It prints one JSON line: which
- * of those values were not held before the compaction, which of the ones for messages before the cut are
- * still reachable after the next request, which markers of messages before the cut the Agent's messages and
- * the heap's large strings still hold, and whether the Agent's tokenizer still had an estimate for them. The
- * parent runs this with the JIT off and HOME and PI_CODING_AGENT_DIR under a temp dir.
+ * array, the append-only log's entries and the messages of the last request. It reads twice: right after
+ * `session.compact()` returns, before any further request, and after the next request. It prints one JSON
+ * line: which of those values were not held before the compaction; at each reading, which of the ones for
+ * messages before the cut are still reachable and which markers of those messages the heap's large strings
+ * still hold; at the compaction, which of those markers the Agent's messages and the append-only log still
+ * hold; after the next request, whether the Agent's tokenizer still had an estimate for them. The parent runs
+ * this with the JIT off and HOME and PI_CODING_AGENT_DIR under a temp dir.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
-import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { type MockResponse, MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -74,12 +76,21 @@ function textOf(message: Context["messages"][number]): string {
 	return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
 }
 
-// Every answer reports a cache write, so the cache warmer confirms each request's entry and the next
-// request's entry replaces the one armed before the compaction.
+// Every answer reports a cache write, so the cache warmer confirms each request's entry, as it does for a
+// real provider's.
 const usage = { input: 1_000, output: 10, cacheWrite: 1_000, totalTokens: 2_010 };
 let compacting = false;
 
-const mock = createMockModel({
+/**
+ * Declares a 5-minute prompt cache lifetime, so the cache warmer keeps a run armed with the last request (its
+ * refresh scheduled at 90% of the lifetime) while the session sits idle (`providers.cacheWarming` is `idle` by
+ * default), as with a real provider.
+ */
+class CachingMockModel extends MockModel {
+	readonly promptCache = { short: 300 };
+}
+
+const mock = new CachingMockModel({
 	handler: (context): MockResponse => {
 		if (compacting) return { content: ["Summary of the earlier turns."], usage };
 		if (!(context.tools ?? []).some(tool => tool.name === "probe")) return { content: ["label"], usage };
@@ -291,6 +302,8 @@ const unheldBefore = observed
 compacting = true;
 await session.compact();
 compacting = false;
+// The mock's record of the compaction's own request is the probe's, not the session's.
+mock.reset();
 
 const fromCut = sessionManager.getBranchFromCut();
 const fromCutIds = new Set(fromCut.map(entry => entry.id));
@@ -304,18 +317,31 @@ const kept = markersIn(
 	JSON.stringify(fromCut.filter(entry => entry.type === "message" || entry.type === "custom_message")),
 );
 const preCut = new Set([...everyMarker].filter(marker => !kept.has(marker)));
-const agentMessagesPreCut = [...markersIn(JSON.stringify(session.agent.state.messages))]
+const releasedStringMarkers = new Set(
+	[...preCut].filter(marker => RELEASED_STRING_KINDS[marker.slice(0, marker.indexOf("-"))] === true),
+);
+
+// At the compaction itself, before any further request: an idle session after `/compact` may send none for a
+// long time.
+await collect(() => reachable(preCut).length === 0);
+const reachableAtCompaction = reachable(preCut);
+const agentMessagesAtCompaction = [...markersIn(JSON.stringify(session.agent.state.messages))]
 	.filter(marker => preCut.has(marker))
 	.sort();
+// The log's entries include the session's own assistant messages, which their entries keep: read what it holds.
+const appendOnlyLogAtCompaction = [
+	...markersIn(JSON.stringify(session.agent.appendOnlyContext?.log.toMessages() ?? [])),
+]
+	.filter(marker => preCut.has(marker))
+	.sort();
+const heapStringsAtCompaction = markersInHeapStrings(releasedStringMarkers);
 
 await session.prompt(body("PROMPT", TURNS));
 await session.waitForIdle();
 mock.reset();
 await collect(() => reachable(preCut).length === 0);
-const afterNextRequest = reachable(preCut);
-const heapStringsPreCut = markersInHeapStrings(
-	new Set([...preCut].filter(marker => RELEASED_STRING_KINDS[marker.slice(0, marker.indexOf("-"))] === true)),
-);
+const reachableAfterNextRequest = reachable(preCut);
+const heapStringsAfterNextRequest = markersInHeapStrings(releasedStringMarkers);
 
 const preCutEntries = sessionManager
 	.getBranch()
@@ -352,9 +378,12 @@ process.stdout.write(
 			]),
 		),
 		unheldBefore,
-		afterNextRequest,
-		agentMessagesPreCut,
-		heapStringsPreCut,
+		reachableAtCompaction,
+		agentMessagesAtCompaction,
+		appendOnlyLogAtCompaction,
+		heapStringsAtCompaction,
+		reachableAfterNextRequest,
+		heapStringsAfterNextRequest,
 		tokenizerChecked,
 		tokenizerKeptEstimates,
 		preCutEntriesWhole,

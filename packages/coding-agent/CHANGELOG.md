@@ -187,6 +187,7 @@
 - The context figure that the status line, compaction and the rate-limit fallback read now counts the latest answer itself (its text, the thinking that is sent back and its tool-call arguments), so a rate limit after a long answer or a large file write no longer moves a session whose context is past `retry.rateLimitFallbackMaxContextTokens` down the chain
 - A session no longer keeps the prompts and tool results that a compaction moves before the cut in memory through their copies prepared for the model
 - A long session no longer keeps in memory, after a compaction moves them before the cut, the text of each steer and follow-up it queued nor a token count for each message
+- A session left idle after a compaction (such as `/compact`) no longer keeps the messages before the cut in memory until its next request
 - A resumed session no longer reads older messages back from disk on every tool call when their tool call ids (OpenAI Responses) or model ids (such as a Bedrock inference profile ARN) are longer than 64 characters
 - A subagent's pending `irc wait` ends once the subagent is parked, killed or released instead of waiting forever, and a message delivered to it while that happens is no longer kept buffered
 - A session on SQL storage that ends on a signal (such as SIGTERM) or a fatal error waits, up to the 10-second cleanup deadline, for the database to store its exit record and last entries instead of exiting while they are still being written
