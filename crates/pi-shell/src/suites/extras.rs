@@ -402,11 +402,15 @@ fn words_past_a_full_line(dir: &Path) -> Vec<String> {
 }
 
 /// How often `stderr` reports a command line the system refused as too
-/// long: in `E2BIG`'s words, or in `ENAMETOOLONG`'s, which GKE Sandbox
-/// (gVisor) says instead.
+/// long: in `E2BIG`'s words, or in `ENAMETOOLONG`'s or `ENOMEM`'s, which GKE
+/// Sandbox (gVisor) says instead (`ENOMEM` when the line's strings end
+/// exactly on its 2 MiB, which depends on the long path's length).
 #[cfg(target_os = "linux")]
 fn too_long_reports(stderr: &str) -> usize {
-	stderr.matches("Argument list too long").count() + stderr.matches("File name too long").count()
+	["Argument list too long", "File name too long", "Cannot allocate memory"]
+		.iter()
+		.map(|words| stderr.matches(words).count())
+		.sum()
 }
 
 /// xargs in the shell: a full line the kernel refuses as too long runs
@@ -451,6 +455,75 @@ async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
 	let ran = run(&mut s, &format!("xargs -a big {sh} {SHOW_ARGS}")).await;
 	assert_eq!((ran.status, ran.stdout.as_str()), (1, ""), "{}", ran.stderr);
 	assert_eq!(ran.stderr, "xargs: can't call exec() due to argument size restrictions\n");
+}
+
+/// xargs in the shell, for a full line whose argument strings, with their
+/// NULs, end exactly on gVisor's 2 MiB with more to come: GKE Sandbox before
+/// google/gvisor@bd278996 refuses it with `ENOMEM`, not `ENAMETOOLONG`, and
+/// it still runs again as two halves with nothing printed; every argument
+/// runs once, in order. Other systems refuse the line as any full line
+/// ([`sh_at_a_long_path`]), so the checks hold everywhere. The first word's
+/// length puts a string boundary on the 2 MiB, whatever the long path's
+/// length (it depends on `TMPDIR`).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xargs_splits_a_line_whose_strings_end_on_gvisors_limit() {
+	if !with_room_to_refuse("xargs_splits_a_line_whose_strings_end_on_gvisors_limit").await {
+		return;
+	}
+	/// gVisor's `ExecMaxTotalSize`.
+	const GVISOR_EXEC_ARGS_MAX: usize = 2 << 20;
+	let dir = tempfile::tempdir().unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	let (_long, sh) = sh_at_a_long_path();
+	// The strings xargs puts before the words, as `sh {SHOW_ARGS}` gives
+	// them: the program, `-c`, the script, `sh`.
+	let script = r#"echo "@ $#"; printf "%s\n" "$@""#;
+	assert_eq!(SHOW_ARGS, format!("-c '{script}' sh"), "the script is SHOW_ARGS'");
+	let before: usize = [sh.as_str(), "-c", script, "sh"]
+		.iter()
+		.map(|arg| arg.len() + 1)
+		.sum();
+	// A first word that brings them to a multiple of 256, then words of 256
+	// bytes with their NULs: a word ends on every multiple, 2 MiB too.
+	let mut first = (256 - (before + 1) % 256) % 256;
+	if first < 8 {
+		first += 256;
+	}
+	assert_eq!((before + first + 1) % 256, 0);
+	// SAFETY: plain call without pointer arguments.
+	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+	let words: Vec<String> = std::iter::once("f".repeat(first))
+		.chain((0..arg_max / 256).map(|i| format!("{i:07}{}", "x".repeat(248))))
+		.collect();
+	std::fs::write(dir.path().join("words"), words.join("\n") + "\n").unwrap();
+	let ran = run(&mut s, &format!("xargs -t -a words {sh} {SHOW_ARGS}")).await;
+	// `-t` traces each line before it is tried.
+	let (traces, reported): (Vec<&str>, Vec<&str>) =
+		ran.stderr.lines().partition(|line| line.starts_with(&sh));
+	assert_eq!((ran.status, reported), (0, vec![]), "every line runs, and nothing else is reported");
+	let lines = lines_run(&ran.stdout);
+	assert!(lines.concat() == words, "the arguments did not each run once, in order");
+	let tried: Vec<usize> = traces
+		.iter()
+		.map(|trace| {
+			trace
+				.split(' ')
+				.filter(|word| word.len() == 255 || word.len() == first)
+				.count()
+		})
+		.collect();
+	let full = tried[0];
+	// The full line's strings pass 2 MiB, so one of its words ends on it.
+	let strings = before + first + 1 + (full - 1) * 256;
+	assert!(strings > GVISOR_EXEC_ARGS_MAX, "the full line has {strings} bytes of strings");
+	assert!(
+		lines[0].len() < full && tried.get(1) == Some(&(full / 2)),
+		"the first, full line of {full} arguments was not refused and halved: {} ran first, and the \
+		 next line tried had {:?}",
+		lines[0].len(),
+		tried.get(1)
+	);
 }
 
 /// `find -exec ... {} +` in the shell: it sizes its batches against the

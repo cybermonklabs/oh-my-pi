@@ -30,7 +30,8 @@
 //!
 //! An external the system refuses to `exec` because its command line is too
 //! long (`E2BIG`, or `ENAMETOOLONG` for a line past `_POSIX_ARG_MAX` whose
-//! paths fit) is the shell's diagnostic and status 126, unless the command
+//! paths fit, or `ENOMEM` for one past gVisor's 2 MiB of argument strings)
+//! is the shell's diagnostic and status 126, unless the command
 //! asked to hear of it ([`ShellCommand::too_long_as_error`]) and is a program
 //! this callout `exec`s itself: then, on Unix, the shell prints nothing and
 //! the utility gets the error, so `xargs` can retry with fewer arguments.

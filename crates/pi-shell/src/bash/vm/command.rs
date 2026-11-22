@@ -2690,8 +2690,19 @@ fn refusals_to_host(vp: &mut Vproc) -> bool {
 
 /// Whether `err`, the failure to start the program at `path` with the
 /// arguments `argv` in the working directory `cwd`, is the system refusing
-/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` as GKE Sandbox
-/// (gVisor) says it, but that only when nothing else can have caused it:
+/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` or `ENOMEM` as
+/// GKE Sandbox (gVisor) says it, but those only when nothing else can have
+/// caused them.
+///
+/// `ENOMEM` counts only for arguments past [`GVISOR_EXEC_ARGS_MAX`]: gVisor
+/// before google/gvisor@bd278996 refuses such a line with `ENOMEM` when its
+/// strings end exactly on that limit with more to come. Linux's `ENOMEM` (the
+/// kernel out of memory) of so long a line is retried too, which costs only
+/// the halves' starts. A shorter line's `ENOMEM` is not its length: Linux's,
+/// or gVisor's when the environment's strings fill the limit, which fewer
+/// arguments cannot help.
+///
+/// `ENAMETOOLONG` counts only when:
 /// - The arguments take more than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
 ///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG` is a
 ///   path's.
@@ -2709,11 +2720,12 @@ fn refusals_to_host(vp: &mut Vproc) -> bool {
 fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd: &[u8]) -> bool {
 	/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`).
 	const POSIX_ARG_MAX: usize = 4096;
+	let line = || argv.iter().map(|arg| arg.len() + 1).sum::<usize>();
 	match err.raw_os_error() {
 		Some(libc::E2BIG) => true,
+		Some(libc::ENOMEM) => line() > GVISOR_EXEC_ARGS_MAX,
 		Some(libc::ENAMETOOLONG) => {
-			let line: usize = argv.iter().map(|arg| arg.len() + 1).sum();
-			line > POSIX_ARG_MAX
+			line() > POSIX_ARG_MAX
 				&& fits_as_path(path)
 				&& fits_as_path(cwd)
 				&& !interpreter_path_too_long(&super::probe::absolute(cwd, path), cwd)
@@ -2721,6 +2733,16 @@ fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd:
 		_ => false,
 	}
 }
+
+/// The most bytes of argument strings, each with its NUL, that gVisor's
+/// `execve` copies (`ExecMaxTotalSize` in its
+/// `pkg/sentry/syscalls/linux/sys_thread.go`). Releases before
+/// google/gvisor@bd278996 refuse a longer line with `ENAMETOOLONG` when a
+/// string crosses the limit, and with `ENOMEM` when the strings end exactly
+/// on it and more follow (`CopyInVector` finds nothing left for the next
+/// one). The same constant as `pi_builtins`' `GVISOR_EXEC_ARGS_MAX`.
+#[cfg(unix)]
+const GVISOR_EXEC_ARGS_MAX: usize = 2 << 20;
 
 /// Whether the program at `path` (a host path: the one the system refused)
 /// is a `#!` script whose interpreter the system cannot reach by its path:
@@ -5465,7 +5487,8 @@ mod tests {
 	/// `E2BIG` is always a command line too long; `ENAMETOOLONG` only for
 	/// arguments past `_POSIX_ARG_MAX` (4,096 bytes) when neither the
 	/// program's path nor the working directory is past `PATH_MAX` or holds
-	/// a name past `NAME_MAX`; any other error never is. The cases of
+	/// a name past `NAME_MAX`; `ENOMEM` only past gVisor's limit (the test
+	/// below); any other error never is. The cases of
 	/// `pi_builtins`' twin (`command_line_too_long`), for resolved paths.
 	#[cfg(unix)]
 	#[test]
@@ -5498,8 +5521,33 @@ mod tests {
 			!refused_as_too_long(&enametoolong, b"/usr/bin/printf", &short, b"/tmp"),
 			"a line no system refuses: a path's error"
 		);
-		let other = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		let other = std::io::Error::from_raw_os_error(libc::EACCES);
 		assert!(!refused_as_too_long(&other, b"/usr/bin/printf", &long, b"/tmp"));
+	}
+
+	/// `ENOMEM` is a command line too long only for arguments past gVisor's
+	/// 2 MiB of strings, which gVisor before google/gvisor@bd278996 refuses
+	/// with it when they end exactly on the limit; whatever the program's
+	/// path or the directory. Arguments that fit are not refused for their
+	/// length. The cases of `pi_builtins`' twin.
+	#[cfg(unix)]
+	#[test]
+	fn enomem_is_a_line_too_long_only_past_gvisors_limit() {
+		use bstr::BString;
+
+		use super::{GVISOR_EXEC_ARGS_MAX, refused_as_too_long};
+		let enomem = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		// "prog" and its NUL, then one string to the given total.
+		let line = |total: usize| [BString::from("prog"), BString::from("a".repeat(total - 6))];
+		let too_long = |path: &str, total: usize| {
+			refused_as_too_long(&enomem, path.as_bytes(), &line(total), b"/tmp")
+		};
+		assert_eq!(GVISOR_EXEC_ARGS_MAX, 2 * 1024 * 1024);
+		assert!(too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX + 1));
+		let name = "n".repeat(256);
+		assert!(too_long(&format!("/{name}"), GVISOR_EXEC_ARGS_MAX + 1), "a path is no matter");
+		assert!(!too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX), "a line gVisor takes whole");
+		assert!(!too_long("/usr/bin/printf", 4097));
 	}
 
 	/// The `#!` rule of `pi_builtins`' twin: an `ENAMETOOLONG` of a long line

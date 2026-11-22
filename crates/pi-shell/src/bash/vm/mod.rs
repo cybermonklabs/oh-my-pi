@@ -242,16 +242,16 @@ pub struct Script {
 	pub unexport_env:     Vec<BString>,
 	/// On Unix, the host hears of an `exec` replacing the run's vproc that
 	/// the system refuses because the command line is too long (`E2BIG`,
-	/// `ENAMETOOLONG`): the shell prints nothing for it, the run ends with
-	/// status 126, and [`Shell::exec_refusal`] has the error. A callout can
-	/// then retry with fewer arguments (`xargs`). A tool the run calls hears
-	/// of it as well ([`ToolCall::too_long_to_caller`]) and hands such a
-	/// refusal of its own command up the same way ([`CallOutcome::TooLong`]).
-	/// Set it only for a script that runs nothing before that `exec` or tool
-	/// (a callout's generated `exec` of a program, or its call of `timeout`,
-	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`];
-	/// the `exec` of the program `timeout` or `nohup` runs): a retry would
-	/// run all of it again.
+	/// `ENAMETOOLONG`, `ENOMEM`): the shell prints nothing for it, the run
+	/// ends with status 126, and [`Shell::exec_refusal`] has the error. A
+	/// callout can then retry with fewer arguments (`xargs`). A tool the run
+	/// calls hears of it as well ([`ToolCall::too_long_to_caller`]) and hands
+	/// such a refusal of its own command up the same way
+	/// ([`CallOutcome::TooLong`]). Set it only for a script that runs nothing
+	/// before that `exec` or tool (a callout's generated `exec` of a program,
+	/// or its call of `timeout`, `nohup`, `env` or `ifne`, in a subshell with
+	/// [`Script::as_program`]; the `exec` of the program `timeout` or `nohup`
+	/// runs): a retry would run all of it again.
 	pub too_long_to_host: bool,
 	/// With [`Script::too_long_to_host`], the host hears of every other
 	/// refusal of that `exec` too (`EACCES`, `ENOENT` of a `#!` interpreter,
@@ -414,9 +414,9 @@ pub enum CallOutcome {
 	Error(BString),
 	/// For a call with [`ToolCall::too_long_to_caller`]: the system refused
 	/// the tool's command as too long with this error (`E2BIG`,
-	/// `ENAMETOOLONG`). The calling run hears of it as of its own refused
-	/// `exec`: status 126, nothing printed, and [`Shell::exec_refusal`] has
-	/// the error.
+	/// `ENAMETOOLONG`, `ENOMEM`). The calling run hears of it as of its own
+	/// refused `exec`: status 126, nothing printed, and
+	/// [`Shell::exec_refusal`] has the error.
 	TooLong(i32),
 }
 

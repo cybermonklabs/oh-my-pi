@@ -1542,13 +1542,13 @@ impl ShellCommand {
 	}
 
 	/// Reports a program the system refuses to run because the command line
-	/// is too long (`E2BIG`, `ENAMETOOLONG`) as that error from
-	/// [`RunningCommand::wait`], with nothing printed for it, so the utility
-	/// can retry with fewer arguments (`xargs`). Only the program the command
-	/// names counts: a builtin's own `exec` (`eval '…; exec prog'`) keeps the
-	/// shell's diagnostic and status 126, since a retry would repeat what the
-	/// builtin did first. Otherwise, and on Windows, the shell prints its
-	/// diagnostic and the command ends with status 126.
+	/// is too long (`E2BIG`, `ENAMETOOLONG`, `ENOMEM`: [`command_line_too_long`])
+	/// as that error from [`RunningCommand::wait`], with nothing printed for
+	/// it, so the utility can retry with fewer arguments (`xargs`). Only the
+	/// program the command names counts: a builtin's own `exec` (`eval '…;
+	/// exec prog'`) keeps the shell's diagnostic and status 126, since a retry
+	/// would repeat what the builtin did first. Otherwise, and on Windows, the
+	/// shell prints its diagnostic and the command ends with status 126.
 	pub fn too_long_as_error(mut self) -> Self {
 		self.too_long_as_error = true;
 		self
@@ -1587,8 +1587,16 @@ impl ShellCommand {
 /// `cwd` with a command line whose arguments take `line` bytes
 /// ([`line_bytes`]), is the system refusing the line as too long, as a
 /// command run with [`ShellCommand::too_long_as_error`] reports it: `E2BIG`,
-/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. A utility that batches
-/// arguments retries such a line in halves, as GNU xargs does.
+/// or `ENAMETOOLONG` or `ENOMEM` as GKE Sandbox (gVisor) says it. A utility
+/// that batches arguments retries such a line in halves, as GNU xargs does.
+///
+/// `ENOMEM` counts only for a line past [`GVISOR_EXEC_ARGS_MAX`]: gVisor
+/// before google/gvisor@bd278996 refuses such a line with `ENOMEM` when its
+/// strings end exactly on that limit with more to come. Linux's `ENOMEM` (the
+/// kernel out of memory) of so long a line is retried too, which costs only
+/// the halves' starts. A shorter line's `ENOMEM` is not its length: Linux's,
+/// or gVisor's when the environment's strings fill the limit, which fewer
+/// arguments cannot help.
 ///
 /// `ENAMETOOLONG` counts only when nothing else can have caused it:
 /// - The line is longer than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
@@ -1617,6 +1625,7 @@ pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usi
 	use std::os::unix::ffi::OsStrExt as _;
 	match error.raw_os_error() {
 		Some(libc::E2BIG) => true,
+		Some(libc::ENOMEM) => line > GVISOR_EXEC_ARGS_MAX,
 		Some(libc::ENAMETOOLONG) if line > POSIX_ARG_MAX => {
 			let cwd = pi_vfs::normalize_lexically(cwd);
 			let named = program.as_os_str().as_bytes().contains(&b'/');
@@ -1666,6 +1675,16 @@ fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
 #[cfg(unix)]
 const POSIX_ARG_MAX: usize = 4096;
 
+/// The most bytes of argument strings, each with its NUL, that gVisor's
+/// `execve` copies (`ExecMaxTotalSize` in its
+/// `pkg/sentry/syscalls/linux/sys_thread.go`). Releases before
+/// google/gvisor@bd278996 refuse a longer line with `ENAMETOOLONG` when a
+/// string crosses the limit, and with `ENOMEM` when the strings end exactly
+/// on it and more follow (`CopyInVector` finds nothing left for the next
+/// one). The shell's twin is `GVISOR_EXEC_ARGS_MAX` in pi-shell's VM.
+#[cfg(unix)]
+const GVISOR_EXEC_ARGS_MAX: usize = 2 << 20;
+
 /// The bytes the arguments `argv` take in a command line: each string and
 /// its terminating NUL, as the system counts them.
 pub(crate) fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
@@ -1694,12 +1713,13 @@ pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _line: 
 mod too_long_tests {
 	use std::{io, path::Path};
 
-	use super::{POSIX_ARG_MAX, command_line_too_long};
+	use super::{GVISOR_EXEC_ARGS_MAX, POSIX_ARG_MAX, command_line_too_long};
 
 	/// `E2BIG` is always a line too long; `ENAMETOOLONG` only for a line
 	/// longer than `_POSIX_ARG_MAX` when neither the program's path nor the
 	/// (normalized) working directory is past `PATH_MAX` or holds a name past
-	/// `NAME_MAX`; any other error never is.
+	/// `NAME_MAX`; `ENOMEM` only past gVisor's limit (the test below); any
+	/// other error never is.
 	#[test]
 	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
 		let e2big = io::Error::from_raw_os_error(libc::E2BIG);
@@ -1733,8 +1753,29 @@ mod too_long_tests {
 		assert!(!short(libc::ENAMETOOLONG, POSIX_ARG_MAX), "a line no system refuses: a path's error");
 		assert!(short(libc::ENAMETOOLONG, POSIX_ARG_MAX + 1));
 		assert!(short(libc::E2BIG, 2), "E2BIG is the line's, however short");
-		let other = io::Error::from_raw_os_error(libc::ENOMEM);
+		let other = io::Error::from_raw_os_error(libc::EACCES);
 		assert!(!command_line_too_long(&other, Path::new("/usr/bin/printf"), long, Path::new("/tmp")));
+	}
+
+	/// `ENOMEM` is a line too long only for a line past gVisor's 2 MiB of
+	/// argument strings, which gVisor before google/gvisor@bd278996 refuses
+	/// with it when the strings end exactly on the limit; whatever the
+	/// program's path or the directory, since gVisor says it before it
+	/// looks either up. A line that fits is not refused for its length.
+	#[test]
+	fn enomem_is_a_line_too_long_only_past_gvisors_limit() {
+		let enomem = io::Error::from_raw_os_error(libc::ENOMEM);
+		let too_long = |program: &str, line: usize, cwd: &str| {
+			command_line_too_long(&enomem, Path::new(program), line, Path::new(cwd))
+		};
+		assert_eq!(GVISOR_EXEC_ARGS_MAX, 2 * 1024 * 1024);
+		assert!(too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX + 1, "/tmp"));
+		assert!(too_long("printf", 3 * GVISOR_EXEC_ARGS_MAX, "/tmp"));
+		let name = "n".repeat(256);
+		assert!(too_long(&format!("./{name}"), GVISOR_EXEC_ARGS_MAX + 1, "/tmp"), "a path is no matter");
+		assert!(!too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX, "/tmp"), "a line gVisor takes whole");
+		assert!(!too_long("/usr/bin/printf", POSIX_ARG_MAX + 1, "/tmp"));
+		assert!(!too_long("/usr/bin/printf", 2, "/tmp"));
 	}
 
 	/// An `ENAMETOOLONG` of a long line whose program is a `#!` script with
@@ -1854,7 +1895,7 @@ pub trait CommandRunner: Send {
 	/// `argv[0]`, [`io::ErrorKind::PermissionDenied`] when it cannot be
 	/// executed, and any other kind for other failures to run it. A command
 	/// line the system refuses as too long fails with that error (`E2BIG`,
-	/// `ENAMETOOLONG`) at least for a command that asks for it
+	/// `ENAMETOOLONG`, `ENOMEM`) at least for a command that asks for it
 	/// ([`ShellCommand::too_long_is_error`]), and so does any other refusal
 	/// to start its program for a command that asks for that
 	/// ([`ShellCommand::refusal_is_error`]).
@@ -3758,9 +3799,10 @@ mod testing {
 	/// How the running kernel answers an `execve` of `argv` with exactly the
 	/// environment `env` from `cwd`, as [`TestRunner`] starts a command:
 	/// `Some(errno)` when it refuses the line as too long (`E2BIG`, or
-	/// `ENAMETOOLONG` as GKE's gVisor says it), `None` when the program
-	/// starts (it runs to its end, its output discarded). Panics on any other
-	/// failure.
+	/// `ENAMETOOLONG` or `ENOMEM` as GKE's gVisor says it: `ENOMEM` only for
+	/// argument strings past [`super::GVISOR_EXEC_ARGS_MAX`]), `None` when the
+	/// program starts (it runs to its end, its output discarded). Panics on
+	/// any other failure.
 	///
 	/// The kernels count different things (measured on Linux 6.12 and on GKE's
 	/// gVisor at stack rlimits of 8 MiB, 128 MiB and none). Linux (fs/exec.c,
@@ -3773,10 +3815,12 @@ mod testing {
 	/// the path apart from `argv[0]`, and counts the environment on its own:
 	/// it refuses once the argument strings with their NULs pass 2 MiB, or the
 	/// environment's do, whatever the stack rlimit. GKE's gVisor allows one
-	/// string up to 512 KiB and says `ENAMETOOLONG`. xargs and find size their
-	/// lines by glibc's `sysconf(_SC_ARG_MAX)`, a quarter of the stack rlimit
-	/// (6 MiB at most), counting the strings, the pointers and the
-	/// environment, less 2,048 bytes.
+	/// string up to 512 KiB and says `ENAMETOOLONG`, or `ENOMEM` when the
+	/// strings end exactly on 2 MiB with more to come (google/gvisor@bd278996
+	/// makes both `E2BIG`). xargs and find size their lines by glibc's
+	/// `sysconf(_SC_ARG_MAX)`, a quarter of the stack rlimit (6 MiB at most),
+	/// counting the strings, the pointers and the environment, less 2,048
+	/// bytes.
 	#[cfg(target_os = "linux")]
 	pub(crate) fn exec_refusal(argv: &[&str], env: &HashMap<String, String>, cwd: &std::path::Path) -> Option<i32> {
 		let spawned = std::process::Command::new(argv[0])
@@ -3795,6 +3839,7 @@ mod testing {
 			},
 			Err(error) => match error.raw_os_error() {
 				Some(errno @ (libc::E2BIG | libc::ENAMETOOLONG)) => Some(errno),
+				Some(libc::ENOMEM) if super::line_bytes(argv) > super::GVISOR_EXEC_ARGS_MAX => Some(libc::ENOMEM),
 				_ => panic!("exec of a {}-word line failed otherwise: {error}", argv.len()),
 			},
 		}
