@@ -2266,25 +2266,19 @@ describe("restoreSession (omp --restore)", () => {
 
 	for (const [label, afterFork, relaunched] of [
 		[
-			"leaves it when a /retry replay's fallback revert wrote a model change under the reply before its first call, then the process was killed",
+			"leaves it when a replay's model change was followed by a quit: the restoring process's exit recovery closes the reply's calls, and restore runs the batch again",
 			(main: SessionManager) => {
 				main.appendModelChange("anthropic/claude-haiku-4-5");
+				appendDisposeExit(main); // the quit: a normal exit that lists the reply's calls as pending
+				appendProcessStart(main); // the --restore process
 			},
 			false,
 		],
 		[
-			"relaunches it when a replay's model change was followed by a quit: restore resumes no turn",
+			"relaunches it when a replay's model change was followed by a kill: the restoring process's startup writes its eval snapshot after it, and restore asks the model again",
 			(main: SessionManager) => {
 				main.appendModelChange("anthropic/claude-haiku-4-5");
-				appendDisposeExit(main);
-			},
-			true,
-		],
-		[
-			"relaunches it when the restoring process's startup wrote its eval snapshot after that model change: restore asks the model again",
-			(main: SessionManager) => {
-				main.appendModelChange("anthropic/claude-haiku-4-5");
-				main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+				appendProcessStart(main); // the --restore process: no exit to recover, then its startup snapshot
 			},
 			true,
 		],
@@ -2295,6 +2289,7 @@ describe("restoreSession (omp --restore)", () => {
 				if (!kept) throw new Error("Expected the reply to keep");
 				main.appendCompaction("S: the work so far.", undefined, kept, 10_000);
 				main.appendMessage(storedEvalSnapshot());
+				appendProcessStart(main); // the --restore process
 			},
 			true,
 		],
@@ -2305,6 +2300,7 @@ describe("restoreSession (omp --restore)", () => {
 				const abort = createInterruptedTurnAbortMessage(main.getBranch(), undefined, { assumeExit: true });
 				if (!abort) throw new Error("Expected the switch to close the parent's turn");
 				main.appendMessage(abort);
+				appendProcessStart(main); // the --restore process
 			},
 			true,
 		],
@@ -2317,18 +2313,82 @@ describe("restoreSession (omp --restore)", () => {
 				main.appendMessage(
 					assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }),
 				);
+				appendProcessStart(main); // the --restore process
 			},
 			true,
 		],
 	] as const) {
 		it(label, async () => {
-			// What a replay or a later writer put under the reply before the batch's first call decides whether restore
-			// runs that batch again: it closes the turn and replays the batch only when the batch's results then follow the
-			// reply in the context (`toolReplayAnchor`). A record (a fallback revert's model change) keeps that; an eval
-			// snapshot or a later reply, or a closing that gives the reply's calls no results, makes restore ask the model
-			// again. If this regresses, either Worker is relaunched beside a cell the batch runs again, or it is left
-			// while no cell runs its work again.
+			// What a replay or a later writer put under the reply before the batch's first call, and what the restoring
+			// process writes as it starts, decide whether restore runs that batch again: it closes the turn and replays
+			// the batch only when the batch's results then follow the reply in the context (`toolReplayAnchor`). A record
+			// (a fallback revert's model change, an exit record) keeps that; an eval snapshot or a later reply, or a
+			// closing that gives the reply's calls no results, makes restore ask the model again. The reply calls an eval
+			// cell, so each process that starts on the session writes its eval snapshot. If this regresses, either Worker
+			// is relaunched beside a cell the batch runs again, or it is left while no cell runs its work again.
 			const { outcome } = await restoreAfterCutOffReplay({ afterFork });
+
+			expect(outcome.subagents).toEqual(relaunched ? ["Worker"] : []);
+		});
+	}
+
+	/**
+	 * A parent in a session with no eval call: its reply calls `task` (`call_task`), whose subagent Worker ended its turn
+	 * on its key, and the call got back an error result that names Worker's run (what the tool returns when a run
+	 * settled and a later step failed, `task/index.ts:2084-2109`). A replay of the batch from the reply then wrote
+	 * `afterFork` under the reply. No process that starts on such a session writes an eval snapshot: its history holds
+	 * no eval activity, and a fresh process holds no eval runtime.
+	 */
+	async function restoreAfterTaskReplay(afterFork: (main: SessionManager) => void) {
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		const anchor = main.appendMessage(toolCallMessage("call_task", "task"));
+		tick();
+		appendExecutionStart(main, "call_task", "task");
+		tick();
+		await writeSubagent(mainFile, cwd, "Worker", stranded, { spawnCallId: "call_task", normalExit: true });
+		tick();
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [{ ...subagentResult("Worker"), exitCode: 1, output: "", error: KEY_ERROR }],
+			totalDurationMs: 5,
+		};
+		main.appendMessage(toolResultMessage("call_task", "task", details, true));
+		tick();
+		main.branch(anchor);
+		afterFork(main);
+		return restoreParent(main, mainFile);
+	}
+
+	for (const [label, afterFork, relaunched] of [
+		[
+			"leaves it when a /retry replay's fallback revert wrote a model change under a task reply before its first call, then the process was killed",
+			(main: SessionManager) => {
+				main.appendModelChange("anthropic/claude-haiku-4-5");
+				appendExitRecovery(main); // the --restore process: nothing to recover after a kill
+			},
+			false,
+		],
+		[
+			"relaunches it when a replay's model change under a task reply was followed by a quit, omp -c and a /restart with no input: restore resumes no turn",
+			(main: SessionManager) => {
+				main.appendModelChange("anthropic/claude-haiku-4-5");
+				appendDisposeExit(main); // the quit
+				appendExitRecovery(main); // omp -c
+				appendDisposeExit(main); // the /restart
+				appendExitRecovery(main); // the --restore process
+			},
+			true,
+		],
+	] as const) {
+		it(label, async () => {
+			// Restore closes a turn a kill cut off and runs the batch again, so a `task` reply's first run is read and
+			// Worker, whose failure the call got, is left. After a quit the next start's exit recovery closes the turn,
+			// and a normal exit after that turn leaves restore no turn to resume, so the batch does not run again and
+			// Worker is relaunched. If this regresses, either Worker is relaunched beside a call the batch runs again, or
+			// it is left while no call runs its work again.
+			const { outcome } = await restoreAfterTaskReplay(afterFork);
 
 			expect(outcome.subagents).toEqual(relaunched ? ["Worker"] : []);
 		});
@@ -2346,16 +2406,21 @@ describe("restoreSession (omp --restore)", () => {
 	}
 
 	/**
-	 * What a process writes as it starts on the session (`sdk.ts`): exit recovery closes a turn the recorded exit left
-	 * unfinished (its calls' results, then the interrupted-turn abort), then the startup eval snapshot.
+	 * Exit recovery as a process starts on the session (`sdk.ts:2209-2215`): it closes a turn the recorded exit left
+	 * unfinished (its calls' results, then the interrupted-turn abort). A kill records no exit, so it recovers nothing.
 	 */
-	function appendProcessStart(main: SessionManager): void {
+	function appendExitRecovery(main: SessionManager): void {
 		const branch = main.getBranch();
 		const abort = createInterruptedTurnAbortMessage(branch);
 		if (abort) {
 			for (const result of createInterruptedToolResults(branch)) main.appendMessage(result);
 			main.appendMessage(abort);
 		}
+	}
+
+	/** What a process writes as it starts on a session whose history holds an eval call: exit recovery, then its eval snapshot. */
+	function appendProcessStart(main: SessionManager): void {
+		appendExitRecovery(main);
 		main.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
 	}
 
@@ -2434,7 +2499,7 @@ describe("restoreSession (omp --restore)", () => {
 			},
 		],
 		[
-			"relaunches a subagent still owed when the selected branch after the closed reply holds a length reply with a call, whose placeholder batch restore would run again instead",
+			"relaunches a subagent still owed when the selected branch after the closed reply holds a length reply with a call and its placeholder result: restore asks the model again",
 			(main: SessionManager) => {
 				appendDisposeExit(main);
 				appendProcessStart(main);
@@ -2446,9 +2511,10 @@ describe("restoreSession (omp --restore)", () => {
 		it(label, async () => {
 			// If this regresses, the selected side reads as the replay of the reply's batch though restore does not run
 			// that batch again: a start record of another call is no replay of it, and with a `length` reply's placeholder
-			// result as the turn's tail, restore's replay runs that reply's batch. The handover on the first run's branch
-			// then settles a subagent the parent still waits on: Background is owed from an earlier reply, so it is
-			// relaunched unless that branch is read.
+			// result as the turn's tail, restore replays no batch at all: `/retry` refuses a `length` reply as a batch's
+			// reply (`toolReplayStart`) and asks the model again. The handover on the first run's branch would then
+			// settle a subagent the parent still waits on: Background is owed from an earlier reply, so it is relaunched
+			// unless that branch is read.
 			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 			const { main, mainFile, cwd } = openParent();
 			const records = { sessionManager: main } as unknown as ToolSession;

@@ -907,8 +907,11 @@ function replayedAfter(branch: readonly SessionEntry[], forkIndex: number, calls
  * between the reply and those results (an eval snapshot `/tree`, a start or a compaction writes, a
  * branch summary), a later reply, or a closing that gives the reply's calls no results, makes restore
  * ask the model again instead, and the batch does not run again. The context is built without a
- * model, from the newest compaction; a session whose model cannot read a provider-native compaction
- * builds from an older one, which moves only what comes before the compaction.
+ * model, from the newest compaction. Restore's own context is built with the session's model, which
+ * builds from an older compaction when it cannot read a provider-native one (`session-context.ts:372-374`).
+ * If such a compaction was written after the reply, the older boundary can put the reply right before
+ * the closing's results: restore then runs the batch again while this says it does not, and the subagent
+ * is relaunched beside the batch. No test builds that shape, and no writer of it there is traced.
  */
 export function restoreRunsBatchAgain(branch: readonly SessionEntry[], calls: ReadonlySet<string>): boolean {
 	if (!hasRestorableTurn(branch)) return false;

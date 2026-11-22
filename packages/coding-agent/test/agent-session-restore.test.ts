@@ -450,14 +450,19 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		});
 	}
 
-	/** What a process writes as it starts on the session: exit recovery's closing of a cut-off turn, then a snapshot. */
-	function appendProcessStart(manager: SessionManager): void {
+	/** Exit recovery as a process starts on the session: it closes a turn the recorded exit left unfinished. */
+	function appendExitRecovery(manager: SessionManager): void {
 		const branch = manager.getBranch();
 		const abort = createInterruptedTurnAbortMessage(branch);
 		if (abort) {
 			for (const result of createInterruptedToolResults(branch)) manager.appendMessage(result);
 			manager.appendMessage(abort);
 		}
+	}
+
+	/** What a process writes as it starts on an eval session: exit recovery's closing of a cut-off turn, then a snapshot. */
+	function appendProcessStart(manager: SessionManager): void {
+		appendExitRecovery(manager);
 		manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
 	}
 
@@ -492,10 +497,22 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 				runsAgain: false,
 			},
 			{
-				label: "a model change, then a quit",
+				label: "a model change, then a quit and the next start's exit recovery",
 				after: manager => {
 					manager.appendModelChange(`${model.provider}/${model.id}`);
 					appendDisposeExit(manager);
+					appendProcessStart(manager);
+				},
+				runsAgain: true,
+			},
+			{
+				label: "a model change, then a quit, omp -c and a /restart with no input, in a session with no eval call",
+				after: manager => {
+					manager.appendModelChange(`${model.provider}/${model.id}`);
+					appendDisposeExit(manager);
+					appendExitRecovery(manager);
+					appendDisposeExit(manager);
+					appendExitRecovery(manager);
 				},
 				runsAgain: false,
 			},
