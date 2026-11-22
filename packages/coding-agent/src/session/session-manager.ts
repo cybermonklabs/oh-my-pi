@@ -1412,6 +1412,23 @@ export class SessionManager {
 	#parentMoveFollow: Promise<void> | undefined;
 	/** The transcript {@link #parentMoveFollow} was started for (see {@link #parentMoveFollowOfThisFile}). */
 	#parentMoveFollowFile: string | undefined;
+	/** The {@link #switchGeneration} {@link #parentMoveFollow} was started in. */
+	#parentMoveFollowGeneration: number | undefined;
+	/**
+	 * Bumped where a switch ({@link setSessionFile}) reads the session it leaves. A parent follow or a queued-conflict
+	 * recovery started before carries the old value and never moves the session off or publishes it (see
+	 * {@link #switchedSince}): between that read and the load that sets the new file, `#sessionFile` still names the
+	 * session left, so a check of the path alone lets an older follow or recovery move it off unrecorded.
+	 */
+	#switchGeneration = 0;
+	/** From that read until the switch sets the new file (or fails): no follow or recovery moves the session off then. */
+	#switchingSession = false;
+	/**
+	 * The subagent transcript a switch adopted under a refused claim, while its parent follow has not yet forked or
+	 * moved it: it was never this manager's, so a switch away from it before then records it as left no more than the
+	 * fork does.
+	 */
+	#heldAdoptionFile: string | undefined;
 	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
 	#queuedConflictRecovery: Promise<void> | undefined;
 	/** Queued-write conflicts recovered since the last confirmed publish; past the bound the session moves off as contested. */
@@ -1914,11 +1931,23 @@ export class SessionManager {
 
 	/**
 	 * Whether {@link #parentMoveFollow} follows the parent of the transcript this manager has now: a follow started
-	 * for a transcript it has since left (a switch to another file while it waited) is not this transcript's, and
-	 * ends at its own file check without writing.
+	 * for a transcript it has since left (a switch to another file while it waited), or before a switch back to the
+	 * same path, is not this transcript's, and ends at its own checks without writing.
 	 */
 	#parentMoveFollowOfThisFile(): boolean {
-		return this.#parentMoveFollow !== undefined && this.#parentMoveFollowFile === this.#sessionFile;
+		return (
+			this.#parentMoveFollow !== undefined &&
+			this.#parentMoveFollowFile === this.#sessionFile &&
+			this.#parentMoveFollowGeneration === this.#switchGeneration
+		);
+	}
+
+	/**
+	 * Whether a switch has started since `generation` was read (see {@link #switchGeneration}): one that is still
+	 * loading the new file, or one that set it.
+	 */
+	#switchedSince(generation: number): boolean {
+		return this.#switchGeneration !== generation || this.#switchingSession;
 	}
 
 	/**
@@ -1943,11 +1972,15 @@ export class SessionManager {
 		}
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
-		const follow: Promise<void> = this.#runParentMoveFollow(childFile, root.stem, recordLeft).finally(() => {
-			if (this.#parentMoveFollow === follow) this.#parentMoveFollow = undefined;
-		});
+		const generation = this.#switchGeneration;
+		const follow: Promise<void> = this.#runParentMoveFollow(childFile, root.stem, recordLeft, generation).finally(
+			() => {
+				if (this.#parentMoveFollow === follow) this.#parentMoveFollow = undefined;
+			},
+		);
 		this.#parentMoveFollow = follow;
 		this.#parentMoveFollowFile = childFile;
+		this.#parentMoveFollowGeneration = generation;
 		return true;
 	}
 
@@ -1963,9 +1996,15 @@ export class SessionManager {
 	 * beside the parent file, under a lease it takes there, its header naming
 	 * the parent as `parentSession` (a lease row names no successor, and a
 	 * move keeps the parent's id), and publishes its whole transcript there:
-	 * no entry is lost, and no id is stranded.
+	 * no entry is lost, and no id is stranded. A follow a switch has outdated (`generation`, see
+	 * {@link #switchedSince}) moves and publishes nothing.
 	 */
-	async #runParentMoveFollow(childFile: string, parentStem: string, recordLeft: boolean): Promise<void> {
+	async #runParentMoveFollow(
+		childFile: string,
+		parentStem: string,
+		recordLeft: boolean,
+		generation: number,
+	): Promise<void> {
 		const parent = `${parentStem}.jsonl`;
 		const deadline = Date.now() + PARENT_MOVE_WAIT_MS;
 		let moveOff = sessionMoveOffs.get(parent);
@@ -1984,9 +2023,10 @@ export class SessionManager {
 			copies.push(moveOff.copied);
 			sibling = moveOff.to;
 		}
-		if (this.#sessionFile !== childFile || this.#entriesReleased) return;
+		if (this.#sessionFile !== childFile || this.#switchedSince(generation) || this.#entriesReleased) return;
 		if (sibling === undefined) {
 			this.#parentMoveFollow = undefined;
+			this.#heldAdoptionFile = undefined;
 			const parentSession = sessionLeaseRoot(childFile)?.id ?? this.#sessionId;
 			this.#closeWriterEventually();
 			this.#moveOffSessionFile(
@@ -2000,7 +2040,7 @@ export class SessionManager {
 			return;
 		}
 		for (const copied of copies) await copied;
-		if (this.#sessionFile !== childFile || this.#entriesReleased) return;
+		if (this.#sessionFile !== childFile || this.#switchedSince(generation) || this.#entriesReleased) return;
 		const next = path.join(
 			sibling.slice(0, -JSONL_SUFFIX_LENGTH),
 			path.relative(parentStem, path.resolve(childFile)),
@@ -2009,6 +2049,7 @@ export class SessionManager {
 		this.#sessionClaim?.release?.();
 		this.#sessionClaim = undefined;
 		this.#sessionFile = next;
+		this.#heldAdoptionFile = undefined;
 		// The parent's copy holds this transcript's durable bytes; the publish replaces them.
 		this.#expectedDiskSize = this.#storage.existsSync(next) ? this.#storage.statSync(next).size : null;
 		this.#fileIsCurrent = false;
@@ -2321,9 +2362,17 @@ export class SessionManager {
 	 * writes to the file settle and reloads the store's index, so the content
 	 * it reads back, and the size the retry is checked against, are the
 	 * store's, never a write of this manager still in flight; a conflict on a
-	 * file this manager already moved off retries at the sibling it went on in.
+	 * file this manager already moved off retries at the sibling it went on in. A recovery of a queued write
+	 * (`generation`, the {@link #switchGeneration} it started in) a switch has outdated moves nothing off and adopts
+	 * nothing: until the switch sets the new file, `#sessionFile` still names the session it leaves.
 	 */
-	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
+	async #recoverFromWriteConflict(
+		error: unknown,
+		recoveries: number,
+		queued = false,
+		generation?: number,
+	): Promise<string | undefined> {
+		const outdated = () => generation !== undefined && this.#switchedSince(generation);
 		if (
 			queued &&
 			error instanceof SessionWriteConflictError &&
@@ -2336,11 +2385,12 @@ export class SessionManager {
 		if (!contested) return undefined;
 		// Every path from here retries or moves off: the conflict is this recovery's, not a failure.
 		if (error instanceof Error) this.#takenOverConflicts.add(error);
+		if (outdated()) return this.#sessionFile;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
 		if (this.#storage.defersSyncPublish) {
 			await this.#storage.confirmWrites?.(contested).catch(() => undefined);
 			await this.#storage.refresh?.();
-			if (this.#sessionFile !== contested) return this.#sessionFile;
+			if (this.#sessionFile !== contested || outdated()) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
 		let content: string;
@@ -2348,17 +2398,17 @@ export class SessionManager {
 			content = await this.#storage.readText(contested);
 		} catch (readError) {
 			// A synchronous rewrite during the read already recovered; retry against its result.
-			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
 			this.#durable = undefined;
 			return contested;
 		}
-		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
 		const found = this.#foreignEntriesIn(content);
 		if (!found) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(found.foreign, this.#blobs);
-		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
 		// An append during the await may have moved the frontier past what was read; the retry republishes.
 		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, Buffer.byteLength(content, "utf8"));
 		return contested;
@@ -2386,9 +2436,11 @@ export class SessionManager {
 		this.#rewriteRequired = true;
 		if (this.#queuedConflictRecovery) return true;
 		const recoveries = this.#queuedConflictRecoveries++;
-		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true)
+		const generation = this.#switchGeneration;
+		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true, generation)
 			.then(async retryPath => {
-				if (this.#exclusiveStopping || this.#entriesReleased) return;
+				// A switch since this started took the session's queued writes as they stood: nothing to publish here.
+				if (this.#exclusiveStopping || this.#entriesReleased || this.#switchedSince(generation)) return;
 				if (!retryPath) {
 					this.#takenOverConflicts.delete(error);
 					this.#noteDiskFailure(error);
@@ -4033,38 +4085,55 @@ export class SessionManager {
 			this.#sessionClaim = undefined;
 			this.#forgetMoveOffs();
 		}
-		if (options?.switched && this.#sessionFile) {
-			options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
-		}
-
-		// `gc --archive` leaves cold transcripts gzipped outside the sessions
-		// tree. Bring one back to its own path before anything reads or appends
-		// to it: the writer appends raw JSONL, so a `.jsonl.gz` must never
-		// become this manager's session file.
-		const requestedFile = path.resolve(sessionFile);
-		let resolvedSessionFile = requestedFile;
-		if (isArchivedSessionPath(requestedFile)) {
-			resolvedSessionFile = (await restoreArchivedSession(requestedFile)).sessionPath;
-			// `SessionManager.open` derived the session dir from the archive path.
-			// Follow the transcript home, or /new and /branch would write there.
-			if (this.#sessionDir === path.dirname(requestedFile)) {
-				this.#sessionDir = path.dirname(resolvedSessionFile);
+		const switching = options?.switched !== undefined;
+		if (options?.switched) {
+			// From here until the new file is set, no older parent follow or queued-conflict recovery moves this
+			// session off: the session left is the one read here (see #switchGeneration).
+			this.#switchGeneration++;
+			this.#switchingSession = true;
+			// A transcript adopted under a refused claim that no follow has forked or moved yet was never this
+			// manager's (see #heldAdoptionFile).
+			if (this.#sessionFile && this.#heldAdoptionFile !== this.#sessionFile) {
+				options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
 			}
-		}
-		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
-		const sourceSize =
-			loaded.sourceSize !== undefined
-				? loaded.sourceSize
-				: this.#storage.existsSync(resolvedSessionFile)
-					? this.#storage.statSync(resolvedSessionFile).size
-					: null;
-		if (loaded.invalidHeader) {
-			throw new Error(
-				`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
-			);
+			this.#heldAdoptionFile = undefined;
 		}
 
-		this.#sessionFile = resolvedSessionFile;
+		let resolvedSessionFile: string;
+		let loaded: SessionLoadResult;
+		let sourceSize: number | null;
+		try {
+			// `gc --archive` leaves cold transcripts gzipped outside the sessions
+			// tree. Bring one back to its own path before anything reads or appends
+			// to it: the writer appends raw JSONL, so a `.jsonl.gz` must never
+			// become this manager's session file.
+			const requestedFile = path.resolve(sessionFile);
+			resolvedSessionFile = requestedFile;
+			if (isArchivedSessionPath(requestedFile)) {
+				resolvedSessionFile = (await restoreArchivedSession(requestedFile)).sessionPath;
+				// `SessionManager.open` derived the session dir from the archive path.
+				// Follow the transcript home, or /new and /branch would write there.
+				if (this.#sessionDir === path.dirname(requestedFile)) {
+					this.#sessionDir = path.dirname(resolvedSessionFile);
+				}
+			}
+			loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
+			sourceSize =
+				loaded.sourceSize !== undefined
+					? loaded.sourceSize
+					: this.#storage.existsSync(resolvedSessionFile)
+						? this.#storage.statSync(resolvedSessionFile).size
+						: null;
+			if (loaded.invalidHeader) {
+				throw new Error(
+					`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
+				);
+			}
+
+			this.#sessionFile = resolvedSessionFile;
+		} finally {
+			if (switching) this.#switchingSession = false;
+		}
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
 		const { entries: fileEntries, titleSlot } = loaded;
@@ -4137,16 +4206,24 @@ export class SessionManager {
 		const claimed = options?.claimed;
 		if (claimed && claimed.sessionId === this.#sessionId) {
 			claimed.adopted = true;
+			// A claim this manager took for another id since the drain released its own (a move-off's sibling) is not
+			// the adopted one: let it go, or nothing releases it.
+			const prior = this.#sessionClaim;
+			if (prior && prior.sessionId !== claimed.sessionId) prior.release?.();
 			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
 			// The held session (or a subagent transcript under a held parent) was never this manager's: the switch leaves
-			// the one it had (setSessionFile), so neither the follow's fork nor the move-off records it as left.
-			if (!claimed.release && !this.#followParentMove({ recordLeft: false })) {
-				this.#moveOffSessionFile(
-					"open-elsewhere",
-					{ holder: claimed.holder, why: "another omp process holds its lease" },
-					undefined,
-					{ recordLeft: false },
-				);
+			// the one it had (setSessionFile), so neither the follow's fork nor the move-off records it as left, and a
+			// switch away before the follow forks or moves the transcript does not either.
+			if (!claimed.release) {
+				if (this.#followParentMove({ recordLeft: false })) this.#heldAdoptionFile = this.#sessionFile;
+				else {
+					this.#moveOffSessionFile(
+						"open-elsewhere",
+						{ holder: claimed.holder, why: "another omp process holds its lease" },
+						undefined,
+						{ recordLeft: false },
+					);
+				}
 			}
 		}
 		// The agent loop that owns this manager now writes this journal: claim it
@@ -5610,9 +5687,17 @@ export class SessionManager {
 		return left.sort((a, b) => a.mark - b.mark).map(({ id, file }) => ({ id, file }));
 	}
 
-	/** Record that this manager left the session `id`, last written at `file`. */
+	/**
+	 * Record that this manager left the session `id`, last written at `file`. A transcript adopted under a refused
+	 * claim that no follow has forked or moved yet ({@link #heldAdoptionFile}) was never this manager's: leaving it
+	 * (`/new`, `/fork`, a branch) records nothing.
+	 */
 	#recordLeftSession(id: string, file: string | undefined): void {
 		if (!id || !file) return;
+		if (file === this.#heldAdoptionFile) {
+			this.#heldAdoptionFile = undefined;
+			return;
+		}
 		this.#leftSessions.set(id, { file, mark: ++this.#leftSessionsMark });
 	}
 

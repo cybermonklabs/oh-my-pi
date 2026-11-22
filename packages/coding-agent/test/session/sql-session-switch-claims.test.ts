@@ -39,16 +39,11 @@ function fileOf(db: LeaseDb, id: string): string {
 }
 
 /**
- * `store`, whose claims through `acquireSessionClaim` take longer: a writer's claim is asked for `writerDelayMs`
- * late and held `writerHoldMs` before it answers (a slow database round trip, before and after the writer slot is
- * taken), another claim is asked for `otherDelayMs` late (an append still on its way). `counts.writer` counts the
- * writer claims asked for.
+ * `store`, whose claims through `acquireSessionClaim` take longer: a writer's claim is held `writerHoldMs` before it
+ * answers (a slow database round trip, with the writer slot already taken), another claim waits `otherDelayMs`
+ * before it is asked for (an append still on its way).
  */
-function slowClaims(
-	store: SqlSessionStorage,
-	{ writerDelayMs = 0, writerHoldMs = 0, otherDelayMs = 0 },
-	counts: { writer: number } = { writer: 0 },
-): SqlSessionStorage {
+function slowClaims(store: SqlSessionStorage, { writerHoldMs = 0, otherDelayMs = 0 }): SqlSessionStorage {
 	return new Proxy(store, {
 		get(target, property) {
 			const value: unknown = Reflect.get(target, property, target);
@@ -56,12 +51,70 @@ function slowClaims(
 				return typeof value === "function" ? value.bind(target) : value;
 			}
 			return async (sessionId: string, sessionPath: string, options?: SessionAcquireOptions) => {
-				if (options?.writer) counts.writer++;
-				const delay = options?.writer ? writerDelayMs : otherDelayMs;
-				if (delay > 0) await Bun.sleep(delay);
+				if (!options?.writer && otherDelayMs > 0) await Bun.sleep(otherDelayMs);
 				const release = await value.call(target, sessionId, sessionPath, options);
 				if (options?.writer && writerHoldMs > 0) await Bun.sleep(writerHoldMs);
 				return release;
+			};
+		},
+	});
+}
+
+/**
+ * `store`, whose claims a switch and an append take in one order of events, whatever the load: the switch's first
+ * writer claim calls `onWriterAsk` (which starts the append) and is passed on only once another claim (the
+ * append's) has been asked for, and that claim is passed on only once the writer claim has answered. So the append
+ * is pending when the switch's claim answers. `counts.writer` counts the writer claims asked for.
+ */
+function orderedClaims(
+	store: SqlSessionStorage,
+	onWriterAsk: () => void,
+	counts: { writer: number },
+): SqlSessionStorage {
+	const otherAsked = Promise.withResolvers<void>();
+	const writerAnswered = Promise.withResolvers<void>();
+	return new Proxy(store, {
+		get(target, property) {
+			const value: unknown = Reflect.get(target, property, target);
+			if (property !== "acquireSessionClaim" || typeof value !== "function") {
+				return typeof value === "function" ? value.bind(target) : value;
+			}
+			return async (sessionId: string, sessionPath: string, options?: SessionAcquireOptions) => {
+				if (options?.writer) {
+					counts.writer++;
+					if (counts.writer === 1) {
+						onWriterAsk();
+						await otherAsked.promise;
+					}
+					const release = await value.call(target, sessionId, sessionPath, options);
+					writerAnswered.resolve();
+					return release;
+				}
+				otherAsked.resolve();
+				await writerAnswered.promise;
+				return value.call(target, sessionId, sessionPath, options);
+			};
+		},
+	});
+}
+
+/**
+ * `store`, whose reads of `file`'s whole text wait for `gate`: a switch to `file` loads it late. `asked` hears when
+ * the first such read is asked for.
+ */
+function slowLoad(store: SqlSessionStorage, file: string, gate: Promise<void>, asked: () => void): SqlSessionStorage {
+	return new Proxy(store, {
+		get(target, property) {
+			const value: unknown = Reflect.get(target, property, target);
+			if (property !== "readText" || typeof value !== "function") {
+				return typeof value === "function" ? value.bind(target) : value;
+			}
+			return async (readPath: string, ...rest: unknown[]) => {
+				if (path.resolve(readPath) === path.resolve(file)) {
+					asked();
+					await gate;
+				}
+				return value.call(target, readPath, ...rest);
 			};
 		},
 	});
@@ -211,6 +264,8 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			// If this regresses, the adoption of the second transcript takes the first transcript's follow, still waiting
 			// for the parent, as its own: it starts none, the first follow ends at its file check, and the second
 			// transcript's next write starts a follow of its own that records it as left when it forks beside the parent.
+			// The switch away from the first transcript before its follow forked it records it as left no more than the
+			// fork does: it was never this manager's either.
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const store = await db.open({ lease: STILL });
 			const parentId = Bun.randomUUIDv7();
@@ -227,6 +282,8 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), store);
 			manager.appendMessage({ role: "user", content: "the session it leaves", timestamp: Date.now() });
 			await manager.flush();
+			const leftId = manager.getSessionId();
+			const leftFile = manager.getSessionFile() ?? "";
 			const notices: SessionPersistenceNotice[] = [];
 			manager.onPersistenceNotice(notice => notices.push(notice));
 			const mark = manager.getLeftSessionsMark();
@@ -241,8 +298,8 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 
 			expect({
 				forked: notices.filter(notice => notice.from === second).length,
-				recorded: manager.getLeftSessions(mark).some(left => left.file === second),
-			}).toEqual({ forked: 1, recorded: false });
+				left: manager.getLeftSessions(mark),
+			}).toEqual({ forked: 1, left: [{ id: leftId, file: leftFile }] });
 			await manager.close();
 		}, 60_000);
 
@@ -262,25 +319,155 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			);
 			expect((await holder.run({ op: "claim", sessionId: targetId, path: held })).held).toBe(true);
 			const counts = { writer: 0 };
-			// The switch's claim is asked for late (SQLite refuses at once, a lease row after `waitMs`), so the append
-			// has started by then and is still on its way when the refusal comes.
-			const slow = slowClaims(store, { writerDelayMs: 600, otherDelayMs: 2500 }, counts);
-			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), slow);
-
 			let appended: Promise<unknown> = Promise.resolve();
-			// The append starts while the switch takes its claim.
-			setTimeout(() => {
-				appended = SessionManager.appendCustomEntriesToFile(targetId, held, RECORDS, slow).catch(() => undefined);
-			}, 200);
+			// The append starts when the switch asks for its claim, and is still on its way when the refusal comes.
+			const ordered: SqlSessionStorage = orderedClaims(
+				store,
+				() => {
+					appended = SessionManager.appendCustomEntriesToFile(targetId, held, RECORDS, ordered).catch(
+						() => undefined,
+					);
+				},
+				counts,
+			);
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), ordered);
+
 			let waits = 0;
 			await manager.setSessionFile(held, { claim: { waitMs: 1500, onWait: () => waits++ } });
 			await appended;
 
-			// A lease row's holder is reported once per wait; SQLite's claim waits on its lock and reports no holder.
+			// A lease row's holder is reported once per wait. SQLite's claim is an OS lock: it is refused at once,
+			// without a wait, and names no holder.
 			expect({ claims: counts.writer, waits, movedOff: manager.getSessionId() !== targetId }).toEqual({
 				claims: 1,
 				waits: adapter === "sqlite" ? 0 : 1,
 				movedOff: true,
+			});
+			await manager.close();
+		}, 60_000);
+
+		it("lets no follow of a transcript adopted under a refused claim fork it while a switch away loads its target", async () => {
+			// If this regresses, the follow outlives the switch: the switch reads the transcript as the session it
+			// leaves, then loads its target, and until that load sets the new file the follow's check of the path still
+			// passes; the follow forks the transcript beside its parent and claims the fork, and the switch then records
+			// the transcript it never had as left, never the fork, and drops the fork's claim unreleased.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const base = await db.open({ lease: STILL });
+			const parentId = Bun.randomUUIDv7();
+			const parent = fileOf(db, parentId);
+			const targetId = Bun.randomUUIDv7();
+			const target = fileOf(db, targetId);
+			await base.writeText(parent, transcript(parentId, "the parent, held elsewhere"));
+			const child = await writeSubagentTranscript(base, parent, "Worker");
+			await base.writeText(target, transcript(targetId, "the session it switches to"));
+			await base.drain();
+			await using holder = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("holder"),
+			);
+			expect((await holder.run({ op: "claim", sessionId: parentId, path: parent })).held).toBe(true);
+			// The follow waits a second for the parent before it forks; the switch's load is held past that second.
+			const gate = Promise.withResolvers<void>();
+			let loadAskedAt = 0;
+			const store = slowLoad(base, target, gate.promise, () => (loadAskedAt ||= Date.now()));
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), store);
+			manager.appendMessage({ role: "user", content: "the session it leaves", timestamp: Date.now() });
+			await manager.flush();
+			const leftId = manager.getSessionId();
+			const leftFile = manager.getSessionFile() ?? "";
+			const notices: SessionPersistenceNotice[] = [];
+			manager.onPersistenceNotice(notice => notices.push(notice));
+			const mark = manager.getLeftSessionsMark();
+
+			await manager.setSessionFile(child, { claim: { waitMs: 0 } });
+			const adoptedAt = Date.now();
+			setTimeout(() => gate.resolve(), 2500);
+			await manager.setSessionFile(target, { claim: { waitMs: 0 } });
+			await manager.flush();
+
+			// The switch reached its load before the follow's second was over: else this run tested nothing.
+			expect(loadAskedAt - adoptedAt).toBeLessThan(800);
+			expect({ id: manager.getSessionId(), notices, left: manager.getLeftSessions(mark) }).toEqual({
+				id: targetId,
+				notices: [],
+				left: [{ id: leftId, file: leftFile }],
+			});
+			await manager.close();
+		}, 60_000);
+
+		it("lets the follow of a first adoption not fork a transcript a switch came back to under its claim", async () => {
+			// If this regresses, the follow the first adoption started outlives a switch away and back: once the
+			// parent's holder has let go, the second adoption holds the transcript's claim, but the first follow, still
+			// waiting for the parent, finds the path unchanged and forks the transcript beside its parent.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const store = await db.open({ lease: STILL });
+			const parentId = Bun.randomUUIDv7();
+			const parent = fileOf(db, parentId);
+			const otherId = Bun.randomUUIDv7();
+			const other = fileOf(db, otherId);
+			await store.writeText(parent, transcript(parentId, "the parent, held elsewhere"));
+			const child = await writeSubagentTranscript(store, parent, "Worker");
+			await store.writeText(other, transcript(otherId, "another session"));
+			await store.drain();
+			await using holder = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("holder"),
+			);
+			expect((await holder.run({ op: "claim", sessionId: parentId, path: parent })).held).toBe(true);
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), store);
+			const notices: SessionPersistenceNotice[] = [];
+			manager.onPersistenceNotice(notice => notices.push(notice));
+
+			await manager.setSessionFile(child, { claim: { waitMs: 0 } });
+			const adoptedAt = Date.now();
+			await manager.setSessionFile(other, { claim: { waitMs: 0 } });
+			await holder.run({ op: "release", sessionId: parentId });
+			await manager.setSessionFile(child, { claim: { waitMs: 0 } });
+			const backAt = Date.now();
+			await manager.flush();
+
+			// The switch came back before the first follow's second was over: else this run tested nothing.
+			expect(backAt - adoptedAt).toBeLessThan(800);
+			expect({ file: manager.getSessionFile(), id: manager.getSessionId(), notices }).toEqual({
+				file: child,
+				id: "Worker",
+				notices: [],
+			});
+			await manager.close();
+		}, 60_000);
+
+		it("forks a transcript once when a switch came back to it under a refused claim within the first follow's wait", async () => {
+			// If this regresses, the second adoption takes the first adoption's follow, which a switch has outdated, as
+			// its own: it starts none, the first follow ends without writing, and the transcript stays held, never forked.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const store = await db.open({ lease: STILL });
+			const parentId = Bun.randomUUIDv7();
+			const parent = fileOf(db, parentId);
+			const otherId = Bun.randomUUIDv7();
+			const other = fileOf(db, otherId);
+			await store.writeText(parent, transcript(parentId, "the parent, held elsewhere"));
+			const child = await writeSubagentTranscript(store, parent, "Worker");
+			await store.writeText(other, transcript(otherId, "another session"));
+			await store.drain();
+			await using holder = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("holder"),
+			);
+			expect((await holder.run({ op: "claim", sessionId: parentId, path: parent })).held).toBe(true);
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), store);
+			const notices: SessionPersistenceNotice[] = [];
+			manager.onPersistenceNotice(notice => notices.push(notice));
+
+			await manager.setSessionFile(child, { claim: { waitMs: 0 } });
+			await manager.setSessionFile(other, { claim: { waitMs: 0 } });
+			await manager.setSessionFile(child, { claim: { waitMs: 0 } });
+			// flush() waits for the follow this transcript has now, the second adoption's.
+			await manager.flush();
+
+			const fork = manager.getSessionFile() ?? "";
+			expect({ notices, beside: path.dirname(fork) }).toEqual({
+				notices: [{ reason: "open-elsewhere", from: child, to: fork }],
+				beside: path.dirname(parent),
 			});
 			await manager.close();
 		}, 60_000);
