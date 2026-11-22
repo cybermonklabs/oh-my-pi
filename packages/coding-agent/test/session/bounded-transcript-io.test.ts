@@ -183,15 +183,39 @@ class RecordingFileStorage extends FileSessionStorage {
 	}
 }
 
-/** A SQL client recording every value bound to or returned by a statement. */
+/** A connection {@link RecordingSqlClient.reserve} hands out, shaped as the store of cybermonklabs/oh-my-pi#59 reads one. */
+interface RecordingReservedConnection extends SqlSessionStorageTransaction {
+	release(): void | Promise<void>;
+	close(): Promise<void>;
+}
+
+/** A SQL client recording every value bound to, written into or returned by a statement. */
 class RecordingSqlClient implements SqlSessionStorageClient {
 	watch: ValueWatch | undefined;
 	readonly options: SqlSessionStorageClient["options"];
+	/**
+	 * Set exactly when the wrapped client can reserve a connection, as `Bun.SQL` can: each connection it reserves
+	 * records its statements as the client does, and passes `release()` and `close()` on. The store of
+	 * cybermonklabs/oh-my-pi#59 runs every PostgreSQL statement on such a connection; the release's
+	 * `reserveWrapped` (sql-session-lease-fixture.ts) does the same for its wrappers, and the cut can fold this
+	 * into it.
+	 */
+	readonly reserve?: () => Promise<RecordingReservedConnection>;
 	readonly #client: SQL;
 
 	constructor(client: SQL) {
 		this.#client = client;
 		this.options = client.options;
+		if (typeof client.reserve === "function") {
+			this.reserve = async () => {
+				const connection = await client.reserve();
+				return {
+					unsafe: (query, values) => this.#recorded(connection, query, values),
+					release: () => connection.release(),
+					close: () => connection.close(),
+				};
+			};
+		}
 	}
 
 	async #recorded(
@@ -199,11 +223,17 @@ class RecordingSqlClient implements SqlSessionStorageClient {
 		query: string,
 		values: unknown[] | undefined,
 	): Promise<SqlSessionStorageResult> {
+		// Some PostgreSQL reads write their values into the text (`PG_SEARCH_PATH; <statement>` before #59).
+		this.watch?.noteValue("sql.text", query);
 		for (const value of values ?? []) this.watch?.noteValue("sql.bound", value);
 		const rows = await executor.unsafe(query, values);
-		for (const row of rows) {
-			if (typeof row !== "object" || row === null) continue;
-			for (const value of Object.values(row)) this.watch?.noteValue("sql.returned", value);
+		// A query of several statements (such a read, or the opening of a transaction of #59) answers one result each.
+		const results = rows.length > 0 && rows.every(Array.isArray) ? (rows as unknown[][]) : [rows];
+		for (const result of results) {
+			for (const row of result) {
+				if (typeof row !== "object" || row === null) continue;
+				for (const value of Object.values(row)) this.watch?.noteValue("sql.returned", value);
+			}
 		}
 		return rows;
 	}
