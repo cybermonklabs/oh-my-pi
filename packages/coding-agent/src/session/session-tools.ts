@@ -186,9 +186,9 @@ export interface SessionToolsHost {
 	/**
 	 * Digest of the tool definitions the next primary request declares, as the wire carries them, comparable with the
 	 * {@link TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE} records on the branch; with `tools`, what it would declare with them
-	 * in place of the active tools.
+	 * in place of the active tools; with `model`, what a request on it declares instead of one on the session's model.
 	 */
-	toolDefinitionsDigest(tools?: AgentTool[]): string;
+	toolDefinitionsDigest(tools?: AgentTool[], model?: Model): string;
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	/**
@@ -1191,8 +1191,9 @@ interface PromptSurface {
 	/** Tool names the eval description lists as callable from cells. */
 	evalToolNames: readonly string[];
 	/**
-	 * Discovered agents listed in the task description: the latest discovery scan for the
-	 * session's cwd and extension roots; undefined when no task tool scanned them.
+	 * Discovered agents listed in the task description: the latest discovery scan for the session's cwd and
+	 * extension roots, or the list committed before while no scan was published for the current ones (an
+	 * `extensions` edit or a cwd move); undefined when no task tool scanned them.
 	 */
 	discoveredAgents: readonly AgentDefinition[] | undefined;
 	/** Per-call models the task and eval descriptions approve; undefined while per-call models are off. */
@@ -1367,8 +1368,11 @@ export class SessionTools {
 	 * model call; see {@link #implicitRebuildBinding}.
 	 */
 	#restoredTranscript: RestoredTranscript | undefined;
-	/** The last primary model call, until its reply ends: its digests, and the active tools when it captured them. */
-	#capturedCall: { digests: ModelCallDigests; activeTools: AgentTool[] } | undefined;
+	/**
+	 * The last primary model call, until its reply ends: its digests, the active tools when it captured them, and the
+	 * model it went to.
+	 */
+	#capturedCall: { digests: ModelCallDigests; activeTools: AgentTool[]; model: Model | undefined } | undefined;
 	/** Digests of the call each primary reply with provider output was produced by. */
 	readonly #replyCalls = new WeakMap<AgentMessage, ModelCallDigests>();
 	/** Newest {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record of a branch view ({@link scanNewestRecord}). */
@@ -1888,17 +1892,21 @@ export class SessionTools {
 		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).perCallModels;
 	}
 
-	/** Derives the candidate surface from live state without publishing it. */
+	/**
+	 * Derives the candidate surface from live state without publishing it. Discovered agents fall back to the
+	 * committed list while no scan is published under the current cwd and extension roots, so a scan a subagent
+	 * publishes there later reaches the model by {@link takeTaskAgentNotice} instead of the task description.
+	 */
 	#derivePromptSurface(): PromptSurface {
 		return {
 			skillHintVisible: cfgSkillful.get(this.#host.settings) === true && this.#promptSkills.length > 0,
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
 			evalToolNames: this.getEvalBridgeToolNames(),
-			discoveredAgents: publishedAgentDiscovery(
-				this.#host.sessionManager.getCwd(),
-				this.#host.effectiveExtensionRoots(),
-			),
+			discoveredAgents:
+				publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots()) ??
+				// Unset while the constructor derives the first surface.
+				this.#promptSurface?.discoveredAgents,
 			perCallModels: this.#perCallModelsAdvertised()
 				? getPerCallModelAdvertisement(this.#host.settings, this.#host.model(), this.#host.modelRegistry)
 				: undefined,
@@ -3113,6 +3121,7 @@ export class SessionTools {
 		this.#capturedCall = {
 			digests: { prompt: promptDigest, tools: toolsDigest },
 			activeTools: this.#host.agent.state.tools,
+			model: this.#host.model(),
 		};
 		if (this.#heldSettingsRebuild) return;
 		if (this.#host.model()?.thinking?.prefixBinding !== true) {
@@ -3140,18 +3149,19 @@ export class SessionTools {
 	/**
 	 * Called each time a provider turns a fallback on in the session's provider state. Only the strict-tools fallback
 	 * changes the digest: the endpoint rejected strict tools, so the call in flight retries sending its tools without
-	 * `strict`. The digest of its tool definitions is taken again for the tools it captured, now that the fallback
-	 * counts in it, and so are the declarations kept with that digest (what the call declares, what a held rebuild
-	 * keeps declaring), so its reply records the definitions the retry sent. A call the fallback does not reach, and
-	 * any other fallback, keeps its digest. Gives whether a call in flight now counts other tool definitions.
+	 * `strict`. The digest of its tool definitions is taken again for the tools it captured, on the model it went to
+	 * (a model switch since does not change what it sends), now that the fallback counts in it, and so are the
+	 * declarations kept with that digest (what the call declares, what a held rebuild keeps declaring), so its reply
+	 * records the definitions the retry sent. A call the fallback does not reach, and any other fallback, keeps its
+	 * digest. Gives whether a call in flight now counts other tool definitions.
 	 */
 	recountCapturedCallTools(): boolean {
 		const call = this.#capturedCall;
 		if (!call) return false;
 		const { digests } = call;
-		const recounted = this.#host.toolDefinitionsDigest(call.activeTools);
+		const recounted = this.#host.toolDefinitionsDigest(call.activeTools, call.model);
 		if (recounted === digests.tools) return false;
-		this.#capturedCall = { digests: { prompt: digests.prompt, tools: recounted }, activeTools: call.activeTools };
+		this.#capturedCall = { ...call, digests: { prompt: digests.prompt, tools: recounted } };
 		const sent = this.#sentDeclarations;
 		if (sent?.toolsDigest === digests.tools) this.#sentDeclarations = { ...sent, toolsDigest: recounted };
 		const held = this.#heldSettingsRebuild;

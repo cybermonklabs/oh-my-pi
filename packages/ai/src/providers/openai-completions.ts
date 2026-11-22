@@ -872,14 +872,16 @@ const streamOpenAICompletionsOnce = (
 			const attemptedReasoningEffortFallbacks = new Set<string>();
 			let activeReasoningEffortFallbackKey: string | undefined;
 			let activeRequestParams: OpenAICompletionsParams | undefined;
+			// The state and the strict-tools scope name the endpoint as the request reaches it: a trailing slash in the
+			// configured URL is no other endpoint.
+			const trimmedBaseUrl = baseUrl.replace(/\/+$/, "");
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
 				model,
-				baseUrl,
+				trimmedBaseUrl,
 				options?.providerSessionState,
 			);
-			const strictToolsScope = getOpenAIStrictToolsScope(model, baseUrl);
+			const strictToolsScope = getOpenAIStrictToolsScope(model, trimmedBaseUrl);
 			let disableStrictTools = isStrictToolsDisabledForScope(providerSessionState, strictToolsScope);
-			const trimmedBaseUrl = baseUrl.replace(/\/+$/, "");
 			const completionsUrl = query
 				? `${trimmedBaseUrl}/chat/completions?${new URLSearchParams(query)}`
 				: `${trimmedBaseUrl}/chat/completions`;

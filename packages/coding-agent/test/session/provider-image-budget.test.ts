@@ -10,6 +10,7 @@ import type {
 	Tool,
 } from "@oh-my-pi/pi-ai";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { streamFactoryDroid } from "@oh-my-pi/pi-ai/providers/factory-droid";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { factoryDroidRegistry } from "@oh-my-pi/pi-catalog/compat/factory-droid";
@@ -22,9 +23,11 @@ import {
 	capArchiveFrameBytes,
 	clampProviderContextImageBytes,
 	clampProviderContextImages,
+	type ImageDropRecord,
 	ProviderImageClamp,
 } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { providerImageBudget } from "@oh-my-pi/snapcompact";
 
 const UMANS_MODEL = buildModel({
 	id: "umans-glm-5.2",
@@ -1648,6 +1651,37 @@ function continuesPrefix(earlier: Context, later: Context): boolean {
 	return Bun.deepEquals(serialize(later.messages.slice(0, earlier.messages.length)), serialize(earlier.messages));
 }
 
+/** The record of a session that holds no drop: a transcript the base release wrote. */
+function recordWithoutDrops(): ImageDropRecord {
+	return { loadRevision: () => 0, drops: () => new Map(), write: () => {} };
+}
+
+/** A reply on `model` the provider tagged with `servedId`; a server-side fallback marks the `requestedId` it left. */
+function taggedReply(model: Model, servedId: string, requestedId?: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [
+			...(requestedId === undefined
+				? []
+				: [{ type: "fallback" as const, from: { model: requestedId }, to: { model: servedId } }]),
+			text("seen"),
+		],
+		api: model.api,
+		provider: model.provider,
+		model: servedId,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 1_000,
+	};
+}
+
 describe("ProviderImageClamp", () => {
 	it("drops the same oldest images while new ones fit and halves the budget at each forced drop", () => {
 		// The Umans route takes 10 images; each turn attaches 3.
@@ -1746,5 +1780,27 @@ describe("ProviderImageClamp", () => {
 		expect(imageData(capture.clampImageBytes(screenshots(7), hosted))).toHaveLength(3);
 		main.clampImageBytes(screenshots(6), hosted);
 		expect(reported).toEqual(["image-count-clamp 7", "image-byte-clamp 2", "image-byte-clamp 3"]);
+	});
+
+	it("takes a transcript's unrecorded drops from its newest reply when the provider retagged that reply", () => {
+		const duo = getBundledModel("gitlab-duo", "duo-chat-opus-4-6");
+		// A server-side fallback tags the reply with the served model; GitLab Duo with the upstream id it sends.
+		const cases = [
+			{ model: ANTHROPIC_MODEL, reply: taggedReply(ANTHROPIC_MODEL, "claude-served", ANTHROPIC_MODEL.id) },
+			{ model: duo, reply: taggedReply(duo, wireModel(duo).id) },
+		];
+		for (const { model, reply } of cases) {
+			const budget = providerImageBudget(model);
+			const history = conversation(Math.ceil(budget / 3) + 1);
+			const sent = imageData(request(history));
+			const clamp = new ProviderImageClamp(undefined, recordWithoutDrops());
+			const next = clamp.clampImageCount(
+				request([...history, reply, { role: "user", content: "no image", timestamp: 2_000 }]),
+				model,
+			);
+			// The release that wrote the transcript dropped the oldest images past the budget in its last request:
+			// the next request drops those again, not the oldest images down to half the budget.
+			expect(imageData(next)).toEqual(sent.slice(sent.length - budget));
+		}
 	});
 });

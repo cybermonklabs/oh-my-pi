@@ -779,7 +779,8 @@ const streamOpenAIResponsesOnce = (
 			}
 			let useWebSocket = attemptContext.mode === "websocket";
 			const closeCountAtStart = providerSessionState?.closeCount;
-			const strictToolsScope = getOpenAIStrictToolsScope(model, baseUrl);
+			// The endpoint as the request reaches it: a trailing slash in the configured URL is no other endpoint.
+			const strictToolsScope = getOpenAIStrictToolsScope(model, resolvedBaseUrl);
 			const promptCacheBreakpointPolicy =
 				resolveCacheRetention(options?.cacheRetention) !== "none" && options?.promptCache?.mode === "explicit"
 					? (options.promptCache.breakpoint ?? "latest-stable-message")

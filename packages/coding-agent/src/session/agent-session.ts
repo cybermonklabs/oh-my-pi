@@ -484,6 +484,7 @@ import {
 	type PromptCacheChange,
 	type PromptCacheEntry,
 	promptTokensOf,
+	requestedModelId,
 	resolvePromptCacheTier,
 } from "./cache-warmer";
 import { type ObservedPromptCacheEntry, promptCacheStatus } from "./prompt-cache-status";
@@ -2804,7 +2805,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
-			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
+			toolDefinitionsDigest: (tools, model) => this.agent.declaredToolsFingerprint(model ?? this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
@@ -2948,7 +2949,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#providerFallbacks = new ProviderFallbackRecord({
 			sessionManager: this.sessionManager,
 			providerSessionState: this.#providerSessionState,
-			findModel: (provider, modelId) => this.#modelRegistry.find(provider, modelId),
+			modelRegistry: this.#modelRegistry,
 		});
 		onProviderFallback(this.#providerSessionState, () => this.#onProviderFallback());
 		// Records this session's work writes name it; the getter follows every
@@ -6491,11 +6492,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!observed) return undefined;
 		const { reply } = observed;
 		// A server-side fallback retags the reply with the served model; the cache entry is the requested one's.
-		const fallback = reply.content.find(block => block.type === "fallback");
-		const model = this.#modelRegistry.find(
-			reply.provider,
-			fallback?.type === "fallback" ? fallback.from.model : reply.model,
-		);
+		const model = this.#modelRegistry.find(reply.provider, requestedModelId(reply));
 		if (!model) return undefined;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
 		const isOAuth = model.api === "anthropic-messages" && this.#modelRegistry.isUsingOAuth(model);
