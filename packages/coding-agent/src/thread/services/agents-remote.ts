@@ -34,9 +34,9 @@ import type { RemoteObject } from "../rpc";
 import type { AgentLifecycleProtocol, AgentRegistryProtocol, IrcBusProtocol, UnansweredSend } from "./agents-protocol";
 
 /**
- * A storage holds a database client or open files and cannot cross a thread.
- * Main then knows a worker agent's storage only as it knows any worker
- * session's: not at all, so a kill there falls back to main's default storage.
+ * No storage instance crosses the RPC: none encodes (RpcEncodeError, file
+ * storage included). Main's side records file storage for every ref a worker
+ * registers, since a worker run is always file-backed (see serveRegistry).
  */
 function withoutStorage(input: RegisterInput): RegisterInput {
 	if (input.storage === undefined) return input;

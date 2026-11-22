@@ -38,6 +38,7 @@ import {
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { serveRegistry } from "@oh-my-pi/pi-coding-agent/thread/services/agents";
 import { VIBE_LIFECYCLE_CUSTOM_TYPE, VIBE_LIFECYCLE_VERSION } from "@oh-my-pi/pi-coding-agent/vibe/lifecycle";
 import { VIBE_CLI_AGENT, type VibeParentSession, VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -382,6 +383,60 @@ describe("agent kill tombstone storage", () => {
 				expect(fs.existsSync(`${sessionFile}.tombstone`)).toBe(true);
 				expect(AgentRegistry.global().get(workerId)).toMatchObject({ status: "aborted", session: null });
 				await sessionManager.close();
+			}, 30_000);
+
+			// A worker run is always file-backed, and no storage crosses the RPC: main's side of the
+			// registry proxy records file storage for the worker's ref. Under a SQL default (an SDK host
+			// with a file-backed parent) a kill whose transcript directory is gone then fails as file
+			// storage does, instead of making the directory under main's default.
+			it("fails the kill of a worker agent whose transcript directory is gone, under a SQL default", async () => {
+				useDefault(await sqlStorage(backend));
+				const dir = tempDir("@omp-tombstone-worker-gone-");
+				const workerId = "Worker-Sub";
+				const sessionFile = dir.join("gone", `${workerId}.jsonl`);
+				// The global registry is a local one in tests, which is what the worker proxy's main side serves.
+				const registry = AgentRegistry.global() as AgentRegistry;
+				const ref = await serveRegistry({} as never).register(registry, {
+					id: workerId,
+					displayName: "task",
+					kind: "sub",
+					parentId: MAIN_AGENT_ID,
+					session: null,
+					sessionFile,
+					status: "running",
+				});
+
+				await expect(
+					AgentLifecycleManager.global().release(workerId, ref, { tombstone: true }),
+				).rejects.toMatchObject({ code: "ENOENT" });
+				expect(fs.existsSync(dir.join("gone"))).toBe(false);
+				expect(registry.get(workerId)).toMatchObject({ status: "aborted", session: null });
+			});
+
+			// A registration that names both a live session and a storage takes the session's.
+			it("takes a live session's storage over the one its registration names", async () => {
+				const storage = await sqlStorage(backend);
+				useDefault(storage);
+				const dir = tempDir("@omp-tombstone-session-wins-");
+				const workerId = "Both-Sub";
+				const sessionFile = dir.join("gone", `${workerId}.jsonl`);
+				const registry = AgentRegistry.global();
+				const ref = registry.register({
+					id: workerId,
+					displayName: "task",
+					kind: "sub",
+					parentId: MAIN_AGENT_ID,
+					session: sessionOn(new FileSessionStorage()),
+					sessionFile,
+					status: "running",
+					storage,
+				});
+				expect(registry.detachSession(workerId, ref)).toBe(true);
+
+				await expect(
+					AgentLifecycleManager.global().release(workerId, ref, { tombstone: true }),
+				).rejects.toMatchObject({ code: "ENOENT" });
+				expect(fs.existsSync(dir.join("gone"))).toBe(false);
 			});
 
 			describe("a vibe worker restored from its parent's journal", () => {
