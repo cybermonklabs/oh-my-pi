@@ -59,7 +59,10 @@ export interface AgentHistorySummary {
 	/** Cumulative own-session assistant and model_usage cost, excluding nested task results. */
 	directCost?: number;
 	readOnly?: boolean;
-	/** Durable task output artifact, when the executor wrote one. */
+	/**
+	 * Durable task output artifact, when the executor wrote one. A record keeps the one beside its session file
+	 * (`<id>.md` beside `<id>.jsonl`) as a getter that derives it ({@link historyAsKept}).
+	 */
 	outputPath?: string;
 	/** Captured isolated-worktree patch, when patch capture succeeded. */
 	patchPath?: string;
@@ -97,6 +100,43 @@ const kMintedRef = Symbol("agent-registry.ref");
 /** Whether `value` is a ref object minted by an {@link AgentRegistry} on this thread (thread bridges encode these). */
 export function isMintedAgentRef(value: unknown): value is AgentRef {
 	return typeof value === "object" && value !== null && Reflect.get(value, kMintedRef) === true;
+}
+
+/** The session file a record's history derives its `outputPath` from; see {@link historyAsKept}. */
+const kOutputPathSessionFile = Symbol("agent-registry.output-path-session-file");
+
+/** The output artifact the executor writes beside the session file `sessionFile`: `<id>.md` beside `<id>.jsonl`. */
+function outputPathBeside(sessionFile: string): string | undefined {
+	return sessionFile.endsWith(".jsonl") ? `${sessionFile.slice(0, -".jsonl".length)}.md` : undefined;
+}
+
+/** `outputPath` of a history {@link historyAsKept} made: the artifact beside the session file it was checked against. */
+function derivedOutputPath(this: AgentHistorySummary): string | undefined {
+	const sessionFile: unknown = Reflect.get(this, kOutputPathSessionFile);
+	return typeof sessionFile === "string" ? outputPathBeside(sessionFile) : undefined;
+}
+
+/**
+ * `history` as a record of session file `sessionFile` keeps it. A parked subagent's record keeps its session file,
+ * and the executor writes its output artifact beside it, so an `outputPath` equal to the artifact beside
+ * `sessionFile` is kept as an enumerable getter that derives it from that session file's string, not as a second
+ * path string. Every read returns the same string, in a spread, JSON (RPC clients) or a structured clone (worker
+ * threads) of the history too, and a later change of the record's session file leaves it unchanged. Any other
+ * history is kept as given.
+ */
+function historyAsKept(
+	history: AgentHistorySummary | undefined,
+	sessionFile: string | null,
+): AgentHistorySummary | undefined {
+	if (history === undefined || sessionFile === null || Reflect.get(history, kOutputPathSessionFile) === sessionFile) {
+		return history;
+	}
+	const outputPath = history.outputPath;
+	if (outputPath === undefined || outputPath !== outputPathBeside(sessionFile)) return history;
+	const { outputPath: _outputPath, ...kept } = history;
+	Object.defineProperty(kept, kOutputPathSessionFile, { value: sessionFile });
+	Object.defineProperty(kept, "outputPath", { get: derivedOutputPath, enumerable: true, configurable: true });
+	return kept;
 }
 
 /**
@@ -243,7 +283,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			createdAt: input.createdAt ?? now,
 			lastActivity: input.lastActivity ?? now,
 			activity: input.activity,
-			history: input.history,
+			history: historyAsKept(input.history, input.sessionFile ?? null),
 			lifecycle: input.lifecycle,
 		};
 		Object.defineProperty(ref, kMintedRef, { value: true });
@@ -310,7 +350,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		) {
 			definedHistory.directCost = Math.max(previousDirectCost, incomingDirectCost);
 		}
-		ref.history = { ...ref.history, ...definedHistory };
+		ref.history = historyAsKept({ ...ref.history, ...definedHistory }, ref.sessionFile);
 		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}
