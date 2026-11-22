@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Loading legacy extensions from a process that did not start through the `omp` CLI (an SDK host, a script) no longer waits about 10 s per cache statement under gVisor while an `omp` session holds the same extension parse cache: the cache now takes the same SQLite record locks as omp's other stores
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
