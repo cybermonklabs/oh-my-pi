@@ -12,7 +12,7 @@ import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/typ
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, reloadOverlay, setClock } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, reloadOverlay, SETTINGS_NOTICE, setClock } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -21,9 +21,6 @@ import {
 	textOf,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-
-/** The opening of the hidden settings notice. */
-const SETTINGS_NOTICE = '<system-notice id="settings">';
 
 /** A `--config` overlay a configuration sync rewrites under a running session: one-hour cache entries, Mnemopi on. */
 const MNEMOPI_ON = "providers:\n  cacheRetention: long\nmemory:\n  backend: mnemopi\n";

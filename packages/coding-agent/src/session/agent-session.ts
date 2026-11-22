@@ -857,20 +857,25 @@ function promptCacheThinkingKey(
 const KIMI_API_FORMATS = ["openai", "anthropic"] as const satisfies readonly SimpleStreamOptions["kimiApiFormat"][];
 
 /**
- * Whether a reply on `model` recorded on the API `api` went out as another wire model than a request on `model` in the
- * Kimi Code API format `kimiApiFormat` goes out as ({@link wireModel}): `api` is not the API that request goes out on,
- * but one a format sends `model` on. A reply on an API no format sends `model` on (a wrapper transport whose replies
- * name its inner client's API, as Factory Droid's Gemini route) tells nothing of the wire it went out as.
+ * Whether a reply on `model` recorded on the API `api` went out as another wire model than a request on `model` goes
+ * out as now, on `wireApi`, the API of its wire model in the Kimi Code API format the request goes out in
+ * ({@link wireModel}): `api` is not `wireApi`, but one a format sends `model` on. A reply on an API no format sends
+ * `model` on (a wrapper transport whose replies name its inner client's API, as Factory Droid's Gemini route) tells
+ * nothing of the wire it went out as.
  */
-function repliedOnOtherWire(
-	model: Model,
-	api: Model["api"],
+function repliedOnOtherWire(model: Model, api: Model["api"], wireApi: string): boolean {
+	return api !== wireApi && KIMI_API_FORMATS.some(format => wireModel(model, { kimiApiFormat: format }).api === api);
+}
+
+/**
+ * The model a request on `model` goes out as in the Kimi Code API format `kimiApiFormat`, as a prompt cache change
+ * names it: the model's name and the API its wire model goes out on ({@link wireModel}).
+ */
+function promptCacheModelLabel(
+	model: Model | undefined,
 	kimiApiFormat: SimpleStreamOptions["kimiApiFormat"],
-): boolean {
-	return (
-		api !== wireModel(model, { kimiApiFormat }).api &&
-		KIMI_API_FORMATS.some(format => wireModel(model, { kimiApiFormat: format }).api === api)
-	);
+): Pick<PromptCacheShape, "modelName" | "api"> {
+	return { modelName: model?.name ?? "no model", api: model ? wireModel(model, { kimiApiFormat }).api : "" };
 }
 
 /**
@@ -880,7 +885,7 @@ function repliedOnOtherWire(
 function modelCacheChange(
 	from: Pick<PromptCacheShape, "modelName" | "api">,
 	to: Pick<PromptCacheShape, "modelName" | "api">,
-): { kind: "model"; from: string; to: string } {
+): Extract<PromptCacheChange, { kind: "model" }> {
 	return from.modelName === to.modelName && from.api !== to.api
 		? { kind: "model", from: `${from.modelName} (${from.api})`, to: `${to.modelName} (${to.api})` }
 		: { kind: "model", from: from.modelName, to: to.modelName };
@@ -6413,8 +6418,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		const shape: PromptCacheShape = {
 			model: model ? promptCacheModelKey(model, kimiApiFormat) : "",
-			modelName: model?.name ?? "no model",
-			api: model ? wireModel(model, { kimiApiFormat }).api : "",
+			...promptCacheModelLabel(model, kimiApiFormat),
 			thinkingLevel,
 			thinkingKey: promptCacheThinkingKey(model, thinkingLevel, kimiApiFormat),
 			tools,
@@ -6508,20 +6512,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (tier === undefined) return undefined;
 		const seconds = model.promptCache?.[tier];
 		const current = this.model;
-		const kimiApiFormat = resolveKimiApiFormat(this.settings);
+		// The model the next request goes out as, named as a change names it, with the API its wire model goes out on.
+		const next = promptCacheModelLabel(current, resolveKimiApiFormat(this.settings));
 		let change: ObservedPromptCacheEntry["change"];
 		if (
 			current?.provider !== model.provider ||
 			current.id !== model.id ||
-			repliedOnOtherWire(current, reply.api, kimiApiFormat)
+			repliedOnOtherWire(current, reply.api, next.api)
 		) {
-			change = modelCacheChange(
-				{ modelName: model.name, api: reply.api },
-				{
-					modelName: current?.name ?? "no model",
-					api: current ? wireModel(current, { kimiApiFormat }).api : "",
-				},
-			);
+			change = modelCacheChange({ modelName: model.name, api: reply.api }, next);
 		} else if (requestedTier !== tier) {
 			// The next request asks for another tier, or for no caching at all.
 			change = { kind: "retention" };

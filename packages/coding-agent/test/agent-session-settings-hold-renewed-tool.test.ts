@@ -13,7 +13,13 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	noticeDeadline,
+	RELOAD_CALLS,
+	reloadOverlay,
+	setClock,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -37,13 +43,6 @@ const MEMORY_OFF = `${LEARNING}memory:\n  backend: off\n`;
 const REFUSED_LEARN = "calls to them are refused from now on: `learn`";
 
 const MINUTE_MS = 60_000;
-
-/** The time a settings notice gives for its change to go out. */
-function noticeDeadline(notice: string): number {
-	const deadline = notice.match(/at the first request made at (\S+) or later/)?.[1];
-	if (!deadline) throw new Error("Expected the notice's deadline");
-	return Date.parse(deadline);
-}
 
 describe("a held memory switch told, switched back, then held again in a process resumed past five minutes", () => {
 	const cleanups: (() => void)[] = [];

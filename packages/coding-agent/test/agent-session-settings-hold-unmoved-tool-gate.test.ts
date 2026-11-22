@@ -19,7 +19,13 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	RELOAD_CALLS,
+	reloadOverlay,
+	SETTINGS_NOTICE,
+	setClock,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -32,9 +38,6 @@ import {
 } from "./helpers/anthropic-gateway";
 import { localSession } from "./helpers/local-session";
 import { restoreEnvValue } from "./helpers/settings-test-state";
-
-/** The opening of the hidden settings notice. */
-const SETTINGS_NOTICE = '<system-notice id="settings">';
 
 const MINUTE_MS = 60_000;
 

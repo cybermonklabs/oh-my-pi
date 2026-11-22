@@ -1047,7 +1047,7 @@ export class SessionMaintenance {
 			!model || !entry || leafId === undefined
 				? undefined
 				: {
-						modelKey: promptCacheModelKey(model, resolveKimiApiFormat(this.#host.settings)),
+						modelKey: this.#cacheModelKey(model),
 						entry: cacheEntryFigures(entry),
 						compactionId: getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null,
 						leafId,
@@ -1200,13 +1200,18 @@ export class SessionMaintenance {
 		return (
 			model !== undefined &&
 			!entry.refreshMissed &&
-			wait.modelKey === promptCacheModelKey(model, resolveKimiApiFormat(this.#host.settings)) &&
+			wait.modelKey === this.#cacheModelKey(model) &&
 			wait.compactionId === (getLatestCompactionEntry(this.#host.sessionManager.getBranchView())?.id ?? null) &&
 			entry.tier === wait.entry.tier &&
 			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
 			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
 			!promptCacheEntryLapsed(entry, Date.now())
 		);
+	}
+
+	/** `model` as the prompt cache keys it, in the session's Kimi Code API format ({@link promptCacheModelKey}). */
+	#cacheModelKey(model: Model): string {
+		return promptCacheModelKey(model, resolveKimiApiFormat(this.#host.settings));
 	}
 
 	/**

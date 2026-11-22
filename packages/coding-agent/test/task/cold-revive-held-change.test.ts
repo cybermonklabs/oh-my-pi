@@ -20,7 +20,14 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "../helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	noticeDeadline,
+	RELOAD_CALLS,
+	reloadOverlay,
+	SETTINGS_NOTICE,
+	setClock,
+} from "../helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -33,9 +40,6 @@ import {
 } from "../helpers/anthropic-gateway";
 import { localSession } from "../helpers/local-session";
 import { restoreEnvValue } from "../helpers/settings-test-state";
-
-/** The opening of the hidden settings notice. */
-const SETTINGS_NOTICE = '<system-notice id="settings">';
 
 /** The workstation line `includeModelInPrompt` renders into the prompt. */
 const MODEL_LINE = "- Model:";
@@ -233,12 +237,11 @@ describe("a parked subagent that held a settings change, revived cold", () => {
 	it("sends the changed prompt from its first request when revived after the deadline the notice gave", async () => {
 		const run = await parkedWhileHolding();
 		const { held, notice } = spawnRequests(run);
-		const deadline = notice.match(/at the first request made at (\S+) or later/)?.[1];
-		if (!deadline) throw new Error("Expected the notice's deadline");
+		const deadline = noticeDeadline(notice);
 
 		setClock(7 * MINUTE_MS);
 		// The revive comes after the time the notice gave for the change to go out.
-		expect(Date.now()).toBeGreaterThanOrEqual(Date.parse(deadline));
+		expect(Date.now()).toBeGreaterThanOrEqual(deadline);
 		const revived = await coldRevive(run);
 		const woken = await wake(run, revived, "one more");
 		const again = await wake(run, revived, "and another");

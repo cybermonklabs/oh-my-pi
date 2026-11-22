@@ -45,6 +45,7 @@ import {
 	type MnemopiSessionStateApi,
 	requireMnemopi,
 	requireMnemopiCore,
+	resolveBankDbPath,
 	setMnemopiSessionState,
 } from "./state";
 
@@ -379,13 +380,6 @@ function createStatsMemory(config: MnemopiBackendConfig, bank: string): Mnemopi 
 		...providerOptions,
 		reconcile: false,
 	} as ConstructorParameters<typeof Mnemopi>[0]);
-}
-
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
-	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
-	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
-	return new BankManager(path.dirname(config.dbPath)).getBankDbPath(bank);
 }
 
 function renderMnemopiStats(banks: readonly MnemopiBankStats[]): string {

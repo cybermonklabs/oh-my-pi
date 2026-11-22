@@ -1302,7 +1302,8 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
+/** The database `bank` lives in: the configured one for the shared bank, else the bank's own beside it. */
+export function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
 	return new BankManager(dirname(config.dbPath)).getBankDbPath(bank);

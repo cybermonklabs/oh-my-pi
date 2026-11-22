@@ -12,6 +12,7 @@ import {
 	isRecord,
 	isStringList,
 	logger,
+	once,
 	prompt,
 	stringProperty,
 	structuredCloneJSON,
@@ -1044,16 +1045,16 @@ const NO_HOLDS: ReadonlySet<string> = new Set();
  * Where each setting a settings notice may name starts, as the model was told of it before the notices of the change
  * the base withholds, if any, which holds each setting of `before` with the value the withholding prompt was built
  * with: each setting it holds at the value the newest notice of another change in the context gave it (`earlier`),
- * while `toldStands` says that value still stands for the model, given the setting, the value and the change whose
- * notice gave it, else at the value the prompt was built with; then each other setting those notices gave a value, at
- * that value, but a credential, whose value no notice records, and a setting this process does not know. The settings
- * notice and the held-tool refusal name each change from here, so both give a setting the same value before the
- * change.
+ * while `toldStands` (always, unless given) says that value still stands for the model, given the setting, the value
+ * and the change whose notice gave it, else at the value the prompt was built with; then each other setting those
+ * notices gave a value, at that value, but a credential, whose value no notice records, and a setting this process
+ * does not know. The settings notice and the held-tool refusal name each change from here, so both give a setting
+ * the same value before the change.
  */
 function noticedSettingStarts(
 	before: ReadonlyMap<AnySetting, unknown>,
 	earlier: EarlierNoticesTold,
-	toldStands: (setting: AnySetting, told: unknown, hold: string | undefined) => boolean,
+	toldStands: (setting: AnySetting, told: unknown, hold: string | undefined) => boolean = () => true,
 ): Map<AnySetting, unknown> {
 	const starts = new Map<AnySetting, unknown>();
 	for (const [setting, value] of before) {
@@ -4476,13 +4477,17 @@ export class SessionTools {
 	}
 
 	/**
-	 * The tools enabled once `held` rebuilds: the enabled tools but the ones it disables, then the ones it enables; the
-	 * enabled tools without a hold.
+	 * The tools enabled once `held` rebuilds: the `enabled` tools (the session's, unless given) but the ones it
+	 * disables, then the ones it enables; the `enabled` tools without a hold.
 	 */
-	#enabledAfterHold(held: HeldSettingsRebuild | undefined): Set<string> {
-		const enabled = new Set(this.getEnabledToolNames().filter(name => !held?.disabledTools.has(name)));
-		for (const name of held?.enabledTools ?? []) enabled.add(name);
-		return enabled;
+	#enabledAfterHold(
+		held: HeldSettingsRebuild | undefined,
+		enabled: Iterable<string> = this.getEnabledToolNames(),
+	): Set<string> {
+		const after = new Set<string>();
+		for (const name of enabled) if (!held?.disabledTools.has(name)) after.add(name);
+		for (const name of held?.enabledTools ?? []) after.add(name);
+		return after;
 	}
 
 	/**
@@ -4558,11 +4563,11 @@ export class SessionTools {
 	}
 
 	/**
-	 * Whether a tool-set step moves the tools enabled once the hold rebuilds ({@link #enabledAfterHold}): one of the
-	 * `removed` tools that was enabled (in `wasEnabled`) and that the hold does not disable yet, or one the hold brings
-	 * with the rebuild; or one of the `added` tools the hold disables, whose calls run again, or one that `activate`s
-	 * and is neither enabled nor brought with the rebuild yet. A step that moves none changes no tool a request
-	 * declares or the prompt lists: a gated tool the session's explicit list leaves out, or a tool registered inactive.
+	 * Whether a tool-set step moves the tools enabled once the hold rebuilds ({@link #enabledAfterHold}, counted from
+	 * `wasEnabled`, the tools enabled before the step): one of the `removed` tools that would be enabled after the
+	 * rebuild; or one of the `added` tools the hold disables, whose calls run again, or one that `activate`s and would
+	 * not be enabled after it. A step that moves none changes no tool a request declares or the prompt lists: a gated
+	 * tool the session's explicit list leaves out, or a tool registered inactive.
 	 */
 	#rosterMoves(
 		wasEnabled: ReadonlySet<string>,
@@ -4570,12 +4575,12 @@ export class SessionTools {
 		added: Iterable<{ readonly name: string; readonly activate: boolean }>,
 	): boolean {
 		const held = this.#heldSettingsRebuild;
+		const after = this.#enabledAfterHold(held, wasEnabled);
 		for (const name of removed) {
-			if (held?.enabledTools.has(name) || (wasEnabled.has(name) && !held?.disabledTools.has(name))) return true;
+			if (after.has(name)) return true;
 		}
 		for (const { name, activate } of added) {
-			if (held?.disabledTools.has(name)) return true;
-			if (activate && !wasEnabled.has(name) && !held?.enabledTools.has(name)) return true;
+			if (held?.disabledTools.has(name) || (activate && !after.has(name))) return true;
 		}
 		return false;
 	}
@@ -4843,7 +4848,7 @@ export class SessionTools {
 		);
 		const movers = [...declarations.movers, ...prompt.movers];
 		if (movers.length > 0) {
-			if (this.#holdSettingsRebuild(movers)) await this.#recordHeldSettingsBuild();
+			if (this.#holdSettingsRebuild(movers)) await this.#recordHeldSettingsBuild(undefined, prompt.surfaceRead);
 			return;
 		}
 		this.#settleKeptRestoredPrompt(prompt.render);
@@ -5056,11 +5061,12 @@ export class SessionTools {
 			({ setting }) => !read.has(setting) && !standIn?.has(setting) && !surfaceRead.has(setting),
 		);
 		const masked = unreadBefore.filter(({ setting }) => render.settingsRead?.has(setting) === true).map(unreadChange);
-		if (moved.length > 0 || masked.length > 0 || !rebuilds)
-			return { movers: [...moved, ...masked], render, surfaceRead };
-		// No setting a build reads moved the prompt: the change moved it through state its listener set (the
-		// session's workspace roots, a memory recall the change withdrew), so each of its settings no build reads did.
-		return { movers: unreadBefore.map(unreadChange), render, surfaceRead };
+		// With `rebuilds` and no setting a build reads that moved the prompt, the change moved it through state its
+		// listener set (the session's workspace roots, a memory recall the change withdrew), so each of its settings no
+		// build reads did.
+		const movers =
+			moved.length > 0 || masked.length > 0 || !rebuilds ? [...moved, ...masked] : unreadBefore.map(unreadChange);
+		return { movers, render, surfaceRead };
 	}
 
 	/** The settings {@link #derivePromptSurface} reads: their changes ride the surface's own notices. */
@@ -5224,11 +5230,11 @@ export class SessionTools {
 		const read = this.#promptSettingsRead;
 		const waiting: [AnySetting, unknown][] = [];
 		const settled: [AnySetting, unknown][] = [];
-		for (const start of this.#heldSettingStarts(held, earlier)) {
+		// The holds the change goes on from ({@link #continuedHolds}), read at most once for the notice.
+		const continued = once(() => this.#continuedHolds(held));
+		for (const start of this.#heldSettingStarts(held, earlier, continued)) {
 			const [setting] = start;
-			const builtOtherwise = held.before.has(setting)
-				? !settingValuesEqual(held.before.get(setting), setting.get(this.#host.settings))
-				: this.#readAtOtherValue(read, setting);
+			const builtOtherwise = this.#readAtOtherValue(held.before.has(setting) ? held.before : read, setting);
 			if (builtOtherwise) waiting.push(start);
 			else settled.push(start);
 		}
@@ -5238,18 +5244,17 @@ export class SessionTools {
 		// for a tool the held rebuild disables or brings again that the notice of a change that ended gave so: that
 		// notice gave that change's time, and this change gives its own. A notice of the change it goes on from, whose
 		// time it keeps, stays told ({@link #continuedHolds}).
-		let continued: ReadonlySet<string> | undefined;
-		const toldStands = (name: string, again: boolean | undefined): boolean => {
+		const toolToldStands = (name: string, again: boolean | undefined): boolean => {
 			if (!again) return true;
 			const hold = earlier.toolsGivenBy.get(name);
-			continued ??= this.#continuedHolds(held);
-			return hold !== undefined && continued.has(hold);
+			return hold !== undefined && continued().has(hold);
 		};
 		const toldDisabled =
 			told?.disabledTools ??
-			earlier.disabledTools.filter(name => toldStands(name, rebuild?.disabledTools.has(name)));
+			earlier.disabledTools.filter(name => toolToldStands(name, rebuild?.disabledTools.has(name)));
 		const toldEnabled =
-			told?.enabledTools ?? earlier.enabledTools.filter(name => toldStands(name, rebuild?.enabledTools.has(name)));
+			told?.enabledTools ??
+			earlier.enabledTools.filter(name => toolToldStands(name, rebuild?.enabledTools.has(name)));
 		let disabledTools: readonly string[];
 		let enabledTools: readonly string[];
 		if (rebuild) {
@@ -5312,15 +5317,21 @@ export class SessionTools {
 	 * change `held` goes on from ({@link #continuedHolds}), whose time that prompt keeps. Otherwise that notice's change
 	 * ended, and the value it gave, which the setting has now, went out by that change's time as far as the model
 	 * knows; but `held`'s prompt is written without it, and it goes out by `held`'s time. So the setting starts at the
-	 * value that prompt was built with, and the notice names it with `held`'s time.
+	 * value that prompt was built with, and the notice names it with `held`'s time. `continued` gives the holds of the
+	 * change `held` goes on from, which a caller that reads them as well passes, read once.
 	 */
-	#heldSettingStarts(held: WithheldChange & HeldSettings, earlier: EarlierNoticesTold): Map<AnySetting, unknown> {
-		let continued: ReadonlySet<string> | undefined;
-		return noticedSettingStarts(held.before, earlier, (setting, told, hold) => {
-			if (!settingValuesEqual(told, setting.get(this.#host.settings))) return true;
-			continued ??= this.#continuedHolds(held);
-			return hold !== undefined && continued.has(hold);
-		});
+	#heldSettingStarts(
+		held: WithheldChange & HeldSettings,
+		earlier: EarlierNoticesTold,
+		continued: () => ReadonlySet<string> = once(() => this.#continuedHolds(held)),
+	): Map<AnySetting, unknown> {
+		return noticedSettingStarts(
+			held.before,
+			earlier,
+			(setting, told, hold) =>
+				!settingValuesEqual(told, setting.get(this.#host.settings)) ||
+				(hold !== undefined && continued().has(hold)),
+		);
 	}
 
 	/**
@@ -5370,10 +5381,7 @@ export class SessionTools {
 	#releasedSettingsNotice(earlier: EarlierNoticesTold): CustomMessage<SettingsNoticeDetails> | undefined {
 		const { newest } = earlier;
 		if (!newest) return undefined;
-		const { changes, given } = this.#settingChanges(
-			noticedSettingStarts(NO_SETTINGS, earlier, () => true),
-			new Map(),
-		);
+		const { changes, given } = this.#settingChanges(noticedSettingStarts(NO_SETTINGS, earlier), new Map());
 		const enabled = new Set(this.getEnabledToolNames());
 		const tools = {
 			disabledTools: [],
@@ -5453,7 +5461,6 @@ export class SessionTools {
 		return prompt.render(heldToolRefusalPrompt, {
 			tool: bareName,
 			changes,
-			oneOfChanges: changes.length > 1,
 			inToolList: listing === "tools",
 			inDeviceListing: listing === "devices",
 			rebuildBy: withheldChangeDeadline(held),

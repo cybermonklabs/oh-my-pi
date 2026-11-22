@@ -18,16 +18,15 @@ export type WireModelOptions = Pick<SimpleStreamOptions, "kimiApiFormat" | "synt
 interface WireModelEntry {
 	/** A shallow snapshot of the model it was resolved from. */
 	source: Model<Api>;
-	kimiApiFormat: WireModelOptions["kimiApiFormat"];
-	syntheticApiFormat: WireModelOptions["syntheticApiFormat"];
 	wire: Model<Api>;
 }
 
 /**
- * Wire models kept per source model, so a decision taken again on the same model does no compat resolution and reads
- * the same object; a source with a field replaced in place since misses the snapshot and resolves again.
+ * Wire models kept per source model and per combination of API formats, so a decision taken again on the same model
+ * in the same formats does no compat resolution and reads the same object, whichever formats were asked for between;
+ * a source with a field replaced in place since misses the snapshot and resolves again.
  */
-const wireModels = new WeakMap<Model<Api>, WireModelEntry>();
+const wireModels = new WeakMap<Model<Api>, Map<string, WireModelEntry>>();
 
 /**
  * The model a main request on `model` with `options` goes out as, as `streamSimple` dispatches it: a wrapper
@@ -44,17 +43,17 @@ const wireModels = new WeakMap<Model<Api>, WireModelEntry>();
 export function wireModel(model: Model<Api>, options?: WireModelOptions): Model<Api> {
 	const kimiApiFormat = options?.kimiApiFormat;
 	const syntheticApiFormat = options?.syntheticApiFormat;
-	const cached = wireModels.get(model);
-	if (
-		cached !== undefined &&
-		cached.kimiApiFormat === kimiApiFormat &&
-		cached.syntheticApiFormat === syntheticApiFormat &&
-		sameOwnFields(cached.source, model)
-	) {
-		return cached.wire;
-	}
+	const formats = `${kimiApiFormat}/${syntheticApiFormat}`;
+	let entries = wireModels.get(model);
+	const cached = entries?.get(formats);
+	if (cached !== undefined && sameOwnFields(cached.source, model)) return cached.wire;
 	const wire = resolveWireModel(model, kimiApiFormat, syntheticApiFormat);
-	if (wire !== model) wireModels.set(model, { source: { ...model }, kimiApiFormat, syntheticApiFormat, wire });
+	if (wire === model) return wire;
+	if (!entries) {
+		entries = new Map();
+		wireModels.set(model, entries);
+	}
+	entries.set(formats, { source: { ...model }, wire });
 	return wire;
 }
 
