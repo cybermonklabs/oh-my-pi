@@ -4200,23 +4200,55 @@ mod tests {
 	/// The exclusive create fails on it: "File exists", or "not writing
 	/// through dangling symlink" for the link, `-f` or not (its
 	/// remove-and-retry is only for a destination cp found), and the backup
-	/// is put back over it. Under POSIXLY_CORRECT cp writes through the link.
+	/// is put back over it. Under POSIXLY_CORRECT cp writes through the link,
+	/// and the file it makes there has the source's permissions (604 for a
+	/// FIFO of mode 604, and as root 440 for one of mode 440, not
+	/// owner-writable), as GNU's has; with `--reflink=always` the clone then
+	/// fails with what `FICLONE` answers, the backup comes back over the link,
+	/// and the file made through it stays, empty, with those permissions.
 	#[test]
 	#[cfg(target_os = "linux")]
 	fn a_name_that_appears_during_the_copy_is_kept() {
-		// (what appears, POSIXLY_CORRECT, exit, stderr, the entries after)
-		let rows = [
-			("file", false, 1, "cp: cannot create regular file 'b': File exists\n", "b=old"),
-			("link", false, 1, "cp: not writing through dangling symlink 'b'\n", "b=old"),
-			("link", true, 0, "", "b=link:none b~=old none=F"),
+		use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+		// What `FICLONE` answers from a FIFO here.
+		let probe = tempdir().unwrap();
+		let fifo = probe.path().join("p");
+		let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+		// SAFETY: `name` is NUL-terminated and outlives the call.
+		assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+		fs::write(probe.path().join("f"), b"").unwrap();
+		let clone = pi_iso::cow::clone_open(
+			&fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap(),
+			&fs::OpenOptions::new().write(true).open(probe.path().join("f")).unwrap(),
+		)
+		.expect_err("a clone from a FIFO");
+		let clone_err = format!("cp: failed to clone 'b' from 'p': {}\n", crate::host::strip_errno(&clone));
+		// (what appears, POSIXLY_CORRECT, --reflink=always, the FIFO's mode, exit, stderr, the
+		// entries after). The last row is root's: a FIFO of mode 440 is written only by root, and
+		// GNU then leaves the file it makes through the link with 440, not owner-writable.
+		// SAFETY: `geteuid` has no preconditions.
+		let as_root = unsafe { libc::geteuid() } == 0;
+		let mut rows = vec![
+			("file", false, false, 0o604, 1, "cp: cannot create regular file 'b': File exists\n", "b=old#644"),
+			("link", false, false, 0o604, 1, "cp: not writing through dangling symlink 'b'\n", "b=old#644"),
+			("link", true, false, 0o604, 0, "", "b=link:none b~=old#644 none=F#604"),
+			("link", true, true, 0o604, 1, clone_err.as_str(), "b=old#644 none=#604"),
 		];
-		for (kind, posix, code, err, after) in rows {
+		if as_root {
+			rows.push(("link", true, true, 0o440, 1, clone_err.as_str(), "b=old#644 none=#440"));
+		} else {
+			eprintln!("skipped: the row of a FIFO of mode 440 needs root");
+		}
+		for (kind, posix, reflink, fifo_mode, code, err, after) in rows {
 			let dir = tempdir().unwrap();
 			let fifo = dir.path().join("p");
 			let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
 			// SAFETY: `name` is NUL-terminated and outlives the call.
 			assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+			fs::set_permissions(&fifo, fs::Permissions::from_mode(fifo_mode)).unwrap();
 			fs::write(dir.path().join("b"), b"old").unwrap();
+			fs::set_permissions(dir.path().join("b"), fs::Permissions::from_mode(0o644)).unwrap();
 			let cwd = dir.path().to_owned();
 			let copy = std::thread::spawn(move || {
 				use crate::host::{Host, Utility as _};
@@ -4224,7 +4256,9 @@ mod tests {
 				if posix {
 					host.set_test_var("POSIXLY_CORRECT", "1");
 				}
-				let parsed = <Cp as clap::Parser>::try_parse_from(["cp", "-f", "-b", "p", "b"]).unwrap();
+				let args: &[&str] =
+					if reflink { &["cp", "-f", "-b", "--reflink=always", "p", "b"] } else { &["cp", "-f", "-b", "p", "b"] };
+				let parsed = <Cp as clap::Parser>::try_parse_from(args).unwrap();
 				let code = parsed.run(&mut host);
 				(code, capture.err())
 			});
@@ -4234,7 +4268,11 @@ mod tests {
 				assert!(!copy.is_finished(), "cp ended before it backed b up");
 				std::thread::yield_now();
 			}
-			let case = format!("a {kind} appears{}", if posix { ", POSIXLY_CORRECT" } else { "" });
+			let case = format!(
+				"a {kind} appears{}{}, a FIFO of mode {fifo_mode:o}",
+				if posix { ", POSIXLY_CORRECT" } else { "" },
+				if reflink { ", --reflink=always" } else { "" }
+			);
 			match kind {
 				"file" => fs::write(dir.path().join("b"), b"new").unwrap(),
 				_ => std::os::unix::fs::symlink("none", dir.path().join("b")).unwrap(),
@@ -4253,12 +4291,59 @@ mod tests {
 					let name = name.to_string_lossy();
 					match fs::read_link(&path) {
 						Ok(target) => format!("{name}=link:{}", target.display()),
-						Err(_) => format!("{name}={}", fs::read_to_string(&path).unwrap()),
+						Err(_) => format!(
+							"{name}={}#{:o}",
+							fs::read_to_string(&path).unwrap(),
+							fs::metadata(&path).unwrap().permissions().mode() & 0o777
+						),
 					}
 				})
 				.collect::<Vec<_>>()
 				.join(" ");
 			assert_eq!(found, after, "{case}");
+		}
+	}
+
+	/// A copied link replaces any destination that is not a directory, as
+	/// GNU 9.4 and 9.7 do as uid 1000 and as root (`copy.c` removes it before
+	/// it makes the link): `cp -P l b`, with `-R`, `-d` and `-f` too, onto a
+	/// FIFO, a socket and, where a device node can be made (root), a device,
+	/// makes `b` the link; with `-v` GNU says `removed 'b'` before
+	/// `'l' -> 'b'`, `-f` or `--remove-destination` or not.
+	#[test]
+	#[cfg(unix)]
+	fn a_copied_link_replaces_a_special_file_as_gnu_does() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let flags: [&[&str]; 7] =
+			[&["-P"], &["-R"], &["-d"], &["-P", "-f"], &["-P", "-v"], &["-P", "-f", "-v"], &["-P", "--remove-destination", "-v"]];
+		for kind in ["fifo", "socket", "device"] {
+			for flag in flags {
+				let dir = tempdir().unwrap();
+				fs::write(dir.path().join("a"), b"A").unwrap();
+				std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+				let b = dir.path().join("b");
+				let name = std::ffi::CString::new(b.as_os_str().as_bytes()).unwrap();
+				let made = match kind {
+					// SAFETY: `name` is NUL-terminated and outlives the call.
+					"fifo" => (unsafe { libc::mkfifo(name.as_ptr(), 0o644) }) == 0,
+					"socket" => std::os::unix::net::UnixListener::bind(&b).is_ok(),
+					// SAFETY: as above.
+					_ => (unsafe { libc::mknod(name.as_ptr(), libc::S_IFCHR | 0o644, libc::makedev(1, 3)) }) == 0,
+				};
+				if !made {
+					assert_eq!(kind, "device", "making the {kind}");
+					eprintln!("skipped: a device node cannot be made here");
+					break;
+				}
+				let mut args = flag.to_vec();
+				args.extend(["l", "b"]);
+				let (code, capture) = run_util::<Cp>(&args, "", dir.path());
+				let case = format!("cp {} onto a {kind}", args.join(" "));
+				let out = if flag.contains(&"-v") { "removed 'b'\n'l' -> 'b'\n" } else { "" };
+				assert_eq!((code, capture.err(), capture.out()), (0, String::new(), out.to_owned()), "{case}");
+				assert_eq!(fs::read_link(&b).ok(), Some(std::path::PathBuf::from("a")), "{case}: b is not the link");
+			}
 		}
 	}
 	#[test]
