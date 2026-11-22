@@ -1,0 +1,216 @@
+/**
+ * Transcript records of the subagent jobs a session's eval cells start or take results of,
+ * which `omp --restore` reads as evidence of whether the session still waits on a job's
+ * subagent ({@link readEvalAgentJobRecord}).
+ *
+ * A job is `owed` from its spawn until its result is handed to the session: an eval `agent()`
+ * job, a background spawn a bridged `tool.task` starts, whose "started" result names no
+ * settled run, and a work pool's worker. A cell's `wait()` and a bridged `tool.wait` write
+ * `delivered` first and then hand the result over, so a process that goes away between the two
+ * leaves `delivered`, and restore never runs that run again; a background `task` spawn's result
+ * a bridged `tool.wait` or a cell's kill of a settled job hands a cell is recorded the same way,
+ * and so is each worker whose latest batch a `peek` hands over, and each worker a work pool's
+ * aggregate result names (its job report's `agentResults`) when such a call returns that result,
+ * with the time the pool drained, when the handover happened.
+ * A handle's `status()`, `done()` and `attempts()` hand the cell no result and write nothing. A
+ * result the session receives as an `async-result` message, a `wait` result or a kill's needs no
+ * marker: that entry is the handover and its record at once, and names a pool's workers too.
+ */
+import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
+import type { SessionEntry } from "../session/session-entries";
+import type { ToolSession } from "../tools";
+
+/** Custom entry type of an eval job record: an `agent()` job's, a bridged `tool.task` background spawn's, or a work pool worker's. */
+export const EVAL_AGENT_JOB_CUSTOM_TYPE = "eval-agent-job";
+
+/** `owed`: spawned, its result not yet handed to the session; `delivered`: handed over, or being handed over. */
+export type EvalAgentJobState = "owed" | "delivered";
+
+/** One state change of the eval job whose subagent is `agentId`. */
+export interface EvalAgentJobRecord {
+	agentId: string;
+	state: EvalAgentJobState;
+	/**
+	 * With `owed`: the parent's top-level calls the run is owed for, when they differ from the one its
+	 * spawn record names (a kept-alive work pool worker's later batch, whose items later `eval` calls
+	 * pushed). `omp --restore` matches the run to a cut-off call by its latest `owed` record's calls.
+	 */
+	spawnCallIds?: string[];
+	/**
+	 * With `delivered`: when the result was handed over (epoch ms), when that was earlier than the
+	 * record: a work pool's drain, whose aggregate result a bridged `tool.wait` or kill takes later.
+	 * `omp --restore` settles the run at this time, so a turn a kept-alive worker began after the
+	 * drain stays owed.
+	 */
+	handedAt?: number;
+}
+
+/**
+ * Appends `state` for each of `agentIds` to `session`'s transcript, then waits until the records
+ * are on disk, and returns the appended entries' ids (a work pool keeps those of its `owed` records,
+ * to find the sessions that hold its spawns). Nothing is written or flushed for no ids or a session
+ * without a transcript. An `owed` record names `spawnCallIds` when given.
+ */
+export async function recordEvalAgentJobs(
+	session: ToolSession,
+	agentIds: readonly string[],
+	state: EvalAgentJobState,
+	spawnCallIds?: readonly string[],
+): Promise<string[]> {
+	return appendJobRecords(
+		session,
+		agentIds.map(agentId =>
+			state === "owed" && spawnCallIds?.length
+				? { agentId, state, spawnCallIds: [...spawnCallIds] }
+				: { agentId, state },
+		),
+	);
+}
+
+/** Appends `records` to `session`'s transcript and waits until they are on disk; returns the entries' ids. */
+async function appendJobRecords(session: ToolSession, records: readonly EvalAgentJobRecord[]): Promise<string[]> {
+	const manager = session.sessionManager;
+	if (!manager || records.length === 0) return [];
+	const entryIds = records.map(record => manager.appendCustomEntry(EVAL_AGENT_JOB_CUSTOM_TYPE, record));
+	await manager.flush();
+	return entryIds;
+}
+
+/** The handover record of one job run: when it was first handed over (epoch ms), and its write and flush. */
+interface Handover {
+	at: number;
+	written: Promise<void>;
+}
+
+/**
+ * Per session manager, the handover record of each job run (keyed by {@link runKey}), settled or
+ * still in flight. `/new` and a session switch keep the manager, so one map can span several
+ * transcripts; job ids do not repeat across them, so no run's record stands for another's.
+ */
+const handovers = new WeakMap<object, Map<string, Handover>>();
+
+/** A job run's identity within its session: its subagent and its job. A follow-up turn is no job run. */
+function runKey(run: { agentId: string; jobId: string }): string {
+	return `${run.agentId}\u0000${run.jobId}`;
+}
+
+/**
+ * Records that each of `runs` handed its subagent's result to `session`'s cell: `delivered`,
+ * on disk, before the caller hands the result over. A run is known by its subagent and job ids,
+ * not by a job object (the worker thread's job manager builds a new one on every read), and is
+ * recorded once: a later `wait()` on the settled handle writes nothing. A caller that finds the
+ * record still being written waits for it to reach the disk too, so no concurrent `wait()` hands
+ * the result over first. A failed write is forgotten, and the next handover of that run writes
+ * it again. A run that says when its result was handed over (`handedAt`: a work pool's drain,
+ * whose aggregate result the cell takes later) records that time when it is the earlier.
+ *
+ * Returns, for each of `runs` in order, when its result first reached the cell (epoch ms), or the
+ * run's own earlier `handedAt`: the time the eval result names it with, so a turn the cell, or an
+ * IRC message, started on the subagent after that stays unsettled, however often or late the
+ * cell waits again.
+ */
+export async function recordHandovers(
+	session: ToolSession,
+	runs: ReadonlyArray<{ agentId: string; jobId: string; handedAt?: number }>,
+): Promise<number[]> {
+	const manager = session.sessionManager;
+	if (!manager) {
+		const now = Date.now();
+		return runs.map(run => handoverTime(run, now));
+	}
+	let byRun = handovers.get(manager);
+	if (!byRun) {
+		byRun = new Map();
+		handovers.set(manager, byRun);
+	}
+	const fresh = runs.filter(run => !byRun.has(runKey(run)));
+	if (fresh.length > 0) {
+		const now = Date.now();
+		const times = fresh.map(run => handoverTime(run, now));
+		// Appended synchronously in this call, before any other caller can look the run up.
+		const written = appendJobRecords(
+			session,
+			fresh.map((run, index): EvalAgentJobRecord => {
+				const at = times[index]!;
+				return at < now
+					? { agentId: run.agentId, state: "delivered", handedAt: at }
+					: { agentId: run.agentId, state: "delivered" };
+			}),
+		).then(() => {});
+		fresh.forEach((run, index) => byRun.set(runKey(run), { at: times[index]!, written }));
+		written.catch(() => {
+			for (const run of fresh) if (byRun.get(runKey(run))?.written === written) byRun.delete(runKey(run));
+		});
+	}
+	const recorded = runs.map(run => byRun.get(runKey(run))!);
+	await Promise.all(recorded.map(handover => handover.written));
+	return recorded.map(handover => handover.at);
+}
+
+/** When `run`'s result was handed over: its own earlier time (a work pool's drain) when it gives one, else `now`. */
+function handoverTime(run: { handedAt?: number }, now: number): number {
+	return run.handedAt !== undefined && Number.isFinite(run.handedAt) && run.handedAt < now ? run.handedAt : now;
+}
+
+/**
+ * A subagent run a job report hands its caller, keyed for {@link recordHandovers}, with the run-end
+ * flags it records and, for a work pool's worker, when the pool drained (`handedAt`).
+ */
+export interface HandedRun {
+	agentId: string;
+	jobId: string;
+	aborted?: boolean;
+	workerLost?: boolean;
+	handedAt?: number;
+}
+
+/**
+ * The settled subagent jobs a job report hands its caller: a `wait` tool result, or a kill's
+ * (`write proc://<id>/kill` of a job that had settled, whose report lists the jobs as a `wait`
+ * does). Each listed job that is no longer running and has a subagent (`agentUrlId`), with its job
+ * id, and the subagents such a job's result hands over (its `agentResults`: a work pool's workers),
+ * each keyed by the job, with its run-end flags and the time the report gives it (the drain's).
+ */
+export function waitHandedSubagents(details: unknown): HandedRun[] {
+	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
+	const handed: HandedRun[] = [];
+	for (const job of details.jobs) {
+		if (!isRecord(job) || job.status === "running") continue;
+		const agentId = stringProperty(job, "agentUrlId");
+		const jobId = stringProperty(job, "id");
+		if (agentId && jobId) handed.push({ agentId, jobId });
+		if (!jobId || !Array.isArray(job.agentResults)) continue;
+		for (const result of job.agentResults) {
+			if (!isRecord(result)) continue;
+			const id = stringProperty(result, "id");
+			if (!id) continue;
+			handed.push({
+				agentId: id,
+				jobId,
+				...(result.aborted === true ? { aborted: true } : {}),
+				...(result.workerLost === true ? { workerLost: true } : {}),
+				...(typeof result.handedAt === "number" && Number.isFinite(result.handedAt)
+					? { handedAt: result.handedAt }
+					: {}),
+			});
+		}
+	}
+	return handed;
+}
+
+/** The eval `agent()` job record `entry` holds; undefined for any other entry. */
+export function readEvalAgentJobRecord(entry: SessionEntry): EvalAgentJobRecord | undefined {
+	if (entry.type !== "custom" || entry.customType !== EVAL_AGENT_JOB_CUSTOM_TYPE) return undefined;
+	const { data } = entry;
+	if (!isRecord(data) || typeof data.agentId !== "string") return undefined;
+	if (data.state !== "owed" && data.state !== "delivered") return undefined;
+	const record: EvalAgentJobRecord = { agentId: data.agentId, state: data.state };
+	const calls = Array.isArray(data.spawnCallIds)
+		? data.spawnCallIds.filter((call): call is string => typeof call === "string")
+		: [];
+	if (calls.length > 0) record.spawnCallIds = calls;
+	if (data.state === "delivered" && typeof data.handedAt === "number" && Number.isFinite(data.handedAt)) {
+		record.handedAt = data.handedAt;
+	}
+	return record;
+}

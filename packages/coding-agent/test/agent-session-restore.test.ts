@@ -9,12 +9,17 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { EVAL_STATE_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/eval/state";
 import {
+	collectPendingToolCalls,
 	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
 	INTERRUPTED_TURN_ERROR,
+	isRestoreSkippedCallResult,
+	SESSION_EXIT_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { restoreRunsBatchAgain } from "@oh-my-pi/pi-coding-agent/task/restore";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -160,6 +165,88 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		const last = session.agent.state.messages.at(-1);
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
 	});
+
+	for (const [label, skipped, ran] of [
+		[
+			"does not run again a cut-off call whose subagent restore relaunched, gives it a result naming the subagent, and runs the batch's other call again",
+			{ relaunched: { call_1: ["Worker"] } },
+			["second"],
+		],
+		[
+			"does not run again a cut-off call an earlier restore did not run again, whose subagent ran since, and says where its result is",
+			{ ran: { call_1: ["Worker"] } },
+			["second"],
+		],
+		[
+			"control: runs every call of the cut-off batch again when restore relaunched no subagent",
+			{ relaunched: {} },
+			["first", "second"],
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, a call that started a subagent `--restore` relaunched, now or at an earlier restore,
+			// runs again: its subagent's work starts a second time, and the parent gets two results for it.
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const executed: string[] = [];
+			// The process died while both calls ran: no tool results, no session_exit record.
+			const { session, mock } = reopen(
+				model,
+				[
+					{ role: "user", content: "run both probes", timestamp: Date.now() },
+					assistant(model, {
+						content: [
+							{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "first" } },
+							{ type: "toolCall", id: "call_2", name: "probe", arguments: { value: "second" } },
+						],
+						stopReason: "toolUse",
+					}),
+				],
+				[probeTool(executed)],
+				[{ content: ["done after restore"], stopReason: "stop" }],
+			);
+
+			await expect(session.restoreInterruptedTurn(skipped)).resolves.toBe(true);
+			await session.waitForIdle();
+
+			expect(executed).toEqual([...ran]);
+			expect(mock.calls.length).toBe(1);
+			const first = session.agent.state.messages.findLast(
+				message => message.role === "toolResult" && message.toolCallId === "call_1",
+			);
+			const text =
+				first?.role === "toolResult"
+					? first.content.map(part => (part.type === "text" ? part.text : "")).join("")
+					: "";
+			if ("relaunched" in skipped && "call_1" in skipped.relaunched) {
+				expect(text).toContain("is not run again");
+				expect(text).toContain("Subagent Worker it started was relaunched by --restore and goes on with its work.");
+				expect(text).toContain("as its own follow-up turn unless a `wait` takes it");
+				expect(text).toContain(
+					"Any of this call's work that had not started when it was cut off did not run either",
+				);
+			} else if ("ran" in skipped) {
+				expect(text).toContain("is not run again");
+				expect(text).toContain("Subagent Worker it started is not running");
+				expect(text).toContain("read it with `read agent://Worker`");
+			} else {
+				expect(text).not.toContain("is not run again");
+			}
+			// The skip is marked in its details, which a later `--restore` reads, in memory and in the transcript.
+			const isSkip = ("relaunched" in skipped && "call_1" in skipped.relaunched) || "ran" in skipped;
+			expect(first !== undefined && isRestoreSkippedCallResult(first)).toBe(isSkip);
+			await session.sessionManager.flush();
+			const persisted = session.sessionManager
+				.getBranch()
+				.findLast(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "toolResult" &&
+						entry.message.toolCallId === "call_1",
+				);
+			expect(persisted?.type === "message" && isRestoreSkippedCallResult(persisted.message)).toBe(isSkip);
+		});
+	}
 
 	it("goes on with a turn exit recovery closed when the eval state snapshot follows it (#16195)", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -350,5 +437,189 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 			await session.dispose();
 		}
 		session = undefined;
+	});
+
+	/** The exit record a quit or a `/restart` writes as its session is disposed. */
+	function appendDisposeExit(manager: SessionManager): void {
+		const pendingToolCalls = collectPendingToolCalls(manager.getBranch());
+		manager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+			...(pendingToolCalls.length > 0 ? { pendingToolCalls } : {}),
+		});
+	}
+
+	/** Exit recovery as a process starts on the session: it closes a turn the recorded exit left unfinished. */
+	function appendExitRecovery(manager: SessionManager): void {
+		const branch = manager.getBranch();
+		const abort = createInterruptedTurnAbortMessage(branch);
+		if (abort) {
+			for (const result of createInterruptedToolResults(branch)) manager.appendMessage(result);
+			manager.appendMessage(abort);
+		}
+	}
+
+	/** What a process writes as it starts on an eval session: exit recovery's closing of a cut-off turn, then a snapshot. */
+	function appendProcessStart(manager: SessionManager): void {
+		appendExitRecovery(manager);
+		manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+	}
+
+	it("runs a cut-off batch again exactly when restoreRunsBatchAgain says so, for each shape writers leave after its reply", async () => {
+		// `task/restore` reads the first run of a batch a replay left only when restore runs that batch again
+		// (`restoreRunsBatchAgain`). If this regresses, that decision and what `restoreInterruptedTurn` does part ways:
+		// a subagent is relaunched beside a batch that runs again, or left while nothing runs its work again.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const shapes: Array<{ label: string; after: (manager: SessionManager) => void; runsAgain: boolean }> = [
+			{ label: "nothing after the reply (a crash mid call)", after: () => {}, runsAgain: true },
+			{
+				label: "a model change (a /retry replay's fallback revert), then a kill",
+				after: manager => {
+					manager.appendModelChange(`${model.provider}/${model.id}`);
+				},
+				runsAgain: true,
+			},
+			{
+				label: "exit recovery's closing, then the startup snapshot",
+				after: manager => {
+					appendDisposeExit(manager);
+					appendProcessStart(manager);
+				},
+				runsAgain: true,
+			},
+			{
+				label: "an eval snapshot (a /tree move to the reply), then a kill",
+				after: manager => {
+					manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a model change, then a quit and the next start's exit recovery",
+				after: manager => {
+					manager.appendModelChange(`${model.provider}/${model.id}`);
+					appendDisposeExit(manager);
+					appendProcessStart(manager);
+				},
+				runsAgain: true,
+			},
+			{
+				label: "a model change, then a quit, omp -c and a /restart with no input, in a session with no eval call",
+				after: manager => {
+					manager.appendModelChange(`${model.provider}/${model.id}`);
+					appendDisposeExit(manager);
+					appendExitRecovery(manager);
+					appendDisposeExit(manager);
+					appendExitRecovery(manager);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a model change, then the startup snapshot",
+				after: manager => {
+					manager.appendModelChange(`${model.provider}/${model.id}`);
+					manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a /tree move's snapshot and summary, then a kill",
+				after: manager => {
+					manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+					manager.branchWithSummary(manager.getLeafId(), "S: what the branch did.");
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a /tree move's snapshot, then a /restart",
+				after: manager => {
+					manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+					appendDisposeExit(manager);
+					appendProcessStart(manager);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a /tree move's snapshot, then a quit, omp -c and a /restart with no input",
+				after: manager => {
+					manager.appendCustomMessageEntry(EVAL_STATE_CONTEXT_TYPE, "eval runtime state", false);
+					appendDisposeExit(manager);
+					appendProcessStart(manager);
+					appendDisposeExit(manager);
+					appendProcessStart(manager);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a compaction and the eval snapshot it stores as a message, then a kill",
+				after: manager => {
+					const kept = manager.getLeafId();
+					if (!kept) throw new Error("Expected the reply to keep");
+					manager.appendCompaction("S: the work so far.", undefined, kept, 10_000);
+					manager.appendMessage({
+						role: "custom",
+						customType: EVAL_STATE_CONTEXT_TYPE,
+						content: "eval runtime state",
+						display: false,
+						attribution: "agent",
+						timestamp: Date.now(),
+					});
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a session switch's closing: the interrupted-turn abort with no results",
+				after: manager => {
+					const abort = createInterruptedTurnAbortMessage(manager.getBranch(), undefined, { assumeExit: true });
+					if (!abort) throw new Error("Expected the switch to close the turn");
+					manager.appendMessage(abort);
+				},
+				runsAgain: false,
+			},
+			{
+				label: "a compaction, then a reply that failed on its key",
+				after: manager => {
+					const kept = manager.getLeafId();
+					if (!kept) throw new Error("Expected the reply to keep");
+					manager.appendCompaction("S: the work so far.", undefined, kept, 10_000);
+					manager.appendMessage(
+						assistant(model, {
+							stopReason: "error",
+							errorMessage: "No API key for provider: anthropic",
+							credentialUnavailable: true,
+						}),
+					);
+				},
+				runsAgain: false,
+			},
+		];
+		const seen: Array<{ label: string; rule: boolean; ran: boolean }> = [];
+		for (const { label, after } of shapes) {
+			const manager = SessionManager.inMemory();
+			manager.appendMessage({ role: "user", content: "run the probe", timestamp: Date.now() });
+			manager.appendMessage(
+				assistant(model, {
+					content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+					stopReason: "toolUse",
+				}),
+			);
+			after(manager);
+			const rule = restoreRunsBatchAgain(manager.getBranch(), new Set(["call_1"]));
+			const executed: string[] = [];
+			const { session: restored } = open(
+				model,
+				manager,
+				[probeTool(executed)],
+				[{ content: ["done after restore"], stopReason: "stop" }],
+			);
+			if (await restored.restoreInterruptedTurn()) await restored.waitForIdle();
+			await restored.dispose();
+			seen.push({ label, rule, ran: executed.includes("again") });
+		}
+		session = undefined;
+
+		expect(seen).toEqual(shapes.map(({ label, runsAgain }) => ({ label, rule: runsAgain, ran: runsAgain })));
 	});
 });

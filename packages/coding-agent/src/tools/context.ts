@@ -32,6 +32,9 @@ declare module "@oh-my-pi/pi-agent-core" {
 		/** Set while the session runs the Spotlight experiment: the tool wrapper passes the final result of each of
 		 *  the agent's own calls (`toolCall` lists it under the tool's name) through it. */
 		spotlightShape?: CalledToolShaper;
+		/** Set on a call an eval cell bridges (`tool.task`): the parent's top-level `eval` call the cell runs under.
+		 *  The spawns the call makes record it as the call that started them, which `omp --restore` reads. */
+		spawnCallId?: string;
 	}
 }
 

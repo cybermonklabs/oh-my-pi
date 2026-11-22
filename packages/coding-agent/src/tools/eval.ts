@@ -29,6 +29,7 @@ import { EvalShadowCellSession } from "../eval/speculation/cell-session";
 import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
 import type {
 	EvalCellResult,
+	EvalHeldAgentResult,
 	EvalLanguage,
 	EvalStatusEvent,
 	EvalToolDetails,
@@ -620,6 +621,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					sessionAbortController,
 					emitUpdate,
 					foreground,
+					toolCallId: _toolCallId,
 				}),
 			);
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
@@ -830,9 +832,21 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		emitUpdate?: (text: string, details: EvalToolDetails) => void;
 		/** Whether the call still waits on the cells; `out://` replies are drawn only then. */
 		foreground: () => boolean;
+		/** The `eval` call the cells run under: the spawns their bridged calls make record it as theirs. */
+		toolCallId: string;
 	}): Promise<AgentToolResult<EvalToolDetails | undefined>> {
-		const { session, cells, languages, notice, excludeWebP, signal, sessionAbortController, emitUpdate, foreground } =
-			options;
+		const {
+			session,
+			cells,
+			languages,
+			notice,
+			excludeWebP,
+			signal,
+			sessionAbortController,
+			emitUpdate,
+			foreground,
+			toolCallId,
+		} = options;
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
@@ -852,6 +866,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 			const images: ImageContent[] = [];
 			const replies: string[] = [];
+			// Subagents whose results the cells' bridged calls handed them, by id (the latest wins).
+			// The result records them, so `omp --restore` knows this parent already holds those results.
+			const agentResults = new Map<string, EvalHeldAgentResult>();
+			const onAgentResults = (results: EvalHeldAgentResult[]): void => {
+				for (const held of results) agentResults.set(held.id, held);
+			};
 
 			const cellResults: EvalCellResult[] = cells.map(cell => ({
 				index: cell.index,
@@ -993,6 +1013,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							outputSink!.push(chunk);
 						},
 						onReply,
+						onAgentResults,
+						spawnCallId: toolCallId,
 						onStatus: event => {
 							if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
 								idle?.pause();
@@ -1105,6 +1127,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						languages,
 						cells: cellResults,
 						replies: replies.length > 0 ? replies : undefined,
+						agentResults: agentResults.size > 0 ? [...agentResults.values()] : undefined,
 						isError: true,
 					};
 					if (notice) details.notice = notice;
@@ -1135,6 +1158,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				languages,
 				cells: cellResults,
 				replies: replies.length > 0 ? replies : undefined,
+				agentResults: agentResults.size > 0 ? [...agentResults.values()] : undefined,
 			};
 			if (notice) details.notice = notice;
 

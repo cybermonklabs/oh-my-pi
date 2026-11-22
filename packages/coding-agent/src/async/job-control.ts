@@ -245,6 +245,9 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
 			...(!resultConsumed && latest.latestDetails?.meta ? { meta: latest.latestDetails.meta } : {}),
 			...(!resultConsumed && latest.structured ? { structured: latest.structured } : {}),
+			// A settled job's result hands over its subagents' results too (a work pool's workers): a `wait` or a kill
+			// that lists the job carries them, or `omp --restore` reads the owner as still waiting on them.
+			...(!running && latest.latestDetails?.agentResults ? { agentResults: latest.latestDetails.agentResults } : {}),
 			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
 			...(latest.agentOutputPublished !== undefined ? { agentOutputPublished: latest.agentOutputPublished } : {}),
 		};

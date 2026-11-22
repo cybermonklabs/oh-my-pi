@@ -323,6 +323,12 @@ export interface SessionInitEntry extends SessionEntryBase {
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/**
+	 * The parent's top-level tool call the spawn was requested under (a `task` call, or the `eval`
+	 * call whose cell spawned it). `omp --restore` reads it to tell which cut-off call started a
+	 * subagent it relaunches. Absent on older files and on spawns no call made.
+	 */
+	spawnCallId?: string;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

@@ -5,6 +5,7 @@ import {
 	resolveOutputSinkArtifactMaxBytes,
 	resolveOutputSinkHeadBytes,
 } from "../../tools/output-meta";
+import type { ExecutorBackendExecOptions } from "../backend";
 import { isEvalTimeoutControlEvent, withBridgeTimeoutPause } from "../bridge-timeout";
 import { DisplayOutputCollector } from "../executor-base";
 import type { EvalDisplayOutput } from "../types";
@@ -29,6 +30,10 @@ export interface JsExecutorOptions {
 	onStatus?: (event: JsStatusEvent) => void;
 	/** Shows the user `out://` replies of the cell's bridged tool calls; absent, those calls are refused. */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results the cell's bridged calls hand it. */
+	onAgentResults?: ExecutorBackendExecOptions["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link ExecutorBackendExecOptions.spawnCallId}). */
+	spawnCallId?: string;
 	signal?: AbortSignal;
 	sessionId: string;
 	/** Logical owner identifier; scopes retained-worker cleanup. */
@@ -172,6 +177,8 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			runState: {
 				signal,
 				onReply: options.onReply,
+				onAgentResults: options.onAgentResults,
+				spawnCallId: options.spawnCallId,
 				onText: chunk => outputSink.push(chunk),
 				onDisplay: output => {
 					if (output.type === "status") {

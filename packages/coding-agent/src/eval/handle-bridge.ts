@@ -4,6 +4,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { recordHandovers } from "./agent-job-records";
 import { withBridgeTimeoutPause } from "./bridge-timeout";
 import { type CompletionAttempt, getCompletionHandle, type CompletionHandleEntry } from "./completion-bridge";
 import type { JsStatusEvent } from "./js/shared/types";
@@ -38,6 +39,8 @@ interface EvalHandleBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Receives the agent handles whose settled results a call hands the cell, and when it handed them over. */
+	onAgentResults?: (results: Array<{ id: string; handedAt: number }>) => void;
 }
 
 type ResolvedHandle =
@@ -291,18 +294,29 @@ export async function runEvalWait(
 				throw new ToolAbortError(undefined, { cause: options.signal?.reason });
 			}
 			const snapshots = resolved.map(snapshot);
-			const settledAgentIds = resolved
-				.filter(handle => "job" in handle && handle.job.status !== "running")
-				.map(handle => handle.ref.id);
+			const settled = resolved.flatMap((handle): Array<Extract<ResolvedHandle, { job: unknown }>> =>
+				"job" in handle && handle.job.status !== "running" ? [handle] : [],
+			);
+			const runs = settled.map(handle => ({ agentId: handle.job.agentId ?? handle.job.id, jobId: handle.job.id }));
+			// `delivered` reaches the disk before the cell gets the results: a process that goes away in between
+			// leaves `delivered`, which `omp --restore` never runs again. Each run is named with when its result
+			// first reached the cell, however often the cell waits on it.
+			const handedAt = await recordHandovers(options.session, runs);
 			const manager = options.session.asyncJobManager;
-			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			if (manager && settled.length > 0) manager.consumeJobResults(settled.map(handle => handle.ref.id));
+			if (runs.length > 0)
+				options.onAgentResults?.(runs.map((run, index) => ({ id: run.agentId, handedAt: handedAt[index]! })));
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,
 	);
 }
 
-/** Return one handle's current state without waiting or consuming it. */
+/**
+ * Return one handle's current state without waiting or consuming it. The cell's `status()`,
+ * `done()` and `attempts()` read only the state and the attempts from it, never a result, so it
+ * records no handover and reports no agent result.
+ */
 export function runEvalStatus(args: unknown, options: EvalHandleBridgeOptions): EvalHandleSnapshot {
 	const resolved = resolveHandle(parseSingleRef(args), options);
 	const result = snapshot(resolved);

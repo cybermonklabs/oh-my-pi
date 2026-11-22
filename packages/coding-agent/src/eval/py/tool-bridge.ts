@@ -10,7 +10,12 @@
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
-import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
+import {
+	bridgeValueFromToolResult,
+	callSessionTool,
+	type JsStatusEvent,
+	type ToolBridgeOptions,
+} from "../js/tool-bridge";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 
 export interface PyToolBridgeEntry {
@@ -32,6 +37,10 @@ export interface PyToolBridgeEntry {
 	emitStatus?: (event: JsStatusEvent) => void;
 	/** Shows the user `out://` replies of bridged calls (`ToolBridgeOptions.onReply`). */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results bridged calls hand the cell. */
+	onAgentResults?: ToolBridgeOptions["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link ToolBridgeOptions.spawnCallId}). */
+	spawnCallId?: string;
 	abortRequested?: () => boolean;
 }
 
@@ -129,6 +138,8 @@ async function callSessionToolPromptOnAbort(
 		signal: entry.signal,
 		emitStatus: entry.emitStatus,
 		onReply: entry.onReply,
+		onAgentResults: entry.onAgentResults,
+		spawnCallId: entry.spawnCallId,
 		identity,
 	});
 	const signal = entry.shieldedSignal ?? entry.signal;

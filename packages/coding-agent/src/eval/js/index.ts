@@ -52,6 +52,8 @@ export default {
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,
 			onReply: opts.onReply,
+			onAgentResults: opts.onAgentResults,
+			spawnCallId: opts.spawnCallId,
 			session: opts.session,
 			localRoots: resolveEvalUrlRoots(opts.session),
 		});
