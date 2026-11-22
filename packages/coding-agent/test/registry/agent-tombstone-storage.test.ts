@@ -187,6 +187,75 @@ describe("agent kill tombstone storage", () => {
 		}
 	});
 
+	// A live session writes back a transcript that vanished at its next entry (the session manager
+	// rewrites a file it cannot account for): a turn in flight records its message as the kill's
+	// dispose stops it, and the kill then marks the transcript the session wrote
+	// (executor-routing.test.ts kills such a worker-homed child). A dispose that writes no
+	// transcript leaves the kill failing as above, also when it makes the directory for something else.
+	describe("a live file-backed subagent whose transcript directory is gone", () => {
+		it("fails the kill of an idle live session whose dispose writes no transcript back", async () => {
+			const storage = new FileSessionStorage();
+			useDefault(storage);
+			const dir = tempDir("@omp-tombstone-live-gone-");
+			const workerId = "Live-Gone";
+			const { root, sessionFile } = await subagentTranscript(dir, storage, workerId);
+			const authStorage = await AuthStorage.create(dir.join("auth.db"));
+			cleanups.push(() => authStorage.close());
+			authStorage.keys.setRuntime("openai", "test-key");
+			const sessionManager = await SessionManager.open(sessionFile, dir.join("main"), storage);
+			await createAgentSession({
+				cwd: dir.path(),
+				agentDir: dir.path(),
+				modelRegistry: new ModelRegistry(authStorage),
+				sessionManager,
+				settings: Settings.isolated({ "archive.enabled": false }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				agentId: workerId,
+				taskDepth: 1,
+				parentAgentId: MAIN_AGENT_ID,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			const ref = AgentRegistry.global().get(workerId);
+			expect(ref).toMatchObject({ status: "running", sessionFile });
+			expect(ref?.session).toBeTruthy();
+			fs.rmSync(path.dirname(sessionFile), { recursive: true, force: true });
+
+			await expect(
+				AgentLifecycleManager.global().release(workerId, ref!, { tombstone: true }),
+			).rejects.toMatchObject({ code: "ENOENT" });
+
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			expect(fs.existsSync(`${sessionFile}.tombstone`)).toBe(false);
+			expect(AgentRegistry.global().get(workerId)).toMatchObject({ status: "aborted", session: null });
+			expect(await rescanned(root, storage, workerId)).toBeUndefined();
+		}, 30_000);
+
+		it("fails the kill when the dispose makes the directory but writes no transcript", async () => {
+			useDefault(new FileSessionStorage());
+			const dir = tempDir("@omp-tombstone-live-gone-");
+			const workerId = "Artifact-Gone";
+			const sessionFile = dir.join("gone", `${workerId}.jsonl`);
+			const ref = registerLive(workerId, sessionFile, new FileSessionStorage(), () => {
+				fs.mkdirSync(dir.join("gone"), { recursive: true });
+				fs.writeFileSync(dir.join("gone", `${workerId}.md`), "output");
+			});
+
+			await expect(AgentLifecycleManager.global().release(workerId, ref, { tombstone: true })).rejects.toMatchObject(
+				{ code: "ENOENT" },
+			);
+
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			expect(fs.existsSync(`${sessionFile}.tombstone`)).toBe(false);
+		});
+	});
+
 	for (const backend of LEASE_BACKENDS) {
 		// Except where a case says otherwise, the process default is file storage
 		// (an SDK host that never installs another), while the subagent's

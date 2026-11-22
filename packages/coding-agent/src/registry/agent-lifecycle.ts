@@ -24,7 +24,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { AgentSessionDisposeOptions, OwnedJobsEnd } from "../session/agent-session-types";
 import { isSameJournalFile, sessionJournalLiveness } from "../session/session-storage";
@@ -865,13 +865,23 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 					logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
 				}
 			}
+			let unmarked: { sessionFile: string; storage: SessionStorage; error: unknown } | undefined;
 			try {
 				if (options?.tombstone && ref.sessionFile) {
 					// The live session's storage, else the one the ref was registered or
 					// scanned with; the process default only when neither is known.
 					const storage =
 						live?.sessionManager?.getStorage?.() ?? refSessionStorage(ref) ?? defaultSessionStorage();
-					await persistAgentTombstone(ref.sessionFile, storage);
+					try {
+						await persistAgentTombstone(ref.sessionFile, storage);
+					} catch (error) {
+						// A live session writes back a transcript that vanished at its next entry
+						// (SessionManager#appendToCurrentSessionFile rewrites a file it cannot
+						// account for), and its dispose below records entries. A missing
+						// directory now is not yet a missing transcript: decide after the dispose.
+						if (!live || !isEnoent(error)) throw error;
+						unmarked = { sessionFile: ref.sessionFile, storage, error };
+					}
 				}
 			} finally {
 				// Detaching removes the registry's only route to the live session. Always
@@ -893,6 +903,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 						error: String(error),
 					});
 				}
+			}
+			if (unmarked) {
+				// Still gone after the dispose: there is nothing to mark, and the kill fails
+				// as file storage's does. Back again: mark the transcript the session wrote.
+				if (!(await unmarked.storage.exists(unmarked.sessionFile))) throw unmarked.error;
+				await persistAgentTombstone(unmarked.sessionFile, unmarked.storage);
 			}
 			if (!options?.tombstone) this.#registry.unregister(id, ref);
 			return true;

@@ -633,4 +633,25 @@ describe("subagent runs routed into pooled workers", () => {
 		},
 		TEST_TIMEOUT_MS,
 	);
+
+	it(
+		"kills a worker-homed child whose transcript directory is gone, and marks the transcript its session writes back",
+		async () => {
+			const running = runSubprocess(runOptions("WorkerGone", HANG_TASK));
+			await server.hung();
+			const ref = AgentRegistry.global().get("WorkerGone");
+			if (!ref?.sessionFile) throw new Error("no session file on the ref");
+			mirrorOf(ref.session);
+			await fs.rm(path.dirname(ref.sessionFile), { recursive: true, force: true });
+
+			// The child's dispose (in its worker) writes the vanished transcript back; the kill then marks it.
+			expect(await AgentLifecycleManager.global().release("WorkerGone", ref, { tombstone: true })).toBe(true);
+			await running;
+
+			expect(await fs.exists(ref.sessionFile)).toBe(true);
+			expect(await fs.exists(`${ref.sessionFile}.tombstone`)).toBe(true);
+			expect(AgentRegistry.global().get("WorkerGone")?.status).toBe("aborted");
+		},
+		TEST_TIMEOUT_MS,
+	);
 });
