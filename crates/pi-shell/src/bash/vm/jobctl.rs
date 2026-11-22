@@ -1857,7 +1857,10 @@ mod tests {
 		(shell, host, store, master)
 	}
 
-	/// Whether the shell continued job `id` (its `SIGCONT` was delivered).
+	/// Whether the shell continued job `id`: the `Signal` event its
+	/// delivery writes (`deliver`) before it looks the job up. The fixture's
+	/// job has no vproc (`Vpid(99)`), so this shows that the shell sent the
+	/// job its `SIGCONT`, not that the job ran again.
 	fn continued(host: &crate::testkit::FakeHost, id: JobId) -> bool {
 		let want = serde_json::to_value(crate::bash::EventData::Signal {
 			sig:    Signal::Cont,
@@ -1882,6 +1885,26 @@ mod tests {
 			assert!(Instant::now() < deadline, "DEADLINE: the run did not end within 10 s");
 			std::thread::sleep(Duration::from_millis(5));
 		}
+	}
+
+	/// Step `shell` until it blocks (nothing can run until what it waits
+	/// for wakes it) or a run ends: whether a run ended. At most 1,000
+	/// steps. The window ends on the shell's own state, not on time: a test
+	/// that holds the writer threads holds them for as long as the shell can
+	/// go on without them, however its process is scheduled.
+	fn step_until_blocked_or_done(
+		shell: &mut crate::bash::Shell,
+		host: &mut crate::testkit::FakeHost,
+		store: &mut MemStore,
+	) -> bool {
+		for _ in 0..1_000 {
+			match shell.step(&mut Cx { host, store }, crate::bash::Budget::default()) {
+				crate::bash::Step::Blocked => return false,
+				crate::bash::Step::Done { .. } => return true,
+				_ => {},
+			}
+		}
+		panic!("the shell neither blocked nor ended its run within 1,000 steps");
 	}
 
 	/// Two notices, the second queued while the terminal's writer thread
@@ -1985,18 +2008,10 @@ mod tests {
 					.set(1, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
 				let held = crate::sys::hold_writers();
 				shell.submit(crate::bash::Script::command(b"set -m; bg %1".to_vec()));
-				let until = Instant::now() + Duration::from_millis(500);
-				while Instant::now() < until {
-					let step = shell.step(
-						&mut Cx { host: &mut host, store: &mut store },
-						crate::bash::Budget::default(),
-					);
-					assert!(
-						!matches!(step, crate::bash::Step::Done { .. }),
-						"the run ended while its line was held"
-					);
-					std::thread::sleep(Duration::from_millis(5));
-				}
+				assert!(
+					!step_until_blocked_or_done(&mut shell, &mut host, &mut store),
+					"the run ended while its line was held"
+				);
 				assert!(!continued(&host, JOB), "the job was continued while its line was held");
 				drop(held);
 				let status = step_until_done(&mut shell, &mut host, &mut store);
@@ -2035,7 +2050,8 @@ mod tests {
 	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
 	/// while a job notice is still going out to the terminal: its message
 	/// goes to the fd 2 its redirections left (the file), not to the fd 2
-	/// they restore. Waiting behind the notice sent it to the restored one.
+	/// they restore. Waiting behind the notice at the failure sent it to the
+	/// restored one.
 	#[test]
 	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_a_notice_waits() {
 		crate::sys::in_blocking_writer_process(
@@ -2050,20 +2066,203 @@ mod tests {
 				shell.submit(crate::bash::Script::command(
 					b"{ :; } 2>/tmp/err.log >/no/such/dir/f".to_vec(),
 				));
-				let until = Instant::now() + Duration::from_secs(2);
-				let mut done = false;
-				while !done && Instant::now() < until {
-					let step = shell.step(
-						&mut Cx { host: &mut host, store: &mut store },
-						crate::bash::Budget::default(),
-					);
-					done = matches!(step, crate::bash::Step::Done { .. });
-					std::thread::sleep(Duration::from_millis(5));
-				}
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
 				drop(held);
 				if !done {
 					let _ = step_until_done(&mut shell, &mut host, &mut store);
 				}
+				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
+					.into_owned();
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert!(
+					file.contains("No such file or directory"),
+					"the message is not in the redirected stderr: file {file:?}, restored stderr \
+					 {stderr:?}"
+				);
+				assert!(
+					!stderr.contains("No such file or directory"),
+					"the message went to the restored stderr"
+				);
+			},
+		);
+	}
+
+	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
+	/// while the line editor's display bytes are still in the terminal's
+	/// writer thread (the editor flushes once at the end of a line and goes
+	/// on): the command waits for them before it applies its redirections,
+	/// so its message goes to the fd 2 they left (the file). The message
+	/// waited behind the bytes past the restore, and went to the restored
+	/// fd 2.
+	#[test]
+	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_the_editors_bytes_wait() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_goes_to_its_redirected_stderr_while_the_editors_bytes_wait"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				let mut tty = super::super::zle::tty::Tty::open(&shell.k).unwrap();
+				tty.put(b"% prompt");
+				assert!(tty.flush(&shell.k).is_some(), "the editor's bytes were out while held");
+				let mut zle = super::super::zle::Zle::new(false);
+				zle.tty = Some(tty);
+				shell.procs[0].zle = Some(Box::new(zle));
+				shell.submit(crate::bash::Script::command(
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/f".to_vec(),
+				));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
+					.into_owned();
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert!(
+					file.contains("No such file or directory"),
+					"the message is not in the redirected stderr: file {file:?}, restored stderr \
+					 {stderr:?}"
+				);
+				assert!(
+					!stderr.contains("No such file or directory"),
+					"the message went to the restored stderr"
+				);
+				assert_eq!(read_terminal(&mut master, 8), "% prompt");
+			},
+		);
+	}
+
+	/// The terminal written as zsh writes its standard error: each write is
+	/// made at once, on the caller's thread. Were fd 2 on a writer thread of
+	/// its own as well, which of two held writes reached the terminal first
+	/// once they were let go would be a race between the two threads; written
+	/// at once, a message that does not wait for a held notice is on the
+	/// terminal before it.
+	struct WrittenAtOnce(std::fs::File);
+
+	impl crate::bash::File for WrittenAtOnce {
+		fn poll_read(
+			&mut self,
+			_cx: &mut Context<'_>,
+			_buf: &mut [u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(std::io::Write::write(&mut self.0, buf))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: crate::bash::fs::SeekFrom) -> std::io::Result<u64> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Tty
+		}
+
+		fn os_handle(&self) -> Option<crate::bash::host::OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> std::io::Result<Box<dyn crate::bash::File>> {
+			Ok(Box::new(Self(self.0.try_clone()?)))
+		}
+	}
+
+	/// A compound command whose redirection fails (`{ :; } >/no/f`) with
+	/// fd 2 on the terminal, while a job notice is still going out there:
+	/// the message comes after the notice, as zsh writes the notice with
+	/// blocking writes first. Written without waiting for the notice, the
+	/// message came first.
+	#[test]
+	fn a_failed_redirections_message_reaches_the_terminal_after_a_job_notice() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_reaches_the_terminal_after_a_job_notice"
+			),
+			|| {
+				let (mut shell, mut host, mut store) = bash_shell();
+				let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
+				let slave = std::fs::File::from(slave);
+				let stderr = WrittenAtOnce(slave.try_clone().unwrap());
+				let tty = crate::sys::StdFile::new(slave);
+				shell.k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
+				shell.k.jobctl.root = Some(shell.procs[0].vpid);
+				shell.procs[0]
+					.fds
+					.set(2, Some(FdRef::open(Box::new(stderr), FdOrigin::Host)));
+				let mut master = std::fs::File::from(master);
+				crate::sys::test_probe::set_nonblocking(&master);
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				shell.submit(crate::bash::Script::command(b"{ :; } >/no/such/dir/f".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let want = "[1]  + continued  sleep 100\r\nbash: line 1: /no/such/dir/f: No such file \
+				            or directory\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A compound command whose redirection fails after the op applied an
+	/// earlier one and parked (`{ :; } 2>err >/no/$(echo f)`, on the
+	/// substitution), with a job notice queued while it was parked, as the
+	/// scheduler reports a job between steps: the message still goes to the
+	/// fd 2 the redirections left (the file). The op waits for the notices
+	/// only before it applies anything; at the failure it cannot wait, since
+	/// the restore follows in the same step.
+	#[test]
+	fn a_failed_redirections_message_goes_to_its_redirected_stderr_past_a_notice_queued_mid_way() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_goes_to_its_redirected_stderr_past_a_notice_queued_mid_way"
+			),
+			|| {
+				let (mut shell, mut host, mut store, _master) = shell_with_a_terminal();
+				let stderr = shell.procs[0].fds.handle(2);
+				shell.submit(crate::bash::Script::command(
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/$(echo f)".to_vec(),
+				));
+				let one_op = crate::bash::Budget { max_ops: 1, max_ns: u64::MAX };
+				let mut held = None;
+				let mut queued = false;
+				let mut done = false;
+				for _ in 0..100_000 {
+					match shell.step(&mut Cx { host: &mut host, store: &mut store }, one_op) {
+						crate::bash::Step::Done { .. } => {
+							done = true;
+							break;
+						},
+						// The shell waits for the notice: it may go now.
+						crate::bash::Step::Blocked => {
+							held = None;
+							std::thread::sleep(Duration::from_millis(1));
+						},
+						_ => {},
+					}
+					if !queued && !shell.procs[0].fds.handle(2).same(&stderr) {
+						held = Some(crate::sys::hold_writers());
+						notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+						queued = true;
+					}
+				}
+				drop(held);
+				assert!(queued, "the op applied its redirections in one step: no notice came mid-way");
+				assert!(done, "the run did not end within 100,000 steps");
 				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
 					.into_owned();
 				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();

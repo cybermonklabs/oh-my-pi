@@ -850,9 +850,12 @@ pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 
 /// [`flush_out`] without waiting for the shell's job notices: for a
 /// failed compound redirection's message, which belongs on the fd 2 its
-/// redirections left and cannot wait past their restore one op later
-/// (waiting there would apply the redirection again, and print its
-/// message twice).
+/// redirections left. The `Redir` op restores the fds in the same step,
+/// right after this ([`clear_scratch`]), and cannot wait in between: an op
+/// that waits runs again, which would try the failed redirection again and
+/// print its message twice. The op waits for the notices and the editor's
+/// display bytes before it applies anything, so only a notice queued while
+/// it was parked mid-way can still be going out here.
 fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
@@ -862,6 +865,9 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 		&& t.flush(k).is_some()
 	{
 		return Some(tty::FD);
+	}
+	if vp.out.is_empty() {
+		return None;
 	}
 	let waker = k.waker.clone();
 	let mut cx = Context::from_waker(&waker);
@@ -3038,36 +3044,50 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore. Not
-				// behind the shell's job notices ([`flush_out`]'s gate): this
-				// op cannot wait and keep its redirections (the restore is the
-				// next step), so waiting would send the message to the
-				// restored fd 2. The notices that can go out go first.
-				super::jobctl::drain_shout(k);
-				let _ = flush_queued(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			// The shell's output to its terminal goes first: its job notices
+			// still going out and the editor's display bytes, as zsh's
+			// blocking writes ordered them ([`flush_out`]). Waited for on the
+			// op's first entry, before any redirection is applied, so a failed
+			// redirection's message comes after them and goes to the fd 2 the
+			// redirections left; a later entry resumes the list where it
+			// parked.
+			if top_frame(vp).scratch.is_none()
+				&& let Some(fd) = flush_out(k, vp)
+			{
+				return Flow::Block(WaitKey::Write { fd });
+			}
+			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore. A notice
+					// queued while the op was parked mid-way is handed to the
+					// terminal first ([`jobctl::drain_shout`] does not wait for it
+					// to be written); the message does not wait behind it, since
+					// the restore follows in this step ([`flush_queued`]).
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
