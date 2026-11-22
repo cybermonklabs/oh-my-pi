@@ -15,9 +15,9 @@ use super::{
 	expand::{self, Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, JobProc,
+		JobProcs, LastBg, LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -4156,6 +4156,29 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 	}
 }
 
+/// Whether the `( … )` whose `Spawn` is at `pc` is the last stage of a
+/// pipeline that is a background job's whole command ([`job_pipeline`]):
+/// its stage starts there, past a redirection and the `Enter`
+/// ([`stage_level`]'s shape).
+fn job_last_stage(unit: &Unit, pc: u32) -> bool {
+	let starts_at = |entry: u32| {
+		let op = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+		let enter = if op(entry) == Some(Opcode::Redir) {
+			entry + 1
+		} else {
+			entry
+		};
+		op(enter) == Some(Opcode::Enter) && enter + 1 == pc
+	};
+	unit.ops.iter().enumerate().any(|(at, op)| {
+		op.code == Opcode::Spawn
+			&& unit.spawns.get(op.a as usize).is_some_and(|s| {
+				s.kind == SpawnKind::Pipeline && s.stages.last().is_some_and(|st| starts_at(st.entry))
+			})
+			&& u32::try_from(at).is_ok_and(|at| job_pipeline(unit, at))
+	})
+}
+
 /// Whether the background job whose body starts at `entry` may be known by
 /// its program's OS pid ([`Bang`]): its body is one simple command
 /// ([`BangStage::Lone`]), a group that `exec`s one (`{ exec cmd; }`,
@@ -4209,7 +4232,7 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 /// Whether the pipeline `Spawn` at `pc` is the whole command of a
 /// background job (`a | b &`): bash runs that pipeline as the job
 /// (`execute_pipeline`'s `asynchronous`), so its stages are the job's
-/// processes. bash runs one of an `&&`
+/// processes ([`crate::bash::store::Job::procs`]). bash runs one of an `&&`
 /// or `||` list, or one under `time`, in a subshell of its own; obash's
 /// `!` follows the spawn (`Not`), so it counts none under `!` either.
 pub(super) fn job_pipeline(unit: &Unit, pc: u32) -> bool {
@@ -4224,6 +4247,35 @@ pub(super) fn job_pipeline(unit: &Unit, pc: u32) -> bool {
 		.spawns
 		.iter()
 		.any(|s| s.kind == SpawnKind::Background && s.stages.first().is_some_and(|st| st.entry == pc))
+}
+
+/// The processes of the background job of vproc `job` whose command starts
+/// at `entry`, if that command is a pipeline ([`job_pipeline`]): bash forks
+/// each stage as it starts the job, the job's status taken under the
+/// `pipefail` on then (`stop_pipeline`'s `J_PIPEFAIL`). Each names the
+/// job's vproc until that vproc starts the stages
+/// ([`super::Shell::stages_started`]). None for a zsh job whose vproc runs
+/// the last stage itself (`last1`, outside sh emulation, as [`spawn`]
+/// decides `lastpipe`).
+fn pipeline_job(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	unit: &Unit,
+	entry: u32,
+	job: Vpid,
+) -> Option<JobProcs> {
+	if !job_pipeline(unit, entry)
+		|| (unit.mode.dialect() == Dialect::Zsh && vp.mode != ModeId::ZshSh)
+	{
+		return None;
+	}
+	let s = unit.spawns.get(unit.ops.get(entry as usize)?.a as usize)?;
+	let list = (0..s.stages.len())
+		.map(|i| JobProc::started(job, super::killed::stage_command(k, cx, vp, unit, s, i)))
+		.collect();
+	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
+	Some(JobProcs { list, pipefail })
 }
 
 /// Whether the `( … )` that `info` spawns at `pc` is the whole body of a
@@ -4364,6 +4416,18 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				if in_place {
 					child.zsh_state().in_place = true;
 				}
+				// zsh's job process runs its pipeline's last stage itself
+				// (`last1`), and a `( … )` there runs in that process without a
+				// fork: no level of its own (`true | ( echo $ZSH_SUBSHELL ) &`
+				// prints 1, zsh 5.9).
+				if info.kind == SpawnKind::Subshell
+					&& vp.mode.dialect() == Dialect::Zsh
+					&& vp.mode != ModeId::ZshSh
+					&& vp.parent.is_some()
+					&& job_last_stage(unit, top_frame(vp).pc)
+				{
+					super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+				}
 				if child.mode.dialect() != Dialect::Zsh
 					|| !async_subshell_body(unit, top_frame(vp).pc, info)
 				{
@@ -4394,7 +4458,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					if op.flags & Op::DISOWN == 0 {
 						let text = job_text(k, cx, vp, unit, op.node);
 						let cwd = vp.cwd.clone();
+						let procs = pipeline_job(k, cx, vp, unit, info.stages[0].entry, vpid);
 						let number = vp.jobs.add(job, vpid, text, control, cwd);
+						if let (Some(procs), Some(entry)) = (procs, vp.jobs.get_mut(number)) {
+							entry.procs = Some(Box::new(procs));
+						}
 						if vp.parent.is_none() {
 							super::jobctl::started(k, cx, vpid, number);
 						}
@@ -4413,15 +4481,23 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			SpawnKind::Pipeline => {
 				let n = info.stages.len();
 				let tap = cx.host.pipe_tap();
-				// `lastpipe` without job control: the last stage runs here. zsh
-				// runs it in the current shell but under sh emulation
-				// (`execcmd_exec`'s `last1 == 2 && input &&
+				// `lastpipe` without job control: the last stage runs here, for
+				// a pipeline bash waits for (`execute_cmd.c:2735`,
+				// `asynchronous == 0`): never for the pipeline a background
+				// job's vproc runs as the job ([`job_pipeline`]), whose every
+				// stage is a process of the job. zsh runs the last stage in
+				// the current shell (the job's own process too) but under sh
+				// emulation (`execcmd_exec`'s `last1 == 2 && input &&
 				// EMULATION(EMULATE_SH)`).
+				// The pipeline a background job's vproc runs as the job: each
+				// stage is a process of the job.
+				let job_stages = vp.parent.is_some() && job_pipeline(unit, top_frame(vp).pc);
 				let lastpipe = if unit.mode.dialect() == Dialect::Zsh {
 					vp.mode != ModeId::ZshSh
 				} else {
 					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
 						&& !job_control(k, cx, vp)
+						&& !job_stages
 				};
 				if !lastpipe {
 					super::killed::cleanup_dead_jobs(vp);
@@ -4442,7 +4518,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						let line_shift = top_frame(vp).line_shift;
 						let sc = scratch(vp);
 						sc.children = children.into_iter().map(|v| (v, None)).collect();
-						sc.inline = Some(InlineStage::Running);
+						sc.pipeline().inline = Some(InlineStage::Running);
 						let mut frame = Frame::new(Some(Arc::clone(unit)), stage.entry, FrameKind::Stage);
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
@@ -4472,8 +4548,16 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
 					zsh_subshell_traps(k, cx, &mut child, true);
-					let level = stage_level(unit, stage.entry, false);
-					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
+					// bash forks each stage of a background job's pipeline as an
+					// asynchronous command of the shell that started the job
+					// (`execute_pipeline` with `asynchronous`), one level below
+					// it, as zsh does: the job's vproc is that level already.
+					let depth = if job_stages {
+						super::subshell_depth(vp).saturating_sub(1) + stage_level(unit, stage.entry, true)
+					} else {
+						super::subshell_depth(vp) + stage_level(unit, stage.entry, false)
+					};
+					super::set_subshell_depth(&mut child, depth);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
 					// stage (`jobs -p | xargs kill`).
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
@@ -4493,14 +4577,26 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				k.emit_op(cx, vp, op.node, EventData::Pipeline { stages: &children });
 			},
 		}
-		scratch(vp).children = children.into_iter().map(|v| (v, None)).collect();
+		// A pipeline's stages are the processes of the job the shell waits
+		// for, of which a notice names each; those of a background job's
+		// pipeline are that job's ([`super::Shell::stages_started`]).
+		let waits = info.kind == SpawnKind::Pipeline
+			&& !(vp.parent.is_some() && job_pipeline(unit, top_frame(vp).pc));
+		let sc = scratch(vp);
+		if waits {
+			let started = children
+				.iter()
+				.map(|&v| JobProc::started(v, BString::default()));
+			sc.pipeline().procs.list.extend(started);
+		}
+		sc.children = children.into_iter().map(|v| (v, None)).collect();
 		super::wait_starts(k, cx, vp);
 	}
 	let status = vp.status;
 	let sc = scratch(vp);
-	if sc.inline == Some(InlineStage::Running) {
+	if sc.inline() == Some(InlineStage::Running) {
 		// Back from the last stage's frame.
-		sc.inline = Some(InlineStage::Done(status));
+		sc.pipeline().inline = Some(InlineStage::Done(status));
 	}
 	for (vpid, status) in &mut sc.children {
 		if status.is_none() {
@@ -4510,17 +4606,25 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	if let Some((vpid, _)) = sc.children.iter().find(|(_, s)| s.is_none()) {
 		return Flow::Block(WaitKey::Proc(*vpid));
 	}
+	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
+	let sc = scratch(vp);
 	let mut statuses: Vec<i32> = sc.children.iter().map(|(_, s)| s.unwrap_or(0)).collect();
-	if let Some(InlineStage::Done(last)) = sc.inline {
+	if let Some(InlineStage::Done(last)) = sc.inline() {
 		statuses.push(last);
 	}
+	// A signal ended the process whose end is the pipeline's status: its
+	// processes, for the notice.
+	let killed = sc.pipeline.as_deref_mut().and_then(|p| {
+		p.procs.pipefail = pipefail;
+		let sig = p.procs.signal()?;
+		Some((sig, std::mem::take(&mut p.procs)))
+	});
 	clear_scratch(&mut k.root, cx.store, vp);
 	// The job's end decides on an `INT` the vproc held for it.
 	super::end_held_sigint(k, vp, false);
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
 		super::jobctl::fg_done(k, cx, vp, None, b"");
 	}
-	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
 	vp.status = if pipefail {
 		statuses
 			.iter()
@@ -4532,6 +4636,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		statuses.last().copied().unwrap_or(0)
 	};
 	vp.pipestatus = statuses;
+	if let Some((sig, procs)) = killed {
+		super::killed::pipeline_ended(k, cx, vp, unit, info, op.node, sig, procs);
+	}
 	Flow::Jump(info.end)
 }
 

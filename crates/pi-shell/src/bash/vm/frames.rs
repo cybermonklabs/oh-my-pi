@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 36;
+pub const FRAMES_VERSION: u32 = 37;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -379,6 +379,9 @@ struct ScratchImage {
 	input:        Vec<u8>,
 	saved:        Vec<SavedImage>,
 	children:     Vec<(Vpid, Option<i32>)>,
+	/// How the stages of a pipeline the shell waits for ended so far
+	/// ([`super::proc::PipelineWait::procs`]).
+	procs:        super::proc::JobProcs,
 	inline:       Option<super::proc::InlineStage>,
 }
 
@@ -476,7 +479,8 @@ fn scratch_image(
 		input: io.map_or_default(|io| io.input.clone()),
 		saved: saved_image(io.map_or_default(|io| io.saved.as_slice()), fds),
 		children: sc.children.clone(),
-		inline: sc.inline,
+		procs: sc.pipeline.as_ref().map_or_default(|p| p.procs.clone()),
+		inline: sc.inline(),
 	}
 }
 
@@ -1048,7 +1052,12 @@ impl Shell {
 							io,
 							live,
 							children: img.children,
-							inline: img.inline,
+							pipeline: (img.inline.is_some() || !img.procs.list.is_empty()).then(|| {
+								Box::new(super::proc::PipelineWait {
+									inline: img.inline,
+									procs:  img.procs,
+								})
+							}),
 							..Scratch::default()
 						}))
 					},

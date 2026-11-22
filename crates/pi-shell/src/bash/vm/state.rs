@@ -3062,8 +3062,10 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
 /// deleted. A job's facts ([`Job::facts`]) are a record of their own,
-/// written with the job's record when it changes (they change only with
-/// its state).
+/// written with the job's record when it changes, and when they change
+/// without it (a pipeline's processes start and end while the job runs,
+/// [`Job::procs`]): those of a job that has any are compared with their
+/// record too. A job's facts never go, so one without any has none written.
 fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
 	let same_ids =
@@ -3090,6 +3092,22 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		};
 		if !written {
 			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
+		}
+		let facts_written = if !written {
+			false
+		} else if !job.has_facts() {
+			true
+		} else {
+			match store.get(Key::JobFacts(job.id)) {
+				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+				Ok(_) => false,
+				Err(err) => {
+					root.fail(err);
+					return;
+				},
+			}
+		};
+		if !facts_written {
 			let facts = job.facts();
 			root.write(
 				store,

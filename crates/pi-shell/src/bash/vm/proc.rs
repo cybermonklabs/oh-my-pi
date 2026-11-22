@@ -6,7 +6,7 @@ use bstr::BString;
 use serde::{Deserialize, Serialize};
 
 use super::state::{Overlay, Scope};
-pub use crate::bash::store::{Job, JobState};
+pub use crate::bash::store::{Job, JobProc, JobProcs, JobState, ProcState};
 use crate::bash::{
 	event::{OriginChain, ResolvedKind, WaitKey},
 	fd::{FdRef, FdTable},
@@ -606,9 +606,23 @@ impl JobTable {
 			wd,
 			os_pid: None,
 			signal: None,
+			procs: None,
 		});
 		self.reset_current();
 		number
+	}
+
+	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
+	/// the program of OS pid `pid`.
+	pub fn proc_settled(&mut self, vpid: Vpid, pid: u32) {
+		if let Some(p) = self
+			.list
+			.iter_mut()
+			.filter_map(|j| j.procs.as_deref_mut())
+			.find_map(|procs| procs.get_mut(vpid))
+		{
+			p.os_pid = Some(pid);
+		}
 	}
 
 	/// Remove job `number` (bash `delete_job`); a removed current or
@@ -1484,8 +1498,10 @@ pub struct Scratch {
 	pub live:        Live,
 	/// Children of a `Spawn` op, with their statuses as they exit.
 	pub children:    Vec<(Vpid, Option<i32>)>,
-	/// A `Spawn` running its last stage in this shell (`lastpipe`).
-	pub inline:      Option<InlineStage>,
+	/// A pipeline `Spawn`'s own progress ([`PipelineWait`]), created on
+	/// first use ([`Self::pipeline()`]) and kept, cleared, by
+	/// [`Self::recycle`]: one pointer, most ops have none.
+	pub pipeline:    Option<Box<PipelineWait>>,
 	/// A finished `Exec`'s state kept so the next command reuses its
 	/// allocations; never serialized.
 	pub spare_exec:  Option<Box<ExecState>>,
@@ -1499,7 +1515,7 @@ impl Scratch {
 	/// Clear for the next op, keeping allocations: a finished `Exec`'s
 	/// state becomes the spare.
 	pub fn recycle(&mut self) {
-		let Self { logs, sub, exec, io, live, children, inline, spare_exec, spare_words: _ } = self;
+		let Self { logs, sub, exec, io, live, children, pipeline, spare_exec, spare_words: _ } = self;
 		for log in logs {
 			log.clear();
 		}
@@ -1518,7 +1534,31 @@ impl Scratch {
 			*live = Live::None;
 		}
 		children.clear();
-		*inline = None;
+		if let Some(pipeline) = pipeline {
+			pipeline.inline = None;
+			pipeline.procs.list.clear();
+			pipeline.procs.pipefail = false;
+		}
+	}
+
+	/// A pipeline `Spawn`'s progress, created on first use.
+	pub fn pipeline(&mut self) -> &mut PipelineWait {
+		self.pipeline.get_or_insert_with(Box::default)
+	}
+
+	/// The last stage of a `Spawn`'s pipeline running in this shell
+	/// (`lastpipe`), if any ([`PipelineWait::inline`]).
+	pub fn inline(&self) -> Option<InlineStage> {
+		self.pipeline.as_ref().and_then(|p| p.inline)
+	}
+
+	/// The process of vproc `vpid` of the pipeline the `Spawn` waits for
+	/// ([`PipelineWait::procs`]).
+	pub fn process_mut(&mut self, vpid: Vpid) -> Option<&mut JobProc> {
+		self
+			.pipeline
+			.as_deref_mut()
+			.and_then(|p| p.procs.get_mut(vpid))
 	}
 
 	/// The op's I/O progress, created on first use (the first redirection,
@@ -1540,6 +1580,20 @@ impl Scratch {
 	pub fn probing(&self) -> Option<&Probe> {
 		self.io.as_ref().and_then(|io| io.probing.as_ref())
 	}
+}
+
+/// What a pipeline `Spawn` keeps beside its children ([`Scratch::pipeline`]).
+#[derive(Default)]
+pub struct PipelineWait {
+	/// Its last stage running in this shell (`lastpipe`).
+	pub inline: Option<InlineStage>,
+	/// Its processes, when the shell waits for it (bash's foreground job's
+	/// `PROCESS` list), each with how it ended as it is reaped, and the
+	/// `pipefail` it ended under: the notice of one a signal killed names
+	/// them ([`super::killed::pipeline_ended`]). None under `lastpipe`, nor
+	/// for the pipeline that is a background job's command (that job's,
+	/// [`Job::procs`]).
+	pub procs:  JobProcs,
 }
 
 /// The I/O progress of an op: redirections, the fds they saved, file

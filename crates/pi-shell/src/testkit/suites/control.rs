@@ -372,6 +372,127 @@ fn a_killed_externals_death_outlives_every_snapshot() {
 	}
 }
 
+/// The processes of a root pipeline job ([`crate::bash::store::Job::procs`])
+/// outlive a store image (`MemStore::to_bytes`, `from_bytes`) and a
+/// restore: the next run's first line reports the job as the run without
+/// the image does, a line for each process `kill %1` ended. Those the job's
+/// vproc started (`$!` waits for that) are named by their own vprocs; those
+/// it had not started yet ended with it, and name it.
+#[test]
+fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
+	const GONE: &str = "while kill -0 %1 2>/dev/null; do :; done";
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let text = "{ while :; do\n    :;\ndone; }";
+	for (start, started) in [(": $!; ", true), ("", false)] {
+		let run = |snapshot: bool| {
+			let mut r = rig();
+			let job = format!("{text} | {text} & {start}kill -KILL %1; {GONE}");
+			r.run(Script::command(job.as_bytes()), Fault::None);
+			assert_eq!(r.host.stderr.bytes(), b"", "nothing reports in the first run");
+			if snapshot {
+				r.snapshot();
+			}
+			let status = r.run(Script::command(&b"echo next"[..]), Fault::None);
+			let out = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+			(status, out(r.host.stdout.bytes()), out(r.host.stderr.bytes()))
+		};
+		let plain = run(false);
+		let lines: Vec<&str> = plain.2.lines().collect();
+		let pid = |line: Option<&&str>, before: &str, after: &str| {
+			line
+				.and_then(|l| l.strip_prefix(before))
+				.and_then(|l| l.strip_suffix(after))
+				.and_then(|p| p.trim().parse::<u32>().ok())
+		};
+		let first = pid(lines.first(), "bash: line 1: ", &format!(" {killed:<27}{{ while :; do"));
+		let second = pid(lines.get(3), "     ", &format!(" {:<25}| {{ while :; do", ""));
+		assert!(
+			plain.1 == "next\n"
+				&& lines.len() == 6
+				&& first.zip(second).is_some_and(|(a, b)| (a != b) == started),
+			"{start}without an image: {plain:?}"
+		);
+		assert_eq!(run(true), plain, "{start}");
+	}
+}
+
+/// How each process of a pipeline ended ([`crate::bash::store::JobProc`])
+/// outlives every snapshot of a run: of a root job (its record in the
+/// store, written as each process ends while the job runs), of one under
+/// `lastpipe` (which is for a pipeline bash waits for, not a job's), of a
+/// subshell's job (the frames image, beside the subshell's job table) and
+/// of a pipeline the shell waits for (the frames image, the `Spawn`'s
+/// scratch). Under `pipefail` the first process, killed before the last
+/// one ends, is the one the notice is for: under `Fault::Snapshot { every:
+/// 1 }` each run prints the notice and status of the run without a
+/// snapshot.
+#[test]
+fn a_pipelines_processes_outlive_every_snapshot() {
+	const BUSY: &str = "{ i=0; while [ $i -lt 50 ]; do i=$((i+1)); done; }";
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	for src in [
+		format!("set -o pipefail; {{ kill -KILL $BASHPID; }} | {BUSY} & wait %1; echo st=$?"),
+		format!(
+			"shopt -s lastpipe; set -o pipefail; {{ kill -KILL $BASHPID; }} | {BUSY} & wait %1; echo \
+			 st=$?"
+		),
+		format!("( set -o pipefail; {{ kill -KILL $BASHPID; }} | {BUSY} & wait %1; echo st=$? )"),
+		format!("set -o pipefail; {{ kill -KILL $BASHPID; }} | {BUSY}; echo st=$?"),
+	] {
+		let run = |fault| {
+			let mut r = rig();
+			let status = r.run(Script::command(src.as_bytes()), fault);
+			let out = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+			(status, out(r.host.stdout.bytes()), out(r.host.stderr.bytes()))
+		};
+		let plain = run(Fault::None);
+		let first = format!(" {killed:<27}{{ kill -KILL $BASHPID; }}\n     ");
+		let second = format!(" {:<27}| {{ i=0;", "Done");
+		assert!(
+			plain.1 == "st=137\n"
+				&& plain.2.starts_with("bash: line 1: ")
+				&& plain.2.contains(&first)
+				&& plain.2.contains(&second),
+			"{src}: the uninterrupted run: {plain:?}"
+		);
+		assert_eq!(run(Fault::Snapshot { every: 1 }), plain, "{src}");
+	}
+}
+
+/// Every stage of a background job's pipeline is one subshell level below
+/// the shell that started the job (bash forks each as an asynchronous
+/// command), a group or a `( … )` stage too, and a lastpipe job's last
+/// stage; a pipeline inside a job's group counts the group's level.
+/// Goldens: bash 5.3.20 and 5.2.21, the same; zsh 5.9's `$ZSH_SUBSHELL`
+/// the same for the first three.
+#[test]
+fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
+	let mut wrong = Vec::new();
+	// The reading stage, `{ read l; echo "$l"; }`, stands for `cat` (the fake
+	// host has no programs).
+	const CAT: &str = "{ read l; echo \"$l\"; }";
+	for (src, want) in [
+		(format!("{{ echo g=$BASH_SUBSHELL; }} | {CAT} & wait"), "g=1\n"),
+		("true | ( echo p=$BASH_SUBSHELL ) & wait".into(), "p=1\n"),
+		(format!("echo s=$BASH_SUBSHELL | {CAT} & wait"), "s=1\n"),
+		("true | { echo l=$BASH_SUBSHELL; } & wait".into(), "l=1\n"),
+		(format!("true | {{ echo f=$BASH_SUBSHELL; }} | {CAT} & wait"), "f=1\n"),
+		("true | ( ( echo pp=$BASH_SUBSHELL ) ) & wait".into(), "pp=2\n"),
+		("shopt -s lastpipe; echo a | { read x; echo lp=$BASH_SUBSHELL; } & wait".into(), "lp=1\n"),
+		("{ true | { echo n=$BASH_SUBSHELL; }; } & wait".into(), "n=2\n"),
+		("( true | { echo m=$BASH_SUBSHELL; } ) & wait".into(), "m=2\n"),
+		(format!("{{ echo fg=$BASH_SUBSHELL; }} | {CAT}"), "fg=1\n"),
+	] {
+		let mut r = rig();
+		r.run(Script::command(src.as_bytes()), Fault::None);
+		let out = String::from_utf8_lossy(&r.host.stdout.bytes()).into_owned();
+		if out != want {
+			wrong.push(format!("{src:?}: got {out:?}, want {want:?}"));
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the rows differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
 /// The status a `wait` collected outlives the job's entry and a store image
 /// (bash's bgp list): a later run's `wait PID` returns it, with and without
 /// a snapshot between the runs.

@@ -20,10 +20,16 @@
 //! own foreground commands but the one it runs with `exec`
 //! ([`subshell_exec`]); a `( … )`, job or stage whose whole command is a
 //! `( … )` is one process with it; a foreground subshell a signal killed is
-//! reported as a command ([`subshell_ended`]).
+//! reported as a command ([`subshell_ended`]). A foreground pipeline is
+//! reported as its processes ([`pipeline_ended`]), when a signal ended the
+//! one whose end is its status (`raw_job_exit_status`: the last one, or
+//! under `pipefail` the last one that did not succeed): the short notice
+//! names how the last process ended and the pipeline, the long one lists
+//! each process on its own line ([`process_lines`]).
 //! A background job that such another signal
 //! killed gets that long notice, with `  (wd: DIR)` when the shell's
-//! directory changed since the job started, at these points of bash 5.3.20
+//! directory changed since the job started, a pipeline's job one line per
+//! process ([`super::proc::Job::procs`]), at these points of bash 5.3.20
 //! (each a `notify_and_cleanup` call), and only these:
 //! - when `wait` waits for it ([`waited`]: through `wait`'s own redirections,
 //!   naming its line, as soon as it has reaped that job, before it waits for
@@ -65,10 +71,14 @@ use super::{
 	Cx, Kernel,
 	builtins::{dirstack, trap},
 	exec, nested,
-	proc::{Comsub, FrameKind, JobState, LoopKind, LoopRec, PendingWrite, ScriptKind, Vproc},
+	proc::{
+		Comsub, FrameKind, JobProc, JobProcs, JobState, LoopKind, LoopRec, PendingWrite, ProcState,
+		ScriptKind, Vproc,
+	},
 	state,
 };
 use crate::bash::{
+	Platform,
 	diag::Diag,
 	event::NodeKind,
 	ids::{Dialect, Vpid},
@@ -129,26 +139,28 @@ pub(super) fn killed(
 	}
 }
 
-/// The notice of the foreground command `text` (syntax node `node`),
-/// process `pid`, that `sig` killed in `vp` (bash `notify_of_job_status` for
-/// a foreground job): `TERM` and a trapped signal print the description and
-/// the command, any other signal but `INT` and `PIPE` the long notice
-/// ([`long_notice`]). From any bash process, a subshell, an asynchronous one
-/// or a pipeline's stage too (bash 5.3.20: `( sh -c 'kill -KILL $$'; echo
-/// after )`), on its own standard error, but as for a background job
-/// ([`reports_jobs`]) not from a command or process substitution's own
-/// process, nor in posix mode from a `-c` shell or a fork of a substitution
-/// (`startup_state` 2). None either in an interactive shell, for the stage a
-/// pipeline runs in the shell itself, and in zsh.
-fn notice(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &Vproc,
-	text: &[u8],
-	node: u32,
-	pid: u32,
-	sig: Signal,
-) -> Option<Vec<u8>> {
+/// How bash reports a foreground command or pipeline a signal killed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+	/// How it ended and the command (`print_pipeline`, `JLIST_STANDARD`;
+	/// [`short_notice`]).
+	Short,
+	/// `NAME: line N: ` and the job (`pretty_print_job`,
+	/// `JLIST_NONINTERACTIVE`; [`long_notice`]).
+	Long,
+}
+
+/// How `vp` reports a foreground command or pipeline that `sig` killed
+/// (bash `notify_of_job_status` for a foreground job): `TERM` and a trapped
+/// signal the short way, any other signal but `INT` and `PIPE` the long way.
+/// From any bash process, a subshell, an asynchronous one or a pipeline's
+/// stage too (bash 5.3.20: `( sh -c 'kill -KILL $$'; echo after )`), on its
+/// own standard error, but as for a background job ([`reports_jobs`]) not
+/// from a command or process substitution's own process, nor in posix mode
+/// from a `-c` shell or a fork of a substitution (`startup_state` 2). None
+/// either in an interactive shell, for the stage a pipeline runs in the
+/// shell itself, and in zsh.
+fn notice_form(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> Option<Form> {
 	if misc_is(cx, vp, MiscKey::Interactive, b"1")
 		|| vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
 		|| vp.jobs.comsub == Comsub::Own
@@ -163,16 +175,149 @@ fn notice(
 	{
 		return None;
 	}
-	let desc = sig.description(k.engine.config().platform);
 	Some(if sig == Signal::Term || trapped(cx, vp, sig) {
-		// `print_pipeline` of the job, `JLIST_STANDARD`.
-		let mut bytes = format!("{desc}{:w$}", "", w = padding(&desc)).into_bytes();
-		bytes.extend_from_slice(text);
-		bytes.push(b'\n');
-		bytes
+		Form::Short
 	} else {
-		long_notice(k, cx, vp, wait_line(vp, node), pid, &desc, text)
+		Form::Long
 	})
+}
+
+/// The notice of the foreground command `text` (syntax node `node`),
+/// process `pid`, that `sig` killed in `vp`, as [`notice_form`] decides:
+/// the short one its description and the command, the long one
+/// ([`long_notice`]) its pid, its description and the command.
+fn notice(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	text: &[u8],
+	node: u32,
+	pid: u32,
+	sig: Signal,
+) -> Option<Vec<u8>> {
+	let form = notice_form(k, cx, vp, sig)?;
+	let desc = sig.description(k.engine.config().platform);
+	Some(match form {
+		Form::Short => short_notice(&desc, text),
+		Form::Long => long_notice(k, cx, vp, wait_line(vp, node), pid, &desc, text),
+	})
+}
+
+/// The pipeline of `vp` the shell waited for (a `Spawn` of `info`, syntax
+/// node `node`) ended, and `sig` ended the process whose end is its status
+/// ([`JobProcs::status_process`]): bash's notice of that foreground job, as
+/// [`notice_form`] decides, on the shell's own standard error. The short one
+/// names how the last process ended and the pipeline (`print_pipeline`,
+/// `JLIST_STANDARD`); the long one lists each process ([`process_lines`]),
+/// as the notice of a background job does. `procs` are its processes
+/// ([`super::proc::PipelineWait::procs`]), their commands not filled yet.
+#[expect(clippy::too_many_arguments, reason = "the pipeline and what ended it")]
+pub(super) fn pipeline_ended(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	unit: &Unit,
+	info: &SpawnIr,
+	node: u32,
+	sig: Signal,
+	JobProcs { list: mut procs, .. }: JobProcs,
+) {
+	let Some(form) = notice_form(k, cx, vp, sig) else {
+		return;
+	};
+	for (i, p) in procs.iter_mut().enumerate() {
+		p.text = stage_command(k, cx, vp, unit, info, i);
+	}
+	let platform = k.engine.config().platform;
+	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	let bytes = match form {
+		Form::Short => {
+			let Some(last) = procs.last() else {
+				return;
+			};
+			let texts: Vec<&[u8]> = procs.iter().map(|p| p.text.as_slice()).collect();
+			short_notice(&ended_text(last.state, posix, platform), &texts.join(&b" | "[..]))
+		},
+		Form::Long => {
+			let Some((pid, ended, lines)) = process_lines(&procs, posix, platform, b"") else {
+				return;
+			};
+			long_notice(k, cx, vp, wait_line(vp, node), pid, &ended, &lines)
+		},
+	};
+	vp.out
+		.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+}
+
+/// The command of stage `i` of pipeline `s` as bash prints it for that
+/// process (`p->command`): with the `2>&1` bash's parser adds for a `|&`
+/// after it.
+pub(super) fn stage_command(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	unit: &Unit,
+	s: &SpawnIr,
+	i: usize,
+) -> BString {
+	let mut text = fork_node(unit, s, i)
+		.map_or_else(BString::default, |node| exec::job_text(k, cx, vp, unit, node));
+	if s.stages.get(i).is_some_and(|st| st.pipe_stderr) {
+		text.extend_from_slice(b" 2>&1");
+	}
+	text
+}
+
+/// bash's short notice: `status` padded ([`padding`]), then `text`
+/// (`print_pipeline` with `JLIST_STANDARD`).
+fn short_notice(status: &str, text: &[u8]) -> Vec<u8> {
+	let mut bytes = format!("{status}{:w$}", "", w = padding(status)).into_bytes();
+	bytes.extend_from_slice(text);
+	bytes.push(b'\n');
+	bytes
+}
+
+/// How a process of a job that ended shows (bash `printable_job_status` of
+/// a dead job): the description of the signal that killed it, `Done` for an
+/// exit with 0, else `Exit N` (in posix mode `Done(N)`).
+fn ended_text(state: ProcState, posix: bool, platform: Platform) -> String {
+	match state {
+		ProcState::Killed(sig) => sig.description(platform),
+		ProcState::Exited(0) => String::from("Done"),
+		ProcState::Exited(status) if posix => format!("Done({status})"),
+		ProcState::Exited(status) => format!("Exit {status}"),
+		ProcState::Running => String::from("Running"),
+	}
+}
+
+/// What bash's long notice ([`long_notice`]) prints of a job of processes
+/// `procs` that ended (`pretty_print_job` with `JLIST_NONINTERACTIVE`:
+/// `print_pipeline` with `JLIST_LONG`), `tail` after the last command: the
+/// first process's pid, how it ended ([`ended_text`]), and its command,
+/// then a line for each other process: five spaces, its pid as `%5ld`, how
+/// it ended (nothing where the first ended so, which pads as `| `'s two
+/// columns) padded ([`padding`]), `| ` and its command. `None` without
+/// processes.
+fn process_lines(
+	procs: &[JobProc],
+	posix: bool,
+	platform: Platform,
+	tail: &[u8],
+) -> Option<(u32, String, Vec<u8>)> {
+	let (first, rest) = procs.split_first()?;
+	let mut lines = first.text.to_vec();
+	for p in rest {
+		let ended = if p.state == first.state {
+			String::new()
+		} else {
+			ended_text(p.state, posix, platform)
+		};
+		let w = padding(if ended.is_empty() { "| " } else { &ended });
+		lines.extend_from_slice(format!("\n     {:>5} {ended}{:w$}| ", p.pid(), "").as_bytes());
+		lines.extend_from_slice(&p.text);
+	}
+	lines.extend_from_slice(tail);
+	Some((first.pid(), ended_text(first.state, posix, platform), lines))
 }
 
 /// Whether bash runs the external of `op` (an `Exec` in `vp`'s base frame
@@ -266,7 +411,7 @@ pub(super) fn subshell_ended(
 		return;
 	};
 	let only = f.scratch.as_ref().is_some_and(|s| {
-		s.inline.is_none() && matches!(s.children.as_slice(), [(v, _)] if *v == child)
+		s.inline().is_none() && matches!(s.children.as_slice(), [(v, _)] if *v == child)
 	});
 	let (true, Some(unit)) = (only, f.unit.clone()) else {
 		return;
@@ -344,10 +489,11 @@ pub(super) fn redirections_undone(k: &mut Kernel, vp: &mut Vproc, depth: u32) {
 }
 
 /// bash's long notice: `NAME: line N: ` at script line `line`, then
-/// `pretty_print_job`'s `JLIST_NONINTERACTIVE` line: `pid` as `%5ld`, the
-/// description `desc` padded ([`padding`]) and `tail` (the command, as
-/// bytes: a diagnostic's text is UTF-8). The `Diag` event carries the whole
-/// notice, the command too.
+/// `pretty_print_job`'s `JLIST_NONINTERACTIVE` lines: `pid` as `%5ld`, the
+/// description `desc` padded ([`padding`]) and `tail` (the command and the
+/// lines of the job's other processes, [`process_lines`], as bytes: a
+/// diagnostic's text is UTF-8). The `Diag` event carries the whole notice,
+/// the command too.
 fn long_notice(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -401,9 +547,11 @@ fn unreported(cx: &mut Cx<'_>, vp: &Vproc, number: u32) -> Option<Signal> {
 }
 
 /// The long notice of job `number` of `vp`, which `sig` killed, at script
-/// line `line`: the job's pid and command, `  (wd: DIR)` when the shell's
-/// directory is not the one the job started in (bash
-/// `polite_directory_format`). The job is reported now (`J_NOTIFIED`).
+/// line `line`: the job's pid and command, or the lines of its processes
+/// ([`super::proc::Job::procs`], [`process_lines`]), `  (wd: DIR)` after
+/// the last command when the shell's directory is not the one the job
+/// started in (bash `polite_directory_format`). The job is reported now
+/// (`J_NOTIFIED`).
 fn job_line(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -413,18 +561,25 @@ fn job_line(
 	line: u32,
 ) -> Option<Vec<u8>> {
 	let job = vp.jobs.get(number)?;
-	let (pid, mut tail) = (job.pid(), job.text.to_vec());
+	let mut wd = Vec::new();
 	if job.wd != vp.cwd {
 		let home = state::lookup(&k.root, cx.store, vp, b"HOME")
 			.ok()
 			.flatten()
 			.and_then(|v| v.as_scalar().map(BString::from));
-		tail.extend_from_slice(b"  (wd: ");
+		wd.extend_from_slice(b"  (wd: ");
 		let home = home.as_ref().map(|h| h.as_slice());
-		tail.extend_from_slice(&dirstack::polite(home, &job.wd, false));
-		tail.push(b')');
+		wd.extend_from_slice(&dirstack::polite(home, &job.wd, false));
+		wd.push(b')');
 	}
-	let desc = sig.description(k.engine.config().platform);
+	let platform = k.engine.config().platform;
+	let (pid, desc, tail) = match job.procs.as_deref() {
+		None => (job.pid(), sig.description(platform), [job.text.as_slice(), &wd].concat()),
+		Some(procs) => {
+			let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+			process_lines(&procs.list, posix, platform, &wd)?
+		},
+	};
 	let bytes = long_notice(k, cx, vp, line, pid, &desc, &tail);
 	if let Some(job) = vp.jobs.get_mut(number) {
 		job.notified = true;

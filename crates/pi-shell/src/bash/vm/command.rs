@@ -2610,6 +2610,8 @@ fn spawned_external(
 				}
 			}
 			scratch(vp).live = Live::Ext(child);
+			// A pipeline stage that is just this program: its process's pid.
+			super::stage_spawned(k, vp, pid);
 			let s = st(vp);
 			s.waiting = Some(Awaited::Ext { pid });
 			s.stage = Stage::Await;

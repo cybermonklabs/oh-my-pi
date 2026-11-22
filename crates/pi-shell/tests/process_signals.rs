@@ -13,6 +13,7 @@ mod zsh_oracle;
 
 use std::{
 	ffi::{CStr, CString, OsStr, OsString},
+	fmt::Write as _,
 	fs,
 	io::{self, Write as _},
 	os::unix::{
@@ -427,7 +428,12 @@ fn masked(o: &Outcome) -> Outcome {
 /// and a subshell print nothing. Each script starts with `exec 2>&1`:
 /// where a notice comes in the output shows. A job is known to have ended
 /// once `kill -0` fails on it ([`GONE`]): the shell has reaped it then.
-/// [`KILLER`]'s job dies once the shell blocks, in `wait`.
+/// When the shell reaps a job a signal killed is a race (bash's `SIGCHLD`,
+/// obash's poll of the program), and a line read or a `wait` without
+/// operands after the reap reports or drops the job there: each row kills
+/// its job on the line that waits for it, after the last line read before
+/// the point the row checks. [`KILLER`]'s job dies once the shell blocks,
+/// in `wait`.
 #[test]
 fn bash_reports_a_background_job_killed_by_a_signal() {
 	/// Wait for the shell to reap job `$!`, with builtins only: a foreground
@@ -448,7 +454,7 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 	let cases: Vec<(String, String)> = vec![
 		// When `wait` waits for it.
 		(format!("{S}; wait $!; echo st=$?"), format!("{}st=137\n", killed(1))),
-		(format!("{S}; wait; echo st=$?"), format!("{}st=0\n", killed(1))),
+		(format!("{ks} & wait; echo st=$?"), format!("{}st=0\n", by_ks(1))),
 		(
 			"/bin/sh -c 'sleep 0.2; kill -KILL $$' & wait; echo st=$?".into(),
 			format!("{}st=0\n", notice(1, libc::SIGKILL, "/bin/sh -c 'sleep 0.2; kill -KILL $$'")),
@@ -459,7 +465,10 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 		(format!("{w}; wait -n; echo st=$?"), format!("{}st=137\n", killed(1))),
 		(format!("{S}; wait $! 2>/dev/null; echo st=$?"), "st=137\n".into()),
 		// Before the next line is read, naming it.
-		(format!("{S}\n{GONE}\necho next"), format!("{}next\n", killed(3))),
+		(
+			format!("/bin/sleep 30 &\nkill -KILL $!; {GONE}\necho next"),
+			format!("{}next\n", killed(3)),
+		),
 		(format!("{w}; echo same\necho next"), format!("same\n{}next\n", killed(2))),
 		(format!("{w}\n\n# comment\necho next"), format!("{}next\n", killed(2))),
 		(format!("{w}; cat <<EOF\nbody\nEOF\necho next"), format!("body\n{}next\n", killed(4))),
@@ -559,7 +568,10 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 		),
 		// A substitution the shell expands: the command's line, plus one,
 		// plus the newlines in its source; before its redirections.
-		(format!("{S}\ntrue\n{GONE}; x=$(echo in); echo \"$x\""), format!("{}in\n", killed(4))),
+		(
+			format!("/bin/sleep 30 &\ntrue\nkill -KILL $!; {GONE}; x=$(echo in); echo \"$x\""),
+			format!("{}in\n", killed(4)),
+		),
 		(format!("f() {{ {w}; x=$(echo in); echo \"$x\"; }}\nf"), format!("{}in\n", killed(2))),
 		(format!("f() {{\n{w}\nx=$(echo in); echo \"$x\"\n}}\nf"), format!("{}in\n", killed(4))),
 		(format!("{w}; cat <(echo in)"), format!("{}in\n", killed(2))),
@@ -756,6 +768,619 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 			assert_eq!(masked(&ours), masked(&theirs), "file: {script:?}");
 		}
 	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `out` with the pid of each line after the first of bash's notice of a
+/// job of several processes (`print_pipeline` with `JLIST_LONG`: five
+/// spaces, the pid as `%5ld`) replaced by `PID`, as [`mask_pids`] does for
+/// the first. The pid's field is checked to be `%5ld`.
+fn mask_stage_pids(out: &[u8]) -> Vec<u8> {
+	let mut masked = Vec::with_capacity(out.len());
+	for line in out.split_inclusive(|&b| b == b'\n') {
+		let Some(rest) = line.strip_prefix(b"     ") else {
+			masked.extend_from_slice(line);
+			continue;
+		};
+		let spaces = rest.iter().take_while(|&&b| b == b' ').count();
+		let digits = rest[spaces..]
+			.iter()
+			.take_while(|b| b.is_ascii_digit())
+			.count();
+		if digits == 0 {
+			masked.extend_from_slice(line);
+			continue;
+		}
+		assert!(
+			spaces + digits >= 5 && (spaces == 0 || spaces + digits == 5),
+			"the pid is printed as `%5ld`: {:?}",
+			String::from_utf8_lossy(line)
+		);
+		masked.extend_from_slice(b"     PID");
+		masked.extend_from_slice(&rest[spaces + digits..]);
+	}
+	masked
+}
+
+/// Stages of the pipelines of
+/// [`bash_reports_a_pipeline_job_killed_by_a_signal`]
+/// and [`bash_reports_a_foreground_pipeline_killed_by_a_signal`]: a program
+/// that kills itself (`K`, `T`, `H`: with `KILL`, `TERM`, `HUP`) or exits
+/// (`E0`, `E3`), one that reads its input to its end, so that the stage
+/// before it has ended, then exits (`R0`, `R5`) or kills itself (`RK`, `RT`,
+/// `RH`), and a group that kills its own process (`G`).
+mod stage {
+	pub const K: &str = "/bin/sh -c 'kill -KILL $$'";
+	pub const T: &str = "/bin/sh -c 'kill -TERM $$'";
+	pub const H: &str = "/bin/sh -c 'kill -HUP $$'";
+	pub const E0: &str = "/bin/sh -c 'exit 0'";
+	pub const E3: &str = "/bin/sh -c 'exit 3'";
+	pub const R0: &str = "/bin/sh -c 'read x; exit 0'";
+	pub const R5: &str = "/bin/sh -c 'read x; exit 5'";
+	pub const RK: &str = "/bin/sh -c 'read x; kill -KILL $$'";
+	pub const RT: &str = "/bin/sh -c 'read x; kill -TERM $$'";
+	pub const RH: &str = "/bin/sh -c 'read x; kill -HUP $$'";
+	pub const G: &str = "{ kill -KILL $BASHPID; }";
+	pub const PF: &str = "set -o pipefail; ";
+}
+
+/// bash 5.3's long notice of a job of the processes `procs` (how each ended,
+/// its command; `pretty_print_job` with `JLIST_NONINTERACTIVE`), at line
+/// `line` of `name`, `tail` after the last command: the first process after
+/// `NAME: line N: `, its pid, how it ended padded to 27 columns
+/// (`LONGEST_SIGNAL_DESC`) and its command; each other one after five
+/// spaces, its pid, how it ended padded so (nothing where the first ended
+/// so), `| ` and its command. Pids as `PID` ([`mask_pids`],
+/// [`mask_stage_pids`]).
+fn job_notice(name: &str, line: u32, procs: &[(&str, &str)], tail: &str) -> String {
+	let mut out = format!("{name}: line {line}: ");
+	for (i, &(end, cmd)) in procs.iter().enumerate() {
+		let _ = if i == 0 {
+			write!(out, "PID {end:<27}{cmd}")
+		} else if end == procs[0].0 {
+			write!(out, "     PID {:<25}| {cmd}", "")
+		} else {
+			write!(out, "     PID {end:<27}| {cmd}")
+		};
+		if i + 1 == procs.len() {
+			out.push_str(tail);
+		}
+		out.push('\n');
+	}
+	out
+}
+
+/// `o` with the pids of both streams masked, those of a job's other
+/// processes too ([`mask_stage_pids`]), and the shell names ([`masked`]).
+fn masked_stages(o: &Outcome) -> Outcome {
+	let mask = |b: &[u8]| mask_names(&mask_stage_pids(&mask_pids(b)));
+	Outcome { stdout: mask(&o.stdout), stderr: mask(&o.stderr), ..o.clone() }
+}
+
+/// bash 5.3's notice of a background pipeline job a signal killed, in a
+/// non-interactive shell (`notify_of_job_status`), as checked-in goldens
+/// measured with bash 5.3.20 (compared live only with a bash 5.3 or later,
+/// [`real_bash_golden`]; bash 5.2.21 prints the same lines with the
+/// descriptions padded to 24 columns, and no notice at the end of `jobs
+/// -p`). The job's status is its last process's, or under `pipefail` that
+/// of the last of its processes that did not succeed (`raw_job_exit_status`,
+/// with the `pipefail` the job started under): a signal bash reports that
+/// ended that process gets the notice, at the points
+/// [`bash_reports_a_background_job_killed_by_a_signal`] lists; one that
+/// ended another process, `TERM`, a trapped signal, an exit and a posix
+/// `-c` shell get none. The notice lists each process on its own line
+/// (`pretty_print_job`, `JLIST_NONINTERACTIVE`): the first after
+/// `NAME: line N: `, with its pid as `%5ld`, how it ended (the signal's
+/// description, `Done`, `Exit N`, in posix mode `Done(N)`) padded to 27
+/// columns and its command; each other one after five spaces, with its pid,
+/// how it ended padded so (nothing when it ended as the first did), `| `
+/// and its command; `  (wd: DIR)` after the last. `jobs` lists the job
+/// instead. Each script starts with `exec 2>&1`. Each stage after the first
+/// reads its input to its end before it ends: the stage before it has ended
+/// then. A job is known to have ended once the shell's table lists no
+/// running job (`jobs -r` into `$F`, `DONE`: builtins only, as a
+/// foreground program would end with a report point).
+#[test]
+fn bash_reports_a_pipeline_job_killed_by_a_signal() {
+	use stage::{E0, E3, G, K, PF, R0, R5, RH, RK, RT, T};
+	const DONE: &str = "while jobs -r >\"$F\"; [ -s \"$F\" ]; do :; done";
+	let killed = desc(libc::SIGKILL);
+	let killed = killed.as_str();
+	let hangup = desc(libc::SIGHUP);
+	let notice = job_notice;
+	// A stage that dies once the shell waits ([`KILLER`]).
+	let ks = format!("/bin/sh -c '{KILLER}'");
+	let at = |line, procs: &[(&str, &str)]| notice("bash", line, procs, "");
+	let cases: Vec<(String, String)> = vec![
+		// `pipefail`: the last process that did not succeed decides, where
+		// it is.
+		(
+			format!("{PF}{K} | {R0} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, K), ("Done", R0)])),
+		),
+		(
+			format!("{PF}{E0} | {RK} | {R0} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK), ("Done", R0)])),
+		),
+		(
+			format!("{PF}{E0} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{PF}{G} | {R0} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, G), ("Done", R0)])),
+		),
+		(format!("{PF}{K} | {R5} & wait %1; echo st=$?"), "st=5\n".into()),
+		(format!("{PF}{K} | {RT} & wait %1; echo st=$?"), "st=143\n".into()),
+		(format!("{PF}{T} | {R0} & wait %1; echo st=$?"), "st=143\n".into()),
+		// Without it the last process decides.
+		(
+			format!("{E0} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{E3} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Exit 3", E3), (killed, RK)])),
+		),
+		(
+			format!("{E0} | {R0} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), ("Done", R0), (killed, RK)])),
+		),
+		(format!("{K} | {R0} & wait %1; echo st=$?"), "st=0\n".into()),
+		(format!("{E0} | {RK} | {R0} & wait %1; echo st=$?"), "st=0\n".into()),
+		(format!("{G} | {R0} & wait %1; echo st=$?"), "st=0\n".into()),
+		(format!("{K} | {RT} & wait %1; echo st=$?"), "st=143\n".into()),
+		// Two processes killed: the second line shows how it ended only
+		// where that differs from the first's.
+		(
+			format!("{K} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, K), (killed, RK)])),
+		),
+		(
+			format!("{PF}{K} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, K), (killed, RK)])),
+		),
+		(
+			format!("{K} | {RH} & wait %1; echo st=$?"),
+			format!("{}st=129\n", at(1, &[(killed, K), (&hangup, RH)])),
+		),
+		(format!("trap 'echo t' HUP; {K} | {RH} & wait %1; echo st=$?"), "st=129\n".into()),
+		// `kill %1` reaches each process (those of a job whose vproc has
+		// not started them too), `kill $!` the last one.
+		(
+			"/bin/sleep 30 | /bin/sleep 31 & kill -KILL %1; wait %1; echo st=$?".into(),
+			format!("{}st=137\n", at(1, &[(killed, "/bin/sleep 30"), (killed, "/bin/sleep 31")])),
+		),
+		(
+			format!("{E0} | /bin/sleep 30 & kill -KILL $!; wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, "/bin/sleep 30")])),
+		),
+		// `wait`, `wait $!`, `wait -n`; the next line read; `jobs`. A `wait`
+		// without operands drops a job that ended before it (bash
+		// `wait_for_background_pids`): this one's last process dies once the
+		// shell waits ([`KILLER`]).
+		(
+			format!("{E0} | {ks} & wait; echo st=$?"),
+			format!("{}st=0\n", at(1, &[("Done", E0), (killed, &ks)])),
+		),
+		(
+			format!("{E0} | {RK} & wait $!; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{E0} | {RK} & wait -n; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{E0} | {RK} & {DONE}\necho next"),
+			format!("{}next\n", at(2, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{PF}{K} | {R0} & {DONE}\necho next"),
+			format!("{}next\n", at(2, &[(killed, K), ("Done", R0)])),
+		),
+		(
+			format!("{E0} | {RK} & {DONE}; jobs -p >/dev/null; echo next"),
+			format!("{}next\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(
+			format!("{E0} | {RK} & {DONE}; jobs; echo next"),
+			format!("[1]+  {killed:<27}{E0} | {RK}\nnext\n"),
+		),
+		(format!("{E0} | {RK} & {DONE}; jobs -l >/dev/null; echo next\necho after"), {
+			"next\nafter\n".into()
+		}),
+		// The directory after the last command; a subshell's job; posix.
+		(
+			format!("cd /; {E0} | {RK} & cd /tmp; wait %1; echo st=$?"),
+			format!("{}st=137\n", notice("bash", 1, &[("Done", E0), (killed, RK)], "  (wd: /)")),
+		),
+		(
+			format!("( {E0} | {RK} & wait %1; echo st=$? )"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+		(format!("set -o posix; {E3} | {RK} & wait %1; echo st=$?"), "st=137\n".into()),
+		// `|&` adds `2>&1` to the command of the process before it.
+		(
+			format!("{E0} |& {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", &format!("{E0} 2>&1")), (killed, RK)])),
+		),
+		// `lastpipe` is for a pipeline bash waits for: a job's every stage
+		// is a process of the job.
+		(
+			format!("shopt -s lastpipe; {E0} | {RK} & wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+		),
+	];
+	let dir = tempfile::tempdir().expect("a directory for `jobs -r`");
+	let file = dir.path().join("running");
+	let masked = masked_stages;
+	let mut wrong = Vec::new();
+	for (script, out) in cases {
+		let script = format!("exec 2>&1; {script}");
+		let run = |shell: &OsStr| Run::script(shell, "bash", &script).env("F", &file).go();
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let got = (
+			String::from_utf8_lossy(&mask_stage_pids(&mask_pids(&ours.stdout))).into_owned(),
+			ours.end(),
+		);
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "{script:?}");
+		}
+	}
+	// A script file in posix mode: an exit shows as `Done(N)`.
+	let path = dir.path().join("s.sh");
+	let name = path.display().to_string();
+	fs::write(&path, format!("exec 2>&1; set -o posix; {E3} | {RK} & wait %1; echo st=$?\n"))
+		.expect("write the script");
+	let run = |shell: &OsStr| Run::new(shell, "bash", &[&path]).go();
+	let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+	let want = format!("{}st=137\n", notice(&name, 1, &[("Done(3)", E3), (killed, RK)], ""));
+	let got = (
+		String::from_utf8_lossy(&mask_stage_pids(&mask_pids(&ours.stdout))).into_owned(),
+		ours.end(),
+	);
+	if got != (want.clone(), Some(Exit(0))) {
+		wrong.push(format!("posix file\n  got:  {got:?}\n  want: {want:?}"));
+	}
+	if let Some(bash) = real_bash_golden() {
+		assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "posix file");
+	}
+	// Each line names its process by the pid its program has (`$$`).
+	let pids = "/bin/sh -c 'echo $$ >\"$F.1\"; exit 0' | /bin/sh -c 'echo $$ >\"$F.2\"; read x; \
+	            kill -KILL $$' & wait %1";
+	check_notice_pids(pids, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash runs the `CHLD` trap once for each process it reaps (`waitchld`
+/// counts them for `run_sigchld_trap`): for each process of a pipeline job,
+/// not once for the job. Checked-in goldens: bash 5.2.21 and 5.3.20 print
+/// the same lines here, the notice padded to 24 and 27 columns (compared
+/// live only with a bash 5.3 or later, [`real_bash_golden`]). A process
+/// that ends while the trap runs is not counted (`run_pending_traps` warns
+/// `bad value in trap_list[17]`), so each stage after the first ends only
+/// once the trap has run for the one before it (`W1`, `W2`: the trap's
+/// lines in `$F`; or once the shell is gone or a zombie, so that a shell
+/// killed at the limit leaves no process holding its output). Each first
+/// stage ends only once the shell sleeps, in `wait` ([`KILLER`]'s test):
+/// bash runs the trap in `wait` for a child it reaps there, while one that
+/// ended before `wait` may get its trap only once `wait` returns (bash on
+/// macOS hung on such a row, its stage `echo x`). A foreground
+/// pipeline's trap runs once the pipeline has ended (its stages read their
+/// input to its end instead), and `kill %1` ends every process at once: bash
+/// reaps them together. That kill is `TERM`, which gets no notice: after
+/// `kill -KILL %1` the point of the notice is a race in bash (its trap run,
+/// `wait`), where obash reaps the job at once.
+#[test]
+fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
+	use stage::{E0, PF, R0};
+	const TRAP: &str = "trap 'echo chld; echo >>\"$F\"' CHLD; ";
+	// The shell has gone, or is a zombie its runner has not reaped yet.
+	const GONE: &str =
+		"case $(ps -o stat= -p $PPID 2>/dev/null | tr -d \" \") in Z*|\"\") true;; *) false;; esac";
+	// Until the shell `pid` names sleeps, is a zombie or is gone.
+	let sleeps = |pid: &str| {
+		format!(
+			"until case $(ps -o stat= -p {pid} 2>/dev/null | tr -d \" \") in S*|Z*|\"\") true;; *) \
+			 false;; esac; do sleep 0.01; done"
+		)
+	};
+	// A first stage: a program that ends so once the shell sleeps, and a
+	// group (the shell's own fork, whose `$$` is the shell's).
+	let first = |end: &str| format!("/bin/sh -c '{}; {end}'", sleeps("$PPID"));
+	let group = |cmd: &str| format!("{{ {}; {cmd}; }}", sleeps("$$"));
+	let e0 = first("exit 0");
+	let k = first("kill -KILL $$");
+	let echo = group("echo x");
+	let ext = group(E0);
+	let w1 = format!("/bin/sh -c 'until [ -s \"$F\" ] || {GONE}; do sleep 0.01; done'");
+	let w2 = format!(
+		"/bin/sh -c 'until [ -s \"$F\" ] && [ \"$(wc -l <\"$F\")\" -ge 2 ] || {GONE}; do sleep \
+		 0.01; done'"
+	);
+	let w1k =
+		format!("/bin/sh -c 'until [ -s \"$F\" ] || {GONE}; do sleep 0.01; done; kill -KILL $$'");
+	let killed = desc(libc::SIGKILL);
+	let killed = killed.as_str();
+	let at = |procs: &[(&str, &str)]| job_notice("bash", 1, procs, "");
+	let cases: Vec<(String, String)> = vec![
+		(format!("{TRAP}{e0} | {w1} & wait %1; echo st=$?"), "chld\nchld\nst=0\n".into()),
+		(
+			format!("{PF}{TRAP}{e0} | {w1} | {w2} & wait %1; echo st=$?"),
+			"chld\nchld\nchld\nst=0\n".into(),
+		),
+		(format!("{TRAP}{echo} | {w1} & wait %1; echo st=$?"), "chld\nchld\nst=0\n".into()),
+		(format!("{TRAP}{ext} | {w1} & wait %1; echo st=$?"), "chld\nchld\nst=0\n".into()),
+		(format!("{TRAP}{k} | {w1} & wait %1; echo st=$?"), "chld\nchld\nst=0\n".into()),
+		(
+			format!("{TRAP}{e0} | {w1k} & wait %1; echo st=$?"),
+			format!("chld\nchld\n{}st=137\n", at(&[("Done", &e0), (killed, &w1k)])),
+		),
+		(format!("{TRAP}{e0} | {w1} & wait; echo done"), "chld\nchld\ndone\n".into()),
+		(
+			format!("shopt -s lastpipe; {TRAP}{e0} | {w1} & wait %1; echo st=$?"),
+			"chld\nchld\nst=0\n".into(),
+		),
+		(
+			"trap 'echo chld' CHLD; /bin/sleep 30 | /bin/sleep 31 & kill -TERM %1; wait; echo st=$?"
+				.into(),
+			"chld\nchld\nst=0\n".into(),
+		),
+		(
+			"trap 'echo chld' CHLD; /bin/sleep 30 | /bin/sleep 31 | /bin/sleep 32 & kill -TERM %1; \
+			 wait; echo st=$?"
+				.into(),
+			"chld\nchld\nchld\nst=0\n".into(),
+		),
+		// One process, one run; a foreground pipeline's processes.
+		(format!("{TRAP}{E0} & wait %1; echo st=$?"), "chld\nst=0\n".into()),
+		(format!("trap 'echo chld' CHLD; {E0} | {R0}; echo st=$?"), "chld\nchld\nst=0\n".into()),
+	];
+	let dir = tempfile::tempdir().expect("a directory for the trap's lines");
+	let mut wrong = Vec::new();
+	for (n, (script, out)) in cases.into_iter().enumerate() {
+		let script = format!("exec 2>&1; {script}");
+		let run = |shell: &OsStr, who: &str| {
+			let file = dir.path().join(format!("{n}.{who}"));
+			Run::script(shell, "bash", &script)
+				.env("F", file)
+				.spawn()
+				.ended_within(EVENT_LIMIT)
+		};
+		let ours = match run(OsStr::new(env!("CARGO_BIN_EXE_obash")), "obash") {
+			Ok(ours) => ours,
+			Err(killed) => {
+				wrong.push(format!("{script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"));
+				continue;
+			},
+		};
+		let got = (
+			String::from_utf8_lossy(&mask_stage_pids(&mask_pids(&ours.stdout))).into_owned(),
+			ours.end(),
+		);
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			let theirs = run(bash.as_os_str(), "bash").unwrap_or_else(|out| {
+				panic!("{script:?}: bash still ran after {EVENT_LIMIT:?}: {out:?}")
+			});
+			assert_eq!(masked_stages(&ours), masked_stages(&theirs), "{script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The pids a notice of `script` (two processes that write their own pids
+/// to `$F.1` and `$F.2`) names on its lines are those of the processes, as
+/// bash's are (checked live with a bash 5.3 or later, [`real_bash_golden`]):
+/// a difference goes to `wrong`.
+fn check_notice_pids(script: &str, wrong: &mut Vec<String>) {
+	let dir = tempfile::tempdir().expect("a directory for the pids");
+	let file = dir.path().join("pid");
+	let script = format!("exec 2>&1; {script}");
+	let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+	for shell in std::iter::once(obash.to_owned()).chain(real_bash_golden().map(Into::into)) {
+		let out = Run::script(&shell, "bash", &script).env("F", &file).go();
+		let text = String::from_utf8_lossy(&out.stdout).into_owned();
+		let shown: Vec<String> = text
+			.lines()
+			.filter_map(|line| match line.split_once(": line ") {
+				Some((_, rest)) => rest.split_once(": ").map(|(_, rest)| rest),
+				None => line.strip_prefix("     "),
+			})
+			.filter_map(|rest| rest.split_whitespace().next().map(str::to_owned))
+			.collect();
+		let written: Vec<String> = [".1", ".2"]
+			.iter()
+			.map(|end| {
+				let mut path = file.clone().into_os_string();
+				path.push(end);
+				fs::read_to_string(path)
+					.unwrap_or_default()
+					.trim()
+					.to_owned()
+			})
+			.collect();
+		if shown != written {
+			let shell = Path::new(&shell).display();
+			wrong.push(format!("{shell} {script:?}\n  pids shown: {shown:?}\n  written: {written:?}"));
+		}
+	}
+}
+
+/// bash 5.3's notice of a foreground pipeline a signal killed, in a
+/// non-interactive shell (`notify_of_job_status` for the foreground job), as
+/// checked-in goldens measured with bash 5.3.20 (compared live only with a
+/// bash 5.3 or later, [`real_bash_golden`]; bash 5.2.21 prints the same long
+/// notices with the descriptions padded to 24 columns, and only the
+/// signal's description for a short one). The pipeline's status is its
+/// last process's, or under `pipefail` that of the last of its processes
+/// that did not succeed (`raw_job_exit_status`): a signal that ended that
+/// process gets the notice a command gets
+/// ([`bash_reports_a_foreground_command_killed_by_a_signal`]), on the
+/// shell's own standard error, at the line bash waits on. The long one
+/// lists each process on its own line, as for a background job
+/// ([`bash_reports_a_pipeline_job_killed_by_a_signal`]); the short one
+/// (`TERM`, a signal the shell traps) names how the last process ended,
+/// padded to 27 columns, and the pipeline (`print_pipeline`,
+/// `JLIST_STANDARD`). `INT`, a command substitution, a posix `-c` shell and
+/// a pipeline whose last stage the shell runs itself (`lastpipe`) print
+/// nothing. Each script starts with `exec 2>&1`.
+#[test]
+fn bash_reports_a_foreground_pipeline_killed_by_a_signal() {
+	use stage::{E0, E3, G, H, K, PF, R0, R5, RH, RK, RT, T};
+	let killed = desc(libc::SIGKILL);
+	let killed = killed.as_str();
+	let hangup = desc(libc::SIGHUP);
+	let terminated = desc(libc::SIGTERM);
+	let at = |line, procs: &[(&str, &str)]| job_notice("bash", line, procs, "");
+	let short = |end: &str, text: &str| format!("{end:<27}{text}\n");
+	let cases: Vec<(String, String, End)> = vec![
+		// The last process decides; under `pipefail` the last one that did
+		// not succeed: the first, a middle or the last one.
+		(
+			format!("{E0} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{E0} | {R0} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), ("Done", R0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{E3} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Exit 3", E3), (killed, RK)])),
+			Exit(0),
+		),
+		(format!("{K} | {R0}; echo st=$?"), "st=0\n".into(), Exit(0)),
+		(format!("{E0} | {RK} | {R0}; echo st=$?"), "st=0\n".into(), Exit(0)),
+		(
+			format!("{PF}{K} | {R0}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, K), ("Done", R0)])),
+			Exit(0),
+		),
+		(
+			format!("{PF}{E0} | {RK} | {R0}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK), ("Done", R0)])),
+			Exit(0),
+		),
+		(
+			format!("{PF}{E0} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{PF}{G} | {R0}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, G), ("Done", R0)])),
+			Exit(0),
+		),
+		(format!("{PF}{K} | {R5}; echo st=$?"), "st=5\n".into(), Exit(0)),
+		// Two processes killed.
+		(
+			format!("{K} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, K), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{K} | {RH}; echo st=$?"),
+			format!("{}st=129\n", at(1, &[(killed, K), (&hangup, RH)])),
+			Exit(0),
+		),
+		// The short notice: how the last process ended, the pipeline.
+		(
+			format!("{E0} | {RT}; echo st=$?"),
+			format!("{}st=143\n", short(&terminated, &format!("{E0} | {RT}"))),
+			Exit(0),
+		),
+		(
+			format!("{K} | {RT}; echo st=$?"),
+			format!("{}st=143\n", short(&terminated, &format!("{K} | {RT}"))),
+			Exit(0),
+		),
+		(
+			format!("{PF}{T} | {R0}; echo st=$?"),
+			format!("{}st=143\n", short("Done", &format!("{T} | {R0}"))),
+			Exit(0),
+		),
+		(
+			format!("trap 'echo t' HUP; {E0} | {RH}; echo st=$?"),
+			format!("{}st=129\n", short(&hangup, &format!("{E0} | {RH}"))),
+			Exit(0),
+		),
+		(
+			format!("trap 'echo t' HUP; {PF}{H} | {R0}; echo st=$?"),
+			format!("{}st=129\n", short("Done", &format!("{H} | {R0}"))),
+			Exit(0),
+		),
+		// Where it runs, its line and its text.
+		(format!("{E0} | {RK}"), at(1, &[("Done", E0), (killed, RK)]), Exit(137)),
+		(
+			format!("( {E0} | {RK}; echo st=$? )"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("if true; then {E0} | {RK}; fi; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("true\n{E0} | {RK}; echo st=$?"),
+			format!("{}st=137\n", at(2, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{E0} |\n{RK}; echo st=$?"),
+			format!("{}st=137\n", at(2, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("! {E0} | {RK}; echo st=$?"),
+			format!("{}st=0\n", at(1, &[("Done", E0), (killed, RK)])),
+			Exit(0),
+		),
+		(
+			format!("{E0} | {RK} 2>/dev/null; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", E0), (killed, &format!("{RK} 2> /dev/null"))])),
+			Exit(0),
+		),
+		(format!("{{ {E0} | {RK}; }} 2>/dev/null; echo st=$?"), "st=137\n".into(), Exit(0)),
+		(
+			format!("{E0} |& {RK}; echo st=$?"),
+			format!("{}st=137\n", at(1, &[("Done", &format!("{E0} 2>&1")), (killed, RK)])),
+			Exit(0),
+		),
+		// No notice.
+		(format!("x=$({E0} | {RK}); echo st=$?"), "st=137\n".into(), Exit(0)),
+		(format!("set -o posix; {E0} | {RK}; echo st=$?"), "st=137\n".into(), Exit(0)),
+		(format!("shopt -s lastpipe; {PF}{K} | {R0}; echo st=$?"), "st=137\n".into(), Exit(0)),
+		(format!("shopt -s lastpipe; {E0} | {RK}; echo st=$?"), "st=137\n".into(), Exit(0)),
+	];
+	let mut wrong = Vec::new();
+	for (script, out, end) in cases {
+		let script = format!("exec 2>&1; {script}");
+		let run = |shell: &OsStr| Run::script(shell, "bash", &script).go();
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let got = (
+			String::from_utf8_lossy(&mask_stage_pids(&mask_pids(&ours.stdout))).into_owned(),
+			ours.end(),
+		);
+		if got != (out.clone(), Some(end)) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {:?}", (out, end)));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked_stages(&ours), masked_stages(&run(bash.as_os_str())), "{script:?}");
+		}
+	}
+	let pids = "/bin/sh -c 'echo $$ >\"$F.1\"; exit 0' | /bin/sh -c 'echo $$ >\"$F.2\"; read x; \
+	            kill -KILL $$'; echo st=$?";
+	check_notice_pids(pids, &mut wrong);
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
