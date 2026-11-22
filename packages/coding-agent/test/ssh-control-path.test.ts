@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -115,6 +115,18 @@ describe("assertOwnerPrivateDir", () => {
 		if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
 	});
 
+	/**
+	 * Make `fs.openSync` of `name` open `target` instead whenever the call asks for `O_DIRECTORY`, as a kernel would
+	 * that resolves the name to `target` on its own. Returns the spy; the caller restores it.
+	 */
+	const openInstead = (name: string, target: string) => {
+		const realOpenSync = fs.openSync;
+		return spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: fs.OpenMode = "r", mode?: fs.Mode) =>
+			file === name && typeof flags === "number" && (flags & fs.constants.O_DIRECTORY) !== 0
+				? realOpenSync(target, flags, mode)
+				: realOpenSync(file, flags, mode)) as typeof fs.openSync);
+	};
+
 	const mkScratch = () => {
 		scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omp-ssh-guard-"));
 		return scratch;
@@ -141,6 +153,39 @@ describe("assertOwnerPrivateDir", () => {
 		// rejected: O_NOFOLLOW refuses the link itself, so a later re-target cannot
 		// slip a foreign directory past the guard.
 		expect(() => assertOwnerPrivateDir(link, "SSH control directory")).toThrow("is a symlink");
+	});
+
+	posixIt("refuses a symlinked final component that an O_DIRECTORY open follows (gVisor #14786)", () => {
+		const root = mkScratch();
+		const victim = path.join(root, "victim");
+		fs.mkdirSync(victim, { mode: 0o700 });
+		const link = path.join(root, "ctl");
+		fs.symlinkSync(victim, link);
+		// gVisor releases before 20261109.0 open the link's target for O_RDONLY | O_NOFOLLOW | O_DIRECTORY, where
+		// Linux fails with ENOTDIR (google/gvisor#14786). That kernel, for this name:
+		const opens = openInstead(link, victim);
+		try {
+			expect(() => assertOwnerPrivateDir(link, "SSH control directory")).toThrow("is a symlink");
+			expect(opens).toHaveBeenCalledWith(link, expect.any(Number));
+		} finally {
+			opens.mockRestore();
+		}
+	});
+
+	posixIt("refuses a name that holds another directory than the one it opened", () => {
+		const root = mkScratch();
+		const dir = path.join(root, "ctl");
+		const other = path.join(root, "other");
+		fs.mkdirSync(dir, { mode: 0o700 });
+		fs.mkdirSync(other, { mode: 0o700 });
+		// The open lands on `other`, as if `ctl` were swapped between the open and the check of the name.
+		const opens = openInstead(dir, other);
+		try {
+			expect(() => assertOwnerPrivateDir(dir, "SSH control directory")).toThrow("was replaced while it was checked");
+			expect(opens).toHaveBeenCalledWith(dir, expect.any(Number));
+		} finally {
+			opens.mockRestore();
+		}
 	});
 
 	it("refuses a non-directory", () => {

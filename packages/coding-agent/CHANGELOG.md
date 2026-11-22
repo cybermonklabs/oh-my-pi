@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The SSH control directory and the eval runner staging directory are refused when a symlink stands in their place under gVisor releases before 20261109.0 (GKE Sandbox among them) too, whose `open` with `O_NOFOLLOW | O_DIRECTORY` follows a final symlink (google/gvisor#14786); before, there a symlink to one of your own 0700 directories passed the check
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
