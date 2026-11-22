@@ -97,6 +97,14 @@ pub fn apply(
 		if multios && done == 0 && io(vp).zsh.as_ref().is_none_or(|z| z.multio.is_empty()) {
 			seed_pipeline(vp, unit);
 		}
+		// The redirections after an open the job's process makes itself
+		// (`DeferPhase::Collect`): a failure among them is the process's.
+		let collecting = !zsh
+			&& k
+				.deferrals
+				.iter()
+				.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect);
+		let mark = vp.out.len();
 		let target = if let Some(t) = io(vp).redir.target.clone().or(copy) {
 			t
 		} else if zsh {
@@ -117,19 +125,20 @@ pub fn apply(
 			io(vp).redir.target = Some(t.clone());
 			t
 		} else {
-			let t = target_text(k, vp, cx, unit, r, line)?;
+			let t = match target_text(k, vp, cx, unit, r, line) {
+				Err(halt) if collecting => return fail_in_child(k, vp, mark, halt),
+				res => res?,
+			};
 			io(vp).redir.target = Some(t.clone());
 			t
 		};
 		let before = io(vp).saved.len();
 		if zsh {
 			zsh_install(k, vp, cx, r, &target, line, multios)?;
-		} else if k
-			.deferrals
-			.iter()
-			.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect)
-		{
-			collect(k, vp, cx, r, &target, line)?;
+		} else if collecting {
+			if let Err(halt) = collect(k, vp, cx, r, &target, line) {
+				return fail_in_child(k, vp, mark, halt);
+			}
 		} else {
 			// A FIFO the job's process will open itself is decided before any
 			// open starts: an in-flight open that is dropped wakes its helper by
@@ -673,6 +682,37 @@ fn start_deferral(vp: &mut Vproc, k: &mut Kernel) {
 	let from = io(vp).redir.done;
 	k.deferrals
 		.push(Deferral { vproc: vp.vpid, from, phase: DeferPhase::Lookup, list: Vec::new() });
+}
+
+/// A redirection the job's process applies itself ([`DeferPhase::Collect`])
+/// failed here: a fd not open, an ambiguous word, an expansion error.
+/// Bash's child meets it after it has made the redirections before it, the
+/// open that waits among them (whose other end then sees the process), and
+/// reports it on its own fd 2. So the diagnostic queued since `mark` and the
+/// failure's status become the list's last entry ([`ChildRedir::Fail`]), the
+/// rest of the list is not made, and the command goes on to spawn. A park (a
+/// command substitution in the word) is no failure: it is returned as is.
+#[cold]
+#[inline(never)]
+fn fail_in_child(k: &mut Kernel, vp: &mut Vproc, mark: usize, halt: Halt) -> Result<(), Halt> {
+	let status = match halt {
+		Halt::Failed => 1,
+		Halt::Flow(Flow::Discard(status) | Flow::Exit(status)) => status,
+		park @ Halt::Flow(_) => return Err(park),
+	};
+	let mut text = BString::default();
+	let queued: Vec<_> = vp.out.drain(mark..).collect();
+	for w in queued {
+		if w.fd == 2 {
+			text.extend_from_slice(&w.bytes[w.off..]);
+		} else {
+			vp.out.push_back(w);
+		}
+	}
+	if let Some(d) = k.deferral(vp.vpid) {
+		d.list.push(ChildRedir::Fail { text, status });
+	}
+	Ok(())
 }
 
 /// What a spawned process prints before an error's description for `what`

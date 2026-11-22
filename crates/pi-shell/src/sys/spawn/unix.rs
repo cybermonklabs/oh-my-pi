@@ -964,6 +964,7 @@ enum ChildStep {
 	Open { fds: Vec<i32>, path: CString, flags: libc::c_int, mode: libc::mode_t, diag: Vec<u8> },
 	Dup { fd: i32, src: i32, diag: Vec<u8> },
 	Close { fd: i32 },
+	Fail { text: Vec<u8>, status: i32 },
 }
 
 impl ChildStep {
@@ -996,6 +997,7 @@ impl ChildStep {
 				Self::Dup { fd: *fd, src: *src, diag: diag.to_vec() }
 			},
 			ChildRedir::Close { fd } => Self::Close { fd: *fd },
+			ChildRedir::Fail { text, status } => Self::Fail { text: text.to_vec(), status: *status },
 		})
 	}
 }
@@ -1139,6 +1141,12 @@ fn fork_redirs(
 					},
 					ChildStep::Close { fd } => {
 						libc::close(*fd);
+					},
+					ChildStep::Fail { text, status } => {
+						// SAFETY: write(2) of a valid buffer; a failure is
+						// ignored (nowhere to report it).
+						libc::write(2, text.as_ptr().cast(), text.len());
+						libc::_exit(*status);
 					},
 				}
 			}

@@ -404,11 +404,12 @@ pub struct SpawnSpec<'a> {
 /// opens (or the exec) to complete. The process applies `list` in order;
 /// when an entry fails it writes that entry's `diag`, the error's
 /// description (`strerror`) and a newline to its fd 2 and exits with
-/// status 1. When the exec fails it writes `exec_diag`, the description and
-/// a newline and exits with 127 (not found) or 126 (any other error), as
-/// bash's child does. The engine's `ENOEXEC` fallback cannot run after this
-/// return; a host may refuse the deferred spawn to let the engine apply the
-/// redirections and retry when the executable may need that fallback.
+/// status 1; at a [`ChildRedir::Fail`] it writes its text and exits with
+/// its status. When the exec fails it writes `exec_diag`, the description
+/// and a newline and exits with 127 (not found) or 126 (any other error),
+/// as bash's child does. The engine's `ENOEXEC` fallback cannot run after
+/// this return; a host may refuse the deferred spawn to let the engine apply
+/// the redirections and retry when the executable may need that fallback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildRedirs {
 	/// The redirections, in order.
@@ -447,6 +448,18 @@ pub enum ChildRedir {
 	Close {
 		/// The fd closed.
 		fd: i32,
+	},
+	/// Write `text` to fd 2 and exit with `status`, the entries before it
+	/// made: a redirection the engine found failing while it handed the
+	/// list over (a fd not open, an ambiguous word, an expansion error),
+	/// which bash's child reports itself after the redirections before it,
+	/// the open that waits among them. Always the list's last entry.
+	Fail {
+		/// The diagnostic, rendered (`bash: line 1: 7: Bad file
+		/// descriptor\n`).
+		text:   BString,
+		/// The exit status.
+		status: i32,
 	},
 }
 

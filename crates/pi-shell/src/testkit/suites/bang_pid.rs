@@ -424,3 +424,30 @@ fn a_redirection_that_would_wait_is_left_to_the_process() {
 	assert!(is_virtual(out.trim()), "{out}");
 	assert!(world.redirs.lock().iter().all(|(_, r)| r.is_none()));
 }
+
+// Failure mode: `cmd > fifo <&7 &` (a redirection after the open left to the
+// process fails in the shell) never opened the FIFO, so its reader waited for
+// ever, and the shell printed the message. Bash's child opens the FIFO, then
+// reports the failure itself: the process gets the open and the failure.
+#[test]
+fn a_failure_after_an_open_left_to_the_process_is_the_processs() {
+	let world = World::new();
+	let fs = MemFs::with_latency(7, 1.0, 1);
+	let host = world.host().with_fs(fs).with_child_opens();
+	let src = "/x/sleeper > /f <&7 & echo $!; kill $!; wait $!; echo $?";
+	let out = run_script(host, src.as_bytes(), &[], Fault::None);
+	assert_eq!(String::from_utf8_lossy(&out.stdout), "5001\n143\n");
+	assert_eq!(String::from_utf8_lossy(&out.stderr), "", "the shell printed the process's message");
+	let seen = world.redirs.lock().clone();
+	let Some((name, Some(redirs))) = seen.first() else {
+		panic!("the spawn got no redirections: {seen:?}");
+	};
+	assert_eq!(name, "/x/sleeper");
+	let [ChildRedir::Open { fds, path, .. }, ChildRedir::Fail { text, status }] =
+		redirs.list.as_slice()
+	else {
+		panic!("{redirs:?}");
+	};
+	assert_eq!((fds.as_slice(), path.as_slice()), (&[1][..], &b"/f"[..]));
+	assert_eq!((text.as_slice(), *status), (&b"bash: line 1: 7: Bad file descriptor\n"[..], 1));
+}

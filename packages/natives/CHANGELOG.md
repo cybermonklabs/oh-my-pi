@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A background command whose redirection waits on a FIFO, and whose later redirection fails (a descriptor that is not open, an ambiguous redirect, `${x:?}`), now opens the FIFO and then reports the failure, as bash does: the FIFO's other end waited for ever.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
