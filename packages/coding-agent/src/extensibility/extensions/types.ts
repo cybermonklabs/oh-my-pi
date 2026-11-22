@@ -2500,6 +2500,12 @@ export interface SendUserInputOptions {
 	deliverAs?: "steer" | "followUp" | "aside";
 	/** Caller correlation id recorded as `tag` on the message the input submits. */
 	tag?: string;
+	/**
+	 * `"outside"` when the text is a person's own input that the extension relays (a bridge's typed Send):
+	 * like a prompt typed at the terminal, it ends the session's cyber-policy hold. The extension's own
+	 * input leaves it unset and keeps the hold.
+	 */
+	origin?: InputOrigin;
 }
 
 /**
