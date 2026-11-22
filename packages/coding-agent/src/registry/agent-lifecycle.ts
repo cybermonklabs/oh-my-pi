@@ -64,10 +64,11 @@ export function runReviver(revive: AdoptedReviver, expected: AgentRef): Promise<
 }
 
 /**
- * Thrown by a warm reviver when its agent's transcript holds none of the inputs it revives from, or
- * only an earlier park's (a transcript written before they were recorded there, or a park whose
- * write failed). The lifecycle then drops that reviver and revives the agent cold from its persisted
- * session contract, as it does an agent restored from disk.
+ * Thrown by a warm reviver when the newest revive inputs its agent's transcript holds are not its
+ * last park's: there are none (a transcript written before they were recorded there), or they are
+ * an earlier park's (a park whose write failed) or another subagent's (a seance fork's transcript
+ * is a copy of its source's). The lifecycle then drops that reviver and revives the agent cold
+ * from its persisted session contract, as it does an agent restored from disk.
  */
 export class WarmReviveInputsMissingError extends Error {
 	constructor(message: string) {
@@ -648,8 +649,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				if (prior) this.#adopted.set(id, prior);
 				else this.#adopted.delete(id);
 			}
-			// A warm reviver whose transcript records no inputs revives nothing: drop it as a dead
-			// worker's is dropped ({@link forgetReviver}), and revive cold from the transcript.
+			// A warm reviver revives nothing when its transcript's newest revive inputs are not its last park's: there
+			// are none (written before they were recorded), or they are an earlier park's (a write that failed) or
+			// another subagent's (a seance fork's copy of its source's). Drop it as a dead worker's is dropped
+			// ({@link forgetReviver}), and revive cold from the transcript.
 			if (
 				error instanceof WarmReviveInputsMissingError &&
 				prior &&
