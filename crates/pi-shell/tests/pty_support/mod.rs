@@ -4,9 +4,10 @@
 //!
 //! [`Spawn`] describes the process: program, `argv[0]`, arguments, a
 //! hermetic environment (`PATH` of the runner, `HOME` and `ZDOTDIR` a fresh
-//! temporary directory, `TERM=xterm-256color`, `LANG` a UTF-8 locale the
-//! machine has ([`utf8_locale`])), startup
-//! files written into that home ([`Spawn::rc_file`]) and the window size.
+//! temporary directory by its canonical path ([`Spawn::home`]),
+//! `TERM=xterm-256color`, `LANG` a UTF-8 locale the machine has
+//! ([`utf8_locale`])), startup files written into that home
+//! ([`Spawn::rc_file`]) and the window size.
 //! [`Spawn::spawn`] starts it as the leader of a new session whose
 //! controlling terminal is the pty (fds 0–2 on its terminal side).
 //!
@@ -93,16 +94,17 @@ pub fn have_real_zsh() -> bool {
 
 /// A shell process to start on a pty.
 pub struct Spawn {
-	program: PathBuf,
-	argv0:   Option<OsString>,
-	args:    Vec<OsString>,
-	env:     Vec<(OsString, OsString)>,
-	rows:    u16,
-	cols:    u16,
-	cwd:     Option<PathBuf>,
-	home:    tempfile::TempDir,
-	rc:      Vec<(String, Vec<u8>)>,
-	sync:    bool,
+	program:  PathBuf,
+	argv0:    Option<OsString>,
+	args:     Vec<OsString>,
+	env:      Vec<(OsString, OsString)>,
+	rows:     u16,
+	cols:     u16,
+	cwd:      Option<PathBuf>,
+	home:     PathBuf,
+	home_dir: tempfile::TempDir,
+	rc:       Vec<(String, Vec<u8>)>,
+	sync:     bool,
 }
 
 /// The UTF-8 locale the shells run in (`LANG`): `C.UTF-8`, which glibc
@@ -143,13 +145,15 @@ impl Spawn {
 	///
 	/// # Panics
 	///
-	/// When the temporary home cannot be created.
+	/// When the temporary home cannot be created, or its canonical path
+	/// read.
 	#[must_use]
 	pub fn new(program: impl Into<PathBuf>) -> Self {
-		let home = tempfile::tempdir().expect("temporary HOME");
+		let home_dir = tempfile::tempdir().expect("temporary HOME");
+		let home = fs::canonicalize(home_dir.path()).expect("the temporary HOME's canonical path");
 		let mut env = vec![
-			(OsString::from("HOME"), home.path().as_os_str().to_owned()),
-			(OsString::from("ZDOTDIR"), home.path().as_os_str().to_owned()),
+			(OsString::from("HOME"), home.as_os_str().to_owned()),
+			(OsString::from("ZDOTDIR"), home.as_os_str().to_owned()),
 			(OsString::from("TERM"), OsString::from("xterm-256color")),
 			(OsString::from("LANG"), OsString::from(utf8_locale())),
 		];
@@ -165,6 +169,7 @@ impl Spawn {
 			cols: 80,
 			cwd: None,
 			home,
+			home_dir,
 			rc: Vec::new(),
 			sync: false,
 		}
@@ -256,10 +261,13 @@ impl Spawn {
 		self
 	}
 
-	/// The home directory.
+	/// The home directory, by its canonical path: on macOS `$TMPDIR` is
+	/// under `/var`, a link to `/private/var`. A shell started there (no
+	/// `PWD` in its environment) takes the physical directory as its own,
+	/// and `%~` shortens it to `~` only when `HOME` names it the same way.
 	#[must_use]
 	pub fn home(&self) -> &Path {
-		self.home.path()
+		&self.home
 	}
 
 	/// Start the process (see the module docs).
@@ -270,10 +278,10 @@ impl Spawn {
 	/// program started.
 	pub fn spawn(self) -> io::Result<Pty> {
 		for (name, text) in &self.rc {
-			fs::write(self.home.path().join(name), text)?;
+			fs::write(self.home.join(name), text)?;
 		}
 		let sync = if self.sync {
-			let fifo = self.home.path().join(ZLE_SYNC_FIFO);
+			let fifo = self.home.join(ZLE_SYNC_FIFO);
 			let c_fifo = CString::new(fifo.as_os_str().as_bytes())?;
 			// SAFETY: mkfifo reads a NUL-terminated path.
 			if unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) } == -1 {
@@ -287,7 +295,7 @@ impl Spawn {
 				"exec {{_zle_sync_fd}}<>'{quoted}'\n_zle_sync() {{ local n; read -r -u $1 n; print \
 				 -rn -- $'\\e{ZLE_SYNC_TAG}'$n$'\\a'; }}\nzle -F $_zle_sync_fd _zle_sync\n"
 			);
-			fs::write(self.home.path().join(ZLE_SYNC_SCRIPT), script)?;
+			fs::write(self.home.join(ZLE_SYNC_SCRIPT), script)?;
 			Some(fifo)
 		} else {
 			None
@@ -341,7 +349,7 @@ impl Spawn {
 			status: None,
 			sync,
 			syncs: 0,
-			_home: self.home,
+			_home: self.home_dir,
 		})
 	}
 }
@@ -935,27 +943,28 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 /// traps (which then runs the EXIT trap itself). A caller whose shell runs
 /// shell code that never blocks does not wait so. Bounded as every wait
 /// ([`TIMEOUT`]): then it fails, naming the processes still running. Off
-/// Linux there is no `/proc`: it returns at once.
+/// Linux there is no `/proc`: it returns at once (the definition below).
+#[cfg(target_os = "linux")]
 pub fn wait_blocked(pid: i32) {
-	#[cfg(target_os = "linux")]
-	{
-		let deadline = Instant::now() + TIMEOUT;
-		loop {
-			let mut running = Vec::new();
-			running_below(pid, &mut running);
-			if running.is_empty() {
-				return;
-			}
-			assert!(
-				Instant::now() < deadline,
-				"after {TIMEOUT:?}, still running below {pid} (pid, state, name): {running:?}"
-			);
-			std::thread::sleep(Duration::from_millis(5));
+	let deadline = Instant::now() + TIMEOUT;
+	loop {
+		let mut running = Vec::new();
+		running_below(pid, &mut running);
+		if running.is_empty() {
+			return;
 		}
+		assert!(
+			Instant::now() < deadline,
+			"after {TIMEOUT:?}, still running below {pid} (pid, state, name): {running:?}"
+		);
+		std::thread::sleep(Duration::from_millis(5));
 	}
-	#[cfg(not(target_os = "linux"))]
-	let _ = pid;
 }
+
+/// `wait_blocked` off Linux: there is no `/proc` to read, so it returns at
+/// once.
+#[cfg(not(target_os = "linux"))]
+pub const fn wait_blocked(_pid: i32) {}
 
 /// Each of `pid` and the processes below it that is running or in an
 /// uninterruptible wait (state `R` or `D`), into `out` with its state and

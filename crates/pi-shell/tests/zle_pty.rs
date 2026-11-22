@@ -136,14 +136,24 @@ fn zle_fd_handler_fires() {
 	same(rc, |pty| keys(pty, "zle -F | grep -v _zle_sync; echo after\r"));
 }
 
+/// The keys after `^C` wait for the next line editor: between the `INT`
+/// and the next `zleread` both shells give the terminal its shell modes,
+/// which echo, so a key typed then is echoed by the kernel and `PROMPT_SP`
+/// marks the partial line (`e%` on macOS, under load).
 #[test]
 fn ctrl_c_abandons_the_line() {
-	same("", |pty| keys(pty, "echo abc\x03echo $?\r"));
+	same("", |pty| {
+		keys(pty, "echo abc\x03")?;
+		keys(pty, "echo $?\r")
+	});
 }
 
 #[test]
 fn ctrl_c_abandons_a_continued_command() {
-	same("PS2='%_> '", |pty| keys(pty, "if true\recho x\x03echo $?\r"));
+	same("PS2='%_> '", |pty| {
+		keys(pty, "if true\recho x\x03")?;
+		keys(pty, "echo $?\r")
+	});
 }
 
 /// A widget whose autoloaded function has no definition file: zsh runs a

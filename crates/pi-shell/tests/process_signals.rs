@@ -1423,12 +1423,14 @@ fn a_terminal_interrupt_reaches_the_program_the_shell_runs_in_place_once() -> io
 
 /// A program the shell `exec`s replaces it, so no EXIT trap of the shell's
 /// runs after the program (bash 5.2.21, zsh 5.9), in a subshell either.
+/// The program is `/bin/sh`, which every Unix has there (macOS has no
+/// `/bin/true`).
 #[test]
 fn an_execd_program_leaves_no_exit_trap_to_run() {
 	for (shell, script, stdout) in [
-		("bash", "trap 'echo x' EXIT; exec /bin/true", ""),
-		("bash", "( trap 'echo sub' EXIT; exec /bin/true ); echo st=$?", "st=0\n"),
-		("zsh", "trap 'print x' EXIT; exec /bin/true", ""),
+		("bash", "trap 'echo x' EXIT; exec /bin/sh -c :", ""),
+		("bash", "( trap 'echo sub' EXIT; exec /bin/sh -c : ); echo st=$?", "st=0\n"),
+		("zsh", "trap 'print x' EXIT; exec /bin/sh -c :", ""),
 	] {
 		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), shell, script).go();
 		assert_eq!(

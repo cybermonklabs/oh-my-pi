@@ -314,30 +314,32 @@ const KILL_SIGNALS_AFTER_5_9: &str =
 /// which names 6 `ABRT` where zsh 5.9's names it `IOT`
 /// ([`KILL_SIGNALS_5_9`]), with zsh 5.9's installed completion functions;
 /// elsewhere it is compared with the real zsh.
+#[cfg(target_os = "linux")]
 #[test]
 fn compsys_kill_signals() {
 	let drive = |pty: &mut Pty| keys(pty, "kill -\t");
-	if !cfg!(target_os = "linux") {
-		same(COMPINIT, drive);
+	let Some(fpath) = comp_support::compsys_fpath() else {
 		return;
-	}
-	#[cfg(target_os = "linux")]
-	{
-		let Some(fpath) = comp_support::compsys_fpath() else {
-			return;
-		};
-		let rc = format!("fpath=( {} )\n{COMPINIT}", comp_support::fpath_words(&fpath));
-		let dir = tempdir();
-		let mut ours = spawn(false, &rc, &dir).spawn().expect("spawn obash");
-		prepared(&mut ours, &drive).expect("pty session");
-		// obash names 6 `ABRT` (`IOT` its second name), as zsh after 5.9
-		// does: a screen with `-IOT`, zsh 5.9's, is a regression.
-		let screen = ours.screen().contents();
-		assert_eq!(
-			screen, KILL_SIGNALS_AFTER_5_9,
-			"obash screen:\n{screen}\n--- zsh 5.9 (6 is IOT there):\n{KILL_SIGNALS_5_9}"
-		);
-	}
+	};
+	let rc = format!("fpath=( {} )\n{COMPINIT}", comp_support::fpath_words(&fpath));
+	let dir = tempdir();
+	let mut ours = spawn(false, &rc, &dir).spawn().expect("spawn obash");
+	prepared(&mut ours, &drive).expect("pty session");
+	// obash names 6 `ABRT` (`IOT` its second name), as zsh after 5.9
+	// does: a screen with `-IOT`, zsh 5.9's, is a regression.
+	let screen = ours.screen().contents();
+	assert_eq!(
+		screen, KILL_SIGNALS_AFTER_5_9,
+		"obash screen:\n{screen}\n--- zsh 5.9 (6 is IOT there):\n{KILL_SIGNALS_5_9}"
+	);
+}
+
+/// Off Linux obash's screen is compared with the real zsh's (on Linux with
+/// zsh after 5.9's: the definition above).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn compsys_kill_signals() {
+	same(COMPINIT, |pty: &mut Pty| keys(pty, "kill -\t"));
 }
 
 #[test]
