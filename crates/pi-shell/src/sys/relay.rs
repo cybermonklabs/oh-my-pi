@@ -308,6 +308,14 @@ impl<'a> Relays<'a> {
 		}
 		Box::new(Relayed { child, relays: self.set, status: None })
 	}
+
+	/// The set once every relay is attached: without the decoding it
+	/// borrowed, so a spawn that waits for a busy program (Unix) keeps it
+	/// until the child exists.
+	#[cfg(unix)]
+	pub(crate) fn attached(self) -> Relays<'static> {
+		Relays { decoding: None, writers: self.writers, set: self.set }
+	}
 }
 
 /// An external whose output runs through relays, which its `poll_wait`

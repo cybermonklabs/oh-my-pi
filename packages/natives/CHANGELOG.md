@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A program a shell session has just written no longer fails at random with "Text file busy" when another session of the same process starts a program at that moment: the bash and zsh shells try such a program again after short waits (about 1 s in all) on the session's own timers, so its other commands, timers, timeout and cancel go on meanwhile. A program that something keeps open for writing still fails with "Text file busy", after those waits rather than at once.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

@@ -61,7 +61,7 @@ pub use crate::sys::{
 	relay::{ByteDecoder, OutputDecoding},
 	spawn::{Exits, Leftover, NativeSpawner, Sessions, SpawnConfig, dispositions_changed},
 };
-pub(crate) use crate::sys::{pump::End, relay::Relays};
+pub(crate) use crate::sys::{pump::End, relay::Relays, spawn::Started};
 
 /// The C library's `PATH_MAX`, which zsh sizes path buffers by. Windows has
 /// no such limit for the engine's paths, so it takes Linux's.

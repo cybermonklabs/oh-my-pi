@@ -269,15 +269,28 @@ impl crate::bash::Host for NativeHost {
 	}
 
 	/// Launches at once (a local process, no I/O to wait for): the future is
-	/// already complete.
+	/// already complete, but for a program the kernel refuses as busy
+	/// (`ETXTBSY`), which is tried again after waits on this host's timers
+	/// ([`crate::sys::Started::settle`]): the engine runs on meanwhile.
 	fn spawn(&mut self, spec: SpawnSpec<'_>) -> SpawnFuture {
-		let spawned = self.spawner.spawn(spec).map(|child| -> Box<dyn ExtProc> {
-			match &self.bridge {
-				Some((ctl, root)) => Box::new(SignalsOnExit { child, ctl: ctl.clone(), root: *root }),
+		let bridge = self.bridge.clone();
+		let bridged = move |child: Box<dyn ExtProc>| -> Box<dyn ExtProc> {
+			match bridge {
+				Some((ctl, root)) => Box::new(SignalsOnExit { child, ctl, root }),
 				None => child,
 			}
-		});
-		Box::pin(std::future::ready(spawned))
+		};
+		match self.spawner.start(spec) {
+			crate::sys::Started::Done(spawned) => Box::pin(std::future::ready(spawned.map(bridged))),
+			#[cfg(unix)]
+			busy @ crate::sys::Started::Busy(_) => {
+				let timers = self.timers.clone();
+				Box::pin(async move {
+					let settled = busy.settle(|wait| timers.arm(Instant::now() + wait)).await;
+					settled.map(bridged)
+				})
+			},
+		}
 	}
 
 	/// Unix spawns fork: the child opens any path of the host's filesystem.
