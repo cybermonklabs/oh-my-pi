@@ -3,6 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as nodePath from "node:path";
 import { type ApiKey, getOpenRouterHeaders, withAuth } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { guardedRequestUrl, guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	$env,
@@ -16,6 +17,7 @@ import {
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
 import { loadFastembed, withEmbedSessionBudget } from "./fastembed-runtime";
+import { configuredModel, configuredRequestError, retryUnlessCyberPolicy } from "./guard-model";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
@@ -422,50 +424,61 @@ async function embedApiBatch(texts: readonly string[]): Promise<EmbeddingMatrix 
 		return null;
 	}
 
-	const body = JSON.stringify({ model: defaultModel(), input: texts });
+	const modelName = defaultModel();
+	const body = JSON.stringify({ model: modelName, input: texts });
+	// The request goes out by raw fetch, past pi-ai's dispatch functions, so it meets the model-call guards
+	// itself. `guardModelRequest` holds it before it starts and reports an error it meets (a `cyber_policy`
+	// refusal included) to the guards before the catch below sees it; the URL reads them again before each
+	// attempt, in the step of its send, so a held attempt sends nothing, unretried. A `cyber_policy` refusal
+	// is never retried. Every failure still returns null for the batch, and is logged.
+	const model = configuredModel(modelName, baseUrl);
+	const url = guardedRequestUrl(model, `${baseUrl.replace(/\/+$/, "")}/embeddings`);
 	try {
-		// withAuth re-resolves the key on 401 (force-refresh, then sibling
-		// rotation) when `apiKey` is a resolver. The 429 backoff stays inside
-		// the attempt via fetchWithRetry. An empty static key attempts without
-		// an Authorization header (local/proxy setups).
-		const response = await withAuth(apiKey, async key => {
-			const headers: Record<string, string> = {
-				"Content-Type": "application/json",
-				...getOpenRouterHeaders(),
-			};
-			if (key !== "") {
-				headers.Authorization = `Bearer ${key}`;
-			}
-			const res = await fetchWithRetry(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
-				method: "POST",
-				headers,
-				body,
-				signal: AbortSignal.timeout(30000),
-				maxAttempts: 3,
-				defaultDelayMs: attempt => 2 ** attempt * 1000,
-			});
-			if (res.status === 401) {
-				// Keep the provider's denial text: the log can only show what the error carries.
-				const detail = (await res.text().catch(() => "")).trim();
-				throw new ProviderHttpError(detail || "mnemopi embedding request unauthorized (401)", 401, {
-					headers: res.headers,
+		return await guardModelRequest(model, async () => {
+			// withAuth re-resolves the key on 401 (force-refresh, then sibling
+			// rotation) when `apiKey` is a resolver. The 429 backoff stays inside
+			// the attempt via fetchWithRetry. An empty static key attempts without
+			// an Authorization header (local/proxy setups).
+			const response = await withAuth(apiKey, async key => {
+				const headers: Record<string, string> = {
+					"Content-Type": "application/json",
+					...getOpenRouterHeaders(),
+				};
+				if (key !== "") {
+					headers.Authorization = `Bearer ${key}`;
+				}
+				const res = await fetchWithRetry(url, {
+					method: "POST",
+					headers,
+					body,
+					signal: AbortSignal.timeout(30000),
+					maxAttempts: 3,
+					defaultDelayMs: attempt => 2 ** attempt * 1000,
+					shouldRetryResponse: retryUnlessCyberPolicy,
 				});
+				if (res.status === 401) {
+					// Keep the provider's denial text: the log can only show what the error carries.
+					const detail = (await res.text().catch(() => "")).trim();
+					throw new ProviderHttpError(detail || "mnemopi embedding request unauthorized (401)", 401, {
+						headers: res.headers,
+					});
+				}
+				return res;
+			});
+			if (!response.ok) {
+				// The body is the error's message, so the rejection log below shows it, as before.
+				throw await configuredRequestError("mnemopi embedding request failed", response);
 			}
-			return res;
-		});
-		if (!response.ok) {
-			logEmbeddingRejection(response.status, await response.text().catch(() => ""));
-			return null;
-		}
-		const data = (await response.json()) as { data?: Array<{ embedding: number[] }> };
-		return withLoopPhase("mnemopi.embed", () => {
-			const { data: rows } = data;
-			// A short or long matrix would stamp vectors onto the wrong memories.
-			if (rows === undefined || rows.length !== texts.length) {
-				return null;
-			}
-			apiCallCount += 1;
-			return rows.map(row => new Float32Array(row.embedding));
+			const data = (await response.json()) as { data?: Array<{ embedding: number[] }> };
+			return withLoopPhase("mnemopi.embed", () => {
+				const { data: rows } = data;
+				// A short or long matrix would stamp vectors onto the wrong memories.
+				if (rows === undefined || rows.length !== texts.length) {
+					return null;
+				}
+				apiCallCount += 1;
+				return rows.map(row => new Float32Array(row.embedding));
+			});
 		});
 	} catch (error) {
 		const status = extractHttpStatusFromError(error);
