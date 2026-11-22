@@ -649,9 +649,15 @@ impl LastBg {
 /// command that vproc dispatches decides: the external spawned as the job's
 /// lone command (or `exec`'d, or a pipeline's last stage's) makes the job
 /// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
-/// (a builtin, a native task, a subshell, a non-`exec` external in a
-/// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// (a builtin, a native task, a subshell, a loop, a forked command
+/// substitution, `.` reading a file that is not regular, a non-`exec`
+/// external in a compound body, the vproc's end) leaves its virtual pid.
+/// A trap action (`set -T`'s DEBUG trap runs before the job's command)
+/// never names its own program: its fast-path builtins, loops and
+/// substitutions decide nothing, and its program or staged builtin leaves
+/// the virtual pid. Readers of the pid (`$!`, `jobs -l`/`-p`/`-x`) wait
+/// for the decision, so whatever may wait or run without end decides it
+/// first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -723,7 +729,7 @@ pub enum BangStage {
 	/// (bash's subshell `exec`s it).
 	Lone,
 	/// Only an `exec`'d external is (`{ exec cmd; } &`, a function called
-	/// as the lone command).
+	/// as the lone command, or `eval`, `.` or `source` as it).
 	Exec,
 	/// A host callout runs as the lone command: it may hand the job to the
 	/// subshell it starts ([`crate::bash::ShellApi::exec_subshell_in`],

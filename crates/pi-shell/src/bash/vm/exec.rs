@@ -2270,6 +2270,9 @@ pub fn start_sub(
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
 		ComsubForm::Fork => {
+			// The vproc waits for the child: a job it may still settle
+			// keeps its virtual pid ([`bang_before_wait`]).
+			bang_before_wait(k, vp);
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
 			// Outside posix mode bash parses `$( )` without aliases and
@@ -2395,6 +2398,7 @@ pub fn start_zsh_sub(
 		push_script(vp, text, line, ScriptKind::Hook);
 		return Flow::Call;
 	}
+	bang_before_wait(k, vp);
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
@@ -2753,7 +2757,7 @@ fn control_flow(
 			Some(branch(op, (vp.status == 0) == (op.code == Opcode::BrOk)))
 		},
 		Opcode::LoopNote | Opcode::LoopBack => Some(loop_note(vp, op)),
-		Opcode::LoopEnter => Some(loop_enter(vp, op)),
+		Opcode::LoopEnter => Some(loop_enter(k, vp, op)),
 		Opcode::LoopExit if !k.mask.any_op(op.ev) => {
 			if let Some(rec) = top_frame(vp).loops.pop() {
 				vp.status = rec.status;
@@ -2787,7 +2791,8 @@ fn control_flow(
 }
 
 /// `LoopEnter`: a `while`/`until` loop's record.
-fn loop_enter(vp: &mut Vproc, op: Op) -> Flow {
+fn loop_enter(k: &mut Kernel, vp: &mut Vproc, op: Op) -> Flow {
+	bang_before_wait(k, vp);
 	let f = top_frame(vp);
 	let depth = depths(f);
 	f.loops.push(LoopRec {
@@ -2799,6 +2804,18 @@ fn loop_enter(vp: &mut Vproc, op: Op) -> Flow {
 		depth,
 	});
 	Flow::Next
+}
+
+/// What may run for ever, or wait for what the shell does after it reads
+/// `$!` (a loop, a forked command substitution), starts in a vproc that
+/// may still settle a background job's pid ([`Bang`]: a function run as
+/// the job's command, which only an `exec` may hand to a program): the job
+/// keeps its virtual pid, so readers of `$!` never wait for it. A lone
+/// job's trap action decides nothing ([`Kernel::bang_held_by_trap`]).
+fn bang_before_wait(k: &mut Kernel, vp: &Vproc) {
+	if !k.bangs.is_empty() && !k.bang_held_by_trap(vp) {
+		k.settle_bang(vp.vpid, None);
+	}
 }
 
 /// `((…))` (or an arith-`for` expression) of a bash unit with nothing to
@@ -2966,7 +2983,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::LoopEnter => loop_enter(vp, op),
+		Opcode::LoopEnter => loop_enter(k, vp, op),
 		Opcode::ForIn => for_in(k, vp, cx, unit, op, line),
 		Opcode::ForNext => for_next(k, vp, cx, op, line),
 		Opcode::LoopNote | Opcode::LoopBack => loop_note(vp, op),
@@ -3589,6 +3606,7 @@ fn for_in(
 	op: Op,
 	line: u32,
 ) -> Flow {
+	bang_before_wait(k, vp);
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let var = unit.names[op.b as usize].clone();
@@ -4946,6 +4964,7 @@ fn repeat(
 	op: Op,
 	line: u32,
 ) -> Flow {
+	bang_before_wait(k, vp);
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let w = &unit.words[op.a as usize];

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `$!` of a background job is there at once, as in bash, when the job's first command is a builtin (`printf … &`, also in a function run as the job or as a pipeline's last stage), when the job is a function, `eval`, `.` or `source` whose body starts with a loop (`while`, `until`, `for`, `select`, zsh `repeat`) or runs a command substitution (also in a `set -T` DEBUG trap action there), or when it is a lone command whose here-document (bash), or words, here-string or here-document (zsh), run a command substitution: reading `$!`, or `kill`, `wait` or `jobs -p` of it, no longer waits for the job to end, which hung when the job waited for the shell or never ended. An `eval`, `.` or `source` job of a regular file names its program in `$!` only when it `exec`s it, as bash does, and a lone job's `set -T` DEBUG trap program, already ended, is no longer named in `$!`. Unlike bash, `$!` keeps the job's own pid, not the program's, for a function, group, `eval`, `.` or `source` job that runs a builtin, a loop, a command substitution or a DEBUG trap action before it `exec`s a program, for a `.` job whose file is not regular, for the lone commands above, and for a lone job whose `set -T` DEBUG trap runs a function, `.`, a program, a pipeline, a subshell, or a builtin with a redirection, a prefix assignment, or a glob or command substitution in its words (bash runs that trap before it forks); the `kill` and `wait` builtins still reach the program
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

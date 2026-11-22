@@ -673,6 +673,21 @@ impl Kernel {
 		self.ctl.notify();
 	}
 
+	/// `vp` runs a trap action while the job it may settle is a lone
+	/// command (or a pipeline's simple stage): bash runs that command's
+	/// DEBUG trap in the shell before it forks, so the action's fast-path
+	/// builtins, loops and command substitutions decide nothing here (what
+	/// else it runs, through `dispatch` or a spawn, leaves the job its own
+	/// pid). In a function, group or `eval` job, whose trap actions bash's
+	/// child runs, an action decides as any command before `exec` does.
+	pub fn bang_held_by_trap(&self, vp: &Vproc) -> bool {
+		vp.trap_frames != 0
+			&& self
+				.bangs
+				.iter()
+				.any(|b| b.vproc == vp.vpid && b.stage == proc::BangStage::Lone)
+	}
+
 	/// Next `$RANDOM` (0..=32767); the generator state is written through.
 	pub fn next_random(&mut self, store: &mut dyn StateStore) -> u32 {
 		let v = self.rand.next();

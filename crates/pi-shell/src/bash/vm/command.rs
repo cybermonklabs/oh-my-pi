@@ -586,6 +586,15 @@ fn plain_statement(
 			return Some(exec(k, vp, cx, unit, op, line));
 		},
 	};
+	// A builtin decides the background job this vproc may settle
+	// ([`super::proc::Bang`]) as [`dispatch`] does: it keeps its virtual
+	// pid (`eval`, `.` and `source` leave it to an `exec` they run).
+	// Decided before it runs, so a reader of `$!` never waits on the
+	// builtin, whose output may wait for that reader. A lone job's trap
+	// action decides nothing ([`Kernel::bang_held_by_trap`]).
+	if !k.bangs.is_empty() && !k.bang_held_by_trap(vp) {
+		bang_dispatch(k, vp.vpid, &Target::Intrinsic(id), false);
+	}
 	// The temporary scope the staged command gives a builtin.
 	let scope =
 		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
@@ -2550,7 +2559,10 @@ fn spawned_external(
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
 			if !k.bangs.is_empty() {
-				k.settle_bang(vp.vpid, Some(pid));
+				// A lone job's trap action ([`Kernel::bang_held_by_trap`]):
+				// its program is not the job's and ends first, so the job
+				// keeps its virtual pid.
+				k.settle_bang(vp.vpid, (!k.bang_held_by_trap(vp)).then_some(pid));
 			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);
@@ -4205,13 +4217,14 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 
 /// This vproc may settle a background job's pid ([`super::proc::Bang`]):
 /// what the command about to run (`target`; `exec` when `exec` runs it)
-/// decides. Its
-/// lone external, or one it `exec`s, settles at the spawn (the job is known
-/// by the program's OS pid); `exec` without a command and a function
-/// called as the lone command leave the decision to what follows (a
-/// function's `exec`); a host callout as the lone command may hand the job
-/// to its subshell ([`crate::bash::ShellApi::exec_subshell_in`]); anything else
-/// keeps the virtual pid.
+/// decides. Its lone external, or one it `exec`s, settles at the spawn
+/// (the job is known by the program's OS pid); `exec` without a command
+/// leaves the decision to what follows; a function called as the lone
+/// command, and `eval`, `.` and `source` (bash runs their text as a
+/// function body), leave it to an `exec` they run; a host callout as the
+/// lone command may hand the job to its subshell
+/// ([`crate::bash::ShellApi::exec_subshell_in`]); anything else keeps the
+/// virtual pid.
 #[cold]
 #[inline(never)]
 fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, exec: bool) {
@@ -4223,7 +4236,11 @@ fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, 
 		(Target::Intrinsic(IntrinsicId::Exec) | Target::Refused { .. }, _)
 		| (Target::External(_) | Target::Interp(_), BangStage::Lone) => {},
 		(Target::External(_) | Target::Interp(_), _) if exec => {},
-		(Target::Function(_), BangStage::Lone | BangStage::Exec) => bang.stage = BangStage::Exec,
+		(
+			Target::Function(_)
+			| Target::Intrinsic(IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source),
+			BangStage::Lone | BangStage::Exec,
+		) => bang.stage = BangStage::Exec,
 		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
 		_ => k.settle_bang(vpid, None),
 	}

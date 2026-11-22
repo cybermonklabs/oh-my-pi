@@ -1,19 +1,19 @@
 //! Control-flow builtins: `eval`, `source`, `return`, `exit`, `break`,
 //! `continue`, `wait`.
 
-use bstr::{BString, ByteSlice};
+use bstr::{BStr, BString, ByteSlice};
 
 use super::{Control, Ctx, Outcome, R, Wait, done, number, opts};
 use crate::bash::{
 	diag::Diag,
 	event::EventData,
-	fs::StatKind,
+	fs::{FileKind, FsPoll, StatKind},
 	ids::Vpid,
 	store::{Key, KeyBuf, MiscKey, OptId, Record},
 	vm::{
 		exec::push_script,
 		locale,
-		probe::{absolute, candidates},
+		probe::{absolute, candidates, dev_fd},
 		proc::{Probe, ProbeResult, ScriptKind},
 		quote,
 	},
@@ -99,6 +99,7 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	// bash's `_evalfile` names the file it found.
 	let shown = path.clone().unwrap_or_else(|| file.clone());
 	let path = path.unwrap_or_else(|| absolute(&ctx.vp.cwd, file));
+	bang_before_read(ctx, &path);
 	let text = match ctx.probe(Probe::Read { path: path.clone() })? {
 		ProbeResult::Bytes(Ok(text)) => text,
 		ProbeResult::Bytes(Err(msg)) if msg.as_slice() == b"Is a directory" => {
@@ -147,6 +148,32 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	ctx.k
 		.emit_op(ctx.cx, ctx.vp, 0, EventData::SourceEnter { path: path.as_bstr() });
 	Ok(Outcome { status: 0, control: Control::Frame })
+}
+
+/// `.` and `source` leave a background job's pid to an `exec` their file
+/// runs (bash runs the file like a function body), but they read the
+/// whole file first. A file that is not a regular file (a FIFO, a pipe as
+/// `/dev/stdin`, which is the shell's own fd 0) may wait for what the
+/// shell does after it reads `$!`, so the job keeps its virtual pid before
+/// that read, also in a trap action, as a trap action's program does.
+fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) {
+	if !ctx.k.bangs.iter().any(|b| b.vproc == ctx.vp.vpid) {
+		return;
+	}
+	let regular = match dev_fd(path) {
+		Some(fd) => ctx
+			.vp
+			.fds
+			.get(fd)
+			.is_some_and(|h| h.kind() == Some(FileKind::Regular)),
+		None => matches!(
+			ctx.cx.host.fs().stat(BStr::new(path), true),
+			FsPoll::Ready(Ok(st)) if st.kind == StatKind::File
+		),
+	};
+	if !regular {
+		ctx.k.settle_bang(ctx.vp.vpid, None);
+	}
 }
 
 /// zsh `. file [args]` / `source file [args]` (`bin_dot`): `source` tries
@@ -210,6 +237,7 @@ pub fn zsh_source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		return done(127);
 	};
+	bang_before_read(ctx, &path);
 	let ProbeResult::Bytes(Ok(text)) = ctx.probe(Probe::Read { path: path.clone() })? else {
 		ctx.err(Diag::NoSuchFile { name: file.clone() });
 		return done(127);
