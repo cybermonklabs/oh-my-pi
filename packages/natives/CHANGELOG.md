@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An empty word used as a file name (`cat < ""`, `exec 3< ""`, `echo x > ""`, `. ""`) now fails with `No such file or directory`, as bash and zsh do, instead of naming the working directory; `<& ""` and `>& ""` are a bad file descriptor, bash's `cd ""` is `null directory` and `history -r ""` is `empty filename`, as in bash 5.3; in zsh mode `exec ""`, `""` and a directory on `$PATH` are `permission denied` (126).
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

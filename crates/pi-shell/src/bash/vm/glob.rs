@@ -261,7 +261,14 @@ pub(super) fn answer(
 			Ok(Fact::Stat(r.ok()))
 		},
 		Ask::List(dir) => {
-			let abs = absolute(cwd, dir);
+			// An empty directory part is the working directory (bash's
+			// `GX_NULLDIR` `.`, zsh's `opendir(".")`); `absolute` keeps an
+			// empty name empty, naming no file.
+			let abs = if dir.is_empty() {
+				BString::from(cwd)
+			} else {
+				absolute(cwd, dir)
+			};
 			let pending = || WaitKey::Fs { op: FsOp::ReadDir, path: abs.clone() };
 			loop {
 				match &mut sc.live {
@@ -394,7 +401,7 @@ impl<'a> Run<'a> {
 	}
 
 	fn stat(&mut self, path: &[u8], follow: bool) -> Option<Stat> {
-		// `stat("")` fails (ENOENT); the cwd-relative path would not.
+		// `stat("")` fails (ENOENT): no need to ask.
 		if path.is_empty() {
 			return None;
 		}
