@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The bash tool's `cp --reflink=always` reports the clone's own error, as GNU cp does (`Invalid cross-device link` across filesystems, `Operation not supported` on an overlayfs), where it said `source and destination are on different devices`. From a source that is not a regular file, such as `/dev/null`, it now tries the clone and fails as GNU cp does, where it copied the data and exited 0. With a backup (`-b`, `--backup=numbered`), a copy that fails renames the backup back, as GNU cp does, where the destination was left only under its backup name.
+- The bash tool's `cp` makes a new file as GNU cp does: with the source's permission bits, less its group and other bits while `-p` or `--preserve=ownership` may still change its owner, and its final mode is set after its owner, where it was readable by the group and others of the user running cp while it copied. A file made through a symbolic link that led nowhere (`POSIXLY_CORRECT`) gets the mode and owner a new file gets. A non-directory over a directory is refused with GNU's message after `-n`, `-i` and `-u`, also in a tree, where `-a` dropped the failure; with a backup the directory keeps its name.
+- The bash tool's `cp` sets the owner, mode, times and extended attributes of a file it copied, cloned (`--reflink`) or opened under `--attributes-only` through that file's own descriptor, as GNU's `fchown`, `fchmod`, `futimens` and `fsetxattr` do, where it set them by name: a name replaced with a link after the copy wrote the file sent them to the link's target. Under `--attributes-only`, `-n` and `-i` decide first, so what they keep is kept. A new file made where a link was gets its final mode. Copying a tree with hard links onto its own earlier copy with `-a -f` exits 0, as GNU's does, where it failed with `cannot create hard link ... File exists`.
+- The bash tool's `cp --attributes-only` refuses a non-directory over a directory with GNU's `cannot overwrite directory` message, and a link copied onto a directory under `-f` says `cannot create symbolic link 'b': Is a directory`, as GNU 9.7's does.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
