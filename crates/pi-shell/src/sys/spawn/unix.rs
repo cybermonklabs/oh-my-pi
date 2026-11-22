@@ -964,6 +964,7 @@ enum ChildStep {
 	Open { fds: Vec<i32>, path: CString, flags: libc::c_int, mode: libc::mode_t, diag: Vec<u8> },
 	Dup { fd: i32, src: i32, diag: Vec<u8> },
 	Close { fd: i32 },
+	Fail { text: Vec<u8> },
 }
 
 impl ChildStep {
@@ -996,6 +997,7 @@ impl ChildStep {
 				Self::Dup { fd: *fd, src: *src, diag: diag.to_vec() }
 			},
 			ChildRedir::Close { fd } => Self::Close { fd: *fd },
+			ChildRedir::Fail { text } => Self::Fail { text: text.to_vec() },
 		})
 	}
 }
@@ -1008,7 +1010,12 @@ fn child_fail(diag: &[u8], errno: i32, status: i32, texts: &[Vec<u8>]) -> ! {
 		.ok()
 		.and_then(|n| texts.get(n))
 		.map_or(&b"Unknown error"[..], Vec::as_slice);
-	for part in [diag, text, b"\n"] {
+	child_exit(&[diag, text, b"\n"], status)
+}
+
+/// Write `parts` to fd 2 and exit with `status`. Async-signal-safe.
+fn child_exit(parts: &[&[u8]], status: i32) -> ! {
+	for part in parts {
 		// SAFETY: write(2) of a valid buffer; a failure is ignored (nowhere
 		// to report it).
 		unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
@@ -1051,8 +1058,19 @@ fn fork_redirs(
 	// ([`close_all_but`]), how it closes the rest, and the bound of its
 	// counting loop, decided here: the child must not allocate.
 	let keep = kept_fds(&raw, closed, &open_without_cloexec());
+	// The kept ones that are the host's own, not placed: listed before the
+	// fork, so the child checks each again ([`close_reused`]).
+	let inherited: Vec<i32> = keep
+		.iter()
+		.copied()
+		.filter(|&fd| !raw.iter().any(|&(target, _)| target == fd))
+		.collect();
 	let open_max = open_max();
 	let sweep = sweep();
+	#[cfg(test)]
+	if let Some(f) = BEFORE_FORK.with(|b| b.borrow_mut().take()) {
+		f();
+	}
 	// Every signal stays blocked across the fork: the child runs with the
 	// host's handlers until it resets them, and a signal delivered then (a
 	// `kill $!` right after the spawn) would run host code and be lost
@@ -1113,6 +1131,7 @@ fn fork_redirs(
 			// other jobs' pipe ends among them, so their readers would wait for
 			// this open (bash's parent keeps no end of another job's pipe).
 			close_all_but(&keep, open_max, sweep);
+			close_reused(&inherited);
 			libc::umask(mask);
 			for (n, &ign) in ignore.iter().enumerate().skip(1) {
 				let n = n as i32;
@@ -1153,6 +1172,7 @@ fn fork_redirs(
 					ChildStep::Close { fd } => {
 						libc::close(*fd);
 					},
+					ChildStep::Fail { text } => child_exit(&[text.as_slice()], 1),
 				}
 			}
 			libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
@@ -1199,6 +1219,41 @@ fn kept_fds(targets: &[(i32, RawFd)], closed: &[i32], inherited: &[i32]) -> Vec<
 	keep.sort_unstable();
 	keep.dedup();
 	keep
+}
+
+/// Close each of `inherited` (the host's descriptors the child of
+/// [`fork_redirs`] keeps, listed before the fork) that has close-on-exec
+/// now: another thread closed the one listed, and a new descriptor took the
+/// number before the fork (another job's pipe end, say). The exec would
+/// close it, so the child must not hold it while its open waits.
+/// Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// Only in the forked child of [`fork_redirs`].
+unsafe fn close_reused(inherited: &[i32]) {
+	for &fd in inherited {
+		// SAFETY: F_GETFD only reads the descriptor's flags.
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		if flags != -1 && flags & libc::FD_CLOEXEC != 0 {
+			// SAFETY: closes a descriptor of the child's own table.
+			unsafe { libc::close(fd) };
+		}
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	static BEFORE_FORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the next [`fork_redirs`] on this thread runs `f` after it lists
+/// the host's descriptors and before it forks, the window [`close_reused`]
+/// covers.
+#[cfg(test)]
+fn before_fork(f: impl FnOnce() + 'static) {
+	BEFORE_FORK.with(|b| *b.borrow_mut() = Some(Box::new(f)));
 }
 
 /// The host's open descriptors above 2 without close-on-exec, now (Linux:
