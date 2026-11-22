@@ -362,7 +362,7 @@ export class AppendOnlyContextManager {
 		// Compaction (array shrunk) — every previously-synced message is gone,
 		// so the log can't carry any byte-stable bytes forward.
 		if (normalizedMessages.length < this.#lastSyncCount) {
-			this.log.clear();
+			this.#truncateLog(0, normalizedMessages);
 			this.#lastSyncCount = 0;
 			this.#messageDigests = [];
 		}
@@ -375,7 +375,7 @@ export class AppendOnlyContextManager {
 		if (this.#lastSyncCount > 0) {
 			const stableCount = Math.min(this.#longestStablePrefix(normalizedMessages), this.log.length);
 			if (stableCount < this.#lastSyncCount) {
-				this.log.truncate(stableCount);
+				this.#truncateLog(stableCount, normalizedMessages);
 				this.#lastSyncCount = stableCount;
 				this.#messageDigests.length = stableCount;
 			}
@@ -388,6 +388,23 @@ export class AppendOnlyContextManager {
 			this.#messageDigests.push(this.#messageDigest(msg));
 		}
 		this.#lastSyncCount = normalizedMessages.length;
+	}
+
+	/**
+	 * Drop the log's entries from `count` on, and the memoized digest of each
+	 * one `next` does not send again. A session message can outlive the log: a
+	 * compaction drops it from the context while its session entry keeps it as
+	 * the transcript, so a memo slot keyed by its identity would last as long.
+	 */
+	#truncateLog(count: number, next: readonly unknown[]): void {
+		const entries = this.log.entries();
+		if (count >= entries.length) return;
+		const resent = new Set(next);
+		for (let index = count; index < entries.length; index++) {
+			const entry = entries[index]!;
+			if (!resent.has(entry)) this.#digestMemo.delete(entry);
+		}
+		this.log.truncate(count);
 	}
 
 	/** Reset prefix + log for a model/provider switch while mode stays active. */

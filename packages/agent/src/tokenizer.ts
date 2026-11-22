@@ -335,6 +335,16 @@ export class Tokenizer {
 	}
 
 	/**
+	 * Drop the memoized estimates of `message`. A message a history drops can
+	 * outlive it: a session keeps the message of each entry before a compaction's
+	 * cut as its transcript, with the body moved to a store, and a memo keyed by
+	 * its identity would keep its counts for the session's life.
+	 */
+	forget(message: AgentMessage): void {
+		this.#estimates.delete(message);
+	}
+
+	/**
 	 * {@link countMessage} for the transcript's latest surviving assistant turn
 	 * (`isSurvivingAssistant`), which an Anthropic Messages replay keeps
 	 * byte-for-byte (`transformMessages`): a turn whose tool calls ended without
