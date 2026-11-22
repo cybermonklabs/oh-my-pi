@@ -20,6 +20,7 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import {
 	loadSessionFile,
 	SESSION_HEADER_READ_LIMIT,
@@ -832,6 +833,24 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			expect([loaded.invalidHeader, loaded.sourceSize]).toEqual([true, Buffer.byteLength(text)]);
 			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
 			expect(await client.exists(`${prefix}file:/s/p.jsonl`)).toBe(false);
+		});
+
+		// The listing parses its window as the loader does, one mark dropped: the header is its first record, so the
+		// session's first prompt is listed first and its search text holds it.
+		it("lists the first prompt of a session that starts with a byte order mark", async () => {
+			const { storage } = await open();
+			const turn = (id: string, parentId: string, role: string, text: string) =>
+				`${JSON.stringify({ type: "message", id, parentId, timestamp: "2026-11-21T00:00:01.000Z", message: { role, content: role === "user" ? text : [{ type: "text", text }], timestamp: 1 } })}\n`;
+			await storage.writeText(
+				"/s/p.jsonl",
+				`\uFEFF${header("S1")}${turn("u1", "S1", "user", "FIRST-PROMPT alpha")}${turn("a1", "u1", "assistant", "FIRST-REPLY")}${turn("u2", "a1", "user", "SECOND-PROMPT beta")}`,
+			);
+			const info = (await listSessions("/s", storage)).find(session => session.path === "/s/p.jsonl");
+			expect([info?.id, info?.firstMessage, info?.allMessagesText.includes("FIRST-PROMPT alpha")]).toEqual([
+				"S1",
+				"FIRST-PROMPT alpha",
+				true,
+			]);
 		});
 	});
 });

@@ -19,6 +19,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -194,6 +195,14 @@ function refusedMoved(file: string, id: string): string {
 
 /** A UTF-8 byte order mark. */
 const MARK = "\uFEFF";
+/** The fixed-width title slot line omp writes, newline included. */
+const SLOT = serializeTitleSlot({ title: "named", source: "user", updatedAt: "2026-11-21T00:00:00.000Z" });
+
+/** A message entry line of `role` with `text`, after `transcript`'s first turn. */
+function turnLine(id: string, parentId: string, role: "user" | "assistant", text: string): string {
+	const content = role === "user" ? text : [{ type: "text", text }];
+	return `${JSON.stringify({ type: "message", id, parentId, timestamp: "2026-11-17T00:00:01.000Z", message: { role, content, timestamp: 2 } })}\n`;
+}
 
 function userTurn(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
@@ -585,12 +594,13 @@ for (const { adapter, url } of BACKENDS) {
 		}, 60_000);
 
 		// Every store returns a session file's text as stored, a leading byte order mark included, and the manager
-		// expects that size; the loader drops exactly one leading mark. Open, append, rewrite whole, reopen and delete:
-		// one session throughout (at bbdb6d5f the file store's text path read 3 bytes fewer than the file holds, so
-		// the first whole rewrite met a size conflict and moved the session to a second file under a new id).
-		async function rewriteMarked(backend: Backend, firstTurn: string): Promise<void> {
+		// expects that size; the loader drops one mark at the file's start and one at the start of the line after the
+		// written title slot. Open, append, rewrite whole, reopen and delete: one session throughout (at bbdb6d5f the
+		// file store's text path read 3 bytes fewer than the file holds, so the first whole rewrite met a size
+		// conflict and moved the session to a second file under a new id).
+		async function rewriteMarked(backend: Backend, firstTurn: string, lead = MARK): Promise<void> {
 			const id = crypto.randomUUID();
-			const file = await listedFile(backend, "bom.jsonl", `${MARK}${transcript(id, firstTurn)}`, id);
+			const file = await listedFile(backend, "bom.jsonl", `${lead}${transcript(id, firstTurn)}`, id);
 			const dir = path.dirname(file);
 			const manager = await SessionManager.open(file, dir, backend.picker, { suppressBreadcrumb: true });
 			try {
@@ -629,6 +639,54 @@ for (const { adapter, url } of BACKENDS) {
 			},
 			180_000,
 		);
+
+		// A mark after the written title slot opened on the file store's stream path at bbdb6d5f (Bun's parser skips a
+		// mark at the start of its input); the loader now drops it on every path, as the start of the session's first
+		// line.
+		it("keeps a session with a byte order mark after the written title slot as one session through an append and a whole rewrite", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			await rewriteMarked(backend, "a turn", `${SLOT}${MARK}`);
+		}, 60_000);
+
+		it.skipIf(adapter !== "file")(
+			"keeps a 9 MiB session with a byte order mark after the written title slot (the stream path) as one session",
+			async () => {
+				await using backend = await openBackend(adapter, url ?? "");
+				await rewriteMarked(backend, "x".repeat(9 * 1024 * 1024), `${SLOT}${MARK}`);
+			},
+			180_000,
+		);
+
+		// The listing parses its window as the loader does: one mark dropped, so the header is its first record and the
+		// session's first prompt is listed first and found by a search.
+		for (const [shape, lead] of [
+			["a byte order mark", MARK],
+			["a mark, then the written title slot", `${MARK}${SLOT}`],
+			["the written title slot, then a mark", `${SLOT}${MARK}`],
+		] as const) {
+			it(`lists the first prompt of a session that starts with ${shape}, and its search text holds it`, async () => {
+				await using backend = await openBackend(adapter, url ?? "");
+				const id = crypto.randomUUID();
+				const turns = [
+					turnLine("a1", "m1", "assistant", "FIRST-REPLY"),
+					turnLine("u2", "a1", "user", "SECOND-PROMPT beta"),
+					turnLine("a2", "u2", "assistant", "SECOND-REPLY"),
+				].join("");
+				const file = await listedFile(
+					backend,
+					"turns.jsonl",
+					`${lead}${transcript(id, "FIRST-PROMPT alpha")}${turns}`,
+					id,
+				);
+				const info = (await listSessions(path.dirname(file), backend.picker)).find(
+					session => session.path === file,
+				);
+				expect([info?.firstMessage, info?.allMessagesText.includes("FIRST-PROMPT alpha")]).toEqual([
+					"FIRST-PROMPT alpha",
+					true,
+				]);
+			}, 60_000);
+		}
 
 		it("returns a session file's leading byte order marks as stored", async () => {
 			await using backend = await openBackend(adapter, url ?? "");

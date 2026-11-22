@@ -6,8 +6,9 @@
  * order mark) is still deleted as listed.
  *
  * Every store returns a session file's text as stored, a leading byte order mark included, and the reader drops
- * exactly one leading mark: a second mark, or one at the start of a later line, leaves that line unreadable, and a
- * mark inside a line stays. Each shape runs through the listing and both delete readers on the file store and the
+ * one mark at the file's start and one at the start of the line after the written title slot (the session's first
+ * line): a second mark there, or one at the start of a later line, leaves that line unreadable, and a mark inside a
+ * line stays. Each shape runs through the listing and both delete readers on the file store and the
  * in-memory store (which returns text as stored, as SQL and Redis do), and through the loader on the file store's
  * text path (below 8 MiB), its byte stream path (from 8 MiB) and the in-memory store: the three load alike, with the
  * file's stored size.
@@ -91,12 +92,27 @@ const SHAPES: Record<string, Shape> = {
 		id: ID,
 		opens: true,
 	},
-	// Only the file's leading mark is dropped: one at the start of a later line leaves that line unreadable.
+	// The line after the written title slot is the session's first line: one mark at its start is dropped too, as on
+	// the file store's stream path at bbdb6d5f; a second one there leaves the header unreadable.
 	"a byte order mark after the written title slot, before the header": {
 		content: `${writtenSlot}${MARK}${header()}\n${turn}`,
 		id: ID,
+		opens: true,
+		title: "named",
+	},
+	"a byte order mark, the written title slot, another mark, then a whole header": {
+		content: `${MARK}${writtenSlot}${MARK}${header()}\n${turn}`,
+		id: ID,
+		opens: true,
+		title: "named",
+	},
+	"the written title slot, two byte order marks, then a whole header": {
+		content: `${writtenSlot}${MARK}${MARK}${header()}\n${turn}`,
+		id: ID,
 		opens: false,
 	},
+	// Only the start of the file and of the session's first line drop a mark: one at the start of a later line leaves
+	// that line unreadable.
 	"a later line that starts with a byte order mark": {
 		content: `${header()}\n${turn}${MARK}${message("m2", "later")}`,
 		id: ID,

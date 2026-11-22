@@ -373,6 +373,16 @@ export interface SessionStorage {
 	 * them, and reports the conflict instead on backends without it.
 	 */
 	readTextSync?(path: string): string;
+	/**
+	 * The file's bytes as stored, decoded as {@link readText} decodes them,
+	 * and their length. Optional: {@link readStoredText} uses it only to size
+	 * text that holds U+FFFD, which an invalid byte or a character cut off at
+	 * the end decodes to (3 bytes for 1). A backend that stores text holds it
+	 * as stored and has none.
+	 */
+	readTextSized?(path: string): Promise<{ text: string; size: number }>;
+	/** Synchronous {@link readTextSized}. See {@link readStoredTextSync}. */
+	readTextSizedSync?(path: string): { text: string; size: number };
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
@@ -1343,13 +1353,24 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	// Not `Bun.file().text()` nor `readFileSync(path, "utf8")`: the first drops a leading byte order mark (see
+	// `utf8Decoder`); the size of what is read is `readStoredText`'s.
 	async readText(path: string): Promise<string> {
-		// Not `Bun.file().text()`: it drops a leading byte order mark (see `utf8Decoder`).
 		return utf8Decoder.decode(await Bun.file(path).bytes());
 	}
 
+	async readTextSized(path: string): Promise<{ text: string; size: number }> {
+		const bytes = await Bun.file(path).bytes();
+		return { text: utf8Decoder.decode(bytes), size: bytes.length };
+	}
+
 	readTextSync(path: string): string {
-		return fs.readFileSync(path, "utf8");
+		return utf8Decoder.decode(fs.readFileSync(path));
+	}
+
+	readTextSizedSync(path: string): { text: string; size: number } {
+		const bytes = fs.readFileSync(path);
+		return { text: utf8Decoder.decode(bytes), size: bytes.length };
 	}
 
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
@@ -1767,6 +1788,51 @@ export async function readSessionTextFrom(
 	if (offset >= bytes.length) return { text: "", size: bytes.length };
 	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
 	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+}
+
+/**
+ * `filePath`'s text, read through {@link SessionStorage.readText} (the one
+ * whole read: a subclass or a test may intercept it), and its stored size in
+ * bytes, the size `SessionManager` checks its writes against. That is the
+ * text's UTF-8 length unless the text holds U+FFFD: an invalid byte, or a
+ * character cut off at the end, decodes to it (3 bytes for 1). Then the
+ * stored bytes are read for their length ({@link SessionStorage.readTextSized}),
+ * kept when they decode to the same text. Otherwise (the file changed or
+ * vanished between the reads, or the backend stores text) the text's length
+ * stands, and a write meets the size conflict the manager recovers from.
+ */
+export async function readStoredText(
+	storage: SessionStorage,
+	filePath: string,
+): Promise<{ text: string; size: number }> {
+	const text = await storage.readText(filePath);
+	const read = { text, size: Buffer.byteLength(text, "utf8") };
+	if (!storage.readTextSized || !text.includes("\uFFFD")) return read;
+	try {
+		const stored = await storage.readTextSized(filePath);
+		return stored.text === text ? stored : read;
+	} catch (err) {
+		if (isEnoent(err)) return read;
+		throw err;
+	}
+}
+
+/** Synchronous {@link readStoredText}; `undefined` on a backend without a synchronous read. */
+export function readStoredTextSync(
+	storage: SessionStorage,
+	filePath: string,
+): { text: string; size: number } | undefined {
+	if (!storage.readTextSync) return undefined;
+	const text = storage.readTextSync(filePath);
+	const read = { text, size: Buffer.byteLength(text, "utf8") };
+	if (!storage.readTextSizedSync || !text.includes("\uFFFD")) return read;
+	try {
+		const stored = storage.readTextSizedSync(filePath);
+		return stored.text === text ? stored : read;
+	} catch (err) {
+		if (isEnoent(err)) return read;
+		throw err;
+	}
 }
 
 function matchesPatternSegment(name: string, pattern: string): boolean {

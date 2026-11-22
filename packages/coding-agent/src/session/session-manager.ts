@@ -126,6 +126,8 @@ import {
 	FileSessionStorage,
 	type ListedSession,
 	MemorySessionStorage,
+	readStoredText,
+	readStoredTextSync,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
 	type SessionStorage,
@@ -1774,19 +1776,20 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (!this.#storage.readTextSync) return undefined;
-		let content: string;
+		// The stored size of what was read (see readStoredText): the retry is checked against it.
+		let read: { text: string; size: number } | undefined;
 		try {
-			content = this.#storage.readTextSync(contested);
+			read = readStoredTextSync(this.#storage, contested);
 		} catch (readError) {
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
 			return contested;
 		}
-		const foreign = this.#foreignEntriesIn(content);
+		if (!read) return undefined;
+		const foreign = this.#foreignEntriesIn(read.text);
 		if (!foreign) return this.#moveOffSessionFile("replaced");
 		resolveBlobRefsInEntriesSync(foreign, this.#blobs);
-		this.#adoptForeignEntries(foreign, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries(foreign, read.size);
 		return contested;
 	}
 
@@ -1819,9 +1822,9 @@ export class SessionManager {
 			if (this.#sessionFile !== contested) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
-		let content: string;
+		let read: { text: string; size: number };
 		try {
-			content = await this.#storage.readText(contested);
+			read = await readStoredText(this.#storage, contested);
 		} catch (readError) {
 			// A synchronous rewrite during the read already recovered; retry against its result.
 			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
@@ -1830,11 +1833,11 @@ export class SessionManager {
 			return contested;
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		const foreign = this.#foreignEntriesIn(content);
+		const foreign = this.#foreignEntriesIn(read.text);
 		if (!foreign) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		this.#adoptForeignEntries(foreign, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries(foreign, read.size);
 		return contested;
 	}
 

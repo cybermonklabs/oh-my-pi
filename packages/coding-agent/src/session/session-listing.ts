@@ -11,7 +11,12 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
-import { extractStringProperty, leadingSessionHeader, visitEntriesFromFile } from "./session-loader";
+import {
+	extractStringProperty,
+	leadingSessionHeader,
+	visitEntriesFromFile,
+	withoutLeadingMarks,
+} from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import {
 	defaultSessionStorage,
@@ -342,7 +347,10 @@ function parseSessionListHeaderLine(line: string, titleOverride?: string | null)
 	};
 }
 
-/** The listed header, read from `content`'s leading text as a delete and the loader read it ({@link leadingSessionHeader}). */
+/**
+ * The listed header, read from `content`'s leading text as a delete and the loader read it ({@link leadingSessionHeader}).
+ * `entries` are the records of `withoutLeadingMarks(content)`; `content` is the text as read.
+ */
 function parseSessionListHeader(
 	content: string,
 	entries: Array<Record<string, unknown>>,
@@ -396,7 +404,9 @@ async function scanSessionFile(
 			withStatus ? SESSION_LIST_SUFFIX_BYTES : 0,
 		);
 		const { size, mtime } = stat;
-		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		// Parsed past the leading byte order marks, as the loader parses (withoutLeadingMarks): a mark left on the
+		// header's line makes it unreadable, and the session's first prompt would then be read as its header.
+		const entries = parseJsonlLenient<Record<string, unknown>>(withoutLeadingMarks(content));
 		const header = parseSessionListHeader(content, entries);
 		if (!header) {
 			// Cache the negative result too: an unparseable file stays unparseable
