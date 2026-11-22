@@ -3,6 +3,12 @@
  * from, a storage or its backend: a test of a memory bound wraps their
  * methods with these and checks what {@link Longest} noted.
  */
+import type {
+	SqlSessionStorageClient,
+	SqlSessionStorageResult,
+	SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { reserveWrapped } from "../session/sql-session-lease-fixture";
 
 /** The UTF-8 bytes of a string, the bytes of a buffer, 0 for anything else. */
 export function byteSize(value: unknown): number {
@@ -87,4 +93,53 @@ export function recordStorage<S extends object>(storage: S, longest: Longest): S
 			return typeof member === "function" ? recordMethod(target, String(key), member, longest) : member;
 		},
 	});
+}
+
+/**
+ * `client` behind a wrapper that notes in `longest` every value bound to a
+ * statement or written into its text, every value a statement returns, and
+ * the values one statement returns together: the statements of the client
+ * itself, of its transactions, and of each connection it reserves (where
+ * `client` can reserve one), on which a store that reserves connections runs
+ * every PostgreSQL statement. `before` runs ahead of each statement, inside
+ * its transaction.
+ */
+export function recordClient(
+	client: SqlSessionStorageClient,
+	longest: Longest,
+	before?: (query: string, values: unknown[] | undefined) => Promise<void>,
+): SqlSessionStorageClient {
+	const exec = async (
+		executor: SqlSessionStorageTransaction,
+		query: string,
+		values: unknown[] | undefined,
+	): Promise<SqlSessionStorageResult> => {
+		await before?.(query, values);
+		// A PostgreSQL read of a store older than cybermonklabs/oh-my-pi#59 writes its values into its text.
+		longest.note(byteSize(query), "the text of a statement");
+		for (const value of values ?? []) longest.note(byteSize(value), "a value bound to a statement");
+		const rows = await executor.unsafe(query, values);
+		// A query of several statements (such a read, or the opening of a transaction of #59) answers one result each.
+		const results = rows.length > 0 && rows.every(Array.isArray) ? (rows as unknown[][]) : [rows];
+		for (const result of results) {
+			let returned = 0;
+			for (const row of result as Array<Record<string, unknown>>) {
+				for (const value of Object.values(row)) {
+					longest.note(byteSize(value), "a value a statement returned");
+					returned += byteSize(value);
+				}
+			}
+			longest.note(returned, "the values one statement returned");
+		}
+		return rows;
+	};
+	const recorded = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		unsafe: (query, values) => exec(executor, query, values),
+	});
+	return {
+		options: client.options,
+		unsafe: (query, values) => exec(client, query, values),
+		transaction: callback => client.transaction(async transaction => callback(recorded(transaction))),
+		...reserveWrapped(client, recorded),
+	};
 }

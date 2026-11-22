@@ -28,13 +28,12 @@ import {
 	SqlSessionStorage,
 	type SqlSessionStorageAdapter,
 	type SqlSessionStorageClient,
-	type SqlSessionStorageResult,
-	type SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
-import { byteSize, Longest, recordStorage } from "../helpers/longest-value";
+import { Longest, recordClient, recordStorage } from "../helpers/longest-value";
 import { raceAfterFirstChunk } from "./chunked-read-race";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -128,35 +127,6 @@ function expectBounded(longest: Longest): void {
 	});
 }
 
-/** `client` behind a wrapper that notes every bound value, every returned value, and every query's returned values together. */
-function instrument(client: SqlClient, longest: Longest): SqlSessionStorageClient {
-	const exec = async (
-		executor: SqlSessionStorageTransaction,
-		query: string,
-		values: unknown[] | undefined,
-	): Promise<SqlSessionStorageResult> => {
-		for (const value of values ?? []) longest.note(byteSize(value), "a value bound to a statement");
-		const rows = await executor.unsafe(query, values);
-		let returned = 0;
-		for (const row of rows as Array<Record<string, unknown>>) {
-			for (const value of Object.values(row)) {
-				longest.note(byteSize(value), "a value a statement returned");
-				returned += byteSize(value);
-			}
-		}
-		longest.note(returned, "the values one statement returned");
-		return rows;
-	};
-	return {
-		options: client.options,
-		unsafe: (query, values) => exec(client, query, values),
-		transaction: callback =>
-			client.transaction(async transaction =>
-				callback({ unsafe: (query, values) => exec(transaction, query, values) }),
-			),
-	};
-}
-
 /**
  * A long compacted session: a title slot, a header, alternating user and
  * assistant messages of about 100 KiB of one-, three- and four-byte
@@ -248,6 +218,7 @@ class Db {
 					callback({ unsafe: (query, values) => transaction.unsafe(query, values) }),
 				);
 			},
+			...reserveWrapped(client, connection => ({ unsafe: (query, values) => connection.unsafe(query, values) })),
 		});
 	}
 
@@ -489,7 +460,7 @@ for (const { adapter, url } of BACKENDS) {
 					await (await db.open()).writeLinesAtomic(file, lines, { expectedSize: null });
 
 					const longest = new Longest();
-					setDefaultSessionStorage(recordStorage(await db.open(instrument(db.client, longest)), longest));
+					setDefaultSessionStorage(recordStorage(await db.open(recordClient(db.client, longest)), longest));
 					let printed = "";
 					vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
 						printed += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");

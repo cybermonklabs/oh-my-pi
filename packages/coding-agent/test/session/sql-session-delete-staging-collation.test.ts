@@ -18,7 +18,7 @@ import type {
 import { SQL } from "bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { type LeaseDb, openLeaseDb, transcript, until } from "./sql-session-lease-fixture";
+import { type LeaseDb, openLeaseDb, reserveWrapped, transcript, until } from "./sql-session-lease-fixture";
 
 const SERVER_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 const ID = "01a1f000-0000-7000-8000-0000000000e2";
@@ -207,7 +207,9 @@ if (ND_SKIP) console.warn(`sql-session-delete-staging-collation (nondeterministi
  * A client wrapper under which a staged full write stops between its staging
  * and its swap: every transaction after the first one that wrote staging
  * parts waits until `release()`. `staged` resolves once that first one has
- * committed.
+ * committed. Where the store reserves a connection for each transaction, a
+ * transaction is the statements of one reserved connection, from its opening
+ * to its `COMMIT`.
  */
 function holdSwapAfterStaging(): {
 	wrap: (inner: SqlSessionStorageClient) => SqlSessionStorageClient;
@@ -217,6 +219,12 @@ function holdSwapAfterStaging(): {
 	const staged = Promise.withResolvers<void>();
 	const gate = Promise.withResolvers<void>();
 	let hasStaged = false;
+	const committed = (stages: boolean): void => {
+		if (stages && !hasStaged) {
+			hasStaged = true;
+			staged.resolve();
+		}
+	};
 	return {
 		staged: staged.promise,
 		release: () => gate.resolve(),
@@ -234,13 +242,26 @@ function holdSwapAfterStaging(): {
 						},
 					} satisfies SqlSessionStorageTransaction),
 				);
-				if (stages && !hasStaged) {
-					hasStaged = true;
-					staged.resolve();
-				}
+				committed(stages);
 				return result;
 			},
 			end: () => inner.end?.() ?? Promise.resolve(),
+			...reserveWrapped(inner, connection => {
+				let opened = false;
+				let stages = false;
+				return {
+					async unsafe(query, values) {
+						if (!opened) {
+							opened = true;
+							if (hasStaged) await gate.promise;
+						}
+						if (values?.some(value => typeof value === "string" && value.includes("#staging-"))) stages = true;
+						const result = await connection.unsafe(query, values);
+						if (query === "COMMIT") committed(stages);
+						return result;
+					},
+				};
+			}),
 		}),
 	};
 }
