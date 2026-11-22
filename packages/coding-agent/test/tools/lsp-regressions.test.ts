@@ -37,7 +37,7 @@ import {
 	type TextDocumentEdit,
 	type WorkspaceEdit,
 } from "@oh-my-pi/pi-coding-agent/lsp/types";
-import { type LspToolDetails } from "@oh-my-pi/pi-tui/tools/lsp";
+import { type LspParams, type LspToolDetails } from "@oh-my-pi/pi-tui/tools/lsp";
 import {
 	applyCodeAction,
 	collectGlobMatches,
@@ -4563,12 +4563,18 @@ describe("lsp regressions", () => {
 	describe("the call's deadline while a language server does not answer", () => {
 		const endings = ["deadline", "cancel"] as const;
 
-		/** Runs `run` in a fresh checkout whose only language server is the fake `fake-lsp`. */
-		async function inCheckout(run: (cwd: string, server: ServerConfig) => Promise<void>): Promise<void> {
+		/**
+		 * Runs `run` in a fresh checkout whose language servers are `servers`, by default only the fake
+		 * `fake-lsp` (`server`).
+		 */
+		async function inCheckout(
+			run: (cwd: string, server: ServerConfig) => Promise<void>,
+			servers?: Record<string, ServerConfig>,
+		): Promise<void> {
 			const tempDir = TempDir.createSync("@omp-lsp-call-deadline-");
 			const server: ServerConfig = { command: "fake-lsp", fileTypes: [".ts"], rootMarkers: [] };
 			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
-				servers: { "fake-lsp": server },
+				servers: servers ?? { "fake-lsp": server },
 				idleTimeoutMs: undefined,
 			});
 			try {
@@ -4763,6 +4769,99 @@ describe("lsp regressions", () => {
 						`may not have been told of the rename (didRenameFiles cut off): ${endedBy(ending)}`,
 					);
 				});
+			});
+		}
+
+		/** `params` as a call with `timeout: 5` in `cwd`; settles to its result or error. */
+		function callLsp(cwd: string, params: Partial<LspParams>, signal: AbortSignal): Promise<unknown> {
+			return new LspTool(makeLspSession(cwd))
+				.execute("silent-server", { ...params, timeout: 5 } as LspParams, signal)
+				.then(
+					result => result,
+					(error: unknown) => error,
+				);
+		}
+
+		for (const [silent, params] of [
+			["initialize", { action: "capabilities" }],
+			["custom/never", { action: "request", query: "custom/never" }],
+			["workspace/symbol", { action: "symbols", file: "*", query: "value" }],
+			["initialize", { action: "reload", file: "*" }],
+		] as const) {
+			for (const ending of endings) {
+				it(`${params.action}${"file" in params ? " *" : ""} whose server has not answered ${silent} reports the call's ${ending}`, async () => {
+					await inCheckout(async cwd => {
+						const call = callEnding(ending);
+						installSilentLsp(silent, call.end);
+
+						const outcome = await callLsp(cwd, params, call.signal);
+
+						expectCallEnded(
+							outcome,
+							ending,
+							`LSP ${params.action} timed out after 5s. The server may still be indexing; try again or pass timeout=<larger>.`,
+						);
+					});
+				});
+			}
+		}
+
+		for (const ending of endings) {
+			// A control: the single-file actions already reported the deadline as a timeout.
+			it(`hover whose server has not answered it reports the call's ${ending}`, async () => {
+				await inCheckout(async cwd => {
+					const call = callEnding(ending);
+					installSilentLsp("textDocument/hover", call.end);
+					const file = path.join(cwd, "a.ts");
+					fs.writeFileSync(file, "export const value = 1;\n");
+
+					const outcome = await callLsp(cwd, { action: "hover", file, line: 1, symbol: "value" }, call.signal);
+
+					expectCallEnded(
+						outcome,
+						ending,
+						"LSP hover timed out after 5s on fake-lsp. The server may still be indexing; try again or pass timeout=<larger>.",
+					);
+				});
+			});
+
+			it(`diagnostics of several files reports the call's ${ending} that comes between two files`, async () => {
+				// The file-by-file report is themed, as in production.
+				await initTheme();
+				const call = callEnding(ending);
+				// A linter whose first file's check finishes just as the call ends.
+				const linted: string[] = [];
+				const linter: ServerConfig = {
+					command: "fake-linter",
+					fileTypes: [".ts"],
+					rootMarkers: [],
+					isLinter: true,
+					createClient: () => ({
+						format: async (_filePath, content) => content,
+						lint: async filePath => {
+							linted.push(path.basename(filePath));
+							if (linted.length === 1) call.end();
+							return [];
+						},
+					}),
+				};
+				await inCheckout(
+					async cwd => {
+						for (const name of ["a.ts", "b.ts"]) {
+							fs.writeFileSync(path.join(cwd, name), "export const value = 1;\n");
+						}
+
+						const outcome = await callLsp(cwd, { action: "diagnostics", file: "*.ts" }, call.signal);
+
+						expectCallEnded(
+							outcome,
+							ending,
+							"LSP diagnostics timed out after 5s. The server may still be indexing; try again or pass timeout=<larger>.",
+						);
+						expect(linted).toHaveLength(1);
+					},
+					{ "fake-linter": linter },
+				);
 			});
 		}
 	});

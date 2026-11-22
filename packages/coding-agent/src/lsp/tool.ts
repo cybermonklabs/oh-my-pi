@@ -257,6 +257,26 @@ function formatRenameStatError(error: unknown): string {
 	return `${replaceTabs(error.code)}${syscall}`;
 }
 
+/** One `lsp` call as its action sees it: the signal it runs under and how it ends. */
+interface LspCall {
+	/** The caller's signal joined with the call's deadline. */
+	signal: AbortSignal;
+	/** The call's deadline, in seconds. */
+	timeoutSec: number;
+	/** How long a diagnostics wait may take, in milliseconds. */
+	waitMs: number;
+	/** Whether the call's own deadline, not the caller, stopped the call. */
+	deadlinePassed: () => boolean;
+	/**
+	 * Rethrow an abort; return for any other error. A caller cancel stays a
+	 * ToolAbortError (one already thrown passes unchanged, so an action's own
+	 * report survives the call's shared catch), while the call's own deadline
+	 * becomes a ToolError naming the budget and server instead of an opaque
+	 * "Operation aborted"; `note` says what the call was doing.
+	 */
+	rethrowAbort: (err: unknown, serverName?: string, note?: string) => void;
+}
+
 /**
  * LSP tool for language server protocol operations.
  */
@@ -304,7 +324,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
-		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
+		const { action, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
 			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
 		}
@@ -314,32 +334,43 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			cfgToolsMaxTimeout.get(this.session.settings),
 		);
 		const timeoutSec = budget.call;
-		const waitMs = budget.wait * 1000;
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const callerSignal = signal;
-		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
-		throwIfAborted(signal);
-		/** Whether the call's own deadline, not the caller, stopped the call. */
+		const callSignal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
+		throwIfAborted(callSignal);
 		const deadlinePassed = (): boolean => timeoutSignal.aborted && !callerSignal?.aborted;
-		/**
-		 * Rethrow an abort; return for any other error. A caller cancel stays a
-		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
-		 * budget and server instead of an opaque "Operation aborted"; `note` says what
-		 * the call was doing.
-		 */
 		const rethrowAbort = (
 			err: unknown,
 			serverName?: string,
 			note = "The server may still be indexing; try again or pass timeout=<larger>.",
 		): void => {
-			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
+			if (!(err instanceof ToolAbortError) && !callSignal.aborted) return;
 			if (deadlinePassed()) {
 				const server = serverName ? ` on ${serverName}` : "";
 				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}. ${note}`);
 			}
-			throw new ToolAbortError();
+			throw err instanceof ToolAbortError ? err : new ToolAbortError();
 		};
+		try {
+			return await this.#runAction(params, {
+				signal: callSignal,
+				timeoutSec,
+				waitMs: budget.wait * 1000,
+				deadlinePassed,
+				rethrowAbort,
+			});
+		} catch (err) {
+			// An action's own catch names the server it waited on. An abort that leaves an
+			// action any other way still reports the call's deadline as a timeout.
+			if (err instanceof ToolError) throw err;
+			rethrowAbort(err);
+			throw err;
+		}
+	}
 
+	async #runAction(params: LspParams, call: LspCall): Promise<AgentToolResult<LspToolDetails>> {
+		const { action, file, line, symbol, query, new_name, apply } = params;
+		const { signal, timeoutSec, waitMs, deadlinePassed, rethrowAbort } = call;
 		const config = getConfig(this.session.cwd);
 
 		// Status action doesn't need a file
