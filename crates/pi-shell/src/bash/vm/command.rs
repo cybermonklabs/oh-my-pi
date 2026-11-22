@@ -311,16 +311,9 @@ pub fn exec(
 						},
 					}
 				}
-				if (op.flags & ir::Op::CAT != 0
-					|| (unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
-						&& cmd.assigns.is_empty()
-						&& cmd
-							.redirs
-							.is_some_and(|list| zsh_read_subst(vp, unit, list))))
-					&& st(vp).argv.is_empty()
-				{
+				if op.flags & ir::Op::CAT != 0 && st(vp).argv.is_empty() {
 					// `$(< file)`: the file is the substitution's output.
-					if let Some(flow) = cat_stdin(k, vp, cx, line) {
+					if let Some(flow) = cat_stdin(k, vp, cx) {
 						return flow;
 					}
 					continue;
@@ -1157,9 +1150,12 @@ fn expand(
 	None
 }
 
-/// `$(< file)`: read fd 0 (the redirected file) to its end and queue it
-/// as the command's output.
-fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
+/// `$(< file)` (bash, in the shell: [`exec::start_sub`]): read fd 0 (the
+/// redirected file) to its end and queue it as the command's output. A
+/// read error is no failure, as in bash's `read_comsub`: `$(< dir)` is
+/// empty with status 0 and no message. (bash keeps what it read before an
+/// error; the engine's read answers nothing then.)
+fn cat_stdin(k: &Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<Flow> {
 	let req = Probe::Read { path: BString::from("/dev/stdin") };
 	let mut sc = exec::take_scratch(vp);
 	let answer = match probe::cached(&sc, &req) {
@@ -1170,13 +1166,6 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 	let text = match answer {
 		Err(key) => return Some(Flow::Block(key)),
 		Ok(ProbeResult::Bytes(Ok(text))) => text,
-		Ok(ProbeResult::Bytes(Err(msg))) => {
-			k.diag(cx, vp, line, Diag::Usage { msg: format!("{msg}").into() });
-			let s = st(vp);
-			s.status = 1;
-			s.stage = Stage::Finish;
-			return None;
-		},
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
@@ -1184,32 +1173,6 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
 	s.stage = Stage::Output;
 	None
-}
-
-/// zsh `getoutput`'s `$(< word)` (`simple_redir_name`): the whole body of
-/// the zsh command substitution `vp` runs is one simple command made of a
-/// lone `<` on fd 0 (redirection list `list` of `unit`). Its output is the
-/// file, read without running `$READNULLCMD`.
-#[inline(never)]
-fn zsh_read_subst(vp: &Vproc, unit: &Unit, list: u32) -> bool {
-	let [Frame { kind: FrameKind::Script { src, what: ScriptKind::Eval, aux, .. }, .. }] =
-		vp.frames.as_slice()
-	else {
-		return false;
-	};
-	if aux.as_ref().is_some_and(|a| a.pending.is_some()) {
-		return false;
-	}
-	// The list markers (`Nop`s) aside.
-	let mut ops = unit.ops.iter().filter(|op| op.code != ir::Opcode::Nop);
-	let lone_exec = matches!((ops.next(), ops.next(), ops.next()), (Some(exec), Some(end), None)
-		if exec.code == ir::Opcode::Exec && end.code == ir::Opcode::End);
-	vp.parent.is_some()
-		&& lone_exec
-		&& unit.redirs.get(list as usize).is_some_and(
-			|rs| matches!(rs.as_slice(), [r] if r.op == RedirKind::In && r.fd == ir::RedirFdIr::Default),
-		)
-		&& src.trim_ascii() == unit.source.trim_ascii()
 }
 
 /// zsh `execcmd` for redirections without a command: without `$NULLCMD`

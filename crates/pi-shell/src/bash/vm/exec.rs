@@ -588,10 +588,12 @@ fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, op: Op) {
 }
 
 /// Whether `op` starts a command bash reports on its own (`BASH_COMMAND`,
-/// the ERR trap): a simple command, `[[ ]]` or `(( ))`.
+/// the ERR trap): a simple command, `[[ ]]` or `(( ))`. The `< file` of a
+/// `$(< file)` ([`Op::CAT`]) is none: bash reads the file without running
+/// a command (no DEBUG trap, `BASH_COMMAND` stays the outer command's).
 fn starts_command(unit: &Unit, op: Op) -> bool {
 	match op.code {
-		Opcode::Exec => true,
+		Opcode::Exec => op.flags & Op::CAT == 0,
 		Opcode::Enter => unit
 			.nodes
 			.get(op.node as usize)
@@ -2212,7 +2214,8 @@ pub fn settle_probe(
 /// The logged form of an expansion probe's answer: a PATH search's path
 /// (`None`: not found); an access check's success as an empty string; a
 /// filesystem request's ([`super::fsprobe`]) bytes, names (a list), other
-/// success (empty) or failure (`None`).
+/// success (empty) or failure (`None`); a file read's contents, or its
+/// failure's `strerror` text as a one-item list.
 pub fn probe_atom(answer: ProbeResult) -> Atom {
 	use super::fsprobe::FsAns;
 	Atom::Str(match answer {
@@ -2225,6 +2228,10 @@ pub fn probe_atom(answer: ProbeResult) -> Atom {
 		},
 		ProbeResult::Fs(Ok(FsAns::Bytes(b))) => Some(b),
 		ProbeResult::Fs(Ok(_)) => Some(BString::default()),
+		// A file read ([`Probe::Read`], zsh's `$(< word)`): its contents, or
+		// the `strerror` text of the failure as a one-item list.
+		ProbeResult::Bytes(Ok(b)) => Some(b),
+		ProbeResult::Bytes(Err(err)) => return Atom::List(vec![err]),
 		_ => None,
 	})
 }
@@ -2269,6 +2276,24 @@ pub fn start_sub(
 	let inherit =
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
+		// `$(< file)`: bash reads the file in the shell itself, with no
+		// subshell (`optimize_cat_file`): the redirection's word expands as
+		// the shell's own (`set -u` ends the shell; no DEBUG trap, xtrace or
+		// ERR trap for the `< file`, which is no command bash runs). The body
+		// runs here in a frame of its own whose stdout is the capture; its
+		// `Exec` ([`ir::Op::CAT`]) outputs the file. A failure inside does
+		// not count for `set -e`.
+		ComsubForm::Fork if unit.cat_exec(entry).is_some() => {
+			let mut frame = Frame::new(Some(unit), entry, FrameKind::Stage);
+			frame.line_shift = shift;
+			frame.ignore_errexit = true;
+			let prev = vp.fds.get(1).cloned();
+			vp.fds.set(1, Some(out));
+			frame.redirs.push(vec![Saved { fd: 1, prev }]);
+			vp.frames.push(frame);
+			sc.sub = Some(PendingSub::NoFork { capture, value: false });
+			Flow::Call
+		},
 		ComsubForm::Fork => {
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
@@ -2277,15 +2302,8 @@ pub fn start_sub(
 			// numbering its lines from the line the shell is at: at top
 			// level, where the whole command ends.
 			let base = top_level_end_line(vp).unwrap_or(line);
-			// `$(< file)` keeps its compiled form ([`ir::Op::CAT`]).
-			let cat = unit
-				.ops
-				.get(entry as usize)
-				.is_some_and(|op| op.flags & ir::Op::CAT != 0);
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
-				!posix
-					&& !cat
-					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
+				!posix && (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)

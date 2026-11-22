@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `$(< file)` reads the file in the shell itself, as bash and zsh do, instead of in a subshell. The file name may hold a substitution (`$(< "$(cmd)")` was empty), and `$(0< file)` is read too (it was empty). `set -u` ends the shell on an unset name in it. No DEBUG trap, `BASH_COMMAND` or trace line is made for the `< file`. A directory reads as empty with status 0 in bash, and as zsh's `error when reading NAME: is a directory`. In zsh, a successful read leaves `$?` alone, and the name is not globbed
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
