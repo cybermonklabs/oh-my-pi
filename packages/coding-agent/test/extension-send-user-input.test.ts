@@ -351,7 +351,8 @@ describe("pi.sendUserInput", () => {
 
 		expect(await api.sendUserInput("/live on")).toEqual({
 			handled: "command",
-			output: "Live voice is not available here: only RPC mode and the interactive terminal run /live.",
+			output:
+				"Live voice cannot be driven from this input: RPC mode runs /live on|off|status, and the interactive terminal runs /live when it is typed there.",
 		});
 		await session.waitForIdle();
 		expect(userTurns(started)).toHaveLength(0);

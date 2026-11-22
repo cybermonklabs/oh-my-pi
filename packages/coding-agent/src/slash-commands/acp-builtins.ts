@@ -32,10 +32,10 @@ export function isAcpBuiltinShadowedName(name: string): boolean {
 /**
  * Commands advertised to ACP clients. Entries without a text-mode `handle`
  * (e.g. `/quit`, `/login`, dashboards) are filtered out so the client doesn't
- * see commands it cannot drive.
+ * see commands it cannot drive, and so are `acpHidden` ones ACP never runs.
  */
 export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMMANDS_INTERNAL.filter(
-	command => command.handle !== undefined,
+	command => command.handle !== undefined && !command.acpHidden,
 ).map(command => {
 	// Honor mode-specific copy: ACP clients receive concise text-mode
 	// descriptions/hints when the spec sets `acpDescription` / `acpInputHint`,

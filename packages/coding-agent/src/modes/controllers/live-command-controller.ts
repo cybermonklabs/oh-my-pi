@@ -63,10 +63,32 @@ export class LiveCommandController {
 		return this.#session !== undefined || this.#settling !== undefined;
 	}
 
-	/** Start live mode, or stop the currently active session. */
-	async handleCommand(): Promise<void> {
-		if (this.#session) {
+	/**
+	 * `/live` and its key: start live mode, or stop the active session. `on` only starts (it reports a
+	 * call that is already up), `off` only stops (it reports when none is), and `status` only reports.
+	 */
+	async handleCommand(action?: "on" | "off" | "status"): Promise<void> {
+		const session = this.#session;
+		if (action === "status") {
+			this.#ctx.showStatus(
+				session
+					? `A live call is ${session.phase === "connecting" ? "starting" : "open"}.`
+					: this.#settling
+						? "The live call is closing."
+						: "No live call is open.",
+			);
+			return;
+		}
+		if (session) {
+			if (action === "on") {
+				this.#ctx.showStatus("A live call is already open; /live off ends it.");
+				return;
+			}
 			await this.stop();
+			return;
+		}
+		if (action === "off") {
+			this.#ctx.showStatus(this.#settling ? "The live call is closing." : "No live call is open.");
 			return;
 		}
 		while (this.#settling) await this.#settling;

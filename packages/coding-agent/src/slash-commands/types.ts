@@ -229,6 +229,11 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 	 */
 	acpInputHint?: string;
 	/**
+	 * Not advertised to ACP clients: the text-mode `handle` serves other hosts (RPC, `sendUserInput`),
+	 * and ACP never runs the command (`/live`, which needs a host with a live call).
+	 */
+	acpHidden?: boolean;
+	/**
 	 * Text/ACP-mode handler. The same body is invoked from the ACP dispatcher
 	 * and, via the TUI adapter, when no `handleTui` override is provided.
 	 *

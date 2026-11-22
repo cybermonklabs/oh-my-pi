@@ -109,10 +109,17 @@ export async function buildAvailableSlashCommands(
 	return commands;
 }
 
+/** Built-ins with a text-mode `handle` that ACP never runs (`acpHidden`): left out of ACP's list. */
+const ACP_HIDDEN_BUILTIN_NAMES: ReadonlySet<string> = new Set(
+	BUILTIN_SLASH_COMMANDS_INTERNAL.filter(command => command.acpHidden).map(command => command.name),
+);
+
 export function toAcpAvailableCommands(commands: readonly InternalAvailableSlashCommand[]): AvailableCommand[] {
-	return commands.map(command => ({
-		name: command.name,
-		description: command.description ?? "",
-		input: command.input,
-	}));
+	return commands
+		.filter(command => !(command.source === "builtin" && ACP_HIDDEN_BUILTIN_NAMES.has(command.name)))
+		.map(command => ({
+			name: command.name,
+			description: command.description ?? "",
+			input: command.input,
+		}));
 }

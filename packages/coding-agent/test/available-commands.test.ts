@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import {
+	buildAvailableSlashCommands,
+	toAcpAvailableCommands,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
 
 describe("buildAvailableSlashCommands", () => {
 	test("returns RPC-safe command metadata with stable sources", async () => {
@@ -80,6 +84,25 @@ describe("buildAvailableSlashCommands", () => {
 
 		expect(loadedCommands).toEqual(fileCommands);
 		expect(commands.find(command => command.name === "notes")?.source).toBe("file");
+	});
+
+	test("lists /live for RPC but not for ACP, which runs no live call", async () => {
+		const commands = await buildAvailableSlashCommands(
+			{
+				customCommands: [],
+				skills: [],
+				sessionManager: { getCwd: () => process.cwd() },
+				setSlashCommands() {},
+			} as never,
+			async () => [],
+		);
+		expect(commands.find(command => command.name === "live")).toMatchObject({
+			source: "builtin",
+			input: { hint: "[on|off|status]" },
+		});
+		expect(toAcpAvailableCommands(commands).some(command => command.name === "live")).toBe(false);
+		expect(toAcpAvailableCommands(commands).some(command => command.name === "model")).toBe(true);
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "live")).toBe(false);
 	});
 
 	test("forwards file-command argumentHint as ACP input hint", async () => {

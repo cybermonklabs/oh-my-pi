@@ -1582,7 +1582,12 @@ the call `/live on` returns when the start ends, with that line as `output`.
 The live frames below are sent as for `live_start`. The checks `live_start`
 makes (dictation, a session change or shutdown) apply to `/live on` too. ACP,
 print mode and subagents run no live session and answer `/live` as not
-available; the interactive terminal's `/live` opens its own live view.
+available, and ACP does not list it. In the interactive terminal `/live on`,
+`/live off` and `/live status` do only that, and a bare `/live` (or its key)
+starts a call or ends the open one; an extension's `sendUserInput("/live …")`
+there gets the not-available answer, since only typing it runs the terminal's
+call. The built-in `/live` runs in place of an extension's or a custom `/live`
+command in RPC mode, ACP, print mode and `sendUserInput`.
 
 ### GPT-Live through the `openai` provider
 

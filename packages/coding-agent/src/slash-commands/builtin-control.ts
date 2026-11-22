@@ -46,7 +46,10 @@ async function startLiveCall(
 async function handleLiveText(args: string, runtime: SlashCommandRuntime) {
 	const live = runtime.live;
 	if (!live) {
-		return usage("Live voice is not available here: only RPC mode and the interactive terminal run /live.", runtime);
+		return usage(
+			"Live voice cannot be driven from this input: RPC mode runs /live on|off|status, and the interactive terminal runs /live when it is typed there.",
+			runtime,
+		);
 	}
 	const verb = args.trim().toLowerCase() || "status";
 	const status = live.status();
@@ -172,12 +175,18 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "live",
 		icon: "voice",
-		description: "Realtime voice mode: the terminal's /live opens it; on, off or status where a host runs calls",
-		acpInputHint: "on|off|status",
+		description: "Realtime voice call: /live on, off or status; in the terminal a bare /live starts or ends one",
+		inlineHint: "[on|off|status]",
+		allowArgs: true,
+		// ACP has no live call to drive; `handle` serves RPC and `sendUserInput`.
+		acpHidden: true,
 		handle: (command, runtime) => handleLiveText(command.args, runtime),
-		handleTui: async (_command, runtime) => {
+		handleTui: async (command, runtime) => {
 			clearSubmittedText(runtime);
-			await runtime.ctx.handleLiveCommand();
+			const verb = command.args.trim().toLowerCase();
+			if (verb === "") await runtime.ctx.handleLiveCommand();
+			else if (verb === "on" || verb === "off" || verb === "status") await runtime.ctx.handleLiveCommand(verb);
+			else runtime.ctx.showWarning("Usage: /live [on|off|status]");
 		},
 	},
 	{

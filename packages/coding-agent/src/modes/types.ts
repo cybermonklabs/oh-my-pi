@@ -621,8 +621,11 @@ export interface InteractiveModeContext {
 	/** Space-bar push-to-talk into `target`: a recognized hold starts dictation and its release stops
 	 *  it. Gated on `stt.enabled`, so a disabled STT leaves the space bar typing normally. */
 	dictationSpaceHold(target: DictationTarget): SpaceHoldHandler;
-	/** Start or stop the Codex-backed realtime voice session. */
-	handleLiveCommand(): Promise<void>;
+	/**
+	 * `/live`: with no action, start a realtime voice call or stop the open one; `on` only starts,
+	 * `off` only stops, `status` only reports.
+	 */
+	handleLiveCommand(action?: "on" | "off" | "status"): Promise<void>;
 	/** Start a live session whose audio runs on an extension's own WebRTC peer (`ctx.startLive`). */
 	startRemoteLive(options: ExtensionLiveStartOptions): Promise<ExtensionLiveSession>;
 	/** Start a `/record` screen capture, or stop the running one. */

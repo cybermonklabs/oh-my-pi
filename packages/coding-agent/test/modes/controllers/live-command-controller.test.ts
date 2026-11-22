@@ -8,6 +8,7 @@ import type { LiveTransportOptions } from "@oh-my-pi/pi-coding-agent/live/transp
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 
 /** Fake InteractiveModeContext plus typed capture channels for focus/mount traffic. */
 interface ContextHarness {
@@ -53,6 +54,7 @@ function createContext(): ContextHarness {
 			requestComponentRender: vi.fn(),
 		},
 		showError: vi.fn(),
+		showStatus: vi.fn(),
 		chatContainer: { children: [] },
 		present: vi.fn(),
 	} as unknown as InteractiveModeContext;
@@ -81,6 +83,53 @@ describe("LiveCommandController", () => {
 		} finally {
 			await controller.stop();
 		}
+	});
+
+	it("/live on, off and status do only that, where a bare /live toggles", async () => {
+		const { ctx } = createContext();
+		let starts = 0;
+		const stop = vi.fn(async () => {});
+		const controller = new LiveCommandController(ctx, options => {
+			starts += 1;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockImplementation(stop);
+			return session;
+		});
+		try {
+			await controller.handleCommand("off");
+			await controller.handleCommand("status");
+			expect(starts).toBe(0);
+			expect(ctx.showStatus).toHaveBeenCalledWith("No live call is open.");
+			await controller.handleCommand("on");
+			expect(starts).toBe(1);
+			await controller.handleCommand("on");
+			await controller.handleCommand("status");
+			expect(starts).toBe(1);
+			expect(stop).not.toHaveBeenCalled();
+			expect(ctx.showStatus).toHaveBeenCalledWith("A live call is already open; /live off ends it.");
+			expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringMatching(/^A live call is (starting|open)\.$/));
+			await controller.handleCommand("off");
+			expect(stop).toHaveBeenCalled();
+		} finally {
+			await controller.stop();
+		}
+	});
+
+	it("the terminal's /live hands on, off and status to the live command and refuses other words", async () => {
+		const actions: (string | undefined)[] = [];
+		const ctx = {
+			editor: { setText: vi.fn() },
+			handleLiveCommand: vi.fn(async (action?: string) => {
+				actions.push(action);
+			}),
+			showWarning: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		for (const text of ["/live", "/live on", "/live OFF", "/live status", "/live louder"]) {
+			expect(await executeBuiltinSlashCommand(text, { ctx })).toBe(true);
+		}
+		expect(actions).toEqual([undefined, "on", "off", "status"]);
+		expect(ctx.showWarning).toHaveBeenCalledWith("Usage: /live [on|off|status]");
 	});
 
 	it("stops the session and restores the editor when the live-toggle chord hits the focused visualizer", async () => {

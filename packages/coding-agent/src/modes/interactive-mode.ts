@@ -9587,14 +9587,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		return undefined;
 	}
 
-	/** Start or stop the Codex-backed realtime voice surface. */
-	async handleLiveCommand(): Promise<void> {
-		const blocker = this.#liveStartBlocker();
+	/** `/live`: start or stop the realtime voice call, or with `action` only start, only stop or only report. */
+	async handleLiveCommand(action?: "on" | "off" | "status"): Promise<void> {
+		// Only a command that may start a call waits for dictation to finish.
+		const blocker = action === "off" || action === "status" ? undefined : this.#liveStartBlocker();
 		if (blocker) {
 			this.showWarning(blocker);
 			return;
 		}
-		await this.#liveCommandController.handleCommand();
+		await this.#liveCommandController.handleCommand(action);
 	}
 
 	/** Start a live session whose audio runs on an extension's own WebRTC peer. */
