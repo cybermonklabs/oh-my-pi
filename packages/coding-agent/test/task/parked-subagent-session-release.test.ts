@@ -29,10 +29,12 @@ const AGENT_ID = "ParkedRelease";
 const MOCK_API_SOURCE = "test/parked-subagent-session-release";
 // After earlier files warm the session code, JSC's optimizing-JIT worklist can
 // keep an object referenced by an in-flight compile reachable for a few seconds
-// (observed ~4 s locally, >8 s on loaded CI runners); collection is polled past
-// that window. A healthy release returns on the first poll that sees it collected,
-// so the deadline only bounds how long a real leak takes to fail.
-const COLLECT_DEADLINE_MS = 15_000;
+// (observed ~4 s locally, >8 s on loaded CI runners), and in a whole run under
+// gVisor the observed object stayed reachable past 15 s. So the wait has no
+// deadline of its own: it forces a collection until the object is gone, and only
+// the row's timeout bounds it, which is where a real leak fails. The pause
+// between collections only paces them.
+const COLLECT_POLL_MS = 100;
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -82,13 +84,12 @@ function weakRefToLiveSession(id: string): WeakRef<AgentSession> {
 	return new WeakRef(localSession(session));
 }
 
-async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<boolean> {
-	const deadline = Date.now() + deadlineMs;
+/** Resolves once `ref`'s target is collected, forcing a full collection before each look. */
+async function collected(ref: WeakRef<object>): Promise<void> {
 	for (;;) {
 		Bun.gc(true);
-		if (ref.deref() === undefined) return true;
-		if (Date.now() > deadline) return false;
-		await Bun.sleep(100);
+		if (ref.deref() === undefined) return;
+		await Bun.sleep(COLLECT_POLL_MS);
 	}
 }
 
@@ -172,7 +173,7 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 		expect(AgentLifecycleManager.global().has(AGENT_ID)).toBe(true);
 
 		run.release();
-		expect(await collected(sessionRef, COLLECT_DEADLINE_MS)).toBe(true);
+		await collected(sessionRef);
 		// Still adopted after collection: the release did not come from dropping the reviver.
 		expect(AgentLifecycleManager.global().has(AGENT_ID)).toBe(true);
 	} finally {
@@ -190,7 +191,7 @@ it("parks without retaining the run's settings overlay and revives with the sett
 		run.release();
 		// The reviver held the run's whole overlay — merged view, memoized values, listener buckets —
 		// for as long as the parked agent stayed adopted.
-		expect(await collected(settingsRef, COLLECT_DEADLINE_MS)).toBe(true);
+		await collected(settingsRef);
 
 		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
 		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
