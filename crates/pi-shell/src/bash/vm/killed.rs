@@ -16,18 +16,29 @@
 //! error, never through the command's redirections, and names the line it
 //! has reached when it waits. A background job that such another signal
 //! killed gets that long notice, with `  (wd: DIR)` when the shell's
-//! directory changed since the job started, wherever bash calls
-//! `notify_and_cleanup`: when `wait` waits for it ([`waited`]: through
-//! `wait`'s own redirections, naming its line, as soon as it has reaped
-//! that job, before it waits for the next); before the shell reads its
-//! next line of input ([`line_read`], naming that line); as it expands a
-//! `$( )`, `${ ;}`, `<( )` or `>( )`, whose text bash re-parses through
-//! the same reader ([`expanded`], naming the command's line plus one plus
-//! the newlines of the substitution's source; a backquote not); and at the
-//! end of `jobs`, for the jobs it did not list ([`jobs_ended`], through its
-//! redirections). Nothing reports while the job list is frozen: in a
-//! `CHLD` trap the `wait` builtin runs, and an `INT` trap bash runs as the
-//! forked foreground command it waited for ends ([`Vproc::jobs_frozen`]).
+//! directory changed since the job started, at these points of bash 5.3.20
+//! (each a `notify_and_cleanup` call), and only these:
+//! - when `wait` waits for it ([`waited`]: through `wait`'s own redirections,
+//!   naming its line, as soon as it has reaped that job, before it waits for
+//!   the next);
+//! - before the shell reads its next line of input ([`line_read`], naming that
+//!   line);
+//! - as it expands a `$( )`, `${ ;}`, `<( )` or `>( )`, which bash re-parses
+//!   through the same reader (`xparse_dolparen`; a backquote not), also one in
+//!   the operand of a `${x:-…}`, `${x:=…}`, `${x:+…}` or `${x:?…}` it does not
+//!   expand ([`expanded`]): naming the command's line plus one, plus the
+//!   newlines of the substitution's source in an assignment's value or a `[[
+//!   ]]` operand;
+//! - as it expands a compound array assignment, `a=( … )`, `a+=( … )` or a
+//!   declaration builtin's (`parse_string_to_word_list`), naming the command's
+//!   line ([`reparsed`]);
+//! - at the end of `jobs` without `-r`, `-s` or `-x`, for the jobs it did not
+//!   list ([`jobs_ended`], through its redirections).
+//!
+//! Nothing reports while the job list is frozen: in a `CHLD` trap the
+//! `wait` builtin runs (not in posix mode, where the trap ends the `wait`),
+//! and an `INT` trap bash runs as the forked foreground job it waited for
+//! ends ([`Vproc::jobs_frozen`]); a finished job stays in the table then.
 //! `TERM` and a trapped signal there say nothing. A posix `-c` shell prints
 //! neither notice. No job notice comes from a command or process
 //! substitution's own process (one comes from a `( … )`, `&` or pipeline
@@ -239,18 +250,25 @@ pub(super) fn line_read(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u
 	}
 }
 
-/// The shell expands a `$( )`, `${ ;}`, `<( )` or `>( )` (not a
-/// backquote) of the command at script line `line`, whose source holds
-/// `lines` newlines: bash re-parses its text through `shell_getc`
-/// (`xparse_dolparen`) and reports as [`line_read`] does, naming the line
-/// its parser has reached by then, `line + 1 + lines`. Written at once,
-/// before the substitution runs and before the command's redirections
-/// move standard error (what would block waits in `vp.out`).
-pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, lines: u32) {
-	line_read(k, cx, vp, line.saturating_add(1).saturating_add(lines));
+/// bash re-parses text through `shell_getc` at run time (a substitution, a
+/// compound array assignment) at script line `line` of `vp`: it reports as
+/// [`line_read`] does, naming `line`. Written at once, before the text
+/// runs and before the command's redirections move standard error (what
+/// would block waits in `vp.out`).
+pub(super) fn reparsed(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) {
+	line_read(k, cx, vp, line);
 	if !vp.out.is_empty() {
 		let _ = exec::flush_out(k, vp);
 	}
+}
+
+/// The shell expands a `$( )`, `${ ;}`, `<( )` or `>( )` (not a
+/// backquote) of the command at script line `line`, or one in an operand
+/// it does not expand: [`reparsed`] naming `line + 1 + lines` (`lines`: the
+/// newlines of its source in an assignment's value or a `[[ ]]` operand,
+/// else 0; [`crate::bash::ir::Part::Comsub`]).
+pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, lines: u32) {
+	reparsed(k, cx, vp, line.saturating_add(1).saturating_add(lines));
 }
 
 /// `jobs` ends at script line `line` (bash's `notify_and_cleanup (-1)` at

@@ -1316,7 +1316,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		));
 	} else if let Some(a) = aux {
 		a.pending = None;
-		if a.parse.is_none() {
+		if a.parse.is_none() && !a.no_line {
 			*aux = None;
 		}
 	}
@@ -1375,7 +1375,10 @@ fn line_to_read(cx: &mut Cx<'_>, vp: &Vproc) -> Option<u32> {
 	else {
 		return None;
 	};
-	if aux.as_ref().is_some_and(|a| a.pending.is_some()) {
+	if aux
+		.as_ref()
+		.is_some_and(|a| a.pending.is_some() || a.no_line)
+	{
 		return None;
 	}
 	let at = pos.0 as usize;
@@ -4465,7 +4468,8 @@ pub fn job_control(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// console groups of their own, out of the console's Ctrl-C.
 ///
 /// zsh 5.9 (`entersubsh` with `ESUB_ASYNC`), on every platform: ignored
-/// traps it lists (`trap -- '' INT`) and may replace or remove; a `( … )`
+/// traps it lists (`trap -- '' INT`) and may replace or remove, in place
+/// of the parent's trap functions (`settrap` removes `TRAPINT`); a `( … )`
 /// inside it starts with them unset, as zsh's subshells unset their traps
 /// (`zsh_subshell_traps`).
 fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
@@ -4487,6 +4491,9 @@ fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 	for sig in [Signal::Int, Signal::Quit] {
 		let key = TrapKey::Signal(sig);
 		child.own_traps = child.own_traps.with(key);
+		// zsh's `settrap` removes the signal's trap function first
+		// (`TRAPINT`, `TRAPQUIT`), as a `trap` command does.
+		super::builtins::trap::remove_trap_funcs(&mut k.root, cx.store, child, key, None);
 		let record = Record::Trap { mode: child.mode, action: BString::default() };
 		state::store_record(&mut k.root, cx.store, child, KeyBuf::Trap(key), Some(record));
 	}
@@ -5025,9 +5032,13 @@ fn push_trap(
 	let status = vp.status;
 	vp.blocked = None;
 	// bash runs a `CHLD` trap `wait` runs from `waitchld`, and an `INT`
-	// trap from its `wait_for`, with the job list frozen.
+	// trap from its `wait_for`, with the job list frozen; in posix mode the
+	// `CHLD` trap ends the `wait` and runs after it (`jobs.c:4240-4250`).
 	let frozen = match key {
-		TrapKey::Signal(crate::bash::signal::Signal::Chld) => vp.in_wait_builtin(),
+		TrapKey::Signal(crate::bash::signal::Signal::Chld) => {
+			vp.in_wait_builtin()
+				&& !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
+		},
 		TrapKey::Signal(crate::bash::signal::Signal::Int) => {
 			let at = k.frozen_ints.iter().position(|v| *v == vp.vpid);
 			at.map(|i| k.frozen_ints.swap_remove(i)).is_some()
@@ -5231,6 +5242,15 @@ pub fn push_script(vp: &mut Vproc, src: &[u8], line: u32, what: ScriptKind) {
 	}
 	vp.frames
 		.push(Frame::new(None, 0, FrameKind::script(src, Pos { offset: 0, line }, what)));
+}
+
+/// The script frame on top of `vp` runs a command a builtin built (`jobs
+/// -x`), which bash runs with `execute_command`: reading it is no read of
+/// an input line, and reports no job ([`line_to_read`]).
+pub fn script_reads_no_line(vp: &mut Vproc) {
+	if let Some(Frame { kind: FrameKind::Script { aux, .. }, .. }) = vp.frames.last_mut() {
+		aux.get_or_insert_with(Box::default).no_line = true;
+	}
 }
 
 // zsh control flow (zsh-dialect units only). Ported from zsh 5.9 (MIT-style

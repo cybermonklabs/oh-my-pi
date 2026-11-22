@@ -289,3 +289,24 @@ fn a_root_jobs_signal_outlives_a_store_image() {
 	assert!(pid.is_some_and(|p| p.trim().parse::<u32>().is_ok()), "{err:?}");
 	assert_eq!(r.host.stdout.bytes(), b"next\n");
 }
+
+/// The signal that ended a subshell's job outlives every snapshot of a run
+/// (a subshell's job table is in the frames image, its jobs' signals beside
+/// it): under `Fault::Snapshot { every: 1 }` the subshell's `wait` prints the
+/// notice the uninterrupted run prints.
+#[test]
+fn a_subshells_killed_job_keeps_its_signal_across_snapshots() {
+	let src = b"( { while :; do :; done; } & kill -KILL $!; wait $!; echo st=$? )";
+	let run = |fault| {
+		let mut r = rig();
+		let status = r.run(Script::command(&src[..]), fault);
+		(status, r.host.stdout.bytes(), r.host.stderr.bytes())
+	};
+	let plain = run(Fault::None);
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	assert!(
+		plain.1 == b"st=137\n" && String::from_utf8_lossy(&plain.2).contains(&*killed),
+		"the uninterrupted run: {plain:?}"
+	);
+	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
+}

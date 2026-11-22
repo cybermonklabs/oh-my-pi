@@ -238,10 +238,11 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		for number in picked {
 			print_job(ctx, number, form, &show);
 		}
+		// bash's `-r` and `-s` listings return without `notify_and_cleanup`.
 		if state.is_none() {
 			cleanup(ctx);
+			ended(ctx);
 		}
-		ended(ctx);
 		return done(0);
 	}
 	if matches!(form, Form::Long | Form::Pids) {
@@ -325,6 +326,9 @@ fn execute_with_pids(ctx: &mut Ctx<'_, '_>, words: &[BString]) -> R {
 	}
 	ctx.vp.status = 0;
 	push_script(ctx.vp, &src, ctx.line, ScriptKind::Eval);
+	// bash runs it with `execute_command`, reading no input line: it reports
+	// no job ([`crate::bash::vm::killed::line_read`]).
+	crate::bash::vm::exec::script_reads_no_line(ctx.vp);
 	ctx.k.emit_op(ctx.cx, ctx.vp, 0, EventData::EvalEnter);
 	Ok(Outcome { status: 0, control: Control::Frame })
 }

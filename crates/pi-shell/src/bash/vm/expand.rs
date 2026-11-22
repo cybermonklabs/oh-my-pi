@@ -965,7 +965,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Lit(b) if inq => sink.lit(b, true),
 			Part::Lit(b) => Self::lit_text(sink, b, rhs),
 			Part::Quoted(b) => sink.lit(b, true),
-			Part::Param(p) => self.param(unit, p, sink, inq || p.quoted, rhs)?,
+			Part::Param(p) => {
+				// bash's `extract_dollar_brace_string` parses a `$( )` of the
+				// operand even where it does not expand it (`xparse_dolparen`).
+				if let Some(lines) = operand_comsub(unit, p) {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line, lines);
+				}
+				self.param(unit, p, sink, inq || p.quoted, rhs)?;
+			},
 			Part::Comsub { entry, kind, quoted, text, lines } => {
 				let out = self.comsub(unit, *entry, *kind, *text, *lines)?;
 				sink.value(&out, inq || *quoted);
@@ -1822,6 +1829,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		out: &mut Vec<CompoundElem>,
 		globs: Option<&mut Vec<(u32, BString)>>,
 	) -> X<()> {
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		if elems.first().is_some_and(|e| e.key.is_none()) {
 			let assoc = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
 				state::Deref::Plain => self.is_assoc(name)?,
@@ -1969,6 +1978,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let (Some(Part::Compound(elems)), WordKind::DeclArg) = (w.parts.last(), w.kind) else {
 			return Ok(false);
 		};
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		let mut sink = Sink::Scalar(Vec::new());
 		for part in &w.parts[..w.parts.len() - 1] {
 			self.part(unit, part, &mut sink, false, false)?;
@@ -3376,6 +3387,28 @@ pub struct CompoundElem {
 	pub value:  BString,
 }
 
+/// The first `$( )`, `${ ;}` or `${| ;}` (not a backquote) in the word
+/// operand of `p` (`${x:-…}`, `${x:=…}`, `${x:+…}`, `${x:?…}`), at any depth
+/// of nested operands: its `lines` ([`Part::Comsub`]). bash parses it when
+/// it expands `p`, whether or not it expands the operand.
+fn operand_comsub(unit: &Unit, p: &ParamIr) -> Option<u32> {
+	let w = match &p.op {
+		OpIr::Default { word, .. } | OpIr::Assign { word, .. } | OpIr::Alt { word, .. } => *word,
+		OpIr::Error { word: Some(word), .. } => *word,
+		_ => return None,
+	};
+	unit
+		.words
+		.get(w as usize)?
+		.parts
+		.iter()
+		.find_map(|part| match part {
+			Part::Comsub { text: Some(_), lines, .. } => Some(*lines),
+			Part::Param(inner) => operand_comsub(unit, inner),
+			_ => None,
+		})
+}
+
 /// The `(…)` text a declaration builtin re-reads: each value (and key)
 /// single-quoted, `[k]=v` / `[k]+=v` for keyed elements.
 pub fn compound_text(elems: &[CompoundElem]) -> BString {
@@ -3874,6 +3907,7 @@ pub fn compound_string(
 	text: &[u8],
 	assoc: bool,
 ) -> Result<Vec<CompoundElem>, Stop> {
+	super::killed::reparsed(k, cx, vp, line);
 	let mode = super::exec::mode_of(vp);
 	let unit = k
 		.engine

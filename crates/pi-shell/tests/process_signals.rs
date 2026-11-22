@@ -409,12 +409,17 @@ fn masked(o: &Outcome) -> Outcome {
 /// `-c` string, an `eval`'s or a trap's text (not at its end), a script
 /// file or standard input (at its end too). It also reads through
 /// `shell_getc` each `$( )`, `${ ;}` and `<( )` it expands (`xparse_dolparen`;
-/// backquotes not), naming the command's line plus one plus the newlines
-/// in the substitution's source, before the command's redirections; and
-/// `jobs` reports at its end, through its own redirections. Nothing
-/// reports while a trap runs that bash runs with the job list frozen
-/// (`jobs_list_frozen`): a `CHLD` trap `wait` runs, an `INT` trap run as
-/// the foreground command it waited for ends; `wait` reports after it. A
+/// backquotes not), also one in an operand it does not expand
+/// (`${x:-$( )}` with `x` set), naming the command's line plus one, plus
+/// the newlines of the substitution's source in an assignment's value or a
+/// `[[ ]]` operand, before the command's redirections; each compound
+/// array assignment (`a=( … )`, `a+=( … )`, `declare -a a=( … )`), naming
+/// the command's line; and `jobs` reports at its end, through its own
+/// redirections, but not `jobs -r`, `-s` or `-x`. Nothing reports while a
+/// trap runs that bash runs with the job list frozen (`jobs_list_frozen`):
+/// a `CHLD` trap `wait` runs, an `INT` trap run as the foreground command
+/// it waited for ends; `wait` reports after it
+/// ([`bash_keeps_finished_jobs_while_the_job_list_is_frozen`]). A
 /// `wait` without operands drops a job that had ended unreported, `jobs`
 /// reports it instead, and `INT`, `TERM`, `PIPE`, a signal the shell
 /// traps, an exit (137 too), a posix `-c` shell, a command substitution
@@ -427,6 +432,9 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 	/// Wait, in the foreground, for the shell to reap job `$!`.
 	const GONE: &str = "while kill -0 $! 2>/dev/null; do /bin/sleep 0.01; done";
 	const S: &str = "/bin/sleep 30 & kill -KILL $!";
+	/// A substitution's text of one and of three newlines.
+	const N1: &str = "echo a\necho b";
+	const N3: &str = "echo a\n\n\necho b";
 	let w = format!("{S}; {GONE}");
 	let notice = |line, sig, text: &str| {
 		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
@@ -577,6 +585,60 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 			format!("{w}; /bin/sleep 30 & jobs %2; kill $!; echo next"),
 			format!("[2]+  {:<27}/bin/sleep 30 &\n{}next\n", "Running", killed(1)),
 		),
+		// The newlines of a substitution's source count in an assignment's
+		// value and a `[[ ]]` operand only: elsewhere the line after the
+		// command's.
+		(format!("{w}; x+=$({N1}); echo \"$x\""), format!("{}a\nb\n", killed(3))),
+		(format!("{w}; a[0]=$({N1}); echo \"${{a[0]}}\""), format!("{}a\nb\n", killed(3))),
+		(format!("{w}; x=$({N1}) true; echo next"), format!("{}next\n", killed(3))),
+		(format!("{w}; x=${{y:-$({N1})}}; echo \"$x\""), format!("{}a\nb\n", killed(3))),
+		(format!("{w}; [[ -n $({N1}) ]] && echo yes"), format!("{}yes\n", killed(3))),
+		(format!("{w}; x=$({N3}); echo \"$x\""), format!("{}a\nb\n", killed(5))),
+		(format!("{w}; echo $({N1})"), format!("{}a b\n", killed(2))),
+		(format!("{w}; echo \"$({N1})\""), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; cat <({N1})"), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; echo ${{ {N1}; }}"), format!("{}a b\n", killed(2))),
+		(format!("{w}; declare x=$({N1}); echo \"$x\""), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; export x=$({N1}); echo \"$x\""), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; f() {{ local x=$({N1}); echo \"$x\"; }}; f"), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; echo hi >$(echo /dev/stdout\n)"), format!("{}hi\n", killed(2))),
+		(format!("{w}; cat <<< $({N1})"), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; for i in $({N1}); do echo $i; done"), format!("{}a\nb\n", killed(2))),
+		(format!("{w}; case $({N1}) in *) echo c;; esac"), format!("{}c\n", killed(2))),
+		(format!("{w}; echo $(( $(echo 1\necho) + 1 ))"), format!("{}2\n", killed(2))),
+		(format!("{w}; echo ${{y:-$({N1})}}"), format!("{}a b\n", killed(2))),
+		(format!("{w}; echo $({N3})"), format!("{}a b\n", killed(2))),
+		// A compound array assignment re-parses its list: the command's line.
+		(format!("{w}; a=( x y ); echo ${{a[1]}}"), format!("{}y\n", killed(1))),
+		(format!("{w}\na=( x y ); echo ${{a[1]}}"), format!("{}y\n", killed(2))),
+		(format!("{w}; a=( x\ny ); echo ${{a[1]}}"), format!("{}y\n", killed(1))),
+		(format!("{w}; a=( $(echo in) ); echo ${{a[0]}}"), format!("{}in\n", killed(1))),
+		(format!("{w}; a+=( x ); echo ${{a[0]}}"), format!("{}x\n", killed(1))),
+		(format!("{w}; declare -a a=( x y ); echo ${{a[1]}}"), format!("{}y\n", killed(1))),
+		(format!("{w}; declare -A a=( [k]=v ); echo ${{a[k]}}"), format!("{}v\n", killed(1))),
+		// A `$( )` in an operand bash does not expand: it parses it anyway.
+		(
+			format!("{w}; x=set; echo ${{x:-$(echo in)}}\necho next"),
+			format!("{}set\nnext\n", killed(2)),
+		),
+		(
+			format!("{w}; x=set; echo ${{x:+$(echo in)}}\necho next"),
+			format!("{}in\nnext\n", killed(2)),
+		),
+		(format!("{w}; x=set; echo ${{x:-$({N1})}}\necho next"), format!("{}set\nnext\n", killed(2))),
+		(
+			format!("{w}; x=set; echo ${{x:-`echo in`}}\necho next"),
+			format!("set\n{}next\n", killed(2)),
+		),
+		// No report at the end of `jobs -r`, `-s` or `-x`; one at `jobs -l`'s
+		// listing of the job.
+		(format!("{w}; jobs -r; echo next\necho after"), format!("next\n{}after\n", killed(2))),
+		(format!("{w}; jobs -s; echo next\necho after"), format!("next\n{}after\n", killed(2))),
+		(
+			format!("{w}; jobs -x echo hi; echo next\necho after"),
+			format!("hi\nnext\n{}after\n", killed(2)),
+		),
+		(format!("{w}; jobs -l >/dev/null; echo next\necho after"), "next\nafter\n".into()),
 	];
 	let mut wrong = Vec::new();
 	for (script, out) in cases {
@@ -637,6 +699,134 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 		if let Some(bash) = real_bash_golden() {
 			let theirs = Run::new(&bash, "bash", &[&path]).go();
 			assert_eq!(masked(&ours), masked(&theirs), "file: {script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash 5.3.20 keeps a finished job in the table while the job list is
+/// frozen (`cleanup_dead_jobs` and `delete_job` return at once,
+/// `jobs.c:1470`, `1492`): a `CHLD` trap that runs `wait` while `wait $!`,
+/// `wait`, `wait -n` or `wait %1` waits for a job that ends (of `KILL`, of
+/// `TERM`, with `exit 200`) leaves it, and the `wait` it interrupted still
+/// ends, with the job's status and notice; the trap's own `wait $!` or
+/// `wait %1` collects it and marks it reported (no notice then), its
+/// `wait -n` returns 127 at once (`wait_for_any_job`, `jobs.c:3465`); an
+/// `INT` trap's `wait` leaves a killed job to the next line's notice. bash
+/// freezes only there:
+/// not for an `INT` trap that comes while it reads a command substitution
+/// (no job; the trap's first line reports), nor for a `CHLD` trap in posix
+/// mode, which ends the `wait` with 128 + `SIGCHLD` and runs after it.
+/// Checked-in goldens measured with bash 5.3.20 (compared live only with a
+/// bash 5.3 or later, [`real_bash_golden`]); each script starts with `exec
+/// 2>&1`; a row whose shell is still running after [`EVENT_LIMIT`] fails.
+/// The job of [`KILLER`]'s form ends once the shell blocks, in `wait`.
+#[test]
+fn bash_keeps_finished_jobs_while_the_job_list_is_frozen() {
+	const W: &str =
+		"/bin/sleep 30 & kill -KILL $!; while kill -0 $! 2>/dev/null; do /bin/sleep 0.01; done";
+	const REAP: &str = "kill -KILL $p; while ps -p $p >/dev/null 2>&1; do /bin/sleep 0.01; done; \
+	                    kill -INT $$; /bin/sleep 0.3";
+	let killer = |end: &str| format!("/bin/sh -c '{}'", KILLER.replace("kill -KILL $$", end));
+	let notice = |line, text: &str| {
+		String::from_utf8(long_notice(line, libc::SIGKILL, text.as_bytes())).expect("ASCII")
+	};
+	let mut rows: Vec<(String, String)> = Vec::new();
+	for (end, status, reported) in
+		[("kill -KILL $$", 137, true), ("kill -TERM $$", 143, false), ("exit 200", 200, false)]
+	{
+		let job = killer(end);
+		let shown = if reported {
+			notice(1, &job)
+		} else {
+			String::new()
+		};
+		for (wait, st) in [("wait $!", status), ("wait", 0), ("wait -n", status), ("wait %1", status)]
+		{
+			rows.push((
+				format!("trap 'echo chld; wait' CHLD; {job} & {wait}; echo st=$?\necho next"),
+				format!("chld\n{shown}st={st}\nnext\n"),
+			));
+		}
+	}
+	// The trap's own `wait $!` or `wait %1` collects the job and marks it
+	// reported (`in=137`, no notice); its `wait -n` returns at once while
+	// the list is frozen (`in=127`), and the outer `wait` reports the job.
+	let job = killer("kill -KILL $$");
+	for (inner, got_in, shown) in [
+		("wait $!", 137, String::new()),
+		("wait %1", 137, String::new()),
+		("wait -n", 127, notice(1, &job)),
+	] {
+		for (outer, st) in [("wait $!", 137), ("wait", 0), ("wait -n", 137)] {
+			rows.push((
+				format!(
+					"trap 'echo chld; {inner}; echo in=$?' CHLD; {job} & {outer}; echo st=$?\necho next"
+				),
+				format!("chld\nin={got_in}\n{shown}st={st}\nnext\n"),
+			));
+		}
+	}
+	let sleep = |line| notice(line, "/bin/sleep 30");
+	rows.push((
+		format!(
+			"trap 'echo int; wait' INT; {W}; /bin/sh -c 'kill -INT $PPID; kill -INT $$'\necho next"
+		),
+		format!("int\n{}next\n", sleep(2)),
+	));
+	for sub in [format!("$({REAP})"), format!("`{REAP}`")] {
+		rows.push((
+			format!("trap 'echo int' INT; /bin/sleep 30 & p=$!; x={sub}\necho next"),
+			format!("{}int\nnext\n", sleep(1)),
+		));
+	}
+	let posix = |end: &str| {
+		format!(
+			"set -o posix; trap 'echo chld' CHLD\n{} &\nwait $!; echo st=$?\necho next",
+			killer(end)
+		)
+	};
+	rows.push((posix("kill -KILL $$"), "chld\nst=145\nnext\n".into()));
+	let mut wrong = Vec::new();
+	for (script, out) in rows {
+		let script = format!("exec 2>&1; {script}");
+		let run = |program: &OsStr| {
+			Run::script(program, "bash", &script)
+				.spawn()
+				.end_within(EVENT_LIMIT, &script)
+		};
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "{script:?}");
+		}
+	}
+	// Posix mode in a script file, which reports: at the trap's first line.
+	let dir = tempfile::tempdir().expect("a directory for the script");
+	let path = dir.path().join("s.sh");
+	let file = path.display().to_string();
+	let job = killer("kill -KILL $$");
+	let killed = format!("{file}: line 1: PID {:<27}{job}\n", desc(libc::SIGKILL));
+	for (script, out) in [
+		(posix("kill -KILL $$"), format!("{killed}chld\nst=145\nnext\n")),
+		(posix("exit 200"), "chld\nst=145\nnext\n".to_owned()),
+	] {
+		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
+		let run = |program: &OsStr| {
+			Run::new(program, "bash", &[&path])
+				.spawn()
+				.end_within(EVENT_LIMIT, &script)
+		};
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("file {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "file: {script:?}");
 		}
 	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
@@ -934,6 +1124,11 @@ fn an_asynchronous_command_ignores_int_and_quit() {
 		("/bin/sh -c 'kill -QUIT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
 		("/bin/sh -c 'kill -INT $$; echo alive' & wait $!; echo st=$?", "alive\nst=0\n"),
 		("( trap; trap -p INT ) & wait; echo done", "trap -- '' INT\ntrap -- '' QUIT\ndone\n"),
+		// `settrap` removes the parent's trap function too.
+		(
+			"TRAPINT() { print fn }; ( trap ) & wait; print done",
+			"trap -- '' INT\ntrap -- '' QUIT\ndone\n",
+		),
 	]
 	.into_iter()
 	.map(|(script, out)| (script.to_owned(), out.to_owned()))

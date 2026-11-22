@@ -3278,6 +3278,11 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 		if !p.waiting_foreground() {
 			p.blocked = None;
 		}
+		// bash in posix mode queues the trap and ends a `wait` it is in,
+		// with 128 + `SIGCHLD` (`jobs.c:4240-4250`); the trap runs after.
+		if !zsh && state::option(&mut k.root, cx.store, p, OptId::Posix).unwrap_or(false) {
+			interrupt_wait(p, Signal::Chld.exit_status(k.engine.config().platform));
+		}
 	}
 }
 

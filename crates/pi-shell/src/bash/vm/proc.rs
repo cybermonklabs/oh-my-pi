@@ -844,14 +844,14 @@ impl Vproc {
 		})
 	}
 
-	/// Whether it waits for a forked foreground command: a subshell, a
-	/// pipeline stage, a command substitution, an external (bash's
-	/// `wait_for`), not a builtin's callout or task.
+	/// Whether it waits for a forked foreground job: a subshell, a
+	/// pipeline stage, an external (bash's `wait_for` of a job, whose
+	/// `set_job_status_and_cleanup` runs the `INT` trap); not a command
+	/// substitution, which is no job, nor a builtin's callout or task.
 	pub fn waiting_for_a_fork(&self) -> bool {
 		self.frames.iter().any(|frame| {
 			frame.scratch.as_ref().is_some_and(|scratch| {
 				!scratch.children.is_empty()
-					|| scratch.sub.is_some()
 					|| matches!(
 						scratch.exec.as_ref().and_then(|exec| exec.waiting),
 						Some(Awaited::Ext { .. })
@@ -980,6 +980,10 @@ pub struct ScriptAux {
 	/// text is parsed before any of it runs, so every command parses with
 	/// the features and aliases of the first.
 	pub parse:   Option<ParseSnapshot>,
+	/// The text is a command a builtin built (`jobs -x`), which bash runs
+	/// with `execute_command`: no line of it is read as input, and none
+	/// reports a job ([`super::killed::line_read`]).
+	pub no_line: bool,
 }
 
 /// The parse context a zsh string keeps for all its commands

@@ -532,6 +532,11 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
+	/// Lowering an assignment's value or a `[[ ]]` operand: a substitution
+	/// there names the line after its own newlines when it reports a job
+	/// ([`Part::Comsub`]'s `lines`); elsewhere bash names the line after
+	/// the command's.
+	sub_lines:     bool,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -601,6 +606,7 @@ impl Lower {
 			cond: 0,
 			features,
 			text: false,
+			sub_lines: false,
 		}
 	}
 
@@ -1008,7 +1014,10 @@ impl Lower {
 			st::CommandKind::Cond(e) => {
 				self.node(cid, NodeKind::Cond, cspan);
 				self.emit(Opcode::Enter, 0, 0, id);
-				self.cond_expr(e, id)?;
+				let outer = std::mem::replace(&mut self.sub_lines, true);
+				let res = self.cond_expr(e, id);
+				self.sub_lines = outer;
+				res?;
 				self.emit(Opcode::Leave, 0, 0, id);
 			},
 			st::CommandKind::Repeat(r) => {
@@ -1133,6 +1142,7 @@ impl Lower {
 			cond:          0,
 			features:      self.features,
 			text:          false,
+			sub_lines:     false,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);
@@ -1263,7 +1273,12 @@ impl Lower {
 			self.node(a.id(), NodeKind::Assign, a.span());
 			let index = a.index().map(|i| self.word(i)).transpose()?;
 			let value = match a.value() {
-				st::AssignValue::Scalar(w) => AssignVal::Scalar(self.word_as(w, WordKind::Assign)?),
+				st::AssignValue::Scalar(w) => {
+					let outer = std::mem::replace(&mut self.sub_lines, true);
+					let value = self.word_as(w, WordKind::Assign);
+					self.sub_lines = outer;
+					AssignVal::Scalar(value?)
+				},
 				st::AssignValue::Array(elems) => AssignVal::Array(self.elems(elems)?),
 			};
 			assigns.push(AssignOp {
@@ -1601,7 +1616,11 @@ impl Lower {
 			},
 			st::Part::Param(p) => out.push(Part::Param(Box::new(self.param(p, quoted)?))),
 			st::Part::Comsub(c) => {
-				let entry = self.block(c.body())?;
+				// Its body's words are not the assignment's.
+				let outer = std::mem::replace(&mut self.sub_lines, false);
+				let entry = self.block(c.body());
+				self.sub_lines = outer;
+				let entry = entry?;
 				let ck = c.kind();
 				let kind = match ck {
 					syn::ComsubKind::Dollar | syn::ComsubKind::Backtick => ComsubForm::Fork,
@@ -1614,7 +1633,7 @@ impl Lower {
 				if kind == ComsubForm::Fork {
 					self.mark_cat(entry);
 				}
-				let lines = if ck == syn::ComsubKind::Backtick {
+				let lines = if ck == syn::ComsubKind::Backtick || !self.sub_lines {
 					0
 				} else {
 					self.newlines(c.span())
@@ -1623,8 +1642,15 @@ impl Lower {
 			},
 			st::Part::Arith(a) => out.push(Part::Arith { text: a.src().into(), quoted }),
 			st::Part::ProcSub(p) => {
-				let entry = self.block(p.body())?;
-				let lines = self.newlines(p.span());
+				let outer = std::mem::replace(&mut self.sub_lines, false);
+				let entry = self.block(p.body());
+				self.sub_lines = outer;
+				let entry = entry?;
+				let lines = if self.sub_lines {
+					self.newlines(p.span())
+				} else {
+					0
+				};
 				out.push(Part::ProcSub { entry, output: p.output(), lines });
 			},
 			st::Part::Compound(elems) => out.push(Part::Compound(self.elems(elems)?)),

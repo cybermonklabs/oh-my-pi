@@ -4425,7 +4425,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
-				if let Some(s) = k.proc_collect(cx.store, v) {
+				if let Some(s) = k.proc_collect(cx.store, v).or_else(|| kept_status(vp, v)) {
 					last = s;
 					waited_notice(k, vp, cx, v, line);
 					forget_job(vp, v);
@@ -4459,7 +4459,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// the job, woke this pass).
 			let mut first = st(vp).writes.is_empty();
 			while let Some(&v) = st(vp).wait_for.first() {
-				if k.proc_collect(cx.store, v).is_some() {
+				if k.proc_collect(cx.store, v).is_some() || kept_status(vp, v).is_some() {
 					if first {
 						waited_notice(k, vp, cx, v, line);
 					}
@@ -4494,20 +4494,32 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				})
 				.map(|j| j.vpid)
 				.collect();
-			for v in done {
-				k.proc_collect(cx.store, v);
-				forget_job(vp, v);
+			// While the job list is frozen, `cleanup_dead_jobs` keeps them
+			// (`jobs.c:1470`).
+			if !vp.jobs_frozen() {
+				for v in done {
+					k.proc_collect(cx.store, v);
+					forget_job(vp, v);
+				}
 			}
 			st(vp).status
 		},
 		Some(Awaited::AnyJob) => {
-			let finished = st(vp).wait_for.iter().find_map(|v| {
-				k.proc_state(cx.store, *v)
-					.and_then(super::ProcState::exited)
-					.map(|s| (*v, s))
-			});
+			// While the job list is frozen, bash's `wait_for_any_job` returns
+			// at once (`jobs.c:3465`): `wait -n` ends with 127.
+			let mut finished = None;
+			if !vp.jobs_frozen() {
+				for i in 0..st(vp).wait_for.len() {
+					let v = st(vp).wait_for[i];
+					let status = k.proc_state(cx.store, v).and_then(super::ProcState::exited);
+					if let Some(s) = status.or_else(|| kept_status(vp, v)) {
+						finished = Some((v, s));
+						break;
+					}
+				}
+			}
 			let Some((v, status)) = finished else {
-				if let Some(&v) = st(vp).wait_for.first() {
+				if let (false, Some(&v)) = (vp.jobs_frozen(), st(vp).wait_for.first()) {
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				let s = st(vp);
@@ -4661,8 +4673,28 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 /// Drop the job led by `v` from the table once it was waited for (bash
 /// `wait_for_job` marks it notified; `cleanup_dead_jobs` deletes it).
 fn forget_job(vp: &mut Vproc, v: crate::bash::ids::Vpid) {
+	// While the job list is frozen, `delete_job` keeps it (`jobs.c:1492`),
+	// marked reported: the `wait` the trap interrupted still finds it, and
+	// prints no notice.
+	if vp.jobs_frozen() {
+		if let Some(job) = vp.jobs.by_vpid_mut(v) {
+			job.notified = true;
+		}
+		return;
+	}
 	if let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number) {
 		vp.jobs.remove(number);
+	}
+}
+
+/// The status of the job led by `v` when it is done and still in the table:
+/// a `wait` in a trap that ran with the job list frozen collected its
+/// process, and the `wait` it interrupted ends with it (bash keeps the
+/// status, the bgp list) instead of blocking on a process that is gone.
+fn kept_status(vp: &Vproc, v: crate::bash::ids::Vpid) -> Option<i32> {
+	match vp.jobs.by_vpid(v)?.state {
+		JobState::Done(status) => Some(status),
+		_ => None,
 	}
 }
 

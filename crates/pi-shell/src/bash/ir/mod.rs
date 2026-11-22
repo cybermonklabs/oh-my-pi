@@ -608,9 +608,10 @@ pub enum Part {
 		/// `$( )`: `strs` index of the body's source text, re-parsed with
 		/// the aliases in effect when it runs (outside posix mode).
 		text:   Option<u32>,
-		/// The newlines in its source (bash's parser passes them as it
-		/// re-parses the text, `xparse_dolparen`: the line a job notice
-		/// names then, `vm::killed`); 0 for a backquote.
+		/// In an assignment's value or a `[[ ]]` operand, the newlines in
+		/// its source: bash 5.3.20 names the line after them when it reports
+		/// a job there (`vm::killed`); 0 elsewhere, where it names the line
+		/// after the command's, and for a backquote.
 		lines:  u32,
 	},
 	/// `$((…))`: arithmetic text, expanded then evaluated.
