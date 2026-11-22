@@ -162,18 +162,27 @@ export interface SqlSessionStorageOptions {
 	 * {@link SESSION_LEASE_HEARTBEAT_MS}; `expiryMs` must exceed `heartbeatMs`.
 	 */
 	lease?: { expiryMs: number; heartbeatMs: number };
+	/**
+	 * How long opening an existing session waits for another process's lease on it to go or expire, in
+	 * milliseconds ({@link SqlSessionStorage.openClaimWaitMs}). Default: one `lease.expiryMs` and 5 s, so a dead
+	 * holder's lease runs out within the wait; {@link SESSION_OPEN_CLAIM_WAIT_MS} under the default timings.
+	 */
+	openClaimWaitMs?: number;
 }
 
 /** A lease whose heartbeat is older than this, by the database clock, may be taken over. */
 export const SESSION_LEASE_EXPIRY_MS = 30_000;
 /** How often a store refreshes the heartbeat of every lease it holds. */
 export const SESSION_LEASE_HEARTBEAT_MS = 10_000;
+/** How much longer than one lease expiry opening a held session waits: room for the holder's last heartbeat to age out. */
+const OPEN_CLAIM_WAIT_MARGIN_MS = 5000;
 /**
  * How long opening an existing session waits for another process's lease on
  * it to go or expire before it moves off (or, under `OMP_SESSION_EXCLUSIVE=1`,
- * stops): one expiry and 5 s.
+ * stops): one expiry and 5 s. A store with other lease timings waits its own
+ * ({@link SqlSessionStorage.openClaimWaitMs}).
  */
-export const SESSION_OPEN_CLAIM_WAIT_MS = SESSION_LEASE_EXPIRY_MS + 5000;
+export const SESSION_OPEN_CLAIM_WAIT_MS = SESSION_LEASE_EXPIRY_MS + OPEN_CLAIM_WAIT_MARGIN_MS;
 
 /** A dialect-rendered statement and the names of the values it binds, in binding order. */
 interface Statement {
@@ -1718,6 +1727,15 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	}
 
 	/**
+	 * {@link SessionStorage.openClaimWaitMs}: the `openClaimWaitMs` option, by default one of this store's lease
+	 * expiries and 5 s, so a dead holder's lease runs out within the wait whatever `lease` timings the store was
+	 * given ({@link SESSION_OPEN_CLAIM_WAIT_MS} under the default ones).
+	 */
+	get openClaimWaitMs(): number {
+		return this.#backend.openClaimWaitMs;
+	}
+
+	/**
 	 * {@link IndexedSessionStorage.drain}, then the blob writes queued so far,
 	 * then the claim releases in flight, so a closed session's lease is gone.
 	 */
@@ -2110,6 +2128,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #sqliteFile: string | undefined;
 	readonly #expiryMs: number;
 	readonly #heartbeatMs: number;
+	/** {@link SqlSessionStorageOptions.openClaimWaitMs}, or its default. */
+	readonly #openClaimWaitMs: number;
 	/** This store's lease holder token: 128 random bits, made once per store, never the host or the pid. */
 	readonly #holder = randomBytes(16).toString("hex");
 	/** The sessions this store claimed, by session id. */
@@ -2170,10 +2190,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				`SqlSessionStorage: lease.expiryMs must exceed lease.heartbeatMs, which must be positive (got ${JSON.stringify(lease)})`,
 			);
 		}
+		const openClaimWaitMs = options.openClaimWaitMs ?? lease.expiryMs + OPEN_CLAIM_WAIT_MARGIN_MS;
+		if (!(Number.isFinite(openClaimWaitMs) && openClaimWaitMs >= 0)) {
+			throw new Error(
+				`SqlSessionStorage: openClaimWaitMs must be a finite number of milliseconds, 0 or more (got ${openClaimWaitMs})`,
+			);
+		}
 		this.#table = table;
 		this.#leaseTable = leaseTable;
 		this.#expiryMs = lease.expiryMs;
 		this.#heartbeatMs = lease.heartbeatMs;
+		this.#openClaimWaitMs = openClaimWaitMs;
 		this.#schema = this.#adapter === "postgres" ? PG_SCHEMA : undefined;
 		this.#q = buildQueries(this.#adapter, table, leaseTable, lease.expiryMs, this.#schema);
 		this.#createTable = options.createTable !== false;
@@ -2202,6 +2229,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** Whether this store claims sessions. */
 	get claims(): boolean {
 		return this.#gate !== undefined;
+	}
+
+	/** {@link SqlSessionStorage.openClaimWaitMs}. */
+	get openClaimWaitMs(): number {
+		return this.#openClaimWaitMs;
 	}
 
 	init(): Promise<void> {

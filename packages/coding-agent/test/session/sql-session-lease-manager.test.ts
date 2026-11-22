@@ -298,7 +298,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			const before = await db.row(file);
 
 			await db.sql(`UPDATE ${db.leaseTable} SET holder = 'another-holder' WHERE session_id = @1`, [ID]);
-			await until(() => manager.getSessionId() !== ID, 5000);
+			await until(() => manager.getSessionId() !== ID);
 
 			expect(notices).toEqual([{ reason: "open-elsewhere", from: file, to: manager.getSessionFile() ?? "" }]);
 			expect(await db.row(file)).toEqual(before);

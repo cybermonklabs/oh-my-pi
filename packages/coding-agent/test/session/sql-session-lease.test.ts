@@ -305,10 +305,17 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				const target = db.dir.join("fresh.db");
 				const alias = db.dir.join("fresh-alias.db");
 				fs.symlinkSync(target, alias);
-				const throughAlias = await db.open({ dsn: `sqlite://${alias}`, claims: false });
-				const direct = await db.open({ dsn: `sqlite://${target}`, claims: false });
+				// A busy wait of 1 ms, which each store keeps: a statement that met the other store's lock (the
+				// stall a shared queue prevents) fails at once, and no clock decides whether one stalled.
+				const clients: SqlSessionStorageClient[] = [];
+				const kept = (client: SqlSessionStorageClient): SqlSessionStorageClient => {
+					clients.push(client);
+					return client;
+				};
+				const busy = { claims: false, sqliteBusyTimeoutMs: 1, wrap: kept };
+				const throughAlias = await db.open({ dsn: `sqlite://${alias}`, ...busy });
+				const direct = await db.open({ dsn: `sqlite://${target}`, ...busy });
 
-				const started = performance.now();
 				const writes: Promise<void>[] = [];
 				for (let n = 0; n < 8; n++) {
 					writes.push(throughAlias.writeText(db.dir.join(`alias-${n}.jsonl`), transcript(ID, `alias ${n}`)));
@@ -317,9 +324,15 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				const outcomes = await Promise.allSettled(writes);
 
 				expect({
-					failed: outcomes.filter(outcome => outcome.status === "rejected").length,
-					stalled: performance.now() - started > 3000,
-				}).toEqual({ failed: 0, stalled: false });
+					failed: outcomes.flatMap(outcome => (outcome.status === "rejected" ? [String(outcome.reason)] : [])),
+					// The control: both stores ran under the 1 ms wait, so a stall would have shown as a failure.
+					busyTimeouts: await Promise.all(
+						clients.map(async client => {
+							const [row] = (await client.unsafe("PRAGMA busy_timeout")) as Array<{ timeout: number }>;
+							return Number(row?.timeout);
+						}),
+					),
+				}).toEqual({ failed: [], busyTimeouts: [1, 1] });
 			},
 			60_000,
 		);
@@ -739,7 +752,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				await heartbeatPaused.promise;
 				await Bun.sleep(lease.heartbeatMs);
 				heartbeatGate.resolve();
-				await until(async () => heartbeatPids.length >= 2 && (await heartbeatAt()) > before, lease.heartbeatMs * 5);
+				await until(async () => heartbeatPids.length >= 2 && (await heartbeatAt()) > before);
 				recordBeats = false;
 				const secondHeartbeatAt = await heartbeatAt();
 				await storage.writeText(file, transcript(ID, "after the server-ended beat"));
@@ -962,7 +975,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			const before = await db.row(file);
 			// Another holder came, wrote and released: only a release deletes a row.
 			await db.sql(`DELETE FROM ${db.leaseTable} WHERE session_id = @1`, [ID]);
-			await until(() => storage.sessionClaimLost?.(ID) === true, 5000);
+			await until(() => storage.sessionClaimLost?.(ID) === true);
 
 			expect(await rejection(storage.writeText(file, transcript(ID, "after")))).toBeInstanceOf(
 				SessionLeaseLostError,

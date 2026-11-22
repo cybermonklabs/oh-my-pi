@@ -404,6 +404,12 @@ export interface SessionStorage {
 		options?: SessionAcquireOptions,
 	): Promise<(() => void) | null>;
 	/**
+	 * How long opening an existing session waits, through {@link acquireSessionClaim}'s `waitMs`, for another
+	 * process's lease on it to go or expire: one lease expiry of this storage and 5 s. Only SQL storage, whose
+	 * leases expire, has it; the CLI and a session switch wait `SESSION_OPEN_CLAIM_WAIT_MS` on other backends.
+	 */
+	readonly openClaimWaitMs?: number;
+	/**
 	 * Whether this process's claim on `sessionId` is lost: another holder took
 	 * it over. A claim whose heartbeat cannot be confirmed for a while is not
 	 * lost; its writes wait until it is confirmed again. False for a session
