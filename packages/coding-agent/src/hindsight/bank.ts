@@ -123,6 +123,24 @@ export function deriveBankId(config: HindsightConfig, directory: string): string
 }
 
 /**
+ * Identifies the server, account, bank and tag filter a first-turn recall reads, so a persisted recall is only reused
+ * for the same ones. The account is a hash of the API token.
+ */
+export function hindsightRecallScope(
+	config: HindsightConfig,
+	scope: Pick<BankScope, "bankId" | "recallTags" | "recallTagsMatch">,
+): string {
+	return JSON.stringify([
+		"hindsight",
+		config.hindsightApiUrl,
+		Bun.hash(config.hindsightApiToken ?? "").toString(16),
+		scope.bankId,
+		scope.recallTags ?? [],
+		scope.recallTagsMatch ?? null,
+	]);
+}
+
+/**
  * Ensure a bank exists, and patch its reflect/retain mission on first use.
  *
  * Idempotent: skips the PUT when the bank id is already in the supplied set.

@@ -12,6 +12,8 @@ import {
 	settingValuesEqual,
 } from "../config/registry";
 import type { Settings } from "../config/settings";
+import { computeBankScope, hindsightRecallScope } from "../hindsight/bank";
+import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
 import {
 	type ConversationRecall,
@@ -20,7 +22,8 @@ import {
 } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendId, MemoryBackendStartOptions } from "../memory-backend/types";
-import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
+import { loadMnemopiConfig } from "../mnemopi/config";
+import { getMnemopiRecallScope, type MnemopiConversationTracking, type MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import type { SettingsChangeOptions } from "./session-tools";
 
@@ -45,6 +48,25 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 		),
 	);
 	return memorySettings;
+}
+
+/**
+ * The scope the first-turn recall of the backend `settings` select reads, as its records name it (`findPersistedRecall`):
+ * Hindsight's server, account, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`.
+ * Undefined under a backend that recalls nothing into the conversation, and under Hindsight with no server. Mnemopi's
+ * needs its core module loaded (`loadMnemopiCore`).
+ */
+export function memoryRecallScope(settings: Settings, cwd: string, agentDir: string): string | undefined {
+	switch (cfgMemoryBackend.get(settings)) {
+		case "hindsight": {
+			const config = loadHindsightConfig(settings);
+			return isHindsightConfigured(config) ? hindsightRecallScope(config, computeBankScope(config, cwd)) : undefined;
+		}
+		case "mnemopi":
+			return getMnemopiRecallScope(loadMnemopiConfig(settings, agentDir));
+		default:
+			return undefined;
+	}
 }
 
 /**
@@ -133,10 +155,13 @@ export class SessionMemory {
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
 			createMemoryTools?: () => Promise<AgentTool[]>;
-			/** Reads the recall the loaded transcript's branch leaves the conversation carrying (`findConversationRecall`). */
-			recall?: () => ConversationRecall | undefined;
+			/**
+			 * Reads the recall the loaded transcript's branch leaves the conversation carrying (`findConversationRecall`),
+			 * of `scope`, the scope the live backend's recall reads ({@link recallScope}).
+			 */
+			recall?: (scope: () => string | undefined) => ConversationRecall | undefined;
 			/** Reads the reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
-			recallChanges?: () => readonly RecallChangesReport[];
+			recallChanges?: (scope: () => string | undefined) => readonly RecallChangesReport[];
 		},
 	) {
 		this.#host = host;
@@ -144,11 +169,13 @@ export class SessionMemory {
 		this.#memoryTaskDepth = options.memoryTaskDepth ?? 0;
 		this.#createMemoryTools = options.createMemoryTools;
 		// Only Hindsight and Mnemopi recall into the conversation: under another backend, or with memory off, the
-		// transcript's recall is history the session does not send again, and its branch is not read for it.
+		// transcript's recall is history the session does not send again, and its branch is not read for it. Nor is
+		// another backend's, bank's or server's recall: the live backend recalls afresh.
 		const backend = cfgMemoryBackend.get(host.settings);
 		this.#runningBackend = backend;
 		if (options.memoryEnabled !== false && recallsIntoConversation(backend)) {
-			this.adoptRecall(options.recall?.(), options.recallChanges?.() ?? []);
+			const scope = () => this.recallScope();
+			this.adoptRecall(options.recall?.(scope), options.recallChanges?.(scope) ?? []);
 		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
@@ -254,6 +281,15 @@ export class SessionMemory {
 	/** The recall the conversation carries, as a hidden message or as the system prompt's own last block. */
 	get recall(): ConversationRecall | undefined {
 		return this.#recall;
+	}
+
+	/**
+	 * The scope the live backend's first-turn recall reads ({@link memoryRecallScope}), for the session's cwd and memory
+	 * directory: a recall the branch records under another is not the conversation's.
+	 */
+	recallScope(): string | undefined {
+		const settings = this.#host.settings;
+		return memoryRecallScope(settings, this.#host.cwd(), this.#memoryAgentDir ?? settings.getAgentDir());
 	}
 
 	/**

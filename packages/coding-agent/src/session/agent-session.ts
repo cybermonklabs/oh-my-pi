@@ -510,6 +510,7 @@ import {
 	cleanupEmptyMoveSession,
 	copySessionArtifacts,
 	extractSessionInit,
+	newestCopiedEntryId,
 	type PersistedSessionInit,
 	type SessionManager,
 } from "./session-manager";
@@ -2556,8 +2557,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
-			recall: () => findConversationRecall(this.sessionManager.getBranchView()),
-			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
+			recall: scope => findConversationRecall(this.sessionManager.getBranchView(), scope),
+			recallChanges: scope => findDeliveredRecallChanges(this.sessionManager.getBranchView(), scope),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -2757,6 +2758,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
+			memoryRecall: () => this.#memory.recall,
+			memoryRecallScope: () => this.#memory.recallScope(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -12862,7 +12865,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * {@link branch} (`session_before_branch`/`session_branch` hooks with reason `"fork"`,
 	 * agent messages rebuilt from the cut). A cut inside an assistant tool-call batch is
 	 * extended through the batch's recorded tool results (see {@link #resolveForkLeaf}), and
-	 * the hook's `entryId` is that last kept entry. An entry fork always requires an idle
+	 * the hook's `entryId` is the last entry the copy keeps under its own id (a label it
+	 * re-creates is not, {@link newestCopiedEntryId}). An entry fork always requires an idle
 	 * session; `options.requireIdle` applies the same rule to the whole-session fork.
 	 * Either refusal throws {@link SessionBusyError} before any session state is discarded.
 	 * @returns true if completed, false if cancelled by hook or not persisting
@@ -12880,10 +12884,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const leafId = this.#resolveForkLeaf(entryId);
 			// Await inside the `using` scope so the transition stays open until it settles.
 			// Kept tool results may cite `artifact://N`, so the fork carries the artifacts too.
-			return await this.#branchIntoNewSession("fork", leafId, leafId, {
-				copyArtifacts: true,
-				requireIdleFor,
-			});
+			return await this.#branchIntoNewSession(
+				"fork",
+				newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? entryId,
+				leafId,
+				{
+					copyArtifacts: true,
+					requireIdleFor,
+				},
+			);
 		}
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		const previousSessionFile = this.sessionFile;
@@ -15140,7 +15149,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_branch",
 				reason: "btw",
-				entryId: leafId,
+				// The newest entry the copy keeps under its own id: a label at the leaf is re-created under a new one.
+				entryId: newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? leafId,
 			})) as SessionBeforeBranchResult | undefined;
 
 			if (result?.cancel) {

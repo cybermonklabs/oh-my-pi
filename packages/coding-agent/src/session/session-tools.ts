@@ -54,6 +54,7 @@ import {
 	type ConversationRecall,
 	findDeliveredRecall,
 	findDeliveredRecallChanges,
+	isRecordedRecall,
 	type RecallChangesReport,
 } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
@@ -198,6 +199,13 @@ export interface SessionToolsHost {
 	 * it, and each prompt build appends the block.
 	 */
 	adoptMemoryRecall(recall: ConversationRecall | undefined, changes: readonly RecallChangesReport[]): void;
+	/** The recall the conversation carries ({@link adoptMemoryRecall}): the one it adopted from the transcript at start. */
+	memoryRecall(): ConversationRecall | undefined;
+	/**
+	 * The scope the live memory backend's first-turn recall reads, as its records name it: a recall the branch records,
+	 * or delivers hidden, under another scope is not the conversation's.
+	 */
+	memoryRecallScope(): string | undefined;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -2970,15 +2978,25 @@ export class SessionTools {
 
 	/**
 	 * Records what a just-committed base prompt lists ({@link #basePromptListing}): `toolNames`, the roster it
-	 * rendered, and the devices its catalog renders (`xdevCatalogNames`) with the routed MCP devices. Ends any roster
-	 * hold ({@link #recordPromptRoster}).
+	 * rendered, and the devices its catalog renders (`xdevCatalogNames`) with the routed MCP devices. A base whose
+	 * bytes the branch stores ({@link #storedPrompt}: one this session's transcript, or the transcript it was copied
+	 * from, recorded when a request carried them) lists what that record names, its skills included, whichever build
+	 * reproduced them (a `/tan` clone's copy of its parent's prompt, a revived task's stored one, whose first block no
+	 * longer matches a fresh render). Ends any roster hold ({@link #recordPromptRoster}).
 	 */
 	#recordBasePromptListing(toolNames: readonly string[], xdevCatalogNames: readonly string[] | undefined): void {
-		this.#basePromptListing = {
-			toolNames: [...toolNames],
-			xdevNames: new Set([...(xdevCatalogNames ?? []), ...this.#routedSummaryXdevNames()]),
-		};
-		this.#recordPromptRoster(toolNames);
+		const stored = this.#storedPrompt(systemPromptDigest(this.#baseSystemPrompt));
+		this.#basePromptListing = stored
+			? {
+					toolNames: stored.toolNames,
+					xdevNames: new Set(stored.xdevNames),
+					skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
+				}
+			: {
+					toolNames: [...toolNames],
+					xdevNames: new Set([...(xdevCatalogNames ?? []), ...this.#routedSummaryXdevNames()]),
+				};
+		this.#recordPromptRoster(this.#basePromptListing.toolNames);
 	}
 
 	/** Mounted MCP devices the live route projection lists with their catalog summary. */
@@ -3454,6 +3472,18 @@ export class SessionTools {
 			return false;
 		}
 		if (!this.#host.transcriptPromptCacheLive(promptDigest)) return false;
+		// The stored prompt ends with a recall the conversation does not carry as its block (another backend's, bank's
+		// or server's, which the operator digest does not cover): that recall never goes out again, and this process's
+		// own build does.
+		const lastBlock = stored.blocks.at(-1);
+		const recall = this.#host.memoryRecall();
+		if (
+			lastBlock !== undefined &&
+			(recall?.hidden !== false || recall.text !== lastBlock) &&
+			isRecordedRecall(this.#host.sessionManager.getBranchView(), lastBlock)
+		) {
+			return false;
+		}
 		recorded ??= this.#recordedHold(promptDigest);
 		const before = recorded ? this.#heldSettingValues(recorded.settings) : new Map<AnySetting, unknown>();
 		// The session records a held change of a setting the model cannot be told of: this process's own build goes out.
@@ -5367,7 +5397,8 @@ export class SessionTools {
 			// and drop its replayed thinking. Each request sends it where its context lacks it, and a prompt rebuild
 			// leaves it out of the memory instructions (`recallDelivered`).
 			const hidden = memory.reused
-				? findDeliveredRecall(this.#host.sessionManager.getBranchView()) !== undefined
+				? findDeliveredRecall(this.#host.sessionManager.getBranchView(), () => this.#host.memoryRecallScope()) !==
+					undefined
 				: this.#promptBound;
 			if (hidden) {
 				return {
@@ -5459,7 +5490,9 @@ export class SessionTools {
 			this.#host.adoptMemoryRecall(recall, []);
 			return;
 		}
-		const changes = findDeliveredRecallChanges(this.#host.sessionManager.getBranchView());
+		const changes = findDeliveredRecallChanges(this.#host.sessionManager.getBranchView(), () =>
+			this.#host.memoryRecallScope(),
+		);
 		const notice = memory.notice;
 		if (notice && !changes.some(report => report.content === notice.content)) changes.push(notice);
 		this.#host.adoptMemoryRecall(recall, changes);
