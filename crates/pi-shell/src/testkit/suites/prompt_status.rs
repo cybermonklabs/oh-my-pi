@@ -55,6 +55,23 @@ fn a_bash_prompt_substitution_leaves_the_status_alone() {
 	]);
 }
 
+/// While a prompt's substitution runs, `$?` is already the line's again: a
+/// trap that runs then sees it. The prompt's first substitution has run
+/// (`$(exit 3)`, which the expansion replays and so sets `$?` to 3) and the
+/// second is still running when it signals the shell. bash 5.2.21 and
+/// 5.3.20, reading the same lines from a pipe, print `trap:1` then `st=1`.
+/// (The next prompt signals the shell again, after `echo` left 0; bash
+/// reaches the end of its input first and prints nothing more, the engine
+/// runs that trap too, with 0.)
+#[test]
+fn a_trap_while_a_prompt_substitution_runs_sees_the_status() {
+	let input =
+		"trap 'echo \"trap:$?\"' USR1\nPS1='$(exit 3)$(kill -USR1 $$)> '; false\necho \"st=$?\"\n";
+	let (out, status) = interactive(ModeId::Bash, input);
+	assert!(out.starts_with("trap:1\nst=1\n"), "{out:?}");
+	assert_eq!(status, 0, "{out:?}");
+}
+
 #[test]
 fn a_zsh_prompt_substitution_leaves_the_status_alone() {
 	check(ModeId::Zsh, &[
