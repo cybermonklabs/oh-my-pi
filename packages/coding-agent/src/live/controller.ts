@@ -1,6 +1,6 @@
 import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
@@ -17,27 +17,28 @@ import {
 	type LiveServerEvent,
 } from "./protocol";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
-import { CodexLiveTransport } from "./transport";
+import { CODEX_LIVE_ROUTE, CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
 
-/** The live call's route, as a cyber-policy hold names it. */
-const LIVE_ROUTE = { provider: "openai-codex", id: "live" } as const;
-
 /**
- * Why the live call may send nothing now, or `undefined` when it may. The call runs on OpenAI (Codex realtime)
- * and carries the session's text, so while the session tree's cyber-policy closure is active (OpenAI refused the
- * tree's content) none of the session's text goes out and no call opens. It is read where each of those sends
- * happens: the transport reads it (`LiveTransportOptions.holdReason`) in the same synchronous step as the
- * signaling POST that opens the call (it carries the instructions) and as each frame of the session's text; the
- * controller reads it before it builds the transport and again once the call has connected, before any audio or
- * text, and closes a held call. The frame that only closes the call (`session.close`) is not held.
+ * Why the live call to `route` may send nothing now, or `undefined` when it may. The call runs on OpenAI (today Codex
+ * realtime only, `CODEX_LIVE_ROUTE`) and carries the session's text, so while the session tree's cyber-policy closure
+ * is active (OpenAI refused the tree's content) none of the session's text goes out and no call opens; the hold's
+ * message names `route`, the route the call goes to. It is read where each of those sends happens: the transport
+ * reads it (`LiveTransportOptions.holdReason`) in the same synchronous step as the signaling POST that opens the call
+ * (it carries the instructions) and as every sideband frame but `session.close`; the controller reads it before it
+ * builds the transport and again once the call has connected, before any audio or text, and closes a held call.
+ * `session.close`, which only ends the call, is not held.
  */
-export function liveCallHoldReason(session: Pick<AgentSession, "cyberPolicyClosure">): string | undefined {
-	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(LIVE_ROUTE) : undefined;
+export function liveCallHoldReason(
+	session: Pick<AgentSession, "cyberPolicyClosure">,
+	route: Pick<Model, "provider" | "id">,
+): string | undefined {
+	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(route) : undefined;
 }
 
 /** Incremental or final transcript for one realtime conversational turn. */
@@ -197,7 +198,7 @@ export class LiveSessionController {
 
 		try {
 			// The call itself goes to OpenAI: none starts while a refusal holds the session's OpenAI routes.
-			const held = liveCallHoldReason(this.#session);
+			const held = liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE);
 			if (held) throw new Error(held);
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
@@ -211,8 +212,8 @@ export class LiveSessionController {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
 				},
-				// Read by the transport in the step of the signaling POST and of each frame of the session's text.
-				holdReason: () => liveCallHoldReason(this.#session),
+				// Read by the transport in the step of the signaling POST and of every frame but `session.close`.
+				holdReason: () => liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE),
 			});
 			this.#transport = transport;
 			await transport.connect();
@@ -221,7 +222,7 @@ export class LiveSessionController {
 			}
 			// A refusal recorded while the call connected (after the POST went out) closes it before any audio
 			// or session text: the catch below stops the call and closes the transport.
-			const heldOnConnect = liveCallHoldReason(this.#session);
+			const heldOnConnect = liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE);
 			if (heldOnConnect) throw new Error(heldOnConnect);
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
