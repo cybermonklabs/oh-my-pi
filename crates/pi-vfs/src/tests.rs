@@ -502,6 +502,69 @@ fn creation_mask_clears_bits_from_host_creations() {
 	assert_eq!(mode(&dir.0.join("fifo")), 0o666);
 }
 
+/// A creation mask applies as well to an open that creates through `O_CREAT`
+/// among its custom flags (with `O_EXCL`, only a new file), whether it writes
+/// or only reads: the new file gets exactly its mode less the mask, whatever
+/// the process umask, and an existing file keeps its mode. One mask looser
+/// than any process umask and one stricter, so the process umask cannot pass
+/// for both.
+#[cfg(unix)]
+#[test]
+fn creation_mask_applies_to_a_custom_o_creat() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = TempDir::new("mask-custom");
+	let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+	let mut creat = OpenOptions::new();
+	creat.write(true).custom_flags(libc::O_CREAT);
+	let mut excl = OpenOptions::new();
+	excl.write(true).custom_flags(libc::O_CREAT | libc::O_EXCL);
+	let mut read_creat = OpenOptions::new();
+	read_creat.read(true).custom_flags(libc::O_CREAT);
+	let mut read_excl = OpenOptions::new();
+	read_excl
+		.read(true)
+		.custom_flags(libc::O_CREAT | libc::O_EXCL);
+	let cases = [
+		("write, O_CREAT", &creat),
+		("write, O_CREAT | O_EXCL", &excl),
+		("read, O_CREAT", &read_creat),
+		("read, O_CREAT | O_EXCL", &read_excl),
+	];
+	let mut wrong = Vec::new();
+	for (mask, want) in [(0, 0o666), (0o077, 0o600)] {
+		let fs = Fs::native().with_creation_mask(Some(mask)).blocking();
+		for (index, (label, options)) in cases.into_iter().enumerate() {
+			let path = dir.0.join(format!("new-{mask:o}-{index}"));
+			match fs.open_with(&path, options) {
+				Ok(_) => {
+					let got = mode(&path);
+					if got != want {
+						wrong.push(format!("{label}, mask {mask:o}: mode {got:o}, not {want:o}"));
+					}
+				},
+				Err(err) => wrong.push(format!("{label}, mask {mask:o}: {err} ({:?})", err.kind())),
+			}
+		}
+	}
+	// An existing file: `O_CREAT` opens it and keeps its mode, `O_EXCL`
+	// refuses it.
+	let fs = Fs::native().with_creation_mask(Some(0o077)).blocking();
+	let existing = dir.0.join("existing");
+	std::fs::write(&existing, "").unwrap();
+	std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+	fs.open_with(&existing, &creat).unwrap();
+	assert_eq!(mode(&existing), 0o644, "O_CREAT on an existing file changed its mode");
+	assert_eq!(
+		fs.open_with(&existing, &excl)
+			.map(drop)
+			.map_err(|err| err.kind()),
+		Err(io::ErrorKind::AlreadyExists),
+		"O_CREAT | O_EXCL on an existing file"
+	);
+	assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn descriptor_overlay_shares_the_pinned_file() {
 	let dir = TempDir::new("mount");
@@ -964,4 +1027,379 @@ fn fifo_opens_through_a_cancellable_view_keep_nofollow() {
 	std::os::unix::fs::symlink(&fifo, &link).unwrap();
 	let err = scoped.open_with(&link, &options).unwrap_err();
 	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+}
+
+/// The opens that create (`O_CREAT`) of the FIFO tests below: the shell's `>`
+/// and `>>`, and a write with a custom `O_CREAT`.
+#[cfg(target_os = "linux")]
+fn creating_fifo_opens() -> [(&'static str, OpenOptions); 3] {
+	let mut redirect = OpenOptions::new();
+	redirect.write(true).create(true).truncate(true);
+	let mut append = OpenOptions::new();
+	append.append(true).create(true);
+	let mut custom = OpenOptions::new();
+	custom.write(true).custom_flags(libc::O_CREAT);
+	[
+		("> (write, create, truncate)", redirect),
+		(">> (append, create)", append),
+		("write, custom O_CREAT", custom),
+	]
+}
+
+/// Through a cancellable view, the helper of a FIFO open that creates opens
+/// the path, so the kernel checks `O_CREAT` against the path's directory as
+/// for the plain open (`fs.protected_fifos`); the helper of one that creates
+/// nothing opens the pin's `/proc/self/fd/N` where procfs reaches it. The
+/// FIFO's two ends are held, so each open completes at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_opens_through_a_cancellable_view_that_create_open_the_path() {
+	let dir = TempDir::new("fifo-route");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let _both = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&fifo)
+		.unwrap();
+	let scoped = BlockingFs::native().with_cancellation(CancellationToken::new());
+	let (mut write, mut read) = (OpenOptions::new(), OpenOptions::new());
+	write.write(true);
+	read.read(true);
+	let mut cases: Vec<_> = creating_fifo_opens()
+		.into_iter()
+		.map(|(label, options)| (label, options, true))
+		.collect();
+	cases.extend([("write", write, false), ("read", read, false)]);
+	for (label, options, _) in &cases {
+		drop(
+			scoped
+				.open_with(&fifo, options)
+				.unwrap_or_else(|err| panic!("{label}: {err}")),
+		);
+	}
+	let proc = Path::new("/proc/self/fd").is_dir();
+	let want: Vec<_> = cases
+		.iter()
+		.map(|&(_, _, creates)| proc && !creates)
+		.collect();
+	let labels: Vec<_> = cases.iter().map(|&(label, ..)| label).collect();
+	assert_eq!(crate::fifo::routes::of(&fifo), want, "through the pin, for {labels:?}");
+}
+
+/// The FIFO the sticky-directory test opens: a FIFO of another user, which
+/// any user may read and write, in a world-writable sticky directory that
+/// user does not own. `PI_TEST_STICKY_FIFO` names one when set (root makes it
+/// before a run as another user; a wrong one fails the test); else, as root,
+/// one is made in `dir`. `Err` says why there is none.
+#[cfg(target_os = "linux")]
+fn sticky_fifo(dir: &Path) -> Result<PathBuf, String> {
+	use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+	// SAFETY: `geteuid` has no preconditions.
+	let me = unsafe { libc::geteuid() };
+	if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+		let fifo = PathBuf::from(given);
+		let meta = std::fs::metadata(&fifo)
+			.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+		let parent = std::fs::metadata(fifo.parent().unwrap()).unwrap();
+		assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+		assert_eq!(
+			parent.mode() & 0o1002,
+			0o1002,
+			"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+		);
+		assert!(
+			meta.uid() != me && meta.uid() != parent.uid(),
+			"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+		);
+		assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+		return Ok(fifo);
+	}
+	if me != 0 {
+		return Err("not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned());
+	}
+	let sticky = dir.join("sticky");
+	std::fs::create_dir(&sticky).unwrap();
+	std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+	let fifo = sticky.join("report.txt");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o666)
+		.unwrap();
+	std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o666)).unwrap();
+	std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+	Ok(fifo)
+}
+
+/// With `fs.protected_fifos` at 1 or more, an open that creates of a FIFO
+/// another user owns in a world-writable sticky directory that user does
+/// not own is refused (`EACCES`), so a command that means to create a file
+/// never writes into such a FIFO. Through a cancellable view, blocking and
+/// async, such an open is refused as the plain open is. The FIFO's read end
+/// is held, so an open that goes ahead ends at once and its write reaches
+/// that reader. As root, which can give the FIFO to another user, or as any
+/// user given such a FIFO (`sticky_fifo`), where `fs.protected_fifos` is 1
+/// or more and the plain open is refused; elsewhere it checks nothing and
+/// says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn fifo_opens_through_a_cancellable_view_that_create_are_refused_in_a_sticky_directory() {
+	use std::os::unix::fs::OpenOptionsExt;
+	let protected = std::fs::read_to_string("/proc/sys/fs/protected_fifos")
+		.ok()
+		.and_then(|value| value.trim().parse::<u32>().ok());
+	if protected.is_none_or(|value| value < 1) {
+		eprintln!("UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked");
+		return;
+	}
+	let dir = TempDir::new("fifo-sticky");
+	let fifo = match sticky_fifo(&dir.0) {
+		Ok(fifo) => fifo,
+		Err(why) => {
+			eprintln!("UNKNOWN: {why}; nothing was checked");
+			return;
+		},
+	};
+	let mut reader = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&fifo)
+		.unwrap();
+	let error = |opened: io::Result<File>| {
+		opened
+			.map(|mut file| {
+				let _ = file.write_all(b"written");
+			})
+			.map_err(|err| (err.kind(), err.raw_os_error()))
+	};
+	let plain = BlockingFs::native();
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let fs = Fs::native().with_cancellation(token);
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let mut wrong = Vec::new();
+	for (label, options) in creating_fifo_opens() {
+		let want = error(plain.open_with(&fifo, &options));
+		if want.is_ok() {
+			eprintln!(
+				"UNKNOWN: {label}: the plain open gave {want:?}, so fs.protected_fifos does not hold \
+				 here; nothing was checked"
+			);
+			return;
+		}
+		let got = [
+			("blocking", error(scoped.open_with(&fifo, &options))),
+			("async", error(runtime.block_on(fs.open_with(&fifo, &options)))),
+		];
+		for (route, result) in got {
+			if result != want {
+				wrong.push(format!("{label}, {route}: {result:?} where the plain open gives {want:?}"));
+			}
+		}
+	}
+	let mut leaked = Vec::new();
+	let _ = reader.read_to_end(&mut leaked);
+	assert!(
+		wrong.is_empty(),
+		"FIFO opens under a token in a sticky directory (another user's FIFO read {} bytes): \
+		 {wrong:#?}",
+		leaked.len()
+	);
+}
+
+/// A `>` (write, create, truncate) through a cancellable view.
+#[cfg(target_os = "linux")]
+fn redirect() -> OpenOptions {
+	let mut options = OpenOptions::new();
+	options.write(true).create(true).truncate(true);
+	options
+}
+
+/// A helper the drop has left changes no file. A `>` through a cancellable
+/// view whose helper is held up between its last check and its open for
+/// longer than the drop waits for it, as a loaded node can hold a thread:
+/// the token fires while the helper is held, the open fails, and the drop
+/// leaves the helper at its bound. The helper then opens the path:
+/// - a regular file put there keeps its bytes: the helper's open does not
+///   truncate, and it closes what it opened at once;
+/// - where the path names nothing, it leaves at most an empty regular file (its
+///   `O_CREAT` creates one, which it closes at once; what is left, see
+///   [`FifoOpen`]), and nothing else: no bytes, no other kind of file;
+/// - where the path still names the FIFO, the helper waits there as a writer
+///   until a reader comes, which then reads end of file (what is left).
+///
+/// Every wait is bounded, so a regression fails rather than hangs.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_open_whose_helper_the_drop_left_changes_no_file() {
+	use std::{os::unix::fs::OpenOptionsExt, sync::mpsc, time::Instant};
+	const LIMIT: Duration = Duration::from_secs(10);
+	let held_for = crate::fifo::LEAVE_AFTER + Duration::from_secs(1);
+	let wait = |done: &dyn Fn() -> bool| {
+		let start = Instant::now();
+		while !done() && start.elapsed() < LIMIT {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		done()
+	};
+	let mut wrong = Vec::new();
+	for late in ["a regular file", "nothing", "the FIFO"] {
+		let dir = TempDir::new("fifo-left");
+		let fifo = dir.0.join("fifo");
+		BlockingFs::native()
+			.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+			.unwrap();
+		let (reached_tx, reached) = mpsc::channel();
+		let (moved_tx, moved) = mpsc::channel();
+		let at = fifo.clone();
+		crate::fifo::hooks::before_open(&fifo, move || {
+			let _ = reached_tx.send(());
+			std::thread::sleep(held_for);
+			match late {
+				"a regular file" => {
+					std::fs::rename(&at, at.with_extension("old")).unwrap();
+					std::fs::write(&at, "kept").unwrap();
+				},
+				"nothing" => std::fs::rename(&at, at.with_extension("old")).unwrap(),
+				_ => {},
+			}
+			let _ = moved_tx.send(());
+		});
+		let token = CancellationToken::new();
+		let scoped = BlockingFs::native().with_cancellation(token.clone());
+		let path = fifo.clone();
+		let opener = std::thread::spawn(move || scoped.open_with(&path, &redirect()).map(drop));
+		if reached.recv_timeout(LIMIT).is_err() {
+			wrong.push(format!("{late}: the helper had not reached its open after {LIMIT:?}"));
+		}
+		token.cancel();
+		if !wait(&|| opener.is_finished()) {
+			wrong.push(format!("{late}: the open had not returned {LIMIT:?} after the token fired"));
+		}
+		if moved.recv_timeout(LIMIT).is_err() {
+			wrong.push(format!("{late}: the helper's hold had not ended after {LIMIT:?}"));
+		}
+		let reader = (late == "the FIFO").then(|| {
+			std::thread::sleep(Duration::from_millis(200));
+			if crate::fifo::hooks::ended(&fifo) {
+				wrong.push(format!("{late}: the helper ended with no reader"));
+			}
+			std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo)
+				.unwrap()
+		});
+		if !wait(&|| crate::fifo::hooks::ended(&fifo)) {
+			wrong.push(format!("{late}: the helper had not ended after {LIMIT:?}"));
+		}
+		match (late, reader) {
+			("a regular file", _) => {
+				let got = std::fs::read_to_string(&fifo).unwrap();
+				if got != "kept" {
+					wrong.push(format!("{late}: the file holds {got:?}, not \"kept\""));
+				}
+			},
+			("nothing", _) => match std::fs::symlink_metadata(&fifo) {
+				Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+				Ok(m) if m.is_file() && m.len() == 0 => {},
+				other => wrong.push(format!(
+					"{late}: the path names {other:?}, not nothing or an empty regular file"
+				)),
+			},
+			(_, Some(mut reader)) => {
+				let mut got = Vec::new();
+				if !matches!(reader.read_to_end(&mut got), Ok(0)) {
+					wrong.push(format!("{late}: the reader got {got:?}, not end of file"));
+				}
+			},
+			_ => unreachable!(),
+		}
+		if opener.is_finished() && opener.join().unwrap().is_ok() {
+			wrong.push(format!("{late}: the open succeeded though its token fired"));
+		}
+	}
+	assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A `>` through a cancellable view whose FIFO is replaced by a regular file
+/// just before its helper's open, while the call still waits for it, opens
+/// that file and truncates it, as `open(2)` of the path with `O_TRUNC` does.
+/// An open that waits instead (its helper on the FIFO the path no longer
+/// names) fails the test within its bound: the token then ends the open.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_open_whose_path_names_a_regular_file_by_its_open_truncates_it() {
+	const LIMIT: Duration = Duration::from_secs(10);
+	let dir = TempDir::new("fifo-live");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let at = fifo.clone();
+	crate::fifo::hooks::before_open(&fifo, move || {
+		std::fs::rename(&at, at.with_extension("old")).unwrap();
+		std::fs::write(&at, "replaced").unwrap();
+	});
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let path = fifo.clone();
+	let opener = std::thread::spawn(move || {
+		let mut file = scoped.open_with(&path, &redirect())?;
+		file.write_all(b"new")
+	});
+	let start = std::time::Instant::now();
+	while !opener.is_finished() && start.elapsed() < LIMIT {
+		std::thread::sleep(Duration::from_millis(5));
+	}
+	let returned = opener.is_finished();
+	if !returned {
+		token.cancel();
+	}
+	let written = opener.join().unwrap();
+	assert!(
+		returned,
+		"the open had not returned after {LIMIT:?}: its helper waits on a FIFO, not the regular \
+		 file at the path"
+	);
+	written.unwrap();
+	assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "new", "the regular file was not truncated");
+}
+
+/// A read-only FIFO open that asks for `O_TRUNC` keeps it when its helper
+/// opens the path (an open that creates), so the kernel asks the write
+/// permission `O_TRUNC` asks, as of the plain open: a FIFO this process may
+/// only read is refused (`EACCES`). Root may write it, so as root both open.
+/// Both of the FIFO's ends are held, so each open ends at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_only_fifo_open_that_truncates_asks_the_write_permission_of_the_plain_open() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = TempDir::new("fifo-read-trunc");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let _both = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&fifo)
+		.unwrap();
+	std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o444)).unwrap();
+	let mut options = OpenOptions::new();
+	options
+		.read(true)
+		.custom_flags(libc::O_CREAT | libc::O_TRUNC);
+	let outcome = |opened: io::Result<File>| opened.map(drop).map_err(|err| err.raw_os_error());
+	let plain = outcome(BlockingFs::native().open_with(&fifo, &options));
+	let scoped = BlockingFs::native().with_cancellation(CancellationToken::new());
+	assert_eq!(outcome(scoped.open_with(&fifo, &options)), plain, "through a cancellable view");
+	// SAFETY: `geteuid` has no preconditions.
+	if unsafe { libc::geteuid() } != 0 {
+		assert_eq!(plain, Err(Some(libc::EACCES)), "the plain open");
+	}
 }

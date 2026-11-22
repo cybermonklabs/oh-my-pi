@@ -65,6 +65,53 @@ zsh:sysopen:11: can't open file sl: too many levels of symbolic links
 	assert_eq!(st, 0);
 }
 
+/// `sysopen -r` passes `-o trunc`, `creat` and `excl` to `open(2)`, as zsh
+/// does: a read-only open truncates a regular file, creates a missing one
+/// and refuses an existing one under `excl`. A file `sysopen` creates, for
+/// reading or writing, gets its mode (0666, or `-m`) less the shell's umask,
+/// as `open(2)` gives zsh's; an existing file keeps its mode. Expected output
+/// from `zsh -f -c SCRIPT` 5.9 on Linux (Ubuntu 24.04), where a read-only
+/// `O_TRUNC` truncates; POSIX leaves that to the system.
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_mod_system_sysopen_read_only_creates_and_truncates_and_creates_under_the_umask() {
+	let (out, err, st) = zsh(
+		"zmodload zsh/system; umask 022
+for o in trunc creat trunc,creat excl,creat; do
+  print -n abc > f; rm -f m
+  sysopen -r -o $o -u fd f && exec {fd}<&-; print -rn -- \"$o f $? $(wc -c < f)\"
+  sysopen -r -o $o -u fd m && exec {fd}<&-; print -r -- \" m $? $(if [[ -e m ]]; then ls -l m | \
+		 cut -c1-10; else echo none; fi)\"
+done
+umask 027; print -n abc > e; chmod 606 e
+sysopen -w -o creat -u fd w; sysopen -r -o creat -u fd r; sysopen -w -o creat -m 0666 -u fd x
+sysopen -w -o creat -m 0600 -u fd y; sysopen -r -o creat -m 0604 -u fd z; sysopen -w -o creat -m \
+		 0600 -u fd e
+ls -l e w r x y z | cut -c1-10",
+	);
+	assert_eq!(
+		out,
+		"trunc f 0 0 m 1 none
+creat f 0 3 m 0 -rw-r--r--
+trunc,creat f 0 0 m 0 -rw-r--r--
+excl,creat f 1 3 m 0 -rw-r--r--
+-rw----rw-
+-rw-r-----
+-rw-r-----
+-rw-r-----
+-rw-------
+-rw-------
+"
+	);
+	assert_eq!(
+		err,
+		"zsh:sysopen:5: can't open file m: no such file or directory
+zsh:sysopen:4: can't open file f: file exists
+"
+	);
+	assert_eq!(st, 0);
+}
+
 /// powerlevel10k's and gitstatus's uses: an append-and-truncate open with a
 /// mode, and a close-on-exec descriptor on a process substitution read
 /// with timeouts into array elements.

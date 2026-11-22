@@ -152,6 +152,17 @@ fn host_mask(scope: &Scope) -> Option<u32> {
 	scope.creation_mask.filter(|_| cfg!(unix))
 }
 
+/// Whether an open creates a missing file: through `create` or
+/// `create_new`, and on Unix through `O_CREAT` among its custom flags, which
+/// the kernel honours alike.
+const fn creates(options: &OpenOptions) -> bool {
+	#[cfg(unix)]
+	let custom = options.get_custom_flags() & libc::O_CREAT != 0;
+	#[cfg(not(unix))]
+	let custom = false;
+	options.is_create() || options.is_create_new() || custom
+}
+
 /// Opens a host path under the facade's creation mask: a file the open
 /// creates gets exactly its requested mode (`0o666` by default) less the
 /// mask. The mask replaces the process umask, which the kernel still applies
@@ -161,15 +172,19 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 	let Some(mask) = host_mask(scope) else {
 		return native::open(path, options);
 	};
-	if !(options.is_create() || options.is_create_new()) {
+	if !creates(options) {
 		return native::open(path, options);
 	}
 	let mode = options.get_mode().unwrap_or(0o666) & !mask;
 	let mut masked = options.clone();
 	masked.mode(mode);
 	// Only an exclusive create proves the file is new; an existing file keeps
-	// its mode.
+	// its mode. On Unix it is asked for as `O_CREAT | O_EXCL`, which a
+	// read-only open may carry too (`create_new` needs write access).
 	let mut exclusive = masked.clone();
+	#[cfg(unix)]
+	exclusive.custom_flags(exclusive.get_custom_flags() | libc::O_CREAT | libc::O_EXCL);
+	#[cfg(not(unix))]
 	exclusive.create_new(true);
 	match native::open(path, &exclusive) {
 		Ok(file) => {
@@ -178,9 +193,8 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 			let _ = file.set_permissions(Permissions::from_mode(mode));
 			Ok(file)
 		},
-		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !options.is_create_new() => {
-			native::open(path, &masked)
-		},
+		// An exclusive open (`create_new`, `O_EXCL`) is refused again here.
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists => native::open(path, &masked),
 		Err(err) => Err(err),
 	}
 }
@@ -284,7 +298,11 @@ async fn native_open_scoped_async(
 /// a helper thread (see [`FifoOpen`]), so that the wait for the other end
 /// observes `token` and, for async callers, holds no runtime worker. The
 /// helper runs the ordinary blocking open, so the open returns exactly when
-/// it would without a token: once the other end connects.
+/// it would without a token: once the other end connects. An open that
+/// creates (`O_CREAT`: the shell's `>`, `tee`) opens the path, so the kernel
+/// checks `O_CREAT` against the path's directory as for the plain open
+/// (`fs.protected_fifos`; see [`FifoOpen`]). The open of the path leaves
+/// `O_TRUNC` to the helper, which applies it only while the open is live.
 ///
 /// Once the token fires, the open fails with [`crate::cancelled`], and
 /// dropping it releases the helper, so it leaves no end of the FIFO behind
@@ -303,16 +321,30 @@ fn start_fifo(
 	if token.is_cancelled() {
 		return Err(crate::cancelled());
 	}
-	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
+	let custom = options.get_custom_flags();
+	let nofollow = custom & libc::O_NOFOLLOW != 0;
+	let creates = creates(options);
+	// A write open leaves `O_TRUNC` to the helper; it asks the write
+	// permission `O_TRUNC` asks anyway. A read-only open keeps it, so the
+	// kernel still asks that permission of its open.
+	let truncates = options.is_writable() && (options.is_truncate() || custom & libc::O_TRUNC != 0);
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start(path, meta, nofollow, move |path, pinned| {
+	Ok(FifoOpen::start(path, meta, nofollow, creates, truncates, move |path, pinned| {
 		if !pinned {
-			return native_open(&scope, path, &options);
+			let mut by_path = options;
+			if truncates {
+				by_path
+					.truncate(false)
+					.custom_flags(custom & !libc::O_TRUNC);
+			}
+			return native_open(&scope, path, &by_path);
 		}
 		// A pin is checked not to be a symbolic link already, and its
-		// `/proc/self/fd/N` always is one.
+		// `/proc/self/fd/N` always is one. `O_TRUNC` stays: the pin is the
+		// FIFO, which ignores it, and the kernel asks the write permission it
+		// asks of the plain open.
 		let mut through_pin = options;
-		through_pin.custom_flags(through_pin.get_custom_flags() & !libc::O_NOFOLLOW);
+		through_pin.custom_flags(custom & !libc::O_NOFOLLOW);
 		native_open(&scope, path, &through_pin)
 	}))
 }
