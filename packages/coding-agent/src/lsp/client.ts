@@ -5,7 +5,7 @@ import { glob } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
-import { resolveSyscallTarget } from "../tools/path-utils";
+import { formatPathRelativeToCwd, resolveSyscallTarget } from "../tools/path-utils";
 import { findRepoRoot } from "../capability/fs";
 import { getConfig } from "./config";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
@@ -23,12 +23,14 @@ import type {
 	LspWriteSink,
 	PublishDiagnosticsParams,
 	ServerConfig,
+	ServerEditWatcher,
 	WorkspaceEdit,
 } from "./types";
 import {
 	detectLanguageId,
 	EquivalentUriMap,
 	fileToUri,
+	LspOutcomeError,
 	mergeDiagnosticLists,
 	readTextFromDisk,
 	uriToFile,
@@ -822,7 +824,11 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 }
 
 /**
- * Handle workspace/applyEdit requests from the server.
+ * Handle workspace/applyEdit requests from the server. A command of ours that is running
+ * (see {@link collectServerEdits}) gets this edit's applied lines once its files are written,
+ * or once it has failed (with the changes it made and the failure), before the open
+ * documents are brought up to date: that reconcile has no bound, and the command's call
+ * must not wait for it.
  */
 async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
 	const params = message.params as { edit?: WorkspaceEdit };
@@ -836,11 +842,46 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 		return;
 	}
 
+	const watchers = [...(client.serverEditWatchers ?? [])];
+	const landed = Promise.withResolvers<void>();
+	for (const watcher of watchers) watcher.landing.add(landed.promise);
 	try {
-		await applyWorkspaceEditWithLsp(params.edit, client.cwd);
+		await applyWorkspaceEditWithLsp(params.edit, client.cwd, undefined, (applied, failure) => {
+			// An edit that failed partway still changed files: the running command reports them.
+			const lines =
+				failure !== undefined && applied.length > 0
+					? [
+							...applied,
+							`The rest of the server's edit failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+						]
+					: applied;
+			for (const watcher of watchers) watcher.edits.push(...lines);
+			landed.resolve();
+		});
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
 		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
+	} finally {
+		landed.resolve();
+	}
+}
+
+/**
+ * Run `run`, a request to `client` that its server may carry out by sending
+ * `workspace/applyEdit` back (a code action's command), and add to `into` the applied
+ * lines of each such edit that starts while it runs. Settles as `run` does, but only once
+ * those edits have written their files, so a caller that `run` rejected (its call was
+ * aborted) still sees what the server changed.
+ */
+export async function collectServerEdits<T>(client: LspClient, into: string[], run: () => Promise<T>): Promise<T> {
+	const watcher: ServerEditWatcher = { edits: into, landing: new Set() };
+	const watchers = (client.serverEditWatchers ??= new Set());
+	watchers.add(watcher);
+	try {
+		return await run();
+	} finally {
+		watchers.delete(watcher);
+		await Promise.all(watcher.landing);
 	}
 }
 
@@ -881,37 +922,96 @@ function uriIsWithin(uri: string, root: string): boolean {
 	return uri === root || uri.startsWith(root.endsWith("/") ? root : `${root}/`);
 }
 
-/** Reconcile open overlays and file watchers with the ops a workspace edit actually performed. */
+/**
+ * A signal that aborts `ms` after `signal` does (`ms` from now if it already has), or none
+ * when there is no `signal`. Made once for a whole reconcile, so all its steps together get
+ * `ms` from the abort (or from the reconcile's start, if the call was aborted before it);
+ * without an abort they wait as long as they take.
+ */
+function boundAfterAbort(signal: AbortSignal | undefined, ms: number): { signal?: AbortSignal; dispose(): void } {
+	if (!signal) return { dispose() {} };
+	if (signal.aborted) return { signal: AbortSignal.timeout(ms), dispose() {} };
+	const bound = new AbortController();
+	const onAbort = () => {
+		const timeout = AbortSignal.timeout(ms);
+		timeout.addEventListener("abort", () => bound.abort(timeout.reason), { once: true });
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	return { signal: bound.signal, dispose: () => signal.removeEventListener("abort", onAbort) };
+}
+
+/**
+ * Reconcile open overlays and file watchers with the ops a workspace edit actually performed.
+ * The ops have already changed the files, so the caller's abort does not stop this. Each
+ * step (a `didClose` for a deleted document, a refresh of an open one) runs on its own: one
+ * that fails is logged and named in the returned notes, and the other files' steps still
+ * run. Without an abort the steps wait as long as the server takes; once `signal` aborts,
+ * all the steps still to finish share one bound of {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}
+ * from then (see {@link boundAfterAbort}), and a server that stops reading is torn down by
+ * the write the bound cuts short. The notice still goes out, and nothing here rejects.
+ */
 async function reconcileExecutedChanges(
 	executed: ExecutedWorkspaceChange[],
 	cwd: string,
-	signal?: AbortSignal,
-): Promise<void> {
-	if (executed.length === 0) return;
+	signal: AbortSignal | undefined,
+): Promise<string[]> {
+	if (executed.length === 0) return [];
 	const { finalUris, deletedRoots, watchedFiles } = workspaceEditChanges(executed);
 	const workspace = path.resolve(cwd);
 	const activeClients = Array.from(clients.values()).filter(
 		client => client.status === "ready" && path.resolve(client.cwd) === workspace,
 	);
+	const notes: string[] = [];
+	const bound = boundAfterAbort(signal, WATCHED_FILES_NOTIFY_TIMEOUT_MS);
+	const step = async (activeClient: LspClient, what: string, run: (stepSignal?: AbortSignal) => Promise<void>) => {
+		// A client torn down by an earlier step's bound is gone; its later steps would only fail.
+		if (clients.get(activeClient.name) !== activeClient) {
+			notes.push(`Note: ${activeClient.config.command} was not told of ${what}: the server was stopped.`);
+			return;
+		}
+		try {
+			await run(bound.signal);
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			logger.warn("LSP overlay reconciliation after a workspace edit failed", {
+				client: activeClient.name,
+				step: what,
+				error: reason,
+			});
+			notes.push(`Note: ${activeClient.config.command} was not told of ${what} (${reason}).`);
+		}
+	};
+	const shown = (uri: string) => formatPathRelativeToCwd(uriToFile(uri), cwd);
 
-	for (const activeClient of activeClients) {
-		for (const uri of Array.from(activeClient.openFiles.keys())) {
-			let deleted = false;
-			for (const root of deletedRoots) {
-				if (uriIsWithin(uri, root)) {
-					deleted = true;
-					break;
+	try {
+		await Promise.all(
+			activeClients.map(async activeClient => {
+				for (const uri of Array.from(activeClient.openFiles.keys())) {
+					let deleted = false;
+					for (const root of deletedRoots) {
+						if (uriIsWithin(uri, root)) {
+							deleted = true;
+							break;
+						}
+					}
+					if (!deleted) continue;
+					await step(activeClient, `the removal of ${shown(uri)}`, stepSignal =>
+						closeDocument(activeClient, uri, stepSignal),
+					);
 				}
-			}
-			if (!deleted) continue;
-			await closeDocument(activeClient, uri, signal);
-		}
-		for (const uri of finalUris) {
-			if (!activeClient.openFiles.has(uri)) continue;
-			await refreshFile(activeClient, uriToFile(uri), signal);
-		}
+				for (const uri of finalUris) {
+					if (!activeClient.openFiles.has(uri)) continue;
+					await step(activeClient, `the new text of ${shown(uri)}`, stepSignal =>
+						refreshFile(activeClient, uriToFile(uri), stepSignal),
+					);
+				}
+			}),
+		);
+	} finally {
+		bound.dispose();
 	}
-	await notifyWorkspaceWatchedFiles(cwd, watchedFiles, signal);
+	await notifyWorkspaceWatchedFiles(cwd, watchedFiles);
+	return notes;
 }
 
 /**
@@ -921,30 +1021,51 @@ async function reconcileExecutedChanges(
  * `ignoreIfExists`/`ignoreIfNotExists` neither closes overlays nor notifies watchers, and
  * when the edit fails partway the already-executed prefix is still reconciled before the
  * error propagates so mutated files never keep stale overlays.
+ *
+ * A `signal` already aborted when the call starts stops it before it changes anything;
+ * the edit itself watches the signal only while a recursive delete lists its tree, before
+ * that delete removes anything and before the edit's first change. Once the edit has run, the abort stops
+ * nothing: the call reports what it changed, and the servers are told of it. The result
+ * lists the applied changes, then a note for each server that was not brought up to date.
+ * `onApplied` gets the applied changes as soon as the files are written, before that; when
+ * the edit fails, it gets the changes made before the failure and the edit's error, also
+ * before the reconcile.
+ * An edit that fails after it changed files rejects with an {@link LspOutcomeError} that
+ * names those changes (they stay), with or without an abort.
  */
 export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
+	onApplied?: (applied: string[], failure?: unknown) => void,
 ): Promise<string[]> {
+	throwIfAborted(signal);
 	const executed: ExecutedWorkspaceChange[] = [];
+	const appliedSoFar: string[] = [];
 	let applied: string[];
 	try {
-		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change)));
+		({ applied } = await applyWorkspaceEdit(
+			edit,
+			cwd,
+			(change, line) => {
+				executed.push(change);
+				if (line !== undefined) appliedSoFar.push(line);
+			},
+			signal,
+		));
 	} catch (err) {
-		// Best-effort: overlays for the mutated prefix must not stay stale, but
-		// reconciliation problems must not mask the original apply failure.
-		try {
-			await reconcileExecutedChanges(executed, cwd, signal);
-		} catch (reconcileErr) {
-			logger.warn("LSP overlay reconciliation after failed workspace edit failed", {
-				error: reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr),
-			});
-		}
-		throw err;
+		onApplied?.([...appliedSoFar], err);
+		const notes = await reconcileExecutedChanges(executed, cwd, signal);
+		if (appliedSoFar.length === 0) throw err;
+		const changed = [...appliedSoFar, ...notes];
+		throw new LspOutcomeError(
+			`Before it failed, the workspace edit made these changes, which stay: ${changed.join("; ")}.`,
+			err,
+			changed,
+		);
 	}
-	await reconcileExecutedChanges(executed, cwd, signal);
-	return applied;
+	onApplied?.(applied);
+	return [...applied, ...(await reconcileExecutedChanges(executed, cwd, signal))];
 }
 
 interface DynamicCapabilityRegistration {
@@ -2034,9 +2155,10 @@ function isPathInsideWorkspace(filePath: string, workspace: string): boolean {
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-/** Budget for the one-way watched-files notification: a wedged server that
- *  stops draining stdin must never hang the filesystem mutation that
- *  triggered it. Failures degrade to a debug log below. */
+/** Budget for the one-way watched-files notification, and, from the call's abort, for
+ *  all the steps still to finish that reconcile open documents with a workspace edit
+ *  that has run: a wedged server that stops draining stdin must never hang the
+ *  filesystem mutation that triggered it. Failures degrade to a log. */
 const WATCHED_FILES_NOTIFY_TIMEOUT_MS = 2_000;
 
 /**
@@ -2047,16 +2169,14 @@ const WATCHED_FILES_NOTIFY_TIMEOUT_MS = 2_000;
  * This also covers sibling files that are not open text documents, such as generated
  * CSS modules or type files that another edited document imports immediately.
  *
- * The underlying stdin write drain is self-bounded by
- * {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}; only an abort of the caller's
- * `signal` rejects.
+ * Every caller announces a change it has already made, so the caller's abort
+ * does not stop the notice: a server left out keeps a stale view of the file for
+ * its next diagnostics. The notice is bounded only by its own
+ * {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}, so a call aborted after its change
+ * can wait up to that long for it. It never rejects: a failed delivery is a
+ * debug log.
  */
-export async function notifyWorkspaceWatchedFiles(
-	cwd: string,
-	changes: readonly WatchedFileChange[],
-	signal?: AbortSignal,
-): Promise<void> {
-	throwIfAborted(signal);
+export async function notifyWorkspaceWatchedFiles(cwd: string, changes: readonly WatchedFileChange[]): Promise<void> {
 	if (changes.length === 0) return;
 
 	const workspace = path.resolve(cwd);
@@ -2065,8 +2185,7 @@ export async function notifyWorkspaceWatchedFiles(
 	);
 	if (activeClients.length === 0) return;
 
-	const timeoutSignal = AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
-	const sendSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const sendSignal = AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
 	const results = await Promise.allSettled(
 		activeClients.map(async client => {
 			const served = await Promise.all(changes.map(change => clientServesPath(client, change.filePath)));
@@ -2097,7 +2216,6 @@ export async function notifyWorkspaceWatchedFiles(
 			await refreshOpenFiles(client, sendSignal);
 		}),
 	);
-	throwIfAborted(signal);
 	for (const result of results) {
 		if (result.status === "rejected") {
 			logger.debug("LSP watched-files notification failed", { cwd, error: String(result.reason) });

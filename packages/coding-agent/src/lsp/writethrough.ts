@@ -418,21 +418,13 @@ async function runLspWritethrough(
 		if (diskContent !== finalContent) await writeContent(finalContent);
 	};
 	let writeNotified = false;
-	const notifyWriteCommitted = async (notifySignal: AbortSignal | undefined = signal) => {
+	// Every call follows a commit, and the notice is bounded by its own timeout
+	// rather than by the caller's abort or the operation budget: the change is
+	// on disk either way.
+	const notifyWriteCommitted = async () => {
 		if (writeNotified) return;
 		writeNotified = true;
-		try {
-			await notifyWorkspaceWatchedFiles(cwd, [{ filePath: dst, type: changeType }], notifySignal);
-		} catch (error) {
-			if (notifySignal?.aborted && !signal?.aborted) {
-				// The operation budget died mid-notify while the caller is still
-				// live: allow the post-write retry below to re-announce with the
-				// caller's signal (didChangeWatchedFiles is idempotent).
-				writeNotified = false;
-				return;
-			}
-			throw error;
-		}
+		await notifyWorkspaceWatchedFiles(cwd, [{ filePath: dst, type: changeType }]);
 	};
 	if (!enableFormat && !enableDiagnostics) {
 		await commitWrite();
@@ -506,7 +498,7 @@ async function runLspWritethrough(
 					formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				}
 				await commitWrite();
-				await notifyWriteCommitted(operationSignal);
+				await notifyWriteCommitted();
 				if (changeType === FileChangeType.Created) {
 					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal, {
 						createMissing: enableDiagnostics,
@@ -520,7 +512,7 @@ async function runLspWritethrough(
 				// dependent's cached missing-module resolution indefinitely.
 				if (changeType === FileChangeType.Created) {
 					await commitWrite();
-					await notifyWriteCommitted(operationSignal);
+					await notifyWriteCommitted();
 					await reloadTypeScriptProjectsAfterCreate(cwd, lspServers, operationSignal);
 				}
 
@@ -548,7 +540,7 @@ async function runLspWritethrough(
 				// 4. Write to disk. A formatter-altered body is the only thing left to
 				// commit when the create already landed above.
 				await commitWrite();
-				await notifyWriteCommitted(operationSignal);
+				await notifyWriteCommitted();
 			}
 
 			if (enableDiagnostics) {
@@ -578,9 +570,8 @@ async function runLspWritethrough(
 			}
 		}
 		await commitWrite();
-		// The write above committed even though the operation budget elapsed:
-		// announce it on the caller's signal — the dead `operationSignal` would
-		// abort the notify before it ever reaches the server.
+		// The write above committed even though the operation stopped early:
+		// announce it, unless the step that stopped came after the notice.
 		await notifyWriteCommitted();
 	} finally {
 		endPendingDiskWrite(dst);

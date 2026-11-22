@@ -521,20 +521,85 @@ export function mergeCodeActions(
 	return [...merged, ...(extra ?? []).filter(action => !seen.has(JSON.stringify(action)))];
 }
 
+/**
+ * An LSP call's failure or abort that the caller must hear more about: changes it made that
+ * stay, or edits its server may still apply. The message is the cause's, then `detail`; the
+ * lsp tool keeps `detail` in what it reports, also for an abort or a timeout.
+ */
+export class LspOutcomeError extends Error {
+	constructor(
+		readonly detail: string,
+		cause: unknown,
+		/** The changes made that stay, as the lines a workspace edit reports. */
+		readonly applied: readonly string[] = [],
+	) {
+		const reason = (cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, "");
+		super(`${reason}. ${detail}`, { cause });
+		this.name = "LspOutcomeError";
+	}
+}
+
 export interface CodeActionApplyDependencies {
 	resolveCodeAction?: (action: CodeAction) => Promise<CodeAction>;
 	applyWorkspaceEdit: (edit: WorkspaceEdit) => Promise<string[]>;
-	executeCommand: (command: Command) => Promise<void>;
+	/**
+	 * Run `command` on the server. Its server may carry it out by sending `workspace/applyEdit`
+	 * back; the implementation adds the applied lines of each such edit to `serverEdits`, also
+	 * when the command's request rejects.
+	 */
+	executeCommand: (command: Command, serverEdits: string[]) => Promise<void>;
+	/** The call's signal (its cancel and its deadline): once files have changed, a command it stops is reported, not thrown. */
+	signal?: AbortSignal;
 }
 
 export interface AppliedCodeActionResult {
 	title: string;
+	/** The action's own edit, then the edits its server applied while its command ran. */
 	edits: string[];
 	executedCommands: string[];
+	/** Commands the call's signal stopped waiting for after files had changed. */
+	abortedCommands?: string[];
 }
 
 function isCommandItem(action: CodeAction | Command): action is Command {
 	return typeof action.command === "string";
+}
+
+/**
+ * Run `command` and add the edits its server applied to `edits`. Once some edit has changed
+ * files (the action's own, or one the server applied for the command), a command the call's
+ * signal stops is reported in the result instead of failing the call, since the changes stay;
+ * a command that fails otherwise fails the call naming those changes. A command the signal
+ * stops before anything changed ends the call as aborted, saying that the server may still
+ * apply edits for it.
+ */
+async function runCommand(
+	command: Command,
+	dependencies: CodeActionApplyDependencies,
+	edits: string[],
+): Promise<Pick<AppliedCodeActionResult, "executedCommands" | "abortedCommands">> {
+	const serverEdits: string[] = [];
+	try {
+		await dependencies.executeCommand(command, serverEdits);
+		return { executedCommands: [command.command] };
+	} catch (error) {
+		const changed = [...edits, ...serverEdits];
+		if (dependencies.signal?.aborted) {
+			if (changed.length > 0) return { executedCommands: [], abortedCommands: [command.command] };
+			throw new LspOutcomeError(
+				`The call did not wait for the command ${command.command}; its server may still apply edits for it.`,
+				error,
+			);
+		}
+		if (changed.length === 0) throw error;
+		throw new LspOutcomeError(
+			`Before the command ${command.command} failed, the code action made these changes, which stay: ${changed.join("; ")}.`,
+			error,
+			changed,
+		);
+	} finally {
+		edits.push(...serverEdits);
+	}
 }
 
 export async function applyCodeAction(
@@ -542,8 +607,8 @@ export async function applyCodeAction(
 	dependencies: CodeActionApplyDependencies,
 ): Promise<AppliedCodeActionResult | null> {
 	if (isCommandItem(action)) {
-		await dependencies.executeCommand(action);
-		return { title: action.title, edits: [], executedCommands: [action.command] };
+		const edits: string[] = [];
+		return { title: action.title, edits, ...(await runCommand(action, dependencies, edits)) };
 	}
 
 	let resolvedAction = action;
@@ -556,17 +621,15 @@ export async function applyCodeAction(
 	}
 
 	const edits = resolvedAction.edit ? await dependencies.applyWorkspaceEdit(resolvedAction.edit) : [];
-	const executedCommands: string[] = [];
-	if (resolvedAction.command) {
-		await dependencies.executeCommand(resolvedAction.command);
-		executedCommands.push(resolvedAction.command.command);
-	}
+	const commandRun = resolvedAction.command
+		? await runCommand(resolvedAction.command, dependencies, edits)
+		: { executedCommands: [] };
 
-	if (edits.length === 0 && executedCommands.length === 0) {
+	if (edits.length === 0 && commandRun.executedCommands.length === 0) {
 		return null;
 	}
 
-	return { title: resolvedAction.title, edits, executedCommands };
+	return { title: resolvedAction.title, edits, ...commandRun };
 }
 
 const GLOB_PATTERN_CHARS = /[*?[{]/;

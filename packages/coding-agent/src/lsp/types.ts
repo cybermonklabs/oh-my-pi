@@ -436,6 +436,17 @@ export interface LspServerCapabilities {
 	[key: string]: unknown;
 }
 
+/**
+ * Collects the edits a client applies for its server's `workspace/applyEdit` requests while
+ * a request of ours (a code action's command) runs. Each apply that starts while the watcher
+ * is registered adds its result to `edits` and holds a `landing` promise until its files are
+ * written (or its edit failed).
+ */
+export interface ServerEditWatcher {
+	edits: string[];
+	landing: Set<Promise<void>>;
+}
+
 /** Last busy and idle build-status notifications for a document, as client-wide sequence numbers. */
 export interface DocumentBuildStatus {
 	busySeq: number;
@@ -484,6 +495,8 @@ export interface LspClient {
 	startedAt?: number;
 	/** Serializes outbound JSON-RPC writes to the server process. */
 	writeQueue: Promise<void>;
+	/** Watchers of the edits the server applies through `workspace/applyEdit` (see {@link ServerEditWatcher}). */
+	serverEditWatchers?: Set<ServerEditWatcher>;
 	/** Tracks active work-done progress tokens from the server */
 	activeProgressTokens: Set<string | number>;
 	/** Resolves when the server's initial project loading completes (or after timeout) */
