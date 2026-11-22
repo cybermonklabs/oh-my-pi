@@ -4348,6 +4348,299 @@ mod tests {
 			}
 		}
 	}
+
+	/// A new file is made as GNU's `copy_reg` makes it (`copy.c` 9.7, lines
+	/// 1450-1460 and 1675-1704): with the source's permission bits, less its
+	/// group and other bits while its owner may still change (`-p`,
+	/// `--preserve=ownership`), plus the owner's write bit where extended
+	/// attributes are copied without root's privileges. Its final mode is set
+	/// after its owner: the source's under a preserved mode, 666 less the umask
+	/// under `--no-preserve=mode`, else the source's less the umask. A link
+	/// that leads nowhere before cp starts (POSIXLY_CORRECT) makes such a new
+	/// file, which gets its final mode and owner too. GNU 9.4 and 9.7 give
+	/// these, as uid 1000 and as root, on runc and gVisor. From a FIFO the
+	/// test reads the mode and owner while cp waits for its data; as root the
+	/// FIFO belongs to uid 1000, so a preserved owner is set.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_new_file_is_private_until_its_owner_is_set() {
+		use std::{
+			io::Write as _,
+			os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+		};
+
+		use crate::host::{Host, Utility as _};
+
+		// SAFETY: `geteuid` and `getegid` have no preconditions.
+		let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+		let as_root = uid == 0;
+		let umask = crate::host::process_umask();
+		let source_owner = if as_root { (1000, 1000) } else { (uid, gid) };
+		let flags = ["", "-p", "--preserve=ownership", "--preserve=mode", "--no-preserve=mode", "--preserve=xattr", "--preserve=all"];
+		// GNU's modes for (flag, source mode): while cp copies, and after.
+		let expected = |flag: &str, mode: u32| {
+			let owner_kept = matches!(flag, "-p" | "--preserve=ownership" | "--preserve=all");
+			let xattr = matches!(flag, "--preserve=xattr" | "--preserve=all");
+			let omitted = if owner_kept { mode & 0o077 } else { 0 };
+			let open = (mode & !omitted) | if xattr && !as_root { 0o200 } else { 0 };
+			let during = (open & !umask) | (open & !mode);
+			let after = match flag {
+				"-p" | "--preserve=mode" | "--preserve=all" => mode,
+				"--no-preserve=mode" => 0o666 & !umask,
+				_ => mode & !umask,
+			};
+			(during, after, if owner_kept { source_owner } else { (uid, gid) })
+		};
+		// Rows GNU 9.4 and 9.7 gave under umask 022, as uid 1000 and as root.
+		if umask == 0o022 {
+			let modes = |flag, mode| {
+				let (during, after, _) = expected(flag, mode);
+				(during, after)
+			};
+			assert_eq!(modes("-p", 0o440), (0o400, 0o440));
+			assert_eq!(modes("-p", 0o666), (0o600, 0o666));
+			assert_eq!(modes("--no-preserve=mode", 0o440), (0o440, 0o644));
+			assert_eq!(modes("", 0o604), (0o604, 0o604));
+		}
+		for mode in [0o440, 0o640, 0o666, 0o604] {
+			for flag in flags {
+				for through in [false, true] {
+					let dir = tempdir().unwrap();
+					let fifo = dir.path().join("p");
+					let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+					// SAFETY: `name` is NUL-terminated and outlives the call.
+					assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+					// Held read-write, so cp's open does not wait and its read does.
+					let writer = fs::OpenOptions::new()
+						.read(true)
+						.write(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&fifo)
+						.unwrap();
+					fs::set_permissions(&fifo, fs::Permissions::from_mode(mode)).unwrap();
+					if as_root {
+						std::os::unix::fs::chown(&fifo, Some(1000), Some(1000)).unwrap();
+					}
+					let made = if through {
+						std::os::unix::fs::symlink("none", dir.path().join("b")).unwrap();
+						dir.path().join("none")
+					} else {
+						dir.path().join("b")
+					};
+					let case = format!(
+						"cp {flag} p b, a FIFO of mode {mode:o}{}",
+						if through { ", b a link to nothing (POSIXLY_CORRECT)" } else { "" }
+					);
+					let cwd = dir.path().to_owned();
+					let copy = std::thread::spawn(move || {
+						let (mut host, capture) = Host::for_test(Cp::NAME, "", &cwd);
+						if through {
+							host.set_test_var("POSIXLY_CORRECT", "1");
+						}
+						let mut args = vec!["cp"];
+						args.extend((!flag.is_empty()).then_some(flag));
+						args.extend(["p", "b"]);
+						let parsed = <Cp as clap::Parser>::try_parse_from(args).unwrap();
+						(parsed.run(&mut host), capture.err())
+					});
+					let during = loop {
+						if let Ok(metadata) = fs::metadata(&made) {
+							break (metadata.mode() & 0o7777, (metadata.uid(), metadata.gid()));
+						}
+						assert!(!copy.is_finished(), "{case}: cp ended before it made the file");
+						std::thread::yield_now();
+					};
+					(&writer).write_all(b"F").unwrap();
+					drop(writer);
+					let (code, err) = copy.join().unwrap();
+					assert_eq!((code, err.as_str()), (0, ""), "{case}");
+					let metadata = fs::metadata(&made).unwrap();
+					let (mode_during, mode_after, owner_after) = expected(flag, mode);
+					assert_eq!(
+						format!(
+							"{:o} {:?}, then {:o} {:?}",
+							during.0,
+							during.1,
+							metadata.mode() & 0o7777,
+							(metadata.uid(), metadata.gid())
+						),
+						format!("{mode_during:o} {:?}, then {mode_after:o} {owner_after:?}", (uid, gid)),
+						"{case}: mode and owner while cp copies, then after"
+					);
+					assert_eq!(fs::read_to_string(&made).unwrap(), "F", "{case}");
+				}
+			}
+		}
+	}
+
+	/// A regular file copied through a link that leads nowhere before cp
+	/// starts (POSIXLY_CORRECT) is new to cp, as it is to GNU 9.4 and 9.7:
+	/// the file the link leads to gets the final mode and owner a new file
+	/// gets (see [`a_new_file_is_private_until_its_owner_is_set`]).
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_file_copied_through_a_link_to_nothing_gets_a_new_files_mode() {
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+		use crate::host::{Host, Utility as _};
+
+		// SAFETY: `geteuid` has no preconditions.
+		let as_root = unsafe { libc::geteuid() } == 0;
+		let umask = crate::host::process_umask();
+		let own = if as_root { (0, 0) } else { unsafe { (libc::geteuid(), libc::getegid()) } };
+		let source_owner = if as_root { (1000, 1000) } else { own };
+		for mode in [0o440, 0o640, 0o604] {
+			for flag in ["", "-p", "--preserve=ownership", "--preserve=mode", "--no-preserve=mode"] {
+				let dir = tempdir().unwrap();
+				fs::write(dir.path().join("a"), b"A").unwrap();
+				fs::set_permissions(dir.path().join("a"), fs::Permissions::from_mode(mode)).unwrap();
+				if as_root {
+					std::os::unix::fs::chown(dir.path().join("a"), Some(1000), Some(1000)).unwrap();
+				}
+				std::os::unix::fs::symlink("none", dir.path().join("b")).unwrap();
+				let (mut host, capture) = Host::for_test(Cp::NAME, "", dir.path());
+				host.set_test_var("POSIXLY_CORRECT", "1");
+				let mut args = vec!["cp"];
+				args.extend((!flag.is_empty()).then_some(flag));
+				args.extend(["a", "b"]);
+				let code = <Cp as clap::Parser>::try_parse_from(args).unwrap().run(&mut host);
+				let case = format!("POSIXLY_CORRECT cp {flag} a b, a of mode {mode:o}, b a link to nothing");
+				assert_eq!((code, capture.err().as_str()), (0, ""), "{case}");
+				let made = fs::metadata(dir.path().join("none")).unwrap();
+				let mode_after = match flag {
+					"-p" | "--preserve=mode" => mode,
+					"--no-preserve=mode" => 0o666 & !umask,
+					_ => mode & !umask,
+				};
+				let owner_after =
+					if matches!(flag, "-p" | "--preserve=ownership") { source_owner } else { own };
+				assert_eq!(
+					format!("{:o} {:?}", made.mode() & 0o7777, (made.uid(), made.gid())),
+					format!("{mode_after:o} {owner_after:?}"),
+					"{case}: mode and owner of the file the link leads to"
+				);
+				assert_eq!(fs::read_link(dir.path().join("b")).unwrap(), std::path::Path::new("none"), "{case}");
+			}
+		}
+	}
+
+	/// A non-directory is not copied over a directory, as GNU 9.7 refuses it
+	/// (`copy.c` lines 2458-2471), once `-n`, `-i` and `-u` let the copy go
+	/// on: a link in a tree (`cp -RT S D`, also with -H and -a, with `S/l` a
+	/// link and `D/l` a directory) and one operand under `-T`. With a backup
+	/// GNU does not refuse, and makes no backup of a directory in a copy: the
+	/// link's creation fails, and the directory stays. Under `-a` the failure
+	/// is reported, not dropped, and `-i` answered no fails, as GNU's does.
+	/// A link to nothing that is newer than the copied link is kept by `-u`.
+	#[test]
+	#[cfg(unix)]
+	fn a_non_directory_is_not_copied_over_a_directory_as_gnu_does() {
+		type Row = (&'static [&'static str], &'static str, i32, &'static str);
+		let refused = "cp: cannot overwrite directory 'D/l' with non-directory 'S/l'\n";
+		let exists = "cp: cannot create symbolic link 'D/l': File exists\n";
+		for mode in ["-RT", "-RHT", "-aT"] {
+			let rows: [Row; 8] = [
+				(&[], "", 1, refused),
+				(&["-f"], "", 1, refused),
+				(&["-v"], "", 1, refused),
+				(&["-f", "-v"], "", 1, refused),
+				(&["--remove-destination"], "", 1, refused),
+				(&["-b"], "", 1, exists),
+				(&["-n"], "", 0, ""),
+				(&["-i"], "n\n", 1, "cp: overwrite 'D/l'? "),
+			];
+			for (flags, stdin, code, err) in rows {
+				let dir = tempdir().unwrap();
+				fs::write(dir.path().join("a"), b"A").unwrap();
+				fs::create_dir_all(dir.path().join("S")).unwrap();
+				std::os::unix::fs::symlink("../a", dir.path().join("S/l")).unwrap();
+				fs::create_dir_all(dir.path().join("D/l")).unwrap();
+				fs::write(dir.path().join("D/l/x"), b"X").unwrap();
+				let mut args = vec![mode];
+				args.extend(flags);
+				args.extend(["S", "D"]);
+				let (got, capture) = run_util::<Cp>(&args, stdin, dir.path());
+				let case = format!("cp {}", args.join(" "));
+				assert_eq!((got, capture.err(), capture.out()), (code, err.to_owned(), String::new()), "{case}");
+				assert_eq!(fs::read_to_string(dir.path().join("D/l/x")).unwrap(), "X", "{case}: D/l is not kept");
+				assert!(!dir.path().join("D/l~").exists(), "{case}: D/l was backed up");
+			}
+			// `-i` answered no onto any other kind fails too.
+			for (kind, make) in [("file", 0), ("link to nothing", 1), ("FIFO", 2)] {
+				let dir = tempdir().unwrap();
+				fs::write(dir.path().join("a"), b"A").unwrap();
+				fs::create_dir_all(dir.path().join("S")).unwrap();
+				std::os::unix::fs::symlink("../a", dir.path().join("S/l")).unwrap();
+				fs::create_dir_all(dir.path().join("D")).unwrap();
+				let l = dir.path().join("D/l");
+				match make {
+					0 => fs::write(&l, b"OLD").unwrap(),
+					1 => std::os::unix::fs::symlink("missing", &l).unwrap(),
+					_ => {
+						let name = std::ffi::CString::new(l.as_os_str().as_encoded_bytes()).unwrap();
+						// SAFETY: `name` is NUL-terminated and outlives the call.
+						assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0, "mkfifo");
+					},
+				}
+				let (got, capture) = run_util::<Cp>(&[mode, "-i", "S", "D"], "n\n", dir.path());
+				assert_eq!((got, capture.err()), (1, "cp: overwrite 'D/l'? ".to_owned()), "cp {mode} -i onto a {kind}");
+			}
+		}
+		let onto_dir: [Row; 7] = [
+			(&[], "", 1, "cp: cannot overwrite directory 'b' with non-directory 'l'\n"),
+			(&["-f"], "", 1, "cp: cannot overwrite directory 'b' with non-directory 'l'\n"),
+			(&["-n"], "", 0, ""),
+			(&["-u"], "", 0, ""),
+			(&["-i"], "n\n", 1, "cp: overwrite 'b'? "),
+			(&["-i"], "y\n", 1, "cp: overwrite 'b'? cp: cannot overwrite directory 'b' with non-directory 'l'\n"),
+			(&["-b"], "", 1, "cp: cannot create symbolic link 'b': File exists\n"),
+		];
+		for (flags, stdin, code, err) in onto_dir {
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), b"A").unwrap();
+			std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+			// The link is older than `b`, which `-u` keeps.
+			let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+			fs::File::options()
+				.write(true)
+				.open(dir.path().join("a"))
+				.unwrap()
+				.set_modified(old)
+				.unwrap();
+			set_link_times(&dir.path().join("l"), old);
+			fs::create_dir(dir.path().join("b")).unwrap();
+			fs::write(dir.path().join("b/x"), b"X").unwrap();
+			let mut args = vec!["-T", "-P"];
+			args.extend(flags);
+			args.extend(["l", "b"]);
+			let (got, capture) = run_util::<Cp>(&args, stdin, dir.path());
+			let case = format!("cp {}, b a directory", args.join(" "));
+			assert_eq!((got, capture.err(), capture.out()), (code, err.to_owned(), String::new()), "{case}");
+			assert_eq!(fs::read_to_string(dir.path().join("b/x")).unwrap(), "X", "{case}: b is not kept");
+		}
+		for flag in ["-P", "-R", "-d"] {
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), b"A").unwrap();
+			std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+			set_link_times(&dir.path().join("l"), std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+			std::os::unix::fs::symlink("missing", dir.path().join("b")).unwrap();
+			let (got, capture) = run_util::<Cp>(&[flag, "-u", "l", "b"], "", dir.path());
+			let case = format!("cp {flag} -u l b, b a newer link to nothing");
+			assert_eq!((got, capture.err()), (0, String::new()), "{case}");
+			assert_eq!(fs::read_link(dir.path().join("b")).unwrap(), std::path::Path::new("missing"), "{case}");
+		}
+	}
+
+	/// Sets the times of the link `path` itself.
+	#[cfg(unix)]
+	fn set_link_times(path: &std::path::Path, time: SystemTime) {
+		let secs = time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+		let times = [libc::timespec { tv_sec: secs, tv_nsec: 0 }, libc::timespec { tv_sec: secs, tv_nsec: 0 }];
+		let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+		// SAFETY: `name` is NUL-terminated, and `times` holds two timespecs.
+		let rc = unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+		assert_eq!(rc, 0, "lutimes {}", path.display());
+	}
 	#[test]
 	fn recursive_copy_creates_missing_target_then_nests_into_existing_one() {
 		let fixture = tempdir().unwrap();
