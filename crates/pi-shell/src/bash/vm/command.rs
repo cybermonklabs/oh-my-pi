@@ -2750,6 +2750,17 @@ fn call_function(
 			return Some(Flow::Discard(1));
 		},
 	};
+	// A timed job's function call: its body's first command decides if it
+	// may run a program, else the job keeps its virtual pid at once
+	// ([`BangStage::First`]).
+	if k
+		.bangs
+		.iter()
+		.any(|b| b.vproc == vp.vpid && b.stage == BangStage::First)
+		&& !super::exec::program_first(&body, 0)
+	{
+		k.settle_bang(vp.vpid, None);
+	}
 	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	let s = st(vp);
 	let args = s.argv[1..].to_vec();
@@ -4221,9 +4232,15 @@ fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, 
 	match (target, bang.stage) {
 		// A refused spawn is retried (`Refused`, `Script`): that decides.
 		(Target::Intrinsic(IntrinsicId::Exec) | Target::Refused { .. }, _)
-		| (Target::External(_) | Target::Interp(_), BangStage::Lone) => {},
+		| (Target::External(_) | Target::Interp(_), BangStage::Lone | BangStage::First) => {},
 		(Target::External(_) | Target::Interp(_), _) if exec => {},
+		// A timed job's function call: the function's first command decides
+		// ([`BangStage::First`], checked where the call loads the body).
+		(Target::Function(_), BangStage::Lone) if bang.timed => bang.stage = BangStage::First,
 		(Target::Function(_), BangStage::Lone | BangStage::Exec) => bang.stage = BangStage::Exec,
+		// A timed function call: its first command decides
+		// ([`BangStage::First`]).
+		(Target::Function(_), BangStage::First) => {},
 		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
 		_ => k.settle_bang(vpid, None),
 	}

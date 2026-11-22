@@ -661,6 +661,11 @@ pub struct Bang {
 	pub job:   Vpid,
 	/// What may still give the job its program.
 	pub stage: BangStage,
+	/// The job's body is timed (`time … &`): bash's forced subshell, which
+	/// `$!` names, is the whole job, so the program the job is known by
+	/// stands for it ([`super::Kernel::pid_owners`] gets no entry; `kill`
+	/// and `wait` of the pid act on the job).
+	pub timed: bool,
 }
 
 /// The redirections of a background job's lone command whose open would
@@ -733,6 +738,15 @@ pub enum BangStage {
 	/// The job's body is a pipeline: its last stage, once started, decides
 	/// as a job body of its own would (`$!` names the last process).
 	Pipeline,
+	/// The job's body is a timed compound command or function call (`time
+	/// { … } &`, `time f &`): bash's forced subshell, which `$!` names,
+	/// lives as long as the job. The body's first command decides: an
+	/// external it runs in the job's vproc makes the job known by that
+	/// program, which stands for the whole job ([`Bang::timed`]); a function
+	/// call leaves the decision to the function's first command; anything
+	/// else (a builtin, a subshell or pipeline in a vproc of its own) keeps
+	/// the virtual pid.
+	First,
 }
 
 /// A running coprocess: its vproc, the variable naming it and the shell's

@@ -5,7 +5,7 @@
 ### Fixed
 
 - Once the last program of a background pipeline is gone (`kill -0 $!` fails) and its other programs have ended, `jobs` (also `-r`, `-n`, `%1`), `$(jobs)`, `fg`, `bg`, `disown -r` and `kill %1` see the job done, as bash does: `jobs` no longer lists it `Running`, `fg`/`bg` say `job has terminated` instead of waiting for it or calling it already in the background. The builtins that report or decide by a job's state, zsh's too, first take in the exits already available, and the end of a pipeline's stage reaches its job before the shell runs on. `kill %1` of a finished job no longer says `no such job`: as bash 5.3 does, it succeeds and signals nothing without job control, and reports `(pid) - No such process` with it.
-- `$!` of a timed background pipeline (`time a | b &`) names the job, not `b`, as bash (which runs it as a subshell of its own) and zsh do: `kill $!` ends the job with status 143 though `b` has ended.
+- A timed background job (`time cmd &`, `time a | b &`) is known by a real process, its program as the untimed job would be (the lone one, a pipeline's last one), so `/bin/kill -0 "$!"`, `ps -p "$!"` and `jobs -p` find it; and that pid stands for the whole job, as bash's forced subshell does: `kill $!` ends the job (`wait $!` gives 143) though `b` has ended. `time cmd &` used to have the shell's virtual pid.
 
 ## [18.18.6] - 2026-11-09
 

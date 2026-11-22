@@ -700,7 +700,10 @@ impl Kernel {
 		let bang = self.bangs.swap_remove(i);
 		if let Some(pid) = os {
 			self.settled.push((bang.job, pid));
-			if bang.vproc != bang.job {
+			// A pipeline stage's program is that stage's own, but for a timed
+			// job, whose pid stands for the whole job ([`proc::Bang::timed`]):
+			// `kill` and `wait` find the job by its pid.
+			if bang.vproc != bang.job && !bang.timed {
 				self.pid_owners.push((pid, bang.vproc, bang.job));
 			}
 		}
