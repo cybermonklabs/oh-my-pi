@@ -573,7 +573,22 @@ impl Lower {
 					stages: Vec::new(),
 					end:    0,
 				});
-				let at = self.emit(Opcode::Spawn, spawn, 0, ao_id);
+				// zsh names a job by its processes' texts
+				// ([`syn::zsh::pipeline_jobtext`]), printed here from the tree:
+				// a here-document's body is outside the job's source span. A
+				// disowned job (`&|`) gets no job entry. An `&&`/`||` list keeps
+				// the text of the whole list: zsh runs all but its last pipeline
+				// in the foreground, which this engine does not.
+				let text = if zsh && sep == syn::Sep::Amp && ao.rest().len() == 0 {
+					self
+						.unit
+						.strs
+						.push(syn::zsh::pipeline_jobtext(ao.first()).into());
+					self.unit.strs.len() as u32
+				} else {
+					0
+				};
+				let at = self.emit(Opcode::Spawn, spawn, text, ao_id);
 				// zsh `&|` / `&!`: disowned at once.
 				if sep == syn::Sep::Disown {
 					self.unit.ops[at as usize].flags |= Op::DISOWN;
@@ -598,6 +613,10 @@ impl Lower {
 
 	fn and_or(&mut self, ao: st::AndOr<'_>) -> R {
 		self.node(ao.id(), NodeKind::AndOr, ao.span());
+		if self.holds_heredoc(ao.span()) {
+			let text = syn::zsh::andor_jobtext(ao);
+			self.job_text(ao.id().0, text);
+		}
 		let rest = ao.rest();
 		let n = rest.len();
 		if n > 0 {
@@ -662,6 +681,27 @@ impl Lower {
 		Ok(())
 	}
 
+	/// zsh: whether the source of the node at `span` holds a here-document
+	/// (`<<`), whose body lies outside it ([`Unit::job_texts`]).
+	fn holds_heredoc(&self, span: syn::Span) -> bool {
+		if self.unit.mode.dialect() != crate::bash::ids::Dialect::Zsh {
+			return false;
+		}
+		let span = span.rebase(self.base);
+		self
+			.unit
+			.source
+			.get(span.lo as usize..span.hi as usize)
+			.is_some_and(|s| s.windows(2).any(|w| w == b"<<"))
+	}
+
+	/// zsh: `text` is the job text of the node `node` ([`Unit::job_texts`]).
+	fn job_text(&mut self, node: u32, text: Vec<u8>) {
+		self.unit.strs.push(text.into());
+		let at = self.unit.strs.len() as u32 - 1;
+		self.unit.job_texts.push((node, at));
+	}
+
 	fn cond_list(&mut self, list: st::List<'_>) -> R {
 		self.cond += 1;
 		let res = self.list(list);
@@ -671,6 +711,10 @@ impl Lower {
 
 	fn command(&mut self, cmd: st::Command<'_>) -> R {
 		let id = cmd.id().0;
+		if self.holds_heredoc(cmd.span()) {
+			let text = syn::zsh::command_jobtext(cmd, false);
+			self.job_text(id, text);
+		}
 		let redirs = cmd.redirs();
 		if let st::CommandKind::Simple(s) = cmd.kind() {
 			self.node(cmd.id(), NodeKind::Simple, cmd.span());
@@ -995,7 +1039,18 @@ impl Lower {
 					stages: Vec::new(),
 					end:    0,
 				});
-				self.emit(Opcode::Spawn, spawn, 0, id);
+				// zsh names a coprocess's job by its body's processes (the
+				// sublist's `coproc` is left out), printed from the tree.
+				let text = if self.unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+					self
+						.unit
+						.strs
+						.push(syn::zsh::coproc_jobtext(c.body()).into());
+					self.unit.strs.len() as u32
+				} else {
+					0
+				};
+				self.emit(Opcode::Spawn, spawn, text, id);
 				let entry = self.here();
 				self.command(c.body())?;
 				self.emit(Opcode::SubExit, 0, 0, id);

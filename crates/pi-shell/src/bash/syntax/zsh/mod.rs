@@ -22,7 +22,8 @@ pub use self::{
 		parse_subst_string, parsestr, skipparens, tokstring, zle_curcmd,
 	},
 	text::{
-		body_text, command_text, function_text, function_text_expand, getjobtext, getpermtext,
-		herestring_word, list_text, quoted_name, reindent_function, source_body_text,
+		andor_jobtext, body_text, command_jobtext, command_text, coproc_jobtext, function_text,
+		function_text_expand, getjobtext, getpermtext, herestring_word, list_text, pipeline_jobtext,
+		quoted_name, reindent_function, source_body_text,
 	},
 };

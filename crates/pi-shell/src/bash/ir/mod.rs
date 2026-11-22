@@ -47,7 +47,7 @@
 //! | `LoopExit` | – | – | pop the loop record, `$?` = its status, emit `LoopEnd` |
 //! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b` |
 //! | `PopRedir` | – | – | restore the fds saved by the matching `Redir` |
-//! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
+//! | `Spawn` | `spawns` index | zsh background job or coprocess: 1 + the `strs` index of its job text (zsh `getjobtext`), else 0 | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
 //! | `SubExit` | – | – | end of a child's code: the vproc exits with `$?` |
 //! | `CaseWord` | `words` index | – | expand the `case` subject (no splitting) and push it |
 //! | `CaseArm` | `pats` index | next-arm pc | match the subject against the patterns; no match: jump to `b` |
@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
@@ -279,8 +279,13 @@ pub struct Unit {
 	pub cmds:                Vec<Cmd>,
 	/// Variable names.
 	pub names:               Vec<BString>,
-	/// Diagnostic texts.
+	/// Diagnostic texts, and zsh job texts (`Spawn`, [`Self::job_texts`]).
 	pub strs:                Vec<BString>,
+	/// zsh: `(node, strs index)` of the job text printed from the syntax
+	/// tree for a command or and-or list whose source holds a
+	/// here-document (its body lies outside the node's source, so the text
+	/// cannot be printed again from that source alone).
+	pub job_texts:           Vec<(u32, u32)>,
 	/// Redirection lists.
 	pub redirs:              Vec<Vec<RedirIr>>,
 	/// Subshells, pipelines and background jobs.
@@ -326,6 +331,7 @@ impl Unit {
 			cmds: Vec::new(),
 			names: Vec::new(),
 			strs: Vec::new(),
+			job_texts: Vec::new(),
 			redirs: Vec::new(),
 			spawns: Vec::new(),
 			pats: Vec::new(),
@@ -400,6 +406,7 @@ impl Unit {
 			&self.cmds,
 			&self.names,
 			&self.strs,
+			&self.job_texts,
 			&self.redirs,
 			&self.spawns,
 			&self.pats,

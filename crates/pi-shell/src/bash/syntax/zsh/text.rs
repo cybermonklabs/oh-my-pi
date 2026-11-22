@@ -61,6 +61,63 @@ pub fn getjobtext(list: List<'_>) -> Vec<u8> {
 	t.out
 }
 
+/// zsh's text of a background job that runs pipeline `p` (`$jobtexts`).
+///
+/// Each process has its own text (`addproc`, its own 80-byte buffer), and
+/// the texts are joined by ` | `. A timed pipeline is one process, a
+/// subshell named `time [!] P`. The sublist's `!` is not in any text.
+pub fn pipeline_jobtext(p: Pipeline<'_>) -> Vec<u8> {
+	if p.time().is_some() {
+		let mut t = Text::new(Vec::new(), 0, 0);
+		t.job = true;
+		t.pipeline(p);
+		return t.out;
+	}
+	let stages = p.stages();
+	if stages.len() == 1 && stages.first().is_some_and(is_empty) {
+		return Vec::new();
+	}
+	let mut out = Vec::new();
+	for (i, st) in stages.iter().enumerate() {
+		if i > 0 {
+			out.extend_from_slice(b" | ");
+		}
+		out.extend(command_jobtext(st, st.pipe_stderr()));
+	}
+	out
+}
+
+/// zsh `getjobtext` of one and-or list (`&&`/`||` and its `!`s kept).
+pub fn andor_jobtext(ao: AndOr<'_>) -> Vec<u8> {
+	let mut t = Text::new(Vec::new(), 0, 0);
+	t.job = true;
+	t.sublist(ao);
+	t.out
+}
+
+/// zsh's text of a coprocess's job: that of the processes its body runs
+/// (the sublist's `coproc` is not in it).
+pub fn coproc_jobtext(body: Command<'_>) -> Vec<u8> {
+	if let CommandKind::Brace(l) = body.kind()
+		&& body.made_group()
+		&& let Some(item) = l.items().one()
+		&& item.and_or().rest().len() == 0
+	{
+		return pipeline_jobtext(item.and_or().first());
+	}
+	command_jobtext(body, false)
+}
+
+/// zsh `getjobtext` of one process running `cmd` (a pipeline's stage),
+/// its redirections included, and `2>&1` when `stderr` (the stage is
+/// joined to the next with `|&`).
+pub fn command_jobtext(cmd: Command<'_>, stderr: bool) -> Vec<u8> {
+	let mut t = Text::new(Vec::new(), 0, 0);
+	t.job = true;
+	t.command(cmd, stderr);
+	t.out
+}
+
 /// What `functions NAME` prints for function `f` defined as `name`.
 ///
 /// `name () {`, the body indented by a tab, `}` and the function's
@@ -398,14 +455,18 @@ impl Text {
 		}
 	}
 
-	/// zsh `taddlist`: words separated by spaces.
+	/// zsh `taddlist`: each word and a space, then the last byte taken back
+	/// (in a full job text the space was not added, so the byte taken is
+	/// the last word's).
 	fn words(&mut self, ws: Seq<'_, Word<'_>>) {
-		for (i, w) in ws.iter().enumerate() {
-			if i > 0 {
-				self.c(b' ');
-			}
-			self.word(w);
+		if ws.is_empty() {
+			return;
 		}
+		for w in ws {
+			self.word(w);
+			self.c(b' ');
+		}
+		self.out.pop();
 	}
 
 	/// Array elements separated by spaces (`[k]=v` as zsh's word holds it).
@@ -914,20 +975,22 @@ impl Text {
 		if self.job
 			&& let RedirTarget::HereDoc(d) = r.target()
 		{
-			// zsh: a here-document's body as a quoted here-string.
+			// zsh `getredirs`: a here-document's body as a here-string, its
+			// last newline left out, in single quotes, or in double quotes
+			// when it holds expansions. The quotes are characters of their
+			// own: a body that does not fit is dropped and they stay.
 			self.s(b"<<<");
 			let body = d.text();
 			let body = body.strip_suffix(b"\n").unwrap_or(body);
-			let mut q = alloc::vec![b'\''];
-			for &c in body {
-				if c == b'\'' {
-					q.extend_from_slice(b"'\\''");
-				} else {
-					q.push(c);
-				}
+			if d.quoted() || !heredoc_has_token(body) {
+				self.c(b'\'');
+				self.s(&quote_single(body));
+				self.c(b'\'');
+			} else {
+				self.c(b'"');
+				self.s(&quote_heredoc_double(body));
+				self.c(b'"');
 			}
-			q.push(b'\'');
-			self.s(&q);
 			return;
 		}
 		self.s(op);
@@ -958,4 +1021,92 @@ fn ungroup(mut e: Cond<'_>) -> Cond<'_> {
 fn is_empty(c: Command<'_>) -> bool {
 	matches!(c.kind(), CommandKind::Simple(s) if s.assigns().is_empty() && s.words().is_empty())
 		&& c.redirs().is_empty()
+}
+
+/// Whether zsh's lexer leaves a token in the body of an unquoted
+/// here-document (`has_token`): an expansion (`$`, a backquote) or a
+/// backslash that quotes `$`, a backquote, a backslash or a newline.
+fn heredoc_has_token(body: &[u8]) -> bool {
+	body.iter().enumerate().any(|(i, &c)| match c {
+		b'$' | b'`' => true,
+		b'\\' => matches!(body.get(i + 1), Some(b'$' | b'`' | b'\\' | b'\n')),
+		_ => false,
+	})
+}
+
+/// zsh `quotestring(QT_SINGLE)`: `'` as `'\''`.
+fn quote_single(body: &[u8]) -> Vec<u8> {
+	let mut q = Vec::with_capacity(body.len());
+	for &c in body {
+		if c == b'\'' {
+			q.extend_from_slice(b"'\\''");
+		} else {
+			q.push(c);
+		}
+	}
+	q
+}
+
+/// zsh `quotestring(QT_DOUBLE)` of an unquoted here-document's tokenized
+/// body: expansions (`$name`, `$(…)`, `${…}`, `$[…]`, backquotes) as
+/// written; a quoting backslash stays and the character it quotes gets a
+/// backslash of its own (`\\` shows as `\\\`); a backslash-newline is
+/// gone; a literal `"` or `\` gets a backslash.
+fn quote_heredoc_double(body: &[u8]) -> Vec<u8> {
+	let mut q = Vec::with_capacity(body.len() + 8);
+	let mut i = 0;
+	while i < body.len() {
+		let c = body[i];
+		match c {
+			b'\\' => match body.get(i + 1) {
+				Some(&n @ (b'$' | b'`' | b'\\')) => {
+					q.extend_from_slice(&[b'\\', b'\\', n]);
+					i += 2;
+					continue;
+				},
+				Some(b'\n') => {
+					i += 2;
+					continue;
+				},
+				_ => q.extend_from_slice(b"\\\\"),
+			},
+			b'"' => q.extend_from_slice(b"\\\""),
+			b'`' => {
+				let end = body[i + 1..]
+					.iter()
+					.position(|&x| x == b'`')
+					.map_or(body.len(), |k| i + 2 + k);
+				q.extend_from_slice(&body[i..end]);
+				i = end;
+				continue;
+			},
+			b'$' if matches!(body.get(i + 1), Some(b'(' | b'{' | b'[')) => {
+				let open = body[i + 1];
+				let close = match open {
+					b'(' => b')',
+					b'{' => b'}',
+					_ => b']',
+				};
+				let mut level = 0usize;
+				let mut end = body.len();
+				for (k, &x) in body.iter().enumerate().skip(i + 1) {
+					if x == open {
+						level += 1;
+					} else if x == close {
+						level -= 1;
+						if level == 0 {
+							end = k + 1;
+							break;
+						}
+					}
+				}
+				q.extend_from_slice(&body[i..end]);
+				i = end;
+				continue;
+			},
+			_ => q.push(c),
+		}
+		i += 1;
+	}
+	q
 }

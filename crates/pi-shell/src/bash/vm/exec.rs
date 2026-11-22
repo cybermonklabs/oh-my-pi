@@ -4084,7 +4084,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					let job = k.job_id(cx.store);
 					// zsh `&|` / `&!`: disowned at once (no job entry).
 					if op.flags & Op::DISOWN == 0 {
-						let text = job_text(k, cx, vp, unit, op.node);
+						let text = spawn_job_text(k, cx, vp, unit, op);
 						let cwd = vp.cwd.clone();
 						let number = vp.jobs.add(job, vpid, text, control, cwd);
 						if vp.parent.is_none() {
@@ -4229,6 +4229,16 @@ fn node_text(unit: &Unit, node: u32) -> BString {
 		.map_or_else(BString::default, BString::from)
 }
 
+/// The text of the job `Spawn` op `op` starts: zsh's, printed when the job
+/// was lowered (its `b`: the sublist's last pipeline, a coprocess's body),
+/// else [`job_text`] of its node.
+fn spawn_job_text(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, unit: &Unit, op: Op) -> BString {
+	match op.b.checked_sub(1).and_then(|i| unit.strs.get(i as usize)) {
+		Some(text) => text.clone(),
+		None => job_text(k, cx, vp, unit, op.node),
+	}
+}
+
 /// The command of a job at `node` as bash prints it (`jobs`, `fg`, `bg`):
 /// re-printed by bash's `make_command_string` (`( sleep 2; exit 4 )`, a
 /// `while` body indented on its own lines), or as written when the text
@@ -4241,6 +4251,13 @@ pub(super) fn job_text(
 	unit: &Unit,
 	node: u32,
 ) -> BString {
+	// zsh: a text the lowering printed from the tree (a here-document's
+	// body is not in the node's source).
+	if let Some(&(_, at)) = unit.job_texts.iter().find(|&&(n, _)| n == node)
+		&& let Some(text) = unit.strs.get(at as usize)
+	{
+		return text.clone();
+	}
 	let src = node_text(unit, node);
 	let feat = features(k, cx.store, vp).unwrap_or(Features::NONE);
 	if unit.mode.dialect() == Dialect::Zsh {
@@ -4381,7 +4398,7 @@ fn start_coproc(
 	vp.fds.set(write, Some(FdRef::mem(in_w)));
 	vp.last_bg = LastBg::new(vpid);
 	let job = k.job_id(cx.store);
-	let text = job_text(k, cx, vp, unit, op.node);
+	let text = spawn_job_text(k, cx, vp, unit, op);
 	let control = job_control(k, cx, vp);
 	let cwd = vp.cwd.clone();
 	vp.jobs.add(job, vpid, text, control, cwd);

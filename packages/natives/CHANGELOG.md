@@ -5,6 +5,7 @@
 ### Fixed
 
 - zsh mode: `functions`, `$functions` and a job's text no longer print the `{ }` group the parser makes for `! time P`, `coproc time P`, `coproc P | Q`, `P | time Q`, `>f time P` and a function body such as `f() time P`; a definition's own redirections (`>g f() time P`) still get a group around the body; a pipeline both timed and negated prints as `time ! P`.
+- zsh mode: a background job's text (`jobs`, `$jobtexts`, `%name`) is that of its processes, as zsh 5.9 keeps it: no sublist `!` or `coproc`, one text per process joined by ` | `, here-documents as quoted here-strings of their bodies, and a full text cut where zsh cuts it.
 
 ## [18.18.6] - 2026-11-09
 

@@ -206,6 +206,95 @@ fn job_texts_show_no_group_around_time() {
 	}
 }
 
+/// zsh names a background job by its processes' texts, without the
+/// sublist's `!` or `coproc` (a `!` inside `time` is the timed pipeline's
+/// own and stays), and shows a here-document as a here-string of its body
+/// (`$jobtexts`; zsh 5.9 `addproc` and `getredirs`).
+#[test]
+fn job_texts_name_the_processes_without_bang_or_coproc() {
+	let rows = [
+		(format!("! {LOOP} &"), LOOP_TEXT.to_string()),
+		(format!("! {{ {LOOP} }} &"), format!("{{ {LOOP_TEXT}; }}")),
+		(format!("! time {LOOP} &"), format!("time {LOOP_TEXT}")),
+		(format!("time ! {LOOP} &"), format!("time ! {LOOP_TEXT}")),
+		(format!("! {LOOP} | {LOOP} &"), format!("{LOOP_TEXT} | {LOOP_TEXT}")),
+		(format!("coproc {LOOP}"), LOOP_TEXT.to_string()),
+		(format!("coproc {LOOP} | {LOOP}"), format!("{LOOP_TEXT} | {LOOP_TEXT}")),
+		(format!("coproc time {LOOP}"), format!("time {LOOP_TEXT}")),
+		(format!("{{ {LOOP}; true }} &"), format!("{{ {LOOP_TEXT}; true; }}")),
+	];
+	for (src, text) in rows {
+		let (out, ..) = zsh(&format!("{src}\nprint -r -- \"${{jobtexts[1]}}\"; kill -9 %1"));
+		assert_eq!(out, format!("{text}\n"), "{src}");
+	}
+}
+
+/// A here-document in a job's text is a here-string of its body, its
+/// last newline left out and its other newlines spaces: in single quotes,
+/// or in double quotes when the body holds an expansion (zsh `getredirs`,
+/// `quotestring`); a body that does not fit is dropped, its quotes stay.
+#[test]
+fn job_texts_show_here_documents_as_zsh_does() {
+	let long = "word ".repeat(20);
+	let rows = [
+		(format!("{LOOP} <<EOF &\nhello world\nEOF"), format!("{LOOP_TEXT} <<<'hello world'")),
+		(format!("{LOOP} <<-EOF &\n\thello\n\tEOF"), format!("{LOOP_TEXT} <<<'hello'")),
+		(format!("{LOOP} <<A 3<<B &\none\nA\ntwo\nB"), format!("{LOOP_TEXT} <<<'one' 3<<<'two'")),
+		(format!("{LOOP} <<'EOF' &\nit's $x\nEOF"), format!("{LOOP_TEXT} <<<'it'\\''s $x'")),
+		(format!("x=1\n{LOOP} <<EOF &\nit's $x\nEOF"), format!("{LOOP_TEXT} <<<\"it's $x\"")),
+		(
+			format!("x=1\n{LOOP} <<EOF &\nsay \"hi\" \\\\ $x\nEOF"),
+			format!("{LOOP_TEXT} <<<\"say \\\"hi\\\" \\\\\\ $x\""),
+		),
+		(format!("{LOOP} <<EOF &\none\ntwo\n\nEOF"), format!("{LOOP_TEXT} <<<'one two '")),
+		(format!("{LOOP} <<EOF &\n{long}\nEOF"), format!("{LOOP_TEXT} <<<''")),
+		(format!("{LOOP} <<EOF &\nEOF"), format!("{LOOP_TEXT} <<<''")),
+		(format!("{LOOP} <<< 'hello world' &"), format!("{LOOP_TEXT} <<< 'hello world'")),
+	];
+	for (src, text) in rows {
+		let (out, ..) = zsh(&format!("{src}\nprint -r -- \"${{jobtexts[1]}}\"; kill -9 %1"));
+		assert_eq!(out, format!("{text}\n"), "{src}");
+	}
+}
+
+/// A job text that is not printed at the job's start (here an `&&` list's
+/// whole text, which stands until zsh's foreground run of the list's head is
+/// done) keeps a here-document's body too: it is printed from the tree.
+/// zsh 5.9 itself shows only `while …` here, as it runs `true` in the
+/// foreground first; the body is the same.
+#[test]
+fn job_texts_of_a_list_keep_here_document_bodies() {
+	let (out, ..) = zsh(&format!(
+		"true && {LOOP} <<EOF &\nhello world\nEOF\nprint -r -- \"${{jobtexts[1]}}\"; kill -9 %1"
+	));
+	assert_eq!(out, format!("true && {LOOP_TEXT} <<<'hello world'\n"));
+}
+
+/// Each process's text has its own 80-byte buffer, and a full buffer
+/// loses the last byte `taddlist` takes back (`B= C`, not `B= C=`).
+#[test]
+fn job_texts_fill_each_process_buffer_as_zsh_does() {
+	let (a70, b20, a72) = ("a".repeat(70), "b".repeat(20), "a".repeat(72));
+	let rows = [
+		(format!("A={a70} B={b20} C=1 f &"), format!("A={a70} B= C")),
+		(format!("f | X={a72} f &"), format!("f | X={a72} f")),
+		(format!("coproc f | X={a72} f"), format!("f | X={a72} f")),
+	];
+	for (src, text) in rows {
+		let (out, ..) =
+			zsh(&format!("f() {{ {LOOP} }}\n{src}\nprint -r -- \"${{jobtexts[1]}}\"; kill -9 %1"));
+		assert_eq!(out, format!("{text}\n"), "{src}");
+	}
+}
+
+/// `%name` matches the start of a job's text: `! P &` is found by P's
+/// name, as in zsh.
+#[test]
+fn a_negated_job_is_found_by_its_command_name() {
+	let (out, ..) = zsh(&format!("! {LOOP} &\nkill -9 %while; print -r -- st=$?"));
+	assert_eq!(out, "st=0\n");
+}
+
 #[test]
 fn kill_resolves_job_specs_with_getjob() {
 	let (out, err, _) =

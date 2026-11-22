@@ -1300,7 +1300,7 @@ fn valid(u: &Unit) -> bool {
 						&& pc + 1 < u.ops.len()
 				},
 				Opcode::Redir => idx(u.redirs.len()) && op.b < n,
-				Opcode::Spawn => idx(u.spawns.len()),
+				Opcode::Spawn => idx(u.spawns.len()) && (op.b as usize) <= u.strs.len(),
 				Opcode::CaseWord => idx(u.words.len()),
 				Opcode::CaseArm => idx(u.pats.len()) && op.b < n,
 				Opcode::Arith => idx(u.ariths.len()),
