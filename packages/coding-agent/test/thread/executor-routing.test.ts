@@ -13,6 +13,7 @@ import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { __resetDirsFromEnvForTests, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobManager } from "../../src/async/job-manager";
+import type { EvalToolDescriptor } from "../../src/eval/types";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
@@ -25,12 +26,14 @@ import type { AuthStorage } from "../../src/session/auth-storage";
 import { CostGate } from "../../src/session/cost-gate";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
+import { createEvalCustomTools } from "../../src/task/eval-tools";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../../src/task/executor";
 import { createPersistedSubagentReviverFactory } from "../../src/task/persisted-revive";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
 import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
+import type { ToolSession } from "../../src/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
@@ -47,6 +50,13 @@ const HANG_TASK = `omp-test-scripted-hang-${SCRIPT_ID}`;
 const BG_JOB_TASK = `omp-test-scripted-bg-job-${SCRIPT_ID}`;
 /** In the routed agent's system prompt only, so a request without it is never the run's own turn. */
 const AGENT_MARKER = `omp-test-agent-${SCRIPT_ID}`;
+/** The one eval custom tool of the runs that carry one. */
+const LOOKUP_ROWS: EvalToolDescriptor = {
+	name: "lookup_rows",
+	description: "Looks up rows by key.",
+	parameters: { type: "object", properties: { key: { type: "string" } } },
+	language: "python",
+};
 
 interface ChatMessage {
 	role: string;
@@ -102,6 +112,8 @@ class FakeModelServer {
 	readonly #server: Bun.Server<undefined>;
 	readonly #hangs: Array<() => void> = [];
 	#hungRequest = Promise.withResolvers<void>();
+	/** The model and tool names of each of the routed agent's own requests, in order. */
+	readonly runRequests: Array<{ model: string; toolNames: string[] }> = [];
 
 	constructor() {
 		this.#server = Bun.serve({
@@ -135,6 +147,10 @@ class FakeModelServer {
 				"        name: Fake Model",
 				"        reasoning: false",
 				"        cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 }",
+				"      - id: fake-model-2",
+				"        name: Fake Model 2",
+				"        reasoning: false",
+				"        cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 }",
 				"",
 			].join("\n"),
 		);
@@ -164,6 +180,14 @@ class FakeModelServer {
 			.map(message => messageText(message.content))
 			.join("\n");
 		const runTurn = systemText.includes(AGENT_MARKER);
+		if (runTurn && typeof body === "object" && body !== null) {
+			const rawTools: unknown = Reflect.get(body, "tools");
+			const toolNames = (Array.isArray(rawTools) ? rawTools : []).map(tool => {
+				const fn: unknown = typeof tool === "object" && tool !== null ? Reflect.get(tool, "function") : undefined;
+				return typeof fn === "object" && fn !== null ? String(Reflect.get(fn, "name")) : "";
+			});
+			this.runRequests.push({ model: String(Reflect.get(body, "model")), toolNames });
+		}
 		let reply: Reply = { text: "pong" };
 		if (runTurn && last?.role === "tool") {
 			reply = { text: `tool said: ${messageText(last.content)}` };
@@ -437,6 +461,25 @@ describe("subagent runs routed into pooled workers", () => {
 	);
 
 	it(
+		"stores each eval tool's descriptor in the spawn spec of a run placed in a worker",
+		async () => {
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [LOOKUP_ROWS]);
+			const result = await runSubprocess(runOptions("EvalTools", "ping", { customTools }));
+			expect(result.output).toBe("pong");
+			// The tools crossed into the worker as views; the spawn there read the descriptors they carried.
+			const mirror = mirrorOf(AgentRegistry.global().get("EvalTools")?.session);
+			await waitFor(() => !mirror.ircWakesPending);
+			await AgentLifecycleManager.global().park("EvalTools");
+			const peek = await SessionManager.peekSessionInit(path.join(root, "artifacts", "EvalTools.jsonl"));
+			if (!peek?.init) throw new Error("the worker run stored no session_init");
+			// Read as stored JSON, so the file also loads where the spawn spec's reader does not exist.
+			const stored = peek.init as unknown as { spawnSpec?: { tools?: { customTools?: unknown } } };
+			expect(stored.spawnSpec?.tools?.customTools).toEqual([LOOKUP_ROWS]);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
 		"aborts the worker run when main's signal aborts",
 		async () => {
 			const controller = new AbortController();
@@ -554,6 +597,61 @@ describe("subagent runs routed into pooled workers", () => {
 				structured: false,
 			});
 			expect(again.output).toBe("pong");
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive in a subagent worker starts on the spawn's model, flags and custom tools",
+		async () => {
+			settings.setModelRole("task", MODEL);
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [LOOKUP_ROWS]);
+			// The agent lists `lsp`, which the spawn's LSP setting (off) keeps out of its tools.
+			const agent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "lsp"] };
+			const first = await runSubprocess(
+				runOptions("ColdInWorker", "ping", { agent, modelOverride: "@task", customTools, enableLsp: false }),
+			);
+			expect(first.output).toBe("pong");
+			expect(server.runRequests.at(-1)?.toolNames).toContain(LOOKUP_ROWS.name);
+			const mirror = mirrorOf(AgentRegistry.global().get("ColdInWorker")?.session);
+			const home = mirror.home;
+			await waitFor(() => !mirror.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			await lifecycle.park("ColdInWorker");
+			// The subagent's worker exits after the park, and its warm reviver with it.
+			const worker = pool.forThread(home);
+			if (!worker) throw new Error("home worker missing");
+			worker.terminate("worker exited after the park");
+			await waitFor(() => pool.forThread(home)?.alive !== true);
+			// Between the park and the revive the role moves, and the root's LSP policy is on.
+			settings.setModelRole("task", "fake/fake-model-2");
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: true,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const sentAt = server.runRequests.length;
+			const receipt = await IrcBus.global().send({
+				from: MAIN_AGENT_ID,
+				to: "ColdInWorker",
+				body: "hello from main",
+			});
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("ColdInWorker")?.session);
+			expect(woken.home).not.toBe(home);
+			await waitFor(() => server.runRequests.length > sentAt);
+			const [wake] = server.runRequests.slice(sentAt);
+			expect(wake?.model).toBe("fake-model");
+			expect(wake?.toolNames).toContain(LOOKUP_ROWS.name);
+			expect(wake?.toolNames).not.toContain("lsp");
+			// Let the wake turn settle before teardown.
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},
 		TEST_TIMEOUT_MS,
 	);
