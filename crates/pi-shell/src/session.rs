@@ -2245,6 +2245,9 @@ mod tests {
 		/// Wait until a `CHLD` trap has waited for a write since the run
 		/// began (the test-only count `TRAPS_HELD_FOR_A_WRITE`).
 		Held,
+		/// Wait until `n` more polls of the run's stdout have waited for room
+		/// than when this step began.
+		PendingMore(usize),
 	}
 
 	/// What [`run_with_steps`] saw.
@@ -2296,6 +2299,14 @@ mod tests {
 						Step::Cancel => {
 							cancel.cancel();
 							true
+						},
+						Step::PendingMore(n) => {
+							let from = crate::sys::pending_polls(fd);
+							while crate::sys::pending_polls(fd) < from + n && !ended.load(Ordering::SeqCst)
+							{
+								std::thread::sleep(Duration::from_millis(1));
+							}
+							crate::sys::pending_polls(fd) >= from + n
 						},
 						Step::Held => {
 							let now = || crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst);
@@ -2628,6 +2639,68 @@ mod tests {
 			 the '0's, the 'C's right after them"
 		);
 		assert!(run.held, "the CHLD trap did not wait for a write");
+	}
+
+	// Failure mode (review of #111 at 5cf0e434, the reviewer's script): a
+	// `CHLD` trap waits for the write of the command it would interrupt when
+	// the vproc is not parked on it too. A job sends USR1 and ends while
+	// `printf`'s write waits; the USR1 trap's own write waits, and then the
+	// job ends, its `CHLD` owed. A second job's USR1 then unparks the vproc: its
+	// trap cannot start inside the first, so the vproc goes back to the USR1
+	// trap's op, which is still part way (`Frame::write_parked`). With the hold
+	// only while parked (round 8's), the `CHLD` trap ran there, its 'C's at byte
+	// 65,536, before any of the trap's spaces. It waits for that write and
+	// runs when the first trap's write ends: the 'C's right after the first
+	// trap's 100,000 spaces, as bash 5.2.21 and 5.3.20 (`0*65536 ' '*100000
+	// C*20`, `printf`'s rest dropped) and zsh 5.9 (`0*73728 ' '*100000 C*20
+	// ' '*100000`) write them.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn a_chld_trap_waits_for_a_traps_write_a_second_signal_unparked() {
+		let dir = tempfile::tempdir().unwrap();
+		let first_done = dir.path().join("first-done");
+		let command = format!(
+			"exec 3<&0\ntrap 'echo in-trap >&2; printf %100000s \"\"' USR1\ntrap 'printf %s \
+			 CCCCCCCCCC' CHLD\n{{ read -r go <&3; kill -USR1 $$; echo done1 >&2; read -r go <&3; : > \
+			 {f}; }} &\n{{ until [ -e {f} ]; do sleep 0.01; done; read -r go <&3; kill -USR1 $$; \
+			 echo done2 >&2; }} &\nprintf %0131072d 0\nwait",
+			f = first_done.display()
+		);
+		// The first job ends only once the USR1 trap's own write waits (the
+		// first poll of stdout that waits after the trap began); the second
+		// reads its line only once the first has ended and its `CHLD` waits
+		// for that write.
+		let run = run_with_steps(
+			&command,
+			&[
+				Step::Pending(1),
+				Step::Send("go"),
+				Step::Line("in-trap"),
+				Step::PendingMore(1),
+				Step::Send("go"),
+				Step::Held,
+				Step::Send("go"),
+				Step::Line("done2"),
+			],
+			true,
+		);
+		assert_eq!(run.status, 0);
+		let got = &run.stdout;
+		let count = |c: u8| got.iter().filter(|&&b| b == c).count();
+		let zeros = got.iter().position(|&b| b != b'0').unwrap_or(got.len());
+		let first_c = got.iter().position(|&b| b == b'C');
+		assert_eq!(
+			(count(b'0'), count(b' '), count(b'C')),
+			(131_072, 200_000, 20),
+			"('0's, spaces, 'C's)"
+		);
+		let spaces_next = got
+			.get(zeros..zeros + 100_000)
+			.is_some_and(|s| s.iter().all(|&b| b == b' '));
+		assert!(
+			zeros > 0 && spaces_next && first_c == Some(zeros + 100_000),
+			"{zeros} '0's first; the first 'C' at {first_c:?}: right after the first trap's spaces"
+		);
 	}
 
 	// Failure mode (review of #111 at a25f15f0): a `CHLD` trap waited while
