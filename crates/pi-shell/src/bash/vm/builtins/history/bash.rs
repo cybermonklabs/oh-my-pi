@@ -11,12 +11,11 @@ use bstr::{BString, ByteSlice};
 use super::{
 	List,
 	bang::{self, BangOpts, Lex, LineState},
-	hist_size,
+	echo_first, hist_size,
 	io::{HistOp, HistOut, Steps, WriteHow},
 	model::{Entry, HA_ACTIVE, Hist},
 	scalar,
 	words::lex_words,
-	write_now,
 	zsh::in_builtin,
 };
 use crate::bash::{
@@ -511,10 +510,7 @@ pub(super) fn edit(
 	let Some(contents) = contents else {
 		return done(1);
 	};
-	let unwritten = write_now(&*ctx, 2, &contents).to_vec();
-	if !unwritten.is_empty() {
-		ctx.out_fd(2, &unwritten);
-	}
+	echo_first(ctx, contents.clone())?;
 	// bash's `fc_replhist`: the edited lines take the `fc` line's place.
 	if list.pending {
 		list.pop();

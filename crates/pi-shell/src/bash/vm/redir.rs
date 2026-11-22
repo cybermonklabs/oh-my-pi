@@ -1291,6 +1291,25 @@ impl Tee {
 		self.done.remove(&me);
 		Poll::Ready(Ok(buf.len()))
 	}
+
+	/// Flush every target; with a key, each target is flushed with the sub
+	/// key it is written with.
+	fn flush(
+		&self,
+		cx: &mut Context<'_>,
+		mut key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<std::io::Result<()>> {
+		for (i, t) in self.targets.iter().enumerate() {
+			let polled = match key.as_deref_mut() {
+				Some(key) => t.poll_flush_keyed(cx, key.sub(i)),
+				None => t.poll_flush(cx),
+			};
+			if polled.is_pending() {
+				return Poll::Pending;
+			}
+		}
+		Poll::Ready(Ok(()))
+	}
 }
 
 impl File for Tee {
@@ -1313,12 +1332,15 @@ impl File for Tee {
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-		for t in &self.targets {
-			if t.poll_flush(cx).is_pending() {
-				return Poll::Pending;
-			}
-		}
-		Poll::Ready(Ok(()))
+		self.flush(cx, None)
+	}
+
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<std::io::Result<()>> {
+		self.flush(cx, Some(key))
 	}
 
 	fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
@@ -1534,6 +1556,24 @@ mod tests {
 			tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key),
 			Poll::Ready(Ok(1))
 		));
+	}
+
+	// Failure mode: a native extra closing its handle of a zsh multios tee
+	// flushed each target with no key, as the engine: on a provider file
+	// (`>&1 >mem://f`) its thread's waker replaced the engine's.
+	#[test]
+	fn a_tee_flushes_each_target_with_the_callers_sub_key() {
+		use crate::bash::fs::test_files::FlushProbe;
+		let (a, b) = (FlushProbe::default(), FlushProbe::default());
+		let targets =
+			vec![FdRef::from_file(Box::new(a.clone())), FdRef::from_file(Box::new(b.clone()))];
+		let mut tee = Tee::new(targets);
+		let mut key = WaitKey::default();
+		let cx = &mut Context::from_waker(Waker::noop());
+		assert!(matches!(tee.poll_flush_keyed(cx, &mut key), Poll::Ready(Ok(()))));
+		assert!(a.reached_by(key.sub(0)), "the first target was flushed without its sub key");
+		assert!(b.reached_by(key.sub(1)), "the second target was flushed without its sub key");
+		assert_eq!(a.keyless() + b.keyless(), 0);
 	}
 
 	// Failure mode (review of #111 at bd60965e): a tee kept one progress for

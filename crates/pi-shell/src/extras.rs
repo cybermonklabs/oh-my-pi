@@ -336,15 +336,21 @@ impl pi_vfs::FileHandle for FdHandle {
 		))
 	}
 
+	/// Waits with a key of its own, as [`Self::read`].
 	async fn flush(&self) -> io::Result<()> {
 		let fd = self.fd()?;
-		std::future::poll_fn(|cx| fd.poll_flush(cx)).await
+		let mut key = WaitKey::default();
+		std::future::poll_fn(|cx| fd.poll_flush_keyed(cx, &mut key)).await
 	}
 
+	/// Flushes with a key of its own, as [`Self::flush`].
 	async fn close(&self) -> io::Result<()> {
 		let fd = self.fd.lock().take();
 		match fd {
-			Some(fd) => std::future::poll_fn(|cx| fd.poll_flush(cx)).await,
+			Some(fd) => {
+				let mut key = WaitKey::default();
+				std::future::poll_fn(|cx| fd.poll_flush_keyed(cx, &mut key)).await
+			},
 			None => Ok(()),
 		}
 	}
@@ -586,5 +592,27 @@ mod tests {
 		assert_eq!(refusal.poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(1));
 		let counts = (probe.0.0.load(Ordering::SeqCst), probe.0.1.load(Ordering::SeqCst));
 		assert_eq!(counts, (1, 0), "(keyed, keyless) writes");
+	}
+
+	// Failure mode (beside 64 busy loops on gVisor, an extra and printf on
+	// one provider fd hung in 2 runs of 10): an extra flushing or closing its
+	// handle flushed the engine fd with no key, as the engine, and on a
+	// provider file its thread's waker replaced the engine's.
+	#[test]
+	fn an_extra_flushes_and_closes_its_handle_with_a_key() {
+		use pi_vfs::FileHandle as _;
+
+		use crate::bash::fs::test_files::FlushProbe;
+		fn now<T>(fut: impl Future<Output = T>) -> T {
+			match std::pin::pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
+				Poll::Ready(value) => value,
+				Poll::Pending => panic!("the probe's flush answers at once"),
+			}
+		}
+		let probe = FlushProbe::default();
+		let handle = FdHandle { fd: Mutex::new(Some(FdRef::from_file(Box::new(probe.clone())))) };
+		now(handle.flush()).unwrap();
+		now(handle.close()).unwrap();
+		assert_eq!((probe.keyed(), probe.keyless()), (2, 0), "(keyed, keyless) flushes");
 	}
 }

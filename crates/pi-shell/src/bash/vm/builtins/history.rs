@@ -28,10 +28,24 @@ use crate::bash::{
 	vm::{
 		Kernel,
 		exec::push_script,
+		fdprobe::FdProbe,
 		proc::{ScriptKind, Vproc},
 		state::{self, Root},
 	},
 };
+
+/// Write `bytes` to standard error before the frame the builtin runs (`fc`'s
+/// echo of what it runs). A builtin's queued output is written only after
+/// that frame, so this is an fd write ([`FdProbe::Write`]): the builtin
+/// parks until it is all written, its progress kept, and runs again with
+/// the answer. Before, it wrote what fit at once and queued the rest whole:
+/// the echo's part way write stayed under the vproc's key, and the command
+/// the frame ran took its result. A failed write loses the echo, and the
+/// builtin goes on, as in bash and zsh.
+fn echo_first(ctx: &Ctx<'_, '_>, bytes: BString) -> Result<(), super::Need> {
+	super::zsh_mod_system::fd_probe(ctx, FdProbe::Write { fd: 2, data: bytes })?;
+	Ok(())
+}
 
 /// The history list as stored: entries, the number of the first one
 /// (bash's `history_base`), and whether the last entry is the current
@@ -372,23 +386,6 @@ fn fc_index(list: &List, count: usize, spec: &[u8], above: usize) -> Option<usiz
 		.find(|&i| list.entries[i].starts_with(spec))
 }
 
-/// Write what of `bytes` fd `fd` takes without waiting, returning the rest.
-/// A builtin's queued output is written only after the frame it runs, so
-/// output that must come before that frame goes out here.
-fn write_now<'b>(ctx: &Ctx<'_, '_>, fd: i32, mut bytes: &'b [u8]) -> &'b [u8] {
-	let waker = ctx.k.waker.clone();
-	let mut tcx = std::task::Context::from_waker(&waker);
-	let handle = ctx.vp.fds.handle(fd);
-	let mut key = ctx.vp.write_key.lock();
-	while !bytes.is_empty() {
-		match handle.poll_write_keyed(&mut tcx, bytes, &mut key) {
-			std::task::Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
-			_ => break,
-		}
-	}
-	bytes
-}
-
 /// `fc [-e ename] [-lnr] [first [last]]`, `fc -s [pat=rep …] [command]`
 /// (bash `fc.def`): list history entries (`-l`; `-n` without numbers, `-r`
 /// newest first) or run one again (`-s`, or `-e -`), echoing it to stderr
@@ -472,10 +469,7 @@ pub fn fc(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		// bash echoes the command before running it.
 		let mut echoed = command.clone();
 		echoed.push(b'\n');
-		let unwritten = write_now(&*ctx, 2, &echoed);
-		if !unwritten.is_empty() {
-			ctx.out_fd(2, unwritten);
-		}
+		echo_first(ctx, echoed)?;
 		// bash's `fc_replhist`: the command takes the `fc` line's place.
 		if list.pending
 			&& let Some(entry) = list.entries.last_mut()
