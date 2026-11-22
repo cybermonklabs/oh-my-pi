@@ -26,6 +26,7 @@ import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
+import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const AGENT_ID = "ReviveDevices";
 const MOCK_API_SOURCE = "test/revived-subagent-device-notice";
@@ -33,16 +34,6 @@ const MOUNT_NOTICE = "xd:// device inventory changed";
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
 let root: string;
-
-function restoreEnvValue(key: string, value: string | undefined): void {
-	if (value === undefined) {
-		delete process.env[key];
-		delete Bun.env[key];
-		return;
-	}
-	process.env[key] = value;
-	Bun.env[key] = value;
-}
 
 beforeEach(async () => {
 	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));

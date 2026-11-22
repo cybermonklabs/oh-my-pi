@@ -9,8 +9,11 @@ import { factoryModel } from "../../../ai/test/helpers/factory-droid";
 import { Agent } from "../../src/agent";
 import type { AgentTool } from "../../src/types";
 
-/** A tool Anthropic declares as strict unless `PI_NO_STRICT` is set, with a schema strict mode can enforce. */
-const edit: AgentTool = {
+/**
+ * A tool Anthropic declares as strict unless the strict-tools fallback or `PI_NO_STRICT` applies, with a schema strict
+ * mode can enforce.
+ */
+export const edit: AgentTool = {
 	name: "edit",
 	label: "edit",
 	description: "edit tool",

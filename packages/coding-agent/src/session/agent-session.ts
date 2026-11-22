@@ -529,7 +529,7 @@ import {
 	type SettingsChangeOptions,
 	toolsDigestOfEntry,
 } from "./session-tools";
-import { resolveWebsocketPreference } from "./settings-stream-fn";
+import { resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ProviderFallbackRecord } from "./provider-fallback-record";
 import { carryImageDrops, type RecordedImageDrop, recordedImageDrops } from "./provider-image-budget";
@@ -832,16 +832,21 @@ interface PromptCacheShape {
 
 /**
  * `level` as the cached prefix tells thinking levels apart on `model`, read on the model its requests go out as
- * ({@link wireModel}: a wrapper transport's inner model, as Factory Droid's Responses route for its GPT models): where
- * that model takes the level per message (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI
- * `configuration_update`, which only the Responses and Codex providers send, {@link sendsConfigurationUpdates}), a
- * change between two levels other than off goes out after the newest content and keeps the request-level effort, so
- * those levels share one key; off changes the request's thinking and keeps its own. Every other API (Azure Responses
- * among them) sends the level as the request's own effort, ahead of every cached message.
+ * ({@link wireModel}, in the Kimi Code API format `kimiApiFormat` they go out in: a wrapper transport's inner model, as
+ * Factory Droid's Responses route for its GPT models): where that model takes the level per message (Anthropic's
+ * per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, which only the Responses and
+ * Codex providers send, {@link sendsConfigurationUpdates}), a change between two levels other than off goes out after
+ * the newest content and keeps the request-level effort, so those levels share one key; off changes the request's
+ * thinking and keeps its own. Every other API (Azure Responses among them) sends the level as the request's own effort,
+ * ahead of every cached message.
  */
-function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
+function promptCacheThinkingKey(
+	model: Model | undefined,
+	level: ThinkingLevel | undefined,
+	kimiApiFormat: SimpleStreamOptions["kimiApiFormat"],
+): string {
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
-	const wire = wireModel(model);
+	const wire = wireModel(model, { kimiApiFormat });
 	return sendsConfigurationUpdates(wire) || takesPerMessageEffort(wire) ? "effort" : level;
 }
 
@@ -1580,7 +1585,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** The request the warmer was armed with last ({@link startCacheWarming}), until dispose releases memory. */
 	#promptCacheArm: PromptCacheArm | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
-	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
+	#promptCacheShapeMemo:
+		| {
+				model: Model | undefined;
+				systemPrompt: unknown;
+				kimiApiFormat: SimpleStreamOptions["kimiApiFormat"];
+				shape: PromptCacheShape;
+		  }
+		| undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -3182,7 +3194,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					this.#promptSentWithheldChanges = false;
 					// What came due by its time since the prompt's notices were written waits a request, as they say;
 					// an entry that lapsed meanwhile (or that this request cannot read) is written whole anyway.
-					if (!this.#maintenance.promptCacheLapsed()) return;
+					// Nothing withheld, nothing to release: the lapse check is skipped.
+					if (!this.#tools.withholdsPromptChange || !this.#maintenance.promptCacheLapsed()) return;
 				}
 				return this.#releaseWithheldPromptChangesIfDue();
 			}),
@@ -6343,6 +6356,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const { systemPrompt } = this.agent.state;
 		const thinkingLevel = this.thinkingLevel;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
+		const kimiApiFormat = resolveKimiApiFormat(this.settings);
 		// The definitions as the wire declares them: a refreshed MCP tool keeps its name, and a tool taken off the
 		// roster that the request keeps declared changes nothing.
 		const tools = this.agent.declaredToolsFingerprint(model);
@@ -6351,6 +6365,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memo !== undefined &&
 			memo.model === model &&
 			memo.systemPrompt === systemPrompt &&
+			memo.kimiApiFormat === kimiApiFormat &&
 			memo.shape.tools === tools &&
 			memo.shape.thinkingLevel === thinkingLevel &&
 			memo.shape.retention === retention
@@ -6361,12 +6376,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
-			thinkingKey: promptCacheThinkingKey(model, thinkingLevel),
+			thinkingKey: promptCacheThinkingKey(model, thinkingLevel, kimiApiFormat),
 			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
 		};
-		this.#promptCacheShapeMemo = { model, systemPrompt, shape };
+		this.#promptCacheShapeMemo = { model, systemPrompt, kimiApiFormat, shape };
 		return shape;
 	}
 
@@ -12889,7 +12904,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Kept tool results may cite `artifact://N`, so the fork carries the artifacts too.
 			return await this.#branchIntoNewSession(
 				"fork",
-				newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? entryId,
+				newestCopiedEntryId(this.sessionManager.getBranch(leafId)) ?? leafId,
 				leafId,
 				{
 					copyArtifacts: true,

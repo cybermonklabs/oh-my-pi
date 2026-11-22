@@ -179,6 +179,12 @@ export interface AgentOptions {
 	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
 	 */
 	kimiApiFormat?: "openai" | "anthropic";
+	/**
+	 * Kimi Code API format read at each main request, for the request and for the model it goes out as
+	 * ({@link Agent.declaredToolsFingerprint}); authoritative when set (replaces {@link kimiApiFormat}), so a host
+	 * setting changed mid-session reaches the next request. Undefined leaves the model's catalog format.
+	 */
+	kimiApiFormatResolver?: () => "openai" | "anthropic" | undefined;
 
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
@@ -554,6 +560,7 @@ export class Agent {
 	}
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
+	#kimiApiFormatResolver?: () => "openai" | "anthropic" | undefined;
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 	#speculativeToolExecution?: SpeculativeToolExecutionConfig;
@@ -671,6 +678,7 @@ export class Agent {
 		this.#cwd = opts.cwd;
 		this.#cwdResolver = opts.cwdResolver;
 		this.#kimiApiFormat = opts.kimiApiFormat;
+		this.#kimiApiFormatResolver = opts.kimiApiFormatResolver;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
 		this.#speculativeToolExecution = opts.speculativeToolExecution;
@@ -863,12 +871,17 @@ export class Agent {
 	}
 
 	/**
-	 * The model the next main request on `model` goes out as ({@link wireModel}, with this agent's Kimi Code API
-	 * format); undefined under an owned dialect, which carries the tools in the prompt.
+	 * The model the next main request on `model` goes out as ({@link wireModel}, in the Kimi Code API format that
+	 * request goes out in); undefined under an owned dialect, which carries the tools in the prompt.
 	 */
 	#wireModel(model: Model | undefined): Model | undefined {
 		if (model === undefined || this.#ownedDialect(model)) return undefined;
-		return wireModel(model, { kimiApiFormat: this.#kimiApiFormat });
+		return wireModel(model, { kimiApiFormat: this.#requestKimiApiFormat() });
+	}
+
+	/** The Kimi Code API format the next main request goes out in. */
+	#requestKimiApiFormat(): "openai" | "anthropic" | undefined {
+		return this.#kimiApiFormatResolver ? this.#kimiApiFormatResolver() : this.#kimiApiFormat;
 	}
 
 	/**
@@ -2256,7 +2269,7 @@ export class Agent {
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
-			kimiApiFormat: this.#kimiApiFormat,
+			kimiApiFormat: this.#requestKimiApiFormat(),
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
 			transformProviderContext: this.#transformProviderContext,
@@ -2281,6 +2294,8 @@ export class Agent {
 				// calls are stripped by the switch of the request that produced it: the next sync runs after them.
 				config.intentTracing = this.#intentTracing;
 				config.pruneToolDescriptions = this.#pruneToolDescriptions;
+				// The request goes out in the Kimi Code format the declared tools read it in.
+				config.kimiApiFormat = this.#requestKimiApiFormat();
 			},
 			getMissingContextMessages: context => this.#missingContextMessageProvider?.(context) ?? [],
 			beforeModelCall:

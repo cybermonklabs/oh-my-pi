@@ -172,6 +172,7 @@ import {
 	appendRecallBlock,
 	type ConversationRecall,
 	findConversationRecall,
+	MEMORY_RECALL_ENTRY_TYPE,
 	recallsIntoConversation,
 	withoutDeliveredRecall,
 } from "./memory-backend/recall-entry";
@@ -264,7 +265,7 @@ import {
 } from "./session/session-tools";
 import { anthropicSlowModeHasNoSiblingHeadroom } from "./session/anthropic-slow-mode";
 import { CacheWarmer } from "./session/cache-warmer";
-import { createSettingsAwareStreamFn } from "./session/settings-stream-fn";
+import { createSettingsAwareStreamFn, resolveKimiApiFormat } from "./session/settings-stream-fn";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
 import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
 import { createSpeculativeToolExecutionConfig } from "./speculation/host";
@@ -391,7 +392,6 @@ import {
 	cfgPersonality,
 	cfgProviderAppendOnlyContext,
 	cfgProvidersCacheWarming,
-	cfgProvidersKimiApiFormat,
 	cfgRetryFallbackChains,
 	cfgRetryModelFallback,
 	cfgRetryUsageAwareFallback,
@@ -4364,13 +4364,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			let memoryRecall: ConversationRecall | undefined;
 			if (hasSession) {
 				memoryRecall = session.memoryRecall;
-			} else if (!restrictToolNames && recallsIntoConversation(cfgMemoryBackend.get(settings))) {
-				// Mnemopi's scope names its banks' databases, which its core module resolves; the backend's start loads
-				// it too, and the session reads the same scope when it adopts the recall.
-				if (cfgMemoryBackend.get(settings) === "mnemopi") await loadMnemopiCore();
-				memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
-					memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
-				);
+			} else if (!restrictToolNames) {
+				const backend = cfgMemoryBackend.get(settings);
+				if (recallsIntoConversation(backend)) {
+					// Mnemopi's scope names its banks' databases, which its core module resolves; the backend's start
+					// loads it too, and the session reads the same scope when it adopts the recall. Only a branch that
+					// records a recall has the scope read.
+					if (
+						backend === "mnemopi" &&
+						sessionManager
+							.getBranchView()
+							.some(entry => entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
+					) {
+						await loadMnemopiCore();
+					}
+					memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
+						memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
+					);
+				}
 			}
 			const recallBlock = memoryRecall && !memoryRecall.hidden ? memoryRecall.text : undefined;
 			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
@@ -4925,14 +4936,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Primary-agent (and its auto-learn capture twin) provider options read per
 		// request, so `/settings` changes to budgets, Kimi format, or the Codex
 		// websocket policy reach the next call without a session recreate.
-		const primaryStreamFn: StreamFn = (streamModel, context, streamOptions) => {
-			const kimiApiFormat = cfgProvidersKimiApiFormat.get(settings);
-			return settingsAwareStreamFn(streamModel, context, {
+		const primaryStreamFn: StreamFn = (streamModel, context, streamOptions) =>
+			settingsAwareStreamFn(streamModel, context, {
 				...streamOptions,
 				thinkingBudgets: streamOptions?.thinkingBudgets ?? cfgThinkingBudgets.get(settings),
-				kimiApiFormat: streamOptions?.kimiApiFormat ?? (kimiApiFormat === "auto" ? undefined : kimiApiFormat),
+				kimiApiFormat: resolveKimiApiFormat(settings, streamOptions?.kimiApiFormat),
 			});
-		};
 		// Prompt-cache warmer for the main agent loop only: replays the last
 		// request through the same primary wrapper just before the entry would
 		// expire, so idle gaps do not force a full-prefix cache re-write.
@@ -4983,6 +4992,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// namespace/project discovery on the original repo's git remote. Re-read it
 			// per turn from the SessionManager.
 			cwdResolver: () => sessionManager.getCwd(),
+			// The Kimi Code format the requests go out in, read per call as `primaryStreamFn` adds it: the strict
+			// hash, the fallback lookup and the declared tools read the model the request goes out as in it.
+			kimiApiFormatResolver: () => resolveKimiApiFormat(settings),
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,
@@ -5028,6 +5040,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
+					// The warmer's tool-choice rule reads the model the request goes out as in this format.
+					kimiApiFormat: resolveKimiApiFormat(settings, streamOptions?.kimiApiFormat),
 				};
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.

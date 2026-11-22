@@ -122,6 +122,21 @@ interface AccountScope {
 }
 
 /**
+ * The upstream and host a request without an OAuth identity takes: the discovered upstream (undefined without one), and
+ * the model's host, else the wire's default.
+ */
+function unidentifiedScope(
+	model: Model<"factory-droid-agent">,
+	registry: FactoryDroidModelPolicy | undefined,
+	wire: FactoryDroidWire,
+): { upstream: string | undefined; baseUrl: string } {
+	return {
+		upstream: defaultUpstream(model, registry),
+		baseUrl: model.baseUrl || factoryDroidWireBaseUrl(wire, undefined),
+	};
+}
+
+/**
  * Bind one attempt to the credential that serves it: host, organization,
  * eligible upstream and native limits all follow that account. Without an
  * OAuth identity the discovered scope applies. Cached live routing may encode
@@ -136,11 +151,12 @@ function scopeToAccount(
 	token: string,
 ): AccountScope {
 	if (!identity) {
+		const { upstream, baseUrl } = unidentifiedScope(model, registry, wire);
 		return {
 			model,
-			upstream: requireUpstream(defaultUpstream(model, registry)),
+			upstream: requireUpstream(upstream),
 			orgId: factoryDroidOrgIdFromToken(token) ?? model.factoryDroidOrgId,
-			baseUrl: model.baseUrl || factoryDroidWireBaseUrl(wire, undefined),
+			baseUrl,
 		};
 	}
 	// Custom gateways keep their URL; Factory's own hosts follow residency.
@@ -242,9 +258,8 @@ function resolveRoute(
 export function factoryDroidRouteModel(model: Model<"factory-droid-agent">): Model<Api> {
 	const registry = resolveFactoryDroidPolicy(model);
 	const wire = registry?.wire ?? "openai-completions";
-	const upstream = defaultUpstream(model, registry);
+	const { upstream, baseUrl } = unidentifiedScope(model, registry, wire);
 	if (wire === "google-generate" || upstream === undefined) return model;
-	const baseUrl = model.baseUrl || factoryDroidWireBaseUrl(wire, undefined);
 	return resolveRoute(model, { model, upstream, orgId: model.factoryDroidOrgId, baseUrl }, wire).inner ?? model;
 }
 

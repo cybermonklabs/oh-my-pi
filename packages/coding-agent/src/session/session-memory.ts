@@ -1,7 +1,7 @@
 /** Session memory backend lifecycle and transcript resets. */
 
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, once } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	type AnySetting,
@@ -22,7 +22,7 @@ import {
 } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendId, MemoryBackendStartOptions } from "../memory-backend/types";
-import { loadMnemopiConfig } from "../mnemopi/config";
+import { loadMnemopiBankConfig } from "../mnemopi/config";
 import { getMnemopiRecallScope, type MnemopiConversationTracking, type MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import type { SettingsChangeOptions } from "./session-tools";
@@ -52,9 +52,9 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 
 /**
  * The scope the first-turn recall of the backend `settings` select reads, as its records name it (`findPersistedRecall`):
- * Hindsight's server, account, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`.
- * Undefined under a backend that recalls nothing into the conversation, and under Hindsight with no server. Mnemopi's
- * needs its core module loaded (`loadMnemopiCore`).
+ * Hindsight's server, account, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`, read
+ * from the settings that name them alone. Undefined under a backend that recalls nothing into the conversation, and
+ * under Hindsight with no server. Mnemopi's needs its core module loaded (`loadMnemopiCore`).
  */
 export function memoryRecallScope(settings: Settings, cwd: string, agentDir: string): string | undefined {
 	switch (cfgMemoryBackend.get(settings)) {
@@ -63,7 +63,7 @@ export function memoryRecallScope(settings: Settings, cwd: string, agentDir: str
 			return isHindsightConfigured(config) ? hindsightRecallScope(config, computeBankScope(config, cwd)) : undefined;
 		}
 		case "mnemopi":
-			return getMnemopiRecallScope(loadMnemopiConfig(settings, agentDir));
+			return getMnemopiRecallScope(loadMnemopiBankConfig(settings, agentDir));
 		default:
 			return undefined;
 	}
@@ -174,7 +174,8 @@ export class SessionMemory {
 		const backend = cfgMemoryBackend.get(host.settings);
 		this.#runningBackend = backend;
 		if (options.memoryEnabled !== false && recallsIntoConversation(backend)) {
-			const scope = () => this.recallScope();
+			// Read once for both readers: computing it can read the backend's configuration and stores.
+			const scope = once(() => this.recallScope());
 			this.adoptRecall(options.recall?.(scope), options.recallChanges?.(scope) ?? []);
 		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();

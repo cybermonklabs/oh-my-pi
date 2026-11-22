@@ -9,6 +9,7 @@
  * the block holds, so a resume can report what changed since as a new message
  * rather than rewriting the block.
  */
+import { once } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { MemoryBackendId } from "./types";
@@ -135,19 +136,21 @@ function recordedRecall(entry: SessionEntry): MemoryRecallEntryData | undefined 
 }
 
 /**
- * `scope` read once, the first time a reader needs it: a reader of a branch that holds no recall to weigh never reads
- * it (computing a backend's scope can read its configuration and stores).
+ * The newest recall `branch` recorded with the text `text` at or before `from`, since its last context reset;
+ * undefined without one.
  */
-function scopeReadOnce(scope: () => string | undefined): () => string | undefined {
-	let read = false;
-	let value: string | undefined;
-	return () => {
-		if (!read) {
-			value = scope();
-			read = true;
-		}
-		return value;
-	};
+function newestRecordedRecall(
+	branch: readonly SessionEntry[],
+	text: string,
+	from: number,
+): MemoryRecallEntryData | undefined {
+	for (let index = from; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "reset_boundary") return undefined;
+		const recall = recordedRecall(entry);
+		if (recall?.text === text) return recall;
+	}
+	return undefined;
 }
 
 /**
@@ -171,13 +174,8 @@ function hiddenRecallOf(
 		return undefined;
 	}
 	if (!scope) return message.content;
-	for (let earlier = index - 1; earlier >= 0; earlier--) {
-		const entry = branch[earlier];
-		if (entry.type === "reset_boundary") break;
-		const recall = recordedRecall(entry);
-		if (recall?.text === message.content) return recall.scope === scope() ? message.content : undefined;
-	}
-	return message.content;
+	const recorded = newestRecordedRecall(branch, message.content, index - 1);
+	return recorded === undefined || recorded.scope === scope() ? message.content : undefined;
 }
 
 /**
@@ -234,7 +232,7 @@ export function findDeliveredRecall(
 	branch: readonly SessionEntry[],
 	scope?: () => string | undefined,
 ): string | undefined {
-	const live = scope && scopeReadOnce(scope);
+	const live = scope && once(scope);
 	for (let index = branch.length - 1; index >= 0; index--) {
 		if (branch[index].type === "reset_boundary") return undefined;
 		const hidden = hiddenRecallOf(branch, index, live);
@@ -274,7 +272,7 @@ export function findConversationRecall(
 	branch: readonly SessionEntry[],
 	scope: () => string | undefined,
 ): ConversationRecall | undefined {
-	const live = scopeReadOnce(scope);
+	const live = once(scope);
 	let turnFollowed = false;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
@@ -301,16 +299,13 @@ export function findDeliveredRecallChanges(
 	branch: readonly SessionEntry[],
 	scope: () => string | undefined,
 ): RecallChangesReport[] {
-	const live = scopeReadOnce(scope);
-	let start = 0;
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		const recall = recordedRecall(entry);
-		if (entry.type === "reset_boundary" || (recall && recall.scope === live())) {
-			start = index + 1;
-			break;
-		}
-	}
+	const live = once(scope);
+	const start =
+		branch.findLastIndex(entry => {
+			if (entry.type === "reset_boundary") return true;
+			const recall = recordedRecall(entry);
+			return recall !== undefined && recall.scope === live();
+		}) + 1;
 	const reports: RecallChangesReport[] = [];
 	const seen = new Set<string>();
 	for (let index = start; index < branch.length; index++) {
@@ -336,12 +331,7 @@ export function findDeliveredRecallChanges(
  * whose last block it is carries that recall as its own block.
  */
 export function isRecordedRecall(branch: readonly SessionEntry[], text: string): boolean {
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry.type === "reset_boundary") return false;
-		if (recordedRecall(entry)?.text === text) return true;
-	}
-	return false;
+	return newestRecordedRecall(branch, text, branch.length - 1) !== undefined;
 }
 
 /**

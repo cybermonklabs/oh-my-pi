@@ -1212,10 +1212,19 @@ interface PromptListing {
 	readonly toolNames: readonly string[];
 	readonly xdevNames: ReadonlySet<string>;
 	/**
-	 * The skills a restored transcript prompt lists, each with the description it gives. Undefined for a prompt this
-	 * process built, which lists {@link SessionTools.promptSkills}.
+	 * The skills a prompt whose bytes the branch stores lists ({@link SessionTools.#storedPrompt}), each with the
+	 * description it gives. Undefined for one it does not store, which lists {@link SessionTools.promptSkills}.
 	 */
 	readonly skills?: ReadonlyMap<string, string>;
+}
+
+/** What the stored prompt `stored` lists: the roster, devices and skills its record names. */
+function storedPromptListing(stored: StoredSystemPrompt): PromptListing {
+	return {
+		toolNames: stored.toolNames,
+		xdevNames: new Set(stored.xdevNames),
+		skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
+	};
 }
 
 /** The skills of `skills` a system prompt lists: the ones not hidden. */
@@ -2987,11 +2996,7 @@ export class SessionTools {
 	#recordBasePromptListing(toolNames: readonly string[], xdevCatalogNames: readonly string[] | undefined): void {
 		const stored = this.#storedPrompt(systemPromptDigest(this.#baseSystemPrompt));
 		this.#basePromptListing = stored
-			? {
-					toolNames: stored.toolNames,
-					xdevNames: new Set(stored.xdevNames),
-					skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
-				}
+			? storedPromptListing(stored)
 			: {
 					toolNames: [...toolNames],
 					xdevNames: new Set([...(xdevCatalogNames ?? []), ...this.#routedSummaryXdevNames()]),
@@ -3212,8 +3217,9 @@ export class SessionTools {
 	}
 
 	/**
-	 * The skills the base prompt lists, by name, with the description it gives each, in the order it lists them: a
-	 * restored transcript prompt's ({@link PromptListing.skills}), else the ones this process's prompt renders.
+	 * The skills the base prompt lists, by name, with the description it gives each, in the order it lists them: those
+	 * of a prompt whose bytes the branch stores ({@link PromptListing.skills}), else the ones this process's prompt
+	 * renders.
 	 */
 	#basePromptSkills(): ReadonlyMap<string, string> {
 		return (
@@ -3511,11 +3517,7 @@ export class SessionTools {
 		this.#applyAgentSystemPrompt(stored.blocks);
 		// The transcript's requests carried the stored roster, devices and skills: a request's roster, mount and skill
 		// notices tell what differs now.
-		this.#basePromptListing = {
-			toolNames: stored.toolNames,
-			xdevNames: new Set(stored.xdevNames),
-			skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
-		};
+		this.#basePromptListing = storedPromptListing(stored);
 		return true;
 	}
 
@@ -3950,7 +3952,7 @@ export class SessionTools {
 		live: readonly AgentDefinition[],
 		messages: readonly AgentMessage[],
 	): CustomMessage<AgentNoticeDetails> | undefined {
-		const disabledAgents = cfgTaskDisabledAgents.get(this.toolCallSettingsFor("task") ?? this.#host.settings);
+		const disabledAgents = cfgTaskDisabledAgents.get(this.#callSettings().of("task"));
 		const policy = resolveSpawnPolicy(this.#host.sessionSpawns());
 		// Each agent the model knows, with the description it was given: undefined when an older notice listed it.
 		const known = new Map<string, string | undefined>(
@@ -4005,15 +4007,15 @@ export class SessionTools {
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
 		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
 	): CustomMessage<PerCallModelAdvertisement> | undefined {
-		const settingsOf = (tool: string): Settings => this.toolCallSettingsFor(tool) ?? this.#host.settings;
+		const callSettings = this.#callSettings();
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
-		if (!known || !this.#perCallModelsAdvertised(enabledToolNames, settingsOf)) return undefined;
+		if (!known || !this.#perCallModelsAdvertised(enabledToolNames, callSettings.of)) return undefined;
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
 		}
-		const settings = this.toolCallSettingsFor("task") ?? settingsOf("eval");
+		const settings = callSettings.held("task") ?? callSettings.of("eval");
 		const live = getPerCallModelAdvertisement(settings, this.#host.model(), this.#host.modelRegistry);
 		if (Bun.deepEquals(live, known)) return undefined;
 		return {
@@ -4028,8 +4030,22 @@ export class SessionTools {
 	}
 
 	/**
+	 * The settings calls to each tool read, each tool's resolved once for the caller (under a hold, resolving one reads
+	 * the tool's declaration): `held`, the ones a held settings change keeps the tool declared under
+	 * ({@link toolCallSettingsFor}); `of`, those or the session's own.
+	 */
+	#callSettings(): { held: (tool: string) => Settings | undefined; of: (tool: string) => Settings } {
+		const resolved = new Map<string, Settings | undefined>();
+		const held = (tool: string): Settings | undefined => {
+			if (!resolved.has(tool)) resolved.set(tool, this.toolCallSettingsFor(tool));
+			return resolved.get(tool);
+		};
+		return { held, of: tool => held(tool) ?? this.#host.settings };
+	}
+
+	/**
 	 * Builds the hidden notice of skills the live registry has gained, changed or lost since the system
-	 * prompt and the notices still in context listed them: the skills a restored transcript prompt lists
+	 * prompt and the notices still in context listed them: the skills a prompt whose bytes the branch stores lists
 	 * ({@link PromptListing.skills}), else the ones this process's prompt renders. A changed description is
 	 * announced again because the model routes on it. Gated like the prompt's skill list: `skillful` on and an
 	 * enabled tool, top-level or `xd://`-mounted, that reads `skill://`.

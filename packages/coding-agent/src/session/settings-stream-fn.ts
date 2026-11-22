@@ -25,6 +25,7 @@ import {
 	cfgProvidersAnthropicSlowMode,
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersCacheRetention,
+	cfgProvidersKimiApiFormat,
 	cfgProvidersMaxInFlightRequests,
 	cfgProvidersMuseCodeStoreResponses,
 	cfgProvidersOpenaiCodexDaybreak,
@@ -55,6 +56,19 @@ export function resolveWebsocketPreference(
 	if (model?.api !== "openai-codex-responses") return requestPreference;
 	const setting = cfgProvidersOpenaiWebsockets.get(settings);
 	return requestPreference ?? (setting === "on" ? true : setting === "off" ? false : undefined);
+}
+
+/**
+ * The Kimi Code API format a main request goes out in: the request's own, else `providers.kimiApiFormat`; undefined
+ * under `auto`, which leaves the model's catalog format.
+ */
+export function resolveKimiApiFormat(
+	settings: Settings,
+	requestFormat?: SimpleStreamOptions["kimiApiFormat"],
+): SimpleStreamOptions["kimiApiFormat"] {
+	if (requestFormat !== undefined) return requestFormat;
+	const setting = cfgProvidersKimiApiFormat.get(settings);
+	return setting === "auto" ? undefined : setting;
 }
 
 function timeoutSecondsToMs(value: number): number | undefined {

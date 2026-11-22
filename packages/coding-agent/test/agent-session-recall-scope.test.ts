@@ -5,7 +5,6 @@
  * scope's memories again.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -16,17 +15,15 @@ import {
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage, setClock } from "./helpers/agent-session-setup";
 import {
-	answer,
 	copiesIn,
-	GATEWAY,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
+	mockHindsightGatewayFetch,
 } from "./helpers/anthropic-gateway";
-import { asGlobalFetch } from "./helpers/fetch-mock";
 
 /** The Hindsight server the settings name; the `fetch` spy answers it, so no request leaves the process. */
 const HINDSIGHT_URL = "http://127.0.0.1:1";
@@ -39,9 +36,17 @@ const MEMORIES: Record<string, string> = {
 
 const HOUR_MS = 60 * 60_000;
 
+/** A `memory.yml` a process loads, and what its Hindsight server recalls. */
+interface Memory {
+	yml: string;
+	results: unknown[];
+}
+
 /** A `memory.yml` on one-hour cache entries under Hindsight, its server the test's, reading `bank`. */
-function hindsightMemory(bank: string): string {
-	return `providers:
+function hindsightMemory(bank: string): Memory {
+	const text = MEMORIES[bank];
+	return {
+		yml: `providers:
   cacheRetention: long
 memory:
   backend: hindsight
@@ -55,12 +60,18 @@ hindsight:
   retainEveryNTurns: 1
   retainOverlapTurns: 0
   mentalModelsEnabled: false
-`;
+`,
+		results: text ? [{ id: "m1", text, type: "world" }] : [],
+	};
 }
 
-/** A `memory.yml` on one-hour cache entries under Mnemopi, its store in `dir`, with nothing remembered. */
-function mnemopiMemory(dir: TempDir): string {
-	return `providers:
+/**
+ * A `memory.yml` on one-hour cache entries under Mnemopi, its store in `dir`, with nothing remembered, and the Mnemopi
+ * settings `extra` gives.
+ */
+function mnemopiMemory(dir: TempDir, extra = ""): Memory {
+	return {
+		yml: `providers:
   cacheRetention: long
 memory:
   backend: mnemopi
@@ -69,7 +80,9 @@ mnemopi:
   scoping: global
   noEmbeddings: true
   llmMode: none
-`;
+${extra}`,
+		results: [],
+	};
 }
 
 describe("a resumed session's recall of another scope", () => {
@@ -77,35 +90,17 @@ describe("a resumed session's recall of another scope", () => {
 		vi.restoreAllMocks();
 	});
 
-	/** One process on the session file (a new session without one) loading `memoryYml`: runs `steps`, then exits. */
+	/** One process on the session file (a new session without one) loading `memory`: runs `steps`, then exits. */
 	async function runProcess(
 		dir: TempDir,
-		memoryYml: string,
+		memory: Memory,
 		sessionFile: string | undefined,
 		steps: (session: AgentSession) => Promise<void>,
 	): Promise<{ requests: MessagesRequest[]; sessionFile: string }> {
 		const overlay = dir.join("memory.yml");
-		await Bun.write(overlay, memoryYml);
+		await Bun.write(overlay, memory.yml);
 		const settings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.path(), configFiles: [overlay] });
-		const requests: MessagesRequest[] = [];
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				const url = new URL(String(input));
-				if (url.href === `${GATEWAY}/v1/messages`) {
-					requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-					return answer(requests.length, { cacheWriteTokens: 100 });
-				}
-				if (url.origin !== HINDSIGHT_URL) throw new Error(`Unexpected request to ${url.href}`);
-				const recall = /^\/v1\/default\/banks\/([^/]+)\/memories\/recall$/.exec(url.pathname);
-				if (recall) {
-					const text = MEMORIES[decodeURIComponent(recall[1])];
-					return Response.json({ results: text ? [{ id: "m1", text, type: "world" }] : [] });
-				}
-				const found = /^\/v1\/default\/banks\/([^/]+)$/.exec(url.pathname);
-				if (found) return Response.json({ bank_id: decodeURIComponent(found[1]) });
-				return Response.json({});
-			}),
-		);
+		const gateway = mockHindsightGatewayFetch(memory.results, { origin: HINDSIGHT_URL });
 		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, dir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
@@ -129,11 +124,11 @@ describe("a resumed session's recall of another scope", () => {
 			await steps(session);
 			const file = sessionManager.getSessionFile();
 			if (!file) throw new Error("Expected a persisted session");
-			return { requests, sessionFile: file };
+			return { requests: gateway.requests, sessionFile: file };
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			fetchSpy.mockRestore();
+			gateway.restore();
 		}
 	}
 
@@ -212,6 +207,44 @@ describe("a resumed session's recall of another scope", () => {
 		expect(copiesIn(firstRequest.system, MEMORIES["fleet-bank"])).toBe(1);
 		// Mnemopi recalls for itself: Hindsight's recall is not the conversation's under it.
 		expect(copiesIn(secondRequest, MEMORIES["fleet-bank"])).toBe(0);
+	}, 60_000);
+
+	// A setting the prompt build read is a prompt input: a later change of it rebuilds the prompt to see whether it
+	// moved, and its id goes into the session's `system-prompt` record.
+	it("records as the resumed prompt's inputs only the Mnemopi settings that name the banks its recall reads", async () => {
+		using dir = TempDir.createSync("@pi-recall-scope-mnemopi-reads-");
+		await Bun.write(dir.join("models.yml"), gatewayModelsYml());
+		setClock(0);
+		const first = await runProcess(dir, hindsightMemory("fleet-bank"), undefined, async session => {
+			await session.prompt("first");
+		});
+		setClock(3 * HOUR_MS);
+		// Two credentials and a recall limit, none of which names a bank or a database.
+		const memory = mnemopiMemory(
+			dir,
+			"  llmApiKey: mnemopi-llm-key\n  embeddingApiKey: mnemopi-embedding-key\n  recallLimit: 7\n",
+		);
+		await runProcess(dir, memory, first.sessionFile, async session => {
+			await session.prompt("second");
+		});
+
+		const sessionManager = await SessionManager.open(first.sessionFile);
+		const stored = sessionManager
+			.getBranch()
+			.findLast(entry => entry.type === "custom" && entry.customType === "system-prompt");
+		await sessionManager.close();
+		const data = stored?.type === "custom" && isRecord(stored.data) ? stored.data : undefined;
+		if (!data || !Array.isArray(data.settingsRead)) throw new Error("Expected the resumed prompt's record");
+		const mnemopiReads = data.settingsRead
+			.flatMap(record => (isRecord(record) && typeof record.id === "string" ? [record.id] : []))
+			.filter(id => id.startsWith("mnemopi."));
+		// The scope of the transcript's recall reads the bank settings; the instructions read their token limit.
+		expect(mnemopiReads.sort()).toEqual([
+			"mnemopi.bank",
+			"mnemopi.dbPath",
+			"mnemopi.injectionTokenLimit",
+			"mnemopi.scoping",
+		]);
 	}, 60_000);
 });
 

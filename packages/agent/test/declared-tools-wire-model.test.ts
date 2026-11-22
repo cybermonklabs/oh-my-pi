@@ -6,8 +6,8 @@ import { NO_STRICT } from "@oh-my-pi/pi-ai/utils/schema/adapt";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveGitLabDuoModelIdentity } from "@oh-my-pi/pi-catalog/provider-models";
 import { Agent } from "../src/agent";
-import type { AgentTool } from "../src/types";
-import { wrappedModelFingerprints } from "./fixtures/declared-tools-wire-process";
+import { edit, wrappedModelFingerprints } from "./fixtures/declared-tools-wire-process";
+import { runUnderNoStrict } from "./helpers";
 
 /**
  * A wrapper transport sends its requests as a model of its own: GitLab Duo as the upstream model, Kimi Code as the
@@ -15,20 +15,6 @@ import { wrappedModelFingerprints } from "./fixtures/declared-tools-wire-process
  * declared-tools fingerprint must read the strict flags and the strict-tools fallback on that model, or a resumed
  * process takes a cache entry the changed tools no longer read for live, or one they still read for lost.
  */
-
-/** A tool Anthropic declares as strict unless the strict-tools fallback or `PI_NO_STRICT` applies. */
-const edit: AgentTool = {
-	name: "edit",
-	label: "edit",
-	description: "edit tool",
-	parameters: {
-		type: "object",
-		properties: { path: { type: "string" } },
-		required: ["path"],
-		additionalProperties: false,
-	} as unknown as AgentTool["parameters"],
-	execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
-};
 
 describe("Agent.declaredToolsFingerprint on a GitLab Duo model routed to Anthropic", () => {
 	it("counts the strict-tools fallback Anthropic keeps under the upstream id", () => {
@@ -66,24 +52,7 @@ describe("Agent.declaredToolsFingerprint on a wrapped model under PI_NO_STRICT",
 		// Precondition: this process runs under default settings.
 		expect(NO_STRICT).toBe(false);
 		const defaults = wrappedModelFingerprints();
-		const child = Bun.spawn([process.execPath, WIRE_PROCESS], {
-			env: {
-				...process.env,
-				PI_NO_STRICT: "1",
-				PI_DIALECT: undefined,
-				CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: undefined,
-			},
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		if (exitCode !== 0) throw new Error(`The process exited with ${exitCode}: ${stderr}`);
-		const noStrict = JSON.parse(stdout) as Record<string, string>;
+		const noStrict = JSON.parse(await runUnderNoStrict(WIRE_PROCESS)) as Record<string, string>;
 
 		const changed = Object.fromEntries(Object.keys(defaults).map(name => [name, noStrict[name] !== defaults[name]]));
 		expect(changed).toEqual({ kimiCode: true, factoryDroid: true, cloudflareAiGateway: false });

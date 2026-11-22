@@ -67,7 +67,17 @@ export interface MnemopiBackendConfig {
 	llmModel?: string;
 }
 
-export function loadMnemopiConfig(settings: Settings, agentDir: string): MnemopiBackendConfig {
+/** The fields of a {@link MnemopiBackendConfig} that name the banks and databases a session reads and writes. */
+export type MnemopiBankConfig = Pick<
+	MnemopiBackendConfig,
+	"dbPath" | "baseBank" | "bank" | "globalBank" | "retainBank" | "recallBanks" | "scoping"
+>;
+
+/**
+ * The banks and databases `settings` select for their cwd, read from the settings that name them alone
+ * (`mnemopi.dbPath`, `mnemopi.scoping`, `mnemopi.bank`).
+ */
+export function loadMnemopiBankConfig(settings: Settings, agentDir: string): MnemopiBankConfig {
 	const configuredDbPath = cfgMnemopiDbPath.get(settings);
 	const cwd = settings.getCwd();
 	const scoping = cfgMnemopiScoping.get(settings);
@@ -77,6 +87,19 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const scope = computeMnemopiBankScope(cfgMnemopiBank.get(settings), cwd, scoping);
 	const recallBanks =
 		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
+	return {
+		dbPath,
+		baseBank: scope.baseBank,
+		bank: scope.bank,
+		globalBank: scope.globalBank,
+		retainBank: scope.retainBank,
+		recallBanks,
+		scoping,
+	};
+}
+
+export function loadMnemopiConfig(settings: Settings, agentDir: string): MnemopiBackendConfig {
+	const banks = loadMnemopiBankConfig(settings, agentDir);
 	const llmMode = cfgMnemopiLlmMode.get(settings);
 	const embeddingOverride = cfgMnemopiEmbeddingModel.get(settings);
 	const embeddingVariant = cfgMnemopiEmbeddingVariant.get(settings);
@@ -87,13 +110,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		embeddingVariant === "multilingual" ? "intfloat/multilingual-e5-large" : "BAAI/bge-base-en-v1.5";
 	const embeddingModel = embeddingOverride?.trim() || variantModel;
 	return {
-		dbPath,
-		baseBank: scope.baseBank,
-		bank: scope.bank,
-		globalBank: scope.globalBank,
-		retainBank: scope.retainBank,
-		recallBanks,
-		scoping,
+		...banks,
 		autoRecall: cfgMnemopiAutoRecall.get(settings),
 		autoRetain: cfgMnemopiAutoRetain.get(settings),
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),

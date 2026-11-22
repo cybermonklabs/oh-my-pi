@@ -15,6 +15,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -333,9 +334,11 @@ describe("a copy of a branch whose leaf was a label", () => {
 	describe("the conversation and session_before_branch's entryId", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5") as Model;
 		const sessions: AgentSession[] = [];
+		const authStorages: AuthStorage[] = [];
 
 		afterEach(async () => {
 			for (const session of sessions.splice(0)) await session.dispose();
+			for (const authStorage of authStorages.splice(0)) authStorage.close();
 		});
 
 		/** A process on `sessionManager` whose `session_before_branch` hook records each event's `entryId`. */
@@ -349,6 +352,7 @@ describe("a copy of a branch whose leaf was a label", () => {
 				},
 			} as unknown as ExtensionRunner;
 			const authStorage = createInMemoryAuthStorage();
+			authStorages.push(authStorage);
 			authStorage.keys.setRuntime("anthropic", "test-key");
 			const session = new AgentSession({
 				agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),

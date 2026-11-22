@@ -11,7 +11,13 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	personalityOverlay,
+	RELOAD_CALLS,
+	reloadOverlay,
+	setClock,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -23,9 +29,6 @@ import {
 
 /** A `--config` overlay a configuration sync rewrites under a running session: one-hour cache entries. */
 const LONG_ENTRIES = "providers:\n  cacheRetention: long\n";
-
-/** {@link LONG_ENTRIES} with another `personality`, a change the system prompt renders. */
-const PRAGMATIC = `${LONG_ENTRIES}personality: pragmatic\n`;
 
 const MINUTE_MS = 60_000;
 
@@ -68,7 +71,8 @@ describe("a held settings change that comes due while its notice's request is pr
 
 		setClock(0);
 		await session.prompt("first");
-		await reloadOverlay({ session, settings, overlay }, PRAGMATIC, RELOAD_CALLS);
+		// Another `personality`, a change the system prompt renders.
+		await reloadOverlay({ session, settings, overlay }, personalityOverlay("pragmatic"), RELOAD_CALLS);
 		// The prompt sends nothing it withholds and writes its notice just before the deadline; the clock passes the
 		// deadline in the first step of the model call that follows.
 		setClock(4.9 * MINUTE_MS);
