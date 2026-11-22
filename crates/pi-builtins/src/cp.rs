@@ -2548,10 +2548,25 @@ fn copy_file(
 	}
 
 	let mut dest_metadata = if backup.is_some() {
-		// The name was renamed to its backup, so the destination is new, as
-		// GNU's `new_dst` makes it: it is created with O_EXCL whatever appears
-		// at the name before the create.
-		None
+		// GNU takes the name as new after its backup, a rename (`new_dst`).
+		// Where the backup was a copy (the source leads to the destination's
+		// own file), the file found before is still at the name and is
+		// replaced as before. A rename onto another link of the same file does
+		// nothing, and GNU still takes the name as new: the exclusive create
+		// fails on it, and a symlink replaces it only under `-f`. Any other
+		// file there appeared after the backup and is new to cp too.
+		let backup_fs = backup.as_deref().map(|backup| host.resolve(backup));
+		match filesystem.symlink_metadata(&dest_fs) {
+			Ok(now)
+				if initial_dest_metadata.as_ref().is_some_and(|before| before.same_file(&now))
+					&& !backup_fs
+						.and_then(|backup| filesystem.symlink_metadata(backup).ok())
+						.is_some_and(|backup| backup.same_file(&now)) =>
+			{
+				Some(now)
+			},
+			_ => None,
+		}
 	} else if dest_replaced {
 		filesystem.symlink_metadata(&dest_fs).ok()
 	} else {
@@ -2816,7 +2831,25 @@ fn copy_link(
 	};
 	#[cfg(not(windows))]
 	let kind = SymlinkKind::Auto;
-	symlink_file(host, state, &link, dest, kind)?;
+	match symlink_file(host, state, &link, dest, kind) {
+		// GNU's `force_symlinkat`: under `-f` a name still there (taken as new
+		// after a backup that left it) is replaced by the link.
+		Err(CpError::IoErrContext(error, _))
+			if error.kind() == io::ErrorKind::AlreadyExists && options.unlink_after_failed_open() =>
+		{
+			let dest_fs = host.resolve(dest);
+			host.fs().remove_file(&dest_fs).map_err(|e| {
+				CpError::IoErrContext(e, format!("cannot remove {}", dest.quote()))
+			})?;
+			symlink_file(host, state, &link, dest, kind)?;
+		},
+		// A copied link is named by its destination alone, as GNU names it
+		// (`copy.c`); `-s` names its target too.
+		Err(CpError::IoErrContext(error, _)) => {
+			return Err(CpError::IoErrContext(error, format!("cannot create symbolic link {}", dest.quote())));
+		},
+		result => result?,
+	}
 	copy_attributes(
 		host,
 		source,
@@ -2970,6 +3003,21 @@ fn copy_data(
 			(file, DestFate::Created { mode: Some(create_mode & !host.umask()), owner: None })
 		},
 		Ok(file) => (file, DestFate::Kept),
+		// The exclusive create of a new destination met a name that appeared
+		// since: GNU fails and keeps it (`copy_reg`), `-f` or not. A link
+		// there is "not writing through dangling symlink", which
+		// POSIXLY_CORRECT opens through instead.
+		Err(error) if dest_metadata.is_none() && error.kind() == io::ErrorKind::AlreadyExists => {
+			if !filesystem.symlink_metadata(&dest_fs).is_ok_and(|now| now.is_symlink()) {
+				return Err(cannot_create(error));
+			}
+			if host.var("POSIXLY_CORRECT").is_none() {
+				return Err(CpError::Error(format!("not writing through dangling symlink {}", dest.quote())));
+			}
+			let mut through = OpenOptions::new();
+			through.write(true).create(true).truncate(!source_is_stream).mode(create_mode);
+			(filesystem.open_with(&dest_fs, &through).map_err(cannot_create)?, DestFate::Kept)
+		},
 		// `-f`: remove a destination that cannot be opened, and try again.
 		Err(_) if options.unlink_after_failed_open() && filesystem.symlink_metadata(&dest_fs).is_ok() => {
 			delete_path(host, state, dest, options)?;
@@ -4057,6 +4105,7 @@ mod tests {
 		assert_eq!(fs::read(dir.path().join("b~")).unwrap(), b"old", "b~ keeps the data");
 	}
 
+
 	/// A backup that leaves the destination's name in place, as GNU 9.4 and
 	/// 9.7 answer it as uid 1000 and as root: a copy backup (pi backs up by
 	/// copy where the source leads to the destination's own file) keeps the
@@ -4212,7 +4261,6 @@ mod tests {
 			assert_eq!(found, after, "{case}");
 		}
 	}
-
 	#[test]
 	fn recursive_copy_creates_missing_target_then_nests_into_existing_one() {
 		let fixture = tempdir().unwrap();
