@@ -407,7 +407,9 @@ mod tests {
 	#[test]
 	fn a_dead_process_reads_as_exited() {
 		let line = |state: &str| {
-			format!("4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n")
+			format!(
+				"4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n"
+			)
 		};
 		for state in ["X", "Z"] {
 			let p = parse_stat(4242, line(state).as_bytes()).expect("parses");
