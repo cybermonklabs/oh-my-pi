@@ -312,18 +312,24 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				},
 				Opcode::CallAnon => !vp.frames.get(fi).is_some_and(|frame| frame.err_reported),
 				Opcode::Redir => matches!(flow, Flow::Jump(_)),
-				Opcode::Leave | Opcode::Arith | Opcode::CondTest => {
+				// A loop, group, `if` or `case` (its `Leave`) takes its status
+				// from a command already judged: bash and zsh run no ERR trap
+				// for the compound itself (zsh's `this_noerrexit`). zsh's
+				// `{ } always { }` sets none: its end is judged like a command,
+				// unless a command since ran the trap (`donetrap`).
+				Opcode::AlwaysEnd | Opcode::Arith | Opcode::CondTest => {
 					!vp.frames.get(fi).is_some_and(|frame| frame.err_reported)
 				},
 				_ => false,
 			};
 		// `set -e` exits on a failed simple command, subshell, pipeline,
-		// compound redirection, `[[ ]]` or `(( ))`; not on other compound
-		// commands, whose status comes from a command already judged.
+		// compound redirection, `[[ ]]`, `(( ))` or zsh `{ } always { }`;
+		// not on other compound commands, whose status comes from a command
+		// already judged.
 		let zsh_unit = unit.mode.dialect() == Dialect::Zsh;
 		let judged = (failing || (zsh_unit && vp.status != 0))
 			&& match op.code {
-				Opcode::Exec | Opcode::Spawn | Opcode::CallAnon => true,
+				Opcode::Exec | Opcode::Spawn | Opcode::CallAnon | Opcode::AlwaysEnd => true,
 				Opcode::Redir => matches!(flow, Flow::Jump(_)),
 				Opcode::Leave => unit
 					.nodes

@@ -16,6 +16,9 @@
 //! snapshots and restores the shell at many ops, so that a forked child's
 //! loop count must survive the frames image.
 //!
+//! The ERR rows count how often the ERR (zsh: ZERR) trap runs, and with
+//! what status, for loops, conditions, lists, `!`, compounds and functions.
+//!
 //! The expected rows are the oracles' output, recorded in
 //! `tests/fixtures/break_in_a_pipeline_element/{bash,zsh}.jsonl` (stdout,
 //! status, and stderr with the program name before `: line` as `SH`).
@@ -288,6 +291,96 @@ fn forks(dialect: Dialect) -> Vec<Row> {
 	rows
 }
 
+/// The ERR trap rows' shapes: how often the ERR (zsh: ZERR) trap runs, and
+/// with what status, for loops, conditions, lists, `!`, compounds and
+/// functions.
+const ERR_SHAPES: &[(&str, &str)] = &[
+	("while-body-false", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; done"),
+	("while-body-status3", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); (exit 3); done"),
+	("until-body-false", "i=0; until [ $i -ge 1 ]; do i=$((i+1)); false; done"),
+	("for-body-false", "for i in 1; do false; done"),
+	("while-two-iterations", "i=0; while [ $i -lt 2 ]; do i=$((i+1)); false; done"),
+	("while-false-then-true", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; :; done"),
+	("while-cond-false", "while false; do :; done"),
+	("until-cond-true", "until true; do :; done"),
+	("if-cond-false", "if false; then :; fi"),
+	("elif-cond-false", "if false; then :; elif false; then :; fi"),
+	("if-body-false", "if true; then false; fi"),
+	("else-body-false", "if false; then :; else false; fi"),
+	("group-body-false", "{ false; }"),
+	("group-false-in-cond", "if { false; }; then :; fi"),
+	("and-list-first-false", "false && true"),
+	("and-list-last-false", "true && false"),
+	("or-list-false", "false || false"),
+	("not-true", "! true"),
+	("not-false", "! false"),
+	("case-body-false", "case x in x) false;; esac"),
+	("function-return-1", "f() { return 1; }; f"),
+	("function-body-false", "f() { false; }; f"),
+	("subshell-false", "( false )"),
+	("while-in-function", "f() { i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; done; }; f"),
+	(
+		"nested-while",
+		"i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; \
+		 done; done",
+	),
+	("select-body-false", "select x in a; do false; break; done <<< 1"),
+	("arith-false", "(( 0 ))"),
+	("cond-false", "[[ -z x ]]"),
+	("group-and-first-false", "{ false && true; }"),
+	("group-not-true", "{ ! true; }"),
+	("while-not-true", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); ! true; done"),
+	("if-body-not-true", "if true; then ! true; fi"),
+	("while-and-first-false", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false && true; done"),
+	("for-and-first-false", "for i in 1; do false && true; done"),
+	("case-and-first-false", "case x in x) false && true;; esac"),
+	("function-and-first-false", "f() { false && true; }; f"),
+];
+
+/// The ERR shapes only bash runs here. zsh runs ZERR for the status a
+/// function returns, and once for a pipeline whose last element fails;
+/// obash in zsh mode does neither (older than these rows, not this cause).
+const BASH_ERR_SHAPES: &[(&str, &str)] = &[
+	("function-false-then-return", "f() { false; return 2; }; f"),
+	("pipeline-last-false", "true | false"),
+];
+
+/// The ERR shapes only zsh has: `{ } always { }` is judged at its end like a
+/// command, unless a command since ran the trap (the always-list's own
+/// failure).
+const ZSH_ERR_SHAPES: &[(&str, &str)] = &[
+	("always-false-true", "{ false } always { true }"),
+	("always-false-false", "{ false } always { false }"),
+	("always-true-false", "{ true } always { false }"),
+	("always-and-first-false", "{ false && true } always { true }"),
+	("always-in-function", "f() { { false } always { echo al } }; f"),
+];
+
+/// The ERR rows, `err/<n|e>/<name>`: each shape after `trap 'echo T$?'
+/// ERR`, then `echo end:$?`; `e` rows also set `-e`.
+fn errs(dialect: Dialect) -> Vec<Row> {
+	let (key, errexit) = if dialect == Dialect::Bash {
+		("ERR", "set -e; ")
+	} else {
+		("ZERR", "setopt errexit; ")
+	};
+	let own = if dialect == Dialect::Bash {
+		BASH_ERR_SHAPES
+	} else {
+		ZSH_ERR_SHAPES
+	};
+	let mut rows = Vec::new();
+	for &(name, shape) in ERR_SHAPES.iter().chain(own) {
+		for (tag, e) in [("n", ""), ("e", errexit)] {
+			rows.push((
+				format!("err/{tag}/{name}"),
+				format!("{e}trap 'echo T$?' {key}; {shape}; echo end:$?"),
+			));
+		}
+	}
+	rows
+}
+
 /// stderr with the program's name before `: ` written `SH` (bash names
 /// itself by its path, and bash 5.2.21 a function's error `environment`).
 fn normalized_stderr(stderr: &[u8]) -> String {
@@ -505,6 +598,20 @@ fn bash_forks_match_bash() {
 #[test]
 fn zsh_forks_match_zsh() {
 	assert_rows(Dialect::Zsh, "fork/", &forks(Dialect::Zsh));
+}
+
+/// The ERR trap runs once per failed command in bash: a loop, group, `if`
+/// or `case` that takes its status from a command already judged runs it
+/// no second time.
+#[test]
+fn bash_err_trap_runs_once() {
+	assert_rows(Dialect::Bash, "err/", &errs(Dialect::Bash));
+}
+
+/// The same for zsh's ZERR trap.
+#[test]
+fn zsh_err_trap_runs_once() {
+	assert_rows(Dialect::Zsh, "err/", &errs(Dialect::Zsh));
 }
 
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
