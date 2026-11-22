@@ -206,5 +206,57 @@ for (const { name, make, skip, defers } of STORES) {
 			},
 			TIMEOUT,
 		);
+
+		// discardEntryDurably (turn recovery, length-stop recovery) publishes its marker, re-journaled usage and removal
+		// through one atomic rewrite and changes memory only once it landed.
+		it(
+			"keeps one session through a discard that meets the other writer's append, losing no entry",
+			async () => {
+				const s = await open(`${header}${userLine("m1", null, "a turn")}`);
+				const notices: unknown[] = [];
+				s.manager.onPersistenceNotice(notice => notices.push(notice));
+				try {
+					// The turn a recovery discards is one this manager recorded and flushed.
+					s.manager.appendMessage(createAssistantMessage("a reply"));
+					await s.manager.flush();
+					const a1 = s.manager.getEntries().at(-1)?.id ?? "";
+					const before = s.manager.getEntries().map(entry => entry.id);
+					await s.store.append(s.file, userLine("f1", a1, "another writer's turn"));
+					const discarded = await s.manager.discardEntryDurably(a1).then(
+						() => undefined,
+						(err: unknown) => err,
+					);
+					// The session kept its file and id: no sibling, no notice.
+					expect({ file: s.manager.getSessionFile(), id: s.manager.getSessionId(), notices }).toEqual({
+						file: s.file,
+						id: ID,
+						notices: [],
+					});
+					// What a process that stopped here would find: every entry already flushed, in one session.
+					const afterRejection = await expectStoredOnce(s);
+					for (const id of ["m1", a1]) expect(afterRejection).toContain(`"id":"${id}"`);
+					// A discard that does not land rejects with the write conflict and changes nothing in memory.
+					if (discarded !== undefined) {
+						expect(discarded).toBeInstanceOf(SessionWriteConflictError);
+						expect(s.manager.getEntries().map(entry => entry.id)).toEqual(before);
+					}
+
+					s.manager.appendMessage({ role: "user", content: "a later turn", timestamp: Date.now() });
+					await s.manager.flush();
+					await s.manager.discardEntryDurably(a1);
+					await s.manager.flush();
+
+					expect(notices).toEqual([]);
+					expect([s.manager.getSessionFile(), s.manager.getSessionId()]).toEqual([s.file, ID]);
+					const stored = await expectStoredOnce(s);
+					for (const entry of s.manager.getEntries()) expect(stored).toContain(`"id":"${entry.id}"`);
+					expect(stored).toContain("a later turn");
+					expect(stored).toContain(`"discardedEntryId":"${a1}"`);
+				} finally {
+					await s.manager.close().catch(() => undefined);
+				}
+			},
+			TIMEOUT,
+		);
 	});
 }
