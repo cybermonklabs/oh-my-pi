@@ -554,6 +554,79 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"setopt err_return; trap 'false' USR1; f() { (exit 3); kill -USR1 $$; echo f:$?; }; f; echo \
 		 top:$?",
 	),
+	// No ZERR trap runs while any trap does (zsh `dotrap`'s `intrap`): a
+	// signal, DEBUG or EXIT trap, a function one calls; `ERR_EXIT` still
+	// applies there.
+	(
+		"zerr-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"zerr-in-signal-trap-function",
+		"trap 'echo Z$?' ZERR; g() { false; echo g; }; trap 'g; echo t2' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-signal-trap-in-function",
+		"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR2; f() { kill -USR2 $$; echo f; }; f; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-debug-trap",
+		"trap 'echo Z$?' ZERR; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { false; echo d; }; :' \
+		 DEBUG; : hit; echo top:$?",
+	),
+	("zerr-in-exit-trap", "trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; echo top"),
+	("zerr-in-exit-trap-from-exit", "trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; exit 0"),
+	(
+		"zerr-after-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'false' USR1; kill -USR1 $$; false; echo top:$?",
+	),
+	(
+		"zerr-in-signal-trap-errexit",
+		"setopt errexit; trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-subshell-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap '(false; echo s); echo t2' USR1; kill -USR1 $$; echo top:$?",
+	),
+	("zerr-in-zerr-trap", "trap 'false; echo Z$?' ZERR; false; echo top:$?"),
+	(
+		"errreturn-trap-runs-no-zerr",
+		"setopt err_return; trap 'echo Z' ZERR; trap 'false; echo t2' USR1; f() { kill -USR1 $$; \
+		 echo f:$?; }; f; echo top:$?",
+	),
+	// A fork made inside a trap keeps `intrap`: no ZERR or DEBUG trap there,
+	// even after the trap ends; a fork made after it runs them.
+	(
+		"zerr-in-cmdsub-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'x=$(false; echo s); echo t2:$x' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-job-from-signal-trap",
+		"trap 'echo Z$?' ZERR; trap '{ false; echo s; } &' USR1; kill -USR1 $$; wait; echo top:$?",
+	),
+	(
+		"zerr-in-subshell-after-signal-trap",
+		"trap 'echo Z$?' ZERR; trap ':' USR1; kill -USR1 $$; ( false; echo s ); echo top:$?",
+	),
+	(
+		"debug-in-subshell-in-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap '( : in; echo s ); echo t2' \
+		 USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"debug-in-cmdsub-in-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D >&2' DEBUG; trap 'x=$(: in; echo s); echo \
+		 t2:$x' USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"debug-in-subshell-after-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap ':' USR1; kill -USR1 $$; ( : \
+		 in; echo s ); echo top:$?",
+	),
 ];
 
 /// The trap shape rows, `trap/x<loops>/<name>`, three at top level, and
@@ -913,8 +986,9 @@ fn assert_rows(dialect: Dialect, prefix: &str, rows: &[Row]) {
 	assert_recorded(dialect, rows, &got, &record);
 }
 
-/// Rows run under snapshots: each forks its child inside a loop and runs
-/// no program (an external in flight skips a snapshot).
+/// Rows run under snapshots: each forks its child inside a loop (or, in
+/// zsh, inside a trap action: `VprocZsh::in_trap`) and runs no program (an
+/// external in flight skips a snapshot).
 const BASH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/for/break/none/last/none",
 	"grid/while/continue/2/first/pipefail",
@@ -935,6 +1009,8 @@ const ZSH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/function/break/none/first/none",
 	"fork/x1/cmdsub-exit-trap",
 	"fork/x1/bg-subshell",
+	"trap/own/zerr-in-subshell-in-signal-trap",
+	"trap/own/zerr-in-job-from-signal-trap",
 ];
 
 /// The grid in bash: a simple command forked as an element keeps the loop
@@ -1006,11 +1082,12 @@ fn zsh_err_trap_runs_once() {
 
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
 /// the recorded outcome of each: a forked child's loops
-/// (`Vproc::outer_loops`) survive the frames image.
+/// (`Vproc::outer_loops`) and zsh's `intrap` survive the frames image.
 fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
 	let rows: Vec<Row> = grid(dialect)
 		.into_iter()
 		.chain(forks(dialect))
+		.chain(trap_shapes(dialect))
 		.filter(|(id, _)| ids.contains(&id.as_str()))
 		.collect();
 	assert_eq!(rows.len(), ids.len(), "a snapshot row id names no row");

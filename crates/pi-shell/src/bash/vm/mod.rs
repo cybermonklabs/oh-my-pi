@@ -2918,10 +2918,13 @@ impl Vproc {
 			let z = vp.zsh.get_or_insert_with(Box::default);
 			z.site = Some(site);
 			z.context = zsh::specials::eval_context(self);
+			// zsh's `intrap` survives the fork.
+			z.in_trap = self.trap_frames != 0;
 			if let Some(parent) = self.zsh.as_deref() {
 				z.ptys.clone_from(&parent.ptys);
 				z.curses.clone_from(&parent.curses);
 				z.last_math = parent.last_math;
+				z.in_trap |= parent.in_trap;
 			}
 		}
 		// The session's terminal (a `zpty` slave) whatever the mode.

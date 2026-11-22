@@ -4985,11 +4985,12 @@ pub const fn mode_of(vp: &Vproc) -> ModeId {
 
 /// zsh `execlist`'s DEBUG trap at the list marker `op` (a `Nop`): before
 /// the list under `DEBUG_BEFORE_CMD` (the default), after it otherwise;
-/// never inside a trap. `ERR_EXIT` is off while it runs (set by the trap,
-/// the list is skipped, [`zsh_debug_done`]); before the list
-/// `$ZSH_DEBUG_CMD` holds its text. Whether the trap started.
+/// never inside a trap, nor in a fork made inside one ([`zsh_in_trap`]).
+/// `ERR_EXIT` is off while it runs (set by the trap, the list is skipped,
+/// [`zsh_debug_done`]); before the list `$ZSH_DEBUG_CMD` holds its text.
+/// Whether the trap started.
 fn zsh_debug_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Unit, op: Op) -> bool {
-	if vp.trap_frames != 0 || !pseudo_trap_maybe(k, cx, TrapKey::Debug) {
+	if zsh_in_trap(vp) || !pseudo_trap_maybe(k, cx, TrapKey::Debug) {
 		return false;
 	}
 	let opt = |k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, o| {
@@ -5121,6 +5122,10 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		}) {
 		return false;
 	}
+	// zsh `dotrap`: no ZERR trap runs while any trap does (`intrap`).
+	if key == TrapKey::Err && vp.mode.dialect() == Dialect::Zsh && zsh_in_trap(vp) {
+		return false;
+	}
 	let (action, trap_mode) = match state::record(cx.store, vp, Key::Trap(key)) {
 		Ok(Some(Record::Trap { action, mode })) if !action.is_empty() => (action.clone(), *mode),
 		// zsh: a `TRAPNAL` function is the trap (zsh `ZSIG_FUNC`).
@@ -5138,6 +5143,14 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
 	}
 	started
+}
+
+/// zsh `intrap`: a trap action runs in `vp`, or ran in the shell that
+/// forked it (a fork keeps the count, [`VprocZsh::in_trap`]).
+///
+/// [`VprocZsh::in_trap`]: super::proc::VprocZsh::in_trap
+fn zsh_in_trap(vp: &Vproc) -> bool {
+	vp.trap_frames != 0 || vp.zsh.as_deref().is_some_and(|z| z.in_trap)
 }
 
 /// Push the frame of trap `key` running `action` set in `trap_mode`

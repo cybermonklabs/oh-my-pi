@@ -620,6 +620,9 @@
 {"id":"trap/err/while/continue/none","script":"trap 'continue' ZERR; i=0; while [ $i -lt 2 ]; do i=$((i+1)); echo a$i; false; echo b$i:$?; done; echo e:$?","stdout":"a1\na2\ne:1\n","stderr":"","status":0}
 {"id":"trap/own/debug-errexit-break","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; : hit; echo b$i; done; echo e; false; echo after","stdout":"a1\ne\n","stderr":"","status":1}
 {"id":"trap/own/debug-errexit-continue","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && continue' DEBUG; for i in 1 2; do echo a$i; : hit; echo b$i; done; echo e; false; echo after","stdout":"a1\na2\ne\n","stderr":"","status":1}
+{"id":"trap/own/debug-in-cmdsub-in-signal-trap","script":"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D >&2' DEBUG; trap 'x=$(: in; echo s); echo t2:$x' USR1; kill -USR1 $$; echo top:$?","stdout":"t2:s\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/debug-in-subshell-after-signal-trap","script":"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap ':' USR1; kill -USR1 $$; ( : in; echo s ); echo top:$?","stdout":"D\ns\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/debug-in-subshell-in-signal-trap","script":"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap '( : in; echo s ); echo t2' USR1; kill -USR1 $$; echo top:$?","stdout":"s\nt2\ntop:0\n","stderr":"","status":0}
 {"id":"trap/own/errexit-trap-in-function","script":"setopt err_exit; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"","stderr":"","status":1}
 {"id":"trap/own/errexit-trap-top","script":"setopt err_exit; trap 'false' USR1; kill -USR1 $$; echo top:$?","stdout":"","stderr":"","status":1}
 {"id":"trap/own/errreturn-debug-in-function","script":"setopt err_return; trap 'false' DEBUG; f() { echo f; }; f; echo top:$?","stdout":"f\ntop:0\n","stderr":"","status":0}
@@ -634,12 +637,26 @@
 {"id":"trap/own/errreturn-trap-localloops","script":"setopt err_return localloops; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; echo f$i; done; echo after; }; for o in X Y; do echo o$o; f; echo s$o:$?; done; echo E:$?","stdout":"oX\nsX:0\noY\nsY:0\nE:0\n","stderr":"zsh:1: `break' active at end of function scope\nzsh:1: `break' active at end of function scope\n","status":0}
 {"id":"trap/own/errreturn-trap-own-loop","script":"setopt err_return; trap 'for j in 1 2; do false; echo t$j; done; echo tend' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
 {"id":"trap/own/errreturn-trap-rest","script":"setopt err_return; trap 'false; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/errreturn-trap-runs-no-zerr","script":"setopt err_return; trap 'echo Z' ZERR; trap 'false; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?","stdout":"f:0\ntop:0\n","stderr":"","status":0}
 {"id":"trap/own/errreturn-trap-top","script":"setopt err_return; trap 'false' USR1; kill -USR1 $$; echo top:$?","stdout":"","stderr":"","status":1}
 {"id":"trap/own/errreturn-zerr-in-function","script":"setopt err_return; trap 'false' ZERR; f() { false; echo f:$?; }; f; echo top:$?","stdout":"top:1\n","stderr":"","status":0}
 {"id":"trap/own/trapzerr-break","script":"TRAPZERR() { echo t; break; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\ne:1\n","stderr":"","status":0}
 {"id":"trap/own/trapzerr-break-errexit","script":"setopt errexit; TRAPZERR() { echo t; break; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\n","stderr":"","status":1}
 {"id":"trap/own/trapzerr-continue","script":"TRAPZERR() { echo t; continue; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\na2\nt\ne:1\n","stderr":"","status":0}
+{"id":"trap/own/zerr-after-signal-trap","script":"trap 'echo Z$?' ZERR; trap 'false' USR1; kill -USR1 $$; false; echo top:$?","stdout":"Z1\ntop:1\n","stderr":"","status":0}
 {"id":"trap/own/zerr-break-on-return","script":"trap 'echo t; break' ZERR; f() { return 2; }; for i in 1 2; do echo a$i; f; echo b$i; done; echo e:$?","stdout":"a1\nt\nb1\na2\nt\nb2\ne:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-cmdsub-in-signal-trap","script":"trap 'echo Z$?' ZERR; trap 'x=$(false; echo s); echo t2:$x' USR1; kill -USR1 $$; echo top:$?","stdout":"t2:s\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-debug-trap","script":"trap 'echo Z$?' ZERR; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { false; echo d; }; :' DEBUG; : hit; echo top:$?","stdout":"d\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-exit-trap","script":"trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; echo top","stdout":"top\nx\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-exit-trap-from-exit","script":"trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; exit 0","stdout":"x\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-job-from-signal-trap","script":"trap 'echo Z$?' ZERR; trap '{ false; echo s; } &' USR1; kill -USR1 $$; wait; echo top:$?","stdout":"s\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-signal-trap","script":"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo top:$?","stdout":"t2\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-signal-trap-errexit","script":"setopt errexit; trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo top:$?","stdout":"","stderr":"","status":1}
+{"id":"trap/own/zerr-in-signal-trap-function","script":"trap 'echo Z$?' ZERR; g() { false; echo g; }; trap 'g; echo t2' USR1; kill -USR1 $$; echo top:$?","stdout":"g\nt2\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-signal-trap-in-function","script":"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR2; f() { kill -USR2 $$; echo f; }; f; echo top:$?","stdout":"t2\nf\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-subshell-after-signal-trap","script":"trap 'echo Z$?' ZERR; trap ':' USR1; kill -USR1 $$; ( false; echo s ); echo top:$?","stdout":"Z1\ns\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-subshell-in-signal-trap","script":"trap 'echo Z$?' ZERR; trap '(false; echo s); echo t2' USR1; kill -USR1 $$; echo top:$?","stdout":"s\nt2\ntop:0\n","stderr":"","status":0}
+{"id":"trap/own/zerr-in-zerr-trap","script":"trap 'false; echo Z$?' ZERR; false; echo top:$?","stdout":"Z1\ntop:1\n","stderr":"","status":0}
 {"id":"trap/sig/for/break/2","script":"trap 'break 2' USR1; for o in X Y; do echo o$o; for i in 1 2; do echo a$i; kill -USR1 $$; echo b$i:$?; done; echo e:$?; echo c$o:$?; done; echo E:$?","stdout":"oX\na1\nE:0\n","stderr":"","status":0}
 {"id":"trap/sig/for/break/none","script":"trap 'break' USR1; for i in 1 2; do echo a$i; kill -USR1 $$; echo b$i:$?; done; echo e:$?","stdout":"a1\ne:0\n","stderr":"","status":0}
 {"id":"trap/sig/for/continue/2","script":"trap 'continue 2' USR1; for o in X Y; do echo o$o; for i in 1 2; do echo a$i; kill -USR1 $$; echo b$i:$?; done; echo e:$?; echo c$o:$?; done; echo E:$?","stdout":"oX\na1\noY\na1\nE:0\n","stderr":"","status":0}

@@ -209,6 +209,11 @@ pub struct VprocZsh {
 	/// `filelist`). A subshell starts without.
 	#[serde(default)]
 	pub tempfiles:          Vec<(u32, BString)>,
+	/// zsh `intrap` a fork keeps: the shell that forked this vproc (or an
+	/// ancestor) was running a trap action, so no ZERR or DEBUG trap runs
+	/// here ([`super::exec::zsh_in_trap`]).
+	#[serde(default)]
+	pub in_trap:            bool,
 	/// The code (and line) of a glob's shell-code qualifier to run above
 	/// the op that returned [`Flow::Call`](super::exec::Flow::Call) for it
 	/// (zsh `qualsheval`); pushed by the run loop, which drops it when the
@@ -243,6 +248,7 @@ impl VprocZsh {
 			&& self.zexit.is_none()
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
+			&& !self.in_trap
 			&& self.glob_hook.is_none()
 	}
 }
