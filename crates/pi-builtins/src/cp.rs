@@ -3751,10 +3751,12 @@ mod tests {
 	/// cp 9.4 and 9.7 do (`failed to clone 'b' from 'a': ` and its error
 	/// text), and leaves no `b` behind: in one directory, whatever `FICLONE`
 	/// answers there (a clone on XFS or btrfs, "Operation not supported" on
-	/// tmpfs, ext4 or an overlayfs that cannot clone), and from `/dev/shm`
-	/// into the temporary directory where they are two filesystems, "Invalid
-	/// cross-device link" on Linux (gVisor answers "Operation not supported"
-	/// to every clone, and GNU cp prints that there).
+	/// tmpfs, ext4 or an overlayfs that cannot clone), from `/dev/shm` into
+	/// the temporary directory where they are two filesystems, "Invalid
+	/// cross-device link" on Linux, and from `/dev/null`, which GNU cp tries
+	/// to clone too rather than copy (gVisor answers "Operation not
+	/// supported" to every clone, and GNU cp prints that there). An existing
+	/// `b` keeps its data, where GNU cp has truncated it.
 	#[test]
 	#[cfg(target_os = "linux")]
 	fn reflink_always_reports_the_clones_own_answer() {
@@ -3763,16 +3765,19 @@ mod tests {
 		let fixture = tempdir().unwrap();
 		fs::write(fixture.path().join("a"), b"A").unwrap();
 		let shm = tempfile::tempdir_in("/dev/shm").ok();
-		let mut sources = vec![("one directory", fixture.path().join("a"))];
+		let mut sources = vec![
+			("one directory", fixture.path().join("a"), &b"A"[..]),
+			("a character device", std::path::PathBuf::from("/dev/null"), &b""[..]),
+		];
 		let device = |path: &std::path::Path| fs::metadata(path).unwrap().dev();
 		match &shm {
 			Some(shm) if device(shm.path()) != device(fixture.path()) => {
 				fs::write(shm.path().join("a"), b"A").unwrap();
-				sources.push(("two filesystems", shm.path().join("a")));
+				sources.push(("two filesystems", shm.path().join("a"), &b"A"[..]));
 			},
 			_ => eprintln!("skipped: /dev/shm and the temporary directory are not two filesystems"),
 		}
-		for (case, source) in sources {
+		for (case, source, data) in sources {
 			// What `FICLONE` answers for this pair, asked on a probe file.
 			let probe = fixture.path().join("probe");
 			let answer = pi_iso::cow::clone_open(
@@ -3781,22 +3786,31 @@ mod tests {
 			);
 			fs::remove_file(&probe).unwrap();
 			let shown = if case == "one directory" { "a".to_owned() } else { source.display().to_string() };
-			let (code, capture) = run_util::<Cp>(&["--reflink=always", &shown, "b"], "", fixture.path());
-			eprintln!("{case}: cp exits {code}: {:?}", capture.err());
 			let dest = fixture.path().join("b");
-			match answer {
-				Ok(()) => {
-					assert_eq!((code, capture.err()), (0, String::new()), "{case}");
-					assert_eq!(fs::read(&dest).unwrap(), b"A", "{case}");
-				},
-				Err(error) => {
-					let message =
-						format!("cp: failed to clone 'b' from '{shown}': {}\n", crate::host::strip_errno(&error));
-					assert_eq!((code, capture.err()), (1, message), "{case}");
-					assert!(!dest.exists(), "{case}: the failed clone left b");
-				},
+			for existing in [None, Some(&b"old"[..])] {
+				let case = if existing.is_some() { format!("{case}, onto an existing b") } else { case.to_owned() };
+				if let Some(old) = existing {
+					fs::write(&dest, old).unwrap();
+				}
+				let (code, capture) = run_util::<Cp>(&["--reflink=always", &shown, "b"], "", fixture.path());
+				eprintln!("{case}: cp exits {code}: {:?}", capture.err());
+				match &answer {
+					Ok(()) => {
+						assert_eq!((code, capture.err()), (0, String::new()), "{case}");
+						assert_eq!(fs::read(&dest).unwrap(), data, "{case}");
+					},
+					Err(error) => {
+						let message =
+							format!("cp: failed to clone 'b' from '{shown}': {}\n", crate::host::strip_errno(error));
+						assert_eq!((code, capture.err()), (1, message), "{case}");
+						match existing {
+							None => assert!(!dest.exists(), "{case}: the failed clone left b"),
+							Some(old) => assert_eq!(fs::read(&dest).unwrap(), old, "{case}: b lost its data"),
+						}
+					},
+				}
+				let _ = fs::remove_file(&dest);
 			}
-			let _ = fs::remove_file(&dest);
 		}
 	}
 
