@@ -1028,8 +1028,10 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							}
 
 							// The empty-response resend reads the model-call guards right before it goes out, after
-							// its backoff, as each `fetchWithRetry` attempt above does.
+							// its backoff, as each `fetchWithRetry` attempt above does. The output is reset only after
+							// the read, so a held resend ends with what the first answer streamed (its usage).
 							assertModelCallAllowed(model);
+							resetOutput();
 							currentResponse = await (options?.fetch ?? fetch)(requestUrl, {
 								method: "POST",
 								headers: requestHeaders,
@@ -1067,10 +1069,6 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						// burns another full reasoning pass; let session recovery add
 						// an explicit final-output reminder instead.
 						if (thoughtOnly) break;
-
-						if (emptyAttempt < MAX_EMPTY_STREAM_RETRIES) {
-							resetOutput();
-						}
 					}
 
 					if (output.stopReason === "aborted" || output.stopReason === "error") {

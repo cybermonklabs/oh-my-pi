@@ -170,7 +170,8 @@ it("resumes from the latest replay-safe checkpoint after an incomplete stream", 
 
 // The retry from a checkpoint sends again after its backoff. Each request reads the model-call guards right
 // before it opens, after the backoff and the `onPayload` hooks, so a hold that begins in either holds the retry.
-// The held call ends with the output the first request streamed, as a failed send does.
+// The held call ends with the output the first request streamed, as a failed send does, and closes the text
+// block that request left open.
 it.each([
 	["holds the checkpoint retry when a model-call hold begins during its backoff", "backoff", 1],
 	["holds the checkpoint retry when a model-call hold begins in its onPayload hook", "onPayload", 1],
@@ -211,7 +212,7 @@ it.each([
 	});
 
 	try {
-		const result = await streamCursor(model, context, {
+		const response = streamCursor(model, context, {
 			apiKey: "not-a-secret",
 			providerRetryWait: async () => {
 				if (holdIn === "backoff") held = true;
@@ -222,8 +223,16 @@ it.each([
 				if (payloads === 2 && holdIn === "onPayload") held = true;
 				return undefined;
 			},
-		}).result();
+		});
+		const eventTypes: string[] = [];
+		for await (const event of response) eventTypes.push(event.type);
+		const result = await response.result();
 		const text = result.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+		// Every text block the call opened is closed before it ends.
+		expect(eventTypes.filter(type => type === "text_end")).toHaveLength(
+			eventTypes.filter(type => type === "text_start").length,
+		);
+		expect(eventTypes.filter(type => type === "text_start").length).toBeGreaterThan(0);
 
 		expect(requestCount).toBe(expectedRequests);
 		if (holdIn === "none") {

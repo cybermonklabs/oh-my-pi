@@ -141,7 +141,10 @@ export function guardModelCall(
  * stream retry, HTTP/1 and wire-model fallbacks, after their `onPayload` hooks and proxy tunnel), each
  * GitLab Duo workflow socket run, each pass of the Anthropic provider's retry loop, and pi-agent's remote
  * compaction. A transport not named here reads them once, when its call starts. A send this read holds
- * still ends the call with an error that names `cyber_policy`, keeping the output streamed before it, and
+ * still ends the call with an error that carries the hold's reason (for the session's hold, it names
+ * `cyber_policy`; GitLab Duo's goal-overflow rewrite leaves it as it is). The held call keeps the output
+ * streamed before it, its open blocks closed: a held Google or Gemini CLI empty-response resend keeps the
+ * first answer (its thinking and usage), because the output is reset for the resend only after the read.
  * {@link guardModelCall} reports that final message to its guards like any other; the guards tell it apart
  * from OpenAI's own refusal and do not record it.
  */

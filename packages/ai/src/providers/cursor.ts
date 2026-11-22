@@ -2222,12 +2222,14 @@ function streamCursorWithWireMode(
 			// them here settles their live cards and pairs the server-owned calls
 			// (`connect_scm`, native todo) that nothing else answers — an
 			// unpaired call is stripped from every rebuilt transcript.
-			// Undefined only when the failure predates the state's construction,
-			// in which case no block was ever opened.
-			if (openBlockState) {
-				endCurrentTextBlock(output, stream, openBlockState);
-				endCurrentThinkingBlock(output, stream, openBlockState);
-				flushOpenToolCalls(output, stream, openBlockState);
+			// A resend that fails before its state is built (a model-call hold right before it opens) still owns
+			// the blocks the earlier request left open: they arrive in `retryContext.blockState`. Undefined only on
+			// a first request that failed before its state was built, when no block was ever opened.
+			const blocksToClose = openBlockState ?? retryContext?.blockState;
+			if (blocksToClose) {
+				endCurrentTextBlock(output, stream, blocksToClose);
+				endCurrentThinkingBlock(output, stream, blocksToClose);
+				flushOpenToolCalls(output, stream, blocksToClose);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			// #8345/#15830: a server-side per-conversation rejection (a bare
