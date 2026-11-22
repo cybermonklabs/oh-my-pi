@@ -5,6 +5,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import * as natives from "@oh-my-pi/pi-natives";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -21,8 +22,8 @@ import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 //
 // The failure comes from the REAL persistence path, not a mocked error: a
 // file-backed SessionManager materializes a genuine session file, then its
-// directory is replaced by a regular file, so every real write fails, the
-// manager latches the failure, and the real dispose()/close() rethrows it into
+// directory is replaced by a regular file, so every real write fails, and an
+// entry the store never took makes the real dispose()/close() reject into
 // shutdown(). (A file another writer appended to no longer fails: the session
 // moves to a sibling file, covered by the SessionManager freshness tests.)
 describe("InteractiveMode shutdown when the session store keeps failing (#12238)", () => {
@@ -94,9 +95,15 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 		await Bun.write(sessionDir, BLOCKER);
 
 		// Any real full-body rewrite (compaction, branch, entry discard, title
-		// repair) now fails; the manager latches the failure and the close()
-		// inside dispose() rethrows it, with no mocked error construction.
+		// repair) now fails, and the manager latches the failure. A latched
+		// failure that cost no entry does not fail a close, so the test also
+		// makes the write the close must report: an entry the store refuses. It
+		// does not lean on the session-exit entry dispose() appends, which a
+		// postmortem exit pass that already ran in this process (another test
+		// file's) records at once, when the session is built.
 		await sessionManager.rewriteEntries().catch(() => undefined);
+		sessionManager.appendMessage({ role: "user", content: "the store refuses this", timestamp: Date.now() });
+		await sessionManager.flush().catch(() => undefined);
 
 		quitCalled = Promise.withResolvers<void>();
 		quitSpy = vi.spyOn(postmortem, "quit").mockImplementation(async () => {
@@ -168,7 +175,20 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 	});
 
 	it("a failed restart arms the same single-Ctrl+C escape hatch", async () => {
+		// Stop at the process replacement boundary. A restart whose teardown did not fail relaunches the CLI in
+		// this process's place (execReplace) or as a child on its stdio (Bun.spawn), which ends or takes over the
+		// test run; here it fails this test instead.
+		const exec = vi.spyOn(natives, "execReplace").mockImplementation(() => undefined as never);
+		const spawn = vi.spyOn(Bun, "spawn").mockReturnValue({ exited: Promise.resolve(0) } as never);
+		const cleanup = vi.spyOn(postmortem, "cleanup").mockResolvedValue();
+		vi.spyOn(postmortem, "drainStdout").mockResolvedValue();
+
 		await mode.restart();
+		// The failed teardown returns before any of the relaunch.
+		expect(exec).not.toHaveBeenCalled();
+		expect(spawn).not.toHaveBeenCalled();
+		expect(cleanup).not.toHaveBeenCalled();
+		expect(mode.teardownFailed).toBe(true);
 		quitSpy.mockClear();
 
 		mode.lastSigintTime = 0;
