@@ -870,7 +870,8 @@ struct Run<'a> {
 
 impl Run<'_> {
 	/// The cwd-relative fs path for a metafied path. Keep an empty path
-	/// empty: `answer` joins it to the cwd without an artificial `.` component.
+	/// empty: `answer` lists the cwd for it without an artificial `.`
+	/// component, and its stat fails, as zsh's `stat("")` does.
 	fn fspath(p: &[u8]) -> BString {
 		BString::from(unmetafy(p))
 	}

@@ -114,7 +114,9 @@ pub trait FsPending<T>: Send {
 /// and resolves `..` logically unless `set -P`). A `scheme://` name (an RFC
 /// 3986 scheme of two or more characters) counts as absolute and reaches the
 /// filesystem as written, relative names under such a working directory join
-/// it with `/` ([`url_root_len`]).
+/// it with `/` ([`url_root_len`]). An empty path (an empty word: `< ""`)
+/// names no file: every operation on it fails with `NotFound` (`ENOENT`), as
+/// the kernel's do.
 ///
 /// Device paths (`/dev/null`, `/dev/fd/N`, `/dev/tcp/…`, host devices) are
 /// ordinary [`Fs::open`] results with the matching [`FileKind`].
