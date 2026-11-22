@@ -18,6 +18,8 @@
 pub mod error;
 pub mod git;
 pub mod jj;
+#[cfg(all(test, unix))]
+mod testprog;
 pub mod types;
 
 use std::{

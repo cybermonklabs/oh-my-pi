@@ -314,13 +314,13 @@ fn missing_program_fails_with_not_found_on_both_paths() {
 
 /// A script without `#!` cannot be exec'd: the spawn must fail with the
 /// kernel's ENOEXEC intact, so the host can run it in-engine as bash does.
+/// [`crate::testprog`] writes the script from a child, so no fork by another
+/// test's thread holds it open for writing (which fails the spawn with
+/// ETXTBSY instead).
 #[test]
 fn shebang_less_script_fails_with_enoexec_on_both_paths() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let path = std::env::temp_dir().join(format!("obash-noexec-{}", std::process::id()));
-	std::fs::write(&path, b"echo inscript $1\n").unwrap();
-	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&path, "echo inscript $1\n");
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = vec![BString::from(path.as_os_str().as_encoded_bytes()), BString::from("arg")];
