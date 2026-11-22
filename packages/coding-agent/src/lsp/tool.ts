@@ -125,14 +125,35 @@ interface FileRenamePair {
 	newUri: string;
 }
 
+/** A directory entry whose type the filesystem did not report (some report none). */
+function isUntyped(entry: fs.Dirent): boolean {
+	return !(
+		entry.isFile() ||
+		entry.isDirectory() ||
+		entry.isSymbolicLink() ||
+		entry.isFIFO() ||
+		entry.isSocket() ||
+		entry.isBlockDevice() ||
+		entry.isCharacterDevice()
+	);
+}
+
 /**
  * Enumerate the {oldUri, newUri} pairs needed for an LSP willRenameFiles/didRenameFiles request.
  * For files this is a single pair. For directories this walks every regular file underneath
  * and produces a parallel pair anchored at the new directory root.
+ *
+ * The walk follows no symbolic link: it reads each directory with `readdir(…, { withFileTypes:
+ * true })` and goes into directory entries only (an entry with no type is a directory only if
+ * `lstat` says so). A link moves with the directory as itself, and nothing behind it is listed.
+ * Without links the walk cannot loop (an entry has one parent, a directory cannot be hard-linked,
+ * and mounts nest as a finite tree), so it reads each directory of the tree once, and it stops
+ * once it has more files than it may list. It checks `signal` before each directory it reads.
  */
 async function enumerateRenamePairs(
 	source: string,
 	dest: string,
+	signal: AbortSignal | undefined,
 ): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded: boolean }> {
 	const stat = await fs.promises.stat(source);
 	if (!stat.isDirectory()) {
@@ -142,20 +163,28 @@ async function enumerateRenamePairs(
 			exceeded: false,
 		};
 	}
-	const entries = await fs.promises.readdir(source, { recursive: true, withFileTypes: true });
 	const pairs: FileRenamePair[] = [];
-	for (const entry of entries) {
-		if (!entry.isFile()) continue;
-		if (pairs.length >= MAX_RENAME_PAIRS) {
-			return { pairs, directory: true, exceeded: true };
+	// The directories to read, relative to `source` ("" is `source`).
+	const directories = [""];
+	for (let next = 0; next < directories.length; next++) {
+		throwIfAborted(signal);
+		const relative = directories[next];
+		for (const entry of await fs.promises.readdir(path.join(source, relative), { withFileTypes: true })) {
+			const rel = path.join(relative, entry.name);
+			const kind = isUntyped(entry) ? await fs.promises.lstat(path.join(source, rel)) : entry;
+			if (kind.isDirectory()) {
+				directories.push(rel);
+				continue;
+			}
+			if (!kind.isFile()) continue;
+			if (pairs.length >= MAX_RENAME_PAIRS) {
+				return { pairs, directory: true, exceeded: true };
+			}
+			pairs.push({
+				oldUri: fileToUri(path.join(source, rel)),
+				newUri: fileToUri(path.join(dest, rel)),
+			});
 		}
-		const parent = entry.parentPath ?? source;
-		const absOld = path.join(parent, entry.name);
-		const rel = path.relative(source, absOld);
-		pairs.push({
-			oldUri: fileToUri(absOld),
-			newUri: fileToUri(path.join(dest, rel)),
-		});
 	}
 	return { pairs, directory: true, exceeded: false };
 }
@@ -589,7 +618,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
-			const enumerated = await enumerateRenamePairs(source, dest);
+			const enumerated = await enumerateRenamePairs(source, dest, signal);
 			if (enumerated.exceeded) {
 				return {
 					content: [

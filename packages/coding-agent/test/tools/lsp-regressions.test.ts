@@ -3903,6 +3903,199 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	/**
+	 * `rename_file` of `old` to `new` under `root`, with a fake language server that answers every
+	 * request with nothing. Resolves with the call's outcome (its result, or what it threw) and the
+	 * paths, relative to `root`, that the server's `workspace/willRenameFiles` request named; or with
+	 * "pending" if the call has not settled 10 s after it started.
+	 */
+	async function renameDirectory(
+		root: string,
+		signal?: AbortSignal,
+	): Promise<{ outcome: unknown; renamed: string[] }> {
+		const server: ServerConfig = { command: "test-lsp", fileTypes: ["ts"], rootMarkers: [] };
+		const client: LspClient = {
+			name: "test-lsp",
+			cwd: root,
+			config: server,
+			proc: {
+				stdin: { write() {}, flush: async () => {} },
+			} as unknown as LspClient["proc"],
+			requestId: 0,
+			diagnostics: new Map(),
+			publishedDiagnostics: new Map(),
+			pulledDiagnostics: new Map(),
+			diagnosticsVersion: 0,
+			openFiles: new Map(),
+			pendingRequests: new Map(),
+			isReading: false,
+			status: "ready",
+			lastActivity: Date.now(),
+			writeQueue: Promise.resolve(),
+			activeProgressTokens: new Set(),
+			projectLoaded: Promise.resolve(),
+			resolveProjectLoaded: () => {},
+		};
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: { "test-lsp": server }, idleTimeoutMs: undefined });
+		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+		const renamed: string[] = [];
+		vi.spyOn(lspClient, "sendRequest").mockImplementation(async (_client, method, params) => {
+			if (method === "workspace/willRenameFiles") {
+				for (const file of (params as { files: Array<{ oldUri: string }> }).files) {
+					renamed.push(path.relative(root, uriToFile(file.oldUri)));
+				}
+			}
+			return null;
+		});
+		vi.spyOn(lspClient, "sendNotification").mockResolvedValue();
+		const call = new LspTool(makeLspSession(root))
+			.execute(
+				"rename-links-test",
+				{ action: "rename_file", file: path.join(root, "old"), new_name: path.join(root, "new"), timeout: 5 },
+				signal,
+			)
+			.then(
+				result => result,
+				(error: unknown) => error,
+			);
+		const outcome = await Promise.race([call, Bun.sleep(10_000).then(() => "pending")]);
+		return { outcome, renamed: renamed.sort() };
+	}
+
+	it("rename_file of a directory holding a link to its own directory renames it", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-self-link-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			fs.mkdirSync(srcDir);
+			fs.writeFileSync(path.join(srcDir, "a.ts"), "export const a = 1;\n");
+			fs.symlinkSync(".", path.join(srcDir, "loop"));
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamed).toEqual(["old/a.ts"]);
+			expect(fs.existsSync(srcDir)).toBe(false);
+			expect(fs.readlinkSync(path.join(tempDir.path(), "new", "loop"))).toBe(".");
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	// A walk that follows the links finds 2^n paths at depth n and does not end: the call would still
+	// be listing, its memory growing, when the race gives up at 10 s.
+	it("rename_file of a directory holding two links to its own directory ends at once", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-two-self-links-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			fs.mkdirSync(srcDir);
+			fs.writeFileSync(path.join(srcDir, "a.ts"), "export const a = 1;\n");
+			fs.symlinkSync(".", path.join(srcDir, "l1"));
+			fs.symlinkSync(".", path.join(srcDir, "l2"));
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamed).toEqual(["old/a.ts"]);
+			expect(fs.existsSync(srcDir)).toBe(false);
+		} finally {
+			tempDir.removeSync();
+		}
+	}, 20_000);
+
+	it("rename_file of a directory holding a link out of it names no file behind the link", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-outside-link-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			const behind = path.join(tempDir.path(), "ext", "e.ts");
+			for (const file of [path.join(srcDir, "a.ts"), behind]) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, "export const a = 1;\n");
+			}
+			fs.symlinkSync("../ext", path.join(srcDir, "link"));
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamed).toEqual(["old/a.ts"]);
+			expect(fs.existsSync(behind)).toBe(true);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("rename_file of a directory whose entries have no type goes into directories, and never through a link", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-untyped-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			for (const file of [
+				path.join(srcDir, "a.ts"),
+				path.join(srcDir, "sub", "b.ts"),
+				path.join(tempDir.path(), "ext", "e.ts"),
+			]) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, "export const a = 1;\n");
+			}
+			fs.symlinkSync("../ext", path.join(srcDir, "link"));
+			// XFS made without ftype, and some FUSE and network filesystems, report no entry types.
+			const untyped = (name: string) => ({
+				name,
+				isFile: () => false,
+				isDirectory: () => false,
+				isSymbolicLink: () => false,
+				isFIFO: () => false,
+				isSocket: () => false,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+			});
+			// The tool calls `fs.promises.readdir`, which a spy on `node:fs/promises` does not reach.
+			const realReaddir = fs.promises.readdir;
+			let reads = 0;
+			vi.spyOn(fs.promises, "readdir").mockImplementation((async (...args: unknown[]) => {
+				reads++;
+				const entries: Array<string | fs.Dirent> = await Reflect.apply(realReaddir, fs.promises, args);
+				return entries.map(entry => (typeof entry === "string" ? entry : untyped(entry.name)));
+			}) as never);
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+			expect(reads).toBeGreaterThan(0);
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamed).toEqual(["old/a.ts", "old/sub/b.ts"]);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("rename_file of a directory stops listing it at the call's abort", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-aborted-listing-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			for (const file of [path.join(srcDir, "a.ts"), path.join(srcDir, "sub", "b.ts")]) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, "export const a = 1;\n");
+			}
+			// The call is aborted once `old` has been read, before `old/sub` is.
+			const controller = new AbortController();
+			const read: string[] = [];
+			const realReaddir = fs.promises.readdir;
+			vi.spyOn(fs.promises, "readdir").mockImplementation((async (...args: unknown[]) => {
+				read.push(path.relative(tempDir.path(), String(args[0])));
+				const entries = await Reflect.apply(realReaddir, fs.promises, args);
+				if (args[0] === srcDir) controller.abort();
+				return entries;
+			}) as never);
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path(), controller.signal);
+
+			expect(outcome).toBeInstanceOf(ToolAbortError);
+			expect(read).toEqual(["old"]);
+			expect(renamed).toEqual([]);
+			expect(fs.existsSync(srcDir)).toBe(true);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
 	it("request action distinguishes auto-built document params from explicit JSON null", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-request-");
 		try {

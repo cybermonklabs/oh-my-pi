@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `lsp` `rename_file` of a directory no longer follows the symbolic links in it while it lists the files to tell the language servers about. A link to the directory itself failed the rename with ELOOP, two such links kept it listing for seconds before ELOOP, and the files behind a link out of the directory were named as renamed. It now lists the directory itself, goes into directories only, and stops at the call's abort or deadline.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
