@@ -38,20 +38,19 @@ class FakeLiveSession implements RpcLiveSession {
 	}
 }
 
-function harness(levelsIntervalMs = 40) {
+function harness(levelsIntervalMs = 40, startRefusal?: () => string | undefined) {
 	const frames: RpcLiveFrame[] = [];
 	const sessions: FakeLiveSession[] = [];
 	const agentSession = { settings: Settings.isolated({ "live.voice": "sol" }) } as unknown as AgentSession;
-	const bridge = new RpcLiveBridge(
-		agentSession,
-		frame => frames.push(frame),
-		options => {
+	const bridge = new RpcLiveBridge(agentSession, frame => frames.push(frame), {
+		createSession: options => {
 			const fake = new FakeLiveSession(options);
 			sessions.push(fake);
 			return fake;
 		},
 		levelsIntervalMs,
-	);
+		startRefusal,
+	});
 	return { bridge, frames, sessions };
 }
 
@@ -119,6 +118,35 @@ describe("RpcLiveBridge", () => {
 		await expect(starting).rejects.toThrow("no auth");
 		expect(bridge.active).toBe(false);
 		expect(frames.at(-1)).toEqual({ type: "live_end" });
+	});
+
+	test("a start the host refuses (dictation running, session changing) opens no session", async () => {
+		let refusal: string | undefined = "End dictation before starting live voice";
+		const { bridge, sessions } = harness(40, () => refusal);
+		await expect(bridge.start()).rejects.toThrow("End dictation before starting live voice");
+		expect(sessions).toEqual([]);
+		expect(bridge.status()).toEqual({ state: "off" });
+		refusal = undefined;
+		const starting = bridge.start();
+		sessions[0]!.started.resolve();
+		await starting;
+		expect(sessions).toHaveLength(1);
+	});
+
+	test("status reports a call as starting, then open with its provider and voice, then off", async () => {
+		const { bridge, sessions } = harness();
+		expect(bridge.status()).toEqual({ state: "off" });
+		const starting = bridge.start({ voice: "cove" });
+		expect(bridge.status()).toMatchObject({ state: "starting", provider: "codex", voice: "cove", muted: false });
+		sessions[0]!.started.resolve();
+		await starting;
+		const open = bridge.status();
+		expect(open).toMatchObject({ state: "open", provider: "codex", voice: "cove" });
+		expect(open.state !== "off" && open.since).toBeInstanceOf(Date);
+		bridge.setMuted(true);
+		expect(bridge.status()).toMatchObject({ muted: true });
+		await bridge.stop();
+		expect(bridge.status()).toEqual({ state: "off" });
 	});
 
 	test("an sdpOffer session reaches the controller and resolves with its SDP answer", async () => {
@@ -278,6 +306,79 @@ describe("live commands over RPC", () => {
 				voice: "sol",
 				instructions: "Hey {{firstName}}",
 			});
+		} finally {
+			child.kill();
+			await child.exited;
+			await stderr;
+			await removeWithRetries(dir);
+		}
+	}, 60_000);
+
+	test("/live on|off|status typed through sendUserInput run at once during a turn and answer in one line", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-live-typed-"));
+		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "live-rpc-agent.ts")], {
+			cwd: dir,
+			// Each model turn runs 20 s, so every command below arrives while the first turn runs.
+			env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_NO_TITLE: "1", OMP_LIVE_TURN_MS: "20000" },
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stderr = new Response(child.stderr).text();
+		const lines = readLines(child.stdout, AbortSignal.timeout(30_000));
+		const decoder = new TextDecoder();
+		const seen: Record<string, unknown>[] = [];
+		const receive = async (): Promise<Record<string, unknown>> => {
+			const line = await lines.next();
+			if (line.done) throw new Error(`RPC agent ended: ${await stderr}`);
+			const frame = JSON.parse(decoder.decode(line.value)) as Record<string, unknown>;
+			seen.push(frame);
+			return frame;
+		};
+		let id = 0;
+		const send = async (fields: object): Promise<void> => {
+			child.stdin.write(`${JSON.stringify({ ...fields, id: String(++id) })}\n`);
+			await child.stdin.flush();
+		};
+		// What the bridge extension's `sendUserInput` answered for `text`, as pi-envoy would post it.
+		const typed = async (text: string): Promise<unknown> => {
+			await send({ type: "prompt", message: `/bridge ${text}`, streamingBehavior: "steer" });
+			for (;;) {
+				const frame = await receive();
+				if (frame.type === "extension_ui_request" && frame.method === "notify") {
+					return JSON.parse(String(frame.message));
+				}
+			}
+		};
+		try {
+			while ((await receive()).type !== "ready") {}
+			await send({ type: "prompt", message: "work for a while" });
+			while ((await receive()).type !== "agent_start") {}
+			seen.length = 0;
+
+			expect(await typed("/live status")).toEqual({ handled: "command", output: "No live call is open." });
+			const on = await typed("/live on");
+			expect(on).toEqual({ handled: "command", output: "Live call open: codex, voice sol." });
+			expect(seen).toContainEqual({ type: "command_output", text: "Live call open: codex, voice sol." });
+			expect(await typed("/live on")).toEqual({
+				handled: "command",
+				output: expect.stringMatching(/^A live call is already open \(since \S+Z\)\.$/),
+			});
+			expect(await typed("/live status")).toEqual({
+				handled: "command",
+				output: expect.stringMatching(/^Live call open since \S+Z: codex, voice sol, microphone on\.$/),
+			});
+			expect(await typed("/live off")).toEqual({ handled: "command", output: "Live call ended." });
+			expect(await typed("/live off")).toEqual({ handled: "command", output: "No live call is open." });
+			expect(await typed("/live louder")).toEqual({ handled: "command", output: "Usage: /live [on|off|status]" });
+			// The checks a live_start frame makes hold for typed input too.
+			await send({ type: "dictation_start", captureId: "c1" });
+			expect(await typed("/live on")).toEqual({
+				handled: "command",
+				output: "Live call did not start: End dictation before starting live voice",
+			});
+			// Every answer came while the first turn still ran.
+			expect(seen.some(frame => frame.type === "agent_end")).toBe(false);
 		} finally {
 			child.kill();
 			await child.exited;

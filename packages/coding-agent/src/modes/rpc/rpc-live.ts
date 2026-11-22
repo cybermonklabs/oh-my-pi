@@ -6,8 +6,9 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { toError } from "@oh-my-pi/pi-utils";
 import { LiveSessionController, type LiveSessionControllerOptions } from "../../live/controller";
-import { resolveLiveVoice } from "../../live/settings";
+import { cfgLiveProvider, resolveLiveVoice } from "../../live/settings";
 import type { AgentSession } from "../../session/agent-session";
+import type { LiveCallStatus, SlashCommandLiveHost } from "../../slash-commands/types";
 import type { RpcLiveFrame } from "./rpc-types";
 
 /** Minimum spacing between `live_levels` frames. */
@@ -33,6 +34,20 @@ export interface RpcLiveStartResult {
 	sdpAnswer?: string;
 }
 
+/** How the RPC host builds and gates the live sessions of its bridge. */
+export interface RpcLiveBridgeOptions {
+	/** Builds the controller for one live session; defaults to the real {@link LiveSessionController}. */
+	createSession?: RpcLiveSessionFactory;
+	/** Minimum spacing between `live_levels` frames. */
+	levelsIntervalMs?: number;
+	/**
+	 * Why the host cannot start a live session now (dictation records, the session is changing or
+	 * shutting down), or `undefined` when it can. Read at every start, from a `live_start` frame and
+	 * from a typed `/live on` alike.
+	 */
+	startRefusal?: () => string | undefined;
+}
+
 /** Visible assistant text: text blocks only, no thinking or tool calls. Shared with interactive mode. */
 export function extractVisibleAssistantText(message: AssistantMessage): string {
 	let text = "";
@@ -42,30 +57,29 @@ export function extractVisibleAssistantText(message: AssistantMessage): string {
 	return text.trim();
 }
 
-/** Owns at most one live session for an RPC server. */
-export class RpcLiveBridge {
+/** Owns at most one live session for an RPC server; `/live on|off|status` drives it as the host's live call. */
+export class RpcLiveBridge implements SlashCommandLiveHost {
 	readonly #session: AgentSession;
 	readonly #output: (frame: RpcLiveFrame) => void;
 	readonly #createSession: RpcLiveSessionFactory;
 	readonly #levelsIntervalMs: number;
+	readonly #startRefusal: () => string | undefined;
 
 	/** Set from construction until the controller has fully stopped (connecting, active, closing). */
 	#controller: RpcLiveSession | undefined;
+	/** The current session's provider, voice and start, and whether it has connected. */
+	#call: { provider: string; voice: string; since: Date; open: boolean } | undefined;
 	#closing: Promise<void> | undefined;
 	#pendingLevels: { input: number; output: number } | undefined;
 	#levelsTimer: NodeJS.Timeout | undefined;
 	#lastLevelsAt = Number.NEGATIVE_INFINITY;
 
-	constructor(
-		session: AgentSession,
-		output: (frame: RpcLiveFrame) => void,
-		createSession: RpcLiveSessionFactory = options => new LiveSessionController(options),
-		levelsIntervalMs = RPC_LIVE_LEVELS_INTERVAL_MS,
-	) {
+	constructor(session: AgentSession, output: (frame: RpcLiveFrame) => void, options: RpcLiveBridgeOptions = {}) {
 		this.#session = session;
 		this.#output = output;
-		this.#createSession = createSession;
-		this.#levelsIntervalMs = levelsIntervalMs;
+		this.#createSession = options.createSession ?? (sessionOptions => new LiveSessionController(sessionOptions));
+		this.#levelsIntervalMs = options.levelsIntervalMs ?? RPC_LIVE_LEVELS_INTERVAL_MS;
+		this.#startRefusal = options.startRefusal ?? (() => undefined);
 	}
 
 	/** Whether a session is connecting, active, or closing. */
@@ -76,6 +90,8 @@ export class RpcLiveBridge {
 	/** Connects a live session and resolves once it is recording (or, with `sdpOffer`, once the call is signaled). */
 	async start(options: RpcLiveStartOptions = {}): Promise<RpcLiveStartResult> {
 		if (this.#controller) throw new Error("A live session is already active");
+		const refusal = this.#startRefusal();
+		if (refusal) throw new Error(refusal);
 		const voice = resolveLiveVoice(this.#session.settings, options.voice);
 		let terminated = false;
 		const controller = this.#createSession({
@@ -109,12 +125,15 @@ export class RpcLiveBridge {
 			},
 		});
 		this.#controller = controller;
+		const call = { provider: cfgLiveProvider.get(this.#session.settings), voice, since: new Date(), open: false };
+		this.#call = call;
 		try {
 			await controller.start();
 		} catch (cause) {
 			await this.#retire(controller);
 			throw toError(cause);
 		}
+		call.open = true;
 		if (options.sdpOffer === undefined) return { voice };
 		const sdpAnswer = controller.sdpAnswer;
 		if (sdpAnswer === undefined) {
@@ -139,12 +158,27 @@ export class RpcLiveBridge {
 		return { muted: controller.muted };
 	}
 
+	/** The live call as `/live status` reports it. */
+	status(): LiveCallStatus {
+		const controller = this.#controller;
+		const call = this.#call;
+		if (!controller || !call || this.#closing) return { state: "off" };
+		return {
+			state: call.open ? "open" : "starting",
+			provider: call.provider,
+			voice: call.voice,
+			since: call.since,
+			muted: controller.muted,
+		};
+	}
+
 	/** Stops `controller` and releases the slot once it has fully stopped. Idempotent. */
 	#retire(controller: RpcLiveSession): Promise<void> {
 		if (this.#controller !== controller) return Promise.resolve();
 		this.#closing ??= controller.stop().finally(() => {
 			if (this.#controller !== controller) return;
 			this.#controller = undefined;
+			this.#call = undefined;
 			this.#closing = undefined;
 			// Levels never follow `live_end`.
 			clearTimeout(this.#levelsTimer);

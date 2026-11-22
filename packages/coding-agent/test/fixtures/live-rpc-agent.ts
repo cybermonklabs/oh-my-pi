@@ -27,6 +27,13 @@ const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 const runtime = new ExtensionRuntime();
 const extension = await loadExtensionFromFactory(
 	pi => {
+		// `/bridge <text>` forwards `<text>` as typed input, the way pi-envoy relays a Dispatch line, and
+		// reports what `sendUserInput` answered as a `notify` UI request.
+		pi.registerCommand("bridge", {
+			handler: async (args, ctx) => {
+				ctx.ui.notify(JSON.stringify(await pi.sendUserInput(args)));
+			},
+		});
 		pi.registerCommand("dictation-new-session", {
 			handler: async (_args, ctx) => {
 				await ctx.newSession();
@@ -66,7 +73,13 @@ const extension = await loadExtensionFromFactory(
 );
 const extensionRunner = new ExtensionRunner([extension], runtime, cwd, sessionManager, modelRegistry);
 const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-const mock = createMockModel({ provider: model.provider, id: model.id, handler: () => ({ content: ["Done"] }) });
+// `OMP_LIVE_TURN_MS` keeps each model turn running that long, so a test can type into a running turn.
+const turnMs = Number(process.env.OMP_LIVE_TURN_MS ?? 0);
+const mock = createMockModel({
+	provider: model.provider,
+	id: model.id,
+	handler: () => ({ content: ["Done"], delayMs: turnMs }),
+});
 const agent = new Agent({
 	getApiKey: () => "test-key",
 	initialState: { model, systemPrompt: ["Test"], tools: [] },
