@@ -692,13 +692,29 @@ function applyNameNotice(known: Set<string>, details: unknown): boolean {
 }
 
 /**
- * Applies a tool list pair of a settings notice's `details` ({@link SettingsNoticeDetails}) to the tools the notices
- * before it gave so: adds each tool `given` lists, then drops each `withdrawn` lists. A list that is not one of names
- * changes nothing.
+ * Applies the tool lists of a settings notice's `details` ({@link SettingsNoticeDetails}) to what the notices before it
+ * told, `disabled` (calls refused) and `enabled` (available after the rebuild), so the newest notice that names a tool
+ * decides its state: a tool it gives as disabled leaves `enabled`, one it gives as enabled leaves `disabled`, one that
+ * runs again leaves `disabled`, and one no longer enabled leaves `enabled`. A list that is not one of names changes
+ * nothing.
  */
-function applyToolLists(told: Set<string>, given: unknown, withdrawn: unknown): void {
-	if (isStringList(given)) for (const name of given) told.add(name);
-	if (isStringList(withdrawn)) for (const name of withdrawn) told.delete(name);
+function applyNoticeToolLists(disabled: Set<string>, enabled: Set<string>, details: Record<string, unknown>): void {
+	if (isStringList(details.disabledTools)) {
+		for (const name of details.disabledTools) {
+			disabled.add(name);
+			enabled.delete(name);
+		}
+	}
+	if (isStringList(details.reenabledTools)) for (const name of details.reenabledTools) disabled.delete(name);
+	if (isStringList(details.enabledTools)) {
+		for (const name of details.enabledTools) {
+			enabled.add(name);
+			disabled.delete(name);
+		}
+	}
+	if (isStringList(details.noLongerEnabledTools)) {
+		for (const name of details.noLongerEnabledTools) enabled.delete(name);
+	}
 }
 
 /** A context's custom messages by `customType`, each list in context order ({@link customMessagesByType}). */
@@ -4355,26 +4371,34 @@ export class SessionTools {
 	 * Rebuilds the stable base prompt for the current tools and model.
 	 * `commitIf` lets asynchronous producers discard a stale rebuild atomically
 	 * after its inputs have been superseded. With `settingsChange` on a bound
-	 * prompt the rebuild is held ({@link #holdSettingsRebuild}). With
+	 * prompt the rebuild is held ({@link #holdSettingsRebuild}), unless it
+	 * renders the kept restored transcript prompt's bytes: that prompt then
+	 * withholds nothing and settles ({@link #settleKeptRestoredPrompt}). With
 	 * `joinsHeldChange` while the base withholds a change (a settings rebuild
 	 * is held, or the restored transcript prompt is kept in place of this
 	 * process's own build), the rebuild is part of that change: its render
 	 * becomes the build the base stands in for ({@link #recordHeldSettingsBuild})
 	 * and goes out with the change, at the held rebuild or when the restored
-	 * prompt is released. Any other rebuild renders the live settings anyway, so
-	 * one that changes the prompt runs a held one with it; one that changes
-	 * nothing of its own (it renders the build the base stands in for again,
-	 * {@link #baseStandIn}) keeps the base and the hold.
+	 * prompt is released, or settles a kept restored prompt it reproduces. Any
+	 * other rebuild renders the live settings anyway, so one that changes the
+	 * prompt runs a held one with it; one that changes nothing of its own (it
+	 * renders the build the base stands in for again, {@link #baseStandIn})
+	 * keeps the base and the hold.
 	 */
 	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
-			if (this.#holdSettingsRebuild(options?.settingsChange)) {
+			const settingsChange = options?.settingsChange;
+			if (settingsChange && this.#promptBound && !this.#heldSettingsRebuild && this.#keptRestoredPrompt()) {
+				if (this.#settleKeptRestoredPrompt(await this.#prepareBaseSystemPrompt(commitIf))) return;
+			}
+			if (this.#holdSettingsRebuild(settingsChange)) {
 				await this.#recordHeldSettingsBuild();
 				return;
 			}
 			if (options?.joinsHeldChange && this.withholdsPromptChange) {
 				const render = await this.#prepareBaseSystemPrompt(commitIf);
-				if (render && commitIf?.() !== false) await this.#recordHeldSettingsBuild(render);
+				if (!render || commitIf?.() === false || this.#settleKeptRestoredPrompt(render)) return;
+				await this.#recordHeldSettingsBuild(render);
 				return;
 			}
 			const base = this.#baseSystemPrompt;
@@ -4462,9 +4486,11 @@ export class SessionTools {
 	 * only the prompt renders (`task.maxConcurrency`), starts no rebuild of its own, so without this the next request
 	 * would send the new definition, or the next rebuild that changes nothing else would send the new prompt. The
 	 * changes held are those the declarations move with ({@link #declarationMovers}) and those the prompt moves with
-	 * ({@link #promptMovers}); with none, nothing is held. A change of a setting the base's build did not read is
-	 * recorded first, for a later hold whose build renders it ({@link #recordUnreadChanges}). Before anything binds the
-	 * prompt, a change of a setting its build read rebuilds it at once instead ({@link #rebuildUnboundPrompt}).
+	 * ({@link #promptMovers}); with none, nothing is held, and a render of the change that reproduces the kept
+	 * restored transcript prompt settles it ({@link #settleKeptRestoredPrompt}). A change of a setting the base's build
+	 * did not read is recorded first, for a later hold whose build renders it ({@link #recordUnreadChanges}). Before
+	 * anything binds the prompt, a change of a setting its build read rebuilds it at once instead
+	 * ({@link #rebuildUnboundPrompt}).
 	 */
 	holdToolDeclarationChange(settingsChange: readonly SettingChange[]): Promise<void> {
 		this.#recordUnreadChanges(settingsChange);
@@ -4484,7 +4510,11 @@ export class SessionTools {
 					settingsChange.filter(change => !declarations.movers.includes(change)),
 				);
 				const movers = [...declarations.movers, ...prompt.movers];
-				if (movers.length === 0 || !this.#holdSettingsRebuild(movers)) return;
+				if (movers.length === 0) {
+					this.#settleKeptRestoredPrompt(prompt.render);
+					return;
+				}
+				if (!this.#holdSettingsRebuild(movers)) return;
 				await this.#recordHeldSettingsBuild(prompt.render, prompt.surfaceRead);
 			}),
 		);
@@ -4718,6 +4748,41 @@ export class SessionTools {
 	}
 
 	/**
+	 * Commits `render`, a build of this process's, when it has the bytes of the kept restored transcript prompt while
+	 * no settings rebuild is held, and returns whether it did. This process's own build then reproduces that prompt,
+	 * which withholds nothing from it, so the change that rendered it holds nothing and no notice names a value the
+	 * prompt was not written under: the commit settles the restored prompt, or keeps it while it holds settings the
+	 * settings notice still puts right ({@link #committedBase}, {@link #settleRestoredPrompt}). A render that keeps the
+	 * base ({@link #keptBasePreparation}) renders the build the base stands in for again, so it reproduces nothing.
+	 */
+	#settleKeptRestoredPrompt(render: SystemPromptPreparation | undefined): boolean {
+		const restored = this.#keptRestoredPrompt();
+		if (!render || !restored || this.#heldSettingsRebuild || render.systemPrompt === restored.base) return false;
+		return sameItems(render.systemPrompt, restored.base) && render.commit?.() === true;
+	}
+
+	/**
+	 * Settles the kept restored transcript prompt when this process's own build, with the reused first-turn recall
+	 * `recall` as a system block after it as the transcript's first turn sent it (as
+	 * {@link buildSystemPromptForAgentStart} appends a fresh recall), reproduces that prompt while no settings rebuild
+	 * is held and the prompt holds no setting ({@link #committedBase}). That build, the one the prompt stands in for
+	 * ({@link #baseStandIn}) with `recall` after it, becomes the base as this process's own: the restored prompt is
+	 * dropped at the next reply ({@link #settleRestoredPrompt}), and nothing replaces it five minutes on. Returns
+	 * whether it did.
+	 */
+	#settleKeptPromptWithRecall(recall: string): boolean {
+		const restored = this.#keptRestoredPrompt();
+		const standIn = this.#baseStandIn;
+		if (!restored || this.#heldSettingsRebuild || standIn?.base !== restored.base) return false;
+		const built = [...standIn.build, recall];
+		if (!sameItems(built, restored.base) || this.#committedBase(built) !== built) return false;
+		this.#baseSystemPrompt = built;
+		this.#promptSettingsRead = standIn.settingsRead;
+		this.#applyAgentSystemPrompt(built);
+		return true;
+	}
+
+	/**
 	 * Adds to the held settings rebuild each earlier change that its build, which read `read`, renders and the hold
 	 * does not hold yet: a setting the base's build read at another value than it has now ({@link #promptSettingsRead}),
 	 * or one that build did not read that changed since ({@link #promptUnreadChanges}), each with the value the base
@@ -4904,8 +4969,7 @@ export class SessionTools {
 			notices.set(hold, notice);
 			if (!isHeldSettingRecords(details.values)) continue;
 			for (const { id, value } of details.values) values.set(id, value);
-			applyToolLists(toldDisabled, details.disabledTools, details.reenabledTools);
-			applyToolLists(toldEnabled, details.enabledTools, details.noLongerEnabledTools);
+			applyNoticeToolLists(toldDisabled, toldEnabled, details);
 		}
 		if (hold === undefined) return undefined;
 		const changes: SettingChangeView[] = [];
@@ -4921,8 +4985,7 @@ export class SessionTools {
 		const enabled = new Set(this.getEnabledToolNames());
 		const tools = {
 			disabledTools: [],
-			// A tool a later notice gave as available after the rebuild was told to come back with it.
-			reenabledTools: [...toldDisabled].filter(name => enabled.has(name) && !toldEnabled.has(name)),
+			reenabledTools: [...toldDisabled].filter(name => enabled.has(name)),
 			enabledTools: [],
 			noLongerEnabledTools: [...toldEnabled].filter(name => !enabled.has(name)),
 		};
@@ -4933,7 +4996,8 @@ export class SessionTools {
 	/**
 	 * What the settings notices of `holds` in `messages` told the model, each notice giving what changed since the one
 	 * before it ({@link SettingsNoticeDetails}): the value the newest gave each setting it names, by id, and the tools
-	 * left given as disabled and as available after the rebuild. Empty without such holds.
+	 * left given as disabled and as available after the rebuild, the newest notice that names a tool deciding which
+	 * ({@link applyNoticeToolLists}). Empty without such holds.
 	 */
 	#earlierNoticesTold(holds: ReadonlySet<string>, messages: readonly AgentMessage[]): EarlierNoticesTold {
 		const values = new Map<string, unknown>();
@@ -4946,8 +5010,7 @@ export class SessionTools {
 				if (!isRecord(details) || typeof details.hold !== "string" || !holds.has(details.hold)) continue;
 				if (!isHeldSettingRecords(details.values)) continue;
 				for (const { id, value } of details.values) values.set(id, value);
-				applyToolLists(disabledTools, details.disabledTools, details.reenabledTools);
-				applyToolLists(enabledTools, details.enabledTools, details.noLongerEnabledTools);
+				applyNoticeToolLists(disabledTools, enabledTools, details);
 			}
 		}
 		return { values, disabledTools: [...disabledTools], enabledTools: [...enabledTools] };
@@ -5149,8 +5212,10 @@ export class SessionTools {
 			}
 			// A reused recall the branch delivered as a system block is in the kept restored transcript prompt already:
 			// that prompt goes out as stored, held changes stay held, and the recall is adopted as the prompt carries
-			// it. The memory instructions render it from now on, so the build the restored prompt stands in for takes
-			// it in, and goes out with it ({@link refreshBaseSystemPrompt} with `joinsHeldChange`).
+			// it. When this process's own build with the recall as that block reproduces the kept prompt, the prompt
+			// is this process's own and settles ({@link #settleKeptPromptWithRecall}). Otherwise the memory
+			// instructions render the recall from now on, so the build the restored prompt stands in for takes it in,
+			// and goes out with it ({@link refreshBaseSystemPrompt} with `joinsHeldChange`).
 			if (memory.reused && this.#keptRestoredPrompt()) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
@@ -5158,6 +5223,7 @@ export class SessionTools {
 					commit: () => {
 						if (!isCurrent() || !memory.commit()) return false;
 						this.#adoptMemoryRecall(memory, undefined);
+						if (this.#settleKeptPromptWithRecall(injected)) return true;
 						void this.refreshBaseSystemPrompt(undefined, { joinsHeldChange: true }).catch(error => {
 							logger.debug("Prompt rebuild after a reused recall failed", {
 								backend: backend.id,
