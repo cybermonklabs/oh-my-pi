@@ -19,7 +19,9 @@
  * refuse in those terms; the last also names the driver's code and, when a
  * server answered, the SQLSTATE it answered with. There is no fallback to file
  * storage: a misconfigured `sql` refuses to start rather than quietly writing
- * sessions somewhere else.
+ * sessions somewhere else. With `openOnFirstUse` (`omp --no-session`) every
+ * refusal but the last still comes at once; the database is opened, and can
+ * refuse, only when something first uses the store.
  */
 
 import { toError } from "@oh-my-pi/pi-utils";
@@ -66,10 +68,23 @@ export class SessionStorageConfigError extends Error {
 export interface ResolveSessionStorageInput {
 	settings: Settings;
 	env: NodeJS.ProcessEnv;
+	/**
+	 * Open a `sql` store on its first use instead of now (`omp --no-session`,
+	 * which keeps no session of its own: a subagent's transcript is the first
+	 * use). The configuration is still checked now and refuses as always; only
+	 * the database is left untouched, so one that is down or locked neither
+	 * ends nor stalls a run that never uses it. A failed open is that use's
+	 * error, worded as the refusal at start-up.
+	 */
+	openOnFirstUse?: boolean;
 }
 
 /** Resolve the configured storage; see the module doc for precedence and refusals. */
-export async function resolveSessionStorage({ settings, env }: ResolveSessionStorageInput): Promise<SessionStorage> {
+export async function resolveSessionStorage({
+	settings,
+	env,
+	openOnFirstUse = false,
+}: ResolveSessionStorageInput): Promise<SessionStorage> {
 	const envKind = env[SESSION_STORAGE_ENV]?.trim();
 	// The configured value unvalidated: the handle would read a typo as the `file` default,
 	// and a misconfigured storage must refuse rather than quietly write sessions to files.
@@ -113,22 +128,34 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
 	}
 	const createTableValue = env[SESSION_SQL_CREATE_TABLE_ENV]?.trim().toLowerCase();
 	const createTable = !(createTableValue === "0" || createTableValue === "false");
+	// The CLI claims every session it writes, so a second live process moves off it.
+	const options = { client, claims: true, createTable };
+	// The client stays open: the next use tries the database again.
+	if (openOnFirstUse) return SqlSessionStorage.createOnFirstUse(options, err => openFailure(source, dsnFile, err));
 	try {
-		// The CLI claims every session it writes, so a second live process moves off it.
-		return await SqlSessionStorage.create({ client, claims: true, createTable });
+		return await SqlSessionStorage.create(options);
 	} catch (err) {
 		void client.end().catch(() => undefined);
-		const error = toError(err);
-		const code = "code" in error ? error.code : undefined;
-		const labels = [code, serverSqlState(error)].filter(
-			(label): label is string => typeof label === "string" && label.length > 0,
-		);
-		const detail = labels.length > 0 ? `${error.message} (${labels.join(" ")})` : error.message;
-		throw new SessionStorageConfigError(
-			`${source} names ${dsnFile}, but the session database could not be opened: ${detail}`,
-			{ cause: error },
-		);
+		throw openFailure(source, dsnFile, err);
 	}
+}
+
+/**
+ * The refusal for a database that could not be opened: the variable or
+ * setting and the path it named, the driver's code and, when a server
+ * answered, its SQLSTATE; never the connection string.
+ */
+function openFailure(source: string, dsnFile: string, err: unknown): SessionStorageConfigError {
+	const error = toError(err);
+	const code = "code" in error ? error.code : undefined;
+	const labels = [code, serverSqlState(error)].filter(
+		(label): label is string => typeof label === "string" && label.length > 0,
+	);
+	const detail = labels.length > 0 ? `${error.message} (${labels.join(" ")})` : error.message;
+	return new SessionStorageConfigError(
+		`${source} names ${dsnFile}, but the session database could not be opened: ${detail}`,
+		{ cause: error },
+	);
 }
 
 /** Five digits or upper-case letters: the SQL standard's SQLSTATE, which PostgreSQL and MySQL both send. */
