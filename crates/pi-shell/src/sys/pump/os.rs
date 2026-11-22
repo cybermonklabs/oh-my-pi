@@ -195,7 +195,10 @@ mod imp {
 		fn new(fd: OwnedFd) -> io::Result<Self> {
 			let raw = fd.as_raw_fd();
 			// SAFETY: fcntl on a descriptor we own. Its open file description
-			// is ours alone (close-on-exec, never handed to a child).
+			// is ours: close-on-exec, so no program a child execs gets it. A
+			// process another thread forks holds a copy until its exec (or,
+			// forked to apply redirections, until it closes the host's
+			// descriptors before them) and does no I/O on it.
 			let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
 			// SAFETY: as above.
 			if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
