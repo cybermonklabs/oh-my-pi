@@ -1002,6 +1002,45 @@ pub fn wait_blocked(pid: i32) {
 #[cfg(not(target_os = "linux"))]
 pub const fn wait_blocked(_pid: i32) {}
 
+/// Wait until the shell `pid` blocks, before a key the terminal turns
+/// into a signal (`^C`): a shell still running then (returning from a
+/// `zle -F` handler) can leave the signal unanswered. On Linux this is
+/// [`wait_blocked`]. On macOS, until none of its threads runs
+/// (`pti_numrunning` of `proc_pidinfo`'s `PROC_PIDTASKINFO`). Bounded as
+/// every wait ([`TIMEOUT`]): then it fails. Elsewhere it returns at once.
+#[cfg(target_os = "linux")]
+pub fn wait_shell_blocked(pid: i32) {
+	wait_blocked(pid);
+}
+
+/// [`wait_shell_blocked`] on macOS.
+#[cfg(target_os = "macos")]
+pub fn wait_shell_blocked(pid: i32) {
+	let deadline = Instant::now() + TIMEOUT;
+	loop {
+		let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+		let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+		// SAFETY: `info` has room for one `proc_taskinfo`.
+		let got = unsafe {
+			libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), want)
+		};
+		// SAFETY: proc_pidinfo filled it when it returned its size.
+		let running = (got == want).then(|| unsafe { info.assume_init() }.pti_numrunning);
+		if running == Some(0) {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"after {TIMEOUT:?}, shell {pid} still runs (running threads: {running:?})"
+		);
+		thread::sleep(Duration::from_millis(5));
+	}
+}
+
+/// [`wait_shell_blocked`] elsewhere: no process state to read.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn wait_shell_blocked(_pid: i32) {}
+
 /// Each of `pid` and the processes below it that is running or in an
 /// uninterruptible wait (state `R` or `D`), into `out` with its state and
 /// name ([`wait_blocked`]); one gone is none.

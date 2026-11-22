@@ -11,12 +11,9 @@
 mod pty_support;
 mod zsh_oracle;
 
-use std::{io, time::Duration};
+use std::io;
 
 use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
-
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(60);
 
 /// `zsh -f -i` with a plain prompt and `~/tf`, an autoloadable function
 /// file that starts with a comment.
@@ -35,9 +32,9 @@ fn spawn(real: bool) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key and wait until the line editor has handled it.
+/// Type `text` in one write and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
+	pty.write(text)?;
 	pty.zle_sync(TIMEOUT)
 }
 
@@ -45,7 +42,7 @@ fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 fn same(drive: impl Fn(&mut Pty) -> io::Result<()>) {
 	let run = |pty: &mut Pty| -> io::Result<()> {
 		pty.wait_raw(TIMEOUT)?;
-		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.write(". ~/.zshrc\r")?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.

@@ -22,8 +22,6 @@ use std::{fs, io, path::Path, time::Duration};
 
 use pty_support::{Pty, Spawn, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(60);
 /// The bound of waits that run `compinit` or completion functions.
 const SLOW: Duration = Duration::from_secs(120);
 
@@ -44,9 +42,9 @@ fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 		.cwd(cwd)
 }
 
-/// Type `text` key by key and wait until the shell has handled it.
+/// Type `text` in one write and wait until the shell has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
+	pty.write(text)?;
 	pty.zle_sync(SLOW)
 }
 
