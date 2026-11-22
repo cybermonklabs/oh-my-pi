@@ -45,6 +45,8 @@ mod unsupported;
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use unsupported as imp;
 
+use std::{ffi::CString, sync::LazyLock};
+
 use crate::VoiceResult;
 
 /// Render callback: fill the whole output buffer with mono `f32` samples.
@@ -60,6 +62,11 @@ pub struct DeviceConfig {
 	pub sample_rate: u32,
 	/// Target callback period in milliseconds.
 	pub period_ms:   u32,
+	/// `PulseAudio` server to open the stream on (`tcp:host:port`, a socket
+	/// path), from [`pulse_server`]; `None` keeps libpulse's own default. A
+	/// named server gets network-sized buffers and no ALSA fallback, and is
+	/// refused off Linux.
+	pub server:      Option<PulseServer>,
 }
 
 impl DeviceConfig {
@@ -67,6 +74,52 @@ impl DeviceConfig {
 	pub fn period_samples(self) -> usize {
 		((self.sample_rate as usize * self.period_ms as usize) / 1000).max(1)
 	}
+}
+
+/// The `PulseAudio` server names [`pulse_server`] registered, owned here for
+/// the process: a [`PulseServer`] is an index into it.
+static PULSE_SERVERS: LazyLock<parking_lot::Mutex<Vec<CString>>> =
+	LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// A registered `PulseAudio` server name: a small handle, so
+/// [`DeviceConfig`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PulseServer(usize);
+
+impl PulseServer {
+	/// The server name as libpulse takes it.
+	pub fn name(self) -> CString {
+		PULSE_SERVERS.lock()[self.0].clone()
+	}
+}
+
+/// Registers a `PulseAudio` server name for [`DeviceConfig::server`]; blank
+/// means none. A name registered before gets its earlier handle, so the
+/// table holds each distinct name once.
+pub fn pulse_server(name: Option<&str>) -> VoiceResult<Option<PulseServer>> {
+	let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+		return Ok(None);
+	};
+	let mut servers = PULSE_SERVERS.lock();
+	if let Some(index) = servers
+		.iter()
+		.position(|server| server.as_bytes() == name.as_bytes())
+	{
+		return Ok(Some(PulseServer(index)));
+	}
+	let owned = CString::new(name)
+		.map_err(|_| format!("PulseAudio server name {name:?} contains a NUL byte"))?;
+	servers.push(owned);
+	Ok(Some(PulseServer(servers.len() - 1)))
+}
+
+/// Only the Linux backend speaks `PulseAudio`: a named server elsewhere is
+/// refused, never ignored for the default device.
+fn reject_server_off_linux(config: DeviceConfig) -> VoiceResult<()> {
+	if cfg!(target_os = "linux") || config.server.is_none() {
+		return Ok(());
+	}
+	Err("a PulseAudio server can be named only on Linux".to_owned())
 }
 
 /// Running default-speaker playback stream driven by a fill callback.
@@ -77,6 +130,7 @@ pub struct PlaybackDevice {
 impl PlaybackDevice {
 	/// Open and start the default speaker; `fill` runs on the audio thread.
 	pub fn start(config: DeviceConfig, fill: PlaybackFill) -> VoiceResult<Self> {
+		reject_server_off_linux(config)?;
 		Ok(Self { inner: imp::Device::start_playback(config, fill)? })
 	}
 
@@ -112,6 +166,7 @@ pub struct CaptureDevice {
 impl CaptureDevice {
 	/// Open and start the default microphone; `sink` runs on the audio thread.
 	pub fn start(config: DeviceConfig, sink: CaptureSink) -> VoiceResult<Self> {
+		reject_server_off_linux(config)?;
 		Ok(Self { inner: imp::Device::start_capture(config, sink)? })
 	}
 

@@ -43,7 +43,7 @@ use webrtc::{
 
 use crate::{
 	VoiceResult,
-	audio::{PlaybackStream, PlaybackWriter},
+	audio::{PlaybackStream, PlaybackWriter, PulseServer},
 };
 
 const DATA_CHANNEL_LABEL: &str = "oai-events";
@@ -110,10 +110,13 @@ struct LiveResources {
 }
 
 /// WebRTC live-conversation peer: accepts 16 kHz mono PCM input and renders
-/// remote Opus audio to the default speaker. Owned as an `Arc` by the N-API
-/// `LiveWebRtcPeer` wrapper.
+/// remote Opus audio to the speaker (the default one, or the named
+/// `PulseAudio` server's). Owned as an `Arc` by the N-API `LiveWebRtcPeer`
+/// wrapper.
 pub struct LivePeerCore {
 	callbacks:        LiveCallbacks,
+	/// `PulseAudio` server of the speaker; `None` is the default device.
+	pulse_server:     Option<PulseServer>,
 	resources:        Mutex<Option<LiveResources>>,
 	signal_tx:        watch::Sender<PeerSignal>,
 	started:          AtomicBool,
@@ -124,11 +127,13 @@ pub struct LivePeerCore {
 }
 
 impl LivePeerCore {
-	/// Create an idle peer with its host callbacks registered.
-	pub fn new(callbacks: LiveCallbacks) -> Self {
+	/// Create an idle peer with its host callbacks registered; its speaker
+	/// opens on `pulse_server` when one is named.
+	pub fn new(callbacks: LiveCallbacks, pulse_server: Option<PulseServer>) -> Self {
 		let (signal_tx, _) = watch::channel(PeerSignal::Connecting);
 		Self {
 			callbacks,
+			pulse_server,
 			resources: Mutex::new(None),
 			signal_tx,
 			started: AtomicBool::new(false),
@@ -151,7 +156,7 @@ impl LivePeerCore {
 			return Err("Native live WebRTC peer is closed".to_owned());
 		}
 
-		let playback = PlaybackStream::start(OUTPUT_SAMPLE_RATE, OUTPUT_JITTER_BUFFER_MS)?;
+		let playback = PlaybackStream::start(OUTPUT_SAMPLE_RATE, OUTPUT_JITTER_BUFFER_MS, self.pulse_server)?;
 		let playback_tx = playback.writer()?;
 		let mut media_engine = MediaEngine::default();
 		let capability = opus_capability();
