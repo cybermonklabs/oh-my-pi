@@ -105,7 +105,9 @@ import {
 	readSessionHeaderId,
 	resolveBlobRefsInEntries,
 	resolveBlobRefsInEntriesSync,
+	SESSION_HEADER_READ_LIMIT,
 	type SessionLoadResult,
+	sessionHeaderIdOfHead,
 	visitEntriesFromFile,
 } from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
@@ -122,6 +124,7 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	type ListedSession,
 	MemorySessionStorage,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
@@ -3286,11 +3289,14 @@ export class SessionManager {
 	 * taken before anything is deleted and held until the delete has run, so
 	 * the delete meets the write fence like any other write; a claim this
 	 * process holds already is shared. Other storages delete as before. ENOENT
-	 * propagates.
+	 * propagates. With `listed`, the session a picker listed at `sessionPath`,
+	 * the storage refuses the delete unless the file still holds that session
+	 * (see {@link SessionStorage.deleteSessionWithArtifacts}).
 	 */
 	static async deleteSessionFile(
 		sessionPath: string,
 		storage: SessionStorage = defaultSessionStorage(),
+		listed?: ListedSession,
 	): Promise<void> {
 		let release = (): void => {};
 		if (storage.acquireSessionClaim) {
@@ -3306,10 +3312,29 @@ export class SessionManager {
 			}
 		}
 		try {
-			await storage.deleteSessionWithArtifacts(sessionPath);
+			await storage.deleteSessionWithArtifacts(sessionPath, listed);
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * Delete a session a picker listed (the startup `--resume` picker's and the
+	 * in-session `/resume` picker's delete): {@link deleteSessionFile}, refused
+	 * with `ListedSessionChangedError`, deleting nothing, unless the file at
+	 * `session.path` still holds the session `session.id` when the delete runs.
+	 * A shared store checks that under the delete's own locks, so a move of the
+	 * session by another client that holds no claim cannot split it.
+	 */
+	static async deleteListedSession(
+		session: { path: string; id: string },
+		storage: SessionStorage = defaultSessionStorage(),
+	): Promise<void> {
+		await SessionManager.deleteSessionFile(session.path, storage, {
+			id: session.id,
+			headBytes: SESSION_HEADER_READ_LIMIT,
+			headerId: sessionHeaderIdOfHead,
+		});
 	}
 
 	/**

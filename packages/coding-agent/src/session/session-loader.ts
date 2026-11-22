@@ -202,7 +202,7 @@ export function parseSessionContent(content: string): SessionLoadResult {
 }
 
 /** Upper bound on the bytes read to find a header: real headers (and the title slot before them) are far smaller. */
-const SESSION_HEADER_READ_LIMIT = 1024 * 1024;
+export const SESSION_HEADER_READ_LIMIT = 1024 * 1024;
 /** First read; holds the title slot and any real header, so the full limit is read only for outliers. */
 const SESSION_HEADER_FIRST_READ = 16 * 1024;
 
@@ -223,8 +223,7 @@ export async function readSessionHeaderId(
 	try {
 		if (!(storage instanceof FileSessionStorage)) {
 			const [prefix] = await storage.readTextSlices(filePath, SESSION_HEADER_READ_LIMIT, 0);
-			const id = sessionHeaderIdFromPrefix(new TextEncoder().encode(prefix), true);
-			return id === HEADER_INCOMPLETE ? undefined : id;
+			return sessionHeaderIdOfHead(prefix);
 		}
 		const id = await peekFile(filePath, SESSION_HEADER_FIRST_READ, prefix =>
 			sessionHeaderIdFromPrefix(prefix, prefix.length < SESSION_HEADER_FIRST_READ),
@@ -238,6 +237,17 @@ export async function readSessionHeaderId(
 		if (isEnoent(err) || isEnotdir(err) || isEisdir(err)) return undefined;
 		throw err;
 	}
+}
+
+/**
+ * The session id a file's first bytes name (`head`, the file's first
+ * {@link SESSION_HEADER_READ_LIMIT} bytes or all of it), past the optional
+ * title slot line; `undefined` when they do not start with a valid session
+ * header whole.
+ */
+export function sessionHeaderIdOfHead(head: string): string | undefined {
+	const id = sessionHeaderIdFromPrefix(new TextEncoder().encode(head), true);
+	return id === HEADER_INCOMPLETE ? undefined : id;
 }
 
 /**

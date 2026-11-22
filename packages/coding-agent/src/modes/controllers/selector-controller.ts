@@ -1949,7 +1949,7 @@ export class SelectorController {
 								}
 								const storage = defaultSessionStorage();
 								try {
-									await SessionManager.deleteSessionFile(session.path, storage);
+									await SessionManager.deleteListedSession(session, storage);
 									return true;
 								} catch (error) {
 									throw new Error(

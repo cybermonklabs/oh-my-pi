@@ -20,6 +20,8 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { SESSION_HEADER_READ_LIMIT, sessionHeaderIdOfHead } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import type { ListedSession } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 interface FakeRedisCall {
@@ -126,7 +128,13 @@ function createFakeRedis(): FakeRedis {
 			if (script.includes("OMP_REMOVE")) {
 				checkFailure("del");
 				const [metaKey, titleKey] = keys;
-				const [filePrefix, pattern, ...paths] = argv;
+				const [filePrefix, pattern, guardKey, guardHead, ...paths] = argv;
+				// A listed session's key must be there and still start with the head the store checked.
+				if (guardKey) {
+					if (!strings.has(guardKey)) return -1;
+					const bytes = Buffer.from(strings.get(guardKey) as string, "utf-8");
+					if (bytes.subarray(0, Buffer.byteLength(guardHead)).toString("utf-8") !== guardHead) return -2;
+				}
 				if (pattern) {
 					// The pattern is an escaped key prefix followed by `*`.
 					const keyPrefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
@@ -462,6 +470,79 @@ describe("RedisSessionStorage", () => {
 		expect(injected).toBe(true);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1.jsonl")).toBe(false);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1/Late.jsonl")).toBe(false);
+	});
+
+	describe("deleteSessionWithArtifacts of a listed session", () => {
+		const header = (id: string) =>
+			`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w" })}\n`;
+		const listed = (id: string): ListedSession => ({
+			id,
+			headBytes: SESSION_HEADER_READ_LIMIT,
+			headerId: sessionHeaderIdOfHead,
+		});
+		const file = "omp:sessions:file:/sessions/p/s1.jsonl";
+		const child = "omp:sessions:file:/sessions/p/s1/A.jsonl";
+		/** Run `change` once, right before the next remove script, after the store checked the head. */
+		const beforeRemoveScript = (change: () => void): void => {
+			const send = redis.send.bind(redis);
+			let done = false;
+			redis.send = async (command, args) => {
+				if (!done && String(args[0]).includes("OMP_REMOVE")) {
+					done = true;
+					change();
+				}
+				return send(command, args);
+			};
+		};
+
+		it("deletes the session and its artifacts when the key still holds it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", `${header("S1")}{"type":"message"}\n`);
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+
+			await storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"));
+
+			expect([redis.strings.has(file), redis.strings.has(child)]).toEqual([false, false]);
+		});
+
+		it("refuses, removing nothing, when another session holds the key", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("OTHER"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([redis.strings.has(file), redis.strings.has(child)]).toEqual([true, true]);
+		});
+
+		it("refuses in the script, removing nothing, when the key moves away after the store checked it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("S1"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+			// Another client's move renames the session's key, not yet its subagent transcript.
+			beforeRemoveScript(() => {
+				redis.strings.set("omp:sessions:file:/sessions/q/s1.jsonl", redis.strings.get(file) as string);
+				redis.strings.delete(file);
+			});
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it moved or was deleted). Nothing was deleted.',
+			);
+			expect(redis.strings.has(child)).toBe(true);
+		});
+
+		it("refuses in the script, removing nothing, when another session takes the key after the store checked it", async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			await storage.writeText("/sessions/p/s1.jsonl", header("S1"));
+			await storage.writeText("/sessions/p/s1/A.jsonl", header("A"));
+			beforeRemoveScript(() => redis.strings.set(file, header("OTHER")));
+
+			await expect(storage.deleteSessionWithArtifacts("/sessions/p/s1.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/sessions/p/s1.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([redis.strings.get(file), redis.strings.has(child)]).toEqual([header("OTHER"), true]);
+		});
 	});
 
 	it("refresh() reloads the metadata index from Redis after out-of-band writes", async () => {

@@ -1,10 +1,11 @@
 import {
 	IndexedSessionStorage,
+	type ListedSessionGuard,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
-import { eexist } from "./session-storage-errors";
+import { eexist, ListedSessionChangedError } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -96,11 +97,22 @@ return 1`;
 // deleting their mtime and title run with no other client's command between:
 // a child set after the scan cannot survive, and a replacement written after
 // the delete keeps its metadata. ARGV[1] is the file-key prefix, ARGV[2] a
-// SCAN pattern for the directory ("" for none), ARGV[3..] explicit paths.
+// SCAN pattern for the directory ("" for none), ARGV[3] a listed session's
+// key ("" for none) and ARGV[4] the head its content must still start with
+// (returns -1 when the key is gone, -2 when its head differs, deleting
+// nothing), ARGV[5..] explicit paths.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
 local prefix = ARGV[1]
+if ARGV[3] ~= "" then
+	if redis.call("EXISTS", ARGV[3]) == 0 then
+		return -1
+	end
+	if redis.call("GETRANGE", ARGV[3], 0, string.len(ARGV[4]) - 1) ~= ARGV[4] then
+		return -2
+	end
+end
 local paths = {}
-for i = 3, #ARGV do
+for i = 5, #ARGV do
 	paths[#paths + 1] = ARGV[i]
 end
 if ARGV[2] ~= "" then
@@ -119,6 +131,9 @@ for _, path in ipairs(paths) do
 	redis.call("HDEL", KEYS[2], path)
 end
 return #paths`;
+
+/** How many times a listed session's removal runs when its head changes between the check and the script. */
+const LISTED_REMOVE_ATTEMPTS = 5;
 
 /** A `SCAN MATCH` glob for the keys starting with `prefix`, its glob characters escaped. */
 function keysStartingWith(prefix: string): string {
@@ -278,17 +293,52 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		await this.writeFull(path, "", mtimeMs);
 	}
 
-	async remove(paths: string[], dir?: string): Promise<void> {
+	async remove(paths: string[], dir?: string, listed?: ListedSessionGuard): Promise<void> {
 		if (paths.length === 0 && dir === undefined) return;
-		await this.#client.send("EVAL", [
-			REMOVE_SCRIPT,
-			"2",
-			this.#metaKey(),
-			this.#titleMetaKey(),
-			this.#fileKey(""),
-			dir === undefined ? "" : keysStartingWith(this.#fileKey(dir)),
-			...paths,
-		]);
+		// A listed session's head is read and checked here, then compared again in the script, byte for byte; a
+		// head that changed but still names the session (a rewrite) runs again with the new head.
+		for (let attempt = 1; ; attempt++) {
+			let guardKey = "";
+			let guardHead = "";
+			if (listed) {
+				guardKey = this.#fileKey(listed.path);
+				const head = await this.#listedHead(listed);
+				// Whole lines only: the script compares bytes, and a cut inside a character would not encode back.
+				const end = head.lastIndexOf("\n");
+				guardHead = end === -1 ? head : head.slice(0, end + 1);
+			}
+			const removed = Number(
+				await this.#client.send("EVAL", [
+					REMOVE_SCRIPT,
+					"2",
+					this.#metaKey(),
+					this.#titleMetaKey(),
+					this.#fileKey(""),
+					dir === undefined ? "" : keysStartingWith(this.#fileKey(dir)),
+					guardKey,
+					guardHead,
+					...paths,
+				]),
+			);
+			if (!listed || removed >= 0) return;
+			if (removed === -1) throw new ListedSessionChangedError(listed.path, listed.id, undefined);
+			if (attempt >= LISTED_REMOVE_ATTEMPTS) {
+				throw new Error(
+					`Cannot delete session "${listed.path}": it kept changing while the delete ran. Nothing was deleted.`,
+				);
+			}
+		}
+	}
+
+	/**
+	 * The listed session's head, refusing with {@link ListedSessionChangedError} unless it names `listed.id`. A
+	 * missing key reads as empty, which names no session.
+	 */
+	async #listedHead(listed: ListedSessionGuard): Promise<string> {
+		const head = await this.#client.getrange(this.#fileKey(listed.path), 0, listed.headBytes - 1);
+		const foundId = listed.headerId(head);
+		if (foundId !== listed.id) throw new ListedSessionChangedError(listed.path, listed.id, foundId);
+		return head;
 	}
 
 	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {

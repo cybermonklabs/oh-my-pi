@@ -27,3 +27,23 @@ export function enotdir(p: string): NodeJS.ErrnoException {
 	err.syscall = "open";
 	return err;
 }
+
+/**
+ * A delete of a session a picker listed, refused because the path no longer
+ * holds that session: it moved or was deleted (`foundId` undefined), or
+ * another session took the path (`foundId`). Nothing was deleted.
+ */
+export class ListedSessionChangedError extends Error {
+	constructor(
+		readonly path: string,
+		readonly listedId: string,
+		readonly foundId: string | undefined,
+	) {
+		super(
+			`Cannot delete session "${path}": the file no longer holds session ${listedId} (${
+				foundId === undefined ? "it moved or was deleted" : `it holds ${foundId}`
+			}). Nothing was deleted.`,
+		);
+		this.name = "ListedSessionChangedError";
+	}
+}

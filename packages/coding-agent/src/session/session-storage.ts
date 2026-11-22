@@ -24,6 +24,25 @@ import {
 	type SessionTitleUpdate,
 	serializeTitleSlot,
 } from "./session-title-slot";
+import { ListedSessionChangedError } from "./session-storage-errors";
+
+/** A file's first `bytes` bytes as UTF-8, or `undefined` when it does not exist. */
+function readHeadSync(filePath: string, bytes: number): string | undefined {
+	let fd: number;
+	try {
+		fd = fs.openSync(filePath, "r");
+	} catch (err) {
+		if (isEnoent(err)) return undefined;
+		throw err;
+	}
+	try {
+		const buffer = Buffer.alloc(bytes);
+		const read = fs.readSync(fd, buffer, 0, bytes, 0);
+		return utf8Decoder.decode(buffer.subarray(0, read));
+	} finally {
+		fs.closeSync(fd);
+	}
+}
 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
@@ -242,6 +261,20 @@ export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 	commitGuard?: () => boolean;
 }
 
+/**
+ * A delete of a session a picker listed at a path ({@link SessionStorage.deleteSessionWithArtifacts}):
+ * refused, deleting nothing, with {@link ListedSessionChangedError} unless the
+ * file at the path still holds that session when the delete runs.
+ */
+export interface ListedSession {
+	/** The id the session was listed with. */
+	id: string;
+	/** How many of the file's first bytes hold its header (the session loader's read limit). */
+	headBytes: number;
+	/** The session id a file's first bytes name, if they start with a valid header (the session loader's parser). */
+	headerId(head: string): string | undefined;
+}
+
 export interface SessionStorage {
 	/** A worker may use its own file-storage default for these same transcripts; omitted means keep runs inline. */
 	readonly crossesWorkerBoundary?: boolean;
@@ -367,7 +400,18 @@ export interface SessionStorage {
 	 */
 	renameNoReplace?(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
-	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
+	/**
+	 * Delete a session file and its artifacts. With `listed`, the session a
+	 * picker listed at `sessionPath`: refused, deleting nothing, with
+	 * {@link ListedSessionChangedError} unless the file still holds that
+	 * session when the delete runs. A shared store makes the check under the
+	 * delete's own locks, so a move of the session by another client that
+	 * holds no claim (an SDK host's store) cannot split it: the move renames
+	 * the session's file, then each subagent transcript under its artifacts
+	 * directory, and a delete of the old path between those steps would remove
+	 * the transcripts the move had not reached.
+	 */
+	deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void>;
 	/**
 	 * Run a synchronous session mutation under the backend's cross-process
 	 * lock. Optional because only backends with a process-shared lock can
@@ -1592,10 +1636,23 @@ export class FileSessionStorage implements SessionStorage {
 	/**
 	 * Delete a session file and its artifacts directory.
 	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
+	 * With `listed`, the header check and the unlink run under the session
+	 * file's lock. The file goes first, so a move that renamed it already
+	 * fails this unlink, and a move that comes after it fails its own first
+	 * rename: neither removes the artifacts of a session that moved.
 	 */
-	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+	async deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void> {
 		// Delete the session file itself
-		await this.unlink(sessionPath);
+		if (listed) {
+			this.withSessionFileLockSync(sessionPath, () => {
+				const found = readHeadSync(sessionPath, listed.headBytes);
+				const foundId = found === undefined ? undefined : listed.headerId(found);
+				if (foundId !== listed.id) throw new ListedSessionChangedError(sessionPath, listed.id, foundId);
+				fs.unlinkSync(sessionPath);
+			});
+		} else {
+			await this.unlink(sessionPath);
+		}
 
 		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
 		const artifactsDir = sessionPath.slice(0, -6);

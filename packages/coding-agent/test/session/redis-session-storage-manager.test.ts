@@ -74,7 +74,13 @@ function createFakeRedis(): FakeRedis {
 			}
 			if (script.includes("OMP_REMOVE")) {
 				const [metaKey, titleKey] = keys;
-				const [filePrefix, pattern, ...paths] = argv;
+				const [filePrefix, pattern, guardKey, guardHead, ...paths] = argv;
+				// A listed session's key must be there and still start with the head the store checked.
+				if (guardKey) {
+					if (!strings.has(guardKey)) return -1;
+					const bytes = Buffer.from(strings.get(guardKey) ?? "", "utf-8");
+					if (bytes.subarray(0, Buffer.byteLength(guardHead)).toString("utf-8") !== guardHead) return -2;
+				}
 				if (pattern) {
 					const keyPrefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
 					for (const key of strings.keys()) {
