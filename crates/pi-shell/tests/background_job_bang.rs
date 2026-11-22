@@ -1,7 +1,9 @@
 //! `$!` in subshells, as Bash 5.3 runs a script (Bash 5.2.21 agrees on
 //! every row): every subshell copies it, while the child it names stays
 //! its parent's, not the subshell's. `$!` of a job whose output or loop
-//! waits for the shell, or runs without end, is there at once.
+//! waits for the shell, or runs without end, is there at once; a job that
+//! `exec`s its program after work that waited for nothing is known by the
+//! program's pid.
 #![cfg(unix)]
 
 mod obash_support;
@@ -89,9 +91,67 @@ fn assert_zsh_rows(rows: &[(&str, &str)], what: &str) {
 /// `kill -0 "$!"` cannot tell the two apart: bash's `$!` may name a live
 /// subshell whose child is the program, and the check succeeds for either.
 fn pid_row(start: &str) -> String {
+	pid_row_as(start, "echo other")
+}
+
+/// [`pid_row`], with `other` told apart: `virtual` for a virtual pid
+/// (2^30 or more), else `os-other` (an OS process that is not the
+/// program, such as one that already ended).
+fn pid_kind_row(start: &str) -> String {
+	pid_row_as(start, KIND)
+}
+
+/// `other` told apart ([`pid_kind_row`]).
+const KIND: &str = r#"{ [ "$p" -ge 1073741824 ] && echo virtual || echo os-other; }"#;
+
+fn pid_row_as(start: &str, other: &str) -> String {
+	probe_row(
+		start,
+		"p=$!; ",
+		"",
+		&format!(r#"[ "$p" = "$(cat "$T")" ] && echo program || {other}"#),
+	)
+}
+
+/// [`pid_row`] with `$!` read only once the program runs, so whatever the
+/// job ran before its `exec` has ended unseen.
+fn late_pid_row(start: &str) -> String {
+	late_pid_row_as(start, "echo other")
+}
+
+/// [`late_pid_row`] with `other` told apart ([`pid_kind_row`]).
+fn late_pid_kind_row(start: &str) -> String {
+	late_pid_row_as(start, KIND)
+}
+
+fn late_pid_row_as(start: &str, other: &str) -> String {
+	probe_row(
+		start,
+		"",
+		"p=$!; ",
+		&format!(r#"[ "$p" = "$(cat "$T")" ] && echo program || {other}"#),
+	)
+}
+
+/// The check a pid file or `ps -p "$!"` makes, by [`pid_row`]'s job:
+/// `/bin/kill -0 "$!"` prints `alive` when `$!` names a live process
+/// (bash's subshell, or the program), else `not-found`.
+fn alive_row(start: &str) -> String {
+	probe_row(
+		start,
+		"p=$!; ",
+		"",
+		r#"/bin/kill -0 "$p" 2>/dev/null && echo alive || echo not-found"#,
+	)
+}
+
+/// The probes' row: `start` as the job; `early` runs before the row waits
+/// for the program to write its pid, `late` after (one of them reads `$!`
+/// into `p`); then `verdict`, then `st=` of `kill` and `wait` of `$!`.
+fn probe_row(start: &str, early: &str, late: &str, verdict: &str) -> String {
 	let start = start.replace("PROG", r#"/bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 30' sh "$T""#);
 	format!(
-		r#"D=$(mktemp -d); T=$D/pid; c='/bin/sh -c '\''echo $$ > "$1"; exec /bin/sleep 30'\'' sh "$T"'; {start} & p=$!; until [ -s "$T" ]; do :; done; [ "$p" = "$(cat "$T")" ] && echo program || echo other; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
+		r#"D=$(mktemp -d); T=$D/pid; c='/bin/sh -c '\''echo $$ > "$1"; exec /bin/sleep 30'\'' sh "$T"'; {start} & {early}until [ -s "$T" ]; do :; done; {late}{verdict}; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
 	)
 }
 
@@ -238,9 +298,9 @@ async fn bang_of_a_function_job_does_not_wait_for_a_command_substitution() {
 
 /// A `.` or `source` job whose file is a FIFO, or a pipe as `/dev/stdin`,
 /// that the row writes only after `$!`: `$!` names the job at once. `.`
-/// and `source` leave the pid to an `exec` their file runs, and they read
-/// the whole file first: the read of a file that is not regular, which
-/// may wait for the row, decides the job's own pid before it starts.
+/// and `source` read the whole file before they run it: the read of a
+/// file that is not regular, which may wait for the row, decides the
+/// job's own pid before it starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 	let fifo = |start: &str| {
@@ -267,18 +327,26 @@ async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 /// action, run in the job before the body's `/bin/true`, waits for what
 /// the row writes after `$!`: a builtin with a redirection (which the
 /// staged path runs), a program, or a command substitution. Bash's child
-/// runs a function body's traps, and in a function job a trap action
-/// decides as any command before `exec` does, so `$!` names the job at
-/// once. The substitution row hung to the run's bound.
+/// runs a function body's traps; here the job keeps its virtual pid once
+/// its action waits, so `$!` names the job at once. The substitution row
+/// hung to the run's bound.
 ///
-/// The last row is a lone job, whose trap runs in the shell before it
-/// forks, as bash runs it: there `(( BASH_SUBSHELL ))` is false and the
-/// action does nothing.
+/// The lone-job rows: a lone command's trap (and a pipeline stage's) runs
+/// in the shell before it forks, as bash runs it, where
+/// `(( BASH_SUBSHELL ))` is false and the action does nothing. A lone
+/// function call's trap runs again in the job under `set -T`, as in bash's
+/// child: an action there that loops without end leaves `$!` waiting for
+/// nothing. The loop rows hung to the run's bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 	let in_function = |action: &str| {
 		format!(
 			r#"{FIFO} f() {{ /bin/true; }}; set -T; trap '[[ $BASH_COMMAND == /bin/true ]] && {{ {action}; }}' DEBUG; f & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
+		)
+	};
+	let looped = |guard: &str, job: &str| {
+		format!(
+			r#"set -T; trap '{guard} {{ while (( 1 )); do (( i++ )); done; }}' DEBUG; {job} & kill "$!"; wait "$!"; echo "st=$?""#
 		)
 	};
 	let rows = [
@@ -290,6 +358,15 @@ async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 				r#"{FIFO} set -T; trap '(( BASH_SUBSHELL )) && /usr/bin/head -n 1 <&3 >/dev/null' DEBUG; /bin/true & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
 			),
 			"st=0\n",
+		),
+		(looped("(( BASH_SUBSHELL )) &&", "/bin/sleep 30"), "st=143\n"),
+		(looped("(( BASH_SUBSHELL )) &&", ": | /bin/sleep 30"), "st=143\n"),
+		(
+			format!(
+				"f() {{ /bin/sleep 30; }}; {}",
+				looped("[[ $BASH_COMMAND == f ]] && (( BASH_SUBSHELL )) &&", "f")
+			),
+			"st=143\n",
 		),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
@@ -320,21 +397,59 @@ async fn bang_of_a_function_job_does_not_wait_for_a_compound_redirection() {
 	assert_bash_outputs(&rows).await;
 }
 
+/// A background job whose redirection opens a FIFO with no reader yet,
+/// which the row opens only after `$!`: `$!` does not wait for that open.
+/// The job's lone program opens it itself, so `$!` is its pid; a builtin's
+/// job keeps its own pid. Bash rows that pass before and after this change;
+/// [`bang_of_a_zsh_job_does_not_wait_for_its_fifo_open`] is zsh's.
+#[tokio::test(flavor = "multi_thread")]
+async fn bang_of_a_job_does_not_wait_for_its_fifo_open() {
+	let opened = |job: &str| {
+		format!(
+			r#"d=$(mktemp -d); mkfifo "$d/q"; {job} > "$d/q" & p=$!; exec 5<"$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#
+		)
+	};
+	let rows = [(opened("printf x"), "st=0\n"), (opened("/bin/echo x"), "st=0\n")];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
+/// A job whose text runs `eval`, `.` or `source` again without end (bash
+/// recurses until the row's `kill` ends it): `$!` names the job at once.
+/// Nothing the job ran decided its pid, and a reader of `$!` waited for
+/// it: every row hung to the run's bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn bang_of_a_job_that_reenters_eval_or_source_is_there_at_once() {
+	let killed =
+		|start: &str| format!(r#"{start} & p=$!; echo got; kill "$p"; wait "$p"; echo "st=$?""#);
+	let own = |builtin: &str| {
+		killed(&format!(
+			r#"D=$(mktemp -d); printf '{builtin} "%s"\n' "$D/s" > "$D/s"; {builtin} "$D/s" 2>/dev/null"#
+		)) + r#"; rm -r "$D""#
+	};
+	let rows = [
+		(killed(r#"x='eval "$x"'; eval "$x" 2>/dev/null"#), "got\nst=143\n"),
+		(killed(r#"x='eval "$x"'; eval "$x""#), "got\nst=143\n"),
+		(killed(r#"x='eval "$x"'; f() { eval "$x"; }; f"#), "got\nst=143\n"),
+		(killed("f() { eval f 2>/dev/null; }; f"), "got\nst=143\n"),
+		(own("."), "got\nst=143\n"),
+		(own("source"), "got\nst=143\n"),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
 /// The process `$!` names for a job a wrapper runs, by the pid probe
-/// ([`pid_row`]), as bash names it: `eval`, `.` and `source` run their
-/// text like a function body (only an `exec`'d program is `$!`; anything
-/// else leaves the job's own pid, bash's subshell), `command` and `exec`
-/// run the program as the job, `time` keeps the job's own pid. A lone
-/// job's DEBUG trap runs in the shell before it forks, as bash runs it, so
-/// nothing it runs decides. With nothing to run, `eval` answers at once,
-/// and `builtin` decides before it runs.
+/// ([`pid_row`]), as bash names it: a program `eval`, `.` or `source`
+/// `exec`s is `$!`; `command` and `exec` run the program as the job;
+/// `time` keeps the job's own pid. A lone job's DEBUG trap runs in the
+/// shell before it forks, as bash runs it, so nothing it runs decides.
+/// With nothing to run, `eval` answers at once, and a `builtin` whose
+/// output waits leaves the job its own pid.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrapped_jobs_bang_names_what_bash_names() {
 	let rows = [
-		(pid_row(r#"eval "$c""#), "other\nst=143\n"),
 		(pid_row(r#"eval "exec $c""#), "program\nst=143\n"),
-		(pid_row(r#"eval "/bin/true; $c""#), "other\nst=143\n"),
-		(pid_row(r#"printf '%s\n' "$c" > "$T.src"; . "$T.src""#), "other\nst=143\n"),
 		(pid_row(r#"printf 'exec %s\n' "$c" > "$T.src"; . "$T.src""#), "program\nst=143\n"),
 		(pid_row(r#"printf 'exec %s\n' "$c" > "$T.src"; source "$T.src""#), "program\nst=143\n"),
 		(pid_row("command PROG"), "program\nst=143\n"),
@@ -344,6 +459,10 @@ async fn a_wrapped_jobs_bang_names_what_bash_names() {
 		(pid_row("set -T; trap 'while false; do :; done' DEBUG; PROG"), "program\nst=143\n"),
 		(
 			pid_row("set -T; trap '[[ -z $once ]] && { once=1; x=$(echo y); }' DEBUG; PROG"),
+			"program\nst=143\n",
+		),
+		(
+			pid_row(r#"set -T; trap 'echo "+ $BASH_COMMAND" >/dev/null' DEBUG; PROG"#),
 			"program\nst=143\n",
 		),
 		(
@@ -366,30 +485,87 @@ async fn a_wrapped_jobs_bang_names_what_bash_names() {
 	assert_bash_outputs(&rows).await;
 }
 
-/// Differences from bash, kept on purpose, all with the job's own
-/// (virtual) pid in `$!` where bash names the program:
-/// - a function, group, `eval`, `.` or `source` job that runs a builtin, a loop
-///   or a command substitution before it `exec`s a program, a DEBUG trap action
-///   in such a job among them, and a lone command whose here-document runs a
-///   command substitution: bash's forked child runs them, then `exec`s the
-///   program; waiting for the `exec` would wait on what runs first, which may
-///   wait for the shell itself, or never end;
-/// - a `.` job whose file is not regular (here a pipe as `/dev/stdin`): its
-///   read may wait for the shell, so it decides first;
-///
-/// `kill` and `wait` of `$!` still reach the program.
+/// `$!` names a live process, as bash's does, by the check a pid file or
+/// `ps -p` makes ([`alive_row`]): a job whose `eval`, `.` or `source` text
+/// runs the program (bash names its subshell, which lives as long; this
+/// engine names the program), a function job that loops before it `exec`s
+/// the program, and a lone program. The first four named the job's own
+/// pid, which no OS process has.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_job_that_runs_something_before_exec_keeps_its_own_pid() {
+async fn a_jobs_bang_is_a_live_process() {
 	let rows = [
-		(pid_row("f() { local y=2; exec PROG; }; f"), "other\nst=143\n"),
-		(pid_row(r#"eval "printf ''; exec $c""#), "other\nst=143\n"),
-		(pid_row("f() { while (( 0 )); do :; done; exec PROG; }; f"), "other\nst=143\n"),
-		(pid_row(r#"f() { exec PROG "$(echo x)"; }; f"#), "other\nst=143\n"),
-		(pid_row("PROG <<EOF") + "\n$(echo x)\nEOF", "other\nst=143\n"),
-		(pid_row("set -T; trap ': dbg' DEBUG; { exec PROG; }"), "other\nst=143\n"),
-		(pid_row(r#"set -T; trap ': dbg' DEBUG; eval "exec $c""#), "other\nst=143\n"),
-		(pid_row("f() { exec PROG; }; set -T; trap ': dbg' DEBUG; f"), "other\nst=143\n"),
-		(pid_row(r#"printf 'exec %s\n' "$c" | . /dev/stdin"#), "other\nst=143\n"),
+		(alive_row(r#"eval "$c""#), "alive\nst=143\n"),
+		(alive_row(r#"eval "$c" 2>/dev/null"#), "alive\nst=143\n"),
+		(alive_row(r#"printf '%s\n' "$c" > "$T.src"; . "$T.src""#), "alive\nst=143\n"),
+		(alive_row("f() { for x in a b; do :; done; exec PROG; }; f"), "alive\nst=143\n"),
+		(alive_row("PROG"), "alive\nst=143\n"),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
+/// A function, group or `eval` job that runs a builtin, a loop, a command
+/// substitution, a subshell, a pipeline of builtins, a job of its own or a
+/// DEBUG trap action before it `exec`s its program, and a lone program
+/// whose here-document runs a command substitution: `$!` is the program's
+/// pid, as bash's forked child `exec`s it. Nothing the job ran waited, so
+/// nothing decided its pid before the `exec`. The last row reads `$!` only
+/// once the program runs ([`late_pid_row`]): its 5000-pass loop has ended
+/// unseen. Every row named the job's own pid before this change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_runs_something_before_exec_is_known_by_its_program() {
+	let rows = [
+		pid_row("f() { local y=2; exec PROG; }; f"),
+		pid_row("f() { cd /; exec PROG; }; f"),
+		pid_row(r#"eval "printf ''; exec $c""#),
+		pid_row("f() { while (( 0 )); do :; done; exec PROG; }; f"),
+		pid_row("f() { for x in a b; do :; done; exec PROG; }; f"),
+		pid_row("f() { for (( i = 0; i < 100; i++ )); do :; done; exec PROG; }; f"),
+		pid_row(r#"f() { exec PROG "$(echo x)"; }; f"#),
+		pid_row("f() { local v=$(echo x); exec PROG; }; f"),
+		pid_row("f() { ( : ); exec PROG; }; f"),
+		pid_row("f() { : | :; exec PROG; }; f"),
+		pid_row("f() { : & exec PROG; }; f"),
+		pid_row("PROG <<EOF") + "\n$(echo x)\nEOF",
+		pid_row("set -T; trap ': dbg' DEBUG; { exec PROG; }"),
+		pid_row(r#"set -T; trap ': dbg' DEBUG; eval "exec $c""#),
+		pid_row("f() { exec PROG; }; set -T; trap ': dbg' DEBUG; f"),
+		late_pid_row("f() { for (( i = 0; i < 5000; i++ )); do :; done; exec PROG; }; f"),
+	];
+	let rows: Vec<(&str, &str)> = rows
+		.iter()
+		.map(|s| (s.as_str(), "program\nst=143\n"))
+		.collect();
+	assert_bash_outputs(&rows).await;
+}
+
+/// Differences from bash, kept on purpose; bash names the program in each.
+/// A function or group job that runs a program before its `exec` (also in
+/// a command substitution, a subshell or a pipeline stage), or reads a
+/// pipe (`.` of `/dev/stdin`), keeps its own (virtual) pid however late
+/// `$!` is read: the program may wait for what the shell does after it
+/// reads `$!`. So does one that runs a scheduler slice (1024 operations)
+/// of work while a reader of `$!` waits, here a 5000-pass loop before its
+/// `exec`: the reader waits no longer, as the job may never end (read
+/// after the loop, `$!` is the program's:
+/// [`a_job_that_runs_something_before_exec_is_known_by_its_program`]).
+/// Older than this change and kept: an `eval` whose text runs another
+/// program first names that program, which has ended (`not-found`; bash
+/// names its subshell, alive). `kill` and `wait` of `$!` still reach the
+/// program.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_that_waits_before_exec_keeps_its_own_pid() {
+	let rows = [
+		(pid_kind_row("f() { /bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
+		(late_pid_kind_row("f() { /bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
+		(pid_kind_row("f() { x=$(/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
+		(late_pid_kind_row("f() { x=$(/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
+		(pid_kind_row(r#"printf 'exec %s\n' "$c" | . /dev/stdin"#), "virtual\nst=143\n"),
+		(
+			pid_kind_row("f() { for (( i = 0; i < 5000; i++ )); do :; done; exec PROG; }; f"),
+			"virtual\nst=143\n",
+		),
+		(alive_row(r#"eval "/bin/true; $c""#), "not-found\nst=143\n"),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_outputs(&rows, "the stated difference").await;
@@ -420,19 +596,64 @@ fn bang_of_a_zsh_function_job_does_not_wait_for_a_command_substitution() {
 	assert_zsh_outputs(&[(&rows[0], "st=0\n"), (&rows[1], "st=0\n")]);
 }
 
-/// zsh: a lone command whose words or here-string run a command
-/// substitution keeps the job's own pid in `$!`, a difference from zsh 5.9
-/// (which prints `program`), for the reason
-/// [`a_job_that_runs_something_before_exec_keeps_its_own_pid`] gives; `kill`
-/// and `wait` still reach the program.
+/// zsh: a lone program whose words or here-string run a command
+/// substitution is `$!`, and a live process ([`alive_row`]'s check), as in
+/// zsh 5.9: the substitution waited for nothing. They named the job's own
+/// pid.
 #[test]
-fn a_zsh_job_whose_words_run_a_substitution_keeps_its_own_pid() {
+fn a_zsh_job_whose_words_run_a_substitution_is_known_by_its_program() {
 	let words = pid_row("PROG $(echo x)");
 	let here_string = pid_row(r#"PROG <<< "$(echo x)""#);
-	assert_zsh_rows(
-		&[(&words, "other\nst=143\n"), (&here_string, "other\nst=143\n")],
-		"the stated difference",
-	);
+	let alive = alive_row(r#"PROG "$(echo x)""#);
+	assert_zsh_outputs(&[
+		(&words, "program\nst=143\n"),
+		(&here_string, "program\nst=143\n"),
+		(&alive, "alive\nst=143\n"),
+	]);
+}
+
+/// zsh: see [`bang_of_a_job_that_reenters_eval_or_source_is_there_at_once`].
+#[test]
+fn bang_of_a_zsh_job_that_reenters_eval_or_source_is_there_at_once() {
+	assert_zsh_outputs(&[
+		(
+			r#"x='eval "$x"'; eval "$x" 2>/dev/null & p=$!; echo got; kill "$p"; wait "$p"; echo "st=$?""#,
+			"got\nst=143\n",
+		),
+		(
+			r#"D=$(mktemp -d); printf '. "%s"\n' "$D/s" > "$D/s"; . "$D/s" & p=$!; echo got; kill "$p"; wait "$p"; echo "st=$?"; rm -r "$D""#,
+			"got\nst=143\n",
+		),
+	]);
+}
+
+/// zsh: a background job whose redirection opens a FIFO with no reader yet
+/// (the job's command's, or one in a function job's body), which the row
+/// opens only after `$!`: `$!` names the job at once (zsh 5.9: `st=0`, and
+/// the line the job wrote). It waited for the open, which waited for the
+/// row: the shell was killed at the obash tests' bound. The same rows
+/// without `$!` passed. A lone program's job keeps its own pid here, where
+/// zsh names its child: [`bang_of_a_job_does_not_wait_for_its_fifo_open`]'s
+/// bash leaves the open to the program.
+#[test]
+fn bang_of_a_zsh_job_does_not_wait_for_its_fifo_open() {
+	let opened = |job: &str, then: &str| {
+		format!(
+			r#"d=$(mktemp -d); mkfifo "$d/q"; {job} & p=$!; exec 5<"$d/q"; {then}wait "$p"; echo "st=$?"; rm -r "$d""#
+		)
+	};
+	let rows = [
+		opened(r#"printf x > "$d/q""#, ""),
+		opened(r#"/bin/echo x > "$d/q""#, ""),
+		opened(r#"f() { printf x > "$d/q" }; f"#, ""),
+		opened(r#"printf x > "$d/q""#, r#"read -r -u 5 l; echo "l=$l"; "#),
+	];
+	assert_zsh_outputs(&[
+		(&rows[0], "st=0\n"),
+		(&rows[1], "st=0\n"),
+		(&rows[2], "st=0\n"),
+		(&rows[3], "l=x\nst=0\n"),
+	]);
 }
 
 /// zsh: see [`bang_of_a_source_job_does_not_wait_for_its_file`].
