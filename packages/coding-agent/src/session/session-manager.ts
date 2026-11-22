@@ -3918,8 +3918,9 @@ export class SessionManager {
 		options?: { claim?: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } },
 	): Promise<void> {
 		const previousSessionFile = this.#sessionFile;
-		const left = this.#sessionFile ? { id: this.#sessionId, file: this.#sessionFile } : undefined;
-		await this.#setSessionFileClaiming(sessionFile, options?.claim);
+		const switched: { left?: { id: string; file: string } } = {};
+		await this.#setSessionFileClaiming(sessionFile, options?.claim, switched);
+		const left = switched.left;
 		if (left && this.#sessionId !== left.id) this.#recordLeftSession(left.id, left.file);
 		this.#notifySessionFileChanged(previousSessionFile);
 	}
@@ -3927,12 +3928,15 @@ export class SessionManager {
 	async #setSessionFileClaiming(
 		sessionFile: string,
 		claim: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } | undefined,
+		switched: { left?: { id: string; file: string } },
 	): Promise<void> {
 		const storage = this.#storage;
-		if (!claim || !storage.acquireSessionClaim || !this.#persist) return this.#setSessionFile(sessionFile);
+		if (!claim || !storage.acquireSessionClaim || !this.#persist) {
+			return this.#setSessionFile(sessionFile, undefined, { switched });
+		}
 		const resolved = path.resolve(sessionFile);
 		const sessionId = await readSessionHeaderId(resolved, storage);
-		if (!sessionId) return this.#setSessionFile(resolved);
+		if (!sessionId) return this.#setSessionFile(resolved, undefined, { switched });
 		let holder: SessionClaimHolder | undefined;
 		const release = await storage.acquireSessionClaim(sessionId, resolved, {
 			waitMs: claim.waitMs,
@@ -3949,7 +3953,7 @@ export class SessionManager {
 		// there, under an id of its own).
 		const claimed = { sessionId, release, holder, adopted: false };
 		try {
-			await this.#setSessionFile(resolved, undefined, { claimed });
+			await this.#setSessionFile(resolved, undefined, { claimed, switched });
 		} finally {
 			if (!claimed.adopted) release?.();
 		}
@@ -3972,6 +3976,12 @@ export class SessionManager {
 				holder: SessionClaimHolder | undefined;
 				adopted: boolean;
 			};
+			/**
+			 * Set to the session the switch leaves, read once the drain and the claim release are over (see
+			 * {@link setSessionFile}): a write the drain runs, or a lease loss while the claim waited, can move the
+			 * session to a sibling, and that sibling is the session left.
+			 */
+			switched?: { left?: { id: string; file: string } };
 		},
 	): Promise<void> {
 		// An append to this file that is still running (a stopped work pool's discards) lands first,
@@ -3988,6 +3998,9 @@ export class SessionManager {
 			this.#sessionClaim?.release?.();
 			this.#sessionClaim = undefined;
 			this.#forgetMoveOffs();
+		}
+		if (options?.switched && this.#sessionFile) {
+			options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
 		}
 
 		// `gc --archive` leaves cold transcripts gzipped outside the sessions
@@ -4361,12 +4374,15 @@ export class SessionManager {
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
 
-		const oldSessionFile = this.#sessionFile;
-		const parentSessionId = this.#sessionId;
-		this.#recordLeftSession(parentSessionId, oldSessionFile);
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
+		// Read once the drain is over: a write it ran can move the session to a sibling, which is the session
+		// this fork leaves and copies.
+		const oldSessionFile = this.#sessionFile;
+		if (!oldSessionFile) return undefined;
+		const parentSessionId = this.#sessionId;
+		this.#recordLeftSession(parentSessionId, oldSessionFile);
 
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();

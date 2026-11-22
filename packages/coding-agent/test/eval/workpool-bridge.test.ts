@@ -2,16 +2,19 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import { runEvalWorkpool } from "../../src/eval/workpool-bridge";
-import { AgentRegistry } from "../../src/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import type { AgentSession } from "../../src/session/agent-session";
 import { plainTurnAbortReason } from "../../src/session/exit-diagnostics";
 import type { SessionEntry } from "../../src/session/session-entries";
-import { SessionManager } from "../../src/session/session-manager";
+import { SessionManager, type SessionPersistenceNotice } from "../../src/session/session-manager";
 import * as discovery from "../../src/task/discovery";
 import * as executor from "../../src/task/executor";
+import { restoreSession } from "../../src/task/restore";
 import * as structured from "../../src/task/structured-subagent";
 import { readDiscardedLaunch } from "../../src/task/speculative-launch";
 import type { AgentDefinition } from "../../src/task/types";
@@ -620,4 +623,132 @@ describe("workpool model validation", () => {
 		expect(fs.existsSync(oldFile)).toBe(false);
 		await live.close();
 	});
+
+	/**
+	 * Pool worker `id`'s transcript under the parent session `parentFile`, as it reads mid-run: its turn cut off inside a
+	 * call. A copy of the parent's artifacts made while the worker runs (a fork, a move to a sibling) holds it so.
+	 */
+	async function writeRunningWorker(parentFile: string, cwd: string, id: string): Promise<void> {
+		const file = path.join(parentFile.slice(0, -".jsonl".length), `${id}.jsonl`);
+		const worker = await SessionManager.open(file, undefined, undefined, {
+			initialCwd: cwd,
+			parentSession: parentFile,
+			suppressBreadcrumb: true,
+		});
+		worker.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "yield"] });
+		worker.appendMessage({ role: "user", content: "work", timestamp: Date.now() });
+		worker.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.ts" } }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		});
+		await worker.close();
+	}
+
+	/** Put another session's journal at `file`, as another omp moving its own session onto the path does. */
+	async function putAnotherSessionAt(file: string, dir: TempDir): Promise<void> {
+		const other = SessionManager.create(dir.path(), dir.join("another"));
+		await other.ensureOnDisk();
+		other.appendMessage({ role: "user", content: "the other session's turn", timestamp: Date.now() });
+		await other.flush();
+		const otherFile = other.getSessionFile()!;
+		await other.close();
+		fs.renameSync(otherFile, file);
+	}
+
+	/** The subagents a later `omp --restore` of the session at `file` relaunches, in a new process. */
+	async function relaunchedByRestoreOf(file: string): Promise<string[]> {
+		AgentRegistry.resetGlobalForTests();
+		const resumed = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
+		const entries = resumed.getEntries();
+		const leafId = resumed.getLeafId();
+		await resumed.close();
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		managers.add(jobs);
+		jobs.registerDeliverySink(MAIN_AGENT_ID, () => {});
+		vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async (options): Promise<SingleResult> => ({
+			index: 0,
+			id: options.id,
+			agent: options.id,
+			agentSource: "user",
+			task: `${options.id} task`,
+			exitCode: 0,
+			output: "finished after the restart",
+			stderr: "",
+			truncated: false,
+			durationMs: 5,
+			tokens: 0,
+			requests: 1,
+		}));
+		const outcome = await restoreSession({
+			sessionManager: { getSessionFile: () => file, getEntries: () => entries, getLeafId: () => leafId },
+			asyncJobManager: jobs,
+			settings: Settings.isolated(),
+			restoreInterruptedTurn: async () => false,
+		} as unknown as AgentSession);
+		for (const id of outcome.subagents) await jobs.getJob(id)?.promise.catch(() => {});
+		return outcome.subagents;
+	}
+
+	const leavings: Array<[string, (live: SessionManager, other: string) => Promise<unknown>]> = [
+		["a /resume of another session", (live, other) => live.setSessionFile(other)],
+		["a whole-session /fork", live => live.fork()],
+		["/new", live => live.newSession()],
+	];
+	for (const [transition, leave] of leavings) {
+		it(`records a stopped pool's workers in the sibling a write the drain of ${transition} moved the session to, so its restore relaunches none`, async () => {
+			// If this regresses, the session left is read before the transition drains the session's writes: a rewrite
+			// queued as the user leaves meets another session's journal at the file and moves this session to a sibling
+			// inside the drain, the sibling is not recorded as left, and the stop writes no discard there. The sibling
+			// holds the worker's transcript as the move copied it mid-run, so `omp --restore` of it relaunches a worker
+			// of a pool the user stopped; the file the session left now holds the other session.
+			using dir = TempDir.createSync("@pi-pool-drain-move-");
+			const sessions = path.join(dir.path(), "sessions");
+			const other = SessionManager.create(dir.path(), sessions);
+			await other.ensureOnDisk();
+			other.appendMessage({ role: "user", content: "another session", timestamp: Date.now() });
+			await other.flush();
+			const otherFile = other.getSessionFile()!;
+			await other.close();
+			const live = SessionManager.create(dir.path(), sessions);
+			await live.ensureOnDisk();
+			live.appendMessage({ role: "user", content: "run the pool", timestamp: Date.now() });
+			await live.flush();
+			const ownFile = live.getSessionFile()!;
+			const { worker, session } = await runningPoolIn(live, "drained");
+			await live.flush();
+			await writeRunningWorker(ownFile, dir.path(), worker);
+			await putAnotherSessionAt(ownFile, dir);
+			const notices: SessionPersistenceNotice[] = [];
+			live.onPersistenceNotice(notice => notices.push(notice));
+			// A rewrite queued as the user leaves (a compaction's, say) runs inside the transition's drain.
+			const rewrite = live.rewriteEntries().catch(() => {});
+			await leave(live, otherFile);
+			await rewrite;
+			await stopPool(session, "drained");
+			await live.close();
+
+			const sibling = notices[0]?.to ?? "";
+			expect(notices).toEqual([{ reason: "replaced", from: ownFile, to: sibling }]);
+			const movedTo = await SessionManager.open(sibling, undefined, undefined, { suppressBreadcrumb: true });
+			const discarded = discardedIn(movedTo.getEntries());
+			await movedTo.close();
+			expect({ discarded, relaunched: await relaunchedByRestoreOf(sibling) }).toEqual({
+				discarded: [worker],
+				relaunched: [],
+			});
+		});
+	}
 });
