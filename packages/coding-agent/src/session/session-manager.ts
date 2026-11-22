@@ -3277,11 +3277,32 @@ export class SessionManager {
 		return sessionFile;
 	}
 
-	/** Delete a session file and its artifact directory. ENOENT is treated as success. */
+	/**
+	 * Delete a session file and its artifact directory. ENOENT is treated as success.
+	 *
+	 * The manager's own file is deleted only while it still holds the session
+	 * this manager owns there (`ListedSessionChangedError` otherwise, deleting
+	 * nothing): the id is read before the writer drains, as a flush can move
+	 * the manager to a sibling. Wherever the manager sets its file, it sets the
+	 * id the file's header names or writes it with that id, so the two differ
+	 * only while nothing of the manager's is written there yet; a delete then
+	 * finds no file, which is nothing of its to delete. Another session that
+	 * took the path is refused, never deleted. Any other path is deleted as
+	 * {@link deleteSessionFile} deletes it.
+	 */
 	async dropSession(sessionPath: string): Promise<void> {
+		const owned =
+			this.#sessionFile !== undefined && path.resolve(sessionPath) === path.resolve(this.#sessionFile)
+				? this.#sessionId
+				: undefined;
 		await this.#drainAndCloseWriter();
 		try {
-			await SessionManager.deleteSessionFile(sessionPath, this.#storage);
+			if (owned !== undefined && !(await this.#storage.exists(sessionPath))) return;
+			await SessionManager.deleteSessionFile(
+				sessionPath,
+				this.#storage,
+				owned === undefined ? undefined : listedSession(owned),
+			);
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
@@ -3329,12 +3350,12 @@ export class SessionManager {
 	}
 
 	/**
-	 * Delete a session a picker listed (the startup `--resume` picker's and the
-	 * in-session `/resume` picker's delete): {@link deleteSessionFile}, refused
-	 * with `ListedSessionChangedError`, deleting nothing, unless the file at
-	 * `session.path` still holds the session `session.id` when the delete runs,
-	 * so it never deletes another session that took the path after the picker
-	 * listed it.
+	 * Delete the session `session.id` at `session.path`: {@link deleteSessionFile},
+	 * refused with `ListedSessionChangedError`, deleting nothing, unless the
+	 * file still holds that session when the delete runs. The pickers' delete
+	 * (the session a picker listed) and `/delete` (the session the manager
+	 * owned there before it detached) make it, so neither deletes another
+	 * session that took the path.
 	 */
 	static async deleteListedSession(
 		session: { path: string; id: string },

@@ -74,7 +74,7 @@ async function pathsUnder(db: LeaseDb, stem: string): Promise<string[]> {
 
 for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 	describe.skipIf(!url)(`a subagent transcript of a ${adapter} session another process takes over`, () => {
-		it("a live subagent transcript follows its parent to the sibling the parent moves to when another process takes the lease over", async () => {
+		it("a live subagent transcript follows its parent to the sibling the parent moves to when another process takes the lease over, and both own deletes then remove them there", async () => {
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const { owner, file, child } = await ownedSession(db);
 			// The writer that created them closes, releasing the lease.
@@ -122,6 +122,21 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				expect(await pathsUnder(db, stemOf(file))).toEqual([child]);
 				// The move leaves no pointer: this build writes no continuation marker.
 				expect(await db.row(`${stemOf(file)}.continuation`)).toBeUndefined();
+
+				// Each manager now owns the session at its new path: its own delete removes it, and leaves the taker's.
+				const childDropped = await holder.run({ op: "dropSubagent" });
+				const parentDropped = await holder.run({ op: "drop" });
+				expect([
+					childDropped.error,
+					childDropped.sessionFile,
+					parentDropped.error,
+					parentDropped.sessionFile,
+				]).toEqual([undefined, subagentLate.sessionFile, undefined, parentFile]);
+				expect([await db.row(subagentLate.sessionFile ?? ""), await db.row(parentFile)]).toEqual([
+					undefined,
+					undefined,
+				]);
+				expect((await db.row(file))?.content).toContain("taker's turn");
 			} finally {
 				await taker.close();
 			}

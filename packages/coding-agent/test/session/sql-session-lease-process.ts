@@ -16,6 +16,8 @@
  *   the session first, and again right before each full write, so the append and every full write meet
  *   a changed file.
  * - `{ op: "appendSubagent", text }`: the same for the held subagent transcript.
+ * - `{ op: "drop" }`, `{ op: "dropSubagent" }`: the held session's (or subagent transcript's) manager deletes its own
+ *   current file (`dropSession`); `sessionFile` names that file, `error` a refusal.
  * - `{ op: "closeHeld" }`: close the held session's manager, leaving the subagent transcript's open.
  * - `{ op: "openSubagent", file }`: close the held subagent transcript's manager, if any, and open `file` as the
  *   held subagent transcript instead.
@@ -290,6 +292,19 @@ async function rewrite(contested: boolean): Promise<Record<string, unknown>> {
 	return { ...describe(manager), error };
 }
 
+/** `manager`'s `dropSession` of its own current file: `sessionFile` names it, `error` a refusal. */
+async function dropOwn(manager: SessionManager | undefined): Promise<Record<string, unknown>> {
+	const file = manager?.getSessionFile();
+	if (!manager || !file) throw new Error("no session is held");
+	let error: string | undefined;
+	try {
+		await manager.dropSession(file);
+	} catch (err) {
+		error = err instanceof Error ? err.message : String(err);
+	}
+	return { sessionFile: file, sessionId: manager.getSessionId(), error };
+}
+
 async function switchTo(command: Record<string, unknown>): Promise<Record<string, unknown>> {
 	const cwd = String(command.cwd);
 	const manager = adopt(SessionManager.create(cwd, String(command.scratchDir), storage));
@@ -361,6 +376,10 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 				: appendTo(held, String(command.text));
 		case "appendSubagent":
 			return appendTo(subagent, String(command.text));
+		case "drop":
+			return dropOwn(held);
+		case "dropSubagent":
+			return dropOwn(subagent);
 		case "closeHeld": {
 			await held?.close();
 			return { sessionFile: held?.getSessionFile() };

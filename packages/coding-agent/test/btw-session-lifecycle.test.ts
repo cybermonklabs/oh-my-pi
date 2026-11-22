@@ -282,6 +282,17 @@ describe("BTW session boundaries", () => {
 		expect(await Bun.file(recordPath).text()).toBe(originalRecord);
 	});
 
+	it("the delete command refuses, deleting nothing, when another session took the current session's file", async () => {
+		const otherId = crypto.randomUUID();
+		const other = `${JSON.stringify({ type: "session", version: 3, id: otherId, timestamp: new Date().toISOString(), cwd: directory.path() })}\n`;
+		await Bun.write(sourceFile, other);
+		vi.spyOn(SelectorController.prototype, "showSessionSelector").mockResolvedValue(undefined);
+		await expect(mode.handleSessionDeleteCommand()).rejects.toThrow(
+			`Cannot delete session "${sourceFile}": the file no longer holds session ${sourceId} (it holds ${otherId}). Nothing was deleted.`,
+		);
+		expect(await Bun.file(sourceFile).text()).toBe(other);
+	});
+
 	describe.each(["initial", "reinitialized"] as const)("%s extension command context", binding => {
 		async function transition(action: "newSession" | "switchSession" | "branch") {
 			const controller = new ExtensionUiController(mode);

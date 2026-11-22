@@ -21,6 +21,7 @@ import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-age
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
 import {
 	LEASE_BACKENDS,
 	LeaseProcess,
@@ -190,6 +191,44 @@ function refusedMoved(file: string, id: string): string {
 	return `refused: Cannot delete session "${file}": the file no longer holds session ${id} (it moved or was deleted). Nothing was deleted.`;
 }
 
+function userTurn(text: string) {
+	return { role: "user" as const, content: text, timestamp: Date.now() };
+}
+
+/**
+ * A session this process's SessionManager writes through the picker's (claiming) store: a turn and its reply,
+ * published (a session with no reply yet is not written).
+ */
+async function ownSession(backend: Backend): Promise<SessionManager> {
+	fs.mkdirSync(backend.dir.join("project"), { recursive: true });
+	const manager = SessionManager.create(
+		backend.dir.join("project"),
+		backend.dir.join("sessions", "-project-"),
+		backend.picker,
+	);
+	manager.appendMessage(userTurn("the manager's turn"));
+	manager.appendMessage(createAssistantMessage("the manager's reply"));
+	await manager.ensureOnDisk();
+	await manager.flush();
+	const file = manager.getSessionFile();
+	if (!file || !(await backend.paths()).includes(file)) throw new Error("the session is not in the store");
+	return manager;
+}
+
+/**
+ * `manager` deletes its own current file (`dropSession`): the file is in the store before, it is deleted, and only
+ * `kept` remain.
+ */
+async function expectOwnDelete(backend: Backend, manager: SessionManager, kept: string[] = []): Promise<void> {
+	await manager.flush();
+	const file = manager.getSessionFile();
+	if (!file) throw new Error("the manager has no file");
+	await backend.picker.refresh?.();
+	expect(await backend.paths()).toEqual([...kept, file].sort());
+	const deleted = await outcome(manager.dropSession(file));
+	expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [...kept].sort() });
+}
+
 /** A delete as its callers make it: readied before the move starts (a caller's session may be open), then run. */
 interface DeleteShape {
 	readonly name: string;
@@ -348,4 +387,143 @@ for (const { adapter, url } of BACKENDS) {
 			);
 		});
 	}
+
+	// `dropSession` of the manager's own file expects the session the manager owns there, never the one the header
+	// names when the delete reads it. Each `site` names where SessionManager sets its file and id.
+	describe.skipIf(!url)(`a SessionManager's delete of its own ${adapter} session`, () => {
+		it("refuses, deleting nothing, when another session took its path", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			try {
+				const file = manager.getSessionFile() ?? "";
+				const other = crypto.randomUUID();
+				await backend.writer.writeText(file, transcript(other, "another session"));
+				await backend.writer.drain();
+				await backend.picker.refresh?.();
+				const deleted = await outcome(manager.dropSession(file));
+				expect({ deleted, paths: await backend.paths() }).toEqual({
+					deleted: `refused: Cannot delete session "${file}": the file no longer holds session ${manager.getSessionId()} (it holds ${other}). Nothing was deleted.`,
+					paths: [file],
+				});
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes a session it started (site: #resetToNewSession)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			try {
+				await expectOwnDelete(backend, manager);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes a session it opened (site: #setSessionFile, the id from the header)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const writer = await ownSession(backend);
+			const file = writer.getSessionFile() ?? "";
+			await writer.close();
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				await expectOwnDelete(backend, manager);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes an empty file it opened and wrote its header to (site: #setSessionFile's empty branch)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const file = backend.dir.join("sessions", "-project-", "explicit.jsonl");
+			backend.writer.ensureDirSync(path.dirname(file));
+			await backend.writer.writeText(file, "");
+			await backend.writer.drain();
+			await backend.picker.refresh?.();
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				expect(manager.getSessionFile()).toBe(file);
+				await expectOwnDelete(backend, manager);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes its session after moving it (site: moveTo)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			try {
+				const from = manager.getSessionFile();
+				fs.mkdirSync(backend.dir.join("moved"), { recursive: true });
+				await manager.moveTo(backend.dir.join("moved"), backend.dir.join("sessions", "zz-moved"));
+				expect(manager.getSessionFile()).not.toBe(from);
+				await expectOwnDelete(backend, manager);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes its fork, keeping the session it forked from (site: fork)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			try {
+				const from = manager.getSessionFile() ?? "";
+				await manager.fork();
+				await expectOwnDelete(backend, manager, [from]);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes its branched session, keeping the session it branched from (site: createBranchedSession)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			try {
+				const from = manager.getSessionFile() ?? "";
+				manager.createBranchedSession(manager.getLeafId() ?? "");
+				await manager.flush();
+				await expectOwnDelete(backend, manager, [from]);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes the session through a clone of its state (site: restoreState)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const manager = await ownSession(backend);
+			const clone = manager.cloneCurrentSession();
+			try {
+				await expectOwnDelete(backend, clone);
+			} finally {
+				await clone.close();
+				await manager.close();
+			}
+		}, 60_000);
+
+		it("deletes the sibling it moved to while another process held its session, keeping that session (site: #moveOffSessionFile)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const writer = await ownSession(backend);
+			const file = writer.getSessionFile() ?? "";
+			await writer.close();
+			await using holder = await LeaseProcess.start({ ...backend.config, claims: true }, backend.dir.join("holder"));
+			const held = await holder.run({ op: "hold", file, sessionDir: path.dirname(file) });
+			expect([held.error, held.sessionFile]).toEqual([undefined, file]);
+			await backend.picker.refresh?.();
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				manager.appendMessage(userTurn("while another process holds the session"));
+				await manager.flush();
+				expect(manager.getSessionFile()).not.toBe(file);
+				await expectOwnDelete(backend, manager, [file]);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+	});
 }
