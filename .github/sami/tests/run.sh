@@ -896,15 +896,24 @@ fi
 # saves only on a push to sami: cache-mode takes no expression, so each of
 # its actions/cache/save steps starts its `if:` with that condition and has
 # no `||`, and it has no actions/cache step (which saves in its post step,
-# under no condition of the job's).
+# under no condition of the job's). Its steps use only the actions it uses
+# today, and .github/actions/bazel-cache calls no action, so no other caching
+# action can save under release_binary's token. A line under jobs: that is
+# not a plain `  <id>:` stops the lint, because its steps would be read as
+# the job above's.
 cache_lint() {
-	local wf="$1" action="$2" rc=0 job jobs steps bun n ok mode saves ns
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok mode saves ns others
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\]*\}\}\\n'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
 	fi
 	jobs="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$wf")"
+	bad="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [^ #]/ && !/^  [A-Za-z_][A-Za-z0-9_-]*:$/' "$wf")"
+	if [ -n "$bad" ]; then
+		echo "UNKNOWN: $wf has a job line cache_lint cannot read: $bad"
+		return 1
+	fi
 	for job in release_binary rust_test rust_test_macos; do
 		printf '%s\n' "$jobs" | grep -qxF "$job" || { echo "UNKNOWN: $wf has no $job job"; return 1; }
 	done
@@ -926,6 +935,11 @@ cache_lint() {
 		if [ "$job" = release_binary ]; then
 			if printf '%s\n' "$steps" | grep -qE 'uses: *actions/cache@'; then
 				echo "release_binary has an actions/cache step that saves in its post step"
+				ok=0
+			fi
+			others="$(printf '%s\n' "$steps" | grep -oE 'uses: *[^ \\]+' | sed 's/^uses: *//' | grep -vE '^(actions/checkout@|actions/upload-artifact@|actions/cache/restore@|actions/cache/save@|\./\.github/actions/(bun-install|bazel-cache)$)' || true)"
+			if [ -n "$others" ]; then
+				echo "release_binary uses an action outside its list: $(printf '%s' "$others" | tr '\n' ' ')"
 				ok=0
 			fi
 			saves="$(printf '%s\n' "$steps" | grep -E 'uses: *actions/cache/save@' || true)"
@@ -952,6 +966,10 @@ cache_lint() {
 		fi
 		[ "$ok" = 1 ] || rc=1
 	done
+	if grep -qE '^ *(- )?uses:' "$bazel_action"; then
+		echo "$bazel_action calls an action"
+		rc=1
+	fi
 	if ! grep -qF 'CACHE_INPUT: ${{ inputs.cache }}' "$action" || ! awk '/elif \[ "\$CACHE_INPUT" = false \]; then/ { getline; if ($0 ~ /echo "cache=none"/) found = 1 } END { exit !found }' "$action"; then
 		echo "$action does not set cache=none for cache: \"false\""
 		rc=1
@@ -963,15 +981,17 @@ cache_lint() {
 	return "$rc"
 }
 # wlint <name> <want> <message regex> <sed for the workflow> <sed for the
-# action>: cache_lint on the repository's files, each edited by its sed script
-# (an empty one leaves it as it is).
+# bun-install action> [<sed for the bazel-cache action>]: cache_lint on the
+# repository's files, each edited by its sed script (an empty one leaves it
+# as it is).
 wlint() {
 	local name="$1" want="$2" msg="$3" w out rc
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
 	w="$(mktemp -d "$scratch/wlint.XXXXXX")"
 	sed -e "${4:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/sami-build.yml"
 	sed -e "${5:-p;d}" "$repo/.github/actions/bun-install/action.yml" >"$w/action.yml"
-	out="$(cache_lint "$w/sami-build.yml" "$w/action.yml" 2>&1)"
+	sed -e "${6:-p;d}" "$repo/.github/actions/bazel-cache/action.yml" >"$w/bazel-cache.yml"
+	out="$(cache_lint "$w/sami-build.yml" "$w/action.yml" "$w/bazel-cache.yml" 2>&1)"
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
@@ -1000,6 +1020,12 @@ wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an 
 wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
 wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to sami' "s#github.ref == 'refs/heads/sami' &&#github.ref == 'refs/heads/sami' ||#" ''
 wlint W18-release-binary-post-save-step 1 'release_binary has an actions/cache step that saves in its post step' 's|uses: actions/cache/restore@|uses: actions/cache@|' ''
+wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}/steps.release-cache-bound.outputs.save == 'true' || github.event_name == 'workflow_dispatch' }}/" ''
+# No other caching action can save under release_binary's token, and a job
+# line the lint cannot read stops it.
+wlint W20-release-binary-other-cache-action 1 'release_binary uses an action outside its list: Swatinem/rust-cache@v2' 's|^      - name: Point Bazel at the release build cache$|      - uses: Swatinem/rust-cache@v2\n&|' ''
+wlint W21-bazel-cache-action-calls-an-action 1 'bazel-cache.yml calls an action' '' '' 's|^   steps:$|&\n      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830|'
+wlint W22-job-line-with-a-comment 1 'job line cache_lint cannot read' 's/^  carry:$/  carry: # the carry check/' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
