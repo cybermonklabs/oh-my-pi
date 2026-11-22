@@ -172,6 +172,15 @@ pub trait Host {
 	fn ppid(&self) -> u32;
 	/// Current user (`~`, `$UID`, `$EUID`).
 	fn user(&self) -> UserInfo;
+	/// The login name of the process's session (`getlogin`), which zsh's
+	/// `LOGNAME` starts as when it is not empty (zsh 5.9
+	/// `Src/params.c:841-846`; else the password database's name, as
+	/// [`Host::user`]). It can name another user than the uid's (macOS
+	/// answers the session's login name). `None` (the default): the host
+	/// has no login session of its own.
+	fn login_name(&self) -> Option<BString> {
+		None
+	}
 	/// The current user's login shell from the password database, for
 	/// `SHELL`. [`Shell::create`](crate::bash::Shell::create) and the in-engine
 	/// nested shell call it only when `SHELL` is not imported (as bash

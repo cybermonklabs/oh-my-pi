@@ -397,6 +397,35 @@ impl crate::bash::Host for NativeHost {
 		self.user.get_or_init(crate::sys::user::read_user).clone()
 	}
 
+	fn login_name(&self) -> Option<BString> {
+		#[cfg(unix)]
+		{
+			// POSIX `getlogin_r`, which the `libc` crate does not bind: the
+			// name goes into a buffer of ours, so another thread of an
+			// embedding process that calls `getlogin` cannot overwrite it.
+			unsafe extern "C" {
+				fn getlogin_r(name: *mut libc::c_char, size: libc::size_t) -> libc::c_int;
+			}
+			let mut buf = vec![0u8; 256];
+			loop {
+				// SAFETY: `buf` is writable for its whole length, which is
+				// passed as the size.
+				let rc = unsafe { getlogin_r(buf.as_mut_ptr().cast(), buf.len()) };
+				if rc == libc::ERANGE && buf.len() < 1 << 16 {
+					buf.resize(buf.len() * 2, 0);
+					continue;
+				}
+				if rc != 0 {
+					return None;
+				}
+				let name = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+				return (!name.is_empty()).then(|| BString::from(name));
+			}
+		}
+		#[cfg(not(unix))]
+		None
+	}
+
 	fn login_shell(&self) -> Option<BString> {
 		read_login_shell()
 	}

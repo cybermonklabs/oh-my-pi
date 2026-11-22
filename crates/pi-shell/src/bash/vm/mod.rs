@@ -1451,7 +1451,9 @@ pub fn zsh_startup_values(
 		out.push((name, Var::scalar(value, Attrs::INTEGER), false));
 	}
 	// zsh exports `HOME` and `LOGNAME` (`addenv` when not imported); `HOME`
-	// is `/` for a user without a password database entry (`setupvals`).
+	// is `/` for a user without a password database entry (`setupvals`), and
+	// `LOGNAME` the session's login name when it has one (`params.c`, which
+	// tries `getlogin` first), else the password database's name.
 	let home = if user.home.is_empty() {
 		BString::from("/")
 	} else if platform == crate::bash::ids::Platform::Windows {
@@ -1460,7 +1462,12 @@ pub fn zsh_startup_values(
 		user.home.clone()
 	};
 	out.push((&b"HOME"[..], Var::scalar(home, Attrs::EXPORT), false));
-	out.push((&b"LOGNAME"[..], Var::scalar(user.name, Attrs::EXPORT), false));
+	let logname = cx
+		.host
+		.login_name()
+		.filter(|name| !name.is_empty())
+		.unwrap_or(user.name);
+	out.push((&b"LOGNAME"[..], Var::scalar(logname, Attrs::EXPORT), false));
 	let (_, release, machine) = cx.host.uname().unwrap_or_default();
 	let macos = cfg!(target_os = "macos");
 	// The configure-time `MACHTYPE`, `VENDOR` and `OSTYPE` of the system's

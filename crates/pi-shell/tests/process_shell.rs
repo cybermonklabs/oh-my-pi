@@ -9,7 +9,7 @@ mod pty_support;
 mod zsh_oracle;
 
 use std::{
-	ffi::{OsStr, OsString},
+	ffi::{CStr, OsStr, OsString},
 	fs, io,
 	os::unix::process::CommandExt,
 	process::Command,
@@ -135,6 +135,25 @@ fn passwd_entry() -> Option<(String, String)> {
 	}
 }
 
+/// The login name of the test's session (`getlogin`), when it has one: the
+/// shells the tests start share the session. glibc answers only for a
+/// process with an audit login uid, or with a terminal it finds in utmp
+/// (the shells' standard input is `/dev/null`); macOS answers the session's
+/// login name, which can be another user's than the uid's.
+fn login_name() -> Option<String> {
+	// SAFETY: getlogin returns null or a NUL-terminated name in static
+	// storage, copied out at once; nothing else in this process calls it.
+	let name = unsafe { libc::getlogin() };
+	if name.is_null() {
+		return None;
+	}
+	// SAFETY: a NUL-terminated string, read before any other call.
+	let name = unsafe { CStr::from_ptr(name) }
+		.to_string_lossy()
+		.into_owned();
+	(!name.is_empty()).then_some(name)
+}
+
 /// `script` run as `name` by `program` under `wrap` (a command and its
 /// arguments, or none), with `USER=nobody-by-env` and neither `HOME` nor
 /// `LOGNAME` set.
@@ -153,22 +172,28 @@ fn without_home(
 }
 
 const ZSH_USER: &str = "print -r -- \"[$USERNAME] [$HOME] [$(print ~)] [${(%):-%n}] [$LOGNAME]\"";
-const BASH_USER: &str = "PS1='\\u'; echo \"[${PS1@P}] [${HOME-unset}] [$(echo ~)]\"";
+const BASH_USER: &str =
+	"PS1='\\u'; echo \"[${PS1@P}] [${HOME-unset}] [$(echo ~)] [${LOGNAME-unset}]\"";
 
-/// zsh names the user (`USERNAME`, `%n`, `LOGNAME`) and sets the default
-/// `HOME` from the password database, and bash names the user (`\u`) and
-/// expands `~` from it without setting `HOME`; neither reads `USER`. Where
-/// the uid running the tests has no entry, the case is reported
+/// zsh names the user (`USERNAME`, `%n`) and sets the default `HOME` from
+/// the password database, and `LOGNAME` from the session's login name
+/// ([`login_name`]) when there is one, else from the password database too
+/// (zsh 5.9 `Src/params.c:841-846`); bash names the user (`\u`) and expands
+/// `~` from it without setting `HOME` or `LOGNAME`; neither reads `USER`.
+/// Where the uid running the tests has no entry, the case is reported
 /// `UNCOMPARED:` (the next test checks that case under a user namespace).
+/// Linux CI gives the shells no login name ([`login_name`]): the case of
+/// one is checked on macOS, where the session's can differ from the uid's.
 #[test]
 fn the_user_name_and_home_come_from_the_password_database() {
 	let Some((name, home)) = passwd_entry() else {
 		zsh_oracle::uncompared("the uid running the tests has no password database entry");
 		return;
 	};
+	let login = login_name().unwrap_or_else(|| name.clone());
 	for (shell, script, want) in [
-		("zsh", ZSH_USER, format!("[{name}] [{home}] [{home}] [{name}] [{name}]\n")),
-		("bash", BASH_USER, format!("[{name}] [unset] [{home}]\n")),
+		("zsh", ZSH_USER, format!("[{name}] [{home}] [{home}] [{name}] [{login}]\n")),
+		("bash", BASH_USER, format!("[{name}] [unset] [{home}] [unset]\n")),
 	] {
 		let ours = without_home(&[], env!("CARGO_BIN_EXE_obash"), shell, script);
 		assert_eq!(
@@ -185,9 +210,11 @@ fn the_user_name_and_home_come_from_the_password_database() {
 
 /// A uid without a password database entry, under a user namespace that
 /// maps one (`unshare --map-user`): zsh has an empty `USERNAME`, `%n` and
-/// `LOGNAME` and `HOME=/`, bash says `I have no name!` for `\u` and `/` for
-/// `~`, and neither takes `USER`. Where no such namespace can be made (no
-/// `unshare`, or user namespaces refused), the test says so.
+/// `LOGNAME` (no login name there either: `getlogin` finds no entry for
+/// the uid) and `HOME=/`, bash says `I have no name!` for `\u` and `/` for
+/// `~` and sets no `LOGNAME`, and neither takes `USER`. Where no such
+/// namespace can be made (no `unshare`, or user namespaces refused), the
+/// test says so.
 #[test]
 fn a_uid_without_a_password_entry_has_each_shells_defaults() {
 	let wrap = ["unshare", "--user", "--map-user=54321", "--map-group=54321"];
@@ -200,7 +227,7 @@ fn a_uid_without_a_password_entry_has_each_shells_defaults() {
 	}
 	for (shell, script, want) in [
 		("zsh", ZSH_USER, "[] [/] [/] [] []\n"),
-		("bash", BASH_USER, "[I have no name!] [unset] [/]\n"),
+		("bash", BASH_USER, "[I have no name!] [unset] [/] [unset]\n"),
 	] {
 		let ours = without_home(&wrap, env!("CARGO_BIN_EXE_obash"), shell, script);
 		assert_eq!(
