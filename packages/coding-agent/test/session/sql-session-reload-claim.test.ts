@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager, type SessionPersistenceNotice } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import {
 	LEASE_BACKENDS,
 	type LeaseDb,
@@ -44,6 +45,38 @@ function underExclusive(): { codes: unknown[]; restore: () => void } {
 			else process.env.OMP_SESSION_EXCLUSIVE = before;
 		},
 	};
+}
+
+const WRITTEN_DURING_RELOAD = "written while the reload loads";
+
+/**
+ * `store`, whose read of `file`'s whole text, once `armed`, first makes a write through `manager`: a write while the
+ * reload's load reads the journal, as a work pool's record can be. `written` says the write was made.
+ */
+function writeWhileReloading(
+	store: SqlSessionStorage,
+	file: string,
+): { store: SqlSessionStorage; manager?: SessionManager; armed: boolean; written: boolean } {
+	const state: { store: SqlSessionStorage; manager?: SessionManager; armed: boolean; written: boolean } = {
+		store,
+		armed: false,
+		written: false,
+	};
+	state.store = new Proxy(store, {
+		get(target, property) {
+			const value: unknown = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			if (property !== "readText") return value.bind(target);
+			return async (readPath: string, ...rest: unknown[]) => {
+				if (state.armed && !state.written && state.manager && path.resolve(readPath) === path.resolve(file)) {
+					state.written = true;
+					state.manager.appendMessage({ role: "user", content: WRITTEN_DURING_RELOAD, timestamp: Date.now() });
+				}
+				return value.call(target, readPath, ...rest);
+			};
+		},
+	}) as SqlSessionStorage;
+	return state;
 }
 
 for (const { adapter, url } of LEASE_BACKENDS) {
@@ -204,6 +237,96 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await until(() => exits.codes.length > 0, 5000);
 
 				expect(exits.codes).toEqual([1]);
+				await manager.close();
+			} finally {
+				exits.restore();
+			}
+		}, 60_000);
+
+		it("keeps a write made while a reload loads, with the session's id and file", async () => {
+			// If this regresses, the manager gives its own claim back before the reload's load, so the only writer slot
+			// left on the journal is the switch's; a write while the load reads (a work pool's record: a reload cancels
+			// no jobs) asks for a claim of its own, is refused, and moves the session to a sibling with a new id.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const base = await db.open({ lease: STILL });
+			const id = Bun.randomUUIDv7();
+			const file = fileOf(db, id);
+			await base.writeText(file, transcript(id, "the session", db.dir.path()));
+			await base.drain();
+			const reload = writeWhileReloading(base, file);
+			const manager = await SessionManager.open(file, path.dirname(file), reload.store, {
+				suppressBreadcrumb: true,
+			});
+			reload.manager = manager;
+			manager.claimForWriting();
+			manager.appendMessage({ role: "user", content: "a turn", timestamp: Date.now() });
+			await manager.flush();
+			const notices: SessionPersistenceNotice[] = [];
+			manager.onPersistenceNotice(notice => notices.push(notice));
+
+			reload.armed = true;
+			await manager.setSessionFile(file, { claim: { waitMs: 0 } });
+			await manager.flush();
+
+			// The load read the journal, and the write came then: else this run tested nothing.
+			expect({
+				written: reload.written,
+				id: manager.getSessionId(),
+				file: manager.getSessionFile(),
+				notices,
+				onBranch: JSON.stringify(manager.getBranch()).includes(WRITTEN_DURING_RELOAD),
+				inRow: ((await db.row(file))?.content ?? "").includes(WRITTEN_DURING_RELOAD),
+			}).toEqual({ written: true, id, file, notices: [], onBranch: true, inRow: true });
+			await manager.close();
+			await base.drain();
+			// No claim of the session is left behind: another process takes it once the manager closed.
+			await using other = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("other"),
+			);
+			expect((await other.run({ op: "claim", sessionId: id, path: file })).held).toBe(true);
+		}, 60_000);
+
+		it("does not stop an OMP_SESSION_EXCLUSIVE=1 session for a write made while a reload loads", async () => {
+			// If this regresses, the write while the reload loads is refused as above, and the exclusive session stops
+			// (it seals itself at once, then ends the process).
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const base = await db.open({ lease: STILL });
+			const id = Bun.randomUUIDv7();
+			const file = fileOf(db, id);
+			await base.writeText(file, transcript(id, "the session", db.dir.path()));
+			await base.drain();
+			const exits = underExclusive();
+			try {
+				const reload = writeWhileReloading(base, file);
+				const manager = await SessionManager.open(file, path.dirname(file), reload.store, {
+					suppressBreadcrumb: true,
+				});
+				reload.manager = manager;
+				manager.claimForWriting();
+				manager.appendMessage({ role: "user", content: "a turn", timestamp: Date.now() });
+				await manager.flush();
+				const seals = vi.spyOn(manager, "seal");
+
+				reload.armed = true;
+				let sealed = 0;
+				try {
+					await manager.setSessionFile(file, { claim: { waitMs: 0 } });
+					await manager.flush();
+				} finally {
+					sealed = seals.mock.calls.length;
+					seals.mockRestore();
+					// A stop that began ends with process.exit after its holder lookup: keep that exit recorded, not
+					// run, so a regression fails this case instead of ending the test run.
+					if (sealed > 0) await until(() => exits.codes.length > 0, 10_000);
+				}
+
+				// The write came while the load read the journal: else this run tested nothing.
+				expect({ written: reload.written, sealed, id: manager.getSessionId() }).toEqual({
+					written: true,
+					sealed: 0,
+					id,
+				});
 				await manager.close();
 			} finally {
 				exits.restore();

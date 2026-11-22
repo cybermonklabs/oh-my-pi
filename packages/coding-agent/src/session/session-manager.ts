@@ -1674,7 +1674,8 @@ export class SessionManager {
 	/**
 	 * Whether a switch to `sessionFile` (session `sessionId`) is this manager reading again the session it holds now:
 	 * same id, same journal file, and a live writer claim on it (a reload, `AgentSession.reload()`). The switch's
-	 * claim then meets this manager's own writer slot, which it gives up once the switch drains. Narrow as
+	 * claim then meets this manager's own writer slot, which the manager keeps through the load (a write in between
+	 * takes it); the adoption lets the switch's duplicate slot go. Narrow as
 	 * {@link #reclaimsJournalHandedToClone}: another manager of this process on the same journal is refused, and a
 	 * second omp process is untouched (`handover` only waives this process's own one-writer refusal).
 	 */
@@ -4054,6 +4055,11 @@ export class SessionManager {
 		await SessionManager.#pendingAppends.get(resolved);
 		const sessionId = await readSessionHeaderId(resolved, storage);
 		if (!sessionId) return this.#setSessionFile(resolved, undefined, { switched });
+		// A reload of the session this manager holds keeps its own claim through the load: a write in between (a work
+		// pool's record; a reload cancels no jobs) takes that claim, not the switch's handover slot, which is the only
+		// one left once the manager gives its own back and which a write's claim cannot share. The adoption then lets
+		// the switch's duplicate slot go.
+		const rereads = this.#rereadsItsOwnSession(sessionId, resolved);
 		let holder: SessionClaimHolder | undefined;
 		let release: (() => void) | null;
 		for (;;) {
@@ -4065,9 +4071,7 @@ export class SessionManager {
 					claim.onWait?.(found);
 				},
 				writer: true,
-				handover:
-					this.#reclaimsJournalHandedToClone(sessionId, resolved) ||
-					this.#rereadsItsOwnSession(sessionId, resolved),
+				handover: rereads || this.#reclaimsJournalHandedToClone(sessionId, resolved),
 				onLost: () => this.#onSessionClaimLost(sessionId),
 			});
 			// An append that started while the claim was taken would meet it: give the claim back, let the append
@@ -4082,7 +4086,7 @@ export class SessionManager {
 		// there, under an id of its own).
 		const claimed = { sessionId, release, holder, adopted: false };
 		try {
-			await this.#setSessionFile(resolved, undefined, { claimed, switched });
+			await this.#setSessionFile(resolved, undefined, { claimed, switched, keepClaim: rereads });
 		} finally {
 			if (!claimed.adopted) release?.();
 		}
@@ -4300,8 +4304,13 @@ export class SessionManager {
 			// A write while the switch loaded landed in the session left and claimed it again, or a move off it then
 			// claimed the sibling it made: that claim is another id's, not the adopted one. Let it go, or nothing does.
 			const prior = this.#sessionClaim;
-			if (prior && prior.sessionId !== claimed.sessionId) prior.release?.();
-			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
+			if (options?.keepClaim && prior?.sessionId === claimed.sessionId && prior.release && claimed.release) {
+				// A reload kept the manager's own claim through the load: the switch's slot duplicates it.
+				claimed.release();
+			} else {
+				if (prior && prior.sessionId !== claimed.sessionId) prior.release?.();
+				this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
+			}
 			// The held session (or a subagent transcript under a held parent) was never this manager's: the switch leaves
 			// the one it had (setSessionFile), so neither the follow's fork nor the move-off records it as left, and a
 			// switch away before the follow forks or moves the transcript does not either.
