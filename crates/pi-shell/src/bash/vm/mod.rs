@@ -2453,13 +2453,14 @@ impl Shell {
 				if !ignored {
 					let process = &mut self.procs[i];
 					process.pending_traps = process.pending_traps.with(sig);
-					// A `CHLD` trap waits while a write is part way; another
-					// runs now, under its own key ([`Vproc::holds_trap`]).
+					// A `CHLD` trap waits while the command it would interrupt
+					// writes; another runs now, under its own key
+					// ([`Vproc::holds_trap`]).
 					if !process.holds_trap(sig) {
 						process.blocked = None;
 					}
 					#[cfg(test)]
-					if sig == Signal::Chld && process.write_part_way() {
+					if sig == Signal::Chld && process.writing_now() {
 						TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					}
 					// bash: a trapped signal ends the `wait` builtin with 128 + n
@@ -2696,20 +2697,21 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
-		// While a write is part way the vproc stays as it is: the trap runs
-		// once the write ends ([`Vproc::holds_trap`]).
+		// While the command the trap would interrupt is part way in a write,
+		// the vproc stays as it is: the trap runs once the write ends
+		// ([`Vproc::holds_trap`]).
 		if !p.holds_trap(Signal::Chld) {
 			p.blocked = None;
 		}
 		#[cfg(test)]
-		if p.write_part_way() {
+		if p.writing_now() {
 			TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		}
 	}
 }
 
-/// Test only: `CHLD` traps owed while a write of their vproc was part way
-/// (they run after it).
+/// Test only: `CHLD` traps owed while the command they would interrupt was
+/// part way in a write (they run after it).
 #[cfg(test)]
 pub(crate) static TRAPS_HELD_FOR_A_WRITE: std::sync::atomic::AtomicUsize =
 	std::sync::atomic::AtomicUsize::new(0);

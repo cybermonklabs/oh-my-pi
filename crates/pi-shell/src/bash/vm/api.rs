@@ -69,12 +69,21 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_read(cx, buf))
 	}
 
-	/// Write to fd `fd` of the calling vproc (possibly partially), with its
-	/// key ([`Vproc::write_key`]).
-	pub fn write(&mut self, fd: i32, bytes: &[u8]) -> IoPoll<usize> {
+	/// Write to fd `fd` of the calling vproc (possibly partially) as the
+	/// writer `key` names. A write part way keeps its progress by its key (a
+	/// zsh multios tee, a provider file), so a callout writes with a key of
+	/// its own, which goes with it, never the vproc's
+	/// ([`Vproc::write_key`]): a callout dropped while its write waits (a
+	/// cancelled run, a killed shell) leaves no progress for the vproc's
+	/// next write.
+	pub fn write_keyed(
+		&mut self,
+		fd: i32,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> IoPoll<usize> {
 		let h = self.vproc().fds.handle(fd);
-		let key = std::sync::Arc::clone(&self.vproc().write_key);
-		self.io(|cx| h.poll_write_keyed(cx, bytes, &mut key.lock()))
+		self.io(|cx| h.poll_write_keyed(cx, bytes, key))
 	}
 
 	/// A variable as the calling vproc sees it. A store failure reads as

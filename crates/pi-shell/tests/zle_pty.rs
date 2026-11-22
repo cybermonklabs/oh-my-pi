@@ -291,6 +291,14 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 /// FIFO's reader (non-blocking); `command` is typed, and its write through
 /// fd 3 waits for room in the full FIFO.
 fn tee_fifo_writer(command: &str) -> (Pty, std::fs::File) {
+	let (pty, reader, _) = tee_fifo_and_file_writer(command, false);
+	(pty, reader)
+}
+
+/// [`tee_fifo_writer`], the tee's second target a file in the shell's home
+/// (with `file`; else `/dev/null`): also the file's path. A tee writes to a
+/// file at once, so the file shows a write made twice.
+fn tee_fifo_and_file_writer(command: &str, file: bool) -> (Pty, std::fs::File, std::path::PathBuf) {
 	use std::{
 		fs::File,
 		os::{fd::AsRawFd, unix::ffi::OsStrExt},
@@ -300,6 +308,11 @@ fn tee_fifo_writer(command: &str) -> (Pty, std::fs::File) {
 		.args(["-f", "-i"])
 		.env("PS1", "P> ")
 		.size(24, 80);
+	let second = if file {
+		s.home().join("tee-file")
+	} else {
+		"/dev/null".into()
+	};
 	let fifo = s.home().join("tee-fifo");
 	let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
 	// SAFETY: a valid C string.
@@ -311,7 +324,7 @@ fn tee_fifo_writer(command: &str) -> (Pty, std::fs::File) {
 		let fifo = fifo.clone();
 		thread::spawn(move || File::open(fifo))
 	};
-	pty.write(format!("exec 3>{} 3>/dev/null\r", fifo.display()))
+	pty.write(format!("exec 3>{} 3>{}\r", fifo.display(), second.display()))
 		.unwrap();
 	let reader = opening.join().unwrap().unwrap();
 	// SAFETY: fcntl on a descriptor this test owns.
@@ -331,7 +344,7 @@ fn tee_fifo_writer(command: &str) -> (Pty, std::fs::File) {
 		thread::sleep(Duration::from_millis(5));
 	}
 	thread::sleep(QUIET);
-	(pty, reader)
+	(pty, reader, second)
 }
 
 /// Drain `reader` 4 KiB at a time on a thread until it is empty after
@@ -472,5 +485,62 @@ fn ctrl_z_during_a_queued_diagnostic_through_a_tee_writes_it_once() {
 		(zeros, count(b"command not found"), count(b"AFTER-42"), got.len()),
 		(131_072, 1, 1, message + 8),
 		"('0's, messages, AFTER-42s, bytes)"
+	);
+}
+
+// Failure mode (review of #111 at a25f15f0, a test gap): Ctrl-Z stopped
+// `cat` in a USR1 trap's `cat | printf ... >&3` while the trap's write and
+// the write it interrupted, `printf`'s, both waited on a tee. The stopped
+// job takes the keys its ops write with: the trap's, and the one the trap
+// interrupted ([`Vproc::trap_keys`]), which comes back when the trap ends
+// after `fg`. A job without the interrupted key went on with the trap's,
+// and the tee wrote `printf`'s rest to the file again. The file holds the
+// '0's once, the trap's spaces once, then `AFTER-42`; the FIFO the same
+// bytes.
+#[test]
+#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+fn ctrl_z_during_a_traps_write_through_a_tee_keeps_each_byte_once() {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	};
+	let (mut pty, reader, file) = tee_fifo_and_file_writer(
+		"trap 'cat | printf %131072s \"\" >&3' USR1; printf %0131072d 0 >&3",
+		true,
+	);
+	// The trap runs while `printf` waits; its own write waits on the full
+	// FIFO too, and `cat` reads the terminal.
+	pty.signal(libc::SIGUSR1).unwrap();
+	thread::sleep(QUIET);
+	pty.write("\x1a").unwrap();
+	pty.wait_screen_contains("suspended", TIMEOUT).unwrap();
+	let stop = Arc::new(AtomicBool::new(false));
+	let draining = drain_fifo(reader, Arc::clone(&stop));
+	pty.write("print -rn -- AFTER-$((40+2)) >&3; print -r -- done-$((6*7))\r")
+		.unwrap();
+	pty.wait_screen_contains("done-42", TIMEOUT).unwrap();
+	pty.write("fg; print -r -- fg-$((6*7))\r").unwrap();
+	// The job has the terminal: `cat` reads it until end of file.
+	pty.wait_screen_contains("continued", TIMEOUT).unwrap();
+	thread::sleep(QUIET);
+	pty.write("\x04").unwrap();
+	pty.wait_screen_contains("fg-42", TIMEOUT).unwrap();
+	stop.store(true, Ordering::SeqCst);
+	let got = draining.join().unwrap();
+	let written = std::fs::read(&file).unwrap();
+	let counts = |b: &[u8]| {
+		let afters = b.windows(8).filter(|w| *w == b"AFTER-42").count();
+		(
+			b.iter().filter(|&&c| c == b'0').count(),
+			b.iter().filter(|&&c| c == b' ').count(),
+			afters,
+			b.len(),
+		)
+	};
+	let want = (131_072, 131_072, 1, 262_144 + 8);
+	assert_eq!(
+		(counts(&written), counts(&got)),
+		(want, want),
+		"(the file's, the FIFO's) ('0's, spaces, AFTER-42s, bytes)"
 	);
 }

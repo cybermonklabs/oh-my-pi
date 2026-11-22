@@ -2242,6 +2242,9 @@ mod tests {
 		Line(&'static str),
 		/// Cancel the run, as the host does.
 		Cancel,
+		/// Wait until a `CHLD` trap has waited for a write since the run
+		/// began (the test-only count `TRAPS_HELD_FOR_A_WRITE`).
+		Held,
 	}
 
 	/// What [`run_with_steps`] saw.
@@ -2275,6 +2278,7 @@ mod tests {
 		let reached = Arc::new(AtomicU8::new(0));
 		let reader = {
 			let (cancel, ended, reached) = (cancel.clone(), Arc::clone(&ended), Arc::clone(&reached));
+			let held_then = held;
 			std::thread::spawn(move || {
 				let mut lines = std::io::BufReader::new(err_r).lines();
 				for step in steps {
@@ -2292,6 +2296,13 @@ mod tests {
 						Step::Cancel => {
 							cancel.cancel();
 							true
+						},
+						Step::Held => {
+							let now = || crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst);
+							while now() <= held_then && !ended.load(Ordering::SeqCst) {
+								std::thread::sleep(Duration::from_millis(1));
+							}
+							now() > held_then
 						},
 					};
 					if !done {
@@ -2562,35 +2573,123 @@ mod tests {
 		some_zeros_then(&run.stdout, 131_072, b"TTTTTTTTTTAFTER7");
 	}
 
-	// Failure mode (review of #111 at 5773e4ed): a `CHLD` trap owed with a
-	// USR1 trap waited only while the vproc was parked on the write, and the
-	// USR1 trap had unparked it: the `CHLD` trap's 'C's came in the middle
-	// of `printf`'s write, before the USR1 trap's 'T's. bash and zsh run a
-	// `CHLD` trap after the command. It now waits while the write is part
-	// way: the 'T's inside the '0's, the 'C's after the last '0'.
+	// Failure mode (review of #111 at 5773e4ed): a `CHLD` trap owed while a
+	// USR1 trap wrote waited only while the vproc was parked on a write, and
+	// the USR1 trap had unparked it: the `CHLD` trap's 'C's came in the
+	// middle of the USR1 trap's write. A `CHLD` trap waits for the write of
+	// the command it would interrupt, here the USR1 trap's `printf`, and then
+	// runs inside that trap: the 'T's inside `printf`'s '0's, the 'C's right
+	// after them. The job ends once the USR1 trap has told it to, just before
+	// the trap's own write, and the reader drains only once the job's `CHLD`
+	// has waited for that write. bash 5.2.21 (10 of 10) and 5.3.20 (9 of
+	// 10) write the 'T's and then the 'C's after the 65,536 '0's that fit,
+	// and drop `printf`'s rest (status 1); zsh 5.9 the same (10 of 10,
+	// status 0). Here the rest of the '0's follows. At a25f15f0 the 'C's came
+	// after the last '0': round 8 held the trap for the write the USR1 trap
+	// had interrupted too.
 	#[test]
-	fn a_chld_trap_owed_with_another_trap_runs_after_the_write() {
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn a_chld_trap_owed_while_another_trap_writes_runs_after_that_write() {
+		use std::os::unix::ffi::OsStrExt;
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("told");
+		let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+		// SAFETY: a valid C string.
+		assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+		let command = format!(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\nexec 5<>{}\ntrap 'echo x >&5; printf \
+			 %s TTTTTTTTTT' USR1\ntrap 'printf %s CCCCCCCCCC' CHLD\n{{ read -r go <&3; kill -USR1 \
+			 $$; echo done >&2; read -r x <&5; }} &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			fifo.display()
+		);
+		// The reader drains only once the job's `CHLD` has waited for the
+		// USR1 trap's write.
 		let run = run_with_steps(
-			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' USR1\ntrap \
-			 'printf %s CCCCCCCCCC' CHLD\n{ read -r go <&3; kill -USR1 $$; echo done >&2; } \
-			 &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
-			SIGNAL_STEPS,
+			&command,
+			&[Step::Pending(1), Step::Send("go"), Step::Line("done"), Step::Pending(2), Step::Held],
 			true,
 		);
 		assert_eq!(run.status, 0);
 		let got = &run.stdout;
-		assert!(got.ends_with(b"CCCCCCCCCC"), "the 'C's are not last");
-		marker_mid_write(&got[..got.len() - 10], 131_072, b"TTTTTTTTTT");
-		assert!(run.held, "the CHLD trap did not wait for the write");
+		let ts = got.windows(10).position(|w| w == b"TTTTTTTTTT");
+		let cs = got.windows(10).position(|w| w == b"CCCCCCCCCC");
+		let last_zero = got.iter().rposition(|&b| b == b'0');
+		let count = |c: u8| got.iter().filter(|&&b| b == c).count();
+		assert_eq!(
+			(count(b'0'), count(b'T'), count(b'C'), got.len()),
+			(131_072, 10, 10, 131_092),
+			"('0's, 'T's, 'C's, bytes)"
+		);
+		assert!(
+			ts.is_some_and(|ts| {
+				ts > 0 && last_zero.is_some_and(|z| ts < z) && cs.is_some_and(|cs| cs == ts + 10)
+			}),
+			"the 'T's at {ts:?}, the 'C's at {cs:?}, the last '0' at {last_zero:?}: the 'T's inside \
+			 the '0's, the 'C's right after them"
+		);
+		assert!(run.held, "the CHLD trap did not wait for a write");
+	}
+
+	// Failure mode (review of #111 at a25f15f0): a `CHLD` trap waited while
+	// any write of the vproc was part way, the one a USR1 trap had
+	// interrupted too, and the USR1 trap waited for the `CHLD` trap's work:
+	// the run never ended (at 5773e4ed it ended in under 60 ms). bash 5.2/5.3
+	// and zsh 5.9 run the `CHLD` trap inside the USR1 trap, and so does this
+	// shell: a `CHLD` trap waits only for the write of the command it would
+	// interrupt. The USR1 trap's 'T' comes inside `printf`'s '0's.
+	#[test]
+	fn a_trap_that_waits_for_the_chld_traps_work_ends() {
+		let run = run_with_steps(
+			"exec 3<&0\ntrap 'c=1' CHLD\ntrap 'until [ -n \"$c\" ]; do sleep 0.1; done; printf %s T' \
+			 USR1\n{ read -r go <&3; kill -USR1 $$; echo done >&2; } &\nprintf %0131072d 0\nwait",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		marker_mid_write(&run.stdout, 131_072, b"T");
+	}
+
+	// Failure mode (review of #111 at a25f15f0): a TERM trap that kills a
+	// job and waits for a `CHLD` trap to count it, while `printf`'s write
+	// through a tee waited, waited all its 30 rounds: the `CHLD` trap waited
+	// for the write the TERM trap had interrupted. bash 5.2/5.3 count the job
+	// after 1 or 2 rounds of `read -t 0.1`, zsh 5.9 at once (0 rounds). The
+	// `CHLD` trap runs inside the TERM trap: `T<rounds>X` after the '0's
+	// written, fewer than 30 rounds, and the trap's `exit 3`.
+	#[test]
+	fn a_cleanup_trap_that_waits_for_a_chld_count_ends() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\nn=0\ntrap 'n=$((n+1))' CHLD\nsleep 100 \
+			 &\nsp=$!\n{ read -r go <&3; kill -TERM $$; echo done >&2; } &\ntrap 'm=$n; kill $sp; \
+			 r=0; until [ $n -gt $m ] || [ $r -ge 30 ]; do read -r -t 0.1 _ <&3; r=$((r+1)); done; \
+			 printf %s T${r}X; exit 3' TERM\nprintf %0131072d 0\necho never",
+			CHLD_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 3);
+		let got = &run.stdout;
+		let zeros = got.iter().position(|&b| b != b'0').unwrap_or(got.len());
+		let tail = String::from_utf8_lossy(&got[zeros..]).into_owned();
+		let rounds = tail
+			.strip_prefix('T')
+			.and_then(|t| t.strip_suffix('X'))
+			.and_then(|r| r.parse::<u32>().ok());
+		assert!(zeros > 0 && zeros < 131_072, "{zeros} '0's, then {tail:?}");
+		assert!(rounds.is_some_and(|r| r < 30), "the TERM trap wrote {tail:?}: rounds < 30");
 	}
 
 	/// Three runs of one session: the first makes fd 3 a tee of a FIFO and
 	/// `file` (`exec 3>fifo 3>file`; the tee outlives the run), the second
 	/// runs `second`, whose write through the tee fills the FIFO and waits,
-	/// and is cancelled, and the third runs `printf %s AFTER >&3`. Returns
-	/// what the FIFO's reader got, ending with `AFTER` unless that was lost,
-	/// and the second run's status.
-	fn cancel_a_write_through_a_fifo_tee(second: &str, file: &std::path::Path) -> (Vec<u8>, i32) {
+	/// and is cancelled (with `cancel`; else `second` ends the shell itself),
+	/// and the third runs `printf %s AFTER >&3`. Returns what the FIFO's
+	/// reader got, ending with `AFTER` unless that was lost, and the second
+	/// run's status.
+	fn drop_a_write_through_a_fifo_tee(
+		second: &str,
+		file: &std::path::Path,
+		cancel: bool,
+	) -> (Vec<u8>, i32) {
 		use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 		let dir = tempfile::tempdir().unwrap();
 		let fifo = dir.path().join("tee-fifo");
@@ -2637,10 +2736,10 @@ mod tests {
 				libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
 			}
 			// The second run's write fills the FIFO and waits for room; then the
-			// run is cancelled.
-			let cancel = CancellationToken::new();
-			let canceller = {
-				let cancel = cancel.clone();
+			// run is cancelled, or ends the shell itself.
+			let token = CancellationToken::new();
+			let canceller = cancel.then(|| {
+				let token = token.clone();
 				let probe = reader.try_clone().unwrap();
 				std::thread::spawn(move || {
 					let start = std::time::Instant::now();
@@ -2648,15 +2747,17 @@ mod tests {
 						std::thread::sleep(Duration::from_millis(5));
 					}
 					std::thread::sleep(Duration::from_millis(300));
-					cancel.cancel();
+					token.cancel();
 				})
-			};
+			});
 			let cancelled =
-				tokio::time::timeout(STUCK, session.run_with(RunOptions::new(second), stdio(), cancel))
+				tokio::time::timeout(STUCK, session.run_with(RunOptions::new(second), stdio(), token))
 					.await;
-			canceller.join().unwrap();
+			if let Some(canceller) = canceller {
+				canceller.join().unwrap();
+			}
 			let cancelled = cancelled.expect("the run ended").unwrap();
-			assert!(cancelled.cancelled, "the run was not cancelled");
+			assert_eq!(cancelled.cancelled, cancel, "(the run was cancelled)");
 			// The third run's write waits until the reader drains.
 			let draining = std::thread::spawn(move || {
 				let mut got = Vec::new();
@@ -2696,9 +2797,10 @@ mod tests {
 	// and was lost. The dropped command takes the key with it.
 	#[test]
 	fn a_run_cancelled_during_a_write_through_a_tee_leaves_the_next_run_whole() {
-		let (got, _) = cancel_a_write_through_a_fifo_tee(
+		let (got, _) = drop_a_write_through_a_fifo_tee(
 			"printf %0131072d 0 >&3",
 			std::path::Path::new("/dev/null"),
+			true,
 		);
 		some_zeros_then(&got, 131_072, b"AFTER");
 	}
@@ -2754,7 +2856,7 @@ mod tests {
 				let dir = tempfile::tempdir().unwrap();
 				let file = dir.path().join("tee-file");
 				let second = format!("{trap}exec 2>&3; {command}");
-				let (got, status) = cancel_a_write_through_a_fifo_tee(&second, &file);
+				let (got, status) = drop_a_write_through_a_fifo_tee(&second, &file, true);
 				let written = std::fs::read(&file).unwrap();
 				let mut once = whole.clone();
 				once.extend_from_slice(b"AFTER");
@@ -2779,6 +2881,59 @@ mod tests {
 						} else {
 							"not a part, then AFTER"
 						},
+					));
+				}
+			}
+		}
+		assert!(wrong.is_empty(), "{}", wrong.join("; "));
+	}
+
+	// Failure mode (review of #132 at 4b045c4d, item 1; here through a tee,
+	// without #132): a host tool's write (`nohup --version`,
+	// `timeout --version`) waited for room in a tee when the run was
+	// cancelled, or when `kill -TERM $$` ended the shell. A tool wrote through
+	// `ShellApi::write` under the vproc's key while its frame waited on the
+	// call, so nothing marked the write part way, and the vproc kept the key
+	// with the tee's progress under it: the next run's `printf %s AFTER`
+	// counted as written where the tool's had got, the file never got
+	// `AFTER`, and the run exited 0. A call writes with a key of its own,
+	// which goes with it. Each case: the file holds the '0's, the tool's
+	// whole message, then `AFTER`; the FIFO the '0's, a part of the message
+	// (none: a pipe takes a short write whole or not at all), then `AFTER`.
+	#[test]
+	fn a_tools_write_dropped_part_way_through_a_tee_leaves_the_next_run_whole() {
+		let mut wrong = Vec::new();
+		for (how, ends, cancel) in
+			[("cancelled", "", true), ("killed", "{ sleep 0.3; kill -TERM $$; } & ", false)]
+		{
+			for tool in ["nohup", "timeout"] {
+				let dir = tempfile::tempdir().unwrap();
+				let file = dir.path().join("tee-file");
+				// 65,532 '0's leave the FIFO room for 4 bytes of the message.
+				let second = format!("{ends}printf %065532d 0 >&3; {tool} --version >&3");
+				let (got, status) = drop_a_write_through_a_fifo_tee(&second, &file, cancel);
+				let written = std::fs::read(&file).unwrap();
+				let message = written
+					.get(65_532..written.len().saturating_sub(5))
+					.unwrap_or_default()
+					.to_vec();
+				let whole = written.len() > 65_532 + 5
+					&& written[..65_532].iter().all(|&b| b == b'0')
+					&& written.ends_with(b"AFTER")
+					&& !message.contains(&b'0')
+					&& message.starts_with(tool.as_bytes());
+				let part = got
+					.get(65_532..)
+					.and_then(|rest| rest.strip_suffix(b"AFTER"))
+					.is_some_and(|p| p.len() < message.len() && message.starts_with(p));
+				if !whole || !part {
+					wrong.push(format!(
+						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO {} \
+						 bytes ending {:?}",
+						written.len(),
+						String::from_utf8_lossy(&written[written.len().saturating_sub(24)..]),
+						got.len(),
+						String::from_utf8_lossy(&got[got.len().saturating_sub(24)..]),
 					));
 				}
 			}

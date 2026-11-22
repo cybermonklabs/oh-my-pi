@@ -124,8 +124,10 @@ pub struct Vproc {
 	/// The key this vproc writes with ([`crate::sys::WaitKey`]): an object
 	/// that several writers write at once (a zsh multios tee, a provider
 	/// file) keeps each writer's progress by it. Every vproc has its own: a
-	/// subshell gets a new one, never its parent's; and each trap run writes
-	/// with a new one ([`Self::trap_keys`]). Never serialized.
+	/// subshell gets a new one, never its parent's; each trap run writes
+	/// with a new one ([`Self::trap_keys`]); and a host callout writes with
+	/// a key of the call's own ([`super::api::ShellApi::write_keyed`]).
+	/// Never serialized.
 	pub write_key:     WriteKey,
 	/// The keys the running traps interrupted, innermost last: a trap
 	/// starts with a new [`Self::write_key`] (a command it interrupted may
@@ -801,15 +803,15 @@ impl Vproc {
 
 	/// Whether a trap for `sig` waits before it runs: while the vproc waits
 	/// for a foreground command ([`Self::waiting_foreground`]), and, for
-	/// `SIGCHLD`, while a write of the vproc is part way
-	/// ([`Self::write_part_way`]), a write another trap interrupted too.
-	/// bash 5.2/5.3 and zsh 5.9 run a `CHLD` trap after the command's
-	/// write; another trap they run at once, and so does this shell, under a
-	/// key of the trap's own ([`Self::trap_keys`]), so the interrupted write
-	/// keeps its progress.
+	/// `SIGCHLD`, while the command it would interrupt is part way in a
+	/// write ([`Self::writing_now`]). bash 5.2/5.3 and zsh 5.9 run a `CHLD`
+	/// trap after the command's write; inside another trap's action they
+	/// run it between that action's commands, so a trap that waits for the
+	/// `CHLD` trap's work goes on, and so does this shell. Another trap runs
+	/// at once, in bash and zsh and here, under a key of the trap's own
+	/// ([`Self::trap_keys`]), so the interrupted write keeps its progress.
 	pub fn holds_trap(&self, sig: crate::bash::signal::Signal) -> bool {
-		self.waiting_foreground()
-			|| (sig == crate::bash::signal::Signal::Chld && self.write_part_way())
+		self.waiting_foreground() || (sig == crate::bash::signal::Signal::Chld && self.writing_now())
 	}
 
 	/// Whether the vproc is parked on a write ([`WaitKey::Write`]).
@@ -817,11 +819,12 @@ impl Vproc {
 		matches!(self.blocked, Some(Blocked { key: WaitKey::Write { .. }, .. }))
 	}
 
-	/// Whether a write of the vproc is part way: it is parked on one, or the
-	/// op of a frame parked on one and a trap then interrupted it
-	/// ([`Frame::write_parked`]).
-	pub fn write_part_way(&self) -> bool {
-		self.parked_on_write() || self.frames.iter().any(|f| f.write_parked)
+	/// Whether the command a trap would interrupt now is part way in a
+	/// write: the vproc is parked on one, or the top frame's op is
+	/// ([`Frame::write_parked`]). A write that a trap interrupted is in a
+	/// frame below that trap's and does not count while the trap runs.
+	pub fn writing_now(&self) -> bool {
+		self.parked_on_write() || self.frames.last().is_some_and(|f| f.write_parked)
 	}
 }
 

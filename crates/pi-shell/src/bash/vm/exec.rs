@@ -88,8 +88,9 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		}
 		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
-			// A `CHLD` trap waits for a write the vproc is parked on
-			// ([`Vproc::holds_trap`]); another runs now, under its own key.
+			// A `CHLD` trap waits while the command it would interrupt
+			// writes ([`Vproc::holds_trap`]); another runs now, under its own
+			// key.
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.holds_trap(*sig)
 					&& !vp.frames.iter().any(|frame| {
@@ -5590,7 +5591,66 @@ fn run_func_trap(
 
 #[cfg(test)]
 mod tests {
-	use super::{BASH_TIMEFORMAT, POSIX_TIMEFORMAT, time_report};
+	use std::sync::Arc;
+
+	use bstr::BString;
+
+	use super::{
+		BASH_TIMEFORMAT, Frame, FrameKind, POSIX_TIMEFORMAT, Root, ScriptKind, TrapKey, Vpid, Vproc,
+		WriteKey, pop_frame, time_report,
+	};
+	use crate::bash::{MemStore, fd::FdTable, signal::Signal};
+
+	/// A frame of a script of kind `what`, its op parked on a write
+	/// ([`Frame::write_parked`]).
+	fn parked(what: ScriptKind) -> Frame {
+		let mut f = Frame::new(None, 0, FrameKind::Script {
+			src: BString::default(),
+			pos: (0, 0),
+			aux: None,
+			what,
+			stdin: false,
+		});
+		f.write_parked = true;
+		f
+	}
+
+	// Failure mode (review of #111 at a25f15f0, a test gap): popping a trap's
+	// frame whose own write waited gives the vproc a new key, which drops the
+	// trap's key and its write's progress, and then puts back the key the trap
+	// interrupted, whose write goes on. In the other order the interrupted
+	// command went on with a new key, and a tee wrote what it had written
+	// again. No script reaches this pop: `return`, `exit`, a cancel and Ctrl-C
+	// also drop the interrupted command (its frame gives the new key last),
+	// and the one zsh way, a signal function trap that returns non-zero (zsh
+	// `dotrapargs`), does not run here (`TRAPUSR1` is not called for USR1).
+	#[test]
+	fn popping_a_parked_trap_frame_puts_back_the_interrupted_key() {
+		let mut store = MemStore::new();
+		let mut root = Root::load(&mut store).unwrap();
+		let mut vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		vp.frames.push(parked(ScriptKind::Run));
+		let interrupted: WriteKey = Arc::clone(&vp.write_key);
+		let trap = ScriptKind::Trap {
+			key:           TrapKey::Signal(Signal::Usr1),
+			status:        0,
+			cancel:        None,
+			return_target: None,
+			exit:          false,
+		};
+		vp.frames.push(parked(trap));
+		vp.trap_keys.push(std::mem::take(&mut vp.write_key));
+		vp.trap_frames = 1;
+		let traps = Arc::clone(&vp.write_key);
+		pop_frame(&mut root, &mut store, &mut vp);
+		assert!(
+			Arc::ptr_eq(&vp.write_key, &interrupted),
+			"the interrupted command's key is not back (the trap's: {})",
+			Arc::ptr_eq(&vp.write_key, &traps)
+		);
+		assert!(vp.trap_keys.is_empty());
+		assert_eq!(Arc::strong_count(&traps), 1, "the trap's key is still held");
+	}
 
 	// Golden: bash 5.3.20 `time -p` and the default format.
 	#[test]
