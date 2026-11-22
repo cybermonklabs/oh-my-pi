@@ -58,6 +58,9 @@ mod text;
 pub mod trace;
 mod vm;
 pub mod zshopt;
+/// Test only: `CHLD` traps that waited for their vproc's write.
+#[cfg(test)]
+pub(crate) use vm::TRAPS_HELD_FOR_A_WRITE;
 
 pub mod pattern;
 pub mod syntax;

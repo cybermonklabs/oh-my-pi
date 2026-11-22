@@ -2447,8 +2447,15 @@ impl Shell {
 				if !ignored {
 					let process = &mut self.procs[i];
 					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
+					// A `CHLD` trap waits for a write the vproc is parked on;
+					// another runs now, under its own key
+					// ([`Vproc::holds_trap`]).
+					if !process.holds_trap(sig) {
 						process.blocked = None;
+					}
+					#[cfg(test)]
+					if sig == Signal::Chld && process.parked_on_write() {
+						TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					}
 					// bash: a trapped signal ends the `wait` builtin with 128 + n
 					// (then the trap runs); `SIGCHLD` does not.
@@ -2684,11 +2691,23 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
-		if !p.waiting_foreground() {
+		// A vproc parked on a write stays parked: the trap runs once the
+		// write ends ([`Vproc::holds_trap`]).
+		if !p.holds_trap(Signal::Chld) {
 			p.blocked = None;
+		}
+		#[cfg(test)]
+		if p.parked_on_write() {
+			TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		}
 	}
 }
+
+/// Test only: `CHLD` traps owed while their vproc was parked on a write
+/// (they run after it).
+#[cfg(test)]
+pub(crate) static TRAPS_HELD_FOR_A_WRITE: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
 
 /// End a `wait` builtin that `p` is in with `status` (a trapped signal
 /// arrived): its `Exec` completes at once, keeping the jobs it waited for.
@@ -2818,6 +2837,7 @@ impl Vproc {
 			zle: None,
 			// A key of its own, a subshell's too (`child_running`).
 			write_key: proc::WriteKey::default(),
+			trap_keys: Vec::new(),
 		}
 	}
 

@@ -2019,13 +2019,14 @@ mod tests {
 	/// chunk at a time. The run must finish within [`STUCK`] with status 0
 	/// and stdout must hold exactly `expect` (byte, count).
 	fn two_writers_finish(command: &str, events: bool, expect: &[(u8, usize)]) {
-		let got = two_writers_read(command, events);
+		let got = writers_read(command, events, 2);
 		assert_eq!(got, expect, "stdout (byte, count) from `{command}`");
 	}
 
-	/// [`two_writers_finish`]'s run; the (byte, count) of each byte on
+	/// [`two_writers_finish`]'s run with `writers` writers (1 or 2; with 1,
+	/// the reader drains once it waits); the (byte, count) of each byte on
 	/// stdout.
-	fn two_writers_read(command: &str, events: bool) -> Vec<(u8, usize)> {
+	fn writers_read(command: &str, events: bool, writers: usize) -> Vec<(u8, usize)> {
 		use std::{io::Write, os::fd::AsRawFd, sync::atomic::AtomicUsize};
 		let command = command
 			.replace("{EXTRA}", &EXTRA.to_string())
@@ -2051,7 +2052,7 @@ mod tests {
 				stage.store(1, Ordering::SeqCst);
 				in_w.write_all(b"go\n").unwrap();
 				// The second waits for room too, on the same file.
-				if !until(|| crate::sys::pending_polls(fd) > waited + 1, &given_up) {
+				if writers > 1 && !until(|| crate::sys::pending_polls(fd) > waited + 1, &given_up) {
 					return;
 				}
 				stage.store(2, Ordering::SeqCst);
@@ -2170,10 +2171,11 @@ mod tests {
 	// each diagnostic names a command of `EXTRA` '0's or `BUILTIN` 'Z's.
 	#[test]
 	fn two_vprocs_diagnostics_through_a_tee_on_the_shells_stderr_are_each_written_once() {
-		let got = two_writers_read(
+		let got = writers_read(
 			"emulate zsh -c 'exec 2>&1 2>/dev/null'\np=$(printf %0{EXTRA}d 0)\nq=$(printf \
 			 %0{BUILTIN}d 0)\n{ \"$p\" & read -r go; \"${q//0/Z}\"; wait; }",
 			false,
+			2,
 		);
 		let count = |c: u8| got.iter().find(|&&(b, _)| b == c).map_or(0, |&(_, n)| n);
 		assert_eq!(
@@ -2181,6 +2183,345 @@ mod tests {
 			(EXTRA, BUILTIN, 2),
 			"stdout (byte, count): {got:?}"
 		);
+	}
+
+	// Failure mode (review of #111 at 2fb85be7): with the tee keeping a
+	// writer's progress after its write ended, the vproc's next write
+	// through the tee started at the old offsets and was lost.
+	#[test]
+	fn one_vproc_writing_twice_through_one_tee_writes_both() {
+		let got = writers_read(
+			"emulate zsh -c '{ printf %{EXTRA}s \"\"; printf %0{BUILTIN}d 0; } >&1 >/dev/null'",
+			true,
+			1,
+		);
+		assert_eq!(got, [(b' ', EXTRA), (b'0', BUILTIN)]);
+	}
+
+	// Failure mode: two host callouts (`timeout`'s diagnostics, through
+	// `ShellApi::write`) in two vprocs wrote through one tee with no key and
+	// were one writer to it. The tee is the shell's stderr; the diagnostics
+	// name intervals of `EXTRA` 'Y's and `BUILTIN` 'Z's.
+	#[test]
+	fn two_callouts_through_a_tee_on_the_shells_stderr_write_their_bytes_once() {
+		let got = writers_read(
+			"emulate zsh -c 'exec 2>&1 2>/dev/null'\np=$(printf %0{EXTRA}d 0)\nq=$(printf \
+			 %0{BUILTIN}d 0)\n{ timeout \"${p//0/Y}\" true & read -r go; timeout \"${q//0/Z}\" true; \
+			 wait; }",
+			false,
+			2,
+		);
+		let count = |c: u8| got.iter().find(|&&(b, _)| b == c).map_or(0, |&(_, n)| n);
+		assert_eq!(
+			(count(b'Y'), count(b'Z'), count(b'\n')),
+			(EXTRA, BUILTIN, 2),
+			"stdout (byte, count): {got:?}"
+		);
+	}
+
+	// Failure mode: two zsh `syswrite`s in two vprocs wrote through one tee
+	// with no key and were one writer to it.
+	#[test]
+	fn two_syswrites_through_one_tee_write_their_bytes_once() {
+		two_writers_finish(
+			"emulate zsh -c 'zmodload zsh/system; a=$(printf %{EXTRA}s \"\"); b=$(printf \
+			 %0{BUILTIN}d 0); { syswrite -o 1 \"$a\" & read -r go; syswrite -o 1 \"$b\"; wait; } >&1 \
+			 >/dev/null'",
+			false,
+			&[(b' ', EXTRA), (b'0', BUILTIN)],
+		);
+	}
+
+	/// A step a trap test takes beside its run ([`run_with_steps`]).
+	enum Step {
+		/// Wait until `n` polls of the run's stdout have waited for room.
+		Pending(usize),
+		/// Write this line to the run's stdin.
+		Send(&'static str),
+		/// Wait for this line on the run's stderr.
+		Line(&'static str),
+		/// Cancel the run, as the host does.
+		Cancel,
+	}
+
+	/// What [`run_with_steps`] saw.
+	struct Stepped {
+		stdout:    Vec<u8>,
+		status:    i32,
+		cancelled: bool,
+		/// Whether a `CHLD` trap waited for a write meanwhile.
+		held:      bool,
+	}
+
+	/// Run `command` with stdin, stdout and stderr on pipes and take `steps`
+	/// in order beside it; nothing reads stdout until they are done. Then,
+	/// with `drain`, a reader drains stdout 4 KiB at a time; without it,
+	/// stdout is read only once the run has ended. A step the run ends
+	/// before is skipped. The run must end within [`STUCK`].
+	fn run_with_steps(command: &str, steps: &'static [Step], drain: bool) -> Stepped {
+		use std::{
+			io::{BufRead, Write},
+			os::fd::{AsRawFd, OwnedFd},
+		};
+		let (mut out_r, out_w) = io::pipe().unwrap();
+		let (in_r, mut in_w) = io::pipe().unwrap();
+		let (err_r, err_w) = io::pipe().unwrap();
+		let out_w = std::fs::File::from(OwnedFd::from(out_w));
+		let fd = out_w.as_raw_fd();
+		let waited = crate::sys::pending_polls(fd);
+		let held = crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst);
+		let cancel = CancellationToken::new();
+		let ended = Arc::new(AtomicBool::new(false));
+		let reached = Arc::new(AtomicU8::new(0));
+		let reader = {
+			let (cancel, ended, reached) = (cancel.clone(), Arc::clone(&ended), Arc::clone(&reached));
+			std::thread::spawn(move || {
+				let mut lines = std::io::BufReader::new(err_r).lines();
+				for step in steps {
+					let done = match step {
+						Step::Pending(n) => {
+							while crate::sys::pending_polls(fd) < waited + n
+								&& !ended.load(Ordering::SeqCst)
+							{
+								std::thread::sleep(Duration::from_millis(1));
+							}
+							crate::sys::pending_polls(fd) >= waited + n
+						},
+						Step::Send(line) => in_w.write_all(format!("{line}\n").as_bytes()).is_ok(),
+						Step::Line(want) => lines.any(|line| line.is_ok_and(|line| line == *want)),
+						Step::Cancel => {
+							cancel.cancel();
+							true
+						},
+					};
+					if !done {
+						break;
+					}
+					reached.fetch_add(1, Ordering::SeqCst);
+				}
+				while !drain && !ended.load(Ordering::SeqCst) {
+					std::thread::sleep(Duration::from_millis(1));
+				}
+				let mut got = Vec::new();
+				let mut buf = vec![0u8; 4 << 10];
+				loop {
+					let n = out_r.read(&mut buf).unwrap();
+					if n == 0 {
+						break;
+					}
+					got.extend_from_slice(&buf[..n]);
+					if drain {
+						std::thread::sleep(Duration::from_micros(500));
+					}
+				}
+				got
+			})
+		};
+		let runtime = own_runtime();
+		let ended_run = runtime.block_on(async {
+			let mut session = session();
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::from(OwnedFd::from(in_r))),
+				stdout: Some(out_w),
+				stderr: Some(std::fs::File::from(OwnedFd::from(err_w))),
+			};
+			tokio::time::timeout(STUCK, session.run_with(RunOptions::new(command), stdio, cancel))
+				.await
+		});
+		ended.store(true, Ordering::SeqCst);
+		let Ok(outcome) = ended_run else {
+			runtime.shutdown_background();
+			panic!(
+				"`{command}` never ended; it reached {} of {} steps",
+				reached.load(Ordering::SeqCst),
+				steps.len()
+			);
+		};
+		let outcome = outcome.unwrap();
+		Stepped {
+			stdout:    reader.join().unwrap(),
+			status:    outcome.status,
+			cancelled: outcome.cancelled,
+			held:      crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst) > held,
+		}
+	}
+
+	/// `got` is `zeros` '0's, then `ts` 'T's.
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn zeros_then_ts(got: &[u8], zeros: usize, ts: usize) {
+		let count = |c: u8| got.iter().filter(|&&b| b == c).count();
+		let first_t = got.iter().position(|&b| b == b'T');
+		assert_eq!(
+			(count(b'0'), count(b'T'), got.len(), first_t),
+			(zeros, ts, zeros + ts, Some(zeros)),
+			"('0's, 'T's, bytes, first 'T' at)"
+		);
+	}
+
+	/// `got` is `zeros` '0's with `marker` once among them, after the first
+	/// and before the last: a trap's bytes in the middle of a command's,
+	/// each of the command's bytes once.
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn marker_mid_write(got: &[u8], zeros: usize, marker: &[u8]) {
+		let at = got.windows(marker.len()).position(|w| w == marker);
+		let zeros_got = got.iter().filter(|&&b| b == b'0').count();
+		assert_eq!(
+			(zeros_got, got.len(), at.is_some_and(|at| at > 0 && at < zeros)),
+			(zeros, zeros + marker.len(), true),
+			"('0's, bytes, marker inside the '0's); marker at {at:?}"
+		);
+	}
+
+	const CHLD_STEPS: &[Step] = &[Step::Pending(1), Step::Send("go"), Step::Line("done")];
+
+	// Failure mode (review of #111 at 2fb85be7): a `CHLD` trap started while
+	// `printf`'s write through a tee waited for room, under the same key, so
+	// the tee took `printf`'s progress as the trap's: stdout held 196,608
+	// '0's and no 'T'. bash 5.2/5.3 and zsh 5.9 run a `CHLD` trap after the
+	// command: 131,072 '0's, then the 10 'T's.
+	#[test]
+	fn a_chld_trap_owed_during_a_write_through_a_tee_runs_after_it() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' CHLD\n{ \
+			 read -r go <&3; echo done >&2; } &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			CHLD_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		zeros_then_ts(&run.stdout, 131_072, 10);
+		assert!(run.held, "the trap was not owed while the write waited");
+	}
+
+	// Failure mode: as above through a plain pipe: the trap's bytes came in
+	// the middle of `printf`'s, where bash and zsh write them after.
+	#[test]
+	fn a_chld_trap_owed_during_a_write_through_a_pipe_runs_after_it() {
+		let run = run_with_steps(
+			"exec 3<&0\ntrap 'printf %s TTTTTTTTTT' CHLD\n{ read -r go <&3; echo done >&2; } \
+			 &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			CHLD_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		zeros_then_ts(&run.stdout, 131_072, 10);
+		assert!(run.held, "the trap was not owed while the write waited");
+	}
+
+	/// `printf` waits, the job sends the signal, and the trap's own write
+	/// waits on the same full pipe before the reader drains.
+	const SIGNAL_STEPS: &[Step] =
+		&[Step::Pending(1), Step::Send("go"), Step::Line("done"), Step::Pending(2)];
+
+	// Failure mode (review of #111 at 2fb85be7): a USR1 trap ran while
+	// `printf`'s write through a tee waited, under the same key: the trap's
+	// bytes counted as written and were lost, and `printf` wrote its first
+	// 65,536 bytes again. The trap now runs at once (as in bash and zsh)
+	// under a key of its own; its write waits on the same full pipe and
+	// ends once the reader drains, and `printf`'s write then goes on. bash
+	// and zsh instead fail `printf` with a write error and drop its rest.
+	#[test]
+	fn a_usr1_trap_during_a_write_through_a_tee_runs_at_once_and_the_write_goes_on() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' USR1\n{ \
+			 read -r go <&3; kill -USR1 $$; echo done >&2; } &\nprintf %0131072d 0\ns=$?\nwait\nexit \
+			 $s",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		marker_mid_write(&run.stdout, 131_072, b"TTTTTTTTTT");
+	}
+
+	// The same through a plain pipe (no tee keeps progress there; it passed
+	// before the trap keys too, and stays as a guard).
+	#[test]
+	fn a_usr1_trap_during_a_write_through_a_pipe_runs_at_once_and_the_write_goes_on() {
+		let run = run_with_steps(
+			"exec 3<&0\ntrap 'printf %s TTTTTTTTTT' USR1\n{ read -r go <&3; kill -USR1 $$; echo done \
+			 >&2; } &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		marker_mid_write(&run.stdout, 131_072, b"TTTTTTTTTT");
+	}
+
+	// A trap that exits ends a shell whose write waits, at once, as bash
+	// 5.2/5.3 do (`trap 'exit 42' TERM`): nothing drains stdout until the
+	// run has ended.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn an_exit_trap_ends_a_shell_whose_write_waits() {
+		let run = run_with_steps(
+			"exec 3<&0\ntrap 'exit 42' TERM\n{ read -r go <&3; kill -TERM $$; echo done >&2; } \
+			 &\nprintf %0131072d 0\necho never",
+			CHLD_STEPS,
+			false,
+		);
+		assert_eq!(run.status, 42);
+		let zeros = run.stdout.iter().filter(|&&b| b == b'0').count();
+		assert!(
+			zeros < 131_072 && zeros == run.stdout.len(),
+			"{zeros} '0's of {} bytes",
+			run.stdout.len()
+		);
+	}
+
+	// Failure mode: nested traps (USR2 while USR1's trap waits to write)
+	// each wrote under the key of what they interrupted. Each trap has its
+	// own key and puts the interrupted one back when it ends: USR2's bytes,
+	// then USR1's, then the rest of `printf`'s, each once.
+	#[test]
+	fn nested_traps_during_a_write_through_a_tee_each_write_once() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s UUUUUUUUUU' USR1\ntrap \
+			 'printf %s VVVVVVVVVV' USR2\n{ read -r go <&3; kill -USR1 $$; read -r go <&3; kill \
+			 -USR2 $$; echo done >&2; } &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			&[
+				Step::Pending(1),
+				Step::Send("go"),
+				Step::Pending(2),
+				Step::Send("go"),
+				Step::Line("done"),
+				Step::Pending(3),
+			],
+			true,
+		);
+		assert_eq!(run.status, 0);
+		marker_mid_write(&run.stdout, 131_072, b"VVVVVVVVVVUUUUUUUUUU");
+	}
+
+	// Failure mode: the host's cancellation starts the TERM trap through
+	// the same path: its bytes were taken as `printf`'s progress and lost.
+	// The trap is the run's last action: `printf`'s rest is not written.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn a_cancellation_trap_during_a_write_through_a_tee_writes_its_bytes() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\ntrap 'printf %s TTTTTTTTTT' TERM\nprintf \
+			 %0131072d 0\necho never",
+			&[Step::Pending(1), Step::Cancel, Step::Pending(2)],
+			true,
+		);
+		assert!(run.cancelled);
+		let zeros = run.stdout.iter().filter(|&&b| b == b'0').count();
+		assert!(zeros > 0 && zeros < 131_072, "{zeros} '0's");
+		zeros_then_ts(&run.stdout, zeros, 10);
+	}
+
+	// The same as the USR1 case for WINCH, which a shell with a line editor
+	// first hands to the editor (`zle::signal`).
+	#[test]
+	fn a_winch_trap_during_a_write_through_a_tee_runs_at_once_and_the_write_goes_on() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' WINCH\n{ \
+			 read -r go <&3; kill -WINCH $$; echo done >&2; } &\nprintf %0131072d \
+			 0\ns=$?\nwait\nexit $s",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		marker_mid_write(&run.stdout, 131_072, b"TTTTTTTTTT");
 	}
 
 	/// A background extra still waiting for room on a run's stdout when the

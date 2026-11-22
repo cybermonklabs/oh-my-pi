@@ -6,6 +6,7 @@
 
 - Fixed bash tool calls that show the live shell view hanging when a built-in utility (`cat`, `head`, `sort`, …) and a shell builtin such as `printf` waited for room in the call's output at the same time: only the one that waited last was woken, so the utility never finished and `wait` never returned. The same hang came with or without the live view when the utility wrote through a zsh multios redirection (`>&1 >file`). A utility still waiting on a finished call's output is now woken when that output closes, so a later `wait` returns. Reading `$PENDING` or printing a job notice no longer keeps the line editor from waking when keys arrive or the terminal has room.
 - Fixed zsh multios redirections (`>&1 >file`) losing or repeating bytes when two commands wrote through one at the same time (a background job and a builtin, or a built-in utility and a builtin): each writer's progress is now kept apart.
+- Fixed a signal trap that ran while a command's output waited for room: through a zsh multios redirection the trap's output was lost and the command's first bytes were written twice. A `CHLD` trap now runs after the command's write, as bash 5.2/5.3 and zsh 5.9 run it. Any other trap runs at once, as in bash and zsh, and the command's write then goes on: the trap's output comes in the middle of it, every byte of it arrives once and its status is 0, where bash and zsh fail it with a write error (status 1 in bash) and drop the rest of its bytes.
 
 ## [18.18.6] - 2026-11-09
 

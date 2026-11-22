@@ -201,3 +201,88 @@ fn eof_on_an_empty_line_exits() {
 fn ignoreeof_warns() {
 	same("setopt ignoreeof\n", |pty| keys(pty, "\x04"));
 }
+
+// Failure mode (review of #111 at 2fb85be7): the interactive shell hands
+// WINCH to its line editor (`zle::signal`), which unparks the shell, and the
+// WINCH trap then ran under the key of the command it interrupted. Through
+// a tee (`exec 3>fifo 3>/dev/null`) the tee took the command's progress as
+// the trap's: the trap's bytes were lost and the command's first bytes went
+// out twice. Each trap writes with a key of its own: its bytes come in the
+// middle of the command's, and each of the command's bytes comes once.
+#[test]
+#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
+	use std::{
+		fs::File,
+		io::Read,
+		os::{fd::AsRawFd, unix::ffi::OsStrExt},
+		time::Instant,
+	};
+	const ZEROS: usize = 131_072;
+	const MARK: &[u8] = b"TTTTTTTTTT";
+	let s = Spawn::zsh()
+		.args(["-f", "-i"])
+		.env("PS1", "P> ")
+		.size(24, 80);
+	let fifo = s.home().join("tee-fifo");
+	let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+	// SAFETY: a valid C string.
+	assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+	let mut pty = s.spawn().unwrap_or_else(|e| panic!("spawn failed: {e}"));
+	pty.wait_screen_contains("P>", TIMEOUT).unwrap();
+	// The reader's open waits for the shell's.
+	let opening = {
+		let fifo = fifo.clone();
+		thread::spawn(move || File::open(fifo))
+	};
+	pty.write(format!(
+		"exec 3>{} 3>/dev/null; trap 'print -n trap-$((40+2)) >&2; printf %s TTTTTTTTTT >&3' WINCH\r",
+		fifo.display()
+	))
+	.unwrap();
+	let mut reader = opening.join().unwrap().unwrap();
+	// SAFETY: fcntl on a descriptor this test owns.
+	unsafe {
+		let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+		libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+	}
+	pty.write(format!("printf %0{ZEROS}d 0 >&3; print -r -- printf-$((6*7))\r"))
+		.unwrap();
+	// `printf` filled the FIFO and waits for room.
+	let queued = || {
+		let mut n: libc::c_int = 0;
+		// SAFETY: FIONREAD writes one int.
+		unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut n) };
+		usize::try_from(n).unwrap_or(0)
+	};
+	let start = Instant::now();
+	while queued() < 4096 && start.elapsed() < TIMEOUT {
+		thread::sleep(Duration::from_millis(5));
+	}
+	thread::sleep(QUIET);
+	// WINCH to the shell; its trap starts, and its write waits on the full
+	// FIFO. The trap runs inside `printf`'s redirection (`>&3`), so it
+	// prints its marker to stderr, the terminal.
+	pty.resize(30, 100).unwrap();
+	pty.wait_screen_contains("trap-42", TIMEOUT).unwrap();
+	let mut got = Vec::new();
+	let mut buf = vec![0u8; 4 << 10];
+	let start = Instant::now();
+	while got.len() < ZEROS + MARK.len() && start.elapsed() < TIMEOUT {
+		match reader.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => got.extend_from_slice(&buf[..n]),
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+			Err(e) => panic!("reading the FIFO: {e}"),
+		}
+		thread::sleep(Duration::from_micros(500));
+	}
+	pty.wait_screen_contains("printf-42", TIMEOUT).unwrap();
+	let at = got.windows(MARK.len()).position(|w| w == MARK);
+	let zeros = got.iter().filter(|&&b| b == b'0').count();
+	assert_eq!(
+		(zeros, got.len(), at.is_some_and(|at| at > 0 && at < ZEROS)),
+		(ZEROS, ZEROS + MARK.len(), true),
+		"('0's, bytes, the trap's bytes inside the command's); trap's bytes at {at:?}"
+	);
+}

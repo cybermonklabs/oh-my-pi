@@ -124,8 +124,15 @@ pub struct Vproc {
 	/// The key this vproc writes with ([`crate::sys::WaitKey`]): an object
 	/// that several writers write at once (a zsh multios tee, a provider
 	/// file) keeps each writer's progress by it. Every vproc has its own: a
-	/// subshell gets a new one, never its parent's. Never serialized.
+	/// subshell gets a new one, never its parent's; and each trap run writes
+	/// with a new one ([`Self::trap_keys`]). Never serialized.
 	pub write_key:     WriteKey,
+	/// The keys the running traps interrupted, innermost last: a trap
+	/// starts with a new [`Self::write_key`] (a command it interrupted may
+	/// have a write part way under the old one), and popping its frame puts
+	/// the old key back. Never serialized (a restored trap frame finds none
+	/// and leaves the key as it is).
+	pub trap_keys:     Vec<WriteKey>,
 }
 
 /// [`Vproc::write_key`], behind an `Arc` so a write site can hold it while
@@ -785,6 +792,22 @@ impl Vproc {
 					)
 			})
 		})
+	}
+
+	/// Whether a trap for `sig` waits before it runs: while the vproc waits
+	/// for a foreground command ([`Self::waiting_foreground`]), and, for
+	/// `SIGCHLD`, while it is parked on a write. bash 5.2/5.3 and zsh 5.9 run
+	/// a `CHLD` trap after the command's write; another trap they run at
+	/// once, and so does this shell, under a key of the trap's own
+	/// ([`Self::trap_keys`]), so the interrupted write keeps its progress.
+	pub fn holds_trap(&self, sig: crate::bash::signal::Signal) -> bool {
+		self.waiting_foreground()
+			|| (sig == crate::bash::signal::Signal::Chld && self.parked_on_write())
+	}
+
+	/// Whether the vproc is parked on a write ([`WaitKey::Write`]).
+	pub const fn parked_on_write(&self) -> bool {
+		matches!(self.blocked, Some(Blocked { key: WaitKey::Write { .. }, .. }))
 	}
 }
 
@@ -1765,8 +1788,10 @@ impl Live {
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
 // that to at most 1,840 B. Each vproc's write key (`Vproc::write_key`, 8 B and
 // one allocation): the bench measured 1,840 B per idle vproc before it and
-// 1,912 B with it.
-const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
+// 1,912 B with it. The keys traps interrupted (`Vproc::trap_keys`, an empty
+// `Vec`, 24 B and no allocation): the bench measured 1,912 B per idle
+// vproc before it and 1,936 B with it.
+const _: () = assert!(size_of::<Vproc>() <= 704, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

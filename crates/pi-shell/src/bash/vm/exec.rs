@@ -88,13 +88,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		}
 		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
+			// A `CHLD` trap waits for a write the vproc is parked on
+			// ([`Vproc::holds_trap`]); another runs now, under its own key.
 			let pending = vp.pending_traps.iter().find(|sig| {
-				!vp.frames.iter().any(|frame| {
-					matches!(frame.kind, FrameKind::Script {
-						what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
-						..
-					} if active == *sig)
-				})
+				!vp.holds_trap(*sig)
+					&& !vp.frames.iter().any(|frame| {
+						matches!(frame.kind, FrameKind::Script {
+							what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
+							..
+						} if active == *sig)
+					})
 			});
 			if let Some(sig) = pending {
 				vp.pending_traps = vp.pending_traps.without(sig);
@@ -1647,6 +1650,11 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	};
 	if matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
 		vp.trap_frames = vp.trap_frames.saturating_sub(1);
+		// The key the trap interrupted ([`start_trap`]), on every way out:
+		// the trap's end, `return`, an error, an unwind.
+		if let Some(interrupted) = vp.trap_keys.pop() {
+			vp.write_key = interrupted;
+		}
 	}
 	if let Some(sc) = f.scratch.take() {
 		drop_scratch(root, store, vp, sc);
@@ -4780,6 +4788,11 @@ fn push_trap(
 		return_target: None,
 		exit: false,
 	});
+	// The trap writes with a key of its own: a command it interrupted may
+	// have a write part way under the vproc's key (a tee keeps its progress
+	// by key). Popping the trap's frame puts the key back ([`pop_frame`]).
+	let interrupted = std::mem::take(&mut vp.write_key);
+	vp.trap_keys.push(interrupted);
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);
 		vp.push_restore(*saved);
