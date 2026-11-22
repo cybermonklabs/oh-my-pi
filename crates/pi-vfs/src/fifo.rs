@@ -824,7 +824,7 @@ mod tests {
 	/// names a new FIFO before the helper opens it: the drop's end, of the
 	/// FIFO the open started on, cannot complete the helper's open of the
 	/// new one, so the drop leaves the helper and returns (a drop that waits
-	/// for the helper hangs the test until the runner's bound). The helper,
+	/// for the helper fails the test within its bound). The helper,
 	/// held until the drop has left it, reaches its last check after that and
 	/// opens nothing: it ends with no reader of the new FIFO, which a helper
 	/// that opened it would wait for. The old FIFO is moved aside, not
@@ -840,7 +840,28 @@ mod tests {
 		}
 		fs::rename(&path, path.with_extension("old")).unwrap();
 		make_fifo(&path);
-		drop(opened);
+		let start = std::time::Instant::now();
+		let dropper = thread::spawn(move || drop(opened));
+		while !dropper.is_finished() && start.elapsed() < LIMIT {
+			thread::sleep(Duration::from_millis(5));
+		}
+		let returned = dropper.is_finished();
+		// A drop still waiting for the helper is released by a reader of the
+		// new FIFO, which the helper's open waits for, so the test ends.
+		let reader = (!returned).then(|| {
+			fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&path)
+				.unwrap()
+		});
+		dropper.join().unwrap();
+		drop(reader);
+		assert!(
+			returned,
+			"the drop had not returned after {LIMIT:?}: it waited for a helper whose path names \
+			 another FIFO"
+		);
 		assert!(shared.slot.lock().left, "the drop did not leave the helper");
 		let start = std::time::Instant::now();
 		while Arc::strong_count(&shared) != 1 && start.elapsed() < LIMIT {
