@@ -120,6 +120,24 @@ for _, path in ipairs(paths) do
 end
 return #paths`;
 
+// Size and bytes from one read, so an append between them cannot pair a size
+// with other content. ARGV[1] is the byte offset, ARGV[2] the most bytes to
+// return ("" for the rest); a missing key returns nil.
+const READ_FROM_SCRIPT = `-- OMP_READ_FROM
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local size = redis.call("STRLEN", KEYS[1])
+local from = tonumber(ARGV[1])
+local take = size - from
+if ARGV[2] ~= "" then
+	take = math.min(take, tonumber(ARGV[2]))
+end
+if take <= 0 then
+	return {size, ""}
+end
+return {size, redis.call("GETRANGE", KEYS[1], from, from + take - 1)}`;
+
 /** A `SCAN MATCH` glob for the keys starting with `prefix`, its glob characters escaped. */
 function keysStartingWith(prefix: string): string {
 	return `${prefix.replace(/[*?[\]\\]/g, "\\$&")}*`;
@@ -220,6 +238,18 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		const head = prefixBytes > 0 ? this.#client.getrange(key, 0, prefixBytes - 1) : Promise.resolve("");
 		const tail = suffixBytes > 0 ? this.#client.getrange(key, -suffixBytes, -1) : Promise.resolve("");
 		return Promise.all([head, tail]);
+	}
+
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+		const result = await this.#client.send("EVAL", [
+			READ_FROM_SCRIPT,
+			"1",
+			this.#fileKey(path),
+			String(Math.max(0, Math.trunc(offset))),
+			maxBytes === undefined ? "" : String(Math.max(0, Math.trunc(maxBytes))),
+		]);
+		if (!Array.isArray(result)) return null;
+		return { size: Number(result[0]), text: String(result[1] ?? "") };
 	}
 
 	async writeFull(

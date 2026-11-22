@@ -2176,7 +2176,10 @@ export class SelectorController {
 
 	/**
 	 * Move a session recorded in a removed worktree of this repository into the
-	 * current folder before resuming it: its own directory cannot be entered.
+	 * current folder before resuming it: its own directory cannot be entered. A
+	 * storage that cannot refuse the move while another omp process writes the
+	 * session ({@link SessionManager.relocatesUnasked}) resumes it where it is
+	 * stored.
 	 * Returns the session file to switch to, or undefined after reporting a failed move.
 	 */
 	async #relocateFromRemovedWorktree(
@@ -2189,6 +2192,7 @@ export class SelectorController {
 		const sessionDir = sessionManager.getSessionDir();
 		const info = await readSessionInfo(sessionPath);
 		if (!info || !(await SessionManager.isFromRemovedWorktree(info, cwd, sessionDir))) return { sessionPath };
+		if (!SessionManager.relocatesUnasked(sessionManager.getStorage())) return { sessionPath };
 		try {
 			const relocated = await SessionManager.openRelocated(sessionPath, info.cwd, cwd, sessionDir);
 			const movedPath = relocated.getSessionFile() ?? sessionPath;

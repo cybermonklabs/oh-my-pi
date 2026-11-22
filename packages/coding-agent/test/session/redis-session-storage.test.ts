@@ -20,7 +20,9 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { FileSessionStorage, readSessionTextFrom } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 interface FakeRedisCall {
 	method: string;
@@ -140,6 +142,16 @@ function createFakeRedis(): FakeRedis {
 					getHash(titleKey).delete(filePath);
 				}
 				return paths.length;
+			}
+			if (script.includes("OMP_READ_FROM")) {
+				// As the script runs on a Redis 7 server: the size and a byte range from one read.
+				checkFailure("getrange");
+				const value = strings.get(keys[0]);
+				if (value === undefined) return null;
+				const bytes = Buffer.from(value, "utf-8");
+				const from = Number(argv[0]);
+				const take = Math.min(bytes.length - from, argv[1] === "" ? bytes.length : Number(argv[1]));
+				return [bytes.length, take <= 0 ? "" : bytes.subarray(from, from + take).toString("utf-8")];
 			}
 			throw new Error("Unsupported Redis script");
 		},
@@ -501,6 +513,28 @@ describe("RedisSessionStorage", () => {
 		expect(redis.calls[1].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", -3, -1]);
 	});
 
+	it("reads from an offset in one script call, as a file read would, never GETting the whole value", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const content = `${"é".repeat(5)}\n€😀 tail\n`;
+		await storage.writeText("/sessions/p/multi.jsonl", content);
+		const bytes = Buffer.from(content, "utf-8");
+
+		redis.calls.length = 0;
+		expect(await readSessionTextFrom(storage, "/sessions/p/multi.jsonl", 11, 5)).toEqual({
+			text: bytes.subarray(11, 16).toString("utf-8"),
+			size: bytes.length,
+		});
+		expect(await readSessionTextFrom(storage, "/sessions/p/multi.jsonl", 11)).toEqual({
+			text: bytes.subarray(11).toString("utf-8"),
+			size: bytes.length,
+		});
+		expect(await readSessionTextFrom(storage, "/sessions/p/multi.jsonl", bytes.length, 4)).toEqual({
+			text: "",
+			size: bytes.length,
+		});
+		expect(redis.calls.map(call => call.method)).toEqual(["send", "send", "send"]);
+	});
+
 	it("custom prefix isolates keyspaces", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis, prefix: "proj-a:" });
 		await storage.writeText("/sessions/x.jsonl", "hello\n");
@@ -592,5 +626,36 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await client.exists(`${prefix}file:/s/p/Late*[x].jsonl`)).toBe(false);
 		expect(await hget(client, "meta", "/s/p/Late*[x].jsonl")).toBeNull();
 		expect(await client.get(`${prefix}file:/s/p-sibling.jsonl`)).toBe("sibling\n");
+	});
+
+	it("reads from an offset what a file read of the same bytes returns", async () => {
+		const { storage } = await open();
+		const content = `${"é€😀".repeat(40)}\n${"plain ".repeat(10)}\n😀\n`;
+		await storage.writeText("/s/multi.jsonl", content);
+		using dir = TempDir.createSync("@omp-redis-read-from-");
+		const file = dir.join("multi.jsonl");
+		await Bun.write(file, content);
+		const reference = new FileSessionStorage();
+		const size = Buffer.byteLength(content, "utf-8");
+		// From a line start, cut inside a character, to the end, past the end, and nothing.
+		for (const [offset, maxBytes] of [
+			[0, 7],
+			[0, undefined],
+			[361, 11],
+			[361, undefined],
+			[size, 4],
+			[0, 0],
+		] as const) {
+			expect({
+				offset,
+				maxBytes,
+				read: await readSessionTextFrom(storage, "/s/multi.jsonl", offset, maxBytes),
+			}).toEqual({
+				offset,
+				maxBytes,
+				read: await readSessionTextFrom(reference, file, offset, maxBytes),
+			});
+		}
+		await expect(readSessionTextFrom(storage, "/s/missing.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

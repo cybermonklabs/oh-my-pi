@@ -525,9 +525,12 @@ export interface TerminalBreadcrumb {
  * A missing target file yields `null` UNLESS the breadcrumb is a `fresh`
  * boundary — a lazy session whose JSONL was never written — in which case the
  * entry is returned with `exists:false` so the caller can distinguish it from a
- * genuinely stale/deleted breadcrumb.
+ * genuinely stale/deleted breadcrumb. The target is looked up in `storage`,
+ * the store the caller resumes from.
  */
-export async function readTerminalBreadcrumbEntry(): Promise<TerminalBreadcrumb | null> {
+export async function readTerminalBreadcrumbEntry(
+	storage: SessionStorage = defaultSessionStorage(),
+): Promise<TerminalBreadcrumb | null> {
 	const terminalId = getTerminalId();
 	if (!terminalId) return null;
 
@@ -537,9 +540,13 @@ export async function readTerminalBreadcrumbEntry(): Promise<TerminalBreadcrumb 
 		if (!parsed) return null;
 		const { cwd: breadcrumbCwd, sessionFile, fresh, cwdIdentity } = parsed;
 
-		// Through the configured storage: under `session.storage: sql` the
+		// Through the caller's storage: under `session.storage: sql` the
 		// target is a row, and a filesystem check would drop every breadcrumb.
-		const exists = defaultSessionStorage().existsSync(sessionFile);
+		// A shared store may hold a row another client committed since this one
+		// loaded its view: another omp process wrote the session this terminal
+		// last ran.
+		await storage.refresh?.();
+		const exists = storage.existsSync(sessionFile);
 		// A materialized target resumes normally; a missing target is honored only
 		// for a never-written lazy fresh-session boundary.
 		if (exists || fresh) return { cwd: breadcrumbCwd, sessionFile, exists, fresh, cwdIdentity };

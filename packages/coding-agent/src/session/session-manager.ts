@@ -5394,6 +5394,23 @@ export class SessionManager {
 	}
 
 	/**
+	 * Whether resuming a session from `storage` may move it into the current
+	 * folder without asking: one from a removed worktree
+	 * ({@link isFromRemovedWorktree}), or one whose project folder was renamed
+	 * ({@link continueRecent}). Only a storage with ownership claims can,
+	 * because the move then refuses while another live omp process writes the
+	 * session. A shared store without them (SQL storage built without
+	 * `claims`, Redis storage) cannot tell whether a process, on this machine
+	 * or another, still has the session open, and a move would send that
+	 * process's later entries to the old key; such a session resumes where it
+	 * is stored. A store only this process opens (an in-memory database) takes
+	 * no claims either, and is treated alike.
+	 */
+	static relocatesUnasked(storage: SessionStorage = defaultSessionStorage()): boolean {
+		return storage.claimSession !== undefined;
+	}
+
+	/**
 	 * Open a session whose recorded directory `recordedCwd` is gone and move it,
 	 * artifacts included, into `cwd` so it resumes from there.
 	 * @param sessionDir Target session directory; defaults to `cwd`'s.
@@ -5479,7 +5496,7 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const resolvedCwd = path.resolve(cwd);
-		const breadcrumb = await readTerminalBreadcrumbEntry();
+		const breadcrumb = await readTerminalBreadcrumbEntry(storage);
 		let chosenSession: string | null | undefined;
 
 		if (breadcrumb) {
@@ -5543,7 +5560,20 @@ export class SessionManager {
 				// Cross-filesystem `mv` (new inode) is intentionally not a re-root.
 				const looksLikeMovedProject =
 					candidateForMove && hasPositiveMovedProjectEvidence(breadcrumb.cwdIdentity, resolvedCwd);
-				if (looksLikeMovedProject) {
+				if (looksLikeMovedProject && !SessionManager.relocatesUnasked(storage)) {
+					// A storage without ownership claims cannot tell whether another omp
+					// process, on this machine or another, still writes the session, and a
+					// move would send that process's later entries to the old key: continue
+					// the session where it is stored.
+					logger.warn(
+						"Not re-rooting moved session: its storage cannot tell whether another omp process has it open",
+						{
+							from: breadcrumbCwd,
+							to: resolvedCwd,
+						},
+					);
+					newestInTargetDir = breadcrumb.sessionFile;
+				} else if (looksLikeMovedProject) {
 					logger.warn("Re-rooting moved session", { from: breadcrumbCwd, to: resolvedCwd });
 					// Anchor at the gone breadcrumb cwd so the moveTo below relocates the
 					// session: open() now falls back to the launch cwd for a missing
