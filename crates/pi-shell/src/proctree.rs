@@ -2066,10 +2066,27 @@ mod tests {
 	/// (this test's parent, and pid 1 where it can be pinned) has another.
 	/// Nothing is asserted about two processes started together: on Linux
 	/// the mark counts 10 ms clock ticks, and a mark names a process only
-	/// with its pid.
+	/// with its pid. So the child is started only once a thread started
+	/// here is in a later tick than the parent, both read from their `stat`
+	/// here: a parent that forked the test binary at once (a wrapper such as
+	/// `timeout`) shared the child's tick, and the marks were equal.
 	#[cfg(unix)]
 	#[test]
 	fn start_mark_names_one_process() {
+		// SAFETY: getppid has no preconditions.
+		let ppid = unsafe { libc::getppid() };
+		let parent = Process::from_pid(ppid).expect("pin the test's parent");
+		// The test's own reading of both ticks, so the wait ends however the
+		// product reads them and the marks below are what is checked.
+		#[cfg(target_os = "linux")]
+		{
+			let parent_ticks = start_ticks_in(&format!("/proc/{ppid}/stat"));
+			while std::thread::spawn(|| start_ticks_in("/proc/thread-self/stat"))
+				.join()
+				.unwrap()
+				<= parent_ticks
+			{}
+		}
 		let mut child = crate::testkit::child::dies_with_this_process(
 			std::process::Command::new("sleep").arg("600"),
 		)
@@ -2080,8 +2097,6 @@ mod tests {
 			Process::from_pid(pid).expect("pin the child"),
 			Process::from_pid(pid).expect("pin the child again"),
 		);
-		// SAFETY: getppid has no preconditions.
-		let parent = Process::from_pid(unsafe { libc::getppid() }).expect("pin the test's parent");
 		let init = Process::from_pid(1);
 		let marks = (first.start_mark(), again.start_mark(), parent.start_mark());
 		let init_mark = init.as_ref().map(Process::start_mark);
@@ -2099,6 +2114,18 @@ mod tests {
 			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
 			assert!(child_mark.starts_with(&format!("{}:", boot.trim())), "{child_mark}");
 		}
+	}
+
+	/// The start time in a task's `stat` at `path`: field 22, clock ticks
+	/// since boot, the count and the unit of Linux's start mark.
+	#[cfg(target_os = "linux")]
+	fn start_ticks_in(path: &str) -> u64 {
+		let stat = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{path}: {error}"));
+		// Field 3, the state, is the first after the name.
+		stat
+			.rsplit_once(") ")
+			.and_then(|(_, rest)| rest.split(' ').nth(22 - 3)?.parse().ok())
+			.unwrap_or_else(|| panic!("{path}: no start time in {stat:?}"))
 	}
 
 	/// The boot id is read once per process: once a mark was read, no later
