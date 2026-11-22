@@ -1591,7 +1591,8 @@ provider's `baseUrl` and key, for example a model gateway:
 1. `POST {base}/live/sessions` with `Authorization: Bearer <provider key>` and
    `{ "session": { "model": <live.model>, "instructions", "audio": { "output": { "voice" } }, "delegation": { "type": "client" }, "idle_timeout_s": 60, "wake_policy": { "type": "speech" } }, "transport": { "type": "webrtc", "sdp": <offer> } }`.
    The answer is `201 { "session": { "id" }, "transport": { "sdp" } }`. No Codex
-   header is sent and no redirect is followed.
+   header is sent and no redirect is followed. An `id` of anything but letters,
+   digits, `_` and `-` is refused before it goes into the sideband URL.
 2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
    bearer. Events whose `event_id` came before (the attach replays 3 s) are
    dropped.

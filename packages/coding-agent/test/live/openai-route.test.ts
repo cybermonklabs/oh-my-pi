@@ -287,6 +287,47 @@ describe("GPT-Live transport", () => {
 		}
 	});
 
+	test("refuses a session id that is not letters, digits, _ and -, before it builds the attach URL", async () => {
+		for (const id of ["..", "live/../x", "live 1"]) {
+			const api = liveApiServer({
+				answer: () => Response.json({ session: { id }, transport: { sdp: "v=0 answer" } }, { status: 201 }),
+			});
+			const transport = openaiTransport({ baseUrl: api.base, apiKey: "gw-key", model: "gpt-live-1.1" });
+			try {
+				await expect(transport.connect()).rejects.toThrow(/invalid session id/);
+				expect(api.upgrades).toEqual([]);
+			} finally {
+				await transport.close();
+				api.server.stop(true);
+			}
+		}
+	});
+
+	test("a redirect's error repeats at most 256 characters of its Location", async () => {
+		const location = `http://elsewhere.invalid/${"a".repeat(10_000)}`;
+		const redirecting = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response(null, { status: 307, headers: { Location: location } }),
+		});
+		const transport = openaiTransport({
+			baseUrl: `http://127.0.0.1:${redirecting.port}/v1`,
+			apiKey: "gw-key",
+			model: "gpt-live-1.1",
+		});
+		try {
+			const error = await transport.connect().then(
+				() => undefined,
+				(cause: unknown) => cause as Error,
+			);
+			expect(error?.message).toContain(`to ${location.slice(0, 256)}…; no redirect is followed`);
+			expect(error!.message.length).toBeLessThan(400);
+		} finally {
+			await transport.close();
+			redirecting.stop(true);
+		}
+	});
+
 	test("follows no redirect, so the key never leaves the provider's origin", async () => {
 		const elsewhere = liveApiServer();
 		const redirecting = Bun.serve({

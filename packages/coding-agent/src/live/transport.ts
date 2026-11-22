@@ -37,6 +37,13 @@ const LIVE_ENDPOINT_PROXY = "live";
 const MAX_ENDPOINT_REDIRECTS = 5;
 /** The models.yml provider whose base URL and key the GPT-Live route uses; also its proxy scope. */
 const OPENAI_LIVE_PROVIDER = "openai";
+/**
+ * The session ids GPT-Live hands out (`live_…`): letters, digits, `_` and `-`. An id of any other form
+ * is refused before it reaches the sideband URL's path, where `.` and `..` would move it.
+ */
+const OPENAI_LIVE_SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+/** How much of a redirect's `Location` an error repeats. */
+const MAX_LOCATION_LENGTH = 256;
 /** Event ids remembered to drop the 3 s replay a sideband attach repeats from the data channel. */
 const SEEN_EVENT_IDS_LIMIT = 1_024;
 
@@ -248,6 +255,13 @@ function boundedErrorBody(body: string, statusText: string): string {
 	return `${normalized.slice(0, MAX_ERROR_BODY_LENGTH)}…`;
 }
 
+/** A redirect's `Location` for an error message, cut to {@link MAX_LOCATION_LENGTH}. */
+function boundedLocation(location: string | null): string {
+	if (!location) return "nowhere";
+	if (location.length <= MAX_LOCATION_LENGTH) return location;
+	return `${location.slice(0, MAX_LOCATION_LENGTH)}…`;
+}
+
 function abortReason(signal: AbortSignal | undefined): Error {
 	if (signal?.reason instanceof Error) return signal.reason;
 	return new DOMException("Live connection aborted", "AbortError");
@@ -441,7 +455,7 @@ export class LiveTransport {
 				if (!target || !preservesPost || target.origin !== origin || redirects >= MAX_ENDPOINT_REDIRECTS) {
 					throw new LiveSignalingError(
 						response.status,
-						`Live endpoint signaling was redirected (${response.status}) to ${location ?? "nowhere"}; ` +
+						`Live endpoint signaling was redirected (${response.status}) to ${boundedLocation(location)}; ` +
 							"only same-origin 307/308 redirects are followed",
 					);
 				}
@@ -498,7 +512,7 @@ export class LiveTransport {
 			await response.body?.cancel();
 			throw new LiveSignalingError(
 				response.status,
-				`GPT-Live session request was redirected (${response.status}) to ${response.headers.get("location") ?? "nowhere"}; no redirect is followed`,
+				`GPT-Live session request was redirected (${response.status}) to ${boundedLocation(response.headers.get("location"))}; no redirect is followed`,
 			);
 		}
 		const text = await response.text();
@@ -510,6 +524,12 @@ export class LiveTransport {
 		const sessionId = isRecord(answer?.session) ? answer.session.id : undefined;
 		if (typeof sessionId !== "string" || !sessionId) {
 			throw new LiveSignalingError(response.status, "GPT-Live session returned no session id");
+		}
+		if (!OPENAI_LIVE_SESSION_ID_PATTERN.test(sessionId)) {
+			throw new LiveSignalingError(
+				response.status,
+				`GPT-Live session returned an invalid session id (${JSON.stringify(sessionId.slice(0, 64))}); ids hold only letters, digits, "_" and "-"`,
+			);
 		}
 		const sdp = isRecord(answer?.transport) ? answer.transport.sdp : undefined;
 		if (typeof sdp !== "string" || !sdp.trim()) {
