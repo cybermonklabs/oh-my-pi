@@ -1,64 +1,91 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
-import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
-import { validateAgentAccountPools } from "../config/account-pools";
+import type { AgentIdentity } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { assertModelSupportsEffortCeiling } from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, modelSupportsEffortCeiling } from "@oh-my-pi/pi-tui/thinking";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
+import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
+	modelNotFoundMessage,
 	resolveAgentAdvisorRolePattern,
-	resolveExactModelIdentity,
+	resolveSpawnModelIdentity,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
+import type { EvalToolDescriptor } from "../eval/types";
+import type { CustomTool } from "../extensibility/custom-tools/types";
 import { MCPManager, type MCPManagerApi } from "../mcp/manager";
-import { initializeExtensions } from "../modes/runtime-init";
-import type { AsyncJobManagerApi } from "../async";
-import type { PreparedExtension } from "../extensibility/extensions/types";
+import unavailableCustomToolsPrompt from "../prompts/system/unavailable-custom-tools.md" with { type: "text" };
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, agentAncestors, bareAgentId, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
-import type { AgentSessionHandle } from "../session/agent-session-handle";
-import type { ArtifactManagerApi } from "../session/artifacts";
-import type { CostGateApi } from "../session/cost-gate";
-import { installRetryFallbackRole } from "../session/retry-fallback-chains";
+import { type AgentSessionHandle, isLocalAgentSession } from "../session/agent-session-handle";
 import type { AuthStorage } from "../session/auth-storage";
+import {
+	formatRetryFallbackBaseSelector,
+	getRetryFallbackRole,
+	installRetryFallbackRole,
+	parseRetryFallbackChainEntry,
+	type RetryFallbackSelector,
+	retryFallbackThinkingLevel,
+} from "../session/retry-fallback-chains";
+import { extractSessionInit, type PersistedSessionInit, SessionManager } from "../session/session-manager";
+import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
 import { revivePersistedPlaced } from "../thread/executor-routing";
 import { subagentWorkerPool } from "../thread/subagent-worker";
-import {
-	extractSessionInit,
-	hasConversationalHistory,
-	type PersistedSessionInit,
-	SessionManager,
-} from "../session/session-manager";
-import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
+import type { ToolSession } from "../tools";
 import type { EventBus } from "../utils/event-bus";
-import {
-	attachIrcWakeTurnMonitor,
-	compactionThresholdSettings,
-	createSubagentSettings,
-	followMCPTools,
-	replayRevivedAgentStart,
-	softRequestBudgetFor,
-	subagentRetryFallbackRole,
-} from "./executor";
 import { isCompletionProbeEnabled } from "./completion-probe";
 import { discoverAgents, getAgent } from "./discovery";
+import { createEvalCustomTools, listEvalTools, unavailableEvalCustomTool } from "./eval-tools";
+import {
+	buildSubagentSession,
+	captureSubagentSettings,
+	compactionThresholdSettings,
+	createSubagentSettings,
+	type ExplicitBuildModel,
+	type LegacyBuildModel,
+	liveEffortCeiling,
+	perCallModelAssertion,
+	RevivedModels,
+	reopenParkedSubagent,
+	type SubagentLegacyRevive,
+	type SubagentLiveInputs,
+	type SubagentLivePolicy,
+	softRequestBudgetFor,
+	spawnerLiveInputs,
+	subagentRetryFallbackRole,
+} from "./executor";
 import {
 	assertPerCallModelApproved,
-	parentModelGrantPattern,
 	PerCallModelError,
-	PerCallModelUnavailableError,
 	type PerCallModelGrants,
+	PerCallModelUnavailableError,
+	parentModelGrantPattern,
 } from "./model-approval";
-import { cfgTaskAgentAccountPools, cfgTaskAgentIdleTtlMs, cfgTaskMaxEffort } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
-import { seanceIsolationOptions } from "./seance-policy";
+import { cfgTaskAgentIdleTtlMs, cfgTaskMaxEffort } from "./settings";
+import {
+	jsonValue,
+	readSpawnSpec,
+	SPAWN_LIVE_INPUT_NAMES,
+	SPAWN_SPEC_VERSION,
+	type SpawnLiveInputName,
+	type SpawnSpecParts,
+	type SpawnSpecPolicy,
+	type SpawnSpecSettings,
+	type SubagentSpawnSpec,
+	spawnSpecSettings,
+} from "./spawn-spec";
+import { subagentLiveInputs } from "./structured-subagent";
 import type { AgentDefinition } from "./types";
+
+/** Custom type of the message that names a revived subagent's unavailable custom tools to its model. */
+const UNAVAILABLE_CUSTOM_TOOLS_NOTICE = "unavailable-custom-tools";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -94,6 +121,38 @@ export interface PersistedSubagentReviveContext {
 	storage?: SessionStorage;
 }
 
+/** The live inputs a cold revive takes from the live parent session; the reviving thread adds its own. */
+export type ColdReviveLiveInputs = Omit<
+	SubagentLiveInputs,
+	"assertDispatchModel" | "customTools" | "oauthAccountPools" | "seance" | "storeMaskCwd"
+>;
+
+/** The model a cold revive builds on: never the patterns of a spawn's deferred model resolution. */
+type ColdReviveBuildModel = ExplicitBuildModel | LegacyBuildModel;
+
+/** A per-call worker's grants besides the live settings and the live parent's model, which each request reads. */
+export type PerCallGrantInputs = Omit<PerCallModelGrants, "settings" | "parentModelPattern">;
+
+/** What the main thread prepares for one cold revive before anything is reopened ({@link prepareColdRevive}). */
+export interface PreparedColdRevive {
+	/** The live parent session's inputs: the parent ref's while it holds a session, else the root's. */
+	readonly live: ColdReviveLiveInputs;
+	/** The model a spawn spec's model or a per-call worker starts on; absent, the record's patterns decide. */
+	readonly model: ExplicitBuildModel | LegacyBuildModel | undefined;
+	/** The model the spec's prewalk target names, where the registry knows it. */
+	readonly prewalkTarget: Model | undefined;
+	/** The registry's discovery ran while this step resolved a model; the build does not run it again. */
+	readonly discoveryRan: boolean;
+	/** A per-call worker's grants, which each of its requests is held to. */
+	readonly grants: PerCallGrantInputs | undefined;
+	/** Each custom tool the spec names, built over the live parent's kernel or kept as unavailable. */
+	readonly customTools: readonly CustomTool[];
+	/** Names of the custom tools no live kernel serves. */
+	readonly unavailableTools: readonly string[];
+	/** The root session's cwd, where a record with no spawn spec runs. */
+	readonly rootCwd: string;
+}
+
 /**
  * Everything one cold revive of a persisted subagent needs, built on main per revive and
  * cloneable (live objects cross as their bridged proxies), so the session can be created
@@ -109,21 +168,13 @@ export interface PersistedReviveSpec {
 	readonly taskDepth: number;
 	/** The consulted source of a persisted seance session. */
 	readonly restoredSeance: RestoredSeanceSession | undefined;
-	/** The live top-level session revived agents join (cwd, extension roots, parent grants). */
+	/** The live top-level session revived agents join (parent grants of its direct children). */
 	readonly root: AgentSessionHandle;
 	/** Registry id of {@link root}. */
 	readonly rootAgentId: string;
-	readonly costGate: CostGateApi;
-	readonly asyncJobManager: AsyncJobManagerApi | undefined;
-	/** The root's artifact manager at revive time; a revived non-seance agent adopts it. */
-	readonly artifactManager: ArtifactManagerApi | undefined;
-	readonly preparedExtensions: readonly PreparedExtension[] | undefined;
-	readonly authStorage: AuthStorage;
-	readonly modelRegistry: ModelRegistry;
+	/** The root session's settings, which the subagent settings of a record with no spawn spec build on. */
 	readonly settings: Settings;
-	readonly enableLsp: boolean;
-	readonly eventBus: EventBus | undefined;
-	readonly subagentEventBus: EventBus | undefined;
+	readonly prepared: PreparedColdRevive;
 	/**
 	 * Set when the host keeps MCP per top-level session
 	 * ({@link PersistedSubagentReviveContext.mcpManager}): the revived agent uses exactly
@@ -140,6 +191,9 @@ export interface PersistedReviveSpec {
 	/** Idle TTL for agents {@link reviverFactory} cold-revives through those actions. */
 	readonly agentIdleTtlMs: number;
 }
+
+/** A cold revive before the main thread prepared it. */
+type ColdReviveTarget = Omit<PersistedReviveSpec, "prepared">;
 
 /**
  * Durable agent definition name (`scout`, `reviewer`, …) of a persisted subagent.
@@ -161,8 +215,8 @@ export function persistedAgentName(displayName: string, init: PersistedSessionIn
 
 /**
  * The agent definition a cold-revived subagent's monitored turns report (IRC wakes,
- * `omp --restore`): persisted files predate an agent-source field, so frames carry
- * the runtime-neutral `user` source; the name is the registry ref's.
+ * `omp --restore`) when its record holds no spawn spec: such files predate an agent-source
+ * field, so frames carry the runtime-neutral `user` source; the name is the registry ref's.
  */
 export function persistedAgentDefinition(displayName: string, init: PersistedSessionInit): AgentDefinition {
 	return {
@@ -180,14 +234,10 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
  * the executor's live reviver closure died with the process/turn that spawned
  * it — so `ensureLive` (IRC sends, hub focus) would otherwise refuse it.
  *
- * This rebuilds the subagent the same way `--resume` rebuilds a session: reopen
- * the JSONL and replay it through {@link createAgentSession}. The catch is that
- * resume restores only conversation/model from the file — the runtime contract
- * (tools / system prompt / output schema / kind) is built from options, so a
- * bare reopen would resurrect a wrong (top-level) session. We source that
- * contract from the persisted `session_init` entry instead, and mirror the
- * executor's subagent wiring (MCP proxy tools, depth-derived gating,
- * yield-required, active-tool clamp, registry status sync).
+ * Each revive builds the subagent through {@link buildSubagentSession} from the spawn spec
+ * of the transcript's latest `session_init` and the live inputs of its live parent session;
+ * a record an older omp wrote takes, part by part, what the cold revive built before spawn
+ * specs existed.
  */
 export function createPersistedSubagentReviverFactory(
 	ctx: PersistedSubagentReviveContext,
@@ -210,11 +260,12 @@ export function createPersistedSubagentReviverFactory(
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
 		if (!peek?.init) return undefined;
+		const init = peek.init;
 		let restoredSeance: RestoredSeanceSession | undefined;
 		if (peek.seanceSource !== undefined) {
 			try {
 				restoredSeance = await restoreSeanceSession({
-					init: peek.init,
+					init,
 					cwd: peek.cwd,
 					modelRegistry: ctx.modelRegistry,
 				});
@@ -233,7 +284,7 @@ export function createPersistedSubagentReviverFactory(
 		// probe below, so gate on the stamped contract instead — otherwise a
 		// restart + peer message revives the agent outside isolation, in the
 		// parent cwd, contradicting the delivery notice.
-		if (peek.init.isolated) return undefined;
+		if (init.isolated) return undefined;
 		try {
 			await fs.stat(restoredSeance?.cwd ?? peek.cwd);
 		} catch {
@@ -263,8 +314,8 @@ export function createPersistedSubagentReviverFactory(
 			taskDepth++;
 		}
 		return async expectedRef => {
-			// Live root state is read per revive, so a later `/new` or cwd move is followed.
-			const spec: PersistedReviveSpec = {
+			// Live state is read per revive, so a later `/new`, cwd move or registry change is followed.
+			const target: ColdReviveTarget = {
 				id: ref.id,
 				displayName: ref.displayName,
 				parentId: ref.parentId,
@@ -274,20 +325,12 @@ export function createPersistedSubagentReviverFactory(
 				restoredSeance,
 				root: ctx.session,
 				rootAgentId: ctx.session.getAgentId?.() ?? MAIN_AGENT_ID,
-				costGate: ctx.session.costGate,
-				asyncJobManager: ctx.session.asyncJobManager,
-				artifactManager: ctx.session.sessionManager.getArtifactManager() ?? undefined,
-				preparedExtensions: ctx.session.preparedExtensions,
-				authStorage: ctx.authStorage,
-				modelRegistry: ctx.modelRegistry,
 				settings: ctx.settings,
-				enableLsp: ctx.enableLsp,
-				eventBus: ctx.eventBus,
-				subagentEventBus: ctx.subagentEventBus,
 				hostMcp: ctx.mcpManager ? { manager: ctx.mcpManager() } : undefined,
 				reviverFactory: factory,
 				agentIdleTtlMs: idleTtlMs,
 			};
+			const spec: PersistedReviveSpec = { ...target, prepared: await prepareColdRevive(ctx, target, init) };
 			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker).
 			const pool = subagentWorkerPool(ctx.settings, storage);
 			return pool
@@ -299,129 +342,686 @@ export function createPersistedSubagentReviverFactory(
 }
 
 /**
+ * The main thread's part of one cold revive, at the start of each reviver call and before anything is
+ * reopened: the live parent session's inputs, the model the record's spawn spec starts on as the registry
+ * holds it now (a per-call worker: its saved model, held to the grants as they are now), and the spec's
+ * custom tools over the live parent's eval kernels. `init` is the `session_init` the factory read.
+ */
+export async function prepareColdRevive(
+	ctx: PersistedSubagentReviveContext,
+	target: ColdReviveTarget,
+	init: PersistedSessionInit,
+): Promise<PreparedColdRevive> {
+	const root = ctx.session;
+	const parts = coldReviveSpecParts(target, init);
+	const parentSession = liveParentSession(target);
+	const localParent = parentSession && isLocalAgentSession(parentSession) ? parentSession : undefined;
+	const agentName = persistedAgentName(target.displayName, init);
+	const live = coldReviveLiveInputs(
+		ctx,
+		localParent?.evalToolSession ? localParent : root,
+		{
+			id: target.id,
+			name: parts.wake?.agent.name ?? agentName,
+			description: parts.wake?.agent.description ?? "",
+		},
+		parts.liveInputs,
+		target.hostMcp,
+	);
+	const settingsParent = coldReviveSettingsParent(target, parts, live);
+	const modelRegistry = live.modelRegistry;
+	const models = new RevivedModels(modelRegistry);
+	// The overlay the chain is read from is restored only where the revive walks the chain.
+	const chain = (): string[] => retryFallbackChain(target.id, parts.settings, init, settingsParent);
+	let model: ColdReviveBuildModel | undefined;
+	let grants: PerCallGrantInputs | undefined;
+	if (isPerCallRecord(parts, init) && !target.restoredSeance) {
+		const identity = parts.model ? parts.model.model : init.perCallModelIdentity;
+		const level = parts.thinking ? parts.thinking.thinkingLevel : init.perCallThinkingLevel;
+		if (!identity || level === undefined) {
+			throw new PerCallModelError(
+				`Cannot revive subagent "${target.id}": its per-call model identity and thinking level were not recorded separately, so they cannot be restored exactly. The agent was not revived.`,
+			);
+		}
+		grants = await perCallGrantInputs(target, init, parentSession, settingsParent);
+		const approve = perCallApproval(target, grants, settingsParent, modelRegistry);
+		const ceiling = liveEffortCeiling(
+			parts.thinking ? parts.thinking.thinkingLevelCeiling : cfgTaskMaxEffort.get(settingsParent),
+			settingsParent,
+		);
+		model = await choosePerCallModel({
+			id: target.id,
+			identity,
+			level: level ?? undefined,
+			chain,
+			models,
+			modelRegistry,
+			ceiling,
+			approve: perCallModelAssertion(approve, () => ceiling),
+			legacy: parts.model === undefined,
+		});
+	} else if (parts.model) {
+		model = await chooseColdReviveModel({
+			id: target.id,
+			identity: parts.model.model,
+			level: parts.thinking?.thinkingLevel ?? undefined,
+			chain,
+			models,
+			modelRegistry,
+			ceiling: liveEffortCeiling(parts.thinking?.thinkingLevelCeiling, settingsParent),
+			// The model of the parent's live session; the root's where the parent ref holds no session.
+			fallback: parentSession?.model ?? root.model,
+		});
+	}
+	let prewalkTarget: Model | undefined;
+	if (parts.prewalk) {
+		prewalkTarget = await models.resolve(parts.prewalk.target);
+		if (!prewalkTarget) {
+			logger.warn("Revived subagent prewalk target unavailable; skipping prewalk", {
+				subagent: target.id,
+				target: parts.prewalk.target,
+			});
+		}
+	}
+	const tools = await coldReviveCustomTools(target.id, parts.tools?.customTools ?? [], localParent?.evalToolSession);
+	return {
+		live,
+		model,
+		prewalkTarget,
+		discoveryRan: models.discoveryRan,
+		grants,
+		customTools: tools.customTools,
+		unavailableTools: tools.unavailable,
+		rootCwd: root.sessionManager.getCwd(),
+	};
+}
+
+/**
+ * The parent's live session: the root session for its direct children, else the parent ref's session while
+ * that ref holds one; undefined when the parent ref is parked, killed or gone.
+ */
+function liveParentSession(target: ColdReviveTarget): AgentSessionHandle | undefined {
+	if (target.parentId === target.rootAgentId) return target.root;
+	return AgentRegistry.global().get(target.parentId ?? "")?.session ?? undefined;
+}
+
+/** The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. */
+function coldReviveSpecParts(target: ColdReviveTarget, init: PersistedSessionInit): SpawnSpecParts {
+	return target.restoredSeance ? { stored: false } : readSpawnSpec(init);
+}
+
+/** What a cold revive restores the subagent's overlay over: the live parent's settings for a spec's, else the root's. */
+function coldReviveSettingsParent(
+	target: ColdReviveTarget,
+	parts: SpawnSpecParts,
+	live: ColdReviveLiveInputs,
+): Settings {
+	return parts.settings ? live.settingsParent : target.settings;
+}
+
+/** Whether the subagent's model came from a per-call `model`: the spec's flag, else the record's. */
+function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boolean {
+	return parts.model ? parts.model.perCallModel : init.perCallModel === true;
+}
+
+/**
+ * The live inputs `session` holds for a subagent build, as a spawn of it reads them, limited to those the
+ * spawn passed where its spec names them. A session built without a tool session (a host's root) gives
+ * its own objects, as cold revives took them before spawn specs.
+ */
+function coldReviveLiveInputs(
+	ctx: PersistedSubagentReviveContext,
+	session: AgentSession,
+	agent: AgentIdentity,
+	names: readonly SpawnLiveInputName[] | undefined,
+	hostMcp: PersistedReviveSpec["hostMcp"],
+): ColdReviveLiveInputs {
+	// What the process allows: the root's policy, whichever session the other inputs come from. A host that
+	// keeps MCP per top-level session runs its root with MCP off and allows its own manager.
+	const rootTools = ctx.session.evalToolSession;
+	const policy: SubagentLivePolicy = {
+		enableLsp: ctx.enableLsp,
+		enableIrc: rootTools?.enableIrc,
+		enableMCP: hostMcp ? undefined : rootTools?.enableMCP,
+	};
+	const tools = session.evalToolSession;
+	let live: ColdReviveLiveInputs;
+	if (tools) {
+		const inputs = subagentLiveInputs(tools);
+		live = {
+			...spawnerLiveInputs(inputs, agent),
+			authStorage: inputs.authStorage ?? ctx.authStorage,
+			modelRegistry: inputs.modelRegistry ?? ctx.modelRegistry,
+			subagentEventBus: tools.subagentEventBus ?? ctx.subagentEventBus,
+			mcpManager: inputs.mcpManager ?? MCPManager.instance(),
+			settingsParent: inputs.settings ?? ctx.settings,
+			eventBus: tools.eventBus ?? ctx.eventBus,
+			parentArtifactManager: inputs.parentArtifactManager,
+			policy,
+		};
+	} else {
+		live = {
+			costGate: session.costGate,
+			authStorage: ctx.authStorage,
+			modelRegistry: ctx.modelRegistry,
+			asyncJobManager: session.asyncJobManager,
+			// Owner policy, read when the session asks, never extension authority from a transcript.
+			extensionRoots: () => session.effectiveExtensionRoots,
+			preloadedPreparedExtensions: session.preparedExtensions,
+			mcpManager: MCPManager.instance(),
+			subagentEventBus: ctx.subagentEventBus,
+			settingsParent: ctx.settings,
+			eventBus: ctx.eventBus,
+			parentArtifactManager: session.sessionManager.getArtifactManager() ?? undefined,
+			policy,
+		};
+	}
+	if (names) {
+		const passed = new Set<string>(names);
+		for (const name of SPAWN_LIVE_INPUT_NAMES) {
+			if (!passed.has(name)) live[name] = undefined;
+		}
+	}
+	// Such a host gives the revived agent exactly its manager, read on main at revive time.
+	if (hostMcp) live.mcpManager = hostMcp.manager;
+	return live;
+}
+
+/**
+ * The custom tools `descriptors` name, each built from its stored descriptor: over `kernelSession` (the live
+ * parent's tool session) where one of its kernels defines that tool, else as an unavailable tool, which
+ * is named in a warning. No tool is dropped.
+ */
+async function coldReviveCustomTools(
+	id: string,
+	descriptors: readonly EvalToolDescriptor[],
+	kernelSession: ToolSession | undefined,
+): Promise<{ customTools: CustomTool[]; unavailable: string[] }> {
+	const customTools: CustomTool[] = [];
+	const unavailable: string[] = [];
+	if (descriptors.length === 0) return { customTools, unavailable };
+	// `listEvalTools`, not `describeEvalTools`, which throws on a name no kernel defines.
+	let defined = new Map<string, string>();
+	if (kernelSession) {
+		try {
+			defined = new Map((await listEvalTools(kernelSession)).map(tool => [tool.name, tool.language]));
+		} catch (error) {
+			logger.warn("Revived subagent could not read its parent's eval tools", {
+				subagent: id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	for (const descriptor of descriptors) {
+		if (kernelSession && defined.get(descriptor.name) === descriptor.language) {
+			customTools.push(...createEvalCustomTools(kernelSession, [descriptor]));
+			continue;
+		}
+		customTools.push(unavailableEvalCustomTool(descriptor));
+		unavailable.push(descriptor.name);
+		logger.warn("Revived subagent keeps a custom tool no live kernel defines; a call to it answers unavailable", {
+			subagent: id,
+			tool: descriptor.name,
+		});
+	}
+	return { customTools, unavailable };
+}
+
+/** The `subagent:<id>` retry-fallback chain the spawn installed: in the spec's settings, else the record's. */
+function retryFallbackChain(
+	id: string,
+	settings: SpawnSpecSettings | undefined,
+	init: PersistedSessionInit,
+	settingsParent: Settings,
+): string[] {
+	if (!settings) return init.retryFallback?.chain ?? [];
+	const role = getRetryFallbackRole(settingsParent.restoreOverlay(settings.layers), subagentRetryFallbackRole(id));
+	return role?.chain ?? [];
+}
+
+/**
+ * Each model a retry-fallback `chain` names when the stored model `identity` failed, in the chain's order,
+ * every entry read as the live retry walk reads it (a provider wildcard keeps the failing model's id under
+ * another provider, without an aggregator's vendor prefix the target provider does not use): the entry's
+ * selector, and the model the registry holds for it, if any.
+ */
+function* chainModels(
+	chain: readonly string[],
+	identity: string,
+	modelRegistry: ModelRegistry,
+): Generator<{ candidate: RetryFallbackSelector; model: Model | undefined }> {
+	// A stored identity is exact: no part of its id is read as a thinking level.
+	const slash = identity.indexOf("/");
+	const current: RetryFallbackSelector = {
+		raw: identity,
+		provider: identity.slice(0, slash),
+		id: identity.slice(slash + 1),
+		thinkingLevel: undefined,
+	};
+	for (const entry of chain) {
+		const candidate = parseRetryFallbackChainEntry({ modelLookup: modelRegistry }, entry, current);
+		if (!candidate) continue;
+		const model = resolveSpawnModelIdentity(formatRetryFallbackBaseSelector(candidate), modelRegistry);
+		yield { candidate, model };
+	}
+}
+
+/**
+ * The model a cold revive of a record with a spawn spec starts on: the spec's model as the registry holds
+ * it, after its discovery ran; else the first model of the subagent's retry-fallback chain the registry
+ * knows; else `fallback`, the live parent's (or the root's) model. Each move is logged with the spawn's own
+ * message for a model the registry does not know.
+ */
+async function chooseColdReviveModel(args: {
+	id: string;
+	identity: string | null;
+	level: ConfiguredThinkingLevel | undefined;
+	/** The subagent's retry-fallback chain, read only where the spec's model is gone. */
+	chain: () => readonly string[];
+	models: RevivedModels;
+	modelRegistry: ModelRegistry;
+	ceiling: Effort | undefined;
+	fallback: Model | undefined;
+}): Promise<ExplicitBuildModel> {
+	const { id, identity, level, modelRegistry, ceiling } = args;
+	// A spawn that started on no model left it to the session, as the warm revive does.
+	if (identity === null) return { kind: "model", model: undefined, thinkingLevel: level };
+	const known = await args.models.resolve(identity);
+	if (known) return { kind: "model", model: known, thinkingLevel: level };
+	const moved = (model: Model | undefined): void => {
+		logger.warn(modelNotFoundMessage([identity], modelRegistry.getAll()), {
+			subagent: id,
+			model: model ? formatModelStringWithRouting(model) : undefined,
+		});
+	};
+	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry)) {
+		if (!model || (ceiling && !modelSupportsEffortCeiling(model, ceiling))) continue;
+		moved(model);
+		const thinkingLevel = retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, ceiling);
+		return { kind: "model", model, thinkingLevel };
+	}
+	moved(args.fallback);
+	return { kind: "model", model: args.fallback, thinkingLevel: level };
+}
+
+/**
+ * The model a per-call worker resumes on: its saved model where the registry knows it and `approve` (the
+ * grants as they are now, and the effort ceiling) passes it; else the first model of its retry-fallback chain
+ * that the registry knows and `approve` passes, logged. It is refused where none is: with the grant's error
+ * where the registry knows a model of the chain, and an error naming each model where it knows none.
+ */
+async function choosePerCallModel(args: {
+	id: string;
+	identity: string;
+	level: ConfiguredThinkingLevel | undefined;
+	/** The worker's retry-fallback chain, read only where its saved model is gone or refused. */
+	chain: () => readonly string[];
+	models: RevivedModels;
+	modelRegistry: ModelRegistry;
+	ceiling: Effort | undefined;
+	approve: (model: Model) => void;
+	/** The record holds no spawn spec. */
+	legacy: boolean;
+}): Promise<ColdReviveBuildModel> {
+	const { id, identity, level, modelRegistry, approve } = args;
+	const started = (model: Model, thinkingLevel: ConfiguredThinkingLevel | undefined): ColdReviveBuildModel =>
+		args.legacy ? { kind: "legacy", model, thinkingLevel } : { kind: "model", model, thinkingLevel };
+	// Discovery a spawn started may still add the saved model.
+	await modelRegistry.awaitBackgroundRefresh();
+	const saved = await args.models.resolve(identity);
+	const unknown: string[] = [];
+	let refusal: unknown;
+	if (saved) {
+		try {
+			approve(saved);
+			return started(saved, level);
+		} catch (error) {
+			refusal = error;
+		}
+	}
+	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry)) {
+		if (!model) {
+			unknown.push(formatRetryFallbackBaseSelector(candidate));
+			continue;
+		}
+		try {
+			approve(model);
+		} catch (error) {
+			refusal ??= error;
+			continue;
+		}
+		const reason = saved
+			? refusal instanceof Error
+				? refusal.message
+				: String(refusal)
+			: modelNotFoundMessage([identity], modelRegistry.getAll());
+		logger.warn(reason, { subagent: id, model: formatModelStringWithRouting(model) });
+		return started(model, retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, args.ceiling));
+	}
+	if (refusal !== undefined) throw refusal;
+	const chain = unknown.length > 0 ? `, nor is any model of its retry-fallback chain (${unknown.join(", ")})` : "";
+	throw new PerCallModelError(
+		`Cannot revive subagent "${id}": its per-call model ${identity} is no longer available${chain}. The agent was not revived.`,
+	);
+}
+
+/** The agent the spawn selected, as the live discovery scope finds it now: what its grants rest on. */
+async function perCallGrantInputs(
+	target: ColdReviveTarget,
+	init: PersistedSessionInit,
+	parentSession: AgentSessionHandle | undefined,
+	settings: Settings,
+): Promise<PerCallGrantInputs> {
+	// File definitions follow the live parent's discovery scope; a missing parent
+	// can use current root file discovery, never unrelated root-local pseudonyms.
+	const discoverySession = parentSession ?? target.root;
+	const configuredAgent = init.agent
+		? getAgent(
+				[
+					...(
+						await discoverAgents(
+							discoverySession.sessionManager.getCwd(),
+							undefined,
+							discoverySession.effectiveExtensionRoots,
+						)
+					).agents,
+					...(parentSession?.getSessionAgents() ?? []),
+				],
+				init.agent,
+			)
+		: undefined;
+	return {
+		agentName: init.agent ?? target.displayName,
+		agentModel: configuredAgent?.model,
+		agentSource: configuredAgent?.source,
+		agentRemoved: configuredAgent === undefined,
+		matchPreferences: structuredClone(getModelMatchPreferences(settings.grantAuthority())),
+	};
+}
+
+/**
+ * Holds a revived per-call worker's models to the operator's grants as they are at each call: the agent
+ * the spawn selected, and the model of its real parent while that parent is live.
+ */
+function perCallApproval(
+	target: ColdReviveTarget,
+	grants: PerCallGrantInputs,
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+): (model: Model) => void {
+	// One grants object per live parent model keeps approval decisions cached across requests.
+	const grantsByParentModel = new Map<string | undefined, PerCallModelGrants>();
+	return model => {
+		// Parent models grant only while the real parent is live, including
+		// after this revival; transcript metadata never substitutes for it.
+		const parentSession = liveParentSession(target);
+		const parentModel = parentSession?.model;
+		const parentModelPattern = parentModel ? parentModelGrantPattern(parentModel) : undefined;
+		let modelGrants = grantsByParentModel.get(parentModelPattern);
+		if (!modelGrants) {
+			modelGrants = { ...grants, settings, parentModelPattern };
+			grantsByParentModel.set(parentModelPattern, modelGrants);
+		}
+		try {
+			assertPerCallModelApproved(model, modelGrants, modelRegistry);
+		} catch (error) {
+			// Only an approval denial depends on the parent; an unavailable model is refused either way.
+			if (parentSession || !(error instanceof PerCallModelError) || error instanceof PerCallModelUnavailableError) {
+				throw error;
+			}
+			throw new PerCallModelError(
+				`${error.message} Parent agent "${target.parentId ?? "unknown"}" of revived subagent "${target.id}" is not live; its model grants nothing and its parent-local agent grants are unavailable until the parent is revived.`,
+			);
+		}
+	};
+}
+
+/**
  * Rebuild the persisted subagent of `spec` on the calling thread (main, or the pooled
  * worker that will home it) and claim `expectedRef` for it.
  */
 export async function revivePersistedSubagent(spec: PersistedReviveSpec, expectedRef: AgentRef): Promise<AgentSession> {
-	const ref = { id: spec.id, displayName: spec.displayName, parentId: spec.parentId };
-	const { sessionFile, taskDepth, restoredSeance } = spec;
-	const seanceOptions = restoredSeance ? seanceIsolationOptions(restoredSeance.cwd) : {};
-	const registry = AgentRegistry.global();
-	// Re-open fresh on every revive: park closes the writer, so this takes
-	// the single-writer lock cleanly and restores the full message history.
-	const reopened = await SessionManager.open(sessionFile, undefined, spec.storage, {
-		suppressBreadcrumb: true,
-		throwIfMissing: true,
-	});
-	const entries = reopened.getEntries();
-	const init = extractSessionInit(entries);
+	const { prepared, restoredSeance } = spec;
+	const reopened = await reopenParkedSubagent(spec.id, spec.sessionFile, spec.storage);
+	const init = extractSessionInit(reopened.getEntries());
 	if (!init) {
 		await reopened.close();
 		throw new Error(
-			`Cannot revive subagent "${ref.id}": session file "${sessionFile}" has no persisted session contract. The agent was not revived.`,
+			`Cannot revive subagent "${spec.id}": session file "${spec.sessionFile}" has no persisted session contract. The agent was not revived.`,
 		);
 	}
-	if (!hasConversationalHistory(entries)) {
-		await reopened.close();
-		throw new Error(
-			`Cannot revive subagent "${ref.id}": session file "${sessionFile}" has no message history (truncated to header/session_init). The agent was not revived.`,
-		);
-	}
-	const resolveParentSession = () =>
-		ref.parentId === spec.rootAgentId ? spec.root : registry.get(ref.parentId ?? "")?.session;
-	const parentSession = resolveParentSession();
-	let perCallModel: Model | undefined;
-	let assertApprovedModel: ((model: Model) => void) | undefined;
-	if (init.perCallModel) {
-		try {
-			if (!init.perCallModelIdentity || init.perCallThinkingLevel === undefined) {
-				throw new PerCallModelError(
-					`Cannot revive subagent "${ref.id}": its per-call model identity and thinking level were not recorded separately, so they cannot be restored exactly. The agent was not revived.`,
-				);
-			}
-			await spec.modelRegistry.awaitBackgroundRefresh();
-			perCallModel = resolveExactModelIdentity(init.perCallModelIdentity, spec.modelRegistry);
-			if (!perCallModel) {
-				throw new PerCallModelError(
-					`Cannot revive subagent "${ref.id}": its per-call model ${init.perCallModelIdentity} is no longer available. A per-call worker revives only on its exact saved model.`,
-				);
-			}
-			// File definitions follow the live parent's discovery scope; a missing parent
-			// can use current root file discovery, never unrelated root-local pseudonyms.
-			const discoverySession = parentSession ?? spec.root;
-			const configuredAgent = init.agent
-				? getAgent(
-						[
-							...(
-								await discoverAgents(
-									discoverySession.sessionManager.getCwd(),
-									undefined,
-									discoverySession.effectiveExtensionRoots,
-								)
-							).agents,
-							...(parentSession?.getSessionAgents() ?? []),
-						],
-						init.agent,
-					)
-				: undefined;
-			const matchPreferences = structuredClone(getModelMatchPreferences(spec.settings.grantAuthority()));
-			// One grants object per live parent model keeps approval decisions cached across requests.
-			const grantsByParentModel = new Map<string | undefined, PerCallModelGrants>();
-			const grantsFor = (parentModelPattern: string | undefined): PerCallModelGrants => {
-				let grants = grantsByParentModel.get(parentModelPattern);
-				if (!grants) {
-					grants = {
-						settings: spec.settings,
-						agentName: init.agent ?? ref.displayName,
-						agentModel: configuredAgent?.model,
-						agentSource: configuredAgent?.source,
-						agentRemoved: configuredAgent === undefined,
-						parentModelPattern,
-						matchPreferences,
-					};
-					grantsByParentModel.set(parentModelPattern, grants);
-				}
-				return grants;
-			};
-			assertApprovedModel = model => {
-				// Parent models grant only while the real parent is live, including
-				// after this revival; transcript metadata never substitutes for it.
-				const liveParentSession = resolveParentSession();
-				const parentModel = liveParentSession?.model;
-				try {
-					assertPerCallModelApproved(
-						model,
-						grantsFor(parentModel ? parentModelGrantPattern(parentModel) : undefined),
-						spec.modelRegistry,
-					);
-				} catch (error) {
-					// Only an approval denial depends on the parent; an unavailable model is refused either way.
-					if (
-						liveParentSession ||
-						!(error instanceof PerCallModelError) ||
-						error instanceof PerCallModelUnavailableError
-					)
-						throw error;
-					throw new PerCallModelError(
-						`${error.message} Parent agent "${ref.parentId ?? "unknown"}" of revived subagent "${ref.id}" is not live; its model grants nothing and its parent-local agent grants are unavailable until the parent is revived.`,
-					);
-				}
-			};
-			assertApprovedModel(perCallModel);
-			assertModelSupportsEffortCeiling(perCallModel, cfgTaskMaxEffort.get(spec.settings));
-		} catch (error) {
-			await reopened.close();
-			throw error;
+	const parts = coldReviveSpecParts(spec, init);
+	const settingsParent = coldReviveSettingsParent(spec, parts, prepared.live);
+	const { spawnSpec, legacy } = coldReviveSpawnSpec(spec, parts, init, settingsParent);
+	const approve = prepared.grants
+		? perCallApproval(spec, prepared.grants, settingsParent, prepared.live.modelRegistry)
+		: undefined;
+	const live: SubagentLiveInputs = {
+		...prepared.live,
+		settingsParent,
+		customTools: [...prepared.customTools],
+		// A per-call model is held to the operator's grants as they are now, and to the effort ceiling.
+		assertDispatchModel: approve
+			? perCallModelAssertion(approve, () => liveEffortCeiling(spawnSpec.thinkingLevelCeiling, settingsParent))
+			: undefined,
+		// A seance consult keeps its own artifacts and its isolation.
+		parentArtifactManager: restoredSeance ? undefined : prepared.live.parentArtifactManager,
+		// The output files go to the parent's artifacts directory, so the root session's secrets mask them.
+		storeMaskCwd: spec.settings.getCwd(),
+		seance: restoredSeance ? {} : undefined,
+	};
+	const model = await coldReviveModel(spec, spawnSpec.perCallModel, init, reopened);
+	const session = await buildSubagentSession({
+		spec: spawnSpec,
+		live,
+		sessionManager: reopened,
+		storage: spec.storage,
+		model,
+		prewalkTarget: prepared.prewalkTarget,
+		revive: {
+			heldInit: init,
+			expectedAgentRef: expectedRef,
+			legacy,
+			agentActionsScope: { reviverFactory: spec.reviverFactory, idleTtlMs: spec.agentIdleTtlMs },
+		},
+	});
+	if (spawnSpec.perCallModel) {
+		// A per-call worker runs only on the model it was approved on, never a similarly named survivor.
+		const expected = model.model ? formatModelStringWithRouting(model.model) : undefined;
+		const identity = session.model ? formatModelStringWithRouting(session.model) : undefined;
+		if (identity !== expected) {
+			await session.dispose();
+			throw new PerCallModelError(
+				`Cannot revive subagent "${spec.id}": its per-call model ${expected} is no longer available${identity ? ` (resolution found ${identity})` : ""}.`,
+			);
 		}
+		// An explicit unset selector must not inherit a new default while reviving.
+		if (!parts.thinking && init.perCallThinkingLevel === null) session.setThinkingLevel(undefined);
 	}
-	// Rebuild the same advisor opt-in the original spawn resolved: `"on"` =
-	// advisor-role model, anything else = the pattern stamped onto this
-	// session's `modelRoles.advisor`. Spawn persists it already expanded
-	// against the spawning owner's roles (a parent subagent may override
-	// them); expanding again is a no-op for those and only resolves aliases
-	// in files written before that. Absent = unadvised (the
-	// createSubagentSettings default).
-	const subagentSettings = createSubagentSettings(spec.settings, {
+	if (prepared.unavailableTools.length > 0) {
+		// After the transcript, so the held prompt, the tool list and the conversation keep their bytes.
+		await session.sendCustomMessage(
+			{
+				customType: UNAVAILABLE_CUSTOM_TOOLS_NOTICE,
+				content: prompt.render(unavailableCustomToolsPrompt, { tools: prepared.unavailableTools }),
+				display: false,
+			},
+			{ deliverAs: "nextTurn" },
+		);
+	}
+	return session;
+}
+
+/**
+ * The model of the build: the prepared one, where a session-local switch since the spawn (a prewalk
+ * hand-off) does not take its place; a per-call worker never switches models, and a seance consult and a
+ * record with no spawn spec start on their patterns, the switched model first.
+ */
+async function coldReviveModel(
+	spec: PersistedReviveSpec,
+	perCall: boolean,
+	init: PersistedSessionInit,
+	reopened: SessionManager,
+): Promise<ColdReviveBuildModel> {
+	const { prepared, restoredSeance } = spec;
+	// A seance fork's selections belong to its source run, never to the consult.
+	if (restoredSeance) return { kind: "legacy", modelPattern: restoredSeance.modelPattern };
+	if (prepared.model && perCall) return prepared.model;
+	const switched = reopened.getSessionLocalModelChange()?.model;
+	if (prepared.model?.kind === "model") {
+		if (switched === undefined) return prepared.model;
+		// The switched model owns the model and the effort; the spec's model backs it up.
+		const model = await new RevivedModels(prepared.live.modelRegistry, prepared.discoveryRan).resolve(switched);
+		return { kind: "model", model: model ?? prepared.model.model, thinkingLevel: undefined };
+	}
+	const spawnModelPattern =
+		init.modelRole && init.modelRole !== "default"
+			? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
+			: init.resolvedModel;
+	return {
+		kind: "legacy",
+		modelPattern:
+			switched === undefined
+				? spawnModelPattern
+				: [switched, ...(spawnModelPattern === undefined ? [] : [spawnModelPattern].flat())],
+		modelPatternAuthFallback: init.resolvedModel,
+	};
+}
+
+/**
+ * The spawn spec the build starts from: each part of the record's spec, and for each part it lacks (every
+ * part of a record an older omp wrote, or of a seance consult) what the cold revive built before spawn
+ * specs, with the values every spawn gives (`cacheWarming: false`) applied to a record with no spec.
+ */
+function coldReviveSpawnSpec(
+	spec: PersistedReviveSpec,
+	parts: SpawnSpecParts,
+	init: PersistedSessionInit,
+	settingsParent: Settings,
+): { spawnSpec: SubagentSpawnSpec; legacy: SubagentLegacyRevive | undefined } {
+	const { id, displayName, restoredSeance } = spec;
+	const agentName = persistedAgentName(displayName, init);
+	const legacyAgent = persistedAgentDefinition(displayName, init);
+	// Older session files persisted the synthetic xd:// write transport in the
+	// enabled set. A read-only agent definition could never grant full write,
+	// so remove that transport name before replaying tools as explicit grants.
+	const legacyToolNames = restoredSeance
+		? restoredSeance.toolNames
+		: init.readOnly === true && init.tools.includes("write")
+			? init.tools.filter(name => name !== "write")
+			: init.tools;
+	// A restricted persisted contract must not consult process-global MCP
+	// state: same-name MCP tools are untrusted capability sources.
+	const restricted = restoredSeance !== undefined || init.restrictToolNames === true;
+	const tools = parts.tools ?? {
+		toolNames: legacyToolNames,
+		mountedToolNames: init.mountedTools ?? [],
+		restrictToolNames: restricted || undefined,
+		// The spawn's result contract: a session persisted without `yield` returned its final message.
+		requireYieldTool: legacyToolNames.includes("yield"),
+		// The record's tool list already leaves out what its spawn stripped.
+		keepTodo: true,
+		outputSchema: jsonValue(init.outputSchema),
+		outputSchemaMode: init.outputSchemaMode,
+		customTools: [],
+	};
+	const structured = (tools.toolNames ?? []).includes("yield");
+	const perCall = isPerCallRecord(parts, init);
+	const legacy: SubagentLegacyRevive = {};
+	if (!parts.tools) {
+		legacy.tools = { mountedToolNames: restoredSeance ? undefined : init.mountedTools, keepDevices: !restoredSeance };
+	}
+	if (!parts.prompt) legacy.replayPrompt = true;
+	const policy: SpawnSpecPolicy = parts.policy ?? {
+		cwd: restoredSeance?.cwd ?? spec.prepared.rootCwd,
+		enableLsp: spec.prepared.live.policy.enableLsp,
+		// A constant of every spawn, applied to a record with no spec: a spec whose policy part is missing or
+		// malformed takes the legacy policy alone.
+		...(parts.stored ? {} : { cacheWarming: false }),
+		...(restricted ? { enableIrc: false, enableMCP: false } : { enableMCP: !spec.prepared.live.mcpManager }),
+		// Mirrors the task executor's own internal-spawner opt-in: `initializeExtensions`
+		// re-runs `discoverStartupSkillPaths()` once session_start fires, and without
+		// this the merge is a no-op, silently dropping any resources_discover
+		// contribution the revived subagent's own extensions make.
+		mergeDiscoveredSkillPaths: true,
+		// Old files predate persisted spawns: deny re-spawning rather than let
+		// createAgentSession default to wildcard ("*").
+		spawns: init.spawns ?? "",
+		taskDepth: spec.taskDepth,
+	};
+	const spawnSpec: SubagentSpawnSpec = {
+		v: SPAWN_SPEC_VERSION,
+		model: parts.model?.model ?? null,
+		thinkingLevel: parts.thinking?.thinkingLevel ?? null,
+		// A per-call model keeps the live task.maxEffort ceiling the spawn ran under.
+		thinkingLevelCeiling: parts.thinking
+			? parts.thinking.thinkingLevelCeiling
+			: perCall
+				? cfgTaskMaxEffort.get(settingsParent)
+				: undefined,
+		perCallModel: perCall,
+		prewalk: parts.prewalk,
+		settings: parts.settings ?? legacySubagentSettings(id, init, settingsParent),
+		tools,
+		// A host that keeps MCP per top-level session gives the revived agent its own manager
+		// (`coldReviveLiveInputs`), and the agent never discovers MCP config itself.
+		policy: spec.hostMcp ? { ...policy, enableMCP: false } : policy,
+		// `id` is the AgentRegistry key, which may be a `qualifyPersistedAgentId`-disambiguated
+		// `owner/bareId` string when this id collided with an unrelated session's identically-named
+		// agent: the build claims and reports under that key. Descendant naming never takes the
+		// qualifier: `AgentOutputManager` nests child ids under `parentTaskPrefix` and `runSubprocess`
+		// writes them to `path.join(artifactsDir, \`${id}.jsonl\`)`, so a slash there would write
+		// descendants below an unexpected intermediate directory that the persisted-agent scan never
+		// looks inside.
+		identity: parts.identity
+			? { ...parts.identity, agentId: id }
+			: {
+					agentId: id,
+					// `agents` rule scoping keys on the durable definition name (see `persistedAgentName`).
+					agentName,
+					agentDisplayName: displayName,
+					parentAgentId: spec.parentId,
+					parentTaskPrefix: bareAgentId(id, spec.parentId),
+				},
+		prompt: parts.prompt
+			? { ...parts.prompt, id }
+			: {
+					id,
+					agentSystemPrompt: legacyAgent.systemPrompt,
+					context: "",
+					planReference: "",
+					planReferencePath: "",
+					worktree: "",
+					structured,
+					outputSchemaOverridesAgent: false,
+					ircEnabled: false,
+				},
+		wake: parts.wake ?? {
+			agent: { name: legacyAgent.name, description: legacyAgent.description, source: legacyAgent.source },
+			completionProbe: isCompletionProbeEnabled(spec.settings, spec.taskDepth - 1),
+			...softRequestBudgetFor(agentName, spec.settings),
+			structured,
+			outputSchema: jsonValue(init.outputSchema),
+			outputSchemaMode: init.outputSchemaMode,
+			// Anchor artifacts to the revived ref's own dir (its parent's children
+			// dir), not the live root session's, matching the spawn callers (#11563).
+			artifactsDir: path.dirname(spec.sessionFile),
+		},
+	};
+	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt ? legacy : undefined };
+}
+
+/**
+ * The subagent settings of a record with no spawn spec, over `parent`: the same advisor opt-in, summarize
+ * switch and compaction threshold the spawn resolved, and the `subagent:<id>` fallback chain it installed,
+ * which the transcript alone cannot rebuild (multi-model agent patterns and inherited role chains are
+ * resolved only at spawn).
+ */
+function legacySubagentSettings(id: string, init: PersistedSessionInit, parent: Settings): SpawnSpecSettings {
+	// `"on"` = advisor-role model, anything else = the pattern stamped onto this session's
+	// `modelRoles.advisor`, which spawn persists already expanded against the spawning owner's roles;
+	// expanding again is a no-op for those and only resolves aliases in files written before that.
+	const settings = createSubagentSettings(parent, {
 		...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 		...(init.advisor
 			? {
@@ -429,8 +1029,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 					...(init.advisor !== "on"
 						? {
 								modelRoles: {
-									...spec.settings.getModelRoles(),
-									advisor: resolveAgentAdvisorRolePattern(init.advisor, spec.settings),
+									...parent.getModelRoles(),
+									advisor: resolveAgentAdvisorRolePattern(init.advisor, parent),
 								},
 							}
 						: undefined),
@@ -438,209 +1038,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			: undefined),
 		...compactionThresholdSettings(init.compactionThreshold),
 	});
-	// Restore the `subagent:<id>` fallback chain the spawn installed; the
-	// transcript alone cannot rebuild it (multi-model agent patterns and
-	// inherited role chains are resolved only at spawn).
-	if (init.retryFallback) {
-		installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
-	}
-	// Account pools are owner policy, like the extension roots below: take the
-	// live exact-name `task.agentAccountPools` entry, never a transcript copy.
-	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(spec.settings));
-	const oauthAccountPools =
-		init.agent && Object.hasOwn(agentAccountPools, init.agent) ? agentAccountPools[init.agent] : undefined;
-	const spawnModelPattern = restoredSeance
-		? restoredSeance.modelPattern
-		: init.modelRole && init.modelRole !== "default"
-			? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
-			: init.resolvedModel;
-	// A session-local switch since spawn (a prewalk handoff) is the model the agent
-	// was working on; the spawn selection only backs it up when it is unavailable. A
-	// seance fork's selections belong to its source run, never to the consult.
-	const sessionLocalModel = restoredSeance ? undefined : reopened.getSessionLocalModelChange()?.model;
-	// A per-call worker revives only onto its exact saved model: no role alias, no auth fallback.
-	const persistedModelPattern = init.perCallModel
-		? undefined
-		: sessionLocalModel
-			? [sessionLocalModel, ...(spawnModelPattern === undefined ? [] : [spawnModelPattern].flat())]
-			: spawnModelPattern;
-	// Older session files persisted the synthetic xd:// write transport in the
-	// enabled set. A read-only agent definition could never grant full write,
-	// so remove that transport name before replaying tools as explicit grants.
-	const revivedToolNames = restoredSeance
-		? restoredSeance.toolNames
-		: init.readOnly === true && init.tools.includes("write")
-			? init.tools.filter(name => name !== "write")
-			: init.tools;
-	const artifactManager = spec.artifactManager;
-	if (artifactManager && !restoredSeance) reopened.adoptArtifactManager(artifactManager);
-	// A restricted persisted contract must not consult process-global MCP
-	// state: same-name MCP tools are untrusted capability sources.
-	const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
-	// The spawn's result contract: a session persisted without `yield` returned its final message.
-	const structured = revivedToolNames.includes("yield");
-	const mcpManager = restrictToolNames ? undefined : spec.hostMcp ? spec.hostMcp.manager : MCPManager.instance();
-	// Subscribe before minting proxies so a manager change during startup is replayed on bind.
-	// The revived session reopens its own view, keeping the tools its earlier requests rendered.
-	const mcpFollower = mcpManager ? followMCPTools(mcpManager, { scope: reopened.getSessionId() }) : undefined;
-	const mcpProxyTools = mcpFollower?.proxyTools() ?? [];
-
-	let session: AgentSession;
-	try {
-		({ session } = await createAgentSession({
-			cwd: restoredSeance?.cwd ?? spec.root.sessionManager.getCwd(),
-			costGate: spec.costGate,
-			authStorage: spec.authStorage,
-			// Revived agents join the root session tree, so their observability
-			// frames ride the same bus the RPC/collab surfaces subscribed to.
-			subagentEventBus: spec.subagentEventBus,
-			modelRegistry: spec.modelRegistry,
-			...(perCallModel ? { model: perCallModel, thinkingLevel: init.perCallThinkingLevel ?? undefined } : {}),
-			...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-			modelPatternAuthFallback: restoredSeance || init.perCallModel ? undefined : init.resolvedModel,
-			settings: subagentSettings,
-			sessionManager: reopened,
-			agentId: ref.id,
-			agentDisplayName: ref.displayName,
-			// `agents` rule scoping keys on the durable definition name (see `persistedAgentName`).
-			agentName: persistedAgentName(ref.displayName, init),
-			// `ref.id` is the AgentRegistry key, which may be a
-			// `qualifyPersistedAgentId`-disambiguated `owner/bareId` string when
-			// this id collided with an unrelated session's identically-named
-			// agent — never propagate that qualifier into descendant naming:
-			// `AgentOutputManager` nests child ids under this prefix and
-			// `runSubprocess` writes them to `path.join(artifactsDir,
-			// \`${id}.jsonl\`)`, so a slash here would write descendants below an
-			// unexpected intermediate directory that the persisted-agent scan
-			// never looks inside.
-			parentTaskPrefix: bareAgentId(ref.id, ref.parentId),
-			asyncJobManager: spec.asyncJobManager,
-			parentAgentId: ref.parentId,
-			oauthAccountPools,
-			// A per-call model is held to the operator's current grants, not the transcript's,
-			// never switches models, and keeps the live task.maxEffort ceiling the spawn ran under.
-			...(assertApprovedModel
-				? {
-						thinkingLevelCeiling: cfgTaskMaxEffort.get(spec.settings),
-						disableModelFallback: true,
-						disableServerSideFallback: true,
-						assertDispatchModel: (model: Model) => {
-							assertApprovedModel(model);
-							assertModelSupportsEffortCeiling(model, cfgTaskMaxEffort.get(spec.settings));
-						},
-					}
-				: {}),
-			expectedAgentRef: expectedRef,
-			taskDepth,
-			toolNames: revivedToolNames,
-			// `revivedToolNames` is the enabled set, devices included: keep those devices,
-			// or they come back as top-level tools and change the replayed tool list.
-			mountedToolNames: restoredSeance ? undefined : init.mountedTools,
-			outputSchema: init.outputSchema,
-			outputSchemaMode: init.outputSchemaMode,
-			restrictToolNames: restrictToolNames || undefined,
-			requireYieldTool: structured,
-			// Mirrors the task executor's own internal-spawner opt-in
-			// (executor.ts, `buildSubagentSessionOptions`): `initializeExtensions`
-			// below re-runs `discoverStartupSkillPaths()` once session_start
-			// fires, and without this the merge is a no-op, silently dropping
-			// any resources_discover contribution the revived subagent's own
-			// extensions make (PR #9379 review).
-			mergeDiscoveredSkillPaths: true,
-			systemPrompt: () => [...init.systemPrompt],
-			// Inherit current owner policy, never extension authority from a transcript.
-			extensionRoots: () => spec.root.effectiveExtensionRoots,
-			preloadedPreparedExtensions: spec.preparedExtensions,
-			// Old files predate persisted spawns: deny re-spawning rather than let
-			// createAgentSession default to wildcard ("*").
-			spawns: init.spawns ?? "",
-			hasUI: false,
-			enableLsp: restrictToolNames ? false : spec.enableLsp,
-			...(restrictToolNames
-				? {
-						enableIrc: false,
-						enableMCP: false,
-						preloadedExtensionPaths: [],
-						preloadedCustomToolPaths: [],
-					}
-				: {
-						enableMCP: !mcpManager && !spec.hostMcp,
-						mcpManager,
-						mcpTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-						mcpToolScope: mcpFollower?.scope,
-					}),
-			...seanceOptions,
-		}));
-	} catch (error) {
-		mcpFollower?.dispose();
-		// The session claimed this journal as its writer before it failed.
-		// Leaving it claimed would divert the next revive of this
-		// transcript to a sibling file instead of rebuilding it in place.
-		await reopened.close();
-		throw error;
-	}
-	// A per-call worker runs only on its exact saved model, never a similarly named survivor.
-	if (init.perCallModel) {
-		try {
-			const saved = init.perCallModelIdentity!;
-			const identity = session.model ? formatModelStringWithRouting(session.model) : undefined;
-			if (identity !== saved) {
-				throw new PerCallModelError(
-					`Cannot revive subagent "${ref.id}": its per-call model ${saved} is no longer available${identity ? ` (resolution found ${identity})` : ""}. A per-call worker revives only on its exact saved model.`,
-				);
-			}
-			// An explicit unset selector must not inherit a new default while reviving.
-			if (init.perCallThinkingLevel === null) session.setThinkingLevel(undefined);
-		} catch (error) {
-			mcpFollower?.dispose();
-			await session.dispose();
-			throw error;
-		}
-	}
-	mcpFollower?.bind(session);
-	// Clamp the active set to the persisted list: createAgentSession's
-	// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
-	// the original run didn't carry. Unknown/missing names are ignored.
-	await session.setActiveToolsByName(
-		restoredSeance ? revivedToolNames : [...revivedToolNames, ...session.getMountedXdevToolNames()],
-	);
-	// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
-	if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
-	// Wire the extension runtime exactly as the live executor does. Without
-	// this the runner stays pre-init, every action method throws
-	// `ExtensionRuntimeNotInitializedError`, and a `tool_call` handler that
-	// touches a runtime action trips the fail-closed gate in `emitToolCall`,
-	// blocking every tool — including the hidden `yield` — in the revived
-	// agent. `session_start` also re-runs so extensions restore per-session
-	// state (issue #8824), and its `discoverStartupSkillPaths()` call now
-	// actually merges into this revive's snapshot (see
-	// `mergeDiscoveredSkillPaths` above).
-	await initializeExtensions(session, {
-		reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-		reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-		agentActionsScope: { reviverFactory: spec.reviverFactory, idleTtlMs: spec.agentIdleTtlMs },
-	});
-	await replayRevivedAgentStart(session);
-	// Cold revives must drive registry status themselves — createAgentSession
-	// doesn't wire this generically (the live path does it in the executor).
-	// The internal run-state signal precedes deferrable public `agent_end`,
-	// keeping idle-TTL ownership synchronized even while prompts unwind.
-	registry.syncSessionStatus(ref.id, session);
-	attachIrcWakeTurnMonitor(session, {
-		id: ref.id,
-		agent: persistedAgentDefinition(ref.displayName, init),
-		completionProbe: isCompletionProbeEnabled(spec.settings, taskDepth - 1),
-		...softRequestBudgetFor(persistedAgentName(ref.displayName, init), spec.settings),
-		eventBus: spec.eventBus,
-		subagentEventBus: spec.subagentEventBus,
-		sessionFile,
-		structured,
-		outputSchema: init.outputSchema,
-		outputSchemaMode: init.outputSchemaMode,
-		// Anchor artifacts to the revived ref's own dir (its parent's children
-		// dir), not the live root session's, matching the spawn callers (#11563).
-		artifactsDir: path.dirname(sessionFile),
-		storeMaskCwd: spec.settings.getCwd(),
-	});
-	return session;
+	if (init.retryFallback) installRetryFallbackRole(settings, subagentRetryFallbackRole(id), init.retryFallback);
+	return spawnSpecSettings(captureSubagentSettings(settings));
 }

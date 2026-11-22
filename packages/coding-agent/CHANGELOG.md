@@ -173,6 +173,7 @@
 - A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
 - SQL session storage on PostgreSQL no longer fails, or stores garbled text, when another client of a transaction-mode pool left a session setting on the connection. It closes a connection that no transaction can repair, such as one left with `cloudsql_session_read_only = locked`, and runs the operation again, at most 3 times. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Subagents on worker threads that save the provider file cache's index in the same millisecond no longer share one temporary file, which could fail the save or leave an index the next load drops
+- Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
 
 ### Breaking Changes
 

@@ -12,6 +12,7 @@ import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } fr
 import { AgentBusyError, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
+import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	countNewlines,
@@ -51,6 +52,7 @@ import {
 	resolveModelOverride,
 	type ModelOverrideAuthResolution,
 	resolveModelOverrideWithAuthFallback,
+	resolveSpawnModelIdentity,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import {
@@ -64,6 +66,7 @@ import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { type OAuthAccountPools, SessionAccountPoolScope, validateAgentAccountPools } from "../config/account-pools";
 import { type OverlayLayers, Settings } from "../config/settings";
 
+import type { EvalToolDescriptor } from "../eval/types";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { PreparedExtension } from "../extensibility/extensions/types";
@@ -73,13 +76,13 @@ import type { LocalProtocolOptions } from "../internal-urls";
 import { IrcBus } from "../irc/bus";
 import type { MCPManagerApi, MCPToolScope } from "../mcp/manager";
 import type { MnemopiSessionStateApi } from "../mnemopi/state";
-import { initializeExtensions } from "../modes/runtime-init";
+import { initializeExtensions, type InitializeExtensionsOptions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import taskBudgetNoticeTemplate from "../prompts/tools/task-budget-notice.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
 	type CreateAgentSessionOptions,
@@ -108,7 +111,12 @@ import {
 	turnAbortKind,
 } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
-import { hasConversationalHistory, SessionManager } from "../session/session-manager";
+import {
+	extractSessionInit,
+	hasConversationalHistory,
+	type PersistedSessionInit,
+	SessionManager,
+} from "../session/session-manager";
 import { maskStoredData } from "../session/session-entry-mask";
 import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -148,6 +156,14 @@ import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
+import {
+	evalToolDescriptor,
+	SPAWN_LIVE_INPUT_NAMES,
+	type SpawnSpecInputs,
+	type SubagentSpawnSpec,
+	spawnSpecFromSpawn,
+	spawnSpecSettings,
+} from "./spawn-spec";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
@@ -547,6 +563,11 @@ export interface ExecutorOptions {
 	enableMCP?: boolean;
 	/** Kernel-defined tools explicitly exposed by the parent eval session. */
 	customTools?: CustomTool[];
+	/**
+	 * Descriptors of the eval tools in {@link customTools}, as plain data for the spawn spec. Set where
+	 * the tools cross into a worker as views; a spawn on the creating thread looks them up instead.
+	 */
+	customToolDescriptors?: EvalToolDescriptor[];
 	/** Workpool items accepted by the child yield tool during this turn. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	/**
@@ -4263,8 +4284,8 @@ async function driveFollowUpTurn(
 	}
 }
 
-/** Inputs of a subagent's rendered system prompt, fixed at spawn. */
-interface SubagentPromptInputs {
+/** Inputs of a subagent's rendered system prompt: its spawn spec's, plus the roster state of the live session. */
+export interface SubagentPromptInputs {
 	id: string;
 	model?: string;
 	agentSystemPrompt: string;
@@ -4279,108 +4300,681 @@ interface SubagentPromptInputs {
 	ircEnabled: boolean;
 	/** Root resolved by the latest roster ensure; peer rows render scoped to it, so a session switch hides stale parked trees. */
 	ircRoot: { sessionFile?: string };
-	/** Peer roster each prompt block the live session rendered shows, keyed by that block. */
+	/**
+	 * Peer roster each prompt block the live session rendered shows, keyed by that block. A warm revive
+	 * starts from the rosters of the parked session's base prompt (see {@link trackSubagentIrcRoster}).
+	 */
 	ircRenders: Map<string, IrcPeerRosterData>;
-	/** Peer roster of the prompt the parked session held; a warm revive renders it again. */
-	ircRoster?: IrcPeerRosterData;
-	/** Set while a warm revive rebuilds the session. */
-	reviving: boolean;
 }
+
+/** What a subagent's process allows it, whatever its spawn spec stores; each is allowed where absent. */
+export interface SubagentLivePolicy {
+	enableLsp?: boolean;
+	enableIrc?: boolean;
+	enableMCP?: boolean;
+}
+
+/** Session options a subagent build takes from the live process: class `L` of the spawn input inventory. */
+type SubagentLiveOptionKeys =
+	| "costGate"
+	| "getApiKey"
+	| "oauthAccountPools"
+	| "inheritedSessionAgents"
+	| "assertDispatchModel"
+	| "contextFiles"
+	| "skills"
+	| "promptTemplates"
+	| "workspaceTree"
+	| "rules"
+	| "extensionRoots"
+	| "preloadedExtensionPaths"
+	| "preloadedPreparedExtensions"
+	| "preloadedCustomToolPaths"
+	| "subagentEventBus"
+	| "parentHindsightSessionState"
+	| "parentMnemopiSessionState"
+	| "asyncJobManager"
+	| "mcpManager"
+	| "localProtocolOptions"
+	| "telemetry"
+	| "customTools";
 
 /**
- * The spawn-time inputs of a subagent session. The live run and the lifecycle reviver both build
- * their {@link createAgentSession} options from it, so the reviver retains this plain capture
- * rather than the spawning run's options, monitor, abort signals, progress sinks or settings.
+ * The live inputs of a subagent build: the spawner's objects at the spawn and at a warm revive, the
+ * live parent session's at a cold revive. A build never reads one of them from a transcript.
  */
-interface SubagentSessionSpec {
-	options: Omit<
-		CreateAgentSessionOptions,
-		| "settings"
-		| "sessionManager"
-		| "expectedAgentRef"
-		| "systemPrompt"
-		| "resolveServiceTierByFamily"
-		| "onFirstChatDispatch"
-	>;
-	preparedSession?: Pick<PreparedSeanceSession, "promptSuffix">;
-	prompt: SubagentPromptInputs;
+export interface SubagentLiveInputs extends Pick<CreateAgentSessionOptions, SubagentLiveOptionKeys> {
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
+	/** Settings a revive restores the subagent's overlay over, and whose live values a build reads. */
+	settingsParent: Settings;
+	/** Bus a revived session's wake-turn monitor reports its lifecycle frames on. */
+	eventBus: EventBus | undefined;
+	/** The parent session's cwd, whose secrets mask the `<id>.md` and `<id>.json` a revived wake turn rewrites. */
+	storeMaskCwd: string;
+	/** Artifact manager the subagent's session manager adopts. */
+	parentArtifactManager: ArtifactManagerApi | undefined;
+	/** What the process allows: a stored LSP, IRC or MCP value never turns on what it has off. */
+	policy: SubagentLivePolicy;
+	/**
+	 * A seance consult: its builds take the seance isolation options. A consult revived from its transcript
+	 * has no prompt suffix; its builds replay the held prompt.
+	 */
+	seance?: Partial<Pick<PreparedSeanceSession, "promptSuffix">>;
 }
 
-/** Launch-only session inputs: a revived session restores these from its transcript or goes without. */
-interface SubagentLaunchInputs {
+/** Model options a subagent build passes. */
+type SubagentModelOptionKeys =
+	| "model"
+	| "thinkingLevel"
+	| "modelPattern"
+	| "modelPatternAuthFallback"
+	| "modelPatternFallbackRole"
+	| "modelPatternDefaultFallbackChain"
+	| "modelPatternChainFallback";
+
+/** An explicit model: the spawn's resolved one, or the one a revive holds or resolves. */
+export interface ExplicitBuildModel {
+	kind: "model";
+	model: Model | undefined;
+	thinkingLevel: ConfiguredThinkingLevel | undefined;
+}
+
+/** The patterns of a spawn that left the model to the session's own resolution: the spawn's first build only. */
+export interface DeferredBuildModel extends Pick<
+	CreateAgentSessionOptions,
+	"modelPattern" | "modelPatternAuthFallback" | "modelPatternFallbackRole" | "modelPatternDefaultFallbackChain"
+> {
+	kind: "deferred";
+}
+
+/** What a cold revive of a record with no spawn spec passes: its patterns, or its per-call model. */
+export interface LegacyBuildModel extends Pick<
+	CreateAgentSessionOptions,
+	"model" | "thinkingLevel" | "modelPattern" | "modelPatternAuthFallback"
+> {
+	kind: "legacy";
+}
+
+/** The model a subagent build starts on. */
+export type SubagentBuildModel = ExplicitBuildModel | DeferredBuildModel | LegacyBuildModel;
+
+/** A subagent overlay's own writes and the root compaction thresholds its chain pins. */
+export interface SubagentSettingsSnapshot {
+	layers: OverlayLayers;
+	rootThresholds: RootCompactionThresholds | undefined;
+}
+
+/** What a warm revive holds besides the spawn spec: process-local state of the live session. */
+export interface WarmReviveCache {
+	/** The model the session started on; a warm revive starts on it as it is. */
+	model: Model | undefined;
+	/** The prewalk target the spawn armed. */
+	prewalkTarget: Model | undefined;
+	/** The overlay's own writes, captured again whenever the live session is disposed. */
+	settings: SubagentSettingsSnapshot;
+	/**
+	 * Pending, never-promoted family candidate. The stash lives only on the live manager, so park
+	 * re-reads it (when the header still carries no task key) and the revive restores it onto the
+	 * fresh manager the reviver opens from disk.
+	 */
+	pendingCacheCandidate: string | undefined;
+	/** Peer roster each block of the parked session's base prompt showed, keyed by that block. */
+	ircRenders: Map<string, IrcPeerRosterData>;
+}
+
+/** Everything the lifecycle reviver of a kept-alive subagent needs, captured explicitly. */
+export interface WarmReviveCapture {
+	sessionFile: string;
+	/** Storage {@link sessionFile} lives in; the revive reopens it there. */
+	storage: SessionStorage;
+	/** The spawn spec: the same plain object the spawn wrote to its session_init. */
+	spec: SubagentSpawnSpec;
+	live: SubagentLiveInputs;
+	cache: WarmReviveCache;
+}
+
+/** The spawn's own inputs and steps around its first build; a revive has none of them. */
+export interface SubagentLaunchInputs {
+	/** The spawn's overlay; a deferred model resolution installs its retry-fallback role into it. */
+	settings: Settings;
 	workPoolYieldItems: readonly WorkPoolYieldItem[];
 	resolveServiceTierByFamily?: CreateAgentSessionOptions["resolveServiceTierByFamily"];
 	onFirstChatDispatch?: () => void;
+	/** The spawn's effort hint where it starts on no model: session creation maps it onto the model it settles on. */
+	taskEffort: TaskEffort | undefined;
+	/** The spawning session's view of the MCP manager, which the subagent's own view starts from. */
+	mcpToolScope: MCPToolScope | undefined;
+	/** The cache a warm revive of this subagent will hold. */
+	cache: WarmReviveCache | undefined;
+	/** Waits for one step of the build, rejecting as soon as the launch is aborted. */
+	settle<T>(step: Promise<T>): Promise<T>;
+	/** Takes a session creation the launch stopped waiting for, so the session it yields is disposed. */
+	abandon(creation: Promise<CreateAgentSessionResult>): void;
+	/** The launch's own steps once the session exists, before the shared steps after its creation. */
+	created(session: AgentSession): void;
+	/** The launch's own steps after the todo strip, before the extensions start. */
+	beforeExtensions(session: AgentSession): Promise<void>;
+	/** Takes an extension send the launch waits for before its first prompt. */
+	trackExtensionSend(send: Promise<unknown>): void;
+	/** The launch's own step once startup discovery ran, inside the extensions' startup hold. */
+	afterStartupDiscovery(session: AgentSession): void;
 }
 
-/** Names of the child's explicitly supplied tools; they win over same-named MCP proxies on every rebind. */
-function explicitSubagentToolNames(spec: SubagentSessionSpec): ReadonlySet<string> {
-	return new Set((spec.options.customTools ?? []).map(tool => tool.name));
+/** A revive's own inputs. */
+export interface SubagentReviveInputs {
+	/** The reopened transcript's latest session_init; null where it holds none. */
+	heldInit: PersistedSessionInit | null;
+	expectedAgentRef: AgentRef;
+	/** A warm revive's cache. */
+	cache?: WarmReviveCache;
+	/** The parts a record with no spawn spec builds as the cold revive before spawn specs did. */
+	legacy?: SubagentLegacyRevive;
+	/** The reviver factory and idle TTL the revived session's own extension `agents` actions cold-revive through. */
+	agentActionsScope?: InitializeExtensionsOptions["agentActionsScope"];
 }
 
-function buildSubagentSessionOptions(
-	spec: SubagentSessionSpec,
-	settings: Settings,
-	sessionManager: SessionManager,
-	expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
-	mcpFollower: MCPToolFollower | undefined,
-	launch?: SubagentLaunchInputs,
-): CreateAgentSessionOptions {
-	const inputs = spec.prompt;
-	// MCP proxies are minted per build, not captured in the spec: a kept-alive
-	// subagent revived after `/mcp reload` must see the manager's current tools.
+/** How a cold revive of a record an older omp wrote builds the parts its record cannot state as a spawn spec. */
+export interface SubagentLegacyRevive {
+	/**
+	 * The record's tool contract: the session mounts `mountedToolNames` (undefined where the record names none),
+	 * and once it exists its active tools are clamped to the spec's tool names, with the devices it mounted
+	 * where `keepDevices`.
+	 */
+	tools?: { mountedToolNames: string[] | undefined; keepDevices: boolean };
+	/** Every build returns the held base prompt, the builds after the revived session's first model call too. */
+	replayPrompt?: boolean;
+}
+
+/** Inputs of {@link buildSubagentSession}. */
+export interface SubagentBuildInput {
+	spec: SubagentSpawnSpec;
+	live: SubagentLiveInputs;
+	sessionManager: SessionManager;
+	/** The store the subagent's transcripts live in, whose persisted roster its prompt's peer rows scope to. */
+	storage: SessionStorage | undefined;
+	model: SubagentBuildModel;
+	/** The model `spec.prewalk.target` names; without it the build arms no prewalk. */
+	prewalkTarget?: Model;
+	launch?: SubagentLaunchInputs;
+	revive?: SubagentReviveInputs;
+}
+
+/** A revive's held base prompt: every build returns it until the revived session's first model call. */
+interface HeldBasePrompt {
+	blocks: string[] | undefined;
+}
+
+/** Session options of a subagent build before the session's own: its settings, manager, prompt and launch hooks. */
+type SubagentBaseOptions = Omit<
+	CreateAgentSessionOptions,
+	| "settings"
+	| "sessionManager"
+	| "expectedAgentRef"
+	| "systemPrompt"
+	| "resolveServiceTierByFamily"
+	| "onFirstChatDispatch"
+>;
+
+/**
+ * Builds a subagent session from its spawn spec, the live inputs of the process and its session manager:
+ * the only code that builds one. The spawn's first build adds its launch inputs and steps; a warm revive
+ * passes the spec it kept, with its cache; a cold revive passes the spec of the latest session_init.
+ * After `createAgentSession` it runs each step a build takes before the session's first turn: the MCP
+ * follower bind, the registry status, the trackers of a session a warm revive follows, the todo strip,
+ * a revive's held work-pool items, the extension start, and at a revive the `before_agent_start`
+ * replay and the wake-turn monitor.
+ */
+export async function buildSubagentSession(input: SubagentBuildInput): Promise<AgentSession> {
+	const { spec, live, sessionManager, launch, revive } = input;
+	const id = spec.prompt.id;
+	const cache = launch?.cache ?? revive?.cache;
+	const settle = <T>(step: Promise<T>): Promise<T> => (launch ? launch.settle(step) : step);
+	const settings =
+		launch?.settings ?? restoreSubagentSettings(live.settingsParent, revive?.cache?.settings ?? spec.settings);
+	if (live.parentArtifactManager) sessionManager.adoptArtifactManager(live.parentArtifactManager);
+	const inputs: SubagentPromptInputs = {
+		...spec.prompt,
+		outputSchema: spec.prompt.outputSchema,
+		ircRoot: {},
+		ircRenders: cache?.ircRenders ?? new Map(),
+	};
+	await refreshSubagentIrcRoot(inputs, sessionManager, input.storage);
+	const options = subagentBaseOptions(input);
+	const customTools = options.customTools ?? [];
+	// Subscribe before the builder mints proxies so a manager change during session startup is replayed
+	// on bind instead of lost. A revived session reopens its own view, keeping the tools its earlier
+	// requests rendered. The explicitly supplied tools win over same-named MCP proxies on every rebind.
+	const mcpFollower = options.mcpManager
+		? followMCPTools(
+				options.mcpManager,
+				{ scope: sessionManager.getSessionId(), seed: launch?.mcpToolScope },
+				new Set(customTools.map(tool => tool.name)),
+			)
+		: undefined;
+	// MCP proxies are minted per build, not stored: a subagent revived after `/mcp reload` must see the
+	// manager's current tools.
 	const mcpTools = mcpFollower?.proxyTools() ?? [];
-	const customTools = spec.options.customTools ?? [];
+	const held: HeldBasePrompt = { blocks: revive?.heldInit?.systemPrompt };
+	let session: AgentSession;
+	let creation: Promise<CreateAgentSessionResult> | undefined;
+	try {
+		creation = createAgentSession({
+			...options,
+			mcpTools: mcpTools.length > 0 ? mcpTools : undefined,
+			mcpToolScope: mcpFollower?.scope,
+			customTools: customTools.length > 0 ? customTools : undefined,
+			settings,
+			sessionManager,
+			expectedAgentRef: revive?.expectedAgentRef ?? null,
+			resolveServiceTierByFamily: launch?.resolveServiceTierByFamily,
+			onFirstChatDispatch: launch?.onFirstChatDispatch,
+			taskEffort: launch?.taskEffort,
+			// A launch prompts its assignment only after setup; a revive's turns are its IRC wakes.
+			awaitingAssignment: launch !== undefined,
+			systemPrompt: subagentSystemPrompt(inputs, held, launch?.workPoolYieldItems, live.seance),
+		});
+		let startupModelFallback: CreateAgentSessionResult["startupModelFallback"];
+		({ session, startupModelFallback } = await settle(creation));
+		if (startupModelFallback) startupModelFallbacks.set(session, startupModelFallback);
+	} catch (error) {
+		mcpFollower?.dispose();
+		if (creation) launch?.abandon(creation);
+		// A revived session claimed this journal as its writer before it failed.
+		// Leaving it claimed would divert the next revive of this
+		// transcript to a sibling file instead of rebuilding it in place.
+		if (revive) await sessionManager.close();
+		throw error;
+	}
+	mcpFollower?.bind(session);
+	launch?.created(session);
+	// Run-state notifications precede deferrable wire-level `agent_end`, so an adopted
+	// keep-alive lifecycle cannot get stuck during prompt unwind.
+	AgentRegistry.global().syncSessionStatus(id, session);
+	if (cache) {
+		trackSubagentSettings(session, cache);
+		trackSubagentPendingCandidate(session, cache);
+		trackSubagentIrcRoster(session, cache.ircRenders);
+	}
+	if (held.blocks && !revive?.legacy?.replayPrompt) releaseHeldPromptAtFirstCall(session, held);
+	// Todos are parent-owned bookkeeping and stripped from subagents, except under prewalk, whose plan
+	// nudge and todo gate require the subagent to commit its own todo list before the hand-off. Strip
+	// before extensions start: every build enables the session's default tools again.
+	const keepTodo = spec.tools.keepTodo;
+	const withoutParentOwnedTools = (toolNames: string[]): string[] =>
+		keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
+	const legacyTools = revive?.legacy?.tools;
+	if (legacyTools) {
+		// An older record's tool list is its contract: `createAgentSession` can re-add extension or custom
+		// tools its run did not carry. Names the session does not have are ignored.
+		const toolNames = spec.tools.toolNames ?? [];
+		await session.setActiveToolsByName(
+			legacyTools.keepDevices ? [...toolNames, ...session.getMountedXdevToolNames()] : toolNames,
+		);
+	} else {
+		const enabledToolNames = session.getEnabledToolNames();
+		const subagentToolNames = withoutParentOwnedTools(enabledToolNames);
+		if (subagentToolNames.length !== enabledToolNames.length) {
+			await settle(session.setActiveToolsByName(subagentToolNames));
+		}
+	}
+	if (launch) {
+		await launch.beforeExtensions(session);
+	} else if (revive?.heldInit?.workPoolYieldItems) {
+		// The yield tool's schema carries the held batch's items; the replayed prefix must match it.
+		await session.setWorkPoolYieldItems(revive.heldInit.workPoolYieldItems);
+	}
+	// Without the extension wiring the runner stays pre-init, so a `tool_call` handler touching a runtime
+	// action trips the fail-closed gate and blocks every tool, `yield` included (issue #8824).
+	await settle(
+		initializeExtensions(session, {
+			reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
+			reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+			trackExtensionSend: launch ? send => launch.trackExtensionSend(send) : undefined,
+			filterActiveTools: withoutParentOwnedTools,
+			afterStartupDiscovery: launch ? started => launch.afterStartupDiscovery(started) : undefined,
+			agentActionsScope: revive?.agentActionsScope,
+		}),
+	);
+	if (revive) {
+		await replayRevivedAgentStart(session);
+		attachIrcWakeTurnMonitor(session, revivedWakeOptions(spec, live, sessionManager));
+	}
+	return session;
+}
+
+/** `stored`, unless the live process turns the capability off. */
+function narrowedToLive(stored: boolean | undefined, allowed: boolean | undefined): boolean | undefined {
+	return allowed === false ? false : stored;
+}
+
+/** The spawn's effort ceiling, lowered to the live `task.maxEffort` when that is lower. */
+export function liveEffortCeiling(ceiling: Effort | undefined, settings: Settings): Effort | undefined {
+	if (ceiling === undefined) return undefined;
+	const maxEffort = cfgTaskMaxEffort.get(settings);
+	return THINKING_EFFORTS.indexOf(maxEffort) < THINKING_EFFORTS.indexOf(ceiling) ? maxEffort : ceiling;
+}
+
+/**
+ * A subagent's telemetry, derived from its parent's: the child loop's spans nest under the parent's
+ * active span (OTEL context propagation links them), carry the subagent's own identity, and use the
+ * subagent's own session id as `gen_ai.conversation.id` (the parent's is cleared).
+ */
+export function subagentTelemetryConfig(
+	parent: AgentTelemetryConfig | undefined,
+	agent: AgentIdentity,
+): AgentTelemetryConfig | undefined {
+	return parent ? { ...parent, agent, conversationId: undefined } : undefined;
+}
+
+/** Executor options a spawner reads from the spawning session's tool session: the live inputs of a subagent build. */
+export type SubagentSpawnerLiveInputs = Pick<
+	ExecutorOptions,
+	| "costGate"
+	| "getApiKey"
+	| "authStorage"
+	| "modelRegistry"
+	| "settings"
+	| "asyncJobManager"
+	| "inheritedSessionAgents"
+	| "mcpManager"
+	| "contextFiles"
+	| "noContextFiles"
+	| "skills"
+	| "workspaceTree"
+	| "promptTemplates"
+	| "rules"
+	| "extensionRoots"
+	| "preloadedExtensionPaths"
+	| "preloadedPreparedExtensions"
+	| "preloadedCustomToolPaths"
+	| "localProtocolOptions"
+	| "parentArtifactManager"
+	| "parentHindsightSessionState"
+	| "parentMnemopiSessionState"
+	| "parentTelemetry"
+>;
+
+/** Live inputs of a subagent build that a spawner's inputs give as they are; see {@link spawnerLiveInputs}. */
+type SpawnerLiveInputKeys =
+	| "costGate"
+	| "getApiKey"
+	| "inheritedSessionAgents"
+	| "contextFiles"
+	| "skills"
+	| "promptTemplates"
+	| "workspaceTree"
+	| "rules"
+	| "extensionRoots"
+	| "preloadedExtensionPaths"
+	| "preloadedPreparedExtensions"
+	| "preloadedCustomToolPaths"
+	| "parentHindsightSessionState"
+	| "parentMnemopiSessionState"
+	| "asyncJobManager"
+	| "localProtocolOptions"
+	| "telemetry";
+
+/**
+ * The live inputs of a subagent build that `inputs`, a spawner's, give as they are, with the subagent's
+ * telemetry derived from the spawner's: what a spawn passes from its options, and what a cold revive takes
+ * from the live parent's tool session. Each caller adds its own fallbacks and the inputs only it has.
+ */
+export function spawnerLiveInputs(
+	inputs: SubagentSpawnerLiveInputs,
+	agent: AgentIdentity,
+): Pick<SubagentLiveInputs, SpawnerLiveInputKeys> {
 	return {
-		...spec.options,
-		mcpTools: mcpTools.length > 0 ? mcpTools : undefined,
-		mcpToolScope: mcpFollower?.scope,
-		customTools: customTools.length > 0 ? customTools : undefined,
-		settings,
-		sessionManager,
-		expectedAgentRef,
-		resolveServiceTierByFamily: launch?.resolveServiceTierByFamily,
-		onFirstChatDispatch: launch?.onFirstChatDispatch,
-		// A launch prompts its assignment only after setup; a revive's turns are its IRC wakes.
-		awaitingAssignment: launch !== undefined,
-		systemPrompt: defaultPrompt => {
-			// A revive shows the roster the parked session's prompt held, and a rebuild that leaves the
-			// rest of the prompt unchanged keeps the roster the prompt it replaces showed: peer rows carry
-			// each peer's live activity, so a re-collected roster changed the prompt's bytes on every such
-			// rebuild and the provider wrote the whole conversation to its prompt cache again. A rebuild
-			// whose default blocks changed loses the cached prefix anyway, so it catches the roster up.
-			const ircRoster = !inputs.ircEnabled
-				? undefined
-				: inputs.reviving && inputs.ircRoster
-					? inputs.ircRoster
-					: (heldIrcRoster(inputs, defaultPrompt) ??
-						collectIrcPeerRoster(AgentRegistry.global(), inputs.id, inputs.ircRoot.sessionFile));
-			const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-				agent: inputs.agentSystemPrompt,
-				context: inputs.context,
-				planReference: inputs.planReference,
-				planReferencePath: inputs.planReferencePath,
-				worktree: inputs.worktree,
-				structured: inputs.structured,
-				outputSchema: inputs.outputSchema,
-				outputSchemaOverridesAgent: inputs.outputSchemaOverridesAgent,
-				// Read the live item set through the registry instead of capturing the session, which
-				// would pin its whole graph past park. A revive builds while the registry session is
-				// null, so it renders the cleared set rather than the launch-time pooled instructions.
-				workPoolYieldItems:
-					ownAttachedSession(inputs.id)?.getWorkPoolYieldItems?.() ?? launch?.workPoolYieldItems ?? [],
-				ircPeers: ircRoster?.peers ?? [],
-				ircParkedCount: ircRoster?.parkedCount ?? 0,
-				ircOmittedCount: ircRoster?.omittedCount ?? 0,
-				ircSelfId: inputs.ircEnabled ? inputs.id : "",
-			});
-			if (ircRoster) recordIrcRender(inputs, subagentPrompt, ircRoster);
-			// Per-spawn text (context, worktree, IRC roster) goes after the trailing
-			// `<project-context>` block so spawns of the same agent share the static
-			// prompt prefix as a cache hit.
-			const seancePrompt = spec.preparedSession?.promptSuffix(inputs.model);
-			return [...defaultPrompt, subagentPrompt, ...(seancePrompt ? [seancePrompt] : [])];
-		},
+		costGate: inputs.costGate,
+		getApiKey: inputs.getApiKey,
+		inheritedSessionAgents: inputs.inheritedSessionAgents,
+		contextFiles: inputs.contextFiles,
+		skills: inputs.skills,
+		promptTemplates: inputs.promptTemplates,
+		workspaceTree: inputs.workspaceTree,
+		rules: inputs.rules,
+		extensionRoots: inputs.extensionRoots,
+		preloadedExtensionPaths: inputs.preloadedExtensionPaths,
+		preloadedPreparedExtensions: inputs.preloadedPreparedExtensions,
+		preloadedCustomToolPaths: inputs.preloadedCustomToolPaths,
+		parentHindsightSessionState: inputs.parentHindsightSessionState,
+		parentMnemopiSessionState: inputs.parentMnemopiSessionState,
+		asyncJobManager: inputs.asyncJobManager,
+		localProtocolOptions: inputs.localProtocolOptions,
+		telemetry: subagentTelemetryConfig(inputs.parentTelemetry, agent),
+	};
+}
+
+/** The live exact-name `task.agentAccountPools` entry of `agentName`: owner policy, never a spawn-time copy. */
+export function liveAgentAccountPools(
+	settings: Settings,
+	agentName: string | undefined,
+): OAuthAccountPools | undefined {
+	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(settings));
+	return agentName !== undefined && Object.hasOwn(agentAccountPools, agentName)
+		? agentAccountPools[agentName]
+		: undefined;
+}
+
+/**
+ * Holds each model a per-call worker dispatches to `approve`, then to the effort ceiling: a model that cannot
+ * run at or below it is refused. `ceiling` is read at each call, so a ceiling over a live setting is taken as
+ * that setting is then.
+ */
+export function perCallModelAssertion(
+	approve: (model: Model) => void,
+	ceiling: () => Effort | undefined,
+): (model: Model) => void {
+	return model => {
+		approve(model);
+		const effort = ceiling();
+		if (effort) assertModelSupportsEffortCeiling(model, effort);
+	};
+}
+
+/**
+ * Holds every request of a per-call worker to an approved model that can run at or below the spawn's
+ * effort ceiling. Module-level, so the warm revive capture that keeps it pins nothing of the spawn.
+ */
+function perCallDispatchAssertion(
+	grants: PerCallModelGrants,
+	modelRegistry: ModelRegistry,
+	ceiling: Effort | undefined,
+): (model: Model) => void {
+	return perCallModelAssertion(
+		model => assertPerCallModelApproved(model, grants, modelRegistry),
+		() => ceiling,
+	);
+}
+
+function subagentModelOptions(
+	model: SubagentBuildModel,
+	spec: SubagentSpawnSpec,
+): Pick<CreateAgentSessionOptions, SubagentModelOptionKeys> {
+	switch (model.kind) {
+		case "model":
+			return { model: model.model, thinkingLevel: model.thinkingLevel };
+		case "deferred":
+			return {
+				model: undefined,
+				modelPattern: model.modelPattern,
+				modelPatternAuthFallback: model.modelPatternAuthFallback,
+				modelPatternFallbackRole: model.modelPatternFallbackRole,
+				modelPatternDefaultFallbackChain: model.modelPatternDefaultFallbackChain,
+				modelPatternChainFallback: true,
+				thinkingLevel: spec.thinkingLevel ?? undefined,
+			};
+		case "legacy":
+			return {
+				model: model.model,
+				modelPattern: model.modelPattern,
+				modelPatternAuthFallback: model.modelPatternAuthFallback,
+				thinkingLevel: model.thinkingLevel,
+			};
+	}
+}
+
+/** A subagent build's session options from its spawn spec and live inputs, before the session's own. */
+function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
+	const { spec, live, revive } = input;
+	const { policy, identity, tools } = spec;
+	// A restricted contract keeps MCP, extension paths and custom-tool paths off, and at a revive LSP too;
+	// the SDK turns IRC off for it. A stored LSP, IRC or MCP value never turns on what the live process has off.
+	const restricted = tools.restrictToolNames === true;
+	const enableMCP = restricted ? false : narrowedToLive(policy.enableMCP, live.policy.enableMCP);
+	return {
+		cwd: policy.cwd,
+		costGate: live.costGate,
+		additionalDirectories: policy.additionalDirectories,
+		authStorage: live.authStorage,
+		modelRegistry: live.modelRegistry,
+		getApiKey: live.getApiKey,
+		credentialSourceSessionId: policy.credentialSourceSessionId,
+		oauthAccountPools: revive
+			? liveAgentAccountPools(live.settingsParent, identity.agentName)
+			: live.oauthAccountPools,
+		inheritedSessionAgents: live.inheritedSessionAgents,
+		...subagentModelOptions(input.model, spec),
+		...(spec.perCallModel
+			? {
+					// Every request stays on an approved model that can run at or below the spawn's effort ceiling.
+					assertDispatchModel: live.assertDispatchModel,
+					disableModelFallback: true,
+					disableServerSideFallback: true,
+				}
+			: {}),
+		thinkingLevelCeiling: liveEffortCeiling(spec.thinkingLevelCeiling, live.settingsParent),
+		cacheWarming: policy.cacheWarming,
+		toolNames: tools.toolNames,
+		// The tool names a revive replays include the devices the spawn mounted; keep them mounted.
+		mountedToolNames: revive?.legacy?.tools
+			? revive.legacy.tools.mountedToolNames
+			: revive
+				? tools.mountedToolNames
+				: undefined,
+		outputSchema: tools.outputSchema,
+		outputSchemaMode: tools.outputSchemaMode,
+		restrictToolNames: tools.restrictToolNames,
+		requireYieldTool: tools.requireYieldTool,
+		contextFiles: live.contextFiles,
+		noContextFiles: policy.noContextFiles,
+		// Subagents never receive AGENTS.md, including from additional workspace roots they rediscover.
+		excludeAgentsMd: true,
+		skills: live.skills,
+		mergeDiscoveredSkillPaths: policy.mergeDiscoveredSkillPaths,
+		promptTemplates: live.promptTemplates,
+		workspaceTree: live.workspaceTree,
+		rules: live.rules,
+		extensionRoots: live.extensionRoots,
+		preloadedExtensionPaths: restricted ? [] : live.preloadedExtensionPaths,
+		preloadedPreparedExtensions: live.preloadedPreparedExtensions,
+		preloadedCustomToolPaths: restricted ? [] : live.preloadedCustomToolPaths,
+		hasUI: false,
+		prewalk:
+			spec.prewalk && input.prewalkTarget
+				? { target: input.prewalkTarget, thinkingLevel: spec.prewalk.thinkingLevel }
+				: undefined,
+		spawns: policy.spawns,
+		taskDepth: policy.taskDepth,
+		// The whole spawn tree shares the root session's observability bus, so nested
+		// lifecycle/progress/event frames reach its surfaces without leaking into another
+		// root session's traffic.
+		subagentEventBus: live.subagentEventBus,
+		parentHindsightSessionState: live.parentHindsightSessionState,
+		parentMnemopiSessionState: live.parentMnemopiSessionState,
+		parentTaskPrefix: identity.parentTaskPrefix,
+		asyncJobManager: live.asyncJobManager,
+		parentAgentId: identity.parentAgentId,
+		agentId: identity.agentId,
+		agentDisplayName: identity.agentDisplayName,
+		agentName: identity.agentName,
+		enableLsp: restricted && revive ? false : narrowedToLive(policy.enableLsp, live.policy.enableLsp),
+		enableIrc: narrowedToLive(policy.enableIrc, live.policy.enableIrc),
+		skipPythonPreflight: policy.skipPythonPreflight,
+		enableMCP,
+		// The manager also feeds the MCP proxy tools of an older record's revive, which keeps MCP itself off.
+		mcpManager: restricted || live.policy.enableMCP === false ? undefined : live.mcpManager,
+		customTools: live.customTools,
+		localProtocolOptions: live.localProtocolOptions,
+		telemetry: live.telemetry,
+		// Seance isolation overrides every inherited field above in one place.
+		...(live.seance ? seanceIsolationOptions(policy.cwd ?? input.sessionManager.getCwd()) : {}),
+	};
+}
+
+/** The system prompt builder of a subagent build; module-level, so it holds nothing but its inputs. */
+function subagentSystemPrompt(
+	inputs: SubagentPromptInputs,
+	held: HeldBasePrompt,
+	launchWorkPoolYieldItems: readonly WorkPoolYieldItem[] | undefined,
+	seance: SubagentLiveInputs["seance"],
+): (defaultPrompt: string[]) => string[] {
+	return defaultPrompt => {
+		// Until its first model call a revived session sends what the parked session's last call sent:
+		// signed thinking is bound to the system prompt, and a changed prefix writes the prompt cache again.
+		if (held.blocks) return [...held.blocks];
+		// A rebuild that leaves the rest of the prompt unchanged keeps the roster the prompt it replaces
+		// showed: peer rows carry each peer's live activity, so a re-collected roster changed the prompt's
+		// bytes on every such rebuild and the provider wrote the whole conversation to its prompt cache
+		// again. A rebuild whose default blocks changed loses the cached prefix anyway, so it catches the
+		// roster up.
+		const ircRoster = inputs.ircEnabled
+			? (heldIrcRoster(inputs, defaultPrompt) ??
+				collectIrcPeerRoster(AgentRegistry.global(), inputs.id, inputs.ircRoot.sessionFile))
+			: undefined;
+		const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+			agent: inputs.agentSystemPrompt,
+			context: inputs.context,
+			planReference: inputs.planReference,
+			planReferencePath: inputs.planReferencePath,
+			worktree: inputs.worktree,
+			structured: inputs.structured,
+			outputSchema: inputs.outputSchema,
+			outputSchemaOverridesAgent: inputs.outputSchemaOverridesAgent,
+			// Read the live item set through the registry instead of capturing the session, which
+			// would pin its whole graph past park.
+			workPoolYieldItems: ownAttachedSession(inputs.id)?.getWorkPoolYieldItems?.() ?? launchWorkPoolYieldItems ?? [],
+			ircPeers: ircRoster?.peers ?? [],
+			ircParkedCount: ircRoster?.parkedCount ?? 0,
+			ircOmittedCount: ircRoster?.omittedCount ?? 0,
+			ircSelfId: inputs.ircEnabled ? inputs.id : "",
+		});
+		if (ircRoster) recordIrcRender(inputs, subagentPrompt, ircRoster);
+		// Per-spawn text (context, worktree, IRC roster) goes after the trailing
+		// `<project-context>` block so spawns of the same agent share the static
+		// prompt prefix as a cache hit.
+		const seancePrompt = seance?.promptSuffix?.(inputs.model);
+		return [...defaultPrompt, subagentPrompt, ...(seancePrompt ? [seancePrompt] : [])];
+	};
+}
+
+/**
+ * Ends a revived session's hold on its base prompt once its first model call is under way; every build
+ * after it renders from the spawn's prompt inputs, under the session's own prompt-binding guard.
+ */
+function releaseHeldPromptAtFirstCall(session: AgentSession, held: HeldBasePrompt): void {
+	const unsubscribe = session.subscribe(event => {
+		if (event.type !== "message_start" || event.message.role !== "assistant") return;
+		held.blocks = undefined;
+		unsubscribe();
+	});
+}
+
+/** A revived session's wake-turn monitor: the spawn's stored wake inputs, reporting on the live event buses. */
+function revivedWakeOptions(
+	spec: SubagentSpawnSpec,
+	live: SubagentLiveInputs,
+	sessionManager: SessionManager,
+): IrcWakeTurnMonitorOptions {
+	const { agent, ...wake } = spec.wake;
+	return {
+		...wake,
+		id: spec.prompt.id,
+		agent: { ...agent, systemPrompt: spec.prompt.agentSystemPrompt },
+		eventBus: live.eventBus,
+		subagentEventBus: live.subagentEventBus,
+		storeMaskCwd: live.storeMaskCwd,
+		sessionFile: sessionManager.getSessionFile(),
 	};
 }
 
@@ -4399,26 +4993,26 @@ function heldIrcRoster(inputs: SubagentPromptInputs, defaultPrompt: readonly str
 /** Remembers the roster `block` shows, dropping blocks the live session's base prompt no longer holds. */
 function recordIrcRender(inputs: SubagentPromptInputs, block: string, roster: IrcPeerRosterData): void {
 	const held = ownAttachedSession(inputs.id)?.baseSystemPrompt;
-	if (held) {
-		for (const rendered of inputs.ircRenders.keys()) {
-			if (!held.includes(rendered)) inputs.ircRenders.delete(rendered);
-		}
-	}
+	if (held) pruneIrcRenders(inputs.ircRenders, held);
 	inputs.ircRenders.set(block, roster);
 }
 
 /**
- * When `session` is disposed, keeps the roster its base prompt held for the next warm revive to
- * render again. The base, not the effective prompt: a `before_agent_start` override may rewrite
- * the block, and the revived turn re-runs that hook over the same base.
+ * When `session` is disposed, keeps only the rosters its base prompt holds, which the builds after
+ * the next warm revive's first model call render again. The base, not the effective prompt: a
+ * `before_agent_start` override may rewrite the block, and the revived turn re-runs that hook over
+ * the same base.
  */
-function trackSubagentIrcRoster(session: AgentSession, inputs: SubagentPromptInputs): void {
-	session.addDisposer(() => {
-		inputs.ircRoster = session.baseSystemPrompt
-			.map(block => inputs.ircRenders.get(block))
-			.find(roster => roster !== undefined);
-		inputs.ircRenders.clear();
-	});
+function trackSubagentIrcRoster(session: AgentSession, ircRenders: Map<string, IrcPeerRosterData>): void {
+	session.addDisposer(() => pruneIrcRenders(ircRenders, session.baseSystemPrompt));
+}
+
+/** Drops from `ircRenders` the roster of every block that `held`, a base prompt, does not hold. */
+function pruneIrcRenders(ircRenders: Map<string, IrcPeerRosterData>, held: readonly string[]): void {
+	const kept = new Set(held);
+	for (const block of ircRenders.keys()) {
+		if (!kept.has(block)) ircRenders.delete(block);
+	}
 }
 
 /**
@@ -4428,79 +5022,72 @@ function trackSubagentIrcRoster(session: AgentSession, inputs: SubagentPromptInp
 async function refreshSubagentIrcRoot(
 	inputs: SubagentPromptInputs,
 	sessionManager: SessionManager,
-	sessionFile: string | null,
-	storage: SessionStorage,
+	storage: SessionStorage | undefined,
 ): Promise<void> {
 	if (!inputs.ircEnabled) return;
 	const registry = AgentRegistry.global();
 	inputs.ircRoot.sessionFile = await ensurePersistedRoster(
 		registry,
 		sessionManager.getSessionFile() ??
-			sessionFile ??
 			registry.get(inputs.id)?.sessionFile ??
 			registry.get(MAIN_AGENT_ID)?.sessionFile,
 		storage,
 	);
 }
 
-/** Recipe for a subagent's settings overlay: its parent plus the overlay's own writes. */
-interface SubagentSettingsRecipe {
-	parent: Settings;
-	layers: OverlayLayers;
-	rootThresholds: RootCompactionThresholds | undefined;
+/** A subagent overlay's own writes and the root compaction thresholds its chain pins. */
+export function captureSubagentSettings(settings: SubagentChainSettings): SubagentSettingsSnapshot {
+	return { layers: settings.overlayLayers(), rootThresholds: settings[kRootCompactionThresholds] };
 }
 
-function captureSubagentSettings(parent: Settings, settings: SubagentChainSettings): SubagentSettingsRecipe {
-	return { parent, layers: settings.overlayLayers(), rootThresholds: settings[kRootCompactionThresholds] };
-}
-
-function restoreSubagentSettings(recipe: SubagentSettingsRecipe): Settings {
-	const settings: SubagentChainSettings = recipe.parent.restoreOverlay(recipe.layers);
-	settings[kRootCompactionThresholds] = recipe.rootThresholds;
+/** The subagent overlay `snapshot` holds, restored over `parent`. */
+function restoreSubagentSettings(
+	parent: Settings,
+	snapshot: { layers: OverlayLayers; rootThresholds?: RootCompactionThresholds },
+): Settings {
+	const settings: SubagentChainSettings = parent.restoreOverlay(snapshot.layers);
+	settings[kRootCompactionThresholds] = snapshot.rootThresholds;
 	return settings;
 }
 
-/** Everything the lifecycle reviver of a kept-alive subagent needs, captured explicitly. */
-interface WarmReviveCapture {
-	sessionFile: string;
-	/** Storage {@link sessionFile} lives in; the revive reopens it there. */
-	storage: SessionStorage;
-	spec: SubagentSessionSpec;
-	/** A per-call worker never switches models; its warm revive keeps only the exact saved model. */
-	perCallModel: boolean;
-	/** Re-captured whenever the live session is disposed, so a revive restores its latest settings writes. */
-	settings: SubagentSettingsRecipe;
-	parentArtifactManager: ArtifactManagerApi | undefined;
-	/** Todos are parent-owned and stripped from subagents, except under prewalk (its todo gate needs them). */
-	keepTodo: boolean;
-	wake: IrcWakeTurnMonitorOptions;
-	/** Exact agent name the live `task.agentAccountPools` entry is looked up by on revive. */
-	agentName: string;
-	/**
-	 * Pending, never-promoted family candidate. The stash lives only on the live manager, so park
-	 * re-reads it (when the header still carries no task key) and the revive restores it onto the
-	 * fresh manager the reviver opens from disk.
-	 */
-	pendingCacheCandidate: string | undefined;
+/**
+ * Descriptors of the spawn's custom tools for its spawn spec: those carried in with the options
+ * when the tools crossed into a worker, else those recorded on this thread. A tool with neither is
+ * left out of the spec, so a revive from the spec cannot build it again.
+ */
+function spawnSpecCustomTools(id: string, options: ExecutorOptions): EvalToolDescriptor[] {
+	const descriptors: EvalToolDescriptor[] = [];
+	for (const tool of options.customTools ?? []) {
+		const descriptor =
+			options.customToolDescriptors?.find(carried => carried.name === tool.name) ?? evalToolDescriptor(tool);
+		if (descriptor) {
+			descriptors.push(descriptor);
+		} else {
+			logger.warn("Subagent custom tool has no eval descriptor; its spawn spec leaves it out", {
+				id,
+				tool: tool.name,
+			});
+		}
+	}
+	return descriptors;
 }
 
-/** Keeps `capture.pendingCacheCandidate` current with `session`'s manager stash until it is disposed. */
-function trackSubagentPendingCandidate(session: AgentSession, capture: WarmReviveCapture): void {
+/** Keeps `cache.pendingCacheCandidate` current with `session`'s manager stash until it is disposed. */
+function trackSubagentPendingCandidate(session: AgentSession, cache: WarmReviveCache): void {
 	session.addDisposer(() => {
 		const manager = session.sessionManager;
 		// An already-persisted header is the carrier a revive reconstitutes from —
 		// only an unpromoted stash must be carried, so a header stripped on disk
 		// (a deliberate drop of persisted affinity) cannot resurrect it.
-		capture.pendingCacheCandidate =
+		cache.pendingCacheCandidate =
 			manager.getHeader()?.taskPromptCacheKey === undefined ? manager.getTaskSiblingCandidate() : undefined;
 	});
 }
 
-/** Keeps `capture.settings` current with `session`'s overlay writes until the session is disposed. */
-function trackSubagentSettings(session: AgentSession, capture: WarmReviveCapture): void {
-	const parent = capture.settings.parent;
+/** Keeps `cache.settings` current with `session`'s overlay writes until the session is disposed. */
+function trackSubagentSettings(session: AgentSession, cache: WarmReviveCache): void {
 	session.addDisposer(() => {
-		capture.settings = captureSubagentSettings(parent, session.settings);
+		cache.settings = captureSubagentSettings(session.settings);
 	});
 }
 
@@ -4515,123 +5102,107 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
 }
 
 /**
- * Lifecycle reviver for a parked subagent: park closed the JSONL writer, so reopening takes the
- * single-writer lock cleanly and restores the full message history (createAgentSession →
- * agent.replaceMessages). Isolated runs keep their worktree for the same lifecycle, so they use
- * this path too. Built at module scope and handed nothing but `capture`: JSC keeps an enclosing
- * function's `arguments` reachable from its arrow closures, so any extra parameter would be pinned.
+ * Reopens a parked subagent's transcript for a revive, in `storage`, where the tree's transcripts live (the
+ * configured store when undefined). Park closed the JSONL writer, so this takes the single-writer lock
+ * cleanly and restores the full message history (createAgentSession → agent.replaceMessages); a transcript
+ * truncated to its header and session_init is refused.
+ */
+export async function reopenParkedSubagent(
+	id: string,
+	sessionFile: string,
+	storage: SessionStorage | undefined,
+): Promise<SessionManager> {
+	const reopened = await SessionManager.open(sessionFile, undefined, storage, {
+		suppressBreadcrumb: true,
+		throwIfMissing: true,
+	});
+	if (!hasConversationalHistory(reopened.getEntries())) {
+		await reopened.close();
+		throw new Error(
+			`Cannot revive subagent "${id}": session file "${sessionFile}" has no message history ` +
+				`(truncated to header/session_init). The agent was not revived.`,
+		);
+	}
+	return reopened;
+}
+
+/**
+ * The models one revive's stored identities (`formatModelStringWithRouting`) name, among every model the
+ * registry holds. At the revive's first identity the registry does not hold, the registry's discovery runs
+ * (started where none runs yet) and the identity is resolved again; a later miss of the same revive waits on
+ * that discovery rather than starting another.
+ */
+export class RevivedModels {
+	readonly #modelRegistry: ModelRegistry;
+	#discovery: Promise<void> | undefined;
+
+	/** `discoveryRan`: an earlier step of the same revive, on another thread, already ran the discovery. */
+	constructor(modelRegistry: ModelRegistry, discoveryRan = false) {
+		this.#modelRegistry = modelRegistry;
+		if (discoveryRan) this.#discovery = Promise.resolve();
+	}
+
+	/** Whether a miss of this revive ran the registry's discovery. */
+	get discoveryRan(): boolean {
+		return this.#discovery !== undefined;
+	}
+
+	/** The model `identity` names; undefined when the registry holds none after its discovery ran. */
+	async resolve(identity: string): Promise<Model | undefined> {
+		const known = resolveSpawnModelIdentity(identity, this.#modelRegistry);
+		if (known) return known;
+		if (!this.#discovery) {
+			this.#modelRegistry.refreshInBackground("online-if-uncached");
+			this.#discovery = this.#modelRegistry.awaitBackgroundRefresh();
+		}
+		await this.#discovery;
+		return resolveSpawnModelIdentity(identity, this.#modelRegistry);
+	}
+}
+
+/**
+ * The model a warm revive starts on: the one its session started on, which it holds. A session-local
+ * switch since the spawn (a prewalk handoff) owns the model and effort: the revive starts on the
+ * switched model where the registry knows it, else on the held one, and the transcript restores the
+ * effort. The spawn's prewalk stays configured; the coordinator sees it was spent. A per-call worker
+ * never switches models, and a seance fork's selections belong to its source run, never to the consult.
+ */
+async function warmReviveModel(capture: WarmReviveCapture, reopened: SessionManager): Promise<SubagentBuildModel> {
+	const { spec, live, cache } = capture;
+	const switched = spec.perCallModel || live.seance ? undefined : reopened.getSessionLocalModelChange()?.model;
+	if (switched === undefined) {
+		return { kind: "model", model: cache.model, thinkingLevel: spec.thinkingLevel ?? undefined };
+	}
+	const model = await new RevivedModels(live.modelRegistry).resolve(switched);
+	return { kind: "model", model: model ?? cache.model, thinkingLevel: undefined };
+}
+
+/**
+ * Lifecycle reviver for a parked subagent: a cache in front of {@link buildSubagentSession}, which it
+ * calls with the spawn spec, the live inputs and the cache it kept from the spawn. Isolated runs keep
+ * their worktree for the same lifecycle, so they use this path too. Built at module scope and handed
+ * nothing but `capture`: JSC keeps an enclosing function's `arguments` reachable from its arrow
+ * closures, so any extra parameter would be pinned.
  */
 function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 	return async expectedAgentRef => {
-		const { id } = capture.spec.prompt;
-		const reopened = await SessionManager.open(capture.sessionFile, undefined, capture.storage, {
-			suppressBreadcrumb: true,
-			throwIfMissing: true,
-		});
-		if (!hasConversationalHistory(reopened.getEntries())) {
-			await reopened.close();
-			throw new Error(
-				`Cannot revive subagent "${id}": session file "${capture.sessionFile}" has no message history ` +
-					`(truncated to header/session_init). The agent was not revived.`,
-			);
-		}
-		if (capture.parentArtifactManager) {
-			reopened.adoptArtifactManager(capture.parentArtifactManager);
-		}
+		const reopened = await reopenParkedSubagent(capture.spec.prompt.id, capture.sessionFile, capture.storage);
+		const { cache } = capture;
 		// The stash died with the parked manager: hand the pending, never-promoted
 		// family candidate to the fresh one so the first eligible request after
 		// revival still finds and persists it.
-		if (capture.pendingCacheCandidate !== undefined) {
-			reopened.setTaskSiblingCandidate(capture.pendingCacheCandidate);
+		if (cache.pendingCacheCandidate !== undefined) {
+			reopened.setTaskSiblingCandidate(cache.pendingCacheCandidate);
 		}
-		await refreshSubagentIrcRoot(capture.spec.prompt, reopened, capture.sessionFile, capture.storage);
-		const mcpManager = capture.spec.options.mcpManager;
-		// The revived session reopens its own view, keeping the tools its earlier requests rendered.
-		const mcpFollower = mcpManager
-			? followMCPTools(mcpManager, { scope: reopened.getSessionId() }, explicitSubagentToolNames(capture.spec))
-			: undefined;
-		let revived: AgentSession;
-		let startupModelFallback: CreateAgentSessionResult["startupModelFallback"];
-		// Account pools are owner policy: take the live exact-name entry, as
-		// dispatch and persisted revival do, never the spawn-time copy.
-		const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(capture.settings.parent));
-		capture.spec.prompt.reviving = true;
-		// A session-local switch since spawn (a prewalk handoff) owns the model and effort: the
-		// transcript restores the effort, and the spawn selection only backs the model up when it is
-		// unavailable. The spawn's prewalk stays configured; the coordinator sees it was spent. A seance
-		// fork's selections belong to its source run, never to the consult.
-		// A per-call worker never switches models, so its warm revive never prepends a session-local switch.
-		const sessionLocalModel =
-			capture.spec.preparedSession || capture.perCallModel
-				? undefined
-				: reopened.getSessionLocalModelChange()?.model;
-		try {
-			try {
-				const options = buildSubagentSessionOptions(
-					capture.spec,
-					restoreSubagentSettings(capture.settings),
-					reopened,
-					expectedAgentRef,
-					mcpFollower,
-				);
-				({ session: revived, startupModelFallback } = await createAgentSession({
-					...options,
-					...(sessionLocalModel
-						? {
-								model: undefined,
-								modelPattern: [
-									sessionLocalModel,
-									...(options.model
-										? [formatModelStringWithRouting(options.model)]
-										: options.modelPattern === undefined
-											? []
-											: [options.modelPattern].flat()),
-								],
-								modelPatternFallbackRole: undefined,
-								modelPatternDefaultFallbackChain: undefined,
-								thinkingLevel: undefined,
-							}
-						: undefined),
-					oauthAccountPools: Object.hasOwn(agentAccountPools, capture.agentName)
-						? agentAccountPools[capture.agentName]
-						: undefined,
-				}));
-			} catch (error) {
-				mcpFollower?.dispose();
-				// The session claimed this journal as its writer before it failed.
-				// Leaving it claimed would divert the next revive of this
-				// transcript to a sibling file instead of rebuilding it in place.
-				await reopened.close();
-				throw error;
-			}
-			mcpFollower?.bind(revived);
-			if (startupModelFallback) startupModelFallbacks.set(revived, startupModelFallback);
-			trackSubagentSettings(revived, capture);
-			trackSubagentPendingCandidate(revived, capture);
-			trackSubagentIrcRoster(revived, capture.spec.prompt);
-			const withoutParentOwnedTools = (toolNames: string[]): string[] =>
-				capture.keepTodo ? toolNames : toolNames.filter(name => name !== "todo");
-			// Strip what the spawn stripped, before extensions start: the rebuilt session enables its defaults again.
-			const revivedToolNames = revived.getEnabledToolNames();
-			const subagentToolNames = withoutParentOwnedTools(revivedToolNames);
-			if (subagentToolNames.length !== revivedToolNames.length) {
-				await revived.setActiveToolsByName(subagentToolNames);
-			}
-			// Re-run the executor's extension wiring on the rebuilt session. Skipping it leaves the
-			// runner pre-init, so a `tool_call` handler touching a runtime action trips the
-			// fail-closed gate and blocks every tool (including `yield`) in the revived agent (issue #8824).
-			await initializeExtensions(revived, {
-				reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-				reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-				filterActiveTools: withoutParentOwnedTools,
-			});
-			await replayRevivedAgentStart(revived);
-		} finally {
-			capture.spec.prompt.reviving = false;
-		}
-		AgentRegistry.global().syncSessionStatus(id, revived);
-		attachIrcWakeTurnMonitor(revived, capture.wake);
-		return revived;
+		return buildSubagentSession({
+			spec: capture.spec,
+			live: capture.live,
+			sessionManager: reopened,
+			storage: capture.storage,
+			model: await warmReviveModel(capture, reopened),
+			prewalkTarget: cache.prewalkTarget,
+			revive: { heldInit: extractSessionInit(reopened.getEntries()), expectedAgentRef, cache },
+		});
 	};
 }
 
@@ -5171,32 +5742,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			}
 
 			const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
-			const mcpManager = enableMCP ? options.mcpManager : undefined;
 
-			// Derive subagent-scoped telemetry from the parent's config so the
-			// child loop's spans nest under the parent's active execute_tool span
-			// (OTEL context propagation handles parent linkage automatically),
-			// carry the subagent's own agent identity, and use the subagent's
-			// own session id for `gen_ai.conversation.id`.
-			const subagentAgentIdentity: AgentIdentity | undefined = options.parentTelemetry
-				? {
-						id,
-						name: agent.name,
-						description: agent.description,
-					}
-				: undefined;
-			const subagentTelemetry: AgentTelemetryConfig | undefined =
-				options.parentTelemetry && subagentAgentIdentity
-					? {
-							...options.parentTelemetry,
-							agent: subagentAgentIdentity,
-							// Clear parent's conversationId; the child loop falls back to
-							// its own AgentLoopConfig.sessionId.
-							conversationId: undefined,
-						}
-					: undefined;
-
-			if (options.parentTelemetry && subagentAgentIdentity) {
+			const subagentAgentIdentity: AgentIdentity = { id, name: agent.name, description: agent.description };
+			if (options.parentTelemetry) {
 				const parentTelemetryHandle = resolveTelemetry(
 					options.parentTelemetry,
 					options.parentTelemetry.conversationId,
@@ -5206,54 +5754,36 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					toAgent: subagentAgentIdentity,
 				});
 			}
+			// The spawner's objects: the live inputs of this build and of its warm revives.
+			const live: SubagentLiveInputs = {
+				...spawnerLiveInputs(options, subagentAgentIdentity),
+				authStorage,
+				modelRegistry,
+				oauthAccountPools: options.oauthAccountPools,
+				assertDispatchModel: perCallModelGrants
+					? perCallDispatchAssertion(perCallModelGrants, modelRegistry, spawnEffortCeiling)
+					: undefined,
+				subagentEventBus: options.subagentEventBus,
+				mcpManager: options.mcpManager,
+				customTools: options.customTools,
+				settingsParent: settings,
+				eventBus: options.eventBus,
+				storeMaskCwd,
+				parentArtifactManager: preparedSession ? undefined : options.parentArtifactManager,
+				// The spawner applied its process's policy to the values the spec stores.
+				policy: {},
+				seance: preparedSession ? { promptSuffix: preparedSession.promptSuffix } : undefined,
+			};
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
-			// Rebuilding an equivalent session from the same JSONL file re-invokes
-			// createAgentSession with this spec (same agent id, tools, model, system
-			// prompt, artifacts dir) — only the SessionManager and settings differ.
-			const sessionSpec: SubagentSessionSpec = {
+			// What the spawn decided, as its spawn spec stores it: every build of this subagent, its
+			// revives included, starts from it.
+			const specInputs: SpawnSpecInputs = {
 				options: {
 					cwd: effectiveCwd,
-					costGate: options.costGate,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
-					authStorage,
-					modelRegistry,
-					getApiKey: options.getApiKey,
 					credentialSourceSessionId: options.credentialSourceSessionId,
-					oauthAccountPools: options.oauthAccountPools,
-					inheritedSessionAgents: options.inheritedSessionAgents,
-					model,
-					modelPattern: deferModelPatterns ? modelPatterns : undefined,
-					modelPatternAuthFallback: deferModelPatterns ? options.parentActiveModelPattern : undefined,
-					modelPatternFallbackRole: deferModelPatterns ? subagentRetryFallbackRole(id) : undefined,
-					modelPatternDefaultFallbackChain: deferModelPatterns ? inheritedRetryFallbackChain : undefined,
-					modelPatternChainFallback: deferModelPatterns || undefined,
-					thinkingLevel: effectiveThinkingLevel,
-					...(perCallModelGrants
-						? {
-								// Every request stays on an approved model that can run at or below the spawn's effort ceiling.
-								assertDispatchModel: (dispatchModel: Model) => {
-									assertPerCallModelApproved(dispatchModel, perCallModelGrants, modelRegistry);
-									if (spawnEffortCeiling) assertModelSupportsEffortCeiling(dispatchModel, spawnEffortCeiling);
-								},
-								disableModelFallback: true,
-								disableServerSideFallback: true,
-							}
-						: {}),
-					thinkingLevelCeiling: spawnEffortCeiling,
-					taskEffort: model ? undefined : options.effort,
-					// Subagents are short-lived; never schedule background warm requests.
-					cacheWarming: false,
-					toolNames,
-					outputSchema,
-					outputSchemaMode: options.outputSchemaMode,
-					restrictToolNames,
-					requireYieldTool: structured,
-					contextFiles: options.contextFiles,
 					noContextFiles: options.noContextFiles,
-					// Subagents never receive AGENTS.md, including from additional workspace roots they rediscover.
-					excludeAgentsMd: true,
-					skills: options.skills,
 					// Internal spawners (task/eval/vibe) forward the parent snapshot
 					// for perf and set this true so discoverStartupSkillPaths still
 					// merges the child's own resources_discover contributions
@@ -5261,42 +5791,27 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					// runSubprocess keep the released fixed-snapshot semantics:
 					// default false, matching createAgentSession's own opt-in.
 					mergeDiscoveredSkillPaths: options.mergeDiscoveredSkillPaths === true,
-					promptTemplates: options.promptTemplates,
-					workspaceTree: options.workspaceTree,
-					rules: options.rules,
-					extensionRoots: options.extensionRoots,
-					preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-					preloadedPreparedExtensions: options.preloadedPreparedExtensions,
-					preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
-					hasUI: false,
-					prewalk,
+					enableLsp: lspEnabled,
+					// Subagents are short-lived; never schedule background warm requests.
+					cacheWarming: false,
+					enableIrc: options.enableIrc,
+					enableMCP,
+					skipPythonPreflight,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
-					// The whole spawn tree shares the root session's observability bus,
-					// so nested lifecycle/progress/event frames reach its surfaces
-					// without leaking into another root session's traffic.
-					subagentEventBus: options.subagentEventBus,
-					parentHindsightSessionState: options.parentHindsightSessionState,
-					parentMnemopiSessionState: options.parentMnemopiSessionState,
-					parentTaskPrefix: id,
-					asyncJobManager: options.asyncJobManager,
-					parentAgentId: options.parentAgentId,
 					agentId: id,
-					agentDisplayName: agent.name,
 					agentName: agent.name,
-					enableLsp: lspEnabled,
-					enableIrc: options.enableIrc,
-					skipPythonPreflight,
-					enableMCP,
-					mcpManager,
-					// MCP proxies are minted per build as `mcpTools` in buildSubagentSessionOptions.
-					customTools: options.customTools,
-					localProtocolOptions: options.localProtocolOptions,
-					telemetry: subagentTelemetry,
-					// Seance isolation overrides every inherited field above in one place.
-					...(preparedSession ? seanceIsolationOptions(effectiveCwd) : {}),
+					agentDisplayName: agent.name,
+					parentAgentId: options.parentAgentId,
+					parentTaskPrefix: id,
+					toolNames,
+					restrictToolNames,
+					requireYieldTool: structured,
+					outputSchema,
+					outputSchemaMode: options.outputSchemaMode,
+					thinkingLevel: effectiveThinkingLevel,
+					thinkingLevelCeiling: spawnEffortCeiling,
 				},
-				preparedSession: preparedSession ? { promptSuffix: preparedSession.promptSuffix } : undefined,
 				prompt: {
 					id,
 					model: progress.resolvedModel,
@@ -5309,260 +5824,274 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					outputSchema: normalizedOutputSchema,
 					outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
 					ircEnabled,
-					ircRoot: {},
-					ircRenders: new Map(),
-					reviving: false,
 				},
+				wake: wakeOptions,
+				model: model ? formatModelStringWithRouting(model) : null,
+				prewalk: prewalk && {
+					target: formatModelStringWithRouting(prewalk.target),
+					thinkingLevel: prewalk.thinkingLevel,
+				},
+				perCallModel: perCallModelGrants !== undefined,
+				keepTodo: prewalk !== undefined,
+				settings: captureSubagentSettings(subagentSettings),
+				mountedToolNames: [],
+				customTools: spawnSpecCustomTools(id, options),
+				liveInputs: SPAWN_LIVE_INPUT_NAMES.filter(name => live[name] !== undefined),
 			};
+			const spec = spawnSpecFromSpawn(specInputs);
+			// The spawn's resolved model, or the patterns it left to the session's own resolution.
+			const buildModel: SubagentBuildModel = deferModelPatterns
+				? {
+						kind: "deferred",
+						modelPattern: modelPatterns,
+						modelPatternAuthFallback: options.parentActiveModelPattern,
+						modelPatternFallbackRole: subagentRetryFallbackRole(id),
+						modelPatternDefaultFallbackChain: inheritedRetryFallbackChain,
+					}
+				: { kind: "model", model, thinkingLevel: effectiveThinkingLevel };
+			// Where the spawn starts on no model, session creation maps its effort onto the model it settles on.
+			const taskEffort = model ? undefined : options.effort;
+			// What a warm revive holds besides the spec; its model and settings are taken once the session exists.
+			const cache: WarmReviveCache | undefined =
+				sessionFile === null
+					? undefined
+					: {
+							model: undefined,
+							prewalkTarget: prewalk?.target,
+							settings: specInputs.settings,
+							pendingCacheCandidate: undefined,
+							ircRenders: new Map(),
+						};
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
 			if (preparedSession) openedSessionManager = sessionManager;
-			if (options.parentArtifactManager && !preparedSession) {
-				sessionManager.adoptArtifactManager(options.parentArtifactManager);
-			}
 			sessionOpenedAt = performance.now();
-			await refreshSubagentIrcRoot(sessionSpec.prompt, sessionManager, sessionFile, sessionStorage);
-
 			// A seance fork inherits the source's model roles; they describe the
 			// source run, not this consult, so the consult still pins its own chain.
 			const hasExistingModelRole = !preparedSession && sessionManager.getLastModelChangeRole() !== undefined;
-			// Subscribe before the builder mints proxies so a manager change during
-			// session startup is replayed on bind instead of lost.
-			const mcpFollower = mcpManager
-				? followMCPTools(
-						mcpManager,
-						{ scope: sessionManager.getSessionId(), seed: options.mcpToolScope },
-						explicitSubagentToolNames(sessionSpec),
-					)
-				: undefined;
-			let session: AgentSession;
-			let sessionPromise: Promise<CreateAgentSessionResult> | undefined;
-			try {
-				sessionPromise = createAgentSession(
-					buildSubagentSessionOptions(sessionSpec, subagentSettings, sessionManager, null, mcpFollower, {
-						workPoolYieldItems: options.workPoolYieldItems ?? [],
-						// A revived session restores the tier history it persisted (including
-						// tiers a provider rejected or an extension changed since spawn); only
-						// the fresh spawn resolves the per-agent override.
-						resolveServiceTierByFamily,
-						onFirstChatDispatch: () => {
-							firstChatDispatchAt ??= performance.now();
-						},
-					}),
-				);
-				let startupModelFallback: CreateAgentSessionResult["startupModelFallback"];
-				({ session, startupModelFallback } = await awaitAbortable(sessionPromise));
-				if (preparedSession) untrackedSession = session;
-				if (startupModelFallback) startupModelFallbacks.set(session, startupModelFallback);
-				// Stash the sibling family candidate once the child session exists,
-				// independent of its initial model, so a later model change (retry
-				// fallback, model switch) still finds it. Consumption is gated per
-				// request by AgentSession.getPromptCacheKeyForModel; the first primary
-				// request on an opted-in model persists it to the header so fork and
-				// reopen keep it. An empty parent lineage derives no candidate:
-				// ":<agent>" would coalesce every such parent onto one family.
-				if (options.parentPromptCacheKey) {
-					sessionManager.setTaskSiblingCandidate(`${options.parentPromptCacheKey}:${agent.name}`);
-				}
-			} catch (err) {
-				mcpFollower?.dispose();
-				// Abort raced session startup. The session may still resolve later
-				// holding live LSP/MCP child processes — dispose it when it does so
-				// a cancelled subagent cannot leak them.
-				if (preparedSession) {
-					pendingSessionDisposal = sessionPromise
-						?.then(created => created.session.dispose())
-						.then(
+			let reviveCapture: WarmReviveCapture | undefined;
+			const pendingExtensionMessages: Array<Promise<unknown>> = [];
+			// Writes the revival contract with the prompt the session sent; set once the session exists.
+			let persistSessionInit: ((started: AgentSession) => void) | undefined;
+			let spawnSystemPrompt: readonly string[] = [];
+			// No closure in this block may capture `session`: JSC gives every closure in a
+			// block one shared scope object, so the lifecycle reviver built below would
+			// then pin the parked, disposed session for the life of the process.
+			const launch: SubagentLaunchInputs = {
+				settings: subagentSettings,
+				workPoolYieldItems: options.workPoolYieldItems ?? [],
+				// A revived session restores the tier history it persisted (including
+				// tiers a provider rejected or an extension changed since spawn); only
+				// the fresh spawn resolves the per-agent override.
+				resolveServiceTierByFamily,
+				onFirstChatDispatch: () => {
+					firstChatDispatchAt ??= performance.now();
+				},
+				taskEffort,
+				mcpToolScope: options.mcpToolScope,
+				cache,
+				settle: awaitAbortable,
+				abandon: creation => {
+					// Abort raced session startup. The session may still resolve later
+					// holding live LSP/MCP child processes — dispose it when it does so
+					// a cancelled subagent cannot leak them.
+					const disposal = creation.then(created => created.session.dispose());
+					if (preparedSession) {
+						pendingSessionDisposal = disposal.then(
 							() => {},
 							() => {},
 						);
-				} else {
-					void sessionPromise?.then(created => created.session.dispose()).catch(() => {});
-				}
-				throw err;
-			}
-			mcpFollower?.bind(session);
-			// The SDK records a new session's initial model as the default role.
-			// Pin the child's own chain so a parent default sharing that model
-			// cannot steal its fallback routing. Resumed history keeps its role.
-			if (
-				!hasExistingModelRole &&
-				retryFallbackRole &&
-				model &&
-				session.model &&
-				formatModelStringWithRouting(session.model) === formatModelStringWithRouting(model)
-			) {
-				sessionManager.appendModelChange(formatModelStringWithRouting(model), retryFallbackRole);
-			}
-			sessionCreatedAt = performance.now();
-
-			monitor.setActiveSession(session);
-			if (preparedSession) untrackedSession = undefined;
-			// Run-state notifications precede deferrable wire-level `agent_end`,
-			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
-			const registry = AgentRegistry.global();
-			registry.syncSessionStatus(id, session);
-			const runRef = registry.get(id);
-			if (runRef) {
-				// Agent Hub kills bypass this run's caller signal: lifecycle.release()
-				// detaches the session and publishes an `aborted` tombstone directly.
-				// Bridge that exact registry generation back into the monitor so the
-				// prompt race and owning async task job settle promptly.
-				registryAbortUnsubscribe = registry.onChange(event => {
-					if (event.type === "status_changed" && event.ref === runRef && event.ref.status === "aborted") {
-						monitor.requestAbort("signal");
+					} else {
+						void disposal.catch(() => {});
 					}
-				});
-				// Close the subscribe-after-read race with a kill that landed while
-				// createAgentSession was returning.
-				if (runRef.status === "aborted") monitor.requestAbort("signal");
-			}
-			// Todos are parent-owned bookkeeping and stripped from subagents —
-			// except under prewalk, whose plan nudge + todo gate require the
-			// subagent to commit its own todo list before the hand-off.
-			const isParentOwnedTool = (name: string): boolean => !prewalk && name === "todo";
-			if (sessionFile !== null) {
-				const reviveCapture: WarmReviveCapture = {
-					sessionFile,
-					storage: sessionStorage,
-					spec: sessionSpec,
-					perCallModel: perCallModelGrants !== undefined,
-					settings: captureSubagentSettings(settings, subagentSettings),
-					parentArtifactManager: preparedSession ? undefined : options.parentArtifactManager,
-					keepTodo: prewalk !== undefined,
-					wake: wakeOptions,
-					agentName: agent.name,
-					pendingCacheCandidate: undefined,
-				};
-				trackSubagentSettings(session, reviveCapture);
-				trackSubagentPendingCandidate(session, reviveCapture);
-				trackSubagentIrcRoster(session, sessionSpec.prompt);
-				reviveSession = createWarmSubagentReviver(reviveCapture);
-			}
-
-			// Emit lifecycle start event
-			const startedPayload = {
-				id,
-				agent: agent.name,
-				parentToolCallId: options.parentToolCallId,
-				detached: options.detached,
-				agentSource: agent.source,
-				description: options.description,
-				status: "started" as const,
-				sessionFile: subtaskSessionFile,
-				index,
-			};
-			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
-
-			const subagentToolNames = session.getEnabledToolNames();
-			const filteredSubagentTools = subagentToolNames.filter(name => !isParentOwnedTool(name));
-			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
-			}
-			if (options.workPoolYieldItems) {
-				await awaitAbortable(session.setWorkPoolYieldItems(options.workPoolYieldItems));
-			}
-			const enabledSubagentTools = session.getEnabledToolNames();
-			// The enabled set includes the synthetic write transport injected for
-			// explicit tool lists that omitted write. `session_init.tools` is later
-			// replayed as an explicit grant during cold revival, so persist write
-			// only when the original agent contract granted it.
-			const persistedSubagentTools =
-				toolNames !== undefined && !toolNames.includes("write")
-					? enabledSubagentTools.filter(name => name !== "write")
-					: enabledSubagentTools;
-
-			// Persist the subagent's revival contract at spawn, before any extension
-			// runs: `readPersistedAgentMetadata()` (registry/persisted-agents.ts) only
-			// scans the first records of the session file, and a `session_start`
-			// handler can append entries of its own. The session is an argument so
-			// this closure does not capture `session` (see below).
-			const persistSessionInit = (started: AgentSession): void => {
-				started.sessionManager.appendSessionInit({
-					// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
-					systemPrompt: started.agent.state.systemPrompt,
-					task,
-					tools: persistedSubagentTools,
-					mountedTools: session.getMountedXdevToolNames(),
-					agent: agent.name,
-					modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
-					// Cold revival restores this model. A model dispatch deferred is
-					// known only once the session settled on it, and the monitor has
-					// not published it yet.
-					resolvedModel: progress.resolvedModel ?? session.servingModel?.selector,
-					...(perCallModelGrants
-						? {
-								perCallModel: true,
-								// Display selectors can conflate literal :level ids with effort, so revival records each separately.
-								perCallModelIdentity: formatModelStringWithRouting(session.model!),
-								perCallThinkingLevel: session.configuredThinkingLevel() ?? null,
-							}
-						: {}),
-					// Deferred model resolution installs this role inside createAgentSession,
-					// so read it back from the settings both install paths write.
-					retryFallback: getRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(id)),
-					readOnly: isReadOnlyAgent(agent),
-					spawns: spawnsEnv,
-					readSummarize: agent.readSummarize,
-					advisor: advisorSelection ? (advisorRolePattern ?? "on") : undefined,
-					compactionThreshold: options.compactionThresholdOverride,
-					outputSchema,
-					outputSchemaMode: options.outputSchemaMode,
-					restrictToolNames: restrictToolNames || undefined,
-					// Isolated runs are never revivable (worktree merged + cleaned):
-					// stamp the contract so cold revival leaves them transcript-only
-					// even when the workspace was retained for recovery.
-					isolated: worktree !== undefined || undefined,
-				});
-			};
-			persistSessionInit(session);
-			const spawnSystemPrompt = [...session.agent.state.systemPrompt];
-
-			abortSignal.addEventListener(
-				"abort",
-				() => {
-					void monitor.abortActiveSession();
 				},
-				{ once: true, signal: sessionAbortController.signal },
-			);
-			// Defensive: if the wall-clock timer (or external signal) fired during
-			// the awaited setup above, the listener registration races the dispatch
-			// and may not observe the already-fired abort event. Mirror it manually.
-			if (abortSignal.aborted) {
-				void monitor.abortActiveSession();
-			}
-
-			// No closure in this block may capture `session`: JSC gives every closure in a
-			// block one shared scope object, so the lifecycle reviver built above would
-			// then pin the parked, disposed session for the life of the process.
-			const pendingExtensionMessages: Array<Promise<unknown>> = [];
-			// `discoverStartupSkillPaths()` rebuilds `session.agent.state.systemPrompt`
-			// when a `resources_discover` handler contributed a directory, and a
-			// cold-revived session (persisted-revive.ts) replays the latest
-			// `session_init` verbatim: append a newer one when discovery changed the
-			// prompt. `initializeExtensions` runs this inside its startup hold, before
-			// any held startup send dispatches, and passes the session in.
-			await awaitAbortable(
-				initializeExtensions(session, {
-					reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
-					reportRuntimeError: err =>
-						logger.error("Extension error", { path: err.extensionPath, error: err.error }),
-					trackExtensionSend: task => {
-						pendingExtensionMessages.push(task.catch(() => {}));
-					},
-					filterActiveTools: toolNames => toolNames.filter(name => !isParentOwnedTool(name)),
-					afterStartupDiscovery: started => {
-						const prompt = started.agent.state.systemPrompt;
-						if (
-							prompt.length === spawnSystemPrompt.length &&
-							prompt.every((block, index) => block === spawnSystemPrompt[index])
-						) {
-							return;
-						}
-						persistSessionInit(started);
-					},
-				}),
-			);
+				created: created => {
+					if (preparedSession) untrackedSession = created;
+					// Stash the sibling family candidate once the child session exists,
+					// independent of its initial model, so a later model change (retry
+					// fallback, model switch) still finds it. Consumption is gated per
+					// request by AgentSession.getPromptCacheKeyForModel; the first primary
+					// request on an opted-in model persists it to the header so fork and
+					// reopen keep it. An empty parent lineage derives no candidate:
+					// ":<agent>" would coalesce every such parent onto one family.
+					if (options.parentPromptCacheKey) {
+						sessionManager.setTaskSiblingCandidate(`${options.parentPromptCacheKey}:${agent.name}`);
+					}
+					// The SDK records a new session's initial model as the default role.
+					// Pin the child's own chain so a parent default sharing that model
+					// cannot steal its fallback routing. Resumed history keeps its role.
+					if (
+						!hasExistingModelRole &&
+						retryFallbackRole &&
+						model &&
+						created.model &&
+						formatModelStringWithRouting(created.model) === formatModelStringWithRouting(model)
+					) {
+						sessionManager.appendModelChange(formatModelStringWithRouting(model), retryFallbackRole);
+					}
+					sessionCreatedAt = performance.now();
+					monitor.setActiveSession(created);
+					if (preparedSession) untrackedSession = undefined;
+					const registry = AgentRegistry.global();
+					const runRef = registry.get(id);
+					if (runRef) {
+						// Agent Hub kills bypass this run's caller signal: lifecycle.release()
+						// detaches the session and publishes an `aborted` tombstone directly.
+						// Bridge that exact registry generation back into the monitor so the
+						// prompt race and owning async task job settle promptly.
+						registryAbortUnsubscribe = registry.onChange(event => {
+							if (event.type === "status_changed" && event.ref === runRef && event.ref.status === "aborted") {
+								monitor.requestAbort("signal");
+							}
+						});
+						// Close the subscribe-after-read race with a kill that landed while
+						// createAgentSession was returning.
+						if (runRef.status === "aborted") monitor.requestAbort("signal");
+					}
+					if (cache && sessionFile !== null) {
+						cache.model = created.model;
+						cache.settings = captureSubagentSettings(subagentSettings);
+						reviveCapture = { sessionFile, storage: sessionStorage, spec, live, cache };
+						reviveSession = createWarmSubagentReviver(reviveCapture);
+					}
+					// Emit lifecycle start event
+					const started = {
+						id,
+						agent: agent.name,
+						parentToolCallId: options.parentToolCallId,
+						detached: options.detached,
+						agentSource: agent.source,
+						description: options.description,
+						status: "started" as const,
+						sessionFile: subtaskSessionFile,
+						index,
+					};
+					emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, started);
+				},
+				beforeExtensions: async created => {
+					if (options.workPoolYieldItems) {
+						await awaitAbortable(created.setWorkPoolYieldItems(options.workPoolYieldItems));
+					}
+					const enabledSubagentTools = created.getEnabledToolNames();
+					// The enabled set includes the synthetic write transport injected for
+					// explicit tool lists that omitted write. `session_init.tools` is later
+					// replayed as an explicit grant during cold revival, so persist write
+					// only when the original agent contract granted it.
+					const persistedSubagentTools =
+						toolNames !== undefined && !toolNames.includes("write")
+							? enabledSubagentTools.filter(name => name !== "write")
+							: enabledSubagentTools;
+					const mountedToolNames = created.getMountedXdevToolNames();
+					// A per-call worker revives on its saved model and its configured thinking level (none on a
+					// model without thinking), which the spec stores as its level too; so does a spawn whose
+					// effort session creation mapped onto the model it settled on (`taskEffort`).
+					const startedThinkingLevel =
+						perCallModelGrants || taskEffort !== undefined
+							? (created.configuredThinkingLevel() ?? null)
+							: undefined;
+					const perCallThinkingLevel = perCallModelGrants ? startedThinkingLevel : undefined;
+					// The spec as the session started: its exact model, the level of a per-call worker or of a
+					// spawn whose effort session creation mapped, the overlay a deferred model resolution installed
+					// its retry-fallback role into, and the devices it mounted.
+					const spawnSpec: SubagentSpawnSpec = {
+						...spec,
+						model: created.model ? formatModelStringWithRouting(created.model) : null,
+						thinkingLevel: startedThinkingLevel === undefined ? spec.thinkingLevel : startedThinkingLevel,
+						settings: spawnSpecSettings(cache?.settings ?? captureSubagentSettings(subagentSettings)),
+						tools: { ...spec.tools, mountedToolNames },
+					};
+					if (reviveCapture) reviveCapture.spec = spawnSpec;
+					// Persist the subagent's revival contract at spawn, before any extension
+					// runs: `readPersistedAgentMetadata()` (registry/persisted-agents.ts) only
+					// scans the first records of the session file, and a `session_start`
+					// handler can append entries of its own. The session is an argument so
+					// this closure does not capture `session` (see below).
+					persistSessionInit = started => {
+						started.sessionManager.appendSessionInit({
+							// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
+							systemPrompt: started.agent.state.systemPrompt,
+							task,
+							tools: persistedSubagentTools,
+							mountedTools: mountedToolNames,
+							agent: agent.name,
+							modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
+							// Cold revival restores this model. A model dispatch deferred is
+							// known only once the session settled on it, and the monitor has
+							// not published it yet.
+							resolvedModel: progress.resolvedModel ?? started.servingModel?.selector,
+							...(perCallModelGrants
+								? {
+										perCallModel: true,
+										// Display selectors can conflate literal :level ids with effort,
+										// so revival records each separately.
+										perCallModelIdentity: formatModelStringWithRouting(started.model!),
+										perCallThinkingLevel,
+									}
+								: {}),
+							// Deferred model resolution installs this role inside createAgentSession,
+							// so read it back from the settings both install paths write.
+							retryFallback: getRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(id)),
+							readOnly: isReadOnlyAgent(agent),
+							spawns: spawnsEnv,
+							readSummarize: agent.readSummarize,
+							advisor: advisorSelection ? (advisorRolePattern ?? "on") : undefined,
+							compactionThreshold: options.compactionThresholdOverride,
+							outputSchema,
+							outputSchemaMode: options.outputSchemaMode,
+							restrictToolNames: restrictToolNames || undefined,
+							// Isolated runs are never revivable (worktree merged + cleaned):
+							// stamp the contract so cold revival leaves them transcript-only
+							// even when the workspace was retained for recovery.
+							isolated: worktree !== undefined || undefined,
+							// A seance consult keeps its own revive route and stores no spawn spec.
+							spawnSpec: preparedSession ? undefined : spawnSpec,
+						});
+					};
+					persistSessionInit(created);
+					spawnSystemPrompt = [...created.agent.state.systemPrompt];
+					abortSignal.addEventListener(
+						"abort",
+						() => {
+							void monitor.abortActiveSession();
+						},
+						{ once: true, signal: sessionAbortController.signal },
+					);
+					// Defensive: if the wall-clock timer (or external signal) fired during
+					// the awaited setup above, the listener registration races the dispatch
+					// and may not observe the already-fired abort event. Mirror it manually.
+					if (abortSignal.aborted) {
+						void monitor.abortActiveSession();
+					}
+				},
+				trackExtensionSend: send => {
+					pendingExtensionMessages.push(send.catch(() => {}));
+				},
+				// `discoverStartupSkillPaths()` rebuilds `session.agent.state.systemPrompt`
+				// when a `resources_discover` handler contributed a directory, and a
+				// cold-revived session (persisted-revive.ts) replays the latest
+				// `session_init` verbatim: append a newer one when discovery changed the
+				// prompt. `initializeExtensions` runs this inside its startup hold, before
+				// any held startup send dispatches, and passes the session in.
+				afterStartupDiscovery: started => {
+					const prompt = started.agent.state.systemPrompt;
+					if (
+						prompt.length === spawnSystemPrompt.length &&
+						prompt.every((block, index) => block === spawnSystemPrompt[index])
+					) {
+						return;
+					}
+					persistSessionInit?.(started);
+				},
+			};
+			const session = await buildSubagentSession({
+				spec,
+				live,
+				sessionManager,
+				storage: sessionStorage,
+				model: buildModel,
+				prewalkTarget: prewalk?.target,
+				launch,
+			});
 			while (pendingExtensionMessages.length > 0) {
 				await awaitAbortable(Promise.all(pendingExtensionMessages.splice(0)));
 			}

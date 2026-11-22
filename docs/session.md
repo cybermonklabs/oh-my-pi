@@ -428,7 +428,11 @@ For `perCallModel: true`, cold revival requires both `perCallModelIdentity` (the
 exact `provider/model-id[@upstream]`, without an effort suffix) and
 `perCallThinkingLevel` (the configured effort selector, including `auto`, or
 `null` for unset). Legacy per-call records missing either field refuse revival
-rather than guessing from the historical-display `resolvedModel`. These fields
+rather than guessing from the historical-display `resolvedModel`. A per-call
+worker revives on its saved model; where that model is gone or the operator's
+grants no longer approve it, it revives on the next model of its retry-fallback
+chain that the registry knows and the grants approve, and it is refused only
+when no model of the chain is known and approved. These fields
 are preserved in anonymized exports under the same flag, model-identity and
 effort rules as other session metadata.
 `isolated: true` marks an isolation-worktree child that cannot be cold-revived.
@@ -437,10 +441,28 @@ tools; cold revival mounts them again, so the revived session sends the same too
 inventory. Files without it revive every name in `tools` top-level, and a seance restore uses its
 own validated tool contract instead. Anonymized exports treat it like `tools`.
 `systemPrompt` holds the base prompt blocks a model call was built from (never a per-turn
-`before_agent_start` override), and revival replays them unchanged. A session appends a newer
-`session_init` when a model call runs on a different base prompt or work-pool yield items
+`before_agent_start` override). A revived session sends them unchanged until its first model
+call; after that, a session revived from a file with `spawnSpec` renders its prompt again from the
+spawn's prompt inputs, and one revived from an older file keeps sending them. A session appends
+a newer `session_init` when a model call runs on a different base prompt or work-pool yield items
 (`workPoolYieldItems`, restored on revival). Older files store one joined string, which revives
 as a single block.
+`spawnSpec` (absent from older files, a seance consult and a `/tan` clone) records, as plain
+data with a version `v`, the inputs the subagent was spawned with: the exact model it started on,
+its thinking level and effort ceiling, the tool names, mounted tools and the descriptor of each
+eval custom tool, the LSP, IRC, MCP, Python-preflight and cache-warming values, the prewalk
+target, the settings overlay the spawn wrote (with its `subagent:<id>` retry-fallback role), the
+inputs of the subagent's prompt block, the wake-turn inputs (agent, description, index, spawning
+tool call id and `maxRuntimeMs`), and the names of the live inputs the spawn passed. Every later
+`session_init` carries it. The in-memory revive and the revive from this file both build the
+subagent from it, so a subagent revived from its file runs on its spawn's settings; a stored LSP,
+IRC or MCP value never turns on what the live process has off. When the model registry, after its
+discovery, does not know the stored model, the revive starts on the next model of the subagent's
+retry-fallback chain that it knows, else on the parent session's model (the root session's when
+the parent is not live), and logs the move. A custom tool that the parent's eval kernel no longer
+defines stays in the tool list, answers a call as unavailable, and is named in a notice on the
+next turn. A file without `spawnSpec` revives as before, except that its session builds no cache
+warmer. Shared exports drop `spawnSpec`; anonymized exports keep it opaque.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 
 ### `mode_change`
