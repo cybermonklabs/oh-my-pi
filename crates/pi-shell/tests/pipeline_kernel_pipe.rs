@@ -560,6 +560,72 @@ fn a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu() {
 	assert!(cpu <= wall / 4.0, "obash used {cpu:.2} s of CPU over {wall:.2} s while it waited");
 }
 
+/// The same on macOS, where a write that would wait waits for the end to
+/// select writable (no thread of the end's own there): 100 lines of 501
+/// bytes, each at most `PIPE_BUF` (512) and so written whole or not at all,
+/// into a reader that takes one line (`dd`, one read: a buffered `head -c`
+/// would take more), then sleeps 10 ms. obash's own CPU time (`ps -o time=`,
+/// read about every 100 ms while it runs; the largest reading counts, as CPU
+/// time only grows and `ps` reads an ended, unreaped obash as `0:00.00` on
+/// macOS) must stay under a quarter of the run's wall time. The writer
+/// stage's first command is an external
+/// (`/usr/bin/true`), which takes the pipe's write end before the writer
+/// writes a byte, so the pipe becomes an OS pipe then: a FIFO holds 8 KiB on
+/// macOS, and a memory pipe that holds more when an external first takes one
+/// of its ends stays a memory pipe (`sys::stage_pipe::os_pipe`), whose writer
+/// never meets this wait. Without it, all 100 lines were in the memory pipe
+/// when the reader took its end (macos-15, every run).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu() {
+	let script = "l=$(printf '%0500d' 0); i=0; { /usr/bin/true; while [ $i -lt 100 ]; do echo \
+	              \"$l\"; i=$((i + 1)); done; } | /bin/sh -c 'i=0; while [ $i -lt 100 ]; do \
+	              /bin/dd bs=501 count=1 > /dev/null 2>&1; /bin/sleep 0.01; i=$((i + 1)); done; \
+	              echo read'";
+	let started = Instant::now();
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_obash"));
+	cmd.arg0("bash")
+		.args(["-c", script])
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0);
+	let child = cmd.spawn().expect("start obash");
+	// obash's own CPU time so far, in seconds (`[[dd-]hh:]mm:ss.hh`): the
+	// largest reading, the number of readings and the last one.
+	let (mut polls, mut reads, mut cpu, mut last) = (0u32, 0u32, 0f64, 0f64);
+	let out = finish(child, script, |pid| {
+		polls += 1;
+		if polls % 10 != 0 {
+			return;
+		}
+		let Ok(ps) = Command::new("/bin/ps")
+			.args(["-o", "time=", "-p", &pid.to_string()])
+			.output()
+		else {
+			return;
+		};
+		let time = String::from_utf8_lossy(&ps.stdout).trim().replace('-', ":");
+		let parts: Option<Vec<f64>> = time.split(':').map(|p| p.parse::<f64>().ok()).collect();
+		if let Some(parts) = parts.filter(|p| !p.is_empty()) {
+			let units = [1.0, 60.0, 3600.0, 86400.0];
+			last = parts.iter().rev().zip(units).map(|(v, u)| v * u).sum();
+			cpu = cpu.max(last);
+			reads += 1;
+		}
+	});
+	let wall = started.elapsed().as_secs_f64();
+	assert_eq!(
+		(out.status.code(), String::from_utf8_lossy(&out.stdout)),
+		(Some(0), "read\n".into()),
+		"{script}: {out:?}"
+	);
+	println!("obash CPU {cpu:.2} s over {wall:.2} s ({reads} readings, the last {last:.2} s)");
+	assert!(reads >= 1, "obash's CPU time was read at least once");
+	assert!(wall >= 1.0, "the reader sleeps 100 x 10 ms, so the run takes 1 s: {wall:.2} s");
+	assert!(cpu <= wall / 4.0, "obash used {cpu:.2} s of CPU over {wall:.2} s while it waited");
+}
+
 /// A shell-code writer into a reader that takes the pipe a byte at a time
 /// (`sh`'s `read`) uses no more CPU than into `cat`, which takes it in large
 /// reads: what obash spends on its own shell code is the same either way, and

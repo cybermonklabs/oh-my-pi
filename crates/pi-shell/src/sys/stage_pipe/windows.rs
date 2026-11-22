@@ -63,7 +63,7 @@ use windows_sys::Win32::{
 
 use crate::{
 	bash::{File, FileKind, OsHandle, Stat},
-	sys::fs::stat_of,
+	sys::{fs::stat_of, wakers::Wakers},
 };
 
 /// The pipe's buffer. A reader waiting in `ReadFile` takes its read's size
@@ -283,36 +283,26 @@ struct WorkState {
 	writing: bool,
 	/// A queued write failed: reported to the next write or flush.
 	failed:  Option<io::ErrorKind>,
-	/// Every task waiting on the end: all are woken on progress, and a task
-	/// is only ever forgotten by waking it (one waker can stand for several
-	/// engine vprocs).
-	wakers:  Vec<Waker>,
+	/// Every task waiting on the end, all woken on progress ([`Wakers`]: a
+	/// task is only ever forgotten by being woken, so the engine's one waker,
+	/// which stands for every engine vproc, never loses one of their waits).
+	tasks:   Wakers,
 	/// The worker is in a call `CancelSynchronousIo` can end.
 	busy:    bool,
 	/// The end is gone: the worker finishes the queue and ends.
 	quit:    bool,
 }
 
-/// Most wakers one end keeps at once. Past it, every stored waker is woken
-/// and forgotten: a live task polls again and waits anew, and the waker of a
-/// task dropped while it waited goes.
-const MAX_WAITERS: usize = 64;
-
 impl WorkState {
-	/// Store `waker` among the tasks waiting on the end, once (an equal waker
-	/// is not repeated).
-	fn wait_with(&mut self, waker: &Waker) {
-		if self.wakers.iter().any(|w| w.will_wake(waker)) {
-			return;
-		}
-		if self.wakers.len() >= MAX_WAITERS {
-			self.wake_all();
-		}
-		self.wakers.push(waker.clone());
+	/// Store `waker` among the tasks waiting on the end. Whether the set was
+	/// empty does not matter: the worker wakes it whenever it finishes a
+	/// call, and a task waits only for a call that is asked for or in flight.
+	fn wait_with(&self, waker: &Waker) {
+		let _ = self.tasks.add(waker);
 	}
 
-	fn wake_all(&mut self) {
-		for w in self.wakers.drain(..) {
+	fn wake_all(&self) {
+		for w in self.tasks.take() {
 			w.wake();
 		}
 	}
@@ -441,7 +431,7 @@ impl File for Private {
 			return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 		}
 		{
-			let mut st = self.work.st.lock();
+			let st = self.work.st.lock();
 			if st.waiting {
 				st.wait_with(cx.waker());
 				return Poll::Pending;
@@ -468,7 +458,7 @@ impl File for Private {
 			return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 		}
 		{
-			let mut st = self.work.st.lock();
+			let st = self.work.st.lock();
 			if let Some(kind) = st.failed {
 				return Poll::Ready(Err(kind.into()));
 			}
@@ -507,7 +497,7 @@ impl File for Private {
 	/// Ready once every byte queued is in the pipe; then a write the worker
 	/// could not make fails it.
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		let mut st = self.work.st.lock();
+		let st = self.work.st.lock();
 		if !st.queue.is_empty() || st.writing {
 			st.wait_with(cx.waker());
 			return Poll::Pending;
@@ -785,12 +775,12 @@ mod tests {
 		until("the worker's call is cancelled", || cancelled.load(Ordering::SeqCst) == 1);
 	}
 
-	// Failure mode: every task dropped while it waited on an idle end keeps
-	// its waker stored for good, or a cap forgets a waiting task without
-	// waking it, or a task whose waker equals another's (the engine's vprocs
-	// share one) loses its wait to the other's progress.
+	// Failure mode: a task waiting on an idle end is never woken once bytes
+	// come, because a full set or the worker's wake forgot it. (That live
+	// tasks past the cap settle is
+	// `wakers::tests::live_tasks_past_the_cap_settle`.)
 	#[test]
-	fn tasks_waiting_on_an_idle_end_stay_bounded_and_are_all_woken() {
+	fn two_hundred_tasks_waiting_on_an_idle_end_are_all_woken() {
 		let (mut r, w) = ends(b"").unwrap();
 		let counts: Vec<Arc<Count>> = (0..200).map(|_| Arc::default()).collect();
 		let mut buf = [0u8; 8];
@@ -799,10 +789,6 @@ mod tests {
 			assert!(
 				r.poll_read(&mut Context::from_waker(&waker), &mut buf)
 					.is_pending()
-			);
-			assert!(
-				r.own.work.st.lock().wakers.len() <= MAX_WAITERS,
-				"the stored wakers stay bounded"
 			);
 		}
 		external(&w).write_all(b"x").unwrap();
