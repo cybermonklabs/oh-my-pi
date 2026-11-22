@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -235,9 +236,7 @@ export class LiveSessionController {
 			let openai: OpenAILiveRoute | undefined;
 			if (viaOpenAI) {
 				openai = await resolveOpenAILiveRoute(this.#session.modelRegistry, settings, this.#session.sessionId);
-				this.#callTranscript = new LiveCallTranscript(await this.#transcriptPath(), (line, final) =>
-					this.#showTranscriptLine(line, final),
-				);
+				this.#callTranscript = new LiveCallTranscript((line, final) => this.#showTranscriptLine(line, final));
 				this.#wire = OPENAI_LIVE_WIRE;
 			}
 			if (this.#stopped) {
@@ -266,6 +265,10 @@ export class LiveSessionController {
 			}
 			if (this.#callTranscript) {
 				this.#callStartedAt = new Date();
+				// The file, and its artifact id, exist from the moment the call is up: an id allocated earlier
+				// with no file behind it could be handed out again (a session switch rebuilds the artifact
+				// manager, which learns ids from the files it finds).
+				void this.#callTranscript.open(this.#transcriptPath());
 				this.#armQuietLimit();
 			}
 			this.#unsubscribeSession = this.#session.subscribe(event =>
@@ -399,14 +402,17 @@ export class LiveSessionController {
 		const reason = this.#endReason ?? (this.#failure ? `it failed: ${this.#failure.message}` : "it was stopped");
 		const usage = this.#usageSeconds === undefined ? "" : `, ${this.#usageSeconds} s of voice time`;
 		const notes = [
-			transcript.writeFailed ? "Some lines could not be written to it." : "",
+			transcript.path && transcript.writeFailed ? "Some lines could not be written to it." : "",
 			closeConfirmed
 				? ""
 				: `GPT-Live sent no session.closed within ${SESSION_CLOSED_WAIT_MS / 1000} s, so its final usage is unconfirmed.`,
 		].filter(Boolean);
 		const content = [
 			`The live voice call ended: ${reason}. It ran from ${startedAt.toISOString()} to ${endedAt.toISOString()}${usage}.`,
-			`Its transcript, each line with its UTC time, is in ${transcript.path}.`,
+			// Without a file of its own the path names nothing of this call: it is left out.
+			transcript.path
+				? `Its transcript, each line with its UTC time, is in ${transcript.path}.`
+				: "Its transcript could not be written to a file.",
 			...notes,
 		].join(" ");
 		await this.#session
@@ -585,14 +591,15 @@ export class LiveSessionController {
 	}
 
 	/**
-	 * Where the call's transcript goes: among the session's artifacts, or in the temp dir for an unsaved
-	 * session. {@link LiveCallTranscript} creates the file, owner-readable only, once the call has words.
+	 * Where the call's transcript goes: among the session's artifacts, or, for an unsaved session, in a
+	 * directory of its own under the temp dir that only this user can enter (`mkdtemp` makes it 0700), so
+	 * no other local user can make or read the file there.
 	 */
 	async #transcriptPath(): Promise<string> {
 		const allocated = await this.#session.sessionManager.allocateArtifactPath("live-transcript");
-		return (
-			allocated.path ?? path.join(os.tmpdir(), `omp-live-transcript-${this.#session.sessionId}-${Date.now()}.log`)
-		);
+		if (allocated.path) return allocated.path;
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-live-"));
+		return path.join(dir, "transcript.log");
 	}
 
 	#handleSessionEvent(event: AgentSessionEvent): void {

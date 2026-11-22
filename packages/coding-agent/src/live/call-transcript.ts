@@ -40,35 +40,66 @@ interface OpenLine extends TranscriptLine {
 
 /** Collects one call's fragments for delegation requests and writes its lines to a file. */
 export class LiveCallTranscript {
-	readonly #path: string;
 	readonly #onLine: (line: TranscriptLine, final: boolean) => void;
 	/** Fragments no request has taken yet, in arrival order. */
 	#unclaimed: TranscriptFragment[] = [];
 	/** How far on the session timeline the user's fragments have reached; see {@link reached}. */
 	#userReachedMs = Number.NEGATIVE_INFINITY;
 	#line: OpenLine | undefined;
+	/** The file, once {@link open} made it; `undefined` before, and for good when it could not be made. */
+	#path: string | undefined;
+	/** {@link open}'s work, from the moment it is called. */
+	#opening: Promise<void> | undefined;
+	/** Lines that ended before {@link open} finished, in order. */
+	#pending: string[] = [];
+	#opened = false;
 	#writes: Promise<void> = Promise.resolve();
-	/** The file's creation, once: see {@link #write}. */
-	#created: Promise<void> | undefined;
 	#writeFailed = false;
 
 	/**
-	 * @param path the transcript file. Nothing is written there until the first line ends or
-	 *   {@link finish} runs, so a call that never starts leaves no file.
+	 * Lines are kept in memory until {@link open} makes the file, so a call that never connects leaves
+	 * no file.
 	 * @param onLine called with the open line as it grows (`final: false`) and once it ends (`final: true`).
 	 */
-	constructor(path: string, onLine: (line: TranscriptLine, final: boolean) => void = () => {}) {
-		this.#path = path;
+	constructor(onLine: (line: TranscriptLine, final: boolean) => void = () => {}) {
 		this.#onLine = onLine;
 	}
 
-	get path(): string {
+	/** The transcript file; `undefined` until it is made, and when it could not be made. */
+	get path(): string | undefined {
 		return this.#path;
 	}
 
-	/** Whether a line could not be written to the file. */
+	/** Whether the file could not be made, or a line could not be written to it. */
 	get writeFailed(): boolean {
 		return this.#writeFailed;
+	}
+
+	/**
+	 * Makes the call's file, once the call is up, at the path `file` resolves to, and writes the lines
+	 * that ended so far. The file is created for this call alone: exclusively (an existing file or link
+	 * at the path is refused, never written through) and readable by its owner only. When `file`
+	 * rejects or the file cannot be made, the transcript keeps no file and {@link path} stays unset.
+	 * Only the first call does anything.
+	 */
+	open(file: Promise<string>): Promise<void> {
+		this.#opening ??= this.#open(file);
+		return this.#opening;
+	}
+
+	async #open(file: Promise<string>): Promise<void> {
+		try {
+			const target = await file;
+			await fs.writeFile(target, "", { flag: "wx", mode: 0o600 });
+			this.#path = target;
+		} catch (error) {
+			this.#writeFailed = true;
+			logger.warn("Live call transcript file was not made", { error: String(error) });
+		}
+		this.#opened = true;
+		const pending = this.#pending;
+		this.#pending = [];
+		for (const text of pending) this.#write(text);
 	}
 
 	/** Records a fragment: a request can take it, and it extends the open line or starts one. */
@@ -127,28 +158,26 @@ export class LiveCallTranscript {
 		this.#write(`${line.at.toISOString()} ${SPEAKER_LABEL[line.role]}: ${text}\n`);
 	}
 
-	/**
-	 * Queues `text` for the file. The first write creates it for this call alone: exclusively (an
-	 * existing file or link at the path is refused, not written through) and readable by its owner only,
-	 * since it holds the call's words and may sit in the shared temp dir.
-	 */
+	/** Queues `text` for the file, or keeps it until {@link open} has made the file. */
 	#write(text: string): void {
-		this.#writes = this.#writes.then(async () => {
-			try {
-				this.#created ??= fs.writeFile(this.#path, "", { flag: "wx", mode: 0o600 });
-				await this.#created;
-				if (text) await fs.appendFile(this.#path, text);
-			} catch (error) {
+		if (!this.#opened) {
+			this.#pending.push(text);
+			return;
+		}
+		const file = this.#path;
+		if (!file) return;
+		this.#writes = this.#writes.then(() =>
+			fs.appendFile(file, text).catch(error => {
 				this.#writeFailed = true;
-				logger.warn("Live call transcript line was not written", { path: this.#path, error: String(error) });
-			}
-		});
+				logger.warn("Live call transcript line was not written", { path: file, error: String(error) });
+			}),
+		);
 	}
 
-	/** Ends the open line and waits until every line is in the file, which exists then even for a quiet call. */
+	/** Ends the open line and waits until every line is in the file (once {@link open} has run). */
 	async finish(): Promise<void> {
 		this.endLine();
-		this.#write("");
+		await this.#opening;
 		await this.#writes;
 	}
 }

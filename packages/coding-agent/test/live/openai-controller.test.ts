@@ -41,9 +41,12 @@ class FakeTransport {
 		readonly options: LiveTransportOptions,
 		/** `untilAborted`: the connect ends only when the controller aborts it, as a server that never answers. */
 		readonly connectMode: ConnectMode = "ok",
+		/** The connect waits for this before it ends. */
+		readonly connectGate?: Promise<void>,
 	) {}
 	async connect(): Promise<void> {
 		if (this.connectMode === "fail") throw new Error("GPT-Live session failed (503): upstream unavailable");
+		await this.connectGate;
 		if (this.connectMode === "untilAborted") {
 			const { signal } = this.options;
 			const { promise, reject } = Promise.withResolvers<never>();
@@ -106,6 +109,10 @@ interface CallOptions {
 	closedAfterMs?: number;
 	/** How the transport's connect ends; `ok` by default. */
 	connect?: ConnectMode;
+	/** The transport's connect waits for this before it ends. */
+	connectGate?: Promise<void>;
+	/** An unsaved session: it allocates no artifact path. */
+	unsaved?: boolean;
 }
 
 function call(options: CallOptions = {}) {
@@ -114,7 +121,7 @@ function call(options: CallOptions = {}) {
 		mockImplementation(implementation: (options: LiveTransportOptions) => object): void;
 	};
 	transportSpy.mockImplementation(function (transportOptions: LiveTransportOptions) {
-		const transport = new FakeTransport(transportOptions, options.connect);
+		const transport = new FakeTransport(transportOptions, options.connect, options.connectGate);
 		if (options.closedAfterMs !== undefined) {
 			const delay = options.closedAfterMs;
 			transport.onSend = message => {
@@ -129,6 +136,7 @@ function call(options: CallOptions = {}) {
 	const registryCalls: string[] = [];
 	let listener: ((event: AgentSessionEvent) => void) | undefined;
 	const transcriptPath = path.join(tempDir, "0.live-transcript.log");
+	let allocations = 0;
 	const session = {
 		modelRegistry: {
 			authStorage: noCodexLogin,
@@ -143,7 +151,12 @@ function call(options: CallOptions = {}) {
 		},
 		settings: Settings.isolated({ "live.provider": "openai", ...options.settings }),
 		sessionId: "s1",
-		sessionManager: { allocateArtifactPath: async () => ({ id: "0", path: transcriptPath }) },
+		sessionManager: {
+			allocateArtifactPath: async () => {
+				allocations += 1;
+				return options.unsaved ? {} : { id: "0", path: transcriptPath };
+			},
+		},
 		subscribe: (next: (event: AgentSessionEvent) => void) => {
 			listener = next;
 			return () => {
@@ -177,6 +190,7 @@ function call(options: CallOptions = {}) {
 		terminals,
 		registryCalls,
 		transcriptPath,
+		allocations: () => allocations,
 		sessionEvent: (event: unknown) => listener?.(event as AgentSessionEvent),
 	};
 }
@@ -468,6 +482,63 @@ describe("GPT-Live call lifecycle", () => {
 		const { mode } = await fs.stat(live.transcriptPath);
 		expect((mode & 0o777).toString(8)).toBe("600");
 		expect(await Bun.file(live.transcriptPath).text()).toContain("User: private words");
+	});
+
+	test("the transcript's artifact id and file are made when the call connects, not before", async () => {
+		const connected = Promise.withResolvers<void>();
+		const live = call({ closedAfterMs: 0, connectGate: connected.promise });
+		const starting = live.controller.start();
+		// The start can wait on file I/O before it builds the transport; each stat lets that I/O finish.
+		for (let i = 0; i < 200 && live.transports.length === 0; i++) await fs.stat(tempDir);
+		await settle();
+		expect(live.allocations()).toBe(0);
+		connected.resolve();
+		await starting;
+		// The file exists once the call is up, before any words.
+		for (let i = 0; i < 200 && !(await Bun.file(live.transcriptPath).exists()); i++) await fs.stat(tempDir);
+		expect(live.allocations()).toBe(1);
+		expect(await Bun.file(live.transcriptPath).exists()).toBe(true);
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+	});
+
+	test("an unsaved session's transcript goes in a directory only this user can enter", async () => {
+		const live = call({ closedAfterMs: 0, unsaved: true });
+		await live.controller.start();
+		live.transport().emit(userSaid("private words", 0, 900));
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+		const content = String(live.ends()[0]?.message.content);
+		const file = /is in (\S+)\.(?:\s|$)/.exec(content)?.[1];
+		expect(file).toBeDefined();
+		const dir = path.dirname(file!);
+		try {
+			// Not the shared temp dir, where another user could make the file first, but a directory below it.
+			expect(dir).not.toBe(os.tmpdir());
+			expect(path.dirname(dir)).toBe(os.tmpdir());
+			expect(((await fs.stat(dir)).mode & 0o777).toString(8)).toBe("700");
+			expect(await Bun.file(file!).text()).toContain("User: private words");
+		} finally {
+			if (dir !== os.tmpdir()) await fs.rm(dir, { recursive: true, force: true });
+			else await fs.rm(file!, { force: true });
+		}
+	});
+
+	test("when the transcript file cannot be made, the end message names no path", async () => {
+		// Someone made the file first: the call must not write to it or point the session at it.
+		await Bun.write(path.join(tempDir, "0.live-transcript.log"), "someone else's words\n");
+		const live = call({ closedAfterMs: 0 });
+		await live.controller.start();
+		live.transport().emit(userSaid("my words", 0, 900));
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+		const content = String(live.ends()[0]?.message.content);
+		expect(content).not.toContain(live.transcriptPath);
+		expect(content).toContain("Its transcript could not be written to a file.");
+		expect(await Bun.file(live.transcriptPath).text()).toBe("someone else's words\n");
 	});
 });
 
