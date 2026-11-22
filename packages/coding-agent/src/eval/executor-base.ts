@@ -11,7 +11,7 @@ import {
 } from "../tools/output-meta";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
-import { registerPyToolBridge } from "./py/tool-bridge";
+import { type PyToolBridgeEntry, registerPyToolBridge } from "./py/tool-bridge";
 import { getActiveEvalShadowCell } from "./speculation/runtime-context";
 import type { EvalDisplayOutput } from "./types";
 
@@ -82,6 +82,10 @@ export interface KernelExecutorBaseOptions {
 	emitStatus?: (event: JsStatusEvent) => void;
 	/** Shows the user `out://` replies of the cell's bridged tool calls; absent, those calls are refused. */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results the cell's bridged calls hand it. */
+	onAgentResults?: PyToolBridgeEntry["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link PyToolBridgeEntry.spawnCallId}). */
+	spawnCallId?: string;
 	toolSession?: ToolSession;
 	bridgeSessionId?: string;
 	artifactId?: string;
@@ -540,6 +544,8 @@ export async function executeWithKernelBase<
 					shieldedSignal: abortShield.signal,
 					emitStatus,
 					onReply: options.onReply,
+					onAgentResults: options.onAgentResults,
+					spawnCallId: options.spawnCallId,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;

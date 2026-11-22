@@ -21,6 +21,7 @@ import type { NestedRepoPatch } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
+import { recordEvalAgentJobs } from "./agent-job-records";
 
 /** Synthetic bridge name reserved for the `agent()` helper across both runtimes. */
 export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
@@ -56,6 +57,8 @@ export interface EvalAgentBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** The parent's top-level `eval` call the cell runs under; the job's subagent records it. */
+	spawnCallId?: string;
 }
 
 /** Handle returned immediately after an eval subagent job is registered. */
@@ -216,6 +219,8 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		}
 		const id = await reserveStructuredSubagentId(options.session, { label: parsed.label });
 		const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
+		// On disk before the job starts: until its result is handed over, the owner still waits on it.
+		await recordEvalAgentJobs(options.session, [id], "owed");
 		manager.register(
 			"task",
 			id,
@@ -226,6 +231,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					const execution = await runStructuredSubagent({
 						session: options.session,
 						invocationKind: "eval",
+						spawnCallId: options.spawnCallId,
 						assignment: parsed.prompt,
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
 						...(parsed.model !== undefined ? { perCallModel: parsed.model } : {}),

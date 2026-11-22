@@ -10,11 +10,14 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
+import { isTaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
+import { recordEvalAgentJobs, recordHandovers, waitHandedSubagents } from "../agent-job-records";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
 import { EVAL_COMPLETION_BRIDGE_NAME, type EvalCompletionHandleResult, runEvalCompletion } from "../completion-bridge";
@@ -61,6 +64,13 @@ export interface ToolBridgeOptions {
 	 * would draw them, so such calls fail instead of reporting a reply nobody sees.
 	 */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results a bridged call hands the cell. */
+	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
+	/**
+	 * The parent's top-level `eval` call the cell runs under. The spawns a bridged call makes
+	 * (`tool.task`, `agent()`, a work pool's workers) record it as the call that started them.
+	 */
+	spawnCallId?: string;
 }
 
 type ToolValue =
@@ -342,6 +352,12 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					if (progress) options.emitStatus?.({ op: "mcp_progress", id: toolCallId, tool: name, ...progress });
 				}
 			: undefined;
+	// The call's spawns record the `eval` call the cell runs under; a session with no tool context records none.
+	const toolContext = options.session.getToolContext?.();
+	const callContext =
+		toolContext === undefined || options.spawnCallId === undefined
+			? toolContext
+			: { ...toolContext, spawnCallId: options.spawnCallId };
 	try {
 		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
 		// signal still reaches it. Without a status sink the pause wrapper is a no-op.
@@ -349,13 +365,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			DELEGATED_WORK_TOOLS.has(name) ? options.emitStatus : undefined,
 			async () => {
 				try {
-					return await tool.execute(
-						toolCallId,
-						validatedArgs,
-						options.signal,
-						onUpdate,
-						options.session.getToolContext?.(),
-					);
+					return await tool.execute(toolCallId, validatedArgs, options.signal, onUpdate, callContext);
 				} finally {
 					settled = true;
 				}
@@ -367,6 +377,50 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			// next resume/rewind/fork and stale todos trigger a false reminder.
 			const phases = committedTodoPhases(result);
 			if (phases) options.session.commitTodoPhases?.(phases);
+		}
+		if (name === "task" && isTaskToolDetails(result.details)) {
+			const settledIds = new Set(result.details.results.map(agent => agent.id));
+			// A background spawn's "started" result settles no run: record it `owed`, on disk before the cell goes
+			// on, as `agent()` does, so `omp --restore` knows the parent still waits on it. Only the call's own
+			// spawns that started (queued or running): the nested snapshots of its progress name the spawns' own
+			// subagents, and a spawn whose job never registered (`failed`) has no run to wait on.
+			const started = (result.details.progress ?? [])
+				.filter(spawn => (spawn.status === "pending" || spawn.status === "running") && !settledIds.has(spawn.id))
+				.map(spawn => spawn.id);
+			await recordEvalAgentJobs(options.session, started, "owed");
+			if (result.details.results.length > 0) {
+				const handedAt = Date.now();
+				options.onAgentResults?.(
+					result.details.results.map(agent => ({
+						id: agent.id,
+						...(agent.aborted ? { aborted: true } : {}),
+						...(agent.workerLost ? { workerLost: true } : {}),
+						handedAt,
+					})),
+				);
+			}
+		}
+		// A wait hands the cell its settled jobs' results and consumes them, so no delivery records the
+		// handover: record each subagent's before the cell gets it, and name it in the eval result. A kill
+		// (`tool.write` to `proc://<id>/kill`; the prelude's `write()` rejects protocol paths) of a job that had
+		// settled does the same, and its result is the same job report. Each settled job's report names the
+		// subagents its result hands over too (a work pool's workers, with the time the pool drained, which the
+		// record and the eval result keep). An aborted run is named, not recorded.
+		const jobReport = name === "wait" ? result.details : killJobReport(name, result.details);
+		const handed = waitHandedSubagents(jobReport);
+		if (handed.length > 0) {
+			const settled = handed.filter(run => !run.aborted && !run.workerLost);
+			const handedAt = await recordHandovers(options.session, settled);
+			const at = new Map(settled.map((run, index) => [run, handedAt[index]!]));
+			const now = Date.now();
+			options.onAgentResults?.(
+				handed.map(run => ({
+					id: run.agentId,
+					...(run.aborted ? { aborted: true } : {}),
+					...(run.workerLost ? { workerLost: true } : {}),
+					handedAt: at.get(run) ?? Math.min(run.handedAt ?? now, now),
+				})),
+			);
 		}
 		const replies = reply === undefined ? toolResultReplies(result.details) : [reply];
 		if (replies.length > 0) {
@@ -381,4 +435,10 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		});
 		throw error;
 	}
+}
+
+/** The job report a `write` result holds when it killed a job (`write proc://<id>/kill`): its `proc` details. */
+function killJobReport(name: string, details: unknown): unknown {
+	if (name !== "write" || !isRecord(details) || !isRecord(details.proc)) return undefined;
+	return details.proc.op === "cancel" ? details.proc : undefined;
 }

@@ -40,7 +40,7 @@ import {
 	type PythonPreludeSource,
 } from "./kernel";
 import { resolveExplicitPythonRuntime } from "./runtime";
-import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
+import { ensurePyToolBridge, type PyToolBridgeEntry, registerPyToolBridge } from "./tool-bridge";
 
 export type PythonKernelMode = "session" | "per-call";
 
@@ -127,6 +127,10 @@ export interface PythonExecutorOptions {
 	onStatus?: (event: JsStatusEvent) => void;
 	/** Shows the user `out://` replies of the cell's bridged tool calls; absent, those calls are refused. */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results the cell's bridged calls hand it. */
+	onAgentResults?: PyToolBridgeEntry["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link PyToolBridgeEntry.spawnCallId}). */
+	spawnCallId?: string;
 	/** @internal Bridge session id, set by `executePython` before delegating. */
 	bridgeSessionId?: string;
 	/** @internal Bridge endpoint info, set by `executePython` before delegating. */

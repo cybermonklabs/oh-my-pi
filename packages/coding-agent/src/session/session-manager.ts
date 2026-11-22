@@ -136,7 +136,8 @@ import { recordSessionRecap, recordSessionTitle } from "./session-index";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
-const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+/** `details.kind` of the empty `branch_summary` {@link SessionManager.discardEntryDurably} writes. */
+export const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
 /** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
 const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
@@ -763,6 +764,13 @@ export class SessionEntryIndex {
 	}
 }
 
+/**
+ * The outcome of {@link SessionManager.appendCustomEntriesToFile}: "appended", "no-records" (the
+ * session holds none of the entries the caller named), or "refused" (another live process owns the
+ * session, or the path now holds another session).
+ */
+export type CustomEntriesAppend = "appended" | "no-records" | "refused";
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -947,6 +955,13 @@ export class SessionManager {
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
+	/**
+	 * Every session this manager went on from, by session id: the file it last left that session at,
+	 * and the order mark of that leave. See {@link getLeftSessions}.
+	 */
+	readonly #leftSessions = new Map<string, { file: string; mark: number }>();
+	/** The order mark of the latest leave recorded in {@link #leftSessions}; 0 before any. */
+	#leftSessionsMark = 0;
 	/**
 	 * Parent-derived sibling family candidate stashed by the Task executor once
 	 * the child session exists. Session-scoped and non-persisted: the header
@@ -1319,6 +1334,7 @@ export class SessionManager {
 	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
+		this.#recordLeftSession(previousSessionId, from);
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
 		this.#taskSiblingCandidate = undefined;
@@ -2396,17 +2412,34 @@ export class SessionManager {
 	}
 	/** Switch to a different session file (resume / branch). */
 	async setSessionFile(sessionFile: string): Promise<void> {
-		await this.#setSessionFile(sessionFile);
+		const switched: { left?: { id: string; file: string } } = {};
+		await this.#setSessionFile(sessionFile, undefined, { switched });
+		const left = switched.left;
+		if (left && this.#sessionId !== left.id) this.#recordLeftSession(left.id, left.file);
 	}
 
 	async #setSessionFile(
 		sessionFile: string,
 		loadedSession?: SessionLoadResult,
-		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions },
+		options?: {
+			throwIfMissing?: boolean;
+			newSession?: NewSessionOptions;
+			/**
+			 * Set to the session the switch leaves, read once the drain is over (see {@link setSessionFile}): a
+			 * write the drain runs can move the session to a sibling, and that sibling is the session left.
+			 */
+			switched?: { left?: { id: string; file: string } };
+		},
 	): Promise<void> {
+		// An append to this file that is still running (a stopped work pool's discards) lands first,
+		// so the session loads it and its next entry follows it. `#open` waits before its own load.
+		if (!loadedSession) await SessionManager.#pendingAppends.get(path.resolve(sessionFile));
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
+		if (options?.switched && this.#sessionFile) {
+			options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
+		}
 		// A switch gives up the previous file. Opening claims nothing: the first
 		// write does, so inspecting a session never counts as owning it.
 		this.#sessionClaim?.release?.();
@@ -2504,6 +2537,7 @@ export class SessionManager {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		await this.#drainAndCloseWriter();
+		this.#recordLeftSession(this.#sessionId, this.#sessionFile);
 		const sessionFile = this.#resetToNewSession(options);
 		if (options?.drop !== true) await this.ensureOnDisk();
 		return sessionFile;
@@ -2526,11 +2560,15 @@ export class SessionManager {
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
 
-		const oldSessionFile = this.#sessionFile;
-		const parentSessionId = this.#sessionId;
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
+		// Read once the drain is over: a write it ran can move the session to a sibling, which is the session
+		// this fork leaves and copies.
+		const oldSessionFile = this.#sessionFile;
+		if (!oldSessionFile) return undefined;
+		const parentSessionId = this.#sessionId;
+		this.#recordLeftSession(parentSessionId, oldSessionFile);
 
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
@@ -3252,6 +3290,34 @@ export class SessionManager {
 		return this.#sessionId;
 	}
 
+	/**
+	 * The order mark of the latest session this manager left, 0 before any: what
+	 * {@link getLeftSessions} counts from.
+	 */
+	getLeftSessionsMark(): number {
+		return this.#leftSessionsMark;
+	}
+
+	/**
+	 * Every session this manager left after the order mark `since` ({@link getLeftSessionsMark}),
+	 * oldest first: its id and the file it last left the session at. A session is left when this
+	 * manager goes on in another one: a resume, `/new`, a whole-session fork, a fork or branch from
+	 * an entry, or the move to a new file when another process holds the old one. A work pool
+	 * stopped after such a change writes its discards into the sessions among these that hold its
+	 * spawn records.
+	 */
+	getLeftSessions(since = 0): Array<{ id: string; file: string }> {
+		const left: Array<{ id: string; file: string; mark: number }> = [];
+		for (const [id, { file, mark }] of this.#leftSessions) if (mark > since) left.push({ id, file, mark });
+		return left.sort((a, b) => a.mark - b.mark).map(({ id, file }) => ({ id, file }));
+	}
+
+	/** Record that this manager left the session `id`, last written at `file`. */
+	#recordLeftSession(id: string, file: string | undefined): void {
+		if (!id || !file) return;
+		this.#leftSessions.set(id, { file, mark: ++this.#leftSessionsMark });
+	}
+
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
 	}
@@ -3542,6 +3608,90 @@ export class SessionManager {
 	}
 
 	/**
+	 * Append custom entries to the session `sessionId` journaled at `sessionPath`, through this
+	 * manager's storage, when this manager does not write it now: a session a work pool's spawn
+	 * records are in, after its owner went on in another one. See {@link appendCustomEntriesToFile}.
+	 */
+	appendCustomEntriesToSession(
+		sessionId: string,
+		sessionPath: string,
+		entries: ReadonlyArray<{ customType: string; data: unknown }>,
+		options?: { holding?: readonly string[] },
+	): Promise<CustomEntriesAppend> {
+		return SessionManager.appendCustomEntriesToFile(sessionId, sessionPath, entries, this.#storage, options);
+	}
+
+	/**
+	 * Append custom entries to the session `sessionId` journaled at `sessionPath` in `storage`, a
+	 * session no manager of this process writes now. Modelled on {@link renameSessionTitle}: the
+	 * ownership lease (when `storage` has one, as the session's own writes take it) is claimed
+	 * before the transcript is loaded and held until the entries are written, so they parent to the
+	 * session's current leaf.
+	 *
+	 * Resolves "refused", and writes nothing, when another live process owns the session or the
+	 * path now holds another session: the lease refuses a header naming another id, and the loaded
+	 * session's id is checked again, for a storage without a lease. Resolves "no-records", and
+	 * writes nothing, when `holding` is given and the session holds none of those entries.
+	 * Rejects when the file is gone: the open runs with `throwIfMissing`, so no session is made at
+	 * the path.
+	 *
+	 * Until the append settles, a load of the same path in this process waits for it
+	 * ({@link #setSessionFile}, {@link open}), so a session that goes back to the file at once (a
+	 * quick `/resume` back) loads the entries and parents its next entry to them, instead of
+	 * putting them on a side branch.
+	 */
+	static appendCustomEntriesToFile(
+		sessionId: string,
+		sessionPath: string,
+		entries: ReadonlyArray<{ customType: string; data: unknown }>,
+		storage: SessionStorage = new FileSessionStorage(),
+		options?: { holding?: readonly string[] },
+	): Promise<CustomEntriesAppend> {
+		const resolvedPath = path.resolve(sessionPath);
+		const append = async (): Promise<CustomEntriesAppend> => {
+			const release = storage.claimSession ? storage.claimSession(sessionId, resolvedPath) : () => {};
+			if (!release) return "refused";
+			let manager: SessionManager | undefined;
+			try {
+				manager = await SessionManager.#open(
+					resolvedPath,
+					undefined,
+					storage,
+					{ suppressBreadcrumb: true, throwIfMissing: true },
+					{ awaitPendingAppends: false },
+				);
+				if (manager.getSessionId() !== sessionId || manager.getSessionFile() !== resolvedPath) return "refused";
+				const holding = options?.holding;
+				if (holding && !holding.some(entryId => manager?.getEntry(entryId) !== undefined)) return "no-records";
+				for (const entry of entries) manager.appendCustomEntry(entry.customType, entry.data);
+				await manager.flush();
+				return "appended";
+			} finally {
+				try {
+					await manager?.close();
+				} finally {
+					release();
+				}
+			}
+		};
+		// Appends to one path run one after another, and a load of the path waits for them all.
+		const appended = (SessionManager.#pendingAppends.get(resolvedPath) ?? Promise.resolve()).then(append);
+		const settled = appended.then(
+			() => {},
+			() => {},
+		);
+		SessionManager.#pendingAppends.set(resolvedPath, settled);
+		void settled.then(() => {
+			if (SessionManager.#pendingAppends.get(resolvedPath) === settled)
+				SessionManager.#pendingAppends.delete(resolvedPath);
+		});
+		return appended;
+	}
+
+	/** The appends of {@link appendCustomEntriesToFile} not yet settled, by resolved session path. */
+	static readonly #pendingAppends = new Map<string, Promise<void>>();
+
+	/**
 	 * Journal an idle recap for this session in history.db. Recaps never enter
 	 * the session file or LLM context; in-memory sessions are not journaled.
 	 */
@@ -3718,6 +3868,7 @@ export class SessionManager {
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
 		workPoolYieldItems?: WorkPoolYieldItem[];
+		spawnCallId?: string;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4194,6 +4345,7 @@ export class SessionManager {
 
 		this.#header = header;
 		this.#entries = [...entriesToKeep, ...labels];
+		this.#recordLeftSession(this.#sessionId, sourceSessionFile);
 		this.#sessionId = newSessionId;
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionName = header.title;
@@ -4442,6 +4594,23 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		options?: { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean },
 	): Promise<SessionManager> {
+		return SessionManager.#open(filePath, sessionDir, storage, options, { awaitPendingAppends: true });
+	}
+
+	/**
+	 * {@link open}; `awaitPendingAppends` waits for the file's pending
+	 * {@link appendCustomEntriesToFile} writes first, which that writer's own load must not do.
+	 */
+	static async #open(
+		filePath: string,
+		sessionDir: string | undefined,
+		storage: SessionStorage,
+		options:
+			| { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean }
+			| undefined,
+		internal: { awaitPendingAppends: boolean },
+	): Promise<SessionManager> {
+		if (internal.awaitPendingAppends) await SessionManager.#pendingAppends.get(path.resolve(filePath));
 		const probed = await loadSessionFile(filePath, storage, { throwIfMissing: options?.throwIfMissing });
 		const header = probed.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		// Resume into the session's recorded cwd only when it is verifiably
@@ -4789,6 +4958,8 @@ export interface PersistedSessionInit {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** The parent's top-level call the spawn was requested under ({@link SessionInitEntry.spawnCallId}). */
+	spawnCallId?: string;
 }
 
 /**
@@ -4821,6 +4992,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
+			...(entry.spawnCallId !== undefined ? { spawnCallId: entry.spawnCallId } : undefined),
 		};
 	}
 	return init;

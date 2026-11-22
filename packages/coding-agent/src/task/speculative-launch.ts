@@ -12,9 +12,10 @@
  * Dispatch then adopts the runs whose spawn params still match
  * ({@link TaskLaunchSession.adopt}); anything unadopted is aborted when the
  * agent loop discards the session (blocked call, changed arguments, aborted
- * turn). Launches require host authorization (`authorizeLaunch`), which denies
- * whenever approval is not auto-allow or extension lifecycle handlers could
- * veto the call.
+ * turn), through {@link TaskLauncher.discard}, which also records it in the parent's
+ * transcript ({@link TASK_LAUNCH_DISCARDED_CUSTOM_TYPE}). Launches require host
+ * authorization (`authorizeLaunch`), which denies whenever approval is not
+ * auto-allow or extension lifecycle handlers could veto the call.
  */
 import {
 	canonicalJson,
@@ -25,7 +26,23 @@ import {
 	type ToolSpeculationStreamSession,
 } from "@oh-my-pi/pi-agent-core";
 import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import type { SessionEntry } from "../session/session-entries";
 import type { SpawnRun } from "./spawn-run";
+
+/**
+ * Custom entry type of the record a parent's transcript keeps of a spawn it discarded: a launch
+ * nobody adopted, whose subagent's run was aborted and no call result reports, and a worker of a
+ * work pool the parent stopped. `omp --restore` never runs it again, though it can end its turn
+ * on a key error before the discard reaches it.
+ */
+export const TASK_LAUNCH_DISCARDED_CUSTOM_TYPE = "task-launch-discarded";
+
+/** The subagent id a discarded-launch record names; undefined for any other entry. */
+export function readDiscardedLaunch(entry: SessionEntry): string | undefined {
+	if (entry.type !== "custom" || entry.customType !== TASK_LAUNCH_DISCARDED_CUSTOM_TYPE) return undefined;
+	return isRecord(entry.data) && typeof entry.data.agentId === "string" ? entry.data.agentId : undefined;
+}
 
 /**
  * Incremental scanner over streamed batch-task argument JSON. Extracts the
@@ -193,6 +210,8 @@ export interface TaskLauncher {
 	spawns(args: unknown): TaskParams[] | undefined;
 	/** Preflight and start one spawn; undefined when it may not start early. */
 	start(toolCallId: string, spawn: TaskParams, index: number, signal: AbortSignal): Promise<SpawnRun | undefined>;
+	/** Abort a run nobody adopted, with `reason`, and record that in the parent's transcript. */
+	discard(run: SpawnRun, reason: string): void;
 }
 
 export interface TaskLaunchSessionOptions {
@@ -277,7 +296,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		for (const [index, run] of this.#runs) {
 			const spawn = spawns[index];
 			if (spawn && canonicalJson(spawn) === this.#planned.get(index)) adopted.set(index, run);
-			else run.discard("task call changed after speculative launch");
+			else this.#options.launcher.discard(run, "task call changed after speculative launch");
 		}
 		this.#runs.clear();
 		return adopted;
@@ -291,7 +310,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 	discard(reason: string): void {
 		if (this.#closed) return;
 		this.#close();
-		for (const run of this.#runs.values()) run.discard(reason);
+		for (const run of this.#runs.values()) this.#options.launcher.discard(run, reason);
 		this.#runs.clear();
 	}
 
@@ -340,7 +359,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 			return;
 		}
 		if (this.#closed) {
-			run.discard("speculative task launch closed while starting");
+			this.#options.launcher.discard(run, "speculative task launch closed while starting");
 			return;
 		}
 		this.#runs.set(index, run);

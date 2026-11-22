@@ -1,12 +1,13 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { recordHandovers } from "./agent-job-records";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import {
 	invalidModelSelectorReason,
 	normalizeModelSelector,
 	resolveEffectiveSubagentPolicy,
 } from "../task/structured-subagent";
-import { type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
+import { settledWorkerResults, type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
@@ -18,6 +19,8 @@ interface EvalWorkpoolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** The parent's top-level `eval` call the cell runs under; the workers a push starts record it. */
+	spawnCallId?: string;
 }
 
 export type EvalWorkpoolResult =
@@ -122,12 +125,26 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		if (!Array.isArray(record.items) || !record.items.every(item => typeof item === "string")) {
 			throw new ToolError("workpool push requires an items string array");
 		}
-		const ids = pool.push(record.items);
+		const ids = pool.push(record.items, options.spawnCallId);
 		options.emitStatus?.({ op: "workpool", action: "push", pool: name, count: ids.length });
 		return { ids };
 	}
 	if (op === "status") return pool.status();
-	if (op === "peek") return pool.peek();
+	if (op === "peek") {
+		const peeked = pool.peek();
+		// A settled batch's output reaches the cell here: record that handover, on disk, before the cell gets it,
+		// so `omp --restore` does not run that worker's turn again for an owner that already holds its result.
+		// Only a worker whose latest batch settled: a peek that shows a kept-alive worker's earlier batch while its
+		// newer one runs hands over nothing of the turn it owes. A cancelled batch's aborted run settles nothing.
+		const latest = new Map(peeked.batches.map(batch => [batch.agent, batch.id]));
+		await recordHandovers(
+			options.session,
+			settledWorkerResults(peeked.batches)
+				.filter(result => !result.aborted)
+				.map(result => ({ agentId: result.id, jobId: latest.get(result.id)! })),
+		);
+		return peeked;
+	}
 	if (op === "close") {
 		const result = pool.close();
 		options.emitStatus?.({ op: "workpool", action: "close", pool: name, count: result.dropped.length });
