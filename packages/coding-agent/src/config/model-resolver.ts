@@ -1797,6 +1797,14 @@ export function disabledProviderIds(settings?: Settings): ReadonlySet<string> {
 	return new Set(settings ? cfgDisabledProviders.get(settings) : undefined);
 }
 
+/**
+ * The models of `models` whose provider `disabled` ({@link disabledProviderIds}) leaves on: `models` itself
+ * where none is off.
+ */
+export function enabledProviderModels(models: Model<Api>[], disabled: ReadonlySet<string>): Model<Api>[] {
+	return disabled.size === 0 ? models : models.filter(model => !disabled.has(model.provider));
+}
+
 function parseSessionModelSelector(modelRegistry: ModelRegistry, selector: string) {
 	return parseModelString(selector, {
 		...MAX_THINKING_SUFFIX_OPTIONS,

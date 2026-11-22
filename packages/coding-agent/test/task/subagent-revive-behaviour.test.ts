@@ -1569,11 +1569,14 @@ describe("a stored settings overlay holding a value its setting rejects", () => 
 		await env?.close();
 	}, 30_000);
 
-	it("revives on the settings of an older record, as a malformed part does, with a warning naming the subagent", () => {
+	it("revives on the settings of an older record, as a malformed part does, with one warning naming the subagent", () => {
 		if (!cold || !warn) throw new Error("The test process did not start");
 		expect(JSON.stringify(cold.build.settingsLayers)).not.toContain("lots");
-		const named = warn.mock.calls.filter(([, fields]) => isRecord(fields) && fields.subagent === id);
-		expect(named.length).toBeGreaterThan(0);
+		const rejected = warn.mock.calls.filter(
+			([message, fields]) =>
+				message.startsWith("Revived subagent's stored settings do not restore") && fields?.subagent === id,
+		);
+		expect(rejected).toHaveLength(1);
 	}, 30_000);
 });
 

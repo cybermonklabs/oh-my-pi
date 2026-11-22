@@ -41,6 +41,7 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { type EditMode, getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
 import {
+	disabledProviderIds,
 	formatModelStringWithRouting,
 	resolveAgentAdvisorRolePattern,
 	resolveAgentAdvisorSelection,
@@ -4890,8 +4891,9 @@ export async function reopenParkedSubagent(id: string, sessionFile: string): Pro
 /**
  * The models one revive's stored identities (`formatModelStringWithRouting`) name, among every model the
  * registry holds whose provider the live settings leave enabled. At the revive's first identity the registry
- * does not hold, the registry's discovery runs (started where none runs yet) and the identity is resolved
- * again; a later miss of the same revive waits on that discovery rather than starting another.
+ * does not hold, the registry's discovery runs (`discover()`) and the identity is resolved again; a later
+ * miss of the same revive waits on that discovery rather than starting another. An identity the registry
+ * holds under a disabled provider resolves to nothing at once: no discovery can make it resolve.
  */
 export class RevivedModels {
 	readonly #modelRegistry: ModelRegistry;
@@ -4908,21 +4910,31 @@ export class RevivedModels {
 		if (discoveryRan) this.#discovery = Promise.resolve();
 	}
 
-	/** Whether a miss of this revive ran the registry's discovery. */
+	/** Whether this revive ran the registry's discovery. */
 	get discoveryRan(): boolean {
 		return this.#discovery !== undefined;
 	}
 
-	/** The model `identity` names; undefined when the registry holds none after its discovery ran. */
-	async resolve(identity: string): Promise<Model | undefined> {
-		const known = resolveSpawnModelIdentity(identity, this.#modelRegistry, this.#settings);
-		if (known) return known;
+	/** The registry's discovery, once per revive: started where this revive started none, else the one it started. */
+	discover(): Promise<void> {
 		if (!this.#discovery) {
 			this.#modelRegistry.refreshInBackground("online-if-uncached");
 			this.#discovery = this.#modelRegistry.awaitBackgroundRefresh();
 		}
-		await this.#discovery;
-		return resolveSpawnModelIdentity(identity, this.#modelRegistry, this.#settings);
+		return this.#discovery;
+	}
+
+	/**
+	 * The model `identity` names; undefined when the registry holds none after its discovery ran, or when the
+	 * model it holds belongs to a disabled provider.
+	 */
+	async resolve(identity: string): Promise<Model | undefined> {
+		let held = resolveSpawnModelIdentity(identity, this.#modelRegistry);
+		if (!held) {
+			await this.discover();
+			held = resolveSpawnModelIdentity(identity, this.#modelRegistry);
+		}
+		return held && !disabledProviderIds(this.#settings).has(held.provider) ? held : undefined;
 	}
 }
 

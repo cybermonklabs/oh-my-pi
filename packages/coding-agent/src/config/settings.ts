@@ -930,6 +930,18 @@ export class Settings {
 		return child;
 	}
 
+	/**
+	 * Checks `layers` as {@link restoreOverlay} checks them, without building the overlay: no child is made
+	 * and nothing of this instance changes.
+	 *
+	 * @throws Error where {@link restoreOverlay} throws: a layer names an unknown setting or holds a value its
+	 * definition rejects.
+	 */
+	assertOverlayLayers(layers: OverlayLayers): void {
+		this.#checkedLayer(structuredClone(layers.global), false);
+		this.#checkedLayer(structuredClone(layers.overrides), false);
+	}
+
 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */
 	#applyParentChange(setting: AnySetting): void {
 		this.#syncParent();

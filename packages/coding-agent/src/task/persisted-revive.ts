@@ -9,6 +9,7 @@ import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	modelNotFoundMessage,
@@ -98,9 +99,10 @@ const UNAVAILABLE_CUSTOM_TOOLS_NOTICE = "unavailable-custom-tools";
  * Ambient context the reviver needs at revive time. The top-level session is kept LIVE and read at each
  * revive rather than snapshotted. A record with no spawn spec runs in the root's current cwd, so a later
  * `/new` or cwd move is followed; a record with a spawn spec runs in the cwd its spawn stored, and a seance
- * consult in the cwd its record holds. Each record but a seance consult's takes the artifact manager its
- * live parent session holds at the revive, the root's where the parent is not live. Auth/models/settings
- * are process-stable and captured by reference.
+ * consult in the cwd its record holds. A revive takes the artifact manager of its live parent session (the
+ * root's where the parent is not live) where its spawn passed one (a spec names the live inputs its spawn
+ * passed; a record with no spawn spec always takes it) and where that manager can reach the main thread; a
+ * seance consult takes none. Auth/models/settings are process-stable and captured by reference.
  */
 export interface PersistedSubagentReviveContext {
 	session: AgentSession;
@@ -170,7 +172,10 @@ export interface PreparedColdRevive {
 	readonly live: ColdReviveLiveInputs;
 	/** The model a spawn spec's model or a per-call worker starts on; absent, the record's patterns decide. */
 	readonly model: ExplicitBuildModel | undefined;
-	/** The model the spec's prewalk target names, where the registry knows it. */
+	/**
+	 * The model the spec's prewalk target names, where the registry knows it and its provider has a credential;
+	 * else the prewalk is not armed.
+	 */
 	readonly prewalkTarget: Model | undefined;
 	/** The registry's discovery ran while this step resolved a model; the build does not run it again. */
 	readonly discoveryRan: boolean;
@@ -343,7 +348,13 @@ export async function prepareColdRevive(
 	init: PersistedSessionInit,
 ): Promise<PreparedColdRevive> {
 	const root = ctx.session;
-	const parts = coldReviveSpecParts(target, init);
+	const { parts, rejected } = coldReviveSpecParts(target, init);
+	if (rejected !== undefined) {
+		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
+			subagent: target.id,
+			error: rejected,
+		});
+	}
 	const parentSession = liveParentSession(target);
 	const descriptors = parts.tools?.customTools ?? [];
 	const parent = await liveParent(target.id, parentSession, descriptors);
@@ -542,21 +553,24 @@ async function parentEvalCustomTools(
 /**
  * The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. The stored
  * settings overlay must restore as `overlay()` checks overrides (each setting known, each value one its
- * definition accepts); an overlay that does not is a malformed part, which takes its legacy variant.
+ * definition accepts); an overlay that does not is a malformed part, which takes its legacy variant, and
+ * `rejected` holds the check's error.
  */
-function coldReviveSpecParts(target: ColdReviveTarget, init: PersistedSessionInit): SpawnSpecParts {
-	if (target.restoredSeance) return { stored: false };
+function coldReviveSpecParts(
+	target: ColdReviveTarget,
+	init: PersistedSessionInit,
+): { parts: SpawnSpecParts; rejected?: string } {
+	if (target.restoredSeance) return { parts: { stored: false } };
 	const parts = readSpawnSpec(init);
-	if (!parts.settings) return parts;
+	if (!parts.settings) return { parts };
 	try {
-		restoreSubagentSettings(target.settings, parts.settings);
-		return parts;
+		target.settings.assertOverlayLayers(parts.settings.layers);
+		return { parts };
 	} catch (error) {
-		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
-			subagent: target.id,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return { ...parts, settings: undefined };
+		return {
+			parts: { ...parts, settings: undefined },
+			rejected: error instanceof Error ? error.message : String(error),
+		};
 	}
 }
 
@@ -707,10 +721,10 @@ function* chainModels(
  * from the models of the providers `settings` leave enabled.
  */
 function notFoundMessage(identity: string, modelRegistry: ModelRegistry, settings: Settings): string {
-	const disabled = disabledProviderIds(settings);
-	const models = modelRegistry.getAll();
-	const enabled = disabled.size === 0 ? models : models.filter(model => !disabled.has(model.provider));
-	return modelNotFoundMessage([identity], enabled);
+	return modelNotFoundMessage(
+		[identity],
+		enabledProviderModels(modelRegistry.getAll(), disabledProviderIds(settings)),
+	);
 }
 
 /**
@@ -738,6 +752,8 @@ async function chooseColdReviveModel(args: {
 	if (identity === null) return { kind: "model", model: undefined, thinkingLevel: level };
 	const known = await args.models.resolve(identity);
 	if (known) return { kind: "model", model: known, thinkingLevel: level };
+	// The chain walk sees what the discovery adds, also where the stored model is held under a disabled provider.
+	await args.models.discover();
 	const moved = (model: Model | undefined): void => {
 		logger.warn(notFoundMessage(identity, modelRegistry, args.settings), {
 			subagent: id,
@@ -787,6 +803,9 @@ async function choosePerCallModel(args: {
 		} catch (error) {
 			refusal = error;
 		}
+	} else {
+		// The chain walk sees what the discovery adds, also where the saved model is held under a disabled provider.
+		await args.models.discover();
 	}
 	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry, args.settings)) {
 		if (!model) {
@@ -900,7 +919,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			`Cannot revive subagent "${spec.id}": session file "${spec.sessionFile}" has no persisted session contract. The agent was not revived.`,
 		);
 	}
-	const parts = coldReviveSpecParts(spec, init);
+	const { parts } = coldReviveSpecParts(spec, init);
 	const settingsParent = coldReviveSettingsParent(spec, parts, prepared.live);
 	const { spawnSpec, legacy } = coldReviveSpawnSpec(spec, parts, init, settingsParent);
 	const approve = prepared.grants
@@ -955,10 +974,10 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 }
 
 /**
- * The model of the build: the prepared one (a spec's model, a per-call worker's), unless a session-local
- * switch since the spawn takes its place, as {@link switchedOrHeldModel} decides for both revives; without
- * one (a seance consult, a record whose spec gives no model), the record's patterns, the switched model
- * first.
+ * The model of the build. A seance consult starts on its source run's patterns, never on a switched model.
+ * A prepared model (a spec's, a per-call worker's) holds unless a session-local switch since the spawn takes
+ * its place, as {@link switchedOrHeldModel} decides for both revives. A record whose spec gives no model
+ * starts on the record's patterns, the switched model first.
  */
 async function coldReviveModel(
 	spec: PersistedReviveSpec,

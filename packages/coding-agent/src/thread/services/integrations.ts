@@ -155,9 +155,10 @@ export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOpti
 /**
  * Main side: the cold revive of `spec`, its live inputs converted as {@link bridgeIntegrationOptions}
  * converts a run's, for a worker-hosted `revivePersistedSubagent`: `extensionRoots` → `rpcSync`, custom
- * tools → {@link toWorkerCustomTool} views (their kernel calls run on main), telemetry →
- * `toWorkerTelemetryConfig`. The spawn spec itself crosses as the plain data it is, read by the worker
- * from the transcript; the other inputs cross through codecs and exported classes.
+ * tools → {@link toWorkerCustomTool} views (a call runs where the live parent's kernel lives: on main, or on
+ * the parent's worker through main), telemetry → `toWorkerTelemetryConfig`. The spawn spec itself crosses as
+ * the plain data it is, read by the worker from the transcript; the other inputs cross through codecs and
+ * exported classes.
  */
 export function bridgePersistedReviveSpec(spec: PersistedReviveSpec): PersistedReviveSpec {
 	const { live, customTools } = spec.prepared;

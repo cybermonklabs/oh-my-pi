@@ -68,6 +68,7 @@ import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mo
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
@@ -3233,14 +3234,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allEnabledModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAll()
-					: modelRegistry.getAll().filter(candidate => !disabledProviders.has(candidate.provider));
-			const availableModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAvailable()
-					: modelRegistry.getAvailable().filter(candidate => !disabledProviders.has(candidate.provider));
+			const allEnabledModels = enabledProviderModels(modelRegistry.getAll(), disabledProviders);
+			const availableModels = enabledProviderModels(modelRegistry.getAvailable(), disabledProviders);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
