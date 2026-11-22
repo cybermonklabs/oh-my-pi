@@ -593,6 +593,9 @@ mod tests {
 		// reach zero.
 		let tracker = Tracker::new(4);
 		let (out_eof, child_out) = os::pipe(false).unwrap();
+		// The copy of the write end that a process another test of this
+		// process forks holds until its exec.
+		let forked = child_out.try_clone().unwrap();
 		let (out_open, child_open) = os::pipe(false).unwrap();
 		let (duplex, child_duplex) = os::socket_pair().unwrap();
 		let sink = || End::Fd(FdRef::from_file(Box::new(Never(Arc::new(())))));
@@ -607,6 +610,18 @@ mod tests {
 		);
 		drop(child_out);
 		let mut cx = Context::from_waker(Waker::noop());
+		pumps.poll(&mut cx, &tracker);
+		pumps.poll(&mut cx, &tracker);
+		assert_eq!(
+			tracker.lock().draining(),
+			4,
+			"no end of file while a forked child holds the pipe"
+		);
+		// That process execs while the pumps are polled.
+		let exec = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_millis(10));
+			drop(forked);
+		});
 		// End of file comes once every holder of the write end has closed it. A
 		// process another test of this process forks holds a copy until its
 		// exec, which delays end of file and never holds it off
@@ -622,6 +637,7 @@ mod tests {
 			pumps.poll(&mut cx, &tracker);
 			std::thread::yield_now();
 		}
+		exec.join().unwrap();
 		pumps.poll(&mut cx, &tracker);
 		assert_eq!(tracker.lock().draining(), 3, "end of file drained one half, once");
 		drop(pumps);
