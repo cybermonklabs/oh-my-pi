@@ -375,14 +375,17 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		// Same-call items share a publication mtime, so their order within a request is unspecified.
 		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
-			items.map(item => ({ content: item.content, tags: item.tags })),
+			items
+				.map(item => ({ content: item.content, tags: item.tags }))
+				.toSorted((a, b) => a.content.localeCompare(b.content)),
 		);
 		expect(requests).toEqual(
 			expect.arrayContaining([
 				[
-					{ content: "pi uses tabs", tags: ["project:pi"] },
 					{ content: "pi builds with bun", tags: ["project:pi"] },
+					{ content: "pi uses tabs", tags: ["project:pi"] },
 				],
 				[{ content: "the user prefers zsh across projects", tags: undefined }],
 			]),
@@ -402,9 +405,14 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
-		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
-			{ content: "shared fact", tags: undefined },
+		// Same-call items share a publication mtime, so their order within the request is unspecified.
+		expect(
+			retainBatchSpy.mock.calls[0][1]
+				.map(item => ({ content: item.content, tags: item.tags }))
+				.toSorted((a, b) => a.content.localeCompare(b.content)),
+		).toEqual([
 			{ content: "explicitly global fact", tags: undefined },
+			{ content: "shared fact", tags: undefined },
 		]);
 	});
 
