@@ -1410,6 +1410,8 @@ export class SessionManager {
 	#closes = 0;
 	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
 	#parentMoveFollow: Promise<void> | undefined;
+	/** The transcript {@link #parentMoveFollow} was started for (see {@link #parentMoveFollowOfThisFile}). */
+	#parentMoveFollowFile: string | undefined;
 	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
 	#queuedConflictRecovery: Promise<void> | undefined;
 	/** Queued-write conflicts recovered since the last confirmed publish; past the bound the session moves off as contested. */
@@ -1896,7 +1898,7 @@ export class SessionManager {
 	 * off itself.
 	 */
 	#holdForParentMove(): boolean {
-		if (this.#parentMoveFollow) return true;
+		if (this.#parentMoveFollowOfThisFile()) return true;
 		if (!this.#storage.acquireSessionClaim) return false;
 		const file = this.#sessionFile;
 		const root = file ? sessionLeaseRoot(file) : undefined;
@@ -1911,16 +1913,27 @@ export class SessionManager {
 	}
 
 	/**
+	 * Whether {@link #parentMoveFollow} follows the parent of the transcript this manager has now: a follow started
+	 * for a transcript it has since left (a switch to another file while it waited) is not this transcript's, and
+	 * ends at its own file check without writing.
+	 */
+	#parentMoveFollowOfThisFile(): boolean {
+		return this.#parentMoveFollow !== undefined && this.#parentMoveFollowFile === this.#sessionFile;
+	}
+
+	/**
 	 * For a subagent transcript (`<parent stem>/…/<agent>.jsonl`) whose
 	 * parent session's lease is lost: start following the parent, once, and
 	 * return `true`. The caller writes nothing; the entries stay in memory
 	 * until {@link #runParentMoveFollow} moves this transcript under the
 	 * sibling the parent goes on in and publishes it there, keeping its id.
 	 * `false` for a main session, which moves off itself. With `recordLeft` false (a switch whose claim another
-	 * process refused, which never had the transcript), a fork beside the parent does not record it as left.
+	 * process refused, which never had the transcript), a fork beside the parent does not record it as left. A
+	 * follow still running for a transcript this manager has left does not count as this one's: this transcript
+	 * starts its own, with its own `recordLeft`.
 	 */
 	#followParentMove({ recordLeft = true }: { recordLeft?: boolean } = {}): boolean {
-		if (this.#parentMoveFollow) return true;
+		if (this.#parentMoveFollowOfThisFile()) return true;
 		// Only a store that claims a subagent transcript under its parent's lease (SQL storage) follows the parent.
 		if (!this.#storage.acquireSessionClaim) return false;
 		const childFile = this.#sessionFile;
@@ -1934,6 +1947,7 @@ export class SessionManager {
 			if (this.#parentMoveFollow === follow) this.#parentMoveFollow = undefined;
 		});
 		this.#parentMoveFollow = follow;
+		this.#parentMoveFollowFile = childFile;
 		return true;
 	}
 
@@ -3962,10 +3976,10 @@ export class SessionManager {
 				onLost: () => this.#onSessionClaimLost(sessionId),
 			});
 			// An append that started while the claim was taken would meet it: give the claim back, let the append
-			// land, and take it again.
+			// land, and take it again. A refused claim holds no writer slot and waits no more: the adoption moves off.
 			const pending = SessionManager.#pendingAppends.get(resolved);
-			if (!pending) break;
-			release?.();
+			if (!pending || !release) break;
+			release();
 			await pending;
 		}
 		// The claim is this call's until the load adopts it with the id: every other way out lets it go, a throw, a

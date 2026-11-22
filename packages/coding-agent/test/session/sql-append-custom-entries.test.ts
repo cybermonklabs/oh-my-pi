@@ -73,6 +73,11 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			const before = await db.row(file);
 			await using other = await LeaseProcess.start(processConfig(db), db.dir.join("home"));
 			expect((await other.run({ op: "claim", sessionId: ID, path: file })).held).toBe(true);
+			// On a store with lease rows, the other process's claim is its row: a setup that missed it fails here, not
+			// as an append that was not refused.
+			if (adapter !== "sqlite") {
+				expect((await db.leases(ID)).map(lease => lease.pid)).toEqual([other.pid]);
+			}
 
 			const outcome = await SessionManager.appendCustomEntriesToFile(ID, file, RECORDS, storage).then(
 				result => result,

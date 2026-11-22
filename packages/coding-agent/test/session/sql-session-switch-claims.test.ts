@@ -22,8 +22,11 @@ import {
 
 /** Timings under which no heartbeat runs during a test. */
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
-/** Short timings: a heartbeat every half second, an expiry in three. */
-const SHORT = { expiryMs: 3000, heartbeatMs: 500 };
+/**
+ * A heartbeat every half second, and an expiry no case reaches: a store judges another holder's lease stale by its
+ * own expiry, so a short one would let the switch take a held target as stale under load.
+ */
+const HEARTBEAT = { expiryMs: 600_000, heartbeatMs: 500 };
 const RECORDS = [
 	{ customType: "eval-agent-job", data: { agentId: "Worker", state: "discarded" } },
 	{ customType: "eval-agent-job", data: { agentId: "Other", state: "discarded" } },
@@ -36,11 +39,16 @@ function fileOf(db: LeaseDb, id: string): string {
 }
 
 /**
- * `store`, whose claims through `acquireSessionClaim` take longer: a writer's claim is held `writerHoldMs` before it
- * answers (a slow database round trip, with the writer slot already taken), another claim waits `otherDelayMs`
- * before it is asked for (an append still on its way).
+ * `store`, whose claims through `acquireSessionClaim` take longer: a writer's claim is asked for `writerDelayMs`
+ * late and held `writerHoldMs` before it answers (a slow database round trip, before and after the writer slot is
+ * taken), another claim is asked for `otherDelayMs` late (an append still on its way). `counts.writer` counts the
+ * writer claims asked for.
  */
-function slowClaims(store: SqlSessionStorage, { writerHoldMs = 0, otherDelayMs = 0 }): SqlSessionStorage {
+function slowClaims(
+	store: SqlSessionStorage,
+	{ writerDelayMs = 0, writerHoldMs = 0, otherDelayMs = 0 },
+	counts: { writer: number } = { writer: 0 },
+): SqlSessionStorage {
 	return new Proxy(store, {
 		get(target, property) {
 			const value: unknown = Reflect.get(target, property, target);
@@ -48,13 +56,25 @@ function slowClaims(store: SqlSessionStorage, { writerHoldMs = 0, otherDelayMs =
 				return typeof value === "function" ? value.bind(target) : value;
 			}
 			return async (sessionId: string, sessionPath: string, options?: SessionAcquireOptions) => {
-				if (!options?.writer && otherDelayMs > 0) await Bun.sleep(otherDelayMs);
+				if (options?.writer) counts.writer++;
+				const delay = options?.writer ? writerDelayMs : otherDelayMs;
+				if (delay > 0) await Bun.sleep(delay);
 				const release = await value.call(target, sessionId, sessionPath, options);
 				if (options?.writer && writerHoldMs > 0) await Bun.sleep(writerHoldMs);
 				return release;
 			};
 		},
 	});
+}
+
+/** A subagent transcript `name` under `parent`'s artifacts directory, as the task tool writes its first line. */
+async function writeSubagentTranscript(store: SqlSessionStorage, parent: string, name: string): Promise<string> {
+	const file = path.join(parent.slice(0, -".jsonl".length), `${name}.jsonl`);
+	await store.writeText(
+		file,
+		`${JSON.stringify({ type: "session", version: 3, id: name, timestamp: new Date().toISOString(), cwd: "/w" })}\n`,
+	);
+	return file;
 }
 
 /** The data of the records `manager`'s current branch holds of {@link RECORDS}' type. */
@@ -156,12 +176,8 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			const store = await db.open({ lease: STILL });
 			const parentId = Bun.randomUUIDv7();
 			const parent = fileOf(db, parentId);
-			const child = path.join(parent.slice(0, -".jsonl".length), "Worker.jsonl");
+			const child = await writeSubagentTranscript(store, parent, "Worker");
 			await store.writeText(parent, transcript(parentId, "the parent, held elsewhere"));
-			await store.writeText(
-				child,
-				`${JSON.stringify({ type: "session", version: 3, id: "Worker", timestamp: new Date().toISOString(), cwd: "/w" })}\n`,
-			);
 			await store.drain();
 			await using holder = await LeaseProcess.start(
 				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
@@ -190,6 +206,84 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			});
 			await manager.close();
 		}, 60_000);
+
+		it("records no subagent transcript as left when it is adopted while the follow of another one still runs", async () => {
+			// If this regresses, the adoption of the second transcript takes the first transcript's follow, still waiting
+			// for the parent, as its own: it starts none, the first follow ends at its file check, and the second
+			// transcript's next write starts a follow of its own that records it as left when it forks beside the parent.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const store = await db.open({ lease: STILL });
+			const parentId = Bun.randomUUIDv7();
+			const parent = fileOf(db, parentId);
+			await store.writeText(parent, transcript(parentId, "the parent, held elsewhere"));
+			const first = await writeSubagentTranscript(store, parent, "Worker");
+			const second = await writeSubagentTranscript(store, parent, "Other");
+			await store.drain();
+			await using holder = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("holder"),
+			);
+			expect((await holder.run({ op: "claim", sessionId: parentId, path: parent })).held).toBe(true);
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), store);
+			manager.appendMessage({ role: "user", content: "the session it leaves", timestamp: Date.now() });
+			await manager.flush();
+			const notices: SessionPersistenceNotice[] = [];
+			manager.onPersistenceNotice(notice => notices.push(notice));
+			const mark = manager.getLeftSessionsMark();
+
+			// The first adoption starts a follow, which waits a second for the parent before it forks; the second
+			// adoption comes inside that second.
+			await manager.setSessionFile(first, { claim: { waitMs: 0 } });
+			await manager.setSessionFile(second, { claim: { waitMs: 0 } });
+			manager.appendMessage({ role: "user", content: "after the switch", timestamp: Date.now() });
+			await manager.flush();
+			await until(() => notices.some(notice => notice.from === second), 10_000);
+
+			expect({
+				forked: notices.filter(notice => notice.from === second).length,
+				recorded: manager.getLeftSessions(mark).some(left => left.file === second),
+			}).toEqual({ forked: 1, recorded: false });
+			await manager.close();
+		}, 60_000);
+
+		it("asks once and waits once when another process refuses the claim while an append to the session runs", async () => {
+			// If this regresses, the switch takes an append that started during its claim as a reason to claim again,
+			// though the refused claim holds no writer slot: it asks a second time, on a store with lease rows waits out
+			// `waitMs` a second time, and reports the wait twice.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const store = await db.open({ lease: STILL });
+			const targetId = Bun.randomUUIDv7();
+			const held = fileOf(db, targetId);
+			await store.writeText(held, transcript(targetId, "held elsewhere"));
+			await store.drain();
+			await using holder = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("holder"),
+			);
+			expect((await holder.run({ op: "claim", sessionId: targetId, path: held })).held).toBe(true);
+			const counts = { writer: 0 };
+			// The switch's claim is asked for late (SQLite refuses at once, a lease row after `waitMs`), so the append
+			// has started by then and is still on its way when the refusal comes.
+			const slow = slowClaims(store, { writerDelayMs: 600, otherDelayMs: 2500 }, counts);
+			const manager = SessionManager.create(db.dir.path(), path.join(db.dir.path(), "elsewhere"), slow);
+
+			let appended: Promise<unknown> = Promise.resolve();
+			// The append starts while the switch takes its claim.
+			setTimeout(() => {
+				appended = SessionManager.appendCustomEntriesToFile(targetId, held, RECORDS, slow).catch(() => undefined);
+			}, 200);
+			let waits = 0;
+			await manager.setSessionFile(held, { claim: { waitMs: 1500, onWait: () => waits++ } });
+			await appended;
+
+			// A lease row's holder is reported once per wait; SQLite's claim waits on its lock and reports no holder.
+			expect({ claims: counts.writer, waits, movedOff: manager.getSessionId() !== targetId }).toEqual({
+				claims: 1,
+				waits: adapter === "sqlite" ? 0 : 1,
+				movedOff: true,
+			});
+			await manager.close();
+		}, 60_000);
 	});
 }
 
@@ -200,7 +294,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			// the session's lease taken over moves it to a sibling during the wait, the sibling is never recorded as
 			// left, and a work pool stopped after the switch writes no discard records there.
 			await using db = await openLeaseDb(adapter, url ?? "");
-			const store = await db.open({ lease: SHORT });
+			const store = await db.open({ lease: HEARTBEAT });
 			const leftId = Bun.randomUUIDv7();
 			const targetId = Bun.randomUUIDv7();
 			const own = fileOf(db, leftId);
