@@ -65,8 +65,9 @@ const FIFO: &str = r#"d=$(mktemp -d); mkfifo "$d/p"; exec 3<>"$d/p"; rm -r "$d";
 /// itself), and a variable it sets is read in the shell after `wait`.
 /// Without `set -T` a job runs no DEBUG trap of its own; the shell ran its
 /// lone command's (also a negated one), its pipeline stages', and a
-/// foreground pipeline's. A `time`d job forks first: under `set -T` it runs
-/// its stages' traps itself.
+/// foreground pipeline's: only a simple stage's, not a `{ … }` or `( … )`
+/// stage's (bash forks for those first). A `time`d job forks first: under
+/// `set -T` it runs its stages' traps itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_debug_trap_runs_in_the_shell_before_it_forks() {
 	let trap = |functrace: &str, body: &str| {
@@ -115,6 +116,10 @@ wait; trap - DEBUG; echo "v=${{v-unset}}""#
 			trap("set -T;", "TIMEFORMAT=; time ! : mark1 | : mark2 &"),
 			"1:: mark1\n1:: mark2\nv=unset\n",
 		),
+		(trap("", "{ : mark; } | : mark2 &"), "0:: mark2\nv=set0\n"),
+		(trap("", "( : mark ) | : mark2 &"), "0:: mark2\nv=set0\n"),
+		(trap("", "{ : mark; } | : mark2"), "0:: mark2\nv=set0\n"),
+		(trap("", "( : mark ) | : mark2"), "0:: mark2\nv=set0\n"),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_bash_outputs(&rows).await;
@@ -188,8 +193,9 @@ fn bounded(action: &str, body: &str) -> String {
 /// A DEBUG trap action's command or process substitution runs no DEBUG
 /// trap and keeps `BASH_COMMAND`, as bash's does, so a trap that
 /// substitutes, or runs a pipeline of simple commands, does not run itself
-/// again: these rows recursed without end (bash goes on). A subshell runs
-/// the trap again in bash too, so none of these rows has one. Each row is
+/// again: these rows recursed without end (bash goes on). A substitution
+/// inside that substitution runs none either. A subshell runs the trap
+/// again in bash too, so none of these rows has one. Each row is
 /// [`bounded`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_debug_trap_does_not_run_itself_again() {
@@ -200,11 +206,47 @@ async fn a_debug_trap_does_not_run_itself_again() {
 		(bounded("x=$(f() { :; }; f)", "/bin/true"), "done\n"),
 		(bounded("cat <(echo y) >/dev/null", "/bin/true"), "done\n"),
 		(bounded("echo y > >(cat >/dev/null)", "/bin/true"), "done\n"),
+		(bounded("x=$(y=$(: a; : b); : c)", "/bin/true"), "done\n"),
 		(
 			r#"set -T; trap '[[ $BASH_COMMAND == ": mark" ]] && x=$(echo "$BASH_SUBSHELL:$BASH_COMMAND"; : inner)' DEBUG; : mark; echo "x=$x""#
 				.to_owned(),
 			"x=1:: mark\n",
 		),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
+/// A function a DEBUG trap action calls runs no RETURN trap, as in bash
+/// (`execute_function`: a DEBUG trap loses the RETURN trap), also under
+/// `set -T`, which gives functions the RETURN trap. Control: the same
+/// function called by the script runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debug_trap_action_runs_no_return_trap() {
+	let rows = [
+		(
+			r#"g() { :; }; set -T; trap "echo ret" RETURN; trap '[[ $BASH_COMMAND == ": mark" ]] && g' DEBUG; : mark; trap - DEBUG RETURN; echo done"#,
+			"done\n",
+		),
+		(r#"g() { :; }; set -T; trap "echo ret" RETURN; g; trap - RETURN; echo done"#, "ret\ndone\n"),
+	];
+	assert_bash_outputs(&rows).await;
+}
+
+/// The process `$!` names for a negated or `time`d background pipeline, by
+/// the pid probe ([`pid_row`]), as bash names it: `! a | PROG &` is known by
+/// its last program; bash runs an asynchronous timed command as a subshell
+/// of its own (`CMD_FORCE_SUBSHELL`), so `$!` of `time a | PROG &` (also
+/// `time ! …`) is not the program's: here the job keeps its own pid.
+/// `kill` of `$!` ends the job in each. The negated row prints no `wait`
+/// status: `wait` of that `$!` gives the job's negated status here (0)
+/// where bash gives the program's (143), an older difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_negated_or_timed_pipelines_bang_names_what_bash_names() {
+	let rows = [
+		(pid_row("! : | PROG").replace(r#"echo "st=$?"; "#, ""), "program\n"),
+		(pid_row("TIMEFORMAT=; time : | PROG"), "other\nst=143\n"),
+		(pid_row("TIMEFORMAT=; time ! : | PROG"), "other\nst=143\n"),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_bash_outputs(&rows).await;
@@ -271,6 +313,9 @@ async fn extdebug_skips_a_job_or_a_stage_before_it_forks() {
 		(skip(": mark | echo second & wait"), "second\n"),
 		(skip(r#"echo mark | (read -r x; echo "got=$x") & wait"#), "got=\n"),
 		(skip(r#"shopt -s lastpipe; set +m; : mark | read -r x; echo "x=${x-unset}""#), "x=\n"),
+		// The `lastpipe` stage itself skipped: the `read` the shell would run
+		// does not run.
+		(skip(r#"shopt -s lastpipe; set +m; echo x | read -r x mark; echo "x=${x-unset}""#), "x=unset\n"),
 		(
 			skip(r#"TIMEFORMAT=; time : mark | echo second; echo "ps=${PIPESTATUS[*]}""#),
 			"second\nps=0\n",
@@ -333,14 +378,33 @@ async fn a_lone_jobs_debug_trap_does_not_change_its_bang() {
 /// zsh: a trap function (any `TRAPNAL`; these rows use `TRAPDEBUG` and
 /// `TRAPZERR`) whose last command fails lets the code go on (zsh 5.9 prints
 /// the rest); only an explicit `return N` with N non-zero ends it (exit N).
-/// The shell exited 1 after any failing trap function.
+/// The shell exited 1 after any failing trap function. `ERR_RETURN` in the
+/// trap function returns from it but is no explicit `return`: the code goes
+/// on (it ended at 8f6ae14d, which marked that return as explicit).
 #[test]
 fn a_zsh_trap_function_ends_the_code_only_on_return() {
-	let rows: [(&str, &str, i32); 4] = [
+	let rows: [(&str, &str, i32); 7] = [
 		("TRAPDEBUG() { false; }; echo a; echo b", "a\nb\n", 0),
 		("TRAPDEBUG() { return 1; }; echo a; echo b", "", 1),
 		("TRAPZERR() { false; }; false; echo after", "after\n", 0),
 		("TRAPZERR() { return 1; }; false; echo after", "", 1),
+		(
+			"TRAPDEBUG() { setopt localoptions errreturn; if [[ $ZSH_DEBUG_CMD == *mark* ]]; then \
+			 false; fi }; print a; : mark; print b",
+			"a\nb\n",
+			0,
+		),
+		(
+			"TRAPZERR() { setopt localoptions errreturn; false; print in-trap }; false; print after",
+			"after\n",
+			0,
+		),
+		(
+			"TRAPDEBUG() { setopt localoptions errreturn; if [[ $ZSH_DEBUG_CMD == *mark* ]]; then \
+			 return 3; fi }; print a; : mark; print b",
+			"a\n",
+			3,
+		),
 	];
 	let mut mismatches = Vec::new();
 	for (script, zsh_output, zsh_status) in rows {
@@ -355,7 +419,7 @@ fn a_zsh_trap_function_ends_the_code_only_on_return() {
 	}
 	assert!(
 		mismatches.is_empty(),
-		"{} of 4 rows differ from zsh:\n{}",
+		"{} of 7 rows differ from zsh:\n{}",
 		mismatches.len(),
 		mismatches.join("\n")
 	);
@@ -397,6 +461,91 @@ fn a_zsh_trap_substitution_does_not_run_the_trap_again() {
 		"{} of {} rows differ from zsh:\n{}",
 		mismatches.len(),
 		rows.len(),
+		mismatches.join("\n")
+	);
+}
+
+/// zsh: a background job's or a pipeline's DEBUG trap runs once, for the
+/// whole command, as zsh 5.9 runs it (`trap … DEBUG` and `TRAPDEBUG`); the
+/// shell-side trap run bash gives each simple stage is bash's alone.
+#[test]
+fn a_zsh_debug_trap_runs_once_for_a_job_or_a_pipeline() {
+	let trap = r#"trap 'echo "dbg:$ZSH_DEBUG_CMD"' DEBUG;"#;
+	let func = r#"TRAPDEBUG() { echo "dbg:$ZSH_DEBUG_CMD" };"#;
+	let rows = [
+		(format!("{trap} : mark & wait; echo done"), "dbg:: mark\ndbg:wait\ndbg:echo done\ndone\n"),
+		(format!("{func} : mark & wait; echo done"), "dbg:: mark\ndbg:wait\ndbg:echo done\ndone\n"),
+		(
+			format!("{trap} : mark | : mark2; echo done"),
+			"dbg:: mark | : mark2\ndbg:echo done\ndone\n",
+		),
+		(
+			format!("{trap} : mark | : mark2 & wait; echo done"),
+			"dbg:: mark | : mark2\ndbg:wait\ndbg:echo done\ndone\n",
+		),
+	];
+	let mut mismatches = Vec::new();
+	for (script, zsh_output) in &rows {
+		let out = output(obash().arg0("zsh").args(["-f", "-c", script]));
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		if (out.status.code(), stdout.as_ref()) != (Some(0), *zsh_output) {
+			mismatches.push(format!(
+				"`{script}`\n  zsh:  Some(0) {zsh_output:?}\n  omp:  {:?} {stdout:?}",
+				out.status.code()
+			));
+		}
+	}
+	assert!(
+		mismatches.is_empty(),
+		"{} of {} rows differ from zsh:\n{}",
+		mismatches.len(),
+		rows.len(),
+		mismatches.join("\n")
+	);
+}
+
+/// The DEBUG trap state a snapshot must carry, run under obash's step fault
+/// mode (`--fault=SEED:K --fault-mode=step`: every K ops a seeded coin
+/// pauses and resumes, or restores a snapshot in the process), for seeds 1
+/// to 6 and K of 1 to 3. Each row prints what bash 5.2.21 and 5.3.20 print
+/// without faults:
+/// - a substitution in a DEBUG trap's action runs no trap
+///   (`Frame::no_debug_trap`, restored with the frame); [`bounded`], so a
+///   recursion fails in milliseconds;
+/// - an `extdebug` stage skip set before the fork (`Kernel::debug_skips`, saved
+///   in the image): the skipped stage does not run (no `ran`).
+#[test]
+fn debug_trap_state_survives_a_restored_snapshot() {
+	let rows = [
+		(bounded("x=$(echo y)", "/bin/true; : two"), "done\n"),
+		(
+			r#"D=$(mktemp -d); shopt -s extdebug; trap 'case $BASH_COMMAND in *mark*) false;; esac' DEBUG; : mark > "$D/ran" | echo second; trap - DEBUG; [ -e "$D/ran" ] && echo ran; rm -r "$D"; echo done"#
+				.to_owned(),
+			"second\ndone\n",
+		),
+	];
+	let mut mismatches = Vec::new();
+	let mut runs = 0;
+	for (script, bash_output) in &rows {
+		for seed in 1..=6 {
+			for k in 1..=3 {
+				runs += 1;
+				let fault = format!("--fault={seed}:{k}");
+				let out = output(obash().args([fault.as_str(), "--fault-mode=step", "-c", script]));
+				let stdout = String::from_utf8_lossy(&out.stdout);
+				if (out.status.code(), stdout.as_ref()) != (Some(0), *bash_output) {
+					mismatches.push(format!(
+						"{fault} `{script}`\n  bash: Some(0) {bash_output:?}\n  omp:  {:?} {stdout:?}",
+						out.status.code()
+					));
+				}
+			}
+		}
+	}
+	assert!(
+		mismatches.is_empty(),
+		"{} of {runs} faulted runs differ from bash:\n{}",
+		mismatches.len(),
 		mismatches.join("\n")
 	);
 }

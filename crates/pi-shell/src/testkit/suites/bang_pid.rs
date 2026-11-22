@@ -197,10 +197,11 @@ fn compound_and_builtin_jobs_keep_virtual_pids() {
 
 // Failure mode: a background pipeline's `$!` is the shell's virtual pid,
 // which `kill` cannot reach as a program, instead of its last program's
-// (bash: `kill $!` signals that program), also under `!` and `time`.
+// (bash: `kill $!` signals that program), also under `!`. A timed one is
+// `a_timed_background_job_is_known_by_its_own_pid`'s.
 #[test]
 fn a_background_pipeline_is_known_by_its_last_program() {
-	for prefix in ["", "! ", "time "] {
+	for prefix in ["", "! "] {
 		let world = World::new();
 		let (out, _) =
 			run(world.host(), &format!("{prefix}/x/true | /x/trap42 & p=$!; kill $p; wait; echo $p"));
@@ -214,6 +215,26 @@ fn a_background_pipeline_is_known_by_its_last_program() {
 		assert_eq!(out, format!("{pid}\n"), "{prefix:?}");
 		assert_eq!(world.got(pid), [Signal::Term], "{prefix:?}");
 	}
+}
+
+// Failure mode: `$!` of `time a | b &` was `b`'s pid. bash runs an
+// asynchronous timed command as a subshell of its own
+// (`CMD_FORCE_SUBSHELL`) and zsh times the job's own process: `$!` names
+// the job, as for `time cmd &` and a compound job. Control: the same
+// pipeline untimed is known by its last program.
+#[test]
+fn a_timed_background_job_is_known_by_its_own_pid() {
+	let world = World::new();
+	let (out, _) = run(
+		world.host(),
+		"TIMEFORMAT=; time /x/true | /x/true & a=$!; wait; time /x/true & b=$!; wait; /x/true | \
+		 /x/true & c=$!; wait; echo $a $b $c",
+	);
+	let pids: Vec<&str> = out.split_whitespace().collect();
+	assert_eq!(pids.len(), 3, "{out}");
+	assert!(is_virtual(pids[0]) && is_virtual(pids[1]), "{out}");
+	// Five programs ran; the untimed pipeline's last one is the fifth.
+	assert_eq!(pids[2], (FIRST + 4).to_string(), "control: {out}");
 }
 
 // Failure mode: once a pipeline's last program ended, `kill` of its pid

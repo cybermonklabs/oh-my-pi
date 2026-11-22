@@ -211,7 +211,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			&& pseudo_trap_maybe(k, cx, TrapKey::Debug)
 		{
 			let done = spawn_debug_done(vp.frames[fi].debug_pc);
-			let next = shell_debug_stages(k, vp, unit, op, vp.frames[fi].pc)
+			let next = shell_debug_stages(k, vp, unit, op)
 				.into_iter()
 				.enumerate()
 				.nth(done);
@@ -4058,28 +4058,25 @@ fn lone_simple(unit: &Unit, entry: u32) -> bool {
 }
 
 /// The pipeline spawn (its index in [`Unit::spawns`]) a job body starting
-/// at `entry` is: `time` and `!` wrap it as `[TimeStart] Spawn …
-/// [Not] [TimeEnd]`, then the job's `SubExit`.
+/// at `entry` is: `!` wraps it as `Spawn … [Not]`, then the job's
+/// `SubExit`. A `time`d body (`[TimeStart] Spawn … [TimeEnd]`) is none:
+/// bash runs an asynchronous timed command as a subshell of its own
+/// (`CMD_FORCE_SUBSHELL`), so `$!` names that subshell, not the
+/// pipeline's last program; here the job keeps its own pid, as a compound
+/// job does.
 fn body_pipeline(unit: &Unit, entry: u32) -> Option<usize> {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-	let at = if code(entry) == Some(Opcode::TimeStart) {
-		entry + 1
-	} else {
-		entry
-	};
 	let op = unit
 		.ops
-		.get(at as usize)
+		.get(entry as usize)
 		.filter(|op| op.code == Opcode::Spawn)?;
 	let spawn = unit
 		.spawns
 		.get(op.a as usize)
 		.filter(|s| s.kind == SpawnKind::Pipeline)?;
 	let mut end = spawn.end;
-	for wrap in [Opcode::Not, Opcode::TimeEnd] {
-		if code(end) == Some(wrap) {
-			end += 1;
-		}
+	if code(end) == Some(Opcode::Not) {
+		end += 1;
 	}
 	(code(end) == Some(Opcode::SubExit)).then_some(op.a as usize)
 }
@@ -4090,7 +4087,8 @@ fn body_pipeline(unit: &Unit, entry: u32) -> Option<usize> {
 /// `extdebug`): a background job's lone command (`cmd &`, `! cmd &`), or
 /// each simple stage of a pipeline, also of the pipeline a background job
 /// is. bash forks a `time`d job first (`time a | b &`), and the job runs
-/// those traps itself under `set -T`, as a `time`d pipeline in it does.
+/// those traps itself under `set -T`, as a `time`d pipeline in it does: a
+/// `time`d body is no [`body_pipeline`].
 fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
 	let simple = |spawn: usize| -> Vec<u32> {
 		unit.spawns[spawn]
@@ -4104,14 +4102,8 @@ fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
 	match info.kind {
 		SpawnKind::Background => {
 			let entry = info.stages[0].entry;
-			let timed = unit
-				.ops
-				.get(entry as usize)
-				.is_some_and(|o| o.code == Opcode::TimeStart);
 			if lone_simple(unit, entry) {
 				(vec![entry], true)
-			} else if timed {
-				(Vec::new(), false)
 			} else {
 				(body_pipeline(unit, entry).map_or_else(Vec::new, simple), false)
 			}
@@ -4123,16 +4115,11 @@ fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
 
 /// [`debug_stage_entries`] the shell runs now: none for the pipeline a
 /// background job is, whose traps the shell ran before it forked the job
-/// (its [`Bang`] still waits on the pipeline), unless the job forked first
-/// for its `time` (the `TimeStart` before `pc`).
-fn shell_debug_stages(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> Vec<u32> {
+/// (its [`Bang`] still waits on the pipeline). A `time`d job has no such
+/// [`Bang`] ([`bang_stage`]): it runs its stages' traps itself.
+fn shell_debug_stages(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op) -> Vec<u32> {
 	let info = &unit.spawns[op.a as usize];
-	let timed = pc
-		.checked_sub(1)
-		.and_then(|at| unit.ops.get(at as usize))
-		.is_some_and(|o| o.code == Opcode::TimeStart);
 	let shell_ran = info.kind == SpawnKind::Pipeline
-		&& !timed
 		&& k
 			.bangs
 			.iter()
@@ -5472,9 +5459,12 @@ fn run_always(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, floor: usize, end
 	true
 }
 
-/// zsh `return N` (`bin_break` with `retflag`): leave the innermost
-/// function, `${ ;}` or `.` file, running the always-lists in the way;
-/// outside any, leave the shell (`zexit`). Also zsh `ERR_RETURN`.
+/// zsh `ERR_RETURN` (`execlist`'s `retflag` after a failed command): leave
+/// the innermost function, `${ ;}` or `.` file, running the always-lists in
+/// the way; outside any, leave the shell (`zexit`). An explicit `return`
+/// goes through [`zsh_return_flow`]; this one does not mark a trap frame
+/// below ([`mark_trap_return`]): in zsh only an explicit `return N` from a
+/// `TRAPNAL` function ends the code the trap interrupted.
 #[inline(never)]
 pub fn zsh_return(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	vp.status = status;
@@ -5490,7 +5480,6 @@ pub fn zsh_return(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) 
 		return;
 	}
 	if let Some(i) = target {
-		mark_trap_return(vp, i);
 		zsh_leave(k, vp, cx, i);
 	} else {
 		exit_shell(k, vp, cx, status);
