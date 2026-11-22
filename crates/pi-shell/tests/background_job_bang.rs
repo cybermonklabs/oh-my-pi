@@ -89,20 +89,9 @@ fn assert_zsh_rows(rows: &[(&str, &str)], what: &str) {
 /// `kill -0 "$!"` cannot tell the two apart: bash's `$!` may name a live
 /// subshell whose child is the program, and the check succeeds for either.
 fn pid_row(start: &str) -> String {
-	pid_row_as(start, "echo other")
-}
-
-/// [`pid_row`], with `other` told apart: `virtual` for a virtual pid
-/// (2^30 or more), else `os-other` (an OS process that is not the
-/// program, such as one that already ended).
-fn pid_kind_row(start: &str) -> String {
-	pid_row_as(start, r#"{ [ "$p" -ge 1073741824 ] && echo virtual || echo os-other; }"#)
-}
-
-fn pid_row_as(start: &str, other: &str) -> String {
 	let start = start.replace("PROG", r#"/bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 30' sh "$T""#);
 	format!(
-		r#"D=$(mktemp -d); T=$D/pid; c='/bin/sh -c '\''echo $$ > "$1"; exec /bin/sleep 30'\'' sh "$T"'; {start} & p=$!; until [ -s "$T" ]; do :; done; [ "$p" = "$(cat "$T")" ] && echo program || {other}; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
+		r#"D=$(mktemp -d); T=$D/pid; c='/bin/sh -c '\''echo $$ > "$1"; exec /bin/sleep 30'\'' sh "$T"'; {start} & p=$!; until [ -s "$T" ]; do :; done; [ "$p" = "$(cat "$T")" ] && echo program || echo other; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
 	)
 }
 
@@ -282,10 +271,9 @@ async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 /// decides as any command before `exec` does, so `$!` names the job at
 /// once. The substitution row hung to the run's bound.
 ///
-/// The last row is a lone job, whose trap bash runs in the shell before it
-/// forks (there `(( BASH_SUBSHELL ))` is false and the action does
-/// nothing); this engine runs it in the job, where the action's program
-/// leaves the job its own pid rather than make `$!` wait for it.
+/// The last row is a lone job, whose trap runs in the shell before it
+/// forks, as bash runs it: there `(( BASH_SUBSHELL ))` is false and the
+/// action does nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 	let in_function = |action: &str| {
@@ -336,11 +324,10 @@ async fn bang_of_a_function_job_does_not_wait_for_a_compound_redirection() {
 /// ([`pid_row`]), as bash names it: `eval`, `.` and `source` run their
 /// text like a function body (only an `exec`'d program is `$!`; anything
 /// else leaves the job's own pid, bash's subshell), `command` and `exec`
-/// run the program as the job, `time` keeps the job's own pid. In a lone
-/// job's DEBUG trap under `set -T`, which bash runs in the shell before it
-/// forks, a fast-path builtin, a loop or a command substitution decides
-/// nothing. With nothing to run, `eval` answers at once, and `builtin`
-/// decides before it runs.
+/// run the program as the job, `time` keeps the job's own pid. A lone
+/// job's DEBUG trap runs in the shell before it forks, as bash runs it, so
+/// nothing it runs decides. With nothing to run, `eval` answers at once,
+/// and `builtin` decides before it runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrapped_jobs_bang_names_what_bash_names() {
 	let rows = [
@@ -389,11 +376,6 @@ async fn a_wrapped_jobs_bang_names_what_bash_names() {
 ///   wait for the shell itself, or never end;
 /// - a `.` job whose file is not regular (here a pipe as `/dev/stdin`): its
 ///   read may wait for the shell, so it decides first;
-/// - a lone job whose `set -T` DEBUG trap runs anything but a fast-path
-///   builtin, a loop or a command substitution (a staged builtin, a function
-///   call, a program, a pipeline or a subshell): bash runs a lone job's trap in
-///   the shell before it forks; this engine runs it in the job, where what the
-///   trap runs is not the job's.
 ///
 /// `kill` and `wait` of `$!` still reach the program.
 #[tokio::test(flavor = "multi_thread")]
@@ -408,12 +390,6 @@ async fn a_job_that_runs_something_before_exec_keeps_its_own_pid() {
 		(pid_row(r#"set -T; trap ': dbg' DEBUG; eval "exec $c""#), "other\nst=143\n"),
 		(pid_row("f() { exec PROG; }; set -T; trap ': dbg' DEBUG; f"), "other\nst=143\n"),
 		(pid_row(r#"printf 'exec %s\n' "$c" | . /dev/stdin"#), "other\nst=143\n"),
-		(pid_kind_row("set -T; trap '/bin/true' DEBUG; PROG"), "virtual\nst=143\n"),
-		(pid_row("g() { :; }; set -T; trap g DEBUG; PROG"), "other\nst=143\n"),
-		(
-			pid_row(r#"set -T; trap 'echo "+ $BASH_COMMAND" >/dev/null' DEBUG; PROG"#),
-			"other\nst=143\n",
-		),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_outputs(&rows, "the stated difference").await;

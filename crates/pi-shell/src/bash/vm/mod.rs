@@ -510,6 +510,13 @@ pub struct Kernel {
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
+	/// `extdebug`: pipeline stages a failing DEBUG trap skips, waiting for
+	/// their `Spawn` ([`proc::DebugSkip`]), one list per vproc and frame:
+	/// imaged (a snapshot can fall between two stages' traps). A list whose
+	/// `Spawn` never ran (a trap `return`ed) is dropped when a `Spawn` at
+	/// that frame or above next runs its stage traps (also with the trap
+	/// gone: the pseudo-trap check stays set once a DEBUG trap was).
+	pub debug_skips:        Vec<proc::DebugSkip>,
 	/// `(job, OS pid)`: jobs settled on their program's OS pid during the
 	/// turn, written into the job tables and `$!` of every vproc by the
 	/// scheduler after it (`Shell::adopt`); empty between turns, not
@@ -629,6 +636,7 @@ impl Kernel {
 			exec_signals: HashMap::new(),
 			reported_signal: None,
 			bangs: Vec::new(),
+			debug_skips: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
 			math_opts: None,
@@ -671,21 +679,6 @@ impl Kernel {
 		}
 		jobctl::bang_settled(self, bang.vproc, os);
 		self.ctl.notify();
-	}
-
-	/// `vp` runs a trap action while the job it may settle is a lone
-	/// command (or a pipeline's simple stage): bash runs that command's
-	/// DEBUG trap in the shell before it forks, so the action's fast-path
-	/// builtins, loops and command substitutions decide nothing here (what
-	/// else it runs, through `dispatch` or a spawn, leaves the job its own
-	/// pid). In a function, group or `eval` job, whose trap actions bash's
-	/// child runs, an action decides as any command before `exec` does.
-	pub fn bang_held_by_trap(&self, vp: &Vproc) -> bool {
-		vp.trap_frames != 0
-			&& self
-				.bangs
-				.iter()
-				.any(|b| b.vproc == vp.vpid && b.stage == proc::BangStage::Lone)
 	}
 
 	/// Next `$RANDOM` (0..=32767); the generator state is written through.
@@ -1785,6 +1778,7 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			callout: false,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {

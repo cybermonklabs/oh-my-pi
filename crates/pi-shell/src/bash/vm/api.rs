@@ -183,13 +183,12 @@ impl ShellApi<'_, '_> {
 		let run = self
 			.shell
 			.submit_from(self.vp, script, Some(store), lineage);
-		let child = self
-			.shell
-			.k
-			.spawned
-			.last()
-			.expect("submitted subshell")
-			.vpid;
+		let child = self.shell.k.spawned.last_mut().expect("submitted subshell");
+		// It stands for the external program the callout runs.
+		if let Some(run) = child.runs.back_mut() {
+			run.callout = true;
+		}
+		let child = child.vpid;
 		let vp = &self.shell.procs[self.vp];
 		let node = vp
 			.frames

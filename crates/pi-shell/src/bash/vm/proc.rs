@@ -123,6 +123,19 @@ pub struct Vproc {
 	pub zle:           Option<Box<super::zle::Zle>>,
 }
 
+/// `extdebug`: the stages of the `Spawn` at frame `frame` of vproc `vproc`
+/// whose DEBUG trap, run in the shell before the fork, failed (their
+/// entries): bash forks no process for such a stage. Moved to the job's
+/// vproc when the pipeline is a background job's. Kept by the kernel
+/// ([`super::Kernel::debug_skips`]), not the vproc or frame (each at its
+/// idle-size bound), and only while a skip waits for its `Spawn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugSkip {
+	pub vproc:   Vpid,
+	pub frame:   u32,
+	pub entries: Vec<u32>,
+}
+
 /// The terminal of the session a vproc runs in when it is not the shell's
 /// ([`VprocZsh::ctty`]).
 #[derive(Clone, Debug, Default)]
@@ -815,6 +828,10 @@ pub struct Run {
 	pub env:               Vec<(BString, BString)>,
 	pub started:           bool,
 	pub exit_trap_started: bool,
+	/// A host callout's subshell runs it (`nohup`, `timeout`, `xargs`,
+	/// `find -exec`): it stands for the external program the callout runs,
+	/// so its frame runs no DEBUG trap ([`Frame::no_debug_trap`]).
+	pub callout:           bool,
 }
 
 /// What kind of activation a frame is.
@@ -911,6 +928,11 @@ pub enum ScriptKind {
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// zsh: the `TRAPNAL` function this frame called ended by `return`
+		/// (zsh's `trapreturn`). Only such a non-zero status ends the
+		/// interrupted code; a function that falls off its end with one
+		/// does not.
+		returned:      bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -978,7 +1000,8 @@ pub struct Frame {
 	/// command substitution by re-parsing its text from the line of the
 	/// command that runs it, so its first command reports that line.
 	pub line_shift:        u32,
-	/// Exec op whose DEBUG trap has already run.
+	/// Exec op whose DEBUG trap has already run (for a `Spawn`, see
+	/// [`super::exec::SPAWN_DEBUG`]).
 	pub debug_pc:          Option<u32>,
 	/// Pseudo-traps installed in this function rather than inherited.
 	pub debug_trap_local:  bool,
@@ -997,6 +1020,14 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// The base frame of a vproc that runs no DEBUG trap and keeps
+	/// `BASH_COMMAND`: a command or process substitution (bash's or zsh's) a
+	/// DEBUG trap action started (or one such substitution started), as
+	/// bash's and zsh's, so a trap that substitutes does not run itself again
+	/// without end (a subshell it starts runs the trap again, as bash's
+	/// does); and a host callout's subshell ([`Run::callout`]), which stands
+	/// for an external program.
+	pub no_debug_trap:     bool,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1023,6 +1054,7 @@ impl Frame {
 			scratch: None,
 			line_shift: 0,
 			debug_pc: None,
+			no_debug_trap: false,
 			debug_trap_local: false,
 			err_trap_local: false,
 			return_trap_local: false,

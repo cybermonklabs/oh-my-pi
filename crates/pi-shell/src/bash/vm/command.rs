@@ -590,9 +590,8 @@ fn plain_statement(
 	// ([`super::proc::Bang`]) as [`dispatch`] does: it keeps its virtual
 	// pid (`eval`, `.` and `source` leave it to an `exec` they run).
 	// Decided before it runs, so a reader of `$!` never waits on the
-	// builtin, whose output may wait for that reader. A lone job's trap
-	// action decides nothing ([`Kernel::bang_held_by_trap`]).
-	if !k.bangs.is_empty() && !k.bang_held_by_trap(vp) {
+	// builtin, whose output may wait for that reader.
+	if !k.bangs.is_empty() {
 		bang_dispatch(k, vp.vpid, &Target::Intrinsic(id), false);
 	}
 	// The temporary scope the staged command gives a builtin.
@@ -2559,10 +2558,9 @@ fn spawned_external(
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
 			if !k.bangs.is_empty() {
-				// A lone job's trap action ([`Kernel::bang_held_by_trap`]):
-				// its program is not the job's and ends first, so the job
-				// keeps its virtual pid.
-				k.settle_bang(vp.vpid, (!k.bang_held_by_trap(vp)).then_some(pid));
+				// A trap action's program is not the job's and ends first:
+				// the job keeps its virtual pid.
+				k.settle_bang(vp.vpid, (vp.trap_frames == 0).then_some(pid));
 			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);

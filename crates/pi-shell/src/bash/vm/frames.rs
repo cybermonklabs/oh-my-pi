@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -71,29 +71,31 @@ struct Header {
 
 #[derive(Serialize, Deserialize)]
 struct Image {
-	seq:       u64,
-	next_run:  u64,
-	next_call: u64,
-	next_cmd:  u64,
-	paused:    bool,
-	mask:      u64,
-	rr:        u32,
+	seq:         u64,
+	next_run:    u64,
+	next_call:   u64,
+	next_cmd:    u64,
+	paused:      bool,
+	mask:        u64,
+	rr:          u32,
 	/// The scheduler's unfinished slice (vproc, ops left).
-	slice:     Option<(Vpid, u32)>,
+	slice:       Option<(Vpid, u32)>,
 	/// The control's wake count (the `at` marks of blocked vprocs refer
 	/// to it).
-	wakes:     u64,
-	done:      Vec<(RunId, i32)>,
-	results:   Vec<(CallId, CallOutcome)>,
-	procs:     Vec<ProcImage>,
+	wakes:       u64,
+	done:        Vec<(RunId, i32)>,
+	results:     Vec<(CallId, CallOutcome)>,
+	procs:       Vec<ProcImage>,
 	/// Fd objects, referred to by index.
-	fd_objs:   Vec<FdObjImage>,
+	fd_objs:     Vec<FdObjImage>,
 	/// Engine memory objects, referred to by index.
-	mems:      Vec<MemImage>,
+	mems:        Vec<MemImage>,
 	/// Background jobs still deciding on their pid ([`Kernel::bangs`]).
-	bangs:     Vec<super::proc::Bang>,
+	bangs:       Vec<super::proc::Bang>,
 	/// Their commands' redirections still deciding ([`Kernel::deferrals`]).
-	deferrals: Vec<super::proc::Deferral>,
+	deferrals:   Vec<super::proc::Deferral>,
+	/// `extdebug` stages waiting to be skipped ([`Kernel::debug_skips`]).
+	debug_skips: Vec<super::proc::DebugSkip>,
 }
 
 /// One fd object.
@@ -306,6 +308,7 @@ struct RunImage {
 	env:               Vec<(BString, BString)>,
 	started:           bool,
 	exit_trap_started: bool,
+	callout:           bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -321,6 +324,7 @@ struct FrameImage {
 	scratch:           Option<ScratchImage>,
 	line_shift:        u32,
 	debug_pc:          Option<u32>,
+	no_debug_trap:     bool,
 	debug_trap_local:  bool,
 	err_trap_local:    bool,
 	return_trap_local: bool,
@@ -550,6 +554,7 @@ impl Shell {
 					scratch,
 					line_shift: f.line_shift,
 					debug_pc: f.debug_pc,
+					no_debug_trap: f.no_debug_trap,
 					debug_trap_local: f.debug_trap_local,
 					err_trap_local: f.err_trap_local,
 					return_trap_local: f.return_trap_local,
@@ -648,6 +653,7 @@ impl Shell {
 			mems: fds.mems,
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
+			debug_skips: k.debug_skips.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -794,6 +800,11 @@ impl Shell {
 			.into_iter()
 			.filter(|d| img.procs.iter().any(|p| p.vpid == d.vproc))
 			.collect();
+		k.debug_skips = img
+			.debug_skips
+			.into_iter()
+			.filter(|s| img.procs.iter().any(|p| p.vpid == s.vproc))
+			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
 			objs: img.fd_objs,
@@ -893,6 +904,7 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
+					callout:           r.callout,
 				});
 			}
 			report.runs += vp.runs.len() as u32;
@@ -1024,6 +1036,7 @@ impl Shell {
 				frame.scratch = scratch;
 				frame.line_shift = f.line_shift;
 				frame.debug_pc = f.debug_pc;
+				frame.no_debug_trap = f.no_debug_trap;
 				frame.debug_trap_local = f.debug_trap_local;
 				frame.err_trap_local = f.err_trap_local;
 				frame.return_trap_local = f.return_trap_local;
@@ -1131,6 +1144,7 @@ fn run_image(r: &Run) -> RunImage {
 		env:               r.env.clone(),
 		started:           r.started,
 		exit_trap_started: r.exit_trap_started,
+		callout:           r.callout,
 	}
 }
 
