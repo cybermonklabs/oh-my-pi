@@ -1959,7 +1959,8 @@ describe("restoreSession (omp --restore)", () => {
 	/**
 	 * A parent whose process ended inside its reply's `call_eval` and `call_bash`, after the cell's subagent `Worker`
 	 * (spawned under `call_eval`) ended its turn on its key and `firstRun` wrote what the batch's first run left: by
-	 * default the cell's cut-off error result, which says the cell got Worker's failure. A first restore then ran
+	 * default the cell's cut-off error result, which says the cell got Worker's failure, and the closing the first
+	 * restore wrote before it ran the batch again ({@link appendRestoreClosing}). A first restore then ran
 	 * the batch again from the reply (with `forkAtStart`, the branch was cut at the cell's start record instead), and
 	 * the process ended again before the replay's first result: `afterFork` writes the selected branch after the
 	 * fork, by default the replayed cell's start record. With `noFork` the replay wrote nothing before it was cut off:
@@ -1984,7 +1985,7 @@ describe("restoreSession (omp --restore)", () => {
 		tick();
 		await writeSubagent(mainFile, cwd, "Worker", stranded, { spawnCallId: "call_eval", normalExit: true });
 		tick();
-		(options.firstRun ?? cellGotWorkersFailure)(main);
+		(options.firstRun ?? cellGotWorkersFailureThenRestoreClosing)(main);
 		tick();
 		if (options.forkAtStart) {
 			main.branch(started);
@@ -1994,6 +1995,25 @@ describe("restoreSession (omp --restore)", () => {
 			(options.afterFork ?? (() => appendExecutionStart(main, "call_eval", "eval")))(main);
 		}
 		return restoreParent(main, mainFile, options.extraEntries);
+	}
+
+	/**
+	 * The closing restore writes before it runs a cut-off batch again (`restoreInterruptedTurn`): results for the
+	 * reply's calls that have none, then the interrupted-turn abort. The replay's strip leaves both on the branch of
+	 * the batch's first run.
+	 */
+	function appendRestoreClosing(main: SessionManager): void {
+		const branch = main.getBranch();
+		const abort = createInterruptedTurnAbortMessage(branch, undefined, { assumeExit: true });
+		if (!abort) throw new Error("Expected restore to close the cut-off turn");
+		for (const result of createInterruptedToolResults(branch)) main.appendMessage(result);
+		main.appendMessage(abort);
+	}
+
+	/** The default first run: the cell's cut-off error result, then the first restore's closing. */
+	function cellGotWorkersFailureThenRestoreClosing(main: SessionManager): void {
+		cellGotWorkersFailure(main);
+		appendRestoreClosing(main);
 	}
 
 	/** The cell's cut-off error result, which says the cell got Worker's failure. */
@@ -2294,10 +2314,12 @@ describe("restoreSession (omp --restore)", () => {
 			true,
 		],
 		[
-			"relaunches it when a session switch closed the turn with the interrupted-turn abort and no results for the reply's calls",
+			"relaunches it when a session switch closed the turn, after the quit that recorded its exit, with the interrupted-turn abort and no results for the reply's calls",
 			(main: SessionManager) => {
+				appendDisposeExit(main); // the quit: the switch closes only a turn a recorded exit follows
+				// The switch (`agent-session.ts:14342-14354`): its model change, then exit recovery's abort, without results.
 				main.appendModelChange("anthropic/claude-sonnet-4-5");
-				const abort = createInterruptedTurnAbortMessage(main.getBranch(), undefined, { assumeExit: true });
+				const abort = createInterruptedTurnAbortMessage(main.getBranch());
 				if (!abort) throw new Error("Expected the switch to close the parent's turn");
 				main.appendMessage(abort);
 				appendProcessStart(main); // the --restore process
@@ -2335,7 +2357,8 @@ describe("restoreSession (omp --restore)", () => {
 	/**
 	 * A parent in a session with no eval call: its reply calls `task` (`call_task`), whose subagent Worker ended its turn
 	 * on its key, and the call got back an error result that names Worker's run (what the tool returns when a run
-	 * settled and a later step failed, `task/index.ts:2084-2109`). A replay of the batch from the reply then wrote
+	 * settled and a later step failed, `task/index.ts:2084-2109`); the parent's next reply then failed on its key, the
+	 * failed turn a `/retry` acts on. A replay of the batch from the reply then wrote
 	 * `afterFork` under the reply. No process that starts on such a session writes an eval snapshot: its history holds
 	 * no eval activity, and a fresh process holds no eval runtime.
 	 */
@@ -2355,6 +2378,7 @@ describe("restoreSession (omp --restore)", () => {
 			totalDurationMs: 5,
 		};
 		main.appendMessage(toolResultMessage("call_task", "task", details, true));
+		main.appendMessage(assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }));
 		tick();
 		main.branch(anchor);
 		afterFork(main);

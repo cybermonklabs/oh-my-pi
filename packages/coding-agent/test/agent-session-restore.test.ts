@@ -501,7 +501,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 				after: manager => {
 					manager.appendModelChange(`${model.provider}/${model.id}`);
 					appendDisposeExit(manager);
-					appendProcessStart(manager);
+					appendExitRecovery(manager); // the reply calls `probe`, not eval: the start writes no eval snapshot
 				},
 				runsAgain: true,
 			},
