@@ -1672,6 +1672,24 @@ export class SessionManager {
 	}
 
 	/**
+	 * Whether a switch to `sessionFile` (session `sessionId`) is this manager reading again the session it holds now:
+	 * same id, same journal file, and a live writer claim on it (a reload, `AgentSession.reload()`). The switch's
+	 * claim then meets this manager's own writer slot, which it gives up once the switch drains. Narrow as
+	 * {@link #reclaimsJournalHandedToClone}: another manager of this process on the same journal is refused, and a
+	 * second omp process is untouched (`handover` only waives this process's own one-writer refusal).
+	 */
+	#rereadsItsOwnSession(sessionId: string, sessionFile: string): boolean {
+		const claim = this.#sessionClaim;
+		return (
+			this.#sessionId === sessionId &&
+			claim?.sessionId === sessionId &&
+			claim.release !== undefined &&
+			this.#sessionFile !== undefined &&
+			isSameJournalFile(this.#sessionFile, sessionFile)
+		);
+	}
+
+	/**
 	 * Take this process's writer claim on the session now, instead of at the
 	 * first append, and keep taking it for every session this manager switches
 	 * to afterwards. A session handed to a running agent loop writes its
@@ -4047,7 +4065,9 @@ export class SessionManager {
 					claim.onWait?.(found);
 				},
 				writer: true,
-				handover: this.#reclaimsJournalHandedToClone(sessionId, resolved),
+				handover:
+					this.#reclaimsJournalHandedToClone(sessionId, resolved) ||
+					this.#rereadsItsOwnSession(sessionId, resolved),
 				onLost: () => this.#onSessionClaimLost(sessionId),
 			});
 			// An append that started while the claim was taken would meet it: give the claim back, let the append
