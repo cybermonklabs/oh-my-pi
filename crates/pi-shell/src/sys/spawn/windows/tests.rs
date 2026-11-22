@@ -114,6 +114,7 @@ fn spawn_with(
 		lineage,
 		redirs: None,
 		ctty: None,
+		on_busy: crate::bash::OnBusy::Retry,
 	})
 	.unwrap()
 }

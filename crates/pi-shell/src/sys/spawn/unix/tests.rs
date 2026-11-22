@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use super::{Scope, State, process_umask};
 use crate::{
 	bash::{
-		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId,
+		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId, OnBusy,
 		OpenFlags, OsHandle, PgroupSpec, Rlimit, RunId, SigSet, Signal, SpawnSpec, StdioSpec, Vpid,
 	},
 	sys::{
@@ -100,6 +100,7 @@ fn spec<'a>(argv: &'a [BString], env: &'a EnvView, pgroup: PgroupSpec) -> SpawnS
 		lineage: crate::bash::Lineage::default(),
 		redirs: None,
 		ctty: None,
+		on_busy: OnBusy::Retry,
 	}
 }
 
@@ -1009,6 +1010,153 @@ fn a_deferred_child_waiting_for_a_busy_program_holds_no_host_descriptor() {
 	assert_eq!(read, 0, "nothing wrote to the pipe");
 	let status = wait(&mut p);
 	assert_eq!(status, ExitStatus::Exited(7), "the program ran at the next try");
+}
+
+/// `./name &`, then `rest`, on the session's spawn path `kind` (the
+/// background job's external spawns as the foreground one would).
+#[cfg(target_os = "linux")]
+fn background_by(kind: &str, name: &str, rest: &str) -> String {
+	match kind {
+		"posix_spawn" => format!("./{name} & {rest}"),
+		"fork" => {
+			let other = if process_umask() == Some(0o077) {
+				"027"
+			} else {
+				"077"
+			};
+			format!("umask {other}; ./{name} & {rest}")
+		},
+		_ => unreachable!("{kind}"),
+	}
+}
+
+/// What a run prints until `want` appears in it, or until it ends.
+#[cfg(target_os = "linux")]
+async fn said_until(said: &flume::Receiver<String>, want: &str) -> String {
+	let mut text = String::new();
+	while !text.contains(want) {
+		match said.recv_async().await {
+			Ok(chunk) => text.push_str(&chunk),
+			Err(_) => break,
+		}
+	}
+	text
+}
+
+/// `prog & pid=$!` with a busy program: `$!` is known, and the script goes
+/// on, before the program's tries end, as bash's forked child is `$!`
+/// before its exec; only `wait $pid` waits for the tries. The test lets the
+/// program go only once the command after `pid=$!` printed: a `$!` that
+/// waited for the tries would have been known only once they ran out, the
+/// program failing (126) while still held. `$!` names the program's own
+/// process (the one that waited for it), as the program prints `$$`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_jobs_pid_is_known_while_its_program_is_busy() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_background_jobs_pid_is_known_while_its_program_is_busy");
+		return;
+	}
+	for kind in SESSION_PATHS {
+		let program = dir.path().join(kind);
+		let own = dir.path().join(format!("{kind}.pid"));
+		write_program(&program, &format!("#!/bin/sh\necho $$ > {}\nexit 7\n", own.display()));
+		let holder = Holder::new(&program);
+		let (chunks, said) = flume::unbounded();
+		let shell = crate::shell::Shell::new(None);
+		let rest = "pid=$!; echo next $pid; wait $pid; echo status $?";
+		let (ran, before) = one_thread().block_on(async {
+			let run = shell.run(
+				run_in(dir.path(), background_by(kind, kind, rest)),
+				Some(chunks),
+				crate::cancel::CancelToken::default(),
+			);
+			let other = async {
+				let before = said_until(&said, "next ").await;
+				drop(holder);
+				before
+			};
+			tokio::join!(run, other)
+		});
+		let ran = ran.expect("the run");
+		let text = before + &said.drain().collect::<String>();
+		let bang = text
+			.lines()
+			.find_map(|line| line.strip_prefix("next "))
+			.unwrap_or_default()
+			.to_owned();
+		assert!(
+			text.contains("status 7"),
+			"{kind}: the program ran once let go, after the next command: {text:?} {ran:?}"
+		);
+		let ran_as = std::fs::read_to_string(&own).unwrap_or_default();
+		assert_eq!(ran_as.trim(), bang, "{kind}: $! is the program's own pid");
+	}
+}
+
+/// A background job's program that stays busy fails as the same command
+/// in the foreground does: the same message (bash's `bad interpreter` for a
+/// `#!` script) and status 126, though the process that waited for it
+/// prints them ([`crate::bash::OnBusy::Child`]).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_program_that_stays_busy_fails_as_in_the_foreground() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_background_program_that_stays_busy_fails_as_in_the_foreground");
+		return;
+	}
+	let program = dir.path().join("held");
+	write_program(&program, "#!/bin/sh\nexit 7\n");
+	let holder = Holder::new(&program);
+	let (chunks, said) = flume::unbounded();
+	let shell = crate::shell::Shell::new(None);
+	let command = "./held 2> bg.err & wait $!; echo bg $?; ./held 2> fg.err; echo fg $?".to_owned();
+	let ran = one_thread().block_on(shell.run(
+		run_in(dir.path(), command),
+		Some(chunks),
+		crate::cancel::CancelToken::default(),
+	));
+	drop(holder);
+	let ran = ran.expect("the run");
+	let text: String = said.drain().collect();
+	let bg = std::fs::read_to_string(dir.path().join("bg.err")).unwrap_or_default();
+	let fg = std::fs::read_to_string(dir.path().join("fg.err")).unwrap_or_default();
+	assert!(text.contains("bg 126") && text.contains("fg 126"), "{text:?} {ran:?}");
+	assert!(fg.contains("bad interpreter: Text file busy"), "foreground: {fg:?}");
+	assert_eq!(bg, fg, "the background job's report");
+}
+
+/// A background job's busy program without `#!` (a possible shell text
+/// file) is waited for before `$!` is known: once free, its exec fails
+/// with `ENOEXEC`, and the engine runs it as a script, which a process
+/// already returned as `$!` could not. The first wait lets the program go
+/// (`KILL_AT_BUSY_WAIT`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_background_script_without_a_shebang_still_runs_as_a_script() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_busy_background_script_without_a_shebang_still_runs_as_a_script");
+		return;
+	}
+	let program = dir.path().join("plain");
+	write_program(&program, "exit 7\n");
+	let holder = Holder::new(&program);
+	let (chunks, said) = flume::unbounded();
+	super::KILL_AT_BUSY_WAIT.set(holder.pid());
+	let shell = crate::shell::Shell::new(None);
+	let ran = one_thread().block_on(shell.run(
+		run_in(dir.path(), "./plain & wait $!; echo status $?".to_owned()),
+		Some(chunks),
+		crate::cancel::CancelToken::default(),
+	));
+	super::KILL_AT_BUSY_WAIT.set(0);
+	drop(holder);
+	let ran = ran.expect("the run");
+	let text: String = said.drain().collect();
+	assert!(text.contains("status 7"), "{text:?} {ran:?}");
 }
 
 /// bash's forked child opens a background command's FIFO redirection: the

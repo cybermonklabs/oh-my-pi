@@ -390,6 +390,49 @@ pub struct SpawnSpec<'a> {
 	/// has no such process). `None` for every other spawn. Hosts that
 	/// cannot do this on their platform fail the spawn with `Unsupported`.
 	pub ctty:        Option<OsHandle>,
+	/// What the host does with a program the kernel refuses as busy
+	/// (`ETXTBSY`: a process holds it open for writing) ([`OnBusy`]).
+	pub on_busy:     OnBusy,
+}
+
+/// What a host does with a program the kernel refuses to run because a
+/// process holds it open for writing (`ETXTBSY`) ([`SpawnSpec::on_busy`]).
+///
+/// Shell sessions that are threads of one process meet this when one
+/// writes a program while another forks: the child holds a copy of the
+/// write descriptor until its own exec. A host tries such a program again
+/// after waits of about 1 s in all, then fails with `ETXTBSY`, as at once
+/// before; a host whose kernel never refuses a busy program ignores this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum OnBusy {
+	/// The spawn completes once the program ran, or its waits ran out.
+	#[default]
+	Retry,
+	/// The spawn fails with `ETXTBSY` at once, without waiting. The engine
+	/// asks this for the external that gives a background job its `$!`:
+	/// it renders the report a refusal would print, then asks again with
+	/// [`OnBusy::Child`].
+	Fail,
+	/// The spawn returns once a process exists that tries the program
+	/// again itself, as bash's forked child is `$!` before its exec: the
+	/// script goes on, and only a use of the job (`wait $!`) waits for the
+	/// tries. The process holds only the descriptors the program gets
+	/// while it waits. When its last try still finds the program busy it
+	/// writes `report` to its fd 2 and exits with `status`; any other exec
+	/// failure is reported as a [`ChildRedirs`] exec failure, with
+	/// `exec_diag`. A host spawns a possible shell text file (no `#!`, no
+	/// NUL in its first line) as for [`OnBusy::Retry`]: its exec may yet
+	/// fail with `ENOEXEC`, which the engine runs as a script, and a process
+	/// already returned could not.
+	Child {
+		/// What the engine prints when the program stays busy, newline
+		/// included.
+		report:    BString,
+		/// The status of the command then.
+		status:    u8,
+		/// What precedes the description of any other exec failure.
+		exec_diag: BString,
+	},
 }
 
 /// The redirections a spawned process applies itself ([`SpawnSpec::redirs`]).

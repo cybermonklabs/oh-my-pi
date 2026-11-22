@@ -31,9 +31,11 @@
 //! **Busy programs.** On the `posix_spawn` and fork paths an exec that fails
 //! with `ETXTBSY` comes back at once as [`super::Started::Busy`], no process
 //! left of it, with the spawn kept for another try after a wait on the
-//! caller's timer ([`super::Started::settle`]). The child of `fork_redirs`,
-//! whose exec the parent does not wait for, tries again itself after the
-//! same waits, once it closed every close-on-exec descriptor.
+//! caller's timer ([`super::Started::settle`]); or, as the spec asks
+//! ([`OnBusy`]), as `ETXTBSY` at once, or through `fork_redirs` with no
+//! redirections. The child of `fork_redirs`, whose exec the parent does not
+//! wait for, tries again itself after the same waits, once it closed every
+//! close-on-exec descriptor.
 //!
 //! **Waiting** reports stops and continues besides the exit
 //! ([`ExtProc::poll_event`]).
@@ -65,8 +67,8 @@ use pi_builtins::read_process_umask as process_umask;
 use super::{Dir, Leftover, Sessions, Shared, Started, child_end};
 use crate::{
 	bash::{
-		ChildRedir, ChildRedirs, EnvView, ExitStatus, ExtProc, OpenFlags, OsHandle, PgroupSpec,
-		Platform, ProcEvent, Rlimit, SigSet, Signal, SpawnSpec, StdioSpec,
+		ChildRedir, ChildRedirs, EnvView, ExitStatus, ExtProc, OnBusy, OpenFlags, OsHandle,
+		PgroupSpec, Platform, ProcEvent, Rlimit, SigSet, Signal, SpawnSpec, StdioSpec,
 	},
 	sys::{
 		lifecycle::{Abandon, Tracker},
@@ -637,6 +639,7 @@ fn try_start(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Started> {
 		lineage,
 		redirs,
 		ctty,
+		on_busy,
 		..
 	} = spec;
 	if redirs.is_some() && may_need_script_fallback(path, cwd) {
@@ -683,15 +686,27 @@ fn try_start(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Started> {
 	let program =
 		Program { path, argv, env, cwd, umask, ign: sigmask_ign, rlimits, tty, closed: &closed };
 	let launched = match &redirs {
-		Some(redirs) => fork_redirs(&program, &fds, place, redirs),
+		Some(redirs) => fork_redirs(&program, &fds, place, redirs, None),
 		None => launch(&shared.state, &program, &fds, place),
 	};
-	if redirs.is_none() && is_busy(&launched) {
-		at_busy_wait();
-		let kept = Kept { pgroup, lineage, tracker, pumps };
-		return Busy::keep(shared, &program, fds, place, kept)
-			.map(|busy| Started::Busy(super::Busy(Box::new(busy))));
-	}
+	// A busy program (`ETXTBSY`), as the spec asks ([`OnBusy`]). `Fail`
+	// reports it at once (below); a possible shell text file is waited
+	// for here even for `Child` (its exec may yet fail with `ENOEXEC`).
+	let launched = match on_busy {
+		OnBusy::Child { report, status, exec_diag }
+			if redirs.is_none() && is_busy(&launched) && !may_need_script_fallback(path, cwd) =>
+		{
+			let waits = ChildRedirs { list: Vec::new(), exec_diag };
+			fork_redirs(&program, &fds, place, &waits, Some((&report, status)))
+		},
+		OnBusy::Retry | OnBusy::Child { .. } if redirs.is_none() && is_busy(&launched) => {
+			at_busy_wait();
+			let kept = Kept { pgroup, lineage, tracker, pumps };
+			return Busy::keep(shared, &program, fds, place, kept)
+				.map(|busy| Started::Busy(super::Busy(Box::new(busy))));
+		},
+		_ => launched,
+	};
 	// Our copies of the child's ends: pumps see end of file when the child
 	// (and what it forks) closes its own.
 	drop(fds);
@@ -1168,6 +1183,17 @@ fn child_fail(diag: &[u8], errno: i32, status: i32, texts: &[Vec<u8>]) -> ! {
 	unsafe { libc::_exit(status) }
 }
 
+/// Write `text` to fd 2 and exit with `status`: the forked child's report
+/// of a program that stayed busy, as the engine renders it
+/// ([`OnBusy::Child`]). Async-signal-safe.
+fn child_report(text: &[u8], status: i32) -> ! {
+	// SAFETY: write(2) of a valid buffer; a failure is ignored (nowhere to
+	// report it).
+	unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+	// SAFETY: `_exit` ends the forked child without running host code.
+	unsafe { libc::_exit(status) }
+}
+
 /// The last OS error number. Async-signal-safe.
 fn errno() -> i32 {
 	io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -1398,12 +1424,15 @@ fn fd_number(name: &[u8]) -> Option<i32> {
 /// the redirections in order (an open may wait for a FIFO's other end:
 /// only the child waits, as bash's does) and execs. The parent returns at
 /// once with the pid; a failure in the child is reported on its own fd 2
-/// and its exit status (1 for a redirection, 127 or 126 for the exec).
+/// and its exit status (1 for a redirection, 127 or 126 for the exec). A
+/// `busy` report `(text, status)` replaces the exec failure's when the last
+/// try still finds the program busy ([`OnBusy::Child`]).
 fn fork_redirs(
 	prog: &Program<'_>,
 	fds: &[(i32, Source)],
 	place: Place,
 	redirs: &ChildRedirs,
+	busy: Option<(&[u8], u8)>,
 ) -> io::Result<(i32, Place)> {
 	let exec = Exec::new(prog)?;
 	let steps = redirs
@@ -1412,6 +1441,7 @@ fn fork_redirs(
 		.map(ChildStep::new)
 		.collect::<io::Result<Vec<_>>>()?;
 	let exec_diag = redirs.exec_diag.to_vec();
+	let busy = busy.map(|(text, status)| (text.to_vec(), i32::from(status)));
 	let texts: &[Vec<u8>] = &ERRNO_TEXT;
 	// The bound of the child's close loop where `/proc` cannot list its
 	// descriptors ([`close_on_exec`]), read here: the child must not
@@ -1546,6 +1576,11 @@ fn fork_redirs(
 			.err()
 			.and_then(|e| e.raw_os_error())
 			.unwrap_or(0);
+			if e == libc::ETXTBSY
+				&& let Some((text, status)) = &busy
+			{
+				child_report(text, *status);
+			}
 			child_fail(&exec_diag, e, if e == libc::ENOENT { 127 } else { 126 }, texts);
 		}
 	}

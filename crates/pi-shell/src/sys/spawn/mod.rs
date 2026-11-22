@@ -42,7 +42,10 @@
 //! on the host's timers, so no thread waits. The child of a spawn that
 //! applies its own redirections ([`SpawnSpec::redirs`]) is already the
 //! program's process (its pid is `$!`, its FIFO opens are done): that child
-//! tries again itself, holding only the descriptors the program will.
+//! tries again itself, holding only the descriptors the program will. The
+//! external that gives a background job its `$!` gets such a child too
+//! ([`crate::bash::OnBusy::Child`]): `$!` is known at once, as bash's
+//! forked child is `$!` before its exec.
 //!
 //! **Leak checks.** The spawner remembers every group (session, job) it
 //! created; [`NativeSpawner::leftovers`] lists the processes still in them,
@@ -400,39 +403,32 @@ pub(crate) enum Started {
 #[cfg(unix)]
 pub(crate) struct Busy(Box<imp::Busy>);
 
+#[cfg(unix)]
 impl Started {
 	/// The external once its program ran, or the error: a busy spawn is
 	/// tried again after each wait of [`BUSY_WAITS_MS`], each a timer `sleep`
 	/// makes for that long (the host's), so no thread waits; once the waits
 	/// ran out the error is `ETXTBSY`, the one the first try met. Dropping
-	/// the future before then spawns nothing.
+	/// the future before then spawns nothing. Only the Unix hosts call it:
+	/// only a Unix kernel refuses a busy program.
 	pub(crate) async fn settle<S>(self, mut sleep: S) -> io::Result<Box<dyn ExtProc>>
 	where
 		S: FnMut(Duration) -> Box<dyn crate::bash::Timer>,
 	{
-		#[cfg(unix)]
-		{
-			let mut started = self;
-			let mut waits = BUSY_WAITS_MS.iter();
-			loop {
-				match started {
-					Self::Done(spawned) => return spawned,
-					Self::Busy(busy) => {
-						let Some(&ms) = waits.next() else {
-							return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
-						};
-						let mut timer = sleep(Duration::from_millis(ms));
-						std::future::poll_fn(|cx| timer.poll(cx)).await;
-						started = busy.0.retry();
-					},
-				}
+		let mut started = self;
+		let mut waits = BUSY_WAITS_MS.iter();
+		loop {
+			match started {
+				Self::Done(spawned) => return spawned,
+				Self::Busy(busy) => {
+					let Some(&ms) = waits.next() else {
+						return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
+					};
+					let mut timer = sleep(Duration::from_millis(ms));
+					std::future::poll_fn(|cx| timer.poll(cx)).await;
+					started = busy.0.retry();
+				},
 			}
-		}
-		#[cfg(windows)]
-		{
-			let _ = &mut sleep;
-			let Self::Done(spawned) = self;
-			spawned
 		}
 	}
 }
