@@ -1,0 +1,52 @@
+# Scratch only, never merged: pi-shell at #53's round-10 head and at its base on a macOS runner (clippy, the
+# whole test set, doctests; head-only failures rerun). Runs on pushes to scratch/zsh53r10.
+name: scratch zsh53r10
+
+on:
+  push:
+    branches: ["scratch/zsh53r10"]
+
+permissions:
+  contents: read
+
+jobs:
+  pi-shell:
+    name: pi-shell head and base (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS only: the head-only failures of run 44900384196 were on macos-15.
+        runner: [macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      HEAD_SHA: 84d0164838bf9ae9d08d06aeb7c9d4200d21f726
+      BASE_SHA: 9058ab9d229663e229e2867824ba6df6f21e9e59
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real bash (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          b="$(brew --prefix)/bin/bash"
+          [ -x "$b" ] || brew install bash
+          "$b" --version | head -1
+          echo "PI_TEST_REAL_BASH=$b" >> "$GITHUB_ENV"
+          /bin/zsh --version
+          sw_vers
+          df -h .
+      - name: Head and base
+        shell: bash
+        run: bash .github/scratch-zsh53r10.sh
+      - name: Disk
+        if: always()
+        shell: bash
+        run: df -h . || true
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsh53r10-logs-${{ matrix.runner }}
+          path: zsh53r10-logs
