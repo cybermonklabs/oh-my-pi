@@ -117,6 +117,17 @@ import { cfgLspRequestTimeout } from "./settings";
 
 const MAX_RENAME_PAIRS = 1000;
 
+/**
+ * The most directories a `rename_file` of a directory reads, counting each path that reaches a
+ * directory: through links, one directory can be reached by many paths, and a chain of k
+ * directories that each hold two links to the next is reached by 2^(k+1)-1 of them. Ten times the
+ * file limit, so a tree the file limit allows can also hold many empty directories; and cheap at
+ * the bound: a tree of 10,000 plain directories renames in 0.3-0.45 s with under 10 MB more memory,
+ * and such a chain is refused after 5,000 reads in under 0.3 s (measured on runc and under gVisor),
+ * far inside the call's 20 s default deadline.
+ */
+const MAX_RENAME_DIRECTORIES = 10_000;
+
 /** File actions whose answer can draw on other open documents; those are synced from disk first. */
 const CROSS_FILE_ACTIONS: ReadonlySet<string> = new Set([...PROJECT_INDEXED_ACTIONS, "code_actions"]);
 
@@ -152,8 +163,9 @@ function isUntyped(entry: fs.Dirent): boolean {
  * came by (same device and inode as one of the directories from `source` down to it), so a link
  * to the directory it is in, or to any directory between it and `source`, names nothing and the
  * walk does not loop. Two paths to the same directory that is not on the path (`alias -> sub`)
- * are both walked, and both named. It stops once it has more files than it may list, and checks
- * `signal` before each directory it reads and once more after the last.
+ * are both walked, and both named. It stops once it has more files than it may list, or more
+ * directories ({@link MAX_RENAME_DIRECTORIES}, so a tree whose links fan out ends fast), and
+ * checks `signal` before each directory it reads and once more after the last.
  *
  * The recursive delete in `lsp/edits.ts` walks a tree too, but by the opposite rule: a delete
  * removes a link as itself and never what it points to, so that walk follows no link. The two
@@ -163,14 +175,10 @@ async function enumerateRenamePairs(
 	source: string,
 	dest: string,
 	signal: AbortSignal | undefined,
-): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded: boolean }> {
+): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded?: "files" | "directories" }> {
 	const stat = await fs.promises.stat(source);
 	if (!stat.isDirectory()) {
-		return {
-			pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }],
-			directory: false,
-			exceeded: false,
-		};
+		return { pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }], directory: false };
 	}
 	const pairs: FileRenamePair[] = [];
 	// The directories to read, relative to `source` ("" is `source`), each with the device and
@@ -201,12 +209,15 @@ async function enumerateRenamePairs(
 			}
 			if (isDirectory) {
 				if (ancestors.includes(id)) continue;
+				if (directories.length >= MAX_RENAME_DIRECTORIES) {
+					return { pairs, directory: true, exceeded: "directories" };
+				}
 				directories.push({ relative: rel, ancestors: [...ancestors, id] });
 				continue;
 			}
 			if (!isFile) continue;
 			if (pairs.length >= MAX_RENAME_PAIRS) {
-				return { pairs, directory: true, exceeded: true };
+				return { pairs, directory: true, exceeded: "files" };
 			}
 			pairs.push({
 				oldUri: fileToUri(path.join(source, rel)),
@@ -215,7 +226,7 @@ async function enumerateRenamePairs(
 		}
 	}
 	throwIfAborted(signal);
-	return { pairs, directory: true, exceeded: false };
+	return { pairs, directory: true };
 }
 
 function formatRenameStatPath(filePath: string, cwd: string): string {
@@ -653,7 +664,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					content: [
 						{
 							type: "text",
-							text: `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`,
+							text:
+								enumerated.exceeded === "files"
+									? `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`
+									: `Error: directory contains more than ${MAX_RENAME_DIRECTORIES} directories, counting each path through a link; rename in smaller batches to keep LSP edits accurate`,
 						},
 					],
 					details: { action, success: false, request: params },

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `lsp` `rename_file` of a directory no longer fails or keeps listing when the directory holds a symbolic link to a directory the link is in. A link to the directory itself failed the rename with ELOOP, and two such links kept it listing for seconds before ELOOP. It now lists the directory itself and follows each link, but does not enter a directory already on the path it came by, as `find -L` does. The files behind a link are named to the language servers by their paths through it, so an import that goes through the link (`./old/link/e1`) is rewritten, and a link to a file is now named too. A cancel or the call's deadline now also stops the listing during its last directory read.
+- `lsp` `rename_file` of a directory no longer fails or keeps listing when the directory holds a symbolic link to a directory the link is in. A link to the directory itself failed the rename with ELOOP, and two such links kept it listing for seconds before ELOOP. It now lists the directory itself and follows each link, but does not enter a directory already on the path it came by, as `find -L` does. The files behind a link are named to the language servers by their paths through it, so an import that goes through the link (`./old/link/e1`) is rewritten, and a link to a file is now named too. A cancel or the call's deadline now also stops the listing during its last directory read. A directory whose links reach the same directories by many paths (each counts) is refused past 10,000 directories, as one past 1,000 files is; before, a few directories that each linked twice to the next could keep the call listing for minutes.
 
 ## [18.18.6] - 2026-11-09
 
