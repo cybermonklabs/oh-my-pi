@@ -1,4 +1,4 @@
-//! N-API bindings for the Codex live WebRTC peer.
+//! N-API bindings for the live voice WebRTC peer.
 //!
 //! The TypeScript host owns authenticated signaling and the sideband protocol;
 //! the realtime peer, Opus media, and speaker playback live in
@@ -66,7 +66,7 @@ impl LiveWebRtcPeer {
 			.map_err(napi::Error::from_reason)
 	}
 
-	/// Apply the remote SDP answer returned by Codex signaling.
+	/// Apply the remote SDP answer returned by the live server's signaling.
 	#[napi]
 	pub async fn accept_answer(&self, sdp: String) -> Result<()> {
 		self

@@ -1,4 +1,4 @@
-//! Native WebRTC media transport for Codex live conversations.
+//! Native WebRTC media transport for live voice conversations.
 //!
 //! The TypeScript host owns authenticated signaling and the sideband protocol;
 //! this module owns the realtime WebRTC peer, Opus media, and speaker
@@ -235,7 +235,7 @@ impl LivePeerCore {
 		Ok(offer.sdp)
 	}
 
-	/// Apply the remote SDP answer returned by Codex signaling.
+	/// Apply the remote SDP answer returned by the live server's signaling.
 	pub async fn accept_answer(&self, sdp: String) -> VoiceResult<()> {
 		let peer = self
 			.resources
@@ -244,7 +244,7 @@ impl LivePeerCore {
 			.map(|resources| Arc::clone(&resources.peer))
 			.ok_or_else(|| "Native live WebRTC peer has not started".to_owned())?;
 		let answer = RTCSessionDescription::answer(sdp)
-			.map_err(|error| format!("Codex returned an invalid live SDP answer: {error}"))?;
+			.map_err(|error| format!("The live server returned an invalid SDP answer: {error}"))?;
 		peer
 			.set_remote_description(answer)
 			.await
@@ -416,7 +416,7 @@ fn install_peer_callbacks(
 			let Some(output_sender) = output_sender else {
 				if let Some(core) = core.upgrade() {
 					core.report_failure(
-						"Codex live returned more than one remote audio track".to_owned(),
+						"The live server returned more than one remote audio track".to_owned(),
 					);
 				}
 				return;
@@ -614,7 +614,7 @@ async fn receive_output_audio(
 	{
 		if let Some(core) = core.upgrade() {
 			core.report_failure(format!(
-				"Codex live negotiated unsupported audio codec {}",
+				"The live server negotiated unsupported audio codec {}",
 				track.codec().capability.mime_type
 			));
 		}
