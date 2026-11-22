@@ -35,6 +35,7 @@ mod modes;
 mod nested_shell;
 mod orphan_jobs;
 mod procsub;
+mod prompt_status;
 mod restore_fidelity;
 mod skeleton;
 mod startup_vars;

@@ -809,8 +809,24 @@ impl Reader {
 		None
 	}
 
-	/// Expand the prompts of this line.
+	/// Expand the prompts of this line. Their command substitutions leave
+	/// `$?` as it was (bash 5.2.21 and 5.3.20, zsh 5.9): each pass of the
+	/// expansion replays them and sets `$?` to their statuses, so it is put
+	/// back whenever the expansion returns, also while a substitution still
+	/// runs.
 	fn prompts(&mut self, k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Result<(), Pause> {
+		let expanded = self.expand_prompts(k, cx, vp);
+		vp.status = self.status;
+		expanded
+	}
+
+	/// [`Self::prompts`] without putting `$?` back.
+	fn expand_prompts(
+		&mut self,
+		k: &mut Kernel,
+		cx: &mut Cx<'_>,
+		vp: &mut Vproc,
+	) -> Result<(), Pause> {
 		let zsh = vp.mode.dialect() == Dialect::Zsh;
 		let (lname, rname): (&[u8], &[u8]) = if self.cont {
 			(b"PS2", b"RPS2")

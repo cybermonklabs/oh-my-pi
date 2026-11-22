@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A command substitution in an interactive shell's prompt (bash `PS1`/`PS2`, zsh `PS1`/`RPS1`/`PS2` with `promptsubst`) no longer sets `$?`: the next command and the shell's exit status see the last command's status, as in bash and zsh (`PS1='$(exit 3)> '; false`, then `echo $?` printed 3)
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
