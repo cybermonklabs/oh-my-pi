@@ -15,15 +15,7 @@ async fn brace_limit_preserves_complete_expansions() {
 		("if false; then echo {1..5000000}; fi; echo after", "after"),
 		("f() { echo {1..5000000}; }; echo defined", "defined"),
 	] {
-		let (result, output) = run_command_capture_within(
-			Duration::from_secs(120),
-			command,
-			None,
-			None,
-			CancelToken::default(),
-		)
-		.await
-		.expect("large brace expansion must finish");
+		let (result, output) = run_command_capture(command, None, None, CancelToken::default()).await;
 		if result.exit_code != Some(0) || output.trim() != expected {
 			failures.push(format!(
 				"{command:?}: status={:?}, output={output:?}, expected={expected:?}",
@@ -49,15 +41,7 @@ async fn brace_limit_reports_oversized_expansions() {
 		("a=( \"${x:-\"{1..2049}\"}${x:-\"{1..2048}\"}\" ); echo ${#a[@]}", 2),
 		("declare -a a='({1..5000000})'", 1),
 	] {
-		let (result, output) = run_command_capture_within(
-			Duration::from_secs(120),
-			command,
-			None,
-			None,
-			CancelToken::default(),
-		)
-		.await
-		.expect("oversized brace expansion must fail promptly");
+		let (result, output) = run_command_capture(command, None, None, CancelToken::default()).await;
 		if result.exit_code != Some(status)
 			|| output.lines().count() != 1
 			|| !output.contains("brace expansion:")
@@ -73,15 +57,8 @@ async fn brace_limit_reports_oversized_expansions() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn uutils_diff_reads_process_substitution_fds() {
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		"diff <(echo a) <(echo b)",
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("process substitution should not hang");
+	let (result, output) =
+		run_command_capture("diff <(echo a) <(echo b)", None, None, CancelToken::default()).await;
 
 	assert_eq!(result.exit_code, Some(1));
 	assert!(output.contains("< a\n---\n> b\n"), "diff output missing changed lines: {output:?}");
@@ -98,16 +75,14 @@ async fn fifo_redirect_waits_for_a_late_writer() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(5),
+	let (result, output) = run_command_capture(
 		"/bin/sh -c 'sleep 0.15; echo one > f' & /bin/cat < f; /bin/sh -c 'sleep 0.15; echo two > \
 		 f' & x=$(< f); echo \"x=$x\"; wait",
 		Some(root.path()),
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("a FIFO redirect waits for its writer and returns");
+	.await;
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "one\nx=two\n"));
 }
@@ -129,8 +104,7 @@ fn fifo_redirects_do_not_hold_the_worker_their_other_end_needs() {
 		"echo one > f & cat < f; cat < g & echo two > g; wait",
 		Some(root.path().to_path_buf()),
 		512,
-	)
-	.expect("a FIFO redirect must not hold the worker its other end needs");
+	);
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "one\ntwo\n"));
 }
@@ -143,17 +117,15 @@ fn fifo_redirects_do_not_hold_the_worker_their_other_end_needs() {
 #[tokio::test(flavor = "current_thread")]
 async fn session_runs_pipelines_on_a_current_thread_runtime() {
 	let _guard = shell_test_lock().lock().await;
-	let (result, output) = time::timeout(
-		Duration::from_secs(5),
-		capture_unlocked(
-			"{ /bin/sleep 0.05; echo late; } | /bin/cat; echo after; ps --help | head -n 1 | wc -l",
-			None,
-			None,
-			CancelToken::default(),
-		),
+	// A session that blocks the runtime's only thread never finishes, and the
+	// runner's bound fails the test.
+	let (result, output) = capture_unlocked(
+		"{ /bin/sleep 0.05; echo late; } | /bin/cat; echo after; ps --help | head -n 1 | wc -l",
+		None,
+		None,
+		CancelToken::default(),
 	)
-	.await
-	.expect("the session must not block the runtime's only thread");
+	.await;
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert!(output.starts_with("late\nafter\n"), "output: {output:?}");
@@ -173,8 +145,7 @@ async fn background_external_command_opens_its_fifo_redirect_itself() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		concat!(
 			// First, so the job is `%1`.
 			"/bin/sleep 30 < f & jobs; kill %1; wait $!; echo \"kill-job=$?\"\n",
@@ -187,8 +158,7 @@ async fn background_external_command_opens_its_fifo_redirect_itself() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("the shell goes on while a background command waits for its FIFO");
+	.await;
 
 	assert_eq!(result.exit_code, Some(0), "{output}");
 	assert!(output.contains("Running"), "`jobs` lists the waiting command: {output}");
@@ -208,15 +178,13 @@ async fn killed_job_leaves_no_reader_on_its_fifo() {
 	pi_vfs::BlockingFs::native()
 		.make_node(&fifo, pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		"cat < f & sleep 0.2; kill %1; wait; echo done",
 		Some(root.path()),
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("the killed job ends");
+	.await;
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "done\n"));
 
 	// The release runs on its own thread; give it time, then a writer that
@@ -244,8 +212,7 @@ async fn killed_job_releases_its_fifo_before_the_next_command() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(30),
+	let (result, output) = run_command_capture(
 		concat!(
 			"for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n",
 			"  cat < f & sleep 0.05; kill %%\n",
@@ -257,8 +224,7 @@ async fn killed_job_releases_its_fifo_before_the_next_command() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("no writer is left without a reader");
+	.await;
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "done\n"));
 }
@@ -275,8 +241,7 @@ async fn deferred_redirects_keep_descriptor_paths_and_the_environment() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		concat!(
 			"/bin/echo out > /dev/stdout & wait\n",
 			"export f1=orig; /usr/bin/env > f & grep '^f1=' < f; wait",
@@ -285,8 +250,7 @@ async fn deferred_redirects_keep_descriptor_paths_and_the_environment() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("the commands finish");
+	.await;
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "out\nf1=orig\n"));
 }
@@ -303,8 +267,7 @@ async fn later_redirects_of_a_deferred_descriptor_stay_in_the_child() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		concat!(
 			"/bin/echo replaced >f >/dev/null & cat <f; wait; echo \"replace=$?\"\n",
 			"/bin/echo closed 3>f >&3 3>&- & cat <f; wait\n",
@@ -316,8 +279,7 @@ async fn later_redirects_of_a_deferred_descriptor_stay_in_the_child() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("the shell goes on while a background command waits for its FIFO");
+	.await;
 
 	assert_eq!(
 		(result.exit_code, output.as_str()),
@@ -336,8 +298,7 @@ async fn deferred_duplications_read_the_descriptors_the_parent_holds() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		concat!(
 			"{ /bin/echo dup3 >f 1>&3 3>/dev/null & cat <f; wait; } 3>out3; cat out3\n",
 			"{ /bin/echo moved4 >f 1>&4- & cat <f; wait; } 4>out4; cat out4\n",
@@ -347,8 +308,7 @@ async fn deferred_duplications_read_the_descriptors_the_parent_holds() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("the shell goes on while a background command waits for its FIFO");
+	.await;
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "dup3\nmoved4\nsw\n"));
 }
@@ -364,8 +324,7 @@ async fn builtins_waiting_on_a_fifo_see_its_writer_close() {
 	pi_vfs::BlockingFs::native()
 		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
 		.expect("create FIFO");
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(10),
+	let (result, output) = run_command_capture(
 		concat!(
 			"{ echo a; sleep 0.2; } > f & mapfile -t lines < f; wait; echo \"mapfile=${#lines[@]}\"\n",
 			"{ echo b; sleep 0.2; } > f & while read -r l; do echo \"read=$l\"; done < f; wait\n",
@@ -375,8 +334,7 @@ async fn builtins_waiting_on_a_fifo_see_its_writer_close() {
 		None,
 		CancelToken::default(),
 	)
-	.await
-	.expect("each reader ends at its writer's EOF");
+	.await;
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "mapfile=1\nread=b\nread-t=1 c\n"));
 }
@@ -388,8 +346,7 @@ async fn builtins_waiting_on_a_fifo_see_its_writer_close() {
 #[test]
 fn pipeline_reads_do_not_nest_on_a_full_blocking_pool() {
 	let (result, output) =
-		capture_on_runtime("printf 'a\\n' | read -r x | read -r y; printf 'done\\n'", None, 2)
-			.expect("read must not wait on a blocking worker it cannot get");
+		capture_on_runtime("printf 'a\\n' | read -r x | read -r y; printf 'done\\n'", None, 2);
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "done\n");
@@ -399,8 +356,7 @@ fn pipeline_reads_do_not_nest_on_a_full_blocking_pool() {
 #[test]
 fn async_utilities_wait_for_a_slow_producer_without_blocking_the_worker() {
 	let (result, output) =
-		capture_on_runtime("{ sleep 0.3; echo hit; } | grep hit | rg hit", None, 512)
-			.expect("async utilities must not block the runtime's only worker");
+		capture_on_runtime("{ sleep 0.3; echo hit; } | grep hit | rg hit", None, 512);
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "hit\n");
@@ -415,13 +371,12 @@ fn async_utilities_pipe_more_than_a_pipe_buffer() {
 			.expect("create file");
 	}
 
-	let find = capture_on_runtime("find . -type f | grep -c f", Some(dir.path().to_path_buf()), 512);
-	let fd = capture_on_runtime("fd -t f . | rg -c f", Some(dir.path().to_path_buf()), 512);
-
-	let (result, output) = find.expect("find | grep must not deadlock on a full pipe");
+	let (result, output) =
+		capture_on_runtime("find . -type f | grep -c f", Some(dir.path().to_path_buf()), 512);
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "3000\n");
-	let (result, output) = fd.expect("fd | rg must not deadlock on a full pipe");
+	let (result, output) =
+		capture_on_runtime("fd -t f . | rg -c f", Some(dir.path().to_path_buf()), 512);
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "3000\n");
 }
@@ -432,8 +387,7 @@ fn async_utility_waiting_on_stdin_is_cancelled_by_timeout() {
 	// The pipeline ends with its producer (1 s); `grep` must be cancelled at
 	// 0.3 s while the producer still needs the worker.
 	let (result, output) =
-		capture_on_runtime("{ sleep 1; echo x; } | timeout 0.3 grep x", None, 512)
-			.expect("timeout must cancel a utility waiting on stdin");
+		capture_on_runtime("{ sleep 1; echo x; } | timeout 0.3 grep x", None, 512);
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(124), ""));
 }
@@ -471,15 +425,7 @@ async fn descriptor_paths_reach_the_commands_descriptors() {
 	let command = "for f in $(cat /dev/stdin <<'EOF'\na\nb\nEOF\n); do echo \"$f\"; done\necho \
 	               to-stderr > /dev/stderr\necho via-tee | tee /dev/stderr > /dev/null\nsource \
 	               /dev/stdin <<< 'echo sourced'";
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		command,
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("descriptor paths must not read the host terminal");
+	let (result, output) = run_command_capture(command, None, None, CancelToken::default()).await;
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "a\nb\nto-stderr\nvia-tee\nsourced\n");
@@ -500,15 +446,7 @@ async fn descriptor_paths_never_reach_host_only_descriptors() {
 	let command =
 		format!("cat /dev/fd/{fd}; echo \"rc=$?\"; cat < /proc/self/fd/{fd}; echo \"rc=$?\"");
 
-	let (_, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		&command,
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("closed descriptor paths should fail fast");
+	let (_, output) = run_command_capture(&command, None, None, CancelToken::default()).await;
 	drop(host_file);
 	let _ = std::fs::remove_dir_all(&dir);
 
@@ -523,15 +461,7 @@ async fn descriptor_paths_never_reach_host_only_descriptors() {
 #[tokio::test(flavor = "multi_thread")]
 async fn process_substitution_operands_keep_the_shell_fd_name() {
 	let command = "wc -l <(printf 'a\\nb\\n'); ls <(true); sed -n -f <(echo p) <<< from-sed";
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		command,
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("process substitution should not hang");
+	let (result, output) = run_command_capture(command, None, None, CancelToken::default()).await;
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
 	assert_eq!(output, "2 /dev/fd/63\n/dev/fd/63\nfrom-sed\n");
@@ -549,15 +479,7 @@ async fn sed_w_dev_stdout_shares_sed_output() {
 		 's/c/d/w /dev/stdout'",
 		dir.display()
 	);
-	let (result, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		&command,
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("sed should not hang");
+	let (result, output) = run_command_capture(&command, None, None, CancelToken::default()).await;
 	let _ = std::fs::remove_dir_all(&dir);
 
 	assert_eq!(result.exit_code, Some(0), "output: {output:?}");
@@ -571,15 +493,7 @@ async fn sed_w_dev_stdout_shares_sed_output() {
 #[tokio::test(flavor = "multi_thread")]
 async fn descriptor_paths_keep_their_spelling() {
 	let command = "pgrep -F /dev/fd/9; sed 'w /dev/fd/9' <<< x; readlink /dev/stdin <<< x";
-	let (_, output) = run_command_capture_within(
-		Duration::from_secs(5),
-		command,
-		None,
-		None,
-		CancelToken::default(),
-	)
-	.await
-	.expect("closed descriptor paths should fail fast");
+	let (_, output) = run_command_capture(command, None, None, CancelToken::default()).await;
 
 	assert!(!output.contains("/dev/fd/-1"), "leaked the placeholder path: {output:?}");
 	assert!(output.contains("cannot read pidfile '/dev/fd/9'"), "output: {output:?}");
@@ -673,9 +587,9 @@ async fn subshell_exit_ends_backgrounded_compound_loops() {
 /// `kill %N` must reach a backgrounded compound loop in a retained session
 /// (the bash-tool persistent shell keeps its job table alive, so the loop
 /// legitimately outlives the call — the agent's only off-switch is the
-/// jobspec). Uses a writing loop so liveness is observable without timing,
-/// and bounds both calls: a hanging `kill %1` is exactly the wedge the
-/// reporter hit on 18.12.5, not a pass.
+/// jobspec). Uses a writing loop so liveness is observable without timing.
+/// A hanging `kill %1`, the wedge the reporter hit on 18.12.5, hangs the
+/// test until the runner's bound fails it.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_jobspec_ends_backgrounded_compound_loop_in_retained_session() {
 	let _guard = shell_test_lock().lock().await;
@@ -684,30 +598,23 @@ async fn kill_jobspec_ends_backgrounded_compound_loop_in_retained_session() {
 	let sub =
 		format!("(while :; do echo x >> {}; done) &", quote_arg(&output.path().to_string_lossy()));
 
-	time::timeout(
-		Duration::from_secs(10),
-		shell.run(
-			ShellRunOptions { command: sub, ..Default::default() },
-			None,
-			CancelToken::default(),
-		),
-	)
-	.await
-	.expect("backgrounding a subshell loop must return promptly")
-	.expect("run backgrounded subshell loop");
-	assert!(still_written(output.path()).await, "loop never started");
+	shell
+		.run(ShellRunOptions { command: sub, ..Default::default() }, None, CancelToken::default())
+		.await
+		.expect("run backgrounded subshell loop");
+	// The loop has started once it has written.
+	while fs::metadata(output.path()).map_or(0, |meta| meta.len()) == 0 {
+		time::sleep(Duration::from_millis(10)).await;
+	}
 
-	let kill = time::timeout(
-		Duration::from_secs(10),
-		shell.run(
+	let kill = shell
+		.run(
 			ShellRunOptions { command: "kill %1".into(), ..Default::default() },
 			None,
 			CancelToken::default(),
-		),
-	)
-	.await
-	.expect("kill %1 must return instead of wedging the session")
-	.expect("kill %1");
+		)
+		.await
+		.expect("kill %1");
 	assert_eq!(kill.exit_code, Some(0), "kill %1 failed");
 	assert!(!still_written(output.path()).await, "kill %1 did not end the compound loop");
 }
@@ -778,37 +685,30 @@ async fn persistent_shell_reaps_background_child_without_followup_run() {
 		.await
 		.expect("start external background child");
 	assert_eq!(started.exit_code, Some(0));
-	let pid = time::timeout(Duration::from_secs(2), async {
-		loop {
-			if let Ok(pid) = fs::read_to_string(pidfile.path())
-				.unwrap_or_default()
-				.trim()
-				.parse::<i32>()
-			{
-				break pid;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	let pid = loop {
+		if let Ok(pid) = fs::read_to_string(pidfile.path())
+			.unwrap_or_default()
+			.trim()
+			.parse::<i32>()
+		{
+			break pid;
 		}
-	})
-	.await
-	.expect("background child did not record its pid");
+		time::sleep(Duration::from_millis(20)).await;
+	};
 	assert!(pid > 0);
 
 	// No calls to the shell (including the live-job counter) until this
-	// child has exited and its parent has reaped it.
-	time::timeout(Duration::from_secs(5), async {
-		loop {
-			// SAFETY: signal 0 only probes this pid's existence.
-			if unsafe { libc::kill(pid, 0) } == -1 {
-				let err = io::Error::last_os_error();
-				assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
-				break;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	// child has exited and its parent has reaped it. Waits as long as that
+	// takes: a child never reaped hangs the test until the runner's timeout.
+	loop {
+		// SAFETY: signal 0 only probes this pid's existence.
+		if unsafe { libc::kill(pid, 0) } == -1 {
+			let err = io::Error::last_os_error();
+			assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
+			break;
 		}
-	})
-	.await
-	.expect("background child remained a zombie after exit");
+		time::sleep(Duration::from_millis(20)).await;
+	}
 
 	assert_eq!(shell.live_background_job_count().await, 0);
 
@@ -834,9 +734,12 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	let first_pidfile = tempfile::NamedTempFile::new().expect("pipeline pidfile");
 	let last_pidfile = tempfile::NamedTempFile::new().expect("last stage pidfile");
 	// `$!` names the job for `wait`; each stage reports its OS pid itself.
+	// The first stage's `sleep 600` (`testkit::child::LIFETIME`) outlives the
+	// test runner's bound, so only the test ends it.
 	let command = format!(
-		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 15' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
-		 sleep 1; exit 9' _ {} >/dev/null 2>&1 & pid=$!",
+		"/bin/sh -c 'echo $$ > \"$1\"; exec {} 600' _ {} | /bin/sh -c 'echo $$ > \"$1\"; sleep 1; \
+		 exit 9' _ {} >/dev/null 2>&1 & pid=$!",
+		crate::testkit::child::on_path("sleep"),
 		quote_arg(&first_pidfile.path().to_string_lossy()),
 		quote_arg(&last_pidfile.path().to_string_lossy())
 	);
@@ -847,7 +750,7 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	assert_eq!(started.exit_code, Some(0));
 	let recorded = |pidfile: &std::path::Path| {
 		let pidfile = pidfile.to_path_buf();
-		time::timeout(Duration::from_secs(2), async move {
+		async move {
 			loop {
 				if let Ok(pid) = fs::read_to_string(&pidfile)
 					.unwrap_or_default()
@@ -858,32 +761,26 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 				}
 				time::sleep(Duration::from_millis(20)).await;
 			}
-		})
+		}
 	};
-	let last_pid = recorded(last_pidfile.path())
-		.await
-		.expect("last pipeline stage did not record its pid");
+	let last_pid = recorded(last_pidfile.path()).await;
 	assert!(last_pid > 0);
-	let first_pid = recorded(first_pidfile.path())
-		.await
-		.expect("first pipeline stage did not record its pid");
+	let first_pid = recorded(first_pidfile.path()).await;
 	assert_ne!(first_pid, last_pid, "pipeline stages need distinct pids");
 
 	// A zombie still responds to signal 0. The last stage must disappear
-	// while the first is alive, without another shell/tool invocation.
-	time::timeout(Duration::from_secs(5), async {
-		loop {
-			// SAFETY: signal 0 only probes this pid's existence.
-			if unsafe { libc::kill(last_pid, 0) } == -1 {
-				let err = io::Error::last_os_error();
-				assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
-				break;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	// while the first is alive, without another shell/tool invocation. Waits
+	// as long as that takes (a stage never reaped hangs the test until the
+	// runner's timeout).
+	loop {
+		// SAFETY: signal 0 only probes this pid's existence.
+		if unsafe { libc::kill(last_pid, 0) } == -1 {
+			let err = io::Error::last_os_error();
+			assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
+			break;
 		}
-	})
-	.await
-	.expect("early exiting pipeline stage remained a zombie");
+		time::sleep(Duration::from_millis(20)).await;
+	}
 	// SAFETY: signal 0 only probes the other child, which must still be
 	// running for this to prove independent reaping.
 	assert_eq!(unsafe { libc::kill(first_pid, 0) }, 0, "first stage exited too soon");
@@ -989,27 +886,20 @@ async fn pids_reports_in_flight_children_until_run_returns() {
 		}
 	});
 
-	let pids = time::timeout(Duration::from_secs(5), async {
-		loop {
-			let pids = shell.pids();
-			if !pids.is_empty() {
-				break pids;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	let pids = loop {
+		let pids = shell.pids();
+		if !pids.is_empty() {
+			break pids;
 		}
-	})
-	.await
-	.expect("in-flight run never reported a pid");
+		time::sleep(Duration::from_millis(10)).await;
+	};
 	assert_eq!(pids.len(), 1, "exactly the sleep child: {pids:?}");
 	let child = proctree::Process::from_pid(pids[0]).expect("reported pid is alive");
 	assert_eq!(child.status(), proctree::ProcessStatus::Running);
 
 	shell.abort().await;
-	let result = time::timeout(Duration::from_secs(5), run)
-		.await
-		.expect("aborted run returns")
-		.expect("run task")
-		.expect("run result");
+	// Returns either on the abort (`cancelled`) or at the sleep's own end.
+	let result = run.await.expect("run task").expect("run result");
 	assert!(result.cancelled, "run was aborted");
 	assert!(shell.pids().is_empty(), "pids cleared once the run returns");
 }
@@ -1058,33 +948,22 @@ async fn fork_starts_from_the_state_before_the_running_command() {
 		);
 		async move { run(&shell, &command).await }
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !started.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("owner command never started");
+	exists(&started).await;
 
 	let fork = shell.fork();
-	let seen = time::timeout(
-		Duration::from_secs(5),
-		run(
-			&fork,
-			"printf '%s|%s|%s' \"$PI_FORK_VAR\" \"$(pi_fork_fn x)\" \"$PWD\"; PI_FORK_VAR=fork",
-		),
+	// A fork that waited for the running command would wait for the gate this
+	// test opens only after it, and hang until the runner's bound.
+	let seen = run(
+		&fork,
+		"printf '%s|%s|%s' \"$PI_FORK_VAR\" \"$(pi_fork_fn x)\" \"$PWD\"; PI_FORK_VAR=fork",
 	)
-	.await
-	.expect("fork waited for the running command");
+	.await;
 	assert_eq!(seen, format!("before|fn:x|{}", dir_path.display()));
 	let random = "echo $RANDOM $RANDOM $RANDOM";
 	assert_ne!(run(&shell.fork(), random).await, run(&shell.fork(), random).await);
 
 	fs::write(&gate, "").expect("open gate");
-	time::timeout(Duration::from_secs(5), owner)
-		.await
-		.expect("owner finishes")
-		.expect("owner task");
+	owner.await.expect("owner task");
 	assert_eq!(run(&shell, "printf %s \"$PI_FORK_VAR\"").await, "during");
 }
 
@@ -1097,11 +976,16 @@ async fn segmented_minimizer_trace_spans_submissions_without_early_completion() 
 	};
 	let _guard = shell_test_lock().lock().await;
 	let root = tempfile::tempdir().expect("trace chain directory");
-	let gate = root.path().join("gate");
+	let mut gate = crate::testkit::child::Gate::new();
+	let gate_link = root.path().join("gate");
+	gate.link(&gate_link);
 	let minimizer = printf_minimizer(&root.path().join("minimizer.toml"), None);
 	let repeated = format!("printf '{}'", "hello\\n".repeat(200));
-	let gate_command =
-		format!("/bin/sh -c 'while [ ! -e \"{}\" ]; do sleep 0.01; done'", gate.display());
+	let gate_command = format!(
+		"/bin/sh -c '{}' 3< {}",
+		crate::testkit::child::AWAIT_GATE,
+		quote_arg(&gate_link.to_string_lossy())
+	);
 	let command =
 		format!("{repeated}; {gate_command}; {repeated}; false && printf skipped; {repeated}; false");
 	let trace = Arc::new(RunTrace::new(command.as_str()));
@@ -1121,17 +1005,13 @@ async fn segmented_minimizer_trace_spans_submissions_without_early_completion() 
 				assert_eq!(snapshot.status, None, "first segment RunEnd cannot end the logical call");
 				assert!(snapshot.history.iter().any(|entry| entry.segment == Some(0)
 					&& matches!(entry.data, HistoryData::RunEnd { status: 0 }) && !entry.logical_end));
-				std::fs::write(&gate, []).expect("release second segment");
+				gate.open();
 				break;
 			}
 			tokio::task::yield_now().await;
 		}
 	};
-	let (result, ()) = time::timeout(Duration::from_secs(10), async {
-		tokio::join!(shell.run(options, Some(tx), CancelToken::default()), probe)
-	})
-	.await
-	.expect("segmented trace completes");
+	let (result, ()) = tokio::join!(shell.run(options, Some(tx), CancelToken::default()), probe);
 	let result = result.expect("real segmented run");
 	assert_eq!(result.exit_code, Some(1));
 	assert_eq!(rx.drain().collect::<String>(), "hello\n".repeat(600));
@@ -1547,6 +1427,12 @@ async fn embedded_external_command_runs_in_its_own_session() {
 
 	// Build the same kind of session pi-natives uses in production.
 	let mut session = default_session().await;
+	// The child prints its pid and waits for the test's gate, so the
+	// `getsid` below reads a live process whatever the host's speed.
+	let root = tempfile::tempdir().expect("gate directory");
+	let mut gate = crate::testkit::child::Gate::new();
+	let gate_link = root.path().join("gate");
+	gate.link(&gate_link);
 
 	// Output pipe shared between the child and a concurrent reader. The
 	// reader runs on a blocking thread because pipe reads are blocking. The
@@ -1585,24 +1471,24 @@ async fn embedded_external_command_runs_in_its_own_session() {
 
 	// Run the session in the background so we can call `getsid(child_pid)`
 	// while the child is still alive.
+	let command = format!(
+		"sh -c 'printf \"%d\\n\" \"$$\"; {}' 3< {}",
+		crate::testkit::child::AWAIT_GATE,
+		quote_arg(&gate_link.to_string_lossy())
+	);
 	let shell_handle = tokio::spawn(async move {
-		// `printf '%d\n' "$$"` then `sleep 0.5`. Long enough for our `getsid`.
-		let exec = session
-			.run_test("sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'", &stdio)
-			.await
-			.expect("run_test");
+		let exec = session.run_test(command, &stdio).await.expect("run_test");
 		drop(stdio);
 		(session, exec)
 	});
 
-	let child_pid = time::timeout(Duration::from_secs(5), pid_rx)
+	let child_pid = pid_rx
 		.await
-		.expect("timed out waiting for child PID")
 		.expect("reader closed pid channel without sending");
 	assert!(child_pid > 0, "got non-positive child pid: {child_pid}");
 
-	// Snapshot the child's session ID immediately, while the child is still
-	// in `sleep`. POSIX guarantees `getsid` against a live PID returns the
+	// Snapshot the child's session ID while the child still waits for its
+	// release. POSIX guarantees `getsid` against a live PID returns the
 	// session of that process.
 	// SAFETY: `child_pid` is a positive PID from the child; errors are
 	// reported via the checked return value.
@@ -1613,13 +1499,11 @@ async fn embedded_external_command_runs_in_its_own_session() {
 		std::io::Error::last_os_error(),
 	);
 
-	// Drain the session task and the pipe reader.
-	let (_session, exec) = time::timeout(Duration::from_secs(5), shell_handle)
-		.await
-		.expect("shell timed out")
-		.expect("shell task panicked");
+	// Release the child, then drain the session task and the pipe reader.
+	gate.open();
+	let (_session, exec) = shell_handle.await.expect("shell task panicked");
 	assert_eq!(exec.status, 0, "unexpected exit: {}", exit_code(&exec));
-	let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
+	let _ = reader_handle.await;
 
 	assert_ne!(
 		child_sid, host_sid,
@@ -1632,18 +1516,38 @@ async fn embedded_external_command_runs_in_its_own_session() {
 	);
 }
 
+/// A shell whose cancel grace is long ([`ShellOptions::cancel_grace`]), so a
+/// test decides when what runs inside the grace is done, not the host.
+#[cfg(unix)]
+fn shell_with_a_long_grace() -> Shell {
+	Shell::new(Some(ShellOptions {
+		cancel_grace: Some(crate::testkit::child::LIFETIME),
+		..Default::default()
+	}))
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() {
 	let _guard = shell_test_lock().lock().await;
 	let root = tempfile::tempdir().expect("cleanup directory");
 	let script = root.path().join("cleanup.sh");
+	// The trap says it started, waits for the test's gate, writes, and marks
+	// its end. The script waits on the gate too, so it ends with a killed
+	// test.
+	let await_gate = crate::testkit::child::AWAIT_GATE;
 	fs::write(
 		&script,
-		"trap 'sleep 0.2; printf cleaned >> cleaned; exit 0' TERM\n: > ready\nwhile :; do :; done\n",
+		format!(
+			"trap ': > trapped; {await_gate}; printf cleaned >> cleaned; : > finished; exit 0' \
+			 TERM\n: > ready\n{await_gate}\n"
+		),
 	)
 	.expect("cleanup script");
-	let shell = Shell::new(None);
+	let mut gate = crate::testkit::child::Gate::new();
+	gate.link(&root.path().join("gate"));
+	// The trap takes as long as the test keeps it, inside a long grace.
+	let shell = shell_with_a_long_grace();
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
 	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
@@ -1651,7 +1555,10 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 		shell
 			.run(
 				ShellRunOptions {
-					command: "sh cleanup.sh & sleep 30".into(),
+					command: format!(
+						"sh cleanup.sh 3< gate & sleep {}",
+						crate::testkit::child::LIFETIME.as_secs()
+					),
 					cwd: Some(cwd),
 					..Default::default()
 				},
@@ -1660,20 +1567,16 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 			)
 			.await
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !root.path().join("ready").exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("background child ready");
+	exists(&root.path().join("ready")).await;
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(5), task)
-		.await
-		.expect("cancel finished")
-		.expect("run task")
-		.expect("shell result");
+	// The background child's trap runs during the grace; the test ends it.
+	exists(&root.path().join("trapped")).await;
+	gate.open();
+	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
+	// The run returns without waiting for its background child; its trap
+	// ends when the test is past the gate, however late that is.
+	exists(&root.path().join("finished")).await;
 	assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
 }
 
@@ -1682,16 +1585,21 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 	let _guard = shell_test_lock().lock().await;
 	let root = tempfile::tempdir().expect("cleanup directory");
-	// The trap writes once the readers' old 500 ms cancel would have closed
-	// them, and finishes well inside the 1 s TERM grace even when a loaded
-	// runner is slow to start `sleep`.
+	let await_gate = crate::testkit::child::AWAIT_GATE;
 	fs::write(
 		root.path().join("cleanup.sh"),
-		"trap 'sleep 0.55; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > ready\nwhile \
-		 :; do :; done\n",
+		format!(
+			"trap ': > trapped; {await_gate}; echo flushing; printf cleaned > cleaned; : > finished; \
+			 exit 0' TERM\n: > ready\n{await_gate}\n"
+		),
 	)
 	.expect("cleanup script");
-	let shell = Shell::new(None);
+	let mut gate = crate::testkit::child::Gate::new();
+	gate.link(&root.path().join("gate"));
+	// The readers stay open for the grace after the cancel, and the TERM
+	// grace lets the trap finish: both are long here, so the trap writes
+	// when the test releases it, not inside a window it has to beat.
+	let shell = shell_with_a_long_grace();
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
 	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
@@ -1699,7 +1607,7 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 		shell
 			.run(
 				ShellRunOptions {
-					command: "sh cleanup.sh".into(),
+					command: "sh cleanup.sh 3< gate".into(),
 					cwd: Some(cwd),
 					..Default::default()
 				},
@@ -1708,34 +1616,96 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 			)
 			.await
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !root.path().join("ready").exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("child ready");
+	exists(&root.path().join("ready")).await;
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(5), task)
-		.await
-		.expect("cancel finished")
-		.expect("run task")
-		.expect("shell result");
+	exists(&root.path().join("trapped")).await;
+	gate.open();
+	// Waits as long as that takes: a run the abort did not end is failed by
+	// the test runner.
+	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
+	// The run can return before the trap ends: wait for the trap's own mark.
+	exists(&root.path().join("finished")).await;
 	assert_eq!(
 		fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup after writing output"),
 		"cleaned"
 	);
 }
 
+/// One shell's cancel grace is its own: while a shell with a long grace
+/// waits out a TERM trap the test holds, another shell with pi's grace
+/// cancels a run whose `sleep` ignores TERM, and the `sleep` ends, killed
+/// after pi's 1 s grace. A grace that reached across shells would leave it
+/// running for the long one, and the test runner would fail the test. (The
+/// run itself returns either way, after the shell's own wait for its task.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_cancel_grace_is_one_shells_own() {
+	let _guard = shell_test_lock().lock().await;
+	let root = tempfile::tempdir().expect("scratch directory");
+	let await_gate = crate::testkit::child::AWAIT_GATE;
+	fs::write(
+		root.path().join("held.sh"),
+		format!("trap ': > trapped; {await_gate}; exit 0' TERM\n: > ready\n{await_gate}\n"),
+	)
+	.expect("held script");
+	let mut gate = crate::testkit::child::Gate::new();
+	gate.link(&root.path().join("gate"));
+	let run = |shell: Shell, command: String, cancel: CancelToken| {
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		tokio::spawn(async move {
+			shell
+				.run(ShellRunOptions { command, cwd: Some(cwd), ..Default::default() }, None, cancel)
+				.await
+		})
+	};
+	let mut long_cancel = CancelToken::default();
+	let long_abort = long_cancel.emplace_abort_token();
+	let long = run(shell_with_a_long_grace(), "sh held.sh 3< gate".into(), long_cancel);
+	exists(&root.path().join("ready")).await;
+	long_abort.abort(AbortReason::Signal);
+	exists(&root.path().join("trapped")).await;
+	// The long grace is in force now.
+	let mut short_cancel = CancelToken::default();
+	let short_abort = short_cancel.emplace_abort_token();
+	let pidfile = root.path().join("sleep.pid");
+	let command = format!(
+		"trap '' TERM; {} {} & echo $! > {}; wait",
+		crate::testkit::child::on_path("sleep"),
+		crate::testkit::child::LIFETIME.as_secs(),
+		pidfile.display()
+	);
+	let short = run(Shell::new(None), command, short_cancel);
+	let pid = loop {
+		if let Some(pid) = fs::read_to_string(&pidfile)
+			.ok()
+			.and_then(|text| text.trim().parse::<i32>().ok())
+		{
+			break pid;
+		}
+		time::sleep(Duration::from_millis(10)).await;
+	};
+	short_abort.abort(AbortReason::Signal);
+	let short = short.await.expect("run task").expect("shell result");
+	// Only KILL ends the `sleep`; waits as long as that takes.
+	while !crate::sys::proc::ended(pid) {
+		time::sleep(Duration::from_millis(20)).await;
+	}
+	gate.open();
+	let long = long.await.expect("run task").expect("shell result");
+	assert!(short.cancelled && long.cancelled, "{short:?} {long:?}");
+}
+
 /// A cancelled run whose child exits on TERM returns as soon as the child
-/// is gone, without waiting out the 1 s grace before KILL.
+/// is gone, without waiting out the grace before KILL. The grace is
+/// [`crate::testkit::child::LIFETIME`], past the runner's bound: a cancel
+/// that waited it out would hang the test, so no elapsed time is measured.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn termination_returns_early_after_the_child_exits() {
 	let _guard = shell_test_lock().lock().await;
 	let root = tempfile::tempdir().expect("scratch directory");
-	let shell = Shell::new(None);
+	let shell = shell_with_a_long_grace();
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
 	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
@@ -1743,7 +1713,10 @@ async fn termination_returns_early_after_the_child_exits() {
 		shell
 			.run(
 				ShellRunOptions {
-					command: "sh -c ': > ready; exec sleep 30'".into(),
+					command: format!(
+						"sh -c ': > ready; exec sleep {}'",
+						crate::testkit::child::LIFETIME.as_secs()
+					),
 					cwd: Some(cwd),
 					..Default::default()
 				},
@@ -1752,22 +1725,12 @@ async fn termination_returns_early_after_the_child_exits() {
 			)
 			.await
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !root.path().join("ready").exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("child ready");
-	let started = time::Instant::now();
+	while !root.path().join("ready").exists() {
+		time::sleep(Duration::from_millis(10)).await;
+	}
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(5), task)
-		.await
-		.expect("cancel finished")
-		.expect("run task")
-		.expect("shell result");
+	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
-	assert!(started.elapsed() < Duration::from_millis(750), "exited child consumed TERM grace");
 }
 
 /// Cancelling one `Shell::run` must only signal processes spawned by that
@@ -1787,7 +1750,10 @@ async fn cancelling_one_run_spares_a_concurrent_runs_child() {
 		shell_b
 			.run(
 				ShellRunOptions {
-					command: "sh -c 'printf \"ready\\n\"; sleep 30'".into(),
+					command: format!(
+						"sh -c 'printf \"ready\\n\"; sleep {}'",
+						crate::testkit::child::LIFETIME.as_secs()
+					),
 					..Default::default()
 				},
 				Some(tx_b),
@@ -1797,20 +1763,16 @@ async fn cancelling_one_run_spares_a_concurrent_runs_child() {
 	});
 
 	let mut b_output = String::new();
-	let b_ready = time::timeout(Duration::from_secs(5), async {
-		loop {
-			let chunk = rx_b
-				.recv_async()
-				.await
-				.expect("run B ended before printing readiness");
-			b_output.push_str(&chunk);
-			if let Some(line_end) = b_output.find('\n') {
-				return b_output[..line_end].to_string();
-			}
+	let b_ready = loop {
+		let chunk = rx_b
+			.recv_async()
+			.await
+			.expect("run B ended before printing readiness");
+		b_output.push_str(&chunk);
+		if let Some(line_end) = b_output.find('\n') {
+			break b_output[..line_end].to_string();
 		}
-	})
-	.await
-	.expect("timed out waiting for run B readiness");
+	};
 	assert_eq!(b_ready.trim(), "ready", "run B should reach its long sleep before run A starts");
 
 	let shell_a = Shell::new(None);
@@ -1829,35 +1791,29 @@ async fn cancelling_one_run_spares_a_concurrent_runs_child() {
 	});
 
 	let mut a_output = String::new();
-	let a_child_pid = time::timeout(Duration::from_secs(5), async {
-		loop {
-			let chunk = rx_a
-				.recv_async()
-				.await
-				.expect("run A ended before printing its child pid");
-			a_output.push_str(&chunk);
-			if let Some(line_end) = a_output.find('\n') {
-				return a_output[..line_end]
-					.trim()
-					.parse::<i32>()
-					.expect("run A pid line should be an integer");
-			}
+	let a_child_pid = loop {
+		let chunk = rx_a
+			.recv_async()
+			.await
+			.expect("run A ended before printing its child pid");
+		a_output.push_str(&chunk);
+		if let Some(line_end) = a_output.find('\n') {
+			break a_output[..line_end]
+				.trim()
+				.parse::<i32>()
+				.expect("run A pid line should be an integer");
 		}
-	})
-	.await
-	.expect("timed out waiting for run A child pid");
+	};
 	assert!(a_child_pid > 0, "got non-positive run A child pid: {a_child_pid}");
 
 	abort_b.abort(AbortReason::Signal);
 
-	let result_a = time::timeout(Duration::from_secs(10), handle_a)
+	let result_a = handle_a
 		.await
-		.expect("run A timed out")
 		.expect("run A task panicked")
 		.expect("run A failed");
-	let result_b = time::timeout(Duration::from_secs(10), handle_b)
+	let result_b = handle_b
 		.await
-		.expect("run B timed out")
 		.expect("run B task panicked")
 		.expect("run B failed");
 
@@ -1880,7 +1836,10 @@ async fn cancelling_while_sourcing_snapshot_kills_snapshot_foreground_child() {
 	let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "'\\''");
 	std::fs::write(
 		&snapshot_path,
-		format!("sh -c 'printf \"%d\\n\" \"$$\" > \"$1\"; sleep 30' sh '{escaped_pid_path}'\n"),
+		format!(
+			"sh -c 'printf \"%d\\n\" \"$$\" > \"$1\"; sleep {}' sh '{escaped_pid_path}'\n",
+			crate::testkit::child::LIFETIME.as_secs()
+		),
 	)
 	.expect("write snapshot file");
 
@@ -1900,25 +1859,20 @@ async fn cancelling_while_sourcing_snapshot_kills_snapshot_foreground_child() {
 			.await
 	});
 
-	let child_pid = time::timeout(Duration::from_secs(5), async {
-		loop {
-			if let Ok(pid_text) = std::fs::read_to_string(&pid_path)
-				&& let Ok(pid) = pid_text.trim().parse::<i32>()
-				&& pid > 0
-			{
-				return pid;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	let child_pid = loop {
+		if let Ok(pid_text) = std::fs::read_to_string(&pid_path)
+			&& let Ok(pid) = pid_text.trim().parse::<i32>()
+			&& pid > 0
+		{
+			break pid;
 		}
-	})
-	.await
-	.expect("timed out waiting for snapshot foreground child to write its positive PID");
+		time::sleep(Duration::from_millis(20)).await;
+	};
 
 	abort_token.abort(AbortReason::Signal);
 
-	let result = time::timeout(Duration::from_secs(10), run_handle)
+	let result = run_handle
 		.await
-		.expect("timed out waiting for cancellation while sourcing snapshot")
 		.expect("snapshot sourcing run task panicked")
 		.expect("shell run failed while cancelling snapshot sourcing");
 	assert!(result.cancelled, "cancelling while sourcing a snapshot should report cancellation");
@@ -1931,32 +1885,26 @@ async fn cancelling_while_sourcing_snapshot_kills_snapshot_foreground_child() {
 		"signal cancellation during snapshot sourcing must not report timeout"
 	);
 
-	let child_dead = time::timeout(Duration::from_secs(5), async {
-		loop {
-			// SAFETY: `child_pid` came from the foreground `sh` spawned by the
-			// snapshot; `kill(pid, 0)` only probes whether that process still
-			// exists.
-			let kill_result = unsafe { libc::kill(child_pid, 0) };
-			if kill_result == -1 {
-				let err = std::io::Error::last_os_error();
-				if err.raw_os_error() == Some(libc::ESRCH) {
-					return;
-				}
-				panic!(
-					"kill({child_pid}, 0) failed with unexpected error while checking snapshot child \
-					 cleanup: {err}"
-				);
+	// The child sleeps past the runner's bound: if the cancel did not end it,
+	// this waits until the runner fails the test.
+	loop {
+		// SAFETY: `child_pid` came from the foreground `sh` spawned by the
+		// snapshot; `kill(pid, 0)` only probes whether that process still
+		// exists.
+		let kill_result = unsafe { libc::kill(child_pid, 0) };
+		if kill_result == -1 {
+			let err = std::io::Error::last_os_error();
+			if err.raw_os_error() == Some(libc::ESRCH) {
+				break;
 			}
-			time::sleep(Duration::from_millis(20)).await;
+			panic!(
+				"kill({child_pid}, 0) failed with unexpected error while checking snapshot child \
+				 cleanup: {err}"
+			);
 		}
-	})
-	.await;
+		time::sleep(Duration::from_millis(20)).await;
+	}
 	let _ = std::fs::remove_dir_all(&root);
-	assert!(
-		child_dead.is_ok(),
-		"snapshot foreground child PID {child_pid} was still alive after cancelling while sourcing \
-		 snapshot; cancel bridge did not terminate the snapshot-spawned process"
-	);
 }
 
 /// Regression for the `suspended (tty input)` bug: an **interactive child
@@ -2018,27 +1966,33 @@ async fn embedded_pipeline_stage_runs_in_its_own_session() {
 		buf
 	});
 
+	let root = tempfile::tempdir().expect("gate directory");
+	let mut gate = crate::testkit::child::Gate::new();
+	let gate_link = root.path().join("gate");
+	gate.link(&gate_link);
+	let command = format!(
+		"sh -c 'printf \"%d\\n\" \"$$\"; {}' 3< {} | sh -c cat",
+		crate::testkit::child::AWAIT_GATE,
+		quote_arg(&gate_link.to_string_lossy())
+	);
 	let shell_handle = tokio::spawn(async move {
-		// First stage prints its own PID and sleeps; `sh -c cat` forwards
-		// the PID line to our reader and exits on EOF. The first stage
-		// leads the pipeline's process group, while the second stage is the
-		// join-or-detach process that would EPERM without the wiring fix.
-		let exec = session
-			.run_test("sh -c 'printf \"%d\\n\" \"$$\"; sleep 1' | sh -c cat", &stdio)
-			.await
-			.expect("run_test");
+		// First stage prints its own PID and waits for the test's gate;
+		// `sh -c cat` forwards the PID line to our reader and exits on EOF.
+		// The first stage leads the pipeline's process group, while the
+		// second stage is the join-or-detach process that would EPERM
+		// without the wiring fix.
+		let exec = session.run_test(&command, &stdio).await.expect("run_test");
 		drop(stdio);
 		(session, exec)
 	});
 
-	let child_pid = time::timeout(Duration::from_secs(5), pid_rx)
+	let child_pid = pid_rx
 		.await
-		.expect("timed out waiting for first-stage PID")
 		.expect("reader closed pid channel without sending");
 	assert!(child_pid > 0, "got non-positive child pid: {child_pid}");
 
-	// SAFETY: `child_pid` is a live positive PID (still in `sleep`); the
-	// return value is checked.
+	// SAFETY: `child_pid` is a live positive PID (still waiting for the
+	// gate); the return value is checked.
 	let child_sid = unsafe { libc::getsid(child_pid) };
 	assert!(
 		child_sid > 0,
@@ -2046,10 +2000,8 @@ async fn embedded_pipeline_stage_runs_in_its_own_session() {
 		std::io::Error::last_os_error(),
 	);
 
-	let (_session, exec) = time::timeout(Duration::from_secs(5), shell_handle)
-		.await
-		.expect("shell timed out")
-		.expect("shell task panicked");
+	gate.open();
+	let (_session, exec) = shell_handle.await.expect("shell task panicked");
 	// Guards the wiring: the second stage spawned without a cross-session
 	// `setpgid` EPERM, so the whole pipeline succeeded.
 	assert_eq!(
@@ -2058,7 +2010,7 @@ async fn embedded_pipeline_stage_runs_in_its_own_session() {
 		"pipeline did not succeed (second stage may have hit setpgid EPERM): {}",
 		exit_code(&exec),
 	);
-	let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
+	let _ = reader_handle.await;
 
 	// Guards the decision: a pipeline stage must not share the host session,
 	// or it could seize the controlling tty and SIGTTIN the host.
@@ -2135,9 +2087,7 @@ async fn abort_state_signals_cancel_token() {
 	abort_state.set(abort_token).await;
 	abort_state.abort().await;
 
-	let reason = time::timeout(Duration::from_millis(100), cancel_token.wait())
-		.await
-		.expect("cancel token should be signalled");
+	let reason = cancel_token.wait().await;
 	assert!(matches!(reason, AbortReason::Signal));
 }
 
@@ -2152,10 +2102,8 @@ async fn read_output_stops_when_cancelled_before_pipe_eof() {
 	time::sleep(Duration::from_millis(10)).await;
 	cancel.cancel();
 
-	time::timeout(Duration::from_millis(100), handle)
-		.await
-		.expect("reader task should stop after cancellation")
-		.expect("reader task should not panic");
+	// The writer stays open, so only the cancel ends the reader.
+	handle.await.expect("reader task should not panic");
 }
 
 #[cfg(unix)]
@@ -2271,20 +2219,16 @@ async fn quoted_heredoc_without_trailing_newline_runs() {
 /// never reads its stdin, so the only way `echo done` runs is if the
 /// heredoc writer is decoupled from the main thread (or, on Linux,
 /// the pipe buffer was grown via `F_SETPIPE_SZ`). The
-/// `tokio::time::timeout` is the safety net that turns a regression
-/// into a 10 s failure instead of hanging CI for the full
-/// hard-timeout window.
+/// regression hangs, and the runner's bound fails it.
 #[tokio::test(flavor = "multi_thread")]
 async fn large_heredoc_does_not_deadlock() {
 	let body = "X".repeat(256 * 1024);
 	let command = format!(": <<'EOF'\n{body}\nEOF\necho done");
 	let options = ShellExecuteOptions { command, ..Default::default() };
 
-	let result =
-		time::timeout(Duration::from_secs(10), execute_shell(options, None, CancelToken::default()))
-			.await
-			.expect("execute_shell hung past 10 s — heredoc writer deadlocked")
-			.expect("execute_shell errored");
+	let result = execute_shell(options, None, CancelToken::default())
+		.await
+		.expect("execute_shell errored");
 
 	assert_eq!(result.exit_code, Some(0), "command did not run to completion");
 }
@@ -2422,9 +2366,8 @@ async fn streaming_output_backpressures_on_bounded_channel_without_loss() {
 		time::sleep(Duration::from_micros(50)).await;
 	}
 
-	let result = time::timeout(Duration::from_secs(30), run)
+	let result = run
 		.await
-		.expect("command should finish despite backpressure")
 		.expect("run task should not panic")
 		.expect("execute should succeed");
 	assert_eq!(result.exit_code, Some(0));
@@ -2440,20 +2383,22 @@ async fn pipe_tap_exposes_input_a_later_stage_holds_back() {
 	let _guard = shell_test_lock().lock().await;
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
-	let (taps, run, rx) = run_tapped("{ printf 'a\\nb\\nc\\n'; sleep 30; } | tail -n 1", cancel);
+	let (taps, run, rx) = run_tapped(
+		&format!(
+			"{{ printf 'a\\nb\\nc\\n'; sleep {}; }} | tail -n 1",
+			crate::testkit::child::LIFETIME.as_secs()
+		),
+		cancel,
+	);
 
-	let seen = time::timeout(Duration::from_secs(10), async {
-		loop {
-			if let Some(read) = taps.read(1, None)
-				&& read.data == b"a\nb\nc\n"
-			{
-				return read;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	let seen = loop {
+		if let Some(read) = taps.read(1, None)
+			&& read.data == b"a\nb\nc\n"
+		{
+			break read;
 		}
-	})
-	.await
-	.expect("producer output never reached stream 1");
+		time::sleep(Duration::from_millis(20)).await;
+	};
 	assert!(seen.open);
 	assert!(rx.try_recv().is_err(), "tail printed before its input ended");
 	let [stream] = taps.list().try_into().expect("one pipe");
@@ -2461,11 +2406,7 @@ async fn pipe_tap_exposes_input_a_later_stage_holds_back() {
 	assert!(stream.consumer.contains("tail"), "consumer text: {}", stream.consumer);
 
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(10), run)
-		.await
-		.expect("run did not stop after abort")
-		.expect("run task panicked")
-		.expect("run");
+	let result = run.await.expect("run task panicked").expect("run");
 	assert!(result.cancelled);
 	assert!(!taps.read(1, None).expect("stream 1").open);
 }
@@ -2482,11 +2423,8 @@ async fn pipe_tap_widows_the_producer_when_the_consumer_exits() {
 	let command = format!("tail -f {} | head -n 1", quote_arg(&log.path().to_string_lossy()));
 	let (_taps, run, rx) = run_tapped(&command, CancelToken::default());
 
-	let result = time::timeout(Duration::from_secs(10), run)
-		.await
-		.expect("tail -f kept following after head exited")
-		.expect("run task panicked")
-		.expect("run");
+	// `tail -f` ends only once it sees its pipe widowed.
+	let result = run.await.expect("run task panicked").expect("run");
 	assert_eq!(result.exit_code, Some(0));
 	assert_eq!(collect_output(&rx).await, "first\n");
 }
@@ -2499,11 +2437,7 @@ async fn pipe_tap_forwards_every_byte_and_counts_them() {
 	const LAST: usize = 200_000;
 	let (taps, run, rx) = run_tapped(&format!("seq 1 {LAST} | wc -l"), CancelToken::default());
 
-	let result = time::timeout(Duration::from_secs(30), run)
-		.await
-		.expect("run did not finish")
-		.expect("run task panicked")
-		.expect("run");
+	let result = run.await.expect("run task panicked").expect("run");
 	assert_eq!(result.exit_code, Some(0));
 	assert_eq!(collect_output(&rx).await.trim(), LAST.to_string());
 	let written: usize = (1..=LAST).map(|n| n.to_string().len() + 1).sum();

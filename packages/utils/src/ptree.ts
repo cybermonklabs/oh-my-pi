@@ -22,6 +22,44 @@ const SUBREAPER_KILL_WINDOW_MS = 100;
 const SUBREAPER_KILL_POLL_MS = 5;
 
 /**
+ * `root`'s children, or `undefined` when the walk could not read every candidate (the natives
+ * throw then, with no descriptor left say): a sweep that gets `undefined` reads again at its
+ * next pass instead of ending. A handle that cannot even tell whether its process runs is
+ * unusable (a class of another realm, say): its error is rethrown, for the caller's fallback
+ * that signals the process directly.
+ */
+function childrenOf(root: Process): Process[] | undefined {
+	try {
+		return root.children();
+	} catch (error) {
+		throwIfUnusable(root, error);
+		return undefined;
+	}
+}
+
+/**
+ * `process.killTree(signal)`, going on past a walk it could not finish: it already signalled
+ * every process it read, and the process group the root leads. An unusable handle's error is
+ * rethrown ({@link childrenOf}).
+ */
+function signalTree(process: Process, signal?: number): void {
+	try {
+		process.killTree(signal);
+	} catch (error) {
+		throwIfUnusable(process, error);
+	}
+}
+
+/** Rethrows `error` when `process`'s handle cannot be used at all: its `status()` fails too. */
+function throwIfUnusable(process: Process, error: unknown): void {
+	try {
+		process.status();
+	} catch {
+		throw error;
+	}
+}
+
+/**
  * Build the Linux child-subreaper entrypoint.
  *
  * @internal Exported so tests can force a missing first libc soname and verify
@@ -392,7 +430,10 @@ export class ChildProcess<In extends InMask = InMask> {
 		if (this.proc.exitCode !== null && this.#windowsRootProcess && this.#openPipeReaders > 0) {
 			// The retained handle keeps the dead root PID reserved, making the
 			// Windows Toolhelp descendant walk identity-safe after root exit.
-			this.#windowsRootProcess.killTree();
+			// The root is dead: an unusable handle leaves nothing to signal.
+			try {
+				signalTree(this.#windowsRootProcess);
+			} catch {}
 			this.#terminating = Promise.resolve();
 			return;
 		}
@@ -457,24 +498,26 @@ export class ChildProcess<In extends InMask = InMask> {
 	 * the caller's process alive.
 	 */
 	async #stopSubreaperTree(root: Process, gracefulMs: number, escalated: Promise<void>): Promise<void> {
-		let children = root.children();
-		if (children.length === 0) {
+		// A walk that could not read every candidate (`undefined`) is no stop that failed: the
+		// waves signalled what they read, and the hard sweep reads again at each pass.
+		let children = childrenOf(root);
+		if (children?.length === 0) {
 			try {
-				root.killTree(os.constants.signals.SIGSTOP);
-				children = root.children();
-				if (children.length === 0) {
-					root.killTree(9);
+				signalTree(root, os.constants.signals.SIGSTOP);
+				children = childrenOf(root);
+				if (children?.length === 0) {
+					signalTree(root, 9);
 					return;
 				}
 				// It launched the command just before the freeze: the first wave
 				// goes to the snapshot taken while it cannot fork.
-				for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+				for (const child of children ?? []) signalTree(child, gracefulMs < 0 ? 9 : 15);
 			} finally {
-				root.killTree(os.constants.signals.SIGCONT);
+				signalTree(root, os.constants.signals.SIGCONT);
 			}
 		} else {
 			// The subreaper launches one command; once it has a child, no later launch can escape the snapshot.
-			for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+			for (const child of children ?? []) signalTree(child, gracefulMs < 0 ? 9 : 15);
 		}
 		if (gracefulMs >= 0) {
 			const { promise: graceOver, resolve: endGrace } = Promise.withResolvers<void>();
@@ -493,17 +536,18 @@ export class ChildProcess<In extends InMask = InMask> {
 			const deadline = Date.now() + SUBREAPER_KILL_WINDOW_MS;
 			let emptySweeps = 0;
 			while (emptySweeps < 2 && Date.now() < deadline) {
-				const children = root.children();
-				if (children.length === 0) {
+				const children = childrenOf(root);
+				// A sweep that could not read every child is no empty one: the next reads again.
+				if (children?.length === 0) {
 					emptySweeps++;
 				} else {
 					emptySweeps = 0;
-					for (const child of children) child.killTree(9);
+					for (const child of children ?? []) signalTree(child, 9);
 				}
 				if (emptySweeps < 2) await Bun.sleep(SUBREAPER_KILL_POLL_MS);
 			}
 		} finally {
-			root.killTree(9);
+			signalTree(root, 9);
 		}
 	}
 

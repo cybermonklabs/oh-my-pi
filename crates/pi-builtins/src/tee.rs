@@ -382,8 +382,6 @@ mod tests {
 		io::{self, Read, Write},
 	};
 
-	#[cfg(unix)]
-	use crate::openfile::OpenFile;
 	use pi_vfs::OpenOptions;
 
 	use super::{MultiWriter, NamedWriter, OutputErrorMode, Tee, Writer};
@@ -416,9 +414,7 @@ mod tests {
 	fn output_error_mode_controls_sigpipe_policy() {
 		fn run(args: &[&str], cwd: &std::path::Path) -> (i32, crate::host::Capture) {
 			let (mut host, capture) = Host::for_test("tee", "contents", cwd);
-			let (reader, writer) = std::io::pipe().unwrap();
-			drop(reader);
-			host.set_test_stdout(OpenFile::from(writer));
+			host.set_test_stdout(crate::host::widowed_pipe());
 			let argv = std::iter::once(OsString::from("tee"))
 				.chain(args.iter().copied().map(OsString::from))
 				.collect::<Vec<_>>();

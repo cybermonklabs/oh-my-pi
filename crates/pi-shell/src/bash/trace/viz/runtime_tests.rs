@@ -796,11 +796,16 @@ async fn segmented_and_chain_keeps_pseudo_connectors_while_running_and_after() {
 	// unit, and the operators between (and before) them were drawn as raw
 	// ` && ` rows instead of Pseudo `and` connectors.
 	let root = tempfile::tempdir().unwrap();
-	let gate = root.path().join("gate");
+	let mut gate = crate::testkit::child::Gate::new();
+	let gate_link = root.path().join("gate");
+	gate.link(&gate_link);
 	let wait = root.path().join("wait.sh");
-	std::fs::write(&wait, format!("while [ ! -e \"{}\" ]; do sleep 0.01; done\n", gate.display()))
-		.unwrap();
-	let command = format!("echo start && /bin/sh {} && echo middle && echo end", wait.display());
+	std::fs::write(&wait, format!("{}\n", crate::testkit::child::AWAIT_GATE)).unwrap();
+	let command = format!(
+		"echo start && /bin/sh {} 3< {} && echo middle && echo end",
+		wait.display(),
+		gate_link.display()
+	);
 	let pending = chain_rows(&present(&RunTrace::new(command.as_str()), &Options::default()));
 	assert_eq!(pending.len(), 4, "{pending:?}");
 	assert_eq!(pending[0], ("print(\"start\")".into(), 0, "stmt".into()));
@@ -841,13 +846,10 @@ async fn segmented_and_chain_keeps_pseudo_connectors_while_running_and_after() {
 			tokio::task::yield_now().await;
 		}
 		let running = chain_rows(&present(&trace, &Options::default()));
-		std::fs::write(&gate, []).unwrap();
+		gate.open();
 		running
 	};
-	let (result, running) =
-		tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(run, probe) })
-			.await
-			.unwrap();
+	let (result, running) = tokio::join!(run, probe);
 	assert_eq!(result.unwrap().exit_code, Some(0));
 	assert_eq!(running, pending, "running");
 	assert_eq!(chain_rows(&present(&trace, &Options::default())), pending, "finished");
@@ -859,13 +861,15 @@ async fn running_command_keeps_the_script_it_runs_active() {
 	// What a command runs is part of the command: while it runs, its heredoc
 	// and its untraced `sh -c` script must not dim like inactive rows.
 	let root = tempfile::tempdir().unwrap();
-	let gate = root.path().join("gate");
-	let wait = format!("while [ ! -e \"{}\" ]; do sleep 0.01; done", gate.display());
-	for command in [
-		format!("/bin/sh <<'EOF'\n{wait}\necho done\nEOF\necho after"),
-		format!("/bin/sh -c '{wait}\necho done'\necho after"),
-	] {
-		let _ = std::fs::remove_file(&gate);
+	let forms: [fn(&str, &str) -> String; 2] = [
+		|gate, wait| format!("/bin/sh 3< {gate} <<'EOF'\n{wait}\necho done\nEOF\necho after"),
+		|gate, wait| format!("/bin/sh -c '{wait}\necho done' 3< {gate}\necho after"),
+	];
+	for (i, form) in forms.into_iter().enumerate() {
+		let mut gate = crate::testkit::child::Gate::new();
+		let gate_link = root.path().join(format!("gate{i}"));
+		gate.link(&gate_link);
+		let command = form(&gate_link.display().to_string(), crate::testkit::child::AWAIT_GATE);
 		let trace = Arc::new(RunTrace::new(command.as_str()));
 		let shell = Shell::new(None);
 		let run = shell.run(
@@ -882,18 +886,13 @@ async fn running_command_keeps_the_script_it_runs_active() {
 				let p = present(&trace, &Options::default());
 				if p["running"] == true {
 					let raw = present(&trace, &Options { view: View::Raw, ..Options::default() });
-					std::fs::write(&gate, []).unwrap();
+					gate.open();
 					return (p, raw);
 				}
 				tokio::task::yield_now().await;
 			}
 		};
-		let (result, (running, raw)) =
-			tokio::time::timeout(std::time::Duration::from_secs(10), async {
-				tokio::join!(run, probe)
-			})
-			.await
-			.unwrap();
+		let (result, (running, raw)) = tokio::join!(run, probe);
 		assert_eq!(result.unwrap().exit_code, Some(0));
 		let shown = rows(&running);
 		let script: Vec<&(String, &Value)> = shown
