@@ -23,7 +23,10 @@ it.skipIf(process.platform !== "linux")(
 	async () => {
 		using dir = TempDir.createSync("@omp-ptree-unread-walk-");
 		const pidfile = path.join(dir.path(), "grandchild.pid");
-		const script = `trap '' TERM; setsid sh -c 'trap "" TERM; echo $$ > ${pidfile}; exec sleep 600' & while [ ! -s ${pidfile} ]; do :; done; echo ready; wait`;
+		// The wait for the pidfile has a bound of its own, 6000 polls of at least 10 ms, past the
+		// test's 30 s: a grandchild that never writes it leaves no shell behind. A loop on the file
+		// alone spun for days at full CPU when it was never written, as the shell ignores TERM.
+		const script = `trap '' TERM; setsid sh -c 'trap "" TERM; echo $$ > ${pidfile}; exec sleep 600' & n=0; while [ ! -s ${pidfile} ]; do n=$((n + 1)); [ $n -le 6000 ] || { echo "no pidfile after $n polls" >&2; exit 97; }; sleep 0.01; done; echo ready; wait`;
 		const child = spawn(["sh", "-c", script], { subreaper: true });
 		const reader = child.stdout.getReader();
 		await reader.read(); // "ready": the grandchild ignores TERM and leads its own session

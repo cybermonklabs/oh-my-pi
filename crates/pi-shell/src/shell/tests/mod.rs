@@ -390,13 +390,25 @@ impl Drop for PidfileProcessCleanup {
 	}
 }
 
+/// Runs `test_name` alone in a child test process, with `marker` set.
+///
+/// The child ends with this process, however this one ends: a child test
+/// that made itself a session leader (`pseudo_terminal_session`) is out of
+/// reach of a runner that kills this process's group, and a child left
+/// waiting holds its fixtures' gates open for ever.
 async fn run_isolated_kill_test(test_name: &str, marker: &str, own_process_group: bool) {
 	let mut command =
 		tokio::process::Command::new(std::env::current_exe().expect("current test executable"));
-	command.args(["--exact", test_name]).env(marker, "1");
+	command
+		.args(["--exact", test_name])
+		.env(marker, "1")
+		.kill_on_drop(true);
 	#[cfg(unix)]
-	if own_process_group {
-		command.process_group(0);
+	{
+		crate::testkit::child::tokio_dies_with_this_process(&mut command);
+		if own_process_group {
+			command.process_group(0);
+		}
 	}
 	#[cfg(not(unix))]
 	let _ = own_process_group;

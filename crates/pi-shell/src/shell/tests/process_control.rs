@@ -942,7 +942,13 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 
 /// fg on a job whose stages were stopped and then continued from outside
 /// the shell waits for the pipeline to complete: no stop report of any
-/// selected stage is left to end the wait early.
+/// selected stage is left to end the wait early. Each stage waits at a
+/// gate ([`crate::testkit::child::Gate`]) the test opens once every stage
+/// runs again, so no running stage outlives a killed test: a stage leads a
+/// session of its own, and one that waited for a file lived on after its
+/// test. A stage still stopped when the test is killed stays stopped: it
+/// reads nothing until continued, and the kernel continues no group of a
+/// session of its own.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn resumed_pipeline_drains_every_selected_stop_report() {
@@ -957,13 +963,17 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 		return;
 	}
 
-	let script = "echo $$ > \"$1\"; : > \"$2\"; if test \"$3\" -eq 1; then kill -STOP $$; fi; \
-	              while ! test -e \"$4\"; do sleep 0.01; done";
+	let script = format!(
+		"echo $$ > \"$1\"; : > \"$2\"; if test \"$3\" -eq 1; then kill -STOP $$; fi; {}",
+		crate::testkit::child::AWAIT_GATE
+	);
 	let (_pty_master, pty_slave) = pseudo_terminal_session();
 	for stage_count in [2_usize, 3] {
 		for stopped_subset in 1..(1_usize << stage_count) {
 			let files = tempfile::tempdir().expect("pipeline files");
-			let release = files.path().join("release");
+			let mut gate = crate::testkit::child::Gate::new();
+			let gate_link = files.path().join("gate");
+			gate.link(&gate_link);
 			let pidfiles: Vec<_> = (0..stage_count)
 				.map(|stage| files.path().join(format!("{stage}.pid")))
 				.collect();
@@ -975,11 +985,11 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				.map(|stage| {
 					let stopped = usize::from(stopped_subset & (1 << stage) != 0);
 					format!(
-						"sh -c {} sh {} {} {stopped} {}",
-						quote_arg(script),
+						"sh -c {} sh {} {} {stopped} 3< {}",
+						quote_arg(&script),
 						quote_arg(pidfiles[stage].to_str().expect("utf8 pidfile")),
 						quote_arg(readyfiles[stage].to_str().expect("utf8 readyfile")),
-						quote_arg(release.to_str().expect("utf8 release")),
+						quote_arg(gate_link.to_str().expect("utf8 gate")),
 					)
 				})
 				.collect::<Vec<_>>()
@@ -1010,7 +1020,7 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 					wait_until_stopped(process).await;
 				}
 			}
-			// The stages finish only once released, which happens after
+			// The stages finish only once the gate opens, which happens after
 			// every stage is running again and fg had time to start waiting:
 			// a job that ended before fg would be refused as terminated.
 			let resume = format!(
@@ -1026,7 +1036,7 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 					time::sleep(Duration::from_millis(10)).await;
 				}
 				time::sleep(Duration::from_millis(200)).await;
-				fs::write(&release, "").expect("release stages");
+				gate.open();
 			};
 			let (resumed, ()) = tokio::join!(session.run_test(resume, &stdio), release_stages);
 			let resumed = resumed.expect("foreground resumed pipeline");
