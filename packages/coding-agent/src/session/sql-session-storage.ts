@@ -153,14 +153,14 @@ export const SESSION_OPEN_CLAIM_WAIT_MS = SESSION_LEASE_EXPIRY_MS + 5000;
  * trying to take the session's OS lock while another process holds it: a
  * claim made while that process lets the session go (it closes the session,
  * or exits) then takes the session instead of moving it to a sibling. The
- * native claim of the lock may answer "taken" at once (the
- * open-file-description lock the natives addon takes on Linux now does) or
- * may itself wait about this long for a live holder to let go (the
- * abstract-socket lock of older Linux builds of the addon did). The store
- * tries again from the event loop, every {@link SQLITE_CLAIM_RETRY_MS}, so
- * it never blocks the thread itself; and since the window counts from the
- * claim's start, a native claim that waited has used it up and is not tried
- * again. Never longer than a claim's `waitMs`.
+ * native claim of a held lock may itself wait about this long for a live
+ * holder to let go (the abstract-socket lock does, in builds that retry a
+ * refused bind) or answer "taken" at once (the open-file-description lock of
+ * newer builds does). The store tries again from the event loop, every
+ * {@link SQLITE_CLAIM_RETRY_MS}, so it never blocks the thread itself; and
+ * since the window counts from the claim's start, a native claim that waited
+ * has used it up and is not tried again. Never longer than a claim's
+ * `waitMs`.
  */
 export const SQLITE_CLAIM_RELEASE_WINDOW_MS = 50;
 
@@ -2818,20 +2818,23 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Claim `sessionId` at `file` and wait for the answer: the claim when it
 	 * is held, `null` when `file` holds another session or another holder has
-	 * the session. On a SQLite file, whose claim is an OS lock, a lock another
-	 * process holds is tried again every {@link SQLITE_CLAIM_RETRY_MS} until
-	 * {@link SQLITE_CLAIM_RELEASE_WINDOW_MS} after the claim began (never past
-	 * `waitMs`), so a holder that lets the session go meanwhile does not move
-	 * it; a SQLite claim waits no longer than that, and `onWait` never hears a
-	 * holder there, since the lock names none. Elsewhere, with `waitMs`, a
-	 * holder's lease is read again every second until it is gone or expired
-	 * on the database clock, `onWait` hearing the holder once, and the session
-	 * claimed then, all within `waitMs`: a claim statement that waited past
-	 * its lock bound behind another process's write is refused, and tried
-	 * again only while the wait lasts. A claim statement that fails for
-	 * another reason (the database is unreachable) counts as held, as a file
-	 * claim that cannot be probed does: it never refuses a session, and the
-	 * first write under it runs the statement again.
+	 * the session. On a SQLite file, whose claim is an OS lock, the claim of
+	 * a lock another process holds keeps trying it until
+	 * {@link SQLITE_CLAIM_RELEASE_WINDOW_MS} after the claim began, so a
+	 * holder that lets the session go meanwhile does not move it: the store
+	 * tries again every {@link SQLITE_CLAIM_RETRY_MS}, never past `waitMs`,
+	 * after a native claim that answered at once, and not after one that
+	 * itself waited out the window. A SQLite claim waits about that long at
+	 * most, and `onWait` never hears a holder there, since the lock names
+	 * none. Elsewhere, with `waitMs`, a holder's lease is read again every
+	 * second until it is gone or expired on the database clock, `onWait`
+	 * hearing the holder once, and the session claimed then, all within
+	 * `waitMs`: a claim statement that waited past its lock bound behind
+	 * another process's write is refused, and tried again only while the
+	 * wait lasts. A claim statement that fails for another reason (the
+	 * database is unreachable) counts as held, as a file claim that cannot be
+	 * probed does: it never refuses a session, and the first write under it
+	 * runs the statement again.
 	 */
 	async acquire(
 		sessionId: string,

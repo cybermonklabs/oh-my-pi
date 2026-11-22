@@ -280,8 +280,9 @@ export interface SessionAcquireOptions extends SessionClaimOptions {
 	 * While another process holds the claim, wait up to this long for its
 	 * lease to go or expire, then claim. Without it a held claim refuses at
 	 * once. A SQLite claim, an OS lock that names no lease, does neither:
-	 * either way it tries the lock again for a moment, never past this (see
-	 * `SQLITE_CLAIM_RELEASE_WINDOW_MS` in sql-session-storage.ts).
+	 * either way it keeps trying the lock for a moment, and never tries it
+	 * again past this (see `SQLITE_CLAIM_RELEASE_WINDOW_MS` in
+	 * sql-session-storage.ts).
 	 */
 	waitMs?: number;
 	/** Called once, when the claim must wait, with the process that holds it. */
@@ -1007,13 +1008,14 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
  * while a process, this one included, holds it. On Linux it probes the lease
  * first (`isFileLockHeld`) and answers `null` at once when the probe finds a
  * holder; it claims only a lease the probe finds free, so a native claim that
- * waits on a refusal (the older abstract-socket lock's, see
- * `tryAcquireFileLock`) waits only when another process claims the lease
- * between the probe and the claim, or when a probe made a free lease look
- * taken. Elsewhere the claim alone answers at once. `omp gc` takes it to
- * delete a session no running process owns; a lease released while it is
- * probed can read as held, which leaves that session for gc's next run.
- * Throws when the lock cannot be probed or taken.
+ * waits on a refusal (the abstract-socket lock's, see `tryAcquireFileLock`;
+ * the open-file-description lock of newer builds of the addon answers at
+ * once) waits only when another process claims the lease between the probe
+ * and the claim, or when a probe made a free lease look taken. Elsewhere the
+ * claim alone answers at once. `omp gc` takes it to delete a session no
+ * running process owns; a lease released while it is probed can read as held,
+ * which leaves that session for gc's next run. Throws when the lock cannot be
+ * probed or taken.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
 	const lockPath = sessionLeasePath(sessionId, true);
@@ -1026,12 +1028,12 @@ export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null
  * Claim a session's ownership lease to write the session, or `null` while a
  * process, this one included, holds it. A process writing the session holds
  * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
- * probing first, so a concurrent probe never makes it refuse a free lease: an
- * open-file-description probe takes nothing, and the older abstract-socket
- * lock's claim retries the moment a probe makes a free lease look taken. A
- * lease another process holds is refused, at once or after the native
- * claim's own wait (see `tryAcquireFileLock`). Throws when the lock cannot be
- * taken.
+ * probing first, so a concurrent probe never makes it refuse a free lease: a
+ * probe of the open-file-description lock of newer builds of the addon takes
+ * nothing, and a claim of the abstract-socket lock retries the moment a probe
+ * makes a free lease look taken. A lease another process holds is refused, at
+ * once or after the native claim's own wait (see `tryAcquireFileLock`). Throws
+ * when the lock cannot be taken.
  */
 export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
@@ -1247,12 +1249,12 @@ export class FileSessionStorage implements SessionStorage {
 	 * `fpath`, failing closed after the same bounded wait the lockfile claim
 	 * uses. The native handle keeps ownership, never the file content, so
 	 * suspension and SIGKILL cannot strand it as stealable. On Linux a claim
-	 * of a gate another process holds answers at once with the
-	 * open-file-description lock, but blocks this thread for about 50 ms with
-	 * the abstract-socket lock that older builds of the addon take (see
-	 * `tryAcquireFileLock`), so every attempt but the last probes the gate
-	 * first and claims only one the probe finds free; a probe that reads a
-	 * just-released gate as held costs one poll.
+	 * of a gate another process holds blocks this thread for about 50 ms with
+	 * the abstract-socket lock (see `tryAcquireFileLock`) and answers at once
+	 * with the open-file-description lock of newer builds of the addon, so
+	 * every attempt but the last probes the gate first and claims only one the
+	 * probe finds free; a probe that reads a just-released gate as held costs
+	 * one poll.
 	 */
 	#acquireOsPublishLock(fpath: string, gatePath: string): NativeFileLock {
 		const deadline = Date.now() + SESSION_PUBLISH_LOCK_WAIT_MS;

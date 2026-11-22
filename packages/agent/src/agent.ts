@@ -1379,12 +1379,22 @@ export class Agent {
 		const previous = this.#state.messages;
 		// New array assignment is intentional: caller-owned `ms` may be mutated
 		// after handoff; snapshot it so external mutations cannot leak in.
-		this.#state.messages = ms.slice();
+		const next = ms.slice();
+		this.#state.messages = next;
 		// A message the new history drops (a compaction's summarized turns) can
 		// outlive it as a session entry whose body moved to a store; the
 		// tokenizer's memo must not keep its count for the session's life.
-		const kept = new Set(this.#state.messages);
-		for (const message of previous) if (!kept.has(message)) this.#tokenizer.forget(message);
+		// The old messages the new history starts with are kept; when they are
+		// all of the old history (an append), nothing was dropped.
+		const shared = Math.min(previous.length, next.length);
+		let prefix = 0;
+		while (prefix < shared && previous[prefix] === next[prefix]) prefix++;
+		if (prefix === previous.length) return;
+		const kept = new Set(next);
+		for (let index = prefix; index < previous.length; index++) {
+			const message = previous[index];
+			if (!kept.has(message)) this.#tokenizer.forget(message);
+		}
 	}
 
 	/** Signal after a queue transition has settled its pending, claim, and
@@ -2178,13 +2188,14 @@ export class Agent {
 			for await (let event of stream) {
 				if (this.#abortController !== loopAbortController) return;
 				// Withdrawn input the loop already holds for this run never reaches the transcript.
-				const withdrawn = this.#withdrawnMessages.get(loopAbortController);
-				if ((event.type === "message_start" || event.type === "message_end") && withdrawn?.has(event.message)) {
-					continue;
-				}
-				if (event.type === "agent_end" && withdrawn) {
-					const messages = event.messages.filter(m => !withdrawn.has(m));
-					if (messages.length < event.messages.length) event = { ...event, messages };
+				if (event.type === "message_start" || event.type === "message_end") {
+					if (this.#withdrawnMessages.get(loopAbortController)?.has(event.message)) continue;
+				} else if (event.type === "agent_end") {
+					const withdrawn = this.#withdrawnMessages.get(loopAbortController);
+					if (withdrawn) {
+						const messages = event.messages.filter(m => !withdrawn.has(m));
+						if (messages.length < event.messages.length) event = { ...event, messages };
+					}
 				}
 				if (event.type === "turn_start") turnOpen = true;
 				if (event.type === "turn_end") turnOpen = false;

@@ -395,11 +395,12 @@ export class AppendOnlyContextManager {
 	#truncateLog(count: number, next: readonly unknown[]): void {
 		const entries = this.log.entries();
 		if (count >= entries.length) return;
-		const resent = new Set(next);
-		for (let index = count; index < entries.length; index++) {
-			const entry = entries[index]!;
-			if (!resent.has(entry)) this.#digestMemo.delete(entry);
+		const dropped = new Set(entries.slice(count));
+		for (const message of next) {
+			dropped.delete(message as Message);
+			if (dropped.size === 0) break;
 		}
+		for (const entry of dropped) this.#digestMemo.delete(entry);
 		this.log.truncate(count);
 	}
 

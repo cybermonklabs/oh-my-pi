@@ -150,9 +150,9 @@ export class HindsightOutbox {
 			throw error;
 		}
 		for (const dir of destinations) {
-			// Probed first: a drain is retried, and while another process holds the lease a claim of an
-			// older build's abstract-socket lock would block the event loop for about 50 ms on every
-			// retry (a claim of the open-file-description lock answers at once).
+			// Probed first: a drain is retried, and while another process holds the lease a claim of the
+			// abstract-socket lock would block the event loop for about 50 ms on every retry (one of the
+			// open-file-description lock of newer builds of the addon answers at once).
 			const lease = tryAcquireFileLockUnlessHeld(path.join(dir, "drain"));
 			if (!lease) {
 				if (dir === this.#dir) result.busy = true;

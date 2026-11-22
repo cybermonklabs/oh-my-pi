@@ -32,6 +32,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const MOCK_API_SOURCE = "test/parked-subagent-parent-holders";
 /** Subagents the parent spawns, in one assistant turn of task calls. */
@@ -44,16 +45,6 @@ const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as
 
 let savedEnv: Record<string, string | undefined> = {};
 let root: string;
-
-function restoreEnvValue(key: string, value: string | undefined): void {
-	if (value === undefined) {
-		delete process.env[key];
-		delete Bun.env[key];
-		return;
-	}
-	process.env[key] = value;
-	Bun.env[key] = value;
-}
 
 beforeEach(async () => {
 	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));

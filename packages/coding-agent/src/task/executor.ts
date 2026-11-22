@@ -4311,7 +4311,10 @@ interface SubagentPromptInputs {
 	 * trees. Resolved again before each session build and dropped at dispose.
 	 */
 	ircRootSessionFile?: string;
-	/** What the live session's prompt renders recorded: made by the first render, dropped at dispose. */
+	/**
+	 * What the live session's prompt renders recorded: made by the first render (by a warm revive, before it builds
+	 * the session), dropped at dispose.
+	 */
 	ircRenders?: IrcRenderLog;
 	/** Set only while a warm revive builds the session: the roster read back by {@link revivalIrcRoster}. */
 	revivalIrcRoster?: IrcPeerRosterData;
@@ -4321,8 +4324,11 @@ interface SubagentPromptInputs {
 interface IrcRenderLog {
 	/** Peer roster each prompt block the live session rendered shows, keyed by that block. */
 	readonly renders: Map<string, IrcPeerRosterData>;
-	/** {@link ircRosterBlockKey} of every block the transcript holds an {@link IRC_ROSTER_ENTRY} for. */
-	readonly recorded: Set<string>;
+	/**
+	 * {@link ircRosterBlockKey} of every block the transcript holds an {@link IRC_ROSTER_ENTRY} for; absent when the
+	 * transcript records none ({@link SubagentSessionSpec.revivable}).
+	 */
+	readonly recorded?: Set<string>;
 }
 
 /**
@@ -4348,6 +4354,13 @@ function isIrcRosterRecord(data: unknown): data is IrcRosterRecord {
 		typeof parkedCount === "number" &&
 		typeof omittedCount === "number"
 	);
+}
+
+/** The roster record `entry` holds, when it is a well-formed {@link IRC_ROSTER_ENTRY}. */
+function ircRosterRecordOf(entry: SessionEntry): IrcRosterRecord | undefined {
+	return entry.type === "custom" && entry.customType === IRC_ROSTER_ENTRY && isIrcRosterRecord(entry.data)
+		? entry.data
+		: undefined;
 }
 
 /** Key an {@link IRC_ROSTER_ENTRY} names its block by: the transcript keeps the block itself in `session_init`. */
@@ -4376,18 +4389,30 @@ interface SubagentSessionSpec {
 	prompt: SubagentPromptInputs;
 	/** A per-call worker's grants; every session built from the spec holds each request to them. */
 	perCall?: { readonly grants: PerCallModelGrants; readonly modelRegistry: ModelRegistry };
+	/**
+	 * Whether a warm revive can read the session's transcript back: the subagent is kept alive and has a session
+	 * file. Only then does the transcript record the rosters its prompt renders ({@link IRC_ROSTER_ENTRY}) and its
+	 * revive inputs ({@link SUBAGENT_REVIVE_ENTRY}).
+	 */
+	revivable: boolean;
 }
 
 /**
- * `fields` without its keys whose value is `undefined`. A parked subagent keeps its spawn's session options and
- * wake-turn inputs for as long as it can be revived, and their readers take a missing key as `undefined`.
+ * `fields` without its keys whose value is `undefined`; with `keys`, only the fields they name. A parked subagent
+ * keeps its spawn's session options and wake-turn inputs for as long as it can be revived, and their readers take a
+ * missing key as `undefined`.
  */
-function withoutUndefinedFields<T extends object>(fields: T): T {
+function withoutUndefinedFields<T extends object>(fields: T): T;
+function withoutUndefinedFields<T extends object, K extends keyof T>(fields: T, keys: readonly K[]): Pick<T, K>;
+function withoutUndefinedFields<T extends object>(
+	fields: T,
+	keys: readonly (keyof T)[] = Object.keys(fields) as (keyof T)[],
+): Partial<T> {
 	const defined: Partial<T> = {};
-	for (const key of Object.keys(fields) as (keyof T)[]) {
+	for (const key of keys) {
 		if (fields[key] !== undefined) defined[key] = fields[key];
 	}
-	return defined as T;
+	return defined;
 }
 
 /** Launch-only session inputs: a revived session restores these from its transcript or goes without. */
@@ -4467,7 +4492,7 @@ function buildSubagentSessionOptions(
 				ircOmittedCount: ircRoster?.omittedCount ?? 0,
 				ircSelfId: inputs.ircEnabled ? inputs.id : "",
 			});
-			if (ircRoster) recordIrcRender(inputs, sessionManager, subagentPrompt, ircRoster);
+			if (ircRoster) recordIrcRender(inputs, sessionManager, subagentPrompt, ircRoster, spec.revivable);
 			// Per-spawn text (context, worktree, IRC roster) goes after the trailing
 			// `<project-context>` block so spawns of the same agent share the static
 			// prompt prefix as a cache hit.
@@ -4491,16 +4516,21 @@ function heldIrcRoster(inputs: SubagentPromptInputs, defaultPrompt: readonly str
 }
 
 /**
- * Remembers the roster `block` shows, dropping blocks the live session's base prompt no longer holds,
- * and records it in the transcript unless the transcript already holds that block's roster.
+ * Remembers the roster `block` shows, dropping blocks the live session's base prompt no longer holds, and, when a
+ * warm revive can read the transcript back (`revivable`), records it there unless the transcript already holds that
+ * block's roster.
  */
 function recordIrcRender(
 	inputs: SubagentPromptInputs,
 	sessionManager: SessionManager,
 	block: string,
 	roster: IrcPeerRosterData,
+	revivable: boolean,
 ): void {
-	const log = (inputs.ircRenders ??= { renders: new Map(), recorded: recordedIrcRosterBlocks(sessionManager) });
+	const log = (inputs.ircRenders ??= {
+		renders: new Map(),
+		recorded: revivable ? recordedIrcRosterBlocks(sessionManager.getEntries()) : undefined,
+	});
 	const held = ownAttachedSession(inputs.id)?.baseSystemPrompt;
 	if (held) {
 		for (const rendered of log.renders.keys()) {
@@ -4508,6 +4538,7 @@ function recordIrcRender(
 		}
 	}
 	log.renders.set(block, roster);
+	if (!log.recorded) return;
 	const key = ircRosterBlockKey(block);
 	if (log.recorded.has(key)) return;
 	log.recorded.add(key);
@@ -4515,13 +4546,12 @@ function recordIrcRender(
 	sessionManager.appendCustomEntry(IRC_ROSTER_ENTRY, record);
 }
 
-/** Keys of the blocks `sessionManager`'s transcript holds an {@link IRC_ROSTER_ENTRY} for. */
-function recordedIrcRosterBlocks(sessionManager: SessionManager): Set<string> {
+/** Keys of the blocks `entries` hold an {@link IRC_ROSTER_ENTRY} for. */
+function recordedIrcRosterBlocks(entries: readonly SessionEntry[]): Set<string> {
 	const recorded = new Set<string>();
-	for (const entry of sessionManager.getEntries()) {
-		if (entry.type === "custom" && entry.customType === IRC_ROSTER_ENTRY && isIrcRosterRecord(entry.data)) {
-			recorded.add(entry.data.block);
-		}
+	for (const entry of entries) {
+		const record = ircRosterRecordOf(entry);
+		if (record) recorded.add(record.block);
 	}
 	return recorded;
 }
@@ -4538,15 +4568,8 @@ function revivalIrcRoster(entries: readonly SessionEntry[]): IrcPeerRosterData |
 	if (!base) return undefined;
 	const held = new Set(base.map(ircRosterBlockKey));
 	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
-		if (
-			entry.type === "custom" &&
-			entry.customType === IRC_ROSTER_ENTRY &&
-			isIrcRosterRecord(entry.data) &&
-			held.has(entry.data.block)
-		) {
-			return entry.data.roster;
-		}
+		const record = ircRosterRecordOf(entries[index]);
+		if (record && held.has(record.block)) return record.roster;
 	}
 	return undefined;
 }
@@ -4686,7 +4709,7 @@ function splitCredentialWrites(writes: SettingsLayerWrites | undefined): {
 		const value = getByPath(set ?? writes.set, setting.segments);
 		if (value === undefined) continue;
 		(credentials ??= {})[setting.id] = value;
-		// A copy: the writes' records are the live overlay's layers.
+		// A copy, so deleting from it leaves the caller's `writes` unchanged.
 		set ??= { ...writes.set };
 		deleteByPath(set, setting.segments);
 	}
@@ -4757,84 +4780,191 @@ const SUBAGENT_REVIVE_ENTRY = "subagent-revive-state";
 type SubagentSpecOptions = SubagentSessionSpec["options"];
 
 /**
- * Spec options whose values are plain data of the spawn's own (strings, numbers, booleans, and
- * lists and records of them): a {@link SUBAGENT_REVIVE_ENTRY} holds them, and the model and output
- * schema too when JSON keeps them whole. Every other option stays referenced in the
- * {@link WarmReviveState}: it names an object the live process holds and shares (registries,
- * managers, buses, the parent's tools, context and extensions) or one JSON cannot hold.
+ * Where a warm revive takes one of a kept-alive subagent's spawn inputs from. Every spec option, prompt input and
+ * wake-turn input has one ({@link SPEC_OPTION_SOURCES}, {@link PROMPT_INPUT_SOURCES}, {@link WAKE_INPUT_SOURCES}), so
+ * an input added to their types without one fails to compile.
+ * - `recorded`: the transcript's {@link SUBAGENT_REVIVE_ENTRY}, which holds plain data of the spawn's own (strings,
+ *   numbers, booleans, and lists and records of them).
+ * - `shared`: the {@link WarmReviveState}, which references it, when the spawn set it: an object the live process
+ *   holds and shares (registries, managers, buses, the parent's tools, context and extensions) or one JSON cannot
+ *   hold.
+ * - `either`: the entry when JSON keeps it whole (the model only when it can also carry no secret), else the state.
+ * - `live`: neither; each revive or session build takes it from the live process or makes it again.
  */
-const RECORDED_SPEC_OPTION_KEYS = [
-	"cwd",
-	"additionalDirectories",
-	"credentialSourceSessionId",
-	"oauthAccountPools",
-	"modelPattern",
-	"modelPatternAuthFallback",
-	"modelPatternFallbackRole",
-	"modelPatternDefaultFallbackChain",
-	"modelPatternChainFallback",
-	"thinkingLevel",
-	"disableModelFallback",
-	"disableServerSideFallback",
-	"thinkingLevelCeiling",
-	"taskEffort",
-	"cacheWarming",
-	"toolNames",
-	"outputSchemaMode",
-	"restrictToolNames",
-	"requireYieldTool",
-	"noContextFiles",
-	"excludeAgentsMd",
-	"mergeDiscoveredSkillPaths",
-	"disableExtensionDiscovery",
-	"preloadedExtensionPaths",
-	"hasUI",
-	"spawns",
-	"taskDepth",
-	"parentTaskPrefix",
-	"parentAgentId",
-	"agentId",
-	"agentDisplayName",
-	"agentName",
-	"enableLsp",
-	"enableIrc",
-	"skipPythonPreflight",
-	"enableMCP",
-] as const satisfies readonly (keyof SubagentSpecOptions)[];
-const RECORDED_SPEC_OPTIONS: ReadonlySet<keyof SubagentSpecOptions> = new Set(RECORDED_SPEC_OPTION_KEYS);
+type ReviveInputSource = "recorded" | "shared" | "either" | "live";
+
+/** The keys of `R` whose {@link ReviveInputSource} is `S`. */
+type KeysWithSource<R, S extends ReviveInputSource> = { [K in keyof R]: R[K] extends S ? K : never }[keyof R];
+
+/** The keys of `sources` whose source is `source`, in their order. */
+function keysWithSource<R extends Readonly<Record<string, ReviveInputSource>>, S extends ReviveInputSource>(
+	sources: R,
+	source: S,
+): readonly KeysWithSource<R, S>[] {
+	return Object.keys(sources).filter(key => sources[key] === source) as KeysWithSource<R, S>[];
+}
+
+/** Where a warm revive takes each spec option from. */
+const SPEC_OPTION_SOURCES = {
+	cwd: "recorded",
+	additionalDirectories: "recorded",
+	credentialSourceSessionId: "recorded",
+	modelPattern: "recorded",
+	modelPatternAuthFallback: "recorded",
+	modelPatternFallbackRole: "recorded",
+	modelPatternDefaultFallbackChain: "recorded",
+	modelPatternChainFallback: "recorded",
+	thinkingLevel: "recorded",
+	disableModelFallback: "recorded",
+	disableServerSideFallback: "recorded",
+	thinkingLevelCeiling: "recorded",
+	taskEffort: "recorded",
+	cacheWarming: "recorded",
+	toolNames: "recorded",
+	outputSchemaMode: "recorded",
+	restrictToolNames: "recorded",
+	requireYieldTool: "recorded",
+	noContextFiles: "recorded",
+	excludeAgentsMd: "recorded",
+	mergeDiscoveredSkillPaths: "recorded",
+	disableExtensionDiscovery: "recorded",
+	preloadedExtensionPaths: "recorded",
+	hasUI: "recorded",
+	spawns: "recorded",
+	taskDepth: "recorded",
+	parentTaskPrefix: "recorded",
+	parentAgentId: "recorded",
+	agentId: "recorded",
+	agentDisplayName: "recorded",
+	agentName: "recorded",
+	enableLsp: "recorded",
+	enableIrc: "recorded",
+	skipPythonPreflight: "recorded",
+	enableMCP: "recorded",
+	model: "either",
+	outputSchema: "either",
+	// Each revive takes the live `task.agentAccountPools` entry; each build sets the rest.
+	oauthAccountPools: "live",
+	awaitingAssignment: "live",
+	mcpTools: "live",
+	mcpToolScope: "live",
+	agentDir: "shared",
+	inheritedSessionAgents: "shared",
+	authStorage: "shared",
+	modelRegistry: "shared",
+	getApiKey: "shared",
+	modelRole: "shared",
+	rebindModelAfterDiscovery: "shared",
+	deferRetryFallbackValidation: "shared",
+	openAIServiceTier: "shared",
+	scopedModels: "shared",
+	prewalk: "shared",
+	deferredPrewalk: "shared",
+	onPrewalkWarning: "shared",
+	suppressAutoPrewalk: "shared",
+	planYolo: "shared",
+	systemPromptTemplate: "shared",
+	customSystemPrompt: "shared",
+	appendSystemPrompt: "shared",
+	titleSystemPrompt: "shared",
+	providerSessionId: "shared",
+	providerPromptCacheKey: "shared",
+	taskPromptCacheKey: "shared",
+	providerPromptCacheKeySource: "shared",
+	deadline: "shared",
+	costGate: "shared",
+	customTools: "shared",
+	extensions: "shared",
+	additionalExtensionPaths: "shared",
+	extensionRoots: "shared",
+	preloadedExtensions: "shared",
+	deferredExtensionPaths: "shared",
+	preloadedPreparedExtensions: "shared",
+	preloadedCustomToolPaths: "shared",
+	eventBus: "shared",
+	subagentEventBus: "shared",
+	skills: "shared",
+	rules: "shared",
+	contextFiles: "shared",
+	workspaceTree: "shared",
+	promptTemplates: "shared",
+	slashCommands: "shared",
+	mcpManager: "shared",
+	lspReadOnly: "shared",
+	mountedToolNames: "shared",
+	allowRestrictedCustomTools: "shared",
+	bindProcessState: "shared",
+	parentHindsightSessionState: "shared",
+	parentMnemopiSessionState: "shared",
+	agentRegistry: "shared",
+	asyncJobManager: "shared",
+	jobWidgetAuthor: "shared",
+	jobCaptionWriter: "shared",
+	localProtocolOptions: "shared",
+	settingsManager: "shared",
+	allowSessionModelFallback: "shared",
+	interactivePrompts: "shared",
+	advertiseHeadlessAsk: "shared",
+	settingsApproval: "shared",
+	tuiTranscript: "shared",
+	autoTitle: "shared",
+	deferSkillDescriptionCompression: "shared",
+	deferUsageReserveConfirmation: "shared",
+	telemetry: "shared",
+	autoApprove: "shared",
+} as const satisfies Record<keyof SubagentSpecOptions, ReviveInputSource>;
+
+/** Spec options a {@link SUBAGENT_REVIVE_ENTRY} holds. */
+const RECORDED_SPEC_OPTION_KEYS = keysWithSource(SPEC_OPTION_SOURCES, "recorded");
+
+/** Where a warm revive takes each prompt input from. */
+const PROMPT_INPUT_SOURCES = {
+	id: "recorded",
+	model: "recorded",
+	agentSystemPrompt: "recorded",
+	context: "recorded",
+	planReference: "recorded",
+	planReferencePath: "recorded",
+	worktree: "recorded",
+	structured: "recorded",
+	outputSchema: "either",
+	outputSchemaOverridesAgent: "recorded",
+	ircEnabled: "recorded",
+	ircRootSessionFile: "live",
+	ircRenders: "live",
+	revivalIrcRoster: "live",
+} as const satisfies Record<keyof SubagentPromptInputs, ReviveInputSource>;
 
 /** Prompt inputs a {@link SUBAGENT_REVIVE_ENTRY} holds: those fixed at spawn but the output schema. */
-const RECORDED_PROMPT_KEYS = [
-	"id",
-	"model",
-	"agentSystemPrompt",
-	"context",
-	"planReference",
-	"planReferencePath",
-	"worktree",
-	"structured",
-	"outputSchemaOverridesAgent",
-	"ircEnabled",
-] as const satisfies readonly (keyof SubagentPromptInputs)[];
+const RECORDED_PROMPT_KEYS = keysWithSource(PROMPT_INPUT_SOURCES, "recorded");
+
+/** Where a warm revive takes each wake-turn monitor input from; its observability bus and schema are the spec options'. */
+const WAKE_INPUT_SOURCES = {
+	id: "recorded",
+	index: "recorded",
+	agent: "either",
+	description: "recorded",
+	modelOverride: "recorded",
+	modelRole: "recorded",
+	eventBus: "shared",
+	subagentEventBus: "shared",
+	parentToolCallId: "recorded",
+	// Each attach passes its own.
+	sessionFile: "live",
+	maxRuntimeMs: "recorded",
+	completionProbe: "recorded",
+	softRequestBudget: "recorded",
+	softRequestBudgetNotice: "recorded",
+	structured: "recorded",
+	outputSchema: "either",
+	outputSchemaMode: "recorded",
+	outputSchemaSource: "recorded",
+	artifactsDir: "recorded",
+	storeMaskCwd: "recorded",
+} as const satisfies Record<keyof IrcWakeTurnMonitorOptions, ReviveInputSource>;
 
 /** Wake-turn monitor inputs a {@link SUBAGENT_REVIVE_ENTRY} holds: all but the buses, agent definition and output schema. */
-const RECORDED_WAKE_KEYS = [
-	"id",
-	"index",
-	"description",
-	"modelOverride",
-	"modelRole",
-	"parentToolCallId",
-	"maxRuntimeMs",
-	"completionProbe",
-	"softRequestBudget",
-	"softRequestBudgetNotice",
-	"structured",
-	"outputSchemaMode",
-	"outputSchemaSource",
-	"artifactsDir",
-	"storeMaskCwd",
-] as const satisfies readonly (keyof IrcWakeTurnMonitorOptions)[];
+const RECORDED_WAKE_KEYS = keysWithSource(WAKE_INPUT_SOURCES, "recorded");
 
 /**
  * What a kept-alive subagent's session is built from besides the live parent's settings and artifact
@@ -4853,8 +4983,6 @@ interface SubagentReviveInputs {
 	 * observability bus and output schema are the spec options'.
 	 */
 	readonly wake: IrcWakeTurnMonitorOptions;
-	/** Exact agent name the live `task.agentAccountPools` entry is looked up by on revive. */
-	readonly agentName: string;
 }
 
 /**
@@ -4881,13 +5009,17 @@ interface SubagentReviveRecord {
 	readonly wake: Pick<IrcWakeTurnMonitorOptions, (typeof RECORDED_WAKE_KEYS)[number]> & {
 		readonly agent?: AgentDefinition;
 	};
-	readonly agentName: string;
 	/**
 	 * Pending, never-promoted family candidate. The stash lives only on the live manager, so its
 	 * disposal reads it (when the header still carries no task key) and the revive restores it onto
 	 * the fresh manager it opens from disk.
 	 */
 	readonly pendingCacheCandidate?: string;
+	/**
+	 * The {@link WarmReviveState.generation} of the park that wrote it. A revive pairs the state only with the entry
+	 * of the same generation.
+	 */
+	readonly generation: number;
 }
 
 function isSubagentReviveRecord(data: unknown): data is SubagentReviveRecord {
@@ -4899,7 +5031,7 @@ function isSubagentReviveRecord(data: unknown): data is SubagentReviveRecord {
 		isRecord(data.settingsInputs) &&
 		isRecord(data.wake) &&
 		typeof data.keepTodo === "boolean" &&
-		typeof data.agentName === "string"
+		typeof data.generation === "number"
 	);
 }
 
@@ -4918,8 +5050,8 @@ function latestSubagentReviveRecord(entries: readonly SessionEntry[]): SubagentR
 	return undefined;
 }
 
-/** Spec options a {@link WarmReviveState} references: every option {@link RECORDED_SPEC_OPTION_KEYS} leaves out. */
-type SharedSpecOptions = Omit<SubagentSpecOptions, (typeof RECORDED_SPEC_OPTION_KEYS)[number]>;
+/** Spec options a {@link WarmReviveState} references, the shared ones and those JSON may not keep whole. */
+type SharedSpecOptions = Pick<SubagentSpecOptions, KeysWithSource<typeof SPEC_OPTION_SOURCES, "shared" | "either">>;
 
 /**
  * What a parked kept-alive subagent keeps in memory for its warm revive, revived by the module-level
@@ -4950,6 +5082,13 @@ interface WarmReviveState extends SharedSpecOptions {
 	readonly wakeAgent?: AgentDefinition;
 	/** Credential settings the subagent's runs wrote, which its {@link SUBAGENT_REVIVE_ENTRY} leaves out. */
 	credentialWrites?: SubagentCredentialWrites;
+	/**
+	 * Generation of the newest {@link SUBAGENT_REVIVE_ENTRY} its parks wrote or tried to write: a park that writes one
+	 * raises it first, and the entry carries it. The model and credential settings here are the last park's, so a
+	 * transcript whose newest entry carries another generation (a write that never reached the file) holds an earlier
+	 * park's inputs, and the revive goes cold rather than pair the two.
+	 */
+	generation: number;
 }
 
 /** Whether `value` parsed back from its JSON is strictly equal to it: JSON loses none of its fields. */
@@ -4989,15 +5128,6 @@ function modelMayCarrySecret(model: Model<Api>): boolean {
 	].some(url => url !== undefined && urlMayCarrySecret(url));
 }
 
-/** The fields of `fields` that `keys` names, without those whose value is `undefined`. */
-function pickFields<T extends object, K extends keyof T>(fields: T, keys: readonly K[]): Pick<T, K> {
-	const picked: Partial<Pick<T, K>> = {};
-	for (const key of keys) {
-		if (fields[key] !== undefined) picked[key] = fields[key];
-	}
-	return picked as Pick<T, K>;
-}
-
 /** The fields of `fields` that `omit` does not name. */
 function omitFields<T extends object>(fields: T, omit: (key: keyof T) => boolean): Partial<T> {
 	const kept: Partial<T> = {};
@@ -5019,10 +5149,11 @@ function createWarmReviveState(
 ): WarmReviveState {
 	const { spec, wake } = inputs;
 	const recordsSchema = jsonKeepsWhole(spec.options.outputSchema);
-	const shared = omitFields(
-		spec.options,
-		key => RECORDED_SPEC_OPTIONS.has(key) || key === "model" || (key === "outputSchema" && recordsSchema),
-	);
+	const shared = omitFields(spec.options, key => {
+		const source = SPEC_OPTION_SOURCES[key];
+		// The model is left to the disposal; a schema JSON keeps whole goes to the entry.
+		return source === "recorded" || source === "live" || key === "model" || (key === "outputSchema" && recordsSchema);
+	});
 	return withoutUndefinedFields({
 		...shared,
 		storage,
@@ -5032,6 +5163,7 @@ function createWarmReviveState(
 		perCall: spec.perCall,
 		wakeEventBus: wake.eventBus,
 		wakeAgent: jsonKeepsWhole(wake.agent) ? undefined : wake.agent,
+		generation: 0,
 	});
 }
 
@@ -5040,7 +5172,7 @@ function createWarmReviveState(
  * the writes its settings overlay holds beyond `baseline` but the credential settings' values, which
  * `state` keeps, and its manager's pending cache candidate, all final once disposal begins, while
  * the transcript's writer is still open. A disposal that would write what the transcript's newest
- * entry already holds writes nothing: the spawn's inputs are fixed, and the settings writes and
+ * {@link SUBAGENT_REVIVE_ENTRY} already holds writes nothing: the spawn's inputs are fixed, and the settings writes and
  * pending candidate rarely change, so each park would otherwise add another copy of the prompt
  * inputs. The model goes to the entry when it is a copy of the subagent's own that JSON keeps
  * whole and that can carry no secret ({@link modelMayCarrySecret}); otherwise `state` references
@@ -5077,12 +5209,12 @@ function trackSubagentReviveRecord(
 		const recordsSchema = state.outputSchema === undefined;
 		const record: SubagentReviveRecord = {
 			options: {
-				...pickFields(options, RECORDED_SPEC_OPTION_KEYS),
+				...withoutUndefinedFields(options, RECORDED_SPEC_OPTION_KEYS),
 				outputSchema: recordsSchema ? options.outputSchema : undefined,
 				model: recordedModel,
 			},
 			prompt: {
-				...pickFields(prompt, RECORDED_PROMPT_KEYS),
+				...withoutUndefinedFields(prompt, RECORDED_PROMPT_KEYS),
 				outputSchema: recordsSchema ? prompt.outputSchema : undefined,
 			},
 			settingsInputs: inputs.settingsInputs,
@@ -5091,20 +5223,23 @@ function trackSubagentReviveRecord(
 				global.writes || overrides.writes ? { global: global.writes, overrides: overrides.writes } : undefined,
 			keepTodo: inputs.keepTodo,
 			wake: {
-				...pickFields(inputs.wake, RECORDED_WAKE_KEYS),
+				...withoutUndefinedFields(inputs.wake, RECORDED_WAKE_KEYS),
 				agent: state.wakeAgent === undefined ? inputs.wake.agent : undefined,
 			},
-			agentName: inputs.agentName,
 			// An already-persisted header is the carrier a revive reconstitutes from — only an unpromoted
 			// stash must be carried, so a header stripped on disk (a deliberate drop of persisted
 			// affinity) cannot resurrect it.
 			pendingCacheCandidate:
 				manager.getHeader()?.taskPromptCacheKey === undefined ? manager.getTaskSiblingCandidate() : undefined,
+			generation: state.generation,
 		};
 		// Compared as JSON reads it back: a field this record leaves `undefined` is one the entry lacks.
 		if (Bun.deepEquals(latestSubagentReviveRecord(manager.getEntries()), record)) return;
+		// The entry carries the state's next generation: should it never reach the file (a disk failure the manager
+		// only notes), the next revive finds the older entry's generation and revives cold.
+		state.generation += 1;
 		try {
-			manager.appendCustomEntry(SUBAGENT_REVIVE_ENTRY, record);
+			manager.appendCustomEntry(SUBAGENT_REVIVE_ENTRY, { ...record, generation: state.generation });
 		} catch (error) {
 			logger.warn("Subagent revive inputs were not recorded", { id: prompt.id, error: String(error) });
 		}
@@ -5126,8 +5261,9 @@ export async function replayRevivedAgentStart(session: AgentSession): Promise<vo
  * own {@link WarmReviveState}. Park closed the JSONL writer, so reopening takes the single-writer
  * lock cleanly and restores the full message history (createAgentSession → agent.replaceMessages),
  * and the transcript's newest {@link SUBAGENT_REVIVE_ENTRY} holds the session's plain inputs. A
- * transcript without one fails with {@link WarmReviveInputsMissingError}, which the lifecycle answers
- * with a cold revive. Isolated runs keep their worktree for the same lifecycle, so they use this path too.
+ * transcript without one, or whose newest is not the last park's ({@link WarmReviveState.generation}), fails with
+ * {@link WarmReviveInputsMissingError}, which the lifecycle answers with a cold revive. Isolated runs keep their
+ * worktree for the same lifecycle, so they use this path too.
  */
 async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveState): Promise<AgentSession> {
 	const { id } = expectedAgentRef;
@@ -5158,13 +5294,14 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 		wakeEventBus,
 		wakeAgent,
 		credentialWrites,
+		generation,
 		...shared
 	} = state;
 	const agent = wakeAgent ?? record?.wake.agent;
-	if (!record || !agent) {
+	if (!record || !agent || record.generation !== generation) {
 		await reopened.close();
 		throw new WarmReviveInputsMissingError(
-			`Cannot warm-revive subagent "${id}": session file "${sessionFile}" records no revive inputs.`,
+			`Cannot warm-revive subagent "${id}": session file "${sessionFile}" records no revive inputs of its last park.`,
 		);
 	}
 	// The inputs the parked session was built from: the plain ones its transcript holds, and the live objects.
@@ -5179,6 +5316,7 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 			preparedSession,
 			prompt: { ...record.prompt, outputSchema: shared.outputSchema ?? record.prompt.outputSchema },
 			perCall,
+			revivable: true,
 		},
 		settingsInputs: record.settingsInputs,
 		retryFallback: record.retryFallback,
@@ -5190,7 +5328,6 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 			subagentEventBus: options.subagentEventBus,
 			outputSchema: options.outputSchema,
 		}),
-		agentName: record.agentName,
 	};
 	if (parentArtifactManager) {
 		reopened.adoptArtifactManager(parentArtifactManager);
@@ -5202,29 +5339,34 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 		reopened.setTaskSiblingCandidate(record.pendingCacheCandidate);
 	}
 	const { spec } = inputs;
-	await refreshSubagentIrcRoot(spec.prompt, reopened, sessionFile, storage);
 	const mcpManager = spec.options.mcpManager;
-	// The revived session reopens its own view, keeping the tools its earlier requests rendered.
-	const mcpFollower = mcpManager
-		? followMCPTools(mcpManager, { scope: reopened.getSessionId() }, explicitSubagentToolNames(spec))
-		: undefined;
+	let mcpFollower: MCPToolFollower | undefined;
 	let revived: AgentSession;
 	let startupModelFallback: CreateAgentSessionResult["startupModelFallback"];
 	let settingsBaseline: OverlayLayers;
-	// Account pools are owner policy: take the live exact-name entry, as
-	// dispatch and persisted revival do, never the spawn-time copy.
-	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(parentSettings));
-	// A session-local switch since spawn (a prewalk handoff) owns the model and effort: the
-	// transcript restores the effort, and the spawn selection only backs the model up when it is
-	// unavailable. The spawn's prewalk stays configured; the coordinator sees it was spent. A seance
-	// fork's selections belong to its source run, never to the consult.
-	// A per-call worker never switches models, so its warm revive never prepends a session-local switch.
-	const sessionLocalModel =
-		spec.preparedSession || spec.perCall ? undefined : reopened.getSessionLocalModelChange()?.model;
 	try {
 		try {
-			// The prompt the parked session sent shows this roster; rendering it again keeps the cached prefix.
-			if (spec.prompt.ircEnabled) spec.prompt.revivalIrcRoster = revivalIrcRoster(entries);
+			await refreshSubagentIrcRoot(spec.prompt, reopened, sessionFile, storage);
+			// The revived session reopens its own view, keeping the tools its earlier requests rendered.
+			mcpFollower = mcpManager
+				? followMCPTools(mcpManager, { scope: reopened.getSessionId() }, explicitSubagentToolNames(spec))
+				: undefined;
+			// Account pools are owner policy: take the live exact-name entry, as
+			// dispatch and persisted revival do, never the spawn-time copy.
+			const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(parentSettings));
+			// A session-local switch since spawn (a prewalk handoff) owns the model and effort: the
+			// transcript restores the effort, and the spawn selection only backs the model up when it is
+			// unavailable. The spawn's prewalk stays configured; the coordinator sees it was spent. A seance
+			// fork's selections belong to its source run, never to the consult.
+			// A per-call worker never switches models, so its warm revive never prepends a session-local switch.
+			const sessionLocalModel =
+				spec.preparedSession || spec.perCall ? undefined : reopened.getSessionLocalModelChange()?.model;
+			if (spec.prompt.ircEnabled) {
+				// The prompt the parked session sent shows this roster; rendering it again keeps the cached prefix.
+				spec.prompt.revivalIrcRoster = revivalIrcRoster(entries);
+				// The blocks the transcript already records, read from the entries in hand rather than again.
+				spec.prompt.ircRenders = { renders: new Map(), recorded: recordedIrcRosterBlocks(entries) };
+			}
 			const revivedSettings = reviveSubagentSettings(
 				parentSettings,
 				inputs,
@@ -5256,15 +5398,15 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 							thinkingLevel: undefined,
 						}
 					: undefined),
-				oauthAccountPools: Object.hasOwn(agentAccountPools, inputs.agentName)
-					? agentAccountPools[inputs.agentName]
+				oauthAccountPools: Object.hasOwn(agentAccountPools, inputs.wake.agent.name)
+					? agentAccountPools[inputs.wake.agent.name]
 					: undefined,
 			}));
 		} catch (error) {
 			mcpFollower?.dispose();
-			// The session claimed this journal as its writer before it failed.
-			// Leaving it claimed would divert the next revive of this
-			// transcript to a sibling file instead of rebuilding it in place.
+			// The reopened manager is this revive's alone, whatever step failed. Once built, the session claimed
+			// this journal as its writer: leaving it claimed would divert the next revive of this transcript to a
+			// sibling file instead of rebuilding it in place.
 			await reopened.close();
 			throw error;
 		}
@@ -5965,6 +6107,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					ircEnabled,
 				},
 				perCall: perCallModelGrants ? { grants: perCallModelGrants, modelRegistry } : undefined,
+				// Only a kept-alive subagent is revived; a one-shot run's transcript records no revive inputs or rosters.
+				revivable: sessionFile !== null && options.keepAlive !== false,
 			};
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
@@ -6076,15 +6220,13 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			// Deferred model resolution installs this role inside createAgentSession,
 			// so read it back from the settings both install paths write.
 			const retryFallback = getRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(id));
-			// Only a kept-alive subagent is revived; a one-shot run's transcript gets no revive inputs.
-			if (sessionFile !== null && options.keepAlive !== false) {
+			if (sessionSpec.revivable) {
 				const reviveInputs: SubagentReviveInputs = {
 					spec: sessionSpec,
 					settingsInputs,
 					retryFallback,
 					keepTodo: prewalk !== undefined,
 					wake: wakeOptions,
-					agentName: agent.name,
 				};
 				const reviveState = createWarmReviveState(
 					reviveInputs,

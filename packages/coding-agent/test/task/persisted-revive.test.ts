@@ -8,8 +8,10 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import * as accountPoolsModule from "@oh-my-pi/pi-coding-agent/config/account-pools";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -74,6 +76,22 @@ function makeTempDir(prefix: string): string {
 	const dir = TempDir.createSync(prefix);
 	tempDirs.push(dir);
 	return dir.path();
+}
+
+const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+
+/** Descriptors of this process open on a file under `dir`. */
+function descriptorsUnder(dir: string): string[] {
+	const found: string[] = [];
+	for (const fd of fs.readdirSync("/proc/self/fd")) {
+		try {
+			const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+			if (target.startsWith(`${dir}${path.sep}`)) found.push(target);
+		} catch {
+			// Closed between the listing and the read.
+		}
+	}
+	return found;
 }
 
 /** Inert shared manager exposing the members a revived subagent reads: its tools and change feed. */
@@ -2130,6 +2148,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		responses: MockResponseSource,
 		hooks?: ExtensionHooks,
 		toolNames?: string[],
+		keepAlive?: boolean,
 	): Promise<RecordingSession> {
 		let spawned: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
@@ -2161,6 +2180,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableLsp: false,
 			artifactsDir: cwd,
+			keepAlive,
 		});
 		expect(result.exitCode).toBe(0);
 		if (!spawned) throw new Error("Expected the spawn to create a session");
@@ -2410,6 +2430,21 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(rosterRecords(live.sessionManager)).toBe(2);
 	});
 
+	// If this regresses, every one-shot subagent's transcript carries a copy of each peer roster its prompt showed,
+	// which no revive ever reads.
+	it("records no roster in the transcript of a one-shot subagent", async () => {
+		const cwd = makeTempDir("@pi-one-shot-roster-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses(), undefined, undefined, false);
+		expect(spawned.requests.at(-1)!.join("\n")).toContain("(no other agents)");
+		const entries = Bun.JSONL.parse(await Bun.file(path.join(cwd, "prompt-blocks.jsonl")).text());
+		expect(entries.some(entry => isRecord(entry) && entry.type === "message")).toBe(true);
+		expect(
+			entries.filter(
+				entry => isRecord(entry) && entry.type === "custom" && entry.customType === "subagent-irc-roster",
+			),
+		).toEqual([]);
+	});
+
 	// If this regresses, a subagent parked by a version that recorded no roster in its transcript comes back unable to
 	// render its prompt, or without the peers that are live now.
 	it("warm-revives a transcript that records no roster with the live registry's roster", async () => {
@@ -2511,6 +2546,121 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		await live.prompt("follow-up");
 		await live.waitForIdle();
 		// A cold revive replays the system prompt the parked session's last request sent.
+		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+	});
+
+	// If this regresses, a host that hands each call its own cold reviver instead of installing one for the process
+	// (ACP) can no longer message a parked subagent whose transcript records no revive inputs: the cold revive after
+	// the warm one finds "no reviver registered".
+	it("revives cold through the caller's reviver when its transcript records no revive inputs", async () => {
+		const cwd = makeTempDir("@pi-revive-unrecorded-inputs-per-call-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const lifecycle = AgentLifecycleManager.global();
+		await lifecycle.park("prompt-blocks");
+		const sessionFile = path.join(cwd, "prompt-blocks.jsonl");
+		const recorded = await Bun.file(sessionFile).text();
+		const unrecorded = recorded.replaceAll('"customType":"subagent-revive-state"', '"customType":"older-version"');
+		expect(unrecorded).not.toBe(recorded);
+		await Bun.write(sessionFile, unrecorded);
+
+		let cold: RecordingSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			const build = options!.systemPrompt;
+			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
+			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
+			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
+			return { session: cold.session } as CreateAgentSessionResult;
+		});
+		// No factory for the process, as under ACP: the call brings its own.
+		const live = localSession(await lifecycle.ensureLive("prompt-blocks", { reviverFactory: createFactory(cwd) }));
+		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
+		await live.prompt("follow-up");
+		await live.waitForIdle();
+		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+	});
+
+	// If this regresses, a warm revive that fails before it builds the session (a `task.agentAccountPools` that does
+	// not validate, a roster scan or an MCP follow that throws) leaves the transcript it reopened open: the store of
+	// its older entries keeps a descriptor and its disk under the temporary directory until a collection, so a host
+	// whose revives keep failing runs out of descriptors or disk.
+	it.skipIf(!HAS_PROC_FD)(
+		"closes the transcript it reopened when a warm revive fails before building the session",
+		async () => {
+			const cwd = makeTempDir("@pi-revive-early-failure-");
+			const tmp = fs.realpathSync(makeTempDir("@pi-revive-early-failure-tmp-"));
+			const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+			// A compaction past two large turns: reopening the transcript puts those turns in a store under os.tmpdir().
+			const body = "x".repeat(4096);
+			const manager = spawned.session.sessionManager;
+			manager.appendMessage({ role: "user", content: [{ type: "text", text: `older ${body}` }], timestamp: 1 });
+			manager.appendMessage({ role: "user", content: [{ type: "text", text: `old ${body}` }], timestamp: 2 });
+			const keep = manager.appendMessage({ role: "user", content: [{ type: "text", text: "keep" }], timestamp: 3 });
+			manager.appendCompaction(`summary ${body}`, undefined, keep, 1000);
+			const lifecycle = AgentLifecycleManager.global();
+			await lifecycle.park("prompt-blocks");
+
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+			const open = SessionManager.open.bind(SessionManager);
+			const reopened: { manager: SessionManager; descriptors: string[] }[] = [];
+			vi.spyOn(SessionManager, "open").mockImplementation(async (...args) => {
+				const opened = await open(...args);
+				// Held here, so a collection cannot close what the revive leaves open.
+				reopened.push({ manager: opened, descriptors: descriptorsUnder(tmp) });
+				return opened;
+			});
+			vi.spyOn(accountPoolsModule, "validateAgentAccountPools").mockImplementation(() => {
+				throw new Error("task.agentAccountPools does not validate");
+			});
+			await expect(lifecycle.ensureLive("prompt-blocks")).rejects.toThrow(
+				"task.agentAccountPools does not validate",
+			);
+			expect({
+				reopened: reopened.length,
+				storeOpenAtReopen: (reopened[0]?.descriptors.length ?? 0) > 0,
+				descriptorsAfterFailure: descriptorsUnder(tmp),
+			}).toEqual({ reopened: 1, storeOpenAtReopen: true, descriptorsAfterFailure: [] });
+		},
+	);
+
+	// If this regresses, a parked subagent whose last park could not write its revive inputs (a disk failure the
+	// session manager only notes) comes back from an earlier park's inputs paired with the later park's model and
+	// credential settings.
+	it("revives cold when its last park's revive inputs never reached the transcript", async () => {
+		const cwd = makeTempDir("@pi-revive-dropped-inputs-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const lifecycle = AgentLifecycleManager.global();
+		const factory = createFactory(cwd);
+		let coldRevivers = 0;
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				coldRevivers++;
+				return factory(ref);
+			},
+			() => 0,
+		);
+		const { live } = await parkAndRevive(() => {});
+		cfgContextPromotionEnabled.set(live, !cfgContextPromotionEnabled.get(live));
+		const manager = live.sessionManager;
+		const append = manager.appendCustomEntry.bind(manager);
+		vi.spyOn(manager, "appendCustomEntry").mockImplementation((customType, data) =>
+			customType === "subagent-revive-state" ? "dropped" : append(customType, data),
+		);
+		await lifecycle.park("prompt-blocks");
+		expect(await reviveRecords(cwd)).toHaveLength(1);
+
+		let cold: RecordingSession | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			const build = options!.systemPrompt;
+			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
+			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
+			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
+			return { session: cold.session } as CreateAgentSessionResult;
+		});
+		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
+		if (!cold || revived !== cold.session) throw new Error("Expected a revive through the lifecycle");
+		expect(coldRevivers).toBe(1);
+		await revived.prompt("follow-up");
+		await revived.waitForIdle();
 		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
 	});
 

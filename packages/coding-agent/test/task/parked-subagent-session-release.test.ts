@@ -127,15 +127,7 @@ function observeRecordedRoster(id: string): { roster: WeakRef<object>; block: st
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== "subagent-irc-roster") continue;
 		const data: unknown = entry.data;
-		if (
-			typeof data === "object" &&
-			data !== null &&
-			"roster" in data &&
-			typeof data.roster === "object" &&
-			data.roster &&
-			"block" in data &&
-			typeof data.block === "string"
-		) {
+		if (isRecord(data) && isRecord(data.roster) && typeof data.block === "string") {
 			return { roster: new WeakRef(data.roster), block: data.block };
 		}
 	}

@@ -41,15 +41,16 @@ function tryAcquireLock(lockPath: string): NativeFileLock | null {
 
 /**
  * One attempt of a waiting loop: on Linux, claim the lease unless the native
- * probe finds it held. A claim of the open-file-description lock the addon
- * takes on Linux now answers at once, but one of the abstract-socket lock that
- * older builds took blocks the thread for about 50 ms before it answers
- * "taken" (see {@link tryAcquireFileLock}), while the probe answers at once,
- * so a loop that waits for a holder does not stall its thread on every attempt;
- * elsewhere a claim answers at once, so no probe runs. A wrong "held" (under
- * gVisor a probe of the older lock can still reach a just-released name)
- * costs the loop one retry delay, so the loop's last attempt claims without
- * the probe, and a probe that fails leaves the answer to the claim.
+ * probe finds it held. There a native claim of a lease another process holds
+ * blocks the thread for about 50 ms before it answers "taken" with the
+ * abstract-socket lock (see {@link tryAcquireFileLock}) and answers at once
+ * with the open-file-description lock of newer builds of the addon, while the
+ * probe answers at once, so a loop that waits for a holder does not stall its
+ * thread on every attempt; elsewhere a claim answers at once, so no probe
+ * runs. A wrong "held" (under gVisor a probe of the abstract-socket lock can
+ * still reach a just-released name) costs the loop one retry delay, so the
+ * loop's last attempt claims without the probe, and a probe that fails leaves
+ * the answer to the claim.
  */
 function attemptLock(lockPath: string, lastAttempt: boolean): NativeFileLock | null {
 	if (!lastAttempt && process.platform === "linux") {
@@ -65,12 +66,13 @@ function attemptLock(lockPath: string, lastAttempt: boolean): NativeFileLock | n
 /**
  * Acquire an exclusive lease without waiting for its holder to release it;
  * `null` while another holder owns it. The claim answers at once, except with
- * the abstract-socket lock that older builds of the addon take on Linux: that
- * claim retries a refusal, because under gVisor a probe can make a free lease
- * look taken for a few milliseconds, for at most 200 ms, and for about 50 ms
- * while another process holds the lease, blocking the calling thread
- * meanwhile (a lease this process holds is refused at once there too).
- * `isFileLockHeld` tells whether a lease is held without any wait.
+ * the abstract-socket lock on Linux (newer builds of the addon take an
+ * open-file-description lock there, whose claim answers at once): that claim
+ * retries a refusal, because under gVisor a probe can make a free lease look
+ * taken for a few milliseconds, for at most 200 ms, and for about 50 ms while
+ * another process holds the lease, blocking the calling thread meanwhile (a
+ * lease this process holds is refused at once there too). `isFileLockHeld`
+ * tells whether a lease is held without any wait.
  */
 export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 	return tryAcquireLock(getLockPath(filePath));
@@ -78,11 +80,12 @@ export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 
 /**
  * {@link tryAcquireFileLock} for a caller that tries again later: on Linux,
- * while another holder owns the lease, a probe answers `null` at once, where
- * the claim of an older build's abstract-socket lock would block the thread
- * for about 50 ms; elsewhere a claim answers at once, so no probe runs. The
- * probe can also read a just-released lease as held, which costs such a
- * caller one retry; a probe that fails leaves the answer to the claim.
+ * while another holder owns the lease, a probe answers `null` at once, where a
+ * claim would block the thread for about 50 ms with the abstract-socket lock
+ * (with the open-file-description lock of newer builds of the addon it answers
+ * at once); elsewhere a claim answers at once, so no probe runs. The probe can
+ * also read a just-released lease as held, which costs such a caller one
+ * retry; a probe that fails leaves the answer to the claim.
  */
 export function tryAcquireFileLockUnlessHeld(filePath: string): FileLockHandle | null {
 	return attemptLock(getLockPath(filePath), false);
@@ -90,11 +93,11 @@ export function tryAcquireFileLockUnlessHeld(filePath: string): FileLockHandle |
 
 /**
  * Whether any holder, including this process, owns the lease, observed without
- * taking it. An open-file-description probe takes nothing; under gVisor a probe
- * of an older build's abstract-socket lock can make a concurrent
- * `tryAcquireFileLock` find the lease in use for a few milliseconds, which that
- * claim retries, so the probe does not make it fail either way. Throws when the
- * lock cannot be probed.
+ * taking it. A probe of the open-file-description lock of newer builds of the
+ * addon takes nothing; under gVisor a probe of the abstract-socket lock can
+ * make a concurrent `tryAcquireFileLock` find the lease in use for a few
+ * milliseconds, which that claim retries, so the probe does not make it fail
+ * either way. Throws when the lock cannot be probed.
  */
 export function isFileLockHeld(filePath: string): boolean {
 	return NativeFileLock.isHeld(getLockPath(filePath));
