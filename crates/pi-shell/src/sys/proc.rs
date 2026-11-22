@@ -45,9 +45,10 @@ pub enum ProcState {
 	Sleeping,
 	/// Stopped by a signal or traced.
 	Stopped,
-	/// Exited, not yet reaped.
+	/// Exited: not yet reaped (`Z`), or being released (`X`, dead). Every
+	/// caller asks whether the process has exited, which both answer.
 	Zombie,
-	/// Anything else (idle kernel threads, being created, dead).
+	/// Anything else (idle kernel threads, being created).
 	Other,
 }
 
@@ -155,7 +156,12 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
 		b'R' => ProcState::Running,
 		b'S' | b'D' => ProcState::Sleeping,
 		b'T' | b't' => ProcState::Stopped,
-		b'Z' => ProcState::Zombie,
+		// `X` (dead): the zombie was taken by its parent's wait, or nobody
+		// waits for it, and it is being released; it no longer runs and its
+		// pid is about to be freed (`task_state_array` in fs/proc/array.c;
+		// `wait_task_zombie` and `exit_notify` in kernel/exit.c). gVisor writes
+		// `X (dead)` for its dead tasks too (pkg/sentry/kernel/task_sched.go).
+		b'Z' | b'X' => ProcState::Zombie,
 		_ => ProcState::Other,
 	};
 	Some(ProcInfo {
@@ -393,6 +399,23 @@ mod tests {
 		assert_eq!(p.state, ProcState::Running);
 		assert_eq!(p.start, 987654);
 		assert!(parse_stat(1, b"1 (init) Z 0").is_none(), "truncated line");
+	}
+
+	/// A process read between its parent's wait and its release shows `X`
+	/// (dead). It has exited, as a zombie has: every caller that asks
+	/// whether a process still runs checks for [`ProcState::Zombie`].
+	#[test]
+	fn a_dead_process_reads_as_exited() {
+		let line = |state: &str| {
+			format!("4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n")
+		};
+		for state in ["X", "Z"] {
+			let p = parse_stat(4242, line(state).as_bytes()).expect("parses");
+			assert_eq!(p.state, ProcState::Zombie, "state {state}");
+			assert_eq!(p.start, 987654);
+		}
+		let p = parse_stat(4242, line("R").as_bytes()).expect("parses");
+		assert_eq!(p.state, ProcState::Running, "the control: a running process");
 	}
 
 	#[test]
