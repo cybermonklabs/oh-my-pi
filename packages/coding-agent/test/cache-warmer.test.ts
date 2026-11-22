@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, SimpleStreamOptions, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, SimpleStreamOptions, ToolChoice, Usage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
@@ -761,5 +761,55 @@ describe("cache warmer lifecycle", () => {
 		h.mode = "off";
 		start(h);
 		expect(h.warmer.status).toMatchObject({ state: "inactive", reason: "cache warming disabled" });
+	});
+
+	// Anthropic keys the cached messages on `tool_choice`: a request with another choice than the default writes
+	// messages the next default request does not read, and refreshes none of the entry the request before it left.
+	test.each([
+		{ choice: "a forced tool", toolChoice: { type: "tool", name: "write" } },
+		{ choice: "no tool", toolChoice: "none" },
+	] satisfies { choice: string; toolChoice: ToolChoice }[])(
+		"keeps warming the request before one whose tool choice is $choice",
+		async ({ toolChoice }) => {
+			const h = harness();
+			const model = makeModel();
+			// Precondition: the model takes a forced tool choice, so the request sends the choice as given.
+			expect(model.compat).toMatchObject({ supportsForcedToolChoice: true });
+			start(h);
+			const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () =>
+				change(h),
+			);
+
+			expect(dispatched).toBeUndefined();
+			await advance(SHORT_DELAY_MS);
+			expect(h.replays).toHaveLength(1);
+			expect(h.replays[0]?.options?.toolChoice).toBeUndefined();
+		},
+	);
+
+	test("arms a forced tool choice the model sends as auto", async () => {
+		const h = harness();
+		const model = buildModel({
+			id: "claude-opus-5-5",
+			name: "Claude Opus 5.5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			promptCache: { short: 300, long: 3600 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		});
+		// Precondition: the model takes no forced tool choice; the provider sends the request with `auto`.
+		expect(model.compat).toMatchObject({ supportsForcedToolChoice: false });
+		const toolChoice: ToolChoice = { type: "tool", name: "write" };
+		h.warmer.start({ model, context: { messages: [] }, options: {} }, () => change(h));
+		h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () => change(h));
+
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+		expect(h.replays[0]?.options?.toolChoice).toEqual(toolChoice);
 	});
 });

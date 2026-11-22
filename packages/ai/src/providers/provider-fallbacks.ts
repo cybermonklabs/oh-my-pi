@@ -10,12 +10,7 @@
  */
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { Api, Model, ProviderSessionState } from "../types";
-import { resolveAnthropicBaseUrl } from "./anthropic-http-options";
-import {
-	ANTHROPIC_PROVIDER_SESSION_STATE_KEY,
-	anthropicProviderSessionStateKey,
-	parseAnthropicProviderSessionStateKey,
-} from "./anthropic-state";
+import { ANTHROPIC_PROVIDER_SESSION_STATE_KEY, parseAnthropicProviderSessionStateKey } from "./anthropic-state";
 import { OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX } from "./openai-completions-state";
 import { OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX } from "./openai-responses-state";
 import type { OpenAIStrictToolsState } from "./openai-shared";
@@ -117,10 +112,11 @@ export function providerFallbacks(providerSessionState: ReadonlyMap<string, Prov
 
 /**
  * Whether a provider state in `providerSessionState` keeps the strict-tools fallback for `model`'s next request, so
- * that request sends no tool as strict where the fallback applies: on Anthropic's messages API, the state for the
- * endpoint the request goes to (GitHub Copilot's, which its token decides, is not known here, and its compat disables
- * strict tools anyway) and the model; on chat completions or Responses (an `openrouter` model's as it routes), a scope
- * of the model's provider and id, whichever endpoint it names. Codex keeps no fallback.
+ * that request sends no tool as strict where the fallback applies: on Anthropic's messages API, a state for the model's
+ * id, whichever endpoint it names (a transport may swap in the endpoint the provider keys its state on, as Snowflake's
+ * and Cloudflare's do for their placeholder URLs, and GitHub Copilot's token decides its own); on chat completions or
+ * Responses (an `openrouter` model's as it routes), a scope of the model's provider and id, whichever endpoint it
+ * names. Codex keeps no fallback.
  */
 export function strictToolsFallbackHolds(
 	providerSessionState: ReadonlyMap<string, ProviderSessionState> | undefined,
@@ -128,9 +124,16 @@ export function strictToolsFallbackHolds(
 ): boolean {
 	if (!providerSessionState || providerSessionState.size === 0) return false;
 	if (isAnthropicMessagesModel(model)) {
-		const baseUrl = resolveAnthropicBaseUrl(model) ?? "https://api.anthropic.com";
-		const state = providerSessionState.get(anthropicProviderSessionStateKey(baseUrl, model.id));
-		return state !== undefined && "strictToolsDisabled" in state && state.strictToolsDisabled === true;
+		for (const [key, state] of providerSessionState) {
+			if (
+				parseAnthropicProviderSessionStateKey(key)?.modelId === model.id &&
+				"strictToolsDisabled" in state &&
+				state.strictToolsDisabled === true
+			) {
+				return true;
+			}
+		}
+		return false;
 	}
 	if (!isOpenAIToolsModel(model)) return false;
 	switch (openAIToolsApi(model)) {

@@ -24,21 +24,17 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
-import { withoutDisabledExperimentalBetas } from "@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch";
+import { experimentalBetasDisabled } from "@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch";
 import {
 	anthropicDeclaredTools,
 	anthropicKeepsToolDeclaration,
 } from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
+import { anthropicStrictnessHashedTools } from "@oh-my-pi/pi-ai/providers/anthropic-tool-schema";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
-import {
-	isOpenAIToolsModel,
-	type OpenAIToolsModelApi,
-	openAIStrictnessHashedTools,
-} from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import { isOpenAIToolsModel, openAIStrictnessHashedTools } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
 import { strictToolsFallbackHolds } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
-import { NO_STRICT } from "@oh-my-pi/pi-ai/utils/schema/adapt";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
@@ -52,7 +48,12 @@ import {
 	steeringQueueState,
 	unpairedToolCallTail,
 } from "./agent-loop";
-import { type AppendOnlyContextManager, toolSpecsFingerprint } from "./append-only-context";
+import {
+	type AppendOnlyContextManager,
+	sameToolKeys,
+	toolKeyForPrefix,
+	toolSpecsFingerprint,
+} from "./append-only-context";
 import { agentPauseGate } from "./pause";
 import { RepeatedPerCallMessages } from "./repeated-per-call-messages";
 import { isProviderRefusalMessage } from "./replay-policy";
@@ -457,26 +458,29 @@ export class Agent {
 		request?: ProviderContextRequest,
 	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
-	/** {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from. */
+	/**
+	 * {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from, the tools
+	 * by their per-tool keys ({@link toolKeyForPrefix}): a tool that renders its definition from live settings changes
+	 * it under the same array.
+	 */
 	#declaredToolsMemo:
 		| {
 				model: Model | undefined;
-				tools: AgentTool[];
+				toolKeys: readonly string[];
 				intentTracing: boolean;
 				intentDescription: string | undefined;
 				pruneDescriptions: boolean;
 				declaration: RecordedToolDeclaration | undefined;
 				sentRevision: number;
-				strictWithheld: boolean;
-				openAIWire: Model<OpenAIToolsModelApi> | undefined;
-				openAIStrictFallback: boolean;
+				betasDisabled: boolean;
+				strictFallback: boolean;
 				fingerprint: string;
 		  }
 		| undefined;
-	/** {@link declaredTools} under a kept declaration, with the inputs it was computed from. */
+	/** {@link declaredTools} under a kept declaration, with the inputs it was computed from (the tools by their keys). */
 	#declaredToolsListMemo:
 		| {
-				tools: AgentTool[];
+				toolKeys: readonly string[];
 				declaration: RecordedToolDeclaration;
 				sentRevision: number;
 				declared: readonly Tool[];
@@ -731,16 +735,16 @@ export class Agent {
 	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}) while a tool is
 	 * active. Withdrawing such a tool beside an active one leaves the fingerprint as it was; it changes when the last
 	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
-	 * process's) leaves the declaration. Where the request sends no tool as strict ({@link #withholdsStrictTools}),
-	 * each tool counts as marked `strict: false`, so turning `PI_NO_STRICT` or Claude Code's experimental-beta kill
-	 * switch on or off, or the provider's strict-tools fallback after the endpoint rejected strict tools, changes it.
-	 * On an OpenAI API (an `openrouter` model's included), not under an owned dialect (which carries the tools in the
-	 * prompt), a tool the request sends with another `strict` flag than it would under default settings counts with
-	 * that flag ({@link openAIStrictnessHashedTools}, the strict-tools fallback the provider state keeps for the model
-	 * included: {@link strictToolsFallbackHolds}), so turning `PI_NO_STRICT` or the fallback on or off changes it
-	 * exactly where it changes the wire, and under default settings it is what it was before strictness counted; a
-	 * change of the model's compat is not seen. With `tools`, the fingerprint the request would declare with them in
-	 * place of the active tools.
+	 * process's) leaves the declaration. Where the request sends a tool with another `strict` or `eager_input_streaming`
+	 * flag than it would under default settings, the tool counts with the flag it goes out with: on Anthropic's messages
+	 * API through {@link anthropicStrictnessHashedTools}, which reads the flags the provider builds its tools with, so
+	 * turning `PI_NO_STRICT` or Claude Code's experimental-beta kill switch on or off, or the provider's strict-tools
+	 * fallback after the endpoint rejected strict tools ({@link strictToolsFallbackHolds}), changes it exactly where it
+	 * changes the wire (a tool the provider never sends strict counts as it is); on an OpenAI API (an `openrouter`
+	 * model's included) through {@link openAIStrictnessHashedTools}, `PI_NO_STRICT` and the fallback alike. Neither
+	 * applies under an owned dialect, which carries the tools in the prompt. Under default settings it is what it was
+	 * before the flags counted; a change of the model's compat is not seen. With `tools`, the fingerprint the request
+	 * would declare with them in place of the active tools.
 	 */
 	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
@@ -749,52 +753,51 @@ export class Agent {
 		const declaration = this.#toolDeclaration(model);
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
-		const strictWithheld = this.#withholdsStrictTools(model);
+		const anthropicWire = this.#anthropicWireModel(model);
 		const openAIWire =
 			model !== undefined && isOpenAIToolsModel(model) && !this.#ownedDialect(model) ? model : undefined;
-		const openAIStrictFallback =
-			openAIWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, openAIWire);
+		const strictWire = anthropicWire ?? openAIWire;
+		const strictFallback =
+			strictWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, strictWire);
+		const betasDisabled = anthropicWire !== undefined && experimentalBetasDisabled(anthropicWire);
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
-		const memoized = tools === this.#state.tools;
+		const toolKeys = tools === this.#state.tools ? tools.map(toolKeyForPrefix) : undefined;
 		const memo = this.#declaredToolsMemo;
 		if (
-			memoized &&
+			toolKeys !== undefined &&
 			memo !== undefined &&
 			memo.model === model &&
-			memo.tools === tools &&
+			sameToolKeys(memo.toolKeys, toolKeys) &&
 			memo.intentTracing === intentTracing &&
 			memo.intentDescription === intentDescription &&
 			memo.pruneDescriptions === pruneDescriptions &&
 			memo.declaration === declaration &&
 			memo.sentRevision === sentRevision &&
-			memo.strictWithheld === strictWithheld &&
-			memo.openAIWire === openAIWire &&
-			memo.openAIStrictFallback === openAIStrictFallback
+			memo.betasDisabled === betasDisabled &&
+			memo.strictFallback === strictFallback
 		) {
 			return memo.fingerprint;
 		}
 		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
 		const declared = this.#declaredFrom(active, declaration);
-		// The provider decodes no tool as strict where it withholds strict tools, as it decodes one marked `strict: false`.
 		const fingerprint = toolSpecsFingerprint(
-			strictWithheld
-				? declared.map(tool => ({ ...tool, strict: false }))
+			anthropicWire
+				? anthropicStrictnessHashedTools(anthropicWire, declared, { disableStrictTools: strictFallback })
 				: openAIWire
-					? openAIStrictnessHashedTools(openAIWire, declared, { disableStrictTools: openAIStrictFallback })
+					? openAIStrictnessHashedTools(openAIWire, declared, { disableStrictTools: strictFallback })
 					: declared,
 		);
-		if (memoized) {
+		if (toolKeys !== undefined) {
 			this.#declaredToolsMemo = {
 				model,
-				tools,
+				toolKeys,
 				intentTracing,
 				intentDescription,
 				pruneDescriptions,
 				declaration,
 				sentRevision,
-				strictWithheld,
-				openAIWire,
-				openAIStrictFallback,
+				betasDisabled,
+				strictFallback,
 				fingerprint,
 			};
 		}
@@ -803,23 +806,29 @@ export class Agent {
 
 	/**
 	 * The tools the next main request on `model` declares, in wire order, as {@link declaredToolsFingerprint} hashes
-	 * them (each tool's own `strict` aside): the active tools as they are (not normalized for the wire), and on a
-	 * provider that keeps its tool declaration across a conversation, while a tool is active, each withdrawn tool it
-	 * still holds as this agent last sent it, a newly active tool as a copy with `deferLoading`. The same list, copies
-	 * included, until the active tools, the declaration or the sent definitions change; the active tools' array
-	 * itself where no declaration is kept.
+	 * them (the `strict` and `eager_input_streaming` flags it counts aside): the active tools as they are (not
+	 * normalized for the wire), and on a provider that keeps its tool declaration across a conversation, while a tool
+	 * is active, each withdrawn tool it still holds as this agent last sent it, a newly active tool as a copy with
+	 * `deferLoading`. The same list, copies included, until the active tools or their definitions, the declaration or
+	 * the sent definitions change; the active tools' array itself where no declaration is kept.
 	 */
 	declaredTools(model: Model | undefined): readonly Tool[] {
 		const tools = this.#state.tools;
 		const declaration = this.#toolDeclaration(model);
 		if (!declaration) return tools;
 		const sentRevision = this.#sentToolDefinitions.revision;
+		const toolKeys = tools.map(toolKeyForPrefix);
 		const memo = this.#declaredToolsListMemo;
-		if (memo?.tools === tools && memo.declaration === declaration && memo.sentRevision === sentRevision) {
+		if (
+			memo !== undefined &&
+			sameToolKeys(memo.toolKeys, toolKeys) &&
+			memo.declaration === declaration &&
+			memo.sentRevision === sentRevision
+		) {
 			return memo.declared;
 		}
 		const declared = this.#declaredFrom(tools, declaration);
-		this.#declaredToolsListMemo = { tools, declaration, sentRevision, declared };
+		this.#declaredToolsListMemo = { toolKeys, declaration, sentRevision, declared };
 		return declared;
 	}
 
@@ -844,24 +853,6 @@ export class Agent {
 		return wireModel && anthropicKeepsToolDeclaration(wireModel)
 			? latestToolDeclaration(this.#state.messages)
 			: undefined;
-	}
-
-	/**
-	 * Whether the next main request on `model` sends no tool as strict: on Anthropic, under `PI_NO_STRICT`
-	 * ({@link NO_STRICT}, the value the provider read when it loaded), where the compat the request goes out with
-	 * disables strict tools ({@link withoutDisabledExperimentalBetas}: Claude Code's experimental-beta kill switch, or a
-	 * host whose compat rejects them), or where the provider state keeps the strict-tools fallback for the model after
-	 * the endpoint rejected strict tools ({@link strictToolsFallbackHolds}); not under an owned dialect, which carries
-	 * the tools in the prompt.
-	 */
-	#withholdsStrictTools(model: Model | undefined): boolean {
-		const wireModel = this.#anthropicWireModel(model);
-		return (
-			wireModel !== undefined &&
-			(NO_STRICT ||
-				withoutDisabledExperimentalBetas(wireModel).compat.disableStrictTools === true ||
-				strictToolsFallbackHolds(this.#providerSessionState, wireModel))
-		);
 	}
 
 	/** `model` when the next main request on it goes out on Anthropic's messages API, not under an owned dialect. */

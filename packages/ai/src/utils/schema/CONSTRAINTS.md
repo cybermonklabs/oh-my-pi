@@ -174,6 +174,10 @@ If any remain, schema is incompatible.
    - Use `adaptSchemaForStrict`.
    - Emit `strict: true` only when effective strict enforcement succeeded.
 
+- **Anthropic Messages strict path** (`anthropic-messages`):
+   - Take each tool's `input_schema`, `strict` and `eager_input_streaming` from `anthropicWireToolFields` (`providers/anthropic-tool-schema.ts`), which `Agent.declaredToolsFingerprint` reads too (`anthropicStrictnessHashedTools`): a gate moved out of it lets the wire and the declared-tools hash drift.
+   - Emit `strict: true` only for allowlisted tools whose schema the strict normalizer accepts within the request-wide budgets.
+
 - **Google Gemini/Vertex/Gemini CLI (non-CCA Claude)**:
    - Use `normalizeSchemaForGoogle` and send schema on `parametersJsonSchema` path.
 

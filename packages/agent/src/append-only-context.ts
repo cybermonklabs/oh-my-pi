@@ -17,7 +17,7 @@
 import type { AgentTool } from "./types";
 import type { Context, Message, Tool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
-import type { StrictnessHashedTool } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import type { AnthropicHashedTool } from "@oh-my-pi/pi-ai/providers/anthropic-tool-schema";
 import { normalizeTools } from "./agent-loop";
 import { messageEstimateVersion } from "./compaction/message-cache";
 import type { AgentContext, AgentMessage } from "./types";
@@ -35,9 +35,11 @@ import type { AgentContext, AgentMessage } from "./types";
  * `examples` contribute by reference: both are treated as immutable config
  * (a registry swap replaces the object), matching how the snapshot consumes
  * them. `intent` functions are compared by reference — same closure means
- * same mode resolution.
+ * same mode resolution. A tool that renders its description or schema from
+ * live settings (getters) changes its key without a new tools array, so a
+ * memo of anything the definitions decide keys on these, not on the array.
  */
-function toolKeyForPrefix(tool: AgentTool): string {
+export function toolKeyForPrefix(tool: AgentTool): string {
 	const params = toolWireSchema(tool);
 	const customFormat = tool.customFormat;
 	const examples = (tool as { examples?: unknown }).examples;
@@ -53,6 +55,15 @@ function toolKeyForPrefix(tool: AgentTool): string {
 		objectId(customFormat),
 		objectId(examples),
 	].join("\u0000");
+}
+
+/** Whether `recorded` holds the same per-tool keys as `keys` ({@link toolKeyForPrefix}), in order. */
+export function sameToolKeys(recorded: readonly string[] | undefined, keys: readonly string[]): boolean {
+	if (recorded === undefined || recorded.length !== keys.length) return false;
+	for (let i = 0; i < keys.length; i++) {
+		if (recorded[i] !== keys[i]) return false;
+	}
+	return true;
 }
 
 const objectIds = new WeakMap<object, number>();
@@ -186,16 +197,7 @@ export class StablePrefix {
 		for (let i = 0; i < cachedSegments.length; i++) {
 			if (cachedSegments[i] !== liveSegments[i]) return false;
 		}
-		const recorded = this.#lastToolKey;
-		if (recorded === undefined || recorded.length !== toolKeys.length) {
-			return false;
-		}
-		for (let i = 0; i < toolKeys.length; i++) {
-			if (recorded[i] !== toolKeys[i]) {
-				return false;
-			}
-		}
-		return true;
+		return sameToolKeys(this.#lastToolKey, toolKeys);
 	}
 
 	#recordFastPathKey(context: AgentContext, options: BuildOptions, renderedToolKeys: readonly string[]): void {
@@ -497,9 +499,10 @@ function normalizeWireTools(tools: AgentContext["tools"], options: BuildOptions)
 /**
  * The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the
  * description. A provider that defers a declared tool's loading marks it `deferLoading`. JSON keeps a `strict: null`
- * (a tool sent without the flag it has by default) apart from an unset `strict`, which it leaves out.
+ * (a tool sent without the flag it has by default) apart from an unset `strict`, which it leaves out, and so an
+ * Anthropic tool's `eagerInputStreaming: null` (sent without its default `eager_input_streaming`).
  */
-function wireToolFields(t: StrictnessHashedTool) {
+function wireToolFields(t: AnthropicHashedTool) {
 	return {
 		n: t.name,
 		d: t.description,
@@ -508,14 +511,16 @@ function wireToolFields(t: StrictnessHashedTool) {
 		cf: t.customFormat,
 		cw: t.customWireName,
 		dl: t.deferLoading,
+		e: t.eagerInputStreaming,
 	};
 }
 
 /**
  * Fingerprint of provider-bound tool specs as a request declares them, in order: a same-name tool whose description,
- * schema, `strict`, `customFormat`, `customWireName` or deferral changed, or another order, makes another one.
+ * schema, `strict`, `customFormat`, `customWireName`, deferral or eager input streaming changed, or another order,
+ * makes another one.
  */
-export function toolSpecsFingerprint(tools: readonly StrictnessHashedTool[]): string {
+export function toolSpecsFingerprint(tools: readonly AnthropicHashedTool[]): string {
 	return hashPayload(JSON.stringify(tools.map(wireToolFields)));
 }
 

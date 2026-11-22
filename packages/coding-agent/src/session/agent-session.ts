@@ -444,7 +444,7 @@ import {
 	USER_INTERRUPT_LABEL,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { ModelControls, type ModelControlsHost } from "./model-controls";
+import { ModelControls, type ModelControlsHost, takesPerMessageEffort } from "./model-controls";
 import {
 	isPrewalkPlanNudge,
 	PrewalkCoordinator,
@@ -805,9 +805,28 @@ interface PromptCacheShape {
 	model: string;
 	modelName: string;
 	thinkingLevel: ThinkingLevel | undefined;
+	/** {@link thinkingLevel} as the cached prefix tells levels apart ({@link promptCacheThinkingKey}). */
+	thinkingKey: string;
 	tools: string;
 	systemPrompt: number | bigint;
 	retention: string;
+}
+
+/**
+ * `level` as the cached prefix tells thinking levels apart on `model`: where the model takes the level per message
+ * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, outside Responses'
+ * `pro` reasoning mode), a change between two levels other than off goes out after the newest content and keeps the
+ * request-level effort, so those levels share one key; off changes the request's thinking and keeps its own.
+ */
+function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
+	if (level === undefined || level === "off" || model === undefined) return level ?? "";
+	const { compat } = model;
+	const configurationUpdate =
+		compat !== undefined &&
+		"supportsConfigurationUpdate" in compat &&
+		compat.supportsConfigurationUpdate === true &&
+		!(model.api === "openai-responses" && model.reasoningMode === "pro");
+	return configurationUpdate || takesPerMessageEffort(model) ? "effort" : level;
 }
 
 /** The main-loop request the prompt cache warmer was armed with last, and what it was armed with. */
@@ -6200,6 +6219,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * session streamFn with its raw request options; retention settings are
 	 * resolved here to match the settings-aware stream wrapper.
 	 * {@link markPromptCacheDispatched} starts the armed entry's lifetime once the request is sent.
+	 * A request with another tool choice than the default (a forced turn) is not armed: the arm and
+	 * the entry of the request before it stay, since that entry is the one the next request reads
+	 * ({@link CacheWarmer.start}).
 	 */
 	startCacheWarming(model: Model, context: Context, options: SimpleStreamOptions): void {
 		const warmer = this.#cacheWarmer;
@@ -6222,10 +6244,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			shape: this.#promptCacheShape(model),
 			messages: armMessages,
 		};
-		this.#promptCacheArm = arm;
 		const dispatched = warmer.start({ model, context, options: warmingOptions }, () =>
 			this.#promptCacheChange(arm.shape, arm.messages),
 		);
+		if (!dispatched) return;
+		this.#promptCacheArm = arm;
 		this.#promptCacheDispatch.set(context, dispatched);
 	}
 
@@ -6260,7 +6283,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#promptCacheChange(arm: PromptCacheShape, armMessages: readonly AgentMessage[]): PromptCacheChange | undefined {
 		const next = this.#promptCacheShape(this.model);
 		if (next.model !== arm.model) return { kind: "model", from: arm.modelName, to: next.modelName };
-		if (next.thinkingLevel !== arm.thinkingLevel) {
+		if (next.thinkingKey !== arm.thinkingKey) {
 			return { kind: "thinking", from: arm.thinkingLevel ?? "off", to: next.thinkingLevel ?? "off" };
 		}
 		if (next.tools !== arm.tools) return { kind: "tools" };
@@ -6301,6 +6324,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
+			thinkingKey: promptCacheThinkingKey(model, thinkingLevel),
 			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
