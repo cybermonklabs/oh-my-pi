@@ -100,9 +100,8 @@ pub const AWAIT_GATE: &str = "while read -r _; do :; done <&3";
 pub struct Gate {
 	reader: std::fs::File,
 	writer: Option<std::io::PipeWriter>,
-	/// Not Linux: a copy of the read end without close-on-exec, made by the
-	/// first [`Gate::link`] from this gate's read end.
-	#[cfg(not(target_os = "linux"))]
+	/// A copy of the read end without close-on-exec, made by the first
+	/// [`Gate::link`] from this gate's read end.
 	linked: std::sync::OnceLock<std::os::fd::OwnedFd>,
 }
 
@@ -114,7 +113,6 @@ impl Gate {
 		Self {
 			reader: std::fs::File::from(std::os::fd::OwnedFd::from(reader)),
 			writer: Some(writer),
-			#[cfg(not(target_os = "linux"))]
 			linked: std::sync::OnceLock::new(),
 		}
 	}
@@ -126,28 +124,25 @@ impl Gate {
 	/// `exec` would. The shell takes `/dev/fd/N` itself for its own fd `N`,
 	/// but opens the symlink on the host.
 	///
-	/// Linux: `/proc/<pid>/fd/N`, this process's read end, which any process
-	/// of the same user opens. Elsewhere `/dev/fd/N`, which names the opener's
-	/// own fd `N`: a copy of the read end without close-on-exec, so such a
-	/// child keeps it.
+	/// The link is `/dev/fd/N`, which names the opener's own fd `N`: a copy
+	/// of the read end without close-on-exec, so such a child keeps it. Not
+	/// `/proc/<pid>/fd/N` of this process: under gVisor, a test binary
+	/// exec'd right after a change of user (`setpriv --reuid=1000 <binary>`)
+	/// cannot be opened that way, not even by its own child. Every child of
+	/// this process inherits the copy while the gate lives; it is a read end,
+	/// so it keeps no reader from end of file.
 	pub fn link(&self, path: &std::path::Path) {
-		use std::os::fd::AsRawFd as _;
-		#[cfg(target_os = "linux")]
-		let target = format!("/proc/{}/fd/{}", std::process::id(), self.reader.as_raw_fd());
-		#[cfg(not(target_os = "linux"))]
-		let target = {
-			use std::os::fd::FromRawFd as _;
-			let linked = self.linked.get_or_init(|| {
-				// SAFETY: F_DUPFD makes a new descriptor of the read end, without
-				// close-on-exec, which nothing else owns.
-				let fd = unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_DUPFD, 3) };
-				assert!(fd >= 0, "a copy of the gate's read end: {}", std::io::Error::last_os_error());
-				// SAFETY: `fd` is new and owned here.
-				unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
-			});
-			format!("/dev/fd/{}", linked.as_raw_fd())
-		};
-		std::os::unix::fs::symlink(target, path).expect("the gate's symlink");
+		use std::os::fd::{AsRawFd as _, FromRawFd as _};
+		let linked = self.linked.get_or_init(|| {
+			// SAFETY: F_DUPFD makes a new descriptor of the read end, without
+			// close-on-exec, which nothing else owns.
+			let fd = unsafe { libc::fcntl(self.reader.as_raw_fd(), libc::F_DUPFD, 3) };
+			assert!(fd >= 0, "a copy of the gate's read end: {}", std::io::Error::last_os_error());
+			// SAFETY: `fd` is new and owned here.
+			unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+		});
+		std::os::unix::fs::symlink(format!("/dev/fd/{}", linked.as_raw_fd()), path)
+			.expect("the gate's symlink");
 	}
 
 	/// A copy of the read end, for a child's stdin.
