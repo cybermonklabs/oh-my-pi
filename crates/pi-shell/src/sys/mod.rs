@@ -13,8 +13,6 @@
 //!   [`File`](crate::bash::File) over `std::fs`, always `Ready` (local
 //!   syscalls), for `obash` and tests.
 //! - [`std_stream`]: the process's own stdin/stdout/stderr as engine files.
-//! - [`Wakers`] and [`WaitKey`]: the tasks waiting on one thing, one slot per
-//!   task's key, all woken at once.
 //! - [`Parker`]: blocks a drive loop's thread until the engine may make
 //!   progress; on Linux it also waits for the exits of externals spawned with
 //!   [`Exits::Park`].

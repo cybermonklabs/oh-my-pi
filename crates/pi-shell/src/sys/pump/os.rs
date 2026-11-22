@@ -494,17 +494,23 @@ mod imp {
 	/// a copy of the write end until its exec). Without one, the child's end
 	/// `read` is read to end of file.
 	pub fn reclaim(
-		mut pipe: Option<OsPipe>,
+		pipe: Option<OsPipe>,
 		mut read: &fs::File,
 		held: &[u8],
 		drain: Option<&Drain>,
 	) -> Vec<u8> {
 		let mut back = Vec::new();
+		// Our write end is closed (dropped) before the read below.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		let made = pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back));
+		let made = {
+			let mut pipe = pipe;
+			pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back))
+		};
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
-		let made = 0;
-		drop(pipe);
+		let made = {
+			drop(pipe);
+			0
+		};
 		match drain {
 			Some(drain) => {
 				drain.take_now(&mut back, &mut vec![0u8; 64 << 10]);
