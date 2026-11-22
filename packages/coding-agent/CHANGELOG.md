@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
