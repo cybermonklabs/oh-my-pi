@@ -13,7 +13,7 @@ use std::{
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
 
-use super::{Scope, State, process_umask};
+use super::{Scope, State, Sweep, process_umask};
 use crate::{
 	bash::{
 		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId,
@@ -415,18 +415,32 @@ fn failures_left_to_the_process_are_its_own_message_and_status() {
 }
 
 /// A process whose redirection open waits (a FIFO with no other end) holds
-/// none of the host's descriptors meanwhile: a pipe's reader in the host
-/// (here, as a pump's end, close-on-exec) gets end of file once its writer
-/// closes, while the open still waits. bash's child holds none either.
-#[test]
-fn a_waiting_redirection_open_holds_no_host_descriptor() {
-	use std::io::Read;
+/// none of the host's close-on-exec descriptors meanwhile: a pipe's reader
+/// in the host gets end of file once the host closes the write end (here
+/// close-on-exec at fd 100 or above, as a pump's end is), while the open
+/// still waits. bash's child holds none either. `sweep` is where the child's
+/// sweep starts ([`Sweep`]): the counting loop must reach past fd 16, and
+/// the walk must find an fd wherever it is.
+fn waiting_open_holds_no_host_descriptor(sweep: Sweep) {
+	use std::{
+		io::Read,
+		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+	};
 
-	let fifo = temp_path("held-fifo");
+	/// A wait that only names a hang: the end of file comes at once, or
+	/// never while the open waits.
+	const HANG: Duration = Duration::from_secs(60);
+	let fifo = temp_path(&format!("held-fifo-{sweep:?}"));
 	let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
 	// SAFETY: mkfifo with a valid C path.
 	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
 	let (mut reader, writer) = std::io::pipe().unwrap();
+	// SAFETY: F_DUPFD_CLOEXEC on a descriptor this test owns makes a new one.
+	let high = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
+	assert!(high >= 100, "F_DUPFD_CLOEXEC: {}", io::Error::last_os_error());
+	// SAFETY: `high` is a new descriptor nothing else owns.
+	let high = unsafe { OwnedFd::from_raw_fd(high) };
+	drop(writer);
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = argv(&["/bin/true"]);
@@ -435,35 +449,57 @@ fn a_waiting_redirection_open_holds_no_host_descriptor() {
 		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
 		exec_diag: BString::from("test: /bin/true: "),
 	});
-	let mut p = s.spawn(sp).expect("spawn");
-	drop(writer);
+	super::force_sweep(sweep);
+	let spawned = s.spawn(sp);
+	super::force_sweep(Sweep::CloseRange);
+	let mut p = spawned.expect("spawn");
+	drop(high);
 	let (tx, eof) = std::sync::mpsc::channel();
 	thread::spawn(move || {
 		let mut rest = Vec::new();
 		let _ = tx.send(reader.read_to_end(&mut rest).map(|_| rest));
 	});
-	// Another test's child holds a copy of the write end only until its exec:
-	// the wait names a hang, not a bound of the answer.
-	let got = eof.recv_timeout(LONG);
+	// Another test's child holds a copy of the write end only until its exec.
+	let got = eof.recv_timeout(HANG);
 	// Let the open go in any case.
 	drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
 	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
 	std::fs::remove_file(&fifo).unwrap();
 	assert!(
 		matches!(&got, Ok(Ok(rest)) if rest.is_empty()),
-		"the reader got no end of file while the open waited: the child held its write end"
+		"the reader got no end of file while the open waited: the child held its write end \
+		 ({sweep:?})"
 	);
 }
 
-/// A process that applies its own redirections keeps only the fds placed
-/// for it, as the macOS `posix_spawn` path does: no stray host fd leaks into
-/// it. An embedded host leaves the descriptors it inherited open without
-/// close-on-exec (`process::host::inherited_fds`). A spawn of the other paths
-/// still passes such a stray on where `posix_spawn` and `fork` close only
-/// close-on-exec descriptors (Linux); this one does not.
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor() {
+	waiting_open_holds_no_host_descriptor(Sweep::CloseRange);
+}
+
+/// Where `close_range` is refused (a kernel before 5.9, a seccomp profile),
+/// the child walks `/proc/self/fd`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor_without_close_range() {
+	waiting_open_holds_no_host_descriptor(Sweep::Walk);
+}
+
+/// Where no descriptor list can be read either (no `/proc`), the child
+/// closes every number below the descriptor limit.
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor_without_a_list() {
+	waiting_open_holds_no_host_descriptor(Sweep::Count);
+}
+
+/// A process that applies its own redirections keeps the host's descriptors
+/// without close-on-exec, as bash's children and this spawner's other paths
+/// (`posix_spawn`, fork+exec) do: an embedded host leaves the descriptors it
+/// inherited open so (`process::host::inherited_fds`), a make jobserver's
+/// pipe among them.
 ///
-/// Two strays, so a close of only part of the range fails: `high`, the
-/// lowest free fd from 10 up, where a shell keeps the copies of the fds a
+/// Two strays, so a sweep of part of the range shows: `high`, the lowest
+/// free fd from 10 up, where a shell keeps the copies of the fds a
 /// redirection of a compound command replaces (dash copies stdout to fd 10
 /// for `if …; fi > out`); and `low`, the lowest free fd from 3 up, below 10
 /// in a run alone, where dash keeps nothing (its copies go to 10 and up).
@@ -471,7 +507,7 @@ fn a_waiting_redirection_open_holds_no_host_descriptor() {
 /// opened for the file before the checks, so only a stray can answer to
 /// either number.
 #[test]
-fn a_process_that_applies_its_redirections_keeps_only_its_placed_fds() {
+fn a_process_that_applies_its_redirections_keeps_the_hosts_inherited_fds() {
 	use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 	let out = temp_path("stray-out");
@@ -482,14 +518,14 @@ fn a_process_that_applies_its_redirections_keeps_only_its_placed_fds() {
 	let stray = |from: i32| {
 		// SAFETY: F_DUPFD on a descriptor this test owns makes a new one.
 		let n = unsafe { libc::fcntl(pipe_read.as_raw_fd(), libc::F_DUPFD, from) };
-		assert!(n >= from, "F_DUPFD: {}", std::io::Error::last_os_error());
+		assert!(n >= from, "F_DUPFD: {}", io::Error::last_os_error());
 		// SAFETY: `n` is a new descriptor nothing else owns.
 		unsafe { OwnedFd::from_raw_fd(n) }
 	};
-	let high = stray(10);
-	let low = stray(3);
+	let high_fd = stray(10);
+	let low_fd = stray(3);
 	drop(pipe_read);
-	let (high, low) = (high.as_raw_fd(), low.as_raw_fd());
+	let (high, low) = (high_fd.as_raw_fd(), low_fd.as_raw_fd());
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = sh(&format!(
@@ -497,25 +533,33 @@ fn a_process_that_applies_its_redirections_keeps_only_its_placed_fds() {
 		 none; fi; done",
 		out.display()
 	));
-	let mut deferred = spec(&a, &env, NEW);
-	deferred.redirs = Some(ChildRedirs {
-		list:      vec![child_open(&[2], &err, WRITE)],
-		exec_diag: BString::from("test: /bin/sh: "),
-	});
-	let mut p = s.spawn(deferred).expect("spawn");
-	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
-	assert_eq!(
-		std::fs::read_to_string(&out).unwrap(),
-		"none\nnone\n",
-		"a stray reached the process (fds {high} then {low})"
-	);
+	for sweep in [Sweep::CloseRange, Sweep::Walk, Sweep::Count] {
+		let mut deferred = spec(&a, &env, NEW);
+		deferred.redirs = Some(ChildRedirs {
+			list:      vec![child_open(&[2], &err, WRITE)],
+			exec_diag: BString::from("test: /bin/sh: "),
+		});
+		super::force_sweep(sweep);
+		let spawned = s.spawn(deferred);
+		super::force_sweep(Sweep::CloseRange);
+		let mut p = spawned.expect("spawn");
+		assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+		assert_eq!(
+			std::fs::read_to_string(&out).unwrap(),
+			"has\nhas\n",
+			"an inherited fd did not reach the process (fds {high} then {low}, {sweep:?})"
+		);
+	}
 	let mut p = s.spawn(spec(&a, &env, NEW)).expect("spawn");
 	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
 	let other = std::fs::read_to_string(&out).unwrap();
+	// macOS's posix_spawn path closes every descriptor it does not place
+	// (POSIX_SPAWN_CLOEXEC_DEFAULT).
 	#[cfg(target_os = "linux")]
 	assert_eq!(other, "has\nhas\n", "the other paths pass the strays on (fds {high} then {low})");
 	#[cfg(not(target_os = "linux"))]
 	let _ = other;
+	drop((high_fd, low_fd));
 	std::fs::remove_file(&out).unwrap();
 	std::fs::remove_file(&err).unwrap();
 }
