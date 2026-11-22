@@ -397,13 +397,19 @@ mod imp {
 	/// Linux: a write of `held` the end's room thread may have in hand is
 	/// finished first ([`UnixEnd::settle`]), so the bytes it made come back
 	/// from the pipe, once and in order.
-	pub fn reclaim(mut pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
+	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
 		let mut back = Vec::new();
+		// Our write end is closed (dropped) before the read below.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		let made = pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back));
+		let made = {
+			let mut pipe = pipe;
+			pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back))
+		};
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
-		let made = 0;
-		drop(pipe);
+		let made = {
+			drop(pipe);
+			0
+		};
 		let _ = read.read_to_end(&mut back);
 		back.extend_from_slice(&held[made..]);
 		back

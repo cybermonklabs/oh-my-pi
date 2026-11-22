@@ -118,6 +118,9 @@ struct State {
 	thread: bool,
 	/// The room was dropped: the thread ends once it has no write in hand.
 	closed: bool,
+	/// Tests: the thread sleeps, waiting for a write to make.
+	#[cfg(test)]
+	asleep: bool,
 }
 
 /// A write made, whose task has not polled again.
@@ -250,6 +253,14 @@ impl Room {
 	fn results(&self) -> usize {
 		self.0.state.lock().done.len()
 	}
+
+	/// Tests: no write is in hand and the thread, if made, sleeps waiting for
+	/// one, so nothing the room does wakes a task until another write waits.
+	#[cfg(test)]
+	fn idle(&self) -> bool {
+		let st = self.0.state.lock();
+		!st.busy && (!st.thread || st.asleep)
+	}
 }
 
 /// Make the room's thread. Fails as `pthread_create` does at the thread limit
@@ -288,7 +299,15 @@ fn run(inner: &Inner) {
 	let mut st = inner.state.lock();
 	loop {
 		while !st.busy && !st.closed {
+			#[cfg(test)]
+			{
+				st.asleep = true;
+			}
 			inner.work.wait(&mut st);
+			#[cfg(test)]
+			{
+				st.asleep = false;
+			}
 		}
 		if !st.busy {
 			break;
@@ -902,5 +921,204 @@ mod tests {
 		let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
 		assert!(used * 20 <= hz, "the thread used {used} ticks of {hz} in 1 s with no write in hand");
 		assert!(room.thread_runs(), "it waits, it does not end, while its room lives");
+	}
+
+	/// A waker that notes that it woke and unparks the thread waiting on it.
+	struct Unpark {
+		woken:  std::sync::atomic::AtomicBool,
+		thread: std::thread::Thread,
+	}
+
+	impl Wake for Unpark {
+		fn wake(self: Arc<Self>) {
+			self.woken.store(true, Ordering::SeqCst);
+			self.thread.unpark();
+		}
+	}
+
+	/// One writer of [`no_wake_is_lost_between_three_writers_and_the_thread`],
+	/// as the test's monitor sees it.
+	#[derive(Default)]
+	struct Writer {
+		/// [`RUNNING`], [`WAITING`] or [`FINISHED`].
+		state: std::sync::atomic::AtomicU8,
+		/// Set by the monitor: stop waiting and poll again.
+		kick:  std::sync::atomic::AtomicBool,
+		/// Polls that returned `Pending`.
+		waits: std::sync::atomic::AtomicU64,
+		/// The writer's waker, once its thread runs.
+		wake:  Mutex<Option<Arc<Unpark>>>,
+	}
+
+	const RUNNING: u8 = 0;
+	const WAITING: u8 = 1;
+	const FINISHED: u8 = 2;
+
+	// Failure mode (review of #115 at 5f3c243a): a poll that finds a write in
+	// hand stores its wait after the thread has made that write and taken the
+	// waits, so nothing wakes it until another write waits; once every other
+	// writer is done or waiting too, nobody ever does. No other test holds the
+	// order in which that wait is stored. Three writers with keys of their
+	// own make 20,000 writes of 2,000 bytes each through one room, while a
+	// reader takes the pipe 512 bytes at a time. A writer that waits unwoken
+	// while the room is idle (no write in hand, its thread asleep or not
+	// made) waits for a wake the room already gave out, or never will: every
+	// wait is stored while a write is in hand, and the thread wakes them all
+	// before it sleeps. The monitor counts each such wait, seen twice 50 ms
+	// apart, and kicks its writer on so the test ends; the test fails if it
+	// saw one. Each writer's records must also arrive once each and in order.
+	#[test]
+	fn no_wake_is_lost_between_three_writers_and_the_thread() {
+		use std::sync::atomic::AtomicBool;
+		const WRITERS: usize = 3;
+		const WRITES: usize = 20_000;
+		const LEN: usize = 2000;
+		let (r, w) = io::pipe().unwrap();
+		let (mut r, w) = (fs::File::from(OwnedFd::from(r)), fs::File::from(OwnedFd::from(w)));
+		nonblocking(&w);
+		let room = Room::new(w.as_raw_fd()).unwrap();
+		// Checks each record as it arrives (writer, its sequence number, whole):
+		// how many records each writer's came to, or the first wrong one.
+		let reader = std::thread::spawn(move || -> Result<[usize; WRITERS], String> {
+			let mut next = [0usize; WRITERS];
+			let mut rec = Vec::with_capacity(LEN);
+			let mut buf = [0u8; 512];
+			loop {
+				let n = match r.read(&mut buf) {
+					Ok(0) => {
+						return if rec.is_empty() {
+							Ok(next)
+						} else {
+							Err("a part record at the end".into())
+						};
+					},
+					Ok(n) => n,
+					Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+					Err(e) => panic!("read: {e}"),
+				};
+				for &byte in &buf[..n] {
+					rec.push(byte);
+					if rec.len() < LEN {
+						continue;
+					}
+					let i = usize::try_from(u32::from_le_bytes(rec[..4].try_into().unwrap())).unwrap();
+					let seq =
+						usize::try_from(u32::from_le_bytes(rec[4..8].try_into().unwrap())).unwrap();
+					if i >= WRITERS {
+						return Err(format!("a record split or mixed with another: {:?}", &rec[..8]));
+					}
+					if seq != next[i] {
+						return Err(format!("writer {i}: record {seq} where {} was next", next[i]));
+					}
+					if !rec[8..]
+						.iter()
+						.all(|&b| b == b'a' + u8::try_from(i).unwrap())
+					{
+						return Err(format!("writer {i}: record {seq} not whole"));
+					}
+					next[i] += 1;
+					rec.clear();
+				}
+			}
+		});
+		let writers: [Writer; WRITERS] = Default::default();
+		let mut lost = 0usize;
+		std::thread::scope(|s| {
+			for (i, me) in writers.iter().enumerate() {
+				let (room, w) = (&room, &w);
+				s.spawn(move || {
+					let wake = Arc::new(Unpark {
+						woken:  AtomicBool::new(false),
+						thread: std::thread::current(),
+					});
+					*me.wake.lock() = Some(Arc::clone(&wake));
+					let waker = Waker::from(Arc::clone(&wake));
+					let cx = Context::from_waker(&waker);
+					let mut key = WaitKey::default();
+					let mut record = [0u8; LEN];
+					record[..4].copy_from_slice(&u32::try_from(i).unwrap().to_le_bytes());
+					record[8..].fill(b'a' + u8::try_from(i).unwrap());
+					for seq in 0..WRITES {
+						record[4..8].copy_from_slice(&u32::try_from(seq).unwrap().to_le_bytes());
+						loop {
+							wake.woken.store(false, Ordering::SeqCst);
+							match room
+								.poll_write(&cx, &record, &mut key, |b| (&*w).write(b))
+								.expect("a thread")
+							{
+								Poll::Ready(Ok(n)) => {
+									assert_eq!(n, LEN, "a pipe write of at most PIPE_BUF is made whole");
+									break;
+								},
+								Poll::Ready(Err(e)) => panic!("writer {i}: {e}"),
+								Poll::Pending => {
+									me.waits.fetch_add(1, Ordering::SeqCst);
+									me.state.store(WAITING, Ordering::SeqCst);
+									while !wake.woken.load(Ordering::SeqCst)
+										&& !me.kick.swap(false, Ordering::SeqCst)
+									{
+										std::thread::park();
+									}
+									me.state.store(RUNNING, Ordering::SeqCst);
+								},
+							}
+						}
+					}
+					me.state.store(FINISHED, Ordering::SeqCst);
+				});
+			}
+			// While the room is idle, each writer that waits unwoken: its count
+			// of waits; `None` for any other writer, or for all of them while
+			// the room is not idle.
+			let unwoken = || -> [Option<u64>; WRITERS] {
+				let mut waits = [None; WRITERS];
+				for (i, me) in writers.iter().enumerate() {
+					let waiting = me.state.load(Ordering::SeqCst) == WAITING
+						&& me
+							.wake
+							.lock()
+							.as_ref()
+							.is_some_and(|u| !u.woken.load(Ordering::SeqCst));
+					if waiting {
+						waits[i] = Some(me.waits.load(Ordering::SeqCst));
+					}
+				}
+				if room.idle() { waits } else { [None; WRITERS] }
+			};
+			let deadline = Instant::now() + Duration::from_secs(120);
+			while writers
+				.iter()
+				.any(|me| me.state.load(Ordering::SeqCst) != FINISHED)
+			{
+				assert!(Instant::now() < deadline, "the writers did not finish within 120 s");
+				std::thread::sleep(Duration::from_millis(20));
+				let first = unwoken();
+				if first.iter().all(Option::is_none) {
+					continue;
+				}
+				std::thread::sleep(Duration::from_millis(50));
+				let second = unwoken();
+				for (i, me) in writers.iter().enumerate() {
+					// The same wait, unwoken across 50 ms with the room idle at
+					// both looks: its wake was lost.
+					if first[i].is_some() && first[i] == second[i] {
+						lost += 1;
+						me.kick.store(true, Ordering::SeqCst);
+						if let Some(u) = me.wake.lock().as_ref() {
+							u.thread.unpark();
+						}
+					}
+				}
+			}
+		});
+		drop(room);
+		drop(w);
+		let checked = reader.join().unwrap();
+		assert_eq!(
+			lost, 0,
+			"a poll that found a write in hand was never woken: a writer waited unwoken with the \
+			 room idle, {lost} times"
+		);
+		assert_eq!(checked, Ok([WRITES; WRITERS]), "every writer's records, once each and in order");
 	}
 }
