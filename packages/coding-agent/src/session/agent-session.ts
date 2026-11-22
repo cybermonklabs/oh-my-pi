@@ -386,7 +386,7 @@ import {
 import { approvedPlanFileOf } from "./cold-message";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
-import { isDateCwdReminderControl } from "./date-cwd-reminder";
+import { type DateCwdReminderInjector, isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
 import {
 	collectPendingToolCalls,
@@ -415,6 +415,7 @@ import {
 	CHECKPOINT_ACTIVE_REMINDER_TYPE,
 	type CustomMessage,
 	type CustomMessagePayload,
+	convertMessagesForContextView,
 	convertToLlm,
 	dedupeEphemeralReply,
 	demoteInterruptedThinking,
@@ -935,6 +936,25 @@ interface TitleInput {
 	tried: boolean;
 }
 
+/**
+ * The persistence keys of the message entries on the current branch from the cut
+ * on (the first entry the model context keeps of the latest compaction), and of
+ * the entries before it only their newest timestamp: a session holds no key for
+ * a message a compaction summarized.
+ */
+interface PersistedMessageKeys {
+	/** The (session file, leaf id) the index describes; any other means it is stale. */
+	anchor: string;
+	keys: Set<string>;
+	/** How many entries of the branch precede the cut. */
+	cut: number;
+	/**
+	 * The newest timestamp of a message entry before the cut. A key holds its
+	 * message's timestamp, so a message stamped later matches no entry there.
+	 */
+	newestBeforeCut: number;
+}
+
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
 
@@ -1308,7 +1328,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
-	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
+	#persistedMessageKeys: PersistedMessageKeys | undefined;
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -1506,6 +1526,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	readonly #cacheWarmer: CacheWarmer | undefined;
+	/** The main loop's date/cwd reminder injector, told of each compaction. */
+	readonly #dateCwdReminder: DateCwdReminderInjector | undefined;
 	/** Transcript the warmer was last armed for: its confirmed entry describes no other transcript. */
 	#promptCacheArmSessionId: string | undefined;
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
@@ -2387,6 +2409,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
 		this.#cacheWarmer = config.cacheWarmer;
+		this.#dateCwdReminder = config.dateCwdReminder;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
 			warmer.onWarmed = (message, extensionOverride, refresh) =>
@@ -3059,9 +3082,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			resetAdvisorRuntimes: (reason, options) => this.#advisors.resetAllRuntimes(reason, options),
 			rebaseAdvisorPrefix: reason => this.#advisors.rebaseDeliveredPrefixes(reason),
 			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
-			releaseLastRequest: () => {
+			releaseBeforeCut: () => {
 				this.agent.appendOnlyContext?.resetSyncCursor();
 				this.#cacheWarmer?.cancel();
+				// Built again from the new cut on at its next use.
+				this.#persistedMessageKeys = undefined;
+				// The turns the next request sends, as the provider context names them.
+				this.#dateCwdReminder?.retainTurns(
+					convertMessagesForContextView(this.agent.state.messages).map(({ message }) => message),
+				);
 			},
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
 			getContextBreakdown: options => this.getContextBreakdown(options),
@@ -4290,10 +4319,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Index every message entry on the current branch by persistence key, so
-	 * the mid-run-compaction planner can ask "is this turn message already on
-	 * the branch?" in O(1). The set is memoized through the current leaf path
-	 * and validated at use time against a (session file, leaf id) anchor.
+	 * Index the message entries on the current branch by persistence key, so
+	 * persistence and the mid-run-compaction planner can ask "is this message
+	 * already on the branch?" in O(1). The index keeps the keys of the entries
+	 * from the cut on ({@link PersistedMessageKeys}); with a key for every entry,
+	 * a long session would keep one for each message its compactions summarized.
+	 * A message stamped after every entry before the cut cannot be one of those,
+	 * so the index alone answers for it, and an older one walks them
+	 * ({@link #persistedKeyOnBranch}).
 	 *
 	 * The mid-run ordering check uses key identity alone: same-key content
 	 * variants are one logical message at this boundary, because otherwise a
@@ -4301,10 +4334,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * results have already persisted.
 	 *
 	 * Coherency is anchor-based, not invalidation-based: every branch mutation
-	 * (rewind, branch switch, new session, custom-entry append) changes the
-	 * session manager's leaf id or session file, so `#ensurePersistedMessageKeys`
-	 * detects staleness itself and rebuilds. No mutation call site has to
-	 * remember to invalidate anything.
+	 * (rewind, branch switch, new session, custom-entry append, compaction)
+	 * changes the session manager's leaf id or session file, so a stale index is
+	 * rebuilt here. No mutation call site has to remember to invalidate
+	 * anything; a compaction also drops the index at once, so a session left idle
+	 * after it keeps no key of the messages it summarized.
 	 *
 	 * Pre-#3629 the equivalent was `sessionManager.getBranch()` called twice
 	 * per turn message, each call rebuilding the path via O(n²) `unshift` and
@@ -4312,38 +4346,62 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * per `onTurnEnd` on a long session and the load-bearing source of the
 	 * `ui.loop-blocked` warnings in the bug report.
 	 */
-	#indexPersistedMessageKeys(): Set<string> {
-		return this.#ensurePersistedMessageKeys();
+	#ensurePersistedMessageKeys(): PersistedMessageKeys {
+		const anchor = this.#persistedMessageKeysAnchor();
+		let cache = this.#persistedMessageKeys;
+		if (cache === undefined || cache.anchor !== anchor) {
+			cache = this.#buildPersistedMessageKeys(anchor);
+			this.#persistedMessageKeys = cache;
+		}
+		return cache;
 	}
 
 	#persistedMessageKeysAnchor(): string {
 		return `${this.sessionManager.getSessionFile() ?? ""}\u0000${this.sessionManager.getLeafId() ?? ""}`;
 	}
 
-	#ensurePersistedMessageKeys(): Set<string> {
-		const anchor = this.#persistedMessageKeysAnchor();
-		let cache = this.#persistedMessageKeys;
-		if (cache === undefined || cache.anchor !== anchor) {
-			cache = { anchor, keys: this.#buildPersistedMessageKeySet() };
-			this.#persistedMessageKeys = cache;
+	#buildPersistedMessageKeys(anchor: string): PersistedMessageKeys {
+		const branch = this.sessionManager.getBranchView();
+		const fromCut = this.sessionManager.getBranchFromCut();
+		const cut = branch.length - fromCut.length;
+		let newestBeforeCut = Number.NEGATIVE_INFINITY;
+		for (let index = 0; index < cut; index++) {
+			const entry = branch[index];
+			if (entry.type === "message" && entry.message.timestamp > newestBeforeCut) {
+				newestBeforeCut = entry.message.timestamp;
+			}
 		}
-		return cache.keys;
-	}
-
-	#buildPersistedMessageKeySet(): Set<string> {
 		const keys = new Set<string>();
-		for (const entry of this.sessionManager.getBranchView()) {
+		for (const entry of fromCut) {
 			if (entry.type !== "message") continue;
 			const key = sessionMessagePersistenceKey(entry.message);
 			if (key !== undefined) keys.add(key);
 		}
-		return keys;
+		return { anchor, keys, cut, newestBeforeCut };
+	}
+
+	/**
+	 * Whether a message entry on the current branch has `key`, the persistence
+	 * key of `message`. The index answers, unless `message` is stamped no later
+	 * than the newest entry before the cut, whose keys it leaves out: those
+	 * entries are walked then. A timestamp that is not a number compares as
+	 * not later, so its message walks them too.
+	 */
+	#persistedKeyOnBranch(index: PersistedMessageKeys, key: string, message: AgentMessage): boolean {
+		if (index.keys.has(key)) return true;
+		if (message.timestamp > index.newestBeforeCut) return false;
+		const branch = this.sessionManager.getBranchView();
+		for (let position = 0; position < index.cut; position++) {
+			const entry = branch[position];
+			if (entry.type === "message" && sessionMessagePersistenceKey(entry.message) === key) return true;
+		}
+		return false;
 	}
 
 	/**
 	 * True when {@link message} is structurally identical to a message already
 	 * appended to the current branch. Uses the current branch's memoized
-	 * persistence-key cache for the common missing-key case, and only walks the
+	 * persistence-key index for the common missing-key case, and only walks the
 	 * branch to verify content when a key hit could be a rare collision.
 	 *
 	 * Error turns need one extra discriminator. An empty error turn carries no
@@ -4359,8 +4417,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#sessionMessageAlreadyPersisted(message: AgentMessage): boolean {
 		const key = sessionMessagePersistenceKey(message);
 		if (key === undefined) return false;
-		const keys = this.#ensurePersistedMessageKeys();
-		if (!keys.has(key)) return false;
+		if (!this.#persistedKeyOnBranch(this.#ensurePersistedMessageKeys(), key, message)) return false;
 		const branch = this.sessionManager.getBranchView();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
@@ -4584,7 +4641,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// JSON-compared every entry per turn message, which on long sessions
 		// turned each `onTurnEnd` into a seconds-long sync block (the
 		// `ui.loop-blocked` warnings tagged `subagent:*` in the bug report).
-		const branchKeys = this.#indexPersistedMessageKeys();
+		const branchKeys = this.#ensurePersistedMessageKeys();
 		const turnKeys = turnMessages.map(sessionMessagePersistenceKey);
 		const persistedKeys = new Set<string>();
 		for (let index = 0; index < turnMessages.length; index++) {
@@ -4594,7 +4651,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// variant (for example, redacted/deobfuscated content) must still count;
 			// otherwise the assistant can look missing while later tool results are
 			// present, producing a false out-of-order skip.
-			if (branchKeys.has(key)) {
+			if (this.#persistedKeyOnBranch(branchKeys, key, turnMessages[index])) {
 				persistedKeys.add(key);
 			}
 		}

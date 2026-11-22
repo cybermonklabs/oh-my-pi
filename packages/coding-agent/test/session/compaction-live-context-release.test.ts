@@ -8,17 +8,24 @@
  * Right after `session.compact()` returns, before any further request (an idle session after `/compact` may
  * send none for a long time), every one of them must be collected: the Agent's messages, the append-only log
  * (whose entries include the session's own assistant messages, so the probe also reads what it holds), the
- * prompt-cache warmer's armed request and the conversion caches keep nothing for a message before the cut,
- * and no large heap string may still hold the body of a prompt, steer, tool result or note. The mock declares
- * a prompt cache lifetime, so the warmer keeps a run armed with the last request while the session is idle,
- * as it does for a real provider. After the next request the same holds, the session entries before the cut
- * hold their bodies only in the cold store, and the Agent's tokenizer keeps no estimate for them.
+ * prompt-cache warmer's armed request, the conversion caches and the date/cwd reminder injector keep nothing
+ * for a message before the cut, and no large heap string may still hold the body of a prompt, steer, tool
+ * result or note. The mock declares a prompt cache lifetime, so the warmer keeps a run armed with the last
+ * request while the session is idle, as it does for a real provider. After the next request the same holds,
+ * the session entries before the cut hold their bodies only in the cold store, and the Agent's tokenizer
+ * keeps no estimate for them.
  *
- * Two holders keep a bounded amount by design and are kept out of the probe's view: the date/cwd reminder
- * injector keeps the first user turn of each of the last 8 conversations it served (`MAX_ROOTS` in
- * `date-cwd-reminder.ts`), so the observed turns follow a warm-up turn; the cold store keeps the 8 records it
- * read last, and a context rebuild reads every assistant entry's content, so the heap check leaves the
- * assistant's bodies out.
+ * Two holders key every message by a short string, which the probe looks for among the heap's strings: the
+ * session's persisted-message index (`sessionMessagePersistenceKey`) and the date/cwd reminder injector
+ * (role and timestamp). Neither may keep a key for a message before the cut at the compaction, nor after the
+ * next request, whose persistence builds the index again after a custom entry moved the leaf. The probe looks
+ * for the keys of assistant turns and tool results, which tell the two apart: a user turn's key is the same
+ * string in both, and the session's journal of the reminders placed (part of the transcript) holds the first
+ * turn's. The injector's state for that turn shows in the copy of it the injector sent.
+ *
+ * The date/cwd reminder rides on a first turn of its own, before the observed turns, whose copy with the
+ * reminder the probe observes on its own. The cold store keeps the 8 records it read last, and a context
+ * rebuild reads every assistant entry's content, so the heap check leaves the assistant's bodies out.
  *
  * Compiled code is counted in the heap and can keep objects alive, so the probe runs with the JIT off and has
  * the engine drop the code of functions that stopped running at the next collection.
@@ -33,12 +40,20 @@ interface ProbeResult {
 	preCut: string[];
 	observed: Record<string, number>;
 	unheldBefore: string[];
+	persistedKeyTargets: number;
+	dateCwdKeyTargets: number;
+	keysUnheldBefore: string[];
 	reachableAtCompaction: string[];
 	agentMessagesAtCompaction: string[];
 	appendOnlyLogAtCompaction: string[];
 	heapStringsAtCompaction: string[];
+	persistedKeysAtCompaction: string[];
+	dateCwdKeysAtCompaction: string[];
+	dateCwdInjectionAtCompaction: boolean;
 	reachableAfterNextRequest: string[];
 	heapStringsAfterNextRequest: string[];
+	persistedKeysAfterNextRequest: string[];
+	dateCwdKeysAfterNextRequest: string[];
 	tokenizerChecked: number;
 	tokenizerKeptEstimates: number;
 	preCutEntriesWhole: string[];
@@ -48,12 +63,17 @@ interface ProbeResult {
 const LIST_FIELDS = [
 	"preCut",
 	"unheldBefore",
+	"keysUnheldBefore",
 	"reachableAtCompaction",
 	"agentMessagesAtCompaction",
 	"appendOnlyLogAtCompaction",
 	"heapStringsAtCompaction",
+	"persistedKeysAtCompaction",
+	"dateCwdKeysAtCompaction",
 	"reachableAfterNextRequest",
 	"heapStringsAfterNextRequest",
+	"persistedKeysAfterNextRequest",
+	"dateCwdKeysAfterNextRequest",
 	"preCutEntriesWhole",
 	"transcriptMissing",
 ];
@@ -64,6 +84,9 @@ function isProbeResult(value: unknown): value is ProbeResult {
 	return (
 		LIST_FIELDS.every(key => Array.isArray(fields[key])) &&
 		typeof fields.observed === "object" &&
+		typeof fields.persistedKeyTargets === "number" &&
+		typeof fields.dateCwdKeyTargets === "number" &&
+		typeof fields.dateCwdInjectionAtCompaction === "boolean" &&
 		typeof fields.tokenizerChecked === "number" &&
 		typeof fields.tokenizerKeptEstimates === "number"
 	);
@@ -98,9 +121,9 @@ async function probe(root: string): Promise<{ output: string; result: ProbeResul
 let probed: Promise<{ output: string; result: ProbeResult }> | undefined;
 
 /**
- * The probe's one run, which both cases read: its reading after the next request follows the one at the
- * compaction in the same session. Neither reading says anything unless the cut moved past every observed turn
- * and each holder kept values for those turns before it did.
+ * The probe's one run, which every case reads: its reading after the next request follows the one at the
+ * compaction in the same session. No reading says anything unless the cut moved past every observed turn
+ * and each holder kept values or keys for those turns before it did.
  */
 function probeOnce(): Promise<{ output: string; result: ProbeResult }> {
 	probed ??= (async () => {
@@ -122,6 +145,9 @@ function probeOnce(): Promise<{ output: string; result: ProbeResult }> {
 			expect(result.observed[holder] ?? 0, `${holder}: ${output}`).toBeGreaterThan(0);
 		}
 		expect(result.unheldBefore, output).toEqual([]);
+		expect(result.persistedKeyTargets, output).toBeGreaterThan(0);
+		expect(result.dateCwdKeyTargets, output).toBeGreaterThan(0);
+		expect(result.keysUnheldBefore, output).toEqual([]);
 		return run;
 	})();
 	return probed;
@@ -130,14 +156,18 @@ function probeOnce(): Promise<{ output: string; result: ProbeResult }> {
 // If this regresses, a session left idle after `/compact` (or after a compaction that ended a run) keeps the
 // prompts, tool calls and results, steers and notes the compaction summarized in memory until its next request,
 // which may not come for a long time: through the append-only log, the cache warmer's armed request, the
-// Agent's messages or a conversion cache.
+// Agent's messages, a conversion cache or the date/cwd reminder injector; and the persisted-message index and
+// the injector keep a key for each of them.
 it("keeps nothing of the messages before a compaction's cut at the compaction, before any further request", async () => {
 	const { output, result } = await probeOnce();
 
 	expect(result.reachableAtCompaction, output).toEqual([]);
+	expect(result.dateCwdInjectionAtCompaction, output).toBe(false);
 	expect(result.agentMessagesAtCompaction, output).toEqual([]);
 	expect(result.appendOnlyLogAtCompaction, output).toEqual([]);
 	expect(result.heapStringsAtCompaction, output).toEqual([]);
+	expect(result.persistedKeysAtCompaction, output).toEqual([]);
+	expect(result.dateCwdKeysAtCompaction, output).toEqual([]);
 }, 180_000);
 
 // If this regresses, a long session's memory grows with every compaction and is never given back: the
@@ -148,9 +178,19 @@ it("keeps nothing of the messages before a compaction's cut once the next reques
 
 	expect(result.reachableAfterNextRequest, output).toEqual([]);
 	expect(result.heapStringsAfterNextRequest, output).toEqual([]);
+	expect(result.dateCwdKeysAfterNextRequest, output).toEqual([]);
 	expect(result.tokenizerChecked, output).toBeGreaterThan(0);
 	expect(result.tokenizerKeptEstimates, output).toBe(0);
 	// The entries stay as the transcript, their bodies in the store.
 	expect(result.preCutEntriesWhole, output).toEqual([]);
 	expect(result.transcriptMissing, output).toEqual([]);
+}, 180_000);
+
+// If this regresses, every lookup after a compaction (each persisted message, a new custom entry or label moving
+// the leaf first) builds the persisted-message index from the whole branch again, so a long session keeps a key
+// for every message its compactions summarized.
+it("builds the persisted-message index again from the cut on after a compaction", async () => {
+	const { output, result } = await probeOnce();
+
+	expect(result.persistedKeysAfterNextRequest, output).toEqual([]);
 }, 180_000);

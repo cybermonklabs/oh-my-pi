@@ -38,6 +38,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { CacheWarmer } from "./cache-warmer";
+import type { DateCwdReminderInjector } from "./date-cwd-reminder";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -332,6 +333,12 @@ export interface AgentSessionConfig {
 	 * Without it, advisors share {@link transformProviderContext}.
 	 */
 	createAdvisorTransformProviderContext?: () => (context: Context, model: Model) => Context | Promise<Context>;
+	/**
+	 * The date/cwd reminder injector {@link transformProviderContext} applies. A
+	 * compaction tells it which turns the history still holds, so it keeps nothing
+	 * for the turns the compaction cut.
+	 */
+	dateCwdReminder?: DateCwdReminderInjector;
 	/** Stream wrapper for side-channel requests. */
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */

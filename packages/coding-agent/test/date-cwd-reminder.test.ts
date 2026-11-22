@@ -1784,4 +1784,147 @@ describe("date-cwd reminder on the provider wire", () => {
 			authStorage.close();
 		}
 	});
+
+	// If this regresses, the requests after a compaction resend the turns it kept with other reminders than they
+	// were first sent with, or without them, so a provider re-reads the kept turns instead of continuing from its
+	// cached copy of them; or they resend a cut turn's date.
+	it("resends the turns a compaction kept with the reminders they were sent with", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-reminder-");
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const api = "test-date-cwd-reminder-compaction";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			const request = contexts.length;
+			queueMicrotask(() => {
+				if (request !== 2) {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+					return;
+				}
+				// The second turn's tool continuation runs on the next day.
+				setSystemTime(new Date(2026, 7, 16, 0, 1));
+				const toolCall = {
+					type: "toolCall" as const,
+					id: "read-1",
+					name: "read",
+					arguments: { path: "notes.txt" },
+				};
+				const message: AssistantMessage = {
+					...createAssistantMessage(""),
+					content: [toolCall],
+					stopReason: "toolUse",
+				};
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "date-cwd-reminder-compaction",
+			name: "Date cwd reminder compaction",
+			api,
+			provider: "managed-primary",
+			// Remote endpoint: a loopback URL would turn on append-only context, which pins message identity.
+			baseUrl: "https://api.example.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		// The compaction keeps the second turn on: it carries a reminder of its own, and the next day's reminder
+		// follows its tool result.
+		const keepFromSecond: ExtensionFactory = pi => {
+			pi.on("session_before_compact", async event => {
+				const second = event.branchEntries.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						JSON.stringify(entry.message.content).includes("second"),
+				);
+				if (!second) throw new Error("The second turn is not on the branch");
+				return {
+					compaction: {
+						summary: "The user said first.",
+						shortSummary: undefined,
+						firstKeptEntryId: second.id,
+						tokensBefore: event.preparation.tokensBefore,
+						details: {},
+					},
+				};
+			});
+		};
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			model,
+			toolNames: ["read"],
+			disableExtensionDiscovery: true,
+			extensions: [keepFromSecond],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+			agentId: "SubAgent",
+		});
+		sessions.push(session);
+
+		const cwd = normalizePromptPath(tempDir.path());
+		setSystemTime(new Date(2026, 7, 14, 23, 59));
+		try {
+			await session.sendUserMessage("first");
+			setSystemTime(new Date(2026, 7, 15, 0, 1));
+			await session.sendUserMessage("second");
+			await session.waitForIdle();
+			await session.compact();
+			await session.sendUserMessage("third");
+			await session.sendUserMessage("fourth");
+
+			expect(contexts).toHaveLength(5);
+			const wire = contexts.map(context =>
+				context.messages.map(message => JSON.stringify([message.role, message.content])),
+			);
+			// The last request before the compaction ends with the second turn, its tool call and result, and the
+			// next day's reminder.
+			const kept = wire[2]!.slice(2);
+			expect(kept[0]).toBe(
+				JSON.stringify([
+					"user",
+					[
+						{ type: "text", text: renderDateCwdReminder("2026-08-15", cwd) },
+						{ type: "text", text: "second" },
+					],
+				]),
+			);
+			expect(kept.at(-1)).toBe(JSON.stringify(["developer", renderDateCwdReminder("2026-08-16", cwd)]));
+			// After it: the summary with today's reminder, then the kept turns as they were sent.
+			const summary = contexts[3]!.messages[0]!;
+			if (summary.role !== "user") throw new Error(`The first turn after the compaction is a ${summary.role} turn`);
+			const summaryText =
+				typeof summary.content === "string"
+					? summary.content
+					: summary.content.map(part => (part.type === "text" ? part.text : "")).join("\n\n");
+			expect(summaryText).toStartWith(renderDateCwdReminder("2026-08-16", cwd));
+			expect(summaryText).toContain("The user said first.");
+			expect(wire[3]!.slice(1, 1 + kept.length)).toEqual(kept);
+			expect(JSON.stringify(contexts[3]!.messages)).not.toContain("2026-08-14");
+			expect(wire[4]!.slice(0, wire[3]!.length)).toEqual(wire[3]!);
+		} finally {
+			setSystemTime();
+			authStorage.close();
+		}
+	});
 });
