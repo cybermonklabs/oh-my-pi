@@ -80,9 +80,11 @@ export interface SlashCommandRuntime {
 	/** Emit text to the operator. TUI maps to `ctx.showStatus`, ACP to `sessionUpdate`. */
 	output: (text: string) => Promise<void> | void;
 	/**
-	 * `"outside"` when a person or a client typed the command (TUI, RPC, ACP, print): commands that send
+	 * `"outside"` when a client or a person typed the command over RPC, ACP or print: commands that send
 	 * the history to a model (`/compact`, `/handoff`) then end the session's cyber-policy hold as a
-	 * prompt from outside does. Unset when an extension or the session runs a command.
+	 * prompt from outside does. The TUI's `handle` adapter leaves it unset: the TUI's `/compact` and
+	 * `/handoff` run their `handleTui` handlers, which pass the origin themselves. Unset when an
+	 * extension or the session runs a command.
 	 */
 	origin?: InputOrigin;
 	/** Re-advertise the available command list (no-op outside ACP). */

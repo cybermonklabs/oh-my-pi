@@ -25,14 +25,14 @@ const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
 
 /**
- * Why the live call to `route` may send nothing now, or `undefined` when it may. The call runs on OpenAI (Codex
- * realtime, or an OpenAI realtime route a gateway or a configured endpoint serves) and carries the session's text, so
- * while the session tree's cyber-policy closure is active (OpenAI refused the tree's content) none of the session's
- * text goes out and no call opens; the hold's message names `route`, the route the call goes to. It is read where
- * each of those sends happens: the transport reads it (`LiveTransportOptions.holdReason`) in the same synchronous step
- * as the signaling POST that opens the call (it carries the instructions) and as every sideband frame but
- * `session.close`; the controller reads it before it builds the transport and again once the call has connected,
- * before any audio or text, and closes a held call. `session.close`, which only ends the call, is not held.
+ * Why the live call to `route` may send nothing now, or `undefined` when it may. The call runs on OpenAI (today Codex
+ * realtime only, `CODEX_LIVE_ROUTE`) and carries the session's text, so while the session tree's cyber-policy closure
+ * is active (OpenAI refused the tree's content) none of the session's text goes out and no call opens; the hold's
+ * message names `route`, the route the call goes to. It is read where each of those sends happens: the transport
+ * reads it (`LiveTransportOptions.holdReason`) in the same synchronous step as the signaling POST that opens the call
+ * (it carries the instructions) and as every sideband frame but `session.close`; the controller reads it before it
+ * builds the transport and again once the call has connected, before any audio or text, and closes a held call.
+ * `session.close`, which only ends the call, is not held.
  */
 export function liveCallHoldReason(
 	session: Pick<AgentSession, "cyberPolicyClosure">,

@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import { addModelCallGuard, ModelCallRefusedError } from "@oh-my-pi/pi-ai/model-call-guard";
@@ -175,6 +175,9 @@ describe("speech and image tools under a pause that returns during the resume", 
 	});
 });
 
+const ONE_PIXEL_PNG =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
 /**
  * Speech synthesis and image generation read the model-call guards once, when the call starts; the tool's request
  * then parks in its held fetch while `/pause` is engaged. A `cyber_policy` refusal another call of the session tree
@@ -189,24 +192,46 @@ describe("speech and image tools held by a refusal recorded while /pause holds t
 		["sends the request when no refusal is recorded (control)", false],
 	] as const;
 
-	/** Starts `run` with the gate open, parks its request under `/pause`, records the refusal or not, then resumes. */
+	/**
+	 * Starts `run` with the gate open, parks its request under `/pause`, records the refusal or not, then resumes.
+	 * The refusal is recorded only once the tool's request has reached the gate's hold while `/pause` is engaged
+	 * (each such entry is counted), so a case cannot pass on a request the refusal reached before it was parked.
+	 */
 	async function parkThenResume<T>(
 		run: () => Promise<T>,
 		sent: readonly boolean[],
 		refuse: () => void,
 		refused: boolean,
 	): Promise<{ result?: T; error?: unknown }> {
-		const pending = run().then(
-			result => ({ result }),
-			(error: unknown) => ({ error }),
-		);
-		agentPauseGate.pause();
-		for (let i = 0; i < 50 && sent.length === 0; i++) await tick();
-		expect(sent).toEqual([]);
-		// Another call of the session tree meets OpenAI's refusal while this request is parked.
-		if (refused) refuse();
-		agentPauseGate.resume();
-		return pending;
+		let parkedEntries = 0;
+		const reached = Promise.withResolvers<void>();
+		const dispatchHold = agentPauseGate.dispatchHold.bind(agentPauseGate);
+		const spy = spyOn(agentPauseGate, "dispatchHold").mockImplementation((signal, next) => {
+			const hold = dispatchHold(signal, next);
+			return () => {
+				if (agentPauseGate.paused) {
+					parkedEntries++;
+					reached.resolve();
+				}
+				return hold();
+			};
+		});
+		try {
+			const pending = run().then(
+				result => ({ result }),
+				(error: unknown) => ({ error }),
+			);
+			agentPauseGate.pause();
+			await reached.promise;
+			expect(parkedEntries).toBeGreaterThan(0);
+			expect(sent).toEqual([]);
+			// Another call of the session tree meets OpenAI's refusal while this request is parked.
+			if (refused) refuse();
+			agentPauseGate.resume();
+			return await pending;
+		} finally {
+			spy.mockRestore();
+		}
 	}
 
 	test.each(CASES)("the tts tool %s", async (_name, refused) => {
@@ -298,6 +323,58 @@ describe("speech and image tools held by a refusal recorded while /pause holds t
 				expect(sent).toEqual([false]);
 				expect(outcome.result?.details?.imageCount).toBe(1);
 			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// The held fetch reads the guards for the request to the model (a POST) only. A refusal recorded while the
+	// generation is answered does not hold the GET of the image that generation made: that is no model call,
+	// and holding it would lose the image.
+	test("the generate_image tool still downloads the image it made when a refusal lands during the generation", async () => {
+		const imageModel = buildModel({
+			id: "downloaded-image",
+			name: "deepinfra/downloaded-image",
+			api: "openai-images",
+			provider: "deepinfra",
+			baseUrl: "https://deepinfra.example/v1",
+			kind: "image",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === imageModel.id ? HOLD : undefined),
+		});
+		const settings = Settings.isolated({
+			modelRoles: { image: `${imageModel.provider}/${imageModel.id}` },
+			"retry.fallbackChains": { image: [] },
+		});
+		const methods: string[] = [];
+		const ctx = toolContext([imageModel], settings, async (input, init) => {
+			const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+			methods.push(method);
+			if (method === "POST") {
+				// Another call of the session tree meets OpenAI's refusal while the generation is answered.
+				held = true;
+				return new Response(JSON.stringify({ data: [{ url: "https://images.example.test/made.png" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response(Buffer.from(ONE_PIXEL_PNG, "base64"), {
+				status: 200,
+				headers: { "content-type": "image/png" },
+			});
+		});
+		try {
+			const result = await imageGenTool.execute("image-download", { subject: "a made image" }, undefined, ctx);
+			generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+			expect(methods).toEqual(["POST", "GET"]);
+			expect(result.details?.imageCount).toBe(1);
 		} finally {
 			removeGuard();
 		}
