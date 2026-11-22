@@ -77,11 +77,13 @@ pub enum ProcState {
 	Stopped,
 	/// Exited, not yet reaped.
 	Zombie,
-	/// Anything else (idle kernel threads, being created, dead).
+	/// Anything else (idle kernel threads, being created, dead), and on
+	/// Linux a process whose leader thread has exited while another thread
+	/// of it has not (see [`info`]).
 	Other,
 }
 
-/// Every process visible to the caller.
+/// Every process visible to the caller, each read as [`info`] reads it.
 ///
 /// Fails, rather than leave a process out, when one could not be read for a
 /// reason that can hide one of the caller's own: no descriptor or memory
@@ -109,6 +111,11 @@ fn gone_or_foreign(error: &io::Error) -> bool {
 }
 
 /// The process `pid`, if it exists.
+///
+/// On Linux a process whose leader thread has exited while another thread of
+/// it has not reads as [`ProcState::Other`], not [`ProcState::Zombie`]: it
+/// runs (or is exiting) until its last thread is gone, and holds what it
+/// opened until then.
 pub fn info(pid: i32) -> Option<ProcInfo> {
 	sys::info(pid)
 }
@@ -314,6 +321,31 @@ fn parse_stat(pid: i32, line: &[u8]) -> Option<ProcInfo> {
 	})
 }
 
+/// `p`, parsed from the stat `line`, unless that shows the leader thread
+/// exited (`Z`) while another thread of the process has not: the line shows
+/// `Z` until the last thread is gone, so such a process reads as
+/// [`ProcState::Other`]. The thread count (`num_threads`, field 20) counts
+/// the exited leader and every thread not yet released, on Linux and under
+/// gVisor alike, so a count above one means a thread that runs, is exiting,
+/// or is held by a tracer. (`/proc/<pid>/task` would name the threads, but
+/// gVisor stops listing it once the leader has exited.)
+#[cfg_attr(
+	not(target_os = "linux"),
+	allow(dead_code, reason = "Linux-only outside tests; the rule is tested everywhere")
+)]
+fn live_leader(mut p: ProcInfo, line: &[u8]) -> ProcInfo {
+	let threads = split_stat(line).and_then(|(_, mut fields)| {
+		std::str::from_utf8(fields.nth(17)?)
+			.ok()?
+			.parse::<u32>()
+			.ok()
+	});
+	if p.state == ProcState::Zombie && threads.is_some_and(|count| count > 1) {
+		p.state = ProcState::Other;
+	}
+	p
+}
+
 #[cfg(target_os = "linux")]
 mod sys {
 	use std::{
@@ -410,11 +442,11 @@ mod sys {
 		let mut buf = [0; 1024];
 		let n = file.read(&mut buf)?;
 		let parsed = if n < buf.len() {
-			parse_stat(pid, &buf[..n])
+			parse_stat(pid, &buf[..n]).map(|p| super::live_leader(p, &buf[..n]))
 		} else {
 			let mut line = buf.to_vec();
 			file.read_to_end(&mut line)?;
-			parse_stat(pid, &line)
+			parse_stat(pid, &line).map(|p| super::live_leader(p, &line))
 		};
 		parsed.ok_or_else(|| io::ErrorKind::InvalidData.into())
 	}
@@ -654,6 +686,169 @@ mod tests {
 		child.wait().unwrap();
 		assert!(start >= since, "a later child started at or after the mark: {start} < {since}");
 		assert!(start <= now().unwrap());
+	}
+
+	#[test]
+	fn a_zombie_line_with_another_thread_reads_as_other() {
+		let line = |state: &str, threads: u32| {
+			format!(
+				"4242 (a) b) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 987654 \
+				 0 0\n"
+			)
+		};
+		let read = |state, threads| {
+			let line = line(state, threads);
+			live_leader(parse_stat(4242, line.as_bytes()).unwrap(), line.as_bytes()).state
+		};
+		assert_eq!(read("Z", 2), ProcState::Other, "the leader exited, a thread runs");
+		assert_eq!(read("Z", 3), ProcState::Other);
+		assert_eq!(read("Z", 1), ProcState::Zombie, "only the exited leader is left");
+		assert_eq!(read("S", 2), ProcState::Sleeping, "a running leader keeps its state");
+	}
+
+	/// Set by [`LeaderGone::start`] for its child: `leader_exits_first` does
+	/// nothing without it, so `--include-ignored` cannot end the leader of
+	/// the test runner itself.
+	#[cfg(target_os = "linux")]
+	const HELPER: &str = "PI_SHELL_LEADER_EXIT_HELPER";
+
+	/// The child process of [`LeaderGone`]: its leader thread exits, from a
+	/// SIGUSR1 handler this test body sends it, while this thread runs on.
+	/// libtest runs the body on a thread of its own, so the leader is free.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by LeaderGone::start"]
+	fn leader_exits_first() {
+		extern "C" fn end_this_thread(_: libc::c_int) {
+			// SAFETY: ends the calling thread alone; the process runs on.
+			unsafe { libc::syscall(libc::SYS_exit, 0) };
+		}
+		if std::env::var_os(HELPER).is_none() {
+			return;
+		}
+		// SAFETY: a handler for a signal only this process sends itself.
+		unsafe { libc::signal(libc::SIGUSR1, end_this_thread as libc::sighandler_t) };
+		let me = std::process::id() as i32;
+		// SAFETY: plain syscall; the leader's thread id is the process id.
+		unsafe { libc::syscall(libc::SYS_tgkill, me, me, libc::SIGUSR1) };
+		loop {
+			std::thread::park();
+		}
+	}
+
+	/// A child process, in a process group of its own, whose leader thread
+	/// has exited while another thread runs; killed and reaped on drop.
+	#[cfg(target_os = "linux")]
+	struct LeaderGone(std::process::Child);
+
+	#[cfg(target_os = "linux")]
+	impl LeaderGone {
+		fn start() -> Self {
+			use std::os::unix::process::CommandExt;
+			let child = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--ignored", "--exact", "sys::proc::tests::leader_exits_first"])
+				.env(HELPER, "1")
+				.process_group(0)
+				.stdout(std::process::Stdio::null())
+				.stderr(std::process::Stdio::null())
+				.spawn()
+				.unwrap();
+			let gone = Self(child);
+			// The helper's leader exits within milliseconds of its start; the
+			// bound only keeps a broken helper from hanging the suite.
+			wait_for_zombie_line(gone.pid(), "the helper's leader exits");
+			let status = std::fs::read_to_string(format!("/proc/{}/status", gone.pid())).unwrap();
+			assert!(
+				status.lines().any(|l| l
+					.strip_prefix("Threads:")
+					.is_some_and(|n| n.trim().parse::<u32>().is_ok_and(|n| n > 1))),
+				"the helper kept no live thread (did --exact select leader_exits_first?): {status}"
+			);
+			gone
+		}
+
+		fn pid(&self) -> i32 {
+			self.0.id() as i32
+		}
+
+		/// Kills the child without reaping it, and returns once every thread
+		/// of it has exited: its pidfd turns readable then.
+		fn kill_unreaped(&mut self) {
+			self.0.kill().unwrap();
+			// SAFETY: pidfd_open takes scalar arguments; the child is unreaped,
+			// so its pid names it.
+			let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid(), 0) } as libc::c_int;
+			assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+			let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+			// SAFETY: one valid pollfd for the call; 30 s only bounds a hang.
+			let ready = unsafe { libc::poll(&raw mut poll, 1, 30_000) };
+			// SAFETY: the pidfd is ours to close.
+			unsafe { libc::close(fd) };
+			assert_eq!(ready, 1, "the killed child's threads did not all exit in 30 s");
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	impl Drop for LeaderGone {
+		fn drop(&mut self) {
+			let _ = self.0.kill();
+			let _ = self.0.wait();
+		}
+	}
+
+	/// Waits until `/proc/<pid>/stat` itself (not [`info`]) shows `Z`.
+	#[cfg(target_os = "linux")]
+	fn wait_for_zombie_line(pid: i32, what: &str) {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		while std::fs::read(format!("/proc/{pid}/stat"))
+			.ok()
+			.and_then(|line| split_stat(&line)?.1.next()?.first().copied())
+			!= Some(b'Z')
+		{
+			assert!(std::time::Instant::now() < deadline, "{what}: no Z line in 30 s");
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_group_kill_reaches_a_process_whose_leader_has_exited() {
+		use std::os::unix::process::ExitStatusExt;
+		let mut gone = LeaderGone::start();
+		let pid = gone.pid();
+		let read = info(pid).map(|p| p.state);
+		let sent = kill_group(pid, Signal::Kill).unwrap();
+		assert!(
+			sent.iter().any(|p| p.pid == pid),
+			"the kill skipped a live process (read as {read:?}): {sent:?}"
+		);
+		assert_eq!(gone.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+	}
+
+	/// The controls: a process with nothing but its exited leader left is a
+	/// zombie, and stays one to a group kill, whether it had one thread or
+	/// several.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_process_with_only_its_exited_leader_left_stays_a_zombie() {
+		use std::os::unix::process::CommandExt;
+		let mut child = std::process::Command::new("/bin/true")
+			.process_group(0)
+			.spawn()
+			.unwrap();
+		let pid = child.id() as i32;
+		wait_for_zombie_line(pid, "true exits");
+		assert_eq!(info(pid).map(|p| p.state), Some(ProcState::Zombie));
+		assert!(kill_group(pid, Signal::Kill).unwrap().is_empty(), "a zombie is not signalled");
+		assert!(child.wait().unwrap().success());
+
+		let mut gone = LeaderGone::start();
+		gone.kill_unreaped();
+		assert_eq!(info(gone.pid()).map(|p| p.state), Some(ProcState::Zombie), "after every thread");
+		assert!(
+			kill_group(gone.pid(), Signal::Kill).unwrap().is_empty(),
+			"a zombie is not signalled"
+		);
 	}
 
 	#[test]

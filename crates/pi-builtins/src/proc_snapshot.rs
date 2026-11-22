@@ -431,9 +431,20 @@ mod proc_snapshot {
 			self.stat.comm.clone()
 		}
 
+		/// Whether the process still runs.
+		///
+		/// A leader that reads `Z` while the thread count (`num_threads`) is
+		/// above one exited before another thread of its process (a
+		/// `pthread_exit` from `main`): the count includes the exited leader
+		/// and every thread not yet released, on Linux and under gVisor alike,
+		/// so the process still runs, is exiting, or has a thread a tracer
+		/// holds.
 		pub fn status(&self) -> ProcessStatus {
 			match read_stat(self.pid) {
-				Some(stat) if stat.start_time == self.stat.start_time && stat.state != 'Z' => {
+				Some(stat)
+					if stat.start_time == self.stat.start_time
+						&& (stat.state != 'Z' || stat.threads > 1) =>
+				{
 					ProcessStatus::Running
 				},
 				_ => ProcessStatus::Exited,
