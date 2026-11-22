@@ -216,8 +216,8 @@ fn fg_and_bg_take_in_the_exits_first() {
 
 // Failure mode: `disown -r` drops the held job as running, so `jobs %1`
 // finds no such job (bash: a job that ended is not running, so it stays).
-// The job's line is not compared: bash's `disown -r` also clears the
-// current job, which obash does not.
+// The job's line, without the `+` that `disown -r` clears, is
+// `jobs::disown_r_leaves_no_current_job`'s.
 #[test]
 fn disown_r_takes_in_the_exits_first() {
 	let world = World::new();

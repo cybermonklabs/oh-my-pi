@@ -176,3 +176,52 @@ fn a_process_substitution_sets_the_last_background_pid() {
 	let (out, ..) = run("read x < <(exit 123); wait $!; echo $?");
 	assert_eq!(out, "123\n");
 }
+
+// Failure mode: `disown -r` keeps the current and previous jobs among the
+// jobs it leaves (finished or stopped ones), so `jobs` marks them `+` and
+// `-`, and `jobs %+`, `wait %%`, `fg` and `bg` find the current job.
+// bash's `delete_all_jobs` clears both first, whatever it deletes;
+// `disown -h -r` deletes nothing and keeps them; the next job started is
+// current again.
+#[test]
+fn disown_r_leaves_no_current_job() {
+	const WAIT: &str = "while kill -0 $! 2>/dev/null; do :; done;";
+	let (out, err, _) = run(&format!(
+		"( exit 3 ) & {WAIT} ( exit 4 ) & {WAIT} disown -r; jobs %+; echo \"st=$?\"; jobs %-; echo \
+		 \"st=$?\"; jobs"
+	));
+	assert_eq!(
+		out,
+		"st=1\nst=1\n[1]   Exit 3                     ( exit 3 )\n[2]   Exit 4                     \
+		 ( exit 4 )\n"
+	);
+	assert_eq!(err, "bash: line 1: jobs: %+: no such job\nbash: line 1: jobs: %-: no such job\n");
+	let (out, err, _) = run(&format!("( exit 3 ) & {WAIT} disown -ar; jobs"));
+	assert_eq!(out, "[1]   Exit 3                     ( exit 3 )\n", "-ar");
+	assert_eq!(err, "", "-ar");
+	let (out, err, _) = run(&format!("( exit 3 ) & {WAIT} disown -r; wait %%; echo \"st=$?\""));
+	assert_eq!(out, "st=127\n", "wait");
+	assert_eq!(err, "bash: line 1: wait: %%: no such job\n", "wait");
+	let (out, err, _) = run(&format!("set -m; ( exit 3 ) & {WAIT} disown -r; fg; echo \"st=$?\""));
+	assert_eq!(out, "st=1\n", "fg");
+	assert_eq!(err, "bash: line 1: fg: current: no such job\n", "fg");
+	let (out, err, _) = run(
+		"set -m; { kill -STOP $BASHPID; exit 7; } & wait %1; disown -r; bg; echo \"st=$?\"; jobs; \
+		 exec 2>/dev/null; kill -9 %1; wait; echo end",
+	);
+	assert_eq!(
+		out, "st=1\n[1]   Stopped                    { kill -STOP $BASHPID; exit 7; }\nend\n",
+		"bg"
+	);
+	assert_eq!(err, "bash: line 1: bg: current: no such job\n", "bg");
+	// Controls: `-h` deletes nothing and keeps the current job; a job
+	// started after `disown -r` is current.
+	let (out, ..) = run(&format!("( exit 3 ) & {WAIT} disown -h -r; jobs"));
+	assert_eq!(out, "[1]+  Exit 3                     ( exit 3 )\n", "-h");
+	let (out, ..) = run(&format!("( exit 3 ) & {WAIT} disown -r; ( exit 4 ) & {WAIT} jobs"));
+	assert_eq!(
+		out,
+		"[1]   Exit 3                     ( exit 3 )\n[2]+  Exit 4                     ( exit 4 )\n",
+		"next job"
+	);
+}

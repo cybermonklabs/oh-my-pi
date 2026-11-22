@@ -519,7 +519,10 @@ fn background(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> i32 {
 
 /// `disown [-h] [-ar] [jobspec … | pid …]`: drop jobs from the table, or
 /// with `-h` mark them not to get a `SIGHUP`; no operand means the current
-/// job (all with `-a`, the running ones with `-r`).
+/// job (all with `-a`, the running ones with `-r`). Dropping all or the
+/// running ones leaves no current or previous job, whatever stays (bash
+/// `delete_all_jobs` clears `js.j_current` and `js.j_previous` first; the
+/// next job started or stopped picks new ones).
 pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let o = match opts(ctx, args, b"ahr", b"", false) {
 		Ok(o) => o,
@@ -529,6 +532,10 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let nohup = o.has(b'h');
 	let running_only = o.has(b'r');
 	if o.rest.is_empty() && (o.has(b'a') || running_only) {
+		if !nohup {
+			ctx.vp.jobs.current = None;
+			ctx.vp.jobs.previous = None;
+		}
 		let picked: Vec<u32> = ctx
 			.vp
 			.jobs
