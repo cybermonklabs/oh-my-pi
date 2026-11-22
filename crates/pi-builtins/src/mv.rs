@@ -46,8 +46,8 @@ enum MvError {
 	SameFile(String, String),
 	#[error("cannot move {0} to a subdirectory of itself, {1}")]
 	SelfTargetSubdirectory(String, String),
-	#[error("cannot overwrite directory {0} with non-directory")]
-	DirectoryToNonDirectory(String),
+	#[error("cannot overwrite directory {0} with non-directory {1}")]
+	DirectoryToNonDirectory(String, String),
 	#[error("cannot overwrite non-directory {1} with directory {0}")]
 	NonDirectoryToDirectory(String, String),
 	#[error("backing up {0} might destroy source;  {1} not moved")]
@@ -468,7 +468,7 @@ fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Option
 			return move_files_into_dir(host, &[source.to_path_buf()], target, opts);
 		}
 		if !filesystem.is_dir(&source_fs) {
-			return Err(MvError::DirectoryToNonDirectory(target.quote().to_string()).into());
+			return Err(MvError::DirectoryToNonDirectory(target.quote().to_string(), source.quote().to_string()).into());
 		}
 	}
 
@@ -848,9 +848,46 @@ fn rename(
 		}
 	}
 
-	rename_with_fallback(host, from, to, display_manager, copier)?;
+	let report = opts.verbose.then_some(backup.as_deref());
+	let copied = match move_entry(host, from, to, display_manager, copier, report) {
+		Ok(copied) => copied,
+		Err(error) => {
+		// The move failed after the destination was backed up: GNU puts the
+		// backup back (`un_backup` in copy.c), so the destination keeps its
+		// name and data. Where that rename fails too, the move's error comes
+		// first and then `cannot un-backup`, as GNU reports them.
+		if let Some(backup) = &backup {
+			match filesystem.rename(backup, &to_fs) {
+				Ok(_) => {
+					if opts.verbose {
+						let _ = writeln!(
+							host.stdout,
+							"{} -> {} (unbackup)",
+							backup_display(to, backup).quote(),
+							to.quote()
+						);
+					}
+				},
+				Err(rename_error) => {
+					return Err(io::Error::new(
+						error.kind(),
+						format!(
+							"{error}\n{}: cannot un-backup {}: {}",
+							Mv::NAME,
+							to.quote(),
+							crate::host::strip_errno(&rename_error)
+						),
+					));
+				},
+			}
+		}
+			return Err(error);
+		},
+	};
 
-	if opts.verbose {
+	// A move between filesystems reported itself as GNU's does: `copied`, then
+	// rm's `removed` lines.
+	if opts.verbose && !copied {
 		let message = if let Some(path) = &backup {
 			// rebuild a display path from the operand for the verbose message.
 			let backup_display = backup_display(to, path);
@@ -884,20 +921,36 @@ fn is_refusal(error: &io::Error) -> bool {
 }
 
 /// A wrapper around `rename`, so that if it fails, we try falling back on
-/// copying and removing.
+/// copying and removing, with nothing reported. Returns whether the move
+/// copied. mv moves an existing file aside to its backup name with it.
 fn rename_with_fallback(
 	host: &mut Host,
 	from: &Path,
 	to: &Path,
 	display_manager: Option<&MultiProgress>,
 	copier: &mut MoveCopier,
-) -> io::Result<()> {
+) -> io::Result<bool> {
+	move_entry(host, from, to, display_manager, copier, None)
+}
+
+/// [`rename_with_fallback`], reporting a copy under `report` (`-v`, with the
+/// backup the move made, if any) as GNU mv reports it: `copied 'from' ->
+/// 'to'` before a file's copy, `created directory` and `copied` lines for a
+/// directory's, then rm's `removed` lines.
+fn move_entry(
+	host: &mut Host,
+	from: &Path,
+	to: &Path,
+	display_manager: Option<&MultiProgress>,
+	copier: &mut MoveCopier,
+	report: Option<Option<&Path>>,
+) -> io::Result<bool> {
 	let filesystem = host.fs().clone();
 	let from_fs = host.resolve(from);
 	let to_fs = host.resolve(to);
 
 	let Err(err) = filesystem.rename(&from_fs, &to_fs) else {
-		return Ok(());
+		return Ok(false);
 	};
 	// We will only copy if:
 	// 1. Files are on different devices or filesystem providers (EXDEV error)
@@ -950,6 +1003,27 @@ fn rename_with_fallback(
 		filesystem.remove_file(&to_fs)?;
 	}
 
+	if let Some(backup) = report
+		&& !file_type.is_dir()
+	{
+		let message = match backup {
+			Some(backup) => format!(
+				"copied {} -> {} (backup: {})",
+				from.quote(),
+				to.quote(),
+				backup_display(to, backup).quote()
+			),
+			None => format!("copied {} -> {}", from.quote(), to.quote()),
+		};
+		match display_manager {
+			Some(pb) => pb.suspend(|| {
+				let _ = writeln!(host.stdout, "{message}");
+			}),
+			None => {
+				let _ = writeln!(host.stdout, "{message}");
+			},
+		}
+	}
 	match copier.copy(host, from, to, metadata, display_manager) {
 		Ok(()) => {},
 		Err(CpError::IoErr(error) | CpError::IoErrContext(error, _)) => return Err(describe(error)),
@@ -961,27 +1035,38 @@ fn rename_with_fallback(
 	}
 
 	if file_type.is_dir() {
-		remove_moved_tree(host, from, &from_fs)
+		remove_tree(host, from, &from_fs, report.is_some())?;
 	} else {
-		filesystem.remove_file(&from_fs).map_err(describe)
+		filesystem.remove_file(&from_fs).map_err(describe)?;
+		if report.is_some() {
+			let _ = writeln!(host.stdout, "removed {}", from.quote());
+		}
 	}
+	Ok(true)
 }
 
 /// Removes the tree at `path` (resolved: `fs_path`) that a move across
 /// filesystems replaces or copied: a symlink is removed itself, and a
 /// directory with everything in it. A native Unix tree goes through rm's own
-/// descriptor walk ([`crate::rm::remove_quietly`]), as GNU mv removes with
+/// descriptor walk ([`crate::rm::remove_moved`]), as GNU mv removes with
 /// rm's code: it opens each directory as the one `lstat` found, following no
 /// symlink, on every kernel. `std::fs::remove_dir_all` trusts `O_DIRECTORY |
 /// O_NOFOLLOW`, which gVisor before release-20261109.0 follows. rm reports
-/// its own errors, so a failure here is [`Reported`].
+/// its own errors, so a failure here is [`Reported`]. Nothing else is
+/// reported: mv removes a replaced destination with it.
 fn remove_moved_tree(host: &mut Host, path: &Path, fs_path: &Path) -> io::Result<()> {
+	remove_tree(host, path, fs_path, false)
+}
+
+/// [`remove_moved_tree`], saying `removed` for each entry of a native tree
+/// under `verbose`, as GNU's mv does through rm's code.
+fn remove_tree(host: &mut Host, path: &Path, fs_path: &Path, verbose: bool) -> io::Result<()> {
 	#[cfg(all(unix, not(target_os = "redox")))]
 	if host.fs().is_native_local(fs_path) {
-		return if crate::rm::remove_quietly(host, path) { Err(io::Error::other(Reported)) } else { Ok(()) };
+		return if crate::rm::remove_moved(host, path, verbose) { Err(io::Error::other(Reported)) } else { Ok(()) };
 	}
 	#[cfg(not(all(unix, not(target_os = "redox"))))]
-	let _ = path;
+	let _ = (path, verbose);
 	host.fs().remove_dir_all(fs_path)
 }
 
@@ -1091,7 +1176,7 @@ fn prompt_overwrite(host: &mut Host, to: &Path, cached_mode: Option<u32>) -> io:
 		let _ = err.flush();
 	}
 	if !read_yes(host) {
-		return Err(io::Error::other(""));
+		return Err(io::Error::other(Reported));
 	}
 	Ok(())
 }

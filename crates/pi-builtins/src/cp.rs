@@ -94,15 +94,14 @@ struct ClobberMode {
 	remove_destination: bool,
 }
 
-/// Specifies whether files should be overwritten.
+/// Specifies whether files should be overwritten. `-n` is `--update=none`
+/// (GNU's `cp.c` sets it so after reading the options).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OverwriteMode {
 	/// [Default] Always overwrite existing files
 	Clobber(ClobberMode),
 	/// Prompt before overwriting a file
 	Interactive(ClobberMode),
-	/// Never overwrite a file
-	NoClobber,
 }
 
 /// Possible arguments for `--reflink`; clones go through
@@ -240,9 +239,9 @@ struct Options {
 	progress_bar:           bool,
 	/// `-Z`, `--context`: never copy the source's SELinux label.
 	set_selinux_context:    bool,
-	/// `mv` copying between filesystems: entries below a moved directory are
-	/// reported as renamed, and the operands are left for `mv` to report once
-	/// their sources are gone.
+	/// `mv` copying between filesystems: a moved directory and the entries
+	/// below it are reported as GNU's mv reports them (`created directory`,
+	/// `copied`), and an operand that is not a directory is left for `mv`.
 	move_mode:              bool,
 	/// The two-operand form, `cp SOURCE DEST` with `DEST` not a directory:
 	/// only there GNU turns `cp -fb a a` into a copy to the backup name
@@ -276,6 +275,7 @@ enum SparseDebug {
 	SeekHole,
 	SeekHoleZeros,
 	Unsupported,
+	Unknown,
 }
 
 /// How one file's data was copied, for `--debug`.
@@ -293,12 +293,26 @@ impl CopyDebug {
 		reflink:          OffloadReflinkDebug::Unsupported,
 		sparse_detection: SparseDebug::Unsupported,
 	};
-	/// A copy-on-write clone: the files share their storage.
+	/// A copy-on-write clone: the files share their storage. GNU looks for no
+	/// holes in a file it cloned, and says so as `unknown`.
 	const CLONED: Self = Self {
 		offload:          OffloadReflinkDebug::Unknown,
 		reflink:          OffloadReflinkDebug::Yes,
-		sparse_detection: SparseDebug::Unsupported,
+		sparse_detection: SparseDebug::Unknown,
 	};
+	/// A copy that failed before it moved any data: GNU reports what it
+	/// never reached as unknown, and a refused clone as unsupported.
+	fn failed(clone_refused: bool, reflink_mode: ReflinkMode) -> Self {
+		Self {
+			offload:          OffloadReflinkDebug::Unknown,
+			reflink:          match reflink_mode {
+				ReflinkMode::Never => OffloadReflinkDebug::No,
+				_ if clone_refused => OffloadReflinkDebug::Unsupported,
+				_ => OffloadReflinkDebug::Unknown,
+			},
+			sparse_detection: SparseDebug::Unknown,
+		}
+	}
 }
 
 impl fmt::Display for OffloadReflinkDebug {
@@ -321,6 +335,7 @@ impl fmt::Display for SparseDebug {
 			Self::SeekHole => "SEEK_HOLE",
 			Self::SeekHoleZeros => "SEEK_HOLE + zeros",
 			Self::Unsupported => "unsupported",
+			Self::Unknown => "unknown",
 		})
 	}
 }
@@ -422,14 +437,11 @@ fn show_warning(host: &mut Host, message: impl fmt::Display) {
 }
 
 fn uu_app() -> Command {
-	const MODE_ARGS: &[&str] = &[
-		options::LINK,
-		options::REFLINK,
-		options::CLONE,
-		options::SYMBOLIC_LINK,
-		options::ATTRIBUTES_ONLY,
-		options::COPY_CONTENTS,
-	];
+	// GNU's -l, -s, --attributes-only and --copy-contents set options of their
+	// own (`cp.c`): -l and -s together are refused, and a link is made with
+	// either whatever the others say. Only the two spellings of --reflink
+	// replace each other.
+	const REFLINK_ARGS: &[&str] = &[options::REFLINK, options::CLONE];
 	Command::new("cp")
 		.version("0.8.0")
 		.about("Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.")
@@ -464,7 +476,8 @@ fn uu_app() -> Command {
 		.arg(
 			Arg::new(options::TARGET_DIRECTORY)
 				.short('t')
-				.conflicts_with(options::NO_TARGET_DIRECTORY)
+				// -T with -t is refused after the operands are counted, as GNU
+				// refuses it (`cp_main`).
 				.long(options::TARGET_DIRECTORY)
 				.value_name(options::TARGET_DIRECTORY)
 				.value_hint(clap::ValueHint::DirPath)
@@ -475,7 +488,6 @@ fn uu_app() -> Command {
 			Arg::new(options::NO_TARGET_DIRECTORY)
 				.short('T')
 				.long(options::NO_TARGET_DIRECTORY)
-				.conflicts_with(options::TARGET_DIRECTORY)
 				.help("Treat DEST as a regular file and not a directory")
 				.action(ArgAction::SetTrue),
 		)
@@ -491,7 +503,6 @@ fn uu_app() -> Command {
 			Arg::new(options::LINK)
 				.short('l')
 				.long(options::LINK)
-				.overrides_with_all(MODE_ARGS)
 				.help("hard-link files instead of copying")
 				.action(ArgAction::SetTrue),
 		)
@@ -535,7 +546,6 @@ fn uu_app() -> Command {
 			Arg::new(options::SYMBOLIC_LINK)
 				.short('s')
 				.long(options::SYMBOLIC_LINK)
-				.overrides_with_all(MODE_ARGS)
 				.help("make symbolic links instead of copying")
 				.action(ArgAction::SetTrue),
 		)
@@ -558,7 +568,8 @@ fn uu_app() -> Command {
 				)
 				.action(ArgAction::SetTrue),
 		)
-		.arg(backup_control::arguments::backup())
+		// Every `--backup` is kept: a bare one keeps the control given before it.
+		.arg(backup_control::arguments::backup().action(ArgAction::Append))
 		.arg(backup_control::arguments::backup_no_args())
 		.arg(backup_control::arguments::suffix())
 		.arg(update_control::arguments::update())
@@ -567,7 +578,7 @@ fn uu_app() -> Command {
 			Arg::new(options::REFLINK)
 				.long(options::REFLINK)
 				.value_name("WHEN")
-				.overrides_with_all(MODE_ARGS)
+				.overrides_with_all(REFLINK_ARGS)
 				.require_equals(true)
 				.default_missing_value("always")
 				.value_parser(ShortcutValueParser::new(["auto", "always", "never"]))
@@ -578,14 +589,13 @@ fn uu_app() -> Command {
 			// macOS cp's spelling, which falls back to a copy like `auto`.
 			Arg::new(options::CLONE)
 				.short('c')
-				.overrides_with_all(MODE_ARGS)
+				.overrides_with_all(REFLINK_ARGS)
 				.help("clone files where the filesystem allows, else copy; same as --reflink=auto")
 				.action(ArgAction::SetTrue),
 		)
 		.arg(
 			Arg::new(options::ATTRIBUTES_ONLY)
 				.long(options::ATTRIBUTES_ONLY)
-				.overrides_with_all(MODE_ARGS)
 				.help("Don't copy the file data, just the attributes")
 				.action(ArgAction::SetTrue),
 		)
@@ -631,16 +641,13 @@ fn uu_app() -> Command {
 				.help("use full source file name under DIRECTORY")
 				.action(ArgAction::SetTrue),
 		)
+		// -P, -L, -H, -a and -d override none of each other: the last of them
+		// decides how links are followed (see `Options::from_matches`), and -a
+		// and -d keep their other parts, as GNU cp's options do.
 		.arg(
 			Arg::new(options::NO_DEREFERENCE)
 				.short('P')
 				.long(options::NO_DEREFERENCE)
-				.overrides_with_all([
-					options::DEREFERENCE,
-					options::CLI_SYMBOLIC_LINKS,
-					options::ARCHIVE,
-					options::NO_DEREFERENCE_PRESERVE_LINKS,
-				])
 				// -d sets this option
 				.help("never follow symbolic links in SOURCE")
 				.action(ArgAction::SetTrue),
@@ -649,24 +656,12 @@ fn uu_app() -> Command {
 			Arg::new(options::DEREFERENCE)
 				.short('L')
 				.long(options::DEREFERENCE)
-				.overrides_with_all([
-					options::NO_DEREFERENCE,
-					options::CLI_SYMBOLIC_LINKS,
-					options::ARCHIVE,
-					options::NO_DEREFERENCE_PRESERVE_LINKS,
-				])
 				.help("always follow symbolic links in SOURCE")
 				.action(ArgAction::SetTrue),
 		)
 		.arg(
 			Arg::new(options::CLI_SYMBOLIC_LINKS)
 				.short('H')
-				.overrides_with_all([
-					options::DEREFERENCE,
-					options::NO_DEREFERENCE,
-					options::ARCHIVE,
-					options::NO_DEREFERENCE_PRESERVE_LINKS,
-				])
 				.help("follow command-line symbolic links in SOURCE")
 				.action(ArgAction::SetTrue),
 		)
@@ -674,24 +669,12 @@ fn uu_app() -> Command {
 			Arg::new(options::ARCHIVE)
 				.short('a')
 				.long(options::ARCHIVE)
-				.overrides_with_all([
-					options::DEREFERENCE,
-					options::NO_DEREFERENCE,
-					options::CLI_SYMBOLIC_LINKS,
-					options::NO_DEREFERENCE_PRESERVE_LINKS,
-				])
 				.help("Same as -dR --preserve=all")
 				.action(ArgAction::SetTrue),
 		)
 		.arg(
 			Arg::new(options::NO_DEREFERENCE_PRESERVE_LINKS)
 				.short('d')
-				.overrides_with_all([
-					options::DEREFERENCE,
-					options::NO_DEREFERENCE,
-					options::CLI_SYMBOLIC_LINKS,
-					options::ARCHIVE,
-				])
 				.help("same as --no-dereference --preserve=links")
 				.action(ArgAction::SetTrue),
 		)
@@ -740,7 +723,6 @@ fn uu_app() -> Command {
 		.arg(
 			Arg::new(options::COPY_CONTENTS)
 				.long(options::COPY_CONTENTS)
-				.overrides_with(options::ATTRIBUTES_ONLY)
 				.help("copy contents of special files when recursive")
 				.action(ArgAction::SetTrue),
 		)
@@ -757,12 +739,6 @@ fn uu_app() -> Command {
 fn cp_main(matches: &ArgMatches, host: &mut Host) -> CopyResult<()> {
 	let mut options = Options::from_matches(matches, host)?;
 
-	if options.overwrite == OverwriteMode::NoClobber && options.backup != BackupMode::None {
-		return Err(CpError::Usage(
-			"--backup is mutually exclusive with -n or --update=none-fail".to_string(),
-		));
-	}
-
 	let paths: Vec<PathBuf> = matches
 		.get_many::<OsString>(options::PATHS)
 		.map_or_default(|values| values.map(PathBuf::from).collect());
@@ -772,7 +748,10 @@ fn cp_main(matches: &ArgMatches, host: &mut Host) -> CopyResult<()> {
 		check_target_directory(host, dir)?;
 	}
 
-	let target_type = TargetType::determine(host, &sources, &target);
+	// -T makes the last operand the destination itself, a directory too; the
+	// copy then decides what a directory there takes (`copy.c`).
+	let target_type =
+		if options.no_target_dir { TargetType::File } else { TargetType::determine(host, &sources, &target) };
 	options.two_operands = matches!(target_type, TargetType::File);
 	copy(host, &sources, &target, target_type, &options)
 }
@@ -787,11 +766,10 @@ impl ClobberMode {
 }
 
 impl OverwriteMode {
+	/// `-i`; `-n` after it, which clap lets override it, is `--update=none`.
 	fn from_matches(matches: &ArgMatches) -> Self {
 		if matches.get_flag(options::INTERACTIVE) {
 			Self::Interactive(ClobberMode::from_matches(matches))
-		} else if matches.get_flag(options::NO_CLOBBER) {
-			Self::NoClobber
 		} else {
 			Self::Clobber(ClobberMode::from_matches(matches))
 		}
@@ -921,18 +899,38 @@ impl Options {
 	fn from_matches(matches: &ArgMatches, host: &mut Host) -> CopyResult<Self> {
 		let recursive = matches.get_flag(options::RECURSIVE) || matches.get_flag(options::ARCHIVE);
 
-		let backup_mode = determine_backup_mode(matches, host).map_err(CpError::Usage)?;
-		let update_mode = update_control::determine_update_mode(matches);
-
-		if backup_mode != BackupMode::None
-			&& matches
-				.get_one::<String>(update_control::arguments::OPT_UPDATE)
-				.is_some_and(|v| v == "none" || v == "none-fail")
-		{
+		if matches.get_flag(options::LINK) && matches.get_flag(options::SYMBOLIC_LINK) {
+			return Err(CpError::Usage("cannot make both hard and symbolic links".to_string()));
+		}
+		// The last of -u and --update=WHEN decides; -n, where -i does not come
+		// after it, is --update=none whatever else was given (`cp.c`).
+		let update_mode = if matches.get_flag(options::NO_CLOBBER) {
+			UpdateMode::None
+		} else {
+			let update = matches.index_of(update_control::arguments::OPT_UPDATE);
+			let update_no_arg = matches
+				.get_flag(update_control::arguments::OPT_UPDATE_NO_ARG)
+				.then(|| matches.index_of(update_control::arguments::OPT_UPDATE_NO_ARG))
+				.flatten();
+			match (update, update_no_arg) {
+				(Some(update), Some(no_arg)) if no_arg > update => UpdateMode::IfOlder,
+				_ => update_control::determine_update_mode(matches),
+			}
+		};
+		// Any backup option, `--backup=none` too, conflicts with skipping.
+		let backup_given = [
+			backup_control::arguments::OPT_BACKUP,
+			backup_control::arguments::OPT_BACKUP_NO_ARG,
+			backup_control::arguments::OPT_SUFFIX,
+		]
+		.into_iter()
+		.any(|option| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine));
+		if backup_given && matches!(update_mode, UpdateMode::None | UpdateMode::NoneFail) {
 			return Err(CpError::Usage(
 				"--backup is mutually exclusive with -n or --update=none-fail".to_string(),
 			));
 		}
+		let backup_mode = determine_backup_mode(matches, host).map_err(CpError::Usage)?;
 
 		let backup_suffix = determine_backup_suffix(matches, host);
 
@@ -1059,20 +1057,40 @@ impl Options {
 		if reflink_mode == ReflinkMode::Always && sparse_mode != SparseMode::Auto {
 			return Err(CpError::Usage("--reflink can be used only with --sparse=auto".to_string()));
 		}
+		// `--sparse=never` turns cloning off where it was only tried (`cp.c`).
+		let reflink_mode = if reflink_mode == ReflinkMode::Auto && sparse_mode == SparseMode::Never {
+			ReflinkMode::Never
+		} else {
+			reflink_mode
+		};
+
+		// The last of -P, -d, -a (never follow), -L (always) and -H (only on
+		// the command line) decides how links are followed; none of them: the
+		// default below. `Some(None)` is -H.
+		let follow = [
+			(options::NO_DEREFERENCE, Some(false)),
+			(options::NO_DEREFERENCE_PRESERVE_LINKS, Some(false)),
+			(options::ARCHIVE, Some(false)),
+			(options::DEREFERENCE, Some(true)),
+			(options::CLI_SYMBOLIC_LINKS, None),
+		]
+		.into_iter()
+		.filter(|(option, _)| matches.get_flag(option))
+		.max_by_key(|(option, _)| matches.index_of(option))
+		.map(|(_, follow)| follow);
 
 		Ok(Self {
 			attributes_only: matches.get_flag(options::ATTRIBUTES_ONLY),
-			copy_contents: matches.get_flag(options::COPY_CONTENTS),
-			cli_dereference: matches.get_flag(options::CLI_SYMBOLIC_LINKS),
+			// GNU reads special files as files only with -R (`copy_as_regular`).
+			copy_contents: recursive && matches.get_flag(options::COPY_CONTENTS),
+			cli_dereference: follow == Some(None),
 			copy_mode,
-			// No dereference is set with -P, -d and --archive
-			dereference: !(matches.get_flag(options::NO_DEREFERENCE)
-				|| matches.get_flag(options::NO_DEREFERENCE_PRESERVE_LINKS)
-				|| matches.get_flag(options::ARCHIVE)
-				// cp normally follows the link only when not copying recursively or when
-				// --link (-l) is used
-				|| (recursive && copy_mode != CopyMode::Link))
-				|| matches.get_flag(options::DEREFERENCE),
+			dereference: match follow {
+				Some(always) => always.unwrap_or(false),
+				// cp normally follows the link only when not copying recursively
+				// or when --link (-l) is used
+				None => !(recursive && copy_mode != CopyMode::Link),
+			},
 			one_file_system: matches.get_flag(options::ONE_FILE_SYSTEM),
 			parents: matches.get_flag(options::PARENTS),
 			update: update_mode,
@@ -1156,6 +1174,11 @@ struct CopyState {
 	/// them skip straight to copying the data.
 	#[cfg(any(target_os = "linux", target_os = "android", windows))]
 	clone_unsupported:   FxHashSet<u64>,
+	/// The host file the copy in progress wrote, by a descriptor of its own:
+	/// its owner, mode and times are set through it, as GNU sets them with
+	/// `fchown`, `fchmod` and `futimens` on the descriptor it wrote, so a name
+	/// swapped for a link after the write cannot send them elsewhere.
+	written:             Option<std::fs::File>,
 }
 
 impl CopyState {
@@ -1183,7 +1206,8 @@ pub(crate) struct MoveCopier {
 }
 
 impl MoveCopier {
-	/// `verbose` reports each entry below a moved directory as renamed.
+	/// `verbose` reports a moved directory and each entry below it as GNU's mv
+	/// does: `created directory` for a directory, `copied` for anything else.
 	pub(crate) fn new(verbose: bool) -> Self {
 		Self {
 			options: Options {
@@ -1272,9 +1296,14 @@ fn parse_path_args(mut paths: Vec<PathBuf>, options: &Options) -> CopyResult<(Ve
 		)));
 	}
 
+	if options.no_target_dir && options.target_dir.is_some() {
+		return Err(CpError::Error(
+			"cannot combine --target-directory (-t) and --no-target-directory (-T)".to_string(),
+		));
+	}
 	// Return an error if the user requested to copy more than one
 	// file source to a file target
-	if options.no_target_dir && options.target_dir.is_none() && paths.len() > 2 {
+	if options.no_target_dir && paths.len() > 2 {
 		return Err(CpError::Usage(format!("extra operand {}", paths[2].quote())));
 	}
 
@@ -1361,7 +1390,8 @@ fn copy(
 	} else {
 		sources
 	};
-	if options.parents && !host.fs().is_dir(host.resolve(target)) {
+	// -T says the destination is not a directory (`do_copy`).
+	if options.parents && (options.no_target_dir || !host.fs().is_dir(host.resolve(target))) {
 		return Err(CpError::Usage("with --parents, the destination must be a directory".to_string()));
 	}
 
@@ -1480,13 +1510,6 @@ fn construct_dest_path(
 	options: &Options,
 ) -> CopyResult<PathBuf> {
 	let target_is_dir = host.fs().is_dir(host.resolve(target));
-	if options.no_target_dir && target_is_dir {
-		return Err(CpError::Error(format!(
-			"cannot overwrite directory {} with non-directory {}",
-			target.quote(),
-			source.quote()
-		)));
-	}
 
 	Ok(match target_type {
 		TargetType::Directory => {
@@ -1525,9 +1548,7 @@ fn copy_source(
 	}
 
 	let dest = dest?;
-	if options.parents {
-		make_parent_dirs(host, state, source, &dest, options)?;
-	}
+	let created = if options.parents { make_parent_dirs(host, state, source, &dest, options)? } else { Vec::new() };
 	let result = copy_file(host, state, source, &dest, options, true, None);
 	if options.parents {
 		for (x, y) in aligned_ancestors(source, &dest) {
@@ -1535,12 +1556,16 @@ fn copy_source(
 				host.resolve(&x),
 				&CanonicalizeOptions::new(MissingHandling::Normal, ResolveMode::Physical),
 			) {
+				// A directory --parents made takes its source's mode as any
+				// directory cp makes does, after the ownership was set (GNU's
+				// `re_protect`).
+				let fresh = created.contains(&y);
 				copy_attributes(
 					host,
 					&src,
 					&y,
 					&options.attributes,
-					false,
+					fresh,
 					true,
 					options.set_selinux_context,
 					None,
@@ -1602,17 +1627,17 @@ fn interactive_prompt(host: &Host, path: &Path, clobber: ClobberMode) -> String 
 impl OverwriteMode {
 	fn verify(self, host: &mut Host, path: &Path, debug: bool) -> CopyResult<()> {
 		match self {
-			Self::NoClobber => {
-				if debug {
-					let _ = writeln!(host.stdout, "skipped {}", path.quote());
-				}
-				Err(CpError::Skipped(false))
-			},
 			Self::Interactive(clobber) => {
 				let prompt = interactive_prompt(host, path, clobber);
 				let _ = write!(host.stderr, "{}: {prompt} ", Cp::NAME);
 				let _ = host.stderr.flush();
-				read_yes(host).ok_or(CpError::Skipped(true))
+				read_yes(host).ok_or_else(|| {
+					// GNU's `--debug` names a destination `-i` kept.
+					if debug {
+						let _ = writeln!(host.stdout, "skipped {}", path.quote());
+					}
+					CpError::Skipped(true)
+				})
 			},
 			Self::Clobber(_) => Ok(()),
 		}
@@ -1668,15 +1693,29 @@ fn preserve_via(
 	}
 }
 
-/// Copies extended attributes (xattrs) from `source` to `dest`, making a
-/// read-only `dest` temporarily user-writable so the attributes can be set.
-/// A source without any leaves `dest` untouched.
+/// Copies extended attributes (xattrs) from `source` to `dest`. A source
+/// without any leaves `dest` untouched.
+///
+/// The file the copy wrote (`written`) gets them through its descriptor, as
+/// GNU's `attr_copy_fd`, before its final mode (see [`copy_attributes`]). A
+/// new file cp made is owner-writable then; a file of cp's own that is not
+/// (a clone macOS's `clonefile` gives a read-only source's mode) is made
+/// owner-writable through its descriptor for them and given its mode back,
+/// as GNU's `copy_reg` gives the file it creates the owner's write bit for
+/// the same reason. A file another user owns, which cp writes through its
+/// group or other bits, is left as it is, as GNU leaves it. A destination
+/// cp did not open (a directory, a provider's file) that is read-only is
+/// made user-writable by name for them, and read-only again. Neither is
+/// needed with an owner's privileges, which need no write bit. A failure to
+/// give a mode back is reported only where setting the attributes did not
+/// fail first.
 fn copy_extended_attrs(
 	filesystem: &BlockingFs,
 	source: &Path,
 	dest: &Path,
 	follow_source: bool,
 	skip_selinux: bool,
+	written: Option<&std::fs::File>,
 ) -> io::Result<()> {
 	let mut names = filesystem.list_xattr(source, follow_source)?;
 	// With -Z the destination gets the default context instead.
@@ -1687,29 +1726,93 @@ fn copy_extended_attrs(
 		return Ok(());
 	}
 
-	let metadata = filesystem.symlink_metadata(dest)?;
-
-	let mut permissions = metadata.permissions();
-	let was_readonly = !metadata.is_symlink() && permissions.readonly();
-	if was_readonly {
+	let readonly = if written.is_none() && !owner_privileges() {
+		let metadata = filesystem.symlink_metadata(dest)?;
+		Some(metadata.permissions()).filter(|permissions| !metadata.is_symlink() && permissions.readonly())
+	} else {
+		None
+	};
+	if let Some(mut permissions) = readonly.clone() {
 		permissions.set_readonly(false);
 		filesystem.set_permissions(dest, permissions)?;
 	}
+	// The attributes are tried also where the write bit cannot be given; the
+	// mode is given back only where it was.
+	let written_mode = match written {
+		Some(file) if !owner_privileges() => owned_read_only_mode(file)?,
+		_ => None,
+	}
+	.filter(|mode| written.is_some_and(|file| set_handle_mode(file, mode | 0o200).is_ok()));
 
 	let copied = names.iter().try_for_each(|name| {
 		match filesystem.get_xattr(source, name, follow_source)? {
-			Some(value) => filesystem.set_xattr(dest, name, &value, false),
+			Some(value) => match written.and_then(|file| set_handle_xattr(file, name, &value)) {
+				Some(set) => set,
+				None => filesystem.set_xattr(dest, name, &value, false),
+			},
 			None => Ok(()),
 		}
 	});
 
-	if was_readonly {
-		let mut permissions = filesystem.symlink_metadata(dest)?.permissions();
-		permissions.set_readonly(true);
-		filesystem.set_permissions(dest, permissions)?;
+	let mut restored = Ok(());
+	if readonly.is_some() {
+		restored = filesystem.symlink_metadata(dest).and_then(|metadata| {
+			let mut permissions = metadata.permissions();
+			permissions.set_readonly(true);
+			filesystem.set_permissions(dest, permissions)
+		});
+	}
+	if let (Some(file), Some(mode)) = (written, written_mode) {
+		restored = restored.and(set_handle_mode(file, mode));
 	}
 
-	copied
+	copied.and(restored)
+}
+
+/// The permission bits of the host file `file`, read through its descriptor,
+/// where the file is cp's own and its owner may not write it; `None`
+/// otherwise. Off Unix, 0444 for a read-only file.
+fn owned_read_only_mode(file: &std::fs::File) -> io::Result<Option<u32>> {
+	let metadata = file.metadata()?;
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		let own = metadata.uid() == nix::unistd::geteuid().as_raw();
+		Ok(Some(metadata.mode() & 0o7777).filter(|mode| own && mode & 0o200 == 0))
+	}
+	#[cfg(not(unix))]
+	{
+		Ok(metadata.permissions().readonly().then_some(0o444))
+	}
+}
+
+/// Sets the extended attribute `name` of the host file `file` through its
+/// descriptor (`fsetxattr`), as GNU's `attr_copy_fd` does; `None` where the
+/// platform has no such call, for the caller to set it by name.
+fn set_handle_xattr(file: &std::fs::File, name: &std::ffi::OsStr, value: &[u8]) -> Option<io::Result<()>> {
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+	{
+		use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+
+		let name = match std::ffi::CString::new(name.as_bytes()) {
+			Ok(name) => name,
+			Err(error) => return Some(Err(io::Error::from(error))),
+		};
+		// SAFETY: the descriptor is borrowed from a live file, `name` is
+		// NUL-terminated, and `value` is valid for `value.len()` bytes; the
+		// kernel retains none of them.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+		// SAFETY: as above; position 0 and no options.
+		#[cfg(target_os = "macos")]
+		let set = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) };
+		Some(if set == 0 { Ok(()) } else { Err(io::Error::last_os_error()) })
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+	{
+		let _ = (file, name, value);
+		None
+	}
 }
 
 /// Copy the specified attributes from one path to another. `follow_source`
@@ -1727,19 +1830,39 @@ fn copy_attributes(
 	follow_source: bool,
 	skip_selinux_xattr: bool,
 	source_metadata: Option<&Metadata>,
-	dest_facts: DestFacts,
+	dest_facts: DestFacts<'_>,
 ) -> CopyResult<()> {
+	let filesystem = host.fs().clone();
+	// A link the copy wrote through: its attributes go to the file it leads
+	// to, as GNU sets them on the descriptor it wrote.
+	let resolved = host.resolve(dest);
+	let dest_fs = if dest_facts.through {
+		filesystem.canonicalize(&resolved).unwrap_or(resolved)
+	} else {
+		resolved
+	};
+	// A new file's final mode, where no preserved mode sets it; set after
+	// its owner, so the group and other bits left out until then are not
+	// given to the user who runs cp (GNU's `copy_reg`). Like GNU, an error
+	// setting it is not reported.
+	let set_then_mode = |filesystem: &BlockingFs, dest_fs: &Path| {
+		if let Some(mode) = dest_facts.then_mode {
+			let _ = match dest_facts.written {
+				Some(file) => set_handle_mode(file, mode),
+				None => filesystem.set_permissions(dest_fs, Permissions::from_mode(mode)),
+			};
+		}
+	};
 	// Plain `cp`/`cp -r` preserves nothing: skip the stats below. A freshly
 	// created directory always gets its mode set, one way or the other.
 	let preserves_nothing = [attributes.ownership, attributes.mode, attributes.timestamps, attributes.xattr]
 		.iter()
 		.all(|preserve| matches!(preserve, Preserve::No { .. }));
 	if preserves_nothing && !dest_is_freshly_created_dir {
+		set_then_mode(&filesystem, &dest_fs);
 		return Ok(());
 	}
-	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
-	let dest_fs = host.resolve(dest);
 	let fetched;
 	let source_metadata = match source_metadata {
 		Some(metadata) => metadata,
@@ -1753,9 +1876,12 @@ fn copy_attributes(
 			&fetched
 		},
 	};
-	let dest_is_symlink = dest_facts
-		.symlink
-		.unwrap_or_else(|| filesystem.is_symlink(&dest_fs));
+	// The file the copy wrote, held open, is never a link, whatever the name
+	// now holds (a link the copy wrote through, or one put in its place).
+	let dest_is_symlink = dest_facts.written.is_none()
+		&& dest_facts
+			.symlink
+			.unwrap_or_else(|| filesystem.is_symlink(&dest_fs));
 	// As in GNU, an owner or mode `dest` already has is not set again.
 	let source_owner = source_metadata.uid().zip(source_metadata.gid());
 	let chowns = matches!(attributes.ownership, Preserve::Yes { .. })
@@ -1774,6 +1900,9 @@ fn copy_attributes(
 		attributes.mode
 	};
 
+	// The seam where a test reads the file's mode before its owner is set.
+	#[cfg(test)]
+	crate::host::run_hook(&dest_fs);
 	// Ownership must be changed first to avoid interfering with mode change.
 	handle_preserve(host, attributes.ownership, || {
 		// A provider without owners has nothing to carry over.
@@ -1781,38 +1910,72 @@ fn copy_attributes(
 			return Ok(());
 		};
 		// GNU cp doesn't report a failure to set the ownership, and falls back
-		// to changing only the group.
-		if filesystem.chown(&dest_fs, Some(uid), Some(gid), false).is_err() {
-			let _ = filesystem.chown(&dest_fs, None, Some(gid), false);
+		// to changing only the group. The file the copy wrote is changed
+		// through its descriptor, as GNU's `fchown`.
+		let chown = |uid: Option<u32>, gid: Option<u32>| match dest_facts.written {
+			Some(file) => chown_handle(file, uid, gid),
+			None => filesystem.chown(&dest_fs, uid, gid, !dest_is_symlink),
+		};
+		if chown(Some(uid), Some(gid)).is_err() {
+			let _ = chown(None, Some(gid));
 		}
 		Ok(())
 	})?;
 
-	handle_preserve(host, mode, || {
-		// chmod cannot change a symbolic link, and every link has the same
-		// permissions anyway.
-		if !dest_is_symlink && !mode_in_place {
-			set_mode(&filesystem, &dest_fs, dest, source_metadata.permissions())?;
-		}
-		Ok(())
-	})?;
+	// The extended attributes go before the mode, as GNU's `copy_reg` copies
+	// them (after the owner, before the final mode): a new file is still
+	// writable then, so a read-only final mode needs no toggle around them.
+	// For a file whose data the copy wrote (a provider's too), a failure to
+	// set them is reported after the mode and the times are set, as GNU's
+	// `copy_reg` records it and goes on; a directory, a symbolic link or a
+	// special file made anew gets no mode past it, as GNU's `copy_internal`
+	// returns there, and only its times (GNU sets them first).
+	let xattrs = handle_preserve(host, attributes.xattr, || {
+		copy_extended_attrs(&filesystem, &source_fs, &dest_fs, follow_source, skip_selinux_xattr, dest_facts.written)
+			.map_err(|e| CpError::IoErrContext(e, format!("setting attributes for {}", dest.quote())))
+	});
+	if !dest_facts.stops_at_attributes || xattrs.is_ok() {
+		set_then_mode(&filesystem, &dest_fs);
 
-	// A directory is created with a restrictive mode (see `build_dir`); when
-	// its mode is not preserved it ends up with the default one.
-	if dest_is_freshly_created_dir && mode_explicitly_disabled {
-		let umask = host.umask();
-		handle_preserve(host, Preserve::Yes { required: false }, || {
-			set_mode(&filesystem, &dest_fs, dest, Permissions::from_mode(0o777 & !umask))
-		})?;
+		handle_preserve(host, mode, || {
+			// The seam where a test makes the mode fail.
+			#[cfg(all(test, unix))]
+			crate::host::fault(&dest_fs)
+				.map_err(|e| CpError::IoErrContext(e, format!("preserving permissions for {}", dest.quote())))?;
+			// chmod cannot change a symbolic link, and every link has the same
+			// permissions anyway.
+			if !dest_is_symlink && !mode_in_place {
+				set_mode(&filesystem, &dest_fs, dest, source_metadata.permissions(), dest_facts.written)?;
+			}
+			Ok(())
+		})
+		.map_err(|later| after_xattrs(host, &xattrs, later))?;
+
+		// A directory is created with a restrictive mode (see `build_dir`);
+		// when its mode is not preserved it ends up with the default one.
+		if dest_is_freshly_created_dir && mode_explicitly_disabled {
+			let umask = host.umask();
+			handle_preserve(host, Preserve::Yes { required: false }, || {
+				set_mode(&filesystem, &dest_fs, dest, Permissions::from_mode(0o777 & !umask), None)
+			})?;
+		}
 	}
 
 	handle_preserve(host, attributes.timestamps, || {
 		let times_error =
 			|e| CpError::IoErrContext(e, format!("preserving times for {}", dest.quote()));
-		let accessed = FileTime::from(source_metadata.accessed().ok());
-		let modified = FileTime::from(source_metadata.modified().map_err(times_error)?);
+		let accessed_at = source_metadata.accessed().ok();
+		let modified_at = source_metadata.modified().map_err(times_error)?;
+		let (accessed, modified) = (FileTime::from(accessed_at), FileTime::At(modified_at));
 		if dest_is_symlink {
 			filesystem.set_times(&dest_fs, accessed, modified, false)
+		} else if let Some(file) = dest_facts.written {
+			// GNU's `futimens` on the descriptor it wrote.
+			let times = std::fs::FileTimes::new().set_modified(modified_at);
+			file.set_times(match accessed_at {
+				Some(accessed_at) => times.set_accessed(accessed_at),
+				None => times,
+			})
 		} else {
 			preserve_via(
 				&filesystem,
@@ -1822,14 +1985,18 @@ fn copy_attributes(
 			)
 		}
 		.map_err(times_error)
-	})?;
+	})
+	.map_err(|later| after_xattrs(host, &xattrs, later))?;
+	xattrs
+}
 
-	handle_preserve(host, attributes.xattr, || {
-		copy_extended_attrs(&filesystem, &source_fs, &dest_fs, follow_source, skip_selinux_xattr)
-			.map_err(|e| CpError::IoErrContext(e, format!("setting attributes for {}", dest.quote())))
-	})?;
-
-	Ok(())
+/// `later`, with the attributes' failure `xattrs` reported first, as GNU
+/// reports both.
+fn after_xattrs(host: &mut Host, xattrs: &CopyResult<()>, later: CpError) -> CpError {
+	if let Err(attributes) = xattrs {
+		show_error_if_needed(host, attributes);
+	}
+	later
 }
 
 /// Sets the permissions of `dest` (resolved as `dest_fs`), for attribute
@@ -1839,14 +2006,49 @@ fn set_mode(
 	dest_fs: &Path,
 	dest: &Path,
 	permissions: Permissions,
+	written: Option<&std::fs::File>,
 ) -> CopyResult<()> {
-	preserve_via(
-		filesystem,
-		dest_fs,
-		|filesystem, path| filesystem.set_permissions(path, permissions),
-		|file| file.set_permissions(permissions),
-	)
+	match written {
+		// GNU's `fchmod` on the descriptor it wrote.
+		Some(file) => set_handle_mode(file, permissions.mode()),
+		None => preserve_via(
+			filesystem,
+			dest_fs,
+			|filesystem, path| filesystem.set_permissions(path, permissions),
+			|file| file.set_permissions(permissions),
+		),
+	}
 	.map_err(|e| CpError::IoErrContext(e, format!("preserving permissions for {}", dest.quote())))
+}
+
+/// Sets the permission bits of the host file `file` through its descriptor
+/// (`fchmod`); off Unix only whether it is read-only.
+fn set_handle_mode(file: &std::fs::File, mode: u32) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt as _;
+		file.set_permissions(std::fs::Permissions::from_mode(mode))
+	}
+	#[cfg(not(unix))]
+	{
+		let mut permissions = file.metadata()?.permissions();
+		permissions.set_readonly(mode & 0o222 == 0);
+		file.set_permissions(permissions)
+	}
+}
+
+/// Sets the owner and group of the host file `file` through its descriptor
+/// (`fchown`); a platform without owners has none to set.
+fn chown_handle(file: &std::fs::File, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::fchown(file, uid, gid)
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (file, uid, gid);
+		Ok(())
+	}
 }
 
 /// Creates the symlink `dest` pointing at the literal `target`; `replace`
@@ -2102,28 +2304,31 @@ fn copy_into_backup(
 	let mode = source_metadata.permissions().mode() & 0o777;
 	let create = |at: &Path| filesystem.open_with(at, OpenOptions::new().write(true).create_new(true).mode(mode));
 	let existing = filesystem.symlink_metadata(backup);
+	// GNU refuses a link at `a~` that leads to a directory or nowhere, and
+	// reports any other failure to read where it leads (`cannot stat`), with
+	// or without `--attributes-only`.
+	if existing.as_ref().is_ok_and(Metadata::is_symlink) {
+		match filesystem.metadata(backup) {
+			Ok(target) if target.is_dir() => return Err(overwrite_directory(&shown, source)),
+			Err(error) if !is_symlink_loop(&filesystem, backup) => {
+				if error.kind() != io::ErrorKind::NotFound {
+					return Err(CpError::IoErrContext(error, format!("cannot stat {}", shown.quote())));
+				}
+				if host.var("POSIXLY_CORRECT").is_none() {
+					return Err(CpError::Error(format!(
+						"not writing through dangling symlink {}",
+						shown.quote()
+					)));
+				}
+			},
+			_ => {},
+		}
+	}
 	let (file, temp) = match &existing {
 		// With `--attributes-only` no data is written, so the link at `a~` is
 		// followed as GNU follows it (its target's data stays); otherwise the
 		// link is replaced, where GNU writes the source's data into its target.
 		Ok(metadata) if metadata.is_symlink() && !options.attributes_only => {
-			match filesystem.metadata(backup) {
-				Ok(target) if target.is_dir() => return Err(overwrite_directory(&shown, source)),
-				// GNU refuses a link that leads nowhere, and reports any other
-				// failure to read where a link leads (`cannot stat`).
-				Err(error) if !is_symlink_loop(&filesystem, backup) => {
-					if error.kind() != io::ErrorKind::NotFound {
-						return Err(CpError::IoErrContext(error, format!("cannot stat {}", shown.quote())));
-					}
-					if host.var("POSIXLY_CORRECT").is_none() {
-						return Err(CpError::Error(format!(
-							"not writing through dangling symlink {}",
-							shown.quote()
-						)));
-					}
-				},
-				_ => {},
-			}
 			let mut created = None;
 			for temp in names_beside(backup) {
 				match create(&temp) {
@@ -2218,47 +2423,6 @@ fn copy_into_backup(
 		Some(&source_metadata),
 		DestFacts { symlink: Some(false), ..DestFacts::default() },
 	)
-}
-
-/// GNU's error where the rename that makes a backup did nothing (the backup
-/// name is another link of `dest`'s own file) and its create of `dest` then
-/// finds `dest` there; `None` where GNU's `-f` replaces `dest` instead, as it
-/// does with a link.
-fn create_refused(
-	filesystem: &BlockingFs,
-	source: &Path,
-	source_fs: &Path,
-	dest: &Path,
-	options: &Options,
-	source_in_command_line: bool,
-) -> Option<CpError> {
-	let exists = |what: String| Some(CpError::Error(format!("{what}: File exists")));
-	let link = |what: String| if options.unlink_after_failed_open() { None } else { exists(what) };
-	match options.copy_mode {
-		// GNU replaces the destination with a hard link where `-f` or `-i`
-		// lets it unlink one (`copy.c`), and a symbolic link only under `-f`.
-		CopyMode::Link if matches!(options.overwrite, OverwriteMode::Interactive(_)) => None,
-		CopyMode::Link => link(format!("cannot create hard link {} to {}", dest.quote(), source.quote())),
-		CopyMode::SymLink => link(format!("cannot create symbolic link {} to {}", dest.quote(), source.quote())),
-		CopyMode::AttrOnly => exists(format!("cannot create regular file {}", dest.quote())),
-		CopyMode::Copy => {
-			let read = if options.dereference(source_in_command_line) {
-				filesystem.metadata(source_fs)
-			} else {
-				filesystem.symlink_metadata(source_fs)
-			};
-			let file_type = read.map(|metadata| metadata.file_type()).ok();
-			let special = options.recursive && !options.copy_contents;
-			match file_type {
-				Some(kind) if kind.is_symlink() => link(format!("cannot create symbolic link {}", dest.quote())),
-				Some(kind) if special && kind.is_fifo() => exists(format!("cannot create fifo {}", dest.quote())),
-				Some(kind) if special && (kind.is_char_device() || kind.is_block_device() || kind.is_socket()) => {
-					exists(format!("cannot create special file {}", dest.quote()))
-				},
-				_ => exists(format!("cannot create regular file {}", dest.quote())),
-			}
-		},
-	}
 }
 
 /// The identity of `path`, when its filesystem reports one.
@@ -2430,7 +2594,7 @@ fn is_forbidden_to_copy_to_same_file(
 		{
 			return true;
 		}
-		if source_is_symlink && !options.dereference {
+		if source_is_symlink && !options.dereference(source_in_command_line) {
 			return false;
 		}
 		if dest_is_symlink {
@@ -2463,13 +2627,28 @@ fn is_forbidden_to_copy_to_same_file(
 	if options.copy_mode == CopyMode::SymLink && dest_is_symlink {
 		return false;
 	}
+	// A special file -R makes again (no `--copy-contents`) reads the
+	// destination with lstat, as GNU's `use_lstat` does: a link there is
+	// another file, whatever it leads to.
+	// Only where cp follows links (-H, -L) does it compare that link with the
+	// source; never following, a link there to the source is the same file.
+	if dest_is_symlink
+		&& options.recursive
+		&& !options.copy_contents
+		&& options.dereference(source_in_command_line)
+		&& filesystem
+			.metadata(source_fs)
+			.is_ok_and(|metadata| is_stream(&metadata) || metadata.file_type().is_socket())
+	{
+		return false;
+	}
 	// If source and dest are both the same symlink but with different names,
 	// then allow the copy. This can occur, for example, if source and dest are
 	// both hardlinks to the same symlink.
 	if dest_is_symlink
 		&& source_is_symlink
 		&& file_name(source) != file_name(dest)
-		&& !options.dereference
+		&& !options.dereference(source_in_command_line)
 	{
 		return false;
 	}
@@ -2492,14 +2671,24 @@ fn handle_existing_dest(
 	options: &Options,
 	source_in_command_line: bool,
 	own_backup: Option<&Path>,
+	dest_by_lstat: bool,
 ) -> CopyResult<(Option<PathBuf>, bool)> {
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
 	let dest_fs = host.resolve(dest);
 	let asked_about = match own_backup {
 		// GNU asks about the backup name only where `stat` of it succeeds
-		// (`copy.c`): a link to nothing there is a new destination.
-		Some(backup) => filesystem.metadata(backup).is_ok().then(|| backup_display(dest, backup)),
+		// (`copy.c`): a link to nothing there is a new destination. Under
+		// `--remove-destination` it reads the name with `lstat`, so any link
+		// there, even one to itself, is asked about.
+		Some(backup) => {
+			let there = if options.remove_destination() {
+				filesystem.symlink_metadata(backup).is_ok()
+			} else {
+				filesystem.metadata(backup).is_ok()
+			};
+			there.then(|| backup_display(dest, backup))
+		},
 		None => Some(dest.to_path_buf()),
 	};
 	if options.update == UpdateMode::None
@@ -2515,6 +2704,20 @@ fn handle_existing_dest(
 		&& let Some(path) = &asked_about
 	{
 		options.overwrite.verify(host, path, options.debug)?;
+	}
+	// A directory at the destination, as GNU reads it, takes no
+	// non-directory: GNU refuses it once `-u` compared and `-i` asked, unless
+	// a backup is asked for. It backs up no directory in copy mode, so the
+	// create then fails on it (`copy.c`).
+	if own_backup.is_none() && !options.move_mode {
+		let existing =
+			if dest_by_lstat { filesystem.symlink_metadata(&dest_fs) } else { filesystem.metadata(&dest_fs) };
+		if existing.is_ok_and(|metadata| metadata.is_dir()) {
+			if options.backup == BackupMode::None {
+				return Err(overwrite_directory(dest, source));
+			}
+			return Ok((None, false));
+		}
 	}
 	if loses_the_followed_source(&filesystem, source, dest, &source_fs, &dest_fs, options, source_in_command_line) {
 		return Err(CpError::Error(if options.copy_mode == CopyMode::Link {
@@ -2599,16 +2802,12 @@ fn handle_existing_dest(
 		}
 		// GNU renames the destination to the backup name, and the copy then
 		// makes a new destination. Where the backup name is another link of
-		// the destination's own file the rename does nothing, and GNU's
-		// create of the destination then finds it: a regular file or a FIFO
-		// fails, a link fails without `-f` and with it replaces the
-		// destination. This fails as GNU does, before anything changes.
-		if paths_refer_to_same_file(&filesystem, &dest_fs, backup, false)
-			&& let Some(refused) =
-				create_refused(&filesystem, source, &source_fs, dest, options, source_in_command_line)
-		{
-			return Err(refused);
-		}
+		// the destination's own file, Linux's rename does nothing and the
+		// create then meets the name (`copy_file` takes it as new after the
+		// backup, as GNU does: a file fails, a copied link replaces it only
+		// under `-f`, and the backup is put back); gVisor's overlay removes the
+		// name, and the copy makes it. Either way the answer is GNU's for the
+		// kernel the copy runs on.
 		filesystem
 			.rename(&dest_fs, backup)
 			.map_err(|e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote())))?;
@@ -2619,6 +2818,36 @@ fn handle_existing_dest(
 	}
 
 	Ok((backup, false))
+}
+
+/// Puts the backup `handle_existing_dest` made (`backup`, a filesystem path)
+/// back under the destination's name after cp failed to create the
+/// destination with `error`, as GNU's `un_backup` does (`copy.c`): `b` keeps
+/// its name and its data, and a file the failed copy left at `b` is replaced.
+/// Returns the error to report. Where the rename back fails too, GNU reports
+/// the copy's error first and then `cannot un-backup`, so both are reported
+/// here, in that order, and an already reported failure is returned.
+fn un_backup(host: &mut Host, options: &Options, dest: &Path, backup: &Path, error: CpError) -> CpError {
+	let dest_fs = host.resolve(dest);
+	let renamed = host.fs().rename(backup, &dest_fs);
+	match renamed {
+		Ok(_) => {
+			if options.verbose {
+				let _ = writeln!(
+					host.stdout,
+					"{} -> {} (unbackup)",
+					backup_display(dest, backup).quote(),
+					dest.quote()
+				);
+			}
+			error
+		},
+		Err(rename_error) => {
+			show_error_if_needed(host, &error);
+			show_error(host, CpError::IoErrContext(rename_error, format!("cannot un-backup {}", dest.quote())));
+			CpError::NotAllFilesCopied
+		},
+	}
 }
 
 /// Deletes `dest` when it has to go before the copy can proceed and the
@@ -2654,7 +2883,6 @@ fn delete_dest_if_needed_and_allowed(
 					.is_some_and(|id| state.copied_files.contains_key(&id))
 			}
 		},
-		OverwriteMode::NoClobber => false,
 	};
 
 	if delete_dest { delete_path(host, state, dest, options) } else { Ok(()) }
@@ -2700,6 +2928,11 @@ fn removed_before_written(
 	let Ok(dest_metadata) = dest_metadata else {
 		return false;
 	};
+	// A hard link `-l` would make again to the same file is left as it is, as
+	// GNU returns before its removal (`copy.c` 9.4, lines 1758-1761).
+	if options.copy_mode == CopyMode::Link && are_hardlinks_to_same_file(filesystem, &source_fs, &dest_fs) {
+		return false;
+	}
 	let never_follows = !options.dereference && !options.cli_dereference;
 	!dest_metadata.is_dir()
 		&& (options.preserve_hard_links() && dest_metadata.nlink().is_some_and(|links| links > 1)
@@ -2771,7 +3004,8 @@ fn make_parent_dirs(
 	source: &Path,
 	dest: &Path,
 	options: &Options,
-) -> CopyResult<()> {
+) -> CopyResult<Vec<PathBuf>> {
+	let mut created = Vec::new();
 	for (x, y) in aligned_ancestors(source, dest) {
 		match host.fs().metadata(host.resolve(&y)) {
 			Ok(metadata) if metadata.is_dir() => {},
@@ -2783,14 +3017,16 @@ fn make_parent_dirs(
 				if options.verbose {
 					state.say(host, format_args!("{} -> {}", x.display(), y.display()));
 				}
+				created.push(y);
 			},
 		}
 	}
-	Ok(())
+	Ok(created)
 }
 
-/// Reports one copy for `-v`: `'source' -> 'dest'`, or `renamed 'source'
-/// -> 'dest'` for an entry below a directory `mv` moves.
+/// Reports one copy for `-v`: `'source' -> 'dest'`, or `copied 'source' ->
+/// 'dest'` for an entry below a directory `mv` moves between filesystems, as
+/// GNU's mv reports it.
 fn print_verbose_output(
 	host: &mut Host,
 	state: &CopyState,
@@ -2799,7 +3035,7 @@ fn print_verbose_output(
 	dest: &Path,
 	backup: Option<&Path>,
 ) {
-	let action = if options.move_mode { "renamed " } else { "" };
+	let action = if options.move_mode { "copied " } else { "" };
 	match backup {
 		Some(backup) => state.say(
 			host,
@@ -2861,6 +3097,9 @@ fn update_keeps(
 		UpdateMode::NoneFail => Err(CpError::Error(format!("not replacing {}", shown.quote()))),
 		UpdateMode::IfOlder => {
 			if source_metadata.modified()? <= existing.modified()? {
+				if options.debug {
+					let _ = writeln!(host.stdout, "skipped {}", shown.quote());
+				}
 				return Ok(true);
 			}
 			options.overwrite.verify(host, shown, options.debug)?;
@@ -2881,7 +3120,6 @@ fn handle_copy_mode(
 	// The lstat of `dest` just before the copy; `None` when there is none.
 	dest_metadata: Option<&Metadata>,
 	source_in_command_line: bool,
-	backed_up: bool,
 ) -> CopyResult<DestFate> {
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
@@ -2890,10 +3128,9 @@ fn handle_copy_mode(
 		CopyMode::Link => {
 			// GNU resolves a source it follows before it touches the
 			// destination, and replaces an existing destination as
-			// `force_linkat` does, where `-f` or `-i` lets it (`copy.c`) or the
-			// destination was backed up by copying: by a link made at a fresh
-			// name and renamed over it. It never removes the destination first,
-			// so `cp -lf l l` leaves `l` another link of `l`'s target.
+			// `force_linkat` does, where `-f` or `-i` lets it (`copy.c`). It
+			// never removes the destination first, so `cp -lf l l` leaves `l`
+			// another link of `l`'s target.
 			let original = if options.dereference(source_in_command_line)
 				&& filesystem.is_symlink(&source_fs)
 			{
@@ -2904,9 +3141,8 @@ fn handle_copy_mode(
 			} else {
 				source_fs
 			};
-			let replace = backed_up
-				|| options.unlink_after_failed_open()
-				|| matches!(options.overwrite, OverwriteMode::Interactive(_));
+			let replace =
+				options.unlink_after_failed_open() || matches!(options.overwrite, OverwriteMode::Interactive(_));
 			link_over(&filesystem, &dest_fs, replace, |at| filesystem.hard_link(&original, at)).map_err(|e| {
 				CpError::IoErrContext(
 					e,
@@ -2924,16 +3160,97 @@ fn handle_copy_mode(
 			symlink_file(host, state, source, dest, SymlinkKind::Auto, options.unlink_after_failed_open())?;
 		},
 		CopyMode::AttrOnly => {
-			filesystem
-				.open_with(&dest_fs, OpenOptions::new().write(true).create(true))
-				.and_then(File::close)
-				.map_err(|e| {
-					CpError::IoErrContext(e, format!("cannot create regular file {}", dest.quote()))
-				})?;
+			// GNU makes a link, and under -R without --copy-contents a FIFO,
+			// socket or device, as a copy does; it opens only a file whose data
+			// a copy would write, and writes none.
+			if source_metadata.is_symlink()
+				|| options.recursive
+					&& !options.copy_contents
+					&& (is_stream(source_metadata) || source_metadata.file_type().is_socket())
+			{
+				return copy_helper(host, state, source, dest, options, source_metadata, dest_metadata);
+			}
+			// A destination cp found nothing at, or backed up, is created with
+			// O_EXCL, as GNU's `copy_reg` creates it: a name still there (a
+			// backup rename that did nothing) fails with "File exists".
+			let mut create = OpenOptions::new();
+			create.write(true);
+			if dest_metadata.is_none() {
+				create.create_new(true);
+			} else {
+				create.create(true);
+			}
+			let cannot_create =
+				|e| CpError::IoErrContext(e, format!("cannot create regular file {}", dest.quote()));
+			let file = filesystem.open_with(&dest_fs, &create).map_err(cannot_create)?;
+			// Its attributes go through this descriptor, as GNU's do.
+			state.written = keep_written(&file, dest)?;
+			file.close().map_err(cannot_create)?;
 		},
 	}
 
 	Ok(DestFate::Kept)
+}
+
+/// A descriptor of its own for the host file `file` the copy wrote at `dest`,
+/// to set its owner, mode and times through (see `CopyState::written`); none
+/// for a provider's file. A descriptor that cannot be duplicated fails the
+/// copy rather than leaving those to be set by name.
+fn keep_written(file: &File, dest: &Path) -> CopyResult<Option<std::fs::File>> {
+	file.native()
+		.map(|file| {
+			file.try_clone().map_err(|e| {
+				CpError::IoErrContext(e, format!("cannot set the attributes of {}", dest.quote()))
+			})
+		})
+		.transpose()
+}
+
+/// Makes `link` another name of `original`, replacing what is at `link`, as
+/// GNU's `force_linkat` does for a file copied before under `--preserve=links`:
+/// a name already of that file is left; another is replaced by renaming a new
+/// link, made under a fresh temporary name beside it, over it, so it is never
+/// missing. A directory there refuses the rename. Returns whether a name was
+/// replaced, which `-v` reports as GNU does.
+fn link_replacing(filesystem: &BlockingFs, original: &Path, link: &Path) -> io::Result<bool> {
+	let error = match filesystem.hard_link(original, link) {
+		Ok(()) => return Ok(false),
+		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => error,
+		Err(error) => return Err(error),
+	};
+	let (Ok(there), Ok(wanted)) = (filesystem.symlink_metadata(link), filesystem.symlink_metadata(original)) else {
+		return Err(error);
+	};
+	if there.same_file(&wanted) {
+		return Ok(false);
+	}
+	// GNU's `try_tempname` with `CuXXXXXX`: a short random name, tried again
+	// only where one exists already.
+	let parent = link.parent().unwrap_or_else(|| Path::new(""));
+	let mut tries = 0;
+	let temp = loop {
+		let temp = parent.join(temp_link_name());
+		match filesystem.hard_link(original, &temp) {
+			Ok(()) => break temp,
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists && tries < 100 => tries += 1,
+			Err(error) => return Err(error),
+		}
+	};
+	filesystem.rename(&temp, link).inspect_err(|_| {
+		let _ = filesystem.remove_file(&temp);
+	})?;
+	Ok(true)
+}
+
+/// A fresh name for [`link_replacing`]'s temporary link: `Cu` and six random
+/// letters and digits, as GNU's.
+fn temp_link_name() -> String {
+	use rand::{RngExt as _, distr::Alphanumeric, rng};
+
+	let mut rng = rng();
+	let mut name = String::from("Cu");
+	name.extend((0..6).map(|_| char::from(rng.sample(Alphanumeric))));
+	name
 }
 
 /// What a copy did to an existing destination, which decides the
@@ -2948,36 +3265,41 @@ enum DestFate {
 	Recreated,
 	/// Created by the copy where there was none, with `mode` (permission
 	/// bits) in place when known, and owned by `owner` (uid, gid) when the
-	/// copy looked: only ownership preservation needs it.
-	Created { mode: Option<u32>, owner: Option<(u32, u32)> },
+	/// copy looked: only ownership preservation needs it. `through`: made
+	/// through a symbolic link that led nowhere (POSIXLY_CORRECT), so the
+	/// file is the one the link leads to.
+	Created { mode: Option<u32>, owner: Option<(u32, u32)>, through: bool },
 }
 
 /// What a caller knows of a destination without looking at it again.
 #[derive(Debug, Clone, Copy, Default)]
-struct DestFacts {
+struct DestFacts<'a> {
 	/// Whether it is a symlink; `None` looks.
 	symlink: Option<bool>,
 	/// Its permission bits, when this copy created it.
-	mode:    Option<u32>,
+	mode:      Option<u32>,
 	/// Its owner and group, when this copy created it and looked.
-	owner:   Option<(u32, u32)>,
+	owner:     Option<(u32, u32)>,
+	/// The mode a new file gets when no preserved mode sets it, set once its
+	/// owner is, as GNU's `copy_reg` sets it.
+	then_mode: Option<u32>,
+	/// It is a symbolic link the copy wrote through: its attributes go to
+	/// the file it leads to.
+	through:   bool,
+	/// The host file the copy wrote, by its own descriptor: its owner, mode
+	/// and times are set through it, not by its name.
+	written:   Option<&'a std::fs::File>,
+	/// It is a directory, a symbolic link or a special file made anew, not a
+	/// file whose data the copy wrote: past a failure to set its extended
+	/// attributes it gets its times but no mode, as GNU's `copy_internal`
+	/// treats what `copy_reg` did not copy.
+	stops_at_attributes: bool,
 }
 
-/// Permissions for the destination: an existing destination keeps its own;
-/// a new one gets the source's, less `--no-preserve=mode` and the umask.
-fn calculate_dest_permissions(
-	dest_metadata: Option<&Metadata>,
-	source_metadata: &Metadata,
-	options: &Options,
-	umask: u32,
-) -> Permissions {
-	match dest_metadata {
-		Some(metadata) => metadata.permissions(),
-		None => {
-			let mode = handle_no_preserve_mode(options, source_metadata.permissions().mode());
-			Permissions::from_mode(mode & !umask)
-		},
-	}
+/// The mode a new destination gets: the source's, less
+/// `--no-preserve=mode` and the umask.
+fn new_dest_mode(source_metadata: &Metadata, options: &Options, umask: u32) -> u32 {
+	handle_no_preserve_mode(options, source_metadata.permissions().mode()) & !umask
 }
 
 /// Copy the a file from `source` to `dest`. `source` will be dereferenced if
@@ -3061,15 +3383,30 @@ fn copy_file(
 			)));
 		}
 
-		if !dest_by_lstat
-			&& !filesystem.try_exists(&dest_fs).unwrap_or(false)
-			&& !is_symlink_loop(&filesystem, &dest_fs)
-			&& host.var("POSIXLY_CORRECT").is_none()
-		{
-			return Err(CpError::Error(format!(
-				"not writing through dangling symlink {}",
-				dest.quote()
-			)));
+		// A link cp writes through must lead somewhere: one to nothing is
+		// refused, and one whose target cannot be read (a directory nobody may
+		// search) is reported as GNU's `stat` of it reports it.
+		if !dest_by_lstat && !is_symlink_loop(&filesystem, &dest_fs) {
+			match filesystem.metadata(&dest_fs) {
+				Ok(_) => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {
+					if host.var("POSIXLY_CORRECT").is_none() {
+						// GNU refuses it when it opens the destination, after
+						// `-v` named the copy, and `--debug` reports it.
+						if report {
+							print_verbose_output(host, state, options, source, dest, None);
+						}
+						if options.debug && !options.attributes_only {
+							state.say(host, CopyDebug::failed(false, options.reflink_mode));
+						}
+						return Err(CpError::Error(format!(
+							"not writing through dangling symlink {}",
+							dest.quote()
+						)));
+					}
+				},
+				Err(error) => return Err(CpError::IoErrContext(error, format!("cannot stat {}", dest.quote()))),
+			}
 		}
 	}
 
@@ -3078,11 +3415,23 @@ fn copy_file(
 	// two are the same file either way (`same_file_ok`).
 	let check_existing_dest = initial_dest_metadata.is_some()
 		&& (!options.attributes_only || options.remove_destination() || options.backup != BackupMode::None);
+	// `-n` and `--update=none[-fail]` leave an existing destination, as GNU
+	// reads it, alone before anything else is decided, the same-file check
+	// too (`copy.c`).
+	if matches!(options.update, UpdateMode::None | UpdateMode::NoneFail)
+		&& let Some(existing) = &initial_dest_metadata
+		&& (dest_by_lstat || filesystem.metadata(&dest_fs).is_ok())
+	{
+		return update_keeps(host, options, &source_metadata, existing, dest).map(drop);
+	}
 	if let Some(existing) = &initial_dest_metadata {
 		if paths_refer_to_same_file(&filesystem, &source_fs, &dest_fs, true)
 			&& options.copy_mode == CopyMode::Link
 		{
-			if source_is_symlink && !options.dereference {
+			// GNU does nothing where the two are one file as lstat reads them
+			// (`same_file_ok`); a link at `dest` that leads to the source
+			// link is another file, which -P replaces.
+			if source_is_symlink && !dereference && paths_refer_to_same_file(&filesystem, &source_fs, &dest_fs, false) {
 				return Ok(());
 			}
 			if !dest_is_symlink
@@ -3164,31 +3513,51 @@ fn copy_file(
 	{
 		return Ok(());
 	}
+	// `--attributes-only` leaves the destination where it is, but GNU asks
+	// about it under `-i` all the same (`copy.c`).
+	if !check_existing_dest && options.attributes_only && initial_dest_metadata.is_some() {
+		let existing =
+			if dest_by_lstat { filesystem.symlink_metadata(&dest_fs) } else { filesystem.metadata(&dest_fs) };
+		if let Ok(existing) = existing {
+			if options.update != UpdateMode::IfOlder {
+				options.overwrite.verify(host, dest, options.debug)?;
+			}
+			// A directory there takes no non-directory (`handle_existing_dest`).
+			if existing.is_dir() && !options.move_mode {
+				return Err(overwrite_directory(dest, source));
+			}
+		}
+	}
 
 	let mut backup = None;
 	if check_existing_dest {
 		let own_entry;
 		(backup, own_entry) =
-			handle_existing_dest(host, state, source, dest, options, source_in_command_line, own_backup.as_deref())?;
+			handle_existing_dest(
+			host,
+			state,
+			source,
+			dest,
+			options,
+			source_in_command_line,
+			own_backup.as_deref(),
+			dest_by_lstat,
+		)?;
 		if own_entry {
 			return Ok(());
 		}
 		dest_replaced = true;
 		if are_hardlinks_to_same_file(&filesystem, &source_fs, &dest_fs) {
-			if options.copy_mode == CopyMode::Copy {
+			// After a backup the name is new to GNU even where the rename did
+			// nothing (the backup name another link of the same file): its
+			// create then fails on it, as below.
+			if options.copy_mode == CopyMode::Copy && backup.is_none() {
 				return Ok(());
 			}
 			if options.copy_mode == CopyMode::Link && (!source_is_symlink || !dest_is_symlink) {
 				return Ok(());
 			}
 		}
-	}
-
-	if options.attributes_only && source_metadata.is_symlink() {
-		return Err(CpError::Error(format!(
-			"cannot change attribute {}: Source file is a non regular file",
-			dest.quote()
-		)));
 	}
 
 	// When using --link mode, hard link structure is automatically preserved
@@ -3204,35 +3573,62 @@ fn copy_file(
 		// A matching identity in the source tree becomes a hard link between
 		// the corresponding names in the destination tree.
 		let new_source = new_source.clone();
-		filesystem
-			.hard_link(host.resolve(&new_source), &dest_fs)
-			.map_err(|e| {
-				CpError::IoErrContext(
+		let replaced = match link_replacing(&filesystem, &host.resolve(&new_source), &dest_fs) {
+			Ok(replaced) => replaced,
+			Err(e) => {
+				let error = CpError::IoErrContext(
 					e,
 					format!("cannot create hard link {} to {}", dest.quote(), new_source.quote()),
-				)
-			})?;
+				);
+				return Err(match &backup {
+					Some(backup) => un_backup(host, options, dest, backup, error),
+					None => error,
+				});
+			},
+		};
 
+		// GNU reports a name its `force_linkat` replaced after the copy's line
+		// for a file; for a link it removed the name first (it never writes
+		// through a link), and says so first.
+		let say_removed = |host: &mut Host, state: &CopyState| {
+			if replaced && options.verbose {
+				state.say(host, format_args!("removed {}", dest.quote()));
+			}
+		};
+		if source_is_symlink {
+			say_removed(host, state);
+		}
 		if report {
 			print_verbose_output(host, state, options, source, dest, backup.as_deref());
+		}
+		if !source_is_symlink {
+			say_removed(host, state);
 		}
 
 		return Ok(());
 	}
 
-	let mut dest_metadata = if dest_replaced {
+	let mut dest_metadata = if backup.is_some() {
+		// GNU takes the name as new after its backup, a rename (`new_dst`).
+		// `handle_existing_dest` backs up by renaming every destination but
+		// the source's own entry, whose backup is the whole copy and returns
+		// there. A rename onto another link of the same file does nothing,
+		// and GNU still takes the name as new: the exclusive create fails on
+		// it, and a symlink replaces it only under `-f`. Any other file there
+		// appeared after the backup and is new to cp too.
+		None
+	} else if dest_replaced {
 		filesystem.symlink_metadata(&dest_fs).ok()
 	} else {
 		initial_dest_metadata
 	};
 
-	// A copied symlink replaces the destination, which GNU removes before
-	// reporting the copy.
+	// A copied symlink replaces any destination that is not a directory (a
+	// FIFO, socket or device too), which GNU removes before reporting the
+	// copy, saying `removed` under `-v` (`copy.c`).
 	if source_metadata.is_symlink()
 		&& options.copy_mode == CopyMode::Copy
-		&& dest_metadata
-			.as_ref()
-			.is_some_and(|metadata| metadata.is_symlink() || metadata.is_file())
+		&& dest_metadata.as_ref().is_some_and(|metadata| !metadata.is_dir())
 	{
 		delete_path(host, state, dest, options)?;
 		dest_metadata = None;
@@ -3245,6 +3641,7 @@ fn copy_file(
 		print_verbose_output(host, state, options, source, dest, backup.as_deref());
 	}
 
+	state.written = None;
 	let fate = handle_copy_mode(
 		host,
 		state,
@@ -3254,55 +3651,69 @@ fn copy_file(
 		&source_metadata,
 		dest_metadata.as_ref(),
 		source_in_command_line,
-		backup.is_some(),
-	)?;
+	);
+	// The file a regular copy wrote, by its own descriptor (see
+	// `CopyState::written`).
+	let written = state.written.take();
+	let fate = match fate {
+		Ok(fate) => fate,
+		Err(error) => {
+			return Err(match &backup {
+				Some(backup) => un_backup(host, options, dest, backup, error),
+				None => error,
+			});
+		},
+	};
 
-	// A file this copy created has a known mode and maybe owner.
-	let (mut created_mode, owner) = match fate {
-		DestFate::Created { mode, owner } => (mode, owner),
-		DestFate::Kept | DestFate::Recreated => (None, None),
+	// A file this copy created has a known mode and maybe owner; one made
+	// through a link that led nowhere is the file the link leads to.
+	let (mut created_mode, owner, through) = match fate {
+		DestFate::Created { mode, owner, through } => (mode, owner, through),
+		DestFate::Kept | DestFate::Recreated => (None, None, false),
 	};
 
 	// Links share their target's permissions; only a copy gets its own.
 	let copied_data = !source_metadata.is_symlink()
 		&& !matches!(options.copy_mode, CopyMode::Link | CopyMode::SymLink);
-	// A preserved mode is set by `copy_attributes` below.
+	// A preserved mode is set by `copy_attributes` below. An existing
+	// destination the copy wrote keeps its own, as GNU's does. A new file gets
+	// the source's, less `--no-preserve=mode` and the umask, which
+	// `copy_attributes` sets after the owner (GNU's `copy_reg`); like GNU, an
+	// error setting it is not reported.
 	let mode_set_later = matches!(options.attributes.mode, Preserve::Yes { .. }) && !source_is_stream;
-	if !dest_is_symlink && copied_data && !mode_set_later {
-		let kept = dest_metadata
-			.as_ref()
-			.filter(|_| fate == DestFate::Kept);
-		let dest_permissions = calculate_dest_permissions(kept, &source_metadata, options, host.umask());
-		// Here, to match GNU semantics, we quietly ignore an error
-		// if a user does not have the correct ownership to modify
-		// the permissions of a file.
-		//
-		// FWIW, the OS will throw an error later, on the write op, if
-		// the user does not have permission to write to the file.
-		if created_mode != Some(dest_permissions.mode()) {
-			let _ = filesystem.set_permissions(&dest_fs, dest_permissions);
+	let kept = dest_metadata
+		.as_ref()
+		.filter(|_| fate == DestFate::Kept);
+	let mut then_mode = None;
+	if copied_data && !mode_set_later && kept.is_none() {
+		let mode = new_dest_mode(&source_metadata, options, host.umask());
+		if created_mode != Some(mode) {
+			then_mode = Some(mode);
 			created_mode = None;
 		}
 	}
 
-	// What the copy left at `dest`: a recreated symlink, or a file wherever no
-	// symlink was written through.
+	// What the copy left at `dest`: a recreated symlink, or a file, which may
+	// be a link's target the copy wrote through. GNU sets the attributes of
+	// that file through its descriptor, so they go to the target.
 	let dest_facts = DestFacts {
 		symlink: match options.copy_mode {
 			CopyMode::Copy if source_metadata.is_symlink() => Some(true),
-			CopyMode::Copy
-				if !dest_metadata.as_ref().is_some_and(Metadata::is_symlink) =>
-			{
-				Some(false)
-			},
+			CopyMode::Copy | CopyMode::AttrOnly if !source_metadata.is_symlink() => Some(false),
 			_ => None,
 		},
 		mode: created_mode,
 		owner,
+		then_mode,
+		through,
+		written: written.as_ref(),
+		stops_at_attributes: source_metadata.is_symlink() || (written.is_none() && !source_metadata.is_file()),
 	};
 
 	// Some stream files may not exist after we have copied them, like
-	// anonymous pipes; there are no attributes left to copy.
+	// anonymous pipes or a FIFO whose writer removed its name: what cp read of
+	// the source before stands for it, as GNU's `copy_reg` uses its `fstat`.
+	// The owner, then the final mode, are set through the descriptor cp wrote.
 	if !(source_is_stream && !filesystem.exists(&source_fs)) {
 		copy_attributes(
 			host,
@@ -3315,6 +3726,45 @@ fn copy_file(
 			Some(&source_metadata),
 			dest_facts,
 		)?;
+	} else {
+		// The seam where a test swaps the name before the owner and mode are
+		// set.
+		#[cfg(test)]
+		crate::host::run_hook(&dest_fs);
+		// Like GNU, a refused owner falls back to the group alone, and is not
+		// reported.
+		if matches!(options.attributes.ownership, Preserve::Yes { .. })
+			&& let Some(file) = &written
+			&& let Some((uid, gid)) = source_metadata.uid().zip(source_metadata.gid())
+			&& owner != Some((uid, gid))
+			&& chown_handle(file, Some(uid), Some(gid)).is_err()
+		{
+			let _ = chown_handle(file, None, Some(gid));
+		}
+		if let Some(mode) = then_mode {
+			let _ = match &written {
+				Some(file) => set_handle_mode(file, mode),
+				None => filesystem.set_permissions(&dest_fs, Permissions::from_mode(mode)),
+			};
+		}
+		// The mode and the times `-p` keeps, from what cp read of it, through
+		// the descriptor, as GNU's `copy_reg` sets them from its `fstat`.
+		if let Some(file) = &written {
+			handle_preserve(host, options.attributes.mode, || {
+				set_mode(&filesystem, &dest_fs, dest, source_metadata.permissions(), Some(file))
+			})?;
+			handle_preserve(host, options.attributes.timestamps, || {
+				let modified = source_metadata
+					.modified()
+					.map_err(|e| CpError::IoErrContext(e, format!("preserving times for {}", dest.quote())))?;
+				let times = std::fs::FileTimes::new().set_modified(modified);
+				file.set_times(match source_metadata.accessed() {
+					Ok(accessed) => times.set_accessed(accessed),
+					Err(_) => times,
+				})
+				.map_err(|e| CpError::IoErrContext(e, format!("preserving times for {}", dest.quote())))
+			})?;
+		}
 	}
 
 	// Only `--preserve=links` looks copies up, and only a file with other
@@ -3382,10 +3832,10 @@ fn copy_helper(
 	if options.recursive && !options.copy_contents {
 		let file_type = source_metadata.file_type();
 		if file_type.is_socket() {
-			return copy_special(host, dest, options, NodeKind::Socket, 0o777);
+			return copy_special(host, dest, NodeKind::Socket, 0o777);
 		}
 		if file_type.is_fifo() {
-			return copy_special(host, dest, options, NodeKind::Fifo, 0o666);
+			return copy_special(host, dest, NodeKind::Fifo, 0o666);
 		}
 		if file_type.is_char_device() || file_type.is_block_device() {
 			let rdev = source_metadata.rdev().ok_or_else(|| {
@@ -3399,7 +3849,7 @@ fn copy_helper(
 			} else {
 				NodeKind::BlockDevice(rdev)
 			};
-			return copy_special(host, dest, options, kind, source_metadata.mode() & 0o7777);
+			return copy_special(host, dest, kind, source_metadata.mode() & 0o7777);
 		}
 	}
 
@@ -3407,7 +3857,18 @@ fn copy_helper(
 		copy_link(host, state, source, dest, options, source_metadata)?;
 		return Ok(DestFate::Kept);
 	}
-	let (copy_debug, fate) = copy_data(host, state, source, dest, options, source_metadata, dest_metadata)?;
+	let (copy_debug, fate) = match copy_data(host, state, source, dest, options, source_metadata, dest_metadata) {
+		Ok(done) => done,
+		Err(error) => {
+			// GNU's `--debug` reports a copy that failed too (`copy.c`).
+			if !options.attributes_only && options.debug {
+				let clone_refused = options.reflink_mode == ReflinkMode::Always
+					&& matches!(&error, CpError::IoErrContext(_, context) if context.starts_with("failed to clone"));
+				state.say(host, CopyDebug::failed(clone_refused, options.reflink_mode));
+			}
+			return Err(error);
+		},
+	};
 	if !options.attributes_only && options.debug {
 		state.say(host, copy_debug);
 	}
@@ -3419,16 +3880,14 @@ fn copy_helper(
 fn copy_special(
 	host: &mut Host,
 	dest: &Path,
-	options: &Options,
 	kind: NodeKind,
 	mode: u32,
 ) -> CopyResult<DestFate> {
 	let filesystem = host.fs().clone();
 	let dest_fs = host.resolve(dest);
-	if filesystem.exists(&dest_fs) {
-		options.overwrite.verify(host, dest, options.debug)?;
-		filesystem.remove_file(&dest_fs)?;
-	}
+	// An existing destination GNU replaces was removed before this
+	// (`delete_dest_if_needed_and_allowed`); one that is still there makes
+	// the new node fail with "File exists", as GNU's does.
 
 	let created = match kind {
 		NodeKind::Fifo => filesystem
@@ -3476,7 +3935,14 @@ fn copy_link(
 	};
 	#[cfg(not(windows))]
 	let kind = SymlinkKind::Auto;
-	symlink_file(host, state, &link, dest, kind, false)?;
+	// A copied link is named by its destination alone, as GNU names it
+	// (`copy.c`); `-s` names its target too.
+	// Under `-f` a name still there (taken as new after a backup that left
+	// it) is replaced, as GNU's `force_symlinkat` does.
+	symlink_file(host, state, &link, dest, kind, options.unlink_after_failed_open()).map_err(|error| match error {
+		CpError::IoErrContext(e, _) => CpError::IoErrContext(e, format!("cannot create symbolic link {}", dest.quote())),
+		other => other,
+	})?;
 	copy_attributes(
 		host,
 		source,
@@ -3486,7 +3952,7 @@ fn copy_link(
 		false,
 		options.set_selinux_context,
 		Some(source_metadata),
-		DestFacts { symlink: Some(true), ..DestFacts::default() },
+		DestFacts { symlink: Some(true), stops_at_attributes: true, ..DestFacts::default() },
 	)
 }
 
@@ -3536,6 +4002,20 @@ fn check_streamed_modes(options: &Options, source: &Path, dest: &Path) -> CopyRe
 		));
 	}
 	Ok(())
+}
+
+/// Whether cp runs with root's privileges over files it does not own, as
+/// GNU's `owner_privileges` asks: then it sets extended attributes on a file
+/// whatever the file's mode.
+fn owner_privileges() -> bool {
+	#[cfg(unix)]
+	{
+		nix::unistd::geteuid().is_root()
+	}
+	#[cfg(not(unix))]
+	{
+		false
+	}
 }
 
 /// Copies the data of the regular file (or stream) `source` to `dest`, whose
@@ -3615,12 +4095,17 @@ fn copy_data(
 			}
 		} else {
 			match pi_iso::cow::clone_file(&source_fs, &dest_fs) {
-				Ok(()) => {
+				Ok(clone) => {
+					// The clone's times, owner and mode are set through the
+					// descriptor it was made with, as GNU sets them on the one it
+					// cloned into (see `CopyState::written`).
 					if !matches!(options.attributes.timestamps, Preserve::Yes { .. }) {
-						filesystem
-							.set_times(&dest_fs, FileTime::Now, FileTime::Now, true)
+						let now = std::time::SystemTime::now();
+						clone
+							.set_times(std::fs::FileTimes::new().set_accessed(now).set_modified(now))
 							.map_err(|e| CpError::IoErrContext(e, context_for(source, dest)))?;
 					}
+					state.written = Some(clone);
 					return Ok((CopyDebug::CLONED, DestFate::Kept));
 				},
 				Err(_) if options.reflink_mode == ReflinkMode::Auto => {
@@ -3636,17 +4121,36 @@ fn copy_data(
 		}
 	}
 
-	// A stream destination (a FIFO, a device) is written, not truncated.
-	// Owner-writable until the final permissions are applied, so a handle can
-	// still be reopened to preserve timestamps.
-	let create_mode =
-		if source_is_stream { 0o622 } else { (source_metadata.permissions().mode() & 0o777) | 0o200 };
+	// A stream destination (a FIFO, a device) is written, not truncated. A
+	// file is created as GNU's `copy_reg` creates it: with the source's
+	// permission bits, a stream's too, less its group and other bits while
+	// its owner may still change (`--preserve=ownership`), which its final
+	// mode puts back once the owner is set; owner-writable only where the
+	// copy sets extended attributes without root's privileges, and where a
+	// provider that sets times only through a handle reopens it for writing.
+	let source_mode = source_metadata.permissions().mode() & 0o777;
+	let omitted = if matches!(options.attributes.ownership, Preserve::Yes { .. }) {
+		source_mode & 0o077
+	} else {
+		0
+	};
+	let writable = !native
+		|| cfg!(not(unix))
+		|| (matches!(options.attributes.xattr, Preserve::Yes { .. }) && !owner_privileges());
+	let create_mode = (source_mode & !omitted) | if writable { 0o200 } else { 0 };
 	let mut dest_options = OpenOptions::new();
-	dest_options
-		.write(true)
-		.create(true)
-		.truncate(!source_is_stream)
-		.mode(create_mode);
+	dest_options.write(true).mode(create_mode);
+	// A link that led nowhere before the copy began (POSIXLY_CORRECT): the
+	// open makes the file it leads to, new to cp as it is to GNU.
+	let dangling = dest_metadata.is_some_and(Metadata::is_symlink) && !filesystem.exists(&dest_fs);
+	// A destination cp found nothing at, or backed up, is created with
+	// O_EXCL and nothing to truncate, as GNU creates a new one (`copy_reg`):
+	// whatever appeared there meanwhile is not written through or over.
+	if dest_metadata.is_none() {
+		dest_options.create_new(true);
+	} else {
+		dest_options.create(true).truncate(!source_is_stream);
+	}
 	let cannot_create =
 		|e| CpError::IoErrContext(e, format!("cannot create regular file {}", dest.quote()));
 	let (dest_file, fate) = match filesystem.open_with(&dest_fs, &dest_options) {
@@ -3654,9 +4158,30 @@ fn copy_data(
 		// (see `Fs::with_creation_mask`), unless the parent directory has a
 		// default ACL; see the fstat below for when that matters.
 		Ok(file) if dest_metadata.is_none() && native => {
-			(file, DestFate::Created { mode: Some(create_mode & !host.umask()), owner: None })
+			(file, DestFate::Created { mode: Some(create_mode & !host.umask()), owner: None, through: false })
+		},
+		Ok(file) if dangling => {
+			(file, DestFate::Created { mode: native.then(|| create_mode & !host.umask()), owner: None, through: true })
 		},
 		Ok(file) => (file, DestFate::Kept),
+		// The exclusive create of a new destination met a name that appeared
+		// since: GNU fails and keeps it (`copy_reg`), `-f` or not. A link
+		// there is "not writing through dangling symlink", which
+		// POSIXLY_CORRECT opens through instead.
+		Err(error) if dest_metadata.is_none() && error.kind() == io::ErrorKind::AlreadyExists => {
+			if !filesystem.symlink_metadata(&dest_fs).is_ok_and(|now| now.is_symlink()) {
+				return Err(cannot_create(error));
+			}
+			if host.var("POSIXLY_CORRECT").is_none() {
+				return Err(CpError::Error(format!("not writing through dangling symlink {}", dest.quote())));
+			}
+			// The file the link leads to is new to cp as it is to GNU: made with
+			// the same mode, and given its final mode and owner as one is.
+			let mut through = OpenOptions::new();
+			through.write(true).create(true).truncate(!source_is_stream).mode(create_mode);
+			let file = filesystem.open_with(&dest_fs, &through).map_err(cannot_create)?;
+			(file, DestFate::Created { mode: native.then(|| create_mode & !host.umask()), owner: None, through: true })
+		},
 		// `-f`: remove a destination that cannot be opened, and try again.
 		Err(_) if options.unlink_after_failed_open() && filesystem.symlink_metadata(&dest_fs).is_ok() => {
 			delete_path(host, state, dest, options)?;
@@ -3668,12 +4193,41 @@ fn copy_data(
 		Err(error) => return Err(cannot_create(error)),
 	};
 
+	// `always` gets here only with a source that is not a regular file (any
+	// other was cloned by path above, or refused): GNU cp asks for the clone
+	// on its descriptors here too, and reports the answer. A destination this
+	// copy made is removed again; an existing one keeps its data, where GNU
+	// cp has already truncated it.
+	let always_cloned = if options.reflink_mode == ReflinkMode::Always {
+		#[cfg(any(target_os = "linux", target_os = "android", windows))]
+		let answer = match (source_file.native(), dest_file.native()) {
+			(Some(source_native), Some(dest_native)) => pi_iso::cow::clone_open(source_native, dest_native),
+			_ => Err(operation_not_supported()),
+		};
+		#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+		let answer: io::Result<()> = Err(operation_not_supported());
+		if let Err(error) = answer {
+			drop(dest_file);
+			if dest_metadata.is_none() || fate == DestFate::Recreated {
+				let _ = filesystem.remove_file(&dest_fs);
+			}
+			return Err(CpError::IoErrContext(
+				error,
+				format!("failed to clone {} from {}", dest.quote(), source.quote()),
+			));
+		}
+		true
+	} else {
+		false
+	};
+
 	// Elsewhere `auto` clones on the open handles, as GNU cp issues FICLONE
 	// on its descriptors, and copies the data wherever the files cannot
 	// share extents (another filesystem, ext4, NTFS, ...). A source
 	// filesystem that refused once is not asked again.
 	#[cfg(any(target_os = "linux", target_os = "android", windows))]
 	let cloned = match (source_file.native(), dest_file.native()) {
+		_ if always_cloned => true,
 		(Some(source_native), Some(dest_native))
 			if native && !source_is_stream && options.reflink_mode == ReflinkMode::Auto =>
 		{
@@ -3697,7 +4251,7 @@ fn copy_data(
 		_ => false,
 	};
 	#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-	let cloned = false;
+	let cloned = always_cloned;
 
 	let copy_debug = if cloned {
 		CopyDebug::CLONED
@@ -3709,7 +4263,22 @@ fn copy_data(
 			})?;
 		}
 		copy_stream_data(host, &source_file, &dest_file, source, dest)?;
-		CopyDebug { offload: OffloadReflinkDebug::Avoided, ..CopyDebug::STREAMED }
+		// GNU's words for a stream (`copy.c`): no offload or clone is tried
+		// on one, `--reflink=never` and `--sparse=always` avoid the offload,
+		// and only `--sparse=always` looks for zeros.
+		match (options.reflink_mode, options.sparse_mode) {
+			(ReflinkMode::Never, _) => CopyDebug {
+				offload:          OffloadReflinkDebug::Avoided,
+				reflink:          OffloadReflinkDebug::No,
+				sparse_detection: SparseDebug::No,
+			},
+			(_, SparseMode::Always) => CopyDebug {
+				offload:          OffloadReflinkDebug::Avoided,
+				reflink:          OffloadReflinkDebug::Unsupported,
+				sparse_detection: SparseDebug::Zeros,
+			},
+			_ => CopyDebug { sparse_detection: SparseDebug::No, ..CopyDebug::STREAMED },
+		}
 	} else {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		let fast = match (native, source_file.native(), dest_file.native(), source_metadata.native()) {
@@ -3729,6 +4298,9 @@ fn copy_data(
 					source_stat,
 					dest_is_fifo,
 					options.sparse_mode,
+					// `--reflink=never` avoids the copy offload too, which can
+					// share extents, as GNU's does.
+					options.reflink_mode != ReflinkMode::Never,
 					options.debug && !options.attributes_only,
 					source,
 					dest,
@@ -3756,21 +4328,23 @@ fn copy_data(
 	// preserved mode relies on it to skip the chmod: a plain copy, like GNU
 	// cp's, keeps whatever mode the open gave it.
 	let fate = match fate {
-		DestFate::Created { .. } if matches!(options.attributes.ownership, Preserve::Yes { .. }) => {
+		DestFate::Created { through, .. } if matches!(options.attributes.ownership, Preserve::Yes { .. }) => {
 			match dest_file.metadata() {
 				Ok(metadata) => DestFate::Created {
-					mode:  Some(metadata.permissions().mode() & 0o7777),
+					mode: Some(metadata.permissions().mode() & 0o7777),
 					owner: metadata.uid().zip(metadata.gid()),
+					through,
 				},
-				Err(_) => DestFate::Created { mode: None, owner: None },
+				Err(_) => DestFate::Created { mode: None, owner: None, through },
 			}
 		},
-		DestFate::Created { owner, .. } if matches!(options.attributes.mode, Preserve::Yes { .. }) => {
-			DestFate::Created { mode: None, owner }
+		DestFate::Created { owner, through, .. } if matches!(options.attributes.mode, Preserve::Yes { .. }) => {
+			DestFate::Created { mode: None, owner, through }
 		},
 		fate => fate,
 	};
 	drop(source_file);
+	state.written = keep_written(&dest_file, dest)?;
 	dest_file
 		.close()
 		.map_err(|e| CpError::IoErrContext(e, format!("failed to close {}", dest.quote())))?;
@@ -3787,10 +4361,8 @@ fn verify_target_type(host: &Host, target: &Path, target_type: TargetType) -> Co
 		(TargetType::Directory, Err(error)) => {
 			Err(CpError::IoErrContext(error, format!("target {}", target.quote())))
 		},
-		(TargetType::File, Ok(metadata)) if metadata.is_dir() => Err(CpError::Error(format!(
-			"cannot overwrite directory {} with non-directory",
-			target.quote()
-		))),
+		// A directory is the destination itself only under -T, where the copy
+		// decides (`handle_existing_dest`).
 		_ => Ok(()),
 	}
 }
@@ -3907,7 +4479,7 @@ fn copy_directory(
 	// a/b -> d/a/b
 	let target: PathBuf = match parent_path(root) {
 		Some(parent) if options.parents && !parent.is_empty() => {
-			make_parent_dirs(host, state, root, &join_path(target, &parents_relative(root)), options)?;
+			let _created = make_parent_dirs(host, state, root, &join_path(target, &parents_relative(root)), options)?;
 			join_path(target, &parents_relative(parent))
 		},
 		_ => target.to_path_buf(),
@@ -3917,6 +4489,8 @@ fn copy_directory(
 	// the copy goes into (`dir/.` into `target/.`, the contents). `-T` copies
 	// the contents into `target`.
 	let root_dest = match filesystem.metadata(host.resolve(&target)) {
+		// With a backup asked for, `copy_entry` backs a non-directory up.
+		Ok(metadata) if !metadata.is_dir() && options.backup != BackupMode::None => target.clone(),
 		Ok(metadata) if !metadata.is_dir() => {
 			return Err(CpError::Error(format!(
 				"cannot overwrite non-directory {} with directory {}",
@@ -3933,6 +4507,15 @@ fn copy_directory(
 					None => target.clone(),
 				}
 			}
+		},
+		// A link there that leads to no directory (to nothing, or into a
+		// directory nobody may search) is a non-directory, as GNU reads it.
+		Err(_) if options.backup == BackupMode::None && filesystem.symlink_metadata(host.resolve(&target)).is_ok() => {
+			return Err(CpError::Error(format!(
+				"cannot overwrite non-directory {} with directory {}",
+				target.quote(),
+				root.quote()
+			)));
 		},
 		_ => target.clone(),
 	};
@@ -4026,32 +4609,47 @@ fn copy_entry(
 	};
 
 	if !source_is_dir {
-		return match copy_file(host, state, source, dest, options, false, Some(metadata)) {
-			// With --archive a symlink may be copied before the file it names.
-			// A move always copies into a fresh tree, so its failure is real:
-			// `mv` must report it and keep the source.
-			Err(_) if options.preserve_hard_links() && entry_is_symlink && !options.move_mode => Ok(()),
-			result => result,
-		};
+		return copy_file(host, state, source, dest, options, false, Some(metadata));
 	}
 
-	let created = match filesystem.metadata(host.resolve(dest)) {
-		Err(_) => {
-			build_dir(host, dest, false, options, Some(source))?;
-			// `mv` reports a moved operand itself, once its source is gone.
-			if options.verbose && !(is_root && options.move_mode) {
-				print_verbose_output(host, state, options, source, dest, None);
-			}
-			true
-		},
-		Ok(existing) if !existing.is_dir() => {
+	let dest_fs = host.resolve(dest);
+	// A non-directory there, a link to nothing too, takes no directory unless
+	// a backup is asked for: GNU then renames it to its backup name and makes
+	// the directory (`copy.c`).
+	let non_directory = match filesystem.symlink_metadata(&dest_fs) {
+		Ok(existing) => !existing.is_dir(),
+		Err(_) => false,
+	};
+	let mut backup = None;
+	if non_directory {
+		if options.backup == BackupMode::None || options.move_mode {
 			return Err(CpError::Error(format!(
 				"cannot overwrite non-directory {} with directory {}",
 				dest.quote(),
 				source.quote()
 			)));
-		},
-		Ok(_) => false,
+		}
+		let named = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
+			.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?;
+		if let Some(named) = named {
+			filesystem
+				.rename(&dest_fs, &named)
+				.map_err(|e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote())))?;
+			backup = Some(named);
+		}
+	}
+	let created = if filesystem.metadata(&dest_fs).is_err() {
+		build_dir(host, dest, false, options, Some(source))?;
+		// A directory `mv` copies between filesystems, the operand too, is
+		// reported as GNU's mv reports it.
+		if options.verbose && options.move_mode {
+			state.say(host, format_args!("created directory {}", dest.quote()));
+		} else if options.verbose {
+			print_verbose_output(host, state, options, source, dest, backup.as_deref());
+		}
+		true
+	} else {
+		false
 	};
 
 	if let Some(pushed) = walk.enter(host, source, is_root) {
@@ -4061,6 +4659,11 @@ fn copy_entry(
 				walk.failed = true;
 			},
 			Ok(entries) => {
+				// GNU reads a directory with `savedir` sorted by inode number
+				// (`SAVEDIR_SORT_FASTREAD`), and copies its entries in that
+				// order, which `-v` shows.
+				let mut entries: Vec<_> = entries.collect();
+				entries.sort_by_key(|entry| entry.as_ref().ok().and_then(entry_inode));
 				for entry in entries {
 					if host.is_cancelled() {
 						walk.failed = true;
@@ -4107,8 +4710,21 @@ fn copy_entry(
 		true,
 		options.set_selinux_context,
 		(!entry_is_symlink).then_some(&metadata),
-		DestFacts { symlink: created.then_some(false), ..DestFacts::default() },
+		DestFacts { symlink: created.then_some(false), stops_at_attributes: true, ..DestFacts::default() },
 	)
+}
+
+/// The inode number of a native directory entry, as `readdir` gives it.
+fn entry_inode(entry: &pi_vfs::DirEntry) -> Option<u64> {
+	#[cfg(unix)]
+	{
+		entry.native().map(std::os::unix::fs::DirEntryExt::ino)
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = entry;
+		None
+	}
 }
 
 /// Builds a directory at the specified path with the given options.
@@ -4158,7 +4774,7 @@ fn build_dir(
 mod linux {
 	use std::{
 		fs::{File, Metadata},
-		io::{self, Read as _, Seek as _, SeekFrom},
+		io::{self, Read as _, Seek as _, SeekFrom, Write as _},
 		os::{
 			fd::AsRawFd as _,
 			unix::fs::{FileExt as _, MetadataExt as _},
@@ -4195,6 +4811,21 @@ mod linux {
 	/// `io::copy` uses `copy_file_range`/`sendfile` between files.
 	fn fs_copy(source: &File, dest: &File) -> io::Result<()> {
 		io::copy(&mut &*source, &mut &*dest).map(drop)
+	}
+
+	/// Copies all of `source` into `dest` from their current offsets with
+	/// plain reads and writes: no `copy_file_range`, which may share extents.
+	fn read_write_copy(mut source: &File, mut dest: &File) -> io::Result<()> {
+		let mut buffer = vec![0; 128 * 1024];
+		loop {
+			let read = match source.read(&mut buffer) {
+				Ok(0) => return Ok(()),
+				Ok(read) => read,
+				Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+				Err(error) => return Err(error),
+			};
+			dest.write_all(&buffer[..read])?;
+		}
 	}
 
 	/// Whether `source`, described by `metadata`, holds any data: `(has data,
@@ -4301,11 +4932,21 @@ mod linux {
 		metadata: &Metadata,
 		dest_is_fifo: bool,
 		sparse_mode: SparseMode,
+		offload: bool,
 		report: bool,
 		source_path: &Path,
 		dest_path: &Path,
 	) -> CopyResult<CopyDebug> {
 		let (copy_debug, result) = match sparse_mode {
+			// Without the offload GNU reads and writes, and says so.
+			SparseMode::Auto | SparseMode::Never if !offload => (
+				CopyDebug {
+					offload: OffloadReflinkDebug::Avoided,
+					reflink: OffloadReflinkDebug::No,
+					sparse_detection: SparseDebug::No,
+				},
+				read_write_copy(source, dest),
+			),
 			SparseMode::Always => {
 				let (debug, method) = detect_sparse_always(source, metadata, dest_is_fifo).unwrap_or((
 					CopyDebug { sparse_detection: SparseDebug::Zeros, ..UNDETECTED },
@@ -5353,6 +5994,35 @@ mod tests {
 		assert_eq!(got, 1, "the attribute on b");
 	}
 
+	/// Only a read-only file cp owns is made owner-writable for its extended
+	/// attributes: the mode `owned_read_only_mode` gives is `None` for a file
+	/// its owner may write and, made as root, for a read-only file another
+	/// user owns, which cp leaves as it is. Not as root, the test says that
+	/// row is skipped.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn only_a_read_only_file_cp_owns_is_made_writable_for_its_attributes() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let dir = tempdir().unwrap();
+		let path = |name: &str| dir.path().join(name);
+		let mode_of = |name: &str, mode: u32, owner: Option<u32>| {
+			fs::write(path(name), b"B").unwrap();
+			if owner.is_some() {
+				std::os::unix::fs::chown(path(name), owner, owner).unwrap();
+			}
+			fs::set_permissions(path(name), fs::Permissions::from_mode(mode)).unwrap();
+			super::owned_read_only_mode(&fs::File::open(path(name)).unwrap()).unwrap()
+		};
+		assert_eq!(mode_of("own-ro", 0o444, None), Some(0o444), "cp's own read-only file");
+		assert_eq!(mode_of("own-rw", 0o644, None), None, "cp's own writable file");
+		if !nix::unistd::geteuid().is_root() {
+			eprintln!("skipped: only root can make a file another user owns");
+			return;
+		}
+		assert_eq!(mode_of("other-ro", 0o444, Some(65534)), None, "another user's read-only file");
+	}
+
 	/// `cp -alvT S D` run again onto its own copy, where every entry of `D` is
 	/// already a hard link to `S`'s, leaves `D` as it is and prints nothing, as
 	/// GNU 9.4 does (`copy.c`, lines 1758-1761): a FIFO there is not removed
@@ -5435,6 +6105,30 @@ mod tests {
 		let made = fs::metadata(path("e")).unwrap();
 		assert_ne!(made.permissions().mode() & 0o7777, 0o555, "e's mode is set past the failure");
 		assert_eq!(made.modified().unwrap(), old, "e's times");
+	}
+
+	/// Where the extended attributes fail and a later step fails too, both
+	/// errors are shown, the attributes' first, as GNU 9.4 shows both
+	/// (`copy.c`, lines 768-793 and 1696). The attributes fail as in
+	/// `an_attribute_that_fails_leaves_the_mode_and_times_set`; the mode
+	/// fails at a test seam (`EIO`).
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn an_attribute_and_a_later_step_that_fail_are_both_shown() {
+		let dir = tempdir().unwrap();
+		let path = |name: &str| dir.path().join(name);
+		fs::write(path("a"), b"A").unwrap();
+		{
+			let source = path("a");
+			crate::host::hook_at(path("b"), move || fs::remove_file(&source).unwrap());
+		}
+		crate::host::fault_at(path("b"), libc::EIO);
+		let (code, capture) = run_util::<Cp>(&["--preserve=mode,xattr", "a", "b"], "", dir.path());
+		let err = capture.err();
+		let lines: Vec<&str> = err.lines().collect();
+		assert_eq!((code, lines.len()), (1, 2), "{err:?}");
+		assert!(lines[0].starts_with("cp: setting attributes for 'b': "), "{err:?}");
+		assert!(lines[1].starts_with("cp: preserving permissions for 'b': "), "{err:?}");
 	}
 
 	/// `cp -p` from a FIFO whose writer removes its name once cp has read it

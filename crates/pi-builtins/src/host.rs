@@ -3286,6 +3286,27 @@ mod testing {
 		}
 	}
 
+	/// Errors keyed by path, each returned once by a [`fault`] for its path
+	/// ([`fault_at`] registers them).
+	#[cfg(all(unix, feature = "util.cp"))]
+	static FAULTS: Mutex<Vec<(PathBuf, i32)>> = Mutex::new(Vec::new());
+
+	/// Makes the next [`fault`] for `path` fail with the OS error `errno`.
+	#[cfg(all(unix, feature = "util.cp"))]
+	pub(crate) fn fault_at(path: PathBuf, errno: i32) {
+		FAULTS.lock().push((path, errno));
+	}
+
+	/// Fails (once) with the error a test registered for `path`, if any: the
+	/// seam where a test makes a step of cp past the extended attributes fail.
+	#[cfg(all(unix, feature = "util.cp"))]
+	pub(crate) fn fault(path: &std::path::Path) -> std::io::Result<()> {
+		let mut faults = FAULTS.lock();
+		match faults.iter().position(|(faulted, _)| faulted == path) {
+			Some(index) => Err(std::io::Error::from_raw_os_error(faults.remove(index).1)),
+			None => Ok(()),
+		}
+	}
 
 	/// A tree for the symlink-swap tests in a fresh canonical temporary
 	/// directory `base`: `root/sub/decoy.txt` holding `inside`, and next to
@@ -4151,6 +4172,8 @@ pub(crate) use testing::tree_with_sparse_file;
 pub(crate) use testing::run_hook;
 #[cfg(all(test, unix, feature = "util.rm"))]
 pub(crate) use testing::hook_at;
+#[cfg(all(test, unix, feature = "util.cp"))]
+pub(crate) use testing::{fault, fault_at};
 #[cfg(all(test, unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
 pub(crate) use testing::SwapTree;
 

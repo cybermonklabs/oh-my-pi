@@ -52,8 +52,11 @@ fn match_backup_method(method: &str, origin: &str) -> Result<BackupMode, String>
 /// falling back to the shell's `VERSION_CONTROL`.
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 pub(crate) fn determine_backup_mode(matches: &ArgMatches, host: &Host) -> Result<BackupMode, String> {
+	// The last `--backup=CONTROL` given decides; a bare `--backup` keeps the
+	// one before it, as GNU's does (it sets the control only with a value).
 	let cli_method = matches
-		.get_one::<String>(backup_control::arguments::OPT_BACKUP)
+		.get_many::<String>(backup_control::arguments::OPT_BACKUP)
+		.and_then(Iterator::last)
 		.map(String::as_str);
 	if matches.contains_id(backup_control::arguments::OPT_BACKUP) {
 		if let Some(method) = cli_method {
