@@ -2461,7 +2461,11 @@ impl Shell {
 					}
 					#[cfg(test)]
 					if sig == Signal::Chld && process.writing_now() {
-						TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+						self
+							.k
+							.engine
+							.traps_held()
+							.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					}
 					// bash: a trapped signal ends the `wait` builtin with 128 + n
 					// (then the trap runs); `SIGCHLD` does not.
@@ -2705,16 +2709,12 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 		}
 		#[cfg(test)]
 		if p.writing_now() {
-			TRAPS_HELD_FOR_A_WRITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			k.engine
+				.traps_held()
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		}
 	}
 }
-
-/// Test only: `CHLD` traps owed while the command they would interrupt was
-/// part way in a write (they run after it).
-#[cfg(test)]
-pub(crate) static TRAPS_HELD_FOR_A_WRITE: std::sync::atomic::AtomicUsize =
-	std::sync::atomic::AtomicUsize::new(0);
 
 /// End a `wait` builtin that `p` is in with `status` (a trapped signal
 /// arrived): its `Exec` completes at once, keeping the jobs it waited for.

@@ -354,6 +354,9 @@ pub struct Session {
 	waker:    Waker,
 	children: Children,
 	image:    LatestImage,
+	/// Test only: the shell's engine, for its test-only counts.
+	#[cfg(test)]
+	engine:   Arc<Engine>,
 }
 
 impl Session {
@@ -435,7 +438,21 @@ impl Session {
 			image: image.clone(),
 		};
 		runtime.spawn(driver.serve());
-		Ok(Self { jobs: Some(jobs), waker, children, image })
+		Ok(Self {
+			jobs: Some(jobs),
+			waker,
+			children,
+			image,
+			#[cfg(test)]
+			engine,
+		})
+	}
+
+	/// Test only: the shell's engine, whose test-only counts are this
+	/// session's alone.
+	#[cfg(test)]
+	pub(crate) fn engine(&self) -> Arc<Engine> {
+		Arc::clone(&self.engine)
 	}
 
 	/// The session's state as of its last command boundary; see
@@ -2242,8 +2259,9 @@ mod tests {
 		Line(&'static str),
 		/// Cancel the run, as the host does.
 		Cancel,
-		/// Wait until a `CHLD` trap has waited for a write since the run
-		/// began (the test-only count `TRAPS_HELD_FOR_A_WRITE`).
+		/// Wait until a `CHLD` trap of this run's shell has waited for a write
+		/// since the run began (its engine's test-only count,
+		/// [`Engine::traps_held`]).
 		Held,
 		/// Wait until `n` more polls of the run's stdout have waited for room
 		/// than when this step began.
@@ -2255,7 +2273,8 @@ mod tests {
 		stdout:    Vec<u8>,
 		status:    i32,
 		cancelled: bool,
-		/// Whether a `CHLD` trap waited for a write meanwhile.
+		/// Whether a `CHLD` trap of the run's shell waited for a write
+		/// meanwhile.
 		held:      bool,
 	}
 
@@ -2275,13 +2294,18 @@ mod tests {
 		let out_w = std::fs::File::from(OwnedFd::from(out_w));
 		let fd = out_w.as_raw_fd();
 		let waited = crate::sys::pending_polls(fd);
-		let held = crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst);
+		let runtime = own_runtime();
+		let mut session = runtime.block_on(async { session() });
+		// The count of this session's shell alone: tests in one process
+		// run shells side by side.
+		let engine = session.engine();
+		let held = engine.traps_held().load(Ordering::SeqCst);
 		let cancel = CancellationToken::new();
 		let ended = Arc::new(AtomicBool::new(false));
 		let reached = Arc::new(AtomicU8::new(0));
 		let reader = {
 			let (cancel, ended, reached) = (cancel.clone(), Arc::clone(&ended), Arc::clone(&reached));
-			let held_then = held;
+			let (engine, held_then) = (Arc::clone(&engine), held);
 			std::thread::spawn(move || {
 				let mut lines = std::io::BufReader::new(err_r).lines();
 				for step in steps {
@@ -2309,7 +2333,7 @@ mod tests {
 							crate::sys::pending_polls(fd) >= from + n
 						},
 						Step::Held => {
-							let now = || crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst);
+							let now = || engine.traps_held().load(Ordering::SeqCst);
 							while now() <= held_then && !ended.load(Ordering::SeqCst) {
 								std::thread::sleep(Duration::from_millis(1));
 							}
@@ -2339,9 +2363,7 @@ mod tests {
 				got
 			})
 		};
-		let runtime = own_runtime();
 		let ended_run = runtime.block_on(async {
-			let mut session = session();
 			let stdio = RunStdio {
 				stdin:  Some(std::fs::File::from(OwnedFd::from(in_r))),
 				stdout: Some(out_w),
@@ -2350,6 +2372,7 @@ mod tests {
 			tokio::time::timeout(STUCK, session.run_with(RunOptions::new(command), stdio, cancel))
 				.await
 		});
+		drop(session);
 		ended.store(true, Ordering::SeqCst);
 		let Ok(outcome) = ended_run else {
 			runtime.shutdown_background();
@@ -2364,7 +2387,7 @@ mod tests {
 			stdout:    reader.join().unwrap(),
 			status:    outcome.status,
 			cancelled: outcome.cancelled,
-			held:      crate::bash::TRAPS_HELD_FOR_A_WRITE.load(Ordering::SeqCst) > held,
+			held:      engine.traps_held().load(Ordering::SeqCst) > held,
 		}
 	}
 
@@ -2427,6 +2450,30 @@ mod tests {
 		assert_eq!(run.status, 0);
 		zeros_then_ts(&run.stdout, 131_072, 10);
 		assert!(run.held, "the trap was not owed while the write waited");
+	}
+
+	// Failure mode (#111 at 5cf0e434, the whole library in one process):
+	// `Step::Held` and `Stepped::held` read one count for the whole process,
+	// so another test's shell could end the step before this run's `CHLD`
+	// trap had waited. The reader then drained too early, and
+	// `a_chld_trap_owed_while_another_trap_writes_runs_after_that_write`
+	// found the 'C's after the last '0'. Each session counts its own shell's.
+	#[test]
+	fn a_held_chld_trap_counts_in_its_own_session_only() {
+		let runtime = own_runtime();
+		let other = runtime.block_on(async { session() });
+		let run = run_with_steps(
+			"exec 3<&0\ntrap 'printf %s TTTTTTTTTT' CHLD\n{ read -r go <&3; echo done >&2; } \
+			 &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			CHLD_STEPS,
+			true,
+		);
+		assert!(run.held, "the run's own shell held no trap");
+		assert_eq!(
+			other.engine().traps_held().load(Ordering::SeqCst),
+			0,
+			"another session counted the run's held trap"
+		);
 	}
 
 	/// `printf` waits, the job sends the signal, and the trap's own write

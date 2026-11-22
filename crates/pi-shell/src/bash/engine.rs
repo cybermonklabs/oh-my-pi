@@ -80,6 +80,12 @@ pub struct Engine {
 	/// `$functions` bodies regenerated from function sources, by source
 	/// (regenerating means a parse; plugins scan `$functions` on every key).
 	bodies:       Mutex<HashMap<BString, BString>>,
+	/// Test only: `CHLD` traps this engine's shells held while the command
+	/// they would interrupt was part way in a write (they run after it).
+	/// One count per engine, so tests in one process do not see each
+	/// other's.
+	#[cfg(test)]
+	traps_held:   std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -100,6 +106,8 @@ impl Engine {
 			patterns: PatternCache::default(),
 			zsh_patterns: ZshPatternCache::default(),
 			bodies: Mutex::new(HashMap::new()),
+			#[cfg(test)]
+			traps_held: std::sync::atomic::AtomicUsize::new(0),
 		})
 	}
 
@@ -139,6 +147,13 @@ impl Engine {
 	/// The configuration.
 	pub const fn config(&self) -> &EngineConfig {
 		&self.cfg
+	}
+
+	/// Test only: how many `CHLD` traps this engine's shells held for a
+	/// write.
+	#[cfg(test)]
+	pub(crate) const fn traps_held(&self) -> &std::sync::atomic::AtomicUsize {
+		&self.traps_held
 	}
 
 	/// Identity of this engine build; frames from another build are refused.
