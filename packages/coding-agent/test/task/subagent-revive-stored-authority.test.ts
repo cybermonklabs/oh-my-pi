@@ -1,26 +1,30 @@
 /**
  * A stored spawn spec never widens what the live process allows. A writer of the session store edits a parked
- * subagent's stored record (its ids, depth, cwd, credential source, workspace roots, prompt id, artifacts dir,
- * settings overlay and wake limits); the cold revive builds the subagent from the live values instead: the
- * depth of the live parent chain, the ids of the registry ref, the live parent's credential source and roots,
- * discovery at the live root's cwd, and limits no looser than the live settings.
+ * subagent's stored record (its ids, depth, cwd, credential source, workspace roots, cache-warming value, prompt id,
+ * artifacts dir, settings overlay, list of live inputs and wake limits, and the workspace roots of its file's
+ * header); the cold revive builds the subagent from the live values instead: the depth of the live parent chain,
+ * the ids of the registry ref, the live parent's credential source, roots, cost gate and extensions, discovery at
+ * the live root's cwd, the constants every spawn writes, and limits no looser than the live settings.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import { cfgTaskMaxRecursionDepth, cfgTaskSoftRequestBudget } from "@oh-my-pi/pi-coding-agent/task/settings";
-import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import {
+	expectEndedAtLimit,
+	heldTurn,
+	holdWake,
+	type LifecycleFrame,
 	type LiveParent,
+	limitLogged,
 	openReviveEnv,
-	type RecordedRequest,
 	type RevivedSubagent,
 	type ReviveEnv,
+	recordFrames,
 	spawnerOptions,
 	userTexts,
 	WAKE_BODY,
@@ -31,62 +35,8 @@ const IMPOSTOR = "Impostor";
 const IMPOSTOR_PARENT = "ImpostorParent";
 /** The credential source the edited record claims. */
 const STOLEN_CREDENTIAL_SOURCE = "stolen-credential-source";
-/** What the runtime limit logs when it aborts a turn. */
-const LIMIT_WARNING = "Subagent runtime limit exceeded; aborting";
 /** The text of the steering notice a run gets once it reaches its soft request budget. */
 const BUDGET_NOTICE = "[budget notice]";
-/** Bound on the wait for a woken turn to start and to end: past the limits these cases set, short of their timeouts. */
-const TURN_BOUND_MS = 12_000;
-/** The answer of a model that holds a request until the turn is aborted. */
-const HELD: MockResponse = { delayMs: 120_000, content: ["late"] };
-
-/** One lifecycle frame of a subagent, with the time it was seen. */
-interface LifecycleFrame {
-	id: string;
-	status: string;
-	at: number;
-}
-
-/** Every lifecycle frame `bus` carries from now on, in order. */
-function recordFrames(bus: EventBus): LifecycleFrame[] {
-	const frames: LifecycleFrame[] = [];
-	bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
-		if (!isRecord(payload)) return;
-		frames.push({ id: String(payload.id), status: String(payload.status), at: Date.now() });
-	});
-	return frames;
-}
-
-/** A turn after `frames[from]`: its `started` frame, and its end where one came within the bound. */
-interface Turn {
-	started: LifecycleFrame;
-	ended: LifecycleFrame | undefined;
-}
-
-/**
- * Waits for the next turn of `id` (of any subagent where `id` is undefined) after `frames[from]` to start, then up
- * to the bound for it to end. The turn runs on real timers (a runtime limit, a held model answer), so the wait
- * polls the frames on the platform clock rather than a fake one.
- */
-async function nextTurn(frames: LifecycleFrame[], id: string | undefined, from: number): Promise<Turn> {
-	const startDeadline = Date.now() + TURN_BOUND_MS;
-	for (;;) {
-		const after = frames.slice(from).filter(frame => id === undefined || frame.id === id);
-		const started = after.find(frame => frame.status === "started");
-		if (started) {
-			const ended = after.find(frame => frame.status !== "started" && frame.at >= started.at);
-			if (ended || Date.now() - started.at > TURN_BOUND_MS) return { started, ended };
-		} else if (Date.now() > startDeadline) {
-			throw new Error(`No turn of ${id ?? "any subagent"} started`);
-		}
-		await Bun.sleep(20);
-	}
-}
-
-/** Holds every request of a wake turn: one whose conversation carries the IRC message that woke it. */
-function holdWake(request: RecordedRequest): MockResponse | undefined {
-	return userTexts(request).some(text => text.includes(WAKE_BODY)) ? HELD : undefined;
-}
 
 /** The `key` part of a stored record, which the edit changes in place. */
 function part(record: Record<string, unknown>, key: string): Record<string, unknown> {
@@ -95,15 +45,14 @@ function part(record: Record<string, unknown>, key: string): Record<string, unkn
 	return value;
 }
 
-/** Edits the spawn spec of every `session_init` of `file` in place, as a writer of the session store does. */
-async function editStoredSpec(file: string, edit: (spec: Record<string, unknown>) => void): Promise<number> {
+/** Edits every line of `file` that `edit` changes, as a writer of the session store does; counts the lines changed. */
+async function editRecords(file: string, edit: (record: Record<string, unknown>) => boolean): Promise<number> {
 	const lines = (await Bun.file(file).text()).split("\n");
 	let changed = 0;
 	const rewritten = lines.map(line => {
-		if (!line.includes('"session_init"')) return line;
+		if (line.trim() === "") return line;
 		const record: unknown = JSON.parse(line);
-		if (!isRecord(record) || record.type !== "session_init" || !isRecord(record.spawnSpec)) return line;
-		edit(record.spawnSpec);
+		if (!isRecord(record) || !edit(record)) return line;
 		changed++;
 		return JSON.stringify(record);
 	});
@@ -111,14 +60,37 @@ async function editStoredSpec(file: string, edit: (spec: Record<string, unknown>
 	return changed;
 }
 
-/** A test process with a live root parent and the cold reviver over it, with `id` spawned by the root and parked. */
+/** Edits the spawn spec of every `session_init` of `file` in place. */
+function editStoredSpec(file: string, edit: (spec: Record<string, unknown>) => void): Promise<number> {
+	return editRecords(file, record => {
+		if (record.type !== "session_init" || !isRecord(record.spawnSpec)) return false;
+		edit(record.spawnSpec);
+		return true;
+	});
+}
+
+/** Sets the workspace roots the header of `file` holds. */
+function editHeaderRoots(file: string, roots: string[]): Promise<number> {
+	return editRecords(file, record => {
+		if (record.type !== "session") return false;
+		record.additionalDirectories = roots;
+		return true;
+	});
+}
+
+/**
+ * A test process with a live root parent and the cold reviver over it, with `id` spawned by the root and parked;
+ * `prepare` runs on the root before the spawn.
+ */
 async function spawnAndPark(
 	id: string,
 	settings: Readonly<Record<string, unknown>> = {},
+	prepare?: (env: ReviveEnv, root: LiveParent) => void,
 ): Promise<{ env: ReviveEnv; root: LiveParent; sessionFile: string }> {
 	const env = await openReviveEnv(settings);
 	const root = env.createLiveParent();
 	env.installColdReviver(root);
+	prepare?.(env, root);
 	const spawned = await env.spawn({ ...spawnerOptions(root.toolSession), ...env.subagentInputs(id) });
 	await env.park(id);
 	return { env, root, sessionFile: spawned.sessionFile };
@@ -134,14 +106,13 @@ async function reviveCold(env: ReviveEnv, id: string): Promise<{ revived?: Reviv
 	}
 }
 
-describe("a cold revive of a record whose stored depth, cwd, credential source, roots, prompt id and settings were edited", () => {
+describe("a cold revive of a record whose stored depth, cwd, credential source, roots, cache warming, prompt id and settings, and whose header's roots, were edited", () => {
 	const id = "StoredPolicy";
 	let env: ReviveEnv | undefined;
 	let root: LiveParent | undefined;
 	let revived: RevivedSubagent | undefined;
 	let failure: string | undefined;
 	let warn: Mock<typeof logger.warn> | undefined;
-	let elsewhere = "";
 	let changed = 0;
 	let wakeFrames: LifecycleFrame[] = [];
 
@@ -150,7 +121,7 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 		env = opened.env;
 		root = opened.root;
 		const frames = recordFrames(env.eventBus);
-		elsewhere = path.join(env.root, "elsewhere");
+		const elsewhere = path.join(env.root, "elsewhere");
 		await fs.mkdir(elsewhere, { recursive: true });
 		changed = await editStoredSpec(opened.sessionFile, spec => {
 			const policy = part(spec, "policy");
@@ -158,16 +129,18 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 			policy.cwd = elsewhere;
 			policy.credentialSourceSessionId = STOLEN_CREDENTIAL_SOURCE;
 			policy.additionalDirectories = [elsewhere];
+			policy.cacheWarming = true;
 			part(spec, "prompt").id = IMPOSTOR;
 			part(part(part(spec, "settings"), "layers"), "overrides").task = { maxRecursionDepth: 5 };
 		});
+		await editHeaderRoots(opened.sessionFile, [elsewhere]);
 		warn = vi.spyOn(logger, "warn");
 		({ revived, failure } = await reviveCold(env, id));
 		if (!revived) return;
 		// The turn's frames are read whichever id they carry.
 		const from = frames.length;
 		await env.wake(revived.session, id);
-		await nextTurn(frames, undefined, from);
+		await heldTurn(frames, undefined, from);
 		wakeFrames = frames.slice(from);
 	}, 60_000);
 
@@ -197,6 +170,16 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 		expect(revived?.build.options.additionalDirectories).toEqual(root?.toolSession.additionalDirectories);
 	});
 
+	it("the header's additionalDirectories: the session holds only the live parent's roots", () => {
+		expect(revived?.session.sessionManager.getAdditionalDirectories()).toEqual(
+			root?.toolSession.additionalDirectories,
+		);
+	});
+
+	it("policy.cacheWarming: the constant every spawn writes, false", () => {
+		expect(revived?.build.options.cacheWarming).toBe(false);
+	});
+
 	it("settings: a stored value no spawn writes reads through to the live parent, with a warning naming the subagent", () => {
 		const settings = revived?.build.options.settings;
 		if (!settings || !warn) throw new Error(`The revive built no session: ${failure}`);
@@ -211,6 +194,43 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 	it("prompt.id: the wake turn's frames carry the registry ref's id", () => {
 		expect(wakeFrames.some(frame => frame.id === id)).toBe(true);
 		expect(wakeFrames.filter(frame => frame.id === IMPOSTOR)).toEqual([]);
+	});
+});
+
+describe("a cold revive of a record whose stored list of live inputs leaves out the cost gate and the prepared extensions", () => {
+	const id = "StoredLiveInputs";
+	let env: ReviveEnv | undefined;
+	let root: LiveParent | undefined;
+	let revived: RevivedSubagent | undefined;
+	let failure: string | undefined;
+
+	beforeAll(async () => {
+		const opened = await spawnAndPark(id, {}, (opening, parent) => {
+			// The tree's cost gate, which every spawner passes on.
+			parent.toolSession.costGate = new CostGate(opening.settings, 0, () => {});
+		});
+		env = opened.env;
+		root = opened.root;
+		await editStoredSpec(opened.sessionFile, spec => {
+			const names = Array.isArray(spec.liveInputs) ? spec.liveInputs : [];
+			spec.liveInputs = names.filter(name => name !== "costGate" && name !== "preloadedPreparedExtensions");
+		});
+		({ revived, failure } = await reviveCold(env, id));
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("costGate: the tree's, so the live session.maxCost still holds", () => {
+		expect(failure).toBeUndefined();
+		expect(root?.toolSession.costGate).toBeDefined();
+		expect(revived?.build.options.costGate).toBe(root?.toolSession.costGate);
+	});
+
+	it("preloadedPreparedExtensions: the live parent's, so the revive discovers no extensions of its own", () => {
+		expect(failure).toBeUndefined();
+		expect(revived?.build.options.preloadedPreparedExtensions).toBe(root?.toolSession.preparedExtensions);
 	});
 });
 
@@ -240,7 +260,7 @@ describe("a cold revive of a record whose stored wake.artifactsDir was edited", 
 		env.turns = { ...env.turns, wakeToolCall: { name: "yield", arguments: env.turns.yieldArguments } };
 		const from = frames.length;
 		await env.wake(cold.revived.session, id);
-		await nextTurn(frames, id, from);
+		await heldTurn(frames, id, from);
 	}, 60_000);
 
 	afterAll(async () => {
@@ -338,16 +358,8 @@ describe("a cold revive of a record whose stored wake limit was edited to none, 
 		const from = frames.length;
 		const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: id, body: WAKE_BODY });
 		expect(receipt.outcome).toBe("revived");
-		const turn = await nextTurn(frames, id, from);
-		expect(turn.ended?.status).toBe("aborted");
-		const elapsed = (turn.ended?.at ?? Number.POSITIVE_INFINITY) - turn.started.at;
-		expect(elapsed).toBeGreaterThanOrEqual(2_000);
-		expect(elapsed).toBeLessThanOrEqual(10_000);
-		const logged = warn.mock.calls.some(
-			([message, fields]) =>
-				message === LIMIT_WARNING && isRecord(fields) && fields.id === id && fields.maxRuntimeMs === 2_000,
-		);
-		expect(logged).toBe(true);
+		expectEndedAtLimit(await heldTurn(frames, id, from), 2_000);
+		expect(limitLogged(warn, id, 2_000)).toBe(true);
 	}, 30_000);
 });
 
@@ -379,7 +391,7 @@ describe("a cold revive of a record whose stored soft request budget was edited 
 		const sentFrom = frames.length;
 		const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: id, body: WAKE_BODY });
 		expect(receipt.outcome).toBe("revived");
-		await nextTurn(frames, id, sentFrom);
+		await heldTurn(frames, id, sentFrom);
 		const notified = env.requests
 			.slice(from)
 			.some(request => userTexts(request).some(text => text.includes(BUDGET_NOTICE)));

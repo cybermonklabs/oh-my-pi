@@ -451,35 +451,38 @@ tool call id and `maxRuntimeMs`), and the names of the live inputs the spawn pas
 `session_init` carries it. The in-memory revive and the revive from this file both build the
 subagent from it, so a subagent revived from its file runs on its spawn's settings; a stored LSP,
 IRC or MCP value never turns on what the live process has off, and no other stored value widens
-what the live process allows either: the revive from the file takes the subagent's ids from its
-registry entry, a task depth never shallower than its live parent chain, the credential source and
-workspace roots of its live parent where its spawn passed them (none where the parent is not
-live), context discovery in the root session's cwd (its tools run in the cwd of the file's
-header), its own directory for its artifacts, and wake limits (`maxRuntimeMs`, the soft request
-budget) never looser than the live
-settings. The stored settings overlay restores over the live parent's settings as a derived
-overlay, whatever flag the file holds, so the file's settings never become grant authority, and
-each stored setting is checked as a settings override is; an overlay that fails the check is
-replaced by the settings a file without `spawnSpec` gets, and of one that passes only the settings
-a spawn writes are restored (any other value reads through to the live parent). When the model
-registry, after its discovery, does not know the stored model,
-the revive starts on the next model of the subagent's retry-fallback chain that it knows, that
-has a credential and that runs within the effort ceiling, else on the parent session's model (the
-root session's when the parent is not live), and logs the move. A model of a provider that
-`disabledProviders` turns off counts as not known: the stored model, each chain entry and the
-prewalk target alike; a prewalk target that is not known or has no credential is not armed. A
-parent session homed in a worker thread counts as live: the revive reads its live inputs, its
-settings and its eval kernel there. A custom tool that the parent's eval kernel no longer
-defines stays in the tool list, answers a call as unavailable, and is named in a notice on the
-next turn. A file without `spawnSpec` takes, field by field, what a revive from such a file took
-before spawn specs existed: among others, the role alias, the root session's LSP value and the
-cut-back to the stored tool list. A value that every spawn gives a subagent whatever its inputs
-applies to such a file too: its session gets no `AGENTS.md` (`excludeAgentsMd: true`) and builds
-no cache warmer. Its live inputs come, as a spawn's do, from the live parent's tool session (the
-root session's when the parent is not live), among them the context files, skills, rules, prompt
-templates, workspace tree, inherited session agents, API key reader, telemetry, protocol options
-and artifact manager; and IRC and MCP stay off where the root session's tool session has them
-off. Shared exports drop `spawnSpec`; anonymized exports keep it opaque.
+what the live process allows either. The revive from the file takes the subagent's ids from its
+registry entry; a task depth never shallower than its live parent chain; the credential source
+and workspace roots of its live parent where its spawn passed them (none where the parent is not
+live), beside the roots of the live settings as at any spawn, and none of the roots the file's
+header holds; the tree's cost gate and the live parent's
+prepared extensions whatever the stored list of live inputs names; context discovery in the root
+session's cwd (its tools run in the cwd of the file's header); the cache-warming value every
+spawn writes (off); its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the
+soft request budget) never looser than the live settings. The stored settings overlay restores
+over the live parent's settings as a derived overlay, whatever flag the file holds, so the file's
+settings never become grant authority, and each stored setting is checked as a settings override
+is; an overlay that fails the check is replaced by the settings a file without `spawnSpec` gets,
+and of one that passes only the settings a spawn writes are restored (any other value reads
+through to the live parent). When the model registry, after its discovery, does not know the
+stored model, the revive starts on the next model of the subagent's retry-fallback chain that it
+knows, that has a credential and that runs within the effort ceiling, else on the parent
+session's model (the root session's when the parent is not live), and logs the move. A model of a
+provider that `disabledProviders` turns off counts as not known: the stored model, each chain
+entry and the prewalk target alike; a prewalk target that is not known or has no credential is
+not armed. A parent session homed in a worker thread counts as live: the revive reads its live
+inputs, its settings and its eval kernel there. A custom tool that the parent's eval kernel no
+longer defines stays in the tool list, answers a call as unavailable, and is named in a notice on
+the next turn. A file without `spawnSpec` takes, field by field, what a revive from such a file
+took before spawn specs existed: among others, the role alias, the root session's LSP value, the
+cut-back to the stored tool list and the workspace roots its header holds. A value that every
+spawn gives a subagent whatever its inputs applies to such a file too: its session gets no
+`AGENTS.md` (`excludeAgentsMd: true`) and builds no cache warmer. Its live inputs come, as a
+spawn's do, from the live parent's tool session (the root session's when the parent is not live),
+among them the context files, skills, rules, prompt templates, workspace tree, inherited session
+agents, API key reader, telemetry, protocol options and artifact manager; and IRC and MCP stay
+off where the root session's tool session has them off. Shared exports drop `spawnSpec`;
+anonymized exports keep it opaque.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 
 ### `mode_change`

@@ -5,7 +5,7 @@
 ### Fixed
 
 - Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
-- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids, task depth, credential source, workspace roots, discovery cwd, artifacts directory and wake limits now come from the live registry entry, parent and settings, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids, credential source, workspace roots, discovery cwd, artifacts directory, cost gate and prepared extensions now come from the live registry entry and parent, its task depth and wake limits are held to the live parent chain and settings, its cache warming stays off as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
 
 ## [18.18.6] - 2026-11-09
 

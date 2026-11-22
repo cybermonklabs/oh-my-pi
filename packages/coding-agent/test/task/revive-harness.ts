@@ -5,7 +5,7 @@
  * A call-through spy records every `createAgentSession` options object, and the scripted model records
  * every request as a provider receives it.
  */
-import { type Mock, vi } from "bun:test";
+import { expect, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -49,14 +49,14 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import * as settingsStreamModule from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { type ExecutorOptions, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ContextFileEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import * as toolsModule from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { buildWorkspaceTree, type WorkspaceTree } from "@oh-my-pi/pi-coding-agent/workspace-tree";
 import type { IrcDeliveryReceipt } from "@oh-my-pi/pi-tui/tools/irc";
 import type { MCPToolDetails } from "@oh-my-pi/pi-tui/tools/mcp";
-import { __resetDirsFromEnvForTests, isRecord, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, isRecord, logger, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 import { restoreEnvValue } from "../helpers/settings-test-state";
@@ -237,6 +237,90 @@ export function userTexts(request: RecordedRequest): string[] {
 		if (typeof message.content === "string") return [message.content];
 		return message.content.flatMap(part => (part.type === "text" ? [part.text] : []));
 	});
+}
+
+/** The text of the runtime limit's log line. */
+export const LIMIT_WARNING = "Subagent runtime limit exceeded; aborting";
+/** A held turn's wait for its end: past every limit the revive tests set, short of their timeouts. */
+export const HELD_TURN_BOUND_MS = 12_000;
+/** The answer of a model that holds a request until the turn is aborted. */
+export const HELD: MockResponse = { delayMs: 120_000, content: ["late"] };
+
+/** One lifecycle frame of a subagent, with the time it was seen. */
+export interface LifecycleFrame {
+	id: string;
+	status: string;
+	agentSource: unknown;
+	description: unknown;
+	parentToolCallId: unknown;
+	index: unknown;
+	at: number;
+}
+
+/** Every lifecycle frame `bus` carries from now on, in order. */
+export function recordFrames(bus: EventBus): LifecycleFrame[] {
+	const frames: LifecycleFrame[] = [];
+	bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+		if (!isRecord(payload)) return;
+		frames.push({
+			id: String(payload.id),
+			status: String(payload.status),
+			agentSource: payload.agentSource,
+			description: payload.description,
+			parentToolCallId: payload.parentToolCallId,
+			index: payload.index,
+			at: Date.now(),
+		});
+	});
+	return frames;
+}
+
+/** A turn whose model may hold its answer: its `started` frame, and its end where one came within the bound. */
+export interface HeldTurn {
+	started: LifecycleFrame;
+	ended: LifecycleFrame | undefined;
+	/** From the `started` frame to the end; undefined when the turn had not ended within the bound. */
+	elapsedMs: number | undefined;
+}
+
+/**
+ * Waits for the next turn of `id` (of any subagent where `id` is undefined) after `frames[from]` to start, then up
+ * to the bound for it to end. The limit under test is a real timer of the subagent's own run (on another thread
+ * for a worker-homed subagent), so the wait polls the frames on the platform clock rather than a fake one.
+ */
+export async function heldTurn(frames: LifecycleFrame[], id: string | undefined, from: number): Promise<HeldTurn> {
+	const startDeadline = Date.now() + HELD_TURN_BOUND_MS;
+	for (;;) {
+		const after = frames.slice(from).filter(frame => id === undefined || frame.id === id);
+		const started = after.find(frame => frame.status === "started");
+		if (started) {
+			const ended = after.find(frame => frame.status !== "started" && frame.at >= started.at);
+			if (ended) return { started, ended, elapsedMs: ended.at - started.at };
+			if (Date.now() - started.at > HELD_TURN_BOUND_MS) return { started, ended: undefined, elapsedMs: undefined };
+		} else if (Date.now() > startDeadline) {
+			throw new Error(`No turn of ${id ?? "any subagent"} started`);
+		}
+		await Bun.sleep(20);
+	}
+}
+
+/** The held turn ended at its limit: an `aborted` frame `minMs` to 10 s after it started. */
+export function expectEndedAtLimit(turn: HeldTurn, minMs: number): void {
+	expect(turn.ended?.status).toBe("aborted");
+	expect(turn.elapsedMs).toBeGreaterThanOrEqual(minMs);
+	expect(turn.elapsedMs).toBeLessThanOrEqual(10_000);
+}
+
+/** omp's log holds the runtime limit's line for `id` with `maxRuntimeMs`. */
+export function limitLogged(warn: Mock<typeof logger.warn>, id: string, maxRuntimeMs: number): boolean {
+	return warn.mock.calls.some(
+		([message, fields]) => message === LIMIT_WARNING && fields?.id === id && fields.maxRuntimeMs === maxRuntimeMs,
+	);
+}
+
+/** Holds every request of a wake turn: one whose conversation carries the IRC message that woke it. */
+export function holdWake(request: RecordedRequest): MockResponse | undefined {
+	return userTexts(request).some(text => text.includes(WAKE_BODY)) ? HELD : undefined;
 }
 
 /** The last result of a tool in a session's conversation. */

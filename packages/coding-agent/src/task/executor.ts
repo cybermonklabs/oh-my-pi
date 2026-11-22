@@ -4289,6 +4289,8 @@ export interface SubagentLegacyRevive {
 	tools?: { mountedToolNames: string[] | undefined; keepDevices: boolean };
 	/** Every build returns the held base prompt, the builds after the revived session's first model call too. */
 	replayPrompt?: boolean;
+	/** The record states no policy: the session keeps the workspace roots its file's header holds. */
+	policy?: boolean;
 }
 
 /** Inputs of {@link buildSubagentSession}. */
@@ -4336,6 +4338,10 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 	const settings =
 		launch?.settings ?? restoreSubagentSettings(live.settingsParent, revive?.cache?.settings ?? spec.settings);
 	if (live.parentArtifactManager) sessionManager.adoptArtifactManager(live.parentArtifactManager);
+	// A revive whose spec states its policy takes its workspace roots from that policy (at a cold revive, the live
+	// parent's) and the live settings, never from the roots the reopened file's header holds, which a writer of the
+	// session store can edit. A record with no spec keeps them, as before spawn specs.
+	if (revive && !revive.legacy?.policy) await sessionManager.setAdditionalDirectories([]);
 	const inputs: SubagentPromptInputs = {
 		...spec.prompt,
 		outputSchema: spec.prompt.outputSchema,

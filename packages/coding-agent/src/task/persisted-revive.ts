@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentIdentity } from "@oh-my-pi/pi-agent-core";
-import type { JsonValue, Model } from "@oh-my-pi/pi-ai";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { type ConfiguredThinkingLevel, modelSupportsEffortCeiling } from "@oh-my-pi/pi-tui/thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -17,7 +17,7 @@ import {
 	resolveSpawnModelIdentity,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
-import type { Settings } from "../config/settings";
+import { deleteByPath, getByPath, type RawSettings, type Settings, setByPath } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { MCPManager } from "../mcp/manager";
@@ -92,7 +92,7 @@ import {
 	type SubagentSpawnSpec,
 	spawnSpecSettings,
 } from "./spawn-spec";
-import { subagentLiveInputs } from "./structured-subagent";
+import { subagentLiveInputs, subagentSpawnerPolicy } from "./structured-subagent";
 import type { AgentDefinition } from "./types";
 
 /** Custom type of the message that names a revived subagent's unavailable custom tools to its model. */
@@ -559,13 +559,10 @@ function parentLiveInputs(tools: ToolSession): ParentLiveInputs {
 	return { ...subagentLiveInputs(tools), eventBus: tools.eventBus, subagentEventBus: tools.subagentEventBus };
 }
 
-/** The policy fields `tools`, a live parent's tool session, gives a spawn of it. */
+/** The policy fields `tools`, a live parent's tool session, gives a spawn of it, its roots copied. */
 function parentPolicy(tools: ToolSession): ParentPolicy {
-	const directories = tools.additionalDirectories;
-	return {
-		credentialSourceSessionId: tools.getCredentialSourceSessionId?.(),
-		additionalDirectories: directories ? [...directories] : undefined,
-	};
+	const { credentialSourceSessionId, additionalDirectories } = subagentSpawnerPolicy(tools);
+	return { credentialSourceSessionId, additionalDirectories: additionalDirectories && [...additionalDirectories] };
 }
 
 /**
@@ -612,61 +609,31 @@ function coldReviveSpecParts(
 		};
 	}
 	const { global, overrides, derived } = parts.settings.layers;
-	const written = { global: spawnWrittenLayer(global), overrides: spawnWrittenLayer(overrides), derived };
-	return {
-		parts: { ...parts, settings: { ...parts.settings, layers: written } },
-		unwritten: !Bun.deepEquals(written, parts.settings.layers),
-	};
+	const keptGlobal = spawnWrittenLayer(global);
+	const keptOverrides = spawnWrittenLayer(overrides);
+	const settings = spawnSpecSettings({
+		layers: { global: keptGlobal.kept, overrides: keptOverrides.kept, derived },
+		rootThresholds: parts.settings.rootThresholds,
+	});
+	return { parts: { ...parts, settings }, unwritten: keptGlobal.unwritten || keptOverrides.unwritten };
 }
 
-/** Setting paths as a tree of their segments; `true` marks a whole setting. */
-interface SettingPathTree {
-	[segment: string]: SettingPathTree | true;
-}
-
-/** `layer` (one layer of a stored overlay) holding only the settings of {@link SUBAGENT_OVERLAY_SETTINGS}. */
-function spawnWrittenLayer(layer: JsonRecord): JsonRecord {
-	const tree: SettingPathTree = {};
+/**
+ * Of `layer`, one layer of a stored overlay: the settings of {@link SUBAGENT_OVERLAY_SETTINGS} it holds, each at its
+ * path (a `null` unset kept), and whether it holds any other.
+ */
+function spawnWrittenLayer(layer: JsonRecord): { kept: RawSettings; unwritten: boolean } {
+	const kept: RawSettings = {};
+	// A shallow copy is enough: `deleteByPath` replaces each record on the path it edits rather than editing it.
+	const rest: RawSettings = { ...layer };
 	for (const id of SUBAGENT_OVERLAY_SETTINGS) {
 		const segments = id.split(".");
-		let node = tree;
-		for (const [index, segment] of segments.entries()) {
-			if (index === segments.length - 1) {
-				node[segment] = true;
-				break;
-			}
-			let next = node[segment];
-			if (next === true) break;
-			if (!next) {
-				next = {};
-				node[segment] = next;
-			}
-			node = next;
-		}
+		const value = getByPath(rest, segments);
+		if (value === undefined) continue;
+		setByPath(kept, segments, value);
+		deleteByPath(rest, segments);
 	}
-	return pickSettings(layer, tree);
-}
-
-/** The values of `layer` at the paths `tree` names. */
-function pickSettings(layer: JsonRecord, tree: SettingPathTree): JsonRecord {
-	const picked: { [key: string]: JsonValue } = {};
-	for (const key in tree) {
-		if (!Object.hasOwn(layer, key)) continue;
-		const value = layer[key];
-		const branch = tree[key];
-		if (branch === true) {
-			picked[key] = value;
-		} else if (isJsonRecord(value)) {
-			const inner = pickSettings(value, branch);
-			if (Object.keys(inner).length > 0) picked[key] = inner;
-		}
-	}
-	return picked;
-}
-
-/** Whether `value` is a JSON object, as a stored overlay layer's settings groups are. */
-function isJsonRecord(value: JsonValue): value is JsonRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+	return { kept, unwritten: Object.keys(rest).length > 0 };
 }
 
 /** What a cold revive restores the subagent's overlay over: the live parent's settings for a spec's, else the root's. */
@@ -684,9 +651,21 @@ function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boo
 }
 
 /**
+ * Live inputs a cold revive passes whatever its record's list names, since leaving one out lets the subagent do
+ * more than the live process allows. Without the tree's cost gate it starts its own, which `session.maxCost` does
+ * not reach; without the prepared extensions it discovers extensions itself, under the default roots where its
+ * extension roots are left out too, so an owner's explicit-only policy no longer holds. Every spawner passes both.
+ */
+const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
+	costGate: true,
+	preloadedPreparedExtensions: true,
+};
+
+/**
  * The live inputs of a subagent build: the live parent's (`parent`), else the root tool session's, as a spawn
- * of either reads them, limited to those the spawn passed where its spec names them. A root built without a
- * tool session (a host's root) gives its own objects, as cold revives took them before spawn specs.
+ * of either reads them, limited to those the spawn passed where its spec names them, except the inputs of
+ * {@link KEPT_LIVE_INPUTS}. A root built without a tool session (a host's root) gives its own objects, as cold
+ * revives took them before spawn specs.
  */
 function coldReviveLiveInputs(
 	ctx: PersistedSubagentReviveContext,
@@ -736,7 +715,7 @@ function coldReviveLiveInputs(
 	if (names) {
 		const passed = new Set<string>(names);
 		for (const name of SPAWN_LIVE_INPUT_NAMES) {
-			if (!passed.has(name)) live[name] = undefined;
+			if (!passed.has(name) && KEPT_LIVE_INPUTS[name] !== true) live[name] = undefined;
 		}
 	}
 	return live;
@@ -1144,6 +1123,7 @@ function coldReviveSpawnSpec(
 		legacy.tools = { mountedToolNames: restoredSeance ? undefined : init.mountedTools, keepDevices: !restoredSeance };
 	}
 	if (!parts.prompt) legacy.replayPrompt = true;
+	if (!parts.policy) legacy.policy = true;
 	const spawnSpec: SubagentSpawnSpec = {
 		v: SPAWN_SPEC_VERSION,
 		model: parts.model?.model ?? null,
@@ -1161,6 +1141,8 @@ function coldReviveSpawnSpec(
 		policy: parts.policy
 			? {
 					...parts.policy,
+					// The constant every spawn writes.
+					cacheWarming: false,
 					// Discovery runs in the root's cwd, as for a record with no spec; the tools run in the cwd of
 					// the record's header.
 					cwd: spec.prepared.rootCwd,
@@ -1236,7 +1218,7 @@ function coldReviveSpawnSpec(
 					artifactsDir: path.dirname(spec.sessionFile),
 				},
 	};
-	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt ? legacy : undefined };
+	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt || legacy.policy ? legacy : undefined };
 }
 
 /**

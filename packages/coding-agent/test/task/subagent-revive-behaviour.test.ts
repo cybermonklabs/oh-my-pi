@@ -10,7 +10,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -35,7 +34,7 @@ import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import { cfgTaskMaxEffort, cfgTaskMaxRuntimeMs } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
-import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ThreadId } from "@oh-my-pi/pi-coding-agent/thread/identity";
 import { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agent-session";
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "@oh-my-pi/pi-coding-agent/thread/subagent-worker";
@@ -46,13 +45,20 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import {
+	expectEndedAtLimit,
 	fixtureAgent,
+	HELD,
+	heldTurn,
+	holdWake,
+	type LifecycleFrame,
 	type LiveParent,
 	lastToolResult,
+	limitLogged,
 	openReviveEnv,
 	type RecordedRequest,
 	type ReviveEnv,
 	type RevivedSubagent,
+	recordFrames,
 	SPAWN_MODEL,
 	SPAWN_TASK,
 	type SpawnedSubagent,
@@ -76,84 +82,6 @@ const THINKING_MODEL = "mock/mock-thinking";
 const SWITCHED_MODEL = "mock/mock-switched";
 /** The model of a per-call worker's spawn. */
 const PER_CALL_MODEL = "mock/mock-percall";
-/** The text of the runtime limit's log line. */
-const LIMIT_WARNING = "Subagent runtime limit exceeded; aborting";
-/** A held turn's wait for its end: past every limit these rows set, short of the test timeouts. */
-const HELD_TURN_BOUND_MS = 12_000;
-/** The answer of a model that holds a request until the turn is aborted. */
-const HELD: MockResponse = { delayMs: 120_000, content: ["late"] };
-
-/** One lifecycle frame of a subagent, with the time it was seen. */
-interface LifecycleFrame {
-	id: string;
-	status: string;
-	agentSource: unknown;
-	description: unknown;
-	parentToolCallId: unknown;
-	index: unknown;
-	at: number;
-}
-
-/** Every lifecycle frame `bus` carries from now on, in order. */
-function recordFrames(bus: EventBus): LifecycleFrame[] {
-	const frames: LifecycleFrame[] = [];
-	bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
-		if (!isRecord(payload)) return;
-		frames.push({
-			id: String(payload.id),
-			status: String(payload.status),
-			agentSource: payload.agentSource,
-			description: payload.description,
-			parentToolCallId: payload.parentToolCallId,
-			index: payload.index,
-			at: Date.now(),
-		});
-	});
-	return frames;
-}
-
-/** A turn of `id` whose model held its answer: its `started` frame, and its end where one came within the bound. */
-interface HeldTurn {
-	started: LifecycleFrame;
-	ended: LifecycleFrame | undefined;
-	/** From the `started` frame to the end; undefined when the turn had not ended within the bound. */
-	elapsedMs: number | undefined;
-}
-
-/**
- * Waits for the next turn of `id` after `frames[from]` to start, then up to the bound for it to end. The limit
- * under test is a real timer of the subagent's own run (on another thread for a worker-homed subagent), so the
- * wait polls the frames on the platform clock rather than a fake one.
- */
-async function heldTurn(frames: LifecycleFrame[], id: string, from: number): Promise<HeldTurn> {
-	const startDeadline = Date.now() + HELD_TURN_BOUND_MS;
-	for (;;) {
-		const after = frames.slice(from).filter(frame => frame.id === id);
-		const started = after.find(frame => frame.status === "started");
-		if (started) {
-			const ended = after.find(frame => frame.status !== "started" && frame.at >= started.at);
-			if (ended) return { started, ended, elapsedMs: ended.at - started.at };
-			if (Date.now() - started.at > HELD_TURN_BOUND_MS) return { started, ended: undefined, elapsedMs: undefined };
-		} else if (Date.now() > startDeadline) {
-			throw new Error(`No turn of ${id} started`);
-		}
-		await Bun.sleep(20);
-	}
-}
-
-/** The held turn ended at its limit: an `aborted` frame `minMs` to 10 s after it started. */
-function expectEndedAtLimit(turn: HeldTurn, minMs: number): void {
-	expect(turn.ended?.status).toBe("aborted");
-	expect(turn.elapsedMs).toBeGreaterThanOrEqual(minMs);
-	expect(turn.elapsedMs).toBeLessThanOrEqual(10_000);
-}
-
-/** omp's log holds the runtime limit's line for `id` with `maxRuntimeMs`. */
-function limitLogged(warn: Mock<typeof logger.warn>, id: string, maxRuntimeMs: number): boolean {
-	return warn.mock.calls.some(
-		([message, fields]) => message === LIMIT_WARNING && fields?.id === id && fields.maxRuntimeMs === maxRuntimeMs,
-	);
-}
 
 /** omp's log holds the spawn's own `Model … not found` text for `gone`, naming `id` and the model it started on. */
 function moveLogged(warn: Mock<typeof logger.warn>, id: string, gone: string, started: string): boolean {
@@ -170,11 +98,6 @@ function readAsDepleted(env: ReviveEnv, modelId: string): void {
 			? { state: "depleted", accounts: [{ credentialId: 1, credentialType: "oauth", state: "depleted" }] }
 			: { state: "healthy", accounts: [] },
 	);
-}
-
-/** Holds every request of a wake turn: one whose conversation carries the IRC message that woke it. */
-function holdWake(request: RecordedRequest): MockResponse | undefined {
-	return userTexts(request).some(text => text.includes(WAKE_BODY)) ? HELD : undefined;
 }
 
 /** Bound on the wait for a woken subagent's first request: a revive that built no usable session sends none. */

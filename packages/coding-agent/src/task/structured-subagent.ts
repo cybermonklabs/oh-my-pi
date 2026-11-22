@@ -810,6 +810,19 @@ export function subagentLiveInputs(session: ToolSession): SubagentSpawnerLiveInp
 	};
 }
 
+/**
+ * The policy fields a subagent build takes from `session`, its spawner: its credential source and workspace roots.
+ * A cold revive takes them from the live parent the same way.
+ */
+export function subagentSpawnerPolicy(
+	session: ToolSession,
+): Pick<ExecutorOptions, "additionalDirectories" | "credentialSourceSessionId"> {
+	return {
+		additionalDirectories: session.additionalDirectories,
+		credentialSourceSessionId: session.getCredentialSourceSessionId?.(),
+	};
+}
+
 function buildExecutorOptions(
 	request: StructuredSubagentRequest,
 	policy: EffectiveSubagentPolicy,
@@ -824,8 +837,7 @@ function buildExecutorOptions(
 	return {
 		...live,
 		cwd: session.cwd,
-		additionalDirectories: session.additionalDirectories,
-		credentialSourceSessionId: session.getCredentialSourceSessionId?.(),
+		...subagentSpawnerPolicy(session),
 		agent: policy.effectiveAgent,
 		task: renderSubagentUserPrompt(request.assignment),
 		assignment: request.assignment.trim(),
