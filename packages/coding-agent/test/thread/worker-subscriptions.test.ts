@@ -38,14 +38,14 @@ describe("worker subscriptions on main", () => {
 		expect(result.aliveWhileSubscribed).toBe(true);
 		expect(result.remaining).toBe(0);
 		// A held unsubscribe that kept its listener would pin the worker's listener scope through the link.
-		expect(result.collected).toBe(true);
+		expect(result.collected, "the unsubscribed listener is still reachable from the held unsubscribe").toBe(true);
 	}, 30_000);
 
 	it("do the same through PeerCleanups, and run each cleanup once", async () => {
 		const result = await probe("peer-cleanups", "dropped");
 		expect(result.aliveWhileSubscribed).toBe(true);
 		expect(result.runs).toBe(1);
-		expect(result.collected).toBe(true);
+		expect(result.collected, "the unsubscribed listener is still reachable from the released cleanup").toBe(true);
 	}, 30_000);
 
 	it("keep a listener something else still holds (control)", async () => {
