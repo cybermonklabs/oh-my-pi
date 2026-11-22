@@ -461,20 +461,29 @@ fn a_waiting_redirection_open_holds_no_host_descriptor() {
 /// close-on-exec (`process::host::inherited_fds`). A spawn of the other paths
 /// still passes such a stray on where `posix_spawn` and `fork` close only
 /// close-on-exec descriptors (Linux); this one does not.
+///
+/// The stray is the lowest free fd from 10 up, where a shell keeps the
+/// copies of the fds a redirection of a compound command replaces (dash
+/// copies stdout to fd 10 for `if …; fi > out`): the probe redirects with
+/// `exec`, which keeps no copy, so only the stray can answer to its number.
 #[test]
 fn a_process_that_applies_its_redirections_keeps_only_its_placed_fds() {
-	use std::os::fd::AsRawFd;
+	use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 	let out = temp_path("stray-out");
 	let err = temp_path("stray-err");
-	let (stray, _writer) = std::io::pipe().unwrap();
-	let n = stray.as_raw_fd();
-	// SAFETY: F_SETFD on a descriptor this test owns.
-	assert_eq!(unsafe { libc::fcntl(n, libc::F_SETFD, 0) }, 0, "clear close-on-exec");
+	let (pipe_read, _writer) = std::io::pipe().unwrap();
+	// SAFETY: F_DUPFD on a descriptor this test owns makes a new one; the
+	// new descriptor is not close-on-exec.
+	let n = unsafe { libc::fcntl(pipe_read.as_raw_fd(), libc::F_DUPFD, 10) };
+	assert!(n >= 10, "F_DUPFD: {}", std::io::Error::last_os_error());
+	// SAFETY: `n` is a new descriptor nothing else owns.
+	let _stray = unsafe { OwnedFd::from_raw_fd(n) };
+	drop(pipe_read);
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = sh(&format!(
-		"if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi > '{}'",
+		"exec > '{}'; if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi",
 		out.display()
 	));
 	let mut deferred = spec(&a, &env, NEW);
