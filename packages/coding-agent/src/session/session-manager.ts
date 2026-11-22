@@ -184,6 +184,9 @@ const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
 
+/** Drains a switch runs for writes made while it loads its target, before it sets the new file (#setSessionFile). */
+const GAP_DRAIN_PASSES = 4;
+
 /** What a store holds at a session's path: nothing, a body (by length and hash), or unknown. */
 type StoredTranscriptState =
 	| { kind: "absent" }
@@ -1415,14 +1418,18 @@ export class SessionManager {
 	/** The {@link #switchGeneration} {@link #parentMoveFollow} was started in. */
 	#parentMoveFollowGeneration: number | undefined;
 	/**
-	 * Bumped where a switch ({@link setSessionFile}) reads the session it leaves. A parent follow or a queued-conflict
-	 * recovery started before carries the old value and never moves the session off or publishes it (see
-	 * {@link #switchedSince}): between that read and the load that sets the new file, `#sessionFile` still names the
-	 * session left, so a check of the path alone lets an older follow or recovery move it off unrecorded.
+	 * Bumped where a switch ({@link setSessionFile}) sets the new file. A parent follow started before carries the old
+	 * value and moves nothing (see {@link #switchedSince}): after a switch away and back to the same path, its check of
+	 * the path alone would still pass.
 	 */
 	#switchGeneration = 0;
-	/** From that read until the switch sets the new file (or fails): no follow or recovery moves the session off then. */
-	#switchingSession = false;
+	/**
+	 * The session the switch in progress leaves, from its read of that session until the load sets the new file.
+	 * Meanwhile `#sessionFile` and `#sessionId` still name the session left, and a write lands there. A move off it in
+	 * that time (a write's, a lease loss's, a follow's or a queued-conflict recovery's) sets `left` to the sibling it
+	 * makes, so the switch records that sibling as the session it leaves.
+	 */
+	#activeSwitch: { left?: { id: string; file: string } } | undefined;
 	/**
 	 * The subagent transcript a switch adopted under a refused claim, while its parent follow has not yet forked or
 	 * moved it: it was never this manager's, so a switch away from it before then records it as left no more than the
@@ -1942,12 +1949,9 @@ export class SessionManager {
 		);
 	}
 
-	/**
-	 * Whether a switch has started since `generation` was read (see {@link #switchGeneration}): one that is still
-	 * loading the new file, or one that set it.
-	 */
+	/** Whether a switch has set a new file since `generation` was read (see {@link #switchGeneration}). */
 	#switchedSince(generation: number): boolean {
-		return this.#switchGeneration !== generation || this.#switchingSession;
+		return this.#switchGeneration !== generation;
 	}
 
 	/**
@@ -1996,8 +2000,9 @@ export class SessionManager {
 	 * beside the parent file, under a lease it takes there, its header naming
 	 * the parent as `parentSession` (a lease row names no successor, and a
 	 * move keeps the parent's id), and publishes its whole transcript there:
-	 * no entry is lost, and no id is stranded. A follow a switch has outdated (`generation`, see
-	 * {@link #switchedSince}) moves and publishes nothing.
+	 * no entry is lost, and no id is stranded. A follow from before a switch set its new file (`generation`, see
+	 * {@link #switchedSince}) moves and publishes nothing; one that moves while a switch loads is recorded by it
+	 * ({@link #activeSwitch}).
 	 */
 	async #runParentMoveFollow(
 		childFile: string,
@@ -2050,6 +2055,7 @@ export class SessionManager {
 		this.#sessionClaim = undefined;
 		this.#sessionFile = next;
 		this.#heldAdoptionFile = undefined;
+		if (this.#activeSwitch) this.#activeSwitch.left = { id: this.#sessionId, file: next };
 		// The parent's copy holds this transcript's durable bytes; the publish replaces them.
 		this.#expectedDiskSize = this.#storage.existsSync(next) ? this.#storage.statSync(next).size : null;
 		this.#fileIsCurrent = false;
@@ -2362,17 +2368,11 @@ export class SessionManager {
 	 * writes to the file settle and reloads the store's index, so the content
 	 * it reads back, and the size the retry is checked against, are the
 	 * store's, never a write of this manager still in flight; a conflict on a
-	 * file this manager already moved off retries at the sibling it went on in. A recovery of a queued write
-	 * (`generation`, the {@link #switchGeneration} it started in) a switch has outdated moves nothing off and adopts
-	 * nothing: until the switch sets the new file, `#sessionFile` still names the session it leaves.
+	 * file this manager already moved off retries at the sibling it went on in. A switch waits for a recovery the
+	 * drain started before it reads the session it leaves ({@link #setSessionFile}), and records a move off one makes
+	 * while it loads ({@link #activeSwitch}).
 	 */
-	async #recoverFromWriteConflict(
-		error: unknown,
-		recoveries: number,
-		queued = false,
-		generation?: number,
-	): Promise<string | undefined> {
-		const outdated = () => generation !== undefined && this.#switchedSince(generation);
+	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
 		if (
 			queued &&
 			error instanceof SessionWriteConflictError &&
@@ -2385,12 +2385,11 @@ export class SessionManager {
 		if (!contested) return undefined;
 		// Every path from here retries or moves off: the conflict is this recovery's, not a failure.
 		if (error instanceof Error) this.#takenOverConflicts.add(error);
-		if (outdated()) return this.#sessionFile;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
 		if (this.#storage.defersSyncPublish) {
 			await this.#storage.confirmWrites?.(contested).catch(() => undefined);
 			await this.#storage.refresh?.();
-			if (this.#sessionFile !== contested || outdated()) return this.#sessionFile;
+			if (this.#sessionFile !== contested) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
 		let content: string;
@@ -2398,17 +2397,17 @@ export class SessionManager {
 			content = await this.#storage.readText(contested);
 		} catch (readError) {
 			// A synchronous rewrite during the read already recovered; retry against its result.
-			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
+			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
 			this.#durable = undefined;
 			return contested;
 		}
-		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
+		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		const found = this.#foreignEntriesIn(content);
 		if (!found) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(found.foreign, this.#blobs);
-		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested || outdated()) return this.#sessionFile;
+		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		// An append during the await may have moved the frontier past what was read; the retry republishes.
 		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, Buffer.byteLength(content, "utf8"));
 		return contested;
@@ -2437,10 +2436,18 @@ export class SessionManager {
 		if (this.#queuedConflictRecovery) return true;
 		const recoveries = this.#queuedConflictRecoveries++;
 		const generation = this.#switchGeneration;
-		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true, generation)
+		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true)
 			.then(async retryPath => {
-				// A switch since this started took the session's queued writes as they stood: nothing to publish here.
-				if (this.#exclusiveStopping || this.#entriesReleased || this.#switchedSince(generation)) return;
+				if (this.#exclusiveStopping || this.#entriesReleased) return;
+				// A switch set a new file before this recovery finished (it waits for one, within its bound): the
+				// entries of the session it left are no longer this manager's to publish. Say so; never lose them silently.
+				if (this.#switchedSince(generation)) {
+					logger.warn("A write conflict of a session a switch left was recovered after the switch", {
+						sessionFile,
+						movedTo: retryPath !== this.#sessionFile ? retryPath : undefined,
+					});
+					return;
+				}
 				if (!retryPath) {
 					this.#takenOverConflicts.delete(error);
 					this.#noteDiskFailure(error);
@@ -2528,6 +2535,8 @@ export class SessionManager {
 		};
 		this.#closeWriterEventually();
 		this.#sessionFile = to;
+		// A switch loading its new file leaves this sibling, not the session moved off (see #activeSwitch).
+		if (this.#activeSwitch) this.#activeSwitch.left = { id: this.#sessionId, file: to };
 		this.#expectedDiskSize = null;
 		this.#durable = undefined;
 		this.#fileIsCurrent = false;
@@ -2590,8 +2599,22 @@ export class SessionManager {
 				{ ignoreEpoch: true },
 			);
 		} finally {
-			this.#writer = undefined;
+			// A write while the drain closed the writer opened another: close that one too, never leave it open.
+			this.#closeWriterEventually();
 			this.#diskTail = Promise.resolve();
+		}
+	}
+
+	/**
+	 * Drains the writer and waits for the confirmations of the appends it took, so a claim released next covers every
+	 * write made under it, as {@link close} waits before its claim goes. A write made during the wait adds its own
+	 * confirmation, which the next pass waits for: at most GAP_DRAIN_PASSES passes.
+	 */
+	async #drainWrites(): Promise<void> {
+		for (let pass = 0; pass < GAP_DRAIN_PASSES; pass++) {
+			await this.#drainAndCloseWriter();
+			if (this.#pendingAppendConfirmations.size === 0) return;
+			await Promise.all(this.#pendingAppendConfirmations);
 		}
 	}
 
@@ -4073,7 +4096,18 @@ export class SessionManager {
 		// An append to this file that is still running (a stopped work pool's discards) lands first,
 		// so the session loads it and its next entry follows it. `#open` waits before its own load.
 		if (!loadedSession) await SessionManager.#pendingAppends.get(path.resolve(sessionFile));
-		await this.#drainAndCloseWriter();
+		await this.#drainWrites();
+		// A queued write's conflict the drain met starts a recovery (#recoverQueuedConflict): it keeps the other
+		// writer's entries and publishes the transcript again, or moves this session to a sibling. Let it finish, as
+		// flush() does, before the switch gives up the claim and reads the session it leaves: its entries are then
+		// published and its sibling is the session left. Bound: one wait per recovery of a chain, which ends by its
+		// (MAX_WRITE_CONFLICT_RECOVERIES + 1)th, as that one moves the session off as contested. A recovery still
+		// running past the bound reports what it could not publish (#recoverQueuedConflict).
+		for (let pass = 0; this.#queuedConflictRecovery && pass <= MAX_WRITE_CONFLICT_RECOVERIES; pass++) {
+			await this.#queuedConflictRecovery;
+		}
+		// What the drain left: a write while the switch loads shows as new disk work (see the load below).
+		let drainedTail = this.#diskTail;
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
 		// A switch gives up the previous file. Opening claims nothing: the first
@@ -4087,21 +4121,22 @@ export class SessionManager {
 		}
 		const switching = options?.switched !== undefined;
 		if (options?.switched) {
-			// From here until the new file is set, no older parent follow or queued-conflict recovery moves this
-			// session off: the session left is the one read here (see #switchGeneration).
-			this.#switchGeneration++;
-			this.#switchingSession = true;
+			// Until the load below sets the new file, a write lands in the session left, and a move off it (a write's,
+			// a lease loss's, a follow's or a recovery's) records the sibling it makes there (see #activeSwitch).
+			this.#activeSwitch = options.switched;
 			// A transcript adopted under a refused claim that no follow has forked or moved yet was never this
 			// manager's (see #heldAdoptionFile).
 			if (this.#sessionFile && this.#heldAdoptionFile !== this.#sessionFile) {
 				options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
 			}
-			this.#heldAdoptionFile = undefined;
 		}
 
 		let resolvedSessionFile: string;
 		let loaded: SessionLoadResult;
 		let sourceSize: number | null;
+		let migrated = false;
+		let headerCwd: string | undefined;
+		let headerCwdEnterable = false;
 		try {
 			// `gc --archive` leaves cold transcripts gzipped outside the sessions
 			// tree. Bring one back to its own path before anything reads or appends
@@ -4129,10 +4164,52 @@ export class SessionManager {
 					`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
 				);
 			}
-
+			// Every await of the load runs before the new file is set, so the file, the id and the entries change in
+			// one step: a write in between would claim the session left's id at the new file's path.
+			if (loaded.entries.length > 0) {
+				migrated = migrateToCurrentVersion(loaded.entries);
+				applyToolResultPrunes(loaded.entries);
+				// The blobs this session names get its reference rows, so another session's delete keeps them.
+				await resolveBlobRefsInEntries(loaded.entries, this.#blobs, resolvedSessionFile);
+				// loadEntriesFromFile guarantees entries[0] is a valid session header.
+				const cwd = (loaded.entries[0] as SessionHeader).cwd;
+				headerCwd = cwd ? path.resolve(cwd) : undefined;
+				headerCwdEnterable =
+					headerCwd !== undefined &&
+					headerCwd !== path.resolve(this.#cwd) &&
+					(await directoryIsEnterable(headerCwd));
+			}
+			// A write while the switch loaded went to the session left, or to the sibling a move off it made: let it
+			// land there, and a recovery it started finish, before the new file is set, as the drain above did for the
+			// writes before. A follow is not waited for: one that moves now is recorded (#activeSwitch), and once the
+			// new file is set it moves nothing (#switchedSince). Bound: GAP_DRAIN_PASSES drains. A write's bytes go to
+			// the writer of the file it was made at when it is made (#appendToCurrentSessionFile), so a write after the
+			// last drain still lands in the session left; only its confirmation is not waited for.
+			for (
+				let pass = 0;
+				pass < GAP_DRAIN_PASSES &&
+				(this.#diskTail !== drainedTail ||
+					this.#queuedConflictRecovery ||
+					this.#pendingAppendConfirmations.size > 0);
+				pass++
+			) {
+				await this.#drainWrites();
+				for (let wait = 0; this.#queuedConflictRecovery && wait <= MAX_WRITE_CONFLICT_RECOVERIES; wait++) {
+					await this.#queuedConflictRecovery;
+				}
+				drainedTail = this.#diskTail;
+			}
+			// A writer a write opened since then is the session left's too: its appends go there.
+			if (this.#writer) this.#closeWriterEventually();
 			this.#sessionFile = resolvedSessionFile;
+			if (switching) {
+				this.#switchGeneration++;
+				this.#heldAdoptionFile = undefined;
+			}
 		} finally {
-			if (switching) this.#switchingSession = false;
+			if (switching) {
+				this.#activeSwitch = undefined;
+			}
 		}
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
@@ -4152,11 +4229,6 @@ export class SessionManager {
 			return;
 		}
 
-		const migrated = migrateToCurrentVersion(fileEntries);
-		applyToolResultPrunes(fileEntries);
-		// The blobs this session names get its reference rows, so another session's delete keeps them.
-		await resolveBlobRefsInEntries(fileEntries, this.#blobs, resolvedSessionFile);
-		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
 
 		// Adopt the loaded session's working directory only when it is verifiably
@@ -4167,8 +4239,7 @@ export class SessionManager {
 		// (extension UI, RPC) would otherwise track a directory the process
 		// cannot enter. Keep the current cwd so the session stays where the
 		// user already is.
-		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd))) {
+		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && headerCwdEnterable) {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#fallbackRuntimeOnly = false;
@@ -4206,8 +4277,8 @@ export class SessionManager {
 		const claimed = options?.claimed;
 		if (claimed && claimed.sessionId === this.#sessionId) {
 			claimed.adopted = true;
-			// A claim this manager took for another id since the drain released its own (a move-off's sibling) is not
-			// the adopted one: let it go, or nothing releases it.
+			// A write while the switch loaded landed in the session left and claimed it again, or a move off it then
+			// claimed the sibling it made: that claim is another id's, not the adopted one. Let it go, or nothing does.
 			const prior = this.#sessionClaim;
 			if (prior && prior.sessionId !== claimed.sessionId) prior.release?.();
 			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
