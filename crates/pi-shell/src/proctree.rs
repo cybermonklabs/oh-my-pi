@@ -203,6 +203,32 @@ mod platform {
 			Ok(())
 		}
 
+		/// True once every thread of the process has stopped (`T`, or `t` under
+		/// a tracer), or the process has ended. A thread stops only on its way
+		/// back to user space, so a `fork` it was making when the stop signal
+		/// came has returned by then, and its child is in [`Self::children`].
+		/// A process that ended, or whose threads cannot be read, has nothing
+		/// left to wait for.
+		pub fn stopped(&self) -> bool {
+			if !self.live_identity() {
+				return true;
+			}
+			let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", self.pid)) else {
+				return true;
+			};
+			tasks.flatten().all(|task| {
+				// A thread that ended after the listing has no stat left to read.
+				let Ok(stat) = fs::read_to_string(task.path().join("stat")) else {
+					return true;
+				};
+				// The state follows the command name, which may itself hold `)`.
+				let state = stat
+					.rfind(')')
+					.and_then(|end| stat[end + 1..].trim_start().chars().next());
+				matches!(state, Some('T' | 't' | 'Z' | 'X'))
+			})
+		}
+
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
@@ -737,6 +763,12 @@ impl Process {
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
 	/// the wait entirely (the polite signal is still emitted). Returns `true`
 	/// when the tree has exited by the end of the hard wave's wait window.
+	///
+	/// On Linux each wave stops the tree, top-down, before it reads it, and
+	/// resumes it once signalled, so a process cannot fork a child between the
+	/// walk and its own signal: such a child used to outlive the termination,
+	/// moved to init when its parent died. A process that has not stopped
+	/// 100 ms into the walk is read as it runs.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -829,6 +861,64 @@ impl Process {
 			.collect()
 	}
 
+	/// The tree under this process, read for one termination wave.
+	///
+	/// Level by level from the top, each process is stopped before its
+	/// children are read, and the walk waits until it has stopped
+	/// ([`platform::Process::stopped`]): a stopped process cannot fork, so no
+	/// process joins the tree between this walk and the wave's signal. The
+	/// wait for the whole walk ends at [`STOP_WAIT_LIMIT`]; a process that has
+	/// not stopped by then (one blocked in the kernel, or traced with its stops
+	/// suppressed) is read as it runs. A protected process is neither stopped
+	/// nor walked into, so its subtree is spared.
+	#[cfg(target_os = "linux")]
+	async fn freeze(&self, protected: &HashSet<i32>, ct: &CancelToken) -> Result<Frozen> {
+		let deadline = tokio::time::Instant::now() + STOP_WAIT_LIMIT;
+		let mut frozen = Frozen { descendants: Vec::new(), stopped: Vec::new() };
+		let mut visited = HashSet::from([self.pid()]);
+		let mut level = vec![self.clone()];
+		while !level.is_empty() {
+			let stopping = frozen.stopped.len();
+			for process in &level {
+				if !protected.contains(&process.pid()) && process.inner.kill(libc::SIGSTOP) {
+					frozen.stopped.push(process.clone());
+				}
+			}
+			while !frozen.stopped[stopping..]
+				.iter()
+				.all(|process| process.inner.stopped())
+				&& tokio::time::Instant::now() < deadline
+			{
+				ct.heartbeat()?;
+				tokio::time::sleep(STOP_POLL_INTERVAL).await;
+			}
+			let mut next = Vec::new();
+			for process in &level {
+				for child in process.children() {
+					if !protected.contains(&child.pid()) && visited.insert(child.pid()) {
+						next.push(child.clone());
+						frozen.descendants.push(child);
+					}
+				}
+			}
+			level = next;
+		}
+		// Level by level, reversed: every child before its parent.
+		frozen.descendants.reverse();
+		Ok(frozen)
+	}
+
+	/// The tree under this process, read for one termination wave, with every
+	/// protected subtree pruned. Nothing is stopped outside Linux.
+	#[cfg(not(target_os = "linux"))]
+	fn freeze(
+		&self,
+		protected: &HashSet<i32>,
+		_ct: &CancelToken,
+	) -> std::future::Ready<Result<Frozen>> {
+		std::future::ready(Ok(Frozen { descendants: self.signalable_descendants(protected) }))
+	}
+
 	async fn terminate_tree_impl(
 		&self,
 		group: bool,
@@ -842,18 +932,11 @@ impl Process {
 
 		let process_group = if group { self.group_id() } else { None };
 		let protected = host_protected_pids();
+		let timeout = Duration::from_millis(u64::from(timeout_ms));
 
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
-		if let Some(pgid) = process_group {
-			let _ = kill_process_group(pgid, TERM_SIGNAL);
-		}
-		let mut descendants = self.signalable_descendants(&protected);
-		for child in &descendants {
-			let _ = child.inner.kill(TERM_SIGNAL);
-		}
-		if !protected.contains(&self.pid()) {
-			let _ = self.inner.kill(TERM_SIGNAL);
-		}
+		let frozen = self.freeze(&protected, &ct).await?;
+		let descendants = frozen.signal(self, TERM_SIGNAL, process_group, &protected);
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
@@ -873,19 +956,92 @@ impl Process {
 
 		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
 		// period — or any process re-parented to the root — is signalled too.
-		if let Some(pgid) = process_group {
-			let _ = kill_process_group(pgid, KILL_SIGNAL);
-		}
-		descendants = self.signalable_descendants(&protected);
-		for child in &descendants {
-			let _ = child.inner.kill(KILL_SIGNAL);
-		}
-		if !protected.contains(&self.pid()) {
-			let _ = self.inner.kill(KILL_SIGNAL);
-		}
+		let frozen = self.freeze(&protected, &ct).await?;
+		let descendants = frozen.signal(self, KILL_SIGNAL, process_group, &protected);
 
-		wait_for_exit(self, &descendants, Some(Duration::from_millis(u64::from(timeout_ms))), ct)
-			.await
+		wait_for_exit(self, &descendants, Some(timeout), ct).await
+	}
+}
+
+/// How long one wave's walk waits for the processes it stopped to stop. A
+/// runnable process stops within microseconds of the signal.
+#[cfg(target_os = "linux")]
+const STOP_WAIT_LIMIT: Duration = Duration::from_millis(100);
+
+/// How often [`Process::freeze`] looks again at the processes it is waiting
+/// on to stop.
+#[cfg(target_os = "linux")]
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The processes one termination wave signals, read by [`Process::freeze`].
+/// Dropping it resumes the ones it stopped, so no way out of a wave, a
+/// cancelled one included, leaves a process stopped.
+struct Frozen {
+	/// Children before parents, the order the wave signals them in.
+	descendants: Vec<Process>,
+	/// Top-down, in the order they were stopped.
+	#[cfg(target_os = "linux")]
+	stopped:     Vec<Process>,
+}
+
+impl Frozen {
+	/// Send `signal` to the group, the descendants, then `root`, and return the
+	/// descendants. The stopped processes resume after it, and act on it then.
+	fn signal(
+		mut self,
+		root: &Process,
+		signal: i32,
+		process_group: Option<i32>,
+		protected: &HashSet<i32>,
+	) -> Vec<Process> {
+		#[cfg(all(test, target_os = "linux"))]
+		wave_hook::run(root.pid());
+		if let Some(pgid) = process_group {
+			let _ = kill_process_group(pgid, signal);
+		}
+		for child in &self.descendants {
+			let _ = child.inner.kill(signal);
+		}
+		if !protected.contains(&root.pid()) {
+			let _ = root.inner.kill(signal);
+		}
+		std::mem::take(&mut self.descendants)
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Frozen {
+	fn drop(&mut self) {
+		// Children first: a parent resumed later finds them already acting on
+		// the wave's signal.
+		for process in self.stopped.iter().rev() {
+			let _ = process.inner.kill(libc::SIGCONT);
+		}
+	}
+}
+
+/// Lets a test act between a wave's walk and its signal.
+#[cfg(all(test, target_os = "linux"))]
+mod wave_hook {
+	use std::{
+		collections::HashMap,
+		sync::{LazyLock, Mutex},
+	};
+
+	type Hook = Box<dyn FnOnce() + Send>;
+
+	static HOOKS: LazyLock<Mutex<HashMap<i32, Hook>>> = LazyLock::new(Mutex::default);
+
+	/// Run `hook` once, in the next wave on the tree under `root`.
+	pub fn set(root: i32, hook: Hook) {
+		HOOKS.lock().expect("wave hooks").insert(root, hook);
+	}
+
+	pub fn run(root: i32) {
+		let hook = HOOKS.lock().expect("wave hooks").remove(&root);
+		if let Some(hook) = hook {
+			hook();
+		}
 	}
 }
 
@@ -1402,5 +1558,107 @@ mod tests {
 			.expect("wait result");
 		assert!(exited, "exit resolves the wait");
 		let _ = child.wait();
+	}
+
+	/// A child the root forks after a wave has read the tree, but before the
+	/// root is signalled, outlived the termination: the root died of the
+	/// signal, the child moved to init, and no later walk could reach it. The
+	/// hook asks the root to fork in exactly that gap, then waits until it has
+	/// forked or reads stopped; no such child may be left running.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_leaves_no_child_forked_after_the_walk() {
+		use std::{
+			io::Write,
+			process::{Command, Stdio},
+			sync::{Arc, Mutex},
+		};
+
+		/// The state letter of `pid`'s main thread: `T` once it has stopped.
+		fn state(pid: i32) -> Option<char> {
+			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+			stat[stat.rfind(')')? + 1..].trim_start().chars().next()
+		}
+
+		// The root forks a long-lived child only once it reads a line.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "read line; sleep 1000 & wait"])
+			.stdin(Stdio::piped())
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		let mut stdin = root.stdin.take().expect("root stdin");
+		let forked = Arc::new(Mutex::new(None::<Process>));
+		{
+			let forked = Arc::clone(&forked);
+			let watched = process.clone();
+			wave_hook::set(
+				root_pid,
+				Box::new(move || {
+					stdin.write_all(b"\n").expect("ask the root to fork");
+					// The root either forks, as it still runs, or reads stopped.
+					loop {
+						if let Some(child) = watched.children().into_iter().next() {
+							*forked.lock().expect("forked child") = Some(child);
+							return;
+						}
+						if state(root_pid) == Some('T') {
+							return;
+						}
+						std::thread::yield_now();
+					}
+				}),
+			);
+		}
+
+		let exited = process
+			.terminate_tree(false, 1000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = root.wait();
+		let child = forked.lock().expect("forked child").take();
+		let outlived = child
+			.as_ref()
+			.is_some_and(|child| child.status() == ProcessStatus::Running);
+		if let Some(child) = &child {
+			let _ = child.signal(KILL_SIGNAL);
+		}
+		assert!(exited, "the root must be gone");
+		assert!(!outlived, "the child the root forked after the walk outlived the termination");
+	}
+
+	/// A wave resumes the processes it stopped, so one that handles the signal
+	/// runs its handler at once, instead of waiting stopped for the hard
+	/// wave's kill.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_resumes_the_processes_it_stopped() {
+		use std::{os::unix::process::ExitStatusExt, process::Command};
+
+		// `wait` returns as soon as a trapped signal arrives, so the trap runs
+		// once the shell may run at all.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "trap 'exit 7' TERM; sleep 1000 & wait"])
+			.spawn()
+			.expect("spawn the root");
+		let process = Process::from_pid(i32::try_from(root.id()).expect("root pid fits in i32"))
+			.expect("pin the root");
+		while process.children().is_empty() {
+			std::thread::yield_now();
+		}
+
+		// The grace period only bounds a failure: the trap ends the root at once.
+		let exited = process
+			.terminate_tree(false, 30_000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let status = root.wait().expect("reap the root");
+		assert!(exited, "the tree must be gone");
+		assert_eq!(
+			(status.code(), status.signal()),
+			(Some(7), None),
+			"the root must run its TERM trap, not die of the hard wave's kill",
+		);
 	}
 }

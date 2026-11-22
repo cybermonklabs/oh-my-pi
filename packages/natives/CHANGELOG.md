@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `Process.terminate()` on Linux no longer leaves running a child that a process of the tree forks while the tree is being read: each wave stops the tree, top-down, before it reads it and resumes it once signalled, so that child is signalled with its parent instead of outliving it under init (an aborted `ptree.spawn` command could keep its output pipe open until such a child ended)
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
