@@ -10,15 +10,17 @@
 //! fault thread races the repeat itself; a known difference.) One raised
 //! once its instruction has run does not repeat (a system call a seccomp
 //! filter traps, `SIGSYS`): the shell takes it as bash does, runs its EXIT
-//! trap, then dies of it.
+//! trap, then dies of it. A general-protection fault (x86-64: an address
+//! that is not canonical) repeats too, though Linux gives its `SEGV` no
+//! fault's code (`SI_KERNEL`).
 //!
 //! Each case runs in a child process: this test binary again, running the
 //! one test with [`CASE`] set. The child starts the shell
 //! ([`pi_shell::process::main`]) on a `-c` string that sends its output to
 //! a file of the test's, sets an EXIT trap, makes the file [`MARK`] names,
 //! then waits; a thread of the child faults once the file exists: a write
-//! to an unmapped address, or (`syscall`) a system call its seccomp filter
-//! traps.
+//! to an unmapped address, (`noncanonical`) a write to an address that is
+//! not canonical, or (`syscall`) a system call its seccomp filter traps.
 
 #![cfg(unix)]
 
@@ -32,7 +34,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-/// The child's case: `standalone`, `embedded` or `syscall`.
+/// The child's case: `standalone`, `embedded`, `noncanonical` or `syscall`.
 const CASE: &str = "PI_SHELL_FAULT_CASE";
 /// The file the script makes once its EXIT trap is set.
 const MARK: &str = "PI_SHELL_FAULT_MARK";
@@ -66,23 +68,49 @@ fn child(case: &str) -> ! {
 			libc::sigaction(libc::SIGSEGV, &raw const action, std::ptr::null_mut());
 		}
 	}
-	let syscall = case == "syscall";
+	let fault: fn() = match case {
+		"standalone" | "embedded" => unmapped_write,
+		"noncanonical" => non_canonical_write,
+		"syscall" => trapped_syscall,
+		other => panic!("no case {other}"),
+	};
 	let mark = PathBuf::from(std::env::var_os(MARK).expect("the mark's path"));
 	thread::spawn(move || {
 		while !mark.exists() {
 			thread::sleep(Duration::from_millis(5));
 		}
-		if syscall {
-			trapped_syscall();
-			return;
-		}
-		// SAFETY: none: a deliberate fault, a write to an unmapped address.
-		unsafe { std::ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
+		fault();
 	});
 	let exit = pi_shell::process::main(["bash", "-c", SCRIPT], pi_shell::process::ProcessOptions {
 		embedded,
 	});
 	std::process::exit(exit.end())
+}
+
+/// A fault an instruction raises before it completes: a write to an
+/// unmapped address (`SEGV_MAPERR`).
+fn unmapped_write() {
+	// SAFETY: none: a deliberate fault, a write to an unmapped address.
+	unsafe { std::ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
+}
+
+/// A general-protection fault, which an instruction raises before it
+/// completes: a write to an address that is not canonical (bit 63 set, the
+/// bits below it clear: with 4- or 5-level paging alike), which x86-64
+/// Linux raises as `SEGV` with `SI_KERNEL`, not a fault's code.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn non_canonical_write() {
+	// SAFETY: none: a deliberate fault, a write to an address that is not
+	// canonical.
+	unsafe {
+		std::ptr::write_volatile(std::hint::black_box(0x8000_0000_0000_0000usize) as *mut u8, 1);
+	}
+}
+
+/// Other targets: the `noncanonical` case runs on x86-64 Linux only.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn non_canonical_write() {
+	unreachable!("the noncanonical case runs on x86-64 Linux only");
 }
 
 /// A fault raised once its instruction has run: a seccomp filter on this
@@ -198,6 +226,23 @@ fn a_real_fault_ends_a_standalone_shell_with_an_exit_trap() {
 	as_child();
 	let (status, out, printed) =
 		run_child("a_real_fault_ends_a_standalone_shell_with_an_exit_trap", "standalone");
+	assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}: {printed}");
+	assert_eq!(out, "", "the process ran on after the fault: {printed}");
+}
+
+/// A general-protection fault (a write to an address that is not
+/// canonical) repeats as any other fault, though Linux gives its `SEGV` no
+/// fault's code (`SI_KERNEL`): the process ends by it at once, and the EXIT
+/// trap does not run. Handed to the shell, the fault would let the trap run
+/// first in some runs and not others: this test fails only in those.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_general_protection_fault_ends_a_standalone_shell_with_an_exit_trap() {
+	as_child();
+	let (status, out, printed) = run_child(
+		"a_general_protection_fault_ends_a_standalone_shell_with_an_exit_trap",
+		"noncanonical",
+	);
 	assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}: {printed}");
 	assert_eq!(out, "", "the process ran on after the fault: {printed}");
 }

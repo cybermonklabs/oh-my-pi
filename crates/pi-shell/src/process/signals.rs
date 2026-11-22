@@ -122,12 +122,30 @@ mod unix {
 
 	/// Whether signal `number`, whose `si_code` is `code`, ends the process
 	/// at once ([`on_signal`]): a fault an instruction of this process raised
-	/// (`SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC`, …: the small positive
-	/// codes, on Linux and the BSDs alike, not a `kill`, `sigqueue` or
-	/// `raise`: `SI_USER`, `SI_QUEUE`, `SI_TKILL`) and would raise again
-	/// ([`REPEATING`]).
+	/// ([`raised_by_a_fault`]) and would raise again ([`REPEATING`]).
 	const fn ends_the_process(number: libc::c_int, code: libc::c_int) -> bool {
-		bit(number) & REPEATING != 0 && code > 0 && code < 0x80
+		bit(number) & REPEATING != 0 && raised_by_a_fault(code)
+	}
+
+	/// Whether a fault signal's `si_code` says an instruction of this process
+	/// raised it: a fault's code (`SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC`,
+	/// …: the small positive codes, on Linux and the BSDs alike), not a
+	/// `kill`, `sigqueue` or `raise` (`SI_USER`, `SI_QUEUE`, `SI_TKILL`). On
+	/// Linux `SI_KERNEL` too: x86-64 raises a general-protection fault (an
+	/// address that is not canonical, a misaligned `movaps`) as a `SEGV` with
+	/// no fault's code, and the instruction raises it again as any other
+	/// fault. (A terminal's `INT`, `QUIT` or `HUP` is `SI_KERNEL` as well,
+	/// [`sent_by_kernel`]: none of them is a fault signal.)
+	#[cfg(target_os = "linux")]
+	const fn raised_by_a_fault(code: libc::c_int) -> bool {
+		(code > 0 && code < 0x80) || code == libc::SI_KERNEL
+	}
+
+	/// Elsewhere a fault's small positive code alone: the BSDs give
+	/// `SI_USER` and the other senders' codes values above 0x10000.
+	#[cfg(not(target_os = "linux"))]
+	const fn raised_by_a_fault(code: libc::c_int) -> bool {
+		code > 0 && code < 0x80
 	}
 
 	/// bash `termsig_sighandler`: a signal is handed to the shell (pending,
@@ -269,10 +287,12 @@ mod unix {
 
 		/// Which deliveries end the process at once ([`ends_the_process`]):
 		/// a fault an instruction raised before it completed (a fault's small
-		/// positive code on `SEGV`, `BUS`, `ILL`, `FPE`); not the same signal
-		/// a `kill` or `raise` sent (`SI_USER`, `SI_TKILL`), nor a `SYS` or
-		/// `TRAP` an instruction raised once it had run (`SYS_SECCOMP`,
-		/// `TRAP_BRKPT`), which the shell takes. How the process then ends is
+		/// positive code on `SEGV`, `BUS`, `ILL`, `FPE`, or `SI_KERNEL`: x86-64's
+		/// general-protection fault); not the same signal a `kill` or `raise`
+		/// sent (`SI_USER`, `SI_TKILL`), nor a `SYS` or `TRAP` an instruction
+		/// raised once it had run (`SYS_SECCOMP`, `TRAP_BRKPT`; x86-64's `int3`
+		/// is `SI_KERNEL`), which the shell takes, nor a terminal's `INT`,
+		/// `QUIT` or `HUP` (`SI_KERNEL` too). How the process then ends is
 		/// [`a_real_fault_ends_the_process_though_its_signal_is_caught`]'s,
 		/// and `process_faults`'.
 		#[test]
@@ -280,11 +300,21 @@ mod unix {
 			let raised = 1;
 			for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
 				assert!(ends_the_process(sig, raised), "{sig} raised by a fault");
+				assert!(ends_the_process(sig, libc::SI_KERNEL), "{sig} raised by a protection fault");
 				assert!(!ends_the_process(sig, libc::SI_USER), "{sig} sent by a kill");
 				assert!(!ends_the_process(sig, libc::SI_TKILL), "{sig} raised by raise");
 			}
-			for sig in [libc::SIGSYS, libc::SIGTRAP, libc::SIGABRT, libc::SIGTERM] {
+			for sig in [
+				libc::SIGSYS,
+				libc::SIGTRAP,
+				libc::SIGABRT,
+				libc::SIGTERM,
+				libc::SIGINT,
+				libc::SIGQUIT,
+				libc::SIGHUP,
+			] {
 				assert!(!ends_the_process(sig, raised), "{sig}, code 1");
+				assert!(!ends_the_process(sig, libc::SI_KERNEL), "{sig}, SI_KERNEL");
 			}
 		}
 
