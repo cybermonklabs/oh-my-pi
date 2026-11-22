@@ -111,6 +111,9 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 /** The session file a record's history derives its `outputPath` from; see {@link historyAsKept}. */
 const kOutputPathSessionFile = Symbol("agent-registry.output-path-session-file");
 
+/** The ancestry of every ref with none; see the registry's mint. */
+const NO_ANCESTORS: readonly string[] = Object.freeze([]);
+
 /** The output artifact the executor writes beside the session file `sessionFile`: `<id>.md` beside `<id>.jsonl`. */
 function outputPathBeside(sessionFile: string): string | undefined {
 	return sessionFile.endsWith(".jsonl") ? `${sessionFile.slice(0, -".jsonl".length)}.md` : undefined;
@@ -329,7 +332,11 @@ export class AgentRegistry implements AgentRegistryApi {
 		return this.#mint(input, ancestors);
 	}
 
-	/** Mint and register the ref for `input.id`, with the ancestry it records. */
+	/**
+	 * Mint and register the ref for `input.id`, with the ancestry it records. An empty ancestry is one frozen list
+	 * shared by every such ref: a ref's ancestry never changes, and a parked subagent keeps its ref for as long as it
+	 * can be revived.
+	 */
 	#mint(input: RegisterInput, ancestors: readonly string[]): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
@@ -338,7 +345,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
-			ancestors,
+			ancestors: ancestors.length === 0 ? NO_ANCESTORS : ancestors,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
