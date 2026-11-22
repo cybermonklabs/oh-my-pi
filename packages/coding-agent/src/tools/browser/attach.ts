@@ -378,6 +378,12 @@ async function runsAsUid(pid: number, uid: number): Promise<boolean> {
 	return ids !== null && Number(ids[1]) === uid && Number(ids[2]) === uid;
 }
 
+/** The processes among `candidates` that run as `uid` ({@link runsAsUid}). */
+async function ownedBy(candidates: Process[], uid: number): Promise<Process[]> {
+	const owned = await Promise.all(candidates.map(candidate => runsAsUid(candidate.pid, uid)));
+	return candidates.filter((_, index) => owned[index]);
+}
+
 /**
  * The live Chromium-family browser holding a profile, whatever executable it
  * runs: a compiled launcher (Arch's /usr/bin/chromium) execs a binary whose
@@ -441,9 +447,13 @@ export async function findReusableCdp(
 	const executablePath = await fs.realpath(exe).catch(() => exe);
 	const isChromium = isChromiumBrowserExecutable(exe);
 	const wrapperTarget = process.platform === "linux" && isChromium ? await resolveWrapperTarget(executablePath) : null;
-	const candidates = Process.fromPath(wrapperTarget ?? executablePath).filter(
+	const running = Process.fromPath(wrapperTarget ?? executablePath).filter(
 		candidate => candidate.status() === ProcessStatus.Running,
 	);
+	// Only this user's browsers are probed or adopted. Root with CAP_SYS_PTRACE resolves every user's
+	// /proc/<pid>/exe, so the lookup by path also finds browsers that other users run.
+	const uid = process.getuid?.();
+	const candidates = process.platform === "linux" && uid !== undefined ? await ownedBy(running, uid) : running;
 	if (isChromium && normalizedRequestedUserDataDir !== null) {
 		const holder = await findProfileLockOwner(normalizedRequestedUserDataDir);
 		if (holder && !candidates.some(candidate => candidate.pid === holder.owner.pid)) {

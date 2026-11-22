@@ -559,7 +559,7 @@ describe("pickElectronTarget", () => {
 	 */
 	async function withLockedProfile(
 		options: { name?: string; argv0?: string; asUid?: number },
-		run: (paths: { launcher: string; profile: string; pid: number; port: number }) => Promise<void>,
+		run: (paths: { launcher: string; browser: string; profile: string; pid: number; port: number }) => Promise<void>,
 	): Promise<void> {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-lock-owner-"));
 		const launcher = path.join(root, "chromium");
@@ -600,7 +600,7 @@ describe("pickElectronTarget", () => {
 			const lockPath = path.join(profile, "SingletonLock");
 			await fs.symlink(`${os.hostname()}-${child.pid}`, lockPath);
 			if (options.asUid !== undefined) await fs.lchown(lockPath, options.asUid, options.asUid);
-			await run({ launcher, profile, pid: child.pid, port });
+			await run({ launcher, browser, profile, pid: child.pid, port });
 		} finally {
 			child.kill();
 			await child.exited;
@@ -656,6 +656,32 @@ describe("pickElectronTarget", () => {
 				// Control: the owner does claim to be chromium.
 				expect((await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0")[0]).toBe("chromium");
 				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${profile}`] })).toBeNull();
+			});
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"probes no browser found by its path that runs as another user",
+		async () => {
+			// Root resolves every user's /proc/<pid>/exe, so the lookup by path can find other users' browsers.
+			await withLockedProfile({}, async ({ browser, profile, pid, port }) => {
+				const appArgs = [`--user-data-dir=${profile}`];
+				// Control: this user's browser, found by its path, is reused.
+				expect(await findReusableCdp(browser, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
+				const statusPath = `/proc/${pid}/status`;
+				const realReadFile = fs.readFile;
+				const readFile = vi.spyOn(fs, "readFile").mockImplementation((async (file: PathLike, opts?: unknown) => {
+					const text = await realReadFile(file, opts as never);
+					if (file !== statusPath) return text;
+					const uid = process.getuid!() + 1;
+					return String(text).replace(/^Uid:.*$/m, `Uid:\t${uid}\t${uid}\t${uid}\t${uid}`);
+				}) as typeof fs.readFile);
+				try {
+					expect(await findReusableCdp(browser, { appArgs })).toBeNull();
+					expect(readFile).toHaveBeenCalledWith(statusPath, "utf8");
+				} finally {
+					readFile.mockRestore();
+				}
 			});
 		},
 	);
