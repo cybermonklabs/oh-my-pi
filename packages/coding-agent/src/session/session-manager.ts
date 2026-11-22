@@ -2412,15 +2412,24 @@ export class SessionManager {
 	}
 	/** Switch to a different session file (resume / branch). */
 	async setSessionFile(sessionFile: string): Promise<void> {
-		const left = this.#sessionFile ? { id: this.#sessionId, file: this.#sessionFile } : undefined;
-		await this.#setSessionFile(sessionFile);
+		const switched: { left?: { id: string; file: string } } = {};
+		await this.#setSessionFile(sessionFile, undefined, { switched });
+		const left = switched.left;
 		if (left && this.#sessionId !== left.id) this.#recordLeftSession(left.id, left.file);
 	}
 
 	async #setSessionFile(
 		sessionFile: string,
 		loadedSession?: SessionLoadResult,
-		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions },
+		options?: {
+			throwIfMissing?: boolean;
+			newSession?: NewSessionOptions;
+			/**
+			 * Set to the session the switch leaves, read once the drain is over (see {@link setSessionFile}): a
+			 * write the drain runs can move the session to a sibling, and that sibling is the session left.
+			 */
+			switched?: { left?: { id: string; file: string } };
+		},
 	): Promise<void> {
 		// An append to this file that is still running (a stopped work pool's discards) lands first,
 		// so the session loads it and its next entry follows it. `#open` waits before its own load.
@@ -2428,6 +2437,9 @@ export class SessionManager {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
+		if (options?.switched && this.#sessionFile) {
+			options.switched.left = { id: this.#sessionId, file: this.#sessionFile };
+		}
 		// A switch gives up the previous file. Opening claims nothing: the first
 		// write does, so inspecting a session never counts as owning it.
 		this.#sessionClaim?.release?.();
@@ -2548,12 +2560,15 @@ export class SessionManager {
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
 
-		const oldSessionFile = this.#sessionFile;
-		const parentSessionId = this.#sessionId;
-		this.#recordLeftSession(parentSessionId, oldSessionFile);
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
+		// Read once the drain is over: a write it ran can move the session to a sibling, which is the session
+		// this fork leaves and copies.
+		const oldSessionFile = this.#sessionFile;
+		if (!oldSessionFile) return undefined;
+		const parentSessionId = this.#sessionId;
+		this.#recordLeftSession(parentSessionId, oldSessionFile);
 
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
