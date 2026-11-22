@@ -2803,6 +2803,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			baseSystemPrompt: this.agent.state.systemPrompt,
 			baseSettingsRead: config.baseSettingsRead,
 			operatorPromptDigest: config.operatorPromptDigest,
+			// A `/tan` clone's fixed prompt is its parent's build: a prompt its copied transcript stores is restored
+			// under the parent's operator inputs, read from the parent itself.
+			storedPromptOperatorDigest: config.tanParent ? config.tanParent.#tools.operatorPromptDigest : undefined,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
 			skillsSettings: config.skillsSettings,
@@ -7630,6 +7633,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Base system prompt blocks the next turn builds on, before any `before_agent_start` override. */
 	get baseSystemPrompt(): string[] {
 		return this.#tools.baseSystemPrompt;
+	}
+
+	/**
+	 * While the base prompt withholds a change (a held settings change, a kept restored transcript prompt), the base
+	 * prompt that goes out with it; undefined otherwise. A copy: nothing a caller does to it reaches the session
+	 * ({@link SessionTools.withheldPromptBuild}). A `/tan` clone sends it once that change goes out.
+	 */
+	get withheldPromptBuild(): string[] | undefined {
+		return this.#tools.withheldPromptBuild;
 	}
 
 	/**

@@ -38,6 +38,7 @@ import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
+import type { AgentSession } from "./agent-session";
 import type { CacheWarmer } from "./cache-warmer";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -358,6 +359,12 @@ export interface AgentSessionConfig {
 	 * resumed transcript's stored prompt is sent again only while it is unchanged.
 	 */
 	operatorPromptDigest?: string;
+	/**
+	 * The session a `/tan` clone forks while that session withholds a change (`TanCommandController`): the clone's
+	 * fixed system prompt is that session's build, so a prompt the copied transcript stores is restored under that
+	 * session's operator inputs, not the clone's.
+	 */
+	tanParent?: AgentSession;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
 	/** `xd://` presentation state backed by the canonical tool map. */

@@ -79,7 +79,12 @@ export class TanCommandController {
 		const parentPromptCacheKey =
 			session.agent.promptCacheKey ?? (taskPromptCacheKey === undefined ? parentSessionId : undefined);
 		const thinkingLevel = session.configuredThinkingLevel();
-		const systemPrompt = [...session.systemPrompt];
+		// While the parent withholds a change, the clone starts on the parent's prompt as sent, which its copied
+		// transcript stores, and sends the parent's build, the prompt that goes out with that change, once the change
+		// goes out: that build is its fixed prompt, and the parent's operator inputs decide the restore (`tanParent`).
+		// Otherwise the clone sends the parent's prompt as it stands.
+		const withheldPromptBuild = session.withheldPromptBuild;
+		const systemPrompt = withheldPromptBuild ?? [...session.systemPrompt];
 		// The copied prompt carries the parent's memory recall; the clone inherits it as delivered.
 		const parentMnemopiSessionState = session.getMnemopiSessionState?.();
 		const toolNames = session.getEnabledToolNames();
@@ -166,6 +171,7 @@ export class TanCommandController {
 								model,
 								thinkingLevel,
 								systemPrompt,
+								tanParent: withheldPromptBuild ? session : undefined,
 								toolNames,
 								mountedToolNames,
 								advertiseHeadlessAsk: activeToolNames.includes("ask"),
