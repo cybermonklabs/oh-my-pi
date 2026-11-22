@@ -356,11 +356,21 @@ impl Child {
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.
-		self.run = Some(if detached {
+		let started = if detached {
 			api.exec_subshell_in(script, lineage)
 		} else {
 			api.run_subshell_in(script, lineage)
-		});
+		};
+		self.run = started;
+		if started.is_none() {
+			// No vpid left although the call's dispatch had one: another vproc
+			// (a background job's child) took the last one since. Only that
+			// race reaches here. The command fails with bash's message and
+			// status 254, and the script goes on; the dispatch-time failure
+			// ([`crate::bash::vm::exec::fork_failed`]) ends the shell instead.
+			api.diag(BStr::new("fork: Resource temporarily unavailable"));
+			self.status = Some(254);
+		}
 	}
 
 	fn on_done(&mut self, run: RunId, status: i32) -> bool {

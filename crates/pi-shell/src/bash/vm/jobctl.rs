@@ -756,6 +756,10 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	let Some(unit) = vp.frames.get(base).and_then(|f| f.unit.clone()) else {
 		return Flow::Call;
 	};
+	// The stopped job is a child of its own.
+	if let Some(flow) = exec::fork_failed(k, vp, cx, 1, exec::line_of(vp, 0)) {
+		return flow;
+	}
 	let pc = vp.frames[base].pc;
 	let construct = !vp.frames[base].enters.is_empty()
 		|| !vp.frames[base].loops.is_empty()

@@ -87,7 +87,8 @@ fn rig(end_orphan_jobs: bool, signals: &Signals) -> Rig {
 		Arc::new(|api: &mut ShellApi<'_, '_>, argv: &[BString]| -> CallOutcome {
 			let mut script = Script::command(&b"\"$@\""[..]);
 			script.args = Some(argv[1..].to_vec());
-			api.run_subshell_in(script, Lineage { label: LABEL, detached: true });
+			api.run_subshell_in(script, Lineage { label: LABEL, detached: true })
+				.expect("a vpid is left");
 			CallOutcome::Exit(0)
 		}),
 	);

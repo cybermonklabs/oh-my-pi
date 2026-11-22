@@ -3,7 +3,7 @@
 use crate::{
 	bash::{
 		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		Script, Shell, ShellError, SigTarget, Signal, StateStore, Step, os_pid_limit,
+		Script, Shell, ShellError, SigTarget, Signal, StateStore, Step, Vpid, os_pid_limit,
 		store::BlobSlot,
 	},
 	testkit::{
@@ -123,6 +123,47 @@ fn a_vpid_base_an_os_pid_can_take_is_refused() {
 	let restored =
 		Shell::restore(&at, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default());
 	assert!(restored.is_ok(), "restore takes the limit: {:?}", restored.err());
+}
+
+/// A vpid base at the last vpid ([`Vpid::CEILING`]) or above it leaves no
+/// vpid for any child (the shell itself takes the base): `create` and
+/// `restore` refuse it. One below the last vpid leaves the last one for a
+/// child, and is taken.
+#[test]
+fn a_vpid_base_that_leaves_no_vpid_is_refused() {
+	let top = Engine::new(EngineConfig { vpid_base: Vpid::CEILING - 1, ..EngineConfig::default() });
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	for base in [Vpid::CEILING, u32::MAX] {
+		let high = Engine::new(EngineConfig { vpid_base: base, ..EngineConfig::default() });
+		let err =
+			Shell::create(&high, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+				.err();
+		assert!(
+			matches!(err, Some(ShellError::VpidBaseAtCeiling { base: b }) if b == base),
+			"create refuses base {base}: {err:?}"
+		);
+	}
+	let shell =
+		Shell::create(&top, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]));
+	assert!(shell.is_ok(), "one below the last vpid is taken: {:?}", shell.err());
+	drop(shell);
+	for base in [Vpid::CEILING, u32::MAX] {
+		let high = Engine::new(EngineConfig { vpid_base: base, ..EngineConfig::default() });
+		let err = Shell::restore(
+			&high,
+			&mut Cx { host: &mut host, store: &mut store },
+			RestoreOpts::default(),
+		)
+		.err();
+		assert!(
+			matches!(err, Some(RestoreError::VpidBaseAtCeiling { base: b }) if b == base),
+			"restore refuses base {base}: {err:?}"
+		);
+	}
+	let restored =
+		Shell::restore(&top, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default());
+	assert!(restored.is_ok(), "restore takes one below the last vpid: {:?}", restored.err());
 }
 
 #[test]

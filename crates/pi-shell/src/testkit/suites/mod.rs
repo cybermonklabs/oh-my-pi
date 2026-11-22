@@ -43,6 +43,7 @@ mod tool_profile;
 mod trace;
 mod trap;
 mod vars;
+mod vpid_ceiling;
 mod windows_platform;
 mod zsh_builtins;
 mod zsh_compctl;

@@ -101,6 +101,9 @@ pub enum Stop {
 	/// A fatal expansion error (`${x?}`, `set -u`): a non-interactive shell
 	/// exits.
 	Fatal(Diag),
+	/// A process substitution needed a vpid and none is left: the command
+	/// fails as when the shell cannot fork ([`super::exec::fork_failure`]).
+	ForkFailed,
 	/// The state store failed.
 	Store(StoreError),
 }
@@ -980,7 +983,11 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
-					let p = super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output);
+					let Some(p) =
+						super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output)
+					else {
+						return Err(Stop::ForkFailed);
+					};
 					self.note(|| Atom::Str(Some(p.clone())));
 					p
 				};
@@ -3952,6 +3959,7 @@ impl arith::Env for Vars<'_, '_> {
 			},
 			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
+			Err(Stop::ForkFailed) => Diag::ForkFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. } | Stop::MathCall(_)) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),
 			},
@@ -3983,6 +3991,7 @@ impl arith::Env for Vars<'_, '_> {
 			},
 			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
+			Err(Stop::ForkFailed) => Diag::ForkFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. } | Stop::MathCall(_)) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),
 			},

@@ -26,6 +26,15 @@ pub enum ShellError {
 		/// The limit.
 		limit: u32,
 	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// at or above the last vpid
+	/// ([`Vpid::CEILING`](crate::bash::Vpid::CEILING)): the shell would take it,
+	/// and no child could have one.
+	#[error("vpid base {base} leaves no vpid below the last one")]
+	VpidBaseAtCeiling {
+		/// The configured base.
+		base: u32,
+	},
 }
 
 /// Failure of [`Shell::restore`](crate::bash::Shell::restore).
@@ -84,6 +93,15 @@ pub enum RestoreError {
 		base:  u32,
 		/// The limit.
 		limit: u32,
+	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// at or above the last vpid
+	/// ([`Vpid::CEILING`](crate::bash::Vpid::CEILING)): the shell would take it,
+	/// and no child could have one.
+	#[error("vpid base {base} leaves no vpid below the last one")]
+	VpidBaseAtCeiling {
+		/// The configured base.
+		base: u32,
 	},
 }
 
