@@ -355,17 +355,25 @@ async function isSameDirectory(absolute: string, id: DirectoryId | undefined): P
  * { withFileTypes: true })` and goes on only into a directory entry, or one with no type. Just
  * before it reads one it checks with `lstat` that a directory is at that path, and keeps that
  * directory's device and inode. Just after the read it checks again that the path, and its
- * parent's path, still give the directories kept for them; if either changed (a directory swapped
- * for a link before or during its read, or an ancestor swapped since it was read, which a path
- * goes through), the read is dropped: its entries are neither listed nor read. A parent that
- * passed its own check means its ancestors were still in place then, so with a swap that stays
- * in place nothing read through it is kept. Each directory the walk reads was found by a kept
- * read, so it reads each directory of the tree once, plus at most one read for each directory
- * swapped meanwhile, and never further behind a link. A swap undone between a read and its check
- * (the directory put back) is not seen; then names from behind the link can be listed, and nothing
- * is removed. Without links the walk cannot loop (an entry has one parent, a directory cannot be
- * hard-linked, and mounts nest as a finite tree). A directory under `root` that is gone when the
- * listing reaches it (another process removed it) has nothing left to list, and is skipped.
+ * parent's path, still lead to the directories kept for them; if either leads elsewhere, the read
+ * is dropped: its entries are neither listed nor read. That catches the directory or its parent
+ * swapped for a link before or during the read (`lstat` then finds a link), and a directory
+ * further up swapped for a link to another directory since it was read (the parent's path then
+ * leads to another directory). Each directory the walk reads was found by a kept read, so it
+ * reads each directory of the tree once, plus at most one read for each directory swapped
+ * meanwhile, and never goes further behind such a link.
+ *
+ * The check does not catch a swap after which both paths still lead to the directories kept for
+ * them. A directory above the parent, moved away and replaced by a link to its new place, is one:
+ * the read is kept, and its entries are named by their paths under `root`, as for a plain move of
+ * that directory. A swap undone between a read and its check (the directory put back) is another:
+ * the entries read behind the link can be named by paths under `root`. In both, the names are
+ * paths under `root`, and nothing outside the tree is removed, since the `rm` removes a link as
+ * itself (on Linux, as above).
+ *
+ * Without links the walk cannot loop (an entry has one parent, a directory cannot be hard-linked,
+ * and mounts nest as a finite tree). A directory under `root` that is gone when the listing
+ * reaches it (another process removed it) has nothing left to list, and is skipped.
  *
  * It checks `signal` before each directory it reads and once more at the end, so an abort during
  * the last read is seen too: an abort, or an error while it lists (a directory it cannot read,
