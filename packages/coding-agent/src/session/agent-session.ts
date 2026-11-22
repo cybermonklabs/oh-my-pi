@@ -7140,6 +7140,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#runStateListeners.clear();
 		this.#ircWakeHoldListeners.clear();
 		this.#sessionChangeCallbacks.clear();
+		// A cold revive sends the newest `session_init` prompt as a fixed prompt and holds nothing, so a session that
+		// parks or ends while its base withholds a change stores the prompt that goes out with it: the revive sends
+		// what the change's notices said the requests would follow, not the held prompt for good.
+		const withheldPromptBuild = this.#tools.withheldPromptBuild;
+		if (withheldPromptBuild) this.#recordModelCallSystemPrompt(withheldPromptBuild);
 
 		// Event handlers can reopen the append writer while they persist their
 		// terminal message; that pipeline has drained (or hit the deadline).

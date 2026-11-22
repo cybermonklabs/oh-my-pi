@@ -1031,6 +1031,8 @@ interface EarlierNoticesTold {
 	readonly disabledTools: readonly string[];
 	/** The tools given as enabled, available after the rebuild. */
 	readonly enabledTools: readonly string[];
+	/** The change of the newest notice that gave each tool as disabled or as enabled, by tool name. */
+	readonly toolsGivenBy: ReadonlyMap<string, string>;
 	/** The change the newest of them describes, and how many of them describe it; undefined without them. */
 	readonly newest: { readonly hold: string; readonly notices: number } | undefined;
 }
@@ -4258,14 +4260,17 @@ export class SessionTools {
 	 * Rediscovers reloadable skills and rebuilds the system prompt's skill list. With `settingsChange` on a bound
 	 * prompt only the registry follows now ({@link reloadSkills}); the prompt's list waits for the held rebuild
 	 * ({@link #holdSettingsRebuild}) and {@link takeSkillNotice} tells the model. A rediscovery that finds the skills
-	 * the prompt lists, each with the description it gives, moves nothing the prompt sends, so it holds nothing; the
-	 * change itself is held only where it moves the prompt or a declaration ({@link holdToolDeclarationChange}).
+	 * the prompt lists, each with the description it gives, moves nothing the prompt sends, so it holds nothing and
+	 * rebuilds nothing: the session's own builds take the registry's list from then on, the list the prompt gives
+	 * already (a kept restored transcript prompt's among them), and the change itself is held only where it moves the
+	 * prompt or a declaration ({@link holdToolDeclarationChange}).
 	 */
 	refreshSkills(options?: SettingsChangeOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			await this.#rediscoverSkills();
 			const settingsChange = options?.settingsChange;
 			if (settingsChange && this.#promptBound && !this.#skillListMoved()) {
+				this.#promptSkills = this.#skills;
 				this.#host.notifyCommandMetadataChanged();
 				return;
 			}
@@ -4473,15 +4478,21 @@ export class SessionTools {
 	/**
 	 * Replaces memory-backend tools while preserving unrelated selections. With `settingsChange` on a bound prompt (a
 	 * memory setting switched or reconfigured the backend) the registry follows the backend, but the reapply is held
-	 * as {@link reconcileBuiltinTools} holds one ({@link #holdSettingsRebuild}): a memory tool the backend no longer
-	 * offers stays declared and its calls are refused, a new one waits for the rebuild.
+	 * as {@link reconcileBuiltinTools} holds one ({@link #holdSettingsRebuild}) when it moves the enabled tools
+	 * ({@link #rosterMoves}): a memory tool the backend no longer offers stays declared and its calls are refused, a new
+	 * one waits for the rebuild. A tool created again with the name and the definition the one it replaces declares (a
+	 * backend re-applied for an edit of its own settings) is neither taken away nor brought: it runs at once, keeps the
+	 * enabled state it had, and holds nothing.
 	 */
 	replaceMemoryTools(tools: AgentTool[], options?: SettingsChangeOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const wasEnabled = new Set(this.getEnabledToolNames());
 			const removed = new Set<string>(MEMORY_BACKEND_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)));
-			const nextActive = [...wasEnabled].filter(name => !removed.has(name));
+			// What each tool the apply replaces declares, to tell one created again as it was from a changed one.
+			const declarations = new Map<string, string>();
 			for (const name of removed) {
+				const tool = this.#toolRegistry.get(name);
+				if (tool) declarations.set(name, toolDeclaration(tool));
 				this.#toolRegistry.delete(name);
 				this.#builtInToolNames.delete(name);
 			}
@@ -4494,16 +4505,14 @@ export class SessionTools {
 				const wrapped = this.#wrapRuntimeTool(tool);
 				this.#toolRegistry.set(wrapped.name, wrapped);
 				this.#builtInToolNames.add(wrapped.name);
-				added.push(wrapped.name);
+				if (declarations.get(wrapped.name) === toolDeclaration(wrapped)) removed.delete(wrapped.name);
+				else added.push(wrapped.name);
 			}
+			const nextActive = [...wasEnabled].filter(name => !removed.has(name));
+			const step = added.map(name => ({ name, activate: true }));
 			const held =
-				(removed.size > 0 || added.length > 0) &&
-				(await this.#holdRosterChange(
-					options?.settingsChange,
-					wasEnabled,
-					removed,
-					added.map(name => ({ name, activate: true })),
-				));
+				this.#rosterMoves(wasEnabled, removed, step) &&
+				(await this.#holdRosterChange(options?.settingsChange, wasEnabled, removed, step));
 			if (held) return;
 			await this.#applyActiveToolsByName([...new Set([...nextActive, ...added])]);
 		});
@@ -4536,6 +4545,29 @@ export class SessionTools {
 		}
 		await this.#recordHeldSettingsBuild();
 		return true;
+	}
+
+	/**
+	 * Whether a tool-set step moves the tools enabled once the hold rebuilds ({@link #enabledAfterHold}): one of the
+	 * `removed` tools that was enabled (in `wasEnabled`) and that the hold does not disable yet, or one the hold brings
+	 * with the rebuild; or one of the `added` tools the hold disables, whose calls run again, or one that `activate`s
+	 * and is neither enabled nor brought with the rebuild yet. A step that moves none changes no tool a request
+	 * declares or the prompt lists: a gated tool the session's explicit list leaves out, or a tool registered inactive.
+	 */
+	#rosterMoves(
+		wasEnabled: ReadonlySet<string>,
+		removed: Iterable<string>,
+		added: Iterable<{ readonly name: string; readonly activate: boolean }>,
+	): boolean {
+		const held = this.#heldSettingsRebuild;
+		for (const name of removed) {
+			if (held?.enabledTools.has(name) || (wasEnabled.has(name) && !held?.disabledTools.has(name))) return true;
+		}
+		for (const { name, activate } of added) {
+			if (held?.disabledTools.has(name)) return true;
+			if (activate && !wasEnabled.has(name) && !held?.enabledTools.has(name)) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -4581,9 +4613,15 @@ export class SessionTools {
 	 * prompt rebuild — unconditionally unless `refreshPrompt` is false, then only
 	 * when the tool set changed. Unrelated selections and MCP/extension tools are
 	 * preserved. With `settingsChange` on a bound prompt the registry still follows
-	 * the settings, but the reapply is held ({@link #holdSettingsRebuild}): an
-	 * unregistered tool stays declared and its calls are refused, a registered one
-	 * waits for the rebuild. A change of the `xd://` state is never held.
+	 * the settings, but the reapply is held ({@link #holdSettingsRebuild}) when it
+	 * moves the enabled tools ({@link #rosterMoves}): an unregistered tool stays
+	 * declared and its calls are refused, a registered one waits for the rebuild.
+	 * A change that moves none (a gate of a tool the session's explicit list
+	 * leaves out, a recursion limit the session's depth stays within) holds
+	 * nothing and reapplies nothing, so no settings notice names it and the bound
+	 * prompt keeps its bytes; a change of a prompt input among its settings is
+	 * held by its own listener or {@link holdToolDeclarationChange}. A change of
+	 * the `xd://` state is never held.
 	 */
 	reconcileBuiltinTools({
 		refreshPrompt = true,
@@ -4611,7 +4649,10 @@ export class SessionTools {
 				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#callableAsDeclared(tool);
 			}
 			if (!refreshPrompt && !xdevChanged && delta.added.length === 0 && delta.removed.length === 0) return;
-			if (!xdevChanged && (await this.#holdRosterChange(settingsChange, wasEnabled, delta.removed, delta.added))) {
+			if (!xdevChanged && settingsChange && this.#promptBound) {
+				if (this.#rosterMoves(wasEnabled, delta.removed, delta.added)) {
+					await this.#holdRosterChange(settingsChange, wasEnabled, delta.removed, delta.added);
+				}
 				return;
 			}
 			await this.#applyActiveToolsByName([...enabled], true);
@@ -5167,21 +5208,38 @@ export class SessionTools {
 		if (!held) return this.#releasedSettingsNotice(earlier);
 		const told = this.#settingsNoticeTold(held, messages);
 		const values = new Map(told?.values);
-		// A setting the change holds, or one the base was built with at another value, goes out with the rebuild; the
-		// prompt and tools the request carries follow every other one already.
+		// A setting the base was built with at another value than it has now goes out with the rebuild, whether the
+		// change holds it or not; the prompt and tools the request carries follow every other one already, a setting the
+		// change holds that was set back to the value the base was built with among them.
 		const read = this.#promptSettingsRead;
 		const waiting: [AnySetting, unknown][] = [];
 		const settled: [AnySetting, unknown][] = [];
 		for (const start of this.#heldSettingStarts(held, earlier)) {
 			const [setting] = start;
-			if (held.before.has(setting) || this.#readAtOtherValue(read, setting)) waiting.push(start);
+			const builtOtherwise = held.before.has(setting)
+				? !settingValuesEqual(held.before.get(setting), setting.get(this.#host.settings))
+				: this.#readAtOtherValue(read, setting);
+			if (builtOtherwise) waiting.push(start);
 			else settled.push(start);
 		}
 		const heldChanges = this.#settingChanges(waiting, values);
 		const releasedChanges = this.#settingChanges(settled, values);
-		// Without a notice of its own on the branch, the change goes on from what the other changes' notices told.
-		const toldDisabled = told?.disabledTools ?? earlier.disabledTools;
-		const toldEnabled = told?.enabledTools ?? earlier.enabledTools;
+		// Without a notice of its own on the branch, the change goes on from what the other changes' notices told, but
+		// for a tool the held rebuild disables or brings again that the notice of a change that ended gave so: that
+		// notice gave that change's time, and this change gives its own. A notice of the change it goes on from, whose
+		// time it keeps, stays told ({@link #continuedHolds}).
+		let continued: ReadonlySet<string> | undefined;
+		const toldStands = (name: string, again: boolean | undefined): boolean => {
+			if (!again) return true;
+			const hold = earlier.toolsGivenBy.get(name);
+			continued ??= this.#continuedHolds(held);
+			return hold !== undefined && continued.has(hold);
+		};
+		const toldDisabled =
+			told?.disabledTools ??
+			earlier.disabledTools.filter(name => toldStands(name, rebuild?.disabledTools.has(name)));
+		const toldEnabled =
+			told?.enabledTools ?? earlier.enabledTools.filter(name => toldStands(name, rebuild?.enabledTools.has(name)));
 		let disabledTools: readonly string[];
 		let enabledTools: readonly string[];
 		if (rebuild) {
@@ -5241,22 +5299,29 @@ export class SessionTools {
 	 * Where each setting a settings notice or a refusal of `held`, the change the base withholds, names starts
 	 * ({@link noticedSettingStarts}). A value a notice of another change (`earlier`) gave a setting `held` holds stands
 	 * while the setting has another value now, so the change is named from it, or while that notice is one of the
-	 * change `held` goes on from: an earlier process's change, whose records the kept restored transcript prompt holds
-	 * ({@link RecordedHold.holds}) and whose time that prompt keeps. Otherwise that notice's change ended, and the value
-	 * it gave, which the setting has now, went out by that change's time as far as the model knows; but `held`'s prompt
-	 * is written without it, and it goes out by `held`'s time. So the setting starts at the value that prompt was built
-	 * with, and the notice names it with `held`'s time.
+	 * change `held` goes on from ({@link #continuedHolds}), whose time that prompt keeps. Otherwise that notice's change
+	 * ended, and the value it gave, which the setting has now, went out by that change's time as far as the model
+	 * knows; but `held`'s prompt is written without it, and it goes out by `held`'s time. So the setting starts at the
+	 * value that prompt was built with, and the notice names it with `held`'s time.
 	 */
 	#heldSettingStarts(held: WithheldChange & HeldSettings, earlier: EarlierNoticesTold): Map<AnySetting, unknown> {
 		let continued: ReadonlySet<string> | undefined;
 		return noticedSettingStarts(held.before, earlier, (setting, told, hold) => {
 			if (!settingValuesEqual(told, setting.get(this.#host.settings))) return true;
-			continued ??=
-				this.#keptRestoredPrompt()?.id === held.id
-					? (this.#recordedHold(held.digest)?.holds ?? NO_HOLDS)
-					: NO_HOLDS;
+			continued ??= this.#continuedHolds(held);
 			return hold !== undefined && continued.has(hold);
 		});
+	}
+
+	/**
+	 * The holds ({@link SettingsNoticeDetails.hold}) of the change `held` goes on from, whose notices gave its time: an
+	 * earlier process's change, whose records the kept restored transcript prompt `held` withholds holds
+	 * ({@link RecordedHold.holds}). None for a change of this process's own.
+	 */
+	#continuedHolds(held: WithheldChange & HeldSettings): ReadonlySet<string> {
+		return this.#keptRestoredPrompt()?.id === held.id
+			? (this.#recordedHold(held.digest)?.holds ?? NO_HOLDS)
+			: NO_HOLDS;
 	}
 
 	/**
@@ -5314,13 +5379,15 @@ export class SessionTools {
 	 * What the settings notices in `messages` of every change but `except` told the model, each notice giving what
 	 * changed since the one before it ({@link SettingsNoticeDetails}): the value the newest gave each setting it names,
 	 * by id, the tools left given as disabled and as available after the rebuild, the newest notice that names a tool
-	 * deciding which ({@link applyNoticeToolLists}), and the change the newest notice describes.
+	 * deciding which ({@link applyNoticeToolLists}), the change of each value's and each tool's notice, and the change
+	 * the newest notice describes.
 	 */
 	#earlierNoticesTold(messages: readonly AgentMessage[], except?: string): EarlierNoticesTold {
 		const values = new Map<string, unknown>();
 		const givenBy = new Map<string, string>();
 		const disabledTools = new Set<string>();
 		const enabledTools = new Set<string>();
+		const toolsGivenBy = new Map<string, string>();
 		const counts = new Map<string, number>();
 		let hold: string | undefined;
 		let notices = 0;
@@ -5337,12 +5404,16 @@ export class SessionTools {
 				givenBy.set(id, hold);
 			}
 			applyNoticeToolLists(disabledTools, enabledTools, details);
+			for (const list of [details.disabledTools, details.enabledTools]) {
+				if (isStringList(list)) for (const name of list) toolsGivenBy.set(name, hold);
+			}
 		}
 		return {
 			values,
 			givenBy,
 			disabledTools: [...disabledTools],
 			enabledTools: [...enabledTools],
+			toolsGivenBy,
 			newest: hold === undefined ? undefined : { hold, notices },
 		};
 	}
@@ -5351,9 +5422,11 @@ export class SessionTools {
 	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it. It names
 	 * each setting whose change disabled it as the settings notice names the change, from the value the model was told
 	 * of it before the change's notices ({@link #heldSettingStarts}), and only while its value differs from that one;
-	 * says where the tool stays listed until the rebuild in what the request the call answers carries (its tool list,
-	 * or the `xd://` listing its system prompt and mount notices give), and nowhere when neither lists it; and gives the
-	 * time the rebuild comes at the latest. Undefined for every other tool.
+	 * those are every setting of the change that took the tool away, which does not tell which of them disabled it,
+	 * so with more than one it says the tool is disabled by one of them. It says where the tool stays listed until the
+	 * rebuild in what the request the call answers carries (its tool list, or the `xd://` listing its system prompt and
+	 * mount notices give), and nowhere when neither lists it; and gives the time the rebuild comes at the latest.
+	 * Undefined for every other tool.
 	 */
 	heldToolRefusal(name: string): string | undefined {
 		const bareName = stripXdUrlPrefix(name);
@@ -5370,6 +5443,7 @@ export class SessionTools {
 		return prompt.render(heldToolRefusalPrompt, {
 			tool: bareName,
 			changes,
+			oneOfChanges: changes.length > 1,
 			inToolList: listing === "tools",
 			inDeviceListing: listing === "devices",
 			rebuildBy: withheldChangeDeadline(held),

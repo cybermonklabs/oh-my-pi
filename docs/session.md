@@ -444,8 +444,10 @@ own validated tool contract instead. Anonymized exports treat it like `tools`.
 `systemPrompt` holds the base prompt blocks a model call was built from (never a per-turn
 `before_agent_start` override), and revival replays them unchanged. A session appends a newer
 `session_init` when a model call runs on a different base prompt or work-pool yield items
-(`workPoolYieldItems`, restored on revival). Older files store one joined string, which revives
-as a single block.
+(`workPoolYieldItems`, restored on revival), and when it parks or ends while its base prompt
+withholds a settings change, with the prompt that goes out with that change: a cold revive holds
+nothing, so it sends the change the hidden settings notice announced rather than the held prompt.
+Older files store one joined string, which revives as a single block.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 
 ### `mode_change`
