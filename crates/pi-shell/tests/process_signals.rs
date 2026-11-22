@@ -942,12 +942,15 @@ fn bash_runs_its_exit_trap_before_dying_of_a_fatal_signal() {
 /// it inherits, ignored (`''`) ones too unless `posixtraps` is set, so a
 /// signal sent to it has its default action; a pipeline stage keeps every
 /// trap and runs a caught one itself. (bash keeps `''` traps in every
-/// subshell and resets the others in every one.)
+/// subshell and resets the others in every one.) The caught trap is
+/// `USR1`'s (10 on Linux, 30 on macOS), never signal 31's, whose trap zsh
+/// 5.9 keeps
+/// ([`a_zsh_subshell_unsets_signal_31s_trap_which_zsh_5_9_keeps`]).
 #[test]
 fn a_zsh_subshell_unsets_its_traps_and_a_pipeline_stage_keeps_them() {
-	let script = "zmodload zsh/system; trap '' TERM; trap 'print caught-usr2' USR2
+	let script = "zmodload zsh/system; trap '' TERM; trap 'print caught-usr1' USR1
 ( kill -TERM $sysparams[pid]; print not-reached ); print paren=$?
-{ kill -USR2 $sysparams[pid]; print stage-alive } | cat; print stage=$pipestatus
+{ kill -USR1 $sysparams[pid]; print stage-alive } | cat; print stage=$pipestatus
 { kill -TERM $sysparams[pid]; print not-reached } & wait $!; print bg=$?
 x=$(kill -TERM $sysparams[pid]; print not-reached); print \"subst=$? $x\"
 setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posix=$?
@@ -960,7 +963,7 @@ setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posi
 			ours.code
 		),
 		(
-			"paren=143\ncaught-usr2\nstage-alive\nstage=0 0\nbg=143\nsubst=143 \
+			"paren=143\ncaught-usr1\nstage-alive\nstage=0 0\nbg=143\nsubst=143 \
 			 \nposix-alive\nposix=0\ntrap -- '' TERM\nlisted\n"
 				.to_owned(),
 			String::new(),
@@ -969,6 +972,74 @@ setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posi
 	);
 	if have_zsh() {
 		assert_eq!(ours, Run::script(zsh_oracle::path(), "zsh", script).go());
+	}
+}
+
+/// zsh 5.9's `entersubsh` stops one signal short: it unsets a subshell's
+/// traps for each `sig < SIGCOUNT` (`Src/exec.c:1037`), and `SIGCOUNT` is
+/// the highest signal number of the C library zsh was built with
+/// (`Src/signames2.awk:63`): 31 on Linux (`SYS`) and on macOS (`USR2`). So a
+/// `( … )`, `&` or `$( )` subshell of zsh 5.9 keeps that signal's trap,
+/// lists it and runs it. obash unsets it with the others, as zsh after 5.9
+/// does (zsh-users/zsh@4616ea398a, "off-by-one error when resetting signals
+/// on subshell entrance", loops `sig <= SIGCOUNT`): a difference from zsh
+/// 5.9 kept on purpose and pinned on both sides here, so that this fails
+/// when either side changes. A real zsh other than 5.9 (a later one, or 5.9
+/// with that fix) must do as obash does.
+#[test]
+fn a_zsh_subshell_unsets_signal_31s_trap_which_zsh_5_9_keeps() {
+	// zsh's `SIGCOUNT` signal, by the C library's numbers.
+	let (name, number) = if cfg!(target_os = "macos") {
+		("USR2", libc::SIGUSR2)
+	} else {
+		("SYS", libc::SIGSYS)
+	};
+	assert_eq!(number, 31, "zsh's SIGCOUNT: {name} is {number} here, not 31");
+	let script = format!(
+		"zmodload zsh/system; trap 'print caught' {name}; ( trap ); print listed
+( kill -{name} $sysparams[pid]; print paren-alive ); print paren=$?
+{{ kill -{name} $sysparams[pid]; print bg-alive }} & wait $!; print bg=$?
+x=$(kill -{name} $sysparams[pid]; print subst-alive); print \"subst=$? $x\""
+	);
+	let text = |o: &Outcome| {
+		(
+			String::from_utf8_lossy(&o.stdout).into_owned(),
+			String::from_utf8_lossy(&o.stderr).into_owned(),
+			o.code,
+		)
+	};
+	let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "zsh", &script).go();
+	let died = 128 + number;
+	assert_eq!(
+		text(&ours),
+		(format!("listed\nparen={died}\nbg={died}\nsubst={died} \n"), String::new(), Some(0)),
+		"obash unsets the {name} trap in each subshell"
+	);
+	if have_zsh() {
+		let real = Run::script(zsh_oracle::path(), "zsh", &script).go();
+		if zsh_oracle::version_is_5_9() {
+			assert_eq!(
+				text(&real),
+				(
+					format!(
+						"trap -- 'print caught' \
+						 {name}\nlisted\ncaught\nparen-alive\nparen=0\ncaught\nbg-alive\nbg=0\nsubst=0 \
+						 caught\nsubst-alive\n"
+					),
+					String::new(),
+					Some(0)
+				),
+				"zsh 5.9 keeps the {name} trap in each subshell (exec.c:1037)"
+			);
+		} else {
+			// A zsh with the fix (after 5.9, or 5.9 with 4616ea398a) does as
+			// obash.
+			assert_eq!(
+				text(&real),
+				text(&ours),
+				"a zsh other than 5.9 unsets the {name} trap as obash does"
+			);
+		}
 	}
 }
 

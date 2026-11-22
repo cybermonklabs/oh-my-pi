@@ -305,7 +305,10 @@ pub fn end_scope(
 /// coproc) it unsets every signal trap but the `TRAPNAL` functions,
 /// ignored ones included unless `posixtraps` is set. With it (`keep`: a
 /// pipeline stage) every trap stays, and a caught signal's trap runs in
-/// the child, where bash's subshells reset it.
+/// the child, where bash's subshells reset it. Every signal's trap goes, as
+/// in zsh after 5.9 (zsh-users/zsh@4616ea398a): zsh 5.9 keeps the trap of
+/// its `SIGCOUNT`, signal 31 (`exec.c:1037` loops `sig < SIGCOUNT`), a
+/// difference `process_signals` pins.
 ///
 /// # Errors
 ///

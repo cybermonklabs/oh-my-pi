@@ -41,17 +41,24 @@ pub fn exists() -> bool {
 	found
 }
 
+/// Whether the real zsh is zsh 5.9 (its `--version`), reporting nothing:
+/// for a test that compares with any zsh but expects 5.9's own output only
+/// from 5.9.
+#[must_use]
+pub fn version_is_5_9() -> bool {
+	Command::new(path())
+		.arg("--version")
+		.output()
+		.is_ok_and(|out| out.stdout.starts_with(b"zsh 5.9 "))
+}
+
 /// Whether the real zsh is zsh 5.9 (its `--version`); when it is not, the
 /// calling test is reported [`uncompared`].
 #[must_use]
 pub fn is_zsh_5_9() -> bool {
-	let zsh = path();
-	let version = Command::new(&zsh).arg("--version").output().ok();
-	let found = version
-		.as_ref()
-		.is_some_and(|out| out.stdout.starts_with(b"zsh 5.9 "));
+	let found = version_is_5_9();
 	if !found {
-		uncompared(&format!("{} is not zsh 5.9", zsh.display()));
+		uncompared(&format!("{} is not zsh 5.9", path().display()));
 	}
 	found
 }
