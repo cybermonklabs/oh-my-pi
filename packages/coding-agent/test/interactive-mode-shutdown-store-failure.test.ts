@@ -181,13 +181,14 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 		const exec = vi.spyOn(natives, "execReplace").mockImplementation(() => undefined as never);
 		const spawn = vi.spyOn(Bun, "spawn").mockReturnValue({ exited: Promise.resolve(0) } as never);
 		const cleanup = vi.spyOn(postmortem, "cleanup").mockResolvedValue();
-		vi.spyOn(postmortem, "drainStdout").mockResolvedValue();
+		const drain = vi.spyOn(postmortem, "drainStdout").mockResolvedValue();
 
 		await mode.restart();
 		// The failed teardown returns before any of the relaunch.
 		expect(exec).not.toHaveBeenCalled();
 		expect(spawn).not.toHaveBeenCalled();
 		expect(cleanup).not.toHaveBeenCalled();
+		expect(drain).not.toHaveBeenCalled();
 		expect(mode.teardownFailed).toBe(true);
 		quitSpy.mockClear();
 
