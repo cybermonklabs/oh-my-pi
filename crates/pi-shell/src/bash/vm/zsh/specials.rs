@@ -808,7 +808,7 @@ pub fn make_local(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8], scope: us
 			PmFlags::FFLOAT => 'F',
 			_ => 'i',
 		};
-		VarValue::Str(BString::from(format!("{}:{c}{base}", ex.k.start_ns)))
+		VarValue::Str(BString::from(format!("{}:{c}{base}", ex.k.start_of(ex.vp))))
 	} else {
 		match get(ex, sp)? {
 			Some(PValue::Scalar(s)) => VarValue::Str(s),
@@ -853,10 +853,7 @@ pub fn restore_locals(ex: &mut Expander<'_, '_>) -> X<()> {
 			let text = var.as_scalar().unwrap_or_default();
 			let (start, ty) = text.split_once_str(":").unwrap_or((text, &b"i"[..]));
 			if let Some(start) = std::str::from_utf8(start).ok().and_then(|s| s.parse().ok()) {
-				ex.k.start_ns = start;
-				ex.k
-					.root
-					.set_misc(ex.cx.store, MiscKey::StartNs, num(start));
+				ex.k.set_start(ex.cx.store, ex.vp, start);
 			}
 			let flags = match ty.first() {
 				Some(b'E') => PmFlags::EFLOAT,
@@ -1011,11 +1008,11 @@ pub fn get(ex: &mut Expander<'_, '_>, sp: Special) -> X<Option<PValue>> {
 			scalar(num(line))
 		},
 		Special::Ppid => scalar(num(ex.cx.host.ppid())),
-		Special::Random => scalar(num(ex.k.next_random(ex.cx.store) & 0x7fff)),
+		Special::Random => scalar(num(ex.k.next_random(ex.cx, ex.vp) & 0x7fff)),
 		Special::Seconds => {
 			// Wrapping: an assignment may put the start before the host
 			// clock's origin (or after it: a negative value).
-			let ns = ex.cx.host.now_ns().wrapping_sub(ex.k.start_ns) as i64;
+			let ns = ex.cx.host.now_ns().wrapping_sub(ex.k.start_of(ex.vp)) as i64;
 			let (ty, base) = seconds_type(ex)?;
 			if ty == PmFlags::INTEGER {
 				let secs = ns.div_euclid(1_000_000_000);
@@ -1701,7 +1698,7 @@ pub fn set(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8], value: PValue) -
 		},
 		Special::Random => {
 			let seed = super::params::parse_int(&as_scalar(&value));
-			ex.k.seed_random(ex.cx.store, seed);
+			ex.k.seed_random(ex.cx.store, ex.vp, seed);
 		},
 		Special::Seconds => {
 			// zsh `intsecondssetfn` / `floatsecondssetfn`.
@@ -1717,9 +1714,7 @@ pub fn set(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8], value: PValue) -
 				(d * 1e9) as i64
 			};
 			let now = ex.cx.host.now_ns();
-			ex.k.start_ns = now.wrapping_sub(ns as u64);
-			let v = ex.k.start_ns;
-			ex.k.root.set_misc(ex.cx.store, MiscKey::StartNs, num(v));
+			ex.k.set_start(ex.cx.store, ex.vp, now.wrapping_sub(ns as u64));
 		},
 		Special::Example(p) => {
 			crate::bash::vm::builtins::zsh_mod_example::param_set(ex, p, value)?;

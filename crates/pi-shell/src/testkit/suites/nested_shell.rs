@@ -48,6 +48,18 @@ fn nested_shells_do_not_reveal_later_root_bindings() {
 	assert_eq!(err, "");
 }
 
+/// A new shell is a new process: its `$SECONDS` counts from zero and its
+/// `$RANDOM` generator is its own (it does not continue the shell's
+/// 19344 after `RANDOM=7`); the shell's own go on unmoved.
+#[test]
+fn starts_its_own_random_and_seconds() {
+	let (out, err, status) = run(
+		"SECONDS=5000; RANDOM=7; bash -c 'echo $SECONDS; [ $RANDOM != 19344 ] && echo fresh'; echo \
+		 $SECONDS $RANDOM",
+	);
+	assert_eq!((out.as_str(), err.as_str(), status), ("0\nfresh\n5000 19344\n", "", 0));
+}
+
 #[test]
 fn takes_its_name_and_arguments() {
 	let (out, ..) = run("bash -c 'echo $0 $# $1' name a b");

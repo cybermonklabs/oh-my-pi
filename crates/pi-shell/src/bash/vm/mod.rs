@@ -461,10 +461,14 @@ pub struct Kernel {
 	/// store at hand): `adopt` gives each the root's state then, with its
 	/// script's changes.
 	pending_forks:          Vec<(Vpid, ForkEdits)>,
-	/// `$RANDOM` generator state (written through as `MiscKey::Random` by
-	/// [`Kernel::next_random`] and [`Kernel::seed_random`]).
+	/// The shell's `$RANDOM` generator state (written through as
+	/// `MiscKey::Random` by [`Kernel::next_random`] and
+	/// [`Kernel::seed_random`]); a forked vproc draws from its own copy
+	/// ([`proc::Clock`]).
 	pub rand:               state::Random,
-	/// `now_ns` at shell creation (`$SECONDS`; `MiscKey::StartNs`).
+	/// The host clock reading the shell's `$SECONDS` counts from (`now_ns`
+	/// at shell creation, moved by `SECONDS=`; `MiscKey::StartNs`); a forked
+	/// vproc counts from its own ([`proc::Clock`], [`Kernel::start_of`]).
 	pub start_ns:           u64,
 	/// Startup files (`path`, contents) the root vproc sources when its
 	/// first run starts ([`ShellInit::startup`]); not imaged (the first run
@@ -687,21 +691,58 @@ impl Kernel {
 		self.ctl.notify();
 	}
 
-	/// Next `$RANDOM` (0..=32767); the generator state is written through.
-	pub fn next_random(&mut self, store: &mut dyn StateStore) -> u32 {
+	/// Next `$RANDOM` (0..=32767) of `vp`. A forked vproc draws from its own
+	/// generator ([`proc::Clock`]), which bash code reseeds on the first
+	/// draw unless `RANDOM` was assigned (bash `get_random_number`'s
+	/// `seeded_subshell`) and zsh code draws on from its parent's; the
+	/// shell's own is written through.
+	pub fn next_random(&mut self, cx: &mut Cx<'_>, vp: &mut Vproc) -> u32 {
+		let bash = vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+		if let Some(clock) = vp.clock.as_mut() {
+			if clock.reseed && bash {
+				clock.rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
+				clock.reseed = false;
+			}
+			return clock.rand.next();
+		}
 		let v = self.rand.next();
 		self
 			.root
-			.set_misc(store, MiscKey::Random, self.rand.encode());
+			.set_misc(cx.store, MiscKey::Random, self.rand.encode());
 		v
 	}
 
-	/// `RANDOM=seed`; written through.
-	pub fn seed_random(&mut self, store: &mut dyn StateStore, seed: i64) {
+	/// `RANDOM=seed` in `vp`: its own generator when forked (no reseed
+	/// follows), else the shell's, written through.
+	pub fn seed_random(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, seed: i64) {
+		if let Some(clock) = vp.clock.as_mut() {
+			clock.rand.seed(seed);
+			clock.reseed = false;
+			return;
+		}
 		self.rand.seed(seed);
 		self
 			.root
 			.set_misc(store, MiscKey::Random, self.rand.encode());
+	}
+
+	/// The host clock reading `vp`'s `$SECONDS` counts from: a forked
+	/// vproc's own ([`proc::Clock`]), else the shell's.
+	pub fn start_of(&self, vp: &Vproc) -> u64 {
+		vp.clock.as_ref().map_or(self.start_ns, |c| c.start_ns)
+	}
+
+	/// `SECONDS=…` in `vp`: its `$SECONDS` counts from `start` on; the
+	/// shell's is written through.
+	pub fn set_start(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, start: u64) {
+		if let Some(clock) = vp.clock.as_mut() {
+			clock.start_ns = start;
+			return;
+		}
+		self.start_ns = start;
+		self
+			.root
+			.set_misc(store, MiscKey::StartNs, start.to_string());
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
@@ -1815,6 +1856,13 @@ impl Shell {
 		}
 		let cwd = script.cwd.unwrap_or_else(|| p.cwd.clone());
 		let status = p.status;
+		// A copy of the parent's `$RANDOM` generator and `$SECONDS` origin,
+		// as a fork makes (`Vproc::child_running`).
+		let clock = proc::Clock {
+			rand:     p.clock.map_or(self.k.rand, |c| c.rand),
+			reseed:   true,
+			start_ns: self.k.start_of(p),
+		};
 		// The parent's global state now; a host's submission (no store) to
 		// the root takes it when the scheduler adopts the subshell, before
 		// the root runs again.
@@ -1845,6 +1893,7 @@ impl Shell {
 		vp.lineage = lineage.unwrap_or(parent_lineage);
 		vp.status = status;
 		vp.mode = mode;
+		vp.clock = Some(clock);
 		vp.runs.push_back(run);
 		match base {
 			Some(((image, locale_gen), scopes)) => {
@@ -2888,6 +2937,7 @@ impl Vproc {
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,
+			clock: None,
 		}
 	}
 
@@ -2979,6 +3029,13 @@ impl Vproc {
 		jobctl::inherit(k, vp.vpid, self.vpid);
 		vp.mode = self.mode;
 		vp.zle.clone_from(&self.zle);
+		// `$RANDOM`'s generator and `$SECONDS`' origin are process state:
+		// the child gets a copy (bash code reseeds it on first use).
+		vp.clock = Some(proc::Clock {
+			rand:     self.clock.map_or(k.rand, |c| c.rand),
+			reseed:   true,
+			start_ns: k.start_of(self),
+		});
 		vp.set_sticky(self.sticky().cloned());
 		// zsh forks keep `scriptname`: diagnostics of the child name the
 		// parent's function, `(eval)` or file.

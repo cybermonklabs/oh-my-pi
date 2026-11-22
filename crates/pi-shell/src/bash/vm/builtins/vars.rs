@@ -556,13 +556,29 @@ fn set_value_plain(
 		return Ok(());
 	}
 	// bash's `RANDOM` is an integer variable whose assignment reseeds the
-	// generator (`assign_random`); reads are always fresh values.
+	// generator (`assign_random`); reads are always fresh values. A forked
+	// vproc reseeds its own.
 	if name == b"RANDOM"
 		&& lhs.index.is_none()
 		&& let AssignValue::Scalar(v) = &value
 	{
 		let seed = arith_value(k, cx, vp, v)?;
-		k.seed_random(cx.store, seed);
+		k.seed_random(cx.store, vp, seed);
+		return Ok(());
+	}
+	// bash's `SECONDS` is an integer variable whose assignment restarts the
+	// count from the value (`assign_seconds`): reads add the seconds since.
+	// A forked vproc's count is its own.
+	if name == b"SECONDS"
+		&& lhs.index.is_none()
+		&& let AssignValue::Scalar(v) = &value
+	{
+		let secs = arith_value(k, cx, vp, v)?;
+		let start = cx
+			.host
+			.now_ns()
+			.wrapping_sub((secs as u64).wrapping_mul(1_000_000_000));
+		k.set_start(cx.store, vp, start);
 		return Ok(());
 	}
 	let Some(value) = assign_in_place(k, cx, vp, lhs, value, level)? else {

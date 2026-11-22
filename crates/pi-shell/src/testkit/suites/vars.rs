@@ -122,6 +122,54 @@ fn random_is_seeded_by_assignment() {
 	assert_eq!(out, "17772 26794 1435\n846\n");
 }
 
+/// A subshell, a background job and a command substitution draw `$RANDOM`
+/// from their own copy of the generator: neither their draws nor their
+/// `RANDOM=` move the shell's sequence (bash keeps it in process memory).
+/// The shell's first value after `RANDOM=7` is 19344 with or without the
+/// child.
+#[test]
+fn random_children_leave_the_shell_sequence() {
+	for child in [
+		"( : $RANDOM $RANDOM )",
+		"( : $RANDOM $RANDOM ) & wait",
+		"x=$(echo $RANDOM $RANDOM)",
+		"( RANDOM=99 ) & wait",
+		"( RANDOM=99; : $RANDOM )",
+	] {
+		let (out, err) = run(&format!("RANDOM=7; {child}; echo $RANDOM"));
+		assert_eq!((out.as_str(), err.as_str()), ("19344\n", ""), "{child}");
+	}
+}
+
+/// bash reseeds a subshell's generator on its first `$RANDOM` unless the
+/// subshell assigned `RANDOM` first (`get_random_number`'s
+/// `seeded_subshell`): an unseeded child does not continue the shell's
+/// sequence (19344 after `RANDOM=7`), a seeded one repeats it.
+#[test]
+fn random_subshell_reseeds_unless_assigned() {
+	let (out, err) = run(
+		"RANDOM=7; u=$(echo $RANDOM); s=$(RANDOM=7; echo $RANDOM); n=$RANDOM; [ \"$u\" != 19344 ] \
+		 && echo own; echo $s $n",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("own\n19344 19344\n", ""));
+}
+
+/// `SECONDS=n` restarts the count from n (bash `assign_seconds`; the
+/// fake host's clock moves 1 µs per read); a fork counts from its own copy,
+/// so neither side's assignment reaches the other.
+#[test]
+fn seconds_assignment_counts_from_the_value_in_each_process() {
+	let (out, err) = run(
+		"SECONDS=5000; echo $SECONDS; ( SECONDS=9000; echo c=$SECONDS ); echo p=$SECONDS; x=$( \
+		 SECONDS=1; echo $SECONDS ); echo $x $SECONDS; ( (( SECONDS < 7000 )) && echo kept ) & \
+		 SECONDS=7000; wait; echo $SECONDS; SECONDS=-5; echo $SECONDS",
+	);
+	assert_eq!(
+		(out.as_str(), err.as_str()),
+		("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", "")
+	);
+}
+
 #[test]
 fn name_references_read_assign_and_unset_their_target() {
 	let (out, err) = run(

@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::Scope;
+use super::state::{Random, Scope};
 pub use crate::bash::store::{Job, JobState};
 use crate::bash::{
 	Image,
@@ -127,6 +127,26 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+	/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
+	/// whose are the kernel's.
+	pub clock:         Option<Clock>,
+}
+
+/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+/// ([`Vproc::clock`]). Both are process state that a fork copies, as
+/// `fork(2)` copies memory, so neither side's draws, `RANDOM=` or
+/// `SECONDS=` reach the other. The shell's own are the kernel's
+/// (`Kernel::rand`, `Kernel::start_ns`), which the store keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clock {
+	pub rand:     Random,
+	/// The generator is reseeded on the vproc's first `$RANDOM` in bash code
+	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
+	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
+	pub reseed:   bool,
+	/// The host clock reading `$SECONDS` counts from.
+	pub start_ns: u64,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

@@ -422,6 +422,12 @@ fn fresh_shell(
 	}
 	let mut child =
 		Vproc::new(vpid, Some(vp.vpid), vp.fds.clone(), vp.cwd.clone(), Some(image), true);
+	// A new process: a generator of its own, `$SECONDS` from zero.
+	child.clock = Some(super::proc::Clock {
+		rand:     state::Random::new((cx.host.random() & 0xffff_ffff) as u32),
+		reseed:   false,
+		start_ns: cx.host.now_ns(),
+	});
 	child.rlimits.clone_from(&vp.rlimits);
 	child.lineage = vp.lineage;
 	// A new shell's options, then the invocation's.

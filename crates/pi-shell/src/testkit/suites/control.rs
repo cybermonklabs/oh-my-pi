@@ -213,6 +213,40 @@ fn restore_rejects_corrupt_and_foreign_frames_and_can_drop_them() {
 	assert!(host.stdout.bytes().ends_with(b"fresh\n"));
 }
 
+/// A forked vproc's own `$RANDOM` generator and `$SECONDS` origin are in
+/// the frames: a job restored mid-run draws on from its own seed and counts
+/// from its own `SECONDS=`, not from the shell's later `RANDOM=99` and
+/// `SECONDS=0` (19344 is the first value after `RANDOM=7`).
+#[test]
+fn restore_keeps_a_jobs_own_random_and_seconds() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	let mut shell =
+		Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+			.unwrap();
+	let id = shell.submit(Script::command(
+		&b"( RANDOM=7; SECONDS=500; i=0; while [ $i -lt 300 ]; do i=$((i+1)); done; echo \"$RANDOM \
+		   $SECONDS\" ) & RANDOM=99; SECONDS=0; wait"[..],
+	));
+	assert_eq!(
+		advance(&mut shell, &mut host, &mut store, id, Budget { max_ops: 400, max_ns: u64::MAX }),
+		Stop::Yield,
+		"the job still runs when the frame is taken"
+	);
+	shell
+		.externalize(&mut Cx { host: &mut host, store: &mut store })
+		.unwrap();
+	drop(shell);
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default())
+			.unwrap();
+	assert!(report.abandoned.is_empty());
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(0));
+	assert_eq!(host.stdout.bytes(), b"19344 500\n");
+	assert!(host.stderr.bytes().is_empty());
+}
+
 #[test]
 fn restore_drop_frames_abandons_the_running_script_with_255() {
 	let engine = Engine::new(EngineConfig::default());

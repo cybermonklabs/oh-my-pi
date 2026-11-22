@@ -2861,19 +2861,22 @@ fn hash_table(
 fn dynamic_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
-	vp: &Vproc,
+	vp: &mut Vproc,
 	line: u32,
 	name: &[u8],
 ) -> Result<Option<DynVal>, StoreError> {
 	Ok(Some(match name {
 		b"RANDOM" => {
-			DynVal::Str(BString::from(k.next_random(cx.store).format_into(&mut NumBuffer::new())))
+			DynVal::Str(BString::from(k.next_random(cx, vp).format_into(&mut NumBuffer::new())))
 		},
 		b"SRANDOM" => DynVal::Str(BString::from(
 			((cx.host.random() & 0xffff_ffff) as u32).format_into(&mut NumBuffer::new()),
 		)),
 		b"SECONDS" => {
-			let s = cx.host.now_ns().saturating_sub(k.start_ns) / 1_000_000_000;
+			// Wrapping: `SECONDS=` with a negative value puts the start
+			// after the host clock's reading.
+			let ns = cx.host.now_ns().wrapping_sub(k.start_of(vp)) as i64;
+			let s = ns.div_euclid(1_000_000_000);
 			DynVal::Str(BString::from(s.format_into(&mut NumBuffer::new())))
 		},
 		b"EPOCHSECONDS" => {
