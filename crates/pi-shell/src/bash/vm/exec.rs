@@ -3962,6 +3962,20 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	(group && exec).then_some(BangStage::Exec)
 }
 
+/// Whether the `Spawn` at `pc` starts the pipeline a background job's
+/// whole command is ([`BangStage::Pipeline`]): only that job's own vproc
+/// runs the code at its entry. A timed one (`time a | b &`, its `Spawn`
+/// after the `TimeStart`) is not: bash runs `time P &` in a subshell of
+/// its own, where the pipeline is synchronous.
+fn job_pipeline(unit: &Unit, pc: u32) -> bool {
+	unit.spawns.iter().any(|s| {
+		s.kind == SpawnKind::Background
+			&& s.stages.first().is_some_and(|st| {
+				pc == st.entry && bang_stage(unit, st.entry) == Some(BangStage::Pipeline)
+			})
+	})
+}
+
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
 /// started `stages` (`(vproc, entry)`; the last one a child, or the job's
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
@@ -4205,7 +4219,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
 		super::jobctl::fg_done(k, cx, vp, None, b"");
 	}
-	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
+	// zsh forks each process of a background job's pipeline from the shell
+	// and keeps no job status for it: `wait` reads the last process's own
+	// status, as `storepipestats` applies `PIPEFAIL` only to a job waited
+	// for in the foreground (`jobs.c`). Bash applies it.
+	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false)
+		&& !(unit.mode.dialect() == Dialect::Zsh && job_pipeline(unit, top_frame(vp).pc));
 	vp.status = if pipefail {
 		statuses
 			.iter()

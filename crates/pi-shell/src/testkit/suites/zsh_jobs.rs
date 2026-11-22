@@ -202,3 +202,22 @@ fn wait_for_a_missing_job() {
 	let (out, err, _) = zsh("wait %2; echo $?");
 	assert_eq!((out.as_str(), err.as_str()), ("127\n", "zsh:wait:1: %2: no such job\n"));
 }
+
+// Failure mode: under `pipefail` a background job whose command is a
+// pipeline took the pipeline's pipefail status, where zsh 5.9 gives it the
+// last process's own status (`storepipestats` applies `PIPEFAIL` only to a
+// job waited for in the foreground). Controls: a pipeline inside the job,
+// a foreground one and no pipefail keep their statuses.
+#[test]
+fn a_background_pipelines_status_leaves_pipefail_out() {
+	let (out, err, _) = zsh(
+		"set -o pipefail; false | true & wait $!; echo a=$?; ( exit 3 ) | true & wait $!; echo \
+		 b=$?; false | true | true & wait $!; echo c=$?; true | false & wait $!; echo d=$?",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("a=0\nb=0\nc=0\nd=1\n", ""));
+	let (out, err, _) = zsh(
+		"set -o pipefail; { false | true; } & wait $!; echo e=$?; false | true; echo g=$?; set +o \
+		 pipefail; false | true & wait $!; echo h=$?",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("e=1\ng=1\nh=0\n", ""), "controls");
+}
