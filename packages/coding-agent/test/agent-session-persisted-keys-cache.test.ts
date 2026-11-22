@@ -157,4 +157,37 @@ describe("AgentSession persistence-keys cache", () => {
 		expect(entries.length).toBe(2);
 		expect(entries[1].message.role).toBe("user");
 	});
+
+	// If this regresses, a message persisted before a compaction's cut that reaches persistence again after it is
+	// appended a second time, so the transcript and every context rebuilt from it repeat the message.
+	it("recognizes a message from before a compaction's cut as persisted", async () => {
+		const persist = async (message: AgentMessage) => {
+			session.agent.emitExternalEvent({ type: "message_end", message });
+			await sessionManager.flush();
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+		};
+		const early: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "Before the cut" }],
+			timestamp: 3000,
+		};
+		await persist(early);
+		await persist({ role: "user", content: [{ type: "text", text: "Kept" }], timestamp: 3001 });
+		const keptId = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "message")
+			.at(-1)!.id;
+		sessionManager.appendCompaction("Earlier turns.", undefined, keptId, 100);
+
+		await persist(early);
+		// Stamped like the message before the cut, but another message: it is persisted.
+		await persist({ role: "developer", content: "Same millisecond, another turn", timestamp: 3000 });
+
+		const messages = sessionManager.getBranch().flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+		expect(messages.map(message => [message.role, message.timestamp])).toEqual([
+			["user", 3000],
+			["user", 3001],
+			["developer", 3000],
+		]);
+	});
 });

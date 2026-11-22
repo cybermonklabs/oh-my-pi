@@ -538,11 +538,13 @@ export interface SessionMaintenanceHost {
 	rebaseAdvisorPrefix(reason: string): void;
 	rebaseAfterCompaction(): void;
 	/**
-	 * After a compaction moved the cut: drop what mirrors the last request sent, the append-only log and the
-	 * prompt-cache warmer's armed request, which hold the messages before the cut until the next request. That
-	 * request syncs the log from the compacted history before it builds, and arms the warmer again.
+	 * After a compaction moved the cut, with the live history rebuilt: drop what the session keeps for the
+	 * messages before the cut. What mirrors the last request sent, the append-only log and the prompt-cache
+	 * warmer's armed request, holds them until the next request, which syncs the log from the compacted history
+	 * before it builds and arms the warmer again. The persisted-message key index and the date/cwd reminder's
+	 * turn state keep only the turns from the cut on.
 	 */
-	releaseLastRequest(): void;
+	releaseBeforeCut(): void;
 	recordAnchoredHistoryRewrite(tokensRemoved: number): void;
 	getContextBreakdown(options?: {
 		contextWindow?: number;
@@ -2747,7 +2749,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
-		this.#host.releaseLastRequest();
+		this.#host.releaseBeforeCut();
 		// Compaction discarded the conversation history that carried the approved
 		// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 		// the plan from disk and re-injects it on the next turn (issue #1246).
@@ -4836,7 +4838,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
-		this.#host.releaseLastRequest();
+		this.#host.releaseBeforeCut();
 		// Same post-rewrite bookkeeping as the regular compaction append: the
 		// rebuilt context no longer carries the transient plan reference (#1246),
 		// and advisor cursors / todo phases were derived from the replaced

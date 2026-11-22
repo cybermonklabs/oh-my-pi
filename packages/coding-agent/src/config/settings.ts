@@ -189,7 +189,7 @@ export interface SettingsOptions {
 /**
  * Get a nested value from an object by path segments.
  */
-function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
+export function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 	let current: unknown = obj;
 	for (const segment of segments) {
 		if (current === null || current === undefined || typeof current !== "object") {
@@ -204,7 +204,7 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed, replacing whatever non-record (a malformed `[]` included) is in the way.
  */
-function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
+export function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
@@ -231,7 +231,7 @@ function setOwn(obj: RawSettings, key: string, value: unknown): void {
  * Removes the value at `segments`, pruning the parent objects the removal leaves empty. Every record on the
  * path below `obj` is replaced by a copy rather than edited: a merged view or a cached read may share it.
  */
-function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
+export function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
 	const containers: RawSettings[] = [obj];
 	for (let i = 0; i < segments.length - 1; i++) {
 		const next = containers[i][segments[i]];

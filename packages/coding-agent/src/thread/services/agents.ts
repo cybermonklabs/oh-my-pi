@@ -27,6 +27,7 @@ import {
 	type AgentReviver,
 	AgentLifecycleManager,
 	runReviver,
+	WarmReviveInputsMissingError,
 } from "../../registry/agent-lifecycle";
 import { AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
@@ -69,6 +70,8 @@ export interface AgentsThreadGlobals {
 function registerSessionErrors(): void {
 	registerRpcError("PromptDroppedError", message => Object.assign(new PromptDroppedError(), { message }));
 	registerRpcError("SessionBusyError", message => Object.assign(new SessionBusyError("continue"), { message }));
+	// A worker's warm reviver throws it to main's lifecycle, which then revives cold.
+	registerRpcError("WarmReviveInputsMissingError", message => new WarmReviveInputsMissingError(message));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

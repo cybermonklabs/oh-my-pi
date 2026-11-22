@@ -85,6 +85,7 @@ function createMockSession(
 	const sentUserMessages: MockSessionHandle["sentUserMessages"] = [];
 	let abortCount = 0;
 	let disposeCount = 0;
+	const disposers: Array<() => void> = [];
 	let promptIndex = 0;
 	let ircWakeTurnObserver:
 		| ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -171,8 +172,13 @@ function createMockSession(
 			abortCount += 1;
 			await onAbort?.();
 		},
+		// As AgentSession's do: teardowns registered here run when the session is disposed.
+		addDisposer: (dispose: () => void) => {
+			disposers.push(dispose);
+		},
 		dispose: async () => {
 			disposeCount += 1;
+			for (const dispose of disposers.splice(0)) dispose();
 			await mockOwnedManagers.get(session as AgentSession)?.close();
 		},
 	};
@@ -192,10 +198,14 @@ function createMockSession(
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 		if (options?.sessionManager) mockOwnedManagers.set(session, options.sessionManager);
-		// As createAgentSession does: the agent's registry record takes the session, the file its session
-		// manager opened (the file a warm revive of the parked agent reopens) and the running status.
-		const id = options?.agentId;
+		// As createAgentSession does: the session works on the session manager and settings it was given (its
+		// disposal writes the agent's revive inputs through them), and the agent's registry record takes the
+		// session, the file that manager opened (the file a warm revive of the parked agent reopens) and the
+		// running status.
 		const sessionManager = options?.sessionManager;
+		if (sessionManager) Object.assign(session, { sessionManager });
+		if (options?.settings) Object.assign(session, { settings: options.settings });
+		const id = options?.agentId;
 		if (id !== undefined && sessionManager) {
 			const registry = AgentRegistry.global();
 			if (registry.attachSession(id, session, sessionManager.getSessionFile() ?? null)) {

@@ -1003,21 +1003,21 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
 }
 
 /**
- * Take a session's ownership lease without waiting, or `null` while a process,
- * this one included, holds it. On Linux it probes the lease first
- * (`isFileLockHeld`) and answers `null` at once when the probe finds a holder;
- * it claims only a lease the probe finds free, so the claim waits only for the
- * moment a probe can make a free lease look taken, or when another process
- * claims the lease between the probe and the claim (see `tryAcquireFileLock`
- * for how long a refused claim waits). Elsewhere the claim alone answers at
- * once. `omp gc` takes it to delete a session no running process owns; on
- * Linux a lease released while it is probed can read as held, which leaves
- * that session for gc's next run. Throws when the lock cannot be probed or
- * taken.
+ * Take a session's ownership lease without waiting for its holder, or `null`
+ * while a process, this one included, holds it. On Linux it probes the lease
+ * first (`isFileLockHeld`) and answers `null` at once when the probe finds a
+ * holder; it claims only a lease the probe finds free, so a native claim that
+ * waits on a refusal (the older abstract-socket lock's, see
+ * `tryAcquireFileLock`) waits only when another process claims the lease
+ * between the probe and the claim, or when a probe made a free lease look
+ * taken. Elsewhere the claim alone answers at once. `omp gc` takes it to
+ * delete a session no running process owns; a lease released while it is
+ * probed can read as held, which leaves that session for gc's next run.
+ * Throws when the lock cannot be probed or taken.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
 	const lockPath = sessionLeasePath(sessionId, true);
-	// Only Linux's claim waits on a refusal; elsewhere the claim alone answers at once.
+	// On Linux a native claim may wait on a refusal (see tryAcquireFileLock); the probe answers at once.
 	if (process.platform === "linux" && isFileLockHeld(lockPath)) return null;
 	return tryAcquireFileLock(lockPath);
 }
@@ -1026,10 +1026,12 @@ export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null
  * Claim a session's ownership lease to write the session, or `null` while a
  * process, this one included, holds it. A process writing the session holds
  * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
- * probing first, and the claim retries a refusal, so a concurrent probe never
- * makes it fail; a lease another process holds is refused (see
- * `tryAcquireFileLock` for how long a refused claim waits). Throws when the
- * lock cannot be taken.
+ * probing first, so a concurrent probe never makes it refuse a free lease: an
+ * open-file-description probe takes nothing, and the older abstract-socket
+ * lock's claim retries the moment a probe makes a free lease look taken. A
+ * lease another process holds is refused, at once or after the native
+ * claim's own wait (see `tryAcquireFileLock`). Throws when the lock cannot be
+ * taken.
  */
 export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
@@ -1245,7 +1247,9 @@ export class FileSessionStorage implements SessionStorage {
 	 * `fpath`, failing closed after the same bounded wait the lockfile claim
 	 * uses. The native handle keeps ownership, never the file content, so
 	 * suspension and SIGKILL cannot strand it as stealable. On Linux a claim
-	 * of a gate another process holds blocks this thread for about 50 ms (see
+	 * of a gate another process holds answers at once with the
+	 * open-file-description lock, but blocks this thread for about 50 ms with
+	 * the abstract-socket lock that older builds of the addon take (see
 	 * `tryAcquireFileLock`), so every attempt but the last probes the gate
 	 * first and claims only one the probe finds free; a probe that reads a
 	 * just-released gate as held costs one poll.

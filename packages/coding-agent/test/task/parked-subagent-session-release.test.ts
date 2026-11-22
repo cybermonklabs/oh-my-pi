@@ -12,20 +12,35 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import type { Context } from "@oh-my-pi/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	type Model,
+	type ModelSpec,
+	registerCustomApi,
+} from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import {
+	cfgMnemopiEmbeddingApiKey,
+	cfgMnemopiLlmApiKey,
+	cfgMnemopiLlmBaseUrl,
+} from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { __resetDirsFromEnvForTests, isRecord, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 
 const AGENT_ID = "ParkedRelease";
@@ -175,9 +190,21 @@ interface KeptAliveRun {
 	close(): void;
 }
 
-/** Runs `AGENT_ID` to a finished keep-alive state. */
+/**
+ * Runs `AGENT_ID` to a finished keep-alive state, with `options.context` as its task context, on `options.model`
+ * when given (the mock still labels the task).
+ */
 async function runKeptAliveSubagent(
-	options: { handler?: MockHandler; tools?: string[]; enableIrc?: boolean } = {},
+	options: {
+		handler?: MockHandler;
+		tools?: string[];
+		enableIrc?: boolean;
+		context?: string;
+		/** Settings beside the test's own, by setting path. */
+		settings?: Readonly<Record<string, unknown>>;
+		/** A model the model registry does not hold, which the subagent runs on. */
+		model?: Model<Api>;
+	} = {},
 ): Promise<KeptAliveRun> {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
@@ -189,6 +216,7 @@ async function runKeptAliveSubagent(
 
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("mock", "test-key");
+	if (options.model) authStorage.keys.setRuntime(options.model.provider, "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const mock = createMockModel({
 		handler:
@@ -201,16 +229,17 @@ async function runKeptAliveSubagent(
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
 	const availableSpy = vi
 		.spyOn(modelRegistry, "getAvailable")
-		.mockImplementation(kind => [mock, ...catalogAvailable(kind)]);
+		.mockImplementation(kind => [...(options.model ? [options.model] : []), mock, ...catalogAvailable(kind)]);
 	try {
 		const result = await runSubprocess({
 			cwd,
 			artifactsDir,
 			agent: { ...TASK_AGENT, tools: options.tools ?? ["read"] },
 			task: "report done",
+			context: options.context,
 			index: 0,
 			id: AGENT_ID,
-			modelOverride: "mock/mock-model",
+			modelOverride: options.model ? `${options.model.provider}/${options.model.id}` : "mock/mock-model",
 			authStorage,
 			modelRegistry,
 			settings: Settings.isolated({
@@ -223,6 +252,7 @@ async function runKeptAliveSubagent(
 				"todo.reminders": false,
 				"advisor.enabled": false,
 				modelRoles: { default: "mock/mock-model" },
+				...options.settings,
 			}),
 			enableLsp: false,
 			enableMCP: false,
@@ -341,3 +371,213 @@ it("revives with the peer roster its transcript recorded, keeping no copy of it 
 		run.close();
 	}
 }, 30_000);
+
+// If this regresses, an API key, token or password a subagent's run set in its settings is written in plain text to
+// its transcript file each time it parks, where whoever can read the session directory finds it; or the subagent
+// comes back without it and fails the calls that need it.
+it("keeps a credential setting a run wrote out of the transcript and revives with it", async () => {
+	const run = await runKeptAliveSubagent();
+	try {
+		const credential = "zq7Xv2Lp9Wk4Rt6Ny3Hb";
+		const overrideCredential = "Jm4Tc8Qf1Ys5Dw0Gx6Ke";
+		const baseUrl = "https://llm.example.test/v1";
+		const live = localSession(AgentRegistry.global().get(AGENT_ID)?.session);
+		cfgMnemopiLlmApiKey.set(live, credential);
+		cfgMnemopiLlmBaseUrl.set(live, baseUrl);
+		cfgMnemopiEmbeddingApiKey.override(live, overrideCredential);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+
+		const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+		if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+		const stored = await Bun.file(sessionFile).text();
+		// The plain setting the run wrote beside the credential is there: the park recorded the run's writes.
+		expect(stored).toContain(baseUrl);
+		for (const value of [credential, overrideCredential]) {
+			for (let start = 0; start + 8 <= value.length; start++) {
+				expect(stored).not.toContain(value.slice(start, start + 8));
+			}
+		}
+
+		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
+		expect(cfgMnemopiLlmApiKey.get(revived)).toBe(credential);
+		expect(cfgMnemopiLlmBaseUrl.get(revived)).toBe(baseUrl);
+		expect(cfgMnemopiEmbeddingApiKey.get(revived)).toBe(overrideCredential);
+	} finally {
+		run.close();
+	}
+}, 30_000);
+
+/** Session store masking of a build that has it (a release build); undefined in a build without it. */
+const maskSessionStore = lookup("secrets.maskSessionStore");
+
+/** Data of the newest custom entry of `customType` in the transcript text `stored`. */
+function storedCustomData(stored: string, customType: string): unknown {
+	const entry = Bun.JSONL.parse(stored).findLast(
+		entry => isRecord(entry) && entry.type === "custom" && entry.customType === customType,
+	);
+	return isRecord(entry) ? entry.data : undefined;
+}
+
+// If this regresses, a value secrets.yml lists that a subagent was given (in its task context, say) is written in plain
+// text to its transcript file each time it parks, although the session store is masked; or a subagent parked under
+// masking can no longer be woken for a follow-up.
+it.skipIf(maskSessionStore === undefined)(
+	"masks the stored revive inputs as other custom data and still revives",
+	async () => {
+		const secret = "Pv8Wq3Lz6Tn1Kd5Rx9Bm";
+		const context = `Deploy with the key ${secret} to staging.`;
+		// The project's secrets.yml, read when the subagent's session first writes in its cwd.
+		await Bun.write(
+			path.join(root, "home", "work", ".omp", "secrets.yml"),
+			`- type: plain\n  content: ${secret}\n  friendlyName: ReviveProbe\n`,
+		);
+		const run = await runKeptAliveSubagent({ context, settings: { "secrets.maskSessionStore": true } });
+		try {
+			// Other custom data holding the same text, written by the same session.
+			localSession(AgentRegistry.global().get(AGENT_ID)?.session).sessionManager.appendCustomEntry(
+				"revive-mask-probe",
+				{ context },
+			);
+			await AgentLifecycleManager.global().park(AGENT_ID);
+			run.release();
+
+			const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+			if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+			const stored = await Bun.file(sessionFile).text();
+			for (let start = 0; start + 8 <= secret.length; start++) {
+				expect(stored).not.toContain(secret.slice(start, start + 8));
+			}
+			const probe = storedCustomData(stored, "revive-mask-probe");
+			const revive = storedCustomData(stored, "subagent-revive-state");
+			if (!isRecord(probe) || typeof probe.context !== "string") throw new Error("The probe entry was not stored");
+			if (!isRecord(revive) || !isRecord(revive.prompt)) throw new Error("No revive inputs were stored");
+			expect(probe.context).not.toBe(context);
+			expect(revive.prompt.context).toBe(probe.context);
+
+			// Woken for a follow-up, it revives warm from the stored inputs, which come back from the store masked as
+			// every other entry does: its prompt shows the masked context, never the value.
+			const followUp = await runSubagentFollowUpTurn({
+				id: AGENT_ID,
+				agent: TASK_AGENT,
+				message: "anything else?",
+				storeMaskCwd: path.join(root, "home", "work"),
+			});
+			expect(followUp.exitCode).toBe(0);
+			const revivedPrompt = runPrompts(run.mock)[0]?.join("\n");
+			expect(revivedPrompt).toContain(probe.context);
+			expect(revivedPrompt).not.toContain(secret);
+		} finally {
+			run.close();
+		}
+	},
+	30_000,
+);
+
+const SECRET_MODEL_API = "test-parked-release-secret-model";
+
+/** A plain model of {@link SECRET_MODEL_API}, as a models.yml provider's, which the model registry does not hold. */
+function providerModel(fields: { baseUrl: string; headers?: Record<string, string> }): Model<Api> {
+	const model = buildModel({
+		id: "secret-model",
+		name: "Secret model",
+		api: SECRET_MODEL_API,
+		provider: "secret-provider",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 4096,
+		...fields,
+	} as ModelSpec<Api>) as Model<Api>;
+	// Plain JSON data, as a models.yml model is: what the transcript can hold whole.
+	return JSON.parse(JSON.stringify(model));
+}
+
+/** Streams for {@link SECRET_MODEL_API}: yields when offered `yield`, else answers; records each call's model. */
+function answeringStream(models: Model<Api>[]): (model: Model<Api>, context: Context) => AssistantMessageEventStream {
+	return (model, context) => {
+		models.push(model);
+		const stream = new AssistantMessageEventStream();
+		queueMicrotask(() => {
+			if (!(context.tools ?? []).some(tool => tool.name === "yield")) {
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				return;
+			}
+			const toolCall = {
+				type: "toolCall" as const,
+				id: `yield-${models.length}`,
+				name: "yield",
+				arguments: { type: "result", data: "done" },
+			};
+			const message: AssistantMessage = {
+				...createAssistantMessage(""),
+				content: [toolCall],
+				stopReason: "toolUse",
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+			stream.push({ type: "done", reason: "toolUse", message });
+		});
+		return stream;
+	};
+}
+
+const FIXTURE_SECRET_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/** A fresh stand-in for a key, made at run time so that no key-shaped text sits in this file. */
+function fixtureSecret(): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(20));
+	return Array.from(bytes, byte => FIXTURE_SECRET_ALPHABET[byte % FIXTURE_SECRET_ALPHABET.length]).join("");
+}
+
+const headerSecret = fixtureSecret();
+const querySecret = fixtureSecret();
+
+for (const { where, secret, fields } of [
+	{
+		where: "a request header",
+		secret: headerSecret,
+		fields: { baseUrl: "https://llm.example.test/v1", headers: { "x-fixture-header": headerSecret } },
+	},
+	{
+		where: "its base URL's query",
+		secret: querySecret,
+		fields: { baseUrl: `https://llm.example.test/v1?q=${querySecret}` },
+	},
+]) {
+	// If this regresses, the API key of a model a provider is configured with (in a request header or in its URL) is
+	// written in plain text to a parked subagent's transcript file each time it parks, where whoever can read the
+	// session directory finds it; or the subagent comes back on the model without it and its calls fail.
+	it(`keeps a model whose key is in ${where} out of the transcript and revives on it`, async () => {
+		const models: Model<Api>[] = [];
+		registerCustomApi(SECRET_MODEL_API, answeringStream(models), MOCK_API_SOURCE);
+		const run = await runKeptAliveSubagent({ model: providerModel(fields) });
+		try {
+			expect(models.length).toBeGreaterThan(0);
+			await AgentLifecycleManager.global().park(AGENT_ID);
+			run.release();
+
+			const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+			if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+			const stored = await Bun.file(sessionFile).text();
+			// The park recorded the run's revive inputs, without the model.
+			expect(isRecord(storedCustomData(stored, "subagent-revive-state"))).toBe(true);
+			for (let start = 0; start + 8 <= secret.length; start++) {
+				expect(stored).not.toContain(secret.slice(start, start + 8));
+			}
+
+			models.length = 0;
+			const followUp = await runSubagentFollowUpTurn({
+				id: AGENT_ID,
+				agent: TASK_AGENT,
+				message: "anything else?",
+				storeMaskCwd: path.join(root, "home", "work"),
+			});
+			expect(followUp.exitCode).toBe(0);
+			expect(models.at(-1)).toMatchObject(fields);
+		} finally {
+			run.close();
+		}
+	}, 30_000);
+}

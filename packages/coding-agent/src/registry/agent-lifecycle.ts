@@ -62,7 +62,8 @@ export interface LiveAgentTarget {
  * A reviver kept as plain data: `reviver` called with the agent's own `state`. An adoption holds it
  * for as long as its agent stays parked, so `reviver` MUST be a module-level function shared by every
  * agent it revives, never a closure (a closure keeps the scope of the run that built it), and
- * `state` holds only the agent's own plain inputs.
+ * `state` holds only what the live process does not already keep for the agent elsewhere: references
+ * to objects the process holds, with the agent's own inputs read back from its transcript.
  */
 export interface AgentReviveState<S = unknown> {
 	// Method syntax: an `AgentReviveState<Inputs>` stands where an `AgentReviveState<unknown>` is expected.
@@ -76,6 +77,19 @@ export type AdoptedReviver = AgentReviver | AgentReviveState;
 /** Runs `revive` for the parked ref `expected`. */
 export function runReviver(revive: AdoptedReviver, expected: AgentRef): Promise<AgentSessionHandle> {
 	return typeof revive === "function" ? revive(expected) : revive.reviver(expected, revive.state);
+}
+
+/**
+ * Thrown by a warm reviver when its agent's transcript holds none of the inputs it revives from
+ * (a transcript written before they were recorded there, or a park whose write failed). The lifecycle
+ * then drops that reviver and revives the agent cold from its persisted session contract, as it does
+ * an agent restored from disk.
+ */
+export class WarmReviveInputsMissingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "WarmReviveInputsMissingError";
+	}
 }
 
 const AGENT_RELEASE_GRACE_MS = 5000;
@@ -819,6 +833,18 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			if (coldReviver && this.#adopted.get(id) === adoption) {
 				if (prior) this.#adopted.set(id, prior);
 				else this.#adopted.delete(id);
+			}
+			// A warm reviver whose transcript records no inputs revives nothing: drop it, as a dead
+			// worker's is ({@link forgetReviver}), and revive cold from the transcript.
+			if (
+				error instanceof WarmReviveInputsMissingError &&
+				prior &&
+				prior.revive === revive &&
+				this.#adopted.get(id) === prior
+			) {
+				prior.revive = undefined;
+				dropReviver(prior);
+				return this.#resolveAndRevive(id, ref);
 			}
 			throw error;
 		}
