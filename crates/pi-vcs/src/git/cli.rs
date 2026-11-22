@@ -838,7 +838,6 @@ mod tests {
 	#[test]
 	fn run_sync_deadline_lets_git_release_its_locks()
 	-> std::result::Result<(), Box<dyn std::error::Error>> {
-		use std::os::unix::fs::PermissionsExt;
 		let dir = tempfile::tempdir()?;
 		let lock = dir.path().join("index.lock");
 		let script = dir.path().join("hold-lock.sh");
@@ -848,8 +847,9 @@ touch \"$1\"
 sleep 60 & sleeper=$!
 wait $sleeper
 ";
-		std::fs::write(&script, HOLD_LOCK)?;
-		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+		// A child writes the script (`testprog`), so no fork by another
+		// test's thread can keep it busy when git runs it.
+		crate::testprog::write(&script, HOLD_LOCK);
 		let args = [
 			"-c".to_owned(),
 			format!("alias.hold-lock=!{}", script.display()),
