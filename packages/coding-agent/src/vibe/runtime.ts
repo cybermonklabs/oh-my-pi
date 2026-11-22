@@ -28,6 +28,7 @@ import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManagerApi, AsyncJobRunResult } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
 import { resolveAgentModelSelection } from "../config/model-resolver";
+import { spawnedSubagentSkills } from "../extensibility/skills";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -1338,7 +1339,7 @@ export class VibeSessionRegistry {
 			mcpToolScope: session.mcpToolScope,
 			contextFiles: session.contextFiles,
 			noContextFiles: session.noContextFiles,
-			skills: [...(session.skills ?? [])],
+			skills: spawnedSubagentSkills(session.skills),
 			// Parent snapshot forwarded for perf; keep the child's own
 			// resources_discover contributions mergeable (executor.ts).
 			mergeDiscoveredSkillPaths: true,

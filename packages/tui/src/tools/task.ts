@@ -1626,6 +1626,14 @@ export function settledTaskDetails(details: TaskToolDetails): TaskToolDetails {
 	return { ...details, progress: details.progress.map(settledProgressRow) };
 }
 
+/**
+ * The recent lists of every finished row {@link settledProgressRow} keeps: a session keeps its settled frames for its
+ * life, and nothing writes a kept row's lists in place (only the executor writes its own live progress's), so every
+ * kept row shares these two frozen empty lists rather than holding two of its own.
+ */
+const SETTLED_RECENT_TOOLS = Object.freeze<AgentProgress["recentTools"]>([]) as AgentProgress["recentTools"];
+const SETTLED_RECENT_OUTPUT = Object.freeze<string[]>([]) as string[];
+
 function settledProgressRow(row: AgentProgress): AgentProgress {
 	if (row.status === "pending" || row.status === "running") return row;
 	const {
@@ -1642,8 +1650,8 @@ function settledProgressRow(row: AgentProgress): AgentProgress {
 		...kept
 	} = row;
 	if (kept.assignment) kept.task = "";
-	kept.recentTools = [];
-	kept.recentOutput = [];
+	kept.recentTools = SETTLED_RECENT_TOOLS;
+	kept.recentOutput = SETTLED_RECENT_OUTPUT;
 	return kept;
 }
 
