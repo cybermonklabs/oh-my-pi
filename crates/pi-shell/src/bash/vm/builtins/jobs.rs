@@ -13,6 +13,7 @@ use crate::bash::{
 	ControlHandle, Platform,
 	diag::Diag,
 	event::{EventData, WaitKey},
+	ids::Vpid,
 	signal::{SigTarget, Signal},
 	store::OptId,
 	vm::{
@@ -20,7 +21,7 @@ use crate::bash::{
 		expand::Stop,
 		jobctl,
 		proc::{Job, JobLookup, JobState, LastBg, ScriptKind},
-		quote,
+		quote, state,
 	},
 };
 
@@ -35,11 +36,11 @@ pub fn active(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
 /// decides by the state of this vproc's jobs, as bash's job states follow
 /// its children's exits at once (its `SIGCHLD` handler's `waitchld`): with
 /// a job of its own still running here, the builtin parks and asks
-/// ([`crate::bash::vm::Kernel::ask_exits`]); the scheduler then wakes every
-/// parked vproc, so the job's vprocs that wait for an exited program or for
-/// ended children take it in and end before the builtin runs again. It
-/// waits for no running job. A job a command substitution lists is its
-/// parent's, copied when it started.
+/// ([`crate::bash::vm::Kernel::ask_exits`]); it is answered once every
+/// other vproc that was parked has had its next turn, so the job's vprocs
+/// that wait for an exited program or for ended children take it in and
+/// end before the builtin runs again. It waits for no running job. A job a
+/// command substitution lists is its parent's, copied when it started.
 pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
 	if ctx.k.exits_taken(ctx.vp.vpid) {
 		return Ok(());
@@ -191,11 +192,27 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 }
 
 /// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`).
+/// `cleanup_dead_jobs`); bash keeps each one's status for `wait PID`
+/// (`delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
-	ctx.vp
+	let dead = |j: &Job| j.notified && matches!(j.state, JobState::Done(_));
+	let kept: Vec<(Vpid, u32, i32)> = ctx
+		.vp
 		.jobs
-		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+		.iter()
+		.filter(|j| dead(j))
+		.filter_map(|j| match j.state {
+			JobState::Done(status) => Some((j.vpid, j.pid(), status)),
+			_ => None,
+		})
+		.collect();
+	if kept.is_empty() {
+		return;
+	}
+	ctx.vp.jobs.remove_where(dead);
+	for (vpid, pid, status) in kept {
+		state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, vpid, pid, status);
+	}
 }
 
 /// `jobs [-lnprs] [jobspec …]`, `jobs -x command [args]`: list jobs as
@@ -536,8 +553,13 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			.filter(|j| !running_only || j.state == JobState::Running)
 			.map(|j| j.number)
 			.collect();
+		// bash `delete_all_jobs`: no status is kept for them, and `-a` forgets
+		// those kept before.
 		for number in picked {
-			drop_job(ctx, number, nohup);
+			drop_job(ctx, number, nohup, false);
+		}
+		if !nohup && !running_only {
+			state::clear_statuses(&mut ctx.k.root, ctx.cx.store, ctx.vp);
 		}
 		return done(0);
 	}
@@ -564,7 +586,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				.ok_or(Bad::Missing),
 		};
 		if let Ok(number) = found {
-			drop_job(ctx, number, nohup);
+			drop_job(ctx, number, nohup, true);
 		} else {
 			no_such_job(ctx, word.map_or(&b"current"[..], |w| w.as_slice()));
 			status = 1;
@@ -574,18 +596,31 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 }
 
 /// `disown`'s effect on one job: `nohup` marks it, else it is deleted
-/// (bash warns when that drops a stopped job).
-fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool) {
+/// (bash warns when that drops a stopped job) and is no child of this shell
+/// any more: `wait` neither waits for it nor finds it, except by the status
+/// `keep` keeps (bash `delete_job`'s `bgp_add`, the status it had then: 0
+/// while it runs).
+fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 	if nohup {
 		if let Some(job) = ctx.vp.jobs.get_mut(number) {
 			job.nohup = true;
 		}
 		return;
 	}
-	if let Some(job) = ctx.vp.jobs.remove(number)
-		&& matches!(job.state, JobState::Stopped(_))
-		&& !ctx.vp.jobs.subshell
-	{
+	let Some(job) = ctx.vp.jobs.remove(number) else {
+		return;
+	};
+	if !job.inherited {
+		ctx.k.disown(ctx.cx.store, job.vpid);
+	}
+	if keep {
+		let status = match job.state {
+			JobState::Done(status) => status,
+			JobState::Running | JobState::Stopped(_) => 0,
+		};
+		state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, job.vpid, job.pid(), status);
+	}
+	if matches!(job.state, JobState::Stopped(_)) && !ctx.vp.jobs.subshell {
 		ctx.diag(Diag::Warning {
 			msg: format!("warning: deleting stopped job {number} with process group {}", job.pid())
 				.into(),

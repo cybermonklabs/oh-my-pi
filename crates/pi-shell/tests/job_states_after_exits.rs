@@ -7,7 +7,10 @@
 //! Bash's answer does not depend on timing; in each `last` row the first stage
 //! ends only after the shell's first report. Bash 5.2.21 prints the same but
 //! for its narrower status column (24, not 27) and an empty `$(jobs)` (its
-//! command substitution starts without the job list).
+//! command substitution starts without the job list). A job that left the
+//! table keeps its status for `wait PID` (bash's bgp list), a job `disown`
+//! dropped is no child, `kill %1` makes a job's state news for `jobs -n`, and
+//! the shell's own loop runs beside background loops that start subshells.
 #![cfg(target_os = "linux")]
 
 mod obash_support;
@@ -202,4 +205,135 @@ fn a_lone_program_or_subshell_job_and_wait_stay_as_bash_has_them() {
 			err:    "",
 		},
 	]);
+}
+
+/// The statuses of jobs that `jobs` reported and forgot stay for `wait
+/// PID` (bash's bgp list): again and again, once in posix mode; a plain
+/// `wait` and `disown -a` forget them, `disown -r` does not.
+#[test]
+fn wait_finds_the_status_of_a_job_jobs_forgot() {
+	assert_rows(&[
+		Row {
+			name:   "kept/pipe-not-last",
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
+			out:    "st=5\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/pipe-not-last-l",
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs -l >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
+			out:    "st=5\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/twice",
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p; echo "st=$?"; wait; echo end"#,
+			out:    "st=5\nst=5\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/posix",
+			script: r#"set -o posix; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p 2>/dev/null; echo "st=$?"; wait; echo end"#,
+			out:    "st=5\nst=127\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/two-jobs",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; /bin/sh -c 'exit 4' & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $q; echo "st=$?""#,
+			out:    "st=3\nst=4\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/plain-wait-forgets",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; /bin/sh -c 'exit 4' & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; jobs >/dev/null; wait; wait $p 2>/dev/null; echo "st=$?""#,
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/disown-a-forgets",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; sleep 1 >/dev/null 2>&1 & disown -a; wait $p 2>/dev/null; echo "st=$?""#,
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "kept/disown-r-keeps",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; sleep 1 >/dev/null 2>&1 & disown -r; wait $p; echo "st=$?""#,
+			out:    "st=3\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `wait PID` of a job `disown` dropped answers at once: `disown` and
+/// `disown %1` keep the status it had (0 while it runs: the program here
+/// ends only after `disown`), `-a` and `-r` keep none (not a child), also
+/// once it ended.
+#[test]
+fn wait_for_a_disowned_job_answers_at_once() {
+	assert_rows(&[
+		Row {
+			name:   "disowned/a",
+			script: r#"sleep 3 >/dev/null 2>&1 & disown -a; wait $! 2>/dev/null; echo "st=$?""#,
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "disowned/r",
+			script: r#"sleep 3 >/dev/null 2>&1 & disown -r; wait $! 2>/dev/null; echo "st=$?""#,
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "disowned/ended-a",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; disown -a; while kill -0 $p 2>/dev/null; do :; done; wait $p 2>/dev/null; echo "st=$?""#,
+			out:    "st=127\n",
+			err:    "",
+		},
+		Row {
+			name:   "disowned/ended-pct",
+			script: r#"T=$(mktemp -d); /bin/sh -c 'until [ -e "$1/go" ]; do :; done; exit 3' sh "$T" & p=$!; disown %1; : > "$T/go"; while kill -0 $p 2>/dev/null; do :; done; wait $p; echo "st=$?"; rm -r "$T""#,
+			out:    "st=0\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `kill %1` makes a job's state news again for `jobs -n` (bash
+/// `kill_pid`); `kill PID` does not.
+#[test]
+fn kill_of_a_job_makes_its_state_news_again() {
+	assert_rows(&[
+		Row {
+			name:   "notified/pct",
+			script: r"sleep 20 & jobs -n; kill -0 %1; jobs -n; echo two; kill %1 2>/dev/null; wait 2>/dev/null; echo end",
+			out:    "[1]+  Running                    sleep 20 &\n[1]+  Running                    \
+			         sleep 20 &\ntwo\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "notified/pct-m",
+			script: r"set -m; sleep 20 & jobs -n; kill -0 %1; jobs -n; echo two; kill %1 2>/dev/null; wait 2>/dev/null; echo end",
+			out:    "[1]+  Running                    sleep 20 &\n[1]+  Running                    \
+			         sleep 20 &\ntwo\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "notified/pid",
+			script: r"sleep 20 & jobs -n; kill -0 $!; jobs -n; echo two; kill %1 2>/dev/null; wait 2>/dev/null; echo end",
+			out:    "[1]+  Running                    sleep 20 &\ntwo\nend\n",
+			err:    "",
+		},
+	]);
+}
+
+/// The shell's own loop runs beside two background loops that start
+/// subshells: it ends long before them, and `kill` ends them.
+#[test]
+fn the_shell_runs_beside_loops_that_start_subshells() {
+	assert_rows(&[Row {
+		name:   "beside/two-loops",
+		script: r"( i=0; while [ $i -lt 20000 ]; do (:); i=$((i+1)); done; echo A-done ) & ( i=0; while [ $i -lt 20000 ]; do (:); i=$((i+1)); done; echo B-done ) & i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; echo fg-done; kill %1 %2; wait 2>/dev/null; echo end",
+		out:    "fg-done\nend\n",
+		err:    "",
+	}]);
 }
