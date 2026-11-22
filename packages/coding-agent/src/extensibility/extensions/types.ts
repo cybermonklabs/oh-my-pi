@@ -828,6 +828,9 @@ export interface ExtensionContext {
 	 * `input.role` selects an approval's execution tier, matched against `plan_review_requested`'s
 	 * `tiers` by role name; without it the approval runs on the tier selected in the
 	 * overlay's model slider. `role` applies only to approvals (`execute`, `compact`, `keep`).
+	 * Pass `input.origin: "outside"` only when the answer relays a person's pick: then the approval or
+	 * refinement it starts ends the session's `cyber_policy` hold, as a pick in the review does. An
+	 * extension's own answer leaves it unset and keeps the hold.
 	 * False when that review is not open, the choice is disabled or missing its feedback,
 	 * `input.role` names no selectable tier or accompanies a non-approval choice, or the
 	 * mode has no plan review.

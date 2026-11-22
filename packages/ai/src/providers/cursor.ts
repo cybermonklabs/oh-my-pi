@@ -184,6 +184,7 @@ import {
 import { classifyJsonPrefix } from "@oh-my-pi/pi-utils/json-parse";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
+import { heldModelCall } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -1203,6 +1204,12 @@ function streamCursorWithWireMode(
 	wireMode: CursorWireMode,
 	timing?: CursorStreamTiming,
 ): AssistantMessageEventStream {
+	// A resend (the stream retry after its backoff, the HTTP/1 and wire-model fallbacks) reads the model-call
+	// guards again right before it goes out; the first send read them when the call started.
+	if (timing) {
+		const held = heldModelCall(model);
+		if (held) return held;
+	}
 	// A relayed run outlives its first response: `context`, `options`, `stream`
 	// and `output` (and the response timings) belong to the request currently
 	// receiving it, and move to the request that resumes it (`CursorParkedRun`).

@@ -1679,9 +1679,6 @@ async function openCodexWebSocketTransport(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
-	// Each WebSocket request (the first, the connect loop's retries and every reopen after a recovery wait)
-	// reads the model-call guards before it goes out; a held one sends nothing.
-	assertModelCallAllowed(model);
 	let canAppendBeforeRequest = websocketState.canAppend === true;
 	let chainedBody = buildCodexChainedRequestBody(requestContext.transformedBody, websocketState);
 	const websocketHeaders = createCodexHeaders(
@@ -1746,6 +1743,9 @@ async function openCodexWebSocketTransport(
 				liveSteers.flatMap(steer => steer.items),
 			);
 			if (plan.kind === "attach") {
+				// The model-call guards' read right before the request goes out, after the attestation and
+				// connection waits (see the frame send below).
+				assertModelCallAllowed(model);
 				recordCodexTurnRequestDiagnostics(websocketState, chainedBody, "websocket", canAppendBeforeRequest);
 				requestContext.rawRequestDump.body = chainedBody;
 				return {
@@ -1843,6 +1843,10 @@ async function openCodexWebSocketTransport(
 				retry,
 				retryBudget: CODEX_WEBSOCKET_RETRY_BUDGET,
 			});
+		// Each WebSocket request (the first, the connect loop's retries and every reopen after a recovery wait)
+		// reads the model-call guards right before it goes out, after the attestation, connection and `onPayload`
+		// waits; a held one sends nothing, and the catch below releases the reservation.
+		assertModelCallAllowed(model);
 		const eventStream = websocketConnection.streamRequest(
 			{ send: websocketRequest },
 			timeouts,
@@ -2134,7 +2138,15 @@ class CodexStreamProcessor {
 				// steers its own response.
 				const steered = await this.#retireSteering();
 				this.#stopSteeringOnNativeLaneRejection(error, steered);
-				const recovered = await this.#recoverStreamError(error);
+				let recovered: boolean;
+				try {
+					recovered = await this.#recoverStreamError(error);
+				} catch (recoveryError) {
+					// A recovery that throws (a held reopen, a transport error while reopening) ends the turn as a
+					// failed recovery does: settle the steering first, so a socket that accepted steering closes.
+					await this.#settleSteering(false);
+					throw recoveryError;
+				}
 				if (!recovered) {
 					await this.#settleSteering(false);
 					throw error;

@@ -4,10 +4,10 @@ import { AssistantMessageEventStream } from "./utils/event-stream";
 
 /**
  * A process-wide check on model calls. Every chat call passes {@link stream} or {@link streamSimple}
- * (`complete` and `completeSimple` go through them), and image generation, speech synthesis and
- * native judgments pass their own entries; each consults the registered guards before the request
- * is built. A host can so hold a model for every caller at once, a run already in flight included,
- * without each caller checking for itself.
+ * (`complete` and `completeSimple` go through them), and image generation, speech synthesis, `embed`,
+ * `rerank`, `submitVideo` and native judgments pass their own entries; each consults the registered guards
+ * before the request is built. A host can so hold a model for every caller at once, a run already in flight
+ * included, without each caller checking for itself.
  *
  * A guard registered with a scope sees only the calls made inside {@link runInModelCallScope} with
  * that scope, and the calls made outside every scope; a guard without one sees every call. So one
@@ -133,10 +133,14 @@ export function guardModelCall(
  * The guards' second read, right before a request leaves: the reason a guard that sees the current call
  * holds `model` now, else `undefined`. {@link guardModelCall} reads the guards when a call starts; a call
  * can then wait (a provider slot, a key resolution, a header resolution) or send again (an auth-retry
- * attempt, a transport retry after a backoff, a stream reopen, a fallback, a live steer), so each send
- * reads them again. A send this read holds still ends the call with an error that names `cyber_policy`,
- * and {@link guardModelCall} reports that final message to its guards like any other; the guards tell it
- * apart from OpenAI's own refusal and do not record it.
+ * attempt, a transport retry after a backoff, a stream reopen, a fallback, a live steer). These sends read
+ * them again, right before each one goes out: every attempt of the OpenAI and Codex HTTP transports, each
+ * Codex and Responses WebSocket request, the replay-safe stream retry, the native judgment loop, Bedrock
+ * and Ollama attempts, each Gemini CLI endpoint, Cursor's resends (stream retry, HTTP/1 and wire-model
+ * fallbacks), each pass of the Anthropic provider's retry loop, and pi-agent's remote compaction. A transport
+ * not named here reads them once, when its call starts. A send this read holds still ends the call with an
+ * error that names `cyber_policy`, and {@link guardModelCall} reports that final message to its guards like
+ * any other; the guards tell it apart from OpenAI's own refusal and do not record it.
  */
 export function modelCallHoldReason(model: Model<Api>): string | undefined {
 	return guards.size === 0 ? undefined : refusal(applicable(), model);
@@ -161,7 +165,7 @@ export function assertModelCallAllowed(model: Model<Api>): void {
  * `networkFailureError` as it is (that wraps only transport failures), so the held call keeps its
  * `cyber_policy` name.
  */
-export function guardedRequestUrl(model: Model<Api>, url: string): (attempt: number) => string {
+export function guardedRequestUrl<U extends string | URL>(model: Model<Api>, url: U): (attempt: number) => U {
 	return () => {
 		assertModelCallAllowed(model);
 		return url;
