@@ -225,3 +225,34 @@ fn disown_r_leaves_no_current_job() {
 		"next job"
 	);
 }
+
+// Failure mode: `disown %n` clears the current and previous jobs as
+// `disown -r` does, so the jobs it leaves lose their `+` and `-`. bash's
+// `delete_job` picks new ones only when it deletes the current or previous
+// job (`reset_current`: the newest running job is `+`, the previous one
+// `-`), and keeps them otherwise. Goldens: bash 5.2.21 and 5.3.20, three
+// runs each, the same.
+#[test]
+fn disown_of_one_job_keeps_the_marks_of_the_others() {
+	const LOOPS: &str =
+		"while :; do :; done & p1=$!; while :; do :; done & p2=$!; while :; do :; done & p3=$!;";
+	let running = |n: u32, mark: char| format!("[{n}]{mark}  Running                    {LOOP} &\n");
+	for (spec, plus, minus) in [("%1", 3, 2), ("%3", 2, 1)] {
+		let (out, err, _) = run(&format!(
+			"{LOOPS} disown {spec}; jobs; jobs %+ %-; exec 2>/dev/null; kill -9 $p1 $p2 $p3; wait; \
+			 echo end"
+		));
+		let (low, high) = (minus.min(plus), minus.max(plus));
+		let mark = |n: u32| if n == plus { '+' } else { '-' };
+		let want = [
+			running(low, mark(low)),
+			running(high, mark(high)),
+			running(plus, '+'),
+			running(minus, '-'),
+		]
+		.concat()
+			+ "end\n";
+		assert_eq!(out, want, "disown {spec}");
+		assert_eq!(err, "", "disown {spec}");
+	}
+}
