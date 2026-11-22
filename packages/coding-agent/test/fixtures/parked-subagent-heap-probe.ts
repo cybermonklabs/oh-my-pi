@@ -37,6 +37,10 @@ interface HeapReading {
 	Function: number;
 	AsyncFunction: number;
 	JSLexicalEnvironment?: number;
+	/** ES module records: a module loaded once per subagent (an extension, a plugin) shows here. */
+	ModuleRecord: number;
+	/** CommonJS module objects (`Module` in heapStats, "Module (CommonJS)" in a heap snapshot). */
+	CommonJSModule: number;
 	/** Parked subagents whose session was still reachable when the reading was taken. */
 	liveParkedSessions: number;
 }
@@ -177,6 +181,8 @@ async function settledHeap(): Promise<HeapReading> {
 		Function: objectTypeCounts.Function ?? 0,
 		AsyncFunction: objectTypeCounts.AsyncFunction ?? 0,
 		JSLexicalEnvironment: objectTypeCounts.JSLexicalEnvironment,
+		ModuleRecord: objectTypeCounts.ModuleRecord ?? 0,
+		CommonJSModule: objectTypeCounts.Module ?? 0,
 		liveParkedSessions: liveParkedSessions(),
 	};
 }
@@ -205,6 +211,8 @@ process.stdout.write(
 			Function: perSubagent(afterSecondBatch.Function, afterFirstBatch.Function),
 			AsyncFunction: perSubagent(afterSecondBatch.AsyncFunction, afterFirstBatch.AsyncFunction),
 			JSLexicalEnvironment: perSubagent(afterSecondBatch.JSLexicalEnvironment, afterFirstBatch.JSLexicalEnvironment),
+			ModuleRecord: perSubagent(afterSecondBatch.ModuleRecord, afterFirstBatch.ModuleRecord),
+			CommonJSModule: perSubagent(afterSecondBatch.CommonJSModule, afterFirstBatch.CommonJSModule),
 		},
 	})}\n`,
 );

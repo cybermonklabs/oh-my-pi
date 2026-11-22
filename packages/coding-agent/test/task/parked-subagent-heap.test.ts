@@ -28,12 +28,16 @@ interface PerParkedSubagent {
 	Map: number;
 	Function: number;
 	AsyncFunction: number;
+	ModuleRecord: number;
+	CommonJSModule: number;
 }
 
 function isPerParkedSubagent(value: unknown): value is PerParkedSubagent {
 	if (typeof value !== "object" || value === null) return false;
 	const fields: Record<string, unknown> = { ...value };
-	return ["heapSize", "Map", "Function", "AsyncFunction"].every(key => typeof fields[key] === "number");
+	return ["heapSize", "Map", "Function", "AsyncFunction", "ModuleRecord", "CommonJSModule"].every(
+		key => typeof fields[key] === "number",
+	);
 }
 
 /** Runs the probe; returns its JSON line and the growth per parked subagent it reports. */
@@ -76,5 +80,8 @@ it("keeps no Map, function or closure for each parked subagent", async () => {
 	expect(perParkedSubagent.Map, output).toBeLessThan(0.5);
 	expect(perParkedSubagent.Function, output).toBeLessThan(0.5);
 	expect(perParkedSubagent.AsyncFunction, output).toBeLessThan(0.5);
+	// A module a subagent's session loads (an extension, a plugin) is loaded once per process, not per subagent.
+	expect(perParkedSubagent.ModuleRecord, output).toBeLessThan(0.5);
+	expect(perParkedSubagent.CommonJSModule, output).toBeLessThan(0.5);
 	expect(perParkedSubagent.heapSize, output).toBeLessThan(MAX_HEAP_BYTES_PER_PARKED_SUBAGENT);
 }, 180_000);
