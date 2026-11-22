@@ -40,10 +40,11 @@ import {
 	isInterruptedTurnAbort,
 	isRestoreSkippedCallResult,
 	type RestoreSkippedCalls,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "../session/exit-diagnostics";
 import { isReasonlessAbort, isUserInterruptAbort } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
-import { extractSessionInit, type SessionManager } from "../session/session-manager";
+import { DISCARDED_ENTRY_BRANCH_MARKER, extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
 import { RETRY_CANCELLED } from "../session/turn-recovery";
 import type { EventBus } from "../utils/event-bus";
@@ -805,18 +806,23 @@ function replyStreamStartedAt(
 
 /**
  * The entries off the selected `branch` that a tool replay left there. A replay (a restored
- * turn's, or `/retry`'s, of a batch whose every call was cut off) moves the leaf back to the
+ * turn's, or `/retry`'s, of a batch whose every result is an error) moves the leaf back to the
  * batch's reply and runs its calls again, so the batch's first run lies on a branch of its own
- * that forks at that reply. Each branch off the selected one is judged by its own contents, not by
- * what the selected branch wrote after the fork (a replay cut off before its first result wrote
- * only start records there): it is a replay's when it forks at a reply with tool calls, holds a
- * result of one of them, and holds nothing else a replay does not leave ({@link leftByReplay}). A
- * branch a person's own navigation left holds a turn the conversation took there (their prompt, a
- * reply that answered it, a call that ran to its end), or forks elsewhere (a `/tree` re-answer of
- * an `ask` forks at the call's start record), and none of its entries is returned.
+ * that forks at that reply. A branch off the selected one is a replay's when both sides say so:
+ * - its own contents: it forks at a reply with tool calls, holds a result of one of them, and holds
+ *   nothing else a replay does not leave ({@link leftByReplay});
+ * - the selected branch after the fork ({@link replayedAfter}): a replay writes each call's start
+ *   record before its result, so the selected branch starts one of the reply's calls again before
+ *   any turn input, or holds no turn after the reply (a replay cut off before its first start
+ *   record, which restore runs again).
+ * A branch a person's own navigation left fails one side: it holds a turn the conversation took
+ * there (their prompt, a reply that answered it, a call that ran to its end), or the conversation
+ * they went on with holds their input first (a `/tree` move to the reply after an Esc leaves what a
+ * replay leaves, and the person's next prompt follows the reply) or no start record (a `/tree`
+ * re-answer of an `ask` writes the call's result with none). None of its entries is returned.
  */
 function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): Set<string> {
-	const onBranch = new Set(branch.map(entry => entry.id));
+	const branchIndex = new Map(branch.map((entry, index) => [entry.id, index]));
 	const byId = new Map(entries.map(entry => [entry.id, entry]));
 	// Each off-branch entry's branch: the off-branch entry whose parent is on the selected branch (null: none, as
 	// for an entry whose parents run in a cycle, which a corrupt file can hold).
@@ -831,7 +837,7 @@ function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly S
 				break;
 			}
 			path.add(current.id);
-			if (current.parentId !== null && onBranch.has(current.parentId)) {
+			if (current.parentId !== null && branchIndex.has(current.parentId)) {
 				root = current.id;
 				break;
 			}
@@ -842,7 +848,7 @@ function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly S
 	};
 	const branches = new Map<string, SessionEntry[]>();
 	for (const entry of entries) {
-		if (onBranch.has(entry.id)) continue;
+		if (branchIndex.has(entry.id)) continue;
 		const root = branchRoot(entry);
 		if (root === null) continue;
 		const group = branches.get(root);
@@ -851,14 +857,45 @@ function replayLeftEntryIds(entries: readonly SessionEntry[], branch: readonly S
 	}
 	const left = new Set<string>();
 	for (const [root, offBranch] of branches) {
-		const fork = byId.get(byId.get(root)?.parentId ?? "");
-		const calls = toolCallIdsOf(fork);
+		const forkId = byId.get(root)?.parentId ?? "";
+		const calls = toolCallIdsOf(byId.get(forkId));
 		if (!calls) continue;
 		if (!offBranch.some(entry => isResultOf(entry, calls))) continue;
-		if (!offBranch.every(entry => leftByReplay(entry, calls))) continue;
+		// The calls of a reply a cut-off ended while it streamed after the batch's results (an Esc): the model's
+		// context drops that reply with its results, so the batch is still the one a replay runs again.
+		const cutOffCalls = new Set(calls);
+		for (const entry of offBranch) {
+			if (isCutOffReply(entry)) for (const id of toolCallIdsOf(entry) ?? []) cutOffCalls.add(id);
+		}
+		if (!offBranch.every(entry => leftByReplay(entry, cutOffCalls))) continue;
+		if (!replayedAfter(branch, branchIndex.get(forkId)!, calls)) continue;
 		for (const entry of offBranch) left.add(entry.id);
 	}
 	return left;
+}
+
+/**
+ * Whether the selected `branch` after the entry at `forkIndex` runs one of `calls` again, or will:
+ * - it holds a start record of one of them before any turn input (a replay writes those first; call
+ *   ids do not repeat, so none can follow a turn input, and the scan stops there);
+ * - or nothing after the fork is a turn ({@link leftByReplay} accepts each entry): the replay was cut
+ *   off before its first start record, and restore runs the batch again. Such a branch may still
+ *   hold what a later process wrote there before restore read it: the startup eval snapshot, and
+ *   exit recovery's closing of the reply's calls (an exit record, their error results, the
+ *   interrupted-turn abort).
+ */
+function replayedAfter(branch: readonly SessionEntry[], forkIndex: number, calls: ReadonlySet<string>): boolean {
+	const after = branch.slice(forkIndex + 1);
+	const input = after.findIndex(isTurnInput);
+	const beforeInput = input < 0 ? after : after.slice(0, input);
+	if (beforeInput.some(entry => startsOneOf(entry, calls))) return true;
+	return input < 0 && after.every(entry => leftByReplay(entry, calls));
+}
+
+/** Whether `entry` is the start record of one of `calls`. */
+function startsOneOf(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
+	if (entry.type !== "custom" || entry.customType !== TOOL_EXECUTION_START_CUSTOM_TYPE) return false;
+	return isRecord(entry.data) && typeof entry.data.toolCallId === "string" && calls.has(entry.data.toolCallId);
 }
 
 /** The ids of the tool calls `entry` makes, when it is a reply that makes any. */
@@ -874,27 +911,46 @@ function isResultOf(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
 	return entry.type === "message" && entry.message.role === "toolResult" && calls.has(entry.message.toolCallId);
 }
 
+/** Whether `entry` is a reply a cut-off ended: an abort, or the error a failed attempt left. */
+function isCutOffReply(entry: SessionEntry): boolean {
+	if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+	return entry.message.stopReason === "aborted" || entry.message.stopReason === "error";
+}
+
 /**
- * Whether `entry` is one a tool replay leaves on the branch of the batch's first run, for the
- * reply that makes `calls`: a result of one of those calls, an error (the replay runs a batch
- * only when every call was cut off); a reply the cut-off ended the turn with, which makes no call
- * (an abort, or the error a failed attempt left); or a record that is no turn of the
+ * Whether `message` is a `length` stop with no text and no call (a reasoning-only reply), which the
+ * length-stop recovery takes out of the model's context and moves the leaf past
+ * (`discardAssistantTurn`); the entry stays in the file as a sibling of the next attempt.
+ */
+function isDroppedLengthStop(message: AgentMessage): boolean {
+	if (message.role !== "assistant" || message.stopReason !== "length") return false;
+	return !message.content.some(part => part.type === "toolCall" || (part.type === "text" && part.text.trim() !== ""));
+}
+
+/**
+ * Whether `entry` is one a tool replay leaves on the branch of the batch's first run, where
+ * `calls` are the calls of the batch's reply and of the replies a cut-off ended there: a result of
+ * one of those calls, an error (the replay runs a batch only when every result is an error, and a
+ * cut-off reply's calls are cut off too); a reply a cut-off ended (an abort, or the error a failed
+ * attempt left), with or without calls; a reasoning-only `length` stop a recovery dropped; the
+ * empty-stop retry's marker (the empty `branch_summary` `discardEntryDurably` writes); the
+ * compaction an overflow or length-stop recovery writes there; or a record that is no turn of the
  * conversation (execution starts, job, exit and discard records, a retry's model and thinking
- * changes, usage, labels). A turn input (a prompt, a delivery, an IRC message), a `/clear`, a
- * compaction or a branch summary, a reply that makes calls or that completed, and a result that is
- * no error or of another call are turns the conversation took on that branch.
+ * changes, usage, labels, eval snapshots). A turn input (a prompt, a delivery, an IRC message), a
+ * `/clear`, another branch summary, a reply that completed, and a result that is no error or of
+ * another call are turns the conversation took on that branch.
  */
 function leftByReplay(entry: SessionEntry, calls: ReadonlySet<string>): boolean {
 	if (entry.type === "message") {
 		const { message } = entry;
 		if (message.role === "toolResult") return message.isError === true && calls.has(message.toolCallId);
-		if (message.role === "assistant") {
-			const cutOff = message.stopReason === "aborted" || message.stopReason === "error";
-			return cutOff && !message.content.some(part => part.type === "toolCall");
-		}
+		if (message.role === "assistant") return isCutOffReply(entry) || isDroppedLengthStop(message);
+	}
+	if (entry.type === "branch_summary") {
+		return isRecord(entry.details) && entry.details.kind === DISCARDED_ENTRY_BRANCH_MARKER;
 	}
 	if (isTurnInput(entry)) return false;
-	return entry.type !== "reset_boundary" && entry.type !== "compaction" && entry.type !== "branch_summary";
+	return entry.type !== "reset_boundary";
 }
 
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {

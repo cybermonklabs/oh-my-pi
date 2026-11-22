@@ -136,7 +136,8 @@ import { recordSessionRecap, recordSessionTitle } from "./session-index";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
-const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+/** `details.kind` of the empty `branch_summary` {@link SessionManager.discardEntryDurably} writes. */
+export const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
 /** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
 const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**

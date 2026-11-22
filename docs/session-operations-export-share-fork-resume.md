@@ -555,16 +555,25 @@ The `task` result that only started a background job settles nothing, nor does
 a result written before the subagent's last turn began (its task prompt, or the
 message that woke it again): that result answered an earlier turn, and the
 parent waits on this one. A parent that holds the failed result acts on it
-itself. A restored turn, or `/retry`, that runs a batch again whose every call
-was cut off leaves the batch's first run on a branch of its own, below the
+itself. A restored turn, or `/retry`, that runs a batch again whose every result
+is an error leaves the batch's first run on a branch of its own, below the
 batch's reply; for a subagent spawned in the current conversation (its spawn
 record names a call there), a handover on such a branch counts too, also when
 the replay itself was cut off before its first result. Such a branch is known
-by what it holds: error results of that reply's calls, a reply the cut-off
-ended without calls, and records that are no turn. A branch the parent's user
-left by their own navigation holds a turn (their prompt, a reply, a call that
-ran to its end) and does not count: the conversation they went on with never
-got those results.
+from both sides. It holds only error results of that reply's calls, replies
+the cut-off ended (an abort or a failed attempt, also one that made calls,
+with the error results of those calls), a reasoning-only `length` reply a
+recovery dropped, the empty-stop retry's marker, a recovery's compaction, and
+records that are no turn. The branch the conversation went on with starts one
+of that reply's calls again before any new input, or holds no turn after the
+reply at all (only records, such as the eval snapshot a restarting process
+writes, and exit recovery's closing of the reply's calls), so restore runs the
+batch again. A branch the parent's user left by their own navigation fails one
+side: it holds a turn (their prompt, a reply, a call that ran to its end), or
+the branch they went on with holds their new input first (a `/tree` move to
+the reply after an Esc) or a result with no start record (a `/tree` re-answer
+of an `ask`). It does not count: the conversation they went on with never got
+those results.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:
