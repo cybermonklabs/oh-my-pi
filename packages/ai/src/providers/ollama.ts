@@ -3,6 +3,7 @@ import { fetchWithRetry, parseStreamingJson, readJsonl } from "@oh-my-pi/pi-util
 import * as AIError from "../error";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
+import { guardedRequestUrl } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -599,7 +600,8 @@ const streamOllamaOnce = (
 			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
 			let response: Response;
 			try {
-				response = await fetchWithRetry(`${baseUrl}/api/chat`, {
+				// Each attempt (the first and every retry after its backoff) reads the model-call guards first.
+				response = await fetchWithRetry(guardedRequestUrl(model, `${baseUrl}/api/chat`), {
 					method: "POST",
 					headers: {
 						...model.headers,

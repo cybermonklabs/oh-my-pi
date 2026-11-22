@@ -9,6 +9,7 @@
 
 import type { Api, CodexCompactionContext, FetchImpl, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { assertModelCallAllowed, guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import type {
@@ -261,8 +262,13 @@ export function buildCompactionV2RequestFromBody(
 // Streaming Request Handler
 // ============================================================================
 
-/** Request V2 compaction over the normal OpenAI Responses streaming endpoint. */
-export async function requestCompactionV2Streaming(
+/**
+ * Request V2 compaction over the normal OpenAI Responses streaming endpoint. It passes pi-ai's model-call
+ * checkpoint: a model a guard holds sends nothing, every attempt (each retry after a backoff included) reads
+ * the guards right before it goes out, and an error the request meets (a `cyber_policy` refusal included)
+ * reaches them before the caller sees it. A `cyber_policy` refusal is never retried.
+ */
+export function requestCompactionV2Streaming(
 	model: Model,
 	apiKey: string,
 	request: CompactionV2Request,
@@ -277,6 +283,18 @@ export async function requestCompactionV2Streaming(
 		codexAccessPrograms?: boolean;
 	},
 ): Promise<CompactionV2Response> {
+	return guardModelRequest(model, () => sendCompactionV2Streaming(model, apiKey, request, signal, options));
+}
+
+async function sendCompactionV2Streaming(
+	model: Model,
+	apiKey: string,
+	request: CompactionV2Request,
+	signal: AbortSignal | undefined,
+	options: Parameters<typeof requestCompactionV2Streaming>[4],
+): Promise<CompactionV2Response> {
+	// The model the guards judge: the caller's, before a Bedrock route swaps in its own.
+	const guardedModel = model;
 	let fetchImpl: FetchImpl = options?.fetch ?? globalThis.fetch;
 	if (isBedrockOpenAIUrl(model.baseUrl)) {
 		({
@@ -312,13 +330,22 @@ export async function requestCompactionV2Streaming(
 	for (let attempt = 0; attempt <= V2_COMPACTION_MAX_RETRIES; attempt++) {
 		const timeoutSignal = ptree.combineSignals(signal, options?.timeoutMs ?? V2_COMPACTION_TIMEOUT_MS);
 		try {
-			return await attemptCompactionV2Streaming(endpoint, apiKey, model, request, fetchImpl, timeoutSignal, {
-				codexMetadata,
-				providerSessionState: options?.providerSessionState,
-				codexCompaction: options?.codexCompaction,
-				preferWebsockets: options?.preferWebsockets,
-				codexAccessPrograms: options?.codexAccessPrograms,
-			});
+			return await attemptCompactionV2Streaming(
+				endpoint,
+				apiKey,
+				model,
+				guardedModel,
+				request,
+				fetchImpl,
+				timeoutSignal,
+				{
+					codexMetadata,
+					providerSessionState: options?.providerSessionState,
+					codexCompaction: options?.codexCompaction,
+					preferWebsockets: options?.preferWebsockets,
+					codexAccessPrograms: options?.codexAccessPrograms,
+				},
+			);
 		} catch (err) {
 			const error = toError(err);
 			if (signal?.aborted) throw error;
@@ -346,6 +373,7 @@ async function attemptCompactionV2Streaming(
 	endpoint: string,
 	apiKey: string,
 	model: Model,
+	guardedModel: Model,
 	request: CompactionV2Request,
 	fetchImpl: FetchImpl,
 	signal: AbortSignal | undefined,
@@ -390,6 +418,7 @@ async function attemptCompactionV2Streaming(
 		return collectCompactionV2Events(eventStream, request);
 	}
 
+	assertModelCallAllowed(guardedModel);
 	const response = await fetchImpl(endpoint, {
 		method: "POST",
 		headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
@@ -684,6 +713,8 @@ function formatCompactionV2Failure(event: Record<string, unknown>, type: string)
 }
 
 function isRetryableCompactionError(error: Error): boolean {
+	// OpenAI judged the request's content: a resend adds a refusal to the organization's record.
+	if (AIError.isCyberPolicyRefusal(error)) return false;
 	// The gateway's synthetic auth_unavailable is an HTTP 503, but the
 	// captured response cause classifies it as auth. Let provider fallback run
 	// immediately instead of spending the transient retry budget.

@@ -1,5 +1,6 @@
 import { expect, it } from "bun:test";
 import * as http2 from "node:http2";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -162,6 +163,67 @@ it("resumes from the latest replay-safe checkpoint after an incomplete stream", 
 		expect(startEvents).toBe(1);
 		expect(originalRequestIds).toEqual(["", requestIds[0]]);
 	} finally {
+		for (const session of sessions) session.destroy();
+		server.close();
+	}
+});
+
+// The retry from a checkpoint sends again after its backoff: it reads the model-call guards right before it
+// goes out, so a hold that begins during the backoff holds it and the call ends on the held error.
+it.each([
+	["holds the checkpoint retry when a model-call hold begins during its backoff", true, 1],
+	["retries from the checkpoint when no hold begins (control)", false, 2],
+])("%s", async (_label, holdDuringWait, expectedRequests) => {
+	const sessions = new Set<http2.Http2Session>();
+	let requestCount = 0;
+	const server = http2.createServer();
+	server.on("session", session => {
+		sessions.add(session);
+		session.on("close", () => sessions.delete(session));
+	});
+	server.on("stream", (providerStream: http2.ServerHttp2Stream) => {
+		requestCount++;
+		let handled = false;
+		providerStream.on("data", () => {
+			if (handled) return;
+			handled = true;
+			providerStream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			if (requestCount === 1) {
+				providerStream.end(Buffer.concat([textDeltaFrame("before"), checkpointFrame()]));
+				return;
+			}
+			providerStream.end(Buffer.concat([textDeltaFrame(" after"), turnEndedFrame()]));
+		});
+	});
+	const listening = Promise.withResolvers<void>();
+	server.once("error", listening.reject);
+	server.listen(0, "127.0.0.1", listening.resolve);
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("expected HTTP/2 fixture server address");
+	const model = makeModel(`http://127.0.0.1:${address.port}`);
+	let held = false;
+	const removeGuard = addModelCallGuard({
+		refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+	});
+
+	try {
+		const result = await streamCursor(model, context, {
+			apiKey: "not-a-secret",
+			providerRetryWait: async () => {
+				held = holdDuringWait;
+			},
+		}).result();
+
+		expect(requestCount).toBe(expectedRequests);
+		if (holdDuringWait) {
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+		} else {
+			expect(result.stopReason).toBe("stop");
+		}
+	} finally {
+		removeGuard();
 		for (const session of sessions) session.destroy();
 		server.close();
 	}
