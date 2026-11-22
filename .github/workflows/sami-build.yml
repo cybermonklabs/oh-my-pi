@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+# Only release_binary may restore or save GitHub Actions caches: it sets
+# cache-mode: write, and every other job gets a cache token that can do
+# neither. Code run in another job of this workflow (a test job has root on
+# its runner) therefore cannot write an entry that release_binary restores.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
+cache-mode: none
+
 jobs:
   carry:
     # A release is a flat merge of member branches, so the previous release is
@@ -58,6 +65,21 @@ jobs:
 
   release_binary:
     needs: version
+    cache-mode: write
+    env:
+      # The release build cache. The restore and save steps must name the
+      # same paths. The bounds keep one entry per target small next to
+      # GitHub's 10 GB cache limit for the whole repository: Bazel's disk
+      # cache (its garbage collection deletes the least recently used
+      # actions), and the downloads (Bazel's repository cache and the cargo
+      # registry), which are emptied when they grow past theirs.
+      RELEASE_CACHE_PATHS: |
+        ~/.cache/omp-release-bazel
+        ~/.cargo/registry/index
+        ~/.cargo/registry/cache
+        ~/.cargo/git/db
+      BAZEL_DISK_CACHE_MAX_BYTES: "3221225472" # 3 GiB
+      DOWNLOADS_MAX_BYTES: "1610612736" # 1.5 GiB
     strategy:
       fail-fast: false
       matrix:
@@ -80,7 +102,49 @@ jobs:
       - uses: ./.github/actions/bun-install
       - id: bazel
         uses: ./.github/actions/bazel-cache
+      # .github/actions/bazel-cache gives Bazel a cache only on upstream's vmon
+      # runners. On these GitHub-hosted runners it says "Not a vmon runner;
+      # building uncached", so every release compiled every native crate from
+      # nothing: "Build native addons" took a median of 36 min on ubuntu-22.04
+      # and 27 min on macos-15 over the 19 pushes of 2026-11-19 to 11-22. The
+      # steps below keep Bazel's disk cache and repository cache, and the
+      # cargo registry that crate_universe reads (CARGO_BAZEL_ISOLATED=0 in
+      # .bazelrc), in GitHub's Actions cache: each push to sami restores the
+      # newest entry for its target and saves a new one.
+      - name: Restore the release build cache
+        id: release-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.RELEASE_CACHE_PATHS }}
+          key: omp-release-bazel-v1-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
+          # An upstream version bump rewrites Cargo.lock, so most releases
+          # take the last fallback, the newest entry for this target. Bazel
+          # keys each action by the digests of its inputs, so an older entry
+          # gives fewer hits, never a wrong output.
+          restore-keys: |
+            omp-release-bazel-v1-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
+            omp-release-bazel-v1-${{ matrix.target }}-
+      - name: Point Bazel at the release build cache
+        env:
+          RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          cache="$HOME/.cache/omp-release-bazel"
+          mkdir -p "$cache/disk" "$cache/repo"
+          {
+            echo "common --disk_cache=$cache/disk"
+            echo "common --repository_cache=$cache/repo"
+            # Extracted repositories would go to <repository_cache>/contents,
+            # which nothing bounds; keep them out of the saved entry.
+            echo "common --repo_contents_cache=$RUNNER_TEMP/bazel-repo-contents"
+            # Bazel 9.2 has only the experimental_ names of these flags. Its
+            # server collects disk cache garbage after it has been idle for
+            # the delay, 5 minutes by default, which this job never is; at 0
+            # the collection starts when the build's last command ends.
+            echo "common --experimental_disk_cache_gc_max_size=$BAZEL_DISK_CACHE_MAX_BYTES"
+            echo "common --experimental_disk_cache_gc_idle_delay=0s"
+          } >>"$RC"
       - name: Build native addons
+        id: natives
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
@@ -115,6 +179,78 @@ jobs:
           name: mise-${{ matrix.target }}
           path: release/*.tar.gz
           if-no-files-found: error
+      # A failed build's finished actions are still valid results, so the
+      # cache is saved whenever the native build ran. A re-run of the same
+      # commit restored its exact key and has nothing to save.
+      - name: Bound the release build cache
+        id: release-cache-bound
+        if: ${{ !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
+        shell: python3 {0}
+        run: |
+          import os, shutil, time
+
+          home = os.path.expanduser("~")
+          disk = os.path.join(home, ".cache/omp-release-bazel/disk")
+          downloads = [os.path.join(home, p) for p in (
+              ".cache/omp-release-bazel/repo",
+              ".cargo/registry/index",
+              ".cargo/registry/cache",
+              ".cargo/git/db",
+          )]
+          disk_max = int(os.environ["BAZEL_DISK_CACHE_MAX_BYTES"])
+          downloads_max = int(os.environ["DOWNLOADS_MAX_BYTES"])
+
+          def size(root, skip=()):
+              """Bytes in regular files under root, as Bazel's collection counts them."""
+              skip = {os.path.join(root, name) for name in skip}
+              total, dirs = 0, [root]
+              while dirs:
+                  try:
+                      entries = list(os.scandir(dirs.pop()))
+                  except FileNotFoundError:
+                      continue
+                  for entry in entries:
+                      try:
+                          if entry.is_file(follow_symlinks=False):
+                              total += entry.stat(follow_symlinks=False).st_size
+                          elif entry.is_dir(follow_symlinks=False) and entry.path not in skip:
+                              dirs.append(entry.path)
+                      except FileNotFoundError:  # the collection deleted it
+                          pass
+              return total
+
+          # The collection runs in Bazel's server after the build, while the
+          # steps above run; wait for it to bring the disk cache under the
+          # bound. Bazel leaves tmp/ and gc/ out of its count.
+          deadline = time.monotonic() + 120
+          while size(disk, ("tmp", "gc")) > disk_max and time.monotonic() < deadline:
+              time.sleep(5)
+          # Files in tmp/ are writes that never finished (Bazel renames a
+          # finished write into place), and the collection never deletes
+          # them: drop them, then count everything the save would archive.
+          shutil.rmtree(os.path.join(disk, "tmp"), ignore_errors=True)
+          disk_size = size(disk)
+          downloads_size = sum(size(path) for path in downloads)
+          if downloads_size > downloads_max:
+              # Downloads are found by their content, and a miss downloads
+              # again: empty them, and the next build keeps what it fetches.
+              for path in downloads:
+                  shutil.rmtree(path, ignore_errors=True)
+              print(f"::notice title=Release build cache::The downloads held {downloads_size} bytes, over their bound; emptying them.")
+              downloads_size = sum(size(path) for path in downloads)
+          print(f"Bazel disk cache: {disk_size} bytes, bound {disk_max}")
+          print(f"Downloads: {downloads_size} bytes, bound {downloads_max}")
+          save = 0 < disk_size <= disk_max and downloads_size <= downloads_max
+          if not save:
+              print(f"::warning title=Release build cache::Not saved: the Bazel disk cache holds {disk_size} bytes (bound {disk_max}, and it must not be empty) and the downloads {downloads_size} bytes (bound {downloads_max}).")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"save={'true' if save else 'false'}\n")
+      - name: Save the release build cache
+        if: ${{ !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.RELEASE_CACHE_PATHS }}
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
 
   release_github:
     needs: [carry, version, release_binary]
