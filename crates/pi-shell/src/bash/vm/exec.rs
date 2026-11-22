@@ -3923,23 +3923,18 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	if code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit) {
 		return Some(BangStage::Lone);
 	}
-	// `time` and `!` wrap the pipeline's spawn: `[TimeStart] Spawn …
-	// [Not] [TimeEnd]`, then the job's `SubExit`.
-	let at = if code(entry) == Some(Opcode::TimeStart) {
-		entry + 1
-	} else {
-		entry
-	};
-	if let Some(op) = unit.ops.get(at as usize)
+	// `!` wraps the pipeline's spawn: `Spawn … [Not]`, then the job's
+	// `SubExit`. A timed job (`[TimeStart] … [TimeEnd]`) keeps its own pid:
+	// bash runs an asynchronous timed command as a subshell of its own
+	// (`CMD_FORCE_SUBSHELL`), and zsh times the job's own process.
+	if let Some(op) = unit.ops.get(entry as usize)
 		&& op.code == Opcode::Spawn
 		&& let Some(spawn) = unit.spawns.get(op.a as usize)
 		&& spawn.kind == SpawnKind::Pipeline
 	{
 		let mut end = spawn.end;
-		for wrap in [Opcode::Not, Opcode::TimeEnd] {
-			if code(end) == Some(wrap) {
-				end += 1;
-			}
+		if code(end) == Some(Opcode::Not) {
+			end += 1;
 		}
 		if code(end) == Some(Opcode::SubExit) {
 			return Some(BangStage::Pipeline);
