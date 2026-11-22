@@ -22,7 +22,8 @@
  *   prepared extensions to main's registry, which the mirror follows (see `./auth`).
  *
  * Main-side values that are plain functions (no type to match a codec on) are converted by
- * {@link bridgeIntegrationOptions} before an `ExecutorOptions` object crosses a link.
+ * {@link bridgeIntegrationOptions} before an `ExecutorOptions` object crosses a link, and by
+ * {@link bridgePersistedReviveSpec} before a cold revive's live inputs do.
  */
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -32,6 +33,8 @@ import type { ExtensionFactory, PreparedExtension } from "../../extensibility/ex
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { MCPManager, type MCPManagerApi, type MCPManagerGlobal, type MCPToolScope } from "../../mcp/manager";
 import type { ExecutorOptions } from "../../task/executor";
+import type { PersistedReviveSpec } from "../../task/persisted-revive";
+import { evalToolDescriptor } from "../../task/spawn-spec";
 import { isMainThread } from "../identity";
 import type { MainThreadLink, WorkerThreadLink } from "../protocol";
 import { type RpcCodec, type RpcServe, rpcSync } from "../rpc";
@@ -121,7 +124,8 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
  * worker-hosted `runSubprocess`; returns a shallow copy (other fields are untouched).
  *
  * - `extensionRoots`: called synchronously by the child → `rpcSync`.
- * - `customTools`: {@link toWorkerCustomTool} views.
+ * - `customTools`: {@link toWorkerCustomTool} views, with each eval tool's descriptor in
+ *   `customToolDescriptors`: a view is a new object, so the worker cannot look the descriptor up.
  * - `parentTelemetry`: `toWorkerTelemetryConfig` (captures the active span as the child's parent, so
  *   call this inside the parent's `execute_tool task` context).
  *
@@ -133,9 +137,37 @@ export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOpti
 	const bridged: ExecutorOptions = { ...options };
 	const extensionRoots = options.extensionRoots;
 	if (extensionRoots) bridged.extensionRoots = rpcSync(() => extensionRoots());
-	if (options.customTools) bridged.customTools = options.customTools.map(tool => toWorkerCustomTool(tool));
+	if (options.customTools) {
+		bridged.customTools = options.customTools.map(tool => toWorkerCustomTool(tool));
+		const descriptors = options.customTools.flatMap(tool => evalToolDescriptor(tool) ?? []);
+		if (descriptors.length > 0) bridged.customToolDescriptors = descriptors;
+	}
 	if (options.parentTelemetry) bridged.parentTelemetry = toWorkerTelemetryConfig(options.parentTelemetry);
 	return bridged;
+}
+
+/**
+ * Main side: the cold revive of `spec`, its live inputs converted as {@link bridgeIntegrationOptions}
+ * converts a run's, for a worker-hosted `revivePersistedSubagent`: `extensionRoots` → `rpcSync`, custom
+ * tools → {@link toWorkerCustomTool} views (their kernel calls run on main), telemetry →
+ * `toWorkerTelemetryConfig`. The spawn spec itself crosses as the plain data it is, read by the worker
+ * from the transcript; the other inputs cross through codecs and exported classes.
+ */
+export function bridgePersistedReviveSpec(spec: PersistedReviveSpec): PersistedReviveSpec {
+	const { live, customTools } = spec.prepared;
+	const extensionRoots = live.extensionRoots;
+	return {
+		...spec,
+		prepared: {
+			...spec.prepared,
+			live: {
+				...live,
+				extensionRoots: extensionRoots ? rpcSync(() => extensionRoots()) : undefined,
+				telemetry: live.telemetry ? toWorkerTelemetryConfig(live.telemetry) : undefined,
+			},
+			customTools: customTools.map(tool => toWorkerCustomTool(tool)),
+		},
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
