@@ -4178,11 +4178,11 @@ export interface DeferredBuildModel extends Pick<
 	kind: "deferred";
 }
 
-/** What a cold revive of a record with no spawn spec passes: its patterns, or its per-call model. */
-export interface LegacyBuildModel extends Pick<
-	CreateAgentSessionOptions,
-	"model" | "thinkingLevel" | "modelPattern" | "modelPatternAuthFallback"
-> {
+/**
+ * What a cold revive passes where its record's spawn spec gives no model (a record an older omp wrote, a
+ * seance consult): its patterns.
+ */
+export interface LegacyBuildModel extends Pick<CreateAgentSessionOptions, "modelPattern" | "modelPatternAuthFallback"> {
 	kind: "legacy";
 }
 
@@ -4576,10 +4576,10 @@ function subagentModelOptions(
 			};
 		case "legacy":
 			return {
-				model: model.model,
+				model: undefined,
 				modelPattern: model.modelPattern,
 				modelPatternAuthFallback: model.modelPatternAuthFallback,
-				thinkingLevel: model.thinkingLevel,
+				thinkingLevel: undefined,
 			};
 	}
 }
@@ -4927,20 +4927,24 @@ export class RevivedModels {
 }
 
 /**
- * The model a warm revive starts on: the one its session started on, which it holds. A session-local
- * switch since the spawn (a prewalk handoff) owns the model and effort: the revive starts on the
- * switched model where the registry knows it, else on the held one, and the transcript restores the
- * effort. The spawn's prewalk stays configured; the coordinator sees it was spent. A per-call worker
- * never switches models, and a seance fork's selections belong to its source run, never to the consult.
+ * The model a revive whose build holds a model starts on: `held`, the one its session started on (a warm
+ * revive) or the one a cold revive prepared from the spawn spec. A session-local switch since the spawn (a
+ * prewalk handoff) owns the model and effort: the revive starts on the switched model where the registry
+ * knows it, else on the held one, and the transcript restores the effort. The spawn's prewalk stays
+ * configured; the coordinator sees it was spent. A per-call worker never switches models, and a seance
+ * fork's selections belong to its source run, never to the consult. `discoveryRan`: an earlier step of the
+ * same revive already ran the registry's discovery.
  */
-async function warmReviveModel(capture: WarmReviveCapture, reopened: SessionManager): Promise<SubagentBuildModel> {
-	const { spec, live, cache } = capture;
-	const switched = spec.perCallModel || live.seance ? undefined : reopened.getSessionLocalModelChange()?.model;
-	if (switched === undefined) {
-		return { kind: "model", model: cache.model, thinkingLevel: spec.thinkingLevel ?? undefined };
-	}
-	const model = await new RevivedModels(live.modelRegistry, live.settingsParent).resolve(switched);
-	return { kind: "model", model: model ?? cache.model, thinkingLevel: undefined };
+export async function switchedOrHeldModel(
+	build: Pick<SubagentBuildInput, "spec" | "live" | "sessionManager">,
+	held: ExplicitBuildModel,
+	discoveryRan = false,
+): Promise<ExplicitBuildModel> {
+	const { spec, live, sessionManager } = build;
+	const switched = spec.perCallModel || live.seance ? undefined : sessionManager.getSessionLocalModelChange()?.model;
+	if (switched === undefined) return held;
+	const model = await new RevivedModels(live.modelRegistry, live.settingsParent, discoveryRan).resolve(switched);
+	return { kind: "model", model: model ?? held.model, thinkingLevel: undefined };
 }
 
 /**
@@ -4953,18 +4957,23 @@ async function warmReviveModel(capture: WarmReviveCapture, reopened: SessionMana
 function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 	return async expectedAgentRef => {
 		const reopened = await reopenParkedSubagent(capture.spec.prompt.id, capture.sessionFile);
-		const { cache } = capture;
+		const { spec, live, cache } = capture;
 		// The stash died with the parked manager: hand the pending, never-promoted
 		// family candidate to the fresh one so the first eligible request after
 		// revival still finds and persists it.
 		if (cache.pendingCacheCandidate !== undefined) {
 			reopened.setTaskSiblingCandidate(cache.pendingCacheCandidate);
 		}
+		const held: ExplicitBuildModel = {
+			kind: "model",
+			model: cache.model,
+			thinkingLevel: spec.thinkingLevel ?? undefined,
+		};
 		return buildSubagentSession({
-			spec: capture.spec,
-			live: capture.live,
+			spec,
+			live,
 			sessionManager: reopened,
-			model: await warmReviveModel(capture, reopened),
+			model: await switchedOrHeldModel({ spec, live, sessionManager: reopened }, held),
 			prewalkTarget: cache.prewalkTarget,
 			revive: { heldInit: extractSessionInit(reopened.getEntries()), expectedAgentRef, cache },
 		});

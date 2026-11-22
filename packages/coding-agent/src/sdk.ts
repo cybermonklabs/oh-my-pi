@@ -809,7 +809,7 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Root-scoped bus carrying `task:subagent:*` observability frames for this
 	 * session and every subagent it spawns. Default: creates a new bus per
-	 * root session; `buildSubagentSessionOptions` inherits the spawner's.
+	 * root session; `buildSubagentSession` inherits the spawner's.
 	 */
 	subagentEventBus?: EventBus;
 

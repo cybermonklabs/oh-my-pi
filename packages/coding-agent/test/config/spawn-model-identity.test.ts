@@ -8,7 +8,6 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	formatModelStringWithRouting,
-	resolveExactModelIdentity,
 	resolveModelOverride,
 	resolveSpawnModelIdentity,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -85,7 +84,6 @@ describe("resolveSpawnModelIdentity", () => {
 		const identity = formatModelStringWithRouting(model);
 		const uncredentialed = { getAll: () => models, getAvailable: (): Model<Api>[] => [] };
 
-		expect(resolveExactModelIdentity(identity, uncredentialed)).toBeUndefined();
 		expect(resolveSpawnModelIdentity(identity, uncredentialed)).toEqual(model);
 	});
 

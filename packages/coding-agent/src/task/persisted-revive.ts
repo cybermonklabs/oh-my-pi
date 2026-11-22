@@ -58,6 +58,7 @@ import {
 	RevivedModels,
 	reopenParkedSubagent,
 	restoreSubagentSettings,
+	type SubagentBuildInput,
 	type SubagentLegacyRevive,
 	type SubagentLiveInputs,
 	type SubagentLivePolicy,
@@ -65,6 +66,7 @@ import {
 	softRequestBudgetFor,
 	spawnerLiveInputs,
 	subagentRetryFallbackRole,
+	switchedOrHeldModel,
 } from "./executor";
 import {
 	assertPerCallModelApproved,
@@ -93,10 +95,12 @@ import type { AgentDefinition } from "./types";
 const UNAVAILABLE_CUSTOM_TOOLS_NOTICE = "unavailable-custom-tools";
 
 /**
- * Ambient context the reviver needs at revive time. The top-level session is
- * kept LIVE (cwd / artifact manager read on demand) so a later `/new` or cwd
- * move is followed rather than snapshotted; auth/models/settings are
- * process-stable and captured by reference.
+ * Ambient context the reviver needs at revive time. The top-level session is kept LIVE and read at each
+ * revive rather than snapshotted. A record with no spawn spec runs in the root's current cwd, so a later
+ * `/new` or cwd move is followed; a record with a spawn spec runs in the cwd its spawn stored, and a seance
+ * consult in the cwd its record holds. Each record but a seance consult's takes the artifact manager its
+ * live parent session holds at the revive, the root's where the parent is not live. Auth/models/settings
+ * are process-stable and captured by reference.
  */
 export interface PersistedSubagentReviveContext {
 	session: AgentSession;
@@ -165,7 +169,7 @@ export interface PreparedColdRevive {
 	/** The live parent session's inputs: the parent ref's while it holds a session, else the root's. */
 	readonly live: ColdReviveLiveInputs;
 	/** The model a spawn spec's model or a per-call worker starts on; absent, the record's patterns decide. */
-	readonly model: ExplicitBuildModel | LegacyBuildModel | undefined;
+	readonly model: ExplicitBuildModel | undefined;
 	/** The model the spec's prewalk target names, where the registry knows it. */
 	readonly prewalkTarget: Model | undefined;
 	/** The registry's discovery ran while this step resolved a model; the build does not run it again. */
@@ -359,7 +363,7 @@ export async function prepareColdRevive(
 	const models = new RevivedModels(modelRegistry, settingsParent);
 	// The overlay the chain is read from is restored only where the revive walks the chain.
 	const chain = (): string[] => retryFallbackChain(target.id, parts.settings, init, settingsParent);
-	let model: ColdReviveBuildModel | undefined;
+	let model: ExplicitBuildModel | undefined;
 	let grants: PerCallGrantInputs | undefined;
 	if (isPerCallRecord(parts, init) && !target.restoredSeance) {
 		const identity = parts.model ? parts.model.model : init.perCallModelIdentity;
@@ -385,7 +389,6 @@ export async function prepareColdRevive(
 			settings: settingsParent,
 			ceiling,
 			approve: perCallModelAssertion(approve, () => ceiling),
-			legacy: parts.model === undefined,
 		});
 	} else if (parts.model) {
 		model = await chooseColdReviveModel({
@@ -770,12 +773,8 @@ async function choosePerCallModel(args: {
 	settings: Settings;
 	ceiling: Effort | undefined;
 	approve: (model: Model) => void;
-	/** The record holds no spawn spec. */
-	legacy: boolean;
-}): Promise<ColdReviveBuildModel> {
+}): Promise<ExplicitBuildModel> {
 	const { id, identity, level, modelRegistry, approve } = args;
-	const started = (model: Model, thinkingLevel: ConfiguredThinkingLevel | undefined): ColdReviveBuildModel =>
-		args.legacy ? { kind: "legacy", model, thinkingLevel } : { kind: "model", model, thinkingLevel };
 	// Discovery a spawn started may still add the saved model.
 	await modelRegistry.awaitBackgroundRefresh();
 	const saved = await args.models.resolve(identity);
@@ -784,7 +783,7 @@ async function choosePerCallModel(args: {
 	if (saved) {
 		try {
 			approve(saved);
-			return started(saved, level);
+			return { kind: "model", model: saved, thinkingLevel: level };
 		} catch (error) {
 			refusal = error;
 		}
@@ -806,7 +805,8 @@ async function choosePerCallModel(args: {
 				: String(refusal)
 			: notFoundMessage(identity, modelRegistry, args.settings);
 		logger.warn(reason, { subagent: id, model: formatModelStringWithRouting(model) });
-		return started(model, retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, args.ceiling));
+		const thinkingLevel = retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, args.ceiling);
+		return { kind: "model", model, thinkingLevel };
 	}
 	if (refusal !== undefined) throw refusal;
 	const chain = unknown.length > 0 ? `, nor is any model of its retry-fallback chain (${unknown.join(", ")})` : "";
@@ -918,7 +918,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		parentArtifactManager: restoredSeance ? undefined : prepared.live.parentArtifactManager,
 		seance: restoredSeance ? {} : undefined,
 	};
-	const model = await coldReviveModel(spec, spawnSpec.perCallModel, init, reopened, settingsParent);
+	const model = await coldReviveModel(spec, init, { spec: spawnSpec, live, sessionManager: reopened });
 	const session = await buildSubagentSession({
 		spec: spawnSpec,
 		live,
@@ -929,7 +929,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	});
 	if (spawnSpec.perCallModel) {
 		// A per-call worker runs only on the model it was approved on, never a similarly named survivor.
-		const expected = model.model ? formatModelStringWithRouting(model.model) : undefined;
+		const expected = model.kind === "model" && model.model ? formatModelStringWithRouting(model.model) : undefined;
 		const identity = session.model ? formatModelStringWithRouting(session.model) : undefined;
 		if (identity !== expected) {
 			await session.dispose();
@@ -955,30 +955,21 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 }
 
 /**
- * The model of the build: the prepared one, where a session-local switch since the spawn (a prewalk
- * hand-off) does not take its place; a per-call worker never switches models, and a seance consult and a
- * record with no spawn spec start on their patterns, the switched model first. `settings` are the live
- * settings the switched model is resolved under.
+ * The model of the build: the prepared one (a spec's model, a per-call worker's), unless a session-local
+ * switch since the spawn takes its place, as {@link switchedOrHeldModel} decides for both revives; without
+ * one (a seance consult, a record whose spec gives no model), the record's patterns, the switched model
+ * first.
  */
 async function coldReviveModel(
 	spec: PersistedReviveSpec,
-	perCall: boolean,
 	init: PersistedSessionInit,
-	reopened: SessionManager,
-	settings: Settings,
+	build: Pick<SubagentBuildInput, "spec" | "live" | "sessionManager">,
 ): Promise<ColdReviveBuildModel> {
 	const { prepared, restoredSeance } = spec;
 	// A seance fork's selections belong to its source run, never to the consult.
 	if (restoredSeance) return { kind: "legacy", modelPattern: restoredSeance.modelPattern };
-	if (prepared.model && perCall) return prepared.model;
-	const switched = reopened.getSessionLocalModelChange()?.model;
-	if (prepared.model?.kind === "model") {
-		if (switched === undefined) return prepared.model;
-		// The switched model owns the model and the effort; the spec's model backs it up.
-		const models = new RevivedModels(prepared.live.modelRegistry, settings, prepared.discoveryRan);
-		const model = await models.resolve(switched);
-		return { kind: "model", model: model ?? prepared.model.model, thinkingLevel: undefined };
-	}
+	if (prepared.model) return switchedOrHeldModel(build, prepared.model, prepared.discoveryRan);
+	const switched = build.sessionManager.getSessionLocalModelChange()?.model;
 	const spawnModelPattern =
 		init.modelRole && init.modelRole !== "default"
 			? [formatModelRoleAlias(init.modelRole), ...(init.resolvedModel ? [init.resolvedModel] : [])]
