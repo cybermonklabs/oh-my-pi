@@ -7,30 +7,10 @@ import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
 import { type DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
-import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
+import { startBroker } from "./helpers";
 
 const NAME = "unpinnable";
-
-function restoreEnv(name: string, value: string | undefined): void {
-	if (value === undefined) delete process.env[name];
-	else process.env[name] = value;
-}
-
-function startBroker(projectDir: string, runtimeDir: string): Promise<void> {
-	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
-	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
-	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
-	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
-	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
-	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
-	const broker = startDaemonBrokerFromEnvironment();
-	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
-	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
-	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
-	return broker;
-}
 
 async function snapshotOf(client: DaemonBrokerClient): Promise<DaemonSnapshot> {
 	const listed = await client.request({ op: "list" });
@@ -113,7 +93,7 @@ async function withRecoveredDetachedDaemon(
 	let pid: number | undefined;
 
 	const firstClient = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const firstBroker = startBroker(projectDir, runtimeDir);
+	const { finished: firstBroker } = await startBroker(firstClient, projectDir, runtimeDir);
 	try {
 		const started = await firstClient.request({
 			op: "start",
@@ -142,7 +122,7 @@ async function withRecoveredDetachedDaemon(
 	const { pinnable, spy } = spyOnPin(() => daemonPid);
 	pinnable.now = unpinnableFrom !== "recovery";
 	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const broker = startBroker(projectDir, runtimeDir);
+	const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 	try {
 		const recovered = await snapshotOf(client);
 		expect({ state: recovered.state, pid: recovered.pid }).toEqual({ state: "running", pid: daemonPid });
@@ -250,7 +230,7 @@ async function withMarklessDaemon(
 		failing.now && candidate !== process.pid ? null : realFromPid(candidate),
 	);
 	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const broker = startBroker(projectDir, runtimeDir);
+	const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 	const dir = path.join(runtimeDir, "daemons", NAME);
 	try {
 		const started = await client.request({
@@ -389,7 +369,7 @@ async function withRecoveredOrphan(
 	const { pinnable, spy } = spyOnPin(() => orphan.pid);
 	pinnable.now = pinnableAtRecovery;
 	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const broker = startBroker(projectDir, runtimeDir);
+	const { finished: broker } = await startBroker(client, projectDir, runtimeDir);
 	try {
 		await body({ client, pinnable }, orphan);
 	} finally {
