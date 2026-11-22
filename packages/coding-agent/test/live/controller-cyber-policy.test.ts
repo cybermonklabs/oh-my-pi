@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as liveAttestation from "@oh-my-pi/pi-coding-agent/live/attestation";
-import { type LiveSessionCallbacks, LiveSessionController } from "@oh-my-pi/pi-coding-agent/live/controller";
+import {
+	type LiveSessionCallbacks,
+	LiveSessionController,
+	liveCallHoldReason,
+} from "@oh-my-pi/pi-coding-agent/live/controller";
 import type { LiveClientMessage } from "@oh-my-pi/pi-coding-agent/live/protocol";
 import { CodexLiveTransport } from "@oh-my-pi/pi-coding-agent/live/transport";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
-import { CyberPolicyClosure } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
+import { CyberPolicyClosure, cyberPolicyHoldMessage } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 
 /**
  * A `/live` call runs on OpenAI (Codex realtime) and carries the session's text to it. While the session tree's
@@ -167,6 +171,8 @@ describe("a /live call during a cyber-policy hold", () => {
 			expect(posts).toHaveLength(0);
 			expect(FakeSocket.instances).toHaveLength(0);
 			expect(terminal[0]?.message).toContain("cyber_policy");
+			// The hold's message names the route this call goes to.
+			expect(terminal[0]?.message).toContain("openai-codex/live");
 		} else {
 			await controller.start();
 			expect(posts).toHaveLength(1);
@@ -273,5 +279,65 @@ describe("a /live call during a cyber-policy hold", () => {
 			expect(appends[0]).toContain("The session's answer");
 			expect(terminal).toEqual([undefined]);
 		}
+	});
+});
+
+// The hold's message names the route the live call goes to: Codex realtime here, and an OpenAI realtime route a
+// gateway or a configured endpoint serves once the call can go there. Each control has no refusal.
+describe("the live call's hold names its route", () => {
+	const ROUTES = [
+		["Codex realtime", { provider: "openai-codex", id: "live" }],
+		["an OpenAI gateway's realtime route", { provider: "openai", id: "gpt-realtime" }],
+		["a configured live endpoint", { provider: "live-endpoint", id: "realtime.example.test" }],
+	] as const;
+	it.each(ROUTES)("names %s while the closure is active", (_name, route) => {
+		const closure = new CyberPolicyClosure();
+		closure.record();
+		const reason = liveCallHoldReason({ cyberPolicyClosure: closure }, route);
+		expect(reason).toContain("cyber_policy");
+		expect(reason).toContain(`no request goes to ${route.provider}/${route.id} `);
+	});
+	it.each(ROUTES)("holds nothing to %s when no refusal holds the session (control)", (_name, route) => {
+		expect(liveCallHoldReason({ cyberPolicyClosure: new CyberPolicyClosure() }, route)).toBeUndefined();
+	});
+});
+
+// The transport holds every sideband frame but `session.close`, not a list of the frames that carry the session's
+// text today: a frame type added later is held too. The refused case writes no such frame while the close still
+// goes out; the control writes it.
+describe("a sideband frame of a type the transport does not name", () => {
+	it.each([
+		["is held while the hold stands, and session.close still goes out", true],
+		["goes out when no refusal holds the call (control)", false],
+	])("%s", async (_name, held) => {
+		const hold = cyberPolicyHoldMessage({ provider: "openai-codex", id: "live" });
+		let holding = false;
+		const transport = new CodexLiveTransport({
+			authStorage: {
+				oauth: { access: async () => ({ accessToken: "not-a-secret", accountId: "acct_synthetic" }) },
+				limits: { rotate: async () => undefined },
+			} as unknown as AgentSession["modelRegistry"]["authStorage"],
+			sessionId: "live-session",
+			instructions: "synthetic instructions",
+			voice: "synthetic-voice",
+			callbacks: { onEvent() {}, onOutputLevel() {} },
+			sdpOffer: "v=0 synthetic-offer",
+			holdReason: () => (holding ? hold : undefined),
+		});
+		await transport.connect();
+		const socket = FakeSocket.instances[0]!;
+		holding = held;
+		// A frame type the transport does not know of, as a later frame that carries the session's text would be.
+		const newFrame = { type: "conversation.item.create", item: { text: "the session's text" } };
+		const send = transport.send(newFrame as unknown as LiveClientMessage);
+		if (held) {
+			await expect(send).rejects.toThrow("cyber_policy");
+			await transport.send({ type: "session.close" } as LiveClientMessage);
+			expect(socket.sentTypes()).toEqual(["session.close"]);
+		} else {
+			await send;
+			expect(socket.sentTypes()).toEqual(["conversation.item.create"]);
+		}
+		await transport.close();
 	});
 });

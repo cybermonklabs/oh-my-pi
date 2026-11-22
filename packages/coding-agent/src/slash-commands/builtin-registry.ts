@@ -187,8 +187,6 @@ export async function executeBuiltinSlashCommand(
 			output: (text: string) => {
 				ctx.showStatus(text);
 			},
-			// Typed in the TUI by a person.
-			origin: "outside",
 			refreshCommands: () => ctx.refreshSlashCommandState(),
 			reloadPlugins: () => reloadTuiPluginState(ctx),
 			notifySessionPinChanged: (sessionId: string, pinned: boolean) => ctx.applySessionPin(sessionId, pinned),
