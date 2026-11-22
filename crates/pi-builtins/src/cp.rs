@@ -3933,6 +3933,112 @@ mod tests {
 		}
 	}
 
+	/// The backup is put back only where cp failed to create `b`, as GNU's
+	/// `un_backup` does (`copy.c`), as GNU 9.4 and 9.7 do as uid 1000 and
+	/// root:
+	/// - a copy that works leaves the new `b` and the old data in `b~`;
+	/// - with `--preserve=links` (`-a`), the second name of a file is a hard
+	///   link to the first copy; where that link fails (here across
+	///   filesystems, `--parents` going through a link to `/dev/shm`), `b`
+	///   comes back with its data and no `b~` is left;
+	/// The rename back that fails is
+	/// [`a_rename_back_that_fails_is_reported_after_the_copy`].
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_failed_copy_puts_the_backup_back() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let fixture = tempdir().unwrap();
+		let path = |name: &str| fixture.path().join(name);
+
+		// A copy that works.
+		fs::write(path("a"), b"A").unwrap();
+		fs::write(path("b"), b"old").unwrap();
+		let (code, capture) = run_util::<Cp>(&["-b", "--reflink=auto", "a", "b"], "", fixture.path());
+		assert_eq!((code, capture.err()), (0, String::new()), "a copy that works");
+		assert_eq!(fs::read(path("b")).unwrap(), b"A", "the copy is at b");
+		assert_eq!(fs::read(path("b~")).unwrap(), b"old", "the old data is in b~");
+
+		// The hard link `--preserve=links` makes fails across filesystems.
+		let shm = tempfile::tempdir_in("/dev/shm").ok();
+		let device = |path: &std::path::Path| fs::metadata(path).unwrap().dev();
+		match &shm {
+			Some(shm) if device(shm.path()) != device(fixture.path()) => {
+				fs::write(path("x"), b"X").unwrap();
+				fs::create_dir(path("m")).unwrap();
+				fs::hard_link(path("x"), path("m/y")).unwrap();
+				fs::create_dir(path("t")).unwrap();
+				std::os::unix::fs::symlink(shm.path(), path("t/m")).unwrap();
+				fs::write(shm.path().join("y"), b"old").unwrap();
+				let (code, capture) =
+					run_util::<Cp>(&["--parents", "-a", "-b", "x", "m/y", "t"], "", fixture.path());
+				assert_eq!(
+					(code, capture.err()),
+					(1, "cp: cannot create hard link 't/m/y' to 't/x': Invalid cross-device link\n".to_owned()),
+					"the hard link across filesystems"
+				);
+				assert_eq!(fs::read(shm.path().join("y")).ok().as_deref(), Some(&b"old"[..]), "y lost its data");
+				assert!(!shm.path().join("y~").exists(), "y is left under its backup name");
+			},
+			_ => eprintln!("skipped: /dev/shm and the temporary directory are not two filesystems"),
+		}
+	}
+
+
+	/// Where the rename back fails too, as GNU 9.4 and 9.7 do as uid 1000 and
+	/// root, on runc and gVisor: once cp has renamed `b` to `b~` and waits for
+	/// the FIFO's writer, a directory is made at `b`. The new `b` is created
+	/// with O_EXCL, as GNU creates it after a backup, so its error is "File
+	/// exists" (a create that read the name again would see the directory and
+	/// say "Is a directory"); then `cannot un-backup 'b'`, and `b~` keeps the
+	/// data. Its own test, so the root arm of the Jobs runs it by name.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_rename_back_that_fails_is_reported_after_the_copy() {
+		let dir = tempdir().unwrap();
+		let fifo = dir.path().join("p");
+		let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+		// SAFETY: `fifo_name` is NUL-terminated and outlives the call.
+		assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o644) }, 0, "mkfifo");
+		fs::write(dir.path().join("b"), b"old").unwrap();
+		let cwd = dir.path().to_owned();
+		let copy = std::thread::spawn(move || {
+			let (code, capture) = run_util::<Cp>(&["-v", "-b", "p", "b"], "", &cwd);
+			(code, capture.err(), capture.out())
+		});
+		// cp renames `b` before it opens the FIFO, whose open waits for a
+		// writer. No writer is opened until the directory is at `b`: it would
+		// let cp go on. A cp that waits on the FIFO before the backup is seen
+		// waiting in the kernel (`fifo_open`), and fails the row.
+		let waits_on_a_fifo = || {
+			fs::read_dir("/proc/self/task").into_iter().flatten().flatten().any(|task| {
+				fs::read_to_string(task.path().join("wchan")).is_ok_and(|wchan| wchan.trim() == "fifo_open")
+			})
+		};
+		while !dir.path().join("b~").exists() {
+			if waits_on_a_fifo() && !dir.path().join("b~").exists() {
+				fs::write(&fifo, b"F").unwrap();
+				let _ = copy.join();
+				panic!("cp opened the FIFO before it backed b up");
+			}
+			assert!(!copy.is_finished(), "cp ended before it backed b up");
+			std::thread::yield_now();
+		}
+		fs::create_dir(dir.path().join("b")).unwrap();
+		// cp may fail at `b` and close the FIFO before the write lands
+		// (EPIPE); the row is decided by what cp did, not by the write.
+		let _ = fs::write(&fifo, b"F");
+		let (code, err, out) = copy.join().unwrap();
+		assert_eq!(
+			(code, err.as_str()),
+			(1, "cp: cannot create regular file 'b': File exists\ncp: cannot un-backup 'b': Is a directory\n"),
+			"the rename back fails"
+		);
+		assert_eq!(out, "'p' -> 'b' (backup: 'b~')\n");
+		assert!(dir.path().join("b").is_dir(), "the directory made at b stays");
+		assert_eq!(fs::read(dir.path().join("b~")).unwrap(), b"old", "b~ keeps the data");
+	}
+
 	#[test]
 	fn recursive_copy_creates_missing_target_then_nests_into_existing_one() {
 		let fixture = tempdir().unwrap();
