@@ -788,6 +788,11 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		super::zsh::zexit::start(k, cx, vp);
 	}
 	if !in_exit_trap && vp.transient && vp.runs.is_empty() {
+		// zsh keeps `exit_val` through the EXIT trap of an `exit`
+		// ([`zsh_discard`] reads this when an error ends the trap).
+		if vp.mode.dialect() == Dialect::Zsh {
+			vp.zsh.get_or_insert_with(Box::default).exited = true;
+		}
 		start_exit_trap_once(k, vp, cx);
 	}
 }
@@ -5899,6 +5904,7 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		// zsh's `ERR_EXIT` ends the shell inside the file, with the error's
 		// status, unless the `.` command runs in a condition.
 		let exits_inside = source && !vp.frames[i].ignore_errexit && errexit_on(k, cx, vp);
+		let end = trap_end(&vp.frames[i].kind);
 		unwind(&mut k.root, cx.store, vp, i);
 		// A DEBUG trap the error ended ends as at its end ([`next_command`]):
 		// `ERR_EXIT`, off while it ran, comes back.
@@ -5924,6 +5930,25 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 			vp.zsh.get_or_insert_with(Box::default).errflag = true;
 		} else {
 			vp.status = status;
+		}
+		// A trap whose end exits ([`TrapEnd::exit`]) still exits: the EXIT
+		// trap `exit` started, with the exit's status (zsh's `exit_val`
+		// survives the trap; so for the root's `exit` at top level, whose
+		// EXIT trap the run's end starts); the ZERR trap `ERR_EXIT` ran,
+		// with the status the trap's error left (zsh's `lastval` is 1 after
+		// a trap error). An EXIT trap at the end of the code keeps that 1.
+		let exited =
+			(vp.parent.is_none() && k.exited.is_some() && k.exited == vp.runs.front().map(|r| r.id))
+				|| vp.zsh.as_deref().is_some_and(|z| z.exited);
+		match end {
+			Some(TrapEnd { key: TrapKey::Exit, status: saved, exit, .. }) if exit || exited => {
+				vp.status = saved;
+				if exit {
+					exit_shell(k, vp, cx, saved);
+				}
+			},
+			Some(TrapEnd { exit: true, .. }) => exit_shell(k, vp, cx, status),
+			_ => {},
 		}
 	} else if let Some(i) = run
 		&& (state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Continueonerror).unwrap_or(false)

@@ -16,6 +16,7 @@
 - zsh: an error that ends a DEBUG trap's action (a `break` with no loop, an unset parameter, a math error) puts `ERR_EXIT` back, as the trap's normal end does, so `setopt errexit` still ends the shell on the next failed command
 - zsh: a `.` file that an error ends (a `break` with no loop, a math syntax error) returns 126, as zsh's `.` does, instead of 1
 - bash: a diagnostic printed inside a `.` file, or inside a function defined in one, names that file (`./s.sh: line 1: …`), as a non-interactive bash names it after `BASH_SOURCE[0]`, instead of the shell's name; a syntax error there no longer says `-c`
+- zsh: an error that ends an EXIT trap `exit` started (a `break` with no loop, a math error) no longer changes the exit status, and one that ends a ZERR trap run under `ERR_EXIT` still ends the shell, with status 1, as zsh does
 
 ## [18.18.6] - 2026-11-09
 

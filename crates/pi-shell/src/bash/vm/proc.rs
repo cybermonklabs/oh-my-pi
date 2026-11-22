@@ -219,6 +219,11 @@ pub struct VprocZsh {
 	/// command runs no ZERR trap (zsh `dotrapargs`).
 	#[serde(default)]
 	pub errflag:            bool,
+	/// A subshell left by zsh's `exit` (`exit_val` set): an error that
+	/// ends its EXIT trap keeps the exit's status ([`super::exec`]'s
+	/// `zsh_discard`).
+	#[serde(default)]
+	pub exited:             bool,
 	/// The code (and line) of a glob's shell-code qualifier to run above
 	/// the op that returned [`Flow::Call`](super::exec::Flow::Call) for it
 	/// (zsh `qualsheval`); pushed by the run loop, which drops it when the
@@ -255,6 +260,7 @@ impl VprocZsh {
 			&& self.last_math.is_none()
 			&& !self.in_trap
 			&& !self.errflag
+			&& !self.exited
 			&& self.glob_hook.is_none()
 	}
 }

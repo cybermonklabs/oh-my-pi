@@ -448,6 +448,19 @@ const BASH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"set -e; trap '[[ $BASH_COMMAND == \": hit\" ]] && { echo t; break; }; true' DEBUG; for i \
 		 in 1 2; do echo a$i; : hit; echo b$i; done; echo e; false; echo after",
 	),
+	// The EXIT trap `exit` runs inside a function's own loop starts with no
+	// loop level: its `break` prints the message and the rest of the trap
+	// runs.
+	(
+		"exit-in-function-loop",
+		"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo \
+		 h; }; h; echo e:$?",
+	),
+	(
+		"exit-in-function-loop-continue",
+		"trap 'echo t1; continue; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; \
+		 echo h; }; for i in 1 2; do echo a$i; h; done; echo e:$?",
+	),
 ];
 
 /// The trap shapes only zsh has, `trap/own/<name>`: a DEBUG trap's `break`
@@ -663,6 +676,28 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"debug-after-error-unset-errexit",
 		"setopt errexit nodebugbeforecmd; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : \
 		 ${x?unset}; }; :' DEBUG; : hit; echo b; false; echo after",
+	),
+	// An error that ends a trap whose end exits: the EXIT trap `exit` ran
+	// still exits with the exit's status; the ZERR trap ERR_EXIT ran exits
+	// with 1. An EXIT trap at the script's end, and an unset parameter (the
+	// shell exits at once), are the controls.
+	("exit-error-break", "trap 'echo t1; break; echo t2' EXIT; exit 3"),
+	("exit-error-math", "trap 'echo t1; echo $(( 1 + )); echo t2' EXIT; exit 3"),
+	("exit-error-in-function", "trap 'echo t1; break; echo t2' EXIT; h() { exit 3; }; h; echo e:$?"),
+	(
+		"exit-error-in-function-loop",
+		"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo \
+		 h; }; h; echo e:$?",
+	),
+	("exit-error-in-subshell", "( trap 'echo t1; break; echo t2' EXIT; exit 3 ); echo s:$?"),
+	("exit-error-end-of-script", "trap 'echo t1; break; echo t2' EXIT; (exit 5)"),
+	(
+		"zerr-errexit-error-break",
+		"setopt errexit; trap 'echo t1; break; echo t2' ZERR; (exit 4); echo after",
+	),
+	(
+		"zerr-errexit-error-unset",
+		"setopt errexit; trap 'echo t1; : ${x?u}; echo t2' ZERR; (exit 4); echo after",
 	),
 ];
 
