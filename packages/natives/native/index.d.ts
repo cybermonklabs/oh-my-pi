@@ -3903,6 +3903,13 @@ export interface ShellRunResult {
   minimized?: MinimizerResult
   /** Shell working directory after command completion. */
   workingDir?: string
+  /**
+   * True when output the command wrote was dropped: the command ended
+   * within its timeout, but past the timeout the output consumer took
+   * nothing for 2 s (5 s on Windows), so the shell stopped delivering it.
+   * The exit code is still the command's. Absent otherwise.
+   */
+  outputDropped?: boolean
 }
 
 /** Native non-executing visualization transformations. */

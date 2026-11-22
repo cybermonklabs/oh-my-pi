@@ -15,6 +15,7 @@ mod env_cwd;
 mod output_drain;
 mod process_control;
 mod redirections;
+mod run_deadline;
 mod session;
 mod stopped_reader;
 
