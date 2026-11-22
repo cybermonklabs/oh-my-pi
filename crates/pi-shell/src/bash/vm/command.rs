@@ -586,15 +586,6 @@ fn plain_statement(
 			return Some(exec(k, vp, cx, unit, op, line));
 		},
 	};
-	// A builtin decides the background job this vproc may settle
-	// ([`super::proc::Bang`]) as [`dispatch`] does: it keeps its virtual
-	// pid (`eval`, `.` and `source` leave it to an `exec` they run).
-	// Decided before it runs, so a reader of `$!` never waits on the
-	// builtin, whose output may wait for that reader. A lone job's trap
-	// action decides nothing ([`Kernel::bang_held_by_trap`]).
-	if !k.bangs.is_empty() && !k.bang_held_by_trap(vp) {
-		bang_dispatch(k, vp.vpid, &Target::Intrinsic(id), false);
-	}
 	// The temporary scope the staged command gives a builtin.
 	let scope =
 		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
@@ -2559,10 +2550,7 @@ fn spawned_external(
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
 			if !k.bangs.is_empty() {
-				// A lone job's trap action ([`Kernel::bang_held_by_trap`]):
-				// its program is not the job's and ends first, so the job
-				// keeps its virtual pid.
-				k.settle_bang(vp.vpid, (!k.bang_held_by_trap(vp)).then_some(pid));
+				k.settle_bang(vp.vpid, Some(pid));
 			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);
@@ -4215,33 +4203,39 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 	None
 }
 
-/// This vproc may settle a background job's pid ([`super::proc::Bang`]):
-/// what the command about to run (`target`; `exec` when `exec` runs it)
-/// decides. Its lone external, or one it `exec`s, settles at the spawn
-/// (the job is known by the program's OS pid); `exec` without a command
-/// leaves the decision to what follows; a function called as the lone
-/// command, and `eval`, `.` and `source` (bash runs their text as a
-/// function body), leave it to an `exec` they run; a host callout as the
-/// lone command may hand the job to its subshell
-/// ([`crate::bash::ShellApi::exec_subshell_in`]); anything else keeps the
-/// virtual pid.
+/// This vproc may settle a background job's pid ([`super::proc::Bang`]);
+/// `target` is the command about to run (`exec` when `exec` runs it). A
+/// function called as the lone command leaves the job to an `exec` in its
+/// body ([`BangStage::Exec`]); a host callout as the lone command may hand
+/// the job to its subshell ([`crate::bash::ShellApi::exec_subshell_in`]).
+/// A program (or a callout) a function or group job runs before its `exec`
+/// is one the job waits for, and may wait for the shell: the job keeps its
+/// virtual pid now; so does one a command substitution, subshell or
+/// pipeline stage of the job runs ([`Kernel::bang_kin`]). Builtins decide
+/// nothing: the job's lone program, or the one it `exec`s, settles at its
+/// spawn ([`spawned_external`]); `eval`, `.` and `source` run their text
+/// as the job's command would; and the job keeps its virtual pid when it
+/// ends, or once it would make a reader of the pid wait
+/// (`Shell::decide_waited_bangs`).
 #[cold]
 #[inline(never)]
 fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, exec: bool) {
 	let Some(bang) = k.bangs.iter_mut().find(|b| b.vproc == vpid) else {
+		if matches!(target, Target::External(_) | Target::Interp(_) | Target::Tool(_))
+			&& let Some(&(_, decider)) = k.bang_kin.iter().find(|&&(child, _)| child == vpid)
+		{
+			k.settle_bang(decider, None);
+		}
 		return;
 	};
 	match (target, bang.stage) {
+		(Target::Function(_), BangStage::Lone) => bang.stage = BangStage::Exec,
+		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
 		// A refused spawn is retried (`Refused`, `Script`): that decides.
 		(Target::Intrinsic(IntrinsicId::Exec) | Target::Refused { .. }, _)
-		| (Target::External(_) | Target::Interp(_), BangStage::Lone) => {},
+		| (Target::Intrinsic(_) | Target::Function(_), BangStage::Exec)
+		| (_, BangStage::Lone) => {},
 		(Target::External(_) | Target::Interp(_), _) if exec => {},
-		(
-			Target::Function(_)
-			| Target::Intrinsic(IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source),
-			BangStage::Lone | BangStage::Exec,
-		) => bang.stage = BangStage::Exec,
-		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
 		_ => k.settle_bang(vpid, None),
 	}
 }

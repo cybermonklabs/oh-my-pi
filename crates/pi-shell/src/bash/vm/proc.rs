@@ -645,19 +645,20 @@ impl LastBg {
 }
 
 /// A background job whose pid is still to be settled, kept by the kernel
-/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The first
-/// command that vproc dispatches decides: the external spawned as the job's
-/// lone command (or `exec`'d, or a pipeline's last stage's) makes the job
-/// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
-/// (a builtin, a native task, a subshell, a loop, a forked command
-/// substitution, `.` reading a file that is not regular, a non-`exec`
-/// external in a compound body, the vproc's end) leaves its virtual pid.
-/// A trap action (`set -T`'s DEBUG trap runs before the job's command)
-/// never names its own program: its fast-path builtins, loops and
-/// substitutions decide nothing, and its program or staged builtin leaves
-/// the virtual pid. Readers of the pid (`$!`, `jobs -l`/`-p`/`-x`) wait
-/// for the decision, so whatever may wait or run without end decides it
-/// first.
+/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The
+/// external spawned as the job's lone command (or `exec`'d, or a
+/// pipeline's last stage's) makes the job known by that program's OS pid
+/// ([`Job::os_pid`], `$!`). Another program (or callout) the job runs,
+/// also in a command substitution, subshell or pipeline stage of its own
+/// ([`super::Kernel::bang_kin`]), keeps its virtual pid: the job waits for
+/// it, and it may wait for the shell. Builtins, loops, command
+/// substitutions and subshells decide nothing, as bash's forked child may
+/// still `exec` its program after them. The job keeps its virtual pid when
+/// it ends, when a redirection or `.` would wait on a FIFO or pipe, or
+/// once it would make a reader of the pid (`$!`, `jobs -l`/`-p`/`-x`), who
+/// waits for the decision, wait: it is stopped or waits for something
+/// outside itself, or has run a scheduler slice since the reader parked
+/// (`Shell::decide_waited_bangs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -726,10 +727,11 @@ impl Vproc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BangStage {
 	/// The job's body is one simple command: its external is the program
-	/// (bash's subshell `exec`s it).
+	/// (bash's subshell `exec`s it). `eval`, `.` and `source` as that
+	/// command run their text at this stage.
 	Lone,
 	/// Only an `exec`'d external is (`{ exec cmd; } &`, a function called
-	/// as the lone command, or `eval`, `.` or `source` as it).
+	/// as the lone command).
 	Exec,
 	/// A host callout runs as the lone command: it may hand the job to the
 	/// subshell it starts ([`crate::bash::ShellApi::exec_subshell_in`],

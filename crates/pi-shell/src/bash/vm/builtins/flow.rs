@@ -150,12 +150,11 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	Ok(Outcome { status: 0, control: Control::Frame })
 }
 
-/// `.` and `source` leave a background job's pid to an `exec` their file
-/// runs (bash runs the file like a function body), but they read the
-/// whole file first. A file that is not a regular file (a FIFO, a pipe as
-/// `/dev/stdin`, which is the shell's own fd 0) may wait for what the
-/// shell does after it reads `$!`, so the job keeps its virtual pid before
-/// that read, also in a trap action, as a trap action's program does.
+/// `.` and `source` read the whole file before they run any of it. A file
+/// that is not a regular file (a FIFO, a pipe as `/dev/stdin`, which is
+/// the shell's own fd 0) may wait for what the shell does after it reads
+/// `$!`, so a background job this vproc decides keeps its virtual pid
+/// before that read, as it does before a redirection's open of a FIFO.
 fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) {
 	if !ctx.k.bangs.iter().any(|b| b.vproc == ctx.vp.vpid) {
 		return;

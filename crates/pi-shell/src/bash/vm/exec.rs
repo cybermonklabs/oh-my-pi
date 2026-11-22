@@ -2270,9 +2270,6 @@ pub fn start_sub(
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
 		ComsubForm::Fork => {
-			// The vproc waits for the child: a job it may still settle
-			// keeps its virtual pid ([`bang_before_wait`]).
-			bang_before_wait(k, vp);
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
 			// Outside posix mode bash parses `$( )` without aliases and
@@ -2312,6 +2309,7 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			k.bang_kin_add(vp.vpid, child.vpid);
 			// With `-e` already off in the parent the child sees it off and
 			// `SHELLOPTS` is already right: nothing to reset.
 			if !inherit && state::option(&mut k.root, cx.store, vp, OptId::Errexit).unwrap_or(true) {
@@ -2398,11 +2396,11 @@ pub fn start_zsh_sub(
 		push_script(vp, text, line, ScriptKind::Hook);
 		return Flow::Call;
 	}
-	bang_before_wait(k, vp);
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	k.bang_kin_add(vp.vpid, child.vpid);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
@@ -2757,7 +2755,7 @@ fn control_flow(
 			Some(branch(op, (vp.status == 0) == (op.code == Opcode::BrOk)))
 		},
 		Opcode::LoopNote | Opcode::LoopBack => Some(loop_note(vp, op)),
-		Opcode::LoopEnter => Some(loop_enter(k, vp, op)),
+		Opcode::LoopEnter => Some(loop_enter(vp, op)),
 		Opcode::LoopExit if !k.mask.any_op(op.ev) => {
 			if let Some(rec) = top_frame(vp).loops.pop() {
 				vp.status = rec.status;
@@ -2791,8 +2789,7 @@ fn control_flow(
 }
 
 /// `LoopEnter`: a `while`/`until` loop's record.
-fn loop_enter(k: &mut Kernel, vp: &mut Vproc, op: Op) -> Flow {
-	bang_before_wait(k, vp);
+fn loop_enter(vp: &mut Vproc, op: Op) -> Flow {
 	let f = top_frame(vp);
 	let depth = depths(f);
 	f.loops.push(LoopRec {
@@ -2804,18 +2801,6 @@ fn loop_enter(k: &mut Kernel, vp: &mut Vproc, op: Op) -> Flow {
 		depth,
 	});
 	Flow::Next
-}
-
-/// What may run for ever, or wait for what the shell does after it reads
-/// `$!` (a loop, a forked command substitution), starts in a vproc that
-/// may still settle a background job's pid ([`Bang`]: a function run as
-/// the job's command, which only an `exec` may hand to a program): the job
-/// keeps its virtual pid, so readers of `$!` never wait for it. A lone
-/// job's trap action decides nothing ([`Kernel::bang_held_by_trap`]).
-fn bang_before_wait(k: &mut Kernel, vp: &Vproc) {
-	if !k.bangs.is_empty() && !k.bang_held_by_trap(vp) {
-		k.settle_bang(vp.vpid, None);
-	}
 }
 
 /// `((…))` (or an arith-`for` expression) of a bash unit with nothing to
@@ -2983,7 +2968,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::LoopEnter => loop_enter(k, vp, op),
+		Opcode::LoopEnter => loop_enter(vp, op),
 		Opcode::ForIn => for_in(k, vp, cx, unit, op, line),
 		Opcode::ForNext => for_next(k, vp, cx, op, line),
 		Opcode::LoopNote | Opcode::LoopBack => loop_note(vp, op),
@@ -3606,7 +3591,6 @@ fn for_in(
 	op: Op,
 	line: u32,
 ) -> Flow {
-	bang_before_wait(k, vp);
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let var = unit.names[op.b as usize].clone();
@@ -4040,18 +4024,6 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.as_ref()
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
-		// A job that forks (a subshell, pipeline, job or coprocess of its
-		// own) is not just one program: it keeps its virtual pid. The
-		// pipeline a job's body is passes the decision to its last stage
-		// ([`retarget_bang`]).
-		let own_pipeline = info.kind == SpawnKind::Pipeline
-			&& k
-				.bangs
-				.iter()
-				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-		if !k.bangs.is_empty() && !own_pipeline {
-			k.settle_bang(vp.vpid, None);
-		}
 		let mut children = Vec::with_capacity(info.stages.len());
 		match info.kind {
 			SpawnKind::Subshell | SpawnKind::Background => {
@@ -4087,6 +4059,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
+				} else {
+					k.bang_kin_add(vp.vpid, child.vpid);
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -4185,6 +4159,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
 						child.jobs = inherited_jobs(vp, true);
 					}
+					k.bang_kin_add(vp.vpid, child.vpid);
 					children.push(child.vpid);
 					k.spawned.push(Box::new(child));
 				}
@@ -4964,7 +4939,6 @@ fn repeat(
 	op: Op,
 	line: u32,
 ) -> Flow {
-	bang_before_wait(k, vp);
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let w = &unit.words[op.a as usize];
