@@ -212,8 +212,17 @@ describe("older bodies kept compressed in memory when no store file can be used"
 			manager.buildSessionContext();
 			expect(heldWhole(manager, [...beforeCut, ...later])).toEqual([]);
 			quarterOfBodies();
-			// No other directory took the bodies: the session's own holds only its file.
-			expect(fs.readdirSync(dir.path()).sort()).toEqual(["not-a-directory", "session.jsonl"]);
+			// No other directory or file took the bodies: the session's own holds only its file. The session
+			// file's own lock files are left out by exact name, as they hold no body: the publish lock
+			// `.session.jsonl.lock` and its OS gate `.session.jsonl.lock.os`, which the file storage keeps
+			// beside the session file after a write. Any other entry still fails.
+			const sessionLocks = [".session.jsonl.lock", ".session.jsonl.lock.os"];
+			expect(
+				fs
+					.readdirSync(dir.path())
+					.filter(name => !sessionLocks.includes(name))
+					.sort(),
+			).toEqual(["not-a-directory", "session.jsonl"]);
 		} finally {
 			await manager.close();
 		}

@@ -179,12 +179,25 @@ function createMockSession(
 }
 
 function mockCreateAgentSession(session: AgentSession) {
-	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+	const created = {
 		session,
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
-	} satisfies CreateAgentSessionResult);
+	} satisfies CreateAgentSessionResult;
+	return vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		// As createAgentSession does: the agent's registry record takes the session, the file its session
+		// manager opened (the file a warm revive of the parked agent reopens) and the running status.
+		const id = options?.agentId;
+		const sessionManager = options?.sessionManager;
+		if (id !== undefined && sessionManager) {
+			const registry = AgentRegistry.global();
+			if (registry.attachSession(id, session, sessionManager.getSessionFile() ?? null)) {
+				registry.setStatus(id, "running");
+			}
+		}
+		return created;
+	});
 }
 // Use a bundled scout so these runSubprocess tests exercise the built-in
 // ceiling together with a lower task.softRequestBudget setting.
@@ -492,7 +505,11 @@ describe("runSubprocess soft request budget", () => {
 		mockCreateAgentSession(handle.session);
 		registerRunning(id, handle.session, workerSessionFile);
 
-		const result = await runSubprocess({ ...baseOptions(id), signal: controller.signal });
+		const result = await runSubprocess({
+			...baseOptions(id),
+			artifactsDir: path.join(tempDir.path(), "main"),
+			signal: controller.signal,
+		});
 
 		expect(result.aborted).toBe(true);
 		expect(AgentRegistry.global().get(id)).toBeUndefined();
@@ -541,7 +558,11 @@ describe("runSubprocess soft request budget", () => {
 			"task",
 			"shutdown regression",
 			async ({ signal }) => {
-				const result = await runSubprocess({ ...baseOptions(id), signal });
+				const result = await runSubprocess({
+					...baseOptions(id),
+					artifactsDir: path.join(tempDir.path(), "main"),
+					signal,
+				});
 				return result.output;
 			},
 			{ ownerId: "Main", agentId: id },

@@ -97,6 +97,8 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 	let yieldSeq = 0;
 	let toolSeq = 0;
 	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
+	// Teardowns the executor registers, run at dispose as AgentSession runs its own.
+	const disposers: Array<() => void> = [];
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
@@ -167,7 +169,12 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
 		settleAsyncWork: async () => {},
 		abort: async () => {},
-		dispose: async () => {},
+		addDisposer: (dispose: () => void) => {
+			disposers.push(dispose);
+		},
+		dispose: async () => {
+			for (const dispose of disposers.splice(0)) dispose();
+		},
 		setIrcWakeTurnObserver: (
 			observer: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
 		) => {
