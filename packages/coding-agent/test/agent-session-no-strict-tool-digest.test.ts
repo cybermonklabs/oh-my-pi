@@ -4,12 +4,14 @@
  * it once, when it loads, so it changes between processes: a process that resumes a transcript with it set or unset
  * since sends other tool bytes than the transcript's last request did, and that request reads none of the cache entry.
  * The prompt cache status must say the tools changed, and the resumed process must send its own system prompt from its
- * first request instead of keeping the transcript's for a cache entry it cannot read. Each process here is a process of
- * its own ({@link ProcessInput}), with `PI_NO_STRICT` set or not.
+ * first request instead of keeping the transcript's for a cache entry it cannot read. Under `PI_NO_STRICT`, Claude
+ * Code's experimental-beta kill switch still changes the tool bytes where the endpoint takes `eager_input_streaming`:
+ * it takes the flag off every tool. Each process here is a process of its own ({@link ProcessInput}), with
+ * `PI_NO_STRICT` set or not.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { gatewayModelsYml, withoutCacheControl } from "./helpers/anthropic-gateway";
 import { type GatewayRequest, type OpenAIGatewayApi, openAIGatewayModelsYml } from "./helpers/openai-gateway";
 import type { ProcessInput, ProcessRun } from "./fixtures/no-strict-session-process";
@@ -19,12 +21,12 @@ const PROCESS = path.join(import.meta.dir, "fixtures/no-strict-session-process.t
 let processes = 0;
 
 /**
- * Runs one process on `tempDir` with `PI_NO_STRICT` set if `noStrict`, on `sessionFile` or a new session, on the
- * gateway's `api` or its Anthropic messages API.
+ * Runs one process on `tempDir` with `PI_NO_STRICT` set if `noStrict` and Claude Code's experimental-beta kill switch
+ * if `killSwitch`, on `sessionFile` or a new session, on the gateway's `api` or its Anthropic messages API.
  */
 async function runProcess(
 	tempDir: TempDir,
-	inputs: { agentsMd: string; noStrict: boolean; api?: OpenAIGatewayApi },
+	inputs: { agentsMd: string; noStrict: boolean; api?: OpenAIGatewayApi; killSwitch?: boolean },
 	sessionFile: string | undefined,
 	prompts: ProcessInput["prompts"],
 ): Promise<ProcessRun> {
@@ -39,7 +41,12 @@ async function runProcess(
 	};
 	const child = Bun.spawn([process.execPath, PROCESS, JSON.stringify(input)], {
 		cwd: tempDir.path(),
-		env: { ...process.env, PI_TEST_RUNTIME: "1", PI_NO_STRICT: inputs.noStrict ? "1" : undefined },
+		env: {
+			...process.env,
+			PI_TEST_RUNTIME: "1",
+			PI_NO_STRICT: inputs.noStrict ? "1" : undefined,
+			CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: inputs.killSwitch ? "1" : undefined,
+		},
 		stdin: "ignore",
 		stdout: "ignore",
 		stderr: "pipe",
@@ -114,6 +121,47 @@ describe("a resumed transcript whose process set PI_NO_STRICT", () => {
 		}
 		expect(withoutCacheControl(resumed.requests.at(-1)?.system)).toContain("Build with ninja.");
 		expect(rewrites).toBe(1);
+	}, 120_000);
+});
+
+describe("a resumed transcript under PI_NO_STRICT whose process turned Claude Code's kill switch on", () => {
+	it("reports the tools changed where the endpoint takes eager_input_streaming", async () => {
+		using tempDir = TempDir.createSync("@pi-no-strict-tool-digest-");
+		// A gateway whose compat takes the per-tool `eager_input_streaming` flag, as api.anthropic.com does.
+		const eagerGateway = gatewayModelsYml().replace(
+			"supportsLongCacheRetention: true",
+			"supportsLongCacheRetention: true\n      supportsEagerToolInputStreaming: true",
+		);
+		await Bun.write(tempDir.join("models.yml"), eagerGateway);
+		const live = await runProcess(tempDir, { agentsMd: "Build with make.", noStrict: true }, undefined, [
+			{ text: "first", minute: 0 },
+		]);
+		const resumed = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with ninja.", noStrict: true, killSwitch: true },
+			live.sessionFile,
+			[{ text: "second", minute: 0 }],
+		);
+		const last = live.requests.at(-1);
+		const [first] = resumed.requests;
+		if (!last || !first) throw new Error("Expected both processes' requests");
+		// Preconditions: no request declares a strict tool, and the switch takes `eager_input_streaming` off every tool.
+		const flags = (request: GatewayRequest) =>
+			(request.tools ?? []).map(tool => ({
+				strict: isRecord(tool) ? tool.strict : undefined,
+				eager: isRecord(tool) ? tool.eager_input_streaming : undefined,
+			}));
+		expect(flags(last)).toEqual([
+			{ strict: undefined, eager: true },
+			{ strict: undefined, eager: true },
+		]);
+		expect(flags(first)).toEqual([
+			{ strict: undefined, eager: undefined },
+			{ strict: undefined, eager: undefined },
+		]);
+
+		expect(resumed.status).toMatchObject({ state: "cold", reason: { kind: "tools" } });
+		expect(systemOf(first)).toContain("Build with ninja.");
 	}, 120_000);
 });
 

@@ -45,6 +45,7 @@ import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
@@ -370,6 +371,9 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #deferredDiagnostics: DeferredDiagnostics;
 	readonly #sessions = new Map<string, OpenEditSession>();
 	readonly #streamedArgs = new Map<string, string>();
+	readonly #description = new Memo<string>();
+	/** The custom wire format by the mode it was built for: one object per mode, so its identity follows the mode. */
+	readonly #customFormat = new Memo<{ syntax: "lark"; definition: string } | undefined>();
 
 	constructor(
 		private readonly session: ToolSession,
@@ -387,7 +391,9 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get description(): string {
-		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
+		const mode = this.mode;
+		const model = this.session.getActiveModel?.();
+		return this.#description.get([mode, model?.editPromptVariant], () => resolveEditToolDescription(mode, model));
 	}
 
 	get parameters(): TInput {
@@ -412,8 +418,11 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get customFormat(): { syntax: "lark"; definition: string } | undefined {
-		const definition = editGrammar(this.mode);
-		return definition === null ? undefined : { syntax: "lark", definition };
+		const mode = this.mode;
+		return this.#customFormat.get([mode], () => {
+			const definition = editGrammar(mode);
+			return definition === null ? undefined : { syntax: "lark", definition };
+		});
 	}
 
 	get customWireName(): string | undefined {

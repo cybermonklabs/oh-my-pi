@@ -617,8 +617,9 @@ interface SnapcompactRefusals {
 
 /**
  * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal on the branch current then, after
- * the leaf the archive was weighed on: a process that resumes the session finds the figures among the entries of every
- * branch and weighs them on any branch that carries that leaf before it starts another pass.
+ * the leaf the archive was weighed on, and into a copy of the branch up to that leaf
+ * (`SessionMaintenance.followBranchCopy`): a process that resumes the session finds the figures among the entries of
+ * every branch and weighs them on any branch that carries that leaf before it starts another pass.
  */
 const SNAPCOMPACT_REFUSAL_ENTRY_TYPE = "snapcompact-refusal";
 
@@ -650,10 +651,13 @@ interface CompactionWait {
 }
 
 /**
- * Custom session entry holding a {@link CompactionWait}, written each time the cut rule answers "waits" for an
- * automatic model-summary compaction on figures the session's newest record does not hold, on the branch current
- * then: a process that reads the session's entries in whole (from its file, or a copy of it) holds the wait of the
- * newest record while it still applies, as the process that wrote it did.
+ * Custom session entry holding a {@link CompactionWait}, written when the cut rule answers "waits" for an automatic
+ * model-summary compaction and the session's newest record does not hold that wait already, on the branch current
+ * then (`SessionMaintenance.#writeCompactionWait`): once for each cache entry the rule waits on, again only once a
+ * request touched the entry after the recorded figures would have lapsed, and into a copy of the branch up to its
+ * newest message (`SessionMaintenance.followBranchCopy`). A process that reads the session's entries in whole (from
+ * its file, or a copy of it) holds the wait of the newest record while it still applies, as the process that wrote it
+ * did.
  */
 const COMPACTION_WAIT_ENTRY_TYPE = "compaction-wait";
 
@@ -1024,9 +1028,9 @@ export class SessionMaintenance {
 	/**
 	 * Records the cut rule's answer for an automatic model-summary compaction: a wait on the entry the next request
 	 * reads, or nothing once the rule admitted it. The session records it too, so a process that reads the session's
-	 * entries in whole holds the same wait: a wait on figures its newest record does not hold writes a
-	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record, and an answer that ends the recorded wait a
-	 * {@link COMPACTION_WAIT_END_ENTRY_TYPE} one.
+	 * entries in whole holds the same wait: a wait its newest record does not hold already writes a
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record ({@link #writeCompactionWait}), and an answer that ends the recorded
+	 * wait a {@link COMPACTION_WAIT_END_ENTRY_TYPE} one.
 	 */
 	#recordCompactionAnswer(admitted: boolean): void {
 		const model = this.#model;
@@ -1051,13 +1055,27 @@ export class SessionMaintenance {
 			this.#endRecordedCompactionWait(records);
 			return;
 		}
+		this.#writeCompactionWait(records, wait);
+	}
+
+	/**
+	 * Writes `wait` to the session as a {@link COMPACTION_WAIT_ENTRY_TYPE} record unless the session's newest record
+	 * already holds it for the entry `wait` follows: the same model, newest compaction, tier and lifetime, on a branch
+	 * that carries the record's leaf, and that entry touched again before the recorded figures lapsed. A process that
+	 * reads the session takes that record for such an entry ({@link #takeCompactionWait}), so a request that only
+	 * touches the live entry again adds no record: one is written for each cache entry the rule waits on, and another
+	 * only once a touch comes after the recorded figures would have lapsed.
+	 */
+	#writeCompactionWait(records: CompactionWaitRecords, wait: CompactionWait): void {
+		const sessionManager = this.#host.sessionManager;
 		const newest = records.newest;
 		if (
 			newest?.modelKey === wait.modelKey &&
 			newest.compactionId === wait.compactionId &&
 			newest.entry.tier === wait.entry.tier &&
-			newest.entry.touchedAt === wait.entry.touchedAt &&
-			newest.entry.ttlMs === wait.entry.ttlMs
+			newest.entry.ttlMs === wait.entry.ttlMs &&
+			!promptCacheEntryLapsed(newest.entry, wait.entry.touchedAt) &&
+			this.#branchCarries(newest.leafId)
 		) {
 			return;
 		}
@@ -1083,7 +1101,7 @@ export class SessionMaintenance {
 			records.taken = true;
 			// Entries read in whole bring the records of every process that wrote them, which stand over the wait this
 			// process held. A copy this process made holds its own history, whose newest answer is the wait it held.
-			return this.#takeCompactionWait(records, records.copied ? this.#compactionWait : records.newest);
+			return this.#takeCompactionWait(records, records.copied ? this.#compactionWait : records.newest) !== undefined;
 		}
 		const wait = this.#compactionWait;
 		if (!wait) return false;
@@ -1102,23 +1120,71 @@ export class SessionMaintenance {
 	 * carries the leaf the rule answered at, as a wait holds ({@link #compactionWaitHolds}). The entry the next request
 	 * reads may now be the one the branch's newest reply left, touched a moment before the request the wait followed,
 	 * so the branch, not that touch, shows it is not an older one; the wait follows that entry from then on. With no
-	 * candidate that applies no wait stands, and the read's newest record is ended, as a wait that stops is.
+	 * candidate that applies no wait stands, and the read's newest record is ended, as a wait that stops is. Returns the
+	 * wait taken in.
 	 */
-	#takeCompactionWait(records: CompactionWaitRecords, candidate: CompactionWait | undefined): boolean {
+	#takeCompactionWait(
+		records: CompactionWaitRecords,
+		candidate: CompactionWait | undefined,
+	): CompactionWait | undefined {
 		const entry = this.#nextPromptCacheEntry();
 		if (
 			!candidate ||
 			!entry ||
-			this.#host.sessionManager.getBranchView().findLastIndex(branchEntry => branchEntry.id === candidate.leafId) <
-				0 ||
+			!this.#branchCarries(candidate.leafId) ||
 			!this.#compactionWaitHolds(candidate, entry)
 		) {
 			this.#compactionWait = undefined;
 			this.#endRecordedCompactionWait(records);
-			return false;
+			return undefined;
 		}
 		this.#compactionWait = { ...candidate, entry: cacheEntryFigures(entry) };
-		return true;
+		return this.#compactionWait;
+	}
+
+	/**
+	 * Writes into a copy of the session's branch up to one of its entries, just made (`/fork <entry>`, `/branch`), the
+	 * wait on a model-summary compaction and the snapcompact refusal this process holds where they apply there and the
+	 * copy holds no record of them. Their records sit after the branch's newest message when they were written, so a
+	 * copy up to that message leaves them out; with them, a process that resumes the copy holds them as this process
+	 * does.
+	 */
+	followBranchCopy(): void {
+		const records = this.#sessionCompactionWaits();
+		// The copy carries the wait this process held while it applies there, as a maintenance point takes it in.
+		if (records.copied && !records.taken && this.#compactionWait) {
+			records.taken = true;
+			const wait = this.#takeCompactionWait(records, this.#compactionWait);
+			if (wait) this.#writeCompactionWait(records, wait);
+		}
+		const refusals = this.#sessionSnapcompactRefusals();
+		const refused = refusals.remembered;
+		if (
+			refused &&
+			this.#branchCarries(refused.leafId) &&
+			!refusals.refusals.some(
+				recorded =>
+					recorded.leafId === refused.leafId &&
+					recorded.contextKey === refused.contextKey &&
+					recorded.afterTokens === refused.afterTokens,
+			)
+		) {
+			this.#recordSnapcompactRefusal(refusals, refused);
+		}
+	}
+
+	/** Whether the current branch carries the entry `id`. */
+	#branchCarries(id: string): boolean {
+		return this.#host.sessionManager.getBranchView().findLastIndex(entry => entry.id === id) >= 0;
+	}
+
+	/**
+	 * Writes `refused` to the session as a {@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE} record and adds it to `records`, the
+	 * session's refusals as this process read them.
+	 */
+	#recordSnapcompactRefusal(records: SnapcompactRefusals, refused: RefusedSnapcompact): void {
+		this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, { version: 1, ...refused });
+		records.refusals.push(refused);
 	}
 
 	/**
@@ -1249,9 +1315,7 @@ export class SessionMaintenance {
 		if (!offer || offer.withheld) return true;
 		const sessionManager = this.#host.sessionManager;
 		if (offer.sessionId !== sessionManager.getSessionId()) return true;
-		return (
-			offer.leafId !== null && sessionManager.getBranchView().findLastIndex(entry => entry.id === offer.leafId) < 0
-		);
+		return offer.leafId !== null && !this.#branchCarries(offer.leafId);
 	}
 
 	/**
@@ -5878,7 +5942,7 @@ export class SessionMaintenance {
 		const applies = (candidate: RefusedSnapcompact | undefined): candidate is RefusedSnapcompact =>
 			candidate !== undefined &&
 			candidate.contextKey === (contextKey ??= this.#snapcompactContextKey(branch, settings)) &&
-			branch.findLastIndex(entry => entry.id === candidate.leafId) >= 0;
+			this.#branchCarries(candidate.leafId);
 		const recorded = this.#sessionSnapcompactRefusals();
 		let refused = recorded.remembered;
 		if (!applies(refused)) {
@@ -5910,7 +5974,7 @@ export class SessionMaintenance {
 	 * process may have refused a pass on a branch that carries this one's leaf since). A copy of the session this
 	 * process made (another session id at the same revision: a `/fork`, a branch into a new file, a move off a contested
 	 * file) holds this process's history, so it keeps the refusal the process remembers, which a branch copied up to
-	 * the refused leaf holds no record of.
+	 * the refused leaf holds no record of until {@link followBranchCopy} writes one there.
 	 */
 	#sessionSnapcompactRefusals(): SnapcompactRefusals {
 		const sessionManager = this.#host.sessionManager;
@@ -7008,11 +7072,7 @@ export class SessionMaintenance {
 						const recorded = this.#sessionSnapcompactRefusals();
 						recorded.remembered = refused;
 						// Kept in the session, so a process that resumes it weighs these figures before it starts.
-						this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, {
-							version: 1,
-							...refused,
-						});
-						recorded.refusals.push(refused);
+						this.#recordSnapcompactRefusal(recorded, refused);
 					}
 					await this.#emitLifecycleEvent(
 						{

@@ -13,6 +13,10 @@ export function applyToolProxy<TTool extends object>(tool: TTool, wrapper: objec
 				continue;
 			}
 			visited.add(key);
+			// The bound method for the function it was bound from: reads hand back the same function while the tool
+			// keeps the same one, so a consumer that keys on it (the agent's per-tool keys key on `intent`) sees it stay.
+			let boundFrom: unknown;
+			let bound: unknown;
 			Object.defineProperty(wrapper, key, {
 				get() {
 					const value = (tool as Record<PropertyKey, unknown>)[key];
@@ -24,7 +28,11 @@ export function applyToolProxy<TTool extends object>(tool: TTool, wrapper: objec
 					// and token accounting. Only genuine methods are bound so `this` is
 					// preserved through the wrapper.
 					if (isArkSchema(value) || typeof value.bind !== "function") return value;
-					return value.bind(tool);
+					if (value !== boundFrom) {
+						bound = value.bind(tool);
+						boundFrom = value;
+					}
+					return bound;
 				},
 				enumerable: true,
 				configurable: true,

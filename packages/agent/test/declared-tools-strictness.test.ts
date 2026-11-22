@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import type { Api, Model, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-ai";
 import { NO_STRICT } from "@oh-my-pi/pi-ai/utils/schema/adapt";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -6,6 +7,7 @@ import { Agent } from "../src/agent";
 import { normalizeTools } from "../src/agent-loop";
 import { toolSpecsFingerprint } from "../src/append-only-context";
 import type { AgentTool } from "../src/types";
+import type { DialectSwitchRun } from "./fixtures/declared-tools-dialect-process";
 
 /**
  * A process that resumes a transcript an earlier release wrote compares that release's declared-tools fingerprint
@@ -72,5 +74,41 @@ describe("Agent.declaredToolsFingerprint on an OpenAI API under default settings
 		// What earlier releases' `declaredToolsFingerprint` returns for a model off Anthropic's messages API.
 		const before = toolSpecsFingerprint(normalizeTools(tools, { injectIntent: false }) ?? []);
 		expect(agent.declaredToolsFingerprint(openAIModel)).toBe(before);
+	});
+});
+
+const DIALECT_SWITCH_PROCESS = path.join(import.meta.dir, "fixtures/declared-tools-dialect-process.ts");
+
+/**
+ * Under `PI_NO_STRICT` an Anthropic request declares a tool the provider would send strict without the flag, and the
+ * fingerprint counts the flag it lacks; under an owned dialect the tools go out in the prompt and count as they are.
+ * The dialect is resolved per request (`tools.format`, `PI_DIALECT`), so it can change while the model stays: the
+ * fingerprint must follow it, or the recorded tool-definitions digest names other tools than the request sent.
+ * `PI_NO_STRICT` is read once, when the providers load, so this runs in a process of its own.
+ */
+describe("Agent.declaredToolsFingerprint when the owned dialect changes under PI_NO_STRICT", () => {
+	it("is the fingerprint a fresh agent takes where the tools now go out", async () => {
+		const child = Bun.spawn([process.execPath, DIALECT_SWITCH_PROCESS], {
+			env: {
+				...process.env,
+				PI_NO_STRICT: "1",
+				PI_DIALECT: undefined,
+				CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: undefined,
+			},
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		if (exitCode !== 0) throw new Error(`The process exited with ${exitCode}: ${stderr}`);
+		const run = JSON.parse(stdout) as DialectSwitchRun;
+		// Precondition: under PI_NO_STRICT the messages API and the dialect declare other tool bytes.
+		expect(run.fresh[0]).not.toBe(run.fresh[1]);
+
+		expect(run.switched).toEqual([run.fresh[0], run.fresh[1], run.fresh[0]]);
 	});
 });

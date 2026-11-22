@@ -1,9 +1,11 @@
 /**
  * Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` kill switch withholds `strict` (and the other beta tool
  * fields) from the tool definitions an `anthropic` request declares. A process that resumes a transcript with the
- * switch turned on or off since sends other tool bytes than the transcript's last request did, so that request reads
- * none of the cache entry: the prompt cache status must say the tools changed, and the resumed process must send its
- * own system prompt from its first request instead of keeping the transcript's for a cache entry it cannot read.
+ * switch turned on or off since sends other tool bytes than the transcript's last request did when one of its tools
+ * went out strict, so that request reads none of the cache entry: the prompt cache status must say the tools changed,
+ * and the resumed process must send its own system prompt from its first request instead of keeping the transcript's
+ * for a cache entry it cannot read. With no tool the provider sends strict, the switch changes no tool byte on the
+ * gateway (it sends no `eager_input_streaming`), and the resumed process must read the entry and keep the prompt.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -37,12 +39,13 @@ function setClock(offsetMs: number): void {
 }
 
 /**
- * One process on the gateway's claude-opus-5-5 with `read` and `edit` (a tool the provider declares as strict), with
- * the kill switch set if `killSwitch`, on `sessionFile` or a new session, `agentsMd` as its context file.
+ * One process on the gateway's claude-opus-5-5 with `tools`, `read` and `edit` (a tool the provider declares as
+ * strict) unless given, with the kill switch set if `killSwitch`, on `sessionFile` or a new session, `agentsMd` as its
+ * context file.
  */
 async function runProcess(
 	tempDir: TempDir,
-	inputs: { agentsMd: string; killSwitch: boolean },
+	inputs: { agentsMd: string; killSwitch: boolean; tools?: string[] },
 	sessionFile: string | undefined,
 	steps: (session: AgentSession) => Promise<void>,
 ): Promise<{ requests: MessagesRequest[]; sessionFile: string }> {
@@ -64,7 +67,7 @@ async function runProcess(
 			modelRegistry,
 			settings: Settings.isolated({ "providers.cacheRetention": "long" }),
 			model,
-			toolNames: ["read", "edit"],
+			toolNames: inputs.tools ?? ["read", "edit"],
 			contextFiles: [{ path: tempDir.join("AGENTS.md"), content: inputs.agentsMd }],
 			skills: [],
 		});
@@ -115,6 +118,40 @@ describe("a resumed transcript whose process turned Claude Code's experimental-b
 		},
 		60_000,
 	);
+
+	it("reads the cache entry and keeps the transcript's prompt when no tool goes out strict", async () => {
+		using tempDir = TempDir.createSync("@pi-beta-kill-switch-tool-digest-");
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
+		// Neither tool is one the provider declares as strict.
+		const tools = ["read", "bash"];
+		const live = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with make.", killSwitch: false, tools },
+			undefined,
+			async session => {
+				await session.prompt("first");
+			},
+		);
+		let status: PromptCacheStatus | undefined;
+		// The context file changed while no process ran: the resumed process's own build differs.
+		const resumed = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with ninja.", killSwitch: true, tools },
+			live.sessionFile,
+			async session => {
+				status = session.getPromptCacheStatus();
+				await session.prompt("second");
+			},
+		);
+		const last = live.requests.at(-1);
+		const [first] = resumed.requests;
+		if (!last || !first) throw new Error("Expected both processes' requests");
+		// Precondition: under the switch the resumed request declares the transcript's tool bytes.
+		expect(withoutCacheControl(first.tools)).toBe(withoutCacheControl(last.tools));
+
+		expect(status).toMatchObject({ state: "warm" });
+		expect(withoutCacheControl(first.system)).toBe(withoutCacheControl(last.system));
+	}, 60_000);
 
 	it("writes the cached prompt once when the resumed process also changed the context file", async () => {
 		using tempDir = TempDir.createSync("@pi-beta-kill-switch-tool-digest-");

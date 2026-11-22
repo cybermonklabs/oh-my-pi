@@ -58,7 +58,7 @@ import {
 import { cfgDisabledProviders, cfgEnabledModels } from "../config/model-settings";
 
 /** Whether `model` takes effort per message, so changing it mid-conversation keeps the cached prefix. */
-function takesPerMessageEffort(model: Model): boolean {
+export function takesPerMessageEffort(model: Model): boolean {
 	const { compat } = model;
 	return compat !== undefined && "supportsPerMessageEffort" in compat && compat.supportsPerMessageEffort === true;
 }

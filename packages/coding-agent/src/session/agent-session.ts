@@ -454,7 +454,7 @@ import {
 	USER_INTERRUPT_LABEL,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { ModelControls, type ModelControlsHost } from "./model-controls";
+import { ModelControls, type ModelControlsHost, takesPerMessageEffort } from "./model-controls";
 import {
 	isPrewalkPlanNudge,
 	PrewalkCoordinator,
@@ -499,6 +499,7 @@ import {
 	type PromptCacheEntry,
 	promptTokensOf,
 	resolvePromptCacheTier,
+	sendsNonDefaultToolChoice,
 } from "./cache-warmer";
 import { prewarmUnlessPaused } from "./connection-prewarm";
 import { type ObservedPromptCacheEntry, promptCacheStatus } from "./prompt-cache-status";
@@ -824,9 +825,28 @@ interface PromptCacheShape {
 	model: string;
 	modelName: string;
 	thinkingLevel: ThinkingLevel | undefined;
+	/** {@link thinkingLevel} as the cached prefix tells levels apart ({@link promptCacheThinkingKey}). */
+	thinkingKey: string;
 	tools: string;
 	systemPrompt: number | bigint;
 	retention: string;
+}
+
+/**
+ * `level` as the cached prefix tells thinking levels apart on `model`: where the model takes the level per message
+ * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, outside Responses'
+ * `pro` reasoning mode), a change between two levels other than off goes out after the newest content and keeps the
+ * request-level effort, so those levels share one key; off changes the request's thinking and keeps its own.
+ */
+function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
+	if (level === undefined || level === "off" || model === undefined) return level ?? "";
+	const { compat } = model;
+	const configurationUpdate =
+		compat !== undefined &&
+		"supportsConfigurationUpdate" in compat &&
+		compat.supportsConfigurationUpdate === true &&
+		!(model.api === "openai-responses" && model.reasoningMode === "pro");
+	return configurationUpdate || takesPerMessageEffort(model) ? "effort" : level;
 }
 
 /** The newest main-loop request: its transcript, model, active tools, shape and messages. */
@@ -3696,6 +3716,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}),
 		);
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
+		// A move off a file another process writes copies the transcript into a sibling under a new id, which the
+		// conversation goes on in: so do the records of a change its prompt withholds.
+		this.addDisposer(
+			this.sessionManager.onPersistenceNotice(() => {
+				const from = this.sessionManager.getHeader()?.continuationOf;
+				if (from) this.#tools.followTranscriptCopy(from);
+			}),
+		);
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
 		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
@@ -6842,6 +6870,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * resolved here to match the settings-aware stream wrapper.
 	 * {@link markPromptCacheDispatched} starts the armed entry's lifetime once the request is sent.
 	 * Also records the request's shape for {@link promptCacheExpiresAt}, in a session with no warmer too.
+	 * A request with another tool choice than the default (a forced turn) is neither recorded nor armed: the arm and
+	 * the entry of the request before it stay, since that entry is the one the next request reads
+	 * ({@link CacheWarmer.start}).
 	 */
 	startCacheWarming(model: Model, context: Context, options: SimpleStreamOptions): void {
 		const sessionId = this.sessionManager.getSessionId();
@@ -6853,7 +6884,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// A copy: `/clear` truncates the live array in place, which an alias would follow.
 			messages: this.messages.slice(),
 		};
-		this.#lastRequestArm = arm;
+		if (!sendsNonDefaultToolChoice(model, options.toolChoice)) this.#lastRequestArm = arm;
 		const warmer = this.#cacheWarmer;
 		if (!warmer) return;
 		// The warmer keeps its confirmed entry across requests until a response
@@ -6868,6 +6899,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const dispatched = warmer.start({ model, context, options: warmingOptions }, () =>
 			this.#promptCacheChange(arm.shape, arm.messages),
 		);
+		if (!dispatched) return;
 		this.#promptCacheDispatch.set(context, dispatched);
 	}
 
@@ -6902,7 +6934,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#promptCacheChange(arm: PromptCacheShape, armMessages: readonly AgentMessage[]): PromptCacheChange | undefined {
 		const next = this.#promptCacheShape(this.model);
 		if (next.model !== arm.model) return { kind: "model", from: arm.modelName, to: next.modelName };
-		if (next.thinkingLevel !== arm.thinkingLevel) {
+		if (next.thinkingKey !== arm.thinkingKey) {
 			return { kind: "thinking", from: arm.thinkingLevel ?? "off", to: next.thinkingLevel ?? "off" };
 		}
 		if (next.tools !== arm.tools) return { kind: "tools" };
@@ -6943,6 +6975,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
+			thinkingKey: promptCacheThinkingKey(model, thinkingLevel),
 			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
@@ -8522,14 +8555,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.setActiveToolsByName(toolNames);
 	}
 
-	/** Restores an exact top-level versus `xd://` tool partition. */
+	/**
+	 * Restores an exact top-level versus `xd://` tool partition. With `settingsChange` on a bound prompt the reapply is
+	 * held (see {@link SessionTools.setActiveToolPresentation}).
+	 */
 	setActiveToolPresentation(
 		toolNames: string[],
 		mountedToolNames: string[],
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		options?: SettingsChangeOptions,
 	): Promise<void> {
-		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
+		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal, options);
 	}
 
 	/** Restores a non-MCP presentation snapshot plus the MCP selection and non-built-in tools registered after it. */
@@ -8735,9 +8772,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
-	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change
-	 * in the background passes `joinsHeldChange`, which joins a held one (see
-	 * {@link SessionTools.refreshBaseSystemPrompt}).
+	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change,
+	 * or this process's startup, in the background passes `joinsHeldChange`, which joins a held one or the kept
+	 * restored transcript prompt (see {@link SessionTools.refreshBaseSystemPrompt}).
 	 */
 	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
@@ -13785,6 +13822,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The fork clones the transcript and keeps this recovery state running
 			// under a fresh id, so the work already produced is still this session's.
 			this.#recovery.reanchorServedAttribution(previousSessionId);
+			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
+			this.#tools.followTranscriptCopy(previousSessionId);
 
 			await copySessionArtifacts(
 				forkResult.oldSessionFile,
@@ -15882,6 +15921,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		options?: { copyArtifacts?: boolean; requireIdleFor?: string },
 	): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
+		const previousSessionId = this.sessionManager.getSessionId();
 		const requireIdleFor = options?.requireIdleFor;
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		let skipConversationRestore = false;
@@ -15952,6 +15992,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
+			// A copy of the path goes on with the conversation, and so do the records of a change its prompt withholds,
+			// and those of the cut rule's wait and refusal, which sat after the copied path's newest message.
+			if (leafId) {
+				this.#tools.followTranscriptCopy(previousSessionId);
+				this.#maintenance.followBranchCopy();
+			}
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -16088,6 +16134,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#modelMentions.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
+			// The conversation goes on in the copy, and so do the records of a change its prompt withholds.
+			this.#tools.followTranscriptCopy(sessionId);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 

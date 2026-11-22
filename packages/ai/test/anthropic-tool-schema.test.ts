@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeAnthropicToolSchema } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { resolveAnthropicBaseUrl } from "@oh-my-pi/pi-ai/providers/anthropic-http-options";
+import {
+	anthropicStrictnessHashedTools,
+	anthropicToolsRequest,
+	anthropicWireToolFields,
+	normalizeAnthropicToolSchema,
+} from "@oh-my-pi/pi-ai/providers/anthropic-tool-schema";
+import type { Model, TJsonSchema, Tool } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 describe("normalizeAnthropicToolSchema — SDK whitelist", () => {
 	describe("number / integer nodes", () => {
@@ -403,5 +411,83 @@ describe("normalizeAnthropicToolSchema — parity with anthropic-sdk-python tran
 		expect(out.type).toBe("object");
 		const props = out.properties as Record<string, unknown>;
 		expect(props.self).toBe(out); // memoized → same reference
+	});
+});
+
+const ANTHROPIC_MODEL: Model<"anthropic-messages"> = buildModel({
+	id: "claude-sonnet-4-5",
+	name: "Claude Sonnet 4.5",
+	api: "anthropic-messages",
+	provider: "anthropic",
+	baseUrl: "https://api.anthropic.com",
+	reasoning: true,
+	input: ["text", "image"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 8_192,
+});
+
+function schemaTool(name: string, properties: Record<string, unknown>, strict?: boolean): Tool {
+	return {
+		name,
+		description: `${name} tool`,
+		...(strict === undefined ? {} : { strict }),
+		parameters: { type: "object", properties, required: Object.keys(properties) } as TJsonSchema,
+	};
+}
+
+const PLAIN = { value: { type: "string" } };
+
+function unions(count: number): Record<string, unknown> {
+	return Object.fromEntries(
+		Array.from({ length: count }, (_, index) => [
+			`item${index}`,
+			{ anyOf: [{ type: "string" }, { type: "number" }] },
+		]),
+	);
+}
+
+describe("anthropicStrictnessHashedTools — the strict flags a request sends by default", () => {
+	// The declared-tools hash reads the flags from a pass that builds no schema for a tool that cannot go out strict;
+	// the provider builds each tool's flags with its schema (`anthropicWireToolFields`). A tool the two judge apart
+	// makes the recorded tool-definitions digest name other tool bytes than the request declared.
+	it.each([
+		[
+			"the strict allowlist",
+			["python", "edit", "find", "yield", "bash", "write"].map(name => schemaTool(name, PLAIN)),
+		],
+		[
+			"a tool marked strict: false and an open map",
+			[
+				schemaTool("edit", PLAIN, false),
+				schemaTool("python", { env: { type: "object", additionalProperties: { type: "string" } } }),
+				schemaTool("find", PLAIN),
+			],
+		],
+		[
+			"keywords strict decoding rejects",
+			[
+				schemaTool("edit", { q: { oneOf: [{ type: "string" }, { type: "integer" }] } }),
+				schemaTool("python", { tagged: { type: "object", patternProperties: { "^x-": { type: "string" } } } }),
+				schemaTool("find", PLAIN),
+			],
+		],
+		[
+			"the request-wide union parameter budget",
+			[schemaTool("find", unions(10)), schemaTool("edit", unions(7)), schemaTool("python", PLAIN)],
+		],
+		["the strict tool budget", Array.from({ length: 21 }, () => schemaTool("find", PLAIN))],
+	] satisfies [string, Tool[]][])("counts strict: null on exactly the tools sent strict, with %s", (_case, tools) => {
+		const sent = anthropicWireToolFields(
+			{ ...anthropicToolsRequest(ANTHROPIC_MODEL, resolveAnthropicBaseUrl(ANTHROPIC_MODEL)), noStrict: false },
+			tools,
+		);
+		// Precondition: the request sends some of the tools strict and some not.
+		expect(new Set(sent.map(field => field.strict))).toEqual(new Set([true, false]));
+
+		const hashed = anthropicStrictnessHashedTools(ANTHROPIC_MODEL, tools, { disableStrictTools: true });
+		expect(hashed.map(tool => tool.strict)).toEqual(
+			sent.map((field, index) => (field.strict ? null : tools[index].strict)),
+		);
 	});
 });

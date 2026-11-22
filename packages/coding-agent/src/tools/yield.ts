@@ -19,6 +19,7 @@ import {
 	tryEnforceStrictSchema,
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import yieldDescription from "../prompts/tools/yield.md" with { type: "text" };
 import yieldDataErrorConflictMessage from "../prompts/tools/yield-data-error-conflict.md" with { type: "text" };
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
@@ -375,21 +376,29 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	readonly #parameters: TSchema;
 	#workPoolBatchKey = "";
 	readonly #submittedWorkPoolItems = new Set<string>();
+	readonly #description = new Memo<string>();
+	/** The work-pool parameters by the item numbers they enumerate: one object per list, so their identity follows it. */
+	readonly #workPoolParameters = new Memo<TSchema>();
 
 	get strict(): boolean {
 		return this.#workPoolItems().length === 0 && this.#schemaStrict;
 	}
 
 	get description(): string {
-		return prompt.render(yieldDescription, {
-			hasOutputSchema: this.#validate !== undefined,
-			workPoolItems: this.#workPoolItems().length > 0,
-		});
+		const hasOutputSchema = this.#validate !== undefined;
+		const workPoolItems = this.#workPoolItems().length > 0;
+		return this.#description.get([hasOutputSchema, workPoolItems], () =>
+			prompt.render(yieldDescription, { hasOutputSchema, workPoolItems }),
+		);
 	}
 
 	get parameters(): TSchema {
 		const items = this.#workPoolItems();
-		return items.length > 0 ? wrapWorkPoolYieldParameters(items) : this.#parameters;
+		if (items.length === 0) return this.#parameters;
+		return this.#workPoolParameters.get(
+			items.map(item => item.index),
+			() => wrapWorkPoolYieldParameters(items),
+		);
 	}
 
 	constructor(session: ToolSession) {

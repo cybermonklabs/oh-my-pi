@@ -1,5 +1,6 @@
 import type { Context, Tool } from "@oh-my-pi/pi-ai";
 import type { AnthropicToolControls } from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
+import { isProviderRefusalMessage } from "./replay-policy";
 import type { AgentMessage } from "./types";
 
 /** A tool declaration a response recorded: the names its request declared, in wire order. */
@@ -7,12 +8,15 @@ export type RecordedToolDeclaration = AnthropicToolControls;
 
 /**
  * The tool declaration the newest response in `messages` that recorded one holds (`requestControls.tools`);
- * undefined when none did.
+ * undefined when none did. A provider refusal is skipped: the replay drops it ({@link isProviderRefusalMessage}), so
+ * the next request keeps the declaration of the response before it.
  */
 export function latestToolDeclaration(messages: readonly AgentMessage[]): RecordedToolDeclaration | undefined {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
-		if (message?.role === "assistant" && message.requestControls?.tools) return message.requestControls.tools;
+		if (message?.role === "assistant" && message.requestControls?.tools && !isProviderRefusalMessage(message)) {
+			return message.requestControls.tools;
+		}
 	}
 	return undefined;
 }

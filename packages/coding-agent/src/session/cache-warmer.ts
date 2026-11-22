@@ -15,6 +15,14 @@
  * A model is warmed only when its catalog entry (or a models.yml `promptCache`
  * override) declares a lifetime for the retention tier the request used, so
  * providers whose replay behavior is unvalidated are never touched.
+ *
+ * A request whose `tool_choice` on the wire is another than the default (a
+ * forced tool its model takes, or `none`) is neither tracked nor warmed
+ * ({@link sendsNonDefaultToolChoice}): Anthropic keys the cached messages on
+ * `tool_choice`, so it writes messages the next request, back on the default
+ * choice, does not read, and refreshes none of the entry the request before it
+ * left, which stays the one tracked and kept warm. The agent loop forces a
+ * tool for one turn when the model skips a soft tool requirement.
  */
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import {
@@ -25,8 +33,10 @@ import {
 	type Model,
 	resolveCacheRetention,
 	type SimpleStreamOptions,
+	type ToolChoice,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { isForcedToolChoice } from "@oh-my-pi/pi-ai/utils/tool-choice";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../extensibility/shared-events";
@@ -199,6 +209,18 @@ export function isReplayable(model: Model<Api>, options: SimpleStreamOptions | u
 		return model.thinking?.mode === "anthropic-adaptive";
 	}
 	return true;
+}
+
+/**
+ * Whether a request with `toolChoice` sends another `tool_choice` than the default (`auto`) on `model`: `none`, or a
+ * forced choice the model's compat takes. Each provider sends a forced choice as `auto` where the compat says
+ * `supportsForcedToolChoice` is off; a forced choice it sends also drops thinking on Anthropic.
+ */
+export function sendsNonDefaultToolChoice(model: Model<Api>, toolChoice: ToolChoice | undefined): boolean {
+	if (toolChoice === undefined || toolChoice === "auto") return false;
+	if (!isForcedToolChoice(toolChoice)) return true;
+	const { compat } = model;
+	return !(compat !== undefined && "supportsForcedToolChoice" in compat && !compat.supportsForcedToolChoice);
 }
 
 /**
@@ -485,9 +507,12 @@ export class CacheWarmer {
 	/**
 	 * Keep the prompt cache entry written by `request` warm until `change` reports a difference in the next request.
 	 * Returns the request's dispatch hook: call it each time the provider sends the request (its `onPayload`),
-	 * so the entry's lifetime counts from when it left rather than from a wait for a provider slot.
+	 * so the entry's lifetime counts from when it left rather than from a wait for a provider slot. Undefined for a
+	 * request with another tool choice than the default ({@link sendsNonDefaultToolChoice}): it is not tracked, and the
+	 * entry and run of the request before it stay.
 	 */
-	start(request: CacheWarmRequest, change: () => PromptCacheChange | undefined): () => void {
+	start(request: CacheWarmRequest, change: () => PromptCacheChange | undefined): (() => void) | undefined {
+		if (sendsNonDefaultToolChoice(request.model, request.options.toolChoice)) return undefined;
 		this.#clearRun();
 		// A string key is classified up front. Resolver keys (rotating
 		// credentials) cannot be inspected without consuming them; they start on

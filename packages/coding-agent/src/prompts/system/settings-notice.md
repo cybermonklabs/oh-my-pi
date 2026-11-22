@@ -1,5 +1,9 @@
 <system-notice id="settings">
+{{#if released}}
+Settings changed after a settings notice above, and the change it described is no longer held: the system prompt and tool definitions above follow the current settings. This lists only what that notice said that no longer holds; anything else it said still holds.
+{{else}}
 Settings changed after the system prompt and tool definitions above were written. The change is held: they stay as written until the prompt is rebuilt with it, at the first request made at {{rebuildBy}} or later, or sooner if the cached prompt expires first. This lists only what changed; any setting not named here is unaffected.
+{{/if}}
 {{#each changes}}
 - `{{id}}`: {{#if secret}}changed (value withheld){{else}}`{{previous}}` → `{{next}}`{{/if}}
 {{/each}}
@@ -13,6 +17,6 @@ No longer disabled; calls to them run again from now on: {{#list reenabledTools 
 Enabled by this change; available after the rebuild: {{#list enabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 {{#if noLongerEnabledTools.length}}
-No longer enabled; not available after the rebuild: {{#list noLongerEnabledTools join=", "}}`{{this}}`{{/list}}
+{{#if released}}No longer enabled; not available: {{else}}No longer enabled; not available after the rebuild: {{/if}}{{#list noLongerEnabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 </system-notice>

@@ -1,10 +1,13 @@
 import { Database } from "bun:sqlite";
 import { vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
+import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 
 /**
  * Shared factory for building a minimal mock `AssistantMessage`
@@ -61,6 +64,41 @@ export interface OverlaySession {
 	settings: Settings;
 	/** Path of the overlay file. */
 	overlay: string;
+}
+
+/** A `--config` overlay with one-hour cache entries and `personality` as given. */
+export function personalityOverlay(personality: string): string {
+	return `providers:\n  cacheRetention: long\npersonality: ${personality}\n`;
+}
+
+/** The real clock, read before any test moves it. */
+const realNow = Date.now.bind(Date);
+
+/** Moves the clock `offsetMs` ahead of real time from now on. */
+export function setClock(offsetMs: number): void {
+	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+}
+
+/** Session storage of a process that may not write the session another omp process owns. */
+export class OwnedElsewhereStorage extends FileSessionStorage {
+	readonly #ownedId: string;
+
+	constructor(ownedId: string) {
+		super();
+		this.#ownedId = ownedId;
+	}
+
+	override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+		return sessionId === this.#ownedId ? null : super.claimSession(sessionId, sessionPath);
+	}
+}
+
+/** The context `messages` send on `session`: its tools and system prompt, and the messages. */
+export function sessionContextTokens(session: AgentSession, messages: readonly AgentMessage[]): number {
+	return (
+		computeNonMessageTokens(session, session.agent.tokenizer, session.settings.revision) +
+		session.agent.tokenizer.countMessages(messages, { excludeEncryptedReasoning: true })
+	);
 }
 
 /**

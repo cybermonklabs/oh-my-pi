@@ -253,6 +253,7 @@ import { SPOTLIGHT_INTENT_DESCRIPTION, SPOTLIGHT_INTENT_GUIDANCE, startSpotlight
 import {
 	collectMountedMCPToolRoutes,
 	projectMountedMCPXdevGuidance,
+	type SettingsChangeOptions,
 	type SettingsGatedToolDelta,
 	type SystemPromptRebuilder,
 } from "./session/session-tools";
@@ -5736,7 +5737,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// session_start handler. Install those late registrations into the live
 		// registry and serialize activation so no update can overwrite a sibling.
 		const scheduledToolRegistrations = new WeakMap<RegisteredTool, Promise<void>>();
-		const scheduleToolRegistration = (registered: RegisteredTool, signal?: AbortSignal): Promise<void> => {
+		// `settingsChange`: the settings edit that started the registration (an extension-sources edit that resumed the
+		// extension), which holds the reapply on a bound prompt.
+		const scheduleToolRegistration = (
+			registered: RegisteredTool,
+			{ signal, settingsChange }: { signal?: AbortSignal } & SettingsChangeOptions = {},
+		): Promise<void> => {
 			const scheduled = scheduledToolRegistrations.get(registered);
 			if (scheduled) return scheduled;
 			const activationSignal = signal ?? AbortSignal.timeout(EXTENSION_HANDLER_TIMEOUT_MS);
@@ -5786,6 +5792,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							mounted.filter(mountedName => mountedName !== name),
 							existingTool !== undefined,
 							activationSignal,
+							{ settingsChange },
 						);
 						return;
 					}
@@ -5810,6 +5817,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						nextMounted,
 						existingTool !== undefined,
 						activationSignal,
+						{ settingsChange },
 					);
 				} catch (error) {
 					if (existingTool) {
@@ -5828,7 +5836,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return activation;
 		};
 		if (!restrictToolNames) {
-			const unsubscribeToolRegistrations = extensionRunner.onToolRegistered(scheduleToolRegistration);
+			const unsubscribeToolRegistrations = extensionRunner.onToolRegistered((registered, signal) =>
+				scheduleToolRegistration(registered, { signal }),
+			);
 			disposeCallbacks.add(unsubscribeToolRegistrations);
 
 			// Close the construction race: a background registration can land after
@@ -5856,7 +5866,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			let extensionReconcile: Promise<void> = Promise.resolve();
 			const announcedUnloadedExtensions = new Set<string>();
 			const seenConfiguredExtensions = new Set(buildSessionExtensionRoots().configured);
-			const reconcileExtensionSources = async (): Promise<void> => {
+			// `settingsChange` is the edit: the tool-set changes a suspension or resumption makes go with it, so a bound
+			// prompt holds them as it holds any other settings change (a built-in an extension replaced comes back with
+			// the held rebuild, and keeps the definition the last request declared until then).
+			const reconcileExtensionSources = async (settingsChange: readonly SettingChange[]): Promise<void> => {
 				const roots = buildSessionExtensionRoots();
 				// Explicit-only sessions (`--no-extensions`, trusted allowlists) ignore both settings.
 				if (roots.mode === "explicit-only") return;
@@ -5896,7 +5909,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					if (effective) {
 						// Re-run activation for the surviving registrant, bypassing the once-per-tool cache.
 						scheduledToolRegistrations.delete(effective);
-						await scheduleToolRegistration(effective);
+						await scheduleToolRegistration(effective, { settingsChange });
 						continue;
 					}
 					if (!suspendedToolNames.has(name)) continue;
@@ -5910,22 +5923,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							toolRegistry.set(name, new ExtensionToolWrapper(native, extensionRunner));
 							builtInRegistryToolNames.add(name);
 							session.setToolBuiltIn(name, true);
-							await session.setActiveToolPresentation(enabled, mounted, true);
+							await session.setActiveToolPresentation(enabled, mounted, true, undefined, { settingsChange });
 							return;
 						}
 						toolRegistry.delete(name);
 						await session.setActiveToolPresentation(
 							enabled.filter(enabledName => enabledName !== name),
 							mounted.filter(mountedName => mountedName !== name),
+							false,
+							undefined,
+							{ settingsChange },
 						);
 					});
 				}
 			};
-			cfgExtensionSources.listen(session, () => {
+			// The skill rediscovery takes the change in, so a bound prompt holds the skill list it finds (a `skill:`
+			// entry in `disabledExtensions` hides that skill) as it holds any other settings change.
+			cfgExtensionSources.listenChanges(session, settingsChange => {
 				const next = extensionReconcile
 					.catch(() => {})
-					.then(reconcileExtensionSources)
-					.then(() => session.refreshSkillsAndCommands());
+					.then(() => reconcileExtensionSources(settingsChange))
+					.then(() => session.refreshSkillsAndCommands({ settingsChange }));
 				extensionReconcile = next;
 				return next;
 			});

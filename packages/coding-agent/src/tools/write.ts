@@ -81,6 +81,7 @@ import {
 	updateRowByRowId,
 } from "./sqlite-reader";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { toolResult } from "./tool-result";
 import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
 
@@ -625,8 +626,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly label = "Write";
 	get description(): string {
 		const deviceOnly = this.session.deviceOnlyWrite === true && this.session.pendingFullWriteDescription !== true;
-		return prompt.render(deviceOnly ? writeDeviceOnlyDescription : writeDescription);
+		return this.#description.get([deviceOnly], () =>
+			prompt.render(deviceOnly ? writeDeviceOnlyDescription : writeDescription),
+		);
 	}
+	readonly #description = new Memo<string>();
 	readonly parameters = writeSchema;
 	readonly strict = true;
 	readonly concurrency = "exclusive";

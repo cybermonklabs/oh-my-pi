@@ -312,11 +312,14 @@ function imageHash(image: ImageContent | ComputerScreenshotRef): number | bigint
 }
 
 /**
- * The turn `message` is: its role and timestamp, which every copy of a stored turn keeps (a context hook can
- * re-stamp only a turn it builds itself), and which a prune that blanks its content leaves in place.
+ * The turn `message` is: its role and timestamp, and a tool result's call id (the results of one parallel batch can
+ * finish in the same millisecond), which every copy of a stored turn keeps (a context hook can re-stamp only a turn it
+ * builds itself), and which a prune that blanks its content leaves in place.
  */
 function turnOf(message: Message): string {
-	return `${message.role}:${message.timestamp}`;
+	return message.role === "toolResult"
+		? `${message.role}:${message.timestamp}:${message.toolCallId}`
+		: `${message.role}:${message.timestamp}`;
 }
 
 /**
@@ -370,25 +373,28 @@ function oldestKnownTurn<T>(
 	return undefined;
 }
 
-/** The images a conversation's count clamp dropped, for the image budget it dropped them for. */
-interface StickyImageDrop {
-	budget: number;
-	/** The {@link imageKeys} of the dropped images. */
-	dropped: Set<string>;
+/**
+ * The key a conversation's drops for an image budget are kept under: the turn that names the conversation
+ * ({@link RecordedImageDrop.turn}) and the budget. A model with another budget keeps drops of its own, so a request
+ * back on the first model finds that model's drops again.
+ */
+function conversationKey(turn: string, budget: number): string {
+	return `${budget}:${turn}`;
 }
 
 /** The drops a clamp and its side-request clamps remember, with the read of the record they go with. */
 interface RememberedImageDrops {
 	/** {@link ImageDropRecord.loadRevision} when they were remembered; undefined for a clamp without a record. */
 	loadRevision: number | undefined;
-	/** Each conversation's drops, by the turn that names it ({@link RecordedImageDrop.turn}). */
-	conversations: LRUCache<string, StickyImageDrop>;
+	/** The {@link imageKeys} of the images each conversation dropped for each budget, by {@link conversationKey}. */
+	conversations: LRUCache<string, Set<string>>;
 }
 
 /**
- * Conversations whose drops one clamp remembers, each by the turn that carried its oldest image at its first forced
- * drop: each compaction starts another, and a branch switch can go back to the history before it. The oldest is
- * forgotten first; a clamp with a record finds it there again.
+ * Conversations whose drops one clamp remembers for an image budget, each by the turn that carried its oldest image at
+ * its first forced drop for that budget: each compaction starts another, a branch switch can go back to the history
+ * before it, and a model with another budget keeps its own. The oldest is forgotten first; a clamp with a record finds
+ * it there again.
  */
 const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
 
@@ -420,8 +426,8 @@ export interface ImageDropRecord {
 	 */
 	loadRevision(): number;
 	/**
-	 * The newest drop recorded for each turn that names a conversation ({@link RecordedImageDrop.turn}), on every
-	 * branch: the process that recorded them dropped the same images on every branch it went to.
+	 * The newest drop recorded for each conversation and image budget, by {@link conversationKey}, on every branch: the
+	 * process that recorded them dropped the same images on every branch it went to.
 	 */
 	drops(): ReadonlyMap<string, RecordedImageDrop>;
 	write(drop: RecordedImageDrop): void;
@@ -459,7 +465,7 @@ export function sessionImageDropRecord(
 		drops.clear();
 		for (const entry of sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === IMAGE_DROP_ENTRY_TYPE && isRecordedImageDrop(entry.data)) {
-				drops.set(entry.data.turn, entry.data);
+				drops.set(conversationKey(entry.data.turn, entry.data.budget), entry.data);
 			}
 		}
 		return drops;
@@ -470,7 +476,7 @@ export function sessionImageDropRecord(
 		write(drop) {
 			read();
 			sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...drop });
-			drops.set(drop.turn, drop);
+			drops.set(conversationKey(drop.turn, drop.budget), drop);
 		},
 	};
 }
@@ -493,7 +499,8 @@ export function sessionImageDropRecord(
  * budget carries is never dropped for one the request no longer sends. The clamp finds such a request's drops by the
  * turn that carried the conversation's oldest image, which the request still carries even where a prune blanked that
  * turn's images. A compaction replaces that turn, so the history it leaves is another conversation whose drops are
- * recomputed from its own images; so are the drops of a model whose budget differs.
+ * recomputed from its own images. A model whose budget differs keeps drops of its own beside the first model's, so a
+ * request back on the first model drops what that model's requests dropped and reads its cached prompt.
  *
  * Each drop the clamp keeps is written to its record as well ({@link sessionImageDropRecord}: an entry on the
  * session's branch current then), and a conversation the clamp does not remember is looked up there, among the drops
@@ -523,7 +530,7 @@ export class ProviderImageClamp {
 	/** The drops this clamp's conversations left, shared with its side-request clamps ({@link #drops}). */
 	#memory: RememberedImageDrops = {
 		loadRevision: undefined,
-		conversations: new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS }),
+		conversations: new LRUCache<string, Set<string>>({ max: MAX_STICKY_IMAGE_CONVERSATIONS }),
 	};
 	readonly #onForcedDrop: ForcedImageDrop | undefined;
 	/** Where each drop the clamp keeps is kept for a later process; none keeps them in memory only. */
@@ -551,11 +558,12 @@ export class ProviderImageClamp {
 	}
 
 	/**
-	 * The drops this clamp remembers, by the turn that names each conversation. They are forgotten once the session's
-	 * file is read again ({@link ImageDropRecord.loadRevision}): the record read then holds the drops of every process
-	 * that continued the session, and those stand over this process's.
+	 * The drops this clamp remembers, by the turn that names each conversation and the image budget
+	 * ({@link conversationKey}). They are forgotten once the session's file is read again
+	 * ({@link ImageDropRecord.loadRevision}): the record read then holds the drops of every process that continued the
+	 * session, and those stand over this process's.
 	 */
-	get #drops(): LRUCache<string, StickyImageDrop> {
+	get #drops(): LRUCache<string, Set<string>> {
 		const memory = this.#memory;
 		const loadRevision = this.#record?.loadRevision();
 		if (memory.loadRevision !== loadRevision) {
@@ -566,24 +574,27 @@ export class ProviderImageClamp {
 	}
 
 	/**
-	 * The conversation `context` continues among those whose drops this clamp remembers or its record holds (a
-	 * previous process's, on a resumed session): the one named by the oldest turn `context` carries that names one,
-	 * whether or not that turn still carries its images.
+	 * The conversation `context` continues for `budget` among those whose drops this clamp remembers or its record
+	 * holds (a previous process's, on a resumed session): the one named by the oldest turn `context` carries that names
+	 * one for that budget, whether or not that turn still carries its images.
 	 */
-	#conversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
+	#conversationOf(context: Context, budget: number): { turn: string; dropped: Set<string> } | undefined {
 		const recorded = this.#record?.drops();
 		const drops = this.#drops;
 		if (drops.size === 0 && !recorded?.size) return undefined;
-		const known = oldestKnownTurn(context, turn => drops.get(turn) ?? this.#adopt(turn, recorded?.get(turn)));
-		return known && { turn: known.turn, drop: known.value };
+		const known = oldestKnownTurn(context, turn => {
+			const key = conversationKey(turn, budget);
+			return drops.get(key) ?? this.#adopt(key, recorded?.get(key));
+		});
+		return known && { turn: known.turn, dropped: known.value };
 	}
 
-	/** `recorded` as the clamp remembers drops, remembered from now on unless the clamp serves side requests. */
-	#adopt(turn: string, recorded: RecordedImageDrop | undefined): StickyImageDrop | undefined {
+	/** `recorded` as the clamp remembers drops, remembered under `key` from now on unless the clamp serves side requests. */
+	#adopt(key: string, recorded: RecordedImageDrop | undefined): Set<string> | undefined {
 		if (!recorded) return undefined;
-		const drop = { budget: recorded.budget, dropped: new Set(recorded.dropped) };
-		if (!this.#side) this.#drops.set(turn, drop);
-		return drop;
+		const dropped = new Set(recorded.dropped);
+		if (!this.#side) this.#drops.set(key, dropped);
+		return dropped;
 	}
 
 	/**
@@ -611,14 +622,14 @@ export class ProviderImageClamp {
 		return sent > budget ? new Set(names.slice(0, sent - budget)) : undefined;
 	}
 
-	/** Whether the record, where the clamp has one, holds `drop` for `turn`. */
-	#recordHolds(turn: string, drop: StickyImageDrop): boolean {
+	/** Whether the record, where the clamp has one, holds `dropped` under `key` ({@link conversationKey}). */
+	#recordHolds(key: string, dropped: Set<string>): boolean {
 		if (!this.#record) return true;
-		const recorded = this.#record.drops().get(turn);
+		const recorded = this.#record.drops().get(key);
 		return (
-			recorded?.budget === drop.budget &&
-			recorded.dropped.length === drop.dropped.size &&
-			recorded.dropped.every(name => drop.dropped.has(name))
+			recorded !== undefined &&
+			recorded.dropped.length === dropped.size &&
+			recorded.dropped.every(name => dropped.has(name))
 		);
 	}
 
@@ -632,12 +643,11 @@ export class ProviderImageClamp {
 		const metadataWire = sendsComputerScreenshotMetadata(model);
 		const budget = providerImageBudget(model);
 		// Looked up before the images are counted: once a prune brought them under the budget, the drops still go.
-		const conversation = this.#conversationOf(context);
-		const state = conversation?.drop.budget === budget ? conversation.drop : undefined;
-		if (!state && countImages(context, metadataWire) <= budget) return context;
+		const conversation = this.#conversationOf(context, budget);
+		if (!conversation && countImages(context, metadataWire) <= budget) return context;
 		const names = [...imageKeys(context, metadataWire)];
 		const inherited = conversation ? undefined : this.#unrecordedDrops(context, model, metadataWire, budget, names);
-		const known = state?.dropped ?? inherited ?? new Set<string>();
+		const known = conversation?.dropped ?? inherited ?? new Set<string>();
 		let sent = 0;
 		for (const name of names) {
 			if (!known.has(name)) sent++;
@@ -664,9 +674,12 @@ export class ProviderImageClamp {
 		// The record holds the drops each of the conversation's requests leaves: a forced drop's, those a transcript
 		// without a record carried, and remembered ones the session file lacks (a branch copied into another one).
 		const turn = conversation?.turn ?? oldestImageTurn(context, metadataWire);
-		if (turn !== undefined && (forced || inherited || (state && !this.#recordHolds(turn, state)))) {
-			this.#drops.set(turn, { budget, dropped });
-			this.#record?.write({ turn, budget, dropped: [...dropped] });
+		if (turn !== undefined) {
+			const key = conversationKey(turn, budget);
+			if (forced || inherited || (conversation && !this.#recordHolds(key, conversation.dropped))) {
+				this.#drops.set(key, dropped);
+				this.#record?.write({ turn, budget, dropped: [...dropped] });
+			}
 		}
 		if (forced) this.#onForcedDrop?.("image-count-clamp", context, clamped);
 		return clamped;
