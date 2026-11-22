@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard, ModelCallRefusedError } from "@oh-my-pi/pi-ai/model-call-guard";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
@@ -171,5 +172,134 @@ describe("speech and image tools under a pause that returns during the resume", 
 			expect(result.details?.imageCount).toBe(1);
 		}
 		expect(sentWhilePaused).toEqual([]);
+	});
+});
+
+/**
+ * Speech synthesis and image generation read the model-call guards once, when the call starts; the tool's request
+ * then parks in its held fetch while `/pause` is engaged. A `cyber_policy` refusal another call of the session tree
+ * records during that wait holds the parked request: the held fetch reads the guards again in the same step as the
+ * send, after the gate's hold, so the resume sends nothing and the tool call ends on the hold's error. Each control
+ * resumes with no refusal, and the request goes out. Synthetic requests only.
+ */
+describe("speech and image tools held by a refusal recorded while /pause holds their request", () => {
+	const HOLD = "held: cyber_policy";
+	const CASES = [
+		["sends nothing when a refusal is recorded while the request is parked", true],
+		["sends the request when no refusal is recorded (control)", false],
+	] as const;
+
+	/** Starts `run` with the gate open, parks its request under `/pause`, records the refusal or not, then resumes. */
+	async function parkThenResume<T>(
+		run: () => Promise<T>,
+		sent: readonly boolean[],
+		refuse: () => void,
+		refused: boolean,
+	): Promise<{ result?: T; error?: unknown }> {
+		const pending = run().then(
+			result => ({ result }),
+			(error: unknown) => ({ error }),
+		);
+		agentPauseGate.pause();
+		for (let i = 0; i < 50 && sent.length === 0; i++) await tick();
+		expect(sent).toEqual([]);
+		// Another call of the session tree meets OpenAI's refusal while this request is parked.
+		if (refused) refuse();
+		agentPauseGate.resume();
+		return pending;
+	}
+
+	test.each(CASES)("the tts tool %s", async (_name, refused) => {
+		const speechModel = getBundledModel("deepinfra", "hexgrad/Kokoro-82M");
+		if (!speechModel) throw new Error("Missing bundled test model: deepinfra/hexgrad/Kokoro-82M");
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === speechModel.id ? HOLD : undefined),
+		});
+		const settings = Settings.isolated({
+			modelRoles: { speech: `${speechModel.provider}/${speechModel.id}` },
+			"retry.fallbackChains": { speech: [] },
+		});
+		const sent: boolean[] = [];
+		const ctx = toolContext([speechModel], settings, async () => {
+			sent.push(agentPauseGate.paused);
+			return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+		});
+		try {
+			const outcome = await parkThenResume(
+				() =>
+					ttsTool.execute("tts-held", { text: "Hello", language: "en", output_path: "held.mp3" }, undefined, ctx),
+				sent,
+				() => {
+					held = true;
+				},
+				refused,
+			);
+			if (refused) {
+				expect(sent).toEqual([]);
+				expect(outcome.error).toBeInstanceOf(ModelCallRefusedError);
+				expect(String((outcome.error as Error).message)).toContain(HOLD);
+			} else {
+				expect(outcome.error).toBeUndefined();
+				expect(sent).toEqual([false]);
+				expect(outcome.result?.details).toMatchObject({ backend: "openai-speech", bytes: 3 });
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+
+	test.each(CASES)("the generate_image tool %s", async (_name, refused) => {
+		const imageModel = buildModel({
+			id: "held-image",
+			name: "deepinfra/held-image",
+			api: "openai-images",
+			provider: "deepinfra",
+			baseUrl: "https://deepinfra.example/v1",
+			kind: "image",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === imageModel.id ? HOLD : undefined),
+		});
+		const settings = Settings.isolated({
+			modelRoles: { image: `${imageModel.provider}/${imageModel.id}` },
+			"retry.fallbackChains": { image: [] },
+		});
+		const sent: boolean[] = [];
+		const ctx = toolContext([imageModel], settings, async () => {
+			sent.push(agentPauseGate.paused);
+			return new Response(
+				JSON.stringify({ data: [{ b64_json: Buffer.from("image").toString("base64"), media_type: "image/png" }] }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		});
+		try {
+			const outcome = await parkThenResume(
+				() => imageGenTool.execute("image-held", { subject: "a held request" }, undefined, ctx),
+				sent,
+				() => {
+					held = true;
+				},
+				refused,
+			);
+			generatedImagePaths.push(...(outcome.result?.details?.imagePaths ?? []));
+			if (refused) {
+				expect(sent).toEqual([]);
+				expect(outcome.error).toBeInstanceOf(ModelCallRefusedError);
+				expect(String((outcome.error as Error).message)).toContain(HOLD);
+			} else {
+				expect(outcome.error).toBeUndefined();
+				expect(sent).toEqual([false]);
+				expect(outcome.result?.details?.imageCount).toBe(1);
+			}
+		} finally {
+			removeGuard();
+		}
 	});
 });

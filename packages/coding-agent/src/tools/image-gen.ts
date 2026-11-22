@@ -342,8 +342,9 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					const result = await generateImage(resolvedModel, request, {
 						apiKey,
 						// A tool already running when `/pause` lands finishes, but its
-						// generation request waits for the resume.
-						fetch: pauseHeldFetch(ctx.fetch ?? fetch),
+						// generation request waits for the resume, and reads the model-call
+						// guards again as it goes out.
+						fetch: pauseHeldFetch(ctx.fetch ?? fetch, resolvedModel),
 						signal: requestSignal,
 						carrier: resolvedCarrier,
 						sessionId,

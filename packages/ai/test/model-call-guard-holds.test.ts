@@ -13,7 +13,12 @@ import type {
 	Model,
 } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import { transportFetch, withoutDispatchHold } from "@oh-my-pi/pi-ai/utils/transport-fetch";
+import {
+	fetchAuthorizedAtWire,
+	transportFetch,
+	type WireAuthorization,
+	withoutDispatchHold,
+} from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 /**
@@ -64,6 +69,50 @@ describe("the transport fetch behind a dispatch hold", () => {
 				});
 				expect(unheld.status).toBe(200);
 				expect(sent).toBe(1);
+			} else {
+				expect((await request).status).toBe(200);
+				expect(sent).toBe(1);
+			}
+		} finally {
+			removeGuard();
+		}
+	});
+});
+
+// A direct caller of pi-ai's transports has no dispatch hold, but a request with a wire authorization (a Codex
+// attestation, a Vertex token, a Bedrock signature) still awaits that authorization after the provider's read. The
+// transport fetch reads the model-call guards in the same step as the send whenever it awaited one, so a refusal
+// recorded while the authorization is made holds the request. The control authorizes with no refusal.
+describe("the transport fetch behind a wire authorization, with no hold", () => {
+	it.each([
+		["sends nothing when a refusal is recorded while the request is authorized", true],
+		["sends when the authorization answers with no refusal (control)", false],
+	] as const)("%s", async (_name, refused) => {
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? HOLD : undefined),
+		});
+		let sent = 0;
+		const base: FetchImpl = async () => {
+			sent++;
+			return new Response("{}", { status: 200 });
+		};
+		const authorize: WireAuthorization = async init => {
+			await Bun.sleep(1);
+			// Another call of the session tree meets a refusal while this request is authorized.
+			if (refused) held = true;
+			return init;
+		};
+		try {
+			const request = fetchAuthorizedAtWire(
+				transportFetch(model, base),
+				"https://api.example.test/v1/responses",
+				{ method: "POST", body: "{}" },
+				authorize,
+			);
+			if (refused) {
+				await expect(request).rejects.toBeInstanceOf(ModelCallRefusedError);
+				expect(sent).toBe(0);
 			} else {
 				expect((await request).status).toBe(200);
 				expect(sent).toBe(1);
