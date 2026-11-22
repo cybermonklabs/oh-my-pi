@@ -6,7 +6,9 @@
 
 - `break` and `continue` in a forked pipeline element, a command or process substitution or a background simple command now act as bash and zsh run them: inside a loop they end that child without the `only meaningful in a loop` message (bash: a simple command, `$( )` and `<( )`; zsh: every fork), a count reaches loops past `eval`, and outside a loop the message is printed under the command's redirections, before its count is read, without dropping the rest of a `${ ;}` or `lastpipe` stage
 - A pipeline element or background job that is a simple command with a `$( )`, backtick or `<( )` word is run as the simple command it is: it keeps bash's loop level (a `break` there ends only it), a builtin or external pipeline element's words see its parent's `$BASH_SUBSHELL`, and a `jobs` element keeps the job list
-- A pipeline element that runs a function or a builtin is one subshell level down once its words are expanded, as in bash: a function, `eval` or `.` element (`f | cat`, `eval 'echo $BASH_SUBSHELL' | cat`) prints one more than its parent's `$BASH_SUBSHELL`, which it printed as its parent's
+- A pipeline element that runs a function or a builtin is one subshell level down once its words are expanded, as in bash: a function, `eval` or `.` element (`f | cat`, `eval 'echo $BASH_SUBSHELL' | cat`) prints one more than its parent's `$BASH_SUBSHELL`, which it printed as its parent's; a substitution in its words is not raised with it
+- The elements of a background pipeline (`f | cat &`, `{ …; } | cat &`, `( … ) | cat &`) are one subshell level down, as bash and zsh fork each element of an async pipeline once, not two; and zsh counts every pipeline element it forks (`$ZSH_SUBSHELL` is 1 in `echo $ZSH_SUBSHELL | cat`), a simple command too
+- A fatal error (an unset `${x?}`, `set -u`) in a pipeline element or background command of a `-c` string exits as bash's does: 127 from the command's own words and from a function it runs, 1 from a builtin it runs (`eval`, `.`), a subshell, a compound element or a substitution
 
 ## [18.18.6] - 2026-11-09
 

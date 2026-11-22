@@ -258,7 +258,7 @@ struct ProcImage {
 	/// `$BASH_SUBSHELL`.
 	subshell:      u32,
 	/// The forking shell's loops it runs inside (`Vproc::outer_loops`).
-	outer_loops:   u32,
+	outer_loops:   u16,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.

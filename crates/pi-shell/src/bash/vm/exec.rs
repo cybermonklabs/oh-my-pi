@@ -1958,7 +1958,7 @@ pub fn bash_loop_count(vp: &Vproc) -> u32 {
 	for (i, f) in vp.frames.iter().enumerate().rev() {
 		n = n.saturating_add(u32::try_from(f.loops.len()).unwrap_or(u32::MAX));
 		if i == 0 {
-			return n.saturating_add(vp.outer_loops);
+			return n.saturating_add(u32::from(vp.outer_loops));
 		}
 		if !bash_loop_frame(&f.kind) {
 			break;
@@ -1974,14 +1974,16 @@ pub fn bash_loop_count(vp: &Vproc) -> u32 {
 /// job of one pipeline, a command or process substitution. bash zeroes the
 /// level for `( … )`, a compound element, an and-or, compound or timed job
 /// and a coprocess.
-pub fn fork_loops(vp: &Vproc, keeps: bool) -> u32 {
-	if vp.mode.dialect() == Dialect::Zsh {
+pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
+	let n = if vp.mode.dialect() == Dialect::Zsh {
 		zsh_loop_count(vp)
 	} else if keeps {
 		bash_loop_count(vp)
 	} else {
 		0
-	}
+	};
+	// Past `u16::MAX` loops the count saturates ([`Vproc::outer_loops`]).
+	u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 /// The first op at or after `at` that is not the jump over a command or
@@ -2271,12 +2273,12 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			{
 				return Flow::Exit(status);
 			}
-			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
-			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			// zsh exits 1 from any of them (`errflag` ends `loop` with 1).
+			// bash exits 127 when the error reaches the command loop of a `-c`
+			// string (`run_one_command`), 1 from a script and from a nearer
+			// `top_level` ([`fatal_reaches_command_loop`]). zsh exits 1 from
+			// any of them (`errflag` ends `loop` with 1).
 			let command = vp.mode.dialect() != Dialect::Zsh
-				&& super::subshell_depth(vp) == 0
+				&& fatal_reaches_command_loop(vp)
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -2287,6 +2289,31 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			k.fail(err);
 			Flow::Discard(1)
 		},
+	}
+}
+
+/// Whether a fatal error here ends at bash's command loop rather than at a
+/// nearer `top_level`: a subshell and a substitution set their own
+/// (`execute_in_subshell`, `command_substitute`), and so does a builtin that
+/// a forked simple command runs (`execute_subshell_builtin_or_function`). A
+/// forked pipeline element's or async command's own expansion, and a
+/// function it runs, reach the shell's (bash's `top_level` is the forking
+/// shell's, copied by the fork). A nested shell (depth 0) is its own shell.
+fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
+	let forked_simple = vp.parent.is_some()
+		&& vp.frames.first().is_some_and(|f| {
+			f.unit.as_deref().is_some_and(|unit| {
+				simple_stage(unit, f.pc).is_some_and(|si| {
+					matches!(unit.spawns[si].kind, SpawnKind::Pipeline | SpawnKind::Background)
+				})
+			})
+		});
+	if forked_simple {
+		vp.frames
+			.get(1)
+			.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }))
+	} else {
+		super::subshell_depth(vp) == 0
 	}
 }
 
@@ -3996,9 +4023,10 @@ fn bash_case_hit(
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
 /// (bash's "not for pipes yet": [`raise_element_level`] counts it when it
-/// runs a builtin or function); anything else is one more. The bodies of
-/// its substitutions come first ([`skip_blocks`]).
-fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
+/// runs a builtin or function) unless `zsh`, whose `entersubsh` counts every
+/// element it forks; anything else is one more. The bodies of its
+/// substitutions come first ([`skip_blocks`]).
+fn stage_level(unit: &Unit, entry: u32, background: bool, zsh: bool) -> u32 {
 	let ops = unit
 		.ops
 		.get(skip_blocks(unit, entry) as usize..)
@@ -4018,7 +4046,7 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 		{
 			0
 		},
-		[exec, ..] if exec.code == Opcode::Exec && !background => 0,
+		[exec, ..] if exec.code == Opcode::Exec && !background => u32::from(zsh),
 		_ => 1,
 	}
 }
@@ -4027,8 +4055,10 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 /// element that runs a builtin or a function is one subshell level down
 /// once its words are expanded (at the parent's level, [`stage_level`]),
 /// so a function, `eval`, `.` or a builtin's callback sees one more than
-/// its parent's `$BASH_SUBSHELL`. Called as the element's own simple
-/// command (the vproc's only frame) starts a builtin or function.
+/// its parent's `$BASH_SUBSHELL`. Not for an element of an async pipeline,
+/// which bash forks as an async command, counted at the fork
+/// ([`async_pipeline`]). Called as the element's own simple command (the
+/// vproc's only frame) starts a builtin or function.
 pub fn raise_element_level(vp: &mut Vproc) {
 	if vp.frames.len() != 1 || vp.parent.is_none() || vp.mode.dialect() != Dialect::Bash {
 		return;
@@ -4037,34 +4067,92 @@ pub fn raise_element_level(vp: &mut Vproc) {
 	let Some(unit) = f.unit.as_deref() else {
 		return;
 	};
-	// A stage's simple command is its last op before the stage's `SubExit`
-	// (its substitutions' bodies come first): anything else is no element
-	// command, without a scan of the unit's stages.
-	let pc = f.pc;
-	if unit
-		.ops
-		.get(pc as usize + 1)
-		.is_none_or(|next| next.code != Opcode::SubExit)
-	{
+	let Some(si) = simple_stage(unit, f.pc) else {
 		return;
-	}
-	// The innermost spawn stage that holds the frame's pc: the one this
-	// vproc runs.
-	let mut stage: Option<(u32, SpawnKind)> = None;
-	for s in &unit.spawns {
-		for (i, st) in s.stages.iter().enumerate() {
-			let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
-			if (st.entry..end).contains(&pc) && stage.is_none_or(|(entry, _)| st.entry > entry) {
-				stage = Some((st.entry, s.kind));
-			}
-		}
-	}
-	if let Some((entry, SpawnKind::Pipeline)) = stage
-		&& stage_level(unit, entry, false) == 0
-	{
+	};
+	if unit.spawns[si].kind == SpawnKind::Pipeline && !async_pipeline(unit, si) {
 		let depth = super::subshell_depth(vp) + 1;
 		super::set_subshell_depth(vp, depth);
 	}
+}
+
+/// The spawn whose stage's own simple command is the op at `pc`: the op
+/// before the stage's closing `SubExit`, after its words' substitution
+/// bodies and a redirection ([`stage_command`]). `None` for an op in a
+/// substitution's body (which ends at a `SubExit` of its own) or in a
+/// compound stage.
+fn simple_stage(unit: &Unit, pc: u32) -> Option<usize> {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	if code(pc) != Some(Opcode::Exec) || code(pc + 1) != Some(Opcode::SubExit) {
+		return None;
+	}
+	unit.spawns.iter().position(|s| {
+		s.stages.iter().enumerate().any(|(i, st)| {
+			let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
+			end == pc + 2 && stage_command(unit, st.entry) == pc
+		})
+	})
+}
+
+/// The op of the stage starting at `entry` that runs its own command: past
+/// its words' substitution bodies ([`skip_blocks`]) and a redirection.
+fn stage_command(unit: &Unit, entry: u32) -> u32 {
+	let at = skip_blocks(unit, entry);
+	if unit
+		.ops
+		.get(at as usize)
+		.is_some_and(|op| op.code == Opcode::Redir)
+	{
+		at + 1
+	} else {
+		at
+	}
+}
+
+/// Whether pipeline spawn `si` is the whole body of a background job
+/// (with or without `!`, [`bash_job_keeps`]): bash runs it as an async
+/// pipeline and zsh forks it element by element, so the job's own fork
+/// stands for each element's and every element, a compound or `( … )` one
+/// too, sits at the job's subshell level.
+fn async_pipeline(unit: &Unit, si: usize) -> bool {
+	let Some(s) = unit.spawns.get(si) else {
+		return false;
+	};
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let after = if code(s.end) == Some(Opcode::Not) {
+		s.end + 1
+	} else {
+		s.end
+	};
+	code(after) == Some(Opcode::SubExit)
+		&& unit.spawns.iter().any(|b| {
+			b.kind == SpawnKind::Background
+				&& b.stages.first().is_some_and(|st| {
+					unit
+						.ops
+						.get(skip_blocks(unit, st.entry) as usize)
+						.is_some_and(|op| op.code == Opcode::Spawn && op.a as usize == si)
+				})
+		})
+}
+
+/// Whether the subshell `Spawn` at `at` is the `( … )` that an element of
+/// an async pipeline runs as its own command ([`async_pipeline`]): forked
+/// once, as the element.
+fn async_element_subshell(unit: &Unit, at: u32) -> bool {
+	at > 0
+		&& unit
+			.ops
+			.get(at as usize - 1)
+			.is_some_and(|op| op.code == Opcode::Enter)
+		&& unit.spawns.iter().enumerate().any(|(si, s)| {
+			s.kind == SpawnKind::Pipeline
+				&& s
+					.stages
+					.iter()
+					.any(|st| stage_command(unit, st.entry) + 1 == at)
+				&& async_pipeline(unit, si)
+		})
 }
 
 /// Whether the background job whose body starts at `entry` may be known by
@@ -4222,8 +4310,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
+				// The `( … )` of an async pipeline's element: bash and zsh fork
+				// it once, as the element ([`async_element_subshell`]).
+				if info.kind == SpawnKind::Subshell && async_element_subshell(unit, top_frame(vp).pc) {
+					super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+				}
 				if info.kind == SpawnKind::Background {
-					let level = stage_level(unit, info.stages[0].entry, true);
+					let level = stage_level(unit, info.stages[0].entry, true, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
@@ -4274,6 +4367,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						&& !job_control(k, cx, vp)
 				};
 				let mut stdin = vp.fds.get(0).cloned();
+				// An async pipeline's elements sit at the job's level.
+				let async_elements = async_pipeline(unit, op.a as usize);
+				let zsh = unit.mode.dialect() == Dialect::Zsh;
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
 						if !k.bangs.is_empty() {
@@ -4325,7 +4421,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.get(skip_blocks(unit, stage.entry) as usize)
 						.is_some_and(|op| op.code == Opcode::Exec);
 					child.outer_loops = fork_loops(vp, simple);
-					let level = stage_level(unit, stage.entry, false);
+					let level = if async_elements {
+						0
+					} else {
+						stage_level(unit, stage.entry, false, zsh)
+					};
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
 					// stage (`jobs -p | xargs kill`).
@@ -5404,7 +5504,7 @@ pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 			.count();
 		n = n.saturating_add(u32::try_from(here).unwrap_or(u32::MAX));
 		if i == 0 {
-			return n.saturating_add(vp.outer_loops);
+			return n.saturating_add(u32::from(vp.outer_loops));
 		}
 		if !matches!(
 			f.kind,
