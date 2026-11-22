@@ -34,6 +34,7 @@ import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/o
 import { isOpenAIToolsModel, openAIStrictnessHashedTools } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
 import { strictToolsFallbackHolds } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -739,26 +740,28 @@ export class Agent {
 	 * active. Withdrawing such a tool beside an active one leaves the fingerprint as it was; it changes when the last
 	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
 	 * process's) leaves the declaration. Where the request sends a tool with another `strict` or `eager_input_streaming`
-	 * flag than it would under default settings, the tool counts with the flag it goes out with: on Anthropic's messages
+	 * flag than it would under default settings, the tool counts with the flag it goes out with, read on the model the
+	 * request goes out as ({@link wireModel}: a wrapper transport's inner model, as Factory Droid's route, GitLab Duo's
+	 * upstream model, Kimi Code's Anthropic format or Cloudflare AI Gateway's reroute sends it): on Anthropic's messages
 	 * API through {@link anthropicStrictnessHashedTools}, which reads the flags the provider builds its tools with, so
 	 * turning `PI_NO_STRICT` or Claude Code's experimental-beta kill switch on or off, or the provider's strict-tools
-	 * fallback after the endpoint rejected strict tools ({@link strictToolsFallbackHolds}), changes it exactly where it
-	 * changes the wire (a tool the provider never sends strict counts as it is); on an OpenAI API (an `openrouter`
-	 * model's included) through {@link openAIStrictnessHashedTools}, `PI_NO_STRICT` and the fallback alike. Neither
-	 * applies under an owned dialect, which carries the tools in the prompt. Under default settings it is what it was
-	 * before the flags counted; a change of the model's compat is not seen. With `tools`, the fingerprint the request
-	 * would declare with them in place of the active tools.
+	 * fallback after the endpoint rejected strict tools ({@link strictToolsFallbackHolds}, kept under that model's id),
+	 * changes it exactly where it changes the wire (a tool the provider never sends strict counts as it is); on an OpenAI
+	 * API (an `openrouter` model's included) through {@link openAIStrictnessHashedTools}, `PI_NO_STRICT` and the fallback
+	 * alike. Neither applies under an owned dialect, which carries the tools in the prompt. Under default settings it is
+	 * what it was before the flags counted; a change of the model's compat is not seen. With `tools`, the fingerprint
+	 * the request would declare with them in place of the active tools.
 	 */
 	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
 		const intentDescription = this.#intentDescription;
 		const pruneDescriptions = this.prunesToolDescriptions(model);
-		const declaration = this.#toolDeclaration(model);
+		const wire = this.#wireModel(model);
+		const declaration = this.#toolDeclaration(wire);
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
-		const anthropicWire = this.#anthropicWireModel(model);
-		const openAIWire =
-			model !== undefined && isOpenAIToolsModel(model) && !this.#ownedDialect(model) ? model : undefined;
+		const anthropicWire = wire !== undefined && isAnthropicMessagesModel(wire) ? wire : undefined;
+		const openAIWire = wire !== undefined && isOpenAIToolsModel(wire) ? wire : undefined;
 		const strictWire = anthropicWire ?? openAIWire;
 		const strictFallback =
 			strictWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, strictWire);
@@ -819,7 +822,7 @@ export class Agent {
 	 */
 	declaredTools(model: Model | undefined): readonly Tool[] {
 		const tools = this.#state.tools;
-		const declaration = this.#toolDeclaration(model);
+		const declaration = this.#toolDeclaration(this.#wireModel(model));
 		if (!declaration) return tools;
 		const sentRevision = this.#sentToolDefinitions.revision;
 		const toolKeys = tools.map(toolKeyForPrefix);
@@ -849,20 +852,23 @@ export class Agent {
 	}
 
 	/**
-	 * The declaration the next main request on `model` keeps ({@link latestToolDeclaration}): undefined on a provider
-	 * that keeps none ({@link anthropicKeepsToolDeclaration}, which Claude Code's experimental-beta kill switch turns
-	 * off), and under an owned dialect, which carries the tools in the prompt.
+	 * The declaration the next main request going out as `wire` keeps ({@link latestToolDeclaration}): undefined off
+	 * Anthropic's messages API and on a model that keeps none there ({@link anthropicKeepsToolDeclaration}, which Claude
+	 * Code's experimental-beta kill switch turns off).
 	 */
-	#toolDeclaration(model: Model | undefined): RecordedToolDeclaration | undefined {
-		const wireModel = this.#anthropicWireModel(model);
-		return wireModel && anthropicKeepsToolDeclaration(wireModel)
+	#toolDeclaration(wire: Model | undefined): RecordedToolDeclaration | undefined {
+		return wire !== undefined && isAnthropicMessagesModel(wire) && anthropicKeepsToolDeclaration(wire)
 			? latestToolDeclaration(this.#state.messages)
 			: undefined;
 	}
 
-	/** `model` when the next main request on it goes out on Anthropic's messages API, not under an owned dialect. */
-	#anthropicWireModel(model: Model | undefined): Model<"anthropic-messages"> | undefined {
-		return model !== undefined && isAnthropicMessagesModel(model) && !this.#ownedDialect(model) ? model : undefined;
+	/**
+	 * The model the next main request on `model` goes out as ({@link wireModel}, with this agent's Kimi Code API
+	 * format); undefined under an owned dialect, which carries the tools in the prompt.
+	 */
+	#wireModel(model: Model | undefined): Model | undefined {
+		if (model === undefined || this.#ownedDialect(model)) return undefined;
+		return wireModel(model, { kimiApiFormat: this.#kimiApiFormat });
 	}
 
 	/**

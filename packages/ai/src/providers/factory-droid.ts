@@ -233,6 +233,21 @@ function resolveRoute(
 	return route;
 }
 
+/**
+ * The model a request on `model` goes out as: the shared transport's model for its route ({@link resolveRoute}), with
+ * the API and compat of the wire, as a request without an OAuth identity resolves the route (the discovered upstream
+ * and host; an account whose region narrows the upstream can resolve another), or `model` itself on the native Gemini
+ * client and without an upstream.
+ */
+export function factoryDroidRouteModel(model: Model<"factory-droid-agent">): Model<Api> {
+	const registry = resolveFactoryDroidPolicy(model);
+	const wire = registry?.wire ?? "openai-completions";
+	const upstream = defaultUpstream(model, registry);
+	if (wire === "google-generate" || upstream === undefined) return model;
+	const baseUrl = model.baseUrl || factoryDroidWireBaseUrl(wire, undefined);
+	return resolveRoute(model, { model, upstream, orgId: model.factoryDroidOrgId, baseUrl }, wire).inner ?? model;
+}
+
 /** The attempt's effort: undefined when reasoning is off. */
 function selectEffort(
 	model: Model<"factory-droid-agent">,

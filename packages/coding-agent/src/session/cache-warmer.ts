@@ -38,6 +38,8 @@ import {
 import { bedrockSendsForcedToolChoice } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { openAICompletionsSendsNonDefaultToolChoice } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { mapOpenAIResponsesToolChoiceForTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { isOpenAIToolsModel, openAIToolsApi } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { isForcedToolChoice } from "@oh-my-pi/pi-ai/utils/tool-choice";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
@@ -206,27 +208,37 @@ function isApiModel<TApi extends Api>(model: Model<Api>, api: TApi): model is Mo
 
 /**
  * Whether `request` sends another `tool_choice` than the default (`auto`) on its model: `none`, or a forced choice the
- * provider sends as given, by the provider's own rule. Bedrock sends `auto` for a model that takes no forced tool use
- * and for a prefix-bound line thinking on the request ({@link bedrockSendsForcedToolChoice}); chat completions and
- * Responses send no `tool_choice` to a host that takes none, and `auto` for a forced choice a host does not take, chat
- * completions under the compat it resolves for the request, the `whenThinking` view with thinking on
- * ({@link openAICompletionsSendsNonDefaultToolChoice}, {@link mapOpenAIResponsesToolChoiceForTools}); elsewhere a
- * forced choice goes out as `auto` where the compat says `supportsForcedToolChoice` is off. A forced choice Anthropic
- * sends also drops thinking.
+ * provider sends as given, by the provider's own rule, read on the model the request goes out as ({@link wireModel}: a
+ * wrapper transport's inner model, as Factory Droid's route sends it) and on the API it goes out on (an `openrouter`
+ * model's on Responses, or on chat completions, as {@link openAIToolsApi} routes it). Bedrock sends `auto` for a model
+ * that takes no forced tool use and for a prefix-bound line thinking on the request
+ * ({@link bedrockSendsForcedToolChoice}); chat completions and Responses send no `tool_choice` to a host that takes
+ * none, and `auto` for a forced choice a host does not take, chat completions under the compat it resolves for the
+ * request, the `whenThinking` view with thinking on ({@link openAICompletionsSendsNonDefaultToolChoice},
+ * {@link mapOpenAIResponsesToolChoiceForTools}); elsewhere a forced choice goes out as `auto` where the compat says
+ * `supportsForcedToolChoice` is off. A forced choice Anthropic sends also drops thinking.
  */
 export function sendsNonDefaultToolChoice(request: Pick<CacheWarmRequest, "model" | "context" | "options">): boolean {
-	const { model, context, options } = request;
+	const { context, options } = request;
 	const toolChoice = options.toolChoice;
 	if (toolChoice === undefined || toolChoice === "auto") return false;
-	if (isApiModel(model, "openai-completions")) {
+	const model = wireModel(request.model, options);
+	// An `openrouter` model goes out on the API it is routed to under its own compat, as `stream` sends it.
+	const api = isOpenAIToolsModel(model) ? openAIToolsApi(model) : model.api;
+	if (api === "openai-completions") {
+		const completions = model as Model<"openai-completions">;
 		return openAICompletionsSendsNonDefaultToolChoice(
-			model,
-			{ ...openAICompletionsReasoningOptions(model, options), toolChoice },
+			completions,
+			{ ...openAICompletionsReasoningOptions(completions, options), toolChoice },
 			Boolean(context.tools?.length),
 		);
 	}
-	if (isApiModel(model, "openai-responses")) {
-		const sent = mapOpenAIResponsesToolChoiceForTools(toolChoice, context.tools ?? [], model);
+	if (api === "openai-responses") {
+		const sent = mapOpenAIResponsesToolChoiceForTools(
+			toolChoice,
+			context.tools ?? [],
+			model as Model<"openai-responses">,
+		);
 		return sent !== undefined && sent !== "auto";
 	}
 	if (!isForcedToolChoice(toolChoice)) return true;

@@ -89,6 +89,7 @@ import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/provider
 import { sendsConfigurationUpdates } from "@oh-my-pi/pi-ai/providers/openai-configuration-update";
 import { onProviderFallback } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
@@ -830,16 +831,18 @@ interface PromptCacheShape {
 }
 
 /**
- * `level` as the cached prefix tells thinking levels apart on `model`: where the model takes the level per message
- * (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI `configuration_update`, which only the
- * Responses and Codex providers send, {@link sendsConfigurationUpdates}), a change between two levels other than off
- * goes out after the newest content and keeps the request-level effort, so those levels share one key; off changes
- * the request's thinking and keeps its own. Every other API (Azure Responses among them) sends the level as the
- * request's own effort, ahead of every cached message.
+ * `level` as the cached prefix tells thinking levels apart on `model`, read on the model its requests go out as
+ * ({@link wireModel}: a wrapper transport's inner model, as Factory Droid's Responses route for its GPT models): where
+ * that model takes the level per message (Anthropic's per-message effort, {@link takesPerMessageEffort}; an OpenAI
+ * `configuration_update`, which only the Responses and Codex providers send, {@link sendsConfigurationUpdates}), a
+ * change between two levels other than off goes out after the newest content and keeps the request-level effort, so
+ * those levels share one key; off changes the request's thinking and keeps its own. Every other API (Azure Responses
+ * among them) sends the level as the request's own effort, ahead of every cached message.
  */
 function promptCacheThinkingKey(model: Model | undefined, level: ThinkingLevel | undefined): string {
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
-	return sendsConfigurationUpdates(model) || takesPerMessageEffort(model) ? "effort" : level;
+	const wire = wireModel(model);
+	return sendsConfigurationUpdates(wire) || takesPerMessageEffort(wire) ? "effort" : level;
 }
 
 /** The main-loop request the prompt cache warmer was armed with last, and what it was armed with. */
