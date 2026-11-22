@@ -4800,12 +4800,18 @@ export function captureSubagentSettings(settings: SubagentChainSettings): Subage
 	return { layers: settings.overlayLayers(), rootThresholds: settings[kRootCompactionThresholds] };
 }
 
-/** The subagent overlay `snapshot` holds, restored over `parent`. */
-function restoreSubagentSettings(
+/**
+ * The subagent overlay `snapshot` holds, restored over `parent`, each stored setting checked as `overlay()`
+ * checks its overrides. It is derived whatever `snapshot` says: every spawn writes a derived overlay, and a
+ * stored one (a transcript's) never becomes grant authority.
+ *
+ * @throws Error when the overlay names an unknown setting or holds a value its definition rejects.
+ */
+export function restoreSubagentSettings(
 	parent: Settings,
 	snapshot: { layers: OverlayLayers; rootThresholds?: RootCompactionThresholds },
 ): Settings {
-	const settings: SubagentChainSettings = parent.restoreOverlay(snapshot.layers);
+	const settings: SubagentChainSettings = parent.restoreOverlay({ ...snapshot.layers, derived: true });
 	settings[kRootCompactionThresholds] = snapshot.rootThresholds;
 	return settings;
 }
@@ -4883,17 +4889,22 @@ export async function reopenParkedSubagent(id: string, sessionFile: string): Pro
 
 /**
  * The models one revive's stored identities (`formatModelStringWithRouting`) name, among every model the
- * registry holds. At the revive's first identity the registry does not hold, the registry's discovery runs
- * (started where none runs yet) and the identity is resolved again; a later miss of the same revive waits on
- * that discovery rather than starting another.
+ * registry holds whose provider the live settings leave enabled. At the revive's first identity the registry
+ * does not hold, the registry's discovery runs (started where none runs yet) and the identity is resolved
+ * again; a later miss of the same revive waits on that discovery rather than starting another.
  */
 export class RevivedModels {
 	readonly #modelRegistry: ModelRegistry;
+	readonly #settings: Settings;
 	#discovery: Promise<void> | undefined;
 
-	/** `discoveryRan`: an earlier step of the same revive, on another thread, already ran the discovery. */
-	constructor(modelRegistry: ModelRegistry, discoveryRan = false) {
+	/**
+	 * `settings`: the live settings, whose `disabledProviders` a model must not belong to. `discoveryRan`: an
+	 * earlier step of the same revive, on another thread, already ran the discovery.
+	 */
+	constructor(modelRegistry: ModelRegistry, settings: Settings, discoveryRan = false) {
 		this.#modelRegistry = modelRegistry;
+		this.#settings = settings;
 		if (discoveryRan) this.#discovery = Promise.resolve();
 	}
 
@@ -4904,14 +4915,14 @@ export class RevivedModels {
 
 	/** The model `identity` names; undefined when the registry holds none after its discovery ran. */
 	async resolve(identity: string): Promise<Model | undefined> {
-		const known = resolveSpawnModelIdentity(identity, this.#modelRegistry);
+		const known = resolveSpawnModelIdentity(identity, this.#modelRegistry, this.#settings);
 		if (known) return known;
 		if (!this.#discovery) {
 			this.#modelRegistry.refreshInBackground("online-if-uncached");
 			this.#discovery = this.#modelRegistry.awaitBackgroundRefresh();
 		}
 		await this.#discovery;
-		return resolveSpawnModelIdentity(identity, this.#modelRegistry);
+		return resolveSpawnModelIdentity(identity, this.#modelRegistry, this.#settings);
 	}
 }
 
@@ -4928,7 +4939,7 @@ async function warmReviveModel(capture: WarmReviveCapture, reopened: SessionMana
 	if (switched === undefined) {
 		return { kind: "model", model: cache.model, thinkingLevel: spec.thinkingLevel ?? undefined };
 	}
-	const model = await new RevivedModels(live.modelRegistry).resolve(switched);
+	const model = await new RevivedModels(live.modelRegistry, live.settingsParent).resolve(switched);
 	return { kind: "model", model: model ?? cache.model, thinkingLevel: undefined };
 }
 

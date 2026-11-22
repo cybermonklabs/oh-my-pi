@@ -209,6 +209,18 @@ describe("settings registry", () => {
 		expect(restored.grantAuthority().getModelRole("review")).toBe(derived ? undefined : "mock/target");
 	});
 
+	it("checks each restored overlay setting as overlay() checks its overrides", () => {
+		const parent = Settings.isolated();
+		const layers = { global: {}, overrides: {}, derived: true };
+		expect(() => parent.restoreOverlay({ ...layers, overrides: { nope: { nope: 1 } } })).toThrow(
+			'Unknown setting "nope.nope"',
+		);
+		expect(() => parent.restoreOverlay({ ...layers, global: { temperature: "hot" } })).toThrow(
+			"Invalid value for temperature",
+		);
+		expect(cfgTemperature.get(parent.restoreOverlay({ ...layers, overrides: { temperature: 0.2 } }))).toBe(0.2);
+	});
+
 	it("preserves a derived view's host authority when cloning for cwd", async () => {
 		const operator = Settings.isolated();
 		const host = operator.overlay({ modelRoles: { review: "mock/target" } });

@@ -12,6 +12,7 @@ import {
 	resolveModelOverride,
 	resolveSpawnModelIdentity,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 const models: Model<Api>[] = [
 	buildModel({
@@ -93,5 +94,25 @@ describe("resolveSpawnModelIdentity", () => {
 		["the base of an @upstream pin", "openrouter/z-ai/retired-model@cerebras"],
 	])("resolves to nothing when the registry no longer holds %s", (_missing, identity) => {
 		expect(resolveSpawnModelIdentity(identity, { getAll: () => models })).toBeUndefined();
+	});
+
+	// A disabled provider has no models however one is named, as the registry's own `find()` says.
+	test.each([
+		["a catalog model", "anthropic/claude-sonnet-4-5"],
+		["an @upstream pin", "openrouter/z-ai/glm-4.7@cerebras"],
+		["an OpenRouter requested-id clone", "openrouter/z-ai/glm-4.7-20251222:nitro"],
+		[
+			"a Bedrock inference-profile model",
+			"amazon-bedrock/arn:aws:bedrock:us-east-2:1234567890:application-inference-profile/company-opus-48",
+		],
+	])("resolves %s to nothing when the settings disable its provider", (_kind, pattern) => {
+		const model = spawnedModel(pattern);
+		const identity = formatModelStringWithRouting(model);
+		const registry = { getAll: () => models };
+		const disabled = Settings.isolated({ disabledProviders: [model.provider] });
+		const otherDisabled = Settings.isolated({ disabledProviders: ["some-other-provider"] });
+
+		expect(resolveSpawnModelIdentity(identity, registry, disabled)).toBeUndefined();
+		expect(resolveSpawnModelIdentity(identity, registry, otherDisabled)).toEqual(model);
 	});
 });

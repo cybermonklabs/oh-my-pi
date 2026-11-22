@@ -8,6 +8,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
 import {
+	disabledProviderIds,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	modelNotFoundMessage,
@@ -52,6 +53,7 @@ import {
 	perCallModelAssertion,
 	RevivedModels,
 	reopenParkedSubagent,
+	restoreSubagentSettings,
 	type SubagentLegacyRevive,
 	type SubagentLiveInputs,
 	type SubagentLivePolicy,
@@ -314,7 +316,7 @@ export async function prepareColdRevive(
 	);
 	const settingsParent = coldReviveSettingsParent(target, parts, live);
 	const modelRegistry = live.modelRegistry;
-	const models = new RevivedModels(modelRegistry);
+	const models = new RevivedModels(modelRegistry, settingsParent);
 	// The overlay the chain is read from is restored only where the revive walks the chain.
 	const chain = (): string[] => retryFallbackChain(target.id, parts.settings, init, settingsParent);
 	let model: ColdReviveBuildModel | undefined;
@@ -340,6 +342,7 @@ export async function prepareColdRevive(
 			chain,
 			models,
 			modelRegistry,
+			settings: settingsParent,
 			ceiling,
 			approve: perCallModelAssertion(approve, () => ceiling),
 			legacy: parts.model === undefined,
@@ -352,6 +355,7 @@ export async function prepareColdRevive(
 			chain,
 			models,
 			modelRegistry,
+			settings: settingsParent,
 			ceiling: liveEffortCeiling(parts.thinking?.thinkingLevelCeiling, settingsParent),
 			// The model of the parent's live session; the root's where the parent ref holds no session.
 			fallback: parentSession?.model ?? root.model,
@@ -359,7 +363,9 @@ export async function prepareColdRevive(
 	}
 	let prewalkTarget: Model | undefined;
 	if (parts.prewalk) {
-		prewalkTarget = await models.resolve(parts.prewalk.target);
+		// Held to the spawn's own check: a target whose provider has no credential is not armed.
+		const resolved = await models.resolve(parts.prewalk.target);
+		prewalkTarget = resolved && modelRegistry.hasConfiguredAuth(resolved) ? resolved : undefined;
 		if (!prewalkTarget) {
 			logger.warn("Revived subagent prewalk target unavailable; skipping prewalk", {
 				subagent: target.id,
@@ -389,9 +395,25 @@ function liveParentSession(target: ColdReviveTarget): AgentSessionHandle | undef
 	return AgentRegistry.global().get(target.parentId ?? "")?.session ?? undefined;
 }
 
-/** The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. */
+/**
+ * The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. The stored
+ * settings overlay must restore as `overlay()` checks overrides (each setting known, each value one its
+ * definition accepts); an overlay that does not is a malformed part, which takes its legacy variant.
+ */
 function coldReviveSpecParts(target: ColdReviveTarget, init: PersistedSessionInit): SpawnSpecParts {
-	return target.restoredSeance ? { stored: false } : readSpawnSpec(init);
+	if (target.restoredSeance) return { stored: false };
+	const parts = readSpawnSpec(init);
+	if (!parts.settings) return parts;
+	try {
+		restoreSubagentSettings(target.settings, parts.settings);
+		return parts;
+	} catch (error) {
+		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
+			subagent: target.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return { ...parts, settings: undefined };
+	}
 }
 
 /** What a cold revive restores the subagent's overlay over: the live parent's settings for a spec's, else the root's. */
@@ -515,7 +537,7 @@ function retryFallbackChain(
 	settingsParent: Settings,
 ): string[] {
 	if (!settings) return init.retryFallback?.chain ?? [];
-	const role = getRetryFallbackRole(settingsParent.restoreOverlay(settings.layers), subagentRetryFallbackRole(id));
+	const role = getRetryFallbackRole(restoreSubagentSettings(settingsParent, settings), subagentRetryFallbackRole(id));
 	return role?.chain ?? [];
 }
 
@@ -523,12 +545,13 @@ function retryFallbackChain(
  * Each model a retry-fallback `chain` names when the stored model `identity` failed, in the chain's order,
  * every entry read as the live retry walk reads it (a provider wildcard keeps the failing model's id under
  * another provider, without an aggregator's vendor prefix the target provider does not use): the entry's
- * selector, and the model the registry holds for it, if any.
+ * selector, and the model the registry holds for it, if any, among the providers `settings` leave enabled.
  */
 function* chainModels(
 	chain: readonly string[],
 	identity: string,
 	modelRegistry: ModelRegistry,
+	settings: Settings,
 ): Generator<{ candidate: RetryFallbackSelector; model: Model | undefined }> {
 	// A stored identity is exact: no part of its id is read as a thinking level.
 	const slash = identity.indexOf("/");
@@ -541,16 +564,28 @@ function* chainModels(
 	for (const entry of chain) {
 		const candidate = parseRetryFallbackChainEntry({ modelLookup: modelRegistry }, entry, current);
 		if (!candidate) continue;
-		const model = resolveSpawnModelIdentity(formatRetryFallbackBaseSelector(candidate), modelRegistry);
+		const model = resolveSpawnModelIdentity(formatRetryFallbackBaseSelector(candidate), modelRegistry, settings);
 		yield { candidate, model };
 	}
 }
 
 /**
+ * The spawn's own message for a model the registry does not know, its hint drawn, as the spawn draws it,
+ * from the models of the providers `settings` leave enabled.
+ */
+function notFoundMessage(identity: string, modelRegistry: ModelRegistry, settings: Settings): string {
+	const disabled = disabledProviderIds(settings);
+	const models = modelRegistry.getAll();
+	const enabled = disabled.size === 0 ? models : models.filter(model => !disabled.has(model.provider));
+	return modelNotFoundMessage([identity], enabled);
+}
+
+/**
  * The model a cold revive of a record with a spawn spec starts on: the spec's model as the registry holds
- * it, after its discovery ran; else the first model of the subagent's retry-fallback chain the registry
- * knows; else `fallback`, the live parent's (or the root's) model. Each move is logged with the spawn's own
- * message for a model the registry does not know.
+ * it, after its discovery ran; else the first model of the subagent's retry-fallback chain that the live
+ * retry walk would switch to (its provider enabled and credentialed, within the effort ceiling); else
+ * `fallback`, the live parent's (or the root's) model. Each move is logged with the spawn's own message for
+ * a model the registry does not know.
  */
 async function chooseColdReviveModel(args: {
 	id: string;
@@ -560,6 +595,8 @@ async function chooseColdReviveModel(args: {
 	chain: () => readonly string[];
 	models: RevivedModels;
 	modelRegistry: ModelRegistry;
+	/** The live settings, whose disabled providers have no models. */
+	settings: Settings;
 	ceiling: Effort | undefined;
 	fallback: Model | undefined;
 }): Promise<ExplicitBuildModel> {
@@ -569,13 +606,14 @@ async function chooseColdReviveModel(args: {
 	const known = await args.models.resolve(identity);
 	if (known) return { kind: "model", model: known, thinkingLevel: level };
 	const moved = (model: Model | undefined): void => {
-		logger.warn(modelNotFoundMessage([identity], modelRegistry.getAll()), {
+		logger.warn(notFoundMessage(identity, modelRegistry, args.settings), {
 			subagent: id,
 			model: model ? formatModelStringWithRouting(model) : undefined,
 		});
 	};
-	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry)) {
-		if (!model || (ceiling && !modelSupportsEffortCeiling(model, ceiling))) continue;
+	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry, args.settings)) {
+		if (!model || !modelRegistry.hasConfiguredAuth(model)) continue;
+		if (ceiling && !modelSupportsEffortCeiling(model, ceiling)) continue;
 		moved(model);
 		const thinkingLevel = retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, ceiling);
 		return { kind: "model", model, thinkingLevel };
@@ -598,6 +636,8 @@ async function choosePerCallModel(args: {
 	chain: () => readonly string[];
 	models: RevivedModels;
 	modelRegistry: ModelRegistry;
+	/** The live settings, whose disabled providers have no models. */
+	settings: Settings;
 	ceiling: Effort | undefined;
 	approve: (model: Model) => void;
 	/** The record holds no spawn spec. */
@@ -619,7 +659,7 @@ async function choosePerCallModel(args: {
 			refusal = error;
 		}
 	}
-	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry)) {
+	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry, args.settings)) {
 		if (!model) {
 			unknown.push(formatRetryFallbackBaseSelector(candidate));
 			continue;
@@ -634,7 +674,7 @@ async function choosePerCallModel(args: {
 			? refusal instanceof Error
 				? refusal.message
 				: String(refusal)
-			: modelNotFoundMessage([identity], modelRegistry.getAll());
+			: notFoundMessage(identity, modelRegistry, args.settings);
 		logger.warn(reason, { subagent: id, model: formatModelStringWithRouting(model) });
 		return started(model, retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, args.ceiling));
 	}
@@ -748,7 +788,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		parentArtifactManager: restoredSeance ? undefined : prepared.live.parentArtifactManager,
 		seance: restoredSeance ? {} : undefined,
 	};
-	const model = await coldReviveModel(spec, spawnSpec.perCallModel, init, reopened);
+	const model = await coldReviveModel(spec, spawnSpec.perCallModel, init, reopened, settingsParent);
 	const session = await buildSubagentSession({
 		spec: spawnSpec,
 		live,
@@ -787,13 +827,15 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 /**
  * The model of the build: the prepared one, where a session-local switch since the spawn (a prewalk
  * hand-off) does not take its place; a per-call worker never switches models, and a seance consult and a
- * record with no spawn spec start on their patterns, the switched model first.
+ * record with no spawn spec start on their patterns, the switched model first. `settings` are the live
+ * settings the switched model is resolved under.
  */
 async function coldReviveModel(
 	spec: PersistedReviveSpec,
 	perCall: boolean,
 	init: PersistedSessionInit,
 	reopened: SessionManager,
+	settings: Settings,
 ): Promise<ColdReviveBuildModel> {
 	const { prepared, restoredSeance } = spec;
 	// A seance fork's selections belong to its source run, never to the consult.
@@ -803,7 +845,8 @@ async function coldReviveModel(
 	if (prepared.model?.kind === "model") {
 		if (switched === undefined) return prepared.model;
 		// The switched model owns the model and the effort; the spec's model backs it up.
-		const model = await new RevivedModels(prepared.live.modelRegistry, prepared.discoveryRan).resolve(switched);
+		const models = new RevivedModels(prepared.live.modelRegistry, settings, prepared.discoveryRan);
+		const model = await models.resolve(switched);
 		return { kind: "model", model: model ?? prepared.model.model, thinkingLevel: undefined };
 	}
 	const spawnModelPattern =

@@ -17,6 +17,7 @@ import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { formatModelStringWithRouting } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import * as lspModule from "@oh-my-pi/pi-coding-agent/lsp";
@@ -29,6 +30,7 @@ import { CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type ExecutorOptions, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { assertPerCallModelApproved } from "@oh-my-pi/pi-coding-agent/task/model-approval";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import { cfgTaskMaxEffort, cfgTaskMaxRuntimeMs } from "@oh-my-pi/pi-coding-agent/task/settings";
@@ -44,6 +46,7 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import {
+	fixtureAgent,
 	type LiveParent,
 	lastToolResult,
 	openReviveEnv,
@@ -1462,5 +1465,212 @@ describe("stored LSP, IRC and MCP values revived in a process with each off", ()
 		expect(cold.build.options.enableLsp).not.toBe(true);
 		expect(cold.build.options.enableIrc).not.toBe(true);
 		expect(cold.build.options.enableMCP).not.toBe(true);
+	}, 30_000);
+});
+
+/**
+ * Rewrites each `session_init` of `sessionFile`, as a party that can write the stored session but not the
+ * operator's config can: `edit` gets the stored spawn spec's settings layers and returns the ones to store.
+ */
+async function editStoredSettingsLayers(
+	sessionFile: string,
+	edit: (layers: Record<string, unknown>) => Record<string, unknown>,
+): Promise<void> {
+	const lines = (await Bun.file(sessionFile).text()).split("\n").map(line => {
+		if (line.length === 0) return line;
+		const entry: unknown = JSON.parse(line);
+		if (!isRecord(entry) || entry.type !== "session_init" || !isRecord(entry.spawnSpec)) return line;
+		const spec = entry.spawnSpec;
+		const settings = isRecord(spec.settings) ? spec.settings : {};
+		const layers = isRecord(settings.layers) ? settings.layers : {};
+		return JSON.stringify({ ...entry, spawnSpec: { ...spec, settings: { ...settings, layers: edit(layers) } } });
+	});
+	await Bun.write(sessionFile, lines.join("\n"));
+}
+
+/** `layers.overrides`, with `extra` merged into it one level deep. */
+function withOverrides(
+	layers: Record<string, unknown>,
+	extra: Readonly<Record<string, Record<string, unknown>>>,
+): Record<string, unknown> {
+	const overrides = isRecord(layers.overrides) ? { ...layers.overrides } : {};
+	for (const [key, value] of Object.entries(extra)) {
+		const existing = overrides[key];
+		overrides[key] = isRecord(existing) ? { ...existing, ...value } : value;
+	}
+	return { ...layers, overrides };
+}
+
+describe("a stored settings overlay that says it is not derived", () => {
+	const id = "StoredAuthority";
+	let env: ReviveEnv | undefined;
+	let cold: RevivedSubagent | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({
+			// The operator denies `git push` and allows only the spawn's model as a per-call model.
+			"bash.patterns": [{ match: "git push *", approval: "deny" }],
+			"task.perCallModelAllow": [SPAWN_MODEL],
+			modelRoles: { default: SPAWN_MODEL, smol: PER_CALL_MODEL },
+		});
+		env = opened.env;
+		env.addModel("mock-percall");
+		const spawned = await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id));
+		env.dropWarmReviver(id);
+		await editStoredSettingsLayers(spawned.sessionFile, layers => ({
+			...withOverrides(layers, {
+				bash: { patterns: [{ match: "*", approval: "allow" }] },
+				task: { perCallModelAllow: [PER_CALL_MODEL] },
+			}),
+			derived: false,
+		}));
+		cold = await env.revive(id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("does not become grant authority: the operator's bash deny rule still holds after the cold revive", () => {
+		const approval = cold?.session.getToolByName("bash")?.approval;
+		if (typeof approval !== "function") throw new Error("The revived subagent has no bash approval check");
+		expect(approval({ command: "git push origin main" })).toMatchObject({ policy: "deny" });
+	}, 30_000);
+
+	it("does not become grant authority: a stored task.perCallModelAllow entry grants nothing to the revived subagent", () => {
+		if (!env || !cold) throw new Error("The test process did not start");
+		const { modelRegistry } = env;
+		const perCall = modelRegistry.getAll().find(model => formatModelStringWithRouting(model) === PER_CALL_MODEL);
+		if (!perCall) throw new Error(`${PER_CALL_MODEL} is not listed`);
+		const grants = { settings: cold.session.settings, agentName: "task", agentSource: "bundled" as const };
+		expect(() => assertPerCallModelApproved(perCall, grants, modelRegistry)).toThrow(/is not approved for agent/);
+	}, 30_000);
+});
+
+describe("a stored settings overlay holding a value its setting rejects", () => {
+	const id = "StoredMalformed";
+	let env: ReviveEnv | undefined;
+	let cold: RevivedSubagent | undefined;
+	let warn: Mock<typeof logger.warn> | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess();
+		env = opened.env;
+		const spawned = await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id));
+		env.dropWarmReviver(id);
+		await editStoredSettingsLayers(spawned.sessionFile, layers =>
+			withOverrides(layers, { compaction: { thresholdPercent: "lots" } }),
+		);
+		warn = vi.spyOn(logger, "warn");
+		cold = await env.revive(id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("revives on the settings of an older record, as a malformed part does, with a warning naming the subagent", () => {
+		if (!cold || !warn) throw new Error("The test process did not start");
+		expect(JSON.stringify(cold.build.settingsLayers)).not.toContain("lots");
+		const named = warn.mock.calls.filter(([, fields]) => isRecord(fields) && fields.subagent === id);
+		expect(named.length).toBeGreaterThan(0);
+	}, 30_000);
+});
+
+/** A provider the operator turns off between the park and the revive; the registry still lists its models. */
+const DISABLED_PROVIDER = "other";
+
+describe("the spawn's model of a provider disabled between the park and the revive", () => {
+	const id = "ModelProviderDisabled";
+	const gone = `${DISABLED_PROVIDER}/mock-other`;
+	let env: ReviveEnv | undefined;
+	let request: RecordedRequest | undefined;
+	let warn: Mock<typeof logger.warn> | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess();
+		env = opened.env;
+		env.scriptDiscovery();
+		env.addModel("mock-other", { provider: DISABLED_PROVIDER });
+		await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id, { modelOverride: gone }));
+		env.dropWarmReviver(id);
+		cfgDisabledProviders.set(env.settings, [DISABLED_PROVIDER]);
+		warn = vi.spyOn(logger, "warn");
+		const cold = await env.revive(id);
+		request = await wakeWithin(env, cold.session, id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("counts as not known: the cold revive starts on the parent's model, and omp logs the move", () => {
+		if (!warn) throw new Error("The test process did not start");
+		expect(request?.model).toBe(SPAWN_MODEL);
+		expect(moveLogged(warn, id, gone, SPAWN_MODEL)).toBe(true);
+	}, 30_000);
+});
+
+describe("a chain model of a provider disabled between the park and the revive", () => {
+	const id = "ChainProviderDisabled";
+	let env: ReviveEnv | undefined;
+	let request: RecordedRequest | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({
+			"retry.fallbackChains": { default: [`${DISABLED_PROVIDER}/mock-other`, CHAIN_MODEL] },
+		});
+		env = opened.env;
+		env.scriptDiscovery();
+		env.addModel("mock-leaving");
+		env.addModel("mock-chain");
+		env.addModel("mock-other", { provider: DISABLED_PROVIDER });
+		await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id, { modelOverride: LEAVING_MODEL }));
+		env.removeModel(LEAVING_MODEL);
+		cfgDisabledProviders.set(env.settings, [DISABLED_PROVIDER]);
+		const cold = await reviveCold(env, id);
+		request = await wakeWithin(env, cold.session, id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("is passed over: the cold revive starts on the next model of the chain whose provider is enabled", () => {
+		expect(request?.model).toBe(CHAIN_MODEL);
+	}, 30_000);
+});
+
+describe("a prewalk target of a provider disabled between the park and the revive", () => {
+	const id = "PrewalkProviderDisabled";
+	const target = `${DISABLED_PROVIDER}/mock-other-prewalk`;
+	let env: ReviveEnv | undefined;
+	let cold: RevivedSubagent | undefined;
+	let warn: Mock<typeof logger.warn> | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess();
+		env = opened.env;
+		env.scriptDiscovery();
+		env.addModel("mock-other-prewalk", { provider: DISABLED_PROVIDER });
+		const agent = fixtureAgent({ prewalk: target });
+		await spawnAndPark(env, { ...taskSpawn(env, opened.root.toolSession, id), ...env.subagentInputs(id, agent) });
+		env.dropWarmReviver(id);
+		cfgDisabledProviders.set(env.settings, [DISABLED_PROVIDER]);
+		warn = vi.spyOn(logger, "warn");
+		cold = await env.revive(id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("is not armed by the cold revive, as the spawn would not arm it, and omp logs that it was skipped", () => {
+		if (!env || !cold || !warn) throw new Error("The test process did not start");
+		const armed = spawnBuildOptions(env, id).prewalk;
+		expect(armed ? formatModelStringWithRouting(armed.target) : undefined).toBe(target);
+		expect(cold.build.options.prewalk).toBeUndefined();
+		const skipped = warn.mock.calls.filter(([, fields]) => isRecord(fields) && fields.subagent === id);
+		expect(skipped.map(([, fields]) => (isRecord(fields) ? fields.target : undefined))).toContain(target);
 	}, 30_000);
 });
