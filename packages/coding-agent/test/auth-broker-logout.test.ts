@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as readline from "node:readline";
+import { PassThrough } from "node:stream";
 import { AuthStorage, isRecoverableDisabledCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { runAuthBrokerCommand } from "@oh-my-pi/pi-coding-agent/cli/auth-broker-cli";
 import * as oauthTerminal from "@oh-my-pi/pi-coding-agent/cli/oauth-terminal";
@@ -65,10 +67,18 @@ describe("auth-broker logout provider picker", () => {
 			stdout += String(chunk);
 			return true;
 		});
+		// The picker is mocked, so its interface reads a stream of its own: closing an interface on the
+		// process's stdin pauses that stdin for every later test file in the same process.
+		const createInterface = readline.createInterface;
+		vi.spyOn(readline, "createInterface").mockImplementation(() =>
+			createInterface({ input: new PassThrough(), output: new PassThrough() }),
+		);
+		const stdinFlowing = process.stdin.readableFlowing;
 
 		await runAuthBrokerCommand({ action: "logout", flags: {} });
 		write.mockRestore();
 
+		expect(process.stdin.readableFlowing).toBe(stdinFlowing);
 		expect(offered).toEqual([["anthropic"]]);
 		expect(stdout).toContain("Logged out of anthropic");
 		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
