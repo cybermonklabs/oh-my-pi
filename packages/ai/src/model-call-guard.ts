@@ -135,16 +135,22 @@ export function guardModelCall(
  * can then wait (a provider slot, a key resolution, a header resolution) or send again (an auth-retry
  * attempt, a transport retry after a backoff, a stream reopen, a fallback, a live steer). These sends read
  * them again, right before each one goes out: every attempt of the OpenAI and Codex HTTP transports, each
- * Codex and Responses WebSocket request, the replay-safe stream retry, the native judgment loop, Bedrock
+ * Codex and Responses WebSocket frame (in the same step as the frame, after its request dump; a Responses
+ * stale-anchor resend included), the replay-safe stream retry, the native judgment loop, Bedrock
  * and Ollama attempts, each Gemini CLI endpoint attempt and empty-response resend, each Google send (the
  * global-endpoint retry after a regional 404 and each empty-response resend), each Cursor request (the
  * stream retry, HTTP/1 and wire-model fallbacks, after their `onPayload` hooks and proxy tunnel), each
- * GitLab Duo workflow socket run, each pass of the Anthropic provider's retry loop, and pi-agent's remote
+ * GitLab Duo workflow socket run (and again on open, in the same step as its goal) and each tool result it
+ * returns on a live socket, each pass of the Anthropic provider's retry loop, and pi-agent's remote
  * compaction. A transport not named here reads them once, when its call starts. A send this read holds
  * still ends the call with an error that carries the hold's reason (for the session's hold, it names
  * `cyber_policy`; GitLab Duo's goal-overflow rewrite leaves it as it is). The held call keeps the output
- * streamed before it, its open blocks closed: a held Google or Gemini CLI empty-response resend keeps the
- * first answer (its thinking and usage), because the output is reset for the resend only after the read.
+ * streamed before it, with its open text and thinking blocks closed (a held Cursor retry closes the ones the
+ * first request left open; GitLab Duo closes them on every error). A held empty-response resend keeps the
+ * answer before the resend: Google and Vertex reset the output only once the resend's response is accepted,
+ * so a resend held at the regional URL or at the global URL after a regional 404 keeps that answer's thinking
+ * and usage; Gemini CLI resets only after the resend's read, and resends only after an answer with no content
+ * and no thinking, so it keeps that answer's usage.
  * {@link guardModelCall} reports that final message to its guards like any other; the guards tell it apart
  * from OpenAI's own refusal and do not record it.
  */

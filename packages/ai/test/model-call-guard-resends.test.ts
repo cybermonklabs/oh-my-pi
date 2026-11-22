@@ -178,7 +178,7 @@ describe("Gemini CLI: each endpoint attempt reads the model-call guards", () => 
 
 	// An endpoint that answers 200 with an empty stop is asked again, after a backoff, with the same body. That
 	// resend reads the guards right before it goes out: a hold that begins after the empty answer holds it, and the
-	// held call keeps the first answer (its usage), since the output is reset only after the read.
+	// held call keeps the answer before the resend (its usage), since the output is reset only after the read.
 	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
 		const urls: string[] = [];
 		const result = await withHold(model, hold => {
@@ -233,7 +233,8 @@ describe("Google (public API and Vertex): each send reads the model-call guards"
 
 	// A STOP with no content is asked again after a backoff: that resend reads the guards right before it goes
 	// out, so a hold that begins after the empty answer holds it. A first answer of thinking only counts as empty;
-	// the held call keeps it (its thinking and usage), since the output is reset only after the read.
+	// the held call keeps it (its thinking and usage), since the output is reset only once the resend's response is
+	// accepted.
 	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
 		let requests = 0;
 		const result = await withHold(model, hold => {
@@ -316,6 +317,48 @@ describe("Google (public API and Vertex): each send reads the model-call guards"
 			else {
 				expect(result.stopReason).toBe("stop");
 				expect(hosts[1]).toBe("aiplatform.googleapis.com");
+			}
+		});
+
+		// An empty-response resend with a regional endpoint goes to the regional URL first, and to the global URL
+		// after a 404. A hold that begins on that 404 holds the global retry, and the held call keeps the answer
+		// before the resend (its thinking and usage): the output is reset only once the resend's response is
+		// accepted. The control sends the global retry and ends with its answer.
+		it.each([
+			["empty-response resend: a hold that begins on the resend's regional 404 keeps the answer before it", true, 2],
+			["empty-response resend: the global retry is sent when no hold begins (control)", false, 3],
+		] as const)("%s", async (_label, holdOn404, expectedRequests) => {
+			const hosts: string[] = [];
+			const result = await withHold(vertexModel, hold => {
+				const fetch: FetchImpl = async input => {
+					const url = input instanceof Request ? input.url : input.toString();
+					hosts.push(new URL(url).host);
+					if (hosts.length === 2) {
+						if (holdOn404) hold();
+						return new Response(JSON.stringify({ error: { message: "not found" } }), { status: 404 });
+					}
+					const parts = hosts.length === 1 ? [{ text: "pondering", thought: true }] : [{ text: "Hello!" }];
+					const body = `data: ${JSON.stringify({
+						candidates: [{ content: { parts }, finishReason: "STOP" }],
+						usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2, totalTokenCount: 12 },
+					})}\n\n`;
+					return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+				};
+				return streamGoogleVertex(vertexModel, context, { apiKey: "not-a-secret", fetch }).result();
+			});
+
+			expect(hosts).toHaveLength(expectedRequests);
+			expect(hosts.slice(0, 2)).toEqual([
+				"us-central1-aiplatform.googleapis.com",
+				"us-central1-aiplatform.googleapis.com",
+			]);
+			if (holdOn404) {
+				expect(result.errorMessage).toContain(HOLD);
+				expect(result.content).toEqual([expect.objectContaining({ type: "thinking", thinking: "pondering" })]);
+				expect(result.usage.input).toBe(10);
+			} else {
+				expect(result.stopReason).toBe("stop");
+				expect(hosts[2]).toBe("aiplatform.googleapis.com");
 			}
 		});
 	});

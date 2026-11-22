@@ -8,6 +8,7 @@ import type { LiveTransportOptions } from "@oh-my-pi/pi-coding-agent/live/transp
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { CyberPolicyClosure } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 
 /** Fake InteractiveModeContext plus typed capture channels for focus/mount traffic. */
 interface ContextHarness {
@@ -257,6 +258,8 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		const delegated: string[] = [];
 		const phases: string[] = [];
 		const agentSession = {
+			// The controller reads the session tree's cyber-policy hold before it starts a call; none stands here.
+			cyberPolicyClosure: new CyberPolicyClosure(),
 			modelRegistry: { authStorage: {} },
 			sessionId: "s1",
 			subscribe: () => () => {},

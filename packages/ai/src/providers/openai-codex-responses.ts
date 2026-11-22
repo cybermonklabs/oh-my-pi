@@ -1702,7 +1702,9 @@ async function openCodexWebSocketTransport(
 		throw new CodexWebSocketBusyError("websocket request already in progress");
 	}
 	// Accepted steering belongs to whichever request ends up owning the socket,
-	// so it is only consumed once this request takes it (see `onOwned` below).
+	// so it is only consumed once this request takes it (see `onOwned` below):
+	// when its frame goes out, so a frame the model-call guards hold leaves it
+	// for the next request instead of dropping it while the socket keeps it.
 	const steered = websocketState.acceptedSteering;
 	const onOwned = () => {
 		if (websocketState.acceptedSteering === steered) websocketState.acceptedSteering = undefined;
@@ -1844,11 +1846,12 @@ async function openCodexWebSocketTransport(
 				retryBudget: CODEX_WEBSOCKET_RETRY_BUDGET,
 			});
 		// Each WebSocket request (the first, the connect loop's retries and every reopen after a recovery wait)
-		// reads the model-call guards right before it goes out, after the attestation, connection and `onPayload`
-		// waits; a held one sends nothing, and the catch below releases the reservation.
+		// reads the model-call guards here, after the attestation, connection and `onPayload` waits; a held one
+		// sends nothing, and the catch below releases the reservation. The connection reads them again in the same
+		// step as the frame, after its request dump.
 		assertModelCallAllowed(model);
 		const eventStream = websocketConnection.streamRequest(
-			{ send: websocketRequest },
+			{ send: websocketRequest, model },
 			timeouts,
 			requestSetup.requestSignal,
 			onSseEvent,
@@ -3765,7 +3768,8 @@ interface CodexWebSocketRequestTimeouts {
 
 /** What {@link CodexWebSocketConnection.streamRequest} puts on the wire before reading a response. */
 type CodexWebSocketExchange =
-	| { send: Record<string, unknown> }
+	/** Send a frame for `model`, whose model-call guards are read in the same step as the frame. */
+	| { send: Record<string, unknown>; model: Model<Api> }
 	/** Read the successor the server creates from accepted steering; nothing is sent. */
 	| { attachSteerIds: readonly string[] };
 
