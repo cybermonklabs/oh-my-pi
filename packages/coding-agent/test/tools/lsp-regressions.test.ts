@@ -7085,9 +7085,10 @@ describe("lsp regressions", () => {
 					fs.mkdirSync(path.dirname(file), { recursive: true });
 					fs.writeFileSync(file, "export const a = 1;\n");
 				}
-				// Once the delete has read `d`, and before it reads `d/sub`, a second process puts a link
+				// Once the delete has read `d`, and before it looks at `d/sub`, a second process puts a link
 				// to `outside` in the place of `d/sub`. The rm then removes the whole tree and fails.
-				afterReaddirOf(dir, () => swapForLink(sub, outside));
+				const reads: string[] = [];
+				swapAtLstatOf(sub, "before", () => swapForLink(sub, outside), reads);
 				failingRm(dir, async realRm => {
 					await realRm(dir, { recursive: true });
 				});
@@ -7102,6 +7103,111 @@ describe("lsp regressions", () => {
 				expect(fs.readdirSync(outside).sort()).toEqual(behind);
 				expect(settled).toBeInstanceOf(Error);
 				expect(lines).toEqual(["Deleted d/sub (the recursive delete of d stopped partway)"]);
+				// The link is seen before any read of it: only `d` is read.
+				expect(reads.map(read => path.relative(tempDir.path(), read))).toEqual(["d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		/**
+		 * Runs `swap` once, at the first `lstat` of `target`: `before` it, or `after` it returns. Counts
+		 * the `readdir` calls in `reads`.
+		 */
+		function swapAtLstatOf(target: string, when: "before" | "after", swap: () => void, reads: string[]): void {
+			let swapped = false;
+			const realLstat = fsp.lstat;
+			vi.spyOn(fsp, "lstat").mockImplementation((async (...args: unknown[]) => {
+				const first = !swapped && args[0] === target;
+				if (first && when === "before") swap();
+				const stat = await Reflect.apply(realLstat, fsp, args);
+				if (first && when === "after") swap();
+				if (first) swapped = true;
+				return stat;
+			}) as never);
+			const realReaddir = fsp.readdir;
+			vi.spyOn(fsp, "readdir").mockImplementation((async (...args: unknown[]) => {
+				reads.push(String(args[0]));
+				return await Reflect.apply(realReaddir, fsp, args);
+			}) as never);
+		}
+
+		it("a recursive delete never names the files behind a directory swapped for a link between its lstat and its read", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-at-read-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const behind = ["o1.ts", "o2.ts"];
+				for (const file of [
+					path.join(dir, "a.ts"),
+					path.join(sub, "s.ts"),
+					...behind.map(name => path.join(outside, name)),
+				]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Once the listing's `lstat` has found `d/sub` a directory, and before it reads it, a second
+				// process puts a link to `outside` in its place. The rm then removes the tree and fails.
+				const reads: string[] = [];
+				swapAtLstatOf(sub, "after", () => swapForLink(sub, outside), reads);
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.readdirSync(outside).sort()).toEqual(behind);
+				expect(lines.sort()).toEqual([
+					"Deleted d/a.ts (the recursive delete of d stopped partway)",
+					"Deleted d/sub (the recursive delete of d stopped partway)",
+				]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete stops listing at once behind an ancestor swapped for a link after it was read", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-ancestor-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const a = path.join(dir, "a");
+				const c = path.join(a, "b", "c");
+				const outside = path.join(tempDir.path(), "outside");
+				// `outside` mirrors `a` down to `b/c`, which holds a file and 20 directories of its own.
+				const behind = path.join(outside, "b", "c");
+				for (const file of [path.join(c, "x.ts"), path.join(behind, "y.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				for (let index = 0; index < 20; index++)
+					fs.mkdirSync(path.join(behind, `n${index}`, "m"), { recursive: true });
+				// `d/a` and `d/a/b` have been read; just before the listing reads `d/a/b/c`, a second
+				// process puts a link to `outside` in the place of `d/a`. The rm then removes the tree and fails.
+				const reads: string[] = [];
+				swapAtLstatOf(c, "before", () => swapForLink(a, outside), reads);
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.existsSync(path.join(behind, "y.ts"))).toBe(true);
+				expect(lines.filter(line => line.includes("y.ts") || line.includes("/n"))).toEqual([]);
+				// `d`, `d/a`, `d/a/b`, and the one read through the link, which is dropped.
+				expect(reads.map(read => path.relative(tempDir.path(), read))).toEqual(["d", "d/a", "d/a/b", "d/a/b/c"]);
 			} finally {
 				tempDir.removeSync();
 			}

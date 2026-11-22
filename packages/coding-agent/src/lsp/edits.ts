@@ -328,23 +328,44 @@ interface ListedPath {
 	directory: boolean;
 }
 
+/** The `relative` path's parent, relative to the same root ("" is the root). */
+function parentOf(relative: string): string {
+	const parent = path.dirname(relative);
+	return parent === "." ? "" : parent;
+}
+
+/** A directory's identity: the device and inode `lstat` gave for it. */
+type DirectoryId = { dev: bigint; ino: bigint };
+
+/** Whether `absolute` is, by `lstat`, still the directory `id`. */
+async function isSameDirectory(absolute: string, id: DirectoryId | undefined): Promise<boolean> {
+	const stat = await fs.lstat(absolute, { bigint: true });
+	return id !== undefined && stat.isDirectory() && stat.dev === id.dev && stat.ino === id.ino;
+}
+
 /**
  * List the paths under the directory `root`, relative to it, before a recursive delete of it, so
  * the paths it removed can be named if it fails partway. The listing only names. The delete itself
  * is Bun's recursive `rm`, which opens each directory from its parent's handle with `O_NOFOLLOW`
- * and removes each entry with `unlinkat` on that handle (Bun 1.4.4, read with strace), so a
- * directory swapped for a link while it runs is removed as the link and not read. It stops at its
- * first failure, and removes what it finds, a path added after the listing included.
+ * and removes each entry with `unlinkat` on that handle (Bun 1.4.4, read with strace), so on Linux
+ * a directory swapped for a link while it runs is removed as the link and not read. It stops at
+ * its first failure, and removes what it finds, a path added after the listing included.
  *
  * The listing follows no symbolic link either. It reads each directory with `readdir(…,
- * { withFileTypes: true })` and goes on only into a directory entry, or one with no type, and
- * just before it reads one it checks with `lstat` that a directory is at that path: an entry with
- * no type that is not a directory, or a directory swapped for a link since its parent was read,
- * is listed as itself and not read. A swap between that check and the read can still list a
- * link's target as paths under `root`; that names, it removes nothing. Without links the walk
- * cannot loop (an entry has one parent, a directory cannot be hard-linked, and mounts nest as a
- * finite tree), so it lists each path of the tree once. A directory under `root` that is gone when
- * the listing reaches it (another process removed it) has nothing left to list, and is skipped.
+ * { withFileTypes: true })` and goes on only into a directory entry, or one with no type. Just
+ * before it reads one it checks with `lstat` that a directory is at that path, and keeps that
+ * directory's device and inode. Just after the read it checks again that the path, and its
+ * parent's path, still give the directories kept for them; if either changed (a directory swapped
+ * for a link before or during its read, or an ancestor swapped since it was read, which a path
+ * goes through), the read is dropped: its entries are neither listed nor read. A parent that
+ * passed its own check means its ancestors were still in place then, so with a swap that stays
+ * in place nothing read through it is kept. Each directory the walk reads was found by a kept
+ * read, so it reads each directory of the tree once, plus at most one read for each directory
+ * swapped meanwhile, and never further behind a link. A swap undone between a read and its check
+ * (the directory put back) is not seen; then names from behind the link can be listed, and nothing
+ * is removed. Without links the walk cannot loop (an entry has one parent, a directory cannot be
+ * hard-linked, and mounts nest as a finite tree). A directory under `root` that is gone when the
+ * listing reaches it (another process removed it) has nothing left to list, and is skipped.
  *
  * It checks `signal` before each directory it reads and once more at the end, so an abort during
  * the last read is seen too: an abort, or an error while it lists (a directory it cannot read,
@@ -353,24 +374,33 @@ interface ListedPath {
  */
 async function listTree(root: string, signal: AbortSignal | undefined): Promise<ListedPath[]> {
 	const listed: ListedPath[] = [];
-	// The directories to read, relative to `root` ("" is `root`).
+	// The directories to read, relative to `root` ("" is `root`), and the identity of each read.
 	const directories = [""];
+	const ids = new Map<string, DirectoryId>();
 	for (let next = 0; next < directories.length; next++) {
 		throwIfAborted(signal);
-		const absolute = path.join(root, directories[next]);
+		const relative = directories[next];
+		const absolute = path.join(root, relative);
 		let entries: Dirent[];
 		try {
-			if (!(await fs.lstat(absolute)).isDirectory()) continue;
+			const before = await fs.lstat(absolute, { bigint: true });
+			if (!before.isDirectory()) continue;
+			ids.set(relative, { dev: before.dev, ino: before.ino });
 			entries = await fs.readdir(absolute, { withFileTypes: true });
+			const parent = parentOf(relative);
+			const kept =
+				(await isSameDirectory(absolute, ids.get(relative))) &&
+				(relative === "" || (await isSameDirectory(path.join(root, parent), ids.get(parent))));
+			if (!kept) continue;
 		} catch (error) {
 			if (next > 0 && isEnoent(error)) continue;
 			throw error;
 		}
 		for (const entry of entries) {
-			const relative = path.join(directories[next], entry.name);
+			const child = path.join(relative, entry.name);
 			const directory = entry.isDirectory() || isUntyped(entry);
-			listed.push({ relative, directory });
-			if (directory) directories.push(relative);
+			listed.push({ relative: child, directory });
+			if (directory) directories.push(child);
 		}
 	}
 	throwIfAborted(signal);
