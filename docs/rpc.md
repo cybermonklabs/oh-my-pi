@@ -1587,7 +1587,8 @@ available, and ACP does not list it. In the interactive terminal `/live on`,
 starts a call or ends the open one; an extension's `sendUserInput("/live …")`
 there gets the not-available answer, since only typing it runs the terminal's
 call. The built-in `/live` runs in place of an extension's or a custom `/live`
-command in RPC mode, ACP, print mode and `sendUserInput`.
+command in the interactive terminal, RPC mode, ACP, print mode and
+`sendUserInput`.
 
 ### GPT-Live through the `openai` provider
 
@@ -1609,21 +1610,26 @@ timeline, so omp builds each delegation's turn from the transcript: both
 speakers' words since the previous delegation, up to the delegation's
 `offset_ms`. It waits up to 3 s for the user's own transcript to reach that
 offset (the voice's words can arrive before the user's earlier ones, so they do
-not end the wait) and sends the turn either way; no delegation is dropped. The
-turn says that its text is recognized speech that may hold errors and asks for
-a short spoken reply.
+not end the wait) and sends the turn either way; no delegation is dropped.
+GPT-Live sends no event that ends the user's transcript, and a delegation's
+offset comes after the user's words, so only words the user says after it end
+the wait early: a spoken request usually waits the full 3 s. The turn says that
+its text is recognized speech that may hold errors and asks for a short spoken
+reply.
 Progress goes to the call as `session.thinking.append` (not spoken) and the
 turn's final reply as `session.commentary.append` (spoken). A turn no delegation
 started is not spoken.
 
 Each call's transcript is written among the session's artifacts as
-`<n>.live-transcript.log` (an unsaved session's goes to the temp dir), one
+`<n>.live-transcript.log`; an unsaved session's goes to a directory of its own
+under the temp dir that only this user can enter (mode 0700). There is one
 `<UTC time> User|Voice: <text>` line per run of a speaker, ended by a change of
 speaker, a delegation, or 1.5 s of the call's timeline without new words. The
-file is made when the call has words or ends, never at a start that fails, and
-only its owner can read it (mode 0600; an existing file at that path is refused).
-When the call ends, the session gets a message
-(for its next turn) naming that file and the call's start and end. On stop omp
+file, and its artifact id, are made when the call connects; a start that fails
+before the call connects leaves no file. Only its owner can read it (mode 0600),
+and an existing file at that path is refused: the call then keeps no file. When
+the call ends, the session gets a message (for its next turn) naming that file,
+or saying there is none, and the call's start and end. On stop omp
 sends `session.close` and waits up to 5 s for `session.closed` before it closes
 the sideband. A call ends by itself after 15 minutes in which the user says
 nothing; while nobody speaks, the 60 s `idle_timeout_s` under a speech wake
