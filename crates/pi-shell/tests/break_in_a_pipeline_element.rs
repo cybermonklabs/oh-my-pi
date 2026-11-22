@@ -238,6 +238,8 @@ const COMMON_FORKS: &[(&str, &str)] = &[
 	("bg-backtick-word", "break `echo 1` & wait"),
 	("bg-assign-cmdsub-word", "v=$(:) break & wait"),
 	("bg-cmdsub-break-inside", "echo \"[$(break; echo s)]\" & wait"),
+	// Two substitution bodies before the command's op: each is skipped.
+	("element-two-blocks-word", ": | v=$(:) w=`:` break $(:) | :"),
 ];
 
 /// The fork shapes only bash runs.
@@ -253,8 +255,54 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("posix-alone", "set -o posix; break"),
 	("element-procsub-word", ": | x=<(:) break"),
 	("bg-procsub-word", "x=<(:) break & wait"),
-	// The element's `$BASH_SUBSHELL` is its parent's (a simple command).
+	// `$BASH_SUBSHELL`: a builtin or external element's words expand at its
+	// parent's level; a builtin or function element then runs one level
+	// down (a function, `eval`, `.`, a builtin's callback), however its
+	// words hold substitutions. A `( … )` element, a background job and a
+	// command substitution count once.
 	("element-subshell-level-cmdsub-word", "echo $BASH_SUBSHELL $(:) | cat"),
+	("builtin-element-level", "echo $BASH_SUBSHELL | cat"),
+	("function-element-level", "f() { echo $BASH_SUBSHELL; }; f | cat"),
+	("function-element-level-cmdsub-word", "f() { echo $BASH_SUBSHELL; }; f $(:) | cat"),
+	("function-element-level-backtick-word", "f() { echo $BASH_SUBSHELL; }; f `:` | cat"),
+	("function-element-level-assign-cmdsub-word", "f() { echo $BASH_SUBSHELL; }; v=$(:) f | cat"),
+	(
+		"function-element-level-redir-cmdsub-word",
+		"f() { echo $BASH_SUBSHELL; }; f 2>$(echo /dev/null) | cat",
+	),
+	("function-middle-element-level-cmdsub-word", "f() { echo $BASH_SUBSHELL; }; : | f $(:) | cat"),
+	("function-last-element-level-cmdsub-word", "f() { echo $BASH_SUBSHELL; }; : | f $(:)"),
+	(
+		"function-element-level-in-cmdsub",
+		"f() { echo $BASH_SUBSHELL; }; x=$(f $(:) | cat); echo \"x=$x\"",
+	),
+	("function-element-level-words", "f() { echo $1 $BASH_SUBSHELL; }; f $BASH_SUBSHELL | cat"),
+	("function-element-level-nested", "g() { echo $BASH_SUBSHELL; }; f() { g | cat; }; f | cat"),
+	("eval-element-level", "eval 'echo $BASH_SUBSHELL' | cat"),
+	("eval-element-level-cmdsub-word", "eval 'echo $BASH_SUBSHELL' $(:) | cat"),
+	("eval-element-level-assign-cmdsub-word", "v=$(:) eval 'echo $BASH_SUBSHELL' | cat"),
+	("eval-element-level-function", "f() { echo $BASH_SUBSHELL; }; eval f | cat"),
+	("command-eval-element-level-cmdsub-word", "command eval 'echo $BASH_SUBSHELL' $(:) | cat"),
+	("builtin-eval-element-level", "builtin eval 'echo $BASH_SUBSHELL' | cat"),
+	("source-element-level", ". /dev/stdin <<< 'echo $BASH_SUBSHELL' | cat"),
+	("source-element-level-cmdsub-word", ". /dev/stdin $(:) <<< 'echo $BASH_SUBSHELL' | cat"),
+	(
+		"mapfile-callback-element-level",
+		"printf 'a\\n' | mapfile -C 'echo $BASH_SUBSHELL >&2; :' -c 1 x 2>&1 | cat",
+	),
+	("subshell-element-function-level", "f() { echo $BASH_SUBSHELL; }; ( f ) | cat"),
+	("bg-function-level", "f() { echo $BASH_SUBSHELL; }; f & wait"),
+	("bg-builtin-level-cmdsub-word", "echo $BASH_SUBSHELL $(:) & wait"),
+	// A builtin of plain words runs before the stages (its fast path): it
+	// is raised there, once however often its callback runs.
+	(
+		"mapfile-callbacks-element-level",
+		"printf 'a\\nb\\n' | mapfile -C 'echo cb $BASH_SUBSHELL; :' -c 1 x",
+	),
+	(
+		"source-file-element-level",
+		"d=$(mktemp -d); printf 'echo $BASH_SUBSHELL\\n' > \"$d/s\"; . \"$d/s\" | cat; rm -r \"$d\"",
+	),
 ];
 
 /// The fork shapes only zsh runs.
