@@ -25,6 +25,20 @@
 //! must read more pipe input and has none queued (`wait_for_receiver`), at the loop
 //! checks once the lists are complete, and at the end.
 //!
+//! Upstream's order is not fixed where a message of the next file list can overtake
+//! the data of the list before it. Its generator must read each incremental list from
+//! its receiver, a separate process, and the output pass of that read writes the
+//! pending messages and keeps the buffered data back when the list is already
+//! waiting, and writes both when it is not. A `--delete` run's
+//! `*deleting   sub/extra2`, or a `--safe-links` run's `ignoring unsafe symlink`
+//! for a `sub/` entry, then comes either before the top-level items or after them,
+//! and the summary's byte counts differ by the 4-byte frame header between the two.
+//! On a Linux host upstream's receiver forwarded the list first in 85 of 100 runs;
+//! under gVisor, where the receiver process starts late, it did so in few. This
+//! generator always takes the first side (`await_list`), so its output does not depend
+//! on how this process's threads are scheduled. A test can take the other side
+//! (`receiver_starting_late`).
+//!
 //! The generator keeps its per-entry state (the mode `dest_mode` computes without
 //! `-p`, FLAG_FILE_SENT / FLAG_MISSING_DIR / FLAG_DIR_CREATED, hard-link progress) in a
 //! private overlay: the shared [`Flists`] entries stay exactly as received, because
@@ -169,6 +183,38 @@ pub(crate) fn sib_pipe(flists: &Flists, inc_recurse: bool) -> (Arc<SibOut>, SibI
 	let out = Arc::new(SibOut { outbox: Mutex::new(Outbox::default()), tx });
 	let sib_in = SibIn { rx, segments: flists.len(), eof: !inc_recurse || flists.is_eof() };
 	(out, sib_in)
+}
+
+#[cfg(test)]
+thread_local! {
+	/// What [`receiver_starting_late`] set for the rsyncs this thread starts.
+	static RECEIVER_STARTS_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: runs `f`, and every rsync it starts on this thread (the builtin's
+/// entry, which hands the setting to its server half) has, when `late`, its
+/// receiver start late: the generator reads nothing its receiver forwards until its
+/// first wait for that input has written its output with nothing waiting (upstream:
+/// the receiver process first runs after the generator's first `perform_io` for its
+/// pipe). After that first wait the generator runs as it always does.
+#[cfg(test)]
+pub(crate) fn receiver_starting_late<T>(late: bool, f: impl FnOnce() -> T) -> T {
+	struct Reset(bool);
+	impl Drop for Reset {
+		fn drop(&mut self) {
+			RECEIVER_STARTS_LATE.set(self.0);
+		}
+	}
+	let _reset = Reset(RECEIVER_STARTS_LATE.replace(late));
+	f()
+}
+
+/// Tests only: `opts` with the setting [`receiver_starting_late`] made for this
+/// thread.
+#[cfg(test)]
+pub(crate) fn with_test_receiver_timing(mut opts: Box<Options>) -> Box<Options> {
+	opts.receiver_starts_late = RECEIVER_STARTS_LATE.get();
+	opts
 }
 
 /// Every local tree the receiving side writes to.
@@ -346,6 +392,10 @@ struct Gen<'a> {
 	/// Pipe input the receiver delivered while the generator awaited a file list
 	/// without an output pass (see `await_list`); unread until the next refill.
 	delivered: VecDeque<Sibling>,
+	/// Tests only (`Options::receiver_starts_late`): until the first refill's output
+	/// pass, the receiver has forwarded nothing, whatever it delivered.
+	#[cfg(test)]
+	receiver_late: bool,
 	/// File-list segments the generator has read (upstream: lists it received).
 	seen_segments: usize,
 	/// The generator read NDX_FLIST_EOF (upstream `flist_eof`).
@@ -535,6 +585,8 @@ impl<'a> Gen<'a> {
 			sib: &sib.rx,
 			inbox: VecDeque::new(),
 			delivered: VecDeque::new(),
+			#[cfg(test)]
+			receiver_late: opts.receiver_starts_late,
 			seen_segments: sib.segments,
 			seen_eof: sib.eof,
 			ndx_out,
@@ -797,8 +849,25 @@ impl<'a> Gen<'a> {
 		Ok(())
 	}
 
-	/// Moves every batch the receiver has delivered into the inbox (no waiting).
+	/// Tests only: a receiver that starts late has forwarded nothing yet (see
+	/// `receiver_starting_late`).
+	#[cfg(test)]
+	fn receiver_late(&self) -> bool {
+		self.receiver_late
+	}
+
+	/// Outside tests the receiver never starts late.
+	#[cfg(not(test))]
+	fn receiver_late(&self) -> bool {
+		false
+	}
+
+	/// Moves every batch the receiver has delivered into the inbox (no waiting); none
+	/// while a receiver that starts late has forwarded nothing yet.
 	fn pull_input(&mut self) {
+		if self.receiver_late() {
+			return;
+		}
 		self.inbox.append(&mut self.delivered);
 		while let Ok(batch) = self.sib.try_recv() {
 			self.inbox.extend(batch);
@@ -867,8 +936,13 @@ impl<'a> Gen<'a> {
 	/// was already waiting, the data stays buffered. Then every waiting batch is read,
 	/// blocking (with keepalives) until one arrives.
 	fn refill(&mut self) -> Result<(), RsyncError> {
-		let ready = !self.delivered.is_empty() || !self.sib.is_empty();
+		// A receiver that starts late has forwarded nothing before this pass.
+		let ready = !self.receiver_late() && (!self.delivered.is_empty() || !self.sib.is_empty());
 		self.out.output_pass(ready).map_err(RsyncError::from_stream)?;
+		#[cfg(test)]
+		{
+			self.receiver_late = false;
+		}
 		self.pull_input();
 		// Output keeps going out while later passes wait for input; what is still
 		// unwritten when input arrives waits for the next pass, as upstream's.
@@ -916,9 +990,11 @@ impl<'a> Gen<'a> {
 	/// starts, and its receiver forwards them while the generator works through the
 	/// list before; the refill then finds them waiting and keeps the data back after
 	/// the messages, however this process's threads are scheduled. A pass that writes
-	/// regardless is not delayed.
+	/// regardless is not delayed, nor is the first refill of a receiver that starts late
+	/// (which finds nothing waiting).
 	fn await_list(&mut self) -> Result<(), RsyncError> {
-		if !self.inbox.is_empty()
+		if self.receiver_late()
+			|| !self.inbox.is_empty()
 			|| !self.delivered.is_empty()
 			|| !self.out.pass_depends_on_input()
 			|| !self.next_list_unconditional()
