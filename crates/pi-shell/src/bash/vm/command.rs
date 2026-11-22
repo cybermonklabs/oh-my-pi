@@ -4456,10 +4456,21 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// (`wait_for_background_pids`): it reports that one, and drops a
 			// later one that ended meanwhile unreported, as it drops one that
 			// ended while it wrote a notice (still queued here: the write, not
-			// the job, woke this pass).
+			// the job, woke this pass); but not the job `$!` names, which
+			// `mark_dead_jobs_as_notified` keeps for the next line's notice
+			// (`jobs.c:5196`). The list holds the jobs running when `wait`
+			// began, `$!` last: it ends in the pass that keeps it.
+			let last = vp.last_bg;
+			let mut kept = None;
 			let mut first = st(vp).writes.is_empty();
 			while let Some(&v) = st(vp).wait_for.first() {
-				if k.proc_collect(cx.store, v).is_some() || kept_status(vp, v).is_some() {
+				let keep = !first
+					&& last.is(v)
+					&& (matches!(k.proc_state(cx.store, v), Some(super::ProcState::Exited(_)))
+						|| kept_status(vp, v).is_some());
+				if keep {
+					kept = Some(v);
+				} else if k.proc_collect(cx.store, v).is_some() || kept_status(vp, v).is_some() {
 					if first {
 						waited_notice(k, vp, cx, v, line);
 					}
@@ -4477,18 +4488,22 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			// bash: `wait` forgets every finished job, except the one `$!`
 			// names when it finished before the wait (POSIX keeps the last
-			// async status until it is waited for or reported). A job this
-			// shell just killed is still being reaped when bash's `wait`
-			// looks, so that wait collects it (jobs.tests).
-			let last = vp.last_bg;
+			// async status until it is waited for or reported) or while it
+			// waited for another. A job this shell just killed is still being
+			// reaped when bash's `wait` looks, so that wait collects it
+			// (jobs.tests).
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
 				.filter(|j| match j.state {
 					JobState::Done(status) => {
 						!last.is(j.vpid)
-							|| status > 128
-							|| !matches!(k.proc_state(cx.store, j.vpid), Some(super::ProcState::Exited(_)))
+							|| (kept != Some(j.vpid)
+								&& (status > 128
+									|| !matches!(
+										k.proc_state(cx.store, j.vpid),
+										Some(super::ProcState::Exited(_))
+									)))
 					},
 					_ => false,
 				})
@@ -4630,7 +4645,9 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				let end = super::killed::killed(k, cx, vp, op, pid, sig, in_place);
 				// bash ran it with `exec`: its process is the command's. In a
 				// subshell zsh ran in place of itself, that process is the
-				// root's too ([`super::proc::VprocZsh::died_of`]).
+				// root's too ([`super::proc::VprocZsh::died_of`]); a bash
+				// subshell's process dies of the signal, which its parent
+				// reports ([`super::killed::subshell_ended`]).
 				if end.no_fork {
 					let signal = i32::from(sig.number(platform));
 					match run {
@@ -4638,6 +4655,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 							k.exec_signals.insert(run, signal);
 						},
 						_ if vp.in_place() => vp.zsh_state().died_of = Some(signal),
+						_ if vp.parent.is_some() => k.deaths.push((vp.vpid, sig)),
 						_ => {},
 					}
 				}

@@ -14,7 +14,10 @@
 //! other signal prints `NAME: line N: `, the pid, the description padded so
 //! and the command as bash prints it. bash writes it to its own standard
 //! error, never through the command's redirections, and names the line it
-//! has reached when it waits. A background job that such another signal
+//! has reached when it waits; a subshell, an asynchronous one or a
+//! pipeline's stage reports its own foreground commands, and a foreground
+//! subshell a signal killed is reported as a command ([`subshell_ended`]).
+//! A background job that such another signal
 //! killed gets that long notice, with `  (wd: DIR)` when the shell's
 //! directory changed since the job started, at these points of bash 5.3.20
 //! (each a `notify_and_cleanup` call), and only these:
@@ -40,10 +43,10 @@
 //! and an `INT` trap bash runs as the forked foreground job it waited for
 //! ends ([`Vproc::jobs_frozen`]); a finished job stays in the table then.
 //! `TERM` and a trapped signal there say nothing. A posix `-c` shell prints
-//! neither notice. No job notice comes from a command or process
-//! substitution's own process (one comes from a `( … )`, `&` or pipeline
-//! stage forked from it), nor from a posix shell's fork of a substitution
-//! ([`Comsub`]). zsh prints nothing in any of these cases.
+//! neither notice. No notice comes from a command or process substitution's
+//! own process (one comes from a `( … )`, `&` or pipeline stage forked from
+//! it), nor from a posix shell's fork of a substitution ([`Comsub`]). zsh
+//! prints nothing in any of these cases.
 
 use bstr::BString;
 use strum::IntoEnumIterator as _;
@@ -99,26 +102,61 @@ pub(super) fn killed(
 	if in_place {
 		return Killed { notice: None, no_fork: true };
 	}
-	if nested::in_subshell(cx.store, vp)
-		|| misc_is(cx, vp, MiscKey::Interactive, b"1")
-		|| vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
-	{
-		return quiet;
+	// bash runs a subshell's last simple command with `exec` and no fork
+	// (`execute_in_subshell`'s `CMD_NO_FORK`): the subshell's process dies
+	// of the signal, and its parent reports the subshell ([`subshell_ended`]).
+	if subshell_tail(k, cx, vp, op, sig) {
+		return Killed { notice: None, no_fork: true };
 	}
-	let c_string = misc_is(cx, vp, MiscKey::RunOrigin, b"c");
-	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
-	if vp.mode.dialect() != Dialect::Bash
-		|| (c_string && posix)
-		|| matches!(sig, Signal::Int | Signal::Pipe)
-	{
+	// A subshell whose process is the external (`cmd &`, `( cmd )`, a
+	// stage): the external's end is the subshell's, which its parent
+	// reports.
+	if vp.parent.is_some() && super::transparent(vp, false) == Some(true) {
 		return quiet;
 	}
 	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
 		return quiet;
 	};
+	Killed { notice: notice(k, cx, vp, &unit, op, pid, sig).map(BString::from), no_fork: false }
+}
+
+/// The notice of the foreground command of `op` in `unit`, process `pid`,
+/// that `sig` killed in `vp` (bash `notify_of_job_status` for a foreground
+/// job): `TERM` and a trapped signal print the description and the command,
+/// any other signal but `INT` and `PIPE` the long notice ([`long_notice`]).
+/// From any bash process, a subshell, an asynchronous one or a pipeline's
+/// stage too (bash 5.3.20: `( sh -c 'kill -KILL $$'; echo after )`), on its
+/// own standard error, but as for a background job ([`reports_jobs`]) not
+/// from a command or process substitution's own process, nor in posix mode
+/// from a `-c` shell or a fork of a substitution (`startup_state` 2). None
+/// either in an interactive shell, for the stage a pipeline runs in the
+/// shell itself, and in zsh.
+fn notice(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	unit: &Unit,
+	op: Op,
+	pid: u32,
+	sig: Signal,
+) -> Option<Vec<u8>> {
+	if misc_is(cx, vp, MiscKey::Interactive, b"1")
+		|| vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
+		|| vp.jobs.comsub == Comsub::Own
+	{
+		return None;
+	}
+	let c_string = misc_is(cx, vp, MiscKey::RunOrigin, b"c");
+	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	if vp.mode.dialect() != Dialect::Bash
+		|| (posix && (c_string || vp.jobs.comsub == Comsub::Fork))
+		|| matches!(sig, Signal::Int | Signal::Pipe)
+	{
+		return None;
+	}
 	let desc = sig.description(k.engine.config().platform);
-	let text = command_text(k, cx, vp, &unit, op);
-	let bytes = if sig == Signal::Term || trapped(cx, vp, sig) {
+	let text = command_text(k, cx, vp, unit, op);
+	Some(if sig == Signal::Term || trapped(cx, vp, sig) {
 		// `print_pipeline` of the job, `JLIST_STANDARD`.
 		let mut bytes = format!("{desc}{:w$}", "", w = padding(&desc)).into_bytes();
 		bytes.extend_from_slice(&text);
@@ -126,8 +164,68 @@ pub(super) fn killed(
 		bytes
 	} else {
 		long_notice(k, cx, vp, wait_line(vp, op.node), pid, &desc, &text)
+	})
+}
+
+/// Whether bash runs the command of `op`, an external a subshell `vp`
+/// starts, with `exec` in the subshell's process: its last simple command
+/// ([`Unit::tails`]) at the subshell's top level, while no trap that counts
+/// is set ([`counts_a_trap`]).
+fn subshell_tail(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op, sig: Signal) -> bool {
+	let [f] = vp.frames.as_slice() else {
+		return false;
 	};
-	Killed { notice: Some(BString::from(bytes)), no_fork: false }
+	// `INT` and `PIPE` print no notice, and the held `INT` keeps its rules.
+	!matches!(sig, Signal::Int | Signal::Pipe)
+		&& vp.mode.dialect() == Dialect::Bash
+		&& vp.parent.is_some()
+		&& vp.jobs.comsub != Comsub::Own
+		&& f.kind == FrameKind::Subshell
+		&& f
+			.unit
+			.as_ref()
+			.is_some_and(|u| u.tails.binary_search(&op.node).is_ok())
+		&& !counts_a_trap(k, cx, vp, true).unwrap_or(true)
+}
+
+/// A foreground subshell (`( … )`) of `vp`, vproc `child`, died of `sig`:
+/// bash reports it as it reports a foreground command ([`notice`]), naming
+/// the subshell's text, from a subshell too (bash 5.3.20:
+/// `( ( kill -QUIT $BASHPID ); : )` prints the inner one's notice); queued
+/// for the shell's own standard error. A pipeline's stage and a
+/// substitution are no such child, and a substitution's own process says
+/// nothing.
+pub(super) fn subshell_ended(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	child: Vpid,
+	sig: Signal,
+) {
+	let Some(f) = vp.frames.last() else {
+		return;
+	};
+	let only = f.scratch.as_ref().is_some_and(|s| {
+		s.inline.is_none() && matches!(s.children.as_slice(), [(v, _)] if *v == child)
+	});
+	let (true, Some(unit)) = (only, f.unit.clone()) else {
+		return;
+	};
+	let Some(&op) = unit.ops.get(f.pc as usize) else {
+		return;
+	};
+	// The `Spawn` of a `( … )`, not of a pipeline whose stage it was.
+	if unit
+		.spawns
+		.get(op.a as usize)
+		.is_none_or(|s| s.kind != crate::bash::ir::SpawnKind::Subshell)
+	{
+		return;
+	}
+	if let Some(bytes) = notice(k, cx, vp, &unit, op, child.0, sig) {
+		vp.out
+			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	}
 }
 
 /// bash's long notice: `NAME: line N: ` at script line `line`, then
@@ -443,6 +541,28 @@ fn wait_line(vp: &Vproc, node: u32) -> u32 {
 			let at = pos.0 as usize;
 			let ended_line = at >= src.len() || (at > 0 && src.get(at - 1) == Some(&b'\n'));
 			(pos.1 - u32::from(ended_line)).saturating_sub(f.line_shift)
+		},
+		// A subshell keeps the line its parent's parser reached when it
+		// forked: the last line of its outermost `( … )`.
+		FrameKind::Subshell => {
+			let Some(n) = u.nodes.get(node as usize) else {
+				return exec::line_of(vp, node);
+			};
+			let outer = u
+				.nodes
+				.iter()
+				.filter(|m| m.kind == NodeKind::Subshell && m.lo <= n.lo && n.hi <= m.hi)
+				.max_by_key(|m| m.hi - m.lo);
+			let Some(m) = outer else {
+				return exec::line_of(vp, node);
+			};
+			#[expect(clippy::naive_bytecount, reason = "a short command's text")]
+			let newlines = u
+				.source
+				.get(m.lo as usize..m.hi as usize)
+				.map_or(0, |s| s.iter().filter(|&&b| b == b'\n').count());
+			(u.line + m.line + u32::try_from(newlines).unwrap_or(u32::MAX))
+				.saturating_sub(f.line_shift)
 		},
 		_ => exec::line_of(vp, node),
 	}

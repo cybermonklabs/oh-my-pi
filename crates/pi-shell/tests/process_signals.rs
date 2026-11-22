@@ -790,18 +790,21 @@ fn bash_keeps_finished_jobs_while_the_job_list_is_frozen() {
 	let mut wrong = Vec::new();
 	for (script, out) in rows {
 		let script = format!("exec 2>&1; {script}");
-		let run = |program: &OsStr| {
-			Run::script(program, "bash", &script)
-				.spawn()
-				.end_within(EVENT_LIMIT, &script)
+		let start = |program: &OsStr| Run::script(program, "bash", &script).spawn();
+		let ours = match start(OsStr::new(env!("CARGO_BIN_EXE_obash"))).ended_within(EVENT_LIMIT) {
+			Ok(ours) => ours,
+			Err(killed) => {
+				wrong.push(format!("{script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"));
+				continue;
+			},
 		};
-		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
 		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
 		if got != (out.clone(), Some(Exit(0))) {
 			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
 		}
 		if let Some(bash) = real_bash_golden() {
-			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "{script:?}");
+			let theirs = start(bash.as_os_str()).end_within(EVENT_LIMIT, &script);
+			assert_eq!(masked(&ours), masked(&theirs), "{script:?}");
 		}
 	}
 	// Posix mode in a script file, which reports: at the trap's first line.
@@ -815,18 +818,238 @@ fn bash_keeps_finished_jobs_while_the_job_list_is_frozen() {
 		(posix("exit 200"), "chld\nst=145\nnext\n".to_owned()),
 	] {
 		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
-		let run = |program: &OsStr| {
-			Run::new(program, "bash", &[&path])
-				.spawn()
-				.end_within(EVENT_LIMIT, &script)
+		let start = |program: &OsStr| Run::new(program, "bash", &[&path]).spawn();
+		let ours = match start(OsStr::new(env!("CARGO_BIN_EXE_obash"))).ended_within(EVENT_LIMIT) {
+			Ok(ours) => ours,
+			Err(killed) => {
+				wrong
+					.push(format!("file {script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"));
+				continue;
+			},
 		};
-		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
 		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
 		if got != (out.clone(), Some(Exit(0))) {
 			wrong.push(format!("file {script:?}\n  got:  {got:?}\n  want: {out:?}"));
 		}
 		if let Some(bash) = real_bash_golden() {
-			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "file: {script:?}");
+			let theirs = start(bash.as_os_str()).end_within(EVENT_LIMIT, &script);
+			assert_eq!(masked(&ours), masked(&theirs), "file: {script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Three older defects, against bash 5.3.20 (checked-in goldens, compared
+/// live only with a bash 5.3 or later, [`real_bash_golden`]; each script
+/// starts with `exec 2>&1`; a row whose shell is still running after
+/// [`EVENT_LIMIT`] fails):
+/// - a `CHLD` trap that starts children of its own (a `$( )`, a `<( )`, a
+///   program) runs once: bash queues the trap for a child reaped while the trap
+///   runs and drops it, warning `run_pending_traps: bad value in trap_list[17]:
+///   0x…`, a bash defect obash does not copy (the live comparison drops that
+///   line); outside the trap a substitution's child runs it as any child does;
+/// - a plain `wait` keeps the job `$!` names when it ended while `wait` waited
+///   for another (`mark_dead_jobs_as_notified`, `jobs.c:5196`), and the next
+///   line reports it: the other job ends only once the shell has reaped `$!`,
+///   which ends once the shell blocks in `wait`;
+/// - a subshell's own process ignores `QUIT` again after its `trap - QUIT`
+///   (`restore_default_signal`), in the foreground and with `&`;
+/// - a foreground subshell a signal killed gets the notice a foreground command
+///   gets, naming the subshell; bash runs a subshell's last simple command with
+///   `exec`, so one that dies takes the subshell with it. A pipeline's stage
+///   and a command substitution say nothing;
+/// - an external a signal killed inside a subshell, not its last command: the
+///   subshell reports it, as bash 5.3.20 does from any of its processes but a
+///   substitution's own process and a posix `startup_state` 2 one (a posix `-c`
+///   shell, or a fork of a substitution); a posix script file's subshell
+///   reports.
+#[test]
+fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() {
+	/// Externals that kill themselves.
+	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
+	const KK: &str = "/bin/sh -c 'kill -KILL $$'";
+	const T: &str = "/bin/sh -c 'kill -TERM $$'";
+	let until = KILLER.trim_end_matches("; kill -KILL $$");
+	let last = format!("/bin/sh -c '{until}; echo $$ > \"$1\"; kill -KILL $$' sh \"$f\"");
+	let first = "/bin/sh -c 'until [ -s \"$1\" ] && ! ps -p \"$(cat \"$1\")\" >/dev/null 2>&1; do \
+	             sleep 0.01; done' sh \"$f\"";
+	let notice = String::from_utf8(long_notice(2, libc::SIGKILL, last.as_bytes())).expect("ASCII");
+	let sub =
+		|sig, text: &str| String::from_utf8(long_notice(1, sig, text.as_bytes())).expect("ASCII");
+	let rows: Vec<(String, String)> = vec![
+		(
+			"trap 'echo chld; x=$(echo in)' CHLD; /bin/sh -c : & wait; echo done".into(),
+			"chld\ndone\n".into(),
+		),
+		(
+			"trap 'echo chld; cat <(echo in) >/dev/null' CHLD; /bin/sh -c : & wait; echo done".into(),
+			"chld\ndone\n".into(),
+		),
+		(
+			"trap 'echo chld; /bin/true' CHLD; /bin/sh -c : & wait; echo done".into(),
+			"chld\ndone\n".into(),
+		),
+		("trap 'echo chld' CHLD; x=$(echo in); echo done".into(), "chld\ndone\n".into()),
+		(
+			"trap 'echo chld' CHLD; cat <(echo in) >/dev/null; echo done".into(),
+			"chld\nchld\ndone\n".into(),
+		),
+		(
+			format!("f=$(mktemp); {first} & {last} & wait; echo st=$?\necho next; rm -f \"$f\""),
+			format!("st=0\n{notice}next\n"),
+		),
+		(
+			"( trap - QUIT; kill -QUIT $BASHPID; echo alive ); echo st=$?".into(),
+			"alive\nst=0\n".into(),
+		),
+		(
+			"( trap - QUIT; kill -QUIT $BASHPID; echo alive ) & wait; echo st=$?".into(),
+			"alive\nst=0\n".into(),
+		),
+		(
+			"( trap '' QUIT; trap - QUIT; kill -QUIT $BASHPID; echo alive ); echo st=$?".into(),
+			"alive\nst=0\n".into(),
+		),
+		// The notice of a foreground subshell a signal killed: its own
+		// process, or its last command, which bash runs with `exec`.
+		(
+			"( kill -QUIT $BASHPID; echo alive ); echo st=$?".into(),
+			format!("{}st=131\n", sub(libc::SIGQUIT, "( kill -QUIT $BASHPID; echo alive )")),
+		),
+		(
+			"( trap - QUIT; /bin/sh -c 'kill -QUIT $$' ); echo st=$?".into(),
+			format!("{}st=131\n", sub(libc::SIGQUIT, "( trap - QUIT; /bin/sh -c 'kill -QUIT $$' )")),
+		),
+		(
+			"( /bin/sh -c 'kill -QUIT $$' ); echo st=$?".into(),
+			format!("{}st=131\n", sub(libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' )")),
+		),
+		(
+			"( kill -KILL $BASHPID; echo alive ); echo st=$?".into(),
+			format!("{}st=137\n", sub(libc::SIGKILL, "( kill -KILL $BASHPID; echo alive )")),
+		),
+		(
+			"( kill -TERM $BASHPID; echo alive ); echo st=$?".into(),
+			format!("{:<27}( kill -TERM $BASHPID; echo alive )\nst=143\n", desc(libc::SIGTERM)),
+		),
+		(
+			"( ( kill -QUIT $BASHPID ); echo inner=$? ); echo st=$?".into(),
+			format!("{}inner=131\nst=0\n", sub(libc::SIGQUIT, "( kill -QUIT $BASHPID )")),
+		),
+		("( kill -QUIT $BASHPID ) | cat; echo st=$?".into(), "st=0\n".into()),
+		("x=$( kill -QUIT $BASHPID ); echo st=$?".into(), "st=131\n".into()),
+		// An external a signal killed inside a subshell, not its last
+		// command: the subshell reports it, from a pipeline's stage and an
+		// asynchronous subshell too; a substitution's own process and a
+		// posix `-c` shell's subshell say nothing.
+		(
+			format!("( {Q}; echo after ); echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGQUIT, Q)),
+		),
+		(
+			format!("( {KK}; echo after ); echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGKILL, KK)),
+		),
+		(
+			format!("( {T}; echo after ); echo st=$?"),
+			format!("{:<27}{T}\nafter\nst=0\n", desc(libc::SIGTERM)),
+		),
+		(
+			"( trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo after ); echo st=$?".into(),
+			format!("{:<27}/bin/sh -c 'kill -USR1 $$'\nafter\nst=0\n", desc(libc::SIGUSR1)),
+		),
+		(
+			format!("( ( {Q}; echo after ) ); echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGQUIT, Q)),
+		),
+		(
+			format!("( {Q}; echo after ) | cat; echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGQUIT, Q)),
+		),
+		(
+			format!("{{ {KK}; echo after; }} & wait; echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGKILL, KK)),
+		),
+		(
+			format!("( {KK}; echo after ) & wait; echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGKILL, KK)),
+		),
+		(format!("x=$( {KK}; echo after ); echo \"x=$x\""), "x=after\n".into()),
+		(
+			format!("x=$( ( {KK}; echo after ) ); echo \"x=$x\""),
+			format!("{}x=after\n", sub(libc::SIGKILL, KK)),
+		),
+		(format!("cat <( {KK}; echo after )"), "after\n".into()),
+		(format!("set -o posix; ( {KK}; echo after ); echo st=$?"), "after\nst=0\n".into()),
+		(format!("set -o posix; x=$( ( {KK}; echo after ) ); echo \"x=$x\""), "x=after\n".into()),
+		(
+			format!("f() {{ {Q}; echo after; }}; ( f ); echo st=$?"),
+			format!("{}after\nst=0\n", sub(libc::SIGQUIT, Q)),
+		),
+		(
+			format!("( {Q}\necho after ); echo st=$?"),
+			format!(
+				"{}after\nst=0\n",
+				String::from_utf8(long_notice(2, libc::SIGQUIT, Q.as_bytes())).expect("ASCII")
+			),
+		),
+	];
+	let without_warning = |o: Outcome| {
+		const WARNING: &[u8] = b"run_pending_traps: bad value in trap_list";
+		let keep = |b: &[u8]| -> Vec<u8> {
+			b.split_inclusive(|&c| c == b'\n')
+				.filter(|l| !l.windows(WARNING.len()).any(|w| w == WARNING))
+				.flatten()
+				.copied()
+				.collect()
+		};
+		let (stdout, stderr) = (keep(&o.stdout), keep(&o.stderr));
+		Outcome { stdout, stderr, ..o }
+	};
+	let mut wrong = Vec::new();
+	for (script, out) in rows {
+		let script = format!("exec 2>&1; {script}");
+		let start = |program: &OsStr| Run::script(program, "bash", &script).spawn();
+		let ours = match start(OsStr::new(env!("CARGO_BIN_EXE_obash"))).ended_within(EVENT_LIMIT) {
+			Ok(ours) => ours,
+			Err(killed) => {
+				wrong.push(format!("{script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"));
+				continue;
+			},
+		};
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			let theirs = start(bash.as_os_str()).end_within(EVENT_LIMIT, &script);
+			assert_eq!(masked(&ours), masked(&without_warning(theirs)), "{script:?}");
+		}
+	}
+	// Posix mode in a script file (`startup_state` 0): its subshell reports,
+	// its fork of a substitution does not.
+	let dir = tempfile::tempdir().expect("a directory for the script");
+	let path = dir.path().join("s.sh");
+	let file = path.display().to_string();
+	for (script, out) in [
+		(
+			format!("set -o posix; ( {KK}; echo after ); echo st=$?"),
+			format!("{file}: line 1: PID {:<27}{KK}\nafter\nst=0\n", desc(libc::SIGKILL)),
+		),
+		(format!("set -o posix; x=$( ( {KK}; echo after ) ); echo \"x=$x\""), "x=after\n".to_owned()),
+	] {
+		fs::write(&path, format!("exec 2>&1; {script}\n")).expect("write the script");
+		let ours = Run::new(env!("CARGO_BIN_EXE_obash"), "bash", &[&path]).go();
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("file {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(
+				masked(&ours),
+				masked(&Run::new(&bash, "bash", &[&path]).go()),
+				"file: {script:?}"
+			);
 		}
 	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));

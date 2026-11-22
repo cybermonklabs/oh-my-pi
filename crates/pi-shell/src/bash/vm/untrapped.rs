@@ -19,7 +19,8 @@
 //! - The signals the root holds ignored while untrapped
 //!   ([`MiscKey::HeldIgnored`]): `QUIT` (bash "in all cases", zsh's
 //!   `init_signals`) and, in zsh, the signals ignored on entry, until a trap
-//!   for one is set or removed ([`release`]).
+//!   for one is set or removed ([`release`]). A bash subshell holds them once
+//!   it ran `trap - SIG` itself.
 //! - zsh's `HUP` handler (`zhandler`: `zexit(SIGHUP)`, status 1 after the EXIT
 //!   trap in effect, at once), interactive or not: caught unless `HUP` was
 //!   ignored on entry (`init_signals`), and again after `trap - HUP`
@@ -153,7 +154,12 @@ fn own(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> Result<Own, Stor
 			return Ok(Own::Ignored);
 		}
 	}
-	if root_process && names_hold(cx.store, vp, MiscKey::HeldIgnored, sig)? {
+	// A bash subshell holds them again once it ran `trap - SIG` itself:
+	// `restore_default_signal` puts the shell's own disposition back (bash
+	// 5.3.20: `( trap - QUIT; kill -QUIT $BASHPID; echo alive )` prints
+	// `alive`); one that did not dies of `QUIT`.
+	let reset = vp.mode.dialect() == Dialect::Bash && vp.own_traps.has(TrapKey::Signal(sig));
+	if (root_process || reset) && names_hold(cx.store, vp, MiscKey::HeldIgnored, sig)? {
 		return Ok(Own::Ignored);
 	}
 	Ok(match vp.mode.dialect() {

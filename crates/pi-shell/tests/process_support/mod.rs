@@ -312,24 +312,32 @@ impl Started {
 	/// process group, with [`Run::own_group`]) with `SIGKILL` and fail,
 	/// naming `what`. For a shell that writes little to its standard
 	/// output and error, which are read once it has ended.
-	pub fn end_within(mut self, limit: Duration, what: &str) -> Outcome {
+	pub fn end_within(self, limit: Duration, what: &str) -> Outcome {
+		self.ended_within(limit).unwrap_or_else(|out| {
+			panic!("{what}: the shell still ran after {limit:?}, killed: {out:?}")
+		})
+	}
+
+	/// As [`Self::end_within`], but a shell still running after `limit` is
+	/// an `Err` of what it wrote before `SIGKILL` killed it, for a test that
+	/// counts it as one failing row among others.
+	pub fn ended_within(mut self, limit: Duration) -> Result<Outcome, Outcome> {
 		let deadline = Instant::now() + limit;
 		while self.child.try_wait().expect("look at the shell").is_none() {
 			if Instant::now() >= deadline {
 				let pid = libc::pid_t::try_from(self.child.id()).expect("a pid");
 				// SAFETY: kill takes integer ids; the child is not reaped yet.
 				unsafe { libc::kill(if self.group { -pid } else { pid }, libc::SIGKILL) };
-				let out = outcome(self.child.wait_with_output().expect("wait for the shell"));
-				panic!("{what}: the shell still ran after {limit:?}, killed: {out:?}");
+				return Err(outcome(self.child.wait_with_output().expect("wait for the shell")));
 			}
 			std::thread::sleep(Duration::from_millis(5));
 		}
-		outcome(
+		Ok(outcome(
 			self
 				.child
 				.wait_with_output()
 				.expect("read the shell's output"),
-		)
+		))
 	}
 }
 

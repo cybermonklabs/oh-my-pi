@@ -2252,6 +2252,13 @@ impl Shell {
 				.k
 				.set_int_note(parent, Some(IntNote::Held(HeldInt::Job { caught })));
 		}
+		// bash reports a foreground subshell that died of a signal; not from
+		// a pipeline's stage, which in bash is the subshell's own process.
+		if let (false, false, Some(sig)) = (background, pipeline, died_of)
+			&& !self.pipeline_stage(parent)
+		{
+			killed::subshell_ended(&mut self.k, cx, &mut self.procs[i], vpid, sig);
+		}
 		jobctl::job_done(&mut self.k, cx, &mut self.procs[i], vpid);
 		owe_chld(&mut self.k, cx, &mut self.procs[i], background);
 	}
@@ -3254,9 +3261,21 @@ pub fn imported_function(k: &Kernel, name: &[u8], value: &[u8]) -> Option<Record
 /// `Exec` for externals `p` ran itself; `background`: the child was one of
 /// `p`'s background jobs. zsh (`update_job`) runs the trap (a `trap` action
 /// or the `TRAPCHLD` function) only for those, not for the foreground job.
+/// bash queues the trap for a child reaped while its `CHLD` trap runs and
+/// then drops it (`run_pending_traps` finds the trap's slot busy and warns
+/// `bad value in trap_list[17]`): the trap runs once, even when it starts
+/// children of its own (a `$( )`, a program).
 pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool) {
 	let zsh = p.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	if zsh && !background {
+		return;
+	}
+	let chld = crate::bash::store::TrapKey::Signal(Signal::Chld);
+	if !zsh
+		&& p.trap_frames != 0
+		&& p.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
+		}) {
 		return;
 	}
 	let key = crate::bash::store::Key::Trap(crate::bash::store::TrapKey::Signal(Signal::Chld));
@@ -3500,7 +3519,7 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 /// only waits for the stages of its pipeline or its `( … )` before it exits
 /// (the job vproc of `a | b &`), and the signal reaches those too
 /// (`children`: a job, label or broadcast target); `None` otherwise.
-fn transparent(p: &Vproc, children: bool) -> Option<bool> {
+pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
 	}
@@ -3527,6 +3546,33 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
 		_ => None,
+	}
+}
+
+impl Shell {
+	/// Whether vproc `v` is a stage its parent's pipeline waits for: in bash
+	/// a `( … )` stage is the subshell's own process.
+	fn pipeline_stage(&self, v: Vpid) -> bool {
+		let Some(g) = self
+			.procs
+			.iter()
+			.find(|p| p.vpid == v)
+			.and_then(|p| p.parent)
+			.and_then(|g| self.procs.iter().find(|q| q.vpid == g))
+		else {
+			return false;
+		};
+		g.frames.iter().any(|f| {
+			f.scratch
+				.as_ref()
+				.is_some_and(|s| s.children.iter().any(|(c, _)| *c == v))
+				&& f.unit.as_ref().is_some_and(|u| {
+					u.ops
+						.get(f.pc as usize)
+						.and_then(|op| u.spawns.get(op.a as usize))
+						.is_some_and(|s| s.kind == ir::SpawnKind::Pipeline)
+				})
+		})
 	}
 }
 
