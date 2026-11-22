@@ -486,6 +486,74 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"trap 'echo t; break' ZERR; f() { return 2; }; for i in 1 2; do echo a$i; f; echo b$i; \
 		 done; echo e:$?",
 	),
+	// `ERR_RETURN` in a trap action ends the action's list, not the function
+	// it interrupted (zsh `dotrapargs` puts `retflag` back), and every loop
+	// in reach of that code ends (`breaks = loops` outlives the trap); in a
+	// DEBUG trap (`noerrexit`) it does nothing; at top level it exits, as
+	// `ERR_EXIT` does (the controls).
+	(
+		"errreturn-trap-in-function",
+		"setopt err_return; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-rest",
+		"setopt err_return; trap 'false; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo \
+		 top:$?",
+	),
+	(
+		"errreturn-trap-calls-function",
+		"setopt err_return; g() { false; echo g; }; trap 'g; echo t' USR1; f() { kill -USR1 $$; \
+		 echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-in-source",
+		"setopt err_return; trap 'false' USR1; . =(print 'kill -USR1 $$; echo s:$?'); echo top:$?",
+	),
+	(
+		"errreturn-trap-in-loop",
+		"setopt err_return; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; echo f$i:$?; \
+		 done; echo after:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-in-loop-caller-loop",
+		"setopt err_return; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; echo f$i; \
+		 done; echo after; }; for o in X Y; do echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-trap-caller-loop",
+		"setopt err_return; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; for o in X Y; do \
+		 echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-trap-own-loop",
+		"setopt err_return; trap 'for j in 1 2; do false; echo t$j; done; echo tend' USR1; f() { \
+		 kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-localloops",
+		"setopt err_return localloops; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; \
+		 echo f$i; done; echo after; }; for o in X Y; do echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-zerr-in-function",
+		"setopt err_return; trap 'false' ZERR; f() { false; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-debug-in-function",
+		"setopt err_return; trap 'false' DEBUG; f() { echo f; }; f; echo top:$?",
+	),
+	("errreturn-debug-top", "setopt err_return; trap 'false' DEBUG; echo x; echo top:$?"),
+	("errreturn-trap-top", "setopt err_return; trap 'false' USR1; kill -USR1 $$; echo top:$?"),
+	("errexit-trap-top", "setopt err_exit; trap 'false' USR1; kill -USR1 $$; echo top:$?"),
+	(
+		"errexit-trap-in-function",
+		"setopt err_exit; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-in-function-then-top",
+		"setopt err_return; trap 'false' USR1; f() { (exit 3); kill -USR1 $$; echo f:$?; }; f; echo \
+		 top:$?",
+	),
 ];
 
 /// The trap shape rows, `trap/x<loops>/<name>`, three at top level, and

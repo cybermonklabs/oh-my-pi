@@ -337,9 +337,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// `set -e` exits on a failed simple command, subshell, pipeline,
 		// compound redirection, `[[ ]]`, `(( ))` or zsh `{ } always { }`;
 		// not on other compound commands, whose status comes from a command
-		// already judged.
+		// already judged. zsh judges nothing again whose code already ran
+		// the ZERR trap (`donetrap`: a call, a pipeline), for `ERR_EXIT` or
+		// `ERR_RETURN` either; a `[[ ]]` or `(( ))` ran it at its own op and
+		// is judged at its `Leave`, in the same `execlist` step.
 		let zsh_unit = unit.mode.dialect() == Dialect::Zsh;
+		let done_trap = zsh_unit
+			&& op.code != Opcode::Leave
+			&& vp.frames.get(fi).is_some_and(|frame| frame.err_reported);
 		let judged = !element
+			&& !done_trap
 			&& (failing || (zsh_unit && vp.status != 0))
 			&& match op.code {
 				Opcode::Exec | Opcode::Spawn | Opcode::CallAnon | Opcode::AlwaysEnd => true,
@@ -479,6 +486,17 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let errexit = errexit_failed
 			&& (errexit_on(k, cx, vp)
 				|| (unit.mode.dialect() == Dialect::Zsh && zsh_errreturn_exits(k, cx, vp)));
+		// zsh `ERR_RETURN`: it ends the innermost function (or `.` file), or
+		// the list of a trap action that runs above it ([`zsh_return_scope`]).
+		let errreturn = !errexit
+			&& errreturn_failed
+			&& unit.mode.dialect() == Dialect::Zsh
+			&& zsh_errreturn(k, cx, vp);
+		let scope = if errreturn {
+			zsh_return_scope(vp)
+		} else {
+			ReturnScope::Code
+		};
 		if failed_command && start_trap(k, vp, cx, TrapKey::Err) {
 			set_trap_line(vp, err_line);
 			for frame in &mut vp.frames[..fi.saturating_add(1)] {
@@ -486,16 +504,31 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 			if errexit {
 				mark_trap_exit(vp);
+			} else if errreturn && matches!(scope, ReturnScope::Code) {
+				// zsh `execlist` runs the ZERR trap, then sets `retflag`: the
+				// return goes on when the trap ends ([`zsh_return`]).
+				mark_return(vp, 0);
 			}
 		} else if errexit {
 			let status = vp.status;
 			exit_shell(k, vp, cx, status);
-		} else if errreturn_failed && unit.mode.dialect() == Dialect::Zsh && zsh_errreturn(k, cx, vp)
-		{
-			// zsh `ERR_RETURN`: a failed command returns from the function
-			// (or `.` file) it runs in.
+		} else if errreturn {
 			let status = vp.status;
-			zsh_return(k, vp, cx, status);
+			match scope {
+				ReturnScope::Code => zsh_return(k, vp, cx, status),
+				ReturnScope::Trap { debug: true, .. } => {},
+				ReturnScope::Trap { at, .. } => {
+					// zsh `dotrapargs`: the trap's list ends (`retflag`, put
+					// back after the trap), and the `breaks = loops` it set
+					// outlives the trap (`breaks += obreaks`): every loop in
+					// reach of the code it interrupted ends too.
+					zsh_end_trap_list(k, vp, cx, at);
+					let loops = zsh_loop_count(vp);
+					if loops > 0 {
+						zsh_break(k, vp, cx, loops, false);
+					}
+				},
+			}
 		}
 	}
 }
@@ -5870,7 +5903,8 @@ fn zsh_errreturn(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 }
 
 /// zsh `execlist`'s `errexit = … || (ERRRETURN && !errreturn)`: `ERR_RETURN`
-/// outside any function or `.` file of a non-interactive shell exits.
+/// outside any function or `.` file of a non-interactive shell exits; not
+/// in a DEBUG trap, which zsh runs under `noerrexit`.
 #[inline(never)]
 fn zsh_errreturn_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	let nested = vp.frames.iter().any(|f| {
@@ -5880,8 +5914,54 @@ fn zsh_errreturn_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		)
 	});
 	!nested
+		&& !matches!(zsh_return_scope(vp), ReturnScope::Trap { debug: true, .. })
 		&& state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Errreturn).unwrap_or(false)
 		&& !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Interactive).unwrap_or(false)
+}
+
+/// What a zsh `return` flag set by `ERR_RETURN` ends ([`zsh_return_scope`]).
+#[derive(Clone, Copy)]
+enum ReturnScope {
+	/// The innermost function, `${ ;}` or `.` file.
+	Code,
+	/// The list of the trap action at frame `at`, which runs above them:
+	/// zsh's `dotrapargs` saves `retflag` and puts it back, so the code the
+	/// trap interrupted goes on. A DEBUG trap (`debug`) runs under
+	/// `noerrexit`: `ERR_RETURN` does nothing there.
+	Trap { at: usize, debug: bool },
+}
+
+/// [`ReturnScope`] at the top of `vp`.
+fn zsh_return_scope(vp: &Vproc) -> ReturnScope {
+	for (at, f) in vp.frames.iter().enumerate().rev() {
+		match f.kind {
+			FrameKind::Function { .. }
+			| FrameKind::NoFork
+			| FrameKind::Script { what: ScriptKind::Source, .. } => return ReturnScope::Code,
+			FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } => {
+				return ReturnScope::Trap { at, debug: key == TrapKey::Debug };
+			},
+			_ => {},
+		}
+	}
+	ReturnScope::Code
+}
+
+/// zsh `ERR_RETURN` in a trap action's own list: the list ends there, and
+/// the trap ends as at its end ([`next_command`]).
+fn zsh_end_trap_list(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, at: usize) {
+	unwind(&mut k.root, cx.store, vp, at + 1);
+	clear_scratch(&mut k.root, cx.store, vp);
+	truncate(vp, Depths::default());
+	let f = top_frame(vp);
+	f.loops.clear();
+	f.unit = None;
+	if let FrameKind::Script { src, pos, aux, .. } = &mut f.kind {
+		*pos = (src.len() as u32, pos.1);
+		if let Some(a) = aux {
+			a.pending = None;
+		}
+	}
 }
 
 /// zsh `TRY_BLOCK_ERROR`: 1 while an always-list runs after an error in its
