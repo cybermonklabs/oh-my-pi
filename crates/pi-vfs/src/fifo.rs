@@ -70,22 +70,25 @@ use crate::file::POLL_SLICE;
 /// helper's open, and maybe given back (`mv p p.b; mv p.a p`) after it. A
 /// drop that waited longer would hold the pinned FIFO's two ends for as long,
 /// and keep the thread that dropped the open. A helper the drop leaves before
-/// its last check, just before `open(2)`, opens nothing. One whose open of
-/// the name reached the pinned FIFO before the name changed is completed by
-/// the drop's peer and closes what it got at once, but the drop, which leaves
-/// it, may return a moment before that close. One past its last check that
-/// waits on B is reached by no release: the drop's peer is of the pinned
-/// FIFO. The helper thread then stays in `open(2)`, holding the pin (and, for
-/// a directory entry, two duplicates of the directory's descriptor: the
-/// name's and its open's), until B's next peer connects; if B's name goes
-/// first (a script that ends with `rm p`), nothing can open B again, and they
-/// stay for the life of the process. A reader peer of B then reads end of
-/// file; a writer peer's writes before the helper's end closes land in B's
-/// buffer and are lost, and its later writes fail with `EPIPE`. That is a
-/// trade-off: a release of B by name would reach that helper, but it would
-/// also complete every other open waiting on B's same end, a FIFO the open
-/// never pinned; keeping a release from reaching a FIFO its open did not
-/// start on is what the pin is for.
+/// its last check, just before `open(2)`, opens nothing. Where
+/// `/proc/self/fd` reaches the pin, one whose open of the name reached the
+/// pinned FIFO before the name changed is completed by the drop's peer and
+/// closes what it got at once, but the drop, which leaves it, may return a
+/// moment before that close. Without it the drop's peer goes by the name
+/// too, and completes such a helper only if it opened before the name
+/// changed; else that helper waits on the pinned FIFO ("What is left",
+/// below). One past its last check that waits on B is reached by no
+/// release: the drop's peer is of the pinned FIFO. The helper thread then
+/// stays in `open(2)`, holding the pin (and, for a directory entry, two
+/// duplicates of the directory's descriptor: the name's and its open's),
+/// until B's next peer connects; if B's name goes first (a script that ends
+/// with `rm p`), nothing can open B again, and they stay for the life of the
+/// process. A reader peer of B then reads end of file; a writer peer's writes
+/// before the helper's end closes land in B's buffer and are lost, and its
+/// later writes fail with `EPIPE`. That is a trade-off: a release of B by
+/// name would reach that helper, but it would also complete every other open
+/// waiting on B's same end, a FIFO the open never pinned; keeping a release
+/// from reaching a FIFO its open did not start on is what the pin is for.
 ///
 /// The helper's open of the name never truncates for a write: the caller
 /// leaves `O_TRUNC` out of it, and the helper applies it itself, under the
@@ -740,12 +743,24 @@ where
 pub(crate) const LEAVE_AFTER: Duration = Duration::from_secs(1);
 
 impl<T> Drop for FifoOpen<T> {
-	/// See [`FifoOpen`]: leaves no end of the FIFO behind once it returns,
-	/// but for a helper it leaves: one whose open waits on another FIFO,
-	/// which it leaves there, and one whose open of the name reached the
-	/// pinned FIFO, which the drop's peer completes and the helper closes a
-	/// moment later. It waits for a helper that opens the name for at most
-	/// [`LEAVE_AFTER`].
+	/// See [`FifoOpen`]. A result the helper stored that was not taken is
+	/// closed, and a helper that has not passed its check of the cancel opens
+	/// nothing. Else the drop opens its peer (`Node::peer`) and waits for the
+	/// helper to end, holding the peer. It leaves the helper instead, and
+	/// returns:
+	/// - when no peer opens: nothing is pinned, the peer's open fails (a FIFO
+	///   this process may not open for both reading and writing), or it reaches
+	///   no pinned FIFO (by name, the name names another file);
+	/// - for a helper that opens the name: when the name names another file once
+	///   the peer is open, and, while it waits, once the name names another file
+	///   or [`LEAVE_AFTER`] has passed.
+	///
+	/// A helper it leaves opens nothing if it has not passed its last check.
+	/// One in `open(2)` of the pinned FIFO is completed by the peer, where
+	/// there is one, and closes what it got, maybe a moment after the drop
+	/// returned; with no peer it waits until the FIFO's other end opens. One
+	/// in `open(2)` of another FIFO waits there. Those helpers aside, the drop
+	/// leaves no end of the FIFO behind once it returns.
 	fn drop(&mut self) {
 		{
 			let mut s = self.shared.slot.lock();
@@ -976,10 +991,12 @@ pub(crate) mod seam {
 
 /// Test hooks, keyed by the path an open's name gives: one run once by its
 /// helper after its last check, just before its open (a stall, or a change
-/// of what the name names); one run once by a drop's peer between its check
-/// that the name names the pinned FIFO and its open of the name; one run once
-/// by a drop that waits for a helper that opens the name, before it waits;
-/// and a record of the helpers that have ended.
+/// of what the name names); one run once by a drop's peer opened by name (no
+/// `/proc/self/fd/N` reaches the pin), between its check that the name names
+/// the pinned FIFO and its open of the name; one run once by a drop that has
+/// its peer and did not leave the helper at once, whichever the helper opens,
+/// before it waits for the helper; and a record of the helpers that have
+/// ended.
 #[cfg(test)]
 pub(crate) mod hooks {
 	use std::path::{Path, PathBuf};
@@ -995,7 +1012,6 @@ pub(crate) mod hooks {
 
 	/// Runs `hook` once, in the next helper of an open given `name`, just
 	/// before its open.
-	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests use it"))]
 	pub(crate) fn before_open(name: &Path, hook: impl FnOnce() + Send + 'static) {
 		BEFORE_OPEN
 			.lock()
@@ -1098,8 +1114,11 @@ mod tests {
 	}
 
 	/// Whether the FIFO at `path` has a reader: a write-only open that does
-	/// not wait fails with ENXIO when it has none.
+	/// not wait fails with ENXIO when it has none. No other test's process
+	/// spawn is under way meanwhile ([`crate::tests::SPAWNS`]), so an end this
+	/// process closed is not seen in a copy.
 	fn has_reader(path: &Path) -> bool {
+		let _no_spawn = crate::tests::SPAWNS.read();
 		match fs::OpenOptions::new()
 			.write(true)
 			.custom_flags(libc::O_NONBLOCK)
@@ -1113,7 +1132,10 @@ mod tests {
 
 	/// Whether the FIFO at `path` has a writer: a reader that does not wait
 	/// reads end of file when it has none, and would block when it has one.
+	/// No other test's process spawn is under way meanwhile, as for
+	/// [`has_reader`].
 	fn has_writer(path: &Path) -> bool {
+		let _no_spawn = crate::tests::SPAWNS.read();
 		let mut reader = fs::OpenOptions::new()
 			.read(true)
 			.custom_flags(libc::O_NONBLOCK)
@@ -1407,10 +1429,20 @@ mod tests {
 	/// helper here waits on another FIFO B, whose name the pinned FIFO took
 	/// back before the drop (as in the test below), and the hook run when the
 	/// drop starts to wait moves the pinned FIFO's name away. A drop that
-	/// went on waiting would wait out its bound, as B has no reader.
+	/// went on waiting would wait out its bound, as B has no reader. The
+	/// pinned FIFO takes its name back only once the helper is seen waiting in
+	/// `open(2)` of B ([`wait_in_open`]): a helper still on its way there
+	/// would open the pinned FIFO, which the drop's end completes, and the test
+	/// would pass whatever the drop's wait does. Linux only, as only `/proc`
+	/// shows that; without `/proc/self/task` it checks nothing and says so.
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_stops_waiting_for_a_helper_once_the_name_moves_away() {
 		const LIMIT: Duration = Duration::from_secs(10);
+		if !Path::new("/proc/self/task").is_dir() {
+			eprintln!("UNKNOWN: no /proc/self/task shows the helper in open(2); nothing was checked");
+			return;
+		}
 		let (_dir, path) = new_fifo();
 		let (aside, other, gone) =
 			(path.with_extension("a"), path.with_extension("b"), path.with_extension("c"));
@@ -1419,17 +1451,16 @@ mod tests {
 		hooks::before_open(&path, move || {
 			fs::rename(&at, at.with_extension("a")).unwrap();
 			make_fifo(&at);
-			let _ = swapped_tx.send(());
+			let _ = swapped_tx.send(crate::tests::thread_id());
 		});
 		let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false, true));
 		let shared = Arc::new(Shared { slot: Mutex::new(Slot::default()), done: Condvar::new() });
 		let helper = spawn_helper(Arc::clone(&shared), Arc::clone(&node), write_end).unwrap();
 		let opened = FifoOpen { shared: Arc::clone(&shared), node, helper: Some(helper) };
-		swapped
+		let tid = swapped
 			.recv_timeout(LIMIT)
 			.expect("the helper never reached its open");
-		// The helper is in `open(2)` of B, waiting for a reader.
-		thread::sleep(Duration::from_millis(500));
+		wait_in_open(tid, LIMIT);
 		assert!(!shared.slot.lock().exited, "the helper did not wait on B");
 		fs::rename(&path, &other).unwrap();
 		fs::rename(&aside, &path).unwrap();
@@ -1604,13 +1635,31 @@ mod tests {
 		assert_eq!(held, (false, false), "an end of the other FIFO stayed open");
 	}
 
+	/// Waits until the helper thread `tid` is seen waiting in `open(2)`
+	/// ([`crate::tests::waits_in_open`]), for at most `limit`: the event a
+	/// test needs before it changes what the name names under a helper past
+	/// its last check, as a helper still on its way would open what the name
+	/// names after the change. Where `/proc/self/task/<tid>/syscall` is not
+	/// there (gVisor), a sleeping thread counts: the helpers here have nothing
+	/// to sleep on between the hook that hands over `tid` and their open.
+	#[cfg(target_os = "linux")]
+	fn wait_in_open(tid: libc::c_long, limit: Duration) {
+		let start = std::time::Instant::now();
+		while crate::tests::waits_in_open(tid) != Some(true) {
+			assert!(start.elapsed() < limit, "the helper was not seen in open(2) after {limit:?}");
+			thread::sleep(Duration::from_millis(1));
+		}
+	}
+
 	/// The name the probe of the test below swaps: a pin's probe is given
 	/// the pin's `/proc/self/fd/N`, not the name.
+	#[cfg(target_os = "linux")]
 	static SWAPPED: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 	/// The probe of the test below, run by the helper just before its open:
 	/// the pinned FIFO is moved to `<name>.a`, and a new FIFO takes the name,
 	/// so the helper's open of the name waits on the new one.
+	#[cfg(target_os = "linux")]
 	fn swap_in_another_fifo(_: &Path) -> bool {
 		let Some(name) = SWAPPED.lock().clone() else {
 			return false;
@@ -1629,26 +1678,36 @@ mod tests {
 	/// reach the other FIFO, so it leaves the helper there and holds no end of
 	/// the pinned FIFO once it returns. A drop that waited for the helper
 	/// would wait until the other FIFO's reader opens, holding both ends of
-	/// the pinned FIFO. The other FIFO's reader then ends the helper.
+	/// the pinned FIFO. The other FIFO's reader then ends the helper. The name
+	/// is given back only once the helper is seen waiting in `open(2)`
+	/// ([`wait_in_open`]): a helper still on its way there would open the
+	/// pinned FIFO by then, which the drop's end completes, and the test would
+	/// pass with no bound. Linux only, as only `/proc` shows that; without
+	/// `/proc/self/task` it checks nothing and says so.
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_returns_while_its_helper_waits_on_a_fifo_moved_away_from_the_name() {
 		const LIMIT: Duration = Duration::from_secs(10);
+		if !Path::new("/proc/self/task").is_dir() {
+			eprintln!("UNKNOWN: no /proc/self/task shows the helper in open(2); nothing was checked");
+			return;
+		}
 		let (_dir, path) = new_fifo();
 		let (aside, other) = (path.with_extension("a"), path.with_extension("b"));
 		*SWAPPED.lock() = Some(path.clone());
+		let (tid_tx, tid) = std::sync::mpsc::channel();
+		hooks::before_open(&path, move || {
+			let _ = tid_tx.send(crate::tests::thread_id());
+		});
 		let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false, true));
 		let slot = Slot { probe: Some(swap_in_another_fifo), ..Slot::default() };
 		let shared = Arc::new(Shared { slot: Mutex::new(slot), done: Condvar::new() });
 		let helper = spawn_helper(Arc::clone(&shared), Arc::clone(&node), write_end).unwrap();
 		let opened = FifoOpen { shared: Arc::clone(&shared), node, helper: Some(helper) };
-		let start = std::time::Instant::now();
-		while shared.slot.lock().peer_held.is_none() && start.elapsed() < LIMIT {
-			thread::yield_now();
-		}
+		let tid = tid.recv_timeout(LIMIT);
 		let peer_held = shared.slot.lock().peer_held;
 		assert_eq!(peer_held, Some(true), "the helper's probe could not swap the name");
-		// The helper is in `open(2)` of the other FIFO, waiting for a reader.
-		thread::sleep(Duration::from_millis(500));
+		wait_in_open(tid.expect("the helper never reached its open"), LIMIT);
 		assert!(!shared.slot.lock().exited, "the helper did not wait on the other FIFO");
 		fs::rename(&path, &other).unwrap();
 		fs::rename(&aside, &path).unwrap();
