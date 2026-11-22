@@ -4788,7 +4788,9 @@ type SubagentSpecOptions = SubagentSessionSpec["options"];
  * - `shared`: the {@link WarmReviveState}, which references it, when the spawn set it: an object the live process
  *   holds and shares (registries, managers, buses, the parent's tools, context and extensions) or one JSON cannot
  *   hold.
- * - `either`: the entry when JSON keeps it whole (the model only when it can also carry no secret), else the state.
+ * - `either`: the entry when JSON keeps it whole, else the state. The model goes to the entry only when it also can
+ *   carry no secret ({@link modelMayCarrySecret}) and differs from the model registry's model of its provider and id:
+ *   one equal to that in every field (the usual case) stays in the state, as the registry's object.
  * - `live`: neither; each revive or session build takes it from the live process or makes it again.
  */
 type ReviveInputSource = "recorded" | "shared" | "either" | "live";
@@ -4992,8 +4994,8 @@ interface SubagentReviveInputs {
 interface SubagentReviveRecord {
 	/**
 	 * The options {@link RECORDED_SPEC_OPTION_KEYS} names; the output schema, unless the
-	 * {@link WarmReviveState} references it; the model, when it is a copy of the subagent's own that
-	 * JSON keeps whole and that can carry no secret ({@link modelMayCarrySecret}).
+	 * {@link WarmReviveState} references it; the model, when JSON keeps it whole, it can carry no
+	 * secret ({@link modelMayCarrySecret}) and it differs from the model registry's model of its provider and id.
 	 */
 	readonly options: Partial<SubagentSpecOptions>;
 	/** The prompt inputs {@link RECORDED_PROMPT_KEYS} names, and the output schema as the options hold it. */
@@ -5017,7 +5019,8 @@ interface SubagentReviveRecord {
 	readonly pendingCacheCandidate?: string;
 	/**
 	 * The {@link WarmReviveState.generation} of the park that wrote it. A revive pairs the state only with the entry
-	 * of the same generation.
+	 * of the same generation, so never with an entry another state wrote, which a fork copies with the rest of its
+	 * transcript.
 	 */
 	readonly generation: number;
 }
@@ -5083,10 +5086,12 @@ interface WarmReviveState extends SharedSpecOptions {
 	/** Credential settings the subagent's runs wrote, which its {@link SUBAGENT_REVIVE_ENTRY} leaves out. */
 	credentialWrites?: SubagentCredentialWrites;
 	/**
-	 * Generation of the newest {@link SUBAGENT_REVIVE_ENTRY} its parks wrote or tried to write: a park that writes one
-	 * raises it first, and the entry carries it. The model and credential settings here are the last park's, so a
-	 * transcript whose newest entry carries another generation (a write that never reached the file) holds an earlier
-	 * park's inputs, and the revive goes cold rather than pair the two.
+	 * Generation of the newest {@link SUBAGENT_REVIVE_ENTRY} its parks wrote or tried to write: it starts at a random
+	 * integer below 2^52, which another state's start equals with odds of about 2^-52, a park that writes one raises it
+	 * by one first, and the entry carries it. The model and credential settings here are the last park's, so a
+	 * transcript whose newest entry carries another generation holds other inputs: an earlier park's (a write that
+	 * never reached the file) or another subagent's (a seance consult's transcript is a copy of its source's, which can
+	 * be another subagent's), and the revive goes cold rather than pair the two.
 	 */
 	generation: number;
 }
@@ -5163,7 +5168,8 @@ function createWarmReviveState(
 		perCall: spec.perCall,
 		wakeEventBus: wake.eventBus,
 		wakeAgent: jsonKeepsWhole(wake.agent) ? undefined : wake.agent,
-		generation: 0,
+		// A random start: an entry another state wrote carries this state's generation only with odds of about 2^-52.
+		generation: Math.floor(Math.random() * 2 ** 52),
 	});
 }
 
@@ -5236,7 +5242,7 @@ function trackSubagentReviveRecord(
 		// Compared as JSON reads it back: a field this record leaves `undefined` is one the entry lacks.
 		if (Bun.deepEquals(latestSubagentReviveRecord(manager.getEntries()), record)) return;
 		// The entry carries the state's next generation: should it never reach the file (a disk failure the manager
-		// only notes), the next revive finds the older entry's generation and revives cold.
+		// only notes), the next revive finds an older entry's generation, or another state's, and revives cold.
 		state.generation += 1;
 		try {
 			manager.appendCustomEntry(SUBAGENT_REVIVE_ENTRY, { ...record, generation: state.generation });

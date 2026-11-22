@@ -58,6 +58,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { localSession } from "../helpers/local-session";
+import { descriptorsUnder, HAS_PROC_FD } from "../helpers/open-descriptors";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
@@ -76,22 +77,6 @@ function makeTempDir(prefix: string): string {
 	const dir = TempDir.createSync(prefix);
 	tempDirs.push(dir);
 	return dir.path();
-}
-
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
-
-/** Descriptors of this process open on a file under `dir`. */
-function descriptorsUnder(dir: string): string[] {
-	const found: string[] = [];
-	for (const fd of fs.readdirSync("/proc/self/fd")) {
-		try {
-			const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
-			if (target.startsWith(`${dir}${path.sep}`)) found.push(target);
-		} catch {
-			// Closed between the listing and the read.
-		}
-	}
-	return found;
 }
 
 /** Inert shared manager exposing the members a revived subagent reads: its tools and change feed. */
@@ -2149,6 +2134,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		hooks?: ExtensionHooks,
 		toolNames?: string[],
 		keepAlive?: boolean,
+		charter = "charter",
 	): Promise<RecordingSession> {
 		let spawned: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
@@ -2172,7 +2158,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		});
 		const result = await executorModule.runSubprocess({
 			cwd,
-			agent: { name: "task", description: "test", systemPrompt: "charter", source: "bundled" },
+			agent: { name: "task", description: "test", systemPrompt: charter, source: "bundled" },
 			task: "do work",
 			index: 0,
 			id: "prompt-blocks",
@@ -2187,23 +2173,46 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		return spawned;
 	}
 
-	/** Cold-revives the parked transcript the way the Agent Hub does and returns the follow-up's request. */
-	async function reviveAndFollowUp(cwd: string, hooks?: ExtensionHooks): Promise<{ system: string[]; tools: string }> {
-		let revived: RecordingSession | undefined;
+	/** What the next cold revive created: its recording session and the working directory it was given. */
+	interface ColdRevive {
+		recording?: RecordingSession;
+		cwd?: string;
+	}
+
+	/**
+	 * Stubs the next `createAgentSession` call as a cold revive: a recording session whose prompt is the SDK's
+	 * subagent prompt builder over a fresh default block. Read the result after the revive.
+	 */
+	function stubColdRevive(hooks?: ExtensionHooks): ColdRevive {
+		const revive: ColdRevive = {};
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
+			revive.cwd = options!.cwd;
 			const build = options!.systemPrompt;
 			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
 			// The SDK hands every rebuild's fresh default prompt to this builder.
 			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
-			revived = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }], hooks);
-			return { session: revived.session } as CreateAgentSessionResult;
+			const recording = createRecordingSession(
+				options!.sessionManager!,
+				buildPrompt,
+				[{ content: ["follow-up"] }],
+				hooks,
+			);
+			revive.recording = recording;
+			return { session: recording.session } as CreateAgentSessionResult;
 		});
+		return revive;
+	}
+
+	/** Cold-revives the parked transcript the way the Agent Hub does and returns the follow-up's request. */
+	async function reviveAndFollowUp(cwd: string, hooks?: ExtensionHooks): Promise<{ system: string[]; tools: string }> {
+		const revive = stubColdRevive(hooks);
 		const ref = { ...createRef(path.join(cwd, "prompt-blocks.jsonl")), id: "prompt-blocks" };
 		const reviver = await createFactory(cwd)(ref);
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		const session = localSession(await reviver(ref));
 		await session.prompt("follow-up");
 		await session.waitForIdle();
+		const revived = revive.recording;
 		if (!revived) throw new Error("Expected the revive to create a session");
 		return { system: revived.requests[0]!, tools: revived.toolRequests[0]! };
 	}
@@ -2533,15 +2542,9 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(unrecorded).not.toBe(recorded);
 		await Bun.write(sessionFile, unrecorded);
 
-		let cold: RecordingSession | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			const build = options!.systemPrompt;
-			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
-			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
-			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
-			return { session: cold.session } as CreateAgentSessionResult;
-		});
+		const revive = stubColdRevive();
 		const live = localSession(await lifecycle.ensureLive("prompt-blocks"));
+		const cold = revive.recording;
 		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
 		await live.prompt("follow-up");
 		await live.waitForIdle();
@@ -2563,16 +2566,10 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(unrecorded).not.toBe(recorded);
 		await Bun.write(sessionFile, unrecorded);
 
-		let cold: RecordingSession | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			const build = options!.systemPrompt;
-			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
-			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
-			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
-			return { session: cold.session } as CreateAgentSessionResult;
-		});
+		const revive = stubColdRevive();
 		// No factory for the process, as under ACP: the call brings its own.
 		const live = localSession(await lifecycle.ensureLive("prompt-blocks", { reviverFactory: createFactory(cwd) }));
+		const cold = revive.recording;
 		if (!cold || live !== cold.session) throw new Error("Expected a revive through the lifecycle");
 		await live.prompt("follow-up");
 		await live.waitForIdle();
@@ -2648,20 +2645,59 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		await lifecycle.park("prompt-blocks");
 		expect(await reviveRecords(cwd)).toHaveLength(1);
 
-		let cold: RecordingSession | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			const build = options!.systemPrompt;
-			if (typeof build !== "function") throw new Error("Expected a system prompt builder");
-			const buildPrompt = (toolNames: string[]) => [build([`fresh default: ${toolNames.join(",")}`])].flat();
-			cold = createRecordingSession(options!.sessionManager!, buildPrompt, [{ content: ["follow-up"] }]);
-			return { session: cold.session } as CreateAgentSessionResult;
-		});
+		const revive = stubColdRevive();
 		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
+		const cold = revive.recording;
 		if (!cold || revived !== cold.session) throw new Error("Expected a revive through the lifecycle");
 		expect(coldRevivers).toBe(1);
 		await revived.prompt("follow-up");
 		await revived.waitForIdle();
 		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+	});
+
+	// If this regresses, a subagent whose transcript holds another subagent's revive inputs (a seance consult's
+	// transcript is a copy of its source's, which can be another subagent's) and whose own park could not write its
+	// inputs comes back as that other subagent: with its prompt, in its working directory.
+	it("revives cold, never from another subagent's revive inputs its transcript holds", async () => {
+		const sourceCwd = makeTempDir("@pi-revive-foreign-source-");
+		await spawn(sourceCwd, subagentPrompt, spawnResponses(), undefined, undefined, undefined, "source charter");
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		const [sourceRecord] = await reviveRecords(sourceCwd);
+		if (!isRecord(sourceRecord)) throw new Error("Expected the source subagent's revive inputs");
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.global().unregister("prompt-blocks");
+
+		const cwd = makeTempDir("@pi-revive-foreign-inputs-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const lifecycle = AgentLifecycleManager.global();
+		const factory = createFactory(cwd);
+		let coldRevivers = 0;
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				coldRevivers++;
+				return factory(ref);
+			},
+			() => 0,
+		);
+		// The source's record, copied in as a fork of its transcript copies it; this subagent's own never lands.
+		const manager = spawned.session.sessionManager;
+		manager.appendCustomEntry("subagent-revive-state", sourceRecord);
+		const append = manager.appendCustomEntry.bind(manager);
+		vi.spyOn(manager, "appendCustomEntry").mockImplementation((customType, data) =>
+			customType === "subagent-revive-state" ? "dropped" : append(customType, data),
+		);
+		await lifecycle.park("prompt-blocks");
+		expect(await reviveRecords(cwd)).toEqual([sourceRecord]);
+
+		const revive = stubColdRevive();
+		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
+		const cold = revive.recording;
+		if (!cold || revived !== cold.session) throw new Error("Expected a revive through the lifecycle");
+		await revived.prompt("follow-up");
+		await revived.waitForIdle();
+		expect(cold.requests[0]).toEqual(spawned.requests.at(-1)!);
+		expect(revive.cwd).toBe(cwd);
+		expect(coldRevivers).toBe(1);
 	});
 
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {

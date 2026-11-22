@@ -20,9 +20,9 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { HAS_PROC_FD, isUnder } from "../helpers/open-descriptors";
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
 /** Words of a body: varied enough that a block of them does not shrink to nothing, as session text does not. */
 const WORDS = ["read", "the", "file", "then", "edit", "line", "test", "passes", "error", "fixed", "build", "again"];
 
@@ -125,15 +125,6 @@ function heldWhole(manager: SessionManager, ids: readonly string[]): string[] {
 		const entry = manager.getEntry(id);
 		return !entry || !isColdEntry(entry);
 	});
-}
-
-/** Whether descriptor `fd` of this process is open on a file under `dir`. */
-function isUnder(fd: number, dir: string): boolean {
-	try {
-		return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${dir}${path.sep}`);
-	} catch {
-		return false;
-	}
 }
 
 /** Let the first `allowed` writes to files under `dir` through, then fail each with ENOSPC, as a disk filling up does. */
