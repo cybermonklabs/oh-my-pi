@@ -7822,14 +7822,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.setActiveToolsByName(toolNames);
 	}
 
-	/** Restores an exact top-level versus `xd://` tool partition. */
+	/**
+	 * Restores an exact top-level versus `xd://` tool partition. With `settingsChange` on a bound prompt the reapply is
+	 * held (see {@link SessionTools.setActiveToolPresentation}).
+	 */
 	setActiveToolPresentation(
 		toolNames: string[],
 		mountedToolNames: string[],
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		options?: SettingsChangeOptions,
 	): Promise<void> {
-		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
+		return this.#tools.setActiveToolPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal, options);
 	}
 
 	/** Restores a non-MCP presentation snapshot plus the MCP selection and non-built-in tools registered after it. */

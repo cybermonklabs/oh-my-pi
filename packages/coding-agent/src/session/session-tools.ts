@@ -4046,6 +4046,10 @@ export class SessionTools {
 	 * `forcePromptRefresh` when an enabled tool's schema or prompt-visible metadata
 	 * changed without changing its name or presentation.
 	 *
+	 * With `settingsChange` on a bound prompt (an extension-sources edit suspended an extension, taking its tool off
+	 * the registry or bringing back the built-in it replaced) the selection follows, but the reapply is held
+	 * ({@link #holdToolSetChange}).
+	 *
 	 * Delegates the actual apply through {@link applyActiveToolsByName} and restores
 	 * the prior runtime selection if that apply throws.
 	 */
@@ -4054,6 +4058,7 @@ export class SessionTools {
 		mountedToolNames: string[],
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		{ settingsChange }: SettingsChangeOptions = {},
 	): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const normalized = normalizeToolNames(toolNames);
@@ -4065,6 +4070,7 @@ export class SessionTools {
 				normalized.includes("write"),
 				forcePromptRefresh,
 				signal,
+				settingsChange,
 			);
 		}, signal);
 	}
@@ -4095,7 +4101,8 @@ export class SessionTools {
 	/**
 	 * Shared body for {@link setActiveToolsByName} and {@link setActiveToolPresentation}:
 	 * pins non-mounted names as the runtime selection (holding `write` back when it is
-	 * transport-only) and applies the set, rolling the selection back if apply throws.
+	 * transport-only) and applies the set, or holds its reapply when `settingsChange` started
+	 * it on a bound prompt ({@link #holdToolSetChange}), rolling the selection back if apply throws.
 	 */
 	async #applyToolPresentation(
 		normalized: string[],
@@ -4103,6 +4110,7 @@ export class SessionTools {
 		writeSelected: boolean,
 		forcePromptRefresh = false,
 		signal?: AbortSignal,
+		settingsChange?: readonly SettingChange[],
 	): Promise<void> {
 		const retainedMountedDevice = [...mounted].some(name => normalized.includes(name));
 		const retainedDeferrableTool = normalized.some(name => this.#toolRegistry.get(name)?.deferrable === true);
@@ -4119,11 +4127,40 @@ export class SessionTools {
 			normalized.filter(name => !mounted.has(name) && !(name === "write" && transportWriteActive)),
 		);
 		try {
+			// A held reapply runs with the held rebuild, under the selection pinned here.
+			if (settingsChange && (await this.#holdToolSetChange(normalized, settingsChange))) return;
 			await this.#applyActiveToolsByName(normalized, forcePromptRefresh, signal);
 		} catch (error) {
 			this.#runtimeSelectedToolNames = previousRuntimeSelectedToolNames;
 			throw error;
 		}
+	}
+
+	/**
+	 * Holds a tool-set apply that `settingsChange` started on a bound prompt, as {@link #holdRosterChange} holds a
+	 * reconcile's: an extension-sources edit that suspends an extension, which takes its tools off the registry or
+	 * brings back the built-in one it replaced, or resumes one. Against the set the hold leaves enabled (the enabled set
+	 * without the tools it disables, with the ones it enables), each tool `toolNames` leaves stays declared and its
+	 * calls are refused, each it adds waits for the rebuild or, disabled by the hold, runs again, and each that stays
+	 * runs the registry's current entry (the built-in brought back) under the declaration the hold keeps for it
+	 * ({@link #declaredAs}). False when nothing is held and the caller applies the set now.
+	 */
+	async #holdToolSetChange(toolNames: readonly string[], settingsChange: readonly SettingChange[]): Promise<boolean> {
+		const held = this.#heldSettingsRebuild;
+		const wasEnabled = new Set(this.getEnabledToolNames().filter(name => !held?.disabledTools.has(name)));
+		for (const name of held?.enabledTools ?? []) wasEnabled.add(name);
+		const names = new Set(toolNames);
+		const removed = [...wasEnabled].filter(name => !names.has(name));
+		const added = toolNames.filter(name => !wasEnabled.has(name)).map(name => ({ name, activate: true }));
+		if (!(await this.#holdRosterChange(settingsChange, wasEnabled, removed, added))) return false;
+		this.#setAgentTools(
+			this.#host.agent.state.tools.map(tool => {
+				const own = this.#declaredOwners.get(tool) ?? tool;
+				const current = this.#toolRegistry.get(own.name);
+				return !current || current === own ? own : this.#wrapToolForAcpPermission(current);
+			}),
+		);
+		return true;
 	}
 
 	/**
