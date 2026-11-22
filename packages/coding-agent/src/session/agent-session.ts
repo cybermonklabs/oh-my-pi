@@ -15008,8 +15008,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
-			// A copy of the path goes on with the conversation, and so do the records of a change its prompt withholds.
-			if (leafId) this.#tools.followTranscriptCopy(previousSessionId);
+			// A copy of the path goes on with the conversation, and so do the records of a change its prompt withholds,
+			// and those of the cut rule's wait and refusal, which sat after the copied path's newest message.
+			if (leafId) {
+				this.#tools.followTranscriptCopy(previousSessionId);
+				this.#maintenance.followBranchCopy();
+			}
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
