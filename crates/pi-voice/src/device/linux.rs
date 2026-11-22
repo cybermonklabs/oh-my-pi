@@ -286,13 +286,16 @@ impl PulseStream {
 			channels: 1,
 		};
 		let mut error = 0;
-		// A named server is the only one libpulse may use; `None` keeps its own lookup.
+		// A named server is the only one libpulse may use; `None` keeps its own
+		// lookup.
 		let server = config.server.map(PulseServer::name);
 		// SAFETY: all pointers reference valid values for the duration of
 		// pa_simple_new.
 		let stream = unsafe {
 			(api.simple_new)(
-				server.as_ref().map_or(ptr::null(), |server| server.as_ptr()),
+				server
+					.as_ref()
+					.map_or(ptr::null(), |server| server.as_ptr()),
 				c"omp".as_ptr(),
 				direction,
 				ptr::null(),
@@ -934,11 +937,12 @@ impl Device {
 					},
 					Err(error) => error,
 				};
-				// A named server is the call's audio: the default ALSA device is someone else's.
+				// A named server is the call's audio: the default ALSA device is
+				// someone else's.
 				if let Some(server) = config.server {
 					let _ = opened_tx.send(Err(format!(
-						"PulseAudio {name} on server {} failed: {pulse_error}; a named server never falls \
-						 back to ALSA",
+						"PulseAudio {name} on server {} failed: {pulse_error}; a named server never \
+						 falls back to ALSA",
 						server.name().to_string_lossy()
 					)));
 					return;
@@ -1041,7 +1045,8 @@ mod tests {
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let port = listener.local_addr().unwrap().port();
 		let accepted = thread::spawn(move || {
-			// Take the connection and drop it at once: libpulse's handshake then fails.
+			// Take the connection and drop it at once: libpulse's handshake then
+			// fails.
 			listener.set_nonblocking(true).unwrap();
 			let deadline = std::time::Instant::now() + Duration::from_secs(10);
 			while std::time::Instant::now() < deadline {
@@ -1054,7 +1059,9 @@ mod tests {
 		});
 		let opened = Device::start_capture(named(&format!("tcp:127.0.0.1:{port}")), Box::new(|_| {}));
 		assert!(accepted.join().unwrap(), "libpulse never connected to the named server");
-		let error = opened.err().expect("a server that hangs up opens no stream");
+		let error = opened
+			.err()
+			.expect("a server that hangs up opens no stream");
 		assert!(error.contains("PulseAudio capture on server tcp:127.0.0.1:"), "{error}");
 		assert!(!error.contains("ALSA:"), "a named server must not fall back to ALSA: {error}");
 	}

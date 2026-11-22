@@ -426,7 +426,11 @@ impl CaptureStream {
 	/// Open the microphone at the requested sample rate: the default device,
 	/// or the default source of `server`. `on_audio` runs on the realtime
 	/// audio thread — it must not block.
-	pub fn start<C>(sample_rate: u32, server: Option<PulseServer>, mut on_audio: C) -> VoiceResult<Self>
+	pub fn start<C>(
+		sample_rate: u32,
+		server: Option<PulseServer>,
+		mut on_audio: C,
+	) -> VoiceResult<Self>
 	where
 		C: FnMut(&[f32]) + Send + 'static,
 	{
@@ -736,7 +740,8 @@ mod tests {
 			return;
 		}
 
-		let mut stream = PlaybackStream::start(16_000, 0, None).expect("default playback device starts");
+		let mut stream =
+			PlaybackStream::start(16_000, 0, None).expect("default playback device starts");
 		stream.stop().expect("default playback device stops");
 	}
 

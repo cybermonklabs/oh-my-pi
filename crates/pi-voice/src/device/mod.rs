@@ -25,6 +25,8 @@
 //!   stops from callbacks; the carve-out exists for contract soundness, not for
 //!   use. Dropping a device stops it.
 
+use std::{ffi::CString, sync::LazyLock};
+
 #[cfg(target_os = "macos")]
 mod coreaudio;
 #[cfg(target_os = "macos")]
@@ -44,8 +46,6 @@ use linux as imp;
 mod unsupported;
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use unsupported as imp;
-
-use std::{ffi::CString, sync::LazyLock};
 
 use crate::VoiceResult;
 
