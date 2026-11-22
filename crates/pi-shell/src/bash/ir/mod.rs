@@ -66,8 +66,8 @@
 //! | `AlwaysEnd` | – | – | pop the try record, `$?` = the try-list's status, resume what ended the try-list early |
 //! | `CallAnon` | `funcs` index | `lists` index | zsh anonymous function: expand the arguments and call the body as function `(anon)` |
 //!
-//! [`IR_VERSION`] changes with every addition, and restore rejects frames of
-//! another version.
+//! [`IR_VERSION`] changes with every addition, and with every change to the
+//! code a source lowers to; restore rejects frames of another version.
 //!
 //! The text form ([`asm`]) is what `obash --ir` prints and what back-end tests
 //! are written in.
@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
