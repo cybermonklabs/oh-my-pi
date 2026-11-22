@@ -31,7 +31,7 @@ export type LiveSessionUpdate = {
 	delegation: { type: "client" };
 };
 
-/** Messages sent by the client over the Frameless Bidi data channel. */
+/** Messages sent by the client over the Frameless Bidi data channel or a GPT-Live sideband. */
 export type LiveClientMessage =
 	| { type: "session.update"; session: LiveSessionUpdate }
 	| {
@@ -45,9 +45,10 @@ export type LiveClientMessage =
 			channel?: LiveContextChannel;
 			content: LiveInputTextContent[];
 	  }
+	| { type: "session.thinking.append" | "session.commentary.append"; delegation_id: string | null; content: string }
 	| { type: "session.close" };
 
-/** Parsed Frameless Bidi server events, including unsupported wire event types. */
+/** Parsed live server events (Frameless Bidi and GPT-Live's public API), including unsupported wire types. */
 export type LiveServerEvent =
 	| {
 			type: "session.started" | "session.updated";
@@ -66,11 +67,19 @@ export type LiveServerEvent =
 			};
 	  }
 	| { type: "error"; message: string }
+	// GPT-Live's public API (`live.provider: openai`); see {@link parseOpenAILiveServerEvent}.
+	| { type: "transcript.delta"; role: "user" | "assistant"; text: string; startMs: number; endMs: number }
+	| { type: "delegation.requested"; id: string; offsetMs: number }
+	| { type: "usage.updated"; seconds: number }
+	| { type: "session.closed"; reason?: string; seconds?: number }
+	/** A rejected command or a moderation cut: the call stays open. */
+	| { type: "warning"; message: string }
 	| { type: "unknown"; wireType: string };
 
 type UnknownRecord = Record<string, unknown>;
 
-function parsePayload(payload: unknown): UnknownRecord | null {
+/** A JSON string or decoded value from a live event channel, as a record; `null` when it is not one. */
+export function parseLiveRecord(payload: unknown): UnknownRecord | null {
 	let parsed = payload;
 	if (typeof payload === "string") {
 		try {
@@ -149,7 +158,7 @@ function parseErrorEvent(payload: UnknownRecord): LiveServerEvent | null {
 
 /** Parse a JSON string or decoded value from the Frameless Bidi data channel. */
 export function parseLiveServerEvent(payload: unknown): LiveServerEvent | null {
-	const parsed = parsePayload(payload);
+	const parsed = parseLiveRecord(payload);
 	if (!parsed || typeof parsed.type !== "string") return null;
 
 	switch (parsed.type) {
@@ -216,6 +225,116 @@ export function buildSessionContextAppend(text: string, channel?: LiveContextCha
 /** Build the message that gracefully closes a live session. */
 export function buildSessionClose(): LiveClientMessage {
 	return { type: "session.close" };
+}
+
+/**
+ * Seconds without an input or output transcript after which GPT-Live returns a call to standby,
+ * which OpenAI bills at its lower rate; 60 is the largest value the API takes (5 to 60).
+ */
+export const OPENAI_LIVE_IDLE_TIMEOUT_S = 60;
+
+/** Body of `POST {base}/live/sessions`, GPT-Live's public WebRTC session request. */
+export interface OpenAILiveSessionRequest {
+	session: {
+		model: string;
+		instructions: string;
+		audio: { output: { voice: string } };
+		delegation: { type: "client" };
+		idle_timeout_s: number;
+		/** OpenAI pauses inference while idle only under a speech wake policy. */
+		wake_policy: { type: "speech" };
+	};
+	transport: { type: "webrtc"; sdp: string };
+}
+
+/** Build the GPT-Live session request: client delegation, standby after silence, the caller's SDP offer. */
+export function buildOpenAILiveSessionRequest(options: {
+	model: string;
+	instructions: string;
+	voice: string;
+	sdp: string;
+}): OpenAILiveSessionRequest {
+	return {
+		session: {
+			model: options.model,
+			instructions: options.instructions,
+			audio: { output: { voice: options.voice } },
+			delegation: { type: "client" },
+			idle_timeout_s: OPENAI_LIVE_IDLE_TIMEOUT_S,
+			wake_policy: { type: "speech" },
+		},
+		transport: { type: "webrtc", sdp: options.sdp },
+	};
+}
+
+/** How a route's server takes a delegation's progress and result. */
+export interface LiveWire {
+	/** Progress the voice may use later but does not say when it arrives. */
+	progress(delegationId: string, text: string): LiveClientMessage;
+	/** The delegation's result, for the voice to say. */
+	result(delegationId: string, text: string): LiveClientMessage;
+}
+
+/** Codex's Frameless Bidi: both go as delegation context, progress on the commentary channel. */
+export const CODEX_LIVE_WIRE: LiveWire = {
+	progress: (delegationId, text) => buildDelegationContextAppend(delegationId, text, "commentary"),
+	result: (delegationId, text) => buildDelegationContextAppend(delegationId, text),
+};
+
+/** GPT-Live's public API: progress as `session.thinking.append`, the result as `session.commentary.append`. */
+export const OPENAI_LIVE_WIRE: LiveWire = {
+	progress: (delegationId, text) => ({ type: "session.thinking.append", delegation_id: delegationId, content: text }),
+	result: (delegationId, text) => ({ type: "session.commentary.append", delegation_id: delegationId, content: text }),
+};
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+/**
+ * Map a GPT-Live public event onto the controller's events. Transcript deltas keep their text exactly
+ * (spaces included) and their session-timeline interval; a delegation names no task text, only its
+ * id and timeline offset; an `error` in a running call is a warning, since a rejected command or a
+ * moderation cut leaves the call open (`session.closed` says when it ends).
+ */
+export function parseOpenAILiveServerEvent(payload: unknown): LiveServerEvent | null {
+	const parsed = parseLiveRecord(payload);
+	if (!parsed || typeof parsed.type !== "string") return null;
+
+	switch (parsed.type) {
+		case "session.input_transcript.delta":
+		case "session.output_transcript.delta": {
+			const { delta, start_ms: startMs, end_ms: endMs } = parsed;
+			if (typeof delta !== "string" || !isFiniteNumber(startMs) || !isFiniteNumber(endMs)) return null;
+			const role = parsed.type === "session.input_transcript.delta" ? "user" : "assistant";
+			return { type: "transcript.delta", role, text: delta, startMs, endMs };
+		}
+		case "session.delegation.created": {
+			const delegation = parsed.delegation;
+			if (!isRecord(delegation) || typeof delegation.id !== "string" || delegation.target !== "client") return null;
+			if (!isFiniteNumber(parsed.offset_ms)) return null;
+			return { type: "delegation.requested", id: delegation.id, offsetMs: parsed.offset_ms };
+		}
+		case "session.usage.updated": {
+			const usage = parsed.usage;
+			if (!isRecord(usage) || !isFiniteNumber(usage.seconds)) return null;
+			return { type: "usage.updated", seconds: usage.seconds };
+		}
+		case "session.closed": {
+			const usage = parsed.usage;
+			return {
+				type: "session.closed",
+				...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+				...(isRecord(usage) && isFiniteNumber(usage.seconds) ? { seconds: usage.seconds } : {}),
+			};
+		}
+		case "error": {
+			const error = parseErrorEvent(parsed);
+			return error?.type === "error" ? { type: "warning", message: error.message } : null;
+		}
+		default:
+			return { type: "unknown", wireType: parsed.type };
+	}
 }
 
 function utf8ByteLength(codePoint: number): number {

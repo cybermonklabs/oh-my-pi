@@ -7,18 +7,23 @@ import {
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
 import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
-import { toError } from "@oh-my-pi/pi-utils";
+import { isRecord, toError } from "@oh-my-pi/pi-utils";
+import type { ModelRegistry } from "../config/model-registry";
+import { kNoAuth } from "../config/model-provider-discovery";
 import type { ScopeLike } from "../config/registry";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { generateCodexAttestation } from "./attestation";
 import {
 	buildLiveSessionPayload,
 	buildLiveSessionUpdate,
+	buildOpenAILiveSessionRequest,
 	type LiveClientMessage,
 	type LiveServerEvent,
+	parseLiveRecord,
 	parseLiveServerEvent,
+	parseOpenAILiveServerEvent,
 } from "./protocol";
-import { cfgLiveApiKey, cfgLiveEndpoint } from "./settings";
+import { cfgLiveApiKey, cfgLiveEndpoint, cfgLiveModel } from "./settings";
 
 const SIGNALING_URL = `${CODEX_BASE_URL}/codex/realtime/calls?intent=quicksilver&architecture=avas`;
 const MAX_ERROR_BODY_LENGTH = 2_048;
@@ -30,6 +35,10 @@ const LIVE_CALL_ID_PATTERN = /^rtc_[\w-]+$/;
 /** Proxy scope of a custom live endpoint: `PI_PROXY_LIVE`, else `PI_PROXY`, else the standard variables. */
 const LIVE_ENDPOINT_PROXY = "live";
 const MAX_ENDPOINT_REDIRECTS = 5;
+/** The models.yml provider whose base URL and key the GPT-Live route uses; also its proxy scope. */
+const OPENAI_LIVE_PROVIDER = "openai";
+/** Event ids remembered to drop the 3 s replay a sideband attach repeats from the data channel. */
+const SEEN_EVENT_IDS_LIMIT = 1_024;
 
 type Lifecycle = "idle" | "connecting" | "connected" | "closing" | "closed";
 
@@ -54,6 +63,46 @@ export async function resolveLiveEndpoint(scope: ScopeLike): Promise<LiveEndpoin
 	const apiKey = await resolveConfigValue(keyConfig);
 	if (!apiKey) throw new Error("live.apiKey resolved to no key: its command failed or printed nothing");
 	return { baseUrl, apiKey };
+}
+
+/** GPT-Live's public API at the `openai` provider of models.yml (`live.provider: openai`). */
+export interface OpenAILiveRoute {
+	/** The provider's base URL, e.g. `http://model-gateway:4000/v1`; the live paths hang off it. */
+	baseUrl: string;
+	/** The provider's key, sent as the bearer of the session request and the sideband. */
+	apiKey: string;
+	/** GPT-Live model (`live.model`). */
+	model: string;
+}
+
+/** The model registry calls the GPT-Live route needs. */
+export type OpenAILiveRegistry = Pick<ModelRegistry, "getProviderBaseUrl" | "getApiKeyForProvider">;
+
+/** The GPT-Live route: the `openai` provider's base URL and key in models.yml, and `live.model`. */
+export async function resolveOpenAILiveRoute(
+	registry: OpenAILiveRegistry,
+	scope: ScopeLike,
+	sessionId: string,
+): Promise<OpenAILiveRoute> {
+	const baseUrl = registry.getProviderBaseUrl(OPENAI_LIVE_PROVIDER)?.trim();
+	if (!baseUrl) throw new Error("live.provider openai: the openai provider has no baseUrl (models.yml)");
+	const apiKey = await registry.getApiKeyForProvider(OPENAI_LIVE_PROVIDER, sessionId);
+	if (!apiKey || apiKey === kNoAuth) {
+		throw new Error("live.provider openai: the openai provider has no key (models.yml apiKey)");
+	}
+	return { baseUrl, apiKey, model: cfgLiveModel.get(scope).trim() || "gpt-live-1.1" };
+}
+
+/** GPT-Live's session URL: `{base}/live/sessions`. */
+export function openAILiveSessionsUrl(baseUrl: string): string {
+	return liveEndpointUrl(baseUrl, "live/sessions").toString();
+}
+
+/** GPT-Live's sideband URL: `{base as ws(s)}/live/sessions/{id}/attach`. */
+export function openAILiveAttachUrl(baseUrl: string, sessionId: string): string {
+	const url = liveEndpointUrl(baseUrl, `live/sessions/${encodeURIComponent(sessionId)}/attach`);
+	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+	return url.toString();
 }
 
 /** Where and with which credentials the call's sideband WebSocket connects. */
@@ -91,6 +140,10 @@ export interface LiveTransportOptions {
 	authStorage: AuthStorage;
 	/** Custom realtime server; unset signals Codex with the session's ChatGPT (Codex) login. */
 	endpoint?: LiveEndpoint;
+	/** GPT-Live's public API (`live.provider: openai`); excludes {@link endpoint}. */
+	openai?: OpenAILiveRoute;
+	/** PulseAudio server for the native peer's speaker (`live.pulseServer`); unset uses the default device. */
+	pulseServer?: string;
 	sessionId: string;
 	instructions: string;
 	voice: string;
@@ -196,8 +249,8 @@ function abortReason(signal: AbortSignal | undefined): Error {
 }
 
 /**
- * WebRTC transport for a Frameless Bidi live session on Codex or a custom endpoint, with a native
- * or caller-owned media peer.
+ * WebRTC transport for a live session on Codex (Frameless Bidi), a custom endpoint, or GPT-Live's
+ * public API, with a native or caller-owned media peer.
  */
 export class LiveTransport {
 	readonly #options: LiveTransportOptions;
@@ -213,11 +266,13 @@ export class LiveTransport {
 	#sendTail: Promise<void> = Promise.resolve();
 	#muted = false;
 	#unexpectedFailureReported = false;
+	/** GPT-Live event ids already delivered, in arrival order; see {@link SEEN_EVENT_IDS_LIMIT}. */
+	readonly #seenEventIds = new Set<string>();
 	readonly #abortListener: () => void;
 
 	constructor(options: LiveTransportOptions) {
 		this.#options = options;
-		this.#label = options.endpoint ? "Live endpoint" : "Codex live";
+		this.#label = options.openai ? "GPT-Live" : options.endpoint ? "Live endpoint" : "Codex live";
 		this.#abortListener = () => {
 			void this.close();
 		};
@@ -290,10 +345,12 @@ export class LiveTransport {
 				}
 			},
 			(error, message) => this.#reportFailure(error?.message ?? message),
+			this.#options.pulseServer,
 		);
 	}
 
 	async #signal(offer: string): Promise<LiveSignalingResult> {
+		if (this.#options.openai) return await this.#signalOpenAI(offer, this.#options.openai);
 		if (this.#options.endpoint) return await this.#signalEndpoint(offer, this.#options.endpoint);
 		const attestation = await generateCodexAttestation();
 		return await withOAuthAccess(
@@ -405,6 +462,57 @@ export class LiveTransport {
 		}
 	}
 
+	/**
+	 * Opens a GPT-Live session through its public API: the session configuration and the SDP offer in
+	 * one JSON request with the provider's bearer key and no Codex header, answered by a 201 naming the
+	 * session and carrying the SDP answer. No redirect is followed, so the key stays at the provider.
+	 */
+	async #signalOpenAI(offer: string, route: OpenAILiveRoute): Promise<LiveSignalingResult> {
+		const credentials = { Authorization: `Bearer ${route.apiKey}` };
+		const url = new URL(openAILiveSessionsUrl(route.baseUrl));
+		const body = buildOpenAILiveSessionRequest({
+			model: route.model,
+			instructions: this.#options.instructions,
+			voice: this.#options.voice,
+			sdp: offer,
+		});
+		const response = await fetch(url, {
+			method: "POST",
+			headers: { ...credentials, Accept: "application/json", "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+			redirect: "manual",
+			proxy: getProxyForUrl(OPENAI_LIVE_PROVIDER, url),
+			signal: this.#options.signal,
+		});
+		if (response.status >= 300 && response.status < 400) {
+			await response.body?.cancel();
+			throw new LiveSignalingError(
+				response.status,
+				`GPT-Live session request was redirected (${response.status}) to ${response.headers.get("location") ?? "nowhere"}; no redirect is followed`,
+			);
+		}
+		const text = await response.text();
+		if (!response.ok) {
+			const detail = boundedErrorBody(text, response.statusText);
+			throw new LiveSignalingError(response.status, `GPT-Live session failed (${response.status}): ${detail}`);
+		}
+		const answer = parseLiveRecord(text);
+		const sessionId = isRecord(answer?.session) ? answer.session.id : undefined;
+		if (typeof sessionId !== "string" || !sessionId) {
+			throw new LiveSignalingError(response.status, "GPT-Live session returned no session id");
+		}
+		const sdp = isRecord(answer?.transport) ? answer.transport.sdp : undefined;
+		if (typeof sdp !== "string" || !sdp.trim()) {
+			throw new LiveSignalingError(response.status, "GPT-Live session returned no SDP answer");
+		}
+		const sideband = {
+			url: openAILiveAttachUrl(route.baseUrl, sessionId),
+			headers: credentials,
+			proxyScope: OPENAI_LIVE_PROVIDER,
+		};
+		return { answer: sdp, sideband };
+	}
+
 	async #connectSideband(sideband: LiveSideband): Promise<void> {
 		let failure = new Error(`${this.#label} sideband connection failed`);
 		for (let attempt = 0; attempt < SIDEBAND_CONNECT_ATTEMPTS; attempt++) {
@@ -502,7 +610,7 @@ export class LiveTransport {
 
 	#handleSidebandEvent(payload: string): void {
 		if (this.#state === "closing" || this.#state === "closed") return;
-		const event = parseLiveServerEvent(payload);
+		const event = this.#parseEvent(payload);
 		if (!event) return;
 		try {
 			this.#options.callbacks.onEvent(event);
@@ -511,11 +619,36 @@ export class LiveTransport {
 
 	#handleServerEvent(payload: string): void {
 		if (this.#state === "closing" || this.#state === "closed") return;
-		const event = parseLiveServerEvent(payload);
-		if (!event || (this.#sideband?.readyState === WebSocket.OPEN && event.type !== "error")) return;
+		const sidebandOpen = this.#sideband?.readyState === WebSocket.OPEN;
+		// GPT-Live sends every event on both channels; once attached, the sideband carries them all.
+		if (sidebandOpen && this.#options.openai) return;
+		const event = this.#parseEvent(payload);
+		if (!event || (sidebandOpen && event.type !== "error")) return;
 		try {
 			this.#options.callbacks.onEvent(event);
 		} catch {}
+	}
+
+	/**
+	 * Parses one event for this route. A GPT-Live sideband replays the 3 s before it attached, which
+	 * the data channel already delivered, so an event id seen before is dropped.
+	 */
+	#parseEvent(payload: string): LiveServerEvent | null {
+		if (!this.#options.openai) return parseLiveServerEvent(payload);
+		const record = parseLiveRecord(payload);
+		if (!record) return null;
+		const eventId = record.event_id;
+		if (typeof eventId === "string") {
+			if (this.#seenEventIds.has(eventId)) return null;
+			this.#seenEventIds.add(eventId);
+			if (this.#seenEventIds.size > SEEN_EVENT_IDS_LIMIT) {
+				for (const oldest of this.#seenEventIds) {
+					this.#seenEventIds.delete(oldest);
+					break;
+				}
+			}
+		}
+		return parseOpenAILiveServerEvent(record);
 	}
 
 	#handleOutputLevel(level: number): void {
