@@ -2419,9 +2419,22 @@ pub enum ZshProcSub {
 	Output,
 }
 
+/// zsh's `PATH_DEV_FD`, the directory a process substitution's name is in:
+/// zsh's configure takes the first of `/proc/self/fd` and `/dev/fd` that
+/// reopens a descriptor, so `/proc/self/fd` on Linux and `/dev/fd` on
+/// macOS. Windows keeps `/dev/fd`: the spawner hands an external a
+/// `/dev/fd/N` argument as a named pipe.
+const fn zsh_dev_fd(platform: crate::bash::ids::Platform) -> &'static str {
+	match platform {
+		crate::bash::ids::Platform::Linux => "/proc/self/fd",
+		crate::bash::ids::Platform::MacOs | crate::bash::ids::Platform::Windows => "/dev/fd",
+	}
+}
+
 /// Start a zsh process substitution running `text` (zsh source) in a child
-/// vproc; the `/dev/fd/N` path the command gets (as `start_procsub`).
-/// `=(…)` is [`super::zsh::subst`]'s `getoutputfile`.
+/// vproc; the path the command gets, `PATH_DEV_FD/N` ([`zsh_dev_fd`]) for
+/// the shell's end of the pipe at fd N (zsh `getproc`). `=(…)` is
+/// [`super::zsh::subst`]'s `getoutputfile`.
 pub fn start_zsh_procsub(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -2433,10 +2446,10 @@ pub fn start_zsh_procsub(
 	let (r, w) = mem::pipe();
 	let (r, w) = (FdRef::mem(r), FdRef::mem(w));
 	let (mine, theirs, their_fd) = if output { (w, r, 0) } else { (r, w, 1) };
-	let fd = (3..64)
-		.rev()
-		.find(|&fd| vp.fds.get(fd).is_none_or(|h| !h.is_open()))
-		.unwrap_or_else(|| vp.fds.lowest_free(64));
+	// zsh `mpipe`: both ends of the pipe move to fds ≥ 10; the shell keeps
+	// the read end of `<(…)` and the write end of `>(…)`.
+	let (read_fd, write_fd) = super::jobctl::zsh_pipe_fds(k, vp);
+	let fd = if output { write_fd } else { read_fd };
 	// The other substitutions' fds stay open in the child (zsh `getproc`'s
 	// `closem` spares `FDT_PROC_SUBST`): its words may name them.
 	let mut fds = vp.fds.clone();
@@ -2464,7 +2477,7 @@ pub fn start_zsh_procsub(
 		KeyBuf::Misc(MiscKey::ZshProcsubstPid),
 		Some(rec),
 	);
-	BString::from(format!("/dev/fd/{fd}"))
+	BString::from(format!("{}/{fd}", zsh_dev_fd(k.engine.config().platform)))
 }
 
 /// `${ ;}` bodies re-parsed while no alias is defined, by the unit and

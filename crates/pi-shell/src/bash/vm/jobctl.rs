@@ -1212,12 +1212,35 @@ fn print_settled(k: &mut Kernel, i: usize) {
 /// with its terminal open, fd 10 is the terminal's (zsh `movefd` puts
 /// `SHTTY` there), so the first one handed out is 11.
 pub fn lowest_free_fd(k: &Kernel, vp: &Vproc, from: i32) -> i32 {
-	let fd = vp.fds.lowest_free(from);
-	if fd == 10 && k.jobctl.shtty.is_some() && vp.mode.dialect() == Dialect::Zsh {
-		vp.fds.lowest_free(11)
+	free_fd(k, vp, from, &[])
+}
+
+/// zsh `mpipe`: the fds of a new pipe's read and write ends. `pipe(2)`
+/// takes the two lowest closed fds, and `movefd` moves each one below 10 to
+/// the lowest free fd ≥ 10 ([`lowest_free_fd`]), the read end first.
+pub fn zsh_pipe_fds(k: &Kernel, vp: &Vproc) -> (i32, i32) {
+	let read = free_fd(k, vp, 0, &[]);
+	let write = free_fd(k, vp, 0, &[read]);
+	let read_moved = if read < 10 {
+		free_fd(k, vp, 10, &[read, write])
 	} else {
-		fd
-	}
+		read
+	};
+	let write_moved = if write < 10 {
+		free_fd(k, vp, 10, &[read_moved, write])
+	} else {
+		write
+	};
+	(read_moved, write_moved)
+}
+
+/// The lowest closed fd ≥ `from` that is not in `taken` nor the zsh
+/// terminal's fd 10 ([`lowest_free_fd`]).
+fn free_fd(k: &Kernel, vp: &Vproc, from: i32, taken: &[i32]) -> i32 {
+	let shtty = k.jobctl.shtty.is_some() && vp.mode.dialect() == Dialect::Zsh;
+	(from..i32::MAX)
+		.find(|&fd| vp.fds.get(fd).is_none() && !taken.contains(&fd) && !(shtty && fd == 10))
+		.unwrap_or(from)
 }
 
 /// The number of jobs in `vp`'s table (prompt `%j`, `\j`).

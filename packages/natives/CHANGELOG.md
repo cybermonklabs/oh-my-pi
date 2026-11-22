@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- In zsh mode a process substitution is named as zsh names it, `/proc/self/fd/N` on Linux (`/dev/fd/N` on macOS and Windows), N being the fd zsh takes for the shell's end of the pipe: the lowest free fds from 10, the read end for `<(…)` and the write end for `>(…)`. It was bash's `/dev/fd/63`, counting down. bash mode is unchanged.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
