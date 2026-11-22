@@ -46,7 +46,9 @@ function readHeadSync(filePath: string, bytes: number): string | undefined {
 
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
-const utf8Decoder = new TextDecoder("utf-8");
+// Keeps a leading byte order mark: a store returns a session file's text as stored, as SQL and Redis do, so the
+// manager's expected size counts the mark; the loader drops one mark itself (`withoutByteOrderMark`).
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** A listing of a directory that does not exist (or is a file): empty, not a fault. */
 function isMissingDirectory(err: unknown): boolean {
@@ -1341,8 +1343,9 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
-	readText(path: string): Promise<string> {
-		return Bun.file(path).text();
+	async readText(path: string): Promise<string> {
+		// Not `Bun.file().text()`: it drops a leading byte order mark (see `utf8Decoder`).
+		return utf8Decoder.decode(await Bun.file(path).bytes());
 	}
 
 	readTextSync(path: string): string {
@@ -1353,7 +1356,8 @@ export class FileSessionStorage implements SessionStorage {
 		const { size } = await fsp.stat(path);
 		if (offset >= size) return { text: "", size };
 		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-		return { text: await Bun.file(path).slice(offset, end).text(), size };
+		// Not `.text()`: it drops a byte order mark at the start of the slice (see `utf8Decoder`).
+		return { text: utf8Decoder.decode(await Bun.file(path).slice(offset, end).bytes()), size };
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {

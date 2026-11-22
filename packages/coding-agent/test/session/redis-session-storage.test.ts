@@ -815,5 +815,23 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 				await client.exists(`${prefix}file:/s/p/A.jsonl`),
 			]).toEqual([false, false]);
 		});
+
+		// The store returns text as stored, every leading mark included; the loader drops exactly one, so a second
+		// mark leaves the header line unreadable (not opened), and the delete still removes the session as listed.
+		it("returns two leading byte order marks as stored, does not open such a session, and deletes it as listed", async () => {
+			const { client, storage } = await open();
+			const text = `\uFEFF\uFEFF${header("S1")}{"type":"custom","id":"c1","parentId":null}\n`;
+			await storage.writeText("/s/p.jsonl", text);
+			const marks = (read: string) => read.length - read.replace(/^\uFEFF+/, "").length;
+			expect({
+				whole: marks(await storage.readText("/s/p.jsonl")),
+				head: marks((await storage.readTextSlices("/s/p.jsonl", 64, 0))[0]),
+				from: storage.readTextFrom ? marks((await storage.readTextFrom("/s/p.jsonl", 0)).text) : "no readTextFrom",
+			}).toEqual({ whole: 2, head: 2, from: 2 });
+			const loaded = await loadSessionFile("/s/p.jsonl", storage);
+			expect([loaded.invalidHeader, loaded.sourceSize]).toEqual([true, Buffer.byteLength(text)]);
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect(await client.exists(`${prefix}file:/s/p.jsonl`)).toBe(false);
+		});
 	});
 });

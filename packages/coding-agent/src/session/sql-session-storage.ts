@@ -725,7 +725,8 @@ function pgErrorCode(error: unknown): string | undefined {
 	const code = "code" in error ? error.code : undefined;
 	return typeof code === "string" ? code : undefined;
 }
-const utf8Decoder = new TextDecoder("utf-8");
+// Keeps a leading byte order mark, as the store's whole reads do; the loader drops one mark itself.
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
  * lengths, and no stored value reaches it (a value is at most 1 GB there).

@@ -192,6 +192,9 @@ function refusedMoved(file: string, id: string): string {
 	return `refused: Cannot delete session "${file}": the file no longer holds session ${id} (it moved or was deleted). Nothing was deleted.`;
 }
 
+/** A UTF-8 byte order mark. */
+const MARK = "\uFEFF";
+
 function userTurn(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
 }
@@ -581,27 +584,29 @@ for (const { adapter, url } of BACKENDS) {
 			}
 		}, 60_000);
 
-		// A SQL or Redis store returns a leading byte order mark as stored, where the file store's decoder drops it.
-		it("opens, writes, reopens and deletes a session that starts with a byte order mark, as the file store does", async () => {
-			await using backend = await openBackend(adapter, url ?? "");
+		// Every store returns a session file's text as stored, a leading byte order mark included, and the manager
+		// expects that size; the loader drops exactly one leading mark. Open, append, rewrite whole, reopen and delete:
+		// one session throughout (at bbdb6d5f the file store's text path read 3 bytes fewer than the file holds, so
+		// the first whole rewrite met a size conflict and moved the session to a second file under a new id).
+		async function rewriteMarked(backend: Backend, firstTurn: string): Promise<void> {
 			const id = crypto.randomUUID();
-			const file = await listedFile(backend, "bom.jsonl", `\uFEFF${transcript(id, "a turn")}`, id);
-			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
-				suppressBreadcrumb: true,
-			});
+			const file = await listedFile(backend, "bom.jsonl", `${MARK}${transcript(id, firstTurn)}`, id);
+			const dir = path.dirname(file);
+			const manager = await SessionManager.open(file, dir, backend.picker, { suppressBreadcrumb: true });
 			try {
 				expect([manager.getSessionId(), manager.getEntries().length]).toEqual([id, 1]);
 				manager.appendMessage(userTurn("a second turn"));
 				manager.appendMessage(createAssistantMessage("a reply"));
+				await manager.flush();
+				await manager.rewriteEntries();
 				await manager.flush();
 				expect([manager.getSessionFile(), manager.getSessionId()]).toEqual([file, id]);
 			} finally {
 				await manager.close();
 			}
 			await backend.picker.refresh?.();
-			const reopened = await SessionManager.open(file, path.dirname(file), backend.picker, {
-				suppressBreadcrumb: true,
-			});
+			expect((await listSessions(dir, backend.picker)).map(info => [info.path, info.id])).toEqual([[file, id]]);
+			const reopened = await SessionManager.open(file, dir, backend.picker, { suppressBreadcrumb: true });
 			try {
 				expect([reopened.getSessionId(), reopened.getEntries().length]).toEqual([id, 3]);
 				const deleted = await outcome(reopened.dropSession(file));
@@ -609,6 +614,55 @@ for (const { adapter, url } of BACKENDS) {
 			} finally {
 				await reopened.close();
 			}
+		}
+
+		it("keeps a session that starts with a byte order mark as one session through an append and a whole rewrite", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			await rewriteMarked(backend, "a turn");
+		}, 60_000);
+
+		it.skipIf(adapter !== "file")(
+			"keeps a 9 MiB session that starts with a byte order mark (the stream path) as one session through an append and a whole rewrite",
+			async () => {
+				await using backend = await openBackend(adapter, url ?? "");
+				await rewriteMarked(backend, "x".repeat(9 * 1024 * 1024));
+			},
+			180_000,
+		);
+
+		it("returns a session file's leading byte order marks as stored", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const file = await listedFile(backend, "marks.jsonl", `${MARK}${MARK}${transcript(id, "a turn")}`, id);
+			const marks = (text: string) => text.length - text.replace(/^\uFEFF+/, "").length;
+			const store = backend.picker;
+			expect({
+				whole: marks(await store.readText(file)),
+				head: marks((await store.readTextSlices(file, 64, 0))[0]),
+				from: store.readTextFrom ? marks((await store.readTextFrom(file, 0)).text) : "no readTextFrom",
+			}).toEqual({ whole: 2, head: 2, from: 2 });
+		}, 60_000);
+
+		// Exactly one leading mark is dropped: a second one leaves the header line unreadable on every store, so the
+		// session is listed by its line, not opened, and deleted as listed.
+		it("lists, does not open, and deletes as listed a session that starts with two byte order marks", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const file = await listedFile(backend, "two-marks.jsonl", `${MARK}${MARK}${transcript(id, "a turn")}`, id);
+			const opening = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			}).then(
+				async manager => {
+					await manager.close();
+					return "opened";
+				},
+				(err: unknown) => `refused: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			expect(opening).toBe(
+				`refused: Cannot resume session "${file}": the session header is missing or malformed. The file was not modified.`,
+			);
+			const deleted = await outcome(SessionManager.deleteListedSession({ path: file, id }, backend.picker));
+			expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [] });
 		}, 60_000);
 	});
 }

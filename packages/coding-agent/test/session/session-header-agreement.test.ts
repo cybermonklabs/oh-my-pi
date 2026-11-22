@@ -2,16 +2,25 @@
  * The session listing, the loader and a delete's check read a session file's header through one function
  * (`leadingSessionHeader`), so they name the same session: a delete accepts every session the picker lists, and the
  * loader opens a session only when that function finds its header whole (and then names the same id). A header that
- * is listed but not opened (cut short, or after a `title` record that is not the written slot) is still deleted as
- * listed. Each shape below runs through the three, read through the file store (which decodes the file) and the
- * in-memory store (which returns the text as stored, a leading byte order mark included, as SQL and Redis do).
+ * is listed but not opened (cut short, after a `title` record that is not the written slot, or after a second byte
+ * order mark) is still deleted as listed.
+ *
+ * Every store returns a session file's text as stored, a leading byte order mark included, and the reader drops
+ * exactly one leading mark: a second mark, or one at the start of a later line, leaves that line unreadable, and a
+ * mark inside a line stays. Each shape runs through the listing and both delete readers on the file store and the
+ * in-memory store (which returns text as stored, as SQL and Redis do), and through the loader on the file store's
+ * text path (below 8 MiB), its byte stream path (from 8 MiB) and the in-memory store: the three load alike, with the
+ * file's stored size.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import {
-	parseSessionContent,
+	leadingSessionHeader,
+	loadEntriesFromFileStream,
+	loadSessionFile,
 	readSessionHeaderId,
+	type SessionLoadResult,
 	sessionHeaderIdOfHead,
 } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import {
@@ -23,9 +32,12 @@ import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-ti
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const ID = "0199c0de-0000-7000-8000-000000000001";
+const MARK = "\uFEFF";
 const header = (fields: Record<string, unknown> = {}) =>
 	JSON.stringify({ type: "session", version: 3, id: ID, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w", ...fields });
-const turn = `${JSON.stringify({ type: "message", id: "m1", parentId: null, timestamp: "2026-11-21T00:00:01.000Z", message: { role: "user", content: "hi", timestamp: 1 } })}\n`;
+const message = (id: string, text: string) =>
+	`${JSON.stringify({ type: "message", id, parentId: null, timestamp: "2026-11-21T00:00:01.000Z", message: { role: "user", content: text, timestamp: 1 } })}\n`;
+const turn = message("m1", "hi");
 /** A `title` record that is not the fixed-width slot omp writes (no `v`, `updatedAt` or `pad`). */
 const slot = JSON.stringify({ type: "title", title: "named" });
 /** The fixed-width title slot line omp writes, newline included. */
@@ -33,10 +45,18 @@ const writtenSlot = serializeTitleSlot({ title: "named", source: "user", updated
 
 interface Shape {
 	readonly content: string;
-	/** The id all three readers name; `undefined` when none does. */
+	/** The id the listing and both delete readers name; `undefined` when none does. */
 	readonly id: string | undefined;
 	/** Whether the loader opens it: its header parses whole as the first record after the written slot. */
 	readonly opens: boolean;
+	/** Whether the header reader returns the header as a whole record (default: `opens`). */
+	readonly whole?: boolean;
+	/** Entries the loader opens (default 2: the header and one turn). */
+	readonly entries?: number;
+	/** The title slot's title the loader applies. */
+	readonly title?: string;
+	/** Whether a byte order mark is left inside the opened entries. */
+	readonly markKept?: boolean;
 }
 
 const SHAPES: Record<string, Shape> = {
@@ -45,21 +65,49 @@ const SHAPES: Record<string, Shape> = {
 		content: `${writtenSlot}${header()}\n${turn}`,
 		id: ID,
 		opens: true,
+		title: "named",
 	},
 	"a title record that is not the written slot, then a whole header": {
 		content: `${slot}\n${header()}\n${turn}`,
 		id: ID,
 		opens: false,
+		whole: true,
 	},
 	"blank lines, then a whole header": { content: `\n\n${header()}\n${turn}`, id: ID, opens: true },
-	// A SQL or Redis store returns a leading byte order mark as stored; the file store's decoder drops it.
-	"a byte order mark, then a whole header": { content: `\uFEFF${header()}\n${turn}`, id: ID, opens: true },
+	"a byte order mark, then a whole header": { content: `${MARK}${header()}\n${turn}`, id: ID, opens: true },
 	"a byte order mark, the written title slot, then a whole header": {
-		content: `\uFEFF${writtenSlot}${header()}\n${turn}`,
+		content: `${MARK}${writtenSlot}${header()}\n${turn}`,
+		id: ID,
+		opens: true,
+		title: "named",
+	},
+	"a byte order mark, then a header cut short": { content: `${MARK}${header().slice(0, -12)}`, id: ID, opens: false },
+	// Exactly one leading mark is dropped: the second leaves the header line unreadable, so the header is named by
+	// its line (listed, deleted as listed) and not opened.
+	"two byte order marks, then a whole header": { content: `${MARK}${MARK}${header()}\n${turn}`, id: ID, opens: false },
+	// The second mark leaves the slot line unreadable: skipped, as any malformed line before the header.
+	"two byte order marks, the written title slot, then a whole header": {
+		content: `${MARK}${MARK}${writtenSlot}${header()}\n${turn}`,
 		id: ID,
 		opens: true,
 	},
-	"a byte order mark, then a header cut short": { content: `\uFEFF${header().slice(0, -12)}`, id: ID, opens: false },
+	// Only the file's leading mark is dropped: one at the start of a later line leaves that line unreadable.
+	"a byte order mark after the written title slot, before the header": {
+		content: `${writtenSlot}${MARK}${header()}\n${turn}`,
+		id: ID,
+		opens: false,
+	},
+	"a later line that starts with a byte order mark": {
+		content: `${header()}\n${turn}${MARK}${message("m2", "later")}`,
+		id: ID,
+		opens: true,
+	},
+	"a byte order mark inside a message's text": {
+		content: `${header()}\n${message("m1", `a${MARK}b`)}`,
+		id: ID,
+		opens: true,
+		markKept: true,
+	},
 	"a pretty-printed header": {
 		content: `${JSON.stringify(JSON.parse(header()), null, 2)}\n${turn}`,
 		id: ID,
@@ -96,38 +144,58 @@ const SHAPES: Record<string, Shape> = {
 	"garbage only": { content: "not json\n", id: undefined, opens: false },
 };
 
+/** What a load opened: the session, its entries, its title, whether a mark is left in them, and the size read. */
+function opened(loaded: SessionLoadResult) {
+	const opens = !loaded.invalidHeader && loaded.entries.length > 0;
+	return {
+		opens,
+		id: opens ? (loaded.entries[0] as { id?: string }).id : undefined,
+		entries: opens ? loaded.entries.length : 0,
+		title: opens ? (loaded.titleSlot?.title ?? null) : null,
+		markKept: opens && JSON.stringify(loaded.entries).includes(MARK),
+		size: loaded.sourceSize,
+	};
+}
+
 describe("the listing, the loader and a delete read a session's header the same way", () => {
 	for (const [name, shape] of Object.entries(SHAPES)) {
 		it(name, async () => {
 			using dir = TempDir.createSync("@omp-header-agreement-");
 			const file = path.join(dir.path(), "s.jsonl");
 			await Bun.write(file, shape.content);
-			// The file store decodes the file (a leading byte order mark dropped); the in-memory store returns the
-			// text as stored, as a SQL or Redis store does.
+			const files = new FileSessionStorage();
 			const memory = new MemorySessionStorage();
 			memory.writeTextSync(file, shape.content);
 
 			const listedBy = async (storage: SessionStorage) =>
 				(await listSessions(dir.path(), storage)).find(info => info.path === file)?.id;
-			const listed = [await listedBy(new FileSessionStorage()), await listedBy(memory)];
-			const deleteReads = [
-				await readSessionHeaderId(file, new FileSessionStorage()),
-				await readSessionHeaderId(file, memory),
-				sessionHeaderIdOfHead(shape.content),
-			];
-			const loaded = parseSessionContent(shape.content);
-			const opens = !loaded.invalidHeader && loaded.entries.length > 0;
+			const expected = {
+				opens: shape.opens,
+				id: shape.opens ? shape.id : undefined,
+				entries: shape.opens ? (shape.entries ?? 2) : 0,
+				title: shape.opens ? (shape.title ?? null) : null,
+				markKept: shape.markKept ?? false,
+				size: Buffer.byteLength(shape.content),
+			};
 
 			expect({
-				listed,
-				deleteReads,
-				opens,
-				openedId: opens ? (loaded.entries[0] as { id?: string }).id : undefined,
+				listed: [await listedBy(files), await listedBy(memory)],
+				deleteReads: [
+					await readSessionHeaderId(file, files),
+					await readSessionHeaderId(file, memory),
+					sessionHeaderIdOfHead(shape.content),
+				],
+				whole: leadingSessionHeader(shape.content)?.record !== undefined,
+				textPath: opened(await loadSessionFile(file, files)),
+				streamPath: opened(await loadEntriesFromFileStream(file, { storage: files })),
+				memory: opened(await loadSessionFile(file, memory)),
 			}).toEqual({
 				listed: [shape.id, shape.id],
 				deleteReads: [shape.id, shape.id, shape.id],
-				opens: shape.opens,
-				openedId: shape.opens ? shape.id : undefined,
+				whole: shape.whole ?? shape.opens,
+				textPath: expected,
+				streamPath: expected,
+				memory: expected,
 			});
 		});
 	}
