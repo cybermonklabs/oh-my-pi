@@ -578,12 +578,29 @@ const ERR_SHAPES: &[(&str, &str)] = &[
 	("case-and-first-false", "case x in x) false && true;; esac"),
 	("function-and-first-false", "f() { false && true; }; f"),
 	("function-false-then-return", "f() { false; return 2; }; f"),
+	("pipeline-last-false", "true | false"),
 ];
 
-/// The ERR shapes only bash runs here. zsh runs ZERR once for a pipeline
-/// whose last element fails; obash in zsh mode runs it twice (older than
-/// these rows, not this cause).
-const BASH_ERR_SHAPES: &[(&str, &str)] = &[("pipeline-last-false", "true | false")];
+/// The ERR shapes only bash runs here: under `set -E` a forked pipeline
+/// element or background job inherits the trap, and bash's child judges
+/// only the lists nested in the element, not a simple command it runs
+/// with its pipes, a `( … )` element's status or a job of one pipeline;
+/// `lastpipe`'s last element runs in the shell and is judged there too.
+const BASH_ERR_SHAPES: &[(&str, &str)] = &[
+	("errtrace-first-false-cat", "set -E; false | cat"),
+	("errtrace-middle-false-cat", "set -E; true | false | cat"),
+	("errtrace-first-cmdsub-word-cat", "set -E; false $(:) | cat"),
+	("errtrace-first-group-cat", "set -E; { false; } | cat"),
+	("errtrace-first-subshell-cat", "set -E; ( false ) | cat"),
+	("errtrace-first-function-cat", "set -E; f() { false; }; f | cat"),
+	("errtrace-first-cond-cat", "set -E; [[ -z x ]] | cat"),
+	("errtrace-background-false", "set -E; false & wait $!"),
+	("errtrace-background-group-false", "set -E; { false; } & wait $!"),
+	("errtrace-background-and-list", "set -E; true && false & wait $!"),
+	("errtrace-background-pipeline", "set -E; true | false & wait $!"),
+	("errtrace-background-subshell", "set -E; ( false ) & wait $!"),
+	("lastpipe-last-false", "shopt -s lastpipe; true | false"),
+];
 
 /// The ERR shapes only zsh has. `{ } always { }` is judged at its end like
 /// a command, unless a command since ran the trap (the always-list's own
@@ -614,6 +631,27 @@ const ZSH_ERR_SHAPES: &[(&str, &str)] = &[
 	("return-top-level", "return 2"),
 	("function-trap-false-then-return", "TRAPZERR() { echo F$?; }; f() { false; return 2; }; f"),
 	("source-false-then-return", ". =(print 'false; return 4')"),
+	// zsh judges a pipeline element (forked, or the last one in the shell)
+	// and a job's list nowhere but in the lists nested in them; the
+	// pipeline's or the job's status once.
+	("pipeline-last-group-false", "true | { false; }"),
+	("pipeline-last-group-false-true", "true | { false; true; }"),
+	("pipeline-last-function", "f() { false; }; true | f"),
+	("pipeline-last-subshell", "true | (exit 3)"),
+	("pipeline-last-cond", "true | [[ -z x ]]"),
+	("pipeline-in-loop", "for i in 1; do true | false; done"),
+	("pipeline-pipefail", "setopt pipefail; false | true"),
+	("pipeline-first-false-cat", "false | cat"),
+	("pipeline-middle-false-cat", "true | false | cat"),
+	("pipeline-first-group-cat", "{ false; } | cat"),
+	("pipeline-first-subshell-cat", "( false ) | cat"),
+	("pipeline-first-function-cat", "f() { false; }; f | cat"),
+	("pipeline-first-cond-cat", "[[ -z x ]] | cat"),
+	("background-false", "false & wait $!"),
+	("background-group-false", "{ false; } & wait $!"),
+	("background-and-list", "true && false & wait $!"),
+	("background-pipeline", "true | false & wait $!"),
+	("background-subshell", "( false ) & wait $!"),
 ];
 
 /// The ERR rows, `err/<n|e>/<name>`: each shape after `trap 'echo T$?'

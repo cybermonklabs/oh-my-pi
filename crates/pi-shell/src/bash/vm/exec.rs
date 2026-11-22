@@ -300,10 +300,22 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// status N, as bash).
 		let cancel_transfer = cancellation.is_some()
 			&& matches!(flow, Flow::Return(_) | Flow::Abort(_) | Flow::Discard(_));
-		let failing = !ignore_errexit && vp.status != 0 && matches!(flow, Flow::Next | Flow::Jump(_));
+		// A pipeline element's or background job's own command, which bash
+		// and zsh do not judge where it runs ([`element_command`]): the
+		// pipeline's or the job's status is judged instead.
+		let element = vp.status != 0 && element_command(vp, unit, op, fi);
+		let failing = !ignore_errexit
+			&& !element
+			&& vp.status != 0
+			&& matches!(flow, Flow::Next | Flow::Jump(_));
 		let failed_command = failing
 			&& match op.code {
-				Opcode::Spawn => true,
+				// zsh: a pipeline whose last element, run in the shell, already
+				// ran the ZERR trap does not run it again (`donetrap`).
+				Opcode::Spawn => {
+					unit.mode.dialect() == Dialect::Bash
+						|| !vp.frames.get(fi).is_some_and(|frame| frame.err_reported)
+				},
 				// zsh: a call whose body already ran the ZERR trap does not
 				// run it again (`donetrap`).
 				Opcode::Exec => {
@@ -327,7 +339,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// not on other compound commands, whose status comes from a command
 		// already judged.
 		let zsh_unit = unit.mode.dialect() == Dialect::Zsh;
-		let judged = (failing || (zsh_unit && vp.status != 0))
+		let judged = !element
+			&& (failing || (zsh_unit && vp.status != 0))
 			&& match op.code {
 				Opcode::Exec | Opcode::Spawn | Opcode::CallAnon | Opcode::AlwaysEnd => true,
 				Opcode::Redir => matches!(flow, Flow::Jump(_)),
@@ -2199,6 +2212,77 @@ fn bash_job_keeps(unit: &Unit, entry: u32) -> bool {
 		after
 	};
 	code(after) == Some(Opcode::SubExit)
+}
+
+/// Whether `op`, at frame `fi`'s pc, is a pipeline element's or background
+/// job's own command, which bash and zsh do not judge where it runs (no
+/// ERR trap, no `set -e`): the pipeline's or the job's status is judged.
+/// bash's child runs a simple command element with its pipes
+/// (`execute_simple_command`), a `( … )` element as itself, and a job of
+/// one pipeline ([`bash_job_keeps`]) without waiting for it. zsh's
+/// `execpline2` runs an element, in a child or (the last one) in the
+/// shell, and a job's list outside any `execlist`, so only the lists
+/// nested in it are judged.
+fn element_command(vp: &Vproc, unit: &Unit, op: Op, fi: usize) -> bool {
+	// The op may have ended its own frame (`SubExit`, the vproc's end).
+	let Some(f) = vp.frames.get(fi) else {
+		return false;
+	};
+	let zsh = unit.mode.dialect() == Dialect::Zsh;
+	// A child's first frame, or zsh's last element run in the shell.
+	if !((fi == 0 && vp.parent.is_some()) || (zsh && f.kind == FrameKind::Stage)) {
+		return false;
+	}
+	let pc = f.pc;
+	// The innermost spawn stage that holds `pc`: the one this frame runs.
+	let mut stage: Option<(u32, SpawnKind)> = None;
+	for s in &unit.spawns {
+		for (i, st) in s.stages.iter().enumerate() {
+			let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
+			if (st.entry..end).contains(&pc) && stage.is_none_or(|(entry, _)| st.entry > entry) {
+				stage = Some((st.entry, s.kind));
+			}
+		}
+	}
+	let Some((entry, kind)) = stage else {
+		return false;
+	};
+	let first = skip_blocks(unit, entry);
+	// A `( … )` element or job: its own `Spawn`, just after its `Enter`.
+	let subshell = pc == first + 1
+		&& op.code == Opcode::Spawn
+		&& unit
+			.spawns
+			.get(op.a as usize)
+			.is_some_and(|s| s.kind == SpawnKind::Subshell)
+		&& unit
+			.ops
+			.get(first as usize)
+			.is_some_and(|enter| enter.code == Opcode::Enter);
+	match kind {
+		SpawnKind::Pipeline | SpawnKind::Background if zsh => {
+			// Not in a substitution's body inside the element (its own child
+			// runs it), nor in a list nested in it (a group, a loop or `if`
+			// body): only a `[[ ]]`, `(( ))` or `( … )` element is entered.
+			let in_body = unit.ops[entry as usize..pc as usize].iter().any(|o| {
+				o.code == Opcode::Jmp
+					&& o.a > pc
+					&& unit
+						.ops
+						.get(o.a as usize - 1)
+						.is_some_and(|end| end.code == Opcode::SubExit)
+			});
+			!in_body
+				&& f.enters.iter().all(|&(node, _)| {
+					unit.nodes.get(node as usize).is_some_and(|n| {
+						matches!(n.kind, NodeKind::Cond | NodeKind::Arith | NodeKind::Subshell)
+					})
+				})
+		},
+		SpawnKind::Pipeline => (pc == first && op.code == Opcode::Exec) || subshell,
+		SpawnKind::Background => (pc == first && bash_job_keeps(unit, entry)) || subshell,
+		_ => false,
+	}
 }
 
 /// A `break`/`continue` that leaves this vproc's own loops for its forking

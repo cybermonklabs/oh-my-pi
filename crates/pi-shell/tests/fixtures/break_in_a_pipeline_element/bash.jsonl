@@ -6,6 +6,18 @@
 {"id":"err/e/cond-false","script":"set -e; trap 'echo T$?' ERR; [[ -z x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/elif-cond-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; elif false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/else-body-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; else false; fi; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-and-list","script":"set -e; trap 'echo T$?' ERR; set -E; true && false & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-false","script":"set -e; trap 'echo T$?' ERR; set -E; false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-group-false","script":"set -e; trap 'echo T$?' ERR; set -E; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-pipeline","script":"set -e; trap 'echo T$?' ERR; set -E; true | false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-subshell","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-first-cmdsub-word-cat","script":"set -e; trap 'echo T$?' ERR; set -E; false $(:) | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-cond-cat","script":"set -e; trap 'echo T$?' ERR; set -E; [[ -z x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-false-cat","script":"set -e; trap 'echo T$?' ERR; set -E; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-function-cat","script":"set -e; trap 'echo T$?' ERR; set -E; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-group-cat","script":"set -e; trap 'echo T$?' ERR; set -E; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-subshell-cat","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-middle-false-cat","script":"set -e; trap 'echo T$?' ERR; set -E; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/for-and-first-false","script":"set -e; trap 'echo T$?' ERR; for i in 1; do false && true; done; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/for-body-false","script":"set -e; trap 'echo T$?' ERR; for i in 1; do false; done; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/function-and-first-false","script":"set -e; trap 'echo T$?' ERR; f() { false && true; }; f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
@@ -19,6 +31,7 @@
 {"id":"err/e/if-body-false","script":"set -e; trap 'echo T$?' ERR; if true; then false; fi; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/if-body-not-true","script":"set -e; trap 'echo T$?' ERR; if true; then ! true; fi; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/if-cond-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/lastpipe-last-false","script":"set -e; trap 'echo T$?' ERR; shopt -s lastpipe; true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/nested-while","script":"set -e; trap 'echo T$?' ERR; i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; done; done; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/not-false","script":"set -e; trap 'echo T$?' ERR; ! false; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/not-true","script":"set -e; trap 'echo T$?' ERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
@@ -44,6 +57,18 @@
 {"id":"err/n/cond-false","script":"trap 'echo T$?' ERR; [[ -z x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/elif-cond-false","script":"trap 'echo T$?' ERR; if false; then :; elif false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/else-body-false","script":"trap 'echo T$?' ERR; if false; then :; else false; fi; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-and-list","script":"trap 'echo T$?' ERR; set -E; true && false & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-false","script":"trap 'echo T$?' ERR; set -E; false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-group-false","script":"trap 'echo T$?' ERR; set -E; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-pipeline","script":"trap 'echo T$?' ERR; set -E; true | false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-subshell","script":"trap 'echo T$?' ERR; set -E; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-cmdsub-word-cat","script":"trap 'echo T$?' ERR; set -E; false $(:) | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-cond-cat","script":"trap 'echo T$?' ERR; set -E; [[ -z x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-false-cat","script":"trap 'echo T$?' ERR; set -E; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-function-cat","script":"trap 'echo T$?' ERR; set -E; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-group-cat","script":"trap 'echo T$?' ERR; set -E; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-subshell-cat","script":"trap 'echo T$?' ERR; set -E; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-middle-false-cat","script":"trap 'echo T$?' ERR; set -E; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/for-and-first-false","script":"trap 'echo T$?' ERR; for i in 1; do false && true; done; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/for-body-false","script":"trap 'echo T$?' ERR; for i in 1; do false; done; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/function-and-first-false","script":"trap 'echo T$?' ERR; f() { false && true; }; f; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
@@ -57,6 +82,7 @@
 {"id":"err/n/if-body-false","script":"trap 'echo T$?' ERR; if true; then false; fi; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/if-body-not-true","script":"trap 'echo T$?' ERR; if true; then ! true; fi; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/if-cond-false","script":"trap 'echo T$?' ERR; if false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/lastpipe-last-false","script":"trap 'echo T$?' ERR; shopt -s lastpipe; true | false; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/nested-while","script":"trap 'echo T$?' ERR; i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; done; done; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/not-false","script":"trap 'echo T$?' ERR; ! false; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/not-true","script":"trap 'echo T$?' ERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}

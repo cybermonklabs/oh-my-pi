@@ -9,6 +9,11 @@
 {"id":"err/e/and-list-last-false","script":"setopt errexit; trap 'echo T$?' ZERR; true && false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/and-not-return","script":"setopt errexit; trap 'echo T$?' ZERR; f() { true && ! return 2; }; f; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/arith-false","script":"setopt errexit; trap 'echo T$?' ZERR; (( 0 )); echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/background-and-list","script":"setopt errexit; trap 'echo T$?' ZERR; true && false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/background-false","script":"setopt errexit; trap 'echo T$?' ZERR; false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/background-group-false","script":"setopt errexit; trap 'echo T$?' ZERR; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
+{"id":"err/e/background-pipeline","script":"setopt errexit; trap 'echo T$?' ZERR; true | false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/background-subshell","script":"setopt errexit; trap 'echo T$?' ZERR; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
 {"id":"err/e/case-and-first-false","script":"setopt errexit; trap 'echo T$?' ZERR; case x in x) false && true;; esac; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/case-body-false","script":"setopt errexit; trap 'echo T$?' ZERR; case x in x) false;; esac; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/cond-false","script":"setopt errexit; trap 'echo T$?' ZERR; [[ -z x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
@@ -39,6 +44,20 @@
 {"id":"err/e/not-true","script":"setopt errexit; trap 'echo T$?' ZERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/or-list-false","script":"setopt errexit; trap 'echo T$?' ZERR; false || false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/or-return","script":"setopt errexit; trap 'echo T$?' ZERR; f() { false || return 2; }; f; echo end:$?","stdout":"T2\n","stderr":"","status":2}
+{"id":"err/e/pipeline-first-cond-cat","script":"setopt errexit; trap 'echo T$?' ZERR; [[ -z x ]] | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-first-false-cat","script":"setopt errexit; trap 'echo T$?' ZERR; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-first-function-cat","script":"setopt errexit; trap 'echo T$?' ZERR; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-first-group-cat","script":"setopt errexit; trap 'echo T$?' ZERR; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-first-subshell-cat","script":"setopt errexit; trap 'echo T$?' ZERR; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-in-loop","script":"setopt errexit; trap 'echo T$?' ZERR; for i in 1; do true | false; done; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-cond","script":"setopt errexit; trap 'echo T$?' ZERR; true | [[ -z x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-false","script":"setopt errexit; trap 'echo T$?' ZERR; true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-function","script":"setopt errexit; trap 'echo T$?' ZERR; f() { false; }; true | f; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-group-false","script":"setopt errexit; trap 'echo T$?' ZERR; true | { false; }; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-group-false-true","script":"setopt errexit; trap 'echo T$?' ZERR; true | { false; true; }; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/pipeline-last-subshell","script":"setopt errexit; trap 'echo T$?' ZERR; true | (exit 3); echo end:$?","stdout":"T3\n","stderr":"","status":3}
+{"id":"err/e/pipeline-middle-false-cat","script":"setopt errexit; trap 'echo T$?' ZERR; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/pipeline-pipefail","script":"setopt errexit; trap 'echo T$?' ZERR; setopt pipefail; false | true; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/return-in-condition","script":"setopt errexit; trap 'echo T$?' ZERR; f() { return 2; }; if f; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/return-in-loop","script":"setopt errexit; trap 'echo T$?' ZERR; f() { for i in 1; do return 3; done; }; f; echo end:$?","stdout":"T3\n","stderr":"","status":3}
 {"id":"err/e/return-in-or-list","script":"setopt errexit; trap 'echo T$?' ZERR; f() { return 2; }; f || echo or; echo end:$?","stdout":"or\nend:0\n","stderr":"","status":0}
@@ -69,6 +88,11 @@
 {"id":"err/n/and-list-last-false","script":"trap 'echo T$?' ZERR; true && false; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/and-not-return","script":"trap 'echo T$?' ZERR; f() { true && ! return 2; }; f; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/arith-false","script":"trap 'echo T$?' ZERR; (( 0 )); echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-and-list","script":"trap 'echo T$?' ZERR; true && false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-false","script":"trap 'echo T$?' ZERR; false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-group-false","script":"trap 'echo T$?' ZERR; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-pipeline","script":"trap 'echo T$?' ZERR; true | false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-subshell","script":"trap 'echo T$?' ZERR; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/case-and-first-false","script":"trap 'echo T$?' ZERR; case x in x) false && true;; esac; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/case-body-false","script":"trap 'echo T$?' ZERR; case x in x) false;; esac; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/cond-false","script":"trap 'echo T$?' ZERR; [[ -z x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
@@ -99,6 +123,20 @@
 {"id":"err/n/not-true","script":"trap 'echo T$?' ZERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/or-list-false","script":"trap 'echo T$?' ZERR; false || false; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/or-return","script":"trap 'echo T$?' ZERR; f() { false || return 2; }; f; echo end:$?","stdout":"T2\nend:2\n","stderr":"","status":0}
+{"id":"err/n/pipeline-first-cond-cat","script":"trap 'echo T$?' ZERR; [[ -z x ]] | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-first-false-cat","script":"trap 'echo T$?' ZERR; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-first-function-cat","script":"trap 'echo T$?' ZERR; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-first-group-cat","script":"trap 'echo T$?' ZERR; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-first-subshell-cat","script":"trap 'echo T$?' ZERR; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-in-loop","script":"trap 'echo T$?' ZERR; for i in 1; do true | false; done; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-cond","script":"trap 'echo T$?' ZERR; true | [[ -z x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-false","script":"trap 'echo T$?' ZERR; true | false; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-function","script":"trap 'echo T$?' ZERR; f() { false; }; true | f; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-group-false","script":"trap 'echo T$?' ZERR; true | { false; }; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-group-false-true","script":"trap 'echo T$?' ZERR; true | { false; true; }; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-last-subshell","script":"trap 'echo T$?' ZERR; true | (exit 3); echo end:$?","stdout":"T3\nend:3\n","stderr":"","status":0}
+{"id":"err/n/pipeline-middle-false-cat","script":"trap 'echo T$?' ZERR; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/pipeline-pipefail","script":"trap 'echo T$?' ZERR; setopt pipefail; false | true; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/return-in-condition","script":"trap 'echo T$?' ZERR; f() { return 2; }; if f; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/return-in-loop","script":"trap 'echo T$?' ZERR; f() { for i in 1; do return 3; done; }; f; echo end:$?","stdout":"T3\nend:3\n","stderr":"","status":0}
 {"id":"err/n/return-in-or-list","script":"trap 'echo T$?' ZERR; f() { return 2; }; f || echo or; echo end:$?","stdout":"or\nend:0\n","stderr":"","status":0}

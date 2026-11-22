@@ -9,6 +9,7 @@
 - The ERR trap (zsh: ZERR) runs once per failed command: a loop, group, `if` or `case` whose status comes from a command already reported no longer runs it a second time when it ends; zsh's `ERR_EXIT` now ends the shell on a failing `{ } always { }`, as zsh judges it like a command
 - `break` and `continue` in a trap action leave the loop the trap interrupted, as bash and zsh run them: a signal, ERR, DEBUG or RETURN trap no longer prints `only meaningful in a loop` there; the interrupted command's status comes back, zsh's `ERR_EXIT` comes back after a DEBUG trap, a function a RETURN trap ends still returns, a cancellation's trap still ends the shell, and in zsh an EXIT trap run by `exit` inside a loop ends at the `break` while the exit goes on
 - zsh: `return N` (N ≠ 0) in a function or `.` file runs the ZERR trap inside it, as zsh runs it for any failed command, and the call it ends does not run it again; a `!` around the `return` inverts its status
+- The ERR trap (zsh: ZERR) and `set -e` judge a pipeline element or background job where bash and zsh do: the command a forked element or job runs (bash: a simple command with its pipes, a `( … )` element's status, a job of one pipeline; zsh: everything but the lists nested in it, and also the last element zsh runs in the shell) no longer runs the trap itself, and the pipeline's or job's status is judged once
 
 ## [18.18.6] - 2026-11-09
 
