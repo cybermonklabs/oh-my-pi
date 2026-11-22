@@ -9,7 +9,8 @@
  * holds is said by the storage that holds the agent's transcript, never by
  * the process default: the live session's, else the one the ref was
  * registered with (the session being built, a roster scan, a restored worker),
- * attached with, or reopened from.
+ * attached with, or reopened from, recorded before any listener hears of the
+ * ref.
  *
  * Each kill is read back the way a restart reads it: a fresh registry scans
  * the transcripts through the storage and lists the agent as killed.
@@ -441,6 +442,60 @@ describe("agent kill tombstone storage", () => {
 				).rejects.toMatchObject({ code: "ENOENT" });
 				expect(fs.existsSync(dir.join("gone"))).toBe(false);
 				expect(registry.get(workerId)).toMatchObject({ status: "aborted", session: null });
+			});
+
+			/** Kills `workerId` from the first `registered` event of a parked ref, as a listener would. */
+			function killOnParkedRegistration(workerId: string): () => Promise<{ ok: boolean } | { error: string }> {
+				let killed: Promise<{ ok: boolean } | { error: string }> | undefined;
+				const stop = AgentRegistry.global().onChange(event => {
+					if (event.type !== "registered" || event.ref.id !== workerId || event.ref.status !== "parked" || killed)
+						return;
+					killed = AgentLifecycleManager.global()
+						.release(workerId, event.ref, { tombstone: true })
+						.then(
+							ok => ({ ok }),
+							error => ({ error: String(error) }),
+						);
+				});
+				cleanups.push(stop);
+				return async () => {
+					if (!killed) throw new Error(`no parked registration of ${workerId}`);
+					return killed;
+				};
+			}
+
+			// The reopen records its storage before it announces the ref, so a listener's kill finds it.
+			it("records the kill a registered listener makes while a killed subagent is reopened", async () => {
+				useDefault(new FileSessionStorage());
+				const storage = await sqlStorage(backend);
+				const dir = tempDir("@omp-tombstone-sql-reopen-listener-");
+				const workerId = "Reopen-Listener";
+				const { sessionFile } = await subagentTranscript(dir, storage, workerId);
+				const first = registerLive(workerId, sessionFile, storage);
+				expect(await AgentLifecycleManager.global().release(workerId, first, { tombstone: true })).toBe(true);
+				fs.rmSync(path.dirname(sessionFile), { recursive: true, force: true });
+				const killed = killOnParkedRegistration(workerId);
+
+				AgentRegistry.global().reopen(workerId, first);
+
+				expect(await killed()).toEqual({ ok: true });
+				expect(fs.existsSync(`${sessionFile}.tombstone`)).toBe(true);
+			});
+
+			// The roster scan records its storage before it announces the ref, so a listener's kill finds it.
+			it("records the kill a registered listener makes while the roster scan registers a subagent", async () => {
+				useDefault(new FileSessionStorage());
+				const storage = await sqlStorage(backend);
+				const dir = tempDir("@omp-tombstone-sql-scan-listener-");
+				const workerId = "Scan-Listener";
+				const { root, sessionFile } = await subagentTranscript(dir, storage, workerId);
+				const killed = killOnParkedRegistration(workerId);
+
+				await ensurePersistedRoster(AgentRegistry.global(), root, storage);
+
+				expect(await killed()).toEqual({ ok: true });
+				expect(fs.existsSync(`${sessionFile}.tombstone`)).toBe(true);
+				expect(await rescanned(root, storage, workerId)).toMatchObject({ status: "aborted", sessionFile });
 			});
 
 			// A registration that names both a live session and a storage takes the session's.
