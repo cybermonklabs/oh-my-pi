@@ -135,6 +135,18 @@ const SHAPES: Record<string, Shape> = {
 		opens: true,
 	},
 	"a line of garbage, then a whole header": { content: `not json\n${header()}\n${turn}`, id: ID, opens: true },
+	// A mark at the start of the second line is dropped only after the written title slot: after any other first
+	// line it leaves the header line unreadable, as at the start of any later line.
+	"a line of garbage, then a byte order mark and a whole header": {
+		content: `not json\n${MARK}${header()}\n${turn}`,
+		id: undefined,
+		opens: false,
+	},
+	"a title record that is not the written slot, then a byte order mark and a whole header": {
+		content: `${slot}\n${MARK}${header()}\n${turn}`,
+		id: ID,
+		opens: false,
+	},
 	"a header longer than the first read (16 KiB)": {
 		content: `${header({ note: "x".repeat(20_000) })}\n${turn}`,
 		id: ID,

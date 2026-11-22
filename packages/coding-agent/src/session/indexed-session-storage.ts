@@ -384,6 +384,23 @@ export class IndexedSessionStorage implements SessionStorage {
 		return title ? overlayTitleSlotContent(content, title) : content;
 	}
 
+	/**
+	 * {@link readText}'s text with the size in bytes the backend stores, from
+	 * one read (the backend's `readFrom` where it has one). SQLite and Redis
+	 * hold whatever bytes another client stored and decode them as they read,
+	 * so a byte that is not UTF-8 reads as U+FFFD (3 bytes for 1) and the
+	 * text's UTF-8 length is not the size the backend checks writes against.
+	 */
+	async readTextSized(path: string): Promise<{ text: string; size: number }> {
+		const entry = this.#index.get(path);
+		if (!entry) throw enoent(path);
+		await this.#awaitPath(path);
+		const read = await this.#readBackendFrom(path, 0, undefined);
+		if (!read) throw enoent(path);
+		const title = titleUpdateForIndex(entry);
+		return title ? { text: overlayTitleSlotContent(read.text, title), size: read.size } : read;
+	}
+
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);

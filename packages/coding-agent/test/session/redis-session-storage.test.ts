@@ -16,6 +16,7 @@
 
 import { RedisClient } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
@@ -66,6 +67,15 @@ function createFakeRedis(): FakeRedis {
 		}
 		return h;
 	};
+
+	/** `key`'s bytes `start` to `end` (negative: from the end), as GETRANGE returns them. */
+	const range = (key: string, start: number, end: number): Buffer => {
+		const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
+		const from = Math.max(0, start < 0 ? bytes.length + start : start);
+		const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
+		return to < from ? Buffer.alloc(0) : bytes.subarray(from, to + 1);
+	};
+	const sha1 = (bytes: Buffer): string => createHash("sha1").update(bytes).digest("hex");
 
 	const client: FakeRedis = {
 		calls,
@@ -130,15 +140,25 @@ function createFakeRedis(): FakeRedis {
 				else getHash(titleKey).delete(dst);
 				return 1;
 			}
+			if (script.includes("OMP_HEAD")) {
+				const head = range(keys[0], 0, Number(argv[0]));
+				return [head.toString("utf-8"), sha1(head), head.length];
+			}
+			if (script.includes("OMP_READ_FROM")) {
+				const [fileKey] = keys;
+				const [start, end] = argv;
+				if (!strings.has(fileKey)) return null;
+				const text = end === "" ? "" : range(fileKey, Number(start), Number(end)).toString("utf-8");
+				return [text, Buffer.byteLength(strings.get(fileKey) as string, "utf-8")];
+			}
 			if (script.includes("OMP_REMOVE")) {
 				checkFailure("del");
 				const [metaKey, titleKey] = keys;
-				const [filePrefix, pattern, guardKey, guardHead, ...paths] = argv;
-				// A listed session's key must be there and still start with the head the store checked.
+				const [filePrefix, pattern, guardKey, guardLast, guardSha1, ...paths] = argv;
+				// A listed session's key must be there and still start with the bytes of the head the store checked.
 				if (guardKey) {
 					if (!strings.has(guardKey)) return -1;
-					const bytes = Buffer.from(strings.get(guardKey) as string, "utf-8");
-					if (bytes.subarray(0, Buffer.byteLength(guardHead)).toString("utf-8") !== guardHead) return -2;
+					if (sha1(range(guardKey, 0, Number(guardLast))) !== guardSha1) return -2;
 				}
 				if (pattern) {
 					// The pattern is an escaped key prefix followed by `*`.
@@ -164,12 +184,7 @@ function createFakeRedis(): FakeRedis {
 		async getrange(key, start, end) {
 			record("getrange", [key, start, end]);
 			checkFailure("getrange");
-			const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
-			if (bytes.length === 0) return "";
-			const from = Math.max(0, start < 0 ? bytes.length + start : start);
-			const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-			if (to < from) return "";
-			return bytes.subarray(from, to + 1).toString("utf-8");
+			return range(key, start, end).toString("utf-8");
 		},
 		async strlen(key) {
 			record("strlen", [key]);

@@ -377,8 +377,10 @@ export interface SessionStorage {
 	 * The file's bytes as stored, decoded as {@link readText} decodes them,
 	 * and their length. Optional: {@link readStoredText} uses it only to size
 	 * text that holds U+FFFD, which an invalid byte or a character cut off at
-	 * the end decodes to (3 bytes for 1). A backend that stores text holds it
-	 * as stored and has none.
+	 * the end decodes to (3 bytes for 1). The file store reads the bytes, and
+	 * the key-indexed stores (SQL, Redis) read the size their backend stores
+	 * with the text: SQLite and Redis hold whatever bytes another client
+	 * stored. The in-memory store holds the text it was given and has none.
 	 */
 	readTextSized?(path: string): Promise<{ text: string; size: number }>;
 	/** Synchronous {@link readTextSized}. See {@link readStoredTextSync}. */
@@ -1798,8 +1800,8 @@ export async function readSessionTextFrom(
  * character cut off at the end, decodes to it (3 bytes for 1). Then the
  * stored bytes are read for their length ({@link SessionStorage.readTextSized}),
  * kept when they decode to the same text. Otherwise (the file changed or
- * vanished between the reads, or the backend stores text) the text's length
- * stands, and a write meets the size conflict the manager recovers from.
+ * vanished between the reads, or the store has no sized read) the text's
+ * length stands, and a write meets the size conflict the manager recovers from.
  */
 export async function readStoredText(
 	storage: SessionStorage,
