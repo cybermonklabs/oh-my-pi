@@ -1636,6 +1636,13 @@ nothing; while nobody speaks, the 60 s `idle_timeout_s` under a speech wake
 policy puts the call on OpenAI's standby rate. `live.endpoint` and
 `live.provider: openai` cannot both be set.
 
+While the session's `cyber_policy` hold stands (OpenAI refused the session's
+content), no live call starts, on any of the three routes: the hold is read
+before the transport is made, in the same step as the signaling request, and
+again once the call has connected, which then ends. During a call each frame of
+the session's text to the voice model reads it in the step of its write; a held
+frame is not sent and the call ends. `session.close` is not held.
+
 `live.pulseServer` names the PulseAudio server for the call's microphone and
 speaker (for example `tcp:127.0.0.1:4713`); it wins over `PULSE_SERVER`, the
 stream gets the buffer sizes of a network round trip as with `PULSE_SERVER`

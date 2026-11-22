@@ -113,6 +113,8 @@ interface CallOptions {
 	connectGate?: Promise<void>;
 	/** An unsaved session: it allocates no artifact path. */
 	unsaved?: boolean;
+	/** Whether the session's cyber_policy hold stands (#106's `session.cyberPolicyClosure.active`). */
+	held?: () => boolean;
 }
 
 function call(options: CallOptions = {}) {
@@ -150,6 +152,11 @@ function call(options: CallOptions = {}) {
 			},
 		},
 		settings: Settings.isolated({ "live.provider": "openai", ...options.settings }),
+		cyberPolicyClosure: {
+			get active() {
+				return options.held?.() ?? false;
+			},
+		},
 		sessionId: "s1",
 		sessionManager: {
 			allocateArtifactPath: async () => {
@@ -539,6 +546,54 @@ describe("GPT-Live call lifecycle", () => {
 		expect(content).not.toContain(live.transcriptPath);
 		expect(content).toContain("Its transcript could not be written to a file.");
 		expect(await Bun.file(live.transcriptPath).text()).toBe("someone else's words\n");
+	});
+});
+
+describe("GPT-Live and the session's cyber_policy hold (#106)", () => {
+	test("a held session starts no call: no transport is made", async () => {
+		const live = call({ held: () => true });
+		await expect(live.controller.start()).rejects.toThrow(/cyber_policy/);
+		expect(live.transports).toEqual([]);
+		expect(live.allocations()).toBe(0);
+	});
+
+	test("the transport gets the session's hold, read each time it asks", async () => {
+		let held = false;
+		const live = call({ closedAfterMs: 0, held: () => held });
+		await live.controller.start();
+		const holdReason = live.transport().options.holdReason;
+		expect(holdReason?.()).toBeUndefined();
+		held = true;
+		expect(holdReason?.()).toMatch(/cyber_policy/);
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+	});
+
+	test("a hold recorded while the call connected closes it before any audio or session text", async () => {
+		let held = false;
+		const connected = Promise.withResolvers<void>();
+		const live = call({ closedAfterMs: 0, held: () => held, connectGate: connected.promise });
+		let settled = false;
+		const starting = live.controller
+			.start()
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			)
+			.finally(() => {
+				settled = true;
+			});
+		for (let i = 0; i < 200 && live.transports.length === 0; i++) await fs.stat(tempDir);
+		held = true;
+		connected.resolve();
+		// The start's own failure stops the call; the clock moves until that stop is done.
+		for (let i = 0; i < 50 && !settled; i++) await advance(200);
+		expect(String(await starting)).toMatch(/cyber_policy/);
+		const transport = live.transport();
+		expect(transport.closed).toBe(true);
+		expect(transport.sent.filter(message => message.type !== "session.close")).toEqual([]);
+		expect(live.allocations()).toBe(0);
 	});
 });
 

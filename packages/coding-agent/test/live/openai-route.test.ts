@@ -4,6 +4,7 @@ import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildOpenAILiveSessionRequest,
+	buildSessionClose,
 	type LiveServerEvent,
 	OPENAI_LIVE_WIRE,
 	parseOpenAILiveServerEvent,
@@ -105,6 +106,7 @@ function openaiTransport(
 	route: OpenAILiveRoute,
 	onEvent: (event: LiveServerEvent) => void = () => {},
 	signal?: AbortSignal,
+	holdReason?: () => string | undefined,
 ): LiveTransport {
 	return new LiveTransport({
 		authStorage: noCodexLogin,
@@ -115,6 +117,7 @@ function openaiTransport(
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },
 		signal,
+		holdReason,
 	});
 }
 
@@ -406,6 +409,54 @@ describe("GPT-Live transport", () => {
 			held.resolve(new Response(null, { status: 499 }));
 			await cancelled.close();
 			slow.server.stop(true);
+		}
+	});
+});
+
+describe("GPT-Live and the session's cyber_policy hold (#106)", () => {
+	const HOLD = "OpenAI refused content of this session (cyber_policy); test hold";
+	const route = (base: string): OpenAILiveRoute => ({ baseUrl: base, apiKey: "gw-key", model: "gpt-live-1.1" });
+
+	test("a held call sends no session request", async () => {
+		const api = liveApiServer();
+		const transport = openaiTransport(
+			route(api.base),
+			() => {},
+			undefined,
+			() => HOLD,
+		);
+		try {
+			await expect(transport.connect()).rejects.toThrow(HOLD);
+			expect(api.posts).toEqual([]);
+			expect(api.upgrades).toEqual([]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("a hold that starts during the call keeps each frame of session text, not session.close", async () => {
+		let held = false;
+		const api = liveApiServer();
+		const transport = openaiTransport(
+			route(api.base),
+			() => {},
+			undefined,
+			() => (held ? HOLD : undefined),
+		);
+		try {
+			await transport.connect();
+			expect(api.posts).toHaveLength(1);
+			held = true;
+			await expect(transport.send(OPENAI_LIVE_WIRE.progress("item_1", "Reading the log."))).rejects.toThrow(HOLD);
+			await expect(transport.send(OPENAI_LIVE_WIRE.result("item_1", "It is green."))).rejects.toThrow(HOLD);
+			const sent = api.message();
+			await transport.send(buildSessionClose());
+			expect(await sent).toEqual({ type: "session.close" });
+			expect(api.received).toEqual([{ type: "session.close" }]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
 		}
 	});
 });

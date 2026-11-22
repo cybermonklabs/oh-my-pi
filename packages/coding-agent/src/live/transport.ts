@@ -162,6 +162,15 @@ export interface LiveTransportOptions {
 	 */
 	signal?: AbortSignal;
 	/**
+	 * Why the call may send nothing to the voice model now (#106's cyber_policy hold of the session), or
+	 * `undefined`. It is read in the same synchronous step as each send it guards: the signaling POST that
+	 * opens the call (it carries the instructions, or opens the call they go to), the session update of a
+	 * custom endpoint, and each frame of the session's text. A held POST is not sent and `connect()`
+	 * rejects with the hold's message; a held frame is not sent and `send()` rejects with it.
+	 * `session.close`, which only ends the call, is not held.
+	 */
+	holdReason?: () => string | undefined;
+	/**
 	 * SDP offer from a caller-owned WebRTC peer (one Opus audio track plus an `oai-events`
 	 * data channel). When set, no native peer is created: the caller's peer carries the audio,
 	 * {@link LiveTransport.sdpAnswer} holds the answer to apply to it, and this transport
@@ -262,6 +271,11 @@ function boundedLocation(location: string | null): string {
 	return `${location.slice(0, MAX_LOCATION_LENGTH)}…`;
 }
 
+/** Whether `message` carries the session's text to the voice model, as `session.close` does not. */
+function carriesSessionText(message: LiveClientMessage): boolean {
+	return message.type !== "session.close";
+}
+
 function abortReason(signal: AbortSignal | undefined): Error {
 	if (signal?.reason instanceof Error) return signal.reason;
 	return new DOMException("Live connection aborted", "AbortError");
@@ -347,6 +361,7 @@ export class LiveTransport {
 		// A custom endpoint got the bare SDP: the session configuration follows on the sideband.
 		if (this.#options.endpoint) {
 			const update = buildLiveSessionUpdate(this.#options.instructions, this.#options.voice);
+			this.#throwIfHeld();
 			this.#sideband?.send(JSON.stringify(update));
 		}
 		this.#state = "connected";
@@ -400,6 +415,8 @@ export class LiveTransport {
 			"Content-Type": "application/json",
 		});
 		const fetchImpl = wrapFetchForProxy(fetch, LIVE_PROVIDER);
+		// Read in the same step as the POST: the attestation and the credential were awaited after the caller's read.
+		this.#throwIfHeld();
 		const response = await fetchImpl(SIGNALING_URL, {
 			method: "POST",
 			headers,
@@ -439,6 +456,7 @@ export class LiveTransport {
 		const origin = url.origin;
 		for (let redirects = 0; ; redirects++) {
 			this.#options.signal?.throwIfAborted();
+			this.#throwIfHeld();
 			const response = await fetch(url, {
 				method: "POST",
 				headers: { ...credentials, "Content-Type": "application/sdp" },
@@ -500,6 +518,7 @@ export class LiveTransport {
 			voice: this.#options.voice,
 			sdp: offer,
 		});
+		this.#throwIfHeld();
 		const response = await fetch(url, {
 			method: "POST",
 			headers: { ...credentials, Accept: "application/json", "Content-Type": "application/json" },
@@ -700,10 +719,20 @@ export class LiveTransport {
 		} catch {}
 	}
 
-	/** Serialize one Frameless Bidi control message onto the call's sideband WebSocket. */
+	/** Throws the hold's message when {@link LiveTransportOptions.holdReason} holds the call's sends now. */
+	#throwIfHeld(): void {
+		const reason = this.#options.holdReason?.();
+		if (reason !== undefined) throw new Error(reason);
+	}
+
+	/**
+	 * Serialize one control message onto the call's sideband WebSocket. A frame of the session's text reads
+	 * {@link LiveTransportOptions.holdReason} in the same step as the write, and a held one rejects unsent.
+	 */
 	send(message: LiveClientMessage): Promise<void> {
 		const operation = this.#sendTail.then(() => {
 			if (this.#state !== "connected") throw new Error("Live transport is not connected");
+			if (carriesSessionText(message)) this.#throwIfHeld();
 			const sideband = this.#sideband;
 			if (!sideband || sideband.readyState !== WebSocket.OPEN) {
 				throw new Error(`${this.#label} sideband is not connected`);

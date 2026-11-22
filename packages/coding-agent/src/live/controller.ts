@@ -242,6 +242,9 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while starting.");
 			}
+			// The call itself goes to OpenAI: none starts while a refusal holds the session's OpenAI routes (#106).
+			const held = liveCallHoldReason(this.#session);
+			if (held) throw new Error(held);
 			const pulseServer = cfgLivePulseServer.get(settings)?.trim() || undefined;
 			const transport = new LiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
@@ -253,6 +256,8 @@ export class LiveSessionController {
 				voice: this.#voice,
 				sdpOffer: this.#sdpOffer,
 				signal: this.#connectAbort.signal,
+				// Read by the transport in the step of the signaling POST and of each frame of the session's text.
+				holdReason: () => liveCallHoldReason(this.#session),
 				callbacks: {
 					onEvent: event => this.#receiveLiveEvent(event),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
@@ -263,6 +268,10 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
+			// A refusal recorded while the call connected (after the POST went out) closes it before any audio
+			// or session text: the catch below stops the call and closes the transport.
+			const heldOnConnect = liveCallHoldReason(this.#session);
+			if (heldOnConnect) throw new Error(heldOnConnect);
 			if (this.#callTranscript) {
 				this.#callStartedAt = new Date();
 				// The file, and its artifact id, exist from the moment the call is up: an id allocated earlier
