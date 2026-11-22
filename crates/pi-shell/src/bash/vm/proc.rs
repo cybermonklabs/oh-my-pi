@@ -670,8 +670,12 @@ pub struct Bang {
 /// pid at once; anything else applies them here as usual.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deferral {
-	/// The vproc running the command.
-	pub vproc: Vpid,
+	/// The command whose open would wait (its vproc is `cmd.vpid`). Only
+	/// that command's stages read the record ([`super::Kernel::deferral`]):
+	/// a command it runs on the same vproc (its function's body, `eval`'s
+	/// or a sourced file's code) is another command and resolves its name
+	/// and opens its redirections as usual.
+	pub cmd:   CmdTag,
 	/// Index of the first redirection left (the one whose open would wait).
 	pub from:  usize,
 	/// Where the command is.

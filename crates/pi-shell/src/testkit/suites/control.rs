@@ -143,6 +143,71 @@ fn restore_rejects_corrupt_and_foreign_frames_and_can_drop_them() {
 	assert!(host.stdout.bytes().ends_with(b"fresh\n"));
 }
 
+/// A frames blob written under the previous frames version (the header's
+/// version byte one less: 30 at version 31) is refused as another build's;
+/// it is never migrated. With `drop_frames` it is discarded: the root store
+/// state stays, and each run it names ends 255.
+#[test]
+fn restore_refuses_frames_of_the_previous_version_and_can_drop_them() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	let mut shell =
+		Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+			.unwrap();
+	let set = shell.submit(Script::command(&b"kept=yes"[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, set, Budget::default()), Stop::Done(0));
+	let id = shell.submit(Script::command(&b"while :; do :; done"[..]));
+	assert_eq!(
+		advance(&mut shell, &mut host, &mut store, id, Budget { max_ops: 9, max_ns: u64::MAX }),
+		Stop::Yield
+	);
+	shell
+		.externalize(&mut Cx { host: &mut host, store: &mut store })
+		.unwrap();
+	drop(shell);
+	let mut blob = store.get_blob(BlobSlot::Frames).unwrap().unwrap();
+
+	// The postcard header: the magic, then the IR and frames versions, each
+	// one varint byte below 128.
+	assert_eq!(&blob[..4], b"OBF1");
+	assert_eq!(u32::from(blob[4]), crate::bash::ir::IR_VERSION);
+	let version = blob[5];
+	assert!((1..0x80).contains(&version), "frames version byte {version}");
+	blob[5] = version - 1;
+	store.put_blob(BlobSlot::Frames, &blob).unwrap();
+	let err = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.err();
+	assert!(
+		matches!(err, Some(RestoreError::Incompatible { why: Incompatibility::Build })),
+		"frames of version {} are refused: {err:?}",
+		version - 1
+	);
+	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_some(), "a refused restore keeps the blob");
+
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
+			drop_frames: true,
+			..RestoreOpts::default()
+		})
+		.unwrap();
+	assert_eq!(report.abandoned, [id], "the header still names the abandoned run");
+	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_none(), "restore consumes the blob");
+	let next = shell.submit(Script::command(&b"echo \"kept=$kept\""[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(255));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, Budget::default()), Stop::Done(0));
+	let out = host.stdout.bytes();
+	assert!(
+		out.ends_with(b"kept=yes\n"),
+		"the root store state stays: {:?}",
+		String::from_utf8_lossy(&out)
+	);
+}
+
 #[test]
 fn restore_drop_frames_abandons_the_running_script_with_255() {
 	let engine = Engine::new(EngineConfig::default());
