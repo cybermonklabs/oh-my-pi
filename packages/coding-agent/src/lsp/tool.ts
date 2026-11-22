@@ -59,6 +59,7 @@ import {
 	applyEditsThenRename,
 	flattenWorkspaceTextEdits,
 	type RenameReferenceEdit,
+	RenameRollbackError,
 	rangesOverlap,
 	sortAndValidateTextEdits,
 } from "./edits";
@@ -979,10 +980,31 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// A deadline or cancel that came while the edits were gathered ends the call
 			// before anything moves.
 			if (signal?.aborted) rethrowAbort(signal.reason, undefined, notRenamed);
-			// Apply the reference edits and move as one unit: a failed move rolls
-			// the reference edits back so the source, destination, and every
-			// reference file are left unchanged.
-			await applyEditsThenRename(referenceEdits, source, dest);
+			// Apply the reference edits and move as one unit: a failed edit or move
+			// rolls the reference edits back so the source, destination, and every
+			// reference file are left unchanged. Its error is reported as itself,
+			// even when the call's deadline or a cancel came meanwhile: more time
+			// would not change it.
+			try {
+				await applyEditsThenRename(referenceEdits, source, dest);
+			} catch (err) {
+				const moveFailed = `LSP rename_file could not move ${sourceLabel} to ${destLabel}`;
+				const reason = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+				if (err instanceof RenameRollbackError) {
+					const files = err.unrestored
+						.map(
+							({ filePath, error }) =>
+								`${formatPathRelativeToCwd(filePath, this.session.cwd)} (${reason(error)})`,
+						)
+						.join(", ");
+					throw new ToolError(
+						`${moveFailed}: ${reason(err.failure)}. Nothing was moved, but undoing its reference edits failed for: ${files}.`,
+					);
+				}
+				throw new ToolError(
+					`${moveFailed}: ${reason(err)}. Its reference edits were undone, and nothing was renamed.`,
+				);
+			}
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
 			// The move is done. A deadline or cancel from here on leaves servers without the

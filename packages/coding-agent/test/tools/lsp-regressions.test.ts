@@ -4772,6 +4772,98 @@ describe("lsp regressions", () => {
 			});
 		}
 
+		/** The outcome as "<class>: <message>", so a failure shows what the call ended with. */
+		const described = (outcome: unknown): string =>
+			outcome instanceof Error ? `${outcome.constructor.name}: ${outcome.message}` : JSON.stringify(outcome);
+
+		/** willRenameFiles answered with an edit that points each of `consumers`' imports at `./new`. */
+		function consumersEdit(consumers: string[]): (message: RpcMessage) => unknown {
+			const edit = {
+				range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } },
+				newText: 'import { a } from "./new";\n',
+			};
+			return message =>
+				message.method === "workspace/willRenameFiles"
+					? { changes: Object.fromEntries(consumers.map(consumer => [fileToUri(consumer), [edit]])) }
+					: null;
+		}
+
+		/** Fails the move of `old.ts` to `new.ts` with EXDEV, after running `before`. */
+		function failTheMove(before: () => void): void {
+			const realRename = fsp.rename;
+			vi.spyOn(fsp, "rename").mockImplementation(async (from, to) => {
+				if (path.basename(String(from)) !== "old.ts" || path.basename(String(to)) !== "new.ts") {
+					return realRename(from, to);
+				}
+				before();
+				throw Object.assign(new Error("EXDEV: cross-device link not permitted"), { code: "EXDEV" });
+			});
+		}
+
+		for (const ending of [...endings, "none"] as const) {
+			const when = ending === "none" ? "" : ` after the call's ${ending}`;
+			it(`rename_file whose move fails${when} reports the move's error, and moves nothing`, async () => {
+				await inCheckout(async cwd => {
+					const consumer = path.join(cwd, "consumer.ts");
+					fs.writeFileSync(consumer, 'import { a } from "./old";\n');
+					const call = ending === "none" ? undefined : callEnding(ending);
+					installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+					// The deadline or cancel comes once the reference edit is written, as the move starts.
+					failTheMove(() => call?.end());
+
+					const outcome = await renameOldTs(cwd, call?.signal ?? new AbortController().signal);
+
+					expect(described(outcome)).toBe(
+						"ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted. Its reference edits were undone, and nothing was renamed.",
+					);
+					expectNothingRenamed(cwd);
+					expect(fs.readFileSync(consumer, "utf-8")).toBe('import { a } from "./old";\n');
+				});
+			});
+		}
+
+		it("rename_file whose second reference file cannot be edited undoes the first edit, and moves nothing", async () => {
+			await inCheckout(async cwd => {
+				const first = path.join(cwd, "first.ts");
+				fs.writeFileSync(first, 'import { a } from "./old";\n');
+				// A directory where the server names a file: reading it for the edit fails.
+				const second = path.join(cwd, "second.ts");
+				fs.mkdirSync(second);
+				installSilentLsp("(none)", () => {}, consumersEdit([first, second]));
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				const seen = described(outcome);
+				expect(seen.startsWith("ToolError: LSP rename_file could not move old.ts to new.ts: ")).toBe(true);
+				expect(seen.endsWith(". Its reference edits were undone, and nothing was renamed.")).toBe(true);
+				expectNothingRenamed(cwd);
+				expect(fs.readFileSync(first, "utf-8")).toBe('import { a } from "./old";\n');
+			});
+		});
+
+		it("rename_file whose move fails and whose undo fails names the file it could not restore", async () => {
+			await inCheckout(async cwd => {
+				const consumer = path.join(cwd, "consumer.ts");
+				fs.writeFileSync(consumer, 'import { a } from "./old";\n');
+				installSilentLsp("(none)", () => {}, consumersEdit([consumer]));
+				// The edited file is swapped for a directory before the move fails, so it cannot be restored.
+				failTheMove(() => {
+					fs.rmSync(consumer);
+					fs.mkdirSync(consumer);
+				});
+
+				const outcome = await renameOldTs(cwd, new AbortController().signal);
+
+				const seen = described(outcome);
+				expect(
+					seen.startsWith(
+						"ToolError: LSP rename_file could not move old.ts to new.ts: EXDEV: cross-device link not permitted. Nothing was moved, but undoing its reference edits failed for: consumer.ts (",
+					),
+				).toBe(true);
+				expectNothingRenamed(cwd);
+			});
+		});
+
 		/** `params` as a call with `timeout: 5` in `cwd`; settles to its result or error. */
 		function callLsp(cwd: string, params: Partial<LspParams>, signal: AbortSignal): Promise<unknown> {
 			return new LspTool(makeLspSession(cwd))

@@ -173,16 +173,34 @@ export interface RenameReferenceEdit {
 }
 
 /**
+ * A rename's reference edits or move failed, and undoing the edits already
+ * written failed for some files, which may still hold the rename's edits.
+ */
+export class RenameRollbackError extends Error {
+	constructor(
+		/** The edit or move error that stopped the rename. */
+		readonly failure: unknown,
+		/** Each reference file that could not be restored, with the error that stopped it. */
+		readonly unrestored: Array<{ filePath: string; error: unknown }>,
+	) {
+		super(`undoing a rename's reference edits failed for ${unrestored.length} file(s)`);
+		this.name = "RenameRollbackError";
+	}
+}
+
+/**
  * Apply a rename's reference edits and then move `source` → `dest` as one unit.
  *
  * The reference edits (import/usage rewrites in other files) must be written
  * before the move so their positions match the pre-move file contents, but a
- * failed move must not leave those files half-rewritten: each edited file is
- * snapshotted first, and if `mkdir`/`rename` throws, every snapshot is restored
- * before the error propagates. A failed move therefore leaves the source,
- * destination, and every reference file exactly as they were.
+ * failed rename must not leave those files half-rewritten: each edited file is
+ * snapshotted first, and if a reference edit, `mkdir` or `rename` throws, every
+ * snapshot taken is restored before the error propagates. A failed rename
+ * therefore leaves the source, destination, and every reference file exactly as
+ * they were.
  *
- * @throws the original `mkdir`/`rename` error, after rolling back the edits.
+ * @throws the original edit, `mkdir` or `rename` error, after rolling back the
+ * edits; or a {@link RenameRollbackError} when some file could not be restored.
  */
 export async function applyEditsThenRename(
 	references: RenameReferenceEdit[],
@@ -190,15 +208,20 @@ export async function applyEditsThenRename(
 	dest: string,
 ): Promise<void> {
 	const backups: Array<{ filePath: string; original: string }> = [];
-	for (const { filePath, edits } of references) {
-		backups.push({ filePath, original: await readTextFromDisk(filePath) });
-		await applyTextEdits(filePath, edits);
-	}
 	try {
+		for (const { filePath, edits } of references) {
+			backups.push({ filePath, original: await readTextFromDisk(filePath) });
+			await applyTextEdits(filePath, edits);
+		}
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.rename(source, dest);
 	} catch (err) {
-		await Promise.all(backups.map(({ filePath, original }) => Bun.write(filePath, original)));
+		const restored = await Promise.allSettled(backups.map(({ filePath, original }) => Bun.write(filePath, original)));
+		const unrestored = backups.flatMap(({ filePath }, i) => {
+			const result = restored[i];
+			return result.status === "rejected" ? [{ filePath, error: result.reason as unknown }] : [];
+		});
+		if (unrestored.length > 0) throw new RenameRollbackError(err, unrestored);
 		throw err;
 	}
 }
