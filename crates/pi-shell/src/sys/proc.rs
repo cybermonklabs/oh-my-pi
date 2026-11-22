@@ -441,14 +441,19 @@ mod sys {
 		// 32 bytes a read at a time (a spawn reads its child's).
 		let mut buf = [0; 1024];
 		let n = file.read(&mut buf)?;
-		let parsed = if n < buf.len() {
-			parse_stat(pid, &buf[..n]).map(|p| super::live_leader(p, &buf[..n]))
+		// A longer line is read to its end; either way the line is parsed and
+		// judged on one path.
+		let mut long = Vec::new();
+		let line = if n < buf.len() {
+			&buf[..n]
 		} else {
-			let mut line = buf.to_vec();
-			file.read_to_end(&mut line)?;
-			parse_stat(pid, &line).map(|p| super::live_leader(p, &line))
+			long.extend_from_slice(&buf);
+			file.read_to_end(&mut long)?;
+			&long[..]
 		};
-		parsed.ok_or_else(|| io::ErrorKind::InvalidData.into())
+		parse_stat(pid, line)
+			.map(|p| super::live_leader(p, line))
+			.ok_or_else(|| io::ErrorKind::InvalidData.into())
 	}
 
 	pub fn now() -> io::Result<u64> {
