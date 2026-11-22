@@ -143,16 +143,21 @@ function isUntyped(entry: fs.Dirent): boolean {
  * For files this is a single pair. For directories this walks every regular file underneath
  * and produces a parallel pair anchored at the new directory root.
  *
- * The walk follows no symbolic link: it reads each directory with `readdir(…, { withFileTypes:
- * true })` and goes into directory entries only (an entry with no type is a directory only if
- * `lstat` says so), and just before it reads a directory under `source` it checks with `lstat`
- * that a directory is still at that path, so one swapped for a link since its parent was read
- * is not read through. A link moves with the directory as itself, and nothing behind it is
- * listed. (A swap between that check and the read can still list a link's target as paths under
- * `source`; that only names, and the rename itself moves the one directory entry `source`.)
- * Without links the walk cannot loop (an entry has one parent, a directory cannot be hard-linked,
- * and mounts nest as a finite tree), so it reads each directory of the tree once, and it stops
- * once it has more files than it may list. It checks `signal` before each directory it reads.
+ * The walk follows a symbolic link to a directory, and names the files behind it by their paths
+ * through the link: those paths move with the directory (the link moves as itself), and a server
+ * rewrites imports that go through them (typescript-language-server does, for a link to a
+ * directory inside the tree or outside it, and for a link to a file). It reads each directory with
+ * `readdir(…, { withFileTypes: true })` and resolves a directory, a link, or an entry with no type,
+ * with `stat`. As `find -L` does, it does not enter a directory that is already on the path it
+ * came by (same device and inode as one of the directories from `source` down to it), so a link
+ * to the directory it is in, or to any directory between it and `source`, names nothing and the
+ * walk does not loop. Two paths to the same directory that is not on the path (`alias -> sub`)
+ * are both walked, and both named. It stops once it has more files than it may list, and checks
+ * `signal` before each directory it reads and once more after the last.
+ *
+ * The recursive delete in `lsp/edits.ts` walks a tree too, but by the opposite rule: a delete
+ * removes a link as itself and never what it points to, so that walk follows no link. The two
+ * stay separate code for that reason.
  */
 async function enumerateRenamePairs(
 	source: string,
@@ -168,21 +173,38 @@ async function enumerateRenamePairs(
 		};
 	}
 	const pairs: FileRenamePair[] = [];
-	// The directories to read, relative to `source` ("" is `source`).
-	const directories = [""];
+	// The directories to read, relative to `source` ("" is `source`), each with the device and
+	// inode of every directory on the path the walk came by, itself included.
+	const directories: Array<{ relative: string; ancestors: string[] }> = [
+		{ relative: "", ancestors: [`${stat.dev}:${stat.ino}`] },
+	];
 	for (let next = 0; next < directories.length; next++) {
 		throwIfAborted(signal);
-		const relative = directories[next];
-		const absolute = path.join(source, relative);
-		if (relative !== "" && !(await fs.promises.lstat(absolute)).isDirectory()) continue;
-		for (const entry of await fs.promises.readdir(absolute, { withFileTypes: true })) {
+		const { relative, ancestors } = directories[next];
+		for (const entry of await fs.promises.readdir(path.join(source, relative), { withFileTypes: true })) {
 			const rel = path.join(relative, entry.name);
-			const kind = isUntyped(entry) ? await fs.promises.lstat(path.join(source, rel)) : entry;
-			if (kind.isDirectory()) {
-				directories.push(rel);
+			let isDirectory = entry.isDirectory();
+			let isFile = entry.isFile();
+			let id = "";
+			if (isDirectory || entry.isSymbolicLink() || isUntyped(entry)) {
+				let target: fs.Stats;
+				try {
+					target = await fs.promises.stat(path.join(source, rel));
+				} catch (error) {
+					// A dangling link, or one that cannot be followed, names nothing.
+					if (isDirectory) throw error;
+					continue;
+				}
+				isDirectory = target.isDirectory();
+				isFile = target.isFile();
+				id = `${target.dev}:${target.ino}`;
+			}
+			if (isDirectory) {
+				if (ancestors.includes(id)) continue;
+				directories.push({ relative: rel, ancestors: [...ancestors, id] });
 				continue;
 			}
-			if (!kind.isFile()) continue;
+			if (!isFile) continue;
 			if (pairs.length >= MAX_RENAME_PAIRS) {
 				return { pairs, directory: true, exceeded: true };
 			}
@@ -192,6 +214,7 @@ async function enumerateRenamePairs(
 			});
 		}
 	}
+	throwIfAborted(signal);
 	return { pairs, directory: true, exceeded: false };
 }
 

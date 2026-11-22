@@ -3981,8 +3981,8 @@ describe("lsp regressions", () => {
 		}
 	});
 
-	// A walk that follows the links finds 2^n paths at depth n and does not end: the call would still
-	// be listing, its memory growing, when the race gives up at 10 s.
+	// A walk that follows each link anew finds 2^n paths at depth n and does not end: the call
+	// would still be listing, its memory growing, when the race gives up at 10 s.
 	it("rename_file of a directory holding two links to its own directory ends at once", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-two-self-links-");
 		try {
@@ -4002,7 +4002,7 @@ describe("lsp regressions", () => {
 		}
 	}, 20_000);
 
-	it("rename_file of a directory holding a link out of it names no file behind the link", async () => {
+	it("rename_file of a directory holding links out of it names the files behind them by their paths through the links", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-outside-link-");
 		try {
 			const srcDir = path.join(tempDir.path(), "old");
@@ -4013,18 +4013,40 @@ describe("lsp regressions", () => {
 				fs.writeFileSync(file, "export const a = 1;\n");
 			}
 			fs.symlinkSync("../ext", path.join(srcDir, "link"));
+			fs.symlinkSync("../ext/e.ts", path.join(srcDir, "flink.ts"));
 
 			const { outcome, renamed } = await renameDirectory(tempDir.path());
 
 			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
-			expect(renamed).toEqual(["old/a.ts", "old/sub/deep/c.ts"]);
+			// typescript-language-server rewrites an import of `./old/link/e` only when told of
+			// `old/link/e.ts`, and one of `./old/flink` only when told of `old/flink.ts`.
+			expect(renamed).toEqual(["old/a.ts", "old/flink.ts", "old/link/e.ts", "old/sub/deep/c.ts"]);
 			expect(fs.existsSync(behind)).toBe(true);
 		} finally {
 			tempDir.removeSync();
 		}
 	});
 
-	it("rename_file of a directory whose entries have no type goes into directories, and never through a link", async () => {
+	it("rename_file of a directory names both paths to a directory linked inside it, and never loops through a link up", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-inside-link-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			fs.mkdirSync(path.join(srcDir, "sub"), { recursive: true });
+			fs.writeFileSync(path.join(srcDir, "sub", "s.ts"), "export const s = 1;\n");
+			// `alias` reaches `sub` a second way; `up` leads back to `old`, a directory on its own path.
+			fs.symlinkSync("sub", path.join(srcDir, "alias"));
+			fs.symlinkSync("..", path.join(srcDir, "sub", "up"));
+
+			const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamed).toEqual(["old/alias/s.ts", "old/sub/s.ts"]);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("rename_file of a directory whose entries have no type goes into directories and through links", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-untyped-");
 		try {
 			const srcDir = path.join(tempDir.path(), "old");
@@ -4062,7 +4084,7 @@ describe("lsp regressions", () => {
 
 			expect(reads).toBeGreaterThan(0);
 			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
-			expect(renamed).toEqual(["old/a.ts", "old/sub/deep/b.ts"]);
+			expect(renamed).toEqual(["old/a.ts", "old/file-link.ts", "old/link/e.ts", "old/sub/deep/b.ts"]);
 		} finally {
 			tempDir.removeSync();
 		}
@@ -4076,24 +4098,24 @@ describe("lsp regressions", () => {
 		}
 	}
 
-	it("rename_file of a directory of 1,000 files and a link to an outside directory renames it", async () => {
+	it("rename_file of a directory of 1,000 files and a link to an outside directory of 5 refuses, and moves nothing", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-cap-link-");
 		try {
 			const srcDir = path.join(tempDir.path(), "old");
 			fillDirectory(srcDir, 1_000);
-			// The files behind the link do not count toward the limit: they are not renamed.
+			// The files behind the link count toward the limit: they are renamed with the directory.
 			fillDirectory(path.join(tempDir.path(), "ext"), 5);
 			fs.symlinkSync("../ext", path.join(srcDir, "link"));
 
 			const { outcome, renamed } = await renameDirectory(tempDir.path());
 
-			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
-			expect(renamed).toHaveLength(1_000);
-			expect(fs.existsSync(srcDir)).toBe(false);
+			expect(outcome).toMatchObject({ details: { action: "rename_file", success: false } });
+			expect(renamed).toEqual([]);
+			expect(fs.existsSync(srcDir)).toBe(true);
 		} finally {
 			tempDir.removeSync();
 		}
-	});
+	}, 30_000);
 
 	it("rename_file of a directory of 1,001 files refuses, and moves nothing", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-cap-over-");
@@ -4116,7 +4138,7 @@ describe("lsp regressions", () => {
 		} finally {
 			tempDir.removeSync();
 		}
-	});
+	}, 30_000);
 
 	it("rename_file of a directory stops listing it at the call's abort", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-aborted-listing-");
@@ -4148,6 +4170,35 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("rename_file of a directory sees an abort during the last directory read, with no server for its files", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-aborted-last-read-");
+		try {
+			const srcDir = path.join(tempDir.path(), "old");
+			const last = path.join(srcDir, "s1");
+			// `.py` files: the fake server handles `.ts` only, so no server request follows the walk.
+			for (const file of [path.join(srcDir, "a.py"), path.join(last, "b.py")]) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, "a = 1\n");
+			}
+			// The call is aborted while `old/s1`, the last directory, is read.
+			const controller = new AbortController();
+			const realReaddir = fs.promises.readdir;
+			vi.spyOn(fs.promises, "readdir").mockImplementation((async (...args: unknown[]) => {
+				const entries = await Reflect.apply(realReaddir, fs.promises, args);
+				if (args[0] === last) controller.abort();
+				return entries;
+			}) as never);
+
+			const { outcome } = await renameDirectory(tempDir.path(), controller.signal);
+
+			expect(outcome).toBeInstanceOf(ToolAbortError);
+			expect(fs.existsSync(srcDir)).toBe(true);
+			expect(fs.existsSync(path.join(tempDir.path(), "new"))).toBe(false);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
 	/** Runs `then` after each `fs.promises.readdir` of `dir` returns (the tool calls that one). */
 	function afterReaddirOf(dir: string, then: () => void): void {
 		const realReaddir = fs.promises.readdir;
@@ -4164,7 +4215,7 @@ describe("lsp regressions", () => {
 		if (swap.exitCode !== 0) throw new Error(`the swap failed: ${swap.stderr.toString()}`);
 	}
 
-	it("rename_file of a directory never names the files behind a directory swapped for a link before it is read", async () => {
+	it("rename_file of a directory treats a directory swapped for a link before it is read as one more link", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-swap-before-read-");
 		try {
 			const srcDir = path.join(tempDir.path(), "old");
@@ -4180,8 +4231,9 @@ describe("lsp regressions", () => {
 
 			const { outcome, renamed } = await renameDirectory(tempDir.path());
 
+			// The link is followed and its file named by its path through it; nothing outside moves.
 			expect(outcome).toMatchObject({ details: { action: "rename_file", success: true } });
-			expect(renamed).toEqual(["old/a.ts"]);
+			expect(renamed).toEqual(["old/a.ts", "old/sub/e1.ts"]);
 			expect(fs.readdirSync(ext)).toEqual(["e1.ts"]);
 			expect(fs.readlinkSync(path.join(tempDir.path(), "new", "sub"))).toBe(ext);
 		} finally {
