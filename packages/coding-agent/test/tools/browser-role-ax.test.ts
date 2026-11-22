@@ -186,6 +186,8 @@ describe.skipIf(!available)("Chromium role/ selectors through the accessibility 
 		}
 	});
 
+	// It launches a Chromium and walks about 120 elements: 2.3-4.9 s on 8 CPU, more beside other work. 30 s is the
+	// hang bound, as for the other tests that drive a real Chromium.
 	it("finds every element Chrome's full accessibility tree gives a role, across tags and contexts", async () => {
 		const puppeteer = await loadPuppeteer();
 		registerSemanticQueryHandlers(puppeteer);
@@ -291,7 +293,7 @@ describe.skipIf(!available)("Chromium role/ selectors through the accessibility 
 		} finally {
 			await browser.close();
 		}
-	});
+	}, 30_000);
 });
 
 /** Observed role and name of each `observe({ includeAll: true })` entry the kit's own role/ engine cannot reselect. */
