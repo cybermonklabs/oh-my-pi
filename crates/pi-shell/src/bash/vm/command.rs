@@ -2413,6 +2413,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				ChildRedirs { list, exec_diag: super::redir::diag_prefix(k, cx, vp, line, &name) }
 			});
 			let child_redirs = redirs.is_some();
+			// An extra fd (above 2) the process's own redirections close or
+			// replace before any of them reads it (`4<&-`, `4<file`, `4>&1`) is
+			// not handed over: the process would hold its engine object (a feed
+			// of the shell's pipe, whose bytes the shell then could not read)
+			// and never use it. stdio is handed over as before.
+			let replaced = redirs
+				.as_ref()
+				.map_or_else(Vec::new, |r| replaced_before_read(&r.list));
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2425,6 +2433,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				],
 				extra_fds: extra_fds(vp)
 					.iter()
+					.filter(|(fd, _)| !replaced.contains(fd))
 					.map(|(fd, h)| (*fd, stdio_spec(h, false)))
 					.collect(),
 				pgroup,
@@ -5184,6 +5193,45 @@ fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 		})
 		.map(|(fd, h)| (fd, h.clone()))
 		.collect()
+}
+
+/// The fds the redirections `list` of a process close or replace (`Open`,
+/// `Dup` onto it, `Close`) before any of them reads the fd itself (as a
+/// `Dup` source, or as the `/dev/fd/N` path an `Open` of two fds names, as
+/// `&>/dev/fd/4` does): the process never uses what the shell has there.
+fn replaced_before_read(list: &[crate::bash::ChildRedir]) -> Vec<i32> {
+	use crate::bash::ChildRedir;
+	let mut read: Vec<i32> = Vec::new();
+	let mut replaced: Vec<i32> = Vec::new();
+	let write = |fd: i32, read: &[i32], replaced: &mut Vec<i32>| {
+		if !read.contains(&fd) && !replaced.contains(&fd) {
+			replaced.push(fd);
+		}
+	};
+	for redir in list {
+		match redir {
+			ChildRedir::Open { fds, path, .. } => {
+				// A source replaced earlier is the replacement, not the shell's.
+				if let Some(src) = probe::dev_fd(path)
+					&& !replaced.contains(&src)
+				{
+					read.push(src);
+				}
+				for &fd in fds {
+					write(fd, &read, &mut replaced);
+				}
+			},
+			ChildRedir::Dup { fd, src, .. } => {
+				// A source replaced earlier is the replacement, not the shell's.
+				if !replaced.contains(src) {
+					read.push(*src);
+				}
+				write(*fd, &read, &mut replaced);
+			},
+			ChildRedir::Close { fd } => write(*fd, &read, &mut replaced),
+		}
+	}
+	replaced
 }
 
 /// The environment of a command: exported variables as the vproc sees them
