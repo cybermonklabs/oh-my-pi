@@ -2931,12 +2931,41 @@ fn copy_data(
 		Err(error) => return Err(cannot_create(error)),
 	};
 
+	// `always` gets here only with a source that is not a regular file (any
+	// other was cloned by path above, or refused): GNU cp asks for the clone
+	// on its descriptors here too, and reports the answer. A destination this
+	// copy made is removed again; an existing one keeps its data, where GNU
+	// cp has already truncated it.
+	let always_cloned = if options.reflink_mode == ReflinkMode::Always {
+		#[cfg(any(target_os = "linux", target_os = "android", windows))]
+		let answer = match (source_file.native(), dest_file.native()) {
+			(Some(source_native), Some(dest_native)) => pi_iso::cow::clone_open(source_native, dest_native),
+			_ => Err(operation_not_supported()),
+		};
+		#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+		let answer: io::Result<()> = Err(operation_not_supported());
+		if let Err(error) = answer {
+			drop(dest_file);
+			if dest_metadata.is_none() || fate == DestFate::Recreated {
+				let _ = filesystem.remove_file(&dest_fs);
+			}
+			return Err(CpError::IoErrContext(
+				error,
+				format!("failed to clone {} from {}", dest.quote(), source.quote()),
+			));
+		}
+		true
+	} else {
+		false
+	};
+
 	// Elsewhere `auto` clones on the open handles, as GNU cp issues FICLONE
 	// on its descriptors, and copies the data wherever the files cannot
 	// share extents (another filesystem, ext4, NTFS, ...). A source
 	// filesystem that refused once is not asked again.
 	#[cfg(any(target_os = "linux", target_os = "android", windows))]
 	let cloned = match (source_file.native(), dest_file.native()) {
+		_ if always_cloned => true,
 		(Some(source_native), Some(dest_native))
 			if native && !source_is_stream && options.reflink_mode == ReflinkMode::Auto =>
 		{
@@ -2960,7 +2989,7 @@ fn copy_data(
 		_ => false,
 	};
 	#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-	let cloned = false;
+	let cloned = always_cloned;
 
 	let copy_debug = if cloned {
 		CopyDebug::CLONED
