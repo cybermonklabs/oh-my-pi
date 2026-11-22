@@ -109,10 +109,11 @@ struct LiveResources {
 	playback:     PlaybackStream,
 }
 
-/// WebRTC live-conversation peer: accepts 16 kHz mono PCM input and renders
-/// remote Opus audio to the speaker (the default one, or the named
-/// `PulseAudio` server's). Owned as an `Arc` by the N-API `LiveWebRtcPeer`
-/// wrapper.
+/// WebRTC live-conversation peer.
+///
+/// Accepts 16 kHz mono PCM input and renders remote Opus audio to the speaker
+/// (the default one, or the named `PulseAudio` server's). Owned as an `Arc` by
+/// the N-API `LiveWebRtcPeer` wrapper.
 pub struct LivePeerCore {
 	callbacks:        LiveCallbacks,
 	/// `PulseAudio` server of the speaker; `None` is the default device.
@@ -156,7 +157,8 @@ impl LivePeerCore {
 			return Err("Native live WebRTC peer is closed".to_owned());
 		}
 
-		let playback = PlaybackStream::start(OUTPUT_SAMPLE_RATE, OUTPUT_JITTER_BUFFER_MS, self.pulse_server)?;
+		let playback =
+			PlaybackStream::start(OUTPUT_SAMPLE_RATE, OUTPUT_JITTER_BUFFER_MS, self.pulse_server)?;
 		let playback_tx = playback.writer()?;
 		let mut media_engine = MediaEngine::default();
 		let capability = opus_capability();
