@@ -725,21 +725,30 @@ fn cannot_run_dir() -> tempfile::TempDir {
 
 	let dir = tempfile::tempdir().unwrap();
 	let at = |name: &str| dir.path().join(name);
-	let write = |name: &str, text: &[u8], mode: u32| {
-		std::fs::write(at(name), text).unwrap();
+	// A child writes each file (`testprog`): this process never holds one
+	// open for writing, so no fork by another test's thread can keep a
+	// program busy ("Text file busy") when the test runs it.
+	let write = |name: &str, text: &str, mode: u32| {
+		crate::testprog::write(&at(name), text);
 		std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(mode)).unwrap();
 	};
 	std::fs::write(at("words"), "1\n2\n3\n").unwrap();
 	std::fs::create_dir_all(at("findroot/a")).unwrap();
 	std::fs::write(at("findroot/f1"), "").unwrap();
 	std::fs::write(at("findroot/a/f2"), "").unwrap();
-	write("noexec", b"echo ran\n", 0o644);
-	write("ia", format!("#!{}\n", at("noexec").display()).as_bytes(), 0o755);
+	write("noexec", "echo ran\n", 0o644);
+	write("ia", &format!("#!{}\n", at("noexec").display()), 0o755);
 	std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
-	write("s", format!("#!{}\n", at("ll").display()).as_bytes(), 0o755);
-	write("mi", b"#!/nonexistent/interpreter\n", 0o755);
+	write("s", &format!("#!{}\n", at("ll").display()), 0o755);
+	write("mi", "#!/nonexistent/interpreter\n", 0o755);
 	std::fs::create_dir(at("d")).unwrap();
-	write("bin", b"\x7fELF\x02\x01\x01garbage\0\0\0", 0o755);
+	// No argument carries a NUL byte: a child (`truncate`) adds the three.
+	write("bin", "\x7fELF\x02\x01\x01garbage", 0o755);
+	let grown = std::process::Command::new("truncate")
+		.args(["-s", "+3"])
+		.arg(at("bin"))
+		.status();
+	assert!(grown.as_ref().is_ok_and(|status| status.success()), "truncate: {grown:?}");
 	dir
 }
 
@@ -1243,7 +1252,7 @@ async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
 	for (sub, mode) in [("a", 0o614), ("b", 0o755)] {
 		std::fs::create_dir(p.join(sub)).unwrap();
 		let file = p.join(sub).join("foo");
-		std::fs::write(&file, format!("#!/bin/sh\necho {}\n", sub.to_uppercase())).unwrap();
+		crate::testprog::write(&file, &format!("#!/bin/sh\necho {}\n", sub.to_uppercase()));
 		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
 	}
 	let path = format!(
@@ -1365,12 +1374,9 @@ async fn a_long_line_refused_for_its_interpreter_is_not_split() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_script_without_a_shebang_gets_the_path_it_ran_by_as_dollar_zero() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let script = dir.path().join("ns");
-	std::fs::write(&script, "echo \"0=$0\"\n").unwrap();
-	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&script, "echo \"0=$0\"\n");
 	let mut s = session_in(dir.path(), &[]);
 	let found = format!("0={}/./ns\n", dir.path().display());
 	for (wrapper, zero) in [("", found.as_str()), ("timeout 5 ", "0=./ns\n"), ("nohup ", "0=./ns\n")]
