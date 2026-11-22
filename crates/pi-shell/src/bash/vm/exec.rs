@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
 		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		Scratch, ScriptKind, Slot, TryEnd, Vproc, WriteKey,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -351,6 +351,11 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		} else {
 			0
 		};
+		// Whether the op is parked on a write: dropped so, it takes the
+		// vproc's write key with it ([`forget_parked_write`]).
+		if let Some(frame) = vp.frames.get_mut(fi) {
+			frame.write_parked = matches!(flow, Flow::Block(WaitKey::Write { .. }));
+		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
 			&& let Some(frame) = vp.frames.get_mut(fi)
 		{
@@ -832,11 +837,10 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 }
 
 /// Write queued diagnostics; the fd that would block, if any. Write errors
-/// on a diagnostic stream are dropped, as bash does.
+/// on a diagnostic stream are dropped, as bash does. A write goes on under
+/// the key it started with ([`Vproc::out_key`]) until it is done.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
-	let key = std::sync::Arc::clone(&vp.write_key);
-	let mut key = key.lock();
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
 	// terminal gets them first, as zsh's blocking writes order them.
@@ -859,19 +863,24 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			// No editor any more: its fallback, standard error.
 			w.fd = 2;
 		}
-		match vp
-			.fds
-			.handle(w.fd)
-			.poll_write_keyed(&mut cx, &w.bytes[w.off..], &mut key)
-		{
+		let key = vp
+			.out_key
+			.get_or_insert_with(|| std::sync::Arc::clone(&vp.write_key));
+		let polled =
+			vp.fds
+				.handle(w.fd)
+				.poll_write_keyed(&mut cx, &w.bytes[w.off..], &mut key.lock());
+		match polled {
 			Poll::Ready(Ok(n)) if n > 0 => {
 				w.off += n;
 				if w.off >= w.bytes.len() {
 					vp.out.pop_front();
+					vp.out_key = None;
 				}
 			},
 			Poll::Ready(_) => {
 				vp.out.pop_front();
+				vp.out_key = None;
 			},
 			Poll::Pending => return Some(w.fd),
 		}
@@ -1648,6 +1657,14 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	let Some(mut f) = vp.frames.pop() else {
 		return;
 	};
+	if let Some(sc) = f.scratch.take() {
+		drop_scratch(root, store, vp, sc);
+	}
+	// The frame's op goes first, under the key it wrote with: a trap's own,
+	// if this is a trap's frame.
+	if f.write_parked {
+		forget_parked_write(vp);
+	}
 	if matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
 		vp.trap_frames = vp.trap_frames.saturating_sub(1);
 		// The key the trap interrupted ([`start_trap`]), on every way out:
@@ -1655,9 +1672,6 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		if let Some(interrupted) = vp.trap_keys.pop() {
 			vp.write_key = interrupted;
 		}
-	}
-	if let Some(sc) = f.scratch.take() {
-		drop_scratch(root, store, vp, sc);
 	}
 	while let Some(saves) = f.redirs.pop() {
 		restore(vp, saves);
@@ -1835,11 +1849,27 @@ pub fn drop_scratch(
 /// few nested calls, small for an idle vproc's memory.
 const SPARE_SCRATCH: usize = 4;
 
-/// Drop the top frame's scratch of an op that is over (recycled).
+/// Drop the top frame's scratch of an op that is over (recycled), or that
+/// is dropped part way.
 pub fn clear_scratch(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
-	if let Some(sc) = top_frame(vp).scratch.take() {
+	let top = top_frame(vp);
+	let parked = std::mem::take(&mut top.write_parked);
+	if let Some(sc) = top.scratch.take() {
 		drop_scratch(root, store, vp, sc);
 	}
+	if parked {
+		forget_parked_write(vp);
+	}
+}
+
+/// An op dropped while parked on a write ([`Frame::write_parked`]) takes
+/// the vproc's write key with it: its write's progress is kept by key (a
+/// zsh multios tee keeps it per target, a provider file keeps the result
+/// of its task), so the vproc's next write with that key would start at
+/// those offsets, or take that result, and lose its bytes. A new key has
+/// none, and the old one's progress goes with it.
+pub fn forget_parked_write(vp: &mut Vproc) {
+	vp.write_key = WriteKey::default();
 }
 
 /// Take the top frame's scratch, or a cleared one (the vproc's spare).

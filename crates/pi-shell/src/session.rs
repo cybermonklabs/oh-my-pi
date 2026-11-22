@@ -2524,6 +2524,268 @@ mod tests {
 		marker_mid_write(&run.stdout, 131_072, b"TTTTTTTTTT");
 	}
 
+	/// `got` is some '0's (more than none, fewer than `whole`), then exactly
+	/// `tail`: a write dropped part way, then the writes after it, whole.
+	fn some_zeros_then(got: &[u8], whole: usize, tail: &[u8]) {
+		let zeros = got.len().saturating_sub(tail.len());
+		let head_is_zeros = got[..zeros].iter().all(|&b| b == b'0');
+		assert!(
+			head_is_zeros && got.ends_with(tail) && zeros > 0 && zeros < whole,
+			"{zeros} bytes before the tail ({}), ending {:?}",
+			if head_is_zeros {
+				"all '0's"
+			} else {
+				"not all '0's"
+			},
+			String::from_utf8_lossy(&got[got.len().saturating_sub(tail.len() + 8)..])
+		);
+	}
+
+	// Failure mode (review of #111 at 5773e4ed): `return` in a trap also
+	// dropped the command the trap interrupted, `printf`, whose write
+	// through a tee waited. The tee kept that write's progress under the
+	// shell's write key, so the next write, `printf %s AFTER7`, started at
+	// those offsets and was lost; at 2fb85be7 the trap's bytes were lost
+	// instead. bash 5.2 keeps both. The dropped command takes the key with
+	// it: stdout holds the '0's written before the trap, its 10 'T's, then
+	// AFTER7.
+	#[test]
+	fn a_write_a_trap_return_drops_leaves_the_next_write_whole() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\nf() { printf %0131072d 0; printf %s \
+			 NEVER; }\ntrap 'printf %s TTTTTTTTTT; return 7' USR1\n{ read -r go <&3; kill -USR1 $$; \
+			 echo done >&2; } &\nf\ns=$?\nprintf %s AFTER$s\nwait",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		some_zeros_then(&run.stdout, 131_072, b"TTTTTTTTTTAFTER7");
+	}
+
+	// Failure mode (review of #111 at 5773e4ed): a `CHLD` trap owed with a
+	// USR1 trap waited only while the vproc was parked on the write, and the
+	// USR1 trap had unparked it: the `CHLD` trap's 'C's came in the middle
+	// of `printf`'s write, before the USR1 trap's 'T's. bash and zsh run a
+	// `CHLD` trap after the command. It now waits while the write is part
+	// way: the 'T's inside the '0's, the 'C's after the last '0'.
+	#[test]
+	fn a_chld_trap_owed_with_another_trap_runs_after_the_write() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' USR1\ntrap \
+			 'printf %s CCCCCCCCCC' CHLD\n{ read -r go <&3; kill -USR1 $$; echo done >&2; } \
+			 &\nprintf %0131072d 0\ns=$?\nwait\nexit $s",
+			SIGNAL_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		let got = &run.stdout;
+		assert!(got.ends_with(b"CCCCCCCCCC"), "the 'C's are not last");
+		marker_mid_write(&got[..got.len() - 10], 131_072, b"TTTTTTTTTT");
+		assert!(run.held, "the CHLD trap did not wait for the write");
+	}
+
+	/// Three runs of one session: the first makes fd 3 a tee of a FIFO and
+	/// `file` (`exec 3>fifo 3>file`; the tee outlives the run), the second
+	/// runs `second`, whose write through the tee fills the FIFO and waits,
+	/// and is cancelled, and the third runs `printf %s AFTER >&3`. Returns
+	/// what the FIFO's reader got, ending with `AFTER` unless that was lost,
+	/// and the second run's status.
+	fn cancel_a_write_through_a_fifo_tee(second: &str, file: &std::path::Path) -> (Vec<u8>, i32) {
+		use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("tee-fifo");
+		let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+		// SAFETY: a valid C string.
+		assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+		let null = |write: bool| {
+			std::fs::OpenOptions::new()
+				.read(!write)
+				.write(write)
+				.open("/dev/null")
+				.unwrap()
+		};
+		let stdio = || RunStdio {
+			stdin:  Some(null(false)),
+			stdout: Some(null(true)),
+			stderr: Some(null(true)),
+		};
+		let queued = |reader: &std::fs::File| {
+			let mut n: libc::c_int = 0;
+			// SAFETY: FIONREAD writes one int.
+			unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut n) };
+			usize::try_from(n).unwrap_or(0)
+		};
+		// The reader's open waits for the shell's.
+		let opening = {
+			let fifo = fifo.clone();
+			std::thread::spawn(move || std::fs::File::open(fifo))
+		};
+		let runtime = own_runtime();
+		runtime.block_on(async {
+			let mut session = session();
+			let made = format!("emulate zsh -c 'exec 3>{} 3>{}'", fifo.display(), file.display());
+			let made = tokio::time::timeout(
+				STUCK,
+				session.run_with(RunOptions::new(made.as_str()), stdio(), CancellationToken::new()),
+			)
+			.await;
+			assert_eq!(made.expect("the tee was made").unwrap().status, 0);
+			let mut reader = opening.join().unwrap().unwrap();
+			// SAFETY: fcntl on a descriptor this test owns.
+			unsafe {
+				let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+				libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+			}
+			// The second run's write fills the FIFO and waits for room; then the
+			// run is cancelled.
+			let cancel = CancellationToken::new();
+			let canceller = {
+				let cancel = cancel.clone();
+				let probe = reader.try_clone().unwrap();
+				std::thread::spawn(move || {
+					let start = std::time::Instant::now();
+					while queued(&probe) < 4096 && start.elapsed() < STUCK {
+						std::thread::sleep(Duration::from_millis(5));
+					}
+					std::thread::sleep(Duration::from_millis(300));
+					cancel.cancel();
+				})
+			};
+			let cancelled =
+				tokio::time::timeout(STUCK, session.run_with(RunOptions::new(second), stdio(), cancel))
+					.await;
+			canceller.join().unwrap();
+			let cancelled = cancelled.expect("the run ended").unwrap();
+			assert!(cancelled.cancelled, "the run was not cancelled");
+			// The third run's write waits until the reader drains.
+			let draining = std::thread::spawn(move || {
+				let mut got = Vec::new();
+				let mut buf = vec![0u8; 4 << 10];
+				let start = std::time::Instant::now();
+				while !got.ends_with(b"AFTER") && start.elapsed() < Duration::from_secs(5) {
+					match reader.read(&mut buf) {
+						Ok(0) => break,
+						Ok(n) => got.extend_from_slice(&buf[..n]),
+						Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+							std::thread::sleep(Duration::from_micros(500));
+						},
+						Err(e) => panic!("reading the FIFO: {e}"),
+					}
+				}
+				got
+			});
+			let after = tokio::time::timeout(
+				STUCK,
+				session.run_with(
+					RunOptions::new("printf %s AFTER >&3"),
+					stdio(),
+					CancellationToken::new(),
+				),
+			)
+			.await;
+			assert_eq!(after.expect("the last run ended").unwrap().status, 0);
+			// Lost, `AFTER` never comes: the reader stops after 5 s.
+			(draining.join().unwrap(), cancelled.status)
+		})
+	}
+
+	// Failure mode (review of #111 at 5773e4ed): a run cancelled while its
+	// write through a tee waited dropped the write, but the session's vproc
+	// kept its write key and the tee kept the write's progress under it, so
+	// the next run's first write through the tee started at those offsets
+	// and was lost. The dropped command takes the key with it.
+	#[test]
+	fn a_run_cancelled_during_a_write_through_a_tee_leaves_the_next_run_whole() {
+		let (got, _) = cancel_a_write_through_a_fifo_tee(
+			"printf %0131072d 0 >&3",
+			std::path::Path::new("/dev/null"),
+		);
+		some_zeros_then(&got, 131_072, b"AFTER");
+	}
+
+	/// What `command` writes to stderr in a session of its own, run whole.
+	fn stderr_of(command: &str) -> Vec<u8> {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("stderr");
+		let null = |write: bool| {
+			std::fs::OpenOptions::new()
+				.read(!write)
+				.write(write)
+				.open("/dev/null")
+				.unwrap()
+		};
+		let stdio = RunStdio {
+			stdin:  Some(null(false)),
+			stdout: Some(null(true)),
+			stderr: Some(std::fs::File::create(&path).unwrap()),
+		};
+		own_runtime().block_on(async {
+			let mut session = session();
+			tokio::time::timeout(
+				STUCK,
+				session.run_with(RunOptions::new(command), stdio, CancellationToken::new()),
+			)
+			.await
+			.expect("the run ended")
+			.unwrap();
+		});
+		std::fs::read(&path).unwrap()
+	}
+
+	// Failure mode (found in round 8): a diagnostic the shell queues
+	// (`Vproc::out`: a command not found, a bad indirection) went on under
+	// the vproc's key of the moment while it waited for room in a tee. After
+	// a key change (a cancel's TERM trap's, a dropped command's) it started
+	// again from its first byte, and the tee's file got it twice. And when
+	// the kill that ends a cancel dropped the queue, the vproc could keep the
+	// key, and the next run's write was lost. Each case: the file holds the
+	// diagnostic once, then `AFTER`; the FIFO a part of it, then `AFTER`.
+	#[test]
+	fn a_queued_diagnostic_cancelled_during_its_write_through_a_tee_is_written_once() {
+		let cases = [
+			("not found", "$(printf %0131072d 0)"),
+			("indirection", "x=$(printf %0131072d 0)a; : ${!x}"),
+		];
+		let mut wrong = Vec::new();
+		for (what, command) in cases {
+			let whole = stderr_of(command);
+			assert!(whole.len() > 131_072, "{what}: the diagnostic is {} bytes", whole.len());
+			for trap in ["", "trap 'exit 5' TERM; "] {
+				let dir = tempfile::tempdir().unwrap();
+				let file = dir.path().join("tee-file");
+				let second = format!("{trap}exec 2>&3; {command}");
+				let (got, status) = cancel_a_write_through_a_fifo_tee(&second, &file);
+				let written = std::fs::read(&file).unwrap();
+				let mut once = whole.clone();
+				once.extend_from_slice(b"AFTER");
+				let part = got
+					.strip_suffix(b"AFTER")
+					.is_some_and(|p| !p.is_empty() && p.len() < whole.len() && whole.starts_with(p));
+				if written != once || !part {
+					wrong.push(format!(
+						"{what}{} (status {status}): the file {} bytes for {} ({}), the FIFO {} bytes \
+						 ({})",
+						if trap.is_empty() { "" } else { ", TERM trap" },
+						written.len(),
+						once.len(),
+						if written.ends_with(b"AFTER") {
+							"AFTER last"
+						} else {
+							"no AFTER"
+						},
+						got.len(),
+						if part {
+							"a part, then AFTER"
+						} else {
+							"not a part, then AFTER"
+						},
+					));
+				}
+			}
+		}
+		assert!(wrong.is_empty(), "{}", wrong.join("; "));
+	}
+
 	/// A background extra still waiting for room on a run's stdout when the
 	/// run ends is woken when the session drops that stdout, and ends: the
 	/// next run's `wait` returns.

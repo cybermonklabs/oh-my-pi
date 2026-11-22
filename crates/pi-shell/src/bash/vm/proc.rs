@@ -133,6 +133,11 @@ pub struct Vproc {
 	/// the old key back. Never serialized (a restored trap frame finds none
 	/// and leaves the key as it is).
 	pub trap_keys:     Vec<WriteKey>,
+	/// The key the first write in [`Self::out`] goes on with once it is part
+	/// way: a key change meanwhile (a trap's, a dropped command's) does not
+	/// move it, so its targets go on from where they got; a suspended job
+	/// takes both. Never serialized (a restored queue starts again).
+	pub out_key:       Option<WriteKey>,
 }
 
 /// [`Vproc::write_key`], behind an `Arc` so a write site can hold it while
@@ -796,18 +801,27 @@ impl Vproc {
 
 	/// Whether a trap for `sig` waits before it runs: while the vproc waits
 	/// for a foreground command ([`Self::waiting_foreground`]), and, for
-	/// `SIGCHLD`, while it is parked on a write. bash 5.2/5.3 and zsh 5.9 run
-	/// a `CHLD` trap after the command's write; another trap they run at
-	/// once, and so does this shell, under a key of the trap's own
-	/// ([`Self::trap_keys`]), so the interrupted write keeps its progress.
+	/// `SIGCHLD`, while a write of the vproc is part way
+	/// ([`Self::write_part_way`]), a write another trap interrupted too.
+	/// bash 5.2/5.3 and zsh 5.9 run a `CHLD` trap after the command's
+	/// write; another trap they run at once, and so does this shell, under a
+	/// key of the trap's own ([`Self::trap_keys`]), so the interrupted write
+	/// keeps its progress.
 	pub fn holds_trap(&self, sig: crate::bash::signal::Signal) -> bool {
 		self.waiting_foreground()
-			|| (sig == crate::bash::signal::Signal::Chld && self.parked_on_write())
+			|| (sig == crate::bash::signal::Signal::Chld && self.write_part_way())
 	}
 
 	/// Whether the vproc is parked on a write ([`WaitKey::Write`]).
 	pub const fn parked_on_write(&self) -> bool {
 		matches!(self.blocked, Some(Blocked { key: WaitKey::Write { .. }, .. }))
+	}
+
+	/// Whether a write of the vproc is part way: it is parked on one, or the
+	/// op of a frame parked on one and a trap then interrupted it
+	/// ([`Frame::write_parked`]).
+	pub fn write_part_way(&self) -> bool {
+		self.parked_on_write() || self.frames.iter().any(|f| f.write_parked)
 	}
 }
 
@@ -1023,6 +1037,13 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// The op at the pc is parked on a write ([`WaitKey::Write`]): its
+	/// bytes may be part way under the vproc's write key
+	/// ([`Vproc::write_key`]), which a zsh multios tee keeps its progress
+	/// by. Dropping the op gives the vproc a new key
+	/// ([`super::exec::forget_parked_write`]). Set after each step of the op
+	/// ([`super::exec::run_slice`]); never serialized.
+	pub write_parked:      bool,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1056,6 +1077,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
+			write_parked: false,
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1790,8 +1812,10 @@ impl Live {
 // one allocation): the bench measured 1,840 B per idle vproc before it and
 // 1,912 B with it. The keys traps interrupted (`Vproc::trap_keys`, an empty
 // `Vec`, 24 B and no allocation): the bench measured 1,912 B per idle
-// vproc before it and 1,936 B with it.
-const _: () = assert!(size_of::<Vproc>() <= 704, "Vproc grew (idle vproc ≤ 2 KiB)");
+// vproc before it and 1,936 B with it. The key a part-way queued write goes
+// on with (`Vproc::out_key`, 8 B, no allocation while idle): the bench
+// measured 1,936 B per idle vproc before it and 1,944 B with it.
+const _: () = assert!(size_of::<Vproc>() <= 712, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
