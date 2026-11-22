@@ -16,7 +16,7 @@ import type {
 	TextEdit,
 	WorkspaceEdit,
 } from "./types";
-import { readTextFromDisk, uriToFile } from "./utils";
+import { readTextFromDisk, refuseSpecialFile, uriToFile } from "./utils";
 
 // =============================================================================
 // Text Edit Application
@@ -173,33 +173,136 @@ export interface RenameReferenceEdit {
 }
 
 /**
+ * A rename that failed before its move was done. Its reference edits were undone,
+ * except in the files `unrestored` names, which may still hold the rename's edits.
+ */
+export class RenameFailedError extends Error {
+	constructor(
+		/** The error that stopped the rename. */
+		readonly failure: unknown,
+		/** The reference file whose edit failed, or undefined when the move failed. */
+		readonly editFile: string | undefined,
+		/** Each reference file that could not be restored, with the error that stopped it. */
+		readonly unrestored: Array<{ filePath: string; error: unknown }>,
+	) {
+		super(failure instanceof Error ? failure.message : String(failure), { cause: failure });
+		this.name = "RenameFailedError";
+	}
+}
+
+/** A reference file as it was before a rename's edit: its bytes, and what putting them back must keep. */
+interface ReferenceSnapshot {
+	/** The path the edit was asked for. */
+	filePath: string;
+	/** The file that path names, through any symbolic links. */
+	realPath: string;
+	bytes: Uint8Array;
+	mode: number;
+	uid: number;
+	gid: number;
+	/** Whether the file has other names, which an undo must keep in step with this one. */
+	linked: boolean;
+}
+
+async function snapshotReference(filePath: string): Promise<ReferenceSnapshot> {
+	const realPath = await fs.realpath(filePath);
+	const stat = await fs.stat(realPath);
+	refuseSpecialFile(filePath, stat);
+	return {
+		filePath,
+		realPath,
+		bytes: await Bun.file(realPath).bytes(),
+		mode: stat.mode & 0o7777,
+		uid: stat.uid,
+		gid: stat.gid,
+		linked: stat.nlink > 1,
+	};
+}
+
+/**
+ * Put a reference file back as its snapshot holds it, byte for byte, unless it still
+ * holds those bytes. The bytes go to a new file beside it, with its mode, owner and
+ * group, renamed over it, so an undo that fails partway leaves the file as it was (with
+ * the edit), not cut short. The file is written in place instead where a new file would
+ * change what it is: when it has other names (they keep the same content), when its
+ * folder takes no new file, or when the new file cannot be given its owner and group.
+ */
+async function restoreReference(snapshot: ReferenceSnapshot): Promise<void> {
+	const current = await Bun.file(snapshot.realPath)
+		.bytes()
+		.catch(() => undefined);
+	if (current && Buffer.compare(current, snapshot.bytes) === 0) return;
+	const folderTakesFiles = await fs.access(path.dirname(snapshot.realPath), fs.constants.W_OK).then(
+		() => true,
+		() => false,
+	);
+	if (snapshot.linked || !folderTakesFiles) {
+		await Bun.write(snapshot.realPath, snapshot.bytes);
+		return;
+	}
+	const temp = path.join(
+		path.dirname(snapshot.realPath),
+		`.${path.basename(snapshot.realPath)}.${crypto.randomUUID()}.undo`,
+	);
+	try {
+		await Bun.write(temp, snapshot.bytes);
+		await fs.chmod(temp, snapshot.mode);
+		const made = await fs.stat(temp);
+		if (made.uid !== snapshot.uid || made.gid !== snapshot.gid) {
+			const owned = await fs.chown(temp, snapshot.uid, snapshot.gid).then(
+				() => true,
+				() => false,
+			);
+			if (!owned) {
+				await fs.rm(temp, { force: true });
+				await Bun.write(snapshot.realPath, snapshot.bytes);
+				return;
+			}
+		}
+		await fs.rename(temp, snapshot.realPath);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+
+/**
  * Apply a rename's reference edits and then move `source` → `dest` as one unit.
  *
  * The reference edits (import/usage rewrites in other files) must be written
  * before the move so their positions match the pre-move file contents, but a
- * failed move must not leave those files half-rewritten: each edited file is
- * snapshotted first, and if `mkdir`/`rename` throws, every snapshot is restored
- * before the error propagates. A failed move therefore leaves the source,
- * destination, and every reference file exactly as they were.
+ * failed rename must not leave those files half-rewritten: each edited file is
+ * snapshotted first, and if a reference edit, `mkdir` or `rename` throws, every
+ * file that no longer holds its snapshot gets it back before the error
+ * propagates. A failed rename therefore leaves the source, destination, and
+ * every reference file exactly as they were.
  *
- * @throws the original `mkdir`/`rename` error, after rolling back the edits.
+ * @throws {@link RenameFailedError}, naming the reference file whose edit failed
+ * (none when the move failed) and each file it could not restore.
  */
 export async function applyEditsThenRename(
 	references: RenameReferenceEdit[],
 	source: string,
 	dest: string,
 ): Promise<void> {
-	const backups: Array<{ filePath: string; original: string }> = [];
-	for (const { filePath, edits } of references) {
-		backups.push({ filePath, original: await readTextFromDisk(filePath) });
-		await applyTextEdits(filePath, edits);
-	}
+	const snapshots: ReferenceSnapshot[] = [];
+	let editFile: string | undefined;
 	try {
+		for (const { filePath, edits } of references) {
+			editFile = filePath;
+			snapshots.push(await snapshotReference(filePath));
+			await applyTextEdits(filePath, edits);
+		}
+		editFile = undefined;
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.rename(source, dest);
 	} catch (err) {
-		await Promise.all(backups.map(({ filePath, original }) => Bun.write(filePath, original)));
-		throw err;
+		const restored = await Promise.allSettled(snapshots.map(restoreReference));
+		const unrestored = snapshots.flatMap(({ filePath }, i) => {
+			const result = restored[i];
+			return result.status === "rejected" ? [{ filePath, error: result.reason as unknown }] : [];
+		});
+		throw new RenameFailedError(err, editFile, unrestored);
 	}
 }
 

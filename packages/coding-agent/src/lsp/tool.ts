@@ -58,6 +58,7 @@ import {
 import {
 	applyEditsThenRename,
 	flattenWorkspaceTextEdits,
+	RenameFailedError,
 	type RenameReferenceEdit,
 	rangesOverlap,
 	sortAndValidateTextEdits,
@@ -117,6 +118,29 @@ import { cfgLspRequestTimeout } from "./settings";
 
 const MAX_RENAME_PAIRS = 1000;
 
+/**
+ * The most directories a `rename_file` of a directory reads, counting each path that reaches a
+ * directory: through links, one directory can be reached by many paths, and a chain of k
+ * directories that each hold two links to the next is reached by 2^(k+1)-1 of them. Ten times the
+ * file limit, so a tree the file limit allows can also hold many empty directories; and cheap at
+ * the bound: a tree of 10,000 plain directories renames in 0.3-0.45 s with under 10 MB more memory,
+ * and such a chain is refused after 5,000 reads in under 0.3 s (measured on runc and under gVisor),
+ * far inside the call's 20 s default deadline.
+ */
+const MAX_RENAME_DIRECTORIES = 10_000;
+
+/**
+ * The most directory entries a `rename_file` of a directory reads, counting each entry once per path
+ * that reaches its directory. The directory limit alone lets a few directories that each hold many
+ * entries no limit counts (links to `/dev/null`, dangling links, FIFOs) be read through many paths:
+ * a chain of 13 such directories, each with 1,000 links to `/dev/null`, kept a call busy for its
+ * whole 20 s deadline. Twice the directory limit, so every tree the other two limits allow (at
+ * most 1,000 files and 10,000 directories, 11,000 entries) fits with 9,000 entries to spare; and
+ * cheap at the bound: the worst entry is a link the walk follows with `stat`, about 40 µs each on
+ * runc, so the bound costs well under a second.
+ */
+const MAX_RENAME_ENTRIES = 20_000;
+
 /** File actions whose answer can draw on other open documents; those are synced from disk first. */
 const CROSS_FILE_ACTIONS: ReadonlySet<string> = new Set([...PROJECT_INDEXED_ACTIONS, "code_actions"]);
 
@@ -125,39 +149,98 @@ interface FileRenamePair {
 	newUri: string;
 }
 
+/** A directory entry whose type the filesystem did not report (some report none). */
+function isUntyped(entry: fs.Dirent): boolean {
+	return !(
+		entry.isFile() ||
+		entry.isDirectory() ||
+		entry.isSymbolicLink() ||
+		entry.isFIFO() ||
+		entry.isSocket() ||
+		entry.isBlockDevice() ||
+		entry.isCharacterDevice()
+	);
+}
+
 /**
  * Enumerate the {oldUri, newUri} pairs needed for an LSP willRenameFiles/didRenameFiles request.
  * For files this is a single pair. For directories this walks every regular file underneath
  * and produces a parallel pair anchored at the new directory root.
+ *
+ * The walk follows a symbolic link to a directory, and names the files behind it by their paths
+ * through the link: those paths move with the directory (the link moves as itself), and a server
+ * rewrites imports that go through them (typescript-language-server does, for a link to a
+ * directory inside the tree or outside it, and for a link to a file). It reads each directory with
+ * `readdir(…, { withFileTypes: true })` and resolves a directory, a link, or an entry with no type,
+ * with `stat`. As `find -L` does, it does not enter a directory that is already on the path it
+ * came by (same device and inode as one of the directories from `source` down to it), so a link
+ * to the directory it is in, or to any directory between it and `source`, names nothing and the
+ * walk does not loop. Two paths to the same directory that is not on the path (`alias -> sub`)
+ * are both walked, and both named. It stops once it has more files than it may list, or more
+ * directories ({@link MAX_RENAME_DIRECTORIES}) or entries ({@link MAX_RENAME_ENTRIES}) through all
+ * paths, so a tree whose links fan out ends fast, and checks `signal` before each directory it
+ * reads and once more after the last.
+ *
+ * The recursive delete in `lsp/edits.ts` walks a tree too, but by the opposite rule: a delete
+ * removes a link as itself and never what it points to, so that walk follows no link. The two
+ * stay separate code for that reason.
  */
 async function enumerateRenamePairs(
 	source: string,
 	dest: string,
-): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded: boolean }> {
+	signal: AbortSignal | undefined,
+): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded?: "files" | "walk" }> {
 	const stat = await fs.promises.stat(source);
 	if (!stat.isDirectory()) {
-		return {
-			pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }],
-			directory: false,
-			exceeded: false,
-		};
+		return { pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }], directory: false };
 	}
-	const entries = await fs.promises.readdir(source, { recursive: true, withFileTypes: true });
 	const pairs: FileRenamePair[] = [];
-	for (const entry of entries) {
-		if (!entry.isFile()) continue;
-		if (pairs.length >= MAX_RENAME_PAIRS) {
-			return { pairs, directory: true, exceeded: true };
+	// The directories to read, relative to `source` ("" is `source`), each with the device and
+	// inode of every directory on the path the walk came by, itself included.
+	const directories: Array<{ relative: string; ancestors: string[] }> = [
+		{ relative: "", ancestors: [`${stat.dev}:${stat.ino}`] },
+	];
+	let entriesRead = 0;
+	for (let next = 0; next < directories.length; next++) {
+		throwIfAborted(signal);
+		const { relative, ancestors } = directories[next];
+		for (const entry of await fs.promises.readdir(path.join(source, relative), { withFileTypes: true })) {
+			if (++entriesRead > MAX_RENAME_ENTRIES) return { pairs, directory: true, exceeded: "walk" };
+			const rel = path.join(relative, entry.name);
+			let isDirectory = entry.isDirectory();
+			let isFile = entry.isFile();
+			let id = "";
+			if (isDirectory || entry.isSymbolicLink() || isUntyped(entry)) {
+				let target: fs.Stats;
+				try {
+					target = await fs.promises.stat(path.join(source, rel));
+				} catch (error) {
+					// A dangling link, or one that cannot be followed, names nothing.
+					if (isDirectory) throw error;
+					continue;
+				}
+				isDirectory = target.isDirectory();
+				isFile = target.isFile();
+				id = `${target.dev}:${target.ino}`;
+			}
+			if (isDirectory) {
+				if (ancestors.includes(id)) continue;
+				if (directories.length >= MAX_RENAME_DIRECTORIES) return { pairs, directory: true, exceeded: "walk" };
+				directories.push({ relative: rel, ancestors: [...ancestors, id] });
+				continue;
+			}
+			if (!isFile) continue;
+			if (pairs.length >= MAX_RENAME_PAIRS) {
+				return { pairs, directory: true, exceeded: "files" };
+			}
+			pairs.push({
+				oldUri: fileToUri(path.join(source, rel)),
+				newUri: fileToUri(path.join(dest, rel)),
+			});
 		}
-		const parent = entry.parentPath ?? source;
-		const absOld = path.join(parent, entry.name);
-		const rel = path.relative(source, absOld);
-		pairs.push({
-			oldUri: fileToUri(absOld),
-			newUri: fileToUri(path.join(dest, rel)),
-		});
 	}
-	return { pairs, directory: true, exceeded: false };
+	throwIfAborted(signal);
+	return { pairs, directory: true };
 }
 
 function formatRenameStatPath(filePath: string, cwd: string): string {
@@ -173,6 +256,26 @@ function formatRenameStatError(error: unknown): string {
 	if (!isFsError(error)) return "unknown filesystem error";
 	const syscall = error.syscall ? ` during ${replaceTabs(error.syscall)}` : "";
 	return `${replaceTabs(error.code)}${syscall}`;
+}
+
+/** One `lsp` call as its action sees it: the signal it runs under and how it ends. */
+interface LspCall {
+	/** The caller's signal joined with the call's deadline. */
+	signal: AbortSignal;
+	/** The call's deadline, in seconds. */
+	timeoutSec: number;
+	/** How long a diagnostics wait may take, in milliseconds. */
+	waitMs: number;
+	/** Whether the call's own deadline, not the caller, stopped the call. */
+	deadlinePassed: () => boolean;
+	/**
+	 * Rethrow an abort; return for any other error. A caller cancel stays a
+	 * ToolAbortError (one already thrown passes unchanged, so an action's own
+	 * report survives the call's shared catch), while the call's own deadline
+	 * becomes a ToolError naming the budget and server instead of an opaque
+	 * "Operation aborted"; `note` says what the call was doing.
+	 */
+	rethrowAbort: (err: unknown, serverName?: string, note?: string) => void;
 }
 
 /**
@@ -222,7 +325,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
-		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
+		const { action, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
 			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
 		}
@@ -232,27 +335,43 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			cfgToolsMaxTimeout.get(this.session.settings),
 		);
 		const timeoutSec = budget.call;
-		const waitMs = budget.wait * 1000;
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const callerSignal = signal;
-		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
-		throwIfAborted(signal);
-		/**
-		 * Rethrow an abort; return for any other error. A caller cancel stays a
-		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
-		 * budget and server instead of an opaque "Operation aborted".
-		 */
-		const rethrowAbort = (err: unknown, serverName?: string): void => {
-			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
-			if (timeoutSignal.aborted && !callerSignal?.aborted) {
+		const callSignal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
+		throwIfAborted(callSignal);
+		const deadlinePassed = (): boolean => timeoutSignal.aborted && !callerSignal?.aborted;
+		const rethrowAbort = (
+			err: unknown,
+			serverName?: string,
+			note = "The server may still be indexing; try again or pass timeout=<larger>.",
+		): void => {
+			if (!(err instanceof ToolAbortError) && !callSignal.aborted) return;
+			if (deadlinePassed()) {
 				const server = serverName ? ` on ${serverName}` : "";
-				throw new ToolError(
-					`LSP ${action} timed out after ${timeoutSec}s${server}. The server may still be indexing; try again or pass timeout=<larger>.`,
-				);
+				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}. ${note}`);
 			}
-			throw new ToolAbortError();
+			throw err instanceof ToolAbortError ? err : new ToolAbortError();
 		};
+		try {
+			return await this.#runAction(params, {
+				signal: callSignal,
+				timeoutSec,
+				waitMs: budget.wait * 1000,
+				deadlinePassed,
+				rethrowAbort,
+			});
+		} catch (err) {
+			// An action's own catch names the server it waited on. An abort that leaves an
+			// action any other way still reports the call's deadline as a timeout.
+			if (err instanceof ToolError) throw err;
+			rethrowAbort(err);
+			throw err;
+		}
+	}
 
+	async #runAction(params: LspParams, call: LspCall): Promise<AgentToolResult<LspToolDetails>> {
+		const { action, file, line, symbol, query, new_name, apply } = params;
+		const { signal, timeoutSec, waitMs, deadlinePassed, rethrowAbort } = call;
 		const config = getConfig(this.session.cwd);
 
 		// Status action doesn't need a file
@@ -589,13 +708,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
-			const enumerated = await enumerateRenamePairs(source, dest);
+			const enumerated = await enumerateRenamePairs(source, dest, signal).catch(err => {
+				rethrowAbort(
+					err,
+					undefined,
+					`It was still listing the files under ${formatRenameStatPath(source, this.session.cwd)}, and nothing was renamed; pass timeout=<larger>, or rename in smaller batches.`,
+				);
+				throw err;
+			});
 			if (enumerated.exceeded) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`,
+							text:
+								enumerated.exceeded === "files"
+									? `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`
+									: `Error: directory contains more than ${MAX_RENAME_DIRECTORIES} directories or ${MAX_RENAME_ENTRIES} entries, counting each path through a link; rename in smaller batches to keep LSP edits accurate`,
 						},
 					],
 					details: { action, success: false, request: params },
@@ -639,9 +768,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// — moving the path without those edits leaves dangling references
 			// (issue #8380).
 			const hardFailures: string[] = [];
+			// The call's deadline before the move: nothing has been moved or edited yet.
+			const notRenamed = "Nothing was renamed; try again or pass timeout=<larger>.";
 
 			for (const [serverName, serverConfig] of servers) {
-				throwIfAborted(signal);
+				if (signal?.aborted) rethrowAbort(signal.reason, undefined, notRenamed);
 				let client: LspClient;
 				// A server that never received the rename's checkouts answers without them.
 				let folderError: unknown;
@@ -665,9 +796,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						await waitForProjectLoaded(client, signal);
 					}
 				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
-					}
+					rethrowAbort(err, serverName, notRenamed);
 					// Could not reach the server at all; note it but don't block —
 					// this is not a willRenameFiles failure.
 					const msg = err instanceof Error ? err.message : String(err);
@@ -692,9 +821,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						perServerEdits.push({ serverName, edit: result });
 					}
 				} catch (err) {
-					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
-					}
+					rethrowAbort(err, serverName, notRenamed);
 					// method-not-found means the server doesn't implement the request;
 					// skip it silently. Any other error is a genuine failure from a
 					// server that supports willRenameFiles.
@@ -850,13 +977,49 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
-			// Apply the reference edits and move as one unit: a failed move rolls
-			// the reference edits back so the source, destination, and every
-			// reference file are left unchanged.
-			await applyEditsThenRename(referenceEdits, source, dest);
+			// A deadline or cancel that came while the edits were gathered ends the call
+			// before anything moves.
+			if (signal?.aborted) rethrowAbort(signal.reason, undefined, notRenamed);
+			// Apply the reference edits and move as one unit: a failed edit or move
+			// rolls the reference edits back so the source, destination, and every
+			// reference file are left unchanged. Its error is reported as itself,
+			// even when the call's deadline or a cancel came meanwhile: more time
+			// would not change it.
+			try {
+				await applyEditsThenRename(referenceEdits, source, dest);
+			} catch (err) {
+				if (!(err instanceof RenameFailedError)) throw err;
+				// An error's own closing period would double the sentence's.
+				const reason = (error: unknown): string =>
+					(error instanceof Error ? error.message : String(error)).replace(/[.\s]+$/, "");
+				const relative = (filePath: string): string => formatPathRelativeToCwd(filePath, this.session.cwd);
+				const failed = err.editFile
+					? `LSP rename_file could not edit ${relative(err.editFile)} for the rename of ${sourceLabel} to ${destLabel}`
+					: `LSP rename_file could not move ${sourceLabel} to ${destLabel}`;
+				if (err.unrestored.length > 0) {
+					const files = err.unrestored
+						.map(({ filePath, error }) => `${relative(filePath)} (${reason(error)})`)
+						.join(", ");
+					throw new ToolError(
+						`${failed}: ${reason(err.failure)}. Nothing was moved, but undoing its reference edits failed for: ${files}.`,
+					);
+				}
+				throw new ToolError(
+					`${failed}: ${reason(err.failure)}. Its reference edits were undone, and nothing was renamed.`,
+				);
+			}
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 
+			// The move is done. A deadline or cancel from here on leaves servers without the
+			// news, and the call still reports the rename it made, naming each server it did
+			// not tell.
+			const endedBy = (): string =>
+				deadlinePassed() ? `the call's ${timeoutSec}s deadline passed` : "the call was cancelled";
 			for (const [serverName, serverConfig] of servers) {
+				if (signal?.aborted) {
+					serverNotes.push(`  ${serverName}: not told of the rename (didRenameFiles not sent): ${endedBy()}`);
+					continue;
+				}
 				try {
 					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
 					for (const { oldUri } of pairs) {
@@ -868,10 +1031,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					await sendNotification(client, "workspace/didRenameFiles", lspParams, signal);
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
-						throw err;
+						serverNotes.push(
+							`  ${serverName}: may not have been told of the rename (didRenameFiles cut off): ${endedBy()}`,
+						);
+					} else {
+						const msg = err instanceof Error ? err.message : String(err);
+						serverNotes.push(`  ${serverName}: ${msg}`);
 					}
-					const msg = err instanceof Error ? err.message : String(err);
-					serverNotes.push(`  ${serverName}: ${msg}`);
 				}
 			}
 

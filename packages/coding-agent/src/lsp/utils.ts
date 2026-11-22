@@ -1,5 +1,6 @@
 export { truncate } from "@oh-my-pi/pi-utils";
 
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
@@ -20,10 +21,15 @@ import type {
 
 export { detectLanguageId } from "@oh-my-pi/pi-tui/lang-from-path";
 
+/** Refuse a FIFO, device or socket, whose reads can block forever or never end. */
+export function refuseSpecialFile(filePath: string, stat: Stats): void {
+	const kind = specialFileKind(stat);
+	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
+}
+
 /** Read a file's text, refusing FIFOs, devices and sockets, whose reads can block forever or never end. */
 export async function readTextFromDisk(filePath: string): Promise<string> {
-	const kind = specialFileKind(await fs.stat(filePath));
-	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
+	refuseSpecialFile(filePath, await fs.stat(filePath));
 	return Bun.file(filePath).text();
 }
 
