@@ -5,8 +5,9 @@
  * registry), so the previous bare `return` left the event loop with live
  * handles and the process hung after the picker left the alternate screen.
  *
- * The fix exits via `process.exit(0)` — matching the `--version`/`--export`
- * early-exit convention in the same function. Only this startup call site
+ * The fix exits with code 0 through `postmortem.exitAfterCleanup(0)`, which runs
+ * the cleanup callbacks (a SQL session store's lease release among them) and then
+ * calls `process.exit(0)`. Only this startup call site
  * exits; the in-session `/resume` picker (selector-controller.ts) keeps its own
  * onCancel that just closes the overlay.
  */
@@ -30,11 +31,11 @@ class ProcessExitSignal extends Error {
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
-	expectNoExitPass();
+	expectNoExitPass(import.meta.file);
 });
 
 describe("runRootCommand — startup --resume picker cancellation", () => {
-	it("exits cleanly (process.exit 0) when the picker is cancelled instead of returning and hanging", async () => {
+	it("exits cleanly (code 0, through postmortem.exitAfterCleanup) when the picker is cancelled instead of returning and hanging", async () => {
 		using tempDir = TempDir.createSync("@omp-resume-cancel-");
 		const sessionDir = tempDir.path();
 		// One answered session so folderSessions is non-empty and the picker (not the

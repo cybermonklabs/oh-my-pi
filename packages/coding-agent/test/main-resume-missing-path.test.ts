@@ -54,7 +54,7 @@ async function makeSessionFile(cwd: string, id: string): Promise<string> {
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
-	expectNoExitPass();
+	expectNoExitPass(import.meta.file);
 });
 
 describe("--resume <path> — missing path (#13928)", () => {

@@ -25,7 +25,7 @@ class ProcessExitSignal extends Error {
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
-	expectNoExitPass();
+	expectNoExitPass(import.meta.file);
 });
 
 describe("runRootCommand — --no-session --resume", () => {
