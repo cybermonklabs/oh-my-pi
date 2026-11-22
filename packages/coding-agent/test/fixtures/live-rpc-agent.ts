@@ -27,7 +27,7 @@ const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 const runtime = new ExtensionRuntime();
 const extension = await loadExtensionFromFactory(
 	pi => {
-		// `/bridge <text>` forwards `<text>` as typed input, the way pi-envoy relays a Dispatch line, and
+		// `/bridge <text>` forwards `<text>` as typed input, the way a chat bridge relays a message, and
 		// reports what `sendUserInput` answered as a `notify` UI request.
 		pi.registerCommand("bridge", {
 			handler: async (args, ctx) => {

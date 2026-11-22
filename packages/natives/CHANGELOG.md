@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- `AudioCapture` takes an optional third argument, `server`, and `LiveWebRtcPeer` an optional fourth, `pulseServerName`: a PulseAudio server (`tcp:host:port`) to open the microphone or the speaker on. A named server is used instead of `PULSE_SERVER`, gets the buffer sizes of a network round trip (`PULSE_LATENCY_MSEC` still wins), and when it cannot be opened, or libpulse is missing, the open fails instead of falling back to ALSA
-
 ### Fixed
 
 - Fixed omp freezing for seconds to minutes on WSL2 while saving sessions: Linux `FileLock` now locks a sidecar file instead of binding a socket, which takes about 10 ms per call there. Older omp versions still running do not see these locks, so restart them after updating ([#19704](https://github.com/can1357/oh-my-pi/pull/19704) by [@turgaybulut](https://github.com/turgaybulut))
@@ -52,6 +48,7 @@
 
 ### Added
 
+- `AudioCapture` takes an optional third argument, `server`, and `LiveWebRtcPeer` an optional fourth, `pulseServerName`: a PulseAudio server (`tcp:host:port`) to open the microphone or the speaker on. A named server is used instead of `PULSE_SERVER`, gets the buffer sizes of a network round trip (`PULSE_LATENCY_MSEC` still wins), and when it cannot be opened, or libpulse is missing, the open fails instead of falling back to ALSA
 - Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once. A file whose size the allocator refuses (beyond the address space, or above memory where overcommit is limited) and that no `maxBytes` skips is rejected with `out of memory`
 - Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`, which then follows that listed link wherever it points when the file is read, inside the walked directory or out of it

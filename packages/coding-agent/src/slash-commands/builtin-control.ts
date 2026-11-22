@@ -17,7 +17,7 @@ function describeLiveCall(status: LiveCallStatus): string {
 
 /**
  * `/live on|off|status` outside the terminal: drives the host's live call (RPC mode's live bridge) and
- * answers in one line, which a bridge such as pi-envoy posts back. A bare `/live` reports status.
+ * answers in one line, which a chat bridge posts back. A bare `/live` reports status.
  */
 async function handleLiveText(args: string, runtime: SlashCommandRuntime) {
 	const live = runtime.live;

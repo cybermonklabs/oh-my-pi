@@ -340,7 +340,7 @@ describe("live commands over RPC", () => {
 			child.stdin.write(`${JSON.stringify({ ...fields, id: String(++id) })}\n`);
 			await child.stdin.flush();
 		};
-		// What the bridge extension's `sendUserInput` answered for `text`, as pi-envoy would post it.
+		// What the bridge extension's `sendUserInput` answered for `text`, as a chat bridge would post it.
 		const typed = async (text: string): Promise<unknown> => {
 			await send({ type: "prompt", message: `/bridge ${text}`, streamingBehavior: "steer" });
 			for (;;) {
