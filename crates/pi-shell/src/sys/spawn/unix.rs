@@ -28,6 +28,11 @@
 //! and hands over the terminal again after the spawn, so neither side
 //! races the other.
 //!
+//! **Busy programs.** On every path an exec that fails with `ETXTBSY` is
+//! tried again after short waits ([`BUSY_WAITS_MS`]): a child another
+//! session of the host forked may hold the program open for writing until
+//! its own exec.
+//!
 //! **Waiting** reports stops and continues besides the exit
 //! ([`ExtProc::poll_event`]).
 
@@ -725,7 +730,12 @@ fn launch(
 		&& let Some(add_chdir) = state.add_chdir
 	{
 		let exec = Exec::new(prog)?;
-		return retry_join(place, |p| posix::spawn(&exec, fds, prog.closed, p, prog.ign, add_chdir));
+		// glibc's and macOS's `posix_spawn` report the exec's error, so a
+		// busy program is spawned again ([`BUSY_WAITS_MS`]).
+		return retry_busy(
+			|| retry_join(place, |p| posix::spawn(&exec, fds, prog.closed, p, prog.ign, add_chdir)),
+			busy_wait,
+		);
 	}
 	#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
 	let _ = state;
@@ -919,9 +929,15 @@ fn fork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Res
 					return Err(io::Error::last_os_error());
 				}
 			}
-			libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
-			// Only reached when exec failed: std reports this errno.
-			Err(io::Error::last_os_error())
+			// A busy program is tried again ([`BUSY_WAITS_MS`]); the result
+			// is only reached when exec failed: std reports this errno.
+			retry_busy(
+				|| {
+					libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
+					Err(io::Error::last_os_error())
+				},
+				busy_wait,
+			)
 		});
 	}
 	retry_join(place, |p| {
@@ -1020,6 +1036,72 @@ fn child_fail(diag: &[u8], errno: i32, status: i32, texts: &[Vec<u8>]) -> ! {
 /// The last OS error number. Async-signal-safe.
 fn errno() -> i32 {
 	io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// The waits, in milliseconds, before each new try of an exec that failed
+/// with `ETXTBSY`: 1023 ms in all.
+///
+/// The host runs its shell sessions as threads of one process. While one
+/// session writes a program (`printf ... > run.sh` opens it in this
+/// process), a child that another session forks gets a copy of the write
+/// descriptor and keeps it until its own exec, and until then the kernel
+/// refuses to run the program ("Text file busy"). bash never meets this
+/// race: each session is a process of its own, which no other session's
+/// fork copies. The copy lives only between that fork and that exec, so
+/// the first short waits outlast it, and the doubling waits cover a child
+/// that a loaded host leaves unscheduled for a while. A program someone
+/// really keeps open for writing still fails after the last wait, with the
+/// error bash reports at once.
+const BUSY_WAITS_MS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+
+/// Runs `attempt` again after each wait of [`BUSY_WAITS_MS`] (through
+/// `wait`) while it fails with `ETXTBSY`; the first other result, or the
+/// last `ETXTBSY` once the waits run out. Async-signal-safe when `attempt`
+/// and `wait` are: it allocates nothing, so the forked children use it too.
+fn retry_busy<T>(
+	mut attempt: impl FnMut() -> io::Result<T>,
+	mut wait: impl FnMut(u64),
+) -> io::Result<T> {
+	let mut waits = BUSY_WAITS_MS.iter();
+	loop {
+		match attempt() {
+			Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => match waits.next() {
+				Some(&ms) => wait(ms),
+				None => return Err(e),
+			},
+			done => return done,
+		}
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	/// A process a test kills at the next [`busy_wait`] on this thread, or
+	/// in a child forked from it, which inherits the value: the stand-in
+	/// for another session's child that lets go of a program by its exec.
+	pub(super) static KILL_AT_BUSY_WAIT: std::cell::Cell<libc::pid_t> =
+		const { std::cell::Cell::new(0) };
+}
+
+/// Sleeps `ms` milliseconds, again for what is left after a signal.
+/// Async-signal-safe (`nanosleep`).
+fn busy_wait(ms: u64) {
+	#[cfg(test)]
+	KILL_AT_BUSY_WAIT.with(|holder| {
+		let pid = holder.replace(0);
+		if pid > 0 {
+			// SAFETY: a plain syscall on the test's own child.
+			unsafe { libc::kill(pid, libc::SIGKILL) };
+		}
+	});
+	let mut left = libc::timespec {
+		tv_sec:  (ms / 1000) as libc::time_t,
+		tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+	};
+	// SAFETY: nanosleep with valid timespecs; it writes what is left on a
+	// signal, which the next call sleeps.
+	while unsafe { libc::nanosleep(&raw const left, &raw mut left) } != 0 && errno() == libc::EINTR {
+	}
 }
 
 /// The spawn of a process that applies redirections itself
@@ -1142,8 +1224,17 @@ fn fork_redirs(
 					},
 				}
 			}
-			libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
-			let e = errno();
+			// A busy program is tried again ([`BUSY_WAITS_MS`]).
+			let e = retry_busy::<()>(
+				|| {
+					libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
+					Err(io::Error::last_os_error())
+				},
+				busy_wait,
+			)
+			.err()
+			.and_then(|e| e.raw_os_error())
+			.unwrap_or(0);
 			child_fail(&exec_diag, e, if e == libc::ENOENT { 127 } else { 126 }, texts);
 		}
 	}

@@ -353,6 +353,231 @@ const WRITE: OpenFlags = OpenFlags::WRITE
 	.with(OpenFlags::CREATE)
 	.with(OpenFlags::TRUNC);
 
+/// An exec that keeps failing with ETXTBSY is tried once more after each
+/// wait of `BUSY_WAITS_MS`, and the last ETXTBSY is reported: the waits are
+/// counted here, not timed.
+#[test]
+fn a_busy_exec_is_tried_after_each_wait_then_reported() {
+	let mut tries = 0;
+	let mut waited = Vec::new();
+	let busy: io::Result<()> = super::retry_busy(
+		|| {
+			tries += 1;
+			Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+		},
+		|ms| waited.push(ms),
+	);
+	assert_eq!(busy.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+	assert_eq!(waited, super::BUSY_WAITS_MS);
+	assert_eq!(tries, super::BUSY_WAITS_MS.len() + 1);
+	assert_eq!(super::BUSY_WAITS_MS.iter().sum::<u64>(), 1023);
+}
+
+/// A busy exec that clears goes on at once, after only the waits so far;
+/// every other error is reported on the first try, without a wait.
+#[test]
+fn only_a_busy_exec_is_tried_again() {
+	let mut busy_left = 2;
+	let mut waited = Vec::new();
+	let ran = super::retry_busy(
+		|| {
+			if busy_left == 0 {
+				return Ok(7);
+			}
+			busy_left -= 1;
+			Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+		},
+		|ms| waited.push(ms),
+	);
+	assert_eq!(ran.unwrap(), 7);
+	assert_eq!(waited, [1, 2]);
+	for errno in [libc::ENOEXEC, libc::ENOENT, libc::EACCES, libc::E2BIG] {
+		let (mut tries, mut waits) = (0, 0);
+		let failed: io::Result<()> = super::retry_busy(
+			|| {
+				tries += 1;
+				Err(io::Error::from_raw_os_error(errno))
+			},
+			|_| waits += 1,
+		);
+		assert_eq!((failed.unwrap_err().raw_os_error(), tries, waits), (Some(errno), 1, 0));
+	}
+}
+
+/// Whether this kernel refuses to run a program held open for writing
+/// (Linux does; gVisor runs it). The probe is a program in `dir`, the
+/// calling test's own directory.
+#[cfg(target_os = "linux")]
+fn busy_exec_refused(dir: &std::path::Path) -> bool {
+	let program = dir.join("busy-probe");
+	write_program(&program, "#!/bin/sh\nexit 0\n");
+	let held = std::fs::OpenOptions::new()
+		.append(true)
+		.open(&program)
+		.expect("open the probe for writing");
+	let ran = std::process::Command::new(&program).status();
+	drop(held);
+	ran.err().and_then(|e| e.raw_os_error()) == Some(libc::ETXTBSY)
+}
+
+/// Says on the test binary's stderr, past libtest's capture, that `test`
+/// did not run: this kernel runs a program held open for writing, so there
+/// is no busy exec to retry. The policy tests cover the retry there.
+#[cfg(target_os = "linux")]
+fn say_not_run(test: &str) {
+	use std::io::Write as _;
+	let _ = writeln!(
+		std::io::stderr(),
+		"NOT-RUN {test}: this kernel runs a program held open for writing"
+	);
+}
+
+/// Writes `text` to `path`, mode 0755.
+#[cfg(target_os = "linux")]
+fn write_program(path: &std::path::Path, text: &str) {
+	use std::os::unix::fs::PermissionsExt as _;
+	std::fs::write(path, text).expect("write the program");
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// A process that holds a program open for writing until it is killed (a
+/// `sleep` with the file on fd 3, opened before it says `held`): another
+/// session's child before its exec.
+#[cfg(target_os = "linux")]
+struct Holder(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Holder {
+	fn new(program: &std::path::Path) -> Self {
+		use std::io::BufRead as _;
+		let mut child = std::process::Command::new("/bin/sh")
+			.args(["-c", "exec 3>>\"$0\" && echo held && exec sleep 600"])
+			.arg(program)
+			.stdout(std::process::Stdio::piped())
+			.spawn()
+			.expect("start the holder");
+		let mut said = String::new();
+		std::io::BufReader::new(child.stdout.as_mut().expect("holder stdout"))
+			.read_line(&mut said)
+			.expect("read the holder");
+		assert_eq!(said, "held\n", "the holder opened the program for writing");
+		Self(child)
+	}
+
+	fn pid(&self) -> libc::pid_t {
+		libc::pid_t::try_from(self.0.id()).unwrap()
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Holder {
+	fn drop(&mut self) {
+		let _ = self.0.kill();
+		let _ = self.0.wait();
+	}
+}
+
+/// The spawn of `program` by path `kind` (`posix_spawn`, the fork path, or
+/// the deferred fork whose child reports a failed exec on its fd 2, here the
+/// file `err`, and by its status).
+#[cfg(target_os = "linux")]
+fn spawn_by(
+	s: &NativeSpawner,
+	kind: &str,
+	program: &[BString],
+	env: &EnvView,
+	err: &std::path::Path,
+) -> io::Result<Box<dyn ExtProc>> {
+	let mut sp = spec(program, env, NEW);
+	match kind {
+		"posix_spawn" => {},
+		"fork" => sp.umask = if sp.umask == 0o077 { 0o027 } else { 0o077 },
+		"deferred" => {
+			sp.redirs = Some(ChildRedirs {
+				list:      vec![child_open(&[2], err, WRITE)],
+				exec_diag: BString::from("test: "),
+			});
+		},
+		_ => unreachable!("{kind}"),
+	}
+	s.spawn(sp)
+}
+
+#[cfg(target_os = "linux")]
+const BUSY_PATHS: [&str; 3] = ["posix_spawn", "fork", "deferred"];
+
+/// On every spawn path, a program another process holds open for writing
+/// runs once that process lets go within the waits. The holder is killed at
+/// the first wait, so the first exec failed with ETXTBSY and a later try
+/// ran the program. Every file is in this test's own directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_program_runs_once_its_holder_lets_go() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_busy_program_runs_once_its_holder_lets_go");
+		return;
+	}
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	for kind in BUSY_PATHS {
+		let program = dir.path().join(kind);
+		let err = dir.path().join(format!("{kind}.err"));
+		write_program(&program, "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&program);
+		super::KILL_AT_BUSY_WAIT.set(holder.pid());
+		let a = vec![BString::from(program.as_os_str().as_encoded_bytes())];
+		let spawned = spawn_by(&s, kind, &a, &env, &err);
+		super::KILL_AT_BUSY_WAIT.set(0);
+		let status = spawned.map(|mut p| wait(&mut p));
+		drop(holder);
+		let said = std::fs::read_to_string(&err).unwrap_or_default();
+		assert_eq!(status.map_err(|e| e.to_string()), Ok(ExitStatus::Exited(7)), "{kind}: {said}");
+	}
+}
+
+/// On every spawn path, a program that stays open for writing still fails
+/// with ETXTBSY once the waits run out, as bash fails at once. The failure
+/// comes no sooner than the waits' sum (a sleep never ends early); the time
+/// it took is printed. Every file is in this test's own directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_program_that_stays_busy_fails_after_the_waits() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_program_that_stays_busy_fails_after_the_waits");
+		return;
+	}
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let waits = Duration::from_millis(super::BUSY_WAITS_MS.iter().sum());
+	for kind in BUSY_PATHS {
+		let program = dir.path().join(kind);
+		let err = dir.path().join(format!("{kind}.err"));
+		write_program(&program, "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&program);
+		let a = vec![BString::from(program.as_os_str().as_encoded_bytes())];
+		let started = Instant::now();
+		let failure = match spawn_by(&s, kind, &a, &env, &err) {
+			Err(e) => e.to_string(),
+			Ok(mut p) => {
+				let status = wait(&mut p);
+				format!("{status:?}: {}", std::fs::read_to_string(&err).unwrap_or_default())
+			},
+		};
+		let took = started.elapsed();
+		drop(holder);
+		eprintln!("BUSY-BOUND {kind}: failed after {took:?} (waits {waits:?}): {failure}");
+		let expected = if kind == "deferred" {
+			"Exited(126): test: Text file busy\n".to_owned()
+		} else {
+			io::Error::from_raw_os_error(libc::ETXTBSY).to_string()
+		};
+		assert_eq!(failure, expected, "{kind}");
+		assert!(took >= waits, "{kind}: failed after {took:?}, before the waits ({waits:?}) ran out");
+	}
+}
+
 /// bash's forked child opens a background command's FIFO redirection: the
 /// spawn returns (with the pid `$!` shows) while the open still waits for
 /// the FIFO's other end, which the shell's next command opens.
