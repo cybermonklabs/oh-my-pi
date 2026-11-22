@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `Process.terminate()` on Linux no longer leaves running a child that a process of the tree forks while the tree is being read: each wave stops the tree, top-down, before it reads it and resumes it once signalled, so that child is signalled with its parent instead of outliving it under init (an aborted `ptree.spawn` command could keep its output pipe open until such a child ended)
+- `Process.terminate()` on Linux no longer leaves running a child that a process of the tree forks while the tree is being read: each wave stops the tree, top-down, before it reads it and resumes it once signalled, so that child is signalled with its parent instead of outliving it under init (an aborted `ptree.spawn` command could keep its output pipe open until such a child ended). A stopped process that blocks the wave's signal is let run, one step at a time, until it unblocks it, so a child it forks in that window is read too: dash blocks every signal around each vfork, and `sh -c 'sleep 30'` stopped there used to leave `sleep` running. Where the system shows no signal masks (gVisor), each stopped process gets a few short steps instead. A process that forks during the grace period and then exits (in a TERM handler, say) still leaves its child out of reach: the child moves to the nearest subreaper or to init before the hard wave reads the tree. A caller that needs that child ended runs the command in a process group of its own and waits until the group is empty, or under a subreaper (`ptree.spawn` with `subreaper: true`)
 
 ## [18.18.6] - 2026-11-09
 
