@@ -5993,6 +5993,12 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 				}
 			},
 			Some(TrapEnd { exit: true, .. }) => exit_shell(k, vp, cx, status),
+			// A signal trap the error ended: the interrupted command's status
+			// comes back, as at the trap's end (zsh runs the trap inside the
+			// command it interrupts, which then returns its own status).
+			Some(TrapEnd { key: TrapKey::Signal(_), status: saved, cancel: None, .. }) => {
+				vp.status = saved;
+			},
 			_ => {},
 		}
 	} else if let Some(i) = run

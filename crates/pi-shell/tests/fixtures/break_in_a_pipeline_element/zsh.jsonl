@@ -648,6 +648,7 @@
 {"id":"trap/own/debug-error-break","script":"trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; false; echo after:$?","stdout":"b\nafter:1\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":0}
 {"id":"trap/own/debug-error-break-errexit","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; false; echo after","stdout":"b\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":1}
 {"id":"trap/own/debug-error-break-errexit-loop","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; for i in 1; do echo a; done; false; echo after","stdout":"a\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":1}
+{"id":"trap/own/debug-error-break-status","script":"trap '[[ $ZSH_DEBUG_CMD == \"(exit 4)\" ]] && break; :' DEBUG; (exit 4); echo s:$?","stdout":"s:4\n","stderr":"","status":0}
 {"id":"trap/own/debug-error-math-errexit","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && (( 1/0 )); :' DEBUG; : hit; echo b; false; echo after","stdout":"b\n","stderr":"zsh:1: division by zero\n","status":1}
 {"id":"trap/own/debug-error-unset-errexit","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; : hit; echo b; false; echo after","stdout":"","stderr":"zsh:1: x: unset\n","status":1}
 {"id":"trap/own/debug-error-unset-errexit-in-function","script":"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; f() { : hit; echo b; false; echo after; }; f; echo top","stdout":"","stderr":"f: x: unset\n","status":1}
@@ -677,6 +678,10 @@
 {"id":"trap/own/exit-error-in-function-loop","script":"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo h; }; h; echo e:$?","stdout":"j1\nt1\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":3}
 {"id":"trap/own/exit-error-in-subshell","script":"( trap 'echo t1; break; echo t2' EXIT; exit 3 ); echo s:$?","stdout":"t1\ns:3\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":0}
 {"id":"trap/own/exit-error-math","script":"trap 'echo t1; echo $(( 1 + )); echo t2' EXIT; exit 3","stdout":"t1\n","stderr":"zsh:1: bad math expression: operand expected at end of string\n","status":3}
+{"id":"trap/own/signal-error-break-status","script":"trap 'echo t1; break; echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?","stdout":"t1\ns:0\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":0}
+{"id":"trap/own/signal-error-in-function","script":"trap 'echo t1; break; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo s:$?","stdout":"t1\nf:0\ns:0\n","stderr":"f:break: not in while, until, select, or repeat loop\n","status":0}
+{"id":"trap/own/signal-error-math-status","script":"trap 'echo t1; echo $(( 1 + )); echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?","stdout":"t1\ns:0\n","stderr":"zsh:1: bad math expression: operand expected at end of string\n","status":0}
+{"id":"trap/own/signal-no-error-status","script":"trap 'echo t1; false' USR1; (exit 4); kill -USR1 $$; echo s:$?","stdout":"t1\ns:0\n","stderr":"","status":0}
 {"id":"trap/own/trapzerr-break","script":"TRAPZERR() { echo t; break; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\ne:1\n","stderr":"","status":0}
 {"id":"trap/own/trapzerr-break-errexit","script":"setopt errexit; TRAPZERR() { echo t; break; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\n","stderr":"","status":1}
 {"id":"trap/own/trapzerr-continue","script":"TRAPZERR() { echo t; continue; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; done; echo e:$?","stdout":"a1\nt\na2\nt\ne:1\n","stderr":"","status":0}
@@ -684,6 +689,8 @@
 {"id":"trap/own/zerr-break-on-return","script":"trap 'echo t; break' ZERR; f() { return 2; }; for i in 1 2; do echo a$i; f; echo b$i; done; echo e:$?","stdout":"a1\nt\nb1\na2\nt\nb2\ne:0\n","stderr":"","status":0}
 {"id":"trap/own/zerr-errexit-error-break","script":"setopt errexit; trap 'echo t1; break; echo t2' ZERR; (exit 4); echo after","stdout":"t1\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":1}
 {"id":"trap/own/zerr-errexit-error-unset","script":"setopt errexit; trap 'echo t1; : ${x?u}; echo t2' ZERR; (exit 4); echo after","stdout":"t1\n","stderr":"zsh:1: x: u\n","status":1}
+{"id":"trap/own/zerr-error-break-status","script":"trap 'echo t1; break; echo t2' ZERR; (exit 4); echo s:$?","stdout":"t1\ns:1\n","stderr":"zsh:break:1: not in while, until, select, or repeat loop\n","status":0}
+{"id":"trap/own/zerr-error-math-status","script":"trap 'echo t1; echo $(( 1 + )); echo t2' ZERR; (exit 4); echo s:$?","stdout":"t1\ns:1\n","stderr":"zsh:1: bad math expression: operand expected at end of string\n","status":0}
 {"id":"trap/own/zerr-in-cmdsub-in-signal-trap","script":"trap 'echo Z$?' ZERR; trap 'x=$(false; echo s); echo t2:$x' USR1; kill -USR1 $$; echo top:$?","stdout":"t2:s\ntop:0\n","stderr":"","status":0}
 {"id":"trap/own/zerr-in-debug-trap","script":"trap 'echo Z$?' ZERR; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { false; echo d; }; :' DEBUG; : hit; echo top:$?","stdout":"d\ntop:0\n","stderr":"","status":0}
 {"id":"trap/own/zerr-in-exit-trap","script":"trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; echo top","stdout":"top\nx\n","stderr":"","status":0}

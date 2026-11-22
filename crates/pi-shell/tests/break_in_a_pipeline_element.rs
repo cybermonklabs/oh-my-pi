@@ -747,6 +747,28 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"zerr-errexit-error-unset",
 		"setopt errexit; trap 'echo t1; : ${x?u}; echo t2' ZERR; (exit 4); echo after",
 	),
+	// An error that ends a signal trap: the interrupted command's status
+	// comes back, as at the trap's end. A DEBUG trap's and a ZERR trap's
+	// already matched (the controls: the command's status; 1).
+	(
+		"signal-error-break-status",
+		"trap 'echo t1; break; echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?",
+	),
+	(
+		"signal-error-math-status",
+		"trap 'echo t1; echo $(( 1 + )); echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?",
+	),
+	(
+		"signal-error-in-function",
+		"trap 'echo t1; break; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo s:$?",
+	),
+	("signal-no-error-status", "trap 'echo t1; false' USR1; (exit 4); kill -USR1 $$; echo s:$?"),
+	(
+		"debug-error-break-status",
+		"trap '[[ $ZSH_DEBUG_CMD == \"(exit 4)\" ]] && break; :' DEBUG; (exit 4); echo s:$?",
+	),
+	("zerr-error-break-status", "trap 'echo t1; break; echo t2' ZERR; (exit 4); echo s:$?"),
+	("zerr-error-math-status", "trap 'echo t1; echo $(( 1 + )); echo t2' ZERR; (exit 4); echo s:$?"),
 ];
 
 /// The trap shape rows, `trap/x<loops>/<name>`, three at top level, and
