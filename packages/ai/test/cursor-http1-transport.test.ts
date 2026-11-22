@@ -1,5 +1,6 @@
 import { expect, it } from "bun:test";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -240,6 +241,74 @@ it(
 			expect(terminalEvents).toEqual(["error"]);
 			expect(result.stopReason).toBe("aborted");
 		} finally {
+			server.stop(true);
+		}
+	},
+	SETTLE_TIMEOUT_MS,
+);
+
+// The HTTP/1 transport reads the model-call guards right before its RunSSE request opens, after the `onPayload`
+// hooks, as the HTTP/2 transport does. A hold that begins in the hook holds the request: nothing reaches the
+// server, and the call ends on the hold's error. The control sends the same request.
+it.each([
+	["holds the HTTP/1 request when a model-call hold begins in its onPayload hook", true, 0],
+	["sends the HTTP/1 request when no hold begins (control)", false, 1],
+] as const)(
+	"%s",
+	async (_label, holdInHook, expectedRuns) => {
+		let runs = 0;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				const url = new URL(request.url);
+				await request.arrayBuffer();
+				if (url.pathname === "/agent.v1.AgentService/RunSSE") {
+					runs++;
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(textDeltaFrame("http1 ok"));
+								controller.enqueue(turnEndedFrame());
+								controller.close();
+							},
+						}),
+						{ headers: { "content-type": "application/connect+proto" } },
+					);
+				}
+				if (url.pathname === "/aiserver.v1.BidiService/BidiAppend") {
+					return new Response(null, { headers: { "content-type": "application/proto" } });
+				}
+				return new Response(null, { status: 404 });
+			},
+		});
+		const model = makeModel(server.url.toString());
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+
+		try {
+			const { result, terminalEvents } = await drain(
+				streamCursor(model, context, {
+					apiKey: "not-a-secret",
+					transport: "http1",
+					onPayload: async () => {
+						held = holdInHook;
+						return undefined;
+					},
+				}),
+			);
+
+			expect(runs).toBe(expectedRuns);
+			if (holdInHook) {
+				expect(terminalEvents).toEqual(["error"]);
+				expect(result.errorMessage).toContain("held: cyber_policy");
+			} else {
+				expect(terminalEvents).toEqual(["done"]);
+				expect(result.stopReason).toBe("stop");
+			}
+		} finally {
+			removeGuard();
 			server.stop(true);
 		}
 	},

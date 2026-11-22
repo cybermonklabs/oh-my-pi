@@ -3,6 +3,7 @@ import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
+import { streamGoogleVertex } from "@oh-my-pi/pi-ai/providers/google-vertex";
 import { streamOllama } from "@oh-my-pi/pi-ai/providers/ollama";
 import type { Api, AssistantMessage, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -176,7 +177,8 @@ describe("Gemini CLI: each endpoint attempt reads the model-call guards", () => 
 	});
 
 	// An endpoint that answers 200 with an empty stop is asked again, after a backoff, with the same body. That
-	// resend reads the guards right before it goes out: a hold that begins after the empty answer holds it.
+	// resend reads the guards right before it goes out: a hold that begins after the empty answer holds it, and the
+	// held call keeps the first answer (its usage), since the output is reset only after the read.
 	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
 		const urls: string[] = [];
 		const result = await withHold(model, hold => {
@@ -186,7 +188,10 @@ describe("Gemini CLI: each endpoint attempt reads the model-call guards", () => 
 				const parts = urls.length === 1 ? [] : [{ text: "ok" }];
 				if (urls.length === 1 && holdAfterFirst) hold();
 				const body = `data: ${JSON.stringify({
-					response: { candidates: [{ content: { parts }, finishReason: "STOP" }] },
+					response: {
+						candidates: [{ content: { parts }, finishReason: "STOP" }],
+						usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 0, totalTokenCount: 10 },
+					},
 				})}\n\n`;
 				const response = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 				// The resend goes to the URL the first response came from.
@@ -201,8 +206,10 @@ describe("Gemini CLI: each endpoint attempt reads the model-call guards", () => 
 		});
 
 		expect(urls).toHaveLength(expectedRequests);
-		if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
-		else {
+		if (holdAfterFirst) {
+			expect(result.errorMessage).toContain(HOLD);
+			expect(result.usage.input).toBe(10);
+		} else {
 			expect(result.stopReason).toBe("stop");
 			// The control's resend went to the same endpoint as the first request.
 			expect(urls[1]).toBe(urls[0]);
@@ -225,17 +232,22 @@ describe("Google (public API and Vertex): each send reads the model-call guards"
 	});
 
 	// A STOP with no content is asked again after a backoff: that resend reads the guards right before it goes
-	// out, so a hold that begins after the empty answer holds it.
+	// out, so a hold that begins after the empty answer holds it. A first answer of thinking only counts as empty;
+	// the held call keeps it (its thinking and usage), since the output is reset only after the read.
 	it.each(CASES)("empty-response resend: %s", async (_label, holdAfterFirst, expectedRequests) => {
 		let requests = 0;
 		const result = await withHold(model, hold => {
 			const fetch: FetchImpl = async () => {
 				requests++;
 				if (requests === 1 && holdAfterFirst) hold();
-				const text = requests === 1 ? "" : "Hello!";
+				const parts = requests === 1 ? [{ text: "pondering", thought: true }] : [{ text: "Hello!" }];
 				const body = `data: ${JSON.stringify({
-					candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }],
-					usageMetadata: { promptTokenCount: 10, candidatesTokenCount: text ? 5 : 0, totalTokenCount: 15 },
+					candidates: [{ content: { parts }, finishReason: "STOP" }],
+					usageMetadata: {
+						promptTokenCount: 10,
+						candidatesTokenCount: requests === 1 ? 2 : 5,
+						totalTokenCount: 15,
+					},
 				})}\n\n`;
 				return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 			};
@@ -243,7 +255,68 @@ describe("Google (public API and Vertex): each send reads the model-call guards"
 		});
 
 		expect(requests).toBe(expectedRequests);
-		if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
-		else expect(result.stopReason).toBe("stop");
+		if (holdAfterFirst) {
+			expect(result.errorMessage).toContain(HOLD);
+			expect(result.content).toEqual([expect.objectContaining({ type: "thinking", thinking: "pondering" })]);
+			expect(result.usage.input).toBe(10);
+		} else expect(result.stopReason).toBe("stop");
+	});
+
+	// Vertex with an ambient region (no explicit `location`) retries the global endpoint once after a regional 404.
+	// That retry reads the guards right before it goes out: a hold that begins on the 404 holds it.
+	describe("Vertex regional-404 retry", () => {
+		const vertexModel: Model<"google-vertex"> = buildModel({
+			id: "gemini-3.1-pro-preview",
+			name: "Gemini 3.1 Pro Preview",
+			api: "google-vertex",
+			provider: "google-vertex",
+			baseUrl: "https://{location}-aiplatform.googleapis.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 65_536,
+		});
+		const LOCATION_KEYS = ["GOOGLE_VERTEX_LOCATION", "GOOGLE_CLOUD_LOCATION", "VERTEX_LOCATION"] as const;
+		const saved = new Map<string, string | undefined>();
+		beforeEach(() => {
+			for (const key of LOCATION_KEYS) saved.set(key, Bun.env[key]);
+			for (const key of LOCATION_KEYS) delete Bun.env[key];
+			Bun.env.GOOGLE_VERTEX_LOCATION = "us-central1";
+		});
+		afterEach(() => {
+			for (const key of LOCATION_KEYS) {
+				const value = saved.get(key);
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+		});
+
+		it.each(CASES)("%s", async (_label, holdAfterFirst, expectedRequests) => {
+			const hosts: string[] = [];
+			const result = await withHold(vertexModel, hold => {
+				const fetch: FetchImpl = async input => {
+					const url = input instanceof Request ? input.url : input.toString();
+					hosts.push(new URL(url).host);
+					if (hosts.length === 1) {
+						if (holdAfterFirst) hold();
+						return new Response(JSON.stringify({ error: { message: "not found" } }), { status: 404 });
+					}
+					const body = `data: ${JSON.stringify({
+						candidates: [{ content: { parts: [{ text: "Hello!" }] }, finishReason: "STOP" }],
+					})}\n\n`;
+					return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+				};
+				return streamGoogleVertex(vertexModel, context, { apiKey: "not-a-secret", fetch }).result();
+			});
+
+			expect(hosts).toHaveLength(expectedRequests);
+			expect(hosts[0]).toBe("us-central1-aiplatform.googleapis.com");
+			if (holdAfterFirst) expect(result.errorMessage).toContain(HOLD);
+			else {
+				expect(result.stopReason).toBe("stop");
+				expect(hosts[1]).toBe("aiplatform.googleapis.com");
+			}
+		});
 	});
 });

@@ -5,7 +5,7 @@ import {
 	type GitLabDuoWorkflowNamespaceSelection,
 } from "@oh-my-pi/pi-catalog/discovery/gitlab-duo-workflow";
 import * as AIError from "../error";
-import { assertModelCallAllowed } from "../model-call-guard";
+import { assertModelCallAllowed, ModelCallRefusedError } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -439,13 +439,20 @@ export const streamGitLabDuoWorkflow: StreamFunction<"gitlab-duo-agent"> = (
 			// A throw (socket reject, abnormal 1006 close, …) on a goal already past the
 			// byte budget is almost certainly the oversized request — surface it as a
 			// context-overflow so the session auto-compacts rather than hard-failing.
-			output.errorMessage = state.goalOverflowMessage ?? errorText;
+			// A held run (`ModelCallRefusedError`) and a `cyber_policy` refusal keep their own text: the hold
+			// sent nothing, and a refusal must stay a refusal, never become an overflow the session recovers from.
+			output.errorMessage = keepsOwnErrorText(error) ? errorText : (state.goalOverflowMessage ?? errorText);
 			stream.push({ type: "error", reason: "error", error: output });
 		}
 	});
 
 	return stream;
 };
+
+/** A model-call hold, or a `cyber_policy` refusal: its own text survives the goal-overflow rewrite. */
+function keepsOwnErrorText(error: unknown): boolean {
+	return error instanceof ModelCallRefusedError || AIError.isCyberPolicyRefusal(error);
+}
 
 export function buildGitLabDuoWorkflowDirectAccessBody(
 	rootNamespaceId: string,
@@ -2221,8 +2228,9 @@ async function handleGitLabDuoWorkflowSocketMessage(
 		traceGitLabDuoWorkflow("websocket.failed", { status });
 		state.output.stopReason = "error";
 		// An oversized goal that fails terminally is almost certainly failing on the byte
-		// size — surface it as a context-overflow so the session auto-compacts.
-		state.output.errorMessage = state.goalOverflowMessage ?? message;
+		// size — surface it as a context-overflow so the session auto-compacts. A `cyber_policy`
+		// refusal keeps its own text.
+		state.output.errorMessage = keepsOwnErrorText(message) ? message : (state.goalOverflowMessage ?? message);
 		state.stream.push({ type: "error", reason: "error", error: state.output });
 		return "terminal";
 	}

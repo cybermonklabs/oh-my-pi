@@ -1174,6 +1174,10 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				} catch {
 					throw new AIError.AbortError();
 				}
+				// Read the model-call guards before the output is reset for the resend: a held resend then ends
+				// with what the first answer streamed (its thinking and usage), as any held send does. The send
+				// itself reads them again right before it goes out (`openStreamAt`).
+				assertModelCallAllowed(model);
 				resetGoogleStreamOutputForRetry(output);
 				body = await openStream();
 			}

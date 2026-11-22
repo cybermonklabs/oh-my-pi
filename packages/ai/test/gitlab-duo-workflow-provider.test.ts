@@ -1600,6 +1600,109 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(result.errorMessage).not.toContain("Internal server error");
 	});
 
+	// A goal in the jitter zone relabels a failed run as a context overflow (the test above). A model-call hold is
+	// not that: the held run sent nothing, so its own error, which names `cyber_policy`, must reach the session,
+	// which would otherwise drop the turn and start an overflow recovery for a call that never went out. The same
+	// holds for a `cyber_policy` refusal the server relays: a refusal must stay a refusal.
+	function jitterZoneFetch(onCreate: () => void): FetchImpl {
+		return async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				onCreate();
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+	}
+
+	it("keeps a model-call hold's error on a goal in the jitter zone", async () => {
+		const jitterGoal: Context = {
+			messages: [{ role: "user", content: "x".repeat(1_500_000), timestamp: Date.now() }],
+		};
+		let held = false;
+		let socketOpened = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const result = await streamGitLabDuoWorkflow(model, jitterGoal, {
+				apiKey: "not-a-secret",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				// The hold begins during the setup calls, before the socket run reads the guards.
+				fetch: jitterZoneFetch(() => {
+					held = true;
+				}),
+				webSocketFactory: () => {
+					socketOpened = true;
+					throw new Error("a held run opens no socket");
+				},
+			}).result();
+
+			expect(socketOpened).toBe(false);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+			expect(result.errorMessage).not.toContain("prompt is too long");
+			expect(isContextOverflow(result)).toBe(false);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	it("keeps a relayed cyber_policy refusal's text on a goal in the jitter zone", async () => {
+		const jitterGoal: Context = {
+			messages: [{ role: "user", content: "x".repeat(1_500_000), timestamp: Date.now() }],
+		};
+		const refusal = "This content was flagged for possible cybersecurity risk (cyber_policy).";
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				socket.onmessage?.(
+					new MessageEvent("message", { data: JSON.stringify({ status: "FAILED", error: refusal }) }),
+				);
+			});
+			return socket;
+		};
+
+		const result = await streamGitLabDuoWorkflow(model, jitterGoal, {
+			apiKey: "not-a-secret",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: jitterZoneFetch(() => {}),
+			webSocketFactory,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("cyber_policy");
+		expect(result.errorMessage).not.toContain("prompt is too long");
+	});
+
 	it("surfaces the raw error verbatim when an erroring goal is within the byte budget", async () => {
 		// A small goal that FAILs is a genuine fault, not an overflow — the raw message
 		// must surface unchanged so it is NOT misclassified as a context overflow.
