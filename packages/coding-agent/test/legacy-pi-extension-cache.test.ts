@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -7,9 +8,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 const probePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-probe.ts");
 const healthProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-health-probe.ts");
 const cjsProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cjs-cache-probe.ts");
+const lockProbePath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-lock-probe.ts");
+const holderPath = path.resolve(import.meta.dir, "fixtures", "legacy-pi-extension-cache-holder.ts");
 const tempDirs: TempDir[] = [];
 
-async function runProbe(cacheRoot: string, script: string = probePath, args: string[] = []): Promise<string> {
+function probeEnv(cacheRoot: string): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = { ...process.env, XDG_CACHE_HOME: cacheRoot };
 	for (const key of ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
 		delete env[key];
@@ -21,9 +24,13 @@ async function runProbe(cacheRoot: string, script: string = probePath, args: str
 		env.USERPROFILE = cacheRoot;
 		env.PI_CONFIG_DIR = "omp";
 	}
+	return env;
+}
+
+async function runProbe(cacheRoot: string, script: string = probePath, args: string[] = []): Promise<string> {
 	const proc = Bun.spawn([process.execPath, script, ...args], {
 		cwd: path.resolve(import.meta.dir, "../.."),
-		env,
+		env: probeEnv(cacheRoot),
 		stderr: "pipe",
 		stdout: "pipe",
 	});
@@ -162,3 +169,49 @@ test("oversized-cache eviction keeps the parse cache usable when a concurrent pr
 		concurrent.close();
 	}
 });
+
+// The lock shim (issue #15586) exists only on Linux, and `/proc/locks` is how the test reads lock kinds;
+// gVisor has no `/proc/locks`, so the test is skipped there.
+test.skipIf(process.platform !== "linux" || !existsSync("/proc/locks"))(
+	"the parse cache takes open-file-description locks in a process that did not start through the CLI",
+	async () => {
+		const tempDir = TempDir.createSync("@legacy-pi-extension-cache-locks-");
+		tempDirs.push(tempDir);
+		const cacheRoot = tempDir.path();
+		await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
+
+		// A CLI process holds this cache with open-file-description locks; POSIX locks here on the same
+		// file do not see those everywhere (gVisor), and each statement then waits out SQLite's protocol.
+		const { kinds } = JSON.parse(await runProbe(cacheRoot, lockProbePath)) as { kinds: string[] };
+		expect(kinds).toEqual(["OFDLCK"]);
+	},
+);
+
+// Runs everywhere, gVisor included, where the test above is skipped: there a POSIX-locked open of a
+// cache another process holds with open-file-description locks waits about 10 s per statement.
+test("a process that did not start through the CLI opens the parse cache another omp process holds", async () => {
+	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-held-");
+	tempDirs.push(tempDir);
+	const cacheRoot = tempDir.path();
+	await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
+
+	const holder = Bun.spawn([process.execPath, holderPath], {
+		cwd: path.resolve(import.meta.dir, "../.."),
+		env: probeEnv(cacheRoot),
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	try {
+		const first = await holder.stdout.getReader().read();
+		expect(new TextDecoder().decode(first.value ?? new Uint8Array()).trim()).toBe("READY");
+
+		const start = performance.now();
+		expect((await runProbe(cacheRoot, healthProbePath)).trim()).toBe("AVAILABLE");
+		// The open takes well under a second; the lock-kind mismatch costs about 10 s per statement.
+		expect(performance.now() - start).toBeLessThan(5_000);
+	} finally {
+		holder.stdin.end();
+		await holder.exited;
+	}
+}, 120_000);

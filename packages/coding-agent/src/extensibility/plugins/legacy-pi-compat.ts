@@ -9,11 +9,11 @@ import * as url from "node:url";
 import type { ParseResult, ParserPlugin } from "@babel/parser";
 import type * as BabelParser from "@babel/parser";
 import {
-	getDbBusyTimeoutMs,
 	getLegacyPiExtensionCacheDbPath,
 	isCompiledBinary,
 	isRecord,
 	logger,
+	openSqliteDatabaseSync,
 	stripWindowsExtendedLengthPathPrefix,
 } from "@oh-my-pi/pi-utils";
 import { registerPluginCacheInvalidator } from "../../discovery/helpers";
@@ -585,25 +585,28 @@ function getExtensionParseCacheDb(): Database | null {
 			// A missing or unreadable cache is a cold cache.
 		}
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-		const db = new Database(cachePath, { create: true });
-		// Install the busy handler BEFORE any lock-taking statement (incl.
-		// `PRAGMA journal_mode=WAL`, which takes an exclusive lock during WAL
-		// recovery). See #2421. WAL + synchronous=NORMAL avoids the per-entry
-		// journal create/delete + fsync churn that serialized this cache behind
-		// concurrent omp startups and blocked the event loop for ~20s (#9549).
-		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
-		db.run("PRAGMA journal_mode=WAL");
-		db.run("PRAGMA synchronous=NORMAL");
-		const schemaVersion = db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-		if (schemaVersion === EXTENSION_PARSE_CACHE_SCHEMA_VERSION) {
-			db.run(CREATE_EXTENSION_PARSE_CACHE_TABLE);
-		} else {
-			db.transaction(() => {
-				db.run("DROP TABLE IF EXISTS extension_parse_cache");
+		// `openSqliteDatabaseSync` installs the lock shim before the open (#15586), so a process that
+		// loads legacy extensions without the CLI entry (an SDK host, a test child) locks this cache as
+		// the other omp processes sharing it do, and it sets the busy handler before any lock-taking
+		// statement (incl. `PRAGMA journal_mode=WAL`, which takes an exclusive lock during WAL
+		// recovery; #2421). WAL + synchronous=NORMAL avoids the per-entry journal create/delete + fsync
+		// churn that serialized this cache behind concurrent omp startups and blocked the event loop
+		// for ~20s (#9549).
+		const db = openSqliteDatabaseSync(cachePath, db => {
+			db.run("PRAGMA journal_mode=WAL");
+			db.run("PRAGMA synchronous=NORMAL");
+			const schemaVersion = db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+			if (schemaVersion === EXTENSION_PARSE_CACHE_SCHEMA_VERSION) {
 				db.run(CREATE_EXTENSION_PARSE_CACHE_TABLE);
-				db.run(`PRAGMA user_version = ${EXTENSION_PARSE_CACHE_SCHEMA_VERSION}`);
-			})();
-		}
+			} else {
+				db.transaction(() => {
+					db.run("DROP TABLE IF EXISTS extension_parse_cache");
+					db.run(CREATE_EXTENSION_PARSE_CACHE_TABLE);
+					db.run(`PRAGMA user_version = ${EXTENSION_PARSE_CACHE_SCHEMA_VERSION}`);
+				})();
+			}
+			return db;
+		});
 		extensionParseCacheDb = db;
 		return db;
 	} catch (error) {
