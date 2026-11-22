@@ -2573,13 +2573,12 @@ fn copy_file(
 		initial_dest_metadata
 	};
 
-	// A copied symlink replaces the destination, which GNU removes before
-	// reporting the copy.
+	// A copied symlink replaces any destination that is not a directory (a
+	// FIFO, socket or device too), which GNU removes before reporting the
+	// copy, saying `removed` under `-v` (`copy.c`).
 	if source_metadata.is_symlink()
 		&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
-		&& dest_metadata
-			.as_ref()
-			.is_some_and(|metadata| metadata.is_symlink() || metadata.is_file())
+		&& dest_metadata.as_ref().is_some_and(|metadata| !metadata.is_dir())
 	{
 		delete_path(host, state, dest, options)?;
 		dest_metadata = None;
@@ -2978,11 +2977,12 @@ fn copy_data(
 	let source_file = filesystem.open(&source_fs).map_err(|e| {
 		CpError::IoErrContext(e, format!("cannot open {} for reading", source.quote()))
 	})?;
-	// A stream destination (a FIFO, a device) is written, not truncated.
-	// Owner-writable until the final permissions are applied, so a handle can
-	// still be reopened to preserve timestamps.
-	let create_mode =
-		if source_is_stream { 0o622 } else { (source_metadata.permissions().mode() & 0o777) | 0o200 };
+	// A stream destination (a FIFO, a device) is written, not truncated. A
+	// file is created with the source's permissions, a stream's too, as GNU
+	// creates it (`copy_reg`); owner-writable until the final permissions are
+	// applied, so a handle can still be reopened to preserve timestamps.
+	let source_mode = source_metadata.permissions().mode() & 0o777;
+	let create_mode = source_mode | 0o200;
 	let mut dest_options = OpenOptions::new();
 	dest_options.write(true).mode(create_mode);
 	// A destination cp found nothing at, or backed up, is created with
@@ -3014,8 +3014,10 @@ fn copy_data(
 			if host.var("POSIXLY_CORRECT").is_none() {
 				return Err(CpError::Error(format!("not writing through dangling symlink {}", dest.quote())));
 			}
+			// The file the link leads to gets the source's permissions as they
+			// are, as GNU's open through it gives them; no later step sets them.
 			let mut through = OpenOptions::new();
-			through.write(true).create(true).truncate(!source_is_stream).mode(create_mode);
+			through.write(true).create(true).truncate(!source_is_stream).mode(source_mode);
 			(filesystem.open_with(&dest_fs, &through).map_err(cannot_create)?, DestFate::Kept)
 		},
 		// `-f`: remove a destination that cannot be opened, and try again.
