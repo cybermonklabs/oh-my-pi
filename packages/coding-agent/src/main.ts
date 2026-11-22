@@ -960,6 +960,7 @@ function isForeignSessionImport(parsed: Pick<Args, "fromClaude" | "fromCodex">):
 type MissingCwdMoveResult =
 	| { status: "not-needed" }
 	| { status: "declined" }
+	| { status: "kept" }
 	| { status: "moved"; manager: SessionManager };
 
 async function moveMissingCwdSessionIfNeeded(
@@ -975,7 +976,10 @@ async function moveMissingCwdSessionIfNeeded(
 	}
 
 	// A removed worktree of this checkout's repository: its session belongs here, no question to ask.
-	if (!(await SessionManager.isFromRemovedWorktree(session, cwd, sessionDir))) {
+	if (await SessionManager.isFromRemovedWorktree(session, cwd, sessionDir)) {
+		// It moves only when its storage refuses the move while another omp process writes it.
+		if (!SessionManager.relocatesUnasked()) return { status: "kept" };
+	} else {
 		const movePromptResult = await askToMoveSession(session);
 		if (movePromptResult === "unavailable") {
 			throw new SessionResolutionError(
@@ -2435,7 +2439,8 @@ export async function runRootCommand(
 				try {
 					pickedManager = await claimOpenedSession(
 						await forkIfMovedAwayUnlessExclusive(
-							(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
+							SessionManager.relocatesUnasked() &&
+								(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
 								? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
 								: await SessionManager.open(chosen.path),
 							parsedArgs.sessionDir,

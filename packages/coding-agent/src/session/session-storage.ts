@@ -1700,6 +1700,46 @@ export async function readSessionTextFrom(
 	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
 }
 
+/**
+ * Bytes of a key-indexed transcript read at a time by a pass over a whole
+ * transcript (the listing's line scan), so memory follows the window, not the
+ * transcript; a window widens when one record is longer.
+ */
+export const SESSION_READ_WINDOW_BYTES = 1024 * 1024;
+
+/**
+ * The bytes of `filePath` in `storage`, in windows of
+ * {@link SESSION_READ_WINDOW_BYTES} read one after another, each kept through
+ * its last newline, where its bytes are exactly the stored ones (a window
+ * holding no newline widens), and the rest of the transcript last. A storage
+ * that cannot read from an offset gives the whole transcript at once. A
+ * missing transcript raises ENOENT.
+ */
+export async function* readSessionLineWindows(storage: SessionStorage, filePath: string): AsyncGenerator<Uint8Array> {
+	const encoder = new TextEncoder();
+	if (!storage.readTextFrom) {
+		yield encoder.encode(await storage.readText(filePath));
+		return;
+	}
+	let offset = 0;
+	let span = SESSION_READ_WINDOW_BYTES;
+	for (;;) {
+		const { text, size } = await storage.readTextFrom(filePath, offset, span);
+		const bytes = encoder.encode(text);
+		// A window that reaches the end holds whole characters only.
+		const last = offset + span >= size;
+		const end = last ? bytes.length : bytes.lastIndexOf(0x0a) + 1;
+		if (end > 0) yield bytes.subarray(0, end);
+		if (last) return;
+		if (end === 0) {
+			span *= 2;
+		} else {
+			offset += end;
+			span = SESSION_READ_WINDOW_BYTES;
+		}
+	}
+}
+
 function matchesPatternSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
 	if (pattern.startsWith("*.")) {

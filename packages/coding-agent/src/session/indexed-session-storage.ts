@@ -4,6 +4,7 @@ import { toError } from "@oh-my-pi/pi-utils";
 import {
 	childDirNames,
 	childKeyName,
+	readSessionLineWindows,
 	SessionLeaseLostError,
 	SessionWriteConflictError,
 	type SessionStorage,
@@ -41,7 +42,8 @@ export interface SessionStorageBackend {
 	 * it, and the session's size in bytes, both from one read of the backing
 	 * store; `null` when `path` holds no session. A capped read may end inside
 	 * a character. Optional: without it the storage reads the whole session
-	 * and cuts it.
+	 * and cuts it, so the listing's line scan reads it whole once instead of
+	 * in read windows.
 	 */
 	readFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null>;
 	/**
@@ -420,9 +422,24 @@ export class IndexedSessionStorage implements SessionStorage {
 		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
+	/**
+	 * Visits the transcript's lines in read windows (see
+	 * {@link readSessionLineWindows}), so a scan holds one window, not the whole
+	 * transcript, and stops reading at the first window that answers it. A
+	 * backend that cannot read a range is read whole, once.
+	 */
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
-		for (const line of (await this.readText(path)).split("\n")) {
-			if (visit(line)) return;
+		if (!this.#backend.readFrom) {
+			for (const line of (await this.readText(path)).split("\n")) {
+				if (visit(line)) return;
+			}
+			return;
+		}
+		const decoder = new TextDecoder();
+		for await (const window of readSessionLineWindows(this, path)) {
+			for (const line of decoder.decode(window).split("\n")) {
+				if (visit(line)) return;
+			}
 		}
 	}
 
