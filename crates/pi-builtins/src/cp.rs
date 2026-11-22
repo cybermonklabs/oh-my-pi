@@ -1405,8 +1405,7 @@ fn copy_operand(
 	options: &Options,
 ) -> CopyResult<()> {
 	let filesystem = host.fs().clone();
-	let dest_path = construct_dest_path(host, source, target, target_type, options);
-	let dest = dest_path.as_deref().unwrap_or(target).to_path_buf();
+	let dest = construct_dest_path(host, source, target, target_type, options);
 	let dest_fs = host.resolve(&dest);
 	let source_fs = host.resolve(source);
 
@@ -1429,7 +1428,7 @@ fn copy_operand(
 		}
 	}
 
-	copy_source(host, state, source, target, dest_path, options)?;
+	copy_source(host, state, source, target, &dest, options)?;
 	state.copied_destinations.insert(dest);
 	Ok(())
 }
@@ -1459,21 +1458,18 @@ fn construct_dest_path(
 	target: &Path,
 	target_type: TargetType,
 	options: &Options,
-) -> CopyResult<PathBuf> {
-	let target_is_dir = host.fs().is_dir(host.resolve(target));
-	if options.no_target_dir && target_is_dir {
-		return Err(CpError::Error(format!(
-			"cannot overwrite directory {} with non-directory {}",
-			target.quote(),
-			source.quote()
-		)));
+) -> PathBuf {
+	// `-T`: the target is the destination, a directory there too; a
+	// non-directory over it is refused by `copy_file` once -n, -i and -u let
+	// the copy go on, as GNU refuses it.
+	if options.no_target_dir {
+		return target.to_path_buf();
 	}
-
-	Ok(match target_type {
+	match target_type {
 		TargetType::Directory => {
 			if options.parents {
 				join_path(target, &parents_relative(source))
-			} else if source == "." && target_is_dir {
+			} else if source == "." && host.fs().is_dir(host.resolve(target)) {
 				// Copying `.` into an existing directory copies its contents.
 				target.to_path_buf()
 			} else {
@@ -1484,7 +1480,7 @@ fn construct_dest_path(
 			}
 		},
 		TargetType::File => target.to_path_buf(),
-	})
+	}
 }
 
 /// Copies `source` into `target`: a directory recursively, anything else as
@@ -1494,7 +1490,7 @@ fn copy_source(
 	state: &mut CopyState,
 	source: &Path,
 	target: &Path,
-	dest: CopyResult<PathBuf>,
+	dest: &Path,
 	options: &Options,
 ) -> CopyResult<()> {
 	let filesystem = host.fs().clone();
@@ -1505,13 +1501,12 @@ fn copy_source(
 		return copy_directory(host, state, source, target, options);
 	}
 
-	let dest = dest?;
 	if options.parents {
-		make_parent_dirs(host, state, source, &dest, options)?;
+		make_parent_dirs(host, state, source, dest, options)?;
 	}
-	let result = copy_file(host, state, source, &dest, options, true, None);
+	let result = copy_file(host, state, source, dest, options, true, None);
 	if options.parents {
-		for (x, y) in aligned_ancestors(source, &dest) {
+		for (x, y) in aligned_ancestors(source, dest) {
 			if let Ok(src) = filesystem.canonicalize_with(
 				host.resolve(&x),
 				&CanonicalizeOptions::new(MissingHandling::Normal, ResolveMode::Physical),
@@ -1710,17 +1705,34 @@ fn copy_attributes(
 	source_metadata: Option<&Metadata>,
 	dest_facts: DestFacts,
 ) -> CopyResult<()> {
+	let filesystem = host.fs().clone();
+	// A link the copy wrote through: its attributes go to the file it leads
+	// to, as GNU sets them on the descriptor it wrote.
+	let resolved = host.resolve(dest);
+	let dest_fs = if dest_facts.through {
+		filesystem.canonicalize(&resolved).unwrap_or(resolved)
+	} else {
+		resolved
+	};
+	// A new file's final mode, where no preserved mode sets it; set after
+	// its owner, so the group and other bits left out until then are not
+	// given to the user who runs cp (GNU's `copy_reg`). Like GNU, an error
+	// setting it is not reported.
+	let set_then_mode = |filesystem: &BlockingFs, dest_fs: &Path| {
+		if let Some(mode) = dest_facts.then_mode {
+			let _ = filesystem.set_permissions(dest_fs, Permissions::from_mode(mode));
+		}
+	};
 	// Plain `cp`/`cp -r` preserves nothing: skip the stats below. A freshly
 	// created directory always gets its mode set, one way or the other.
 	let preserves_nothing = [attributes.ownership, attributes.mode, attributes.timestamps, attributes.xattr]
 		.iter()
 		.all(|preserve| matches!(preserve, Preserve::No { .. }));
 	if preserves_nothing && !dest_is_freshly_created_dir {
+		set_then_mode(&filesystem, &dest_fs);
 		return Ok(());
 	}
-	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
-	let dest_fs = host.resolve(dest);
 	let fetched;
 	let source_metadata = match source_metadata {
 		Some(metadata) => metadata,
@@ -1768,6 +1780,7 @@ fn copy_attributes(
 		}
 		Ok(())
 	})?;
+	set_then_mode(&filesystem, &dest_fs);
 
 	handle_preserve(host, mode, || {
 		// chmod cannot change a symbolic link, and every link has the same
@@ -1992,12 +2005,35 @@ fn is_forbidden_to_copy_to_same_file(
 	true
 }
 
+/// The destination as GNU's `copy.c` reads it (`use_lstat`): with lstat
+/// where the copy would not write through a link there (a source that is
+/// not copied as a regular file, `-l`, `-s`, a backup,
+/// `--remove-destination`, `mv`), and followed where a regular file is
+/// written through it.
+fn read_dest(
+	filesystem: &BlockingFs,
+	dest_fs: &Path,
+	source_metadata: &Metadata,
+	options: &Options,
+) -> io::Result<Metadata> {
+	let copy_as_regular = !options.recursive || options.copy_contents;
+	let use_lstat = (!source_metadata.is_file()
+		&& (!copy_as_regular || source_metadata.is_dir() || source_metadata.is_symlink()))
+		|| options.move_mode
+		|| matches!(options.copy_mode, CopyMode::Link | CopyMode::SymLink)
+		|| options.backup != BackupMode::None
+		|| options.remove_destination();
+	if use_lstat { filesystem.symlink_metadata(dest_fs) } else { filesystem.metadata(dest_fs) }
+}
+
 /// Back up, remove, or leave intact the existing destination file, depending
-/// on the options. Returns the backup made, if any.
+/// on the options. Returns the backup made, if any. `source_metadata` is the
+/// source as the copy reads it.
 fn handle_existing_dest(
 	host: &mut Host,
 	state: &CopyState,
 	source: &Path,
+	source_metadata: &Metadata,
 	dest: &Path,
 	options: &Options,
 	source_in_command_line: bool,
@@ -2014,6 +2050,23 @@ fn handle_existing_dest(
 
 	if options.update != UpdateMode::IfOlder {
 		options.overwrite.verify(host, dest, options.debug)?;
+	}
+
+	// GNU refuses a non-directory over a directory once -n, -i and -u let
+	// the copy go on, unless a backup is asked for (`copy.c`). A copy never
+	// backs a directory up: with a backup the copy then fails where it makes
+	// the name, and the directory stays. `mv` backs a directory up.
+	if !options.move_mode
+		&& read_dest(&filesystem, &dest_fs, source_metadata, options).is_ok_and(|existing| existing.is_dir())
+	{
+		if options.backup == BackupMode::None {
+			return Err(CpError::Error(format!(
+				"cannot overwrite directory {} with non-directory {}",
+				dest.quote(),
+				source.quote()
+			)));
+		}
+		return Ok(None);
 	}
 
 	let mut is_dest_removed = false;
@@ -2306,8 +2359,10 @@ enum DestFate {
 	Recreated,
 	/// Created by the copy where there was none, with `mode` (permission
 	/// bits) in place when known, and owned by `owner` (uid, gid) when the
-	/// copy looked: only ownership preservation needs it.
-	Created { mode: Option<u32>, owner: Option<(u32, u32)> },
+	/// copy looked: only ownership preservation needs it. `through`: made
+	/// through a symbolic link that led nowhere (POSIXLY_CORRECT), so the
+	/// file is the one the link leads to.
+	Created { mode: Option<u32>, owner: Option<(u32, u32)>, through: bool },
 }
 
 /// What a caller knows of a destination without looking at it again.
@@ -2316,26 +2371,21 @@ struct DestFacts {
 	/// Whether it is a symlink; `None` looks.
 	symlink: Option<bool>,
 	/// Its permission bits, when this copy created it.
-	mode:    Option<u32>,
+	mode:      Option<u32>,
 	/// Its owner and group, when this copy created it and looked.
-	owner:   Option<(u32, u32)>,
+	owner:     Option<(u32, u32)>,
+	/// The mode a new file gets when no preserved mode sets it, set once its
+	/// owner is, as GNU's `copy_reg` sets it.
+	then_mode: Option<u32>,
+	/// It is a symbolic link the copy wrote through: its attributes go to
+	/// the file it leads to.
+	through:   bool,
 }
 
-/// Permissions for the destination: an existing destination keeps its own;
-/// a new one gets the source's, less `--no-preserve=mode` and the umask.
-fn calculate_dest_permissions(
-	dest_metadata: Option<&Metadata>,
-	source_metadata: &Metadata,
-	options: &Options,
-	umask: u32,
-) -> Permissions {
-	match dest_metadata {
-		Some(metadata) => metadata.permissions(),
-		None => {
-			let mode = handle_no_preserve_mode(options, source_metadata.permissions().mode());
-			Permissions::from_mode(mode & !umask)
-		},
-	}
+/// The mode a new destination gets: the source's, less
+/// `--no-preserve=mode` and the umask.
+fn new_dest_mode(source_metadata: &Metadata, options: &Options, umask: u32) -> u32 {
+	handle_no_preserve_mode(options, source_metadata.permissions().mode()) & !umask
 }
 
 /// Copy the a file from `source` to `dest`. `source` will be dereferenced if
@@ -2471,8 +2521,15 @@ fn copy_file(
 		}
 	}
 
-	// `-u`/`--update` decides before anything is backed up or removed.
-	if options.copy_mode == CopyMode::Update && filesystem.exists(&dest_fs) {
+	// `-u`/`--update` decides before anything is backed up or removed, on the
+	// destination as GNU reads it: a link at it is one, where a link is
+	// copied, even one that leads nowhere.
+	let update_dest = if options.copy_mode == CopyMode::Update {
+		read_dest(&filesystem, &dest_fs, &source_metadata, options).ok()
+	} else {
+		None
+	};
+	if let Some(existing) = update_dest {
 		match options.update {
 			UpdateMode::All => {},
 			UpdateMode::None => {
@@ -2485,7 +2542,7 @@ fn copy_file(
 				return Err(CpError::Error(format!("not replacing {}", dest.quote())));
 			},
 			UpdateMode::IfOlder => {
-				let dest_time = filesystem.symlink_metadata(&dest_fs)?.modified()?;
+				let dest_time = existing.modified()?;
 				if source_metadata.modified()? <= dest_time {
 					return Ok(());
 				}
@@ -2496,7 +2553,8 @@ fn copy_file(
 
 	let mut backup = None;
 	if check_existing_dest {
-		backup = handle_existing_dest(host, state, source, dest, options, source_in_command_line)?;
+		backup =
+			handle_existing_dest(host, state, source, &source_metadata, dest, options, source_in_command_line)?;
 		dest_replaced = true;
 		if are_hardlinks_to_same_file(&filesystem, &source_fs, &dest_fs) {
 			if options.copy_mode == CopyMode::Copy {
@@ -2611,30 +2669,30 @@ fn copy_file(
 		},
 	};
 
-	// A file this copy created has a known mode and maybe owner.
-	let (mut created_mode, owner) = match fate {
-		DestFate::Created { mode, owner } => (mode, owner),
-		DestFate::Kept | DestFate::Recreated => (None, None),
+	// A file this copy created has a known mode and maybe owner; one made
+	// through a link that led nowhere is the file the link leads to.
+	let (mut created_mode, owner, through) = match fate {
+		DestFate::Created { mode, owner, through } => (mode, owner, through),
+		DestFate::Kept | DestFate::Recreated => (None, None, false),
 	};
 
 	// Links share their target's permissions; only a copy gets its own.
 	let copied_data = !source_metadata.is_symlink()
 		&& !matches!(options.copy_mode, CopyMode::Link | CopyMode::SymLink);
-	// A preserved mode is set by `copy_attributes` below.
+	// A preserved mode is set by `copy_attributes` below. An existing
+	// destination the copy wrote keeps its own, as GNU's does. A new file gets
+	// the source's, less `--no-preserve=mode` and the umask, which
+	// `copy_attributes` sets after the owner (GNU's `copy_reg`); like GNU, an
+	// error setting it is not reported.
 	let mode_set_later = matches!(options.attributes.mode, Preserve::Yes { .. }) && !source_is_stream;
-	if !dest_is_symlink && copied_data && !mode_set_later {
-		let kept = dest_metadata
-			.as_ref()
-			.filter(|_| fate == DestFate::Kept);
-		let dest_permissions = calculate_dest_permissions(kept, &source_metadata, options, host.umask());
-		// Here, to match GNU semantics, we quietly ignore an error
-		// if a user does not have the correct ownership to modify
-		// the permissions of a file.
-		//
-		// FWIW, the OS will throw an error later, on the write op, if
-		// the user does not have permission to write to the file.
-		if created_mode != Some(dest_permissions.mode()) {
-			let _ = filesystem.set_permissions(&dest_fs, dest_permissions);
+	let kept = dest_metadata
+		.as_ref()
+		.filter(|_| fate == DestFate::Kept);
+	let mut then_mode = None;
+	if (!dest_is_symlink || through) && copied_data && !mode_set_later && kept.is_none() {
+		let mode = new_dest_mode(&source_metadata, options, host.umask());
+		if created_mode != Some(mode) {
+			then_mode = Some(mode);
 			created_mode = None;
 		}
 	}
@@ -2653,10 +2711,12 @@ fn copy_file(
 		},
 		mode: created_mode,
 		owner,
+		then_mode,
+		through,
 	};
 
 	// Some stream files may not exist after we have copied them, like
-	// anonymous pipes; there are no attributes left to copy.
+	// anonymous pipes; there are no attributes left to copy, only the mode.
 	if !(source_is_stream && !filesystem.exists(&source_fs)) {
 		copy_attributes(
 			host,
@@ -2669,6 +2729,8 @@ fn copy_file(
 			Some(&source_metadata),
 			dest_facts,
 		)?;
+	} else if let Some(mode) = then_mode {
+		let _ = filesystem.set_permissions(&dest_fs, Permissions::from_mode(mode));
 	}
 
 	// Only `--preserve=links` looks copies up, and only a file with other
@@ -2910,6 +2972,20 @@ fn check_streamed_modes(options: &Options, source: &Path, dest: &Path) -> CopyRe
 	Ok(())
 }
 
+/// Whether cp runs with root's privileges over files it does not own, as
+/// GNU's `owner_privileges` asks: then it sets extended attributes on a file
+/// whatever the file's mode.
+fn owner_privileges() -> bool {
+	#[cfg(unix)]
+	{
+		nix::unistd::geteuid().is_root()
+	}
+	#[cfg(not(unix))]
+	{
+		false
+	}
+}
+
 /// Copies the data of the regular file (or stream) `source` to `dest`, whose
 /// lstat just before the copy is `dest_metadata` (`None`: absent).
 ///
@@ -2978,13 +3054,27 @@ fn copy_data(
 		CpError::IoErrContext(e, format!("cannot open {} for reading", source.quote()))
 	})?;
 	// A stream destination (a FIFO, a device) is written, not truncated. A
-	// file is created with the source's permissions, a stream's too, as GNU
-	// creates it (`copy_reg`); owner-writable until the final permissions are
-	// applied, so a handle can still be reopened to preserve timestamps.
+	// file is created as GNU's `copy_reg` creates it: with the source's
+	// permission bits, a stream's too, less its group and other bits while
+	// its owner may still change (`--preserve=ownership`), which its final
+	// mode puts back once the owner is set; owner-writable only where the
+	// copy sets extended attributes without root's privileges, and where a
+	// provider that sets times only through a handle reopens it for writing.
 	let source_mode = source_metadata.permissions().mode() & 0o777;
-	let create_mode = source_mode | 0o200;
+	let omitted = if matches!(options.attributes.ownership, Preserve::Yes { .. }) {
+		source_mode & 0o077
+	} else {
+		0
+	};
+	let writable = !native
+		|| cfg!(not(unix))
+		|| (matches!(options.attributes.xattr, Preserve::Yes { .. }) && !owner_privileges());
+	let create_mode = (source_mode & !omitted) | if writable { 0o200 } else { 0 };
 	let mut dest_options = OpenOptions::new();
 	dest_options.write(true).mode(create_mode);
+	// A link that led nowhere before the copy began (POSIXLY_CORRECT): the
+	// open makes the file it leads to, new to cp as it is to GNU.
+	let dangling = dest_metadata.is_some_and(Metadata::is_symlink) && !filesystem.exists(&dest_fs);
 	// A destination cp found nothing at, or backed up, is created with
 	// O_EXCL and nothing to truncate, as GNU creates a new one (`copy_reg`):
 	// whatever appeared there meanwhile is not written through or over.
@@ -3000,7 +3090,10 @@ fn copy_data(
 		// (see `Fs::with_creation_mask`), unless the parent directory has a
 		// default ACL; see the fstat below for when that matters.
 		Ok(file) if dest_metadata.is_none() && native => {
-			(file, DestFate::Created { mode: Some(create_mode & !host.umask()), owner: None })
+			(file, DestFate::Created { mode: Some(create_mode & !host.umask()), owner: None, through: false })
+		},
+		Ok(file) if dangling => {
+			(file, DestFate::Created { mode: native.then(|| create_mode & !host.umask()), owner: None, through: true })
 		},
 		Ok(file) => (file, DestFate::Kept),
 		// The exclusive create of a new destination met a name that appeared
@@ -3014,11 +3107,12 @@ fn copy_data(
 			if host.var("POSIXLY_CORRECT").is_none() {
 				return Err(CpError::Error(format!("not writing through dangling symlink {}", dest.quote())));
 			}
-			// The file the link leads to gets the source's permissions as they
-			// are, as GNU's open through it gives them; no later step sets them.
+			// The file the link leads to is new to cp as it is to GNU: made with
+			// the same mode, and given its final mode and owner as one is.
 			let mut through = OpenOptions::new();
-			through.write(true).create(true).truncate(!source_is_stream).mode(source_mode);
-			(filesystem.open_with(&dest_fs, &through).map_err(cannot_create)?, DestFate::Kept)
+			through.write(true).create(true).truncate(!source_is_stream).mode(create_mode);
+			let file = filesystem.open_with(&dest_fs, &through).map_err(cannot_create)?;
+			(file, DestFate::Created { mode: native.then(|| create_mode & !host.umask()), owner: None, through: true })
 		},
 		// `-f`: remove a destination that cannot be opened, and try again.
 		Err(_) if options.unlink_after_failed_open() && filesystem.symlink_metadata(&dest_fs).is_ok() => {
@@ -3148,17 +3242,18 @@ fn copy_data(
 	// preserved mode relies on it to skip the chmod: a plain copy, like GNU
 	// cp's, keeps whatever mode the open gave it.
 	let fate = match fate {
-		DestFate::Created { .. } if matches!(options.attributes.ownership, Preserve::Yes { .. }) => {
+		DestFate::Created { through, .. } if matches!(options.attributes.ownership, Preserve::Yes { .. }) => {
 			match dest_file.metadata() {
 				Ok(metadata) => DestFate::Created {
-					mode:  Some(metadata.permissions().mode() & 0o7777),
+					mode: Some(metadata.permissions().mode() & 0o7777),
 					owner: metadata.uid().zip(metadata.gid()),
+					through,
 				},
-				Err(_) => DestFate::Created { mode: None, owner: None },
+				Err(_) => DestFate::Created { mode: None, owner: None, through },
 			}
 		},
-		DestFate::Created { owner, .. } if matches!(options.attributes.mode, Preserve::Yes { .. }) => {
-			DestFate::Created { mode: None, owner }
+		DestFate::Created { owner, through, .. } if matches!(options.attributes.mode, Preserve::Yes { .. }) => {
+			DestFate::Created { mode: None, owner, through }
 		},
 		fate => fate,
 	};
@@ -3418,13 +3513,7 @@ fn copy_entry(
 	};
 
 	if !source_is_dir {
-		return match copy_file(host, state, source, dest, options, false, Some(metadata)) {
-			// With --archive a symlink may be copied before the file it names.
-			// A move always copies into a fresh tree, so its failure is real:
-			// `mv` must report it and keep the source.
-			Err(_) if options.preserve_hard_links() && entry_is_symlink && !options.move_mode => Ok(()),
-			result => result,
-		};
+		return copy_file(host, state, source, dest, options, false, Some(metadata));
 	}
 
 	let created = match filesystem.metadata(host.resolve(dest)) {
