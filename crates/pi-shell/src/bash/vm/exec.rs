@@ -2173,10 +2173,14 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			}
 			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
 			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			// zsh exits 1 from any of them (`errflag` ends `loop` with 1).
+			// failure status); a nested shell is its own `-c` shell, and a
+			// fork of one command reaches what its parent reaches
+			// (`Vproc::fork`). Under `set -e` bash's `report_error` exits at
+			// once with the failure status. zsh exits 1 from any of them
+			// (`errflag` ends `loop` with 1).
 			let command = vp.mode.dialect() != Dialect::Zsh
-				&& super::subshell_depth(vp) == 0
+				&& vp.fork().catches()
+				&& !errexit_on(k, cx, vp)
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -2979,31 +2983,52 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			let pc = top_frame(vp).pc;
+			// The own redirections of the command a fork was made for, and of
+			// a `( … )`, are made in the fork without undo; a compound command's
+			// in the shell are undone after it.
+			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
+			let subshell = matches!(
+				unit.ops.get(pc as usize + 1..pc as usize + 3),
+				Some([enter, spawn])
+					if enter.code == Opcode::Enter
+						&& spawn.code == Opcode::Spawn
+						&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
+			);
+			let owner = redir::Owner::Compound { undo: !forked && !subshell };
+			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
+			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
+				// Past the fork's own redirections, its body runs under bash's
+				// `execute_in_subshell`, which catches its fatal errors.
+				vp.set_fork(super::proc::Fork::CHILD);
+			}
+			match res {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore.
+					let _ = flush_out(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
@@ -3886,6 +3911,25 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
+/// Mark `child`, forked by `vp` to run the command at `entry` (an async
+/// command, a pipeline stage), as bash's fork for it
+/// ([`super::proc::Fork::entry`]): that command's own redirections are made
+/// without undo, and a fatal expansion error in them, or anywhere in a simple
+/// command, reaches what `vp`'s reaches: bash's fork runs a simple command and
+/// a compound's own redirections before any `execute_in_subshell` catches. A
+/// compound without redirections of its own catches its own at once.
+pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
+	let own = unit
+		.ops
+		.get(entry as usize)
+		.is_some_and(|op| matches!(op.code, Opcode::Exec | Opcode::Redir));
+	child.set_fork(if own {
+		super::proc::Fork::entry(vp.fork())
+	} else {
+		super::proc::Fork::CHILD
+	});
+}
+
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
@@ -4061,6 +4105,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				if info.kind == SpawnKind::Background {
+					forked_for(&mut child, vp, unit, info.stages[0].entry);
+				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4160,6 +4207,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					forked_for(&mut child, vp, unit, stage.entry);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline

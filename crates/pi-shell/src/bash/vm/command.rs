@@ -268,12 +268,39 @@ pub fn exec(
 					} else {
 						None
 					};
-					let res = super::redir::apply(k, vp, cx, unit, list, line);
+					let null = st(vp).argv.is_empty();
+					let null_forks = null && super::redir::null_forks(&unit.redirs[list as usize]);
+					let owner = super::redir::Owner::Simple { null_forks };
+					let res = super::redir::apply(k, vp, cx, unit, list, line, owner);
 					if let Some(scope) = hidden {
 						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
 					}
 					match res {
 						Ok(()) => {},
+						// A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in
+						// the redirections of a command bash runs in a fork of its
+						// own (an external, a null command that redirects fd 0) ends
+						// that fork, not the shell: the command fails with the
+						// status the fork exits with, as the shell itself would (127
+						// or 1; 1 after an arithmetic error; 1 for a null command,
+						// whose fork bash 5.3 gives a catcher of its own).
+						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+							if if null {
+								null_forks
+							} else {
+								forks_for(k, cx, vp)
+							} =>
+						{
+							let s = st(vp);
+							s.status = if null { 1 } else { code };
+							s.stage = Stage::Finish;
+							// The message goes to stderr as the redirections so far
+							// left it (`2>/dev/null < ${x:?}` prints none).
+							if let Some(fd) = exec::flush_out(k, vp) {
+								return Flow::Block(WaitKey::Write { fd });
+							}
+							continue;
+						},
 						Err(super::redir::Halt::Flow(f)) => return f,
 						Err(super::redir::Halt::Failed) => {
 							// A special builtin's redirection error ends a posix
@@ -1817,6 +1844,63 @@ fn resolve(
 		None if host.is_some() => Resolved::NotFound,
 		None => resolved,
 	})
+}
+
+/// Whether bash runs the simple command on top of `vp` (its words
+/// expanded, its name not yet looked up) in a fork that makes its
+/// redirections itself (`execute_disk_command`): a name that is not a
+/// function or a builtin (an external, one not found), also behind
+/// `command`. Read only: [`lookup`] still resolves it.
+pub(super) fn forks_for(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return false;
+	}
+	let mode = exec::mode_of(vp);
+	let posix =
+		state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false);
+	let argv = current_argv(vp);
+	let mut at = 0;
+	let mut via = Via::Plain;
+	while let Some(name) = argv.get(at) {
+		let has_slash = name.contains(&b'/')
+			|| (k.engine.config().platform == crate::bash::ids::Platform::Windows
+				&& name.contains(&b'\\'));
+		let rctx = ResolveCtx { has_slash, via };
+		let Ok(resolved) = resolve(k, cx, vp, name, mode, rctx) else {
+			return false;
+		};
+		let special =
+			posix && !has_slash && matches!(resolved, Resolved::Intrinsic(id) if is_special(id));
+		// Outside posix mode a function name may contain a slash.
+		if via == Via::Plain
+			&& (!has_slash || !posix)
+			&& !special
+			&& matches!(
+				state::record(cx.store, vp, Key::Func(BStr::new(name))),
+				Ok(Some(Record::Func { .. }))
+			) {
+			return false;
+		}
+		match resolved {
+			// `command NAME`: NAME, never a function.
+			Resolved::Intrinsic(IntrinsicId::Command) => {
+				at += 1;
+				while argv
+					.get(at)
+					.is_some_and(|a| matches!(a.as_slice(), b"-p" | b"--"))
+				{
+					at += 1;
+				}
+				if argv.get(at).is_none_or(|a| a.starts_with(b"-")) {
+					return false;
+				}
+				via = Via::Command;
+			},
+			Resolved::Intrinsic(_) => return false,
+			_ => return true,
+		}
+	}
+	false
 }
 
 /// Resolve the command name: `command`/`builtin` prefixes, functions,

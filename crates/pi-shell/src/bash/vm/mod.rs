@@ -2891,6 +2891,9 @@ impl Vproc {
 		// caught-signal traps stay in the overlay: the child lists them but
 		// does not run them (`state::inherited_trap`).
 		set_subshell_depth(&mut vp, subshell_depth(self).saturating_add(1));
+		// A subshell catches its own fatal errors (bash
+		// `execute_in_subshell`); `exec::forked_for` marks a fork's.
+		vp.set_fork(proc::Fork::CHILD);
 		vp.status = self.status;
 		vp.scopes = state::copy_scopes(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);
@@ -2961,7 +2964,7 @@ impl Vproc {
 /// `$BASH_SUBSHELL` of `vp` ([`Vproc::subshell`]); zero for the shell
 /// itself and a nested shell.
 pub const fn subshell_depth(vp: &Vproc) -> u32 {
-	vp.subshell
+	vp.subshell & proc::SUBSHELL_DEPTH
 }
 
 /// Set `vp`'s `$BASH_SUBSHELL` (a vproc without an overlay is the shell
@@ -2969,7 +2972,7 @@ pub const fn subshell_depth(vp: &Vproc) -> u32 {
 /// `exec::spawn` for pipeline stages and background jobs.
 pub const fn set_subshell_depth(vp: &mut Vproc, depth: u32) {
 	if vp.overlay.is_some() {
-		vp.subshell = depth;
+		vp.subshell = (vp.subshell & !proc::SUBSHELL_DEPTH) | (depth & proc::SUBSHELL_DEPTH);
 	}
 }
 

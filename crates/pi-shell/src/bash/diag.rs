@@ -476,6 +476,13 @@ pub enum Diag {
 		/// Command.
 		name: BString,
 	},
+	/// A move (`<&N-`) the shell will undo, or a `{var}` duplication, whose
+	/// source is not open: saving the source (bash's `add_undo_redirect`,
+	/// the `{var}` `F_DUPFD`) fails before the redirection does. bash
+	/// prints it with `sys_error`, without a line number, before the
+	/// redirection's own message.
+	#[error("redirection error: cannot duplicate fd: Bad file descriptor")]
+	CannotDuplicateFd,
 }
 
 impl Diag {
@@ -590,7 +597,7 @@ pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 		out.push(b'\n');
 		return out;
 	}
-	if let Diag::BadInterpreter { .. } = diag {
+	if let Diag::BadInterpreter { .. } | Diag::CannotDuplicateFd = diag {
 		// bash's `sys_error`: no line number.
 		out.extend_from_slice(b": ");
 		write!(out, "{diag}").expect("writing to a Vec cannot fail");

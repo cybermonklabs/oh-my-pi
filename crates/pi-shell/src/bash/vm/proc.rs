@@ -86,8 +86,11 @@ pub struct Vproc {
 	/// substitution.
 	pub trace_base:    u32,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
-	/// nested shell). A field, not an overlay record: a record would cost
-	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
+	/// nested shell) in its low 24 bits ([`super::subshell_depth`]), and the
+	/// vproc's [`Fork`] in its top byte ([`Vproc::fork`]). A field, not an
+	/// overlay record: a record would cost every subshell a ~530-byte map
+	/// allocation (idle vproc ≤ 2 KiB, which leaves no byte for a field of
+	/// its own).
 	pub subshell:      u32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
@@ -121,6 +124,62 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+}
+
+/// What a vproc's fatal expansion errors reach and whether bash forked it
+/// to run one command ([`Vproc::fork`]), kept in the top byte of
+/// [`Vproc::subshell`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fork(u8);
+
+impl Fork {
+	/// A subshell catcher (bash's `execute_in_subshell`, a command
+	/// substitution's) lies between it and the run's top level.
+	const CAUGHT: u8 = 1;
+	/// A subshell, a command substitution, a compound job: bash's
+	/// `execute_in_subshell` (or the substitution's own catcher) catches its
+	/// fatal errors, which exit with the failure status.
+	pub const CHILD: Self = Self(Self::CAUGHT);
+	/// The one command it was forked for has its own redirections to come.
+	const ENTRY: u8 = 2;
+	/// The shell itself, or a nested shell: bash's `run_one_command` catches
+	/// its fatal errors (a `-c` string exits 127).
+	pub const SHELL: Self = Self(0);
+
+	/// A fork made to run one command (an async command, a pipeline
+	/// stage), bash's fork before it: that command's own redirections are
+	/// made without undo (`RX_UNDOABLE` unset), and a fatal error in them,
+	/// or anywhere in a simple command, reaches what `parent`'s reach.
+	pub const fn entry(parent: Self) -> Self {
+		Self((parent.0 & Self::CAUGHT) | Self::ENTRY)
+	}
+
+	/// A fatal expansion error here reaches the run's top level.
+	pub const fn catches(self) -> bool {
+		self.0 & Self::CAUGHT == 0
+	}
+
+	/// Forked to run one command whose own redirections are still to come:
+	/// the command at the vproc's base frame is that command.
+	pub const fn at_entry(self) -> bool {
+		self.0 & Self::ENTRY != 0
+	}
+}
+
+/// The bits of [`Vproc::subshell`] that hold the depth.
+pub(super) const SUBSHELL_DEPTH: u32 = 0x00ff_ffff;
+
+impl Vproc {
+	/// What this vproc's fatal expansion errors reach, and whether it was
+	/// forked to run one command whose own redirections are still to come.
+	pub const fn fork(&self) -> Fork {
+		Fork((self.subshell >> 24) as u8)
+	}
+
+	/// Set [`Self::fork`].
+	pub const fn set_fork(&mut self, fork: Fork) {
+		self.subshell = (self.subshell & SUBSHELL_DEPTH) | ((fork.0 as u32) << 24);
+	}
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

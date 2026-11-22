@@ -14,6 +14,7 @@
 //! 1992-1997 Paul Falstad and the zsh development group).
 
 use std::{
+	fmt::NumBuffer,
 	sync::Arc,
 	task::{Context, Poll},
 };
@@ -64,7 +65,29 @@ fn io(vp: &mut Vproc) -> &mut super::proc::ScratchIo {
 	scratch(vp).io()
 }
 
-/// Apply redirection list `list` of `unit`.
+/// Who makes a redirection list, as bash's `RX_UNDOABLE` sees it: the
+/// shell saves what a redirection it will undo replaces, and a move
+/// (`<&N-`) saves its source too, which fails first when the source is not
+/// open (`redirection error: cannot duplicate fd`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+	/// A simple command's: undone unless bash forks for it first (an
+	/// external; the command an async job or a pipeline stage was forked
+	/// for; a null command that redirects fd 0 or a `{var}`), which
+	/// [`undone`] works out only when a move fails.
+	Simple {
+		/// The command has no words and bash forks it ([`null_forks`]).
+		null_forks: bool,
+	},
+	/// A compound command's (`{ …; } <&7-`, a loop's): `undo` is false for
+	/// a subshell's own and for the command a fork was made for.
+	Compound {
+		/// Made in the shell and undone after the command.
+		undo: bool,
+	},
+}
+
+/// Apply redirection list `list` of `unit` for `owner`.
 pub fn apply(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -72,6 +95,7 @@ pub fn apply(
 	unit: &Arc<Unit>,
 	list: u32,
 	line: u32,
+	owner: Owner,
 ) -> Result<(), Halt> {
 	let redirs = &unit.redirs[list as usize];
 	let zsh = unit.mode.dialect() == Dialect::Zsh;
@@ -129,7 +153,7 @@ pub fn apply(
 			.iter()
 			.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect)
 		{
-			collect(k, vp, cx, r, &target, line)?;
+			collect(k, vp, cx, unit, r, &target, line)?;
 		} else {
 			// A FIFO the job's process will open itself is decided before any
 			// open starts: an in-flight open that is dropped wakes its helper by
@@ -142,7 +166,7 @@ pub fn apply(
 					return Ok(());
 				}
 			}
-			match install(k, vp, cx, unit, r, &target, line) {
+			match install(k, vp, cx, unit, r, &target, line, owner) {
 				Err(Halt::Flow(Flow::Block(WaitKey::Fs { op: FsOp::Open, path })))
 					if !k.bangs.is_empty() =>
 				{
@@ -203,6 +227,17 @@ const fn default_fd(op: RedirKind) -> i32 {
 		| RedirKind::HereString => 0,
 		_ => 1,
 	}
+}
+
+/// Whether bash runs a null command with redirections `list` (`< f`,
+/// `{v}<&7`) in a fork of its own (`execute_null_command`'s `forcefork`): a
+/// redirection of fd 0 or of a `{var}`.
+pub(super) fn null_forks(list: &[RedirIr]) -> bool {
+	list.iter().any(|r| match r.fd {
+		RedirFdIr::Var(_) => true,
+		RedirFdIr::Num(n) => n == 0,
+		RedirFdIr::Default => default_fd(r.op) == 0,
+	})
 }
 
 /// Source text of word `w` (for `ambiguous redirect`).
@@ -441,6 +476,7 @@ fn var_fd(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, name: &[u8]) -> Optio
 	std::str::from_utf8(&text).ok()?.trim().parse().ok()
 }
 
+#[expect(clippy::too_many_arguments, reason = "the redirection's context, as `apply` has it")]
 fn install(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -449,6 +485,7 @@ fn install(
 	r: &RedirIr,
 	target: &BString,
 	line: u32,
+	owner: Owner,
 ) -> Result<(), Halt> {
 	match r.op {
 		RedirKind::HereDoc | RedirKind::HereString => {
@@ -475,11 +512,18 @@ fn install(
 					.and_then(|s| s.parse().ok())
 					.unwrap_or(-1);
 				let Some(h) = vp.fds.get(src).cloned().filter(FdRef::is_open) else {
-					// bash names the word as written (`$fd: Bad file descriptor`).
-					let path = match r.target {
-						RedirTargetIr::Word(w) => word_text(unit, w),
-						RedirTargetIr::HereDoc { .. } => target.clone(),
-					};
+					// Saving the source first fails first: a `{var}` copy
+					// (`F_DUPFD`), or a move the shell undoes whose target
+					// is open (`add_undo_redirect`).
+					let var = matches!(r.fd, RedirFdIr::Var(_));
+					if var
+						|| (moving
+							&& dup_fd(r).is_some_and(|fd| vp.fds.get(fd).is_some_and(FdRef::is_open))
+							&& undone(k, cx, vp, owner))
+					{
+						k.diag(cx, vp, line, Diag::CannotDuplicateFd);
+					}
+					let path = dup_name(unit, r, src, target);
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
 					return Err(fail(k, vp, cx, line, Diag::Io { path, err }));
 				};
@@ -555,6 +599,55 @@ fn install(
 				return Err(fail(k, vp, cx, line, d));
 			}
 			Ok(())
+		},
+	}
+}
+
+/// The fd duplication `r` (`<&`, `>&`) sets when it names one: its
+/// number, or the operator's (0 for `<&`, 1 for `>&`); `None` for
+/// `{var}`, whose fd is chosen when it opens.
+fn dup_fd(r: &RedirIr) -> Option<i32> {
+	match r.fd {
+		RedirFdIr::Num(n) => i32::try_from(n).ok(),
+		RedirFdIr::Default => Some(i32::from(r.op != RedirKind::DupIn)),
+		RedirFdIr::Var(_) => None,
+	}
+}
+
+/// The name bash's `redirection_error` gives a duplication whose source
+/// `src` is not open (redir.c): a source written as a number (`<&7`,
+/// `<&07`, `<&7-`) by its value; a word (`<&$fd`, `<&"7"`) that copies
+/// onto the operator's own fd (`<&` 0, `>&` 1) as written; any other word
+/// (`3<&$fd`, a move `<&$fd-`) by the fd it sets.
+fn dup_name(unit: &Unit, r: &RedirIr, src: i32, target: &BString) -> BString {
+	let RedirTargetIr::Word(w) = r.target else {
+		return target.clone();
+	};
+	let written = word_text(unit, w);
+	let (digits, moving) = match written.strip_suffix(b"-") {
+		Some(d) => (d, true),
+		None => (written.as_slice(), false),
+	};
+	if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+		return BString::from(src.format_into(&mut NumBuffer::new()));
+	}
+	let own = i32::from(r.op != RedirKind::DupIn);
+	match dup_fd(r) {
+		Some(fd) if moving || fd != own => BString::from(fd.format_into(&mut NumBuffer::new())),
+		_ => written,
+	}
+}
+
+/// Whether the shell undoes the redirections `owner` makes (bash's
+/// `RX_UNDOABLE`): a compound's as [`apply`]'s caller says; a simple
+/// command's unless bash forks for it before them (the command a fork was
+/// made for, an external, a null command that [`null_forks`]).
+fn undone(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, owner: Owner) -> bool {
+	match owner {
+		Owner::Compound { undo } => undo,
+		Owner::Simple { null_forks } => {
+			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
+			!forked && !null_forks && !super::command::forks_for(k, cx, vp)
 		},
 	}
 }
@@ -694,6 +787,7 @@ fn collect(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
+	unit: &Unit,
 	r: &RedirIr,
 	target: &BString,
 	line: u32,
@@ -716,10 +810,11 @@ fn collect(
 					.unwrap_or(-1);
 				if !child_fd_open(k, vp, src) {
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
-					return Err(fail(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
+					let path = dup_name(unit, r, src, target);
+					return Err(fail(k, vp, cx, line, Diag::Io { path, err }));
 				}
 				let fd = fd_number(k, vp, cx, r, false, line)?;
-				let diag = diag_prefix(k, cx, vp, line, digits);
+				let diag = diag_prefix(k, cx, vp, line, &dup_name(unit, r, src, target));
 				add.push(ChildRedir::Dup { fd, src, diag });
 				if moving && src != fd {
 					add.push(ChildRedir::Close { fd: src });

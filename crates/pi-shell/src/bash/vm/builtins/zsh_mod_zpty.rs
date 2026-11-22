@@ -42,7 +42,7 @@ use crate::bash::{
 	syntax::{NO_ALIASES, ParseError, Parser, Pos},
 	vm::{
 		ProcState, exec,
-		proc::{Ctty, Probe, ProbeResult, Vproc},
+		proc::{Ctty, Fork, Probe, ProbeResult, Vproc},
 		set_subshell_depth, state, subshell_depth,
 		zsh::params,
 	},
@@ -575,6 +575,11 @@ fn newptycmd(
 	let mut child = ctx.vp.child_text(ctx.k, ctx.cx.store, &src, ctx.line, fds);
 	// zsh's zpty child is not a subshell level of its own.
 	set_subshell_depth(&mut child, subshell_depth(ctx.vp));
+	child.set_fork(if ctx.vp.fork().catches() {
+		Fork::SHELL
+	} else {
+		Fork::CHILD
+	});
 	{
 		let z = child.zsh.get_or_insert_with(Box::default);
 		z.ptys = PtyTable::default();
