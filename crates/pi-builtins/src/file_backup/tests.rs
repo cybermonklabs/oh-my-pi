@@ -235,9 +235,9 @@ pub(crate) fn listing(dir: &Path) -> String {
 /// - With a second link, `other`, no name or identity tells the entries
 ///   apart. The backup replaces the entry `DEST~` and P stays in
 ///   `other`, as with GNU; mv moves and ln links the old contents, as
-///   GNU's do; cp finds its source replaced when it opens it and fails as
-///   GNU cp fails, leaving the old contents at the backup name, where GNU
-///   renames them back to `dest`.
+///   GNU's do; cp finds its source replaced when it opens it, fails as GNU
+///   cp fails, and renames the old contents back to `dest`, as GNU does
+///   (`un_backup`).
 pub(crate) fn check_folded_sources(util: &str, run: impl Fn(&pi_vfs::Fs, &Path, &[&str]) -> (i32, String)) {
 	let root = tempfile::tempdir().unwrap();
 	if folds_names(root.path()) {
@@ -283,8 +283,8 @@ fn check_folded_source(half: &str, util: &str, root: &Path, run: impl Fn(&Path, 
 			"cp" => {
 				let skipped = "cp: skipping file 'DEST~', as it was replaced while being copied\n";
 				assert_eq!(got, (1, skipped.to_owned()), "{case}");
-				assert_eq!(read("DEST~").as_deref(), Some("old"), "{case}: no backup");
-				assert_eq!(read("dest"), None, "{case}: the replaced source was copied");
+				assert_eq!(read("dest").as_deref(), Some("old"), "{case}: the backup is not back at dest");
+				assert_eq!(read("DEST~"), None, "{case}: the backup is left");
 			},
 			"mv" => {
 				assert_eq!(got, (0, String::new()), "{case}");

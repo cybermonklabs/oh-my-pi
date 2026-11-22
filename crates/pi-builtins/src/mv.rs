@@ -1191,7 +1191,8 @@ mod tests {
 		assert_eq!(code, 1);
 		assert_eq!(fs::read(fixture.path().join("source")).unwrap(), b"new");
 		assert_eq!(fs::read(fixture.path().join("target")).unwrap(), b"old");
-		assert_eq!(capture.err(), "mv: overwrite 'target'? mv: \n");
+		// GNU's prompt, and nothing after it: the answer is the user's.
+		assert_eq!(capture.err(), "mv: overwrite 'target'? ");
 	}
 
 	#[test]
@@ -1366,6 +1367,201 @@ mod tests {
 		assert!(err.to_string().starts_with("cannot overwrite non-directory"), "{err}");
 		assert_eq!(fs::read(&dest).unwrap(), b"kept", "the fallback removed the file");
 		assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "the source changed");
+	}
+
+	/// `mv -b` across file systems from a source it cannot read, as GNU mv
+	/// 9.4 does as uid 1000: the copy fails ("cannot open ... for reading"),
+	/// and the backup is put back (`un_backup`), so `b` keeps its name and data
+	/// and no backup is left; `-v` says `'b~' -> 'b' (unbackup)`. Root reads
+	/// a file of mode 000, so the test runs only as another user.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_failed_move_across_file_systems_puts_the_backup_back() {
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!("skipped: root reads a file of mode 000");
+			return;
+		}
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		for (flags, backup, verbose) in [
+			(&["-b"][..], "b~", ""),
+			(&["--backup=numbered"][..], "b.~1~", ""),
+			(&["-v", "-b"][..], "b~", "'b~' -> 'b' (unbackup)\n"),
+		] {
+			let from = tempfile::tempdir_in("/dev/shm").unwrap();
+			let to = tempdir().unwrap();
+			let source = from.path().join("a");
+			fs::write(&source, b"A").unwrap();
+			fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+			fs::write(to.path().join("b"), b"old").unwrap();
+			let mut argv = flags.to_vec();
+			argv.extend([source.to_str().unwrap(), "b"]);
+			let (code, capture) = run_util::<Mv>(&argv, "", to.path());
+			let case = flags.join(" ");
+			assert_eq!(code, 1, "{case}: {:?}", capture.err());
+			assert!(capture.err().contains("Permission denied"), "{case}: {:?}", capture.err());
+			assert!(capture.out().ends_with(verbose), "{case}: {:?}", capture.out());
+			assert_eq!(fs::read(to.path().join("b")).ok().as_deref(), Some(&b"old"[..]), "{case}: b lost its data");
+			assert!(!to.path().join(backup).exists(), "{case}: b is left under its backup name");
+			assert!(source.exists(), "{case}: the source is gone");
+			fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+		}
+	}
+
+	/// A link that leads nowhere at the destination, as GNU 9.7 treats it as
+	/// uid 1000 and as root: `mv -b l b` keeps it as `b~`, `-n` keeps it and
+	/// exits 0, and `-i` answered no keeps it and exits 1, with nothing after
+	/// the prompt.
+	#[cfg(unix)]
+	#[test]
+	fn a_link_to_nothing_at_the_destination_is_kept_as_gnu_does() {
+		type Row = (&'static [&'static str], &'static str, i32, &'static str, &'static str, Option<&'static str>);
+		let rows: [Row; 3] = [
+			(&["-b"], "", 0, "", "a", Some("missing")),
+			(&["-n"], "", 0, "", "missing", None),
+			(&["-i"], "n\n", 1, "mv: overwrite 'b'? ", "missing", None),
+		];
+		for (flags, stdin, code, err, b, backup) in rows {
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), b"A").unwrap();
+			std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+			std::os::unix::fs::symlink("missing", dir.path().join("b")).unwrap();
+			let mut args = flags.to_vec();
+			args.extend(["l", "b"]);
+			let (got, capture) = run_util::<Mv>(&args, stdin, dir.path());
+			let case = format!("mv {}, b a link to nothing", args.join(" "));
+			assert_eq!((got, capture.err()), (code, err.to_owned()), "{case}");
+			assert_eq!(fs::read_link(dir.path().join("b")).unwrap(), std::path::Path::new(b), "{case}: b");
+			assert_eq!(
+				fs::read_link(dir.path().join("b~")).ok(),
+				backup.map(std::path::PathBuf::from),
+				"{case}: the backup"
+			);
+		}
+	}
+
+	/// `mv -T` of a non-directory onto a directory is refused with GNU 9.7's
+	/// message, which names the source too (9.4's did not), and both stay.
+	#[cfg(unix)]
+	#[test]
+	fn a_non_directory_moved_onto_a_directory_under_t_is_refused_as_gnu_does() {
+		let dir = tempdir().unwrap();
+		fs::write(dir.path().join("a"), b"A").unwrap();
+		std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+		fs::create_dir(dir.path().join("b")).unwrap();
+		fs::write(dir.path().join("b/x"), b"X").unwrap();
+		for source in ["l", "a"] {
+			let (code, capture) = run_util::<Mv>(&["-T", source, "b"], "", dir.path());
+			assert_eq!(
+				(code, capture.err()),
+				(1, format!("mv: cannot overwrite directory 'b' with non-directory '{source}'\n")),
+				"mv -T {source} b"
+			);
+			assert!(fs::symlink_metadata(dir.path().join(source)).is_ok(), "mv -T {source} b: the source is gone");
+			assert_eq!(fs::read(dir.path().join("b/x")).unwrap(), b"X", "mv -T {source} b: b changed");
+		}
+	}
+
+	/// `mv -v` between file systems says what GNU 9.4 and 9.7 say, as uid
+	/// 1000 and as root: `copied 'a' -> 'b'` (with the backup, if any), then
+	/// `removed 'a'`, for a file; for a directory, `created directory` for
+	/// it and each directory in it, `copied` for every other entry, in the
+	/// order GNU copies them (by inode number), then rm's `removed` lines.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_move_across_file_systems_is_reported_as_gnu_does() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		for backup in [false, true] {
+			let from = tempfile::tempdir_in("/dev/shm").unwrap();
+			let to = tempdir().unwrap();
+			let source = from.path().join("a");
+			fs::write(&source, b"A").unwrap();
+			if backup {
+				fs::write(to.path().join("b"), b"old").unwrap();
+			}
+			let shown = source.display().to_string();
+			let mut args = vec!["-v"];
+			args.extend(backup.then_some("-b"));
+			args.extend([shown.as_str(), "b"]);
+			let (code, capture) = run_util::<Mv>(&args, "", to.path());
+			let note = if backup { " (backup: 'b~')" } else { "" };
+			assert_eq!(
+				(code, capture.err(), capture.out()),
+				(0, String::new(), format!("copied '{shown}' -> 'b'{note}\nremoved '{shown}'\n")),
+				"mv {}",
+				args.join(" ")
+			);
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let to = tempdir().unwrap();
+		let d = from.path().join("d");
+		fs::create_dir(&d).unwrap();
+		fs::write(d.join("x"), b"X").unwrap();
+		fs::create_dir(d.join("e")).unwrap();
+		fs::write(d.join("e/y"), b"Y").unwrap();
+		std::os::unix::fs::symlink("x", d.join("l")).unwrap();
+		let shown = d.display().to_string();
+		// GNU copies a directory's entries by inode number (`savedir` sorts
+		// them), and reports each directory as created before what is in it.
+		let mut entries: Vec<_> = ["x", "e", "l"]
+			.into_iter()
+			.map(|name| (fs::symlink_metadata(d.join(name)).unwrap().ino(), name))
+			.collect();
+		entries.sort_unstable();
+		let mut expected = vec!["created directory 'd'".to_owned()];
+		for (_, name) in entries {
+			if name == "e" {
+				expected.push("created directory 'd/e'".to_owned());
+				expected.push(format!("copied '{shown}/e/y' -> 'd/e/y'"));
+			} else {
+				expected.push(format!("copied '{shown}/{name}' -> 'd/{name}'"));
+			}
+		}
+		let (code, capture) = run_util::<Mv>(&["-v", shown.as_str(), "d"], "", to.path());
+		assert_eq!((code, capture.err()), (0, String::new()), "mv -v {shown} d");
+		let out = capture.out();
+		let lines: Vec<_> = out.lines().collect();
+		let copied: Vec<_> = lines
+			.iter()
+			.filter(|line| line.starts_with("copied ") || line.starts_with("created directory "))
+			.map(|line| (*line).to_owned())
+			.collect();
+		let removed: Vec<_> = lines.iter().filter(|line| line.starts_with("removed ")).copied().collect();
+		assert_eq!(copied.len() + removed.len(), lines.len(), "{out}");
+		assert_eq!(copied, expected, "{out}");
+		let mut sorted_removed = removed.clone();
+		sorted_removed.sort_unstable();
+		assert_eq!(
+			sorted_removed,
+			[
+				"removed '<D>/e/y'".replace("<D>", &shown),
+				"removed '<D>/l'".replace("<D>", &shown),
+				"removed '<D>/x'".replace("<D>", &shown),
+				"removed directory '<D>'".replace("<D>", &shown),
+				"removed directory '<D>/e'".replace("<D>", &shown),
+			],
+			"{out}"
+		);
+		assert_eq!(removed.last(), Some(&format!("removed directory '{shown}'").as_str()), "{out}");
+		assert!(lines.iter().position(|line| line.starts_with("removed ")) > Some(copied.len() - 1), "{out}");
 	}
 
 	/// Moves `from/src`, a directory, into `to/file-dest`, which holds a

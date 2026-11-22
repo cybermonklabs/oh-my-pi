@@ -3082,6 +3082,13 @@ mod testing {
 			self.env.insert(key.to_string(), value.to_string());
 		}
 
+		/// Gives a test host the filesystem `fs` (a provider's, say), keeping
+		/// its working directory.
+		pub(crate) fn set_test_fs(&mut self, fs: &pi_vfs::Fs) {
+			self.paths =
+				ShellPaths::new(self.paths.cwd().to_path_buf(), fs, None, std::iter::empty::<(i32, OpenFile)>());
+		}
+
 		/// Requests cancellation on a test host.
 		pub(crate) fn cancel_for_test(&self) {
 			self.cancel.store(true, super::Ordering::Relaxed);
@@ -3278,6 +3285,7 @@ mod testing {
 			hook();
 		}
 	}
+
 
 	/// A tree for the symlink-swap tests in a fresh canonical temporary
 	/// directory `base`: `root/sub/decoy.txt` holding `inside`, and next to
