@@ -67,18 +67,19 @@ pub fn os_pipe(_prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 mod imp {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	use std::os::unix::fs::OpenOptionsExt;
 	use std::{
 		fs,
 		io::{self, Read, SeekFrom, Write},
-		os::{
-			fd::{AsRawFd, OwnedFd, RawFd},
-			unix::fs::OpenOptionsExt,
-		},
+		os::fd::{AsRawFd, OwnedFd, RawFd},
 		ptr,
 		sync::Arc,
 		task::{Context, Poll, Waker},
 	};
 
+	#[cfg(target_os = "macos")]
+	use crate::sys::fifo_pair::fifo_descriptions;
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	use crate::sys::room::Room;
 	use crate::{
@@ -153,68 +154,6 @@ mod imp {
 			Box::new(Shared { file: theirs_read, own: reads }),
 			Box::new(Shared { file: theirs_write, own: writes }),
 		))
-	}
-
-	/// Four open file descriptions of a new FIFO: the shell's non-blocking
-	/// read and write ones, then the externals' blocking read and write ones.
-	/// The FIFO and its directory (mode 0700, under `tmp`) are removed before
-	/// this returns, whatever the outcome; the pipe lives on in its open
-	/// descriptions, all close-on-exec.
-	#[cfg(target_os = "macos")]
-	fn fifo_descriptions(tmp: &std::path::Path) -> io::Result<[fs::File; 4]> {
-		use std::{
-			ffi::{CString, OsString},
-			os::unix::ffi::{OsStrExt, OsStringExt},
-			path::PathBuf,
-		};
-		let template = CString::new(tmp.join("obash-pipe.XXXXXX").as_os_str().as_bytes())?;
-		let mut name = template.into_bytes_with_nul();
-		// SAFETY: `name` is a NUL-terminated template that `mkdtemp` fills in
-		// place.
-		if unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null() {
-			return Err(io::Error::last_os_error());
-		}
-		name.pop();
-		let dir = PathBuf::from(OsString::from_vec(name));
-		let fifo = dir.join("pipe");
-		let opened = (|| {
-			let path = CString::new(fifo.as_os_str().as_bytes())?;
-			// SAFETY: a NUL-terminated path.
-			if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } < 0 {
-				return Err(io::Error::last_os_error());
-			}
-			let open = |write: bool| {
-				fs::OpenOptions::new()
-					.read(!write)
-					.write(write)
-					.custom_flags(libc::O_NONBLOCK)
-					.open(&fifo)
-			};
-			// The shell's read end first: a FIFO's non-blocking read open
-			// needs no writer, and every write open after it finds a reader
-			// (one with none fails with `ENXIO`).
-			let ours_read = open(false)?;
-			let ours_write = open(true)?;
-			let theirs_read = blocking(open(false)?)?;
-			let theirs_write = blocking(open(true)?)?;
-			Ok([ours_read, ours_write, theirs_read, theirs_write])
-		})();
-		let _ = fs::remove_file(&fifo);
-		let _ = fs::remove_dir(&dir);
-		opened
-	}
-
-	/// `file` with `O_NONBLOCK` cleared on its description.
-	#[cfg(target_os = "macos")]
-	fn blocking(file: fs::File) -> io::Result<fs::File> {
-		let fd = file.as_raw_fd();
-		// SAFETY: fcntl on a descriptor we own, of a description only it has.
-		let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-		// SAFETY: as above.
-		if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		Ok(file)
 	}
 
 	/// The `revents` of `fd` for `events` right now (`poll(2)`, zero

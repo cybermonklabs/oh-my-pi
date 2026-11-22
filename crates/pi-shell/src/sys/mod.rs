@@ -18,7 +18,8 @@
 //!   [`Exits::Park`].
 //! - [`stage_pipe`]: the OS pipe a pipeline's memory pipe becomes once an
 //!   external takes one of its ends, so two external stages share one kernel
-//!   pipe (Linux; elsewhere the memory pipe stays and is pumped).
+//!   pipe (Linux, macOS and Windows; elsewhere the memory pipe stays and is
+//!   pumped).
 //! - `proc` (Unix): the process table, session and group membership,
 //!   identity-pinned signals.
 //! - [`pathext`]: Windows `PATHEXT` executable resolution.
@@ -30,6 +31,8 @@
 pub mod cmdline;
 #[cfg(windows)]
 pub mod console;
+#[cfg(target_os = "macos")]
+pub(crate) mod fifo_pair;
 mod fs;
 mod fs_ops;
 #[cfg(any(windows, test))]
