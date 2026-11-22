@@ -554,6 +554,163 @@ mod tests {
 		assert_eq!(labels.group(outer), [outer]);
 	}
 
+	/// A tool whose subshell finds no vpid left (another vproc took the last
+	/// one after the call's dispatch checked) fails as bash's fork does: its
+	/// message, status 254, and the script goes on. Without that status the
+	/// tool would wait for a subshell that never started (`git` and `nohup`
+	/// answer only with their child's status): the row then fails by the
+	/// count of steps the run took.
+	#[test]
+	fn a_tool_whose_subshell_finds_no_vpid_fails_as_a_fork() {
+		use crate::{
+			bash::{Budget, Step, Vpid},
+			testkit::{FakeHost, Rig, ToolFn, fault::skeleton_init},
+		};
+		const STEP_BOUND: u32 = 10_000;
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.expect("runtime");
+		let config = ToolConfig::from_env(&[], None, runtime.handle().clone());
+		let mut host = FakeHost::new();
+		// The engine names a host callout by its place in the host's list:
+		// `nohup` is the third, `NOHUP`. The calls go to `ToolCalls` instead.
+		let unused: ToolFn = Arc::new(|_: &mut ShellApi<'_, '_>, _: &[BString]| -> CallOutcome {
+			unreachable!("the test hands every call to ToolCalls")
+		});
+		for name in ["unused", "timeout", "nohup"] {
+			host.tool(name, Arc::clone(&unused));
+		}
+		let mut rig = Rig::new(host, skeleton_init(&[]));
+		rig.set_next_vpid(Vpid::CEILING);
+		let mut tools = ToolCalls::new(config, SpawnLog::default(), Waker::noop().clone());
+		let (shell, host, store) = rig.parts();
+		let main = shell.submit(Script::command(&b"nohup echo in; echo \"st=$?\""[..]));
+		let mut steps = 0;
+		let status = loop {
+			steps += 1;
+			assert!(
+				steps <= STEP_BOUND,
+				"{STEP_BOUND} steps and the run goes on: the tool waits for a subshell that never \
+				 started"
+			);
+			let mut cx = Cx { host: &mut *host, store: &mut *store };
+			match shell.step(&mut cx, Budget::default()) {
+				Step::Done { run, status } if run == main => break status,
+				// The only other run: the subshell that took the last vpid,
+				// none of the tool's.
+				Step::Done { .. } => {},
+				Step::Call { id, call } => {
+					// Another vproc takes the last vpid after the dispatch
+					// checked it.
+					let mut api = shell.api(&mut cx, id).expect("the call is outstanding");
+					assert!(api.run_subshell(Script::command(&b":"[..])).is_some(), "the last vpid");
+					tools.on_call(shell, &mut cx, id, call);
+				},
+				Step::Yield | Step::Blocked | Step::Idle => tools.poll(shell, &mut cx),
+				other => panic!("{other:?}"),
+			}
+		};
+		assert_eq!(status, 0);
+		assert_eq!(String::from_utf8_lossy(&host.stdout.bytes()), "st=254\n");
+		assert_eq!(
+			String::from_utf8_lossy(&host.stderr.bytes()),
+			"bash: line 1: nohup: fork: Resource temporarily unavailable\n"
+		);
+	}
+
+	/// An extra utility whose command finds no vpid left (another vproc took
+	/// the last one after the call's dispatch checked) sees its fork fail
+	/// (`WouldBlock`), reports it, and the call ends with the utility's
+	/// status; the script goes on. The utility runs on the runtime: the test
+	/// parks until the tools' waker is called and fails by the count of
+	/// parks with nothing new (a reply nobody sends would never wake it).
+	#[test]
+	fn an_extras_command_that_finds_no_vpid_sees_its_fork_fail() {
+		use std::{
+			sync::atomic::{AtomicBool, Ordering},
+			task::Wake,
+			thread::Thread,
+		};
+
+		use crate::{
+			bash::{Budget, Step, Vpid},
+			testkit::{FakeHost, Rig, ToolFn, fault::skeleton_init},
+		};
+		/// Unparks the test's thread and marks that something woke it.
+		struct Unpark(Thread, AtomicBool);
+		impl Wake for Unpark {
+			fn wake(self: Arc<Self>) {
+				self.1.store(true, Ordering::SeqCst);
+				self.0.unpark();
+			}
+		}
+		/// Parks with no wake before the run goes on is a failure; each park
+		/// is at most 10 ms, so the bound is reached in about 30 s.
+		const QUIET_PARKS: u32 = 3_000;
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(2)
+			.enable_all()
+			.build()
+			.expect("runtime");
+		let config = ToolConfig::from_env(&[], None, runtime.handle().clone());
+		let mut host = FakeHost::new();
+		// The engine names a host callout by its place in the host's list:
+		// `xargs` is the fifth, `EXTRA`. The calls go to `ToolCalls` instead.
+		let unused: ToolFn = Arc::new(|_: &mut ShellApi<'_, '_>, _: &[BString]| -> CallOutcome {
+			unreachable!("the test hands every call to ToolCalls")
+		});
+		for name in ["unused", "timeout", "nohup", "git", "xargs"] {
+			host.tool(name, Arc::clone(&unused));
+		}
+		let mut rig = Rig::new(host, skeleton_init(&[]));
+		rig.set_next_vpid(Vpid::CEILING);
+		let woke = Arc::new(Unpark(std::thread::current(), AtomicBool::new(false)));
+		let waker = Waker::from(Arc::clone(&woke));
+		let mut tools = ToolCalls::new(config, SpawnLog::default(), waker);
+		let (shell, host, store) = rig.parts();
+		let main = shell.submit(Script::command(&b"xargs echo <<< in; echo \"st=$?\""[..]));
+		let mut quiet = 0;
+		let status = loop {
+			let mut cx = Cx { host: &mut *host, store: &mut *store };
+			match shell.step(&mut cx, Budget::default()) {
+				Step::Done { run, status } if run == main => break status,
+				// The only other run: the subshell that took the last vpid.
+				Step::Done { .. } => {},
+				Step::Call { id, call } => {
+					// Another vproc takes the last vpid after the dispatch
+					// checked it.
+					let mut api = shell.api(&mut cx, id).expect("the call is outstanding");
+					assert!(api.run_subshell(Script::command(&b":"[..])).is_some(), "the last vpid");
+					tools.on_call(shell, &mut cx, id, call);
+				},
+				Step::Yield => tools.poll(shell, &mut cx),
+				Step::Blocked | Step::Idle => {
+					tools.poll(shell, &mut cx);
+					if !woke.1.swap(false, Ordering::SeqCst) {
+						quiet += 1;
+						assert!(
+							quiet <= QUIET_PARKS,
+							"{QUIET_PARKS} parks with no wake and the run goes on: the utility waits for \
+							 a command that never started"
+						);
+						std::thread::park_timeout(std::time::Duration::from_millis(10));
+					}
+				},
+				other => panic!("{other:?}"),
+			}
+		};
+		drop(runtime);
+		let (out, err) = (host.stdout.bytes(), host.stderr.bytes());
+		let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+		// pi's xargs: a command it could not run is 126. GNU findutils 4.9.0
+		// under `ulimit -u 1` says `cannot fork` and exits 1; the utility is
+		// not this change's.
+		assert_eq!(
+			(status, out.as_ref(), err.as_ref()),
+			(0, "st=126\n", "xargs: Command could not be run: Resource temporarily unavailable\n")
+		);
+	}
+
 	#[test]
 	fn tools_follow_the_session_environment() {
 		let env = |pairs: &[(&str, &str)]| -> Vec<(BString, BString)> {

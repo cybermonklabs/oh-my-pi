@@ -27,7 +27,8 @@ use crate::bash::{
 	diag::Diag,
 	event::WaitKey,
 	ir::{
-		CaseIr, ComsubForm, OpIr, ParamIr, ParamRef, Part, ReplaceIr, SubIr, Unit, Word, WordKind,
+		CaseIr, ComsubForm, OpIr, Opcode, ParamIr, ParamRef, Part, ReplaceIr, SubIr, Unit, Word,
+		WordKind,
 	},
 	pattern::{PatOpts, Pattern},
 	store::{Attrs, Elem, OptId, StoreError, VarValue},
@@ -1027,6 +1028,21 @@ impl<'e, 'c> Expander<'e, 'c> {
 		form: ComsubForm,
 		text: Option<u32>,
 	) -> X<BString> {
+		// A `$( )` with no command (`$()`, `$( )`, only comments or blank
+		// lines, empty backquotes) runs nothing: bash's `command_substitute`
+		// returns at once, without a fork, and leaves `$?` alone (`false;
+		// echo "$( )" $?` prints 1). So no vproc is made and nothing is
+		// logged; none is needed with no vpid left either. Only bash words
+		// come here: a zsh unit's words are `Part::Zsh`, whose `$( )` zsh
+		// forks for (zsh 5.9 under `ulimit -u 1`).
+		if form == ComsubForm::Fork
+			&& unit
+				.ops
+				.get(entry as usize)
+				.is_some_and(|op| op.code == Opcode::SubExit)
+		{
+			return Ok(BString::default());
+		}
 		// A word compiled as unable to park (no replay log) can still meet
 		// a command substitution in run-time text (a nameref's subscript,
 		// `declare -n r='a[$(cmd)]'`). The executor logs every finished

@@ -7,14 +7,14 @@
 //! temporarily unavailable` and leaves with 1, without `TRAPEXIT`. Nothing
 //! half-built is left: the next run of the shell works.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bstr::BString;
 
 use crate::{
 	bash::{
-		Budget, CallOutcome, Cx, ModeId, RestoreOpts, Script, ShellApi, ShellInit, Step, Vpid,
-		VprocSel,
+		Budget, CallOutcome, Cx, ModeId, Origin, RestoreOpts, Script, ShellApi, ShellInit, Step,
+		Vpid, VprocSel,
 	},
 	testkit::{FakeHost, Fault, Rig, fault::skeleton_init},
 };
@@ -274,4 +274,110 @@ fn a_restored_counter_starts_above_the_live_vprocs() {
 	r.set_next_vpid(5);
 	let got = run(&mut r, &format!("( echo $BASHPID ); kill {job}; echo \"st=$?\""));
 	assert_eq!(got, (format!("{}\nst=0\n", job + 1), String::new(), 0));
+}
+
+/// The most fork messages an interactive row may print. A reader that
+/// expands its prompt again without end, inside one step, prints the message
+/// without end; such a row fails once it printed more, by that count.
+const PROMPT_BOUND: usize = 64;
+
+/// An interactive shell (`init`) reading `input` from stdin, its next vpid
+/// `next`, run on a thread of its own: stdout, stderr and status once the
+/// run ends. Fails by count when more than [`PROMPT_BOUND`] fork messages
+/// come first (the hang this guards never returns from its step).
+fn interactive(init: ShellInit, next: u32, input: &str) -> (String, String, i32) {
+	let mut r = Rig::new(FakeHost::new().with_stdin(input.as_bytes()), init);
+	r.set_next_vpid(next);
+	let (out, err) = (r.host.stdout.clone(), r.host.stderr.clone());
+	let run = std::thread::spawn(move || {
+		r.run(Script { origin: Origin::Stdin, ..Script::command(Vec::new()) }, Fault::None)
+	});
+	while !run.is_finished() {
+		let printed = err.bytes().windows(4).filter(|w| w == b"fork").count();
+		assert!(
+			printed <= PROMPT_BOUND,
+			"{printed} fork messages and the run goes on: the prompt is expanded again without end"
+		);
+		// Only paces the count; the verdict is the run's end or the count.
+		std::thread::park_timeout(Duration::from_millis(1));
+	}
+	let status = run.join().expect("the run");
+	let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+	(text(out.bytes()), text(err.bytes()), status)
+}
+
+/// An interactive bash whose prompt has a command substitution, with no vpid
+/// left: the prompt's expansion fails as an expansion does. The message is
+/// printed once per prompt, the prompt is empty, and each line is read and
+/// run with `$?` as it was. zsh 5.9 does the same on a pty under `ulimit -u
+/// 1`; bash 5.2.21 and 5.3.20 retry the fork for 15 s, print the message and
+/// expand the prompt again, and never read a line. A shell that takes the
+/// last vpid for a prompt shows that one, and fails at the next.
+#[test]
+fn a_prompt_substitution_with_no_vpid_fails_as_an_expansion() {
+	let mut init = ShellInit { interactive: true, ..skeleton_init(&[]) };
+	init.env.push(("PS1".into(), "$ ".into()));
+	let input = "PS1='$(echo p)> '; false\necho \"st=$?\"\necho hi\n";
+	let got = interactive(init.clone(), Vpid::CEILING + 1, input);
+	assert_eq!(got, ("st=1\nhi\n".to_owned(), format!("$ {}", MESSAGE.repeat(3)), 0));
+	// One left: the first prompt with the substitution takes it.
+	let got = interactive(init, Vpid::CEILING, "PS1='$(echo p)> '\necho hi\n");
+	assert_eq!(got, ("hi\n".to_owned(), format!("$ p> {MESSAGE}"), 0));
+}
+
+/// zsh with `promptsubst` and a command substitution in `PS1`, with no vpid
+/// left: `zsh: fork failed: …` (no line, as zsh 5.9 prints it for its
+/// prompt on a pty under `ulimit -u 1`), the prompt empty, the line read
+/// and run with `$?` as it was.
+#[test]
+fn a_zsh_prompt_substitution_with_no_vpid_fails_as_an_expansion() {
+	let mut init =
+		ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), interactive: true, ..skeleton_init(&[]) };
+	init.env.push(("PS1".into(), "$ ".into()));
+	let input = "setopt promptsubst; PS1='$(print p)> '; false\nprint \"st=$?\"\nprint hi\n";
+	let (out, err, status) = interactive(init, Vpid::CEILING + 1, input);
+	let message = "zsh: fork failed: resource temporarily unavailable\n";
+	assert_eq!((out.as_str(), status), ("st=1\nhi\n", 0), "stderr: {err:?}");
+	assert_eq!(err.matches(message).count(), 3, "stderr: {err:?}");
+	assert!(!err.contains("p> "), "the failed prompt is empty: {err:?}");
+}
+
+/// A command substitution with no command (`$()`, `$( )`, only a comment,
+/// only a newline, empty backquotes) needs no vpid: bash 5.2.21 and 5.3.20
+/// under `ulimit -u 1` run them without a fork, the value empty and `$?` 0.
+/// zsh 5.9 forks for them, so zsh mode still fails as its fork does.
+#[test]
+fn a_substitution_with_no_command_needs_no_vpid() {
+	let rows = [
+		"false; x=$( ); echo \"after st=$? x=[$x]\"",
+		"false; x=$(); echo \"after st=$? x=[$x]\"",
+		"false; x=$( # only a comment\n); echo \"after st=$? x=[$x]\"",
+		"false; x=$(\n); echo \"after st=$? x=[$x]\"",
+		"false; x=`` ; echo \"after st=$? x=[$x]\"",
+	];
+	let mut mismatches = Vec::new();
+	for src in rows {
+		let mut r = rig_at(Vpid::CEILING + 1);
+		let got = run(&mut r, src);
+		if got != ("after st=0 x=[]\n".to_owned(), String::new(), 0) {
+			mismatches.push(format!("`{src}` gave {got:?}"));
+		}
+	}
+	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+	let mut r = zsh_rig_at(Vpid::CEILING + 1);
+	let got = run(&mut r, "x=$( ); print after");
+	assert_eq!(got, (String::new(), ZSH_MESSAGE.to_owned(), 1));
+}
+
+/// Stated, not changed: `$(< file)` still runs in a vproc, so with none left
+/// it fails as a fork, where bash 5.2.21, 5.3.20 and zsh 5.9 read the file in
+/// the shell itself and go on.
+#[test]
+fn a_file_substitution_still_needs_a_vpid() {
+	let mut r = rig_at(Vpid::CEILING + 1);
+	let got = run(&mut r, "x=$(< /dev/null); echo after");
+	assert_eq!(got, (String::new(), MESSAGE.to_owned(), 254));
+	let mut r = zsh_rig_at(Vpid::CEILING + 1);
+	let got = run(&mut r, "x=$(< /dev/null); print after");
+	assert_eq!(got, (String::new(), ZSH_MESSAGE.to_owned(), 1));
 }

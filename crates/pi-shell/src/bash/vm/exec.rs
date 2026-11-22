@@ -702,8 +702,8 @@ pub(super) fn fork_failed(
 /// trap does not run, unlike after other errors (zsh 5.9 under `ulimit -u
 /// 1`; a `${x:?}` error does run it).
 pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Flow {
+	fork_message(k, vp, cx, line);
 	if vp.mode.dialect() == Dialect::Zsh {
-		k.diag(cx, vp, line, Diag::ZshForkFailed);
 		if let Some(run) = vp.runs.front_mut() {
 			run.exit_trap_started = true;
 		}
@@ -712,7 +712,6 @@ pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 		}
 		return Flow::Discard(1);
 	}
-	k.diag(cx, vp, line, Diag::ForkFailed);
 	let interactive = vp.parent.is_none()
 		&& matches!(
 			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
@@ -722,6 +721,34 @@ pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 		Flow::Discard(254)
 	} else {
 		Flow::Exit(254)
+	}
+}
+
+/// The message of [`fork_failure`] alone, in the vproc's dialect: bash's
+/// `fork: Resource temporarily unavailable` (no line), zsh's `fork failed:
+/// resource temporarily unavailable` (with its line where zsh prints one).
+pub(crate) fn fork_message(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) {
+	let diag = if vp.mode.dialect() == Dialect::Zsh {
+		Diag::ZshForkFailed
+	} else {
+		Diag::ForkFailed
+	};
+	k.diag(cx, vp, line, diag);
+}
+
+/// Whether the expansion stopped at `stop` for a substitution that needs a
+/// vproc, and no vpid is left for one ([`Kernel::vpids_left`]): a `$( )`
+/// that forks, a zsh `$(…)` that is not a hook call run in the shell, or a
+/// process substitution that already found none ([`Stop::ForkFailed`]).
+/// The interactive reader fails such a prompt expansion instead of
+/// starting it ([`super::zle::reader`]).
+pub(crate) const fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
+	match stop {
+		Stop::ForkFailed => true,
+		Stop::Sub { form: ComsubForm::Fork, .. } | Stop::ZshSub { here: false, .. } => {
+			k.vpids_left() == 0
+		},
+		_ => false,
 	}
 }
 
