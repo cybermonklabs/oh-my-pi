@@ -2324,8 +2324,12 @@ pub fn start_sub(
 				}
 			}
 			// bash keeps job control and the job list in `$( )`: `jobs`
-			// lists the parent's jobs, `fg` finds no current job.
+			// lists the parent's jobs, `fg` finds no current job. bash 5.3
+			// drops the finished jobs it would not report there first.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+			if child.mode.dialect() != Dialect::Zsh {
+				drop_finished_jobs(k, cx, &mut child);
+			}
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -4323,6 +4327,49 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		job.inherited = true;
 	}
 	jobs
+}
+
+/// bash 5.3 for a command substitution child of a shell that is not
+/// interactive: before the child reads its first command, `shell_getc`'s
+/// `notify_and_cleanup` (parse.y) deletes each finished job that
+/// `notify_of_job_status` marks notified there (`startup_state` 2 with
+/// `SUBSHELL_COMSUB`): every one but the job `$!` names, and not one a
+/// SIGINT, SIGTERM or SIGPIPE killed, whose end such a shell never reports.
+/// Each one deleted keeps its status for `wait PID` (`delete_job`'s
+/// `bgp_add`), and the current and previous jobs are chosen again as
+/// `delete_job` does. An interactive shell's command substitution reads no
+/// line through that path, and keeps every job.
+fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
+	if super::jobctl::interactive(k) {
+		return;
+	}
+	let platform = k.engine.config().platform;
+	let unreported = |status: i32| {
+		use crate::bash::Signal;
+		// A status above 128 is the signal that killed the job
+		// (`builtins::jobs::signaled`).
+		let signal = status
+			.checked_sub(128)
+			.and_then(|n| u8::try_from(n).ok())
+			.and_then(|n| Signal::from_number(n, platform));
+		matches!(signal, Some(Signal::Int | Signal::Term | Signal::Pipe))
+	};
+	let dropped: Vec<(u32, Vpid, u32, i32)> = child
+		.jobs
+		.iter()
+		.filter_map(|j| match j.state {
+			super::proc::JobState::Done(status)
+				if !unreported(status) && !child.last_bg.is(j.vpid) =>
+			{
+				Some((j.number, j.vpid, j.pid(), status))
+			},
+			_ => None,
+		})
+		.collect();
+	for (number, vpid, pid, status) in dropped {
+		child.jobs.remove(number);
+		state::save_status(&mut k.root, cx.store, child, vpid, pid, status);
+	}
 }
 
 /// Whether the pipeline stage starting at `entry` is a simple command
