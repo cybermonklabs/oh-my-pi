@@ -37,6 +37,7 @@ use crate::bash::{
 	syntax::zsh::tok::metafy,
 	vm::{
 		exec::push_script,
+		jobctl,
 		proc::{Probe, ProbeResult, ScriptKind},
 		state::{self, Level},
 		zsh::{arith, params},
@@ -402,6 +403,12 @@ impl<'r, 'a, 'c> Zf<'r, 'a, 'c> {
 			ProbeResult::Zftp(a) => Ok(*a),
 			_ => Ok(ZftpAns::Done),
 		}
+	}
+
+	/// Where zsh's `zfmovefd` puts a new socket: the lowest free fd from
+	/// here, past the shell's own ([`jobctl::zsh_movefd_from`]).
+	fn movefd_from(&mut self) -> i32 {
+		jobctl::zsh_movefd_from(self.ctx.k, self.ctx.cx.store, self.ctx.vp)
 	}
 
 	/// Write to an fd (zsh's stdio output to stdout/stderr).
@@ -827,7 +834,8 @@ impl<'r, 'a, 'c> Zf<'r, 'a, 'c> {
 					return Ok(None);
 				},
 			};
-			match self.ask(ZftpOp::Connect { addr, deadline: None })? {
+			let from = self.movefd_from();
+			match self.ask(ZftpOp::Connect { addr, deadline: None, from })? {
 				ZftpAns::Sock(Ok(SockInfo { fd, .. })) => self.sess().dfd = Some(fd),
 				ZftpAns::Sock(Err(f)) => {
 					self.warn(name, format!("connect failed: {}", f.text()))?;
@@ -847,7 +855,8 @@ impl<'r, 'a, 'c> Zf<'r, 'a, 'c> {
 			return Ok(None);
 		};
 		let bind = SocketAddr::new(local.ip(), 0);
-		let (fd, addr) = match self.ask(ZftpOp::Listen { addr: bind })? {
+		let from = self.movefd_from();
+		let (fd, addr) = match self.ask(ZftpOp::Listen { addr: bind, from })? {
 			ZftpAns::Listen(Ok(SockInfo { fd, local: Some(addr), .. })) => (fd, addr),
 			ZftpAns::Listen(Ok(SockInfo { fd, local: None, .. })) => {
 				self.ask(ZftpOp::Close { fd })?;
@@ -925,7 +934,8 @@ impl<'r, 'a, 'c> Zf<'r, 'a, 'c> {
 			let Some(lfd) = self.sess().dfd.take() else {
 				return Ok(true);
 			};
-			match self.ask(ZftpOp::Accept { fd: lfd })? {
+			let from = self.movefd_from();
+			match self.ask(ZftpOp::Accept { fd: lfd, from })? {
 				ZftpAns::Sock(Ok(SockInfo { fd, .. })) => self.sess().dfd = Some(fd),
 				ZftpAns::Sock(Err(f)) => {
 					self.warn(name, format!("unable to accept data: {}", f.text()))?;
@@ -1446,7 +1456,8 @@ impl<'r, 'a, 'c> Zf<'r, 'a, 'c> {
 			let mut err = None;
 			for addr in &addrs {
 				let sa = SocketAddr::new(*addr, tcp_port);
-				match self.ask(ZftpOp::Connect { addr: sa, deadline })? {
+				let from = self.movefd_from();
+				match self.ask(ZftpOp::Connect { addr: sa, deadline, from })? {
 					ZftpAns::Sock(Ok(info)) => {
 						connected = Some((info, *addr));
 						break;

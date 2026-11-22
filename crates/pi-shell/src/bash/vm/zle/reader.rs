@@ -416,8 +416,8 @@ impl Reader {
 				self.sc.recycle();
 				Ok(Some(v))
 			},
-			Err(Stop::ZshSub { text, here }) => {
-				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, 0).into())
+			Err(Stop::ZshSub { text, run }) => {
+				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, run, 0).into())
 			},
 			// A math function (`functions -M`) called from a prompt: its
 			// frame runs above, the expansion replays with its value.

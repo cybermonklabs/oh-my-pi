@@ -22,6 +22,7 @@ use crate::bash::{
 	vm::{
 		fdprobe::{FdAnswer, FdProbe, FdSlot},
 		fsprobe::FsErr,
+		jobctl,
 		probe::absolute,
 	},
 };
@@ -91,7 +92,7 @@ pub fn zsocket(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 			FdSlot::At(targetfd)
 		} else {
 			// zsh `movefd`: nobody reads a listener.
-			FdSlot::Free(10)
+			FdSlot::Free(jobctl::zsh_movefd_from(ctx.k, ctx.cx.store, ctx.vp))
 		};
 		let fd = install(ctx, slot, file);
 		if let Err(d) = setiparam(ctx, b"REPLY", i64::from(fd))? {

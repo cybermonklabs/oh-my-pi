@@ -31,6 +31,7 @@ use crate::bash::{
 		expand::{Expander, Stop, X},
 		fdprobe::{FdAnswer, FdProbe, FdSlot, release_lock},
 		fsprobe::FsErr,
+		jobctl,
 		probe::absolute,
 		proc::{Probe, ProbeResult},
 		state,
@@ -710,7 +711,8 @@ fn sysopen(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 	};
 	let name = args.first().cloned().unwrap_or_default();
 	let path = absolute(&ctx.vp.cwd, &name);
-	let slot = explicit.map_or(FdSlot::Free(10), FdSlot::At);
+	let from = jobctl::zsh_movefd_from(ctx.k, ctx.cx.store, ctx.vp);
+	let slot = explicit.map_or(FdSlot::Free(from), FdSlot::At);
 	let open = FdProbe::Open { path, flags, mode: perms, slot, fd_flags };
 	let fd = match fd_probe(ctx, open)? {
 		FdAnswer::Opened { fd, .. } => fd,
@@ -1007,6 +1009,7 @@ fn flock(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		write: !readlock,
 		timeout_ns,
 		interval_ns,
+		slot: FdSlot::Free(jobctl::zsh_movefd_from(ctx.k, ctx.cx.store, ctx.vp)),
 		fd_flags,
 	};
 	match fd_probe(ctx, probe)? {

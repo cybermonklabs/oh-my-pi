@@ -78,11 +78,8 @@ pub enum Stop {
 	ZshSub {
 		/// The body.
 		text: BString,
-		/// A hook function call zsh makes from an expansion
-		/// (`subst_string_by_func`: `zsh_directory_name`): it runs in the
-		/// current shell, its output not captured; the replay sees its
-		/// status.
-		here: bool,
+		/// Where it runs.
+		run:  ZshSubRun,
 	},
 	/// A zsh user math function must run first (zsh `callmathfunc`'s
 	/// `doshfunc`): the op parks while the shell function runs in the
@@ -103,6 +100,20 @@ pub enum Stop {
 	Fatal(Diag),
 	/// The state store failed.
 	Store(StoreError),
+}
+
+/// Where a zsh command substitution ([`Stop::ZshSub`]) runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZshSubRun {
+	/// A forked child whose standard output is captured (zsh `getoutput`).
+	Fork,
+	/// The same for `=(…)` (zsh `getoutputfile`), whose child starts
+	/// without the shell's own fds (`closem`).
+	File,
+	/// A hook function call zsh makes from an expansion
+	/// (`subst_string_by_func`: `zsh_directory_name`): it runs in the
+	/// current shell, its output not captured; the replay sees its status.
+	Here,
 }
 
 /// A call of the shell function behind a zsh math function

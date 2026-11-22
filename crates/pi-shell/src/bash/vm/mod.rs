@@ -2927,6 +2927,11 @@ impl Vproc {
 		if let Some(tty) = self.zsh.as_deref().and_then(|z| z.ctty.0.clone()) {
 			vp.zsh.get_or_insert_with(Box::default).ctty = proc::Ctty(Some(tty));
 		}
+		// A fork of a process substitution's commands: zsh's own fds stay
+		// closed.
+		if self.zsh.as_deref().is_some_and(|z| z.own_fds_closed) {
+			vp.zsh.get_or_insert_with(Box::default).own_fds_closed = true;
+		}
 		// bash `without_job_control`: no jobs, no job control (a command
 		// substitution turns it back on when it starts).
 		vp.jobs.subshell = true;

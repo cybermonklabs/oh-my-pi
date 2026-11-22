@@ -84,8 +84,9 @@ pub enum ZftpOp {
 	/// The addresses of a host in one family (`getipnodebyname`), giving
 	/// up at the deadline.
 	Resolve { host: BString, v6: bool, deadline: Option<u64> },
-	/// Connect to `addr`, the socket going to the lowest free fd from 10.
-	Connect { addr: SocketAddr, deadline: Option<u64> },
+	/// Connect to `addr`, the socket going to the lowest free fd from
+	/// `from` (zsh `zfmovefd`, [`crate::bash::vm::jobctl::zsh_movefd_from`]).
+	Connect { addr: SocketAddr, deadline: Option<u64>, from: i32 },
 	/// One write of `data` to an fd (zftp `write`), timing out after
 	/// `timeout` seconds (0: never).
 	Write { fd: i32, data: BString, timeout: u32 },
@@ -96,10 +97,12 @@ pub enum ZftpOp {
 	/// Whether the control connection has input waiting (zsh `poll` with a
 	/// zero timeout).
 	Poll { fd: i32 },
-	/// Listen on `addr` (port 0) for the server's data connection.
-	Listen { addr: SocketAddr },
-	/// Accept the data connection on listening fd `fd` and close that fd.
-	Accept { fd: i32 },
+	/// Listen on `addr` (port 0) for the server's data connection, the
+	/// socket going to the lowest free fd from `from`.
+	Listen { addr: SocketAddr, from: i32 },
+	/// Accept the data connection on listening fd `fd` and close that fd;
+	/// the connection goes to the lowest free fd from `from`.
+	Accept { fd: i32, from: i32 },
 	/// Close an fd.
 	Close { fd: i32 },
 	/// The abort sequence: `IAC IP IAC` in band, `SYNCH` out of band.
@@ -331,15 +334,15 @@ const fn inet(a: &SockAddr) -> Option<SocketAddr> {
 }
 
 /// Put a connected or listening socket into the fd table at the lowest
-/// free fd from 10 (zsh `zfmovefd`), close-on-exec.
-fn install(cx: &mut Cx<'_>, vp: &mut Vproc, file: Box<dyn File>) -> SockInfo {
+/// free fd from `from` (zsh `zfmovefd`), close-on-exec.
+fn install(cx: &mut Cx<'_>, vp: &mut Vproc, file: Box<dyn File>, from: i32) -> SockInfo {
 	let (local, peer) = match (file.os_handle(), cx.host.sockets()) {
 		(Some(h), Some(s)) => {
 			(s.local_addr(h).ok().as_ref().and_then(inet), s.peer_addr(h).ok().as_ref().and_then(inet))
 		},
 		_ => (None, None),
 	};
-	let fd = vp.fds.lowest_free(10);
+	let fd = vp.fds.lowest_free(from);
 	let r = FdRef::open(file, FdOrigin::Host);
 	r.set_flags(FdFlags::CLOEXEC);
 	vp.fds.set(fd, Some(r));
@@ -436,7 +439,7 @@ pub fn perform(
 				Poll::Pending => return Err(WaitKey::Fs { op: FsOp::Open, path: host.clone() }),
 			}
 		},
-		ZftpOp::Connect { addr, deadline } => {
+		ZftpOp::Connect { addr, deadline, from } => {
 			let l = live(sc);
 			if expired(tcx, cx, l, *deadline) {
 				return Ok(ZftpAns::Sock(Err(Fail::timeout())));
@@ -458,7 +461,7 @@ pub fn perform(
 				},
 			};
 			match polled {
-				Poll::Ready(Ok(file)) => ZftpAns::Sock(Ok(install(cx, vp, file))),
+				Poll::Ready(Ok(file)) => ZftpAns::Sock(Ok(install(cx, vp, file, *from))),
 				Poll::Ready(Err(e)) => ZftpAns::Sock(Err(Fail::of(&e))),
 				Poll::Pending => {
 					return Err(WaitKey::Fs { op: FsOp::Open, path: BString::from(addr.to_string()) });
@@ -589,12 +592,12 @@ pub fn perform(
 			}
 			ZftpAns::Polled(Ok(h.poll_read(tcx, &mut []).is_ready()))
 		},
-		ZftpOp::Listen { addr } => {
+		ZftpOp::Listen { addr, from } => {
 			let Some(s) = cx.host.sockets() else {
 				return Ok(ZftpAns::Listen(Err((0, Fail::of(&unsupported())))));
 			};
 			match s.listen(&SockAddr::Inet(*addr), 1) {
-				Ok(file) => ZftpAns::Listen(Ok(install(cx, vp, file))),
+				Ok(file) => ZftpAns::Listen(Ok(install(cx, vp, file, *from))),
 				Err(e) => {
 					let stage = match e.stage {
 						ListenStage::Socket => 0,
@@ -605,7 +608,7 @@ pub fn perform(
 				},
 			}
 		},
-		ZftpOp::Accept { fd } => {
+		ZftpOp::Accept { fd, from } => {
 			let l = live(sc);
 			let polled = match &mut l.step {
 				Step::Accept(fut) => fut.poll(tcx),
@@ -628,7 +631,7 @@ pub fn perform(
 					// The listening socket goes first (zsh `zfclosedata` after
 					// `accept`), so the data socket may take its fd.
 					vp.fds.set(*fd, None);
-					Ok(install(cx, vp, acc.file))
+					Ok(install(cx, vp, acc.file, *from))
 				},
 				Poll::Ready(Err(e)) => {
 					vp.fds.set(*fd, None);

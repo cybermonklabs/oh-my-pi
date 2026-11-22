@@ -2,8 +2,8 @@
 
 use crate::{
 	bash::{
-		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		Script, Shell, SigTarget, Signal, StateStore, Step, store::BlobSlot,
+		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, ModeId, RestoreError,
+		RestoreOpts, Script, Shell, ShellInit, SigTarget, Signal, StateStore, Step, store::BlobSlot,
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -171,4 +171,100 @@ fn restore_drop_frames_abandons_the_running_script_with_255() {
 		shell.step(&mut Cx { host: &mut host, store: &mut store }, Budget::default()),
 		Step::Done { run, status: 255 } if run == id
 	));
+}
+
+/// A zsh shell running `-c` strings: zsh keeps its own input at fd 10, so
+/// the fds it hands out start at 11.
+fn zsh_init() -> ShellInit {
+	ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..skeleton_init(&[]) }
+}
+
+/// A zsh shell with a process substitution's reader parked on its pipe
+/// (`exec {w}> >(…)`), snapshot to the store: the reader allocates `{a}`
+/// once it reads a line, writing `child $a` to `/tmp/psn/out`.
+fn zsh_with_a_parked_procsub(
+	engine: &std::sync::Arc<Engine>,
+	host: &mut FakeHost,
+	store: &mut MemStore,
+) {
+	host.fs.add_dir("/tmp/psn");
+	let mut shell =
+		Shell::create(engine, &mut Cx { host: &mut *host, store: &mut *store }, zsh_init()).unwrap();
+	let id = shell.submit(Script::command(
+		&br#"kept=yes; exec {w}> >(read -r x; exec {a}</dev/null; print -r -- "child $a" > /tmp/psn/out)"#[..],
+	));
+	assert_eq!(advance(&mut shell, host, store, id, Budget::default()), Stop::Done(0));
+	shell
+		.externalize(&mut Cx { host: &mut *host, store: &mut *store })
+		.unwrap();
+}
+
+/// A process substitution's commands start without zsh's own fds (zsh
+/// `getproc`'s `closem`), and keep that across a snapshot: the restored
+/// reader's `{a}` is 10 where the shell's own `{b}` is 11, as zsh 5.9 gives
+/// under `-c`.
+#[test]
+fn a_process_substitution_keeps_zsh_s_own_fds_closed_across_a_restore() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	zsh_with_a_parked_procsub(&engine, &mut host, &mut store);
+	let (mut shell, _) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.unwrap();
+	let id = shell.submit(Script::command(
+		&br#"print go >&$w; exec {w}>&-; while [[ ! -s /tmp/psn/out ]]; do :; done; exec {b}</dev/null; print -r -- "$(</tmp/psn/out) parent $b""#[..],
+	));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(0));
+	assert_eq!(String::from_utf8_lossy(&host.stdout.bytes()), "child 10 parent 11\n");
+}
+
+/// Frames written under the previous frames version, holding a process
+/// substitution's reader (whose closed fds the image now records), are
+/// refused as another build's and never migrated. With `drop_frames` they
+/// are discarded: the root store state stays.
+#[test]
+fn restore_refuses_previous_version_frames_holding_a_process_substitution() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	zsh_with_a_parked_procsub(&engine, &mut host, &mut store);
+	let mut blob = store.get_blob(BlobSlot::Frames).unwrap().unwrap();
+	// The postcard header: the magic, then the IR and frames versions, each
+	// one varint byte below 128.
+	assert_eq!(&blob[..4], b"OBF1");
+	assert_eq!(u32::from(blob[4]), crate::bash::ir::IR_VERSION);
+	let version = blob[5];
+	assert!((1..0x80).contains(&version), "frames version byte {version}");
+	blob[5] = version - 1;
+	store.put_blob(BlobSlot::Frames, &blob).unwrap();
+	let err = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.err();
+	assert!(
+		matches!(err, Some(RestoreError::Incompatible { why: Incompatibility::Build })),
+		"frames of version {} are refused: {err:?}",
+		version - 1
+	);
+	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_some(), "a refused restore keeps the blob");
+	let (mut shell, _) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
+			drop_frames: true,
+			..RestoreOpts::default()
+		})
+		.unwrap();
+	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_none(), "restore consumes the blob");
+	let next = shell.submit(Script::command(&b"echo \"kept=$kept\""[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, Budget::default()), Stop::Done(0));
+	assert!(
+		host.stdout.bytes().ends_with(b"kept=yes\n"),
+		"the root store state stays: {:?}",
+		String::from_utf8_lossy(&host.stdout.bytes())
+	);
 }

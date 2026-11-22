@@ -202,6 +202,12 @@ pub struct VprocZsh {
 	/// `filelist`). A subshell starts without.
 	#[serde(default)]
 	pub tempfiles:          Vec<(u32, BString)>,
+	/// The shell's own fds from 10 (`SHTTY`, `SHIN`) are closed here: zsh
+	/// `closem` in the child of a process substitution or `=(…)`. Its fds
+	/// from 10 are free to hand out ([`super::jobctl::zsh_own_fds`]); a
+	/// subshell starts with it.
+	#[serde(default)]
+	pub own_fds_closed:     bool,
 	/// The code (and line) of a glob's shell-code qualifier to run above
 	/// the op that returned [`Flow::Call`](super::exec::Flow::Call) for it
 	/// (zsh `qualsheval`); pushed by the run loop, which drops it when the
@@ -235,6 +241,7 @@ impl VprocZsh {
 			&& self.curses.is_none()
 			&& self.zexit.is_none()
 			&& !self.exit_from_function
+			&& !self.own_fds_closed
 			&& self.last_math.is_none()
 			&& self.glob_hook.is_none()
 	}
@@ -1347,7 +1354,7 @@ pub enum PendingSub {
 	/// `${ ;}` / `${| ;}`: a `NoFork` frame above this one.
 	NoFork { capture: Capture, value: bool },
 	/// A zsh hook function call run in the current shell
-	/// ([`crate::bash::vm::expand::Stop::ZshSub::here`]): a script frame
+	/// ([`crate::bash::vm::expand::ZshSubRun::Here`]): a script frame
 	/// above this one; `status` is the caller's `$?`, put back when it ends.
 	Here { status: i32 },
 	/// A zsh user math function's shell function run in the current shell

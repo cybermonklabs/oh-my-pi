@@ -41,7 +41,7 @@ use crate::bash::{
 	store::Attrs,
 	syntax::{NO_ALIASES, ParseError, Parser, Pos},
 	vm::{
-		ProcState, exec,
+		ProcState, exec, jobctl,
 		proc::{Ctty, Probe, ProbeResult, Vproc},
 		set_subshell_depth, state, subshell_depth,
 		zsh::params,
@@ -598,7 +598,8 @@ fn newptycmd(
 	ctx.k
 		.emit_op(ctx.cx, ctx.vp, 0, EventData::Subshell { child: vpid });
 	ctx.k.spawned.push(Box::new(child));
-	let fd = ctx.vp.fds.lowest_free(10);
+	let from = jobctl::zsh_movefd_from(ctx.k, ctx.cx.store, ctx.vp);
+	let fd = ctx.vp.fds.lowest_free(from);
 	ctx.vp.fds.set(fd, Some(master));
 	let owner = ctx.vp.vpid;
 	table_mut(ctx.vp).cmds.insert(0, PtyCmd {

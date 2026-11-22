@@ -4081,10 +4081,10 @@ fn builtin_zsh_stop(
 	stop: Stop,
 ) -> Option<Flow> {
 	let flow = match stop {
-		Stop::ZshSub { text, here } => {
+		Stop::ZshSub { text, run } => {
 			// A call run here pushes its frame above the builtin's.
 			let fi = vp.frames.len() - 1;
-			let flow = exec::start_zsh_sub(k, vp, cx, &mut sc, &text, here, line);
+			let flow = exec::start_zsh_sub(k, vp, cx, &mut sc, &text, run, line);
 			vp.frames[fi].scratch = Some(sc);
 			return Some(flow);
 		},

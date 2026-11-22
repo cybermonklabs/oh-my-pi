@@ -37,7 +37,7 @@ use crate::bash::{
 	},
 	vm::{
 		builtins::zsh_quote,
-		expand::{Expander, Stop, X},
+		expand::{Expander, Stop, X, ZshSubRun},
 		proc::Atom,
 		state,
 	},
@@ -339,9 +339,9 @@ fn once(
 }
 
 /// zsh `getoutput`: the output of the command substitution `body` (raw
-/// zsh source, metafied). On the first pass it parks the op
-/// ([`Stop::ZshSub`]); on the replay it is the logged output.
-pub(super) fn getoutput(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Vec<u8>> {
+/// zsh source, metafied) run as `run` says. On the first pass it parks the
+/// op ([`Stop::ZshSub`]); on the replay it is the logged output.
+pub(super) fn getoutput(ex: &mut Expander<'_, '_>, body: &[u8], run: ZshSubRun) -> X<Vec<u8>> {
 	let atom = if ex.record {
 		replay(ex)
 	} else {
@@ -355,14 +355,14 @@ pub(super) fn getoutput(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Vec<u8>> {
 			ex.vp.status = status;
 			Ok(out.to_vec())
 		},
-		_ => Err(Stop::ZshSub { text: BString::from(unmetafy(body)), here: false }),
+		_ => Err(Stop::ZshSub { text: BString::from(unmetafy(body)), run }),
 	}
 }
 
 /// zsh `subst_string_by_func`'s call of hook function code `call` (raw zsh
 /// source, metafied) in the current shell: its status, once it has run (the
-/// first pass parks the op, [`Stop::ZshSub`] with `here`; the replay reads
-/// the logged status). The caller's `$?` is kept.
+/// first pass parks the op, [`Stop::ZshSub`] with [`ZshSubRun::Here`]; the
+/// replay reads the logged status). The caller's `$?` is kept.
 pub(super) fn call_here(ex: &mut Expander<'_, '_>, call: &[u8]) -> X<i32> {
 	let atom = if ex.record {
 		replay(ex)
@@ -373,7 +373,7 @@ pub(super) fn call_here(ex: &mut Expander<'_, '_>, call: &[u8]) -> X<i32> {
 	};
 	match atom {
 		Some(Atom::Sub { status, .. }) => Ok(status),
-		_ => Err(Stop::ZshSub { text: BString::from(unmetafy(call)), here: true }),
+		_ => Err(Stop::ZshSub { text: BString::from(unmetafy(call)), run: ZshSubRun::Here }),
 	}
 }
 
@@ -836,7 +836,7 @@ fn comsubst(
 		}
 		k += 1;
 	}
-	let out = getoutput(ex, &b)?;
+	let out = getoutput(ex, &b, ZshSubRun::Fork)?;
 	let mut words = readoutput(ex, &out, qt || pf_flags & PREFORK_SINGLE != 0)?;
 	let prefix = head(&w, i).to_vec();
 	let rest = tail(&w, end).to_vec();
@@ -936,7 +936,7 @@ fn getoutputfile(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Vec<u8>> {
 		s
 	} else {
 		let (status, sub_status) = (ex.vp.status, ex.sub_status);
-		let out = getoutput(ex, body)?;
+		let out = getoutput(ex, body, ZshSubRun::File)?;
 		ex.vp.status = status;
 		ex.sub_status = sub_status.map(|_| 0);
 		out

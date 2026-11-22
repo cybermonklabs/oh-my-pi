@@ -12,7 +12,7 @@ use bstr::{BStr, BString, ByteSlice};
 
 use super::{
 	Cx, Kernel, assign_scope, builtins, command,
-	expand::{self, Expander, Stop},
+	expand::{self, Expander, Stop, ZshSubRun},
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
@@ -2074,10 +2074,10 @@ fn stopped(
 	stop: Stop,
 ) -> Flow {
 	match stop {
-		Stop::ZshSub { text, here } => {
+		Stop::ZshSub { text, run } => {
 			// A call run here pushes its frame above this op's.
 			let fi = vp.frames.len() - 1;
-			let flow = start_zsh_sub(k, vp, cx, &mut sc, &text, here, line);
+			let flow = start_zsh_sub(k, vp, cx, &mut sc, &text, run, line);
 			vp.frames[fi].scratch = Some(sc);
 			flow
 		},
@@ -2375,22 +2375,23 @@ pub fn start_sub(
 }
 
 /// Start a zsh command substitution: `text` (zsh source, the body of
-/// `$(…)` or `` `…` ``) parsed in the vproc's mode and run in a forked
-/// child vproc whose standard output is captured (zsh `getoutput`).
-/// `here` ([`Stop::ZshSub::here`]): a hook function call zsh makes from an
-/// expansion (`subst_string_by_func`) runs in the current shell instead,
-/// above the op's frame, its output uncaptured; the logged substitution
-/// is its status.
+/// `$(…)`, `` `…` `` or `=(…)`) parsed in the vproc's mode and run in a
+/// forked child vproc whose standard output is captured (zsh `getoutput`);
+/// the child of `=(…)` starts without the shell's own fds (zsh
+/// `getoutputfile`'s `closem`). [`ZshSubRun::Here`]: a hook function call
+/// zsh makes from an expansion (`subst_string_by_func`) runs in the current
+/// shell instead, above the op's frame, its output uncaptured; the logged
+/// substitution is its status.
 pub fn start_zsh_sub(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	sc: &mut Scratch,
 	text: &[u8],
-	here: bool,
+	run: ZshSubRun,
 	line: u32,
 ) -> Flow {
-	if here {
+	if run == ZshSubRun::Here {
 		sc.sub = Some(PendingSub::Here { status: vp.status });
 		push_script(vp, text, line, ScriptKind::Hook);
 		return Flow::Call;
@@ -2399,6 +2400,9 @@ pub fn start_zsh_sub(
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	if run == ZshSubRun::File {
+		child.zsh.get_or_insert_with(Box::default).own_fds_closed = true;
+	}
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
@@ -2448,14 +2452,16 @@ pub fn start_zsh_procsub(
 	let (mine, theirs, their_fd) = if output { (w, r, 0) } else { (r, w, 1) };
 	// zsh `mpipe`: both ends of the pipe move to fds ≥ 10; the shell keeps
 	// the read end of `<(…)` and the write end of `>(…)`.
-	let (read_fd, write_fd) = super::jobctl::zsh_pipe_fds(k, vp);
+	let (read_fd, write_fd) = super::jobctl::zsh_pipe_fds(k, cx.store, vp);
 	let fd = if output { write_fd } else { read_fd };
 	// The other substitutions' fds stay open in the child (zsh `getproc`'s
-	// `closem` spares `FDT_PROC_SUBST`): its words may name them.
+	// `closem` spares `FDT_PROC_SUBST`): its words may name them. The
+	// shell's own fds do not.
 	let mut fds = vp.fds.clone();
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	child.zsh.get_or_insert_with(Box::default).own_fds_closed = true;
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}

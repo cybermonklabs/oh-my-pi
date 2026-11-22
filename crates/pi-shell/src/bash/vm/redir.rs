@@ -369,7 +369,7 @@ fn target_fd(
 				return var_fd(k, vp, cx, name)
 					.ok_or_else(|| Diag::AmbiguousRedirect { word: name.clone() });
 			}
-			let fd = super::jobctl::lowest_free_fd(k, vp, 10);
+			let fd = super::jobctl::lowest_free_fd(k, cx.store, vp, 10);
 			assign_fd_var(k, vp, cx, name, fd, line)?;
 			Ok(fd)
 		},
@@ -527,7 +527,7 @@ fn install(
 			// readonly one leaves the file created); a parked open keeps
 			// its slot free, so the fd is the same on resume.
 			let fd = match &r.fd {
-				RedirFdIr::Var(_) => super::jobctl::lowest_free_fd(k, vp, 10),
+				RedirFdIr::Var(_) => super::jobctl::lowest_free_fd(k, cx.store, vp, 10),
 				_ => target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?,
 			};
 			// bash moves a `{var}` fd to 10 or above with `F_DUPFD`, which
@@ -934,7 +934,7 @@ fn zsh_target_fd(
 					name.as_bstr()
 				)));
 			}
-			Ok(super::jobctl::lowest_free_fd(k, vp, 10))
+			Ok(super::jobctl::lowest_free_fd(k, cx.store, vp, 10))
 		},
 	}
 }

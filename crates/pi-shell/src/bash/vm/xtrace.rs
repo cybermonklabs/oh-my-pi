@@ -143,7 +143,7 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 
 /// Queue `bytes` (a whole trace line, or zsh's pieces of one) for the
 /// trace output.
-pub fn write(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, bytes: Vec<u8>) {
+pub fn write(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, bytes: Vec<u8>) {
 	let fd = trace_fd(k, cx, vp);
 	vp.out
 		.push_back(PendingWrite { fd, bytes: BString::from(bytes), off: 0 });
@@ -231,9 +231,10 @@ pub fn quote_tokenized(s: &[u8]) -> Vec<u8> {
 /// Where trace output goes. bash: `BASH_XTRACEFD` when it names an open
 /// descriptor, else 2. zsh ([`zsh_trace_fd`]): the standard error the
 /// command running a `.`/`eval` had before its redirections.
-fn trace_fd(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> i32 {
+fn trace_fd(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> i32 {
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-		return zsh_trace_fd(vp);
+		let movefd_from = |vp: &Vproc| super::jobctl::zsh_movefd_from(k, cx.store, vp);
+		return zsh_trace_fd(vp, movefd_from);
 	}
 	state::lookup(&k.root, cx.store, vp, b"BASH_XTRACEFD")
 		.ok()
@@ -248,9 +249,9 @@ fn trace_fd(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> i32 {
 /// the standard error it had before them for the trace of what it runs
 /// (`.`, `eval`), the outermost such command since the innermost function
 /// call (`execshfunc` resets it to the standard error). The copy is put at
-/// a free descriptor ≥ 10 (zsh `movefd`, `FDT_XTRACE`), closed with the
-/// command's own redirections.
-fn zsh_trace_fd(vp: &mut Vproc) -> i32 {
+/// the lowest free descriptor from `movefd_from` (zsh `movefd`,
+/// `FDT_XTRACE`), closed with the command's own redirections.
+fn zsh_trace_fd(vp: &mut Vproc, movefd_from: impl FnOnce(&Vproc) -> i32) -> i32 {
 	let mut found = None;
 	for i in (0..vp.frames.len().saturating_sub(1)).rev() {
 		if matches!(vp.frames[i + 1].kind, FrameKind::Function { .. }) {
@@ -265,7 +266,11 @@ fn zsh_trace_fd(vp: &mut Vproc) -> i32 {
 			found = Some(i);
 		}
 	}
-	let Some(io) = found.and_then(|i| vp.frames[i].scratch.as_mut()?.io.as_mut()) else {
+	let Some(i) = found else {
+		return 2;
+	};
+	let from = movefd_from(vp);
+	let Some(io) = vp.frames[i].scratch.as_mut().and_then(|sc| sc.io.as_mut()) else {
 		return 2;
 	};
 	// Closed before the redirections: the trace goes nowhere.
@@ -284,7 +289,7 @@ fn zsh_trace_fd(vp: &mut Vproc) -> i32 {
 	{
 		return s.fd;
 	}
-	let fd = vp.fds.lowest_free(10);
+	let fd = vp.fds.lowest_free(from);
 	vp.fds.set(fd, Some(prev));
 	io.saved.push(Saved { fd, prev: None });
 	fd

@@ -43,8 +43,9 @@ use crate::bash::{
 pub enum FdSlot {
 	/// Exactly this fd (zsh `redup`): what it held is closed.
 	At(i32),
-	/// The lowest closed fd at or above this one: zsh's `movefd` (≥ 10)
-	/// or a fresh `socket(2)`/`accept(2)` descriptor (≥ 0).
+	/// The lowest closed fd at or above this one: zsh's `movefd` (from
+	/// [`super::jobctl::zsh_movefd_from`]) or a fresh `socket(2)`/`accept(2)`
+	/// descriptor (≥ 0).
 	Free(i32),
 }
 
@@ -85,7 +86,7 @@ pub enum FdProbe {
 	},
 	/// zsh `zsystem flock`: open absolute `path` (read-write for an
 	/// exclusive lock, read-only for a shared one), lock the whole file
-	/// and install it at the lowest free fd ≥ 10 with `fd_flags`. Without
+	/// and install it into `slot` (zsh `movefd`) with `fd_flags`. Without
 	/// `timeout_ns` it waits as long as it takes, retrying every
 	/// `interval_ns`; `Some(0)` tries once; otherwise it retries every
 	/// `interval_ns` until the timeout.
@@ -94,6 +95,7 @@ pub enum FdProbe {
 		write:       bool,
 		timeout_ns:  Option<u64>,
 		interval_ns: u64,
+		slot:        FdSlot,
 		fd_flags:    FdFlags,
 	},
 	/// Connect a stream socket to `addr` into `slot`.
@@ -251,10 +253,15 @@ pub fn perform(
 			let r = FdRef::open(file, FdOrigin::Host);
 			Ok(FdAnswer::Opened { fd: install(vp, *slot, r, *fd_flags), peer: None })
 		},
-		FdProbe::Lock { path, write, timeout_ns, interval_ns, fd_flags } => {
+		FdProbe::Lock { path, write, timeout_ns, interval_ns, slot, fd_flags } => {
 			let owner = (Arc::as_ptr(&k.ctl).addr(), vp.vpid.0);
-			let how =
-				LockHow { write: *write, timeout_ns: *timeout_ns, interval_ns: *interval_ns, owner };
+			let how = LockHow {
+				write: *write,
+				timeout_ns: *timeout_ns,
+				interval_ns: *interval_ns,
+				slot: *slot,
+				owner,
+			};
 			lock(tcx, cx, vp, sc, path, how, *fd_flags)
 		},
 		FdProbe::Connect { addr, slot } => {
@@ -641,6 +648,8 @@ struct LockHow {
 	write:       bool,
 	timeout_ns:  Option<u64>,
 	interval_ns: u64,
+	/// Where the locked file's fd goes.
+	slot:        FdSlot,
 	/// The shell and vproc asking ([`Holder::owner`]).
 	owner:       (usize, u32),
 }
@@ -655,7 +664,7 @@ fn lock(
 	how: LockHow,
 	fd_flags: FdFlags,
 ) -> Result<FdAnswer, WaitKey> {
-	let LockHow { write, timeout_ns, interval_ns, owner } = how;
+	let LockHow { write, timeout_ns, interval_ns, slot, owner } = how;
 	let wait = WaitKey::Fs { op: FsOp::Open, path: path.clone() };
 	// A retry timer still running: wait for it.
 	if let Live::Fd(live) = &mut sc.live
@@ -744,7 +753,7 @@ fn lock(
 					.lock()
 					.push(Holder { key, owner, exclusive: write, token, handle });
 			}
-			Ok(FdAnswer::Locked(Some(install(vp, FdSlot::Free(10), r, fd_flags))))
+			Ok(FdAnswer::Locked(Some(install(vp, slot, r, fd_flags))))
 		},
 		// zsh: without a timeout `F_SETLKW` waits; with `-t 0` a busy lock
 		// is a failure; with a timeout `EAGAIN`/`EACCES` retry.

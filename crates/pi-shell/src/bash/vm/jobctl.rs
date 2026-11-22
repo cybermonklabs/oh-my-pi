@@ -24,6 +24,7 @@
 
 use std::{
 	fmt::Write as _,
+	ops::Range,
 	task::{Context, Poll, Waker},
 };
 
@@ -41,7 +42,7 @@ use crate::bash::{
 	ids::{Dialect, JobId, Platform, Vpid},
 	ir::{Opcode, Unit},
 	signal::{SigSet, Signal},
-	store::{KeyBuf, OptId, TrapKey},
+	store::{KeyBuf, OptId, StateStore, TrapKey},
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
 };
@@ -1208,38 +1209,60 @@ fn print_settled(k: &mut Kernel, i: usize) {
 	}
 }
 
-/// The lowest fd ≥ `from` a `{var}` redirection or a module opens: in a zsh
-/// with its terminal open, fd 10 is the terminal's (zsh `movefd` puts
-/// `SHTTY` there), so the first one handed out is 11.
-pub fn lowest_free_fd(k: &Kernel, vp: &Vproc, from: i32) -> i32 {
-	free_fd(k, vp, from, &[])
+/// The lowest fd ≥ `from` a `{var}` redirection opens: zsh's own fds
+/// ([`zsh_own_fds`]) are not free.
+pub fn lowest_free_fd(k: &mut Kernel, store: &mut dyn StateStore, vp: &Vproc, from: i32) -> i32 {
+	let own = zsh_own_fds(k, store, vp);
+	free_fd(vp, from, &own, &[])
+}
+
+/// The fds from 10 a zsh keeps for itself, opened at start-up through
+/// `movefd` and so the first fds from 10: its terminal (`SHTTY`, zsh
+/// `init_io`) when it has one open, then its input (`SHIN`) when it runs a
+/// `-c` string (`/dev/null`, zsh `init_misc`) or a script file; reading its
+/// commands from standard input (`SHIN_STDIN`), `SHIN` is fd 0. The
+/// commands of a process substitution start without either (zsh `closem`
+/// in `getproc`, `getpipe` and `getoutputfile`). None outside zsh.
+pub fn zsh_own_fds(k: &mut Kernel, store: &mut dyn StateStore, vp: &Vproc) -> Range<i32> {
+	if vp.mode.dialect() != Dialect::Zsh || vp.zsh.as_ref().is_some_and(|z| z.own_fds_closed) {
+		return 10..10;
+	}
+	let shtty = i32::from(k.jobctl.shtty.is_some());
+	let shin = !state::zsh_option(&mut k.root, store, vp, ZshOpt::Shinstdin).unwrap_or(false);
+	10..10 + shtty + i32::from(shin)
+}
+
+/// zsh `movefd`: the fd it moves a new descriptor to is the lowest free one
+/// from here, past the shell's own ([`zsh_own_fds`]).
+pub fn zsh_movefd_from(k: &mut Kernel, store: &mut dyn StateStore, vp: &Vproc) -> i32 {
+	zsh_own_fds(k, store, vp).end
 }
 
 /// zsh `mpipe`: the fds of a new pipe's read and write ends. `pipe(2)`
 /// takes the two lowest closed fds, and `movefd` moves each one below 10 to
 /// the lowest free fd ≥ 10 ([`lowest_free_fd`]), the read end first.
-pub fn zsh_pipe_fds(k: &Kernel, vp: &Vproc) -> (i32, i32) {
-	let read = free_fd(k, vp, 0, &[]);
-	let write = free_fd(k, vp, 0, &[read]);
+pub fn zsh_pipe_fds(k: &mut Kernel, store: &mut dyn StateStore, vp: &Vproc) -> (i32, i32) {
+	let own = zsh_own_fds(k, store, vp);
+	let read = free_fd(vp, 0, &own, &[]);
+	let write = free_fd(vp, 0, &own, &[read]);
 	let read_moved = if read < 10 {
-		free_fd(k, vp, 10, &[read, write])
+		free_fd(vp, 10, &own, &[read, write])
 	} else {
 		read
 	};
 	let write_moved = if write < 10 {
-		free_fd(k, vp, 10, &[read_moved, write])
+		free_fd(vp, 10, &own, &[read_moved, write])
 	} else {
 		write
 	};
 	(read_moved, write_moved)
 }
 
-/// The lowest closed fd ≥ `from` that is not in `taken` nor the zsh
-/// terminal's fd 10 ([`lowest_free_fd`]).
-fn free_fd(k: &Kernel, vp: &Vproc, from: i32, taken: &[i32]) -> i32 {
-	let shtty = k.jobctl.shtty.is_some() && vp.mode.dialect() == Dialect::Zsh;
+/// The lowest closed fd ≥ `from` that is neither the shell's `own` nor in
+/// `taken`.
+fn free_fd(vp: &Vproc, from: i32, own: &Range<i32>, taken: &[i32]) -> i32 {
 	(from..i32::MAX)
-		.find(|&fd| vp.fds.get(fd).is_none() && !taken.contains(&fd) && !(shtty && fd == 10))
+		.find(|&fd| vp.fds.get(fd).is_none() && !own.contains(&fd) && !taken.contains(&fd))
 		.unwrap_or(from)
 }
 

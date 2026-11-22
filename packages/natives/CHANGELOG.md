@@ -5,6 +5,7 @@
 ### Fixed
 
 - In zsh mode a process substitution is named as zsh names it, `/proc/self/fd/N` on Linux (`/dev/fd/N` on macOS and Windows), N being the fd zsh takes for the shell's end of the pipe: the lowest free fds from 10, the read end for `<(…)` and the write end for `>(…)`. It was bash's `/dev/fd/63`, counting down. bash mode is unchanged.
+- In zsh mode the fds the shell hands out from 10 (`{var}` redirections, process substitutions, `sysopen`, `zsystem flock`, `zsocket -l`, `ztcp -l`, `zpty`, `zftp` and the trace output's copy) skip the ones zsh keeps for itself, as zsh does: its terminal, and its input when it runs a `-c` string or a script file. A process substitution's or `=(…)`'s commands start without them. Under `-c` the first `{var}` fd is now 11, as in zsh; reading commands from standard input it stays 10. Saved frames of the previous version are refused.
 
 ## [18.18.6] - 2026-11-09
 

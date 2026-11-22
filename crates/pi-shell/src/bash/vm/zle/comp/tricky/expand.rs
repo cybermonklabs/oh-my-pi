@@ -71,9 +71,9 @@ where
 				sc.recycle();
 				return k(zw, sc, Ok(v));
 			},
-			Err(Stop::ZshSub { text, here }) => {
+			Err(Stop::ZshSub { text, run: how }) => {
 				let depth = zw.vp.frames.len();
-				match start_zsh_sub(zw.k, zw.vp, zw.cx, &mut sc, &text, here, 0) {
+				match start_zsh_sub(zw.k, zw.vp, zw.cx, &mut sc, &text, how, 0) {
 					Flow::Block(key) => return then(Await::Wait(key), move |zw, _| run(zw, sc, f, k)),
 					Flow::Call => return then(Await::Frame { depth }, move |zw, _| run(zw, sc, f, k)),
 					_ => {
