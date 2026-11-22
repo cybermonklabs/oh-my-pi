@@ -52,6 +52,7 @@ import {
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { sanitizeText, TempDir } from "@oh-my-pi/pi-utils";
@@ -4154,8 +4155,8 @@ describe("lsp regressions", () => {
 		return reads;
 	}
 
-	const tooManyDirectories =
-		"Error: directory contains more than 10000 directories, counting each path through a link; rename in smaller batches to keep LSP edits accurate";
+	const walkTooBig =
+		"Error: directory contains more than 10000 directories or 20000 entries, counting each path through a link; rename in smaller batches to keep LSP edits accurate";
 
 	it("rename_file of a directory whose links fan out refuses at 10,000 directory reads, and moves nothing", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-fan-out-");
@@ -4178,7 +4179,7 @@ describe("lsp regressions", () => {
 			const { outcome, renamed } = await renameDirectory(tempDir.path());
 
 			expect(outcome).toMatchObject({
-				content: [{ text: tooManyDirectories }],
+				content: [{ text: walkTooBig }],
 				details: { action: "rename_file", success: false },
 			});
 			expect(reads.count).toBeLessThanOrEqual(10_000);
@@ -4189,13 +4190,13 @@ describe("lsp regressions", () => {
 		}
 	}, 60_000);
 
-	it("rename_file of a directory holding 10,000 directories renames it, and one of 10,001 refuses", async () => {
+	it("rename_file of the widest tree the limits allow (1,000 files, 10,000 directories) renames it, and one directory more refuses", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-wide-");
 		try {
-			// `old`, 99 directories under it, and 100 under each of those, with one file.
+			// `old` with 1,000 files, 99 directories under it, and 100 under each of those: 10,999
+			// entries, well under the entry limit.
 			const srcDir = path.join(tempDir.path(), "old");
-			fs.mkdirSync(srcDir);
-			fs.writeFileSync(path.join(srcDir, "a.ts"), "export const a = 1;\n");
+			fillDirectory(srcDir, 1_000);
 			for (let top = 0; top < 99; top++) {
 				for (let inner = 0; inner < 100; inner++) {
 					fs.mkdirSync(path.join(srcDir, `t${top}`, `i${inner}`), { recursive: true });
@@ -4204,7 +4205,7 @@ describe("lsp regressions", () => {
 			// 1 + 99 + 99 * 100 = 10,000 directories.
 			const renamedOk = await renameDirectory(tempDir.path());
 			expect(renamedOk.outcome).toMatchObject({ details: { action: "rename_file", success: true } });
-			expect(renamedOk.renamed).toEqual(["old/a.ts"]);
+			expect(renamedOk.renamed).toHaveLength(1_000);
 
 			// Back again, with one more directory: 10,001.
 			vi.restoreAllMocks();
@@ -4212,7 +4213,7 @@ describe("lsp regressions", () => {
 			fs.mkdirSync(path.join(srcDir, "extra"));
 			const refused = await renameDirectory(tempDir.path());
 			expect(refused.outcome).toMatchObject({
-				content: [{ text: tooManyDirectories }],
+				content: [{ text: walkTooBig }],
 				details: { action: "rename_file", success: false },
 			});
 			expect(refused.renamed).toEqual([]);
@@ -4221,6 +4222,156 @@ describe("lsp regressions", () => {
 			tempDir.removeSync();
 		}
 	}, 120_000);
+
+	/**
+	 * `old` holding `a.ts` and two links to `ext/d1`, each `ext/dI` two links to the next (13
+	 * directories reached by 16,383 paths), and `fill` run on each of the 14 directories.
+	 */
+	function linkChain(root: string, fill: (dir: string) => void): string {
+		const srcDir = path.join(root, "old");
+		const ext = path.join(root, "ext");
+		fs.mkdirSync(srcDir);
+		fs.writeFileSync(path.join(srcDir, "a.ts"), "export const a = 1;\n");
+		for (let index = 1; index <= 13; index++) fs.mkdirSync(path.join(ext, `d${index}`), { recursive: true });
+		for (const name of ["a", "b"]) {
+			fs.symlinkSync("../ext/d1", path.join(srcDir, name));
+			for (let index = 1; index < 13; index++) fs.symlinkSync(`../d${index + 1}`, path.join(ext, `d${index}`, name));
+		}
+		for (const dir of [srcDir, ...Array.from({ length: 13 }, (_, index) => path.join(ext, `d${index + 1}`))])
+			fill(dir);
+		return srcDir;
+	}
+
+	/** Counts the directory entries a `rename_file` walk reads (it reads with `fs.promises.readdir`). */
+	function countEntriesRead(): { entries: number } {
+		const read = { entries: 0 };
+		const realReaddir = fs.promises.readdir;
+		vi.spyOn(fs.promises, "readdir").mockImplementation((async (...args: unknown[]) => {
+			const entries = (await Reflect.apply(realReaddir, fs.promises, args)) as unknown[];
+			read.entries += entries.length;
+			return entries;
+		}) as never);
+		return read;
+	}
+
+	// Each directory of the chain holds 1,000 entries that are neither files nor directories: the
+	// walk reads them through every path, and is refused once it has read 20,000 (one directory's
+	// read, 1,002 entries, can pass the limit).
+	for (const [kind, fill] of [
+		[
+			"links to /dev/null",
+			(dir: string) => {
+				for (let index = 0; index < 1_000; index++) fs.symlinkSync("/dev/null", path.join(dir, `n${index}`));
+			},
+		],
+		[
+			"dangling links",
+			(dir: string) => {
+				for (let index = 0; index < 1_000; index++) fs.symlinkSync("missing", path.join(dir, `n${index}`));
+			},
+		],
+		[
+			"FIFOs",
+			(dir: string) => {
+				const names = Array.from({ length: 1_000 }, (_, index) => `n${index}`);
+				const made = Bun.spawnSync(["mkfifo", ...names], { cwd: dir });
+				if (made.exitCode !== 0) throw new Error(`mkfifo failed: ${made.stderr.toString()}`);
+			},
+		],
+	] as const) {
+		it(`rename_file of a directory whose linked directories hold 1,000 ${kind} each refuses past 20,000 entries`, async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-rename-entries-");
+			try {
+				const srcDir = linkChain(tempDir.path(), fill);
+				const read = countEntriesRead();
+
+				const { outcome, renamed } = await renameDirectory(tempDir.path());
+
+				expect(outcome).toMatchObject({
+					content: [{ text: walkTooBig }],
+					details: { action: "rename_file", success: false },
+				});
+				expect(read.entries).toBeLessThanOrEqual(20_000 + 1_002);
+				expect(renamed).toEqual([]);
+				expect(fs.existsSync(srcDir)).toBe(true);
+			} finally {
+				tempDir.removeSync();
+			}
+		}, 60_000);
+	}
+
+	it("rename_file of a directory of 20,000 entries renames it, and one of 20,001 refuses", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-entry-limit-");
+		try {
+			// `old` holds `a.ts` and 19,999 dangling links: 20,000 entries.
+			const srcDir = path.join(tempDir.path(), "old");
+			fs.mkdirSync(srcDir);
+			fs.writeFileSync(path.join(srcDir, "a.ts"), "export const a = 1;\n");
+			for (let index = 0; index < 19_999; index++) fs.symlinkSync("missing", path.join(srcDir, `n${index}`));
+			const renamedOk = await renameDirectory(tempDir.path());
+			expect(renamedOk.outcome).toMatchObject({ details: { action: "rename_file", success: true } });
+			expect(renamedOk.renamed).toEqual(["old/a.ts"]);
+
+			// Back again, with one entry more: 20,001.
+			vi.restoreAllMocks();
+			fs.renameSync(path.join(tempDir.path(), "new"), srcDir);
+			fs.symlinkSync("missing", path.join(srcDir, "n19999"));
+			const refused = await renameDirectory(tempDir.path());
+			expect(refused.outcome).toMatchObject({
+				content: [{ text: walkTooBig }],
+				details: { action: "rename_file", success: false },
+			});
+			expect(refused.renamed).toEqual([]);
+			expect(fs.existsSync(srcDir)).toBe(true);
+		} finally {
+			tempDir.removeSync();
+		}
+	}, 60_000);
+
+	it("rename_file of a directory reports the call's deadline during its listing as a timeout, and a cancel as a cancel", async () => {
+		for (const ending of ["deadline", "cancel"] as const) {
+			const tempDir = TempDir.createSync(`@omp-lsp-rename-${ending}-in-listing-`);
+			try {
+				const srcDir = path.join(tempDir.path(), "old");
+				for (const file of [path.join(srcDir, "a.ts"), path.join(srcDir, "sub", "b.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// The call's deadline (`timeout: 5`) is a signal the test controls. Once `old` has been
+				// read, the deadline passes, or the caller cancels.
+				const deadline = new AbortController();
+				const caller = new AbortController();
+				const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+				vi.spyOn(AbortSignal, "timeout").mockImplementation(ms =>
+					ms === 5_000 ? deadline.signal : realTimeout(ms),
+				);
+				const realReaddir = fs.promises.readdir;
+				vi.spyOn(fs.promises, "readdir").mockImplementation((async (...args: unknown[]) => {
+					const entries = await Reflect.apply(realReaddir, fs.promises, args);
+					if (args[0] === srcDir) {
+						if (ending === "deadline") deadline.abort(new DOMException("timed out", "TimeoutError"));
+						else caller.abort();
+					}
+					return entries;
+				}) as never);
+
+				const { outcome } = await renameDirectory(tempDir.path(), caller.signal);
+
+				if (ending === "deadline") {
+					expect(outcome).toBeInstanceOf(ToolError);
+					expect((outcome as Error).message).toBe(
+						"LSP rename_file timed out after 5s. It was still listing the files under old, and nothing was renamed; pass timeout=<larger>, or rename in smaller batches.",
+					);
+				} else {
+					expect(outcome).toBeInstanceOf(ToolAbortError);
+				}
+				expect(fs.existsSync(srcDir)).toBe(true);
+			} finally {
+				vi.restoreAllMocks();
+				tempDir.removeSync();
+			}
+		}
+	});
 
 	it("rename_file of a directory stops listing it at the call's abort", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-aborted-listing-");

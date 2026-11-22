@@ -128,6 +128,18 @@ const MAX_RENAME_PAIRS = 1000;
  */
 const MAX_RENAME_DIRECTORIES = 10_000;
 
+/**
+ * The most directory entries a `rename_file` of a directory reads, counting each entry once per path
+ * that reaches its directory. The directory limit alone lets a few directories that each hold many
+ * entries no limit counts (links to `/dev/null`, dangling links, FIFOs) be read through many paths:
+ * a chain of 13 such directories, each with 1,000 links to `/dev/null`, kept a call busy for its
+ * whole 20 s deadline. Twice the directory limit, so every tree the other two limits allow (at
+ * most 1,000 files and 10,000 directories, 11,000 entries) fits with 9,000 entries to spare; and
+ * cheap at the bound: the worst entry is a link the walk follows with `stat`, about 40 µs each on
+ * runc, so the bound costs well under a second.
+ */
+const MAX_RENAME_ENTRIES = 20_000;
+
 /** File actions whose answer can draw on other open documents; those are synced from disk first. */
 const CROSS_FILE_ACTIONS: ReadonlySet<string> = new Set([...PROJECT_INDEXED_ACTIONS, "code_actions"]);
 
@@ -164,8 +176,9 @@ function isUntyped(entry: fs.Dirent): boolean {
  * to the directory it is in, or to any directory between it and `source`, names nothing and the
  * walk does not loop. Two paths to the same directory that is not on the path (`alias -> sub`)
  * are both walked, and both named. It stops once it has more files than it may list, or more
- * directories ({@link MAX_RENAME_DIRECTORIES}, so a tree whose links fan out ends fast), and
- * checks `signal` before each directory it reads and once more after the last.
+ * directories ({@link MAX_RENAME_DIRECTORIES}) or entries ({@link MAX_RENAME_ENTRIES}) through all
+ * paths, so a tree whose links fan out ends fast, and checks `signal` before each directory it
+ * reads and once more after the last.
  *
  * The recursive delete in `lsp/edits.ts` walks a tree too, but by the opposite rule: a delete
  * removes a link as itself and never what it points to, so that walk follows no link. The two
@@ -175,7 +188,7 @@ async function enumerateRenamePairs(
 	source: string,
 	dest: string,
 	signal: AbortSignal | undefined,
-): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded?: "files" | "directories" }> {
+): Promise<{ pairs: FileRenamePair[]; directory: boolean; exceeded?: "files" | "walk" }> {
 	const stat = await fs.promises.stat(source);
 	if (!stat.isDirectory()) {
 		return { pairs: [{ oldUri: fileToUri(source), newUri: fileToUri(dest) }], directory: false };
@@ -186,10 +199,12 @@ async function enumerateRenamePairs(
 	const directories: Array<{ relative: string; ancestors: string[] }> = [
 		{ relative: "", ancestors: [`${stat.dev}:${stat.ino}`] },
 	];
+	let entriesRead = 0;
 	for (let next = 0; next < directories.length; next++) {
 		throwIfAborted(signal);
 		const { relative, ancestors } = directories[next];
 		for (const entry of await fs.promises.readdir(path.join(source, relative), { withFileTypes: true })) {
+			if (++entriesRead > MAX_RENAME_ENTRIES) return { pairs, directory: true, exceeded: "walk" };
 			const rel = path.join(relative, entry.name);
 			let isDirectory = entry.isDirectory();
 			let isFile = entry.isFile();
@@ -209,9 +224,7 @@ async function enumerateRenamePairs(
 			}
 			if (isDirectory) {
 				if (ancestors.includes(id)) continue;
-				if (directories.length >= MAX_RENAME_DIRECTORIES) {
-					return { pairs, directory: true, exceeded: "directories" };
-				}
+				if (directories.length >= MAX_RENAME_DIRECTORIES) return { pairs, directory: true, exceeded: "walk" };
 				directories.push({ relative: rel, ancestors: [...ancestors, id] });
 				continue;
 			}
@@ -309,15 +322,18 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		/**
 		 * Rethrow an abort; return for any other error. A caller cancel stays a
 		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
-		 * budget and server instead of an opaque "Operation aborted".
+		 * budget and server instead of an opaque "Operation aborted"; `note` says what
+		 * the call was doing.
 		 */
-		const rethrowAbort = (err: unknown, serverName?: string): void => {
+		const rethrowAbort = (
+			err: unknown,
+			serverName?: string,
+			note = "The server may still be indexing; try again or pass timeout=<larger>.",
+		): void => {
 			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
 			if (timeoutSignal.aborted && !callerSignal?.aborted) {
 				const server = serverName ? ` on ${serverName}` : "";
-				throw new ToolError(
-					`LSP ${action} timed out after ${timeoutSec}s${server}. The server may still be indexing; try again or pass timeout=<larger>.`,
-				);
+				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}. ${note}`);
 			}
 			throw new ToolAbortError();
 		};
@@ -658,7 +674,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
-			const enumerated = await enumerateRenamePairs(source, dest, signal);
+			const enumerated = await enumerateRenamePairs(source, dest, signal).catch(err => {
+				rethrowAbort(
+					err,
+					undefined,
+					`It was still listing the files under ${formatRenameStatPath(source, this.session.cwd)}, and nothing was renamed; pass timeout=<larger>, or rename in smaller batches.`,
+				);
+				throw err;
+			});
 			if (enumerated.exceeded) {
 				return {
 					content: [
@@ -667,7 +690,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							text:
 								enumerated.exceeded === "files"
 									? `Error: directory contains more than ${MAX_RENAME_PAIRS} files; rename in smaller batches to keep LSP edits accurate`
-									: `Error: directory contains more than ${MAX_RENAME_DIRECTORIES} directories, counting each path through a link; rename in smaller batches to keep LSP edits accurate`,
+									: `Error: directory contains more than ${MAX_RENAME_DIRECTORIES} directories or ${MAX_RENAME_ENTRIES} entries, counting each path through a link; rename in smaller batches to keep LSP edits accurate`,
 						},
 					],
 					details: { action, success: false, request: params },
