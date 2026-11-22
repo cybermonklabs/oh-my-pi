@@ -1024,7 +1024,7 @@ async function reconcileExecutedChanges(
  *
  * A `signal` already aborted when the call starts stops it before it changes anything;
  * the edit itself watches the signal only while a recursive delete lists its tree, before
- * that delete removes anything. Once the edit has run, the abort stops
+ * that delete removes anything and before the edit's first change. Once the edit has run, the abort stops
  * nothing: the call reports what it changed, and the servers are told of it. The result
  * lists the applied changes, then a note for each server that was not brought up to date.
  * `onApplied` gets the applied changes as soon as the files are written, before that; when

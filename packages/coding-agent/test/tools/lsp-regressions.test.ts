@@ -6759,12 +6759,14 @@ describe("lsp regressions", () => {
 				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
 				await lspClient.ensureFileOpen(client, removed[0]);
 				await server.waitFor(message => message.method === "textDocument/didOpen");
-				// The unlink of keep.ts fails, as one in a directory the user cannot write does.
-				const realUnlink = fsp.unlink;
-				vi.spyOn(fsp, "unlink").mockImplementation((async (target: fs.PathLike) => {
-					if (target !== kept) return await realUnlink(target);
-					throw Object.assign(new Error(`EACCES: permission denied, unlink '${kept}'`), { code: "EACCES" });
-				}) as typeof fsp.unlink);
+				// The recursive rm removes two files, then fails, as a rm that meets a directory the
+				// user cannot write does.
+				const realRm = fsp.rm;
+				vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+					if (target !== dir) return await realRm(target, options);
+					for (const file of removed) await realRm(file);
+					throw Object.assign(new Error(`EACCES: permission denied, rm '${dir}'`), { code: "EACCES" });
+				}) as typeof fsp.rm);
 				const edit: WorkspaceEdit = {
 					documentChanges: [{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } }],
 				};
@@ -6778,11 +6780,11 @@ describe("lsp regressions", () => {
 				expect(settled).toBeInstanceOf(Error);
 				const message = (settled as Error).message;
 				expect(message).toStartWith(
-					`EACCES: permission denied, unlink '${kept}'. Before it failed, the workspace edit`,
+					`EACCES: permission denied, rm '${dir}' (the recursive delete of d stops at its first failure; a path added under d while it ran is not named, and may have been removed). Before it failed, the workspace edit`,
 				);
 				expect(message).toContain("Deleted d/x1.ts (the recursive delete of d stopped partway)");
 				expect(message).toContain("Deleted d/sub/s.ts (the recursive delete of d stopped partway)");
-				expect(message).not.toContain("Deleted d/keep.ts");
+				expect(message).not.toContain("keep.ts");
 				// The server is told: the open document is closed, and the removed files are announced.
 				await server.waitFor(
 					m => m.method === "textDocument/didClose" && JSON.stringify(m.params).includes(fileToUri(removed[0])),
@@ -6830,6 +6832,25 @@ describe("lsp regressions", () => {
 				if (args[0] === dir) then();
 				return entries;
 			}) as never);
+		}
+
+		/**
+		 * The recursive rm of `dir` runs `first` with the real `rm`, then fails, as one that meets a
+		 * directory the user cannot write does.
+		 */
+		function failingRm(dir: string, first: (realRm: typeof fsp.rm) => Promise<void>): void {
+			const realRm = fsp.rm;
+			vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+				if (target !== dir) return await realRm(target, options);
+				await first(realRm);
+				throw Object.assign(new Error(`EACCES: permission denied, rm '${dir}'`), { code: "EACCES" });
+			}) as typeof fsp.rm);
+		}
+
+		/** A second process puts a link to `target` in the place of the directory `dir`, kept as `dir.moved`. */
+		function swapForLink(dir: string, target: string): void {
+			const swap = Bun.spawnSync(["sh", "-c", 'mv "$1" "$1.moved" && ln -s "$2" "$1"', "swap", dir, target]);
+			if (swap.exitCode !== 0) throw new Error(`the swap failed: ${swap.stderr.toString()}`);
 		}
 
 		it("a recursive delete of a tree holding a link to its own directory deletes the tree", async () => {
@@ -6897,35 +6918,34 @@ describe("lsp regressions", () => {
 			}
 		}, 70_000);
 
-		it.skipIf(asRoot)(
-			"a recursive delete that stops partway names a link it removed, and never the files behind it",
-			async () => {
-				const tempDir = TempDir.createSync("@omp-lsp-partial-delete-outside-link-");
-				const parent = path.join(tempDir.path(), "p");
-				try {
-					const dir = path.join(parent, "d");
-					const behind = path.join(tempDir.path(), "outside", "o1.ts");
-					fs.mkdirSync(dir, { recursive: true });
-					fs.mkdirSync(path.dirname(behind));
-					for (const file of [path.join(dir, "a.ts"), behind]) fs.writeFileSync(file, "export const a = 1;\n");
-					fs.symlinkSync("../../outside", path.join(dir, "out"));
-					// `d` is emptied, then cannot be removed: its parent is not writable.
-					fs.chmodSync(parent, 0o555);
+		it("a recursive delete that stops partway names a link it removed, and never the files behind it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-outside-link-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const file = path.join(dir, "a.ts");
+				const link = path.join(dir, "out");
+				const behind = path.join(tempDir.path(), "outside", "o1.ts");
+				fs.mkdirSync(dir);
+				fs.mkdirSync(path.dirname(behind));
+				for (const target of [file, behind]) fs.writeFileSync(target, "export const a = 1;\n");
+				fs.symlinkSync("../outside", link);
+				failingRm(dir, async realRm => {
+					await realRm(file);
+					await realRm(link);
+				});
 
-					const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
 
-					expect(fs.existsSync(behind)).toBe(true);
-					expect(settled).toBeInstanceOf(Error);
-					const message = (settled as Error).message;
-					expect(message).toContain("Deleted p/d/a.ts (the recursive delete of p/d stopped partway)");
-					expect(message).toContain("Deleted p/d/out (the recursive delete of p/d stopped partway)");
-					expect(message).not.toContain("o1.ts");
-				} finally {
-					if (fs.existsSync(parent)) fs.chmodSync(parent, 0o755);
-					tempDir.removeSync();
-				}
-			},
-		);
+				expect(fs.existsSync(behind)).toBe(true);
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toContain("Deleted d/a.ts (the recursive delete of d stopped partway)");
+				expect(message).toContain("Deleted d/out (the recursive delete of d stopped partway)");
+				expect(message).not.toContain("o1.ts");
+			} finally {
+				tempDir.removeSync();
+			}
+		});
 
 		it.skipIf(asRoot)(
 			"a recursive delete whose tree holds a directory it cannot read removes nothing, and fails with the read's error",
@@ -6957,46 +6977,22 @@ describe("lsp regressions", () => {
 			},
 		);
 
-		it("a recursive delete where entries have no type goes into directories, and never through a link", async () => {
-			const tempDir = TempDir.createSync("@omp-lsp-delete-untyped-");
+		it("a recursive delete that stops partway where entries have no type names what it removed, never through a link", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-untyped-");
 			try {
 				const dir = path.join(tempDir.path(), "d");
+				const removed = [path.join(dir, "sub", "s.ts"), path.join(dir, "out")];
 				const behind = path.join(tempDir.path(), "outside", "o1.ts");
-				for (const file of [path.join(dir, "a.ts"), path.join(dir, "sub", "s.ts"), behind]) {
+				for (const file of [removed[0], path.join(dir, "a.ts"), behind]) {
 					fs.mkdirSync(path.dirname(file), { recursive: true });
 					fs.writeFileSync(file, "export const a = 1;\n");
 				}
-				fs.symlinkSync("../outside", path.join(dir, "out"));
+				fs.symlinkSync("../outside", removed[1]);
 				// XFS made without ftype, and some FUSE and network filesystems, report no entry types.
 				untypedReaddir();
-
-				const result = await applyWorkspaceEdit(recursiveDelete(dir), tempDir.path());
-
-				expect(fs.existsSync(dir)).toBe(false);
-				expect(fs.existsSync(behind)).toBe(true);
-				expect(result.applied).toEqual(["Deleted d"]);
-			} finally {
-				tempDir.removeSync();
-			}
-		});
-
-		it("a recursive delete that fails on one file still removes the rest, and names them", async () => {
-			const tempDir = TempDir.createSync("@omp-lsp-delete-one-fails-");
-			try {
-				const dir = path.join(tempDir.path(), "d");
-				const files = ["a.ts", "b.ts", "sub/c.ts"].map(file => path.join(dir, file));
-				for (const file of files) {
-					fs.mkdirSync(path.dirname(file), { recursive: true });
-					fs.writeFileSync(file, "export const a = 1;\n");
-				}
-				// The first unlink fails, whichever file the walk gives it.
-				let failed = "";
-				const realUnlink = fsp.unlink;
-				vi.spyOn(fsp, "unlink").mockImplementation((async (target: fs.PathLike) => {
-					if (failed !== "") return await realUnlink(target);
-					failed = String(target);
-					throw Object.assign(new Error(`EACCES: permission denied, unlink '${failed}'`), { code: "EACCES" });
-				}) as typeof fsp.unlink);
+				failingRm(dir, async realRm => {
+					for (const file of removed) await realRm(file);
+				});
 				const lines: string[] = [];
 
 				const settled = await settle(
@@ -7005,15 +7001,107 @@ describe("lsp regressions", () => {
 					}),
 				);
 
-				expect((settled as Error).message).toBe(`EACCES: permission denied, unlink '${failed}'`);
-				const shown = (file: string) => `Deleted ${path.relative(tempDir.path(), file)} (`;
-				const others = files.filter(file => file !== failed);
-				expect({
-					failed: fs.existsSync(failed),
-					others: others.map(file => fs.existsSync(file)),
-					named: others.map(file => lines.some(line => line.startsWith(shown(file)))),
-					failedNamed: lines.some(line => line.startsWith(shown(failed))),
-				}).toEqual({ failed: true, others: [false, false], named: [true, true], failedNamed: false });
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.existsSync(behind)).toBe(true);
+				expect(lines.sort()).toEqual([
+					"Deleted d/out (the recursive delete of d stopped partway)",
+					"Deleted d/sub/s.ts (the recursive delete of d stopped partway)",
+				]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it.skipIf(asRoot)(
+			"a recursive delete that stops at a directory it cannot write names each listed path that is gone, and none that stays",
+			async () => {
+				const tempDir = TempDir.createSync("@omp-lsp-partial-delete-unwritable-");
+				const dir = path.join(tempDir.path(), "d");
+				const readOnly = path.join(dir, "ro");
+				try {
+					const paths = ["d/x1.ts", "d/x2.ts", "d/sub", "d/sub/s.ts", "d/ro", "d/ro/r.ts"];
+					for (const file of ["x1.ts", "x2.ts", "sub/s.ts", "ro/r.ts"].map(name => path.join(dir, name))) {
+						fs.mkdirSync(path.dirname(file), { recursive: true });
+						fs.writeFileSync(file, "export const a = 1;\n");
+					}
+					fs.chmodSync(readOnly, 0o555);
+					const lines: string[] = [];
+
+					const settled = await settle(
+						applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+							if (line !== undefined) lines.push(line);
+						}),
+					);
+
+					// Bun's rm stops at its first failure, after the entries its directory order put
+					// before `ro/r.ts`: which those are depends on the filesystem.
+					expect((settled as NodeJS.ErrnoException).code).toBe("EACCES");
+					expect((settled as Error).message).toContain("the recursive delete of d stops at its first failure");
+					expect(fs.existsSync(path.join(readOnly, "r.ts"))).toBe(true);
+					const gone = paths.filter(file => !fs.existsSync(path.join(tempDir.path(), file)));
+					expect(lines.sort()).toEqual(
+						gone.map(file => `Deleted ${file} (the recursive delete of d stopped partway)`).sort(),
+					);
+				} finally {
+					if (fs.existsSync(readOnly)) fs.chmodSync(readOnly, 0o755);
+					tempDir.removeSync();
+				}
+			},
+		);
+
+		it("a recursive delete removes nothing outside the tree when another process swaps a listed directory for a link", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-after-listing-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const names = ["x1.ts", "x2.ts", "x3.ts"];
+				for (const parent of [sub, outside]) {
+					fs.mkdirSync(parent, { recursive: true });
+					for (const name of names) fs.writeFileSync(path.join(parent, name), "export const a = 1;\n");
+				}
+				// Once the delete has read `d/sub`, a second process puts a link to `outside` in its place:
+				// a delete that then removes `d/sub/x1.ts` by its path removes `outside/x1.ts`.
+				afterReaddirOf(sub, () => swapForLink(sub, outside));
+
+				const settled = await settle(applyWorkspaceEdit(recursiveDelete(dir), tempDir.path()));
+
+				expect(fs.readdirSync(outside).sort()).toEqual(names);
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(settled).toMatchObject({ applied: ["Deleted d"] });
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete never names the files behind a directory swapped for a link before the listing reads it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-before-read-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const behind = ["e1.ts", "e2.ts"];
+				for (const file of [path.join(sub, "s.ts"), ...behind.map(name => path.join(outside, name))]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Once the delete has read `d`, and before it reads `d/sub`, a second process puts a link
+				// to `outside` in the place of `d/sub`. The rm then removes the whole tree and fails.
+				afterReaddirOf(dir, () => swapForLink(sub, outside));
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(fs.readdirSync(outside).sort()).toEqual(behind);
+				expect(settled).toBeInstanceOf(Error);
+				expect(lines).toEqual(["Deleted d/sub (the recursive delete of d stopped partway)"]);
 			} finally {
 				tempDir.removeSync();
 			}
@@ -7064,68 +7152,184 @@ describe("lsp regressions", () => {
 			}
 		});
 
-		it("a recursive delete removes only what it listed: a file added during it stays, unnamed", async () => {
-			const tempDir = TempDir.createSync("@omp-lsp-delete-added-file-");
+		it("a recursive delete aborted while it reads the last directory removes nothing", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-aborted-last-read-");
 			try {
 				const dir = path.join(tempDir.path(), "d");
-				const late = path.join(dir, "late.ts");
+				const files = [path.join(dir, "a.ts"), path.join(dir, "b.ts")];
+				fs.mkdirSync(dir);
+				for (const file of files) fs.writeFileSync(file, "export const a = 1;\n");
+				// `d` is the only directory: the call is aborted while it is read.
+				const controller = new AbortController();
+				afterReaddirOf(dir, () => controller.abort());
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path(), controller.signal),
+				);
+
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect(files.map(file => fs.existsSync(file))).toEqual([true, true]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("an edit aborted while a recursive delete lists its tree, after an earlier change, runs to its end", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-aborted-after-change-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const [before, after] = [path.join(tempDir.path(), "c.ts"), path.join(tempDir.path(), "e.ts")];
 				for (const file of [path.join(dir, "a.ts"), path.join(dir, "sub", "s.ts")]) {
 					fs.mkdirSync(path.dirname(file), { recursive: true });
 					fs.writeFileSync(file, "export const a = 1;\n");
 				}
-				// Another writer adds `d/late.ts` once `d` has been read.
+				// The edit creates `c.ts`, deletes `d`, then creates `e.ts`; the call is aborted once
+				// `c.ts` exists and `d` has been read.
+				const controller = new AbortController();
+				afterReaddirOf(dir, () => controller.abort());
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "create", uri: fileToUri(before) },
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } },
+						{ kind: "create", uri: fileToUri(after) },
+					],
+				};
+
+				await settle(lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path(), controller.signal));
+
+				expect(controller.signal.aborted).toBe(true);
+				expect({ c: fs.existsSync(before), d: fs.existsSync(dir), e: fs.existsSync(after) }).toEqual({
+					c: true,
+					d: false,
+					e: true,
+				});
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("with ignoreIfNotExists, a recursive delete whose subdirectory another process removes still deletes the tree", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-subdir-gone-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				for (const file of [path.join(dir, "x1.ts"), path.join(dir, "x2.ts"), path.join(sub, "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Another process removes `d/sub` once `d` has been read.
+				afterReaddirOf(dir, () => fs.rmSync(sub, { recursive: true }));
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true, ignoreIfNotExists: true } },
+					],
+				};
+
+				const result = await applyWorkspaceEdit(edit, tempDir.path());
+
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(result.applied).toEqual(["Deleted d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("with ignoreIfNotExists, a recursive delete of a tree that exists still fails when its rm fails with ENOENT", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-rm-enoent-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const first = path.join(dir, "a.ts");
+				for (const file of [first, path.join(dir, "b.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// The rm removes `d/a.ts`, then meets an entry another process removed.
+				const realRm = fsp.rm;
+				vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+					if (target !== dir) return await realRm(target, options);
+					await realRm(first);
+					throw Object.assign(new Error(`ENOENT: no such file or directory, rm '${dir}'`), { code: "ENOENT" });
+				}) as typeof fsp.rm);
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true, ignoreIfNotExists: true } },
+					],
+				};
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(edit, tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect((settled as NodeJS.ErrnoException).code).toBe("ENOENT");
+				expect(lines).toEqual(["Deleted d/a.ts (the recursive delete of d stopped partway)"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete that stops partway does not name a file added while it ran, and says so", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-added-file-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const first = path.join(dir, "a.ts");
+				const late = path.join(dir, "late.ts");
+				for (const file of [first, path.join(dir, "sub", "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Another writer adds `d/late.ts` once `d` has been read; the rm removes it and `d/a.ts`,
+				// then fails.
 				afterReaddirOf(dir, () => fs.writeFileSync(late, "export const late = 1;\n"));
+				failingRm(dir, async realRm => {
+					for (const file of [late, first]) await realRm(file);
+				});
 
 				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
 
-				expect(fs.existsSync(late)).toBe(true);
+				expect(fs.existsSync(late)).toBe(false);
 				expect(settled).toBeInstanceOf(Error);
 				const message = (settled as Error).message;
-				expect(message).toContain("ENOTEMPTY");
+				expect(message).toContain("a path added under d while it ran is not named, and may have been removed");
 				expect(message).toContain("Deleted d/a.ts (the recursive delete of d stopped partway)");
-				expect(message).toContain("Deleted d/sub/s.ts (the recursive delete of d stopped partway)");
 				expect(message).not.toContain("late.ts");
 			} finally {
 				tempDir.removeSync();
 			}
 		});
 
-		it.skipIf(asRoot)(
-			"a recursive delete that stops partway after many files names 20, counts the rest, and tells the server of all",
-			async () => {
-				const tempDir = TempDir.createSync("@omp-lsp-partial-delete-many-");
-				const parent = path.join(tempDir.path(), "p");
-				try {
-					const dir = path.join(parent, "d");
-					fs.mkdirSync(dir, { recursive: true });
-					const files = Array.from({ length: 30 }, (_, index) =>
-						path.join(dir, `f${String(index).padStart(2, "0")}.ts`),
-					);
-					for (const file of files) fs.writeFileSync(file, "export const a = 1;\n");
-					const server = installHandshakeLsp();
-					await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
-					// `d` is emptied, then cannot be removed: its parent is not writable.
-					fs.chmodSync(parent, 0o555);
+		it("a recursive delete that stops partway after many files names 20, counts the rest, and tells the server of all", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-many-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				fs.mkdirSync(dir);
+				const files = Array.from({ length: 30 }, (_, index) =>
+					path.join(dir, `f${String(index).padStart(2, "0")}.ts`),
+				);
+				for (const file of files) fs.writeFileSync(file, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				failingRm(dir, async realRm => {
+					for (const file of files) await realRm(file);
+				});
 
-					const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
 
-					expect(settled).toBeInstanceOf(Error);
-					const message = (settled as Error).message;
-					const named = message.match(/Deleted p\/d\/f\d\d\.ts \(the recursive delete of p\/d stopped partway\)/g);
-					expect(named).toHaveLength(20);
-					expect(message).toContain(
-						"Deleted 10 more paths under p/d (the recursive delete of p/d stopped partway)",
-					);
-					const watched = await server.waitFor(m => m.method === "workspace/didChangeWatchedFiles");
-					const announced = JSON.stringify(watched.params);
-					expect(files.filter(file => announced.includes(fileToUri(file)))).toHaveLength(30);
-				} finally {
-					await lspClient.shutdownAll();
-					if (fs.existsSync(parent)) fs.chmodSync(parent, 0o755);
-					tempDir.removeSync();
-				}
-			},
-		);
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				const named = message.match(/Deleted d\/f\d\d\.ts \(the recursive delete of d stopped partway\)/g);
+				expect(named).toHaveLength(20);
+				expect(message).toContain("Deleted 10 more paths under d (the recursive delete of d stopped partway)");
+				const watched = await server.waitFor(m => m.method === "workspace/didChangeWatchedFiles");
+				const announced = JSON.stringify(watched.params);
+				expect(files.filter(file => announced.includes(fileToUri(file)))).toHaveLength(30);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
 
 		it("a command whose server edit fails partway while the server stops reading still returns at the abort", async () => {
 			const tempDir = TempDir.createSync("@omp-lsp-server-edit-partway-stalled-");
