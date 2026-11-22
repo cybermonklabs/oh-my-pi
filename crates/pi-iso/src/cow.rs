@@ -17,7 +17,7 @@
 //!
 //! ```ignore
 //! match pi_iso::cow::clone_file(src, dst) {
-//!     Ok(()) => {},
+//!     Ok(_clone) => {},
 //!     Err(err) if pi_iso::cow::is_unsupported(&err) => drop(std::fs::copy(src, dst)?),
 //!     Err(err) => return Err(err),
 //! }
@@ -31,7 +31,11 @@ use std::{
 };
 
 /// Makes `dst` a copy-on-write clone of the regular file `src`, following
-/// symlinks at either path.
+/// symlinks at either path, and returns the clone open.
+///
+/// A caller sets the clone's owner, mode and times through that descriptor,
+/// as GNU `cp` sets them on the descriptor it cloned into, so that a name
+/// another user swaps for a link after the clone cannot send them elsewhere.
 ///
 /// A missing `dst` is created. Only its data is guaranteed: an APFS clone
 /// also carries `src`'s mode, flags, extended attributes, and timestamps,
@@ -54,7 +58,7 @@ use std::{
 /// `cp --reflink=always` reports it: across filesystems the cross-device
 /// error, elsewhere what the filesystem answers. On error no clone is left
 /// behind and an existing `dst` is unchanged.
-pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+pub fn clone_file(src: &Path, dst: &Path) -> io::Result<File> {
 	let existing = match fs::metadata(dst) {
 		Ok(metadata) if metadata.is_file() => Some(metadata),
 		Ok(_) => return Err(unsupported("destination is not a regular file")),
@@ -62,10 +66,7 @@ pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
 		Err(err) => return Err(err),
 	};
 	match existing {
-		None => {
-			clone_new(src, dst)?;
-			Ok(())
-		},
+		None => clone_new(src, dst).map(clone_of),
 		// Swap the file a symlinked `dst` names, as an in-place copy writes it.
 		Some(metadata) => clone_over(src, &fs::canonicalize(dst)?, &metadata),
 	}
@@ -124,9 +125,22 @@ fn unsupported(reason: &str) -> io::Error {
 	io::Error::new(io::ErrorKind::Unsupported, reason)
 }
 
+/// The clone of what [`clone_new`] returns.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+fn clone_of((_src, dst): (File, File)) -> File {
+	dst
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+const fn clone_of(dst: File) -> File {
+	dst
+}
+
 /// Replaces the regular file `dst` (described by `metadata`) with a clone of
-/// `src` made beside it, when the swap passes for an in-place copy.
-fn clone_over(src: &Path, dst: &Path, metadata: &Metadata) -> io::Result<()> {
+/// `src` made beside it, when the swap passes for an in-place copy. The
+/// clone takes `dst`'s owner and mode through its own descriptor before the
+/// rename, and is returned open.
+fn clone_over(src: &Path, dst: &Path, metadata: &Metadata) -> io::Result<File> {
 	/// Keeps the temporaries of concurrent clones in one process apart.
 	static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -144,29 +158,30 @@ fn clone_over(src: &Path, dst: &Path, metadata: &Metadata) -> io::Result<()> {
 		std::process::id(),
 		SEQUENCE.fetch_add(1, Ordering::Relaxed)
 	));
-	clone_new(src, &temp)?;
+	let clone = clone_of(clone_new(src, &temp)?);
 	let swapped = (|| {
 		#[cfg(unix)]
-		take_owner(&temp, metadata)?;
-		fs::set_permissions(&temp, metadata.permissions())?;
+		take_owner(&clone, metadata)?;
+		clone.set_permissions(metadata.permissions())?;
 		fs::rename(&temp, dst)
 	})();
 	if swapped.is_err() {
 		let _ = fs::remove_file(&temp);
 	}
-	swapped
+	swapped.map(|()| clone)
 }
 
-/// Gives `clone` the owner and group of the file it replaces.
+/// Gives `clone` the owner and group of the file it replaces, through its
+/// descriptor.
 #[cfg(unix)]
-fn take_owner(clone: &Path, metadata: &Metadata) -> io::Result<()> {
-	use std::os::unix::fs::{MetadataExt as _, chown};
+fn take_owner(clone: &File, metadata: &Metadata) -> io::Result<()> {
+	use std::os::unix::fs::{MetadataExt as _, fchown};
 
-	let current = fs::symlink_metadata(clone)?;
+	let current = clone.metadata()?;
 	if (current.uid(), current.gid()) == (metadata.uid(), metadata.gid()) {
 		return Ok(());
 	}
-	chown(clone, Some(metadata.uid()), Some(metadata.gid()))
+	fchown(clone, Some(metadata.uid()), Some(metadata.gid()))
 		.map_err(|_| unsupported("clone cannot take the destination's owner"))
 }
 
@@ -187,10 +202,18 @@ fn link_count(_file: &File, _metadata: &Metadata) -> io::Result<u64> {
 	Err(unsupported("copy-on-write cloning is not implemented on this platform"))
 }
 
-/// Creates `dst` as a clone of `src`.
+/// Creates `dst` as a clone of `src`, and opens it without following a link
+/// there: `clonefile` gives no descriptor, so a name swapped for a link after
+/// the clone fails the open rather than being followed.
 #[cfg(target_os = "macos")]
-fn clone_new(src: &Path, dst: &Path) -> io::Result<()> {
-	clonefile(src, dst, 0)
+fn clone_new(src: &Path, dst: &Path) -> io::Result<File> {
+	use std::os::unix::fs::OpenOptionsExt as _;
+
+	clonefile(src, dst, 0)?;
+	fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(dst)
 }
 
 /// Creates the missing `dst` as a clone of `src`, removing it again on any
@@ -217,7 +240,7 @@ pub(crate) fn clone_new(src: &Path, dst: &Path) -> io::Result<(File, File)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
-fn clone_new(_src: &Path, _dst: &Path) -> io::Result<()> {
+fn clone_new(_src: &Path, _dst: &Path) -> io::Result<File> {
 	Err(unsupported("copy-on-write cloning is not implemented on this platform"))
 }
 
