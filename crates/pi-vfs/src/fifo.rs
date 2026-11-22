@@ -66,6 +66,15 @@ use crate::file::POLL_SLICE;
 /// keep the thread that dropped the open. A helper the drop leaves before
 /// its last check, just before `open(2)`, opens nothing.
 ///
+/// The helper's open of the path never truncates for a write: the caller
+/// leaves `O_TRUNC` out of it, and the helper applies it itself, under the
+/// open's lock and only while the open has not been dropped, to a regular
+/// file the path names by then (see [`TruncateRegular`]; a FIFO ignores
+/// `O_TRUNC`). A helper whose open was dropped closes what it opened at once,
+/// unchanged. A write asks the write permission `O_TRUNC` asks anyway; a
+/// read-only open that asks for `O_TRUNC` keeps it, so the kernel still asks
+/// that permission, and so does the reopen of the pin, which opens the FIFO.
+///
 /// What is left, each until the other end of the FIFO its helper waits on
 /// opens; the helper then takes that connection and closes it:
 /// - a helper that waits on another FIFO, as above;
@@ -74,7 +83,21 @@ use crate::file::POLL_SLICE;
 /// - without procfs, a helper whose path no longer names the FIFO when the drop
 ///   starts;
 /// - a helper held up for longer than [`LEAVE_AFTER`] between its last check
-///   and its `open(2)`, which then opens the path after the drop has gone.
+///   and its `open(2)` (a loaded node can hold a thread that long), which then
+///   opens the path after the drop has gone. It writes nothing, and closes what
+///   it opened at once; until then it holds its thread and the pin's
+///   descriptor. Where the path still names the FIFO, it waits there until the
+///   other end opens, which then sees end of file (a writer's first write fails
+///   with `EPIPE`). A write's helper truncates nothing; a read-only open that
+///   asks for `O_TRUNC` keeps it (above), so its helper truncates a regular
+///   file the path names by then, as that open asks.
+///
+///   Where the path names nothing by then, an open that creates leaves an
+///   empty regular file there, as the open would have, and nothing else. That
+///   cannot be avoided: the open needs `O_CREAT` so that the kernel checks
+///   `fs.protected_fifos` when the path names a FIFO, and `O_CREAT` creates a
+///   missing file in the same `open(2)`. Removing that file afterwards would
+///   remove by its path a file the helper cannot prove is the one it created.
 pub struct FifoOpen<T> {
 	shared: Arc<Shared<T>>,
 	node:   Arc<Node>,
@@ -163,17 +186,20 @@ struct Node {
 	/// descriptor of the FIFO (which opens no end of it), so the drop reaches
 	/// this node whatever the original path names later. Elsewhere, or
 	/// without procfs, it is the path itself.
-	path:    PathBuf,
+	path:      PathBuf,
 	/// The path the open was given.
-	name:    PathBuf,
+	name:      PathBuf,
 	/// Whether a symbolic link at `name` is followed (no `O_NOFOLLOW`).
-	follow:  bool,
+	follow:    bool,
 	/// Device and inode.
-	id:      (u64, u64),
+	id:        (u64, u64),
 	/// The pin, an `O_PATH` descriptor of the FIFO (Linux only).
-	pin:     Option<OwnedFd>,
+	pin:       Option<OwnedFd>,
 	/// The open creates (`O_CREAT`), so its helper opens `name`.
-	creates: bool,
+	creates:   bool,
+	/// The open truncates (`O_TRUNC`), which its helper applies itself (see
+	/// [`FifoOpen`]).
+	truncates: bool,
 }
 
 impl Node {
@@ -192,6 +218,7 @@ impl Node {
 			id: (meta.dev(), meta.ino()),
 			pin: None,
 			creates,
+			truncates: false,
 		}
 	}
 
@@ -214,12 +241,13 @@ impl Node {
 		let pin = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
 		let meta = pin.metadata().ok().filter(|m| m.file_type().is_fifo())?;
 		let node = Self {
-			path:    PathBuf::from(format!("/proc/self/fd/{fd}")),
-			name:    path.to_path_buf(),
-			follow:  !nofollow,
-			id:      (meta.dev(), meta.ino()),
-			pin:     Some(OwnedFd::from(pin)),
-			creates: false,
+			path:      PathBuf::from(format!("/proc/self/fd/{fd}")),
+			name:      path.to_path_buf(),
+			follow:    !nofollow,
+			id:        (meta.dev(), meta.ino()),
+			pin:       Some(OwnedFd::from(pin)),
+			creates:   false,
+			truncates: false,
 		};
 		node.is(fs::metadata(&node.path)).then_some(node)
 	}
@@ -270,7 +298,7 @@ impl Node {
 	}
 }
 
-impl<T: Send + 'static> FifoOpen<T> {
+impl<T: TruncateRegular + Send + 'static> FifoOpen<T> {
 	/// Starts opening the FIFO at `path`, which `meta` describes, on a helper
 	/// thread, which calls `open` with the path to open and whether that path
 	/// is a pin's `/proc/self/fd/N`. That path is a symbolic link, which the
@@ -278,12 +306,22 @@ impl<T: Send + 'static> FifoOpen<T> {
 	/// `nofollow` a symbolic link at `path` is never pinned, so `open`'s own
 	/// `O_NOFOLLOW` open of the path refuses it. An open that `creates`
 	/// (`O_CREAT`) is handed `path` itself, never the pin (see [`FifoOpen`]).
-	/// When the helper cannot be started, its error is the open's result.
-	pub fn start<F>(path: &Path, meta: &fs::Metadata, nofollow: bool, creates: bool, open: F) -> Self
+	/// For an open that `truncates` (a write with `O_TRUNC`), `open` must
+	/// leave `O_TRUNC` out when it is handed the path: the helper truncates
+	/// what it returns, while the open is live (see [`FifoOpen`]). When the
+	/// helper cannot be started, its error is the open's result.
+	pub fn start<F>(
+		path: &Path,
+		meta: &fs::Metadata,
+		nofollow: bool,
+		creates: bool,
+		truncates: bool,
+		open: F,
+	) -> Self
 	where
 		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 	{
-		let node = Arc::new(Node::new(path, meta, nofollow, creates));
+		let node = Arc::new(Node { truncates, ..Node::new(path, meta, nofollow, creates) });
 		let shared = Arc::new(Shared { slot: Mutex::new(Slot::default()), done: Condvar::new() });
 		let helper = match spawn_helper(Arc::clone(&shared), Arc::clone(&node), open) {
 			Ok(helper) => Some(helper),
@@ -295,6 +333,36 @@ impl<T: Send + 'static> FifoOpen<T> {
 			},
 		};
 		Self { shared, node, helper }
+	}
+}
+
+/// What a FIFO open's `open` returns: a file its helper can truncate.
+///
+/// For a write that asks for `O_TRUNC`, the helper's open of the path leaves
+/// it out, and the helper applies it itself under the open's lock, only while
+/// the open has not been dropped, so a helper the drop has left truncates
+/// nothing (see [`FifoOpen`]).
+pub trait TruncateRegular {
+	/// Truncates the file to no bytes when it is a regular file, as
+	/// `O_TRUNC` does; anything else (the FIFO, a device) is left as it is.
+	fn truncate_regular(&self) -> io::Result<()>;
+}
+
+impl TruncateRegular for fs::File {
+	fn truncate_regular(&self) -> io::Result<()> {
+		if self.metadata()?.is_file() {
+			self.set_len(0)?;
+		}
+		Ok(())
+	}
+}
+
+impl TruncateRegular for crate::File {
+	fn truncate_regular(&self) -> io::Result<()> {
+		if self.metadata()?.is_file() {
+			self.set_len(0)?;
+		}
+		Ok(())
 	}
 }
 
@@ -343,7 +411,7 @@ fn spawn_helper<T, F>(
 	open: F,
 ) -> io::Result<thread::JoinHandle<()>>
 where
-	T: Send + 'static,
+	T: TruncateRegular + Send + 'static,
 	F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 {
 	thread::Builder::new()
@@ -351,6 +419,8 @@ where
 		.stack_size(64 << 10)
 		.spawn(move || {
 			let _exit = Exit(Arc::clone(&shared));
+			#[cfg(test)]
+			let _end = hooks::End(node.name.clone());
 			{
 				let mut s = shared.slot.lock();
 				if s.cancelled {
@@ -390,12 +460,23 @@ where
 					s.in_open = true;
 				}
 			}
+			#[cfg(test)]
+			hooks::run_before_open(&node.name);
 			let opened = catch_unwind(AssertUnwindSafe(|| open(path, pinned)))
 				.unwrap_or_else(|_| Err(io::Error::other("the FIFO open panicked")));
 			let mut s = shared.slot.lock();
 			if s.cancelled {
+				// A helper whose open was dropped, or that the drop has left:
+				// what it opened is closed here, unchanged.
 				return;
 			}
+			// The caller's `O_TRUNC` for an open of the path, applied under
+			// the lock: a drop that comes now waits for it, and one that came
+			// first was seen above.
+			let opened = match opened {
+				Ok(file) if node.truncates && !pinned => file.truncate_regular().map(|()| file),
+				opened => opened,
+			};
 			s.result = Some(opened);
 			let waker = s.waker.take();
 			drop(s);
@@ -410,7 +491,7 @@ where
 /// names the FIFO the open started on (see [`FifoOpen`]). That helper's open
 /// of that FIFO ends at once, as the drop holds the FIFO's two ends; one that
 /// is still waiting when this has passed waits on another FIFO.
-const LEAVE_AFTER: Duration = Duration::from_secs(1);
+pub(crate) const LEAVE_AFTER: Duration = Duration::from_secs(1);
 
 impl<T> Drop for FifoOpen<T> {
 	/// See [`FifoOpen`]: leaves no end of the FIFO behind once it returns,
@@ -518,6 +599,56 @@ pub(crate) mod routes {
 	}
 }
 
+/// Test hooks, keyed by the path an open was given: one run once by its
+/// helper after its last check, just before its open (a stall, or a change
+/// of what the path names), and a record of the helpers that have ended.
+#[cfg(test)]
+pub(crate) mod hooks {
+	use std::path::{Path, PathBuf};
+
+	use parking_lot::Mutex;
+
+	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+	static BEFORE_OPEN: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+	static ENDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` once, in the next helper of an open given `name`, just
+	/// before its open.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests use it"))]
+	pub(crate) fn before_open(name: &Path, hook: impl FnOnce() + Send + 'static) {
+		BEFORE_OPEN
+			.lock()
+			.push((name.to_path_buf(), Box::new(hook)));
+	}
+
+	pub(crate) fn run_before_open(name: &Path) {
+		let hook = {
+			let mut hooks = BEFORE_OPEN.lock();
+			let at = hooks.iter().position(|(path, _)| path == name);
+			at.map(|at| hooks.remove(at).1)
+		};
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	/// Whether a helper of an open given `name` has ended.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests use it"))]
+	pub(crate) fn ended(name: &Path) -> bool {
+		ENDED.lock().iter().any(|path| path == name)
+	}
+
+	/// Records its helper as ended when dropped.
+	pub(crate) struct End(pub(crate) PathBuf);
+
+	impl Drop for End {
+		fn drop(&mut self) {
+			ENDED.lock().push(std::mem::take(&mut self.0));
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -598,7 +729,7 @@ mod tests {
 	/// An open of `path`, which `creates` or not, whose helper has passed its
 	/// check of the cancel.
 	fn opening(path: &Path, creates: bool, open: Open) -> FifoOpen<fs::File> {
-		let opened = FifoOpen::start(path, &fs::metadata(path).unwrap(), false, creates, open);
+		let opened = FifoOpen::start(path, &fs::metadata(path).unwrap(), false, creates, false, open);
 		while !opened.shared.slot.lock().opening {
 			thread::yield_now();
 		}
@@ -786,6 +917,14 @@ mod tests {
 		assert_eq!(!writers.is_empty(), in_open, "writers opened, against the helper's last check");
 	}
 
+	/// What the route test's helper returns: the path it was handed, which is
+	/// no file to truncate.
+	impl TruncateRegular for (PathBuf, bool) {
+		fn truncate_regular(&self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
 	/// An open that creates (`O_CREAT`) is handed the path it was given, so
 	/// the kernel checks `O_CREAT` against the path's directory, as for a
 	/// plain `open(2)` of the path (`fs.protected_fifos`). An open that does
@@ -797,9 +936,10 @@ mod tests {
 		let proc = cfg!(target_os = "linux") && Path::new("/proc/self/fd").is_dir();
 		let handed = |creates| {
 			let meta = fs::metadata(&path).unwrap();
-			let mut opened = FifoOpen::start(&path, &meta, false, creates, |given: &Path, pinned| {
-				Ok((given.to_path_buf(), pinned))
-			});
+			let mut opened =
+				FifoOpen::start(&path, &meta, false, creates, false, |given: &Path, pinned| {
+					Ok((given.to_path_buf(), pinned))
+				});
 			loop {
 				if let Some(result) = opened.wait_for(Duration::from_secs(1)) {
 					break result.unwrap();

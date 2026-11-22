@@ -382,6 +382,12 @@ impl OpenFlags {
 		Self(self.0 | other.0)
 	}
 
+	/// These flags without those of `other`.
+	#[must_use]
+	pub const fn without(self, other: Self) -> Self {
+		Self(self.0 & !other.0)
+	}
+
 	/// Whether every flag of `other` is set.
 	pub const fn contains(self, other: Self) -> bool {
 		self.0 & other.0 == other.0

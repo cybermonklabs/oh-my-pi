@@ -777,6 +777,9 @@ mod fifo {
 	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
 	/// the path that creates a file (the FIFO was removed since the look)
 	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
+	/// The open of the path leaves `O_TRUNC` (`>`) to the helper, which
+	/// applies it only while the open is live, so a helper a drop has left
+	/// truncates nothing ([`pi_vfs::FifoOpen`]).
 	pub fn pending(
 		path: &BStr,
 		flags: OpenFlags,
@@ -794,9 +797,17 @@ mod fifo {
 		}
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
 		let creates = flags.contains(OpenFlags::CREATE);
+		// A write open leaves `O_TRUNC` to the helper; it asks the write
+		// permission `O_TRUNC` asks anyway. A read-only open keeps it.
+		let truncates = flags.contains(OpenFlags::TRUNC) && write;
+		let by_path = if truncates {
+			flags.without(OpenFlags::TRUNC)
+		} else {
+			flags
+		};
 		#[cfg(test)]
 		let name = host.to_path_buf();
-		let open = FifoOpen::start(host, &meta, nofollow, creates, move |path, pinned| {
+		let open = FifoOpen::start(host, &meta, nofollow, creates, truncates, move |path, pinned| {
 			#[cfg(test)]
 			{
 				ROUTES.lock().push((name.clone(), pinned));
@@ -809,15 +820,20 @@ mod fifo {
 					hook();
 				}
 			}
-			if pinned {
+			let opened = if pinned {
 				// A pin is checked not to be a symbolic link already, and its
 				// `/proc/self/fd/N` always is one.
 				let mut opts = options(flags, mode);
 				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
-				return opts.open(path);
-			}
-			// The path, opened as the plain open of it opens it.
-			create_with_mode(path, flags, mode, umask, false)
+				opts.open(path)
+			} else {
+				// The path, opened as the plain open of it opens it but for
+				// a write's `O_TRUNC`, which the helper applies itself.
+				create_with_mode(path, by_path, mode, umask, false)
+			};
+			#[cfg(test)]
+			OPENED.lock().push(name);
+			opened
 		});
 		Some(Box::new(Pending(open)))
 	}
@@ -838,6 +854,11 @@ mod fifo {
 	/// open.
 	#[cfg(test)]
 	static BEFORE_OPEN: parking_lot::Mutex<Vec<BeforeOpen>> = parking_lot::Mutex::new(Vec::new());
+
+	/// Test record of the helpers whose open has returned, by the path their
+	/// open was given.
+	#[cfg(test)]
+	static OPENED: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
 
 	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
@@ -1085,6 +1106,137 @@ mod fifo {
 				}
 			}
 			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` dropped while its helper is held up between its last check
+		/// and its open for longer than the drop waits for it, as a loaded
+		/// node can hold a thread: the drop leaves the helper at its bound,
+		/// and the helper opens the path after the call has ended. It changes
+		/// no existing file: a regular file put at the path keeps its bytes.
+		/// Where the path names nothing, it leaves at most an empty regular
+		/// file (its `O_CREAT` creates one; see [`pi_vfs::FifoOpen`]), and
+		/// nothing else. Every wait is bounded, so a regression fails rather
+		/// than hangs.
+		#[test]
+		fn a_redirect_whose_helper_the_drop_left_truncates_nothing() {
+			use std::{
+				sync::mpsc,
+				time::{Duration, Instant},
+			};
+			const LIMIT: Duration = Duration::from_secs(10);
+			let mut wrong = Vec::new();
+			for late in ["a regular file", "nothing"] {
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let (reached_tx, reached) = mpsc::channel();
+				let at = path.clone();
+				BEFORE_OPEN.lock().push((
+					path.clone(),
+					Box::new(move || {
+						let _ = reached_tx.send(());
+						thread::sleep(Duration::from_secs(2));
+						fs::rename(&at, at.with_extension("old")).unwrap();
+						if late == "a regular file" {
+							fs::write(&at, "kept").unwrap();
+						}
+					}),
+				));
+				let flags = OpenFlags::WRITE
+					.with(OpenFlags::CREATE)
+					.with(OpenFlags::TRUNC);
+				let open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				if reached.recv_timeout(LIMIT).is_err() {
+					wrong.push(format!("{late}: the helper never reached its open"));
+					continue;
+				}
+				let dropper = thread::spawn(move || drop(open));
+				let start = Instant::now();
+				while !dropper.is_finished() && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !dropper.is_finished() {
+					wrong.push(format!("{late}: the drop had not returned after {LIMIT:?}"));
+					continue;
+				}
+				let start = Instant::now();
+				while !OPENED.lock().contains(&path) && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !OPENED.lock().contains(&path) {
+					wrong.push(format!("{late}: the helper had not opened the path after {LIMIT:?}"));
+					continue;
+				}
+				match (late, fs::symlink_metadata(&path)) {
+					("a regular file", _) => {
+						let got = fs::read_to_string(&path).unwrap();
+						if got != "kept" {
+							wrong.push(format!("{late}: the file holds {got:?}, not \"kept\""));
+						}
+					},
+					(_, Err(err)) if err.kind() == io::ErrorKind::NotFound => {},
+					(_, Ok(m)) if m.is_file() && m.len() == 0 => {},
+					(_, other) => wrong.push(format!(
+						"{late}: the path names {other:?}, not nothing or an empty regular file"
+					)),
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` whose FIFO is replaced by a regular file just before its
+		/// helper's open, while the shell still waits for it, opens that file
+		/// and truncates it, as `open(2)` of the path with `O_TRUNC` does. An
+		/// open that waits instead (its helper on the FIFO the path no longer
+		/// names) fails the test within its bound; the open's drop then ends
+		/// the helper.
+		#[test]
+		fn a_redirect_whose_path_names_a_regular_file_by_its_open_truncates_it() {
+			use std::io::Read;
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let at = path.clone();
+			BEFORE_OPEN.lock().push((
+				path.clone(),
+				Box::new(move || {
+					fs::rename(&at, at.with_extension("old")).unwrap();
+					fs::write(&at, "replaced").unwrap();
+				}),
+			));
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut open =
+				pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+			let limit = std::time::Duration::from_secs(10);
+			let start = std::time::Instant::now();
+			let opened = loop {
+				if let Poll::Ready(r) = open.poll(&mut Context::from_waker(Waker::noop())) {
+					break Some(r);
+				}
+				if start.elapsed() > limit {
+					break None;
+				}
+				thread::sleep(std::time::Duration::from_millis(5));
+			};
+			drop(open);
+			let Some(opened) = opened else {
+				panic!(
+					"the open had not returned after {limit:?}: its helper waits on a FIFO, not the \
+					 regular file at the path"
+				);
+			};
+			let mut file = opened.unwrap();
+			match file.poll_write(&mut Context::from_waker(Waker::noop()), b"new") {
+				Poll::Ready(Ok(3)) => {},
+				other => panic!("write: {other:?}"),
+			}
+			drop(file);
+			let mut got = String::new();
+			fs::File::open(&path)
+				.unwrap()
+				.read_to_string(&mut got)
+				.unwrap();
+			assert_eq!(got, "new", "the regular file was not truncated");
 		}
 
 		/// The FIFO the sticky-directory test opens: a FIFO of another user,
