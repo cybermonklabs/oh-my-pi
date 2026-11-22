@@ -73,6 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			raised: false,
 		}
 	}
 
@@ -104,6 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			raised,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*raised = false;
 	}
 }
 
@@ -586,6 +589,9 @@ fn plain_statement(
 			return Some(exec(k, vp, cx, unit, op, line));
 		},
 	};
+	// A forked pipeline element's builtin runs one level down, its words
+	// expanded (the stages would raise it in `dispatch`).
+	exec::raise_element_level(vp);
 	// The temporary scope the staged command gives a builtin.
 	let scope =
 		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
@@ -614,6 +620,7 @@ fn plain_statement(
 	let mut sc = exec::take_scratch(vp);
 	let mut e = seeded_exec(k, vp, &mut sc, argv, arrayref);
 	e.scoped = true;
+	e.raised = true;
 	e.target = Some(Target::Intrinsic(id));
 	e.stage = Stage::Dispatch;
 	sc.exec = Some(e);
@@ -2204,6 +2211,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		s.status = 1;
 		s.stage = Stage::Output;
 		return None;
+	}
+	// A forked pipeline element's builtin or function runs one level down,
+	// once per command (a builtin that runs again after a frame it pushed
+	// comes back here).
+	if matches!(target, Target::Function(_) | Target::Intrinsic(_)) && !st(vp).raised {
+		st(vp).raised = true;
+		exec::raise_element_level(vp);
 	}
 	match target {
 		Target::Function(fname) => call_function(k, vp, cx, op, line, fname),

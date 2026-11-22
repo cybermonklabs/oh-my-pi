@@ -1542,6 +1542,10 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// A forked pipeline element's builtin or function was put one
+	/// subshell level down ([`super::exec::raise_element_level`]), once.
+	#[serde(default)]
+	pub raised:      bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.

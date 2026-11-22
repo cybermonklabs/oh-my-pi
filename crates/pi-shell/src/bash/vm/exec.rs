@@ -3995,7 +3995,8 @@ fn bash_case_hit(
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
-/// (bash's "not for pipes yet"); anything else is one more. The bodies of
+/// (bash's "not for pipes yet": [`raise_element_level`] counts it when it
+/// runs a builtin or function); anything else is one more. The bodies of
 /// its substitutions come first ([`skip_blocks`]).
 fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 	let ops = unit
@@ -4019,6 +4020,50 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 		},
 		[exec, ..] if exec.code == Opcode::Exec && !background => 0,
 		_ => 1,
+	}
+}
+
+/// bash's `execute_subshell_builtin_or_function`: a forked pipeline
+/// element that runs a builtin or a function is one subshell level down
+/// once its words are expanded (at the parent's level, [`stage_level`]),
+/// so a function, `eval`, `.` or a builtin's callback sees one more than
+/// its parent's `$BASH_SUBSHELL`. Called as the element's own simple
+/// command (the vproc's only frame) starts a builtin or function.
+pub fn raise_element_level(vp: &mut Vproc) {
+	if vp.frames.len() != 1 || vp.parent.is_none() || vp.mode.dialect() != Dialect::Bash {
+		return;
+	}
+	let f = &vp.frames[0];
+	let Some(unit) = f.unit.as_deref() else {
+		return;
+	};
+	// A stage's simple command is its last op before the stage's `SubExit`
+	// (its substitutions' bodies come first): anything else is no element
+	// command, without a scan of the unit's stages.
+	let pc = f.pc;
+	if unit
+		.ops
+		.get(pc as usize + 1)
+		.is_none_or(|next| next.code != Opcode::SubExit)
+	{
+		return;
+	}
+	// The innermost spawn stage that holds the frame's pc: the one this
+	// vproc runs.
+	let mut stage: Option<(u32, SpawnKind)> = None;
+	for s in &unit.spawns {
+		for (i, st) in s.stages.iter().enumerate() {
+			let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
+			if (st.entry..end).contains(&pc) && stage.is_none_or(|(entry, _)| st.entry > entry) {
+				stage = Some((st.entry, s.kind));
+			}
+		}
+	}
+	if let Some((entry, SpawnKind::Pipeline)) = stage
+		&& stage_level(unit, entry, false) == 0
+	{
+		let depth = super::subshell_depth(vp) + 1;
+		super::set_subshell_depth(vp, depth);
 	}
 }
 
