@@ -4172,18 +4172,15 @@ fn settle_builtin(
 		}
 	}
 	for c in chunks {
-		let (fd, bytes) = match c {
-			Chunk::Out(fd, b) => (fd, b),
+		let write = match c {
+			Chunk::Out(fd, b) => PendingWrite::new(fd, b.into()),
 			Chunk::Diag(d) => {
 				super::zle::display::trash_for_message(k, cx, vp);
-				(2, k.render_diag(cx, vp, line, &d))
+				PendingWrite::new(2, k.render_diag(cx, vp, line, &d).into())
 			},
+			Chunk::Cont(id) => PendingWrite::then_continue(id),
 		};
-		sc.exec
-			.as_mut()
-			.expect("exec")
-			.writes
-			.push_back(PendingWrite::new(fd, bytes.into()));
+		sc.exec.as_mut().expect("exec").writes.push_back(write);
 	}
 	let e = sc.exec.as_mut().expect("exec");
 	e.status = outcome.status;
@@ -4820,7 +4817,10 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 			None => {},
 		}
 		if done {
-			st(vp).writes.pop_front();
+			// A job held back behind this output runs on now (bash `bg`).
+			if let Some(id) = st(vp).writes.pop_front().and_then(|w| w.cont) {
+				super::jobctl::continue_job(k, id);
+			}
 			continue;
 		}
 		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
@@ -4897,7 +4897,10 @@ fn write_failed(
 	fd: i32,
 	err: std::io::Error,
 ) -> Option<Flow> {
-	st(vp).writes.retain(|queued| queued.fd != fd);
+	// A job held back behind the output still runs on once the rest is out.
+	st(vp)
+		.writes
+		.retain(|queued| queued.fd != fd || queued.cont.is_some());
 	if fd == 2 {
 		return None;
 	}
@@ -4924,6 +4927,7 @@ fn write_failed(
 	st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
 	None
 }
+
 /// Whether `SIGPIPE` is ignored (`trap '' PIPE`), so a write to a pipe
 /// without readers reports `Broken pipe` instead of ending the shell.
 fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {

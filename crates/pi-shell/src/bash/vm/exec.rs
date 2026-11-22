@@ -839,8 +839,13 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// and the settle. The chunk handed off last settles before the next one
 /// goes, and an entry stops at its first failed chunk; write errors on a
 /// diagnostic stream are dropped, as bash does.
-pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
+pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
+	// The shell's job notices still going out to its terminal come first
+	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
+	if super::jobctl::shout_waits(k, vp) {
+		return Some(tty::FD);
+	}
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
 	// terminal gets them first, as zsh's blocking writes order them.
@@ -849,13 +854,19 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	{
 		return Some(tty::FD);
 	}
-	let mut cx = Context::from_waker(&k.waker);
+	let waker = k.waker.clone();
+	let mut cx = Context::from_waker(&waker);
 	while let Some(w) = vp.out.front_mut() {
 		if w.fd == tty::FD {
 			if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
 				t.put(&w.bytes[w.off..]);
-				vp.out.pop_front();
-				if t.flush(k).is_some() {
+				pop_out(k, vp);
+				if vp
+					.zle
+					.as_deref_mut()
+					.and_then(|z| z.tty.as_mut())
+					.is_some_and(|t| t.flush(k).is_some())
+				{
 					return Some(tty::FD);
 				}
 				continue;
@@ -877,12 +888,12 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			};
 			w.handed = super::proc::HandedOff::default();
 			if settled.is_err() {
-				vp.out.pop_front();
+				pop_out(k, vp);
 				continue;
 			}
 		}
 		if done {
-			vp.out.pop_front();
+			pop_out(k, vp);
 			continue;
 		}
 		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
@@ -892,12 +903,22 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
-				vp.out.pop_front();
+				pop_out(k, vp);
 			},
 			Poll::Pending => return Some(w.fd),
 		}
 	}
 	None
+}
+
+/// The front of `vp.out` is out (written and settled, or dropped): pop it,
+/// and continue the job it held back ([`PendingWrite::then_continue`]).
+fn pop_out(k: &mut Kernel, vp: &mut Vproc) {
+	if let Some(w) = vp.out.pop_front()
+		&& let Some(id) = w.cont
+	{
+		super::jobctl::continue_job(k, id);
+	}
 }
 
 /// Grammar switches from the current options (also `zpty`'s parse of its

@@ -56,7 +56,7 @@ pub mod utmp;
 #[cfg(not(unix))]
 pub(crate) use fs::BLOCKING_WRITE_CHUNK;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use fs::{CHUNKS_FAILED, in_blocking_writer_process};
+pub(crate) use fs::{CHUNKS_FAILED, hold_writers, in_blocking_writer_process, test_probe};
 #[cfg(unix)]
 pub(crate) use ready::WRITE_CHUNK;
 

@@ -103,6 +103,10 @@ pub enum Chunk {
 	Out(i32, Vec<u8>),
 	/// A diagnostic for stderr (rendered when the builtin completes).
 	Diag(Diag),
+	/// Continue this job (`SIGCONT`) once the output before it is out
+	/// ([`PendingWrite::then_continue`](super::proc::PendingWrite::then_continue)):
+	/// bash `bg` prints the job first.
+	Cont(crate::bash::ids::JobId),
 }
 
 /// Why a builtin could not complete yet (or at all).

@@ -223,6 +223,8 @@ impl BlockingWriter {
 			.spawn(move || {
 				// Ends once the `StdFile` is dropped and the last chunk is done.
 				while let Ok((mark, bytes)) = queue.recv() {
+					#[cfg(all(test, target_os = "linux"))]
+					wait_while_held();
 					let result = write_all_waiting(&mut file, &bytes);
 					#[cfg(all(test, target_os = "linux"))]
 					if result.is_err() {
@@ -407,6 +409,99 @@ pub(crate) fn in_blocking_writer_process(test: &str, body: impl FnOnce()) {
 		out.status,
 		String::from_utf8_lossy(&out.stderr)
 	);
+}
+
+/// Test only: while held ([`hold_writers`]), a writer thread has taken its
+/// chunk (it is busy) but does not write it, so a test finds the thread
+/// busy for as long as it likes, without racing it.
+#[cfg(all(test, target_os = "linux"))]
+static HELD: (std::sync::Mutex<bool>, std::sync::Condvar) =
+	(std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Test only: every writer thread of this process holds the chunk it takes
+/// until the guard is dropped. Process-wide: a test that holds runs in a
+/// process of its own ([`in_blocking_writer_process`]).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn hold_writers() -> WritersHeld {
+	*HELD.0.lock().unwrap() = true;
+	WritersHeld(())
+}
+
+/// The hold of [`hold_writers`]; dropping it lets the writer threads go on.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct WritersHeld(());
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for WritersHeld {
+	fn drop(&mut self) {
+		*HELD.0.lock().unwrap() = false;
+		HELD.1.notify_all();
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn wait_while_held() {
+	let mut held = HELD.0.lock().unwrap();
+	while *held {
+		held = HELD.1.wait(held).unwrap();
+	}
+}
+
+/// Test only: socket and descriptor probes for the engine's tests, whose
+/// module forbids `unsafe`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_probe {
+	use std::os::fd::{AsRawFd, RawFd};
+
+	/// `SIOCATMARK` (Linux `asm-generic/sockios.h`).
+	const SIOCATMARK: libc::c_ulong = 0x8905;
+
+	/// Whether this system carries TCP urgent data (`MSG_OOB`) end to end: a
+	/// control on a connection of its own, whose other end must see it
+	/// (`POLLPRI`) within a second. gVisor sends it but never signals it.
+	pub(crate) fn urgent_data_is_carried() -> bool {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+		let (server, _) = listener.accept().unwrap();
+		// SAFETY: a valid one-byte buffer.
+		let sent =
+			unsafe { libc::send(client.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) == 1 };
+		sent && urgent_arrives(&server, 1_000)
+	}
+
+	/// Whether urgent data arrives at `fd` within `ms` milliseconds
+	/// (`POLLPRI`).
+	pub(crate) fn urgent_arrives(fd: &impl AsRawFd, ms: i32) -> bool {
+		let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+		// SAFETY: one `pollfd`, valid for the call.
+		let n = unsafe { libc::poll(&raw mut p, 1, ms) };
+		n == 1 && p.revents & libc::POLLPRI != 0
+	}
+
+	/// Whether `fd`'s read position is at the urgent mark (`SIOCATMARK`).
+	pub(crate) fn at_mark(fd: &impl AsRawFd) -> bool {
+		let mut at: libc::c_int = 0;
+		// SAFETY: `SIOCATMARK` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd.as_raw_fd(), SIOCATMARK, &raw mut at) };
+		assert_eq!(r, 0, "SIOCATMARK: {}", std::io::Error::last_os_error());
+		at != 0
+	}
+
+	/// The bytes queued to read at `fd` (`FIONREAD`).
+	pub(crate) fn queued(fd: RawFd) -> usize {
+		let mut n: libc::c_int = 0;
+		// SAFETY: `FIONREAD` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut n) };
+		assert_eq!(r, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+		usize::try_from(n).unwrap()
+	}
+
+	/// Make `fd` non-blocking.
+	pub(crate) fn set_nonblocking(fd: &impl AsRawFd) {
+		// SAFETY: `F_SETFL` on a valid descriptor.
+		let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+		assert_eq!(r, 0, "F_SETFL: {}", std::io::Error::last_os_error());
+	}
 }
 
 /// Reopen a Linux pipe through procfs, producing a distinct non-blocking open
@@ -2278,8 +2373,11 @@ mod tests {
 				let mut p = libc::pollfd { fd: writer.file.as_raw_fd(), events: 0, revents: 0 };
 				// SAFETY: one `pollfd`, valid for the call.
 				let n = unsafe { libc::poll(&raw mut p, 1, 100) };
-				assert!(n >= 0, "poll: {}", io::Error::last_os_error());
-				if p.revents & libc::POLLERR != 0 {
+				if n < 0 {
+					// A signal ended the wait: the loop waits again.
+					let e = io::Error::last_os_error();
+					assert_eq!(e.kind(), io::ErrorKind::Interrupted, "poll: {e}");
+				} else if p.revents & libc::POLLERR != 0 {
 					break;
 				}
 				assert!(Instant::now() < deadline, "DEADLINE: the read end was not gone within 10 s");
