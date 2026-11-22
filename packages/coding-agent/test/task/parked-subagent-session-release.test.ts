@@ -24,7 +24,7 @@ import { createMockModel, type MockHandler, type MockModel, registerMockApi } fr
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -177,6 +177,7 @@ const recallingHandler: MockHandler = context => {
 
 interface KeptAliveRun {
 	mock: MockModel;
+	modelRegistry: ModelRegistry;
 	/** Drops the mock's session-bound recordings. */
 	release(): void;
 	close(): void;
@@ -184,7 +185,7 @@ interface KeptAliveRun {
 
 /**
  * Runs `AGENT_ID` to a finished keep-alive state, with `options.context` as its task context, on `options.model`
- * when given (the mock still labels the task).
+ * or the first model of `options.provider` when given (the mock still labels the task).
  */
 async function runKeptAliveSubagent(
 	options: {
@@ -196,6 +197,8 @@ async function runKeptAliveSubagent(
 		settings?: Readonly<Record<string, unknown>>;
 		/** A model the model registry does not hold, which the subagent runs on. */
 		model?: Model<Api>;
+		/** A provider the model registry registers (as an extension does), on whose first model the subagent runs. */
+		provider?: { name: string; config: ProviderConfigInput };
 	} = {},
 ): Promise<KeptAliveRun> {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
@@ -210,6 +213,12 @@ async function runKeptAliveSubagent(
 	authStorage.keys.setRuntime("mock", "test-key");
 	if (options.model) authStorage.keys.setRuntime(options.model.provider, "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
+	if (options.provider) modelRegistry.registerProvider(options.provider.name, options.provider.config);
+	const modelOverride = options.model
+		? `${options.model.provider}/${options.model.id}`
+		: options.provider
+			? `${options.provider.name}/${options.provider.config.models?.[0]?.id}`
+			: "mock/mock-model";
 	const mock = createMockModel({
 		handler:
 			options.handler ??
@@ -231,7 +240,7 @@ async function runKeptAliveSubagent(
 			context: options.context,
 			index: 0,
 			id: AGENT_ID,
-			modelOverride: options.model ? `${options.model.provider}/${options.model.id}` : "mock/mock-model",
+			modelOverride,
 			authStorage,
 			modelRegistry,
 			settings: Settings.isolated({
@@ -257,6 +266,7 @@ async function runKeptAliveSubagent(
 	}
 	return {
 		mock,
+		modelRegistry,
 		// Recorded mock calls carry stream options with closures bound to the session.
 		release: () => {
 			mock.reset();
@@ -573,3 +583,76 @@ for (const { where, secret, fields } of [
 		}
 	}, 30_000);
 }
+
+const REGISTRY_MODEL_API = "test-parked-release-registry-model";
+const REGISTRY_PROVIDER = "registry-provider";
+const REGISTRY_MODEL_ID = "registry-model";
+
+/** An extension's provider: its model is plain data with `undefined` fields, as a models.yml provider's is. */
+const registryProvider: ProviderConfigInput = {
+	api: REGISTRY_MODEL_API,
+	baseUrl: "https://llm.example.test/v1",
+	apiKey: fixtureSecret(),
+	models: [
+		{
+			id: REGISTRY_MODEL_ID,
+			name: "Registry model",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 4096,
+		},
+	],
+};
+
+/**
+ * Observes weakly the model registry's object of the provider's model, and copies its fields (outside the test body,
+ * so no strong local binding outlives the capture).
+ */
+function observeRegistryModel(modelRegistry: ModelRegistry): { model: WeakRef<Model<Api>>; fields: Model<Api> } {
+	const model = modelRegistry.find(REGISTRY_PROVIDER, REGISTRY_MODEL_ID);
+	if (!model) throw new Error(`The model registry holds no ${REGISTRY_PROVIDER}/${REGISTRY_MODEL_ID}`);
+	return { model: new WeakRef(model), fields: structuredClone(model) };
+}
+
+/** Whether the model registry now holds another object than `model` for the provider's model. */
+function registryReplaced(modelRegistry: ModelRegistry, model: WeakRef<Model<Api>>): boolean {
+	const current = modelRegistry.find(REGISTRY_PROVIDER, REGISTRY_MODEL_ID);
+	return current !== undefined && current !== model.deref();
+}
+
+// If this regresses, every subagent parked on a configured model (an extension's or a models.yml provider's) keeps its
+// own copy of that model for the rest of the process once the model registry rebuilds its catalog after the park, as
+// it does when its configuration or credentials change; or a revived subagent runs on a model other than the one it
+// parked with.
+it("keeps no model the registry replaced after the park, and revives on the registry's equal one", async () => {
+	const models: Model<Api>[] = [];
+	registerCustomApi(REGISTRY_MODEL_API, answeringStream(models), MOCK_API_SOURCE);
+	const run = await runKeptAliveSubagent({ provider: { name: REGISTRY_PROVIDER, config: registryProvider } });
+	try {
+		expect(models.length).toBeGreaterThan(0);
+		const parked = observeRegistryModel(run.modelRegistry);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+		models.length = 0;
+
+		// A catalog rebuild: the registry replaces its model objects with equal copies.
+		await run.modelRegistry.refresh("offline", { refreshCommandCredentials: true });
+		expect(registryReplaced(run.modelRegistry, parked.model)).toBe(true);
+		expect(await collected(parked.model, COLLECT_DEADLINE_MS)).toBe(true);
+
+		const followUp = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: TASK_AGENT,
+			message: "anything else?",
+			storeMaskCwd: path.join(root, "home", "work"),
+		});
+		expect(followUp.exitCode).toBe(0);
+		const revivedModel = models.at(-1);
+		expect(revivedModel).toBe(run.modelRegistry.find(REGISTRY_PROVIDER, REGISTRY_MODEL_ID));
+		expect(Bun.deepEquals(revivedModel, parked.fields, true)).toBe(true);
+	} finally {
+		run.close();
+	}
+}, 30_000);

@@ -1,8 +1,8 @@
 /**
  * A subagent's registry record names the output artifact its executor wrote (`history.outputPath`); the Agent Hub
- * shows it and RPC clients and worker threads get it in their copies of the record. The record keeps an artifact
- * beside its session file as a getter derived from that file, so every reader, and every copy of the record, must
- * still read the path that was written, whatever the record goes through after.
+ * shows it and RPC clients and worker threads get it in their copies of the record. The record keeps the artifact
+ * beside its session file as a getter derived from the directory and id it keeps that file as, so every reader, and
+ * every copy of the record, must still read the path that was written, whatever the record goes through after.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -77,6 +77,11 @@ describe("a subagent record's output artifact", () => {
 		// A cost to reset: the next replacement rebuilds it too.
 		expect(registry.attachSession("Worker", sessionStub(), SESSION_FILE, ref)).toBe(true);
 		expect(ref.history?.directCost).toBeUndefined();
+		expect(ref.history?.outputPath).toBe(OUTPUT_PATH);
+		// A transcript of the same name in another directory, which a history write against it rebuilds for.
+		const moved = path.join(path.sep, "artifacts", "other", "Worker.jsonl");
+		expect(registry.attachSession("Worker", sessionStub(), moved, ref)).toBe(true);
+		expect(registry.setHistory("Worker", { directCost: 0.2 }, moved)).toBe(true);
 		expect(ref.history?.outputPath).toBe(OUTPUT_PATH);
 	});
 

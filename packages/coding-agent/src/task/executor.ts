@@ -4789,8 +4789,9 @@ type SubagentSpecOptions = SubagentSessionSpec["options"];
  *   holds and shares (registries, managers, buses, the parent's tools, context and extensions) or one JSON cannot
  *   hold.
  * - `either`: the entry when JSON keeps it whole, else the state. The model goes to the entry only when it also can
- *   carry no secret ({@link modelMayCarrySecret}) and differs from the model registry's model of its provider and id:
- *   one equal to that in every field (the usual case) stays in the state, as the registry's object.
+ *   carry no secret ({@link modelMayCarrySecret}), and also when JSON only leaves out its `undefined` fields (the
+ *   entry lists them) if the model registry holds a model equal to it in every field (the usual case). A revive takes
+ *   the registry's object while the registry holds an equal one.
  * - `live`: neither; each revive or session build takes it from the live process or makes it again.
  */
 type ReviveInputSource = "recorded" | "shared" | "either" | "live";
@@ -4994,10 +4995,13 @@ interface SubagentReviveInputs {
 interface SubagentReviveRecord {
 	/**
 	 * The options {@link RECORDED_SPEC_OPTION_KEYS} names; the output schema, unless the
-	 * {@link WarmReviveState} references it; the model, when JSON keeps it whole, it can carry no
-	 * secret ({@link modelMayCarrySecret}) and it differs from the model registry's model of its provider and id.
+	 * {@link WarmReviveState} references it; the model, when it can carry no secret ({@link modelMayCarrySecret})
+	 * and the entry gives it back equal in every field ({@link modelUndefinedFields}): one the model registry holds an
+	 * equal one of, or a copy of the subagent's own that JSON keeps whole.
 	 */
 	readonly options: Partial<SubagentSpecOptions>;
+	/** The fields of the options' model whose value is `undefined`, which its JSON leaves out; absent when none. */
+	readonly modelUndefinedFields?: readonly (readonly string[])[];
 	/** The prompt inputs {@link RECORDED_PROMPT_KEYS} names, and the output schema as the options hold it. */
 	readonly prompt: Pick<SubagentPromptInputs, (typeof RECORDED_PROMPT_KEYS)[number]> & {
 		readonly outputSchema?: unknown;
@@ -5025,6 +5029,19 @@ interface SubagentReviveRecord {
 	readonly generation: number;
 }
 
+/** Whether `value` is a list of field paths (keys from the outermost in), as a revive record's model has. */
+function isFieldPaths(value: unknown): value is string[][] {
+	return (
+		Array.isArray(value) &&
+		value.every(
+			(fieldPath: unknown) =>
+				Array.isArray(fieldPath) &&
+				fieldPath.length > 0 &&
+				fieldPath.every((key: unknown) => typeof key === "string"),
+		)
+	);
+}
+
 function isSubagentReviveRecord(data: unknown): data is SubagentReviveRecord {
 	return (
 		isRecord(data) &&
@@ -5034,7 +5051,8 @@ function isSubagentReviveRecord(data: unknown): data is SubagentReviveRecord {
 		isRecord(data.settingsInputs) &&
 		isRecord(data.wake) &&
 		typeof data.keepTodo === "boolean" &&
-		typeof data.generation === "number"
+		typeof data.generation === "number" &&
+		(data.modelUndefinedFields === undefined || isFieldPaths(data.modelUndefinedFields))
 	);
 }
 
@@ -5064,10 +5082,14 @@ type SharedSpecOptions = Pick<SubagentSpecOptions, KeysWithSource<typeof SPEC_OP
  * the few inputs its transcript does not hold: functions, a prewalk target's model, telemetry hooks,
  * a model, output schema or agent definition JSON would not keep whole, a model that may carry a
  * secret, and the credential settings its runs wrote. The model is set when the live session is
- * disposed, to the model registry's own object when the subagent's agrees with it in every field,
- * and so are the credential settings. Its plain inputs are in its transcript's newest
- * {@link SUBAGENT_REVIVE_ENTRY} and the peer roster its prompt showed in an {@link IRC_ROSTER_ENTRY};
- * its session file is the one its registry record names, which the lifecycle hands each revive.
+ * disposed, and only when the entry cannot give it back equal: one that may carry a secret, or one
+ * JSON would not keep whole that the model registry holds no equal one of. A model equal to the
+ * registry's goes to the entry: a catalog rebuild after the park replaces the registry's objects
+ * with equal copies, so a state that kept the registry's object would then keep alive one nothing
+ * else holds. The credential settings are set at disposal too. Its plain inputs are in its
+ * transcript's newest {@link SUBAGENT_REVIVE_ENTRY} and the peer roster its prompt showed in an
+ * {@link IRC_ROSTER_ENTRY}; its session file is the one its registry record names, which the
+ * lifecycle hands each revive.
  */
 interface WarmReviveState extends SharedSpecOptions {
 	/** Storage the parked session's file lives in; the revive reopens it there. */
@@ -5105,6 +5127,57 @@ function jsonKeepsWhole(value: unknown): boolean {
 		// A cycle or a BigInt.
 		return false;
 	}
+}
+
+/** The paths (keys from the outermost in) of the fields in `value` whose value is `undefined`. */
+function undefinedFieldPaths(value: object, at: readonly string[] = [], within = new Set<object>()): string[][] {
+	// A value JSON took whole has no cycle among its fields; this only guards a field JSON reads through `toJSON`.
+	if (within.has(value)) return [];
+	within.add(value);
+	const paths: string[][] = [];
+	for (const [key, field] of Object.entries(value)) {
+		if (field === undefined) {
+			paths.push([...at, key]);
+		} else if (typeof field === "object" && field !== null) {
+			paths.push(...undefinedFieldPaths(field, [...at, key], within));
+		}
+	}
+	within.delete(value);
+	return paths;
+}
+
+/** Sets each field `paths` names in `value` (as JSON gave it back, so a new object) to `undefined` again. */
+function setUndefinedFields<T>(value: T, paths: readonly (readonly string[])[]): T {
+	for (const fieldPath of paths) {
+		let parent: unknown = value;
+		for (const key of fieldPath.slice(0, -1)) {
+			parent = typeof parent === "object" && parent !== null ? Reflect.get(parent, key) : undefined;
+		}
+		if (typeof parent === "object" && parent !== null) {
+			Reflect.set(parent, fieldPath[fieldPath.length - 1], undefined);
+		}
+	}
+	return value;
+}
+
+/**
+ * The fields of `model` whose value is `undefined`, which its JSON leaves out, when its JSON with those set again gives
+ * back a model strictly equal to it: one that holds no function, cycle or other value JSON changes (a models.yml model
+ * holds `undefined` fields). `undefined` when it does not.
+ */
+function modelUndefinedFields(model: Model<Api>): string[][] | undefined {
+	let json: string | undefined;
+	try {
+		json = JSON.stringify(model);
+	} catch {
+		// A cycle or a BigInt.
+		return undefined;
+	}
+	if (json === undefined) return undefined;
+	const undefinedFields = undefinedFieldPaths(model);
+	return Bun.deepEquals(setUndefinedFields(JSON.parse(json), undefinedFields), model, true)
+		? undefinedFields
+		: undefined;
 }
 
 /** Whether `url` may hold a key: userinfo or a query string, or a text that is no absolute URL. */
@@ -5180,11 +5253,12 @@ function createWarmReviveState(
  * the transcript's writer is still open. A disposal that would write what the transcript's newest
  * {@link SUBAGENT_REVIVE_ENTRY} already holds writes nothing: the spawn's inputs are fixed, and the settings writes and
  * pending candidate rarely change, so each park would otherwise add another copy of the prompt
- * inputs. The model goes to the entry when it is a copy of the subagent's own that JSON keeps
- * whole and that can carry no secret ({@link modelMayCarrySecret}); otherwise `state` references
- * it, as the model registry's object when the two agree in every field: a catalog rebuild replaces
- * the registry's model objects with equal copies, so a parked subagent would otherwise hold the
- * copy its spawn resolved, which nothing else holds.
+ * inputs. The model goes to the entry when it can carry no secret ({@link modelMayCarrySecret}) and
+ * the entry gives it back equal in every field ({@link modelUndefinedFields}), when the model registry
+ * holds an equal one or JSON keeps it whole; otherwise `state` references it, as the registry's object
+ * when the two agree in every field. A catalog rebuild replaces the registry's model objects with
+ * equal copies, before the park (so the spawn's copy is the one nothing else holds) or after it (so
+ * the park's is), and a parked subagent keeps neither.
  */
 function trackSubagentReviveRecord(
 	session: AgentSession,
@@ -5198,8 +5272,9 @@ function trackSubagentReviveRecord(
 		const registered = model && options.modelRegistry?.find(model.provider, model.id);
 		const registryModel =
 			registered && (registered === model || Bun.deepEquals(registered, model, true)) ? registered : undefined;
-		const recordedModel =
-			model && !registryModel && !modelMayCarrySecret(model) && jsonKeepsWhole(model) ? model : undefined;
+		const undefinedFields = model && !modelMayCarrySecret(model) ? modelUndefinedFields(model) : undefined;
+		// A model the registry never held stays as before: in the entry only when JSON keeps it whole.
+		const recordedModel = undefinedFields && (registryModel || undefinedFields.length === 0) ? model : undefined;
 		const keptModel = recordedModel ? undefined : (registryModel ?? model);
 		if (state.model !== keptModel) state.model = keptModel;
 		const layers = session.settings.overlayLayers();
@@ -5219,6 +5294,7 @@ function trackSubagentReviveRecord(
 				outputSchema: recordsSchema ? options.outputSchema : undefined,
 				model: recordedModel,
 			},
+			modelUndefinedFields: recordedModel && undefinedFields?.length ? undefinedFields : undefined,
 			prompt: {
 				...withoutUndefinedFields(prompt, RECORDED_PROMPT_KEYS),
 				outputSchema: recordsSchema ? prompt.outputSchema : undefined,
@@ -5310,11 +5386,19 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 			`Cannot warm-revive subagent "${id}": session file "${sessionFile}" records no revive inputs of its last park.`,
 		);
 	}
+	// The model the subagent parked with, as the entry gives it back, is the model registry's object when the registry
+	// still holds an equal one.
+	const recordedModel =
+		record.options.model && record.modelUndefinedFields
+			? setUndefinedFields(structuredClone(record.options.model), record.modelUndefinedFields)
+			: record.options.model;
+	const registered = recordedModel && shared.modelRegistry?.find(recordedModel.provider, recordedModel.id);
 	// The inputs the parked session was built from: the plain ones its transcript holds, and the live objects.
 	const options: SubagentSpecOptions = withoutUndefinedFields({
 		...record.options,
 		...shared,
-		model: shared.model ?? record.options.model,
+		model:
+			shared.model ?? (registered && Bun.deepEquals(registered, recordedModel, true) ? registered : recordedModel),
 	});
 	const inputs: SubagentReviveInputs = {
 		spec: {
