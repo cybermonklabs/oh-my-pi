@@ -45,6 +45,9 @@ fail() {
 root="$(pwd -P)"
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
+# The lists' one reader, list_entries, shared with rust-test.sh.
+# shellcheck source=.github/sami/rust-test-lists.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
 
 # The packages test:rs leaves out: the strings of the VENDORED_FORK_EXCLUDES
 # array other than "--exclude".
@@ -91,7 +94,7 @@ jq -r --arg root "$root/" '.packages[].manifest_path | ltrimstr($root)' "$tmp/me
 	fail "could not read the root workspace's manifests from cargo metadata"
 echo Cargo.toml >>"$tmp/members"
 [ -f .github/sami/rust-test-cargo-workspaces.txt ] || fail ".github/sami/rust-test-cargo-workspaces.txt is missing"
-awk '!/^[[:space:]]*(#|$)/ { print $1 }' .github/sami/rust-test-cargo-workspaces.txt >>"$tmp/members"
+list_entries .github/sami/rust-test-cargo-workspaces.txt 1 >>"$tmp/members" || fail ".github/sami/rust-test-cargo-workspaces.txt has a malformed line (above)"
 LC_ALL=C sort -u -o "$tmp/members" "$tmp/members"
 git ls-files -- 'Cargo.toml' '*/Cargo.toml' >"$tmp/manifests" || fail "git ls-files failed"
 [ -s "$tmp/manifests" ] || fail "git ls-files names no Cargo.toml"
@@ -177,7 +180,8 @@ echo "Rust test parity: $total test targets in the suite, $missing without a Baz
 # .github/sami/rust-test-sanctioned-skips.txt; otherwise those tests run
 # nowhere.
 [ -f .github/sami/rust-test-sanctioned-skips.txt ] || fail ".github/sami/rust-test-sanctioned-skips.txt is missing"
-awk '!/^[[:space:]]*(#|$)/ { print $1 "\t" $2 }' .github/sami/rust-test-sanctioned-skips.txt | LC_ALL=C sort -u >"$tmp/sanctioned"
+list_entries .github/sami/rust-test-sanctioned-skips.txt 2 >"$tmp/sanctioned" || fail ".github/sami/rust-test-sanctioned-skips.txt has a malformed line (above)"
+LC_ALL=C sort -u -o "$tmp/sanctioned" "$tmp/sanctioned"
 jq -r -s '
 	def attrs($r): ($r.attribute // []);
 	def str($r; $n): [attrs($r)[] | select(.name == $n) | .stringValue // empty] | .[0] // "";

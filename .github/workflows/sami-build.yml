@@ -77,7 +77,13 @@ jobs:
       # Bun version follows package.json "packageManager" (exact pin or floor),
       # the same way upstream's CI does; a hard pin here lags upstream's floor
       # and produced a binary that crashed at startup under 18.2.0's bytecode.
+      # The release restores no GitHub cache: rust_test and rust_test_macos
+      # run test code with sudo on this ref, which can read the runner's token
+      # and save any key for the ref, and a ref's own entries come before
+      # main's. A harness case (W1) keeps it so.
       - uses: ./.github/actions/bun-install
+        with:
+          cache: "false"
       - id: bazel
         uses: ./.github/actions/bazel-cache
       - name: Build native addons
@@ -455,15 +461,35 @@ jobs:
           echo "fs.protected_fifos: $(cat /proc/sys/fs/protected_fifos); the sticky directory's FIFO is refused to $(id -un)"
       # sdk/rust/omp-rpc's two #[ignore]d smoke tests run the repository's
       # omp server (`bun packages/coding-agent/src/cli.ts --mode rpc`), so the
-      # test step runs them alone with --ignored (rust-test-ignored.txt)
-      # under the bun release_binary builds with (package.json's
-      # packageManager, through the same action), with the dependencies and
-      # the native addon in place.
+      # test step runs them alone with --ignored (rust-test-ignored.txt), with
+      # the dependencies and the native addon in place. package.json's
+      # packageManager names only a floor (bun@>=1.4.4), with which
+      # .github/actions/bun-install runs bun.sh's installer for whatever bun
+      # is latest. Test code runs in this job, so it gets one exact bun
+      # instead: the release zip whose sha256 is pinned here (the release's
+      # own digest and its SHASUMS256.txt give the same). bun-install then
+      # finds a bun that meets the floor on PATH and runs no installer, and
+      # the addon step checks the version it runs.
+      - name: bun 1.4.5
+        shell: bash
+        run: |
+          bash .github/sami/fetch-verified.sh "bun 1.4.5" "$RUNNER_TEMP/bun-linux-x64.zip" \
+            94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-linux-x64.zip
+          unzip -q -d "$RUNNER_TEMP/bun" "$RUNNER_TEMP/bun-linux-x64.zip"
+          mkdir -p "$HOME/.bun/bin"
+          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" "$HOME/.bun/bin/bun"
+          echo "$HOME/.bun/bin" >>"$GITHUB_PATH"
       - uses: ./.github/actions/bun-install
       - name: The native addon the smoke tests' server loads
+        shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
+          if [ "$(bun --version)" != 1.4.5 ]; then
+            echo "::error title=bun::$(command -v bun) is bun $(bun --version), not the pinned 1.4.5"
+            exit 1
+          fi
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           OMP_NATIVE_BUILD_BACKEND=bazel bun scripts/bazel-natives.ts host --dest packages/natives/native
           ls -l packages/natives/native
@@ -533,24 +559,58 @@ jobs:
         with:
           persist-credentials: false
       # The test step and its harness need bash 4 or later (associative
-      # arrays), and macOS's /bin/bash is 3.2 (run 44875114140); Homebrew's
-      # bash goes first on PATH for every later step. The step runs here on
-      # macOS's own awk, sed and sort.
-      - name: bash 4 or later
+      # arrays), and macOS's /bin/bash is 3.2 (run 44875114140). bash 5.2.21
+      # is built from the GNU tarball whose sha256 rust_test pins for its
+      # reference bash, cached under a key that names it and the runner
+      # image, and goes first on PATH for every later step; the tests' own
+      # bash stays /bin/bash. The step runs here on macOS's own awk, sed and
+      # sort.
+      - id: image
+        name: The runner image's version, for the cache key
         shell: bash
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-          HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          brew install bash
-          prefix="$(brew --prefix)"
-          version="$("$prefix/bin/bash" -c 'echo "${BASH_VERSINFO[0]}"')"
-          "$prefix/bin/bash" --version | sed -n 1p
-          if [ "$version" -lt 4 ]; then
-            echo "::error title=bash::$prefix/bin/bash is bash $version, not 4 or later"
+          if [ -z "${ImageOS:-}" ] || [ -z "${ImageVersion:-}" ]; then
+            echo "::error title=Runner image::ImageOS or ImageVersion is not set, so the cache key cannot name the image"
             exit 1
           fi
-          echo "$prefix/bin" >>"$GITHUB_PATH"
+          echo "version=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          echo "runner image: $ImageOS-$ImageVersion"
+      - id: bash-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/bash-ref
+          key: bash-5.2.21-c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8-${{ steps.image.outputs.version }}
+      - name: Build bash 5.2.21
+        if: steps.bash-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          bash .github/sami/fetch-verified.sh "bash 5.2.21" "$RUNNER_TEMP/bash-5.2.21.tar.gz" \
+            c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8 \
+            https://ftpmirror.gnu.org/gnu/bash/bash-5.2.21.tar.gz \
+            https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz
+          mkdir -p "$RUNNER_TEMP/bash-build"
+          tar -xzf "$RUNNER_TEMP/bash-5.2.21.tar.gz" -C "$RUNNER_TEMP/bash-build"
+          cd "$RUNNER_TEMP/bash-build/bash-5.2.21" || exit 1
+          ./configure --prefix="$HOME/bash-ref"
+          make -j "$(sysctl -n hw.ncpu)"
+          make install
+      - name: Check bash 5.2.21
+        shell: bash
+        run: |
+          version="$("$HOME/bash-ref/bin/bash" --version | sed -n 1p)"
+          echo "$version"
+          case "$version" in "GNU bash, version 5.2.21("*) ;; *)
+            echo "::error title=bash 5.2.21::$HOME/bash-ref/bin/bash is not bash 5.2.21"
+            exit 1
+            ;;
+          esac
+          echo "$HOME/bash-ref/bin" >>"$GITHUB_PATH"
+      - name: Save bash 5.2.21
+        if: steps.bash-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/bash-ref
+          key: ${{ steps.bash-cache.outputs.cache-primary-key }}
       - name: The gate's own regression tests
         shell: bash
         run: bash .github/sami/tests/run.sh

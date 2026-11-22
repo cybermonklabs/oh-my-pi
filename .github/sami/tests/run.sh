@@ -8,6 +8,8 @@
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
 #   - rust-test-tmpdir.sh.
+#   - sami-build.yml's release_binary and .github/actions/bun-install: the
+#     release restores no GitHub cache (cache_lint).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -212,8 +214,10 @@ own_default() {
 # and STICKY_ROOT_BODY (the stub's answer to those invocations), OWN_TESTS and
 # OWN_PRINTS (for own_default), MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS,
 # STICKY_FIFO (`none`: RUST_TEST_STICKY_FIFO names no FIFO), JQ_FAIL (jq exits
-# 5 after any run whose arguments hold this text), NOT_MSG (a regex the output
-# must not match).
+# 5 after any run whose arguments hold this text), RAW_LIST (a
+# rust-test-known-raw-output.txt to use in place of KNOWN_RAW's),
+# SANCTIONED_LINE (a line written as it is after SANCTIONED's), NOT_MSG (a
+# regex the output must not match).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -229,12 +233,17 @@ run() {
 	list rust-test-known-skips.txt "${KNOWN_SKIPS:-}" "reason"
 	list rust-test-known-output.txt "${KNOWN_OUTPUT:-}" "prints a summary; no skip"
 	list rust-test-sanctioned-skips.txt "${SANCTIONED:-}" "ruling"
+	if [ -n "${SANCTIONED_LINE:-}" ]; then printf '%s\n' "$SANCTIONED_LINE" >>"$w/repo/.github/sami/rust-test-sanctioned-skips.txt"; fi
 	list rust-test-own-process.txt "${OWN:-}" "why"
 	list rust-test-ignored.txt "${IGNORED_RUN:-}" "why"
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
 	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
 	list rust-test-macos.txt "${MACOS:-}" "macOS only"
-	{ echo '# raw'; [ -n "${KNOWN_RAW:-}" ] && printf '%s\n' "$KNOWN_RAW" | while IFS= read -r l; do printf '%s  prints it; no skip\n' "$l"; done; } >"$w/repo/.github/sami/rust-test-known-raw-output.txt"
+	if [ -n "${RAW_LIST:-}" ]; then
+		cp -- "$RAW_LIST" "$w/repo/.github/sami/rust-test-known-raw-output.txt"
+	else
+		{ echo '# raw'; [ -n "${KNOWN_RAW:-}" ] && printf '%s\n' "$KNOWN_RAW" | while IFS= read -r l; do printf '%s  prints it; no skip\n' "$l"; done; } >"$w/repo/.github/sami/rust-test-known-raw-output.txt"
+	fi
 	local only_env=()
 	if [ -n "${ONLY:-}" ]; then
 		list only.txt "$ONLY" "macOS only"
@@ -590,7 +599,7 @@ run J87-silent-return-passes 0 'Passing tests whose output the skip scan read: 1
 KNOWN_OUTPUT="" run J88-no-output-anywhere 1 'UNKNOWN: no passing test.s output reached the skip scan' '' "rt $D PASSED lt_pass a::one >\"\$bep\"; exit 0"
 
 # m2: the lists read whole lines.
-run J89-list-line-without-name 1 'rust-test-known-failures.txt has a line without its fields' "$B" "{ $P; rt $B PASSED lt_pass x::a; } >\"\$bep\"; exit 0"
+run J89-list-line-without-name 1 'rust-test-known-failures.txt:[0-9]+: no second field: //crates/pi-builtins:pi-builtins_test' "$B" "{ $P; rt $B PASSED lt_pass x::a; } >\"\$bep\"; exit 0"
 
 # The accounting: a filter in a target's args, or a skip, that takes a test
 # out of every invocation.
@@ -714,6 +723,22 @@ run J139-number-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: 
 # (the cargo workspaces' and the doctest run's), not inside a raw-output error.
 JQ_FAIL='else $l end' NOT_MSG="lines outside libtest's record that" run J140-jq-error-on-a-bazel-log-fails-in-the-job-log 1 "^::error title=Rust tests::jq could not read .*/logs/[0-9]+\\.log to its end" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 JQ_FAIL='else $l end' NOT_MSG="lines outside libtest's record that" run J141-jq-error-on-a-cargo-log-fails-in-the-job-log 1 "^::error title=Rust tests::jq could not read .*/logs/cargo-[0-9]+\\.log to its end" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# pi-natives' crash report, read with the committed raw-output list (or the
+# one RUST_TEST_RAW_LIST names): its lines count only in a log that holds the
+# report's first line, and a frame must look like one.
+NAT=//crates/pi-natives:pi_natives_test
+RAWLIST="${RUST_TEST_RAW_LIST:-$repo/.github/sami/rust-test-known-raw-output.txt}"
+crash_rec() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "vcs::tests::catch" }\n'; printf '%s\n' "$@"; printf '{ "type": "test", "name": "vcs::tests::catch", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
+CRASH="$(declare -f crash_rec)"
+REPORT="'pi-natives panic crash' 'pi-natives crash report written to /tmp/t/pi-natives-test-logs-7/native-panic-1-2.log' 'timestamp: 1763700000000 (unix ms)' 'pid:       4242' 'thread:    vcs::tests::catch_panic_converts_native_panics_into_backend_errors' 'message:   valid name: Os { code: 2 }' 'location:  bazel-out/k8-fastbuild/bin/crates/pi-natives/src/vcs.rs:40:9' 'backtrace:' '   0: <std::backtrace::Backtrace>::create' '             at /rustc/f5cedb83a788ea9581097abc36a2a8503a7f541c/library/std/src/backtrace.rs:331:13' '   1: pi_natives::crash_handler::format_panic_report' '  13: __rust_try' '  39: <unknown>'"
+RAW_LIST=$RAWLIST NOT_MSG='::error' run J143-crash-report-passes 0 "Lines outside libtest's record: 13 distinct, 0 named by no entry" '' "$CRASH; { $P; rt $NAT PASSED crash_rec $REPORT; } >\"\$bep\"; exit 0"
+RAW_LIST=$RAWLIST run J144-crash-frames-without-the-report-fail 1 "$NAT wrote 2 lines outside libtest's record that" '' "$CRASH; { $P; rt $NAT PASSED crash_rec '   4: std::panicking::begin_panic' '             at /rustc/f5cedb83a788ea9581097abc36a2a8503a7f541c/library/std/src/panicking.rs:1:2'; } >\"\$bep\"; exit 0"
+RAW_LIST=$RAWLIST run J145-word-frame-in-a-report-fails 1 "$NAT wrote 1 lines outside libtest's record that .*, the first:   3: unavailable" '' "$CRASH; { $P; rt $NAT PASSED crash_rec $REPORT '  3: unavailable'; } >\"\$bep\"; exit 0"
+RAW_LIST=$RAWLIST run J146-source-line-with-words-in-a-report-fails 1 "$NAT wrote 1 lines outside libtest's record that .*, the first: +at no port: nothing to test x.rs:1:1" '' "$CRASH; { $P; rt $NAT PASSED crash_rec $REPORT '             at no port: nothing to test x.rs:1:1'; } >\"\$bep\"; exit 0"
+# Every list is read by one reader: a line without two spaces before its why
+# stops the step, with the reader's message (rust-test-parity.sh and
+# rust-test-macos-inventory.sh give the same one: P13, I9).
+SANCTIONED_LINE="$D a::two ruling" run J147-list-line-without-its-why-stops 1 "rust-test-sanctioned-skips.txt:[0-9]+: no two spaces before its why: $D a::two ruling" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
@@ -740,15 +765,15 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 # binaries> and <linux listings>: lines of `<label> <test>...` (a label with
 # no test has a binary that lists none; a label absent has no binary, or no
 # Linux listing). <named>: rust-test-macos.txt's lines `<label> <test>`.
-# LINUX_INDEX=none leaves the Linux listings out. The output names the
-# inventory file's lines.
+# LINUX_INDEX=none leaves the Linux listings out. NAMED_LINE, a line written
+# as it is after <named>'s. The output names the inventory file's lines.
 irun() {
 	local name="$1" want="$2" msg="$3" targets="$4" mac="$5" linux="$6" named="$7" w out rc label tests t i=0
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
 	w="$(mktemp -d "$scratch/inventory.XXXXXX")"
 	mkdir -p "$w/bin" "$w/repo/.github/sami" "$w/binroot" "$w/linux" "$w/tmp"
 	printf '%s\n' "$targets" >"$w/targets.txt"
-	{ echo '# named'; [ -n "$named" ] && printf '%s\n' "$named" | while read -r a b; do printf '%s %s  macOS libc\n' "$a" "$b"; done; } >"$w/repo/.github/sami/rust-test-macos.txt"
+	{ echo '# named'; [ -n "$named" ] && printf '%s\n' "$named" | while read -r a b; do printf '%s %s  macOS libc\n' "$a" "$b"; done; [ -n "${NAMED_LINE:-}" ] && printf '%s\n' "$NAMED_LINE"; } >"$w/repo/.github/sami/rust-test-macos.txt"
 	while read -r label tests; do
 		[ -n "$label" ] || continue
 		t="${label#//}"
@@ -792,6 +817,7 @@ irun I1b-named-test-joins 0 "$T1 a::named  named in rust-test-macos.txt" "$T1" "
 irun I2-no-linux-listings 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T1 a::one" "" "" </dev/null
 LINUX_INDEX=none irun I2b-no-linux-listings-dir 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T1 a::one" "$T1 a::one" ""
 irun I3-named-test-in-no-mac-binary 1 "$T1 a::gone is in .github/sami/rust-test-macos.txt but in no macOS binary's listing" "$T1" "$T1 a::one" "$T1 a::one" "$T1 a::gone"
+NAMED_LINE="$T1 a::named macOS libc" irun I9-named-line-without-its-why 1 "rust-test-macos.txt:2: no two spaces before its why: $T1 a::named macOS libc" "$T1" "$T1 a::one a::named" "$T1 a::one" ""
 irun I4-target-linux-did-not-list 0 "$T2 b::mac  compiled only on macOS" "$T1
 $T2" "$T1 a::one
 $T2 b::mac" "$T1 a::one" "$T1 a::one"
@@ -840,7 +866,7 @@ EOF
 }
 fetch F1-first-mirror 0 'out.tar.gz from https://a/t' https://a/t=ok https://b/t=ok
 fetch F2-fallback-after-a-failed-download 0 'out.tar.gz from https://b/t' https://a/t=fail https://b/t=ok
-fetch F3-checksum-mismatch-then-good 0 '::warning title=Tarball::https://a/t gave no tarball' https://a/t=bad https://b/t=ok
+fetch F3-checksum-mismatch-then-good 0 '::warning title=Tarball::https://a/t gave no file with sha256' https://a/t=bad https://b/t=ok
 fetch F4-exhausted 1 '::error title=Tarball::no source gave out.tar.gz with sha256' https://a/t=bad https://b/t=fail
 BAD_SHA=1 fetch F5-not-a-sha256 1 'is not a sha256' https://a/t=ok
 
@@ -854,10 +880,62 @@ if [ -z "$only" ] || [[ T1-each-action-its-own-tmpdir =~ $only ]]; then
 	verdict T1-each-action-its-own-tmpdir 0 "$rc" '' "$a $b"
 fi
 
+# --- the release's caches ---------------------------------------------------------
+# cache_lint <workflow> <bun-install action>: release_binary restores no GitHub
+# Actions cache. rust_test and rust_test_macos run test code with sudo on the
+# release's ref; such code can read the runner's token and save any key for
+# that ref, and a ref's own entries come before main's. So release_binary has
+# no actions/cache step, and passes `cache: "false"` to every bun-install
+# step, which then sets cache=none and runs neither of its cache steps.
+cache_lint() {
+	local wf="$1" action="$2" rc=0 steps
+	awk '/^  release_binary:$/ { on = 1; next } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { exit } on' "$wf" >"$scratch/release-binary.yml"
+	[ -s "$scratch/release-binary.yml" ] || { echo "UNKNOWN: $wf has no release_binary job"; return 1; }
+	if grep -nE 'uses: *actions/cache' "$scratch/release-binary.yml"; then
+		echo "release_binary has an actions/cache step (above)"
+		rc=1
+	fi
+	steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$scratch/release-binary.yml" | grep -F 'uses: ./.github/actions/bun-install')"
+	[ -n "$steps" ] || { echo "UNKNOWN: release_binary has no bun-install step"; return 1; }
+	if printf '%s\n' "$steps" | grep -vF 'cache: "false"' | grep -q .; then
+		echo "release_binary has a bun-install step without cache: \"false\""
+		rc=1
+	fi
+	if ! grep -qF 'CACHE_INPUT: ${{ inputs.cache }}' "$action" || ! awk '/elif \[ "\$CACHE_INPUT" = false \]; then/ { getline; if ($0 ~ /echo "cache=none"/) found = 1 } END { exit !found }' "$action"; then
+		echo "$action does not set cache=none for cache: \"false\""
+		rc=1
+	fi
+	if awk '/^      - / { if (s ~ /uses: actions\/cache/ && s !~ /steps\.env\.outputs\.cache == .gha./) bad = 1; s = "" } { s = s $0 "\n" } END { if (s ~ /uses: actions\/cache/ && s !~ /steps\.env\.outputs\.cache == .gha./) bad = 1; exit !bad }' "$action"; then
+		echo "$action has a cache step that does not need cache=gha"
+		rc=1
+	fi
+	[ "$rc" = 0 ] && echo "release_binary: $(printf '%s\n' "$steps" | grep -c .) bun-install steps, each with cache: \"false\"; no actions/cache step"
+	return "$rc"
+}
+# wlint <name> <want> <message regex> <sed for the workflow> <sed for the
+# action>: cache_lint on the repository's files, each edited by its sed script
+# (an empty one leaves it as it is).
+wlint() {
+	local name="$1" want="$2" msg="$3" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/wlint.XXXXXX")"
+	sed -e "${4:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/sami-build.yml"
+	sed -e "${5:-p;d}" "$repo/.github/actions/bun-install/action.yml" >"$w/action.yml"
+	out="$(cache_lint "$w/sami-build.yml" "$w/action.yml" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+wlint W1-release-binary-restores-no-cache 0 'release_binary: 1 bun-install steps, each with cache: "false"; no actions/cache step' '' ''
+wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-install step without cache: "false"' '/^          cache: "false"$/d' ''
+wlint W3-release-binary-cache-step 1 'release_binary has an actions/cache step' 's|^        uses: ./.github/actions/bazel-cache$|        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
+wlint W5-action-cache-step-ungated 1 'has a cache step that does not need cache=gha' '' 's/if: steps.env.outputs.cache == .gha. && github.ref/if: github.ref/'
+
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
 # a repository with one package, demo (a library with tests and doctests),
-# against stubs of cargo metadata and bazel query.
+# against stubs of cargo metadata and bazel query. PARITY_SANCTIONED_LINE, a
+# line written as it is after PARITY_SANCTIONED's.
 prun() {
 	local name="$1" want="$2" msg="$3" rules="$4" w out rc
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -870,7 +948,7 @@ prun() {
 		printf '[package]\nname = "demo"\n' >crates/demo/Cargo.toml
 		printf '[package]\nname = "x"\n' >sdk/rust/x/Cargo.toml
 		printf '# list\n%s\n' "${PARITY_WS:-sdk/rust/x/Cargo.toml  standalone}" >.github/sami/rust-test-cargo-workspaces.txt
-		{ echo '# sanctioned'; [ -n "${PARITY_SANCTIONED:-}" ] && printf '%s  ruling\n' "$PARITY_SANCTIONED"; } >.github/sami/rust-test-sanctioned-skips.txt
+		{ echo '# sanctioned'; [ -n "${PARITY_SANCTIONED:-}" ] && printf '%s  ruling\n' "$PARITY_SANCTIONED"; [ -n "${PARITY_SANCTIONED_LINE:-}" ] && printf '%s\n' "$PARITY_SANCTIONED_LINE"; } >.github/sami/rust-test-sanctioned-skips.txt
 		git init -q . && git add -A && git -c user.email=h@example.invalid -c user.name=harness commit -qm fixture
 	) || { verdict "$name" "$want" 97 "$msg" "could not make the fixture repository"; return 0; }
 	printf '%s\n' "$rules" >"$w/rules.json"
@@ -917,6 +995,8 @@ prun P7-skip-equals-spelling-uncovered 1 "//crates/demo:demo_test's args skip ::
 prun P8-skip-equals-spelling-covered 0 "Skips in test targets' args: 1, 0 run nowhere" "$(covered "$(strs args --skip=::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args ::slow::)")"
 PARITY_SANCTIONED='//crates/demo:demo_test x::flaky' prun P9-sanctioned-skip-in-args 0 'Sanctioned skip in //crates/demo:demo_test.s args: x::flaky' "$(covered "$(strs args --skip x::flaky)")"
+PARITY_SANCTIONED='//crates/demo:demo_test x::a b' prun P12-sanctioned-name-with-a-space 0 'Sanctioned skip in //crates/demo:demo_test.s args: x::a b' "$(covered "$(strs args --skip 'x::a b')")"
+PARITY_SANCTIONED_LINE='//crates/demo:demo_test x::flaky ruling' prun P13-sanctioned-line-without-its-why 1 'rust-test-sanctioned-skips.txt:2: no two spaces before its why: //crates/demo:demo_test x::flaky ruling' "$(covered "$(strs args --skip x::flaky)")"
 prun P10-filter-of-another-binary-does-not-cover 1 "//crates/demo:demo_test's args skip ::slow::" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/other:other_test)" "$(strs args ::slow::)")"
 prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust_test' "$LIB"

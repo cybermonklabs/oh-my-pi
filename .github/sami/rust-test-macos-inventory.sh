@@ -77,10 +77,11 @@ while read -r label; do
 done <"$tmp/targets.txt"
 [ "$listed" != 0 ] || stop "UNKNOWN: no macOS test binary could be listed"
 
-# The tests #[ignore]d off macOS that rust-test-macos.txt names.
-# The line format is list_entries' in rust-test.sh: the name runs from the
-# first space to the first two spaces.
-awk '/^[[:space:]]*(#|$)/ { next } { i = index($0, " "); t = substr($0, 1, i - 1); rest = substr($0, i + 1); j = index(rest, "  "); print t "\t" (j ? substr(rest, 1, j - 1) : rest) }' "$sami/rust-test-macos.txt" >"$tmp/named.tsv"
+# The tests #[ignore]d off macOS that rust-test-macos.txt names, read with the
+# lists' one reader, list_entries, shared with rust-test.sh.
+# shellcheck source=.github/sami/rust-test-lists.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+list_entries "$sami/rust-test-macos.txt" 2 >"$tmp/named.tsv" || stop "$sami/rust-test-macos.txt has a malformed line (above)"
 while IFS=$'\t' read -r label name; do
 	[ -n "${mac_listed[$label$'\t'$name]:-}" ] || stop "$label $name is in $sami/rust-test-macos.txt but in no macOS binary's listing (renamed or removed: fix its line)"
 	printf '%s %s  named in rust-test-macos.txt\n' "$label" "$name" >>"$out"

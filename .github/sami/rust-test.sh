@@ -128,38 +128,14 @@ libtest_event='def libtest_event:
 		or (.type == "suite" and (.event == "started" or .event == "ok" or .event == "failed"))
 		or (.type == "bench" and (.name | type) == "string" and (.median | type) == "number" and (.deviation | type) == "number"));'
 
-# list_entries <list file> <fields>: each entry of a list, as tab-separated
-# fields. An entry line is `<first> <second>  <why>` (fields 2) or
-# `<first>  <why>` (fields 1): the first field is the first word, and the
-# second is everything after it up to two spaces, so a second field with
-# single spaces in it, such as a doctest's `src/lib.rs - f (line 3)`, is read
-# whole. Lines that are blank or start with `#` are comments. A line without
-# its fields fails.
-list_entries() {
-	awk -v fields="$2" '
-		/^[[:space:]]*(#|$)/ { next }
-		{
-			line = $0
-			sub(/[[:space:]]+$/, "", line)
-			i = index(line, " ")
-			first = (i ? substr(line, 1, i - 1) : line)
-			if (fields == 1) { print first; next }
-			rest = (i ? substr(line, i + 1) : "")
-			j = index(rest, "  ")
-			second = (j ? substr(rest, 1, j - 1) : rest)
-			if (second == "" || second ~ /^ /) {
-				printf "%s:%d: no second field: %s\n", FILENAME, FNR, $0 > "/dev/stderr"
-				bad = 1
-				next
-			}
-			print first "\t" second
-		}
-		END { exit bad }' "$1"
-}
+# The lists' one reader, list_entries (`<first> <second>  <why>`), shared with
+# rust-test-parity.sh and rust-test-macos-inventory.sh.
+# shellcheck source=.github/sami/rust-test-lists.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
 
 # entries <list> <fields> <tsv>: list_entries of .github/sami/<list>.
 entries() {
-	list_entries "$sami/$1" "$2" >"$tmp/$3" || stop "$sami/$1 has a line without its fields (above)"
+	list_entries "$sami/$1" "$2" >"$tmp/$3" || stop "$sami/$1 has a malformed line (above)"
 }
 entries rust-test-known-failures.txt 2 known-failures.tsv
 entries rust-test-known-skips.txt 2 known-skips.tsv
@@ -174,7 +150,7 @@ entries rust-test-ignored-root.txt 2 ignored-root.tsv
 entries rust-test-child-entries.txt 2 child-entries.tsv
 entries rust-test-macos.txt 2 macos.tsv
 if [ -n "$only" ]; then
-	list_entries "$only" 2 >"$tmp/only.tsv" || stop "$only has a line without its fields (above)"
+	list_entries "$only" 2 >"$tmp/only.tsv" || stop "$only has a malformed line (above)"
 	[ -s "$tmp/only.tsv" ] || stop "$only names no test"
 fi
 
@@ -762,7 +738,7 @@ scan_output() {
 	done < <(grep -aE "$raw_skip_line" "$tmp/raw-here.txt" || true)
 	case "$label" in
 		*:doc | *:doc:*) ;;
-		*) grep -avE "$raw_skip_line" "$tmp/raw-here.txt" | awk -v t="$label" '{ gsub(/\t/, " "); print t "\t" $0 }' >>"$raw_output" || true ;;
+		*) grep -avE "$raw_skip_line" "$tmp/raw-here.txt" | awk -v t="$label" -v lg="$1" '{ gsub(/\t/, " "); print t "\t" $0 "\t" lg }' >>"$raw_output" || true ;;
 	esac
 }
 
@@ -989,17 +965,41 @@ echo "\`\`\`ignore doc blocks, not tests, marked ignore by upstream: $(count "$t
 # distinct line must match an entry of .github/sami/rust-test-known-raw-output.txt
 # for its target (`<target> <extended regular expression of the whole line>
 # <why it is no skip>`); any other fails the job, since it can be a skip in
-# other words. An entry that matched nothing gets a notice.
+# other words. An entry whose target is written `<target>@<anchor>` (an
+# extended regular expression without a space) counts only for a line of a
+# log that also holds a line the anchor matches whole: a line of a crash
+# report counts only beside the report's first line. raw_output has one row
+# per target, line and log (scan_output). An entry that matched nothing gets a
+# notice.
 LC_ALL=C sort -u -o "$raw_output" "$raw_output"
+cp -- "$raw_output" "$tmp/raw-output-anchors.tsv"
 awk -F'\t' '
-	FILENAME == ARGV[1] { n[$1]++; re[$1, n[$1]] = $2; used[$1, n[$1]] = 0; next }
+	FILENAME == ARGV[1] {
+		t = $1
+		a = ""
+		k = index(t, "@")
+		if (k) {
+			a = substr(t, k + 1)
+			t = substr(t, 1, k - 1)
+		}
+		n[t]++
+		re[t, n[t]] = $2
+		anchor[t, n[t]] = a
+		entry[t, n[t]] = $1
+		used[t, n[t]] = 0
+		next
+	}
+	FILENAME == ARGV[2] {
+		for (i = 1; i <= n[$1]; i++) if (anchor[$1, i] != "" && $2 ~ ("^(" anchor[$1, i] ")$")) held[$1, i, $3] = 1
+		next
+	}
 	{
 		hit = 0
-		for (i = 1; i <= n[$1]; i++) if ($2 ~ ("^(" re[$1, i] ")$")) { hit = 1; used[$1, i] = 1 }
+		for (i = 1; i <= n[$1]; i++) if ((anchor[$1, i] == "" || held[$1, i, $3]) && $2 ~ ("^(" re[$1, i] ")$")) { hit = 1; used[$1, i] = 1 }
 		if (!hit) print "unknown\t" $1 "\t" $2
 	}
-	END { for (k in used) if (!used[k]) { split(k, p, SUBSEP); print "unused\t" p[1] "\t" re[p[1], p[2]] } }
-' "$tmp/known-raw-output.tsv" "$raw_output" | LC_ALL=C sort >"$tmp/raw-verdict.tsv"
+	END { for (k in used) if (!used[k]) { split(k, p, SUBSEP); print "unused\t" entry[p[1], p[2]] "\t" re[p[1], p[2]] } }
+' "$tmp/known-raw-output.tsv" "$tmp/raw-output-anchors.tsv" "$raw_output" | LC_ALL=C sort -u >"$tmp/raw-verdict.tsv"
 awk -F'\t' '$1 == "unknown" { print $2 }' "$tmp/raw-verdict.tsv" | LC_ALL=C sort -u >"$tmp/raw-targets.txt"
 while read -r label; do
 	awk -F'\t' -v t="$label" '$1 == "unknown" && $2 == t { print $3 }' "$tmp/raw-verdict.tsv" >"$tmp/raw-lines.txt"
@@ -1011,7 +1011,7 @@ done <"$tmp/raw-targets.txt"
 while IFS=$'\t' read -r _ label re; do
 	echo "::notice title=Known raw output did not happen::$label $re is in $sami/rust-test-known-raw-output.txt but matched no line"
 done < <(awk -F'\t' '$1 == "unused"' "$tmp/raw-verdict.tsv")
-echo "Lines outside libtest's record: $(count "$raw_output") distinct, $(awk -F'\t' '$1 == "unknown"' "$tmp/raw-verdict.tsv" | awk 'END { print NR }') named by no entry"
+echo "Lines outside libtest's record: $(cut -f1,2 "$raw_output" | LC_ALL=C sort -u | awk 'END { print NR }') distinct, $(awk -F'\t' '$1 == "unknown"' "$tmp/raw-verdict.tsv" | awk 'END { print NR }') named by no entry"
 
 # The cargo re-run reads each doctest's output, so it must have run the same
 # doctests as Bazel's doctest target of the crate (whose crate features can

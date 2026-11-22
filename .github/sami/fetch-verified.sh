@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Downloads a tarball whose sha256 is pinned, from the first of its URLs that
-# gives exactly those bytes: the rust_test job's reference rsync, zsh and bash
-# in .github/workflows/sami-build.yml.
+# Downloads a file whose sha256 is pinned, from the first of its URLs that
+# gives exactly those bytes: in .github/workflows/sami-build.yml, the rust_test
+# job's reference rsync, zsh and bash and its bun, and the bash that
+# rust_test_macos runs its steps with.
 #
 # Usage: fetch-verified.sh <title> <destination> <sha256> <url>...
 #
@@ -33,7 +34,7 @@ for url in "$@"; do
 		echo "$(basename -- "$dest") from $url"
 		exit 0
 	fi
-	echo "::warning title=$title::$url gave no tarball with sha256 $sha"
+	echo "::warning title=$title::$url gave no file with sha256 $sha"
 done
 rm -f -- "$dest"
 echo "::error title=$title::no source gave $(basename -- "$dest") with sha256 $sha"
