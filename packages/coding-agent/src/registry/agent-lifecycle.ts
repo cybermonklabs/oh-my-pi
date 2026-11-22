@@ -41,13 +41,13 @@ import { getAgentTombstonePath } from "./agent-tombstone";
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSessionHandle>;
 
 /**
- * A reviver kept as plain data: `reviver` called with the agent's own `state`. An adoption holds it
- * for as long as its agent stays parked, so `reviver` MUST be a module-level function shared by every
- * agent it revives, never a closure (a closure keeps the scope of the run that built it), and
- * `state` holds only what the agent's transcript cannot: references to objects the live process
- * holds, and inputs the transcript must not or cannot keep whole (credential values, a model that
- * may carry a secret, a value JSON would change). The agent's other inputs are read back from its
- * transcript.
+ * A reviver kept as plain data: `reviver` called with the agent's own `state`. An adoption holds the
+ * two, as fields of its own, for as long as its agent stays parked, so `reviver` MUST be a
+ * module-level function shared by every agent it revives, never a closure (a closure keeps the scope
+ * of the run that built it), and `state` holds only what the agent's transcript cannot: references to
+ * objects the live process holds, and inputs the transcript must not or cannot keep whole (credential
+ * values, a model that may carry a secret, a value JSON would change). The agent's other inputs are
+ * read back from its transcript.
  */
 export interface AgentReviveState<S = unknown> {
 	// Method syntax: an `AgentReviveState<Inputs>` stands where an `AgentReviveState<unknown>` is expected.
@@ -129,10 +129,31 @@ export interface AdoptOptions {
 interface AdoptedAgent {
 	ref: AgentRef;
 	idleTtlMs: number;
-	revive?: AdoptedReviver;
+	/**
+	 * The adopted reviver, called with {@link reviveState}: a plain-data reviver's `reviver` and `state` held as two
+	 * fields of the adoption, not in an object that pairs them, and a closure as the state of
+	 * {@link reviveWithClosure}. Both `undefined` once the adoption holds no reviver.
+	 */
+	reviver?: HeldReviver;
+	reviveState?: unknown;
 	onRelease?: () => Promise<void>;
 	onReviverDropped?: () => void;
 	timer?: NodeJS.Timeout;
+}
+
+/** How an adoption holds every reviver: a function called with the parked ref and the adoption's revive state. */
+type HeldReviver = (expected: AgentRef, state: unknown) => Promise<AgentSessionHandle>;
+
+/** The {@link HeldReviver} of a closure reviver, which an adoption keeps as its revive state. */
+function reviveWithClosure(expected: AgentRef, revive: unknown): Promise<AgentSessionHandle> {
+	return (revive as AgentReviver)(expected);
+}
+
+/** Whether `adopted` holds `revive`: the same closure, or the same plain-data reviver and state. */
+function holdsReviver(adopted: AdoptedAgent, revive: AdoptedReviver): boolean {
+	return typeof revive === "function"
+		? adopted.reviver === reviveWithClosure && adopted.reviveState === revive
+		: adopted.reviver === revive.reviver && adopted.reviveState === revive.state;
 }
 
 /** Fire (at most once) the adoption's reviver-dropped hook. */
@@ -145,6 +166,15 @@ function dropReviver(adopted: AdoptedAgent | undefined): void {
 	} catch (error) {
 		logger.warn("AgentLifecycleManager: onReviverDropped hook failed", { error: String(error) });
 	}
+}
+
+/** Make `adopted` let go of its reviver, keeping the adoption: its next revive is cold. */
+function forgetAdoptedReviver(adopted: AdoptedAgent): void {
+	clearTimeout(adopted.timer);
+	adopted.timer = undefined;
+	adopted.reviver = undefined;
+	adopted.reviveState = undefined;
+	dropReviver(adopted);
 }
 
 interface ParkInFlight {
@@ -312,10 +342,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		}
 		const existing = this.#adopted.get(id);
 		clearTimeout(existing?.timer);
+		const revive = opts.revive;
 		const adopted: AdoptedAgent = {
 			ref,
 			idleTtlMs: opts.idleTtlMs,
-			revive: opts.revive,
+			reviver: revive === undefined ? undefined : typeof revive === "function" ? reviveWithClosure : revive.reviver,
+			reviveState: typeof revive === "function" ? revive : revive?.state,
 			onRelease: opts.onRelease,
 			onReviverDropped: opts.onReviverDropped,
 		};
@@ -333,11 +365,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 */
 	forgetReviver(id: string, revive: AdoptedReviver): boolean {
 		const adopted = this.#adopted.get(id);
-		if (adopted?.revive !== revive) return false;
-		clearTimeout(adopted.timer);
-		adopted.timer = undefined;
-		adopted.revive = undefined;
-		dropReviver(adopted);
+		if (!adopted || !holdsReviver(adopted, revive)) return false;
+		forgetAdoptedReviver(adopted);
 		return true;
 	}
 
@@ -604,14 +633,13 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * when the agent is not revivable or no reviver can be produced.
 	 */
 	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSessionHandle> {
-		let adoption = this.#adopted.get(id);
+		const current = this.#adopted.get(id);
 		// A reviver-less adoption of this ref (its warm reviver's thread died) keeps
 		// its release hook through cold revival and restores it if that fails.
-		const prior = adoption?.ref === ref ? adoption : undefined;
-		let revive = prior?.revive;
-		let coldAdopted = false;
-		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
-			revive = await this.#persistedReviverFactory(ref);
+		const prior = current?.ref === ref ? current : undefined;
+		let adoption = prior?.reviver ? prior : undefined;
+		if (!adoption && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
+			const revive = await this.#persistedReviverFactory(ref);
 			// Teardown can complete during the factory await. A late cold revive must
 			// not cold-adopt (and later attach a live session + TTL) into a disposed
 			// manager — reject deterministically before creating any session.
@@ -624,28 +652,30 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				adoption = {
 					ref,
 					idleTtlMs: prior?.idleTtlMs ?? this.#persistedReviveTtlMs(),
-					revive,
+					reviver: reviveWithClosure,
+					reviveState: revive,
 					onRelease: prior?.onRelease,
 				};
 				this.#adopted.set(id, adoption);
-				coldAdopted = true;
 			}
 		}
 		if (this.#registry.get(id) !== ref) {
 			throw new Error(`Agent "${id}" changed while its persisted session was being prepared.`);
 		}
-		if (ref.status !== "parked" || !revive || !adoption) {
+		const reviver = adoption?.reviver;
+		if (ref.status !== "parked" || !adoption || !reviver) {
 			throw new Error(
-				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
+				`Agent "${id}" is ${ref.status} and cannot be revived${reviver ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
 			);
 		}
+		const reviveState = adoption.reviveState;
 		try {
-			return await this.#revive(id, revive, ref, adoption);
+			return await this.#revive(id, ref, adoption, reviver, reviveState);
 		} catch (error) {
 			// A failed cold revive (stale ctx, missing cwd, bad MCP) must not leave a
 			// poisoned reviver stuck in #adopted — drop it so a later ensureLive
 			// rebuilds via the factory (which may have fresher context by then).
-			if (coldAdopted && this.#adopted.get(id) === adoption) {
+			if (adoption !== prior && this.#adopted.get(id) === adoption) {
 				if (prior) this.#adopted.set(id, prior);
 				else this.#adopted.delete(id);
 			}
@@ -655,10 +685,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			// ({@link forgetReviver}), and revive cold from the transcript.
 			if (
 				error instanceof WarmReviveInputsMissingError &&
-				prior &&
+				adoption === prior &&
 				this.#adopted.get(id) === prior &&
-				this.forgetReviver(id, revive)
+				prior.reviver === reviver &&
+				prior.reviveState === reviveState
 			) {
+				forgetAdoptedReviver(prior);
 				return this.#resolveAndRevive(id, ref);
 			}
 			throw error;
@@ -781,11 +813,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 
 	async #revive(
 		id: string,
-		revive: AdoptedReviver,
 		ref: AgentRef,
 		adopted: AdoptedAgent,
+		reviver: HeldReviver,
+		reviveState: unknown,
 	): Promise<AgentSessionHandle> {
-		const session = await runReviver(revive, ref);
+		const session = await reviver(ref, reviveState);
 		if (this.#disposed) {
 			// The owning lifecycle tore down while the reviver was in flight; dispose
 			// the freshly built session instead of attaching it, and fail the waiter.
