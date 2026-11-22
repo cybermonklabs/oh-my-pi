@@ -7,12 +7,14 @@ import { procmgr } from "@oh-my-pi/pi-utils";
 import { closeDaemonClient, daemonClient, probeDaemon } from "../../src/daemon/client";
 import { daemonTokenPath } from "../../src/daemon/paths";
 import {
+	DAEMON_WORKER_ARG,
 	type DaemonClient,
 	type DaemonCompletionEvent,
 	GLOBAL_SCOPE,
 	type ProcSpec,
 	type UnitSnapshot,
 } from "../../src/daemon/protocol";
+import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../../src/subprocess/worker-client";
 import { daemonLockHeld, IsolatedDaemon, isAlive, waitFor } from "../fixtures/daemon-harness";
 
 const SHELL = process.platform === "win32" ? procmgr.resolveWindowsShell() : "/bin/sh";
@@ -26,6 +28,32 @@ beforeEach(async () => {
 afterEach(async () => {
 	await harness.dispose();
 });
+
+/**
+ * Start this test's daemon and wait until it answers. A client gives a daemon it spawns 10 s to
+ * answer, and a loaded machine can take longer to start one; a test whose subject is not the start
+ * waits for the daemon itself, bounded by its own timeout, and fails at once if the daemon exits.
+ */
+async function startDaemon(): Promise<void> {
+	const spawn = resolveWorkerSpawnCmd(DAEMON_WORKER_ARG);
+	const daemon = Bun.spawn(spawn.cmd, {
+		cwd: spawn.cwd,
+		env: workerEnvFromParent(),
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	harness.track(daemon.pid);
+	for (;;) {
+		const probe = await probeDaemon();
+		if (probe) {
+			probe.close();
+			return;
+		}
+		if (daemon.exitCode !== null) throw new Error(`The daemon exited ${daemon.exitCode} before it answered`);
+		await Bun.sleep(25);
+	}
+}
 
 function parentEnv(): Record<string, string> {
 	const env: Record<string, string> = {};
@@ -108,6 +136,7 @@ describe("daemon client", () => {
 	}, 60_000);
 
 	it("rejects a client holding the wrong token at once instead of retrying until the start timeout", async () => {
+		await startDaemon();
 		const first = await daemonClient();
 		const daemonPid = first.welcome.daemon.pid;
 		harness.track(daemonPid);
@@ -146,6 +175,7 @@ describe("daemon client", () => {
 	}, 30_000);
 
 	it("rejects an aborted open and releases the lease its late answer grants", async () => {
+		await startDaemon();
 		const client = await daemonClient();
 		harness.track(client.welcome.daemon.pid);
 		const key = "abort-open";
@@ -181,6 +211,7 @@ describe("daemon client", () => {
 	}, 60_000);
 
 	it("fires onReconnect and redelivers an unacked completion after the daemon is killed", async () => {
+		await startDaemon();
 		const client = await daemonClient();
 		const firstPid = client.welcome.daemon.pid;
 		harness.track(firstPid);
@@ -225,6 +256,7 @@ describe("daemon client", () => {
 	}, 60_000);
 
 	it("tunnels bytes sent immediately after attach to a proc unit and its output back", async () => {
+		await startDaemon();
 		const client = await daemonClient();
 		harness.track(client.welcome.daemon.pid);
 		const { unit } = await client.open({ kind: "proc", scope: GLOBAL_SCOPE, key: "cat", proc: shProc("exec cat") });
