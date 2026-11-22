@@ -1526,12 +1526,19 @@ impl Shell {
 	/// # Errors
 	///
 	/// [`ShellError::UnknownOption`] for an option name bash does not know;
+	/// [`ShellError::VpidBase`] for a vpid base an OS pid can take;
 	/// [`ShellError::Store`] when the store fails.
 	pub fn create(
 		engine: &Arc<Engine>,
 		cx: &mut Cx<'_>,
 		init: ShellInit,
 	) -> Result<Self, ShellError> {
+		let base = engine.config().vpid_base;
+		if let Some(limit) = crate::bash::os_pid_limit()
+			&& base < limit
+		{
+			return Err(ShellError::VpidBase { base, limit });
+		}
 		let shell_pid = if init.shell_pid == 0 {
 			cx.host.shell_pid()
 		} else {

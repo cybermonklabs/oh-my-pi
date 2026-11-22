@@ -671,12 +671,19 @@ impl Shell {
 	/// [`RestoreError::Incompatible`] for frames of another IR version or
 	/// engine build (retry with `drop_frames`), [`RestoreError::Corrupt`] /
 	/// [`RestoreError::InvalidUnit`] for undecodable or inconsistent blobs,
-	/// [`RestoreError::MissingUnit`], [`RestoreError::Store`].
+	/// [`RestoreError::MissingUnit`], [`RestoreError::VpidBase`] for a vpid
+	/// base an OS pid can take, [`RestoreError::Store`].
 	pub fn restore(
 		engine: &Arc<Engine>,
 		cx: &mut Cx<'_>,
 		opts: RestoreOpts,
 	) -> Result<(Self, RestoreReport), RestoreError> {
+		let base = engine.config().vpid_base;
+		if let Some(limit) = crate::bash::os_pid_limit()
+			&& base < limit
+		{
+			return Err(RestoreError::VpidBase { base, limit });
+		}
 		let root = Root::load(cx.store)?;
 		let argv0 = state::root_misc(cx.store, MiscKey::Argv0)?
 			.map_or_else(|| BString::from("bash"), BString::from);
@@ -690,7 +697,7 @@ impl Shell {
 		let mut k = Kernel::new(engine, root, argv0, shell_pid);
 		// The counters a shell restored from the store alone continues
 		// (`Shell::create` wrote them; the root vproc took the first vpid).
-		let base = engine.config().vpid_base;
+		// `base` was checked above.
 		k.next_vpid = parse_misc(cx.store, MiscKey::NextVpid)?.unwrap_or(base + 1);
 		k.written_vpid = k.next_vpid;
 		k.next_job = parse_misc(cx.store, MiscKey::NextJob)?.unwrap_or(1);

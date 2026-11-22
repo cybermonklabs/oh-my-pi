@@ -2891,7 +2891,20 @@ fn dynamic_value(
 		b"BASH_CMDS" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::CmdHash)?),
 		b"BASH_ALIASES" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::Alias)?),
 		b"DIRSTACK" => DynVal::List(super::builtins::dirstack::dirstack_value(cx.store, vp)?),
-		b"BASHPID" => DynVal::Str(BString::from(vp.vpid.0.format_into(&mut NumBuffer::new()))),
+		// bash: the shell's own process outside a subshell, `$$`; a
+		// subshell's own (here its vpid). A nested in-engine shell's `$$` is
+		// its vpid already.
+		b"BASHPID" => DynVal::Str(match vp.parent {
+			None => match state::record(
+				cx.store,
+				vp,
+				crate::bash::store::Key::Misc(crate::bash::store::MiscKey::ShellPid),
+			)? {
+				Some(crate::bash::store::Record::Misc(v)) => v.clone(),
+				_ => BString::from(k.shell_pid.format_into(&mut NumBuffer::new())),
+			},
+			Some(_) => BString::from(vp.vpid.0.format_into(&mut NumBuffer::new())),
+		}),
 		b"BASH_SUBSHELL" => {
 			DynVal::Str(BString::from(super::subshell_depth(vp).format_into(&mut NumBuffer::new())))
 		},
