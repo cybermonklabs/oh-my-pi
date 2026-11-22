@@ -80,7 +80,7 @@ describe.skipIf(process.platform === "win32")("MCP through the daemon", () => {
 		shared.release();
 		await disposeLocalMcpHost();
 		await harness.dispose();
-	});
+	}, IsolatedDaemon.DISPOSE_TIMEOUT_MS);
 
 	async function connect(): Promise<void> {
 		harness.track((await daemonClient()).welcome.daemon.pid);

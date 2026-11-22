@@ -58,6 +58,9 @@ beforeEach(async () => {
 	projectDir = await canonicalProjectDir(project.path());
 });
 
+// The cleanup isolateDaemonForSmokeTest returns can take a probe (a 250 ms dial and a 10 s hello), a
+// shutdown request with the client's 30 s default timeout and a 10 s wait for the daemon to exit; bun's
+// default for a hook is 5 s.
 afterEach(async () => {
 	for (const tunnel of tunnels.splice(0)) tunnel.close();
 	await restoreDaemon?.();
@@ -68,7 +71,7 @@ afterEach(async () => {
 	daemonPids.clear();
 	await project?.remove();
 	project = undefined;
-});
+}, DAEMON_TEST_TIMEOUT_MS);
 
 async function daemon(): Promise<DaemonClient> {
 	const client = await daemonClient();

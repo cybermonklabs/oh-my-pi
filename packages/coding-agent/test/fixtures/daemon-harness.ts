@@ -52,6 +52,15 @@ export class IsolatedDaemon {
 	readonly #previousTcp: string | undefined;
 	readonly #pids = new Set<number>();
 
+	/**
+	 * How long {@link dispose} may take: TEARDOWN_TIMEOUT_MS from the start of dispose() for the daemon to
+	 * shut down and let go of its lock, then 5 s of slack for the client close, a probe that ends after the
+	 * deadline (it gives up by itself after a 250 ms dial and a 10 s hello), the kills and the removal. The
+	 * deadline does not cut the client close or the probe short. An afterEach that disposes needs at least
+	 * this as its timeout; bun's default for a hook is 5 s.
+	 */
+	static readonly DISPOSE_TIMEOUT_MS = TEARDOWN_TIMEOUT_MS + 5_000;
+
 	private constructor(dir: string, previousDir: string | undefined, previousTcp: string | undefined) {
 		this.dir = dir;
 		this.#previousDir = previousDir;
@@ -75,6 +84,7 @@ export class IsolatedDaemon {
 	}
 
 	async dispose(): Promise<void> {
+		const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
 		try {
 			await closeDaemonClient();
 			// A dispose that outlived its test must never reach another test's daemon,
@@ -83,14 +93,13 @@ export class IsolatedDaemon {
 			if (probe) {
 				this.#pids.add(probe.welcome.daemon.pid);
 				try {
-					await probe.request({ op: "shutdown" });
+					await probe.request({ op: "shutdown" }, AbortSignal.timeout(Math.max(1, deadline - Date.now())));
 				} catch {
 					// Killed below.
 				} finally {
 					probe.close();
 				}
 			}
-			const deadline = Date.now() + TEARDOWN_TIMEOUT_MS;
 			while (process.env[DAEMON_DIR_ENV] === this.dir && daemonLockHeld() && Date.now() < deadline) {
 				await Bun.sleep(25);
 			}

@@ -25,7 +25,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await harness.dispose();
-});
+}, IsolatedDaemon.DISPOSE_TIMEOUT_MS);
 
 function parentEnv(): Record<string, string> {
 	const env: Record<string, string> = {};

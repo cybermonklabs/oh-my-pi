@@ -64,7 +64,7 @@ describe("daemon speech module", () => {
 		for (const tunnel of tunnels.splice(0)) tunnel.close();
 		await daemon.dispose();
 		await fs.rm(tempDir, { recursive: true, force: true });
-	});
+	}, IsolatedDaemon.DISPOSE_TIMEOUT_MS);
 
 	async function openSpeech(client: DaemonClient, key: string): Promise<string> {
 		const { unit } = await client.open({

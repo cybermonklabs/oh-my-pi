@@ -228,7 +228,7 @@ describe("hint single-flight through the daemon", () => {
 
 	afterEach(async () => {
 		await harness.dispose();
-	});
+	}, IsolatedDaemon.DISPOSE_TIMEOUT_MS);
 
 	it("asks the model once per hint when two processes condense the same hints at once", async () => {
 		// Up before either child dials, so neither goes ahead without it.

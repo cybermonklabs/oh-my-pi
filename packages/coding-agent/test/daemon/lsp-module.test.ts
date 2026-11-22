@@ -150,6 +150,10 @@ beforeEach(async () => {
 	cwd = await fs.realpath(workspace.path());
 });
 
+// shutdownAll can take a 5 s shutdown request and two 1 s exit waits; then the cleanup
+// isolateDaemonForSmokeTest returns can take a probe (a 250 ms dial and a 10 s hello), a shutdown
+// request with the client's 30 s default timeout and a 10 s wait for the daemon to exit. Bun's default
+// for a hook is 5 s.
 afterEach(async () => {
 	await shutdownAll();
 	vi.restoreAllMocks();
@@ -160,7 +164,7 @@ afterEach(async () => {
 	watchedPids.clear();
 	await workspace?.remove();
 	workspace = undefined;
-});
+}, DAEMON_TEST_TIMEOUT_MS);
 
 async function daemon(): Promise<DaemonClient> {
 	const client = await daemonClient();

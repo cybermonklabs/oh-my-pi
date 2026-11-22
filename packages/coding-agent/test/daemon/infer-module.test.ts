@@ -115,7 +115,7 @@ describe("daemon infer module", () => {
 	afterEach(async () => {
 		for (const tunnel of tunnels.splice(0)) tunnel.close();
 		await daemon.dispose();
-	});
+	}, IsolatedDaemon.DISPOSE_TIMEOUT_MS);
 
 	/** The isolated daemon of this test, started on first use. */
 	async function startDaemon(): Promise<DaemonClient> {
