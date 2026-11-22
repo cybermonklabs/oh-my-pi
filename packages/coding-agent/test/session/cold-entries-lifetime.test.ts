@@ -26,13 +26,13 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { descriptorsUnder, HAS_PROC_FD, isUnder } from "../helpers/open-descriptors";
 
 /** Larger than any value an entry before the cut keeps in memory. */
 const BODY = "x".repeat(4096);
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** A value whose JSON text is longer than this is a body. */
 const LARGE_JSON_BYTES = 4096;
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
 /** Patch records are appended by `SessionManager.patchEntries`, which a build without the patch-record change lacks. */
@@ -201,28 +201,6 @@ function entriesById(manager: SessionManager, ids: readonly string[]): SessionEn
 		if (!found) throw new Error(`missing entry ${id}`);
 		return found;
 	});
-}
-
-/** Descriptors of this process open on a file under `dir`. */
-function descriptorsUnder(dir: string): string[] {
-	const found: string[] = [];
-	for (const fd of fs.readdirSync("/proc/self/fd")) {
-		try {
-			const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
-			if (target.startsWith(`${dir}${path.sep}`)) found.push(target);
-		} catch {
-			// Closed between the listing and the read.
-		}
-	}
-	return found;
-}
-
-function isUnder(fd: number, dir: string): boolean {
-	try {
-		return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${dir}${path.sep}`);
-	} catch {
-		return false;
-	}
 }
 
 function requestedBytes(data: unknown, offset: unknown, length: unknown): number {

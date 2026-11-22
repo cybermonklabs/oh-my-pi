@@ -23,13 +23,13 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { HAS_PROC_FD, isUnder } from "../helpers/open-descriptors";
 
 /** Larger than any value an entry before the cut keeps in memory. */
 const BODY = "x".repeat(4096);
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
-const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
 /** Windows has no account ids or POSIX modes, so a shared store directory cannot be made there. */
 const HAS_POSIX_OWNERS = process.platform !== "win32" && process.getuid !== undefined;
 
@@ -145,15 +145,6 @@ function uncreatableDir(dir: string): string {
 	const blocker = path.join(dir, "not-a-directory");
 	fs.writeFileSync(blocker, "");
 	return path.join(blocker, "tmp");
-}
-
-/** Whether descriptor `fd` of this process is open on a file under `dir`. */
-function isUnder(fd: number, dir: string): boolean {
-	try {
-		return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${dir}${path.sep}`);
-	} catch {
-		return false;
-	}
 }
 
 /** Bytes a `writeSync`/`writevSync` call asks to write. */
