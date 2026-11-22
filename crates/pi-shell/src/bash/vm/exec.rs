@@ -853,9 +853,12 @@ pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 /// redirections left. The `Redir` op restores the fds in the same step,
 /// right after this ([`clear_scratch`]), and cannot wait in between: an op
 /// that waits runs again, which would try the failed redirection again and
-/// print its message twice. The op waits for the notices and the editor's
-/// display bytes before it applies anything, so only a notice queued while
-/// it was parked mid-way can still be going out here.
+/// print its message twice. No notice can be pending there: the op's wait
+/// on entry returns only with the notices out and the editor's bytes
+/// written, and nothing between it and the failure (`redir::apply`)
+/// queues a notice. So this does what [`flush_out`] would; it is kept so
+/// that a notice a later change queues there still leaves the message on
+/// the redirected fd 2.
 fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
@@ -3047,14 +3050,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::Redir => {
 			// The shell's output to its terminal goes first: its job notices
 			// still going out and the editor's display bytes, as zsh's
-			// blocking writes ordered them ([`flush_out`]). Waited for on the
-			// op's first entry, before any redirection is applied, so a failed
-			// redirection's message comes after them and goes to the fd 2 the
-			// redirections left; a later entry resumes the list where it
-			// parked.
-			if top_frame(vp).scratch.is_none()
-				&& let Some(fd) = flush_out(k, vp)
-			{
+			// blocking writes ordered them ([`flush_out`]; `vp.out` is empty
+			// when an op starts, [`run_slice`]). Waited for on every entry,
+			// before the list goes on: on the first, before any redirection
+			// is applied, and after the op parked mid-way (on a substitution
+			// in a target), for a notice queued meanwhile. No redirection
+			// moves the terminal, so a failed redirection's message comes
+			// after them and goes to the fd 2 the redirections left.
+			if let Some(fd) = flush_out(k, vp) {
 				return Flow::Block(WaitKey::Write { fd });
 			}
 			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
@@ -3076,11 +3079,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
 					// The message goes to stderr as the redirections so far left
-					// it; what would block is written after the restore. A notice
-					// queued while the op was parked mid-way is handed to the
-					// terminal first ([`jobctl::drain_shout`] does not wait for it
-					// to be written); the message does not wait behind it, since
-					// the restore follows in this step ([`flush_queued`]).
+					// it; what would block is written after the restore. No notice
+					// can be pending here: the wait on entry returned with the
+					// notices out, and `redir::apply` queues none. The hand-off
+					// ([`jobctl::drain_shout`]) and the write without the notice
+					// gate ([`flush_queued`]) are kept for a notice a later change
+					// queues in between: it goes to the terminal first, and the
+					// message still goes to the fd 2 the redirections left, since
+					// the restore follows in this step.
 					super::jobctl::drain_shout(k);
 					let _ = flush_queued(k, vp);
 					clear_scratch(&mut k.root, cx.store, vp);
