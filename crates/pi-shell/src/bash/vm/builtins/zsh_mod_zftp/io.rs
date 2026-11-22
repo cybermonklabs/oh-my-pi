@@ -550,11 +550,19 @@ pub fn perform(
 			loop {
 				// An option answer is out before the next byte is read (zsh
 				// writes it with a blocking `write`); while the descriptor's
-				// writer thread still holds the one before, it waits.
+				// writer thread still holds the one before, it waits, under the
+				// line's timeout as zsh's `zfalarm` covers that write.
 				if let LineAt::Answer(cmd, mut off) = st.at {
 					let polled = write_whole(tcx, &h, &cmd, &mut off, unsettled);
 					st.at = LineAt::Answer(cmd, off);
 					if polled.is_pending() {
+						if timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
+							return Ok(ZftpAns::Line {
+								text:      BString::from(std::mem::take(&mut st.text)),
+								eof:       false,
+								timed_out: true,
+							});
+						}
 						return Err(WaitKey::Write { fd: *fd });
 					}
 					st.at = LineAt::Plain;
@@ -1265,6 +1273,47 @@ mod tests {
 					.read_exact(&mut got)
 					.expect("both answers within 10 s");
 				assert_eq!(got, [IAC, DONT, 1, IAC, WONT, 3]);
+			},
+		);
+	}
+
+	/// The line reader's timeout covers an option answer that cannot go out
+	/// (zsh `zfgetline` writes it under `zfalarm`): with the writer thread
+	/// holding the answer and the server sending nothing more, the reader
+	/// answers `timed_out` at its deadline. While it only waited for the
+	/// answer, it never read its timer, and a server that stopped reading
+	/// held zftp past `ZFTP_TMOUT`.
+	#[test]
+	fn a_line_times_out_while_its_option_answer_waits() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_line_times_out_while_its_option_answer_waits"),
+			|| {
+				let (k, mut store) = kernel();
+				let mut host = host();
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let (mut vp, mut server, client) = connected();
+				server.write_all(&[IAC, WILL, 1]).unwrap();
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while probe::queued(client) < 3 {
+					assert!(Instant::now() < deadline, "DEADLINE: the server's bytes did not arrive");
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				let mut sc = Scratch::default();
+				// A one-second line timeout (zsh `ZFTP_TMOUT=1`).
+				let op = ZftpOp::Line { fd: FD, timeout: 1 };
+				let held = crate::sys::hold_writers();
+				let started = Instant::now();
+				let ans = answered(&k, &mut cx, &mut vp, &mut sc, &op);
+				let took = started.elapsed();
+				drop(held);
+				let ZftpAns::Line { timed_out, eof, .. } = ans else {
+					panic!("the line reader answered with no line");
+				};
+				assert!(timed_out && !eof, "timed_out {timed_out}, eof {eof}");
+				assert!(
+					took >= Duration::from_millis(900),
+					"answered after {took:?}, before its timeout"
+				);
 			},
 		);
 	}

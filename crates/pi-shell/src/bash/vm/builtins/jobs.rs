@@ -600,10 +600,7 @@ pub fn suspend(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-	use std::{
-		io::Read as _,
-		time::{Duration, Instant},
-	};
+	use std::time::Duration;
 
 	use super::*;
 	use crate::bash::{
@@ -611,11 +608,7 @@ mod tests {
 		fd::{FdOrigin, FdTable},
 		ids::{JobId, Vpid},
 		signal::SigSet,
-		vm::{
-			Kernel, exec,
-			proc::{PendingWrite, Vproc},
-			state,
-		},
+		vm::{Kernel, proc::Vproc, state},
 	};
 
 	/// A kernel, a host, its store, and the shell's vproc with a stopped
@@ -681,40 +674,6 @@ mod tests {
 				let _held = crate::sys::hold_writers();
 				let _ = bg(&mut k, &mut cx, &mut vp);
 				assert_eq!(k.ctl.word(), 0, "bg continued the job before its line was written");
-			},
-		);
-	}
-
-	/// bash `bg`'s continue waits behind its job line in the shell's output:
-	/// while the writer thread holds the line, the job is not continued; once
-	/// the line is out, it is.
-	#[test]
-	fn bash_bg_continues_its_job_once_the_line_is_out() {
-		crate::sys::in_blocking_writer_process(
-			concat!(module_path!(), "::bash_bg_continues_its_job_once_the_line_is_out"),
-			|| {
-				let (mut k, mut host, mut store, mut vp, mut peer) = shell_with_a_stopped_job();
-				let mut cx = crate::bash::vm::Cx { host: &mut host, store: &mut store };
-				let held = crate::sys::hold_writers();
-				for chunk in bg(&mut k, &mut cx, &mut vp) {
-					match chunk {
-						Chunk::Out(fd, bytes) => vp.out.push_back(PendingWrite::new(fd, bytes.into())),
-						Chunk::Cont(id) => vp.out.push_back(PendingWrite::then_continue(id)),
-						Chunk::Diag(_) => panic!("bg reported an error"),
-					}
-				}
-				assert!(exec::flush_out(&mut k, &mut vp).is_some(), "the line went out while held");
-				assert_eq!(k.ctl.word(), 0, "the job was continued while its line was not out");
-				drop(held);
-				let deadline = Instant::now() + Duration::from_secs(10);
-				while exec::flush_out(&mut k, &mut vp).is_some() {
-					assert!(Instant::now() < deadline, "DEADLINE: the line was not out within 10 s");
-					std::thread::sleep(Duration::from_millis(5));
-				}
-				assert_ne!(k.ctl.word(), 0, "the job was not continued once its line was out");
-				let mut got = [0u8; 16];
-				peer.read_exact(&mut got).unwrap();
-				assert_eq!(&got, b"[1]+ sleep 100 &");
 			},
 		);
 	}

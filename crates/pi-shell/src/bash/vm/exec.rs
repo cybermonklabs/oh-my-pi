@@ -840,12 +840,21 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// goes, and an entry stops at its first failed chunk; write errors on a
 /// diagnostic stream are dropped, as bash does.
 pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
-	use super::zle::tty;
 	// The shell's job notices still going out to its terminal come first
 	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
 	if super::jobctl::shout_waits(k, vp) {
-		return Some(tty::FD);
+		return Some(super::zle::tty::FD);
 	}
+	flush_queued(k, vp)
+}
+
+/// [`flush_out`] without waiting for the shell's job notices: for a
+/// failed compound redirection's message, which belongs on the fd 2 its
+/// redirections left and cannot wait past their restore one op later
+/// (waiting there would apply the redirection again, and print its
+/// message twice).
+fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
 	// terminal gets them first, as zsh's blocking writes order them.
@@ -3048,8 +3057,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Err(redir::Halt::Flow(f)) => f,
 			Err(redir::Halt::Failed) => {
 				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
+				// it; what would block is written after the restore. Not
+				// behind the shell's job notices ([`flush_out`]'s gate): this
+				// op cannot wait and keep its redirections (the restore is the
+				// next step), so waiting would send the message to the
+				// restored fd 2. The notices that can go out go first.
+				super::jobctl::drain_shout(k);
+				let _ = flush_queued(k, vp);
 				clear_scratch(&mut k.root, cx.store, vp);
 				vp.status = 1;
 				Flow::Jump(op.b)
