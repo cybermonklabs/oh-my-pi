@@ -1916,9 +1916,10 @@ export class SessionManager {
 	 * return `true`. The caller writes nothing; the entries stay in memory
 	 * until {@link #runParentMoveFollow} moves this transcript under the
 	 * sibling the parent goes on in and publishes it there, keeping its id.
-	 * `false` for a main session, which moves off itself.
+	 * `false` for a main session, which moves off itself. With `recordLeft` false (a switch whose claim another
+	 * process refused, which never had the transcript), a fork beside the parent does not record it as left.
 	 */
-	#followParentMove(): boolean {
+	#followParentMove({ recordLeft = true }: { recordLeft?: boolean } = {}): boolean {
 		if (this.#parentMoveFollow) return true;
 		// Only a store that claims a subagent transcript under its parent's lease (SQL storage) follows the parent.
 		if (!this.#storage.acquireSessionClaim) return false;
@@ -1929,7 +1930,7 @@ export class SessionManager {
 		}
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
-		const follow: Promise<void> = this.#runParentMoveFollow(childFile, root.stem).finally(() => {
+		const follow: Promise<void> = this.#runParentMoveFollow(childFile, root.stem, recordLeft).finally(() => {
 			if (this.#parentMoveFollow === follow) this.#parentMoveFollow = undefined;
 		});
 		this.#parentMoveFollow = follow;
@@ -1950,7 +1951,7 @@ export class SessionManager {
 	 * move keeps the parent's id), and publishes its whole transcript there:
 	 * no entry is lost, and no id is stranded.
 	 */
-	async #runParentMoveFollow(childFile: string, parentStem: string): Promise<void> {
+	async #runParentMoveFollow(childFile: string, parentStem: string, recordLeft: boolean): Promise<void> {
 		const parent = `${parentStem}.jsonl`;
 		const deadline = Date.now() + PARENT_MOVE_WAIT_MS;
 		let moveOff = sessionMoveOffs.get(parent);
@@ -1978,6 +1979,7 @@ export class SessionManager {
 				"open-elsewhere",
 				{ why: "its parent session is another omp process's" },
 				{ dir: path.dirname(parentStem), parentSession },
+				{ recordLeft },
 			);
 			if (this.#released) this.#closeOwesPublish = true;
 			else this.#rewriteSynchronously();
@@ -2417,11 +2419,15 @@ export class SessionManager {
 	 * loop on a large artifacts directory; the sibling's artifact manager waits
 	 * for it before scanning ids or resolving `artifact://`, and flush/close
 	 * await it. Returns the sibling.
+	 *
+	 * The session moved off is recorded as left (see {@link getLeftSessions}), unless `recordLeft` is false: a
+	 * switch that loaded a session another process holds never had it, so nothing of its own is there.
 	 */
 	#moveOffSessionFile(
 		reason: SessionPersistenceNotice["reason"],
 		detail: { holder?: SessionClaimHolder; why?: string } = {},
 		place?: { dir: string; parentSession: string },
+		{ recordLeft = true }: { recordLeft?: boolean } = {},
 	): string | undefined {
 		const from = this.#sessionFile as string;
 		if (isSessionExclusive() && !place) {
@@ -2429,7 +2435,7 @@ export class SessionManager {
 			return undefined;
 		}
 		const previousSessionId = this.#sessionId;
-		this.#recordLeftSession(previousSessionId, from);
+		if (recordLeft) this.#recordLeftSession(previousSessionId, from);
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
 		this.#taskSiblingCandidate = undefined;
@@ -3935,19 +3941,33 @@ export class SessionManager {
 			return this.#setSessionFile(sessionFile, undefined, { switched });
 		}
 		const resolved = path.resolve(sessionFile);
+		// An append to this file still running (a stopped work pool's discards, `appendCustomEntriesToFile`) writes
+		// as the journal's writer: let it land before this switch takes the writer claim, or the two meet, and the
+		// append's session or this one moves to a sibling.
+		await SessionManager.#pendingAppends.get(resolved);
 		const sessionId = await readSessionHeaderId(resolved, storage);
 		if (!sessionId) return this.#setSessionFile(resolved, undefined, { switched });
 		let holder: SessionClaimHolder | undefined;
-		const release = await storage.acquireSessionClaim(sessionId, resolved, {
-			waitMs: claim.waitMs,
-			onWait: found => {
-				holder = found;
-				claim.onWait?.(found);
-			},
-			writer: true,
-			handover: this.#reclaimsJournalHandedToClone(sessionId, resolved),
-			onLost: () => this.#onSessionClaimLost(sessionId),
-		});
+		let release: (() => void) | null;
+		for (;;) {
+			holder = undefined;
+			release = await storage.acquireSessionClaim(sessionId, resolved, {
+				waitMs: claim.waitMs,
+				onWait: found => {
+					holder = found;
+					claim.onWait?.(found);
+				},
+				writer: true,
+				handover: this.#reclaimsJournalHandedToClone(sessionId, resolved),
+				onLost: () => this.#onSessionClaimLost(sessionId),
+			});
+			// An append that started while the claim was taken would meet it: give the claim back, let the append
+			// land, and take it again.
+			const pending = SessionManager.#pendingAppends.get(resolved);
+			if (!pending) break;
+			release?.();
+			await pending;
+		}
 		// The claim is this call's until the load adopts it with the id: every other way out lets it go, a throw, a
 		// file that holds another session by then, or one emptied since its header was read (a new session starts
 		// there, under an id of its own).
@@ -4104,11 +4124,15 @@ export class SessionManager {
 		if (claimed && claimed.sessionId === this.#sessionId) {
 			claimed.adopted = true;
 			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
-			if (!claimed.release && !this.#followParentMove()) {
-				this.#moveOffSessionFile("open-elsewhere", {
-					holder: claimed.holder,
-					why: "another omp process holds its lease",
-				});
+			// The held session (or a subagent transcript under a held parent) was never this manager's: the switch leaves
+			// the one it had (setSessionFile), so neither the follow's fork nor the move-off records it as left.
+			if (!claimed.release && !this.#followParentMove({ recordLeft: false })) {
+				this.#moveOffSessionFile(
+					"open-elsewhere",
+					{ holder: claimed.holder, why: "another omp process holds its lease" },
+					undefined,
+					{ recordLeft: false },
+				);
 			}
 		}
 		// The agent loop that owns this manager now writes this journal: claim it
