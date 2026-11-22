@@ -746,5 +746,38 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 				await client.exists(`${prefix}file:/s/p/A.jsonl`),
 			]).toEqual([2, false, false]);
 		});
+
+		// The store reads the header as the listing does (leadingSessionHeader), so a session the picker lists is
+		// deleted as listed; the script then compares the whole head the store checked.
+		it("deletes a listed session whose header was cut short, and a cut-short head another session replaced is kept", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			const cut = header("S1").trimEnd().slice(0, -12);
+			await storage.writeText("/s/p.jsonl", cut);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+
+			await storage.writeText("/s/q.jsonl", cut);
+			beforeRemoveScript(client, () => other.client.send("SET", [`${prefix}file:/s/q.jsonl`, header("OTHER")]));
+			await expect(storage.deleteSessionWithArtifacts("/s/q.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/q.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect(await client.get(`${prefix}file:/s/q.jsonl`)).toBe(header("OTHER"));
+		});
+
+		it("deletes a listed session past a malformed line before its header", async () => {
+			const { client, storage } = await open();
+			await storage.writeText("/s/p.jsonl", `{"type":"title","title":"torn\n${header("S1")}`);
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+			expect([
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([false, false]);
+		});
 	});
 });

@@ -684,6 +684,21 @@ export class SessionBusyError extends Error {
 	}
 }
 
+/**
+ * {@link AgentSession.newSession} with `drop` started the new session, but the
+ * previous session's delete failed: `cause` holds the delete's error (a
+ * refusal leaves that session as it was). The message names the reason.
+ */
+export class SessionDropError extends Error {
+	constructor(
+		readonly sessionFile: string,
+		cause: unknown,
+	) {
+		super(`Session not deleted: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+		this.name = "SessionDropError";
+	}
+}
+
 /** Result of {@link AgentSession.navigateTree}. */
 export interface NavigateTreeResult {
 	editorText?: string;
@@ -12221,6 +12236,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @param options - Optional initial messages and parent session path
 	 * @returns true if completed, false if cancelled by hook
+	 * @throws {SessionDropError} with `drop`, when the new session started but the previous one was not deleted
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		const queued = this.#enterSessionTransition(() => this.newSession(options));
@@ -12249,6 +12265,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 		let sessionTransitioned = false;
+		let dropError: SessionDropError | undefined;
 		try {
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
@@ -12260,7 +12277,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					try {
 						await this.sessionManager.dropSession(previousSessionFile);
 					} catch (err) {
+						// The new session still starts: the agent is reset already. The caller learns at the end.
 						logger.error("Failed to delete session during /delete", { err });
+						dropError = new SessionDropError(previousSessionFile, err);
 					}
 				} else {
 					await this.sessionManager.flush();
@@ -12341,6 +12360,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				});
 			}
 
+			if (dropError) throw dropError;
 			return true;
 		} finally {
 			if (advisorRecordersDetached) {

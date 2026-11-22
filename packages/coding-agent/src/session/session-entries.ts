@@ -82,6 +82,8 @@ export interface NewSessionOptions {
 	/**
 	 * Skip flushing the current session and delete it instead of saving. The
 	 * successor starts lazy: no empty header is written until it has content.
+	 * When the delete fails (a refusal, or an error), the successor still
+	 * starts and `AgentSession.newSession` throws `SessionDropError` naming why.
 	 */
 	drop?: boolean;
 	/** Additional workspace directories to seed on the new session. */

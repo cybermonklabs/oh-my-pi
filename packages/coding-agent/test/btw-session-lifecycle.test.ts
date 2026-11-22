@@ -282,7 +282,7 @@ describe("BTW session boundaries", () => {
 		expect(await Bun.file(recordPath).text()).toBe(originalRecord);
 	});
 
-	it("the delete command refuses, deleting nothing, when another session took the current session's file", async () => {
+	it("/session delete refuses, deleting nothing, when another session took the current session's file", async () => {
 		const otherId = crypto.randomUUID();
 		const other = `${JSON.stringify({ type: "session", version: 3, id: otherId, timestamp: new Date().toISOString(), cwd: directory.path() })}\n`;
 		await Bun.write(sourceFile, other);
@@ -291,6 +291,41 @@ describe("BTW session boundaries", () => {
 			`Cannot delete session "${sourceFile}": the file no longer holds session ${sourceId} (it holds ${otherId}). Nothing was deleted.`,
 		);
 		expect(await Bun.file(sourceFile).text()).toBe(other);
+	});
+
+	/** `/delete` (`newSession({ drop: true })`): what it showed the user, and the manager's session after it. */
+	async function deleteCommand(): Promise<{ shown: string[]; errors: string[]; sessionId: string }> {
+		const shown: string[] = [];
+		vi.spyOn(mode, "present").mockImplementation(content => {
+			for (const item of Array.isArray(content) ? content : [content]) {
+				shown.push(...item.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, "").trim()));
+			}
+		});
+		await mode.handleDeleteCommand();
+		const errors = (mode.showError as unknown as { mock: { calls: string[][] } }).mock.calls.map(call => call[0]!);
+		return { shown: shown.filter(Boolean), errors, sessionId: manager.getSessionId() };
+	}
+
+	it("/delete says the session was not deleted, and why, when another session took its file", async () => {
+		const otherId = crypto.randomUUID();
+		const other = `${JSON.stringify({ type: "session", version: 3, id: otherId, timestamp: new Date().toISOString(), cwd: directory.path() })}\n`;
+		await Bun.write(sourceFile, other);
+		const result = await deleteCommand();
+		expect(result.errors).toEqual([
+			`Session not deleted: Cannot delete session "${sourceFile}": the file no longer holds session ${sourceId} (it holds ${otherId}). Nothing was deleted.`,
+		]);
+		expect(result.shown.some(line => line.includes("Session deleted"))).toBe(false);
+		// The new session started all the same; the other session stays as it was.
+		expect(result.sessionId).not.toBe(sourceId);
+		expect(await Bun.file(sourceFile).text()).toBe(other);
+	});
+
+	it("/delete says the session was deleted when it was", async () => {
+		const result = await deleteCommand();
+		expect(result.errors).toEqual([]);
+		expect(result.shown.filter(line => line.includes("Session deleted"))).toHaveLength(1);
+		expect(result.sessionId).not.toBe(sourceId);
+		expect(await Bun.file(sourceFile).exists()).toBe(false);
 	});
 
 	describe.each(["initial", "reinitialized"] as const)("%s extension command context", binding => {

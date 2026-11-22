@@ -16,6 +16,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -521,6 +522,60 @@ for (const { adapter, url } of BACKENDS) {
 				await manager.flush();
 				expect(manager.getSessionFile()).not.toBe(file);
 				await expectOwnDelete(backend, manager, [file]);
+			} finally {
+				await manager.close();
+			}
+		}, 60_000);
+	});
+
+	// The listing, the loader and the delete read a header the same way (leadingSessionHeader): a session the picker
+	// lists is deleted as listed, and one the loader opens is deleted by its own manager.
+	describe.skipIf(!url)(`a delete of a listed ${adapter} session whose header the listing reads leniently`, () => {
+		/** A session file `content` at `name` in the picker's session dir, listed by the picker with its id. */
+		async function listedFile(backend: Backend, name: string, content: string, id: string): Promise<string> {
+			const dir = backend.dir.join("sessions", "-project-");
+			const file = path.join(dir, name);
+			backend.writer.ensureDirSync(dir);
+			await backend.writer.writeText(file, content);
+			await backend.writer.drain();
+			await backend.picker.refresh?.();
+			const listed = (await listSessions(dir, backend.picker)).map(info => [info.path, info.id]);
+			expect(listed).toEqual([[file, id]]);
+			return file;
+		}
+		const headerLine = (id: string) =>
+			JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w" });
+
+		it("deletes a session whose header was cut short (listed, not resumable)", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const cut = headerLine(id).slice(0, -12);
+			const file = await listedFile(backend, "cut.jsonl", cut, id);
+			const deleted = await outcome(SessionManager.deleteListedSession({ path: file, id }, backend.picker));
+			expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [] });
+		}, 60_000);
+
+		it("deletes a session listed past a malformed line before its header, through the picker", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const content = `{"type":"title","title":"torn\n${headerLine(id)}\n${transcript(id, "a turn").split("\n").slice(1).join("\n")}`;
+			const file = await listedFile(backend, "torn.jsonl", content, id);
+			const deleted = await outcome(SessionManager.deleteListedSession({ path: file, id }, backend.picker));
+			expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [] });
+		}, 60_000);
+
+		it("deletes a session opened past a malformed line before its header, by its own manager", async () => {
+			await using backend = await openBackend(adapter, url ?? "");
+			const id = crypto.randomUUID();
+			const content = `{"type":"title","title":"torn\n${headerLine(id)}\n${transcript(id, "a turn").split("\n").slice(1).join("\n")}`;
+			const file = await listedFile(backend, "torn.jsonl", content, id);
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			try {
+				expect(manager.getSessionId()).toBe(id);
+				const deleted = await outcome(manager.dropSession(file));
+				expect({ deleted, paths: await backend.paths() }).toEqual({ deleted: "deleted", paths: [] });
 			} finally {
 				await manager.close();
 			}
