@@ -1,0 +1,8 @@
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "t::a_passes" }
+{ "type": "test", "event": "started", "name": "t::b_fails" }
+{ "type": "test", "event": "started", "name": "t::c_ignored" }
+{ "type": "test", "name": "t::c_ignored", "event": "ignored" }
+{ "type": "test", "name": "t::a_passes", "event": "ok" }
+{ "type": "test", "name": "t::b_fails", "event": "failed", "stdout": "captured line\n\nthread 't::b_fails' (453645) panicked at fail.rs:6:47:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "suite", "event": "failed", "passed": 1, "failed": 1, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.004758538 }
