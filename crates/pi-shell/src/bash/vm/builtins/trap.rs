@@ -777,21 +777,13 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		// bash 5.3 `restore_default_signal`: `trap - SIG` before any trap for a
 		// signal an asynchronous command ignores gives it its default back
-		// (Posix interpretation 751, [`MiscKey::AsyncIgnored`]); after a trap,
+		// (Posix interpretation 751, [`Vproc::async_ignored`]); after a trap,
 		// it puts the ignore back.
 		if let (TrapKey::Signal(sig), None) = (key, &effective)
+			&& ctx.vp.async_ignored.has(sig)
 			&& ctx.record(Key::Trap(key))?.is_none()
-			&& let Some(Record::Words(names)) = ctx.record(Key::Misc(MiscKey::AsyncIgnored))?
 		{
-			let name = sig.to_string();
-			if names.iter().any(|n| n.as_slice() == name.as_bytes()) {
-				let left: Vec<BString> = names
-					.into_iter()
-					.filter(|n| n.as_slice() != name.as_bytes())
-					.collect();
-				let rec = (!left.is_empty()).then_some(Record::Words(left));
-				ctx.store_record(KeyBuf::Misc(MiscKey::AsyncIgnored), rec);
-			}
+			ctx.vp.async_ignored = ctx.vp.async_ignored.without(sig);
 		}
 		let record = effective.map(|action| Record::Trap { mode: mode_of(ctx.vp), action });
 		// The innermost function (for DEBUG also `.` file) and the vproc
@@ -824,9 +816,14 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// bash: a new shell (a script run as `ENOEXEC`) cannot trap or reset the
 /// signals ignored when it starts. Records in `child` the signals `parent`
 /// ignores, by a `''` trap or as an asynchronous command
-/// ([`exec::async_ignored`](crate::bash::vm::exec)); the nested shell's
-/// `fresh_shell` (also a script run as `ENOEXEC`) calls it on the child it
-/// creates.
+/// ([`exec::async_ignored`](crate::bash::vm::exec)), as hard-ignored; a bash
+/// `child` also holds a `''` trap for each, as a bash started with them
+/// ignored lists them (`trap -- '' SIGINT`), ignores them itself, and
+/// starts its programs with them ignored. The nested shell's `fresh_shell`
+/// (also a script run as `ENOEXEC`) calls it on the child it creates.
+/// `async_int`: the asynchronous ignore of `INT` reaches `child` (a script
+/// a fork inside the job runs gets `INT` back at its default, `QUIT` still
+/// ignored: `nested::start_script`).
 ///
 /// # Errors
 ///
@@ -836,30 +833,52 @@ pub fn hard_ignore(
 	store: &mut dyn StateStore,
 	parent: &Vproc,
 	child: &mut Vproc,
+	async_int: bool,
 ) -> Result<(), StoreError> {
-	let mut names: Vec<BString> = state::scan(&k.root, store, parent, Table::Trap)?
+	let mut sigs: Vec<Signal> = state::scan(&k.root, store, parent, Table::Trap)?
 		.into_iter()
 		.filter_map(|(key, rec)| match (key, rec) {
 			(KeyBuf::Trap(TrapKey::Signal(sig)), Record::Trap { action, .. }) if action.is_empty() => {
-				Some(BString::from(sig.to_string()))
+				Some(sig)
 			},
 			_ => None,
 		})
 		.collect();
-	for sig in [crate::bash::Signal::Int, crate::bash::Signal::Quit] {
-		let name = BString::from(sig.to_string());
-		if !names.contains(&name) && super::super::exec::async_ignored(store, parent, sig, true)? {
-			names.push(name);
+	for sig in [Signal::Int, Signal::Quit] {
+		if (sig != Signal::Int || async_int)
+			&& !sigs.contains(&sig)
+			&& super::super::exec::async_ignored(store, parent, sig, true)?
+		{
+			sigs.push(sig);
 		}
 	}
-	if !names.is_empty() {
-		state::store_record(
-			&mut k.root,
-			store,
-			child,
-			KeyBuf::Misc(MiscKey::HardIgnored),
-			Some(Record::Words(names)),
-		);
+	if sigs.is_empty() {
+		return Ok(());
 	}
+	// fresh_shell's overlay shows the root's `''` traps, not those of a
+	// subshell `parent` nor its asynchronous ignore.
+	if child.mode.dialect() != crate::bash::ids::Dialect::Zsh {
+		for &sig in &sigs {
+			let record = Record::Trap { mode: mode_of(child), action: BString::default() };
+			state::store_record(
+				&mut k.root,
+				store,
+				child,
+				KeyBuf::Trap(TrapKey::Signal(sig)),
+				Some(record),
+			);
+		}
+	}
+	let names = sigs
+		.iter()
+		.map(|sig| BString::from(sig.to_string()))
+		.collect();
+	state::store_record(
+		&mut k.root,
+		store,
+		child,
+		KeyBuf::Misc(MiscKey::HardIgnored),
+		Some(Record::Words(names)),
+	);
 	Ok(())
 }

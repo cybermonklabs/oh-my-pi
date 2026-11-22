@@ -2114,10 +2114,14 @@ fn bash_reports_a_job_killed_in_a_fork_of_a_substitution() {
 /// trap for it gives the subshell and what it starts `INT` at its default
 /// (`SigIgn` 4). After a `trap '' INT` or `trap CMD INT`, `trap - INT`
 /// puts the ignore back for what it starts, while the subshell itself acts
-/// on `INT`. A trap with an action replaces the ignore while it is set,
-/// and a `( … )` forked under it starts with `INT` at its default. A trap
-/// the parent shell set is no trap in the job. Under `set -m` (job control)
-/// nothing is ignored. Checked-in goldens measured with bash 5.3.20
+/// on `INT`, and so does a fork of it (a `( … )`, a pipeline stage), which
+/// keeps its parent's own disposition; the fork's programs still ignore
+/// `INT`, and a process substitution, asynchronous itself, ignores it
+/// again. After `trap - QUIT` a fork still ignores `QUIT`. A trap with an
+/// action replaces the ignore while it is set, and a `( … )` forked under
+/// it starts with `INT` at its default. A trap the parent shell set is no
+/// trap in the job. Under `set -m` (job control) nothing is ignored.
+/// Checked-in goldens measured with bash 5.3.20
 /// (compared live only with a bash 5.3 or later, [`real_bash_golden`]);
 /// each script starts with `exec 2>&1`. `SigIgn` is read where the
 /// system's `/proc/PID/status` shows it (Linux does; gVisor's has no
@@ -2142,6 +2146,38 @@ fn an_asynchronous_command_ignores_int_and_quit() {
 		("( trap - INT; kill -INT $BASHPID; echo alive ) & wait; echo st=$?", "st=0\n"),
 		("( trap - INT; ( kill -INT $BASHPID; echo no ); echo st=$? ) & wait", "st=130\n"),
 		("( trap '' INT; trap - INT; kill -INT $BASHPID; echo alive ) & wait; echo st=$?", "st=0\n"),
+		(
+			"( trap '' INT; trap - INT; ( kill -INT $BASHPID; echo alive ); echo st=$? ) & wait",
+			"st=130\n",
+		),
+		(
+			"( trap 'echo x' INT; trap - INT; ( kill -INT $BASHPID; echo alive ); echo st=$? ) & wait",
+			"st=130\n",
+		),
+		(
+			"( trap 'echo x' INT; trap - INT; ( ( kill -INT $BASHPID; echo alive ); echo st=$? ) ) & \
+			 wait",
+			"st=130\n",
+		),
+		(
+			"( trap 'echo x' INT; trap - INT; { kill -INT $BASHPID; echo alive; } | cat; echo st=$? \
+			 ) & wait",
+			"st=0\n",
+		),
+		(
+			"( trap 'echo x' INT; trap - INT; cat <( kill -INT $BASHPID; echo alive ); echo st=$? ) \
+			 & wait",
+			"alive\nst=0\n",
+		),
+		(
+			"( trap '' QUIT; trap - QUIT; ( kill -QUIT $BASHPID; echo alive ); echo st=$? ) & wait",
+			"alive\nst=0\n",
+		),
+		(
+			"( trap 'echo x' QUIT; trap - QUIT; ( kill -QUIT $BASHPID; echo alive ); echo st=$? ) & \
+			 wait",
+			"alive\nst=0\n",
+		),
 	]
 	.into_iter()
 	.map(|(script, out)| (script.to_owned(), out.to_owned()))
@@ -2164,6 +2200,8 @@ fn an_asynchronous_command_ignores_int_and_quit() {
 			(format!("( trap 'echo x' INT; {G} ) & wait"), 4),
 			(format!("( trap 'echo x' INT; trap - INT; {G} ) & wait"), 6),
 			(format!("( trap 'echo x' INT; ( {G} ) ) & wait"), 4),
+			(format!("( trap 'echo x' INT; trap - INT; ( {G} ) ) & wait"), 6),
+			(format!("( trap 'echo x' INT; trap - INT; ( ( {G} ) ) ) & wait"), 6),
 			(format!("trap 'echo t' INT; ( {G} ) & wait"), 6),
 			(format!("trap '' INT; ( trap - INT; {G} ) & wait"), 6),
 		] {

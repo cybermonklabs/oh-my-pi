@@ -15,7 +15,7 @@ use crate::bash::{
 	ids::{CallId, CmdTag, IntrinsicId, JobId, ModeId, NativeRef, RunId, ToolRef, Vpid},
 	ir::Unit,
 	mem::Capture,
-	signal::SigSet,
+	signal::{SigSet, Signal},
 	syntax::Pos,
 };
 
@@ -102,6 +102,15 @@ pub struct Vproc {
 	/// `errtrace`/`functrace`; bash 5.3 keeps listing inherited signal
 	/// traps until the subshell changes one).
 	pub own_traps:     OwnTraps,
+	/// bash: the signals this vproc ignores as an asynchronous command
+	/// without job control (`INT`, `QUIT`; bash 5.3 `setup_async_signals`,
+	/// `set_signal_async_ignored`), and whether it acts on an ignored `INT`
+	/// itself all the same (a fork of a vproc that named `INT` in `trap`).
+	/// Set by `exec::ignore_async_signals`, read by `exec::async_ignored`;
+	/// its forks inherit it (`exec::fork_async_ignored`). A field, not an
+	/// overlay record: a record would cost every asynchronous vproc a
+	/// ~530-byte map allocation (idle vproc ≤ 2 KiB).
+	pub async_ignored: AsyncIgnored,
 	/// Trap-action frames ([`ScriptKind::Trap`]) on `frames`: zero lets
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
@@ -366,6 +375,61 @@ impl OwnTraps {
 				Self { pseudo: self.pseudo, signals: self.signals.with(sig) }
 			},
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
+		}
+	}
+}
+
+/// The signals of [`Vproc::async_ignored`]: `INT` and `QUIT` ignored, one
+/// bit each, and one bit more each for an ignored signal the vproc acts on
+/// itself all the same ([`Self::trapped`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncIgnored(u8);
+
+impl AsyncIgnored {
+	/// `INT` and `QUIT`, as an asynchronous command starts.
+	pub const INT_QUIT: Self = Self(Self::bit(Signal::Int) | Self::bit(Signal::Quit));
+	/// Neither signal.
+	pub const NONE: Self = Self(0);
+
+	/// The bit of `sig`: none for a signal other than `INT` and `QUIT`.
+	const fn bit(sig: Signal) -> u8 {
+		match sig {
+			Signal::Int => 1,
+			Signal::Quit => 2,
+			_ => 0,
+		}
+	}
+
+	/// The [`Self::trapped`] bit of `sig`.
+	const fn trapped_bit(sig: Signal) -> u8 {
+		Self::bit(sig) << 2
+	}
+
+	/// Whether `sig` is ignored.
+	pub const fn has(self, sig: Signal) -> bool {
+		self.0 & Self::bit(sig) != 0
+	}
+
+	/// Whether the vproc acts on `sig` itself, while what it starts ignores
+	/// it (kept only while `sig` is ignored): the vproc it forked from had
+	/// named `sig` in `trap`, or had this bit itself; bash's fork keeps its
+	/// parent's own disposition (`exec::fork_async_ignored` sets it for
+	/// `INT`).
+	pub const fn trapped(self, sig: Signal) -> bool {
+		self.0 & Self::trapped_bit(sig) != 0
+	}
+
+	/// The set without `sig`, ignored or trapped.
+	pub const fn without(self, sig: Signal) -> Self {
+		Self(self.0 & !(Self::bit(sig) | Self::trapped_bit(sig)))
+	}
+
+	/// The set with `sig`, if ignored, also [`Self::trapped`].
+	pub const fn with_trapped(self, sig: Signal) -> Self {
+		if self.has(sig) {
+			Self(self.0 | Self::trapped_bit(sig))
+		} else {
+			self
 		}
 	}
 }
@@ -2023,8 +2087,12 @@ impl Live {
 // vproc with it. bash's kept `wait` statuses (`JobTable::bgp`, one pointer,
 // `None` while empty: Vproc 672 → 680 B): the bench, a debug build beside
 // one without it, measured 8 B more per idle vproc (2,450 → 2,458 B; only the
-// `Vproc` allocation's size class moved), so at most 1,856 B in release.
-const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
+// `Vproc` allocation's size class moved). Those figures held a store record
+// in each background vproc's overlay, bash's asynchronous ignore of `INT`
+// and `QUIT`: 587 B (a 532-byte map, a 48-byte word list, the two names).
+// It is a field now (`Vproc::async_ignored`, one byte: Vproc 680 → 688 B),
+// and the bench (debug) measured 2,458 → 1,879 B per idle vproc.
+const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");

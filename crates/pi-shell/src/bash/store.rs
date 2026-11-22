@@ -1417,15 +1417,6 @@ pub enum MiscKey {
 	/// takes it out (zsh `settrap`, `removetrap`: a handler, then the
 	/// default). An interactive zsh has none: its own handlers decide.
 	HeldIgnored,
-	/// bash: the signals an asynchronous command without job control
-	/// ignores without a trap (`INT`, `QUIT`; `Record::Words` of signal
-	/// names), kept in its overlay and its forks' (bash 5.3
-	/// `setup_async_signals`, `set_signal_async_ignored`): what it starts
-	/// inherits the ignore, a signal sent to it does nothing, `trap` lists
-	/// none of them. A `trap - SIG` before any trap for it takes it out (its
-	/// default comes back); a trap for it with an action replaces the
-	/// ignore while it is set (`exec::async_ignored`).
-	AsyncIgnored,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);

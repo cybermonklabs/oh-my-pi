@@ -4206,6 +4206,26 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	(group && exec).then_some(BangStage::Exec)
 }
 
+/// Whether the pipeline `Spawn` at `pc` is the whole command of a
+/// background job (`a | b &`): bash runs that pipeline as the job
+/// (`execute_pipeline`'s `asynchronous`), so its stages are the job's
+/// processes. bash runs one of an `&&`
+/// or `||` list, or one under `time`, in a subshell of its own; obash's
+/// `!` follows the spawn (`Not`), so it counts none under `!` either.
+pub(super) fn job_pipeline(unit: &Unit, pc: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	unit.ops.get(pc as usize).is_some_and(|op| {
+		op.code == Opcode::Spawn
+			&& unit
+				.spawns
+				.get(op.a as usize)
+				.is_some_and(|s| s.kind == SpawnKind::Pipeline && code(s.end) == Some(Opcode::SubExit))
+	}) && unit
+		.spawns
+		.iter()
+		.any(|s| s.kind == SpawnKind::Background && s.stages.first().is_some_and(|st| st.entry == pc))
+}
+
 /// Whether the `( … )` that `info` spawns at `pc` is the whole body of a
 /// background job (`( … ) &`): zsh runs that as one process, whose
 /// `entersubsh` ran with the job's, so its traps are not unset again (they
@@ -4565,7 +4585,7 @@ pub fn job_control(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `SIGQUIT`.
 ///
 /// bash 5.3 (`setup_async_signals`), on every platform: it marks them
-/// ignored without a trap ([`MiscKey::AsyncIgnored`]), which `trap` does
+/// ignored without a trap ([`Vproc::async_ignored`]), which `trap` does
 /// not list and may replace or reset ([`async_ignored`]). Its programs
 /// start with them ignored
 /// ([`SpawnSpec::sigmask_ign`](crate::bash::SpawnSpec)): on Windows they lead
@@ -4579,17 +4599,7 @@ pub fn job_control(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 	use crate::bash::Signal;
 	if child.mode.dialect() != Dialect::Zsh {
-		let names = [Signal::Int, Signal::Quit]
-			.map(|s| BString::from(s.to_string()))
-			.to_vec();
-		let record = Some(Record::Words(names));
-		state::store_record(
-			&mut k.root,
-			cx.store,
-			child,
-			KeyBuf::Misc(MiscKey::AsyncIgnored),
-			record,
-		);
+		child.async_ignored = super::proc::AsyncIgnored::INT_QUIT;
 		return;
 	}
 	for sig in [Signal::Int, Signal::Quit] {
@@ -4604,11 +4614,12 @@ fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 }
 
 /// Whether `vp` ignores `sig` as an asynchronous command does
-/// ([`MiscKey::AsyncIgnored`], bash 5.3 `SIG_ASYNCSIG`), for what it starts
+/// ([`Vproc::async_ignored`], bash 5.3 `SIG_ASYNCSIG`), for what it starts
 /// (`started`: its programs, the forks it makes) or for itself: not while
 /// a trap with an action it set itself replaces the ignore, and not for
 /// itself once its own `trap` has named the signal (bash's subshell then
-/// acts on the signal itself).
+/// acts on the signal itself), or that of the vproc it forked from
+/// ([`AsyncIgnored::trapped`](super::proc::AsyncIgnored::trapped)).
 pub(super) fn async_ignored(
 	store: &mut dyn StateStore,
 	vp: &Vproc,
@@ -4616,17 +4627,11 @@ pub(super) fn async_ignored(
 	started: bool,
 ) -> Result<bool, StoreError> {
 	let key = TrapKey::Signal(sig);
-	let listed = match state::record(store, vp, Key::Misc(MiscKey::AsyncIgnored))? {
-		Some(Record::Words(names)) => names
-			.iter()
-			.any(|n| n.as_slice() == sig.to_string().as_bytes()),
-		_ => false,
-	};
-	if !listed {
+	if !vp.async_ignored.has(sig) {
 		return Ok(false);
 	}
 	if !vp.own_traps.has(key) {
-		return Ok(true);
+		return Ok(started || !vp.async_ignored.trapped(sig));
 	}
 	if !started {
 		return Ok(false);
@@ -4636,10 +4641,20 @@ pub(super) fn async_ignored(
 	)
 }
 
-/// `child`, a fork of `parent`, starts without the asynchronous ignore of a
-/// signal `parent` trapped with an action of its own (bash 5.3.20: the trap
-/// replaced the ignore, and the fork resets the trap to the default; a
-/// `( … )` inside `( trap CMD INT; … ) &` gets `INT` at its default).
+/// `child`, a fork of `parent`, inherits `parent`'s asynchronous ignore
+/// ([`Vproc::async_ignored`]), except for a signal `parent` trapped with an
+/// action of its own (bash 5.3.20: the trap replaced the ignore, and the
+/// fork resets the trap to the default; a `( … )` inside `( trap CMD INT;
+/// … ) &` gets `INT` at its default). An `INT` that `parent` named in
+/// `trap` otherwise (`trap - INT` after a trap, `trap '' INT`) stays
+/// ignored for what `child` starts, but not for `child` itself: bash's fork
+/// keeps its parent's own `INT` disposition (the default after `trap -
+/// INT`, the ignoring trap it inherits after `trap '' INT`), while its
+/// programs start with the ignore (bash 5.3.20: `( trap '' INT; trap - INT;
+/// ( kill -INT $BASHPID; echo alive ) ) &` prints nothing). A `QUIT` stays
+/// ignored for both: the fork's `QUIT` goes back to the ignore its parent
+/// started with (`( trap 'echo x' QUIT; trap - QUIT; ( kill -QUIT
+/// $BASHPID; echo alive ) ) &` prints `alive`).
 pub(super) fn fork_async_ignored(
 	k: &mut Kernel,
 	store: &mut dyn StateStore,
@@ -4647,24 +4662,18 @@ pub(super) fn fork_async_ignored(
 	child: &mut Vproc,
 ) {
 	use crate::bash::Signal;
-	let mut names = match state::record(store, parent, Key::Misc(MiscKey::AsyncIgnored)) {
-		Ok(Some(Record::Words(names))) => names.clone(),
-		Ok(_) => return,
-		Err(err) => {
-			k.fail(err);
-			return;
-		},
-	};
-	let before = names.len();
+	child.async_ignored = parent.async_ignored;
 	for sig in [Signal::Int, Signal::Quit] {
 		let key = TrapKey::Signal(sig);
-		if !parent.own_traps.has(key) {
+		if !parent.async_ignored.has(sig) || !parent.own_traps.has(key) {
 			continue;
 		}
 		match state::record(store, parent, Key::Trap(key)) {
 			Ok(Some(Record::Trap { action, .. })) if !action.is_empty() => {
-				let name = sig.to_string();
-				names.retain(|n| n.as_slice() != name.as_bytes());
+				child.async_ignored = child.async_ignored.without(sig);
+			},
+			Ok(_) if sig == Signal::Int => {
+				child.async_ignored = child.async_ignored.with_trapped(sig);
 			},
 			Ok(_) => {},
 			Err(err) => {
@@ -4672,10 +4681,6 @@ pub(super) fn fork_async_ignored(
 				return;
 			},
 		}
-	}
-	if names.len() != before {
-		let record = (!names.is_empty()).then_some(Record::Words(names));
-		state::store_record(&mut k.root, store, child, KeyBuf::Misc(MiscKey::AsyncIgnored), record);
 	}
 }
 

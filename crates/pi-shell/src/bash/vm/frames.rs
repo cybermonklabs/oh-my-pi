@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 35;
+pub const FRAMES_VERSION: u32 = 36;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -271,6 +271,8 @@ struct ProcImage {
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
 	own_traps:     super::proc::OwnTraps,
+	/// The signals it ignores as an asynchronous command.
+	async_ignored: super::proc::AsyncIgnored,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,
 	/// zsh state (sticky emulation, frames' restores).
@@ -633,6 +635,7 @@ impl Shell {
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
+				async_ignored: p.async_ignored,
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
@@ -888,6 +891,7 @@ impl Shell {
 			vp.subshell = p.subshell;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
+			vp.async_ignored = p.async_ignored;
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;

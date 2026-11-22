@@ -1972,6 +1972,9 @@ impl Shell {
 		}
 		let cwd = script.cwd.unwrap_or_else(|| p.cwd.clone());
 		let status = p.status;
+		// The parent's asynchronous ignore ([`Vproc::async_ignored`]) comes
+		// with the traps its overlay copy holds.
+		let async_ignored = p.async_ignored;
 		let mut scopes = match store.as_deref_mut() {
 			Some(store) => state::copy_scopes(&self.k.root, store, p).unwrap_or_else(|err| {
 				self.k.root.fail(err);
@@ -1997,6 +2000,7 @@ impl Shell {
 		let mut vp = Vproc::new(vpid, Some(parent_vpid), fds, cwd, Some(overlay), true);
 		vp.lineage = lineage.unwrap_or(parent_lineage);
 		vp.status = status;
+		vp.async_ignored = async_ignored;
 		vp.scopes = scopes;
 		if let Some(args) = script.args {
 			// A copied function scope takes precedence over the overlay: install
@@ -3691,6 +3695,7 @@ impl Vproc {
 			spare: Vec::new(),
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,
+			async_ignored: proc::AsyncIgnored::NONE,
 			trap_frames: 0,
 			mode: ModeId::Bash,
 			zsh: None,
