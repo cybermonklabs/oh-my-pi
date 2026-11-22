@@ -9,7 +9,9 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { guardedRequestUrl } from "@oh-my-pi/pi-ai/model-call-guard";
 import { fetchWithRetry } from "@oh-my-pi/pi-utils";
+import { configuredModel } from "./guard-model";
 import { type CompleteOptions, callHostLlm, getHostLlmBackend } from "./llm-backends";
 import { envFlag, envInt, envString } from "../util/env";
 import {
@@ -325,13 +327,18 @@ export async function callRemoteLlm(
 		return null;
 	}
 
+	const modelName = llmModelName();
 	const body = JSON.stringify({
-		model: llmModelName(),
+		model: modelName,
 		messages: [{ role: "user", content: prompt }],
 		max_tokens: llmMaxTokens(),
 		temperature,
 		stop: ["</s>", "<|user|>"],
 	});
+	// The request goes out by raw fetch, past pi-ai's dispatch functions, so it reads the model-call
+	// guards itself: before each attempt, in the step of its send. A held attempt sends nothing and ends
+	// the call (null), unretried.
+	const url = guardedRequestUrl(configuredModel(modelName, baseUrl), `${baseUrl}/chat/completions`);
 	const fetchImpl = options.fetch ?? fetch;
 	try {
 		// withAuth re-resolves the key on 401 (force-refresh, then sibling
@@ -342,7 +349,7 @@ export async function callRemoteLlm(
 			if (key !== "") {
 				headers.Authorization = `Bearer ${key}`;
 			}
-			const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
+			const res = await fetchWithRetry(url, {
 				method: "POST",
 				headers,
 				body,

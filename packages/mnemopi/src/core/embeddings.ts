@@ -3,6 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as nodePath from "node:path";
 import { type ApiKey, getOpenRouterHeaders, withAuth } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { guardedRequestUrl } from "@oh-my-pi/pi-ai/model-call-guard";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	$env,
@@ -16,6 +17,7 @@ import {
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
 import { loadFastembed, withEmbedSessionBudget } from "./fastembed-runtime";
+import { configuredModel } from "./guard-model";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
@@ -422,7 +424,12 @@ async function embedApiBatch(texts: readonly string[]): Promise<EmbeddingMatrix 
 		return null;
 	}
 
-	const body = JSON.stringify({ model: defaultModel(), input: texts });
+	const modelName = defaultModel();
+	const body = JSON.stringify({ model: modelName, input: texts });
+	// The request goes out by raw fetch, past pi-ai's dispatch functions, so it reads the model-call
+	// guards itself: before each attempt, in the step of its send. A held attempt sends nothing and the
+	// batch returns null, unretried.
+	const url = guardedRequestUrl(configuredModel(modelName, baseUrl), `${baseUrl.replace(/\/+$/, "")}/embeddings`);
 	try {
 		// withAuth re-resolves the key on 401 (force-refresh, then sibling
 		// rotation) when `apiKey` is a resolver. The 429 backoff stays inside
@@ -436,7 +443,7 @@ async function embedApiBatch(texts: readonly string[]): Promise<EmbeddingMatrix 
 			if (key !== "") {
 				headers.Authorization = `Bearer ${key}`;
 			}
-			const res = await fetchWithRetry(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
+			const res = await fetchWithRetry(url, {
 				method: "POST",
 				headers,
 				body,

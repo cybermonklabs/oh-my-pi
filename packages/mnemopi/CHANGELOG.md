@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A remote completion (`llm.mode` remote) and an API embedding request (an API embedding model such as `openai/text-embedding-3-small`) read pi-ai's model-call guards before each attempt, so a hold such as coding-agent's `cyber_policy` hold sends neither. The guards see a model built from the configured name: `<provider>/<id>` is that provider's model, and a name with no provider is of an unknown family. A held request returns no summary or vector, as a failed one does
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed
