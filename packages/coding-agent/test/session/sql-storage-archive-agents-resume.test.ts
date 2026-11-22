@@ -183,6 +183,35 @@ function longTranscript(id: string, cwd: string): string {
 	return content;
 }
 
+/**
+ * A transcript whose second read window starts with a user prompt that opens
+ * with a byte order mark (`MARKED PROMPT`), then the first prompt and the
+ * first reply. The loader drops the marked line as malformed (`JSON.parse`
+ * refuses a mark), so its first prompt is `FIRST after mark`; nothing before
+ * the window holds a prompt or a reply, so listing it scans its lines.
+ */
+function markedWindowTranscript(id: string, cwd: string, windowBytes: number): string {
+	const head = header(id, cwd, AT);
+	const pad = (bytes: number) =>
+		`${JSON.stringify({ type: "custom", customType: "pad", data: "p".repeat(bytes), id: "pad", parentId: null, timestamp: AT })}\n`;
+	// The header and the pad line fill the first window exactly.
+	const filler = pad(windowBytes - Buffer.byteLength(head) - Buffer.byteLength(pad(0)));
+	return (
+		head +
+		filler +
+		`\uFEFF${message("m0", "pad", AT, "user", "MARKED PROMPT")}` +
+		message("m1", "pad", AT, "user", "FIRST after mark") +
+		message("m2", "m1", AT, "assistant", "the first reply")
+	);
+}
+
+/**
+ * The keyed stores whose range read keeps a byte order mark that opens the
+ * range, as the whole read does. The SQL stores' `readFrom` decodes with a
+ * decoder that drops such a mark; once it keeps it, they belong here too.
+ */
+const MARK_KEEPING_BACKENDS = KEYED_BACKENDS.filter(backend => backend === "redis");
+
 /** Writes `content` as session `id` of project `cwd` through `storage`; returns its key. */
 async function storeSession(
 	storage: SessionStorage,
@@ -230,6 +259,7 @@ describe("the session listing over the session storage", () => {
 			expect(windows.length).toBeGreaterThan(1);
 			expect(Math.max(...windows)).toBeLessThan(whole);
 		},
+		30_000,
 	);
 
 	it.each(KEYED_BACKENDS)(
@@ -263,6 +293,36 @@ describe("the session listing over the session storage", () => {
 			expect(Math.max(...asked)).toBeGreaterThan(SESSION_READ_WINDOW_BYTES);
 			expect(visited).toEqual(content.split("\n").filter(Boolean));
 		},
+		30_000,
+	);
+
+	it.each(MARK_KEEPING_BACKENDS)(
+		"lists the loader's first prompt for a %s-stored transcript whose read window opens with a byte-order-marked line",
+		async backend => {
+			const { storage } = await installBackend(backend);
+			const project = tempDir.join("project");
+			const id = `marked-${crypto.randomUUID()}`;
+			// Through the module, so the file still loads where the window size is not exported.
+			const windowBytes = sessionStorageModule.SESSION_READ_WINDOW_BYTES ?? 1024 * 1024;
+			const content = markedWindowTranscript(id, project, windowBytes);
+			const file = await storeSession(storage, project, id, AT, content);
+			const loaded = await loadEntriesFromFile(file, storage);
+			const loaderFirst = loaded.flatMap(entry =>
+				entry.type === "message" && entry.message.role === "user" && typeof entry.message.content === "string"
+					? [entry.message.content]
+					: [],
+			)[0];
+
+			const listed = await SessionManager.list(project, undefined, storage);
+
+			// The marked line starts the second window.
+			expect(Buffer.from(content, "utf-8").indexOf(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(windowBytes);
+			expect({ loader: loaderFirst, listed: listed.map(session => [session.id, session.firstMessage]) }).toEqual({
+				loader: "FIRST after mark",
+				listed: [[id, "FIRST after mark"]],
+			});
+		},
+		30_000,
 	);
 
 	it("lists a SQLite session whose first prompt outgrows the listing's prefix without reading it whole", async () => {

@@ -435,7 +435,10 @@ export class IndexedSessionStorage implements SessionStorage {
 			}
 			return;
 		}
-		const decoder = new TextDecoder();
+		// `ignoreBOM`: every window starts a new decode, and a decoder that drops a
+		// byte order mark would drop one that opens the window's first line, which
+		// the whole read keeps (so its line parses here but not in the loader).
+		const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 		for await (const window of readSessionLineWindows(this, path)) {
 			for (const line of decoder.decode(window).split("\n")) {
 				if (visit(line)) return;
