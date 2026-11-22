@@ -924,6 +924,25 @@ const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
 		"echo s; break; echo x",
 		"trap 'echo r' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
 	),
+	// bash names a diagnostic after `BASH_SOURCE[0]`: the `.` file, or the
+	// file a function was defined in (`$0` for one defined in the `-c`
+	// string), however deep the error.
+	("file-break-top", "echo s; break; echo x", ". ./s.sh; echo top:$?"),
+	(
+		"file-break-in-function",
+		"echo s; break; echo x",
+		"f() { . ./s.sh; echo f:$?; }; for i in 1 2; do echo a$i; f; echo b$i:$?; done",
+	),
+	("file-command-not-found", "nosuchcmd_q", ". ./s.sh; echo top:$?"),
+	("file-unbound", "set -u; echo $nosuchvar_q", "( . ./s.sh ); echo top:$?"),
+	("file-defines-function", "g() { break; }", ". ./s.sh; for i in 1; do g; done; echo top:$?"),
+	("file-calls-main-function", "f", "f() { break; }; for i in 1; do . ./s.sh; done; echo top:$?"),
+	("main-function", "", "f() { nosuchcmd_q; }; f; echo top:$?"),
+	("file-nested", "printf \"%s\\n\" break > t.sh; . ./t.sh", ". ./s.sh; echo top:$?"),
+	("file-syntax-error", "if", ". ./s.sh; echo top:$?"),
+	("file-eval-error", "eval nosuchcmd_q", ". ./s.sh; echo top:$?"),
+	("file-cmdsub-error", "x=$(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
+	("file-subshell-error", "(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
 ];
 
 /// [`SOURCE_SHAPES`] only zsh has: its `.` does not count the caller's

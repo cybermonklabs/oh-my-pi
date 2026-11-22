@@ -1021,20 +1021,35 @@ impl Kernel {
 			});
 		}
 		static COMMAND: Origin = Origin::Command;
+		static FILE: Origin = Origin::File(BString::new(Vec::new()));
 		let origin = vp
 			.runs
 			.front()
 			.and_then(|r| r.chain.links.first())
 			.map_or(&COMMAND, |l| &l.origin);
 		let utf8 = locale::is_utf8(self, cx.store, vp);
-		// An in-engine nested shell names itself (its `$0`).
-		let shell_name = match vp
-			.overlay
-			.as_ref()
-			.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
-		{
-			Some(Some(Record::Misc(name))) => name.as_slice(),
-			_ => self.argv0.as_slice(),
+		// bash's `get_name_for_error`: a non-interactive shell names a
+		// diagnostic after `BASH_SOURCE[0]` (the `.` file, or the file a
+		// function was defined in), a script file's own; else its `$0`. An
+		// in-engine nested shell names itself (its `$0`).
+		let file = if jobctl::interactive(self) {
+			None
+		} else {
+			callstack::innermost_file(vp).filter(|f| !f.is_empty())
+		};
+		let (shell_name, origin) = match file {
+			Some(file) => (file.as_slice(), &FILE),
+			None => (
+				match vp
+					.overlay
+					.as_ref()
+					.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
+				{
+					Some(Some(Record::Misc(name))) => name.as_slice(),
+					_ => self.argv0.as_slice(),
+				},
+				origin,
+			),
 		};
 		render(diag, DiagSite { shell_name, origin, line, utf8 })
 	}

@@ -15,6 +15,7 @@
 - bash: `break` and `continue` in a `.` file (a file or a process substitution) and in its RETURN trap leave the loop around the `.` command, as bash's `source` keeps the loop level, instead of printing `only meaningful in a loop`
 - zsh: an error that ends a DEBUG trap's action (a `break` with no loop, an unset parameter, a math error) puts `ERR_EXIT` back, as the trap's normal end does, so `setopt errexit` still ends the shell on the next failed command
 - zsh: a `.` file that an error ends (a `break` with no loop, a math syntax error) returns 126, as zsh's `.` does, instead of 1
+- bash: a diagnostic printed inside a `.` file, or inside a function defined in one, names that file (`./s.sh: line 1: …`), as a non-interactive bash names it after `BASH_SOURCE[0]`, instead of the shell's name; a syntax error there no longer says `-c`
 
 ## [18.18.6] - 2026-11-09
 
