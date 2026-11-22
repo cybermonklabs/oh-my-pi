@@ -361,11 +361,7 @@ export class AppendOnlyContextManager {
 	syncMessages(normalizedMessages: any[]): void {
 		// Compaction (array shrunk) — every previously-synced message is gone,
 		// so the log can't carry any byte-stable bytes forward.
-		if (normalizedMessages.length < this.#lastSyncCount) {
-			this.#truncateLog(0, normalizedMessages);
-			this.#lastSyncCount = 0;
-			this.#messageDigests = [];
-		}
+		if (normalizedMessages.length < this.#lastSyncCount) this.#clearLog(normalizedMessages);
 
 		// In-place rewrite: trim the log down to the longest byte-stable prefix
 		// that both the previous sync and the new messages share. Bound it by
@@ -415,9 +411,18 @@ export class AppendOnlyContextManager {
 		this.#messageDigests = [];
 	}
 
-	/** Reset the sync cursor AND clear the log. */
+	/**
+	 * Reset the sync cursor AND clear the log, with the memoized digest of each
+	 * entry; the next sync replays the whole history. A compaction calls it so
+	 * the messages before its cut leave the log at once, not at the next request.
+	 */
 	resetSyncCursor(): void {
-		this.log.clear();
+		this.#clearLog([]);
+	}
+
+	/** Empty the log and the sync cursor, keeping the memoized digest of each entry `next` sends again. */
+	#clearLog(next: readonly unknown[]): void {
+		this.#truncateLog(0, next);
 		this.#lastSyncCount = 0;
 		this.#messageDigests = [];
 	}

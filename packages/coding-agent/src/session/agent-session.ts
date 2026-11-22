@@ -1142,8 +1142,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	/** Epoch ms the current run went `running`; undefined while idle. */
 	#runStartedAt: number | undefined;
-	/** The last `agent_end` that {@link #settleAgentEnd} published; a failed maintenance pass settles any other. */
-	#settledAgentEnd: AgentEndEvent | undefined;
+	/**
+	 * The last `agent_end` that {@link #settleAgentEnd} published; a failed maintenance pass settles any other.
+	 * Held weakly: the event would keep its run's messages until the next run settles, those a compaction moved
+	 * before the cut too.
+	 */
+	#settledAgentEnd: WeakRef<AgentEndEvent> | undefined;
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<() => void>();
 	#observedSessionId: string | undefined;
@@ -3055,6 +3059,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			resetAdvisorRuntimes: (reason, options) => this.#advisors.resetAllRuntimes(reason, options),
 			rebaseAdvisorPrefix: reason => this.#advisors.rebaseDeliveredPrefixes(reason),
 			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
+			releaseLastRequest: () => {
+				this.agent.appendOnlyContext?.resetSyncCursor();
+				this.#cacheWarmer?.cancel();
+			},
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
@@ -4251,7 +4259,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const message = toError(error).message;
 			logger.error("agent_end maintenance failed", { error: message });
 			this.emitNotice("warning", `Post-turn maintenance failed: ${message}`, "agent-end");
-			if (this.#settledAgentEnd !== event) await this.#settleAgentEnd(event, [...this.agent.state.messages]);
+			if (this.#settledAgentEnd?.deref() !== event) {
+				await this.#settleAgentEnd(event, [...this.agent.state.messages]);
+			}
 		} finally {
 			this.#inFlightAgentEndMaintenance.delete(promise);
 			resolve();
@@ -5977,7 +5987,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		activeMessages: AgentMessage[],
 		options?: AgentEndSettleOptions,
 	): Promise<void> {
-		this.#settledAgentEnd = event;
+		this.#settledAgentEnd = new WeakRef(event);
 		this.#emitRunState("idle");
 		// Tagged isTerminal so subscribers can tell final settles from scheduled
 		// continuations, and `yielded` so they can tell the agent's own follow-up
