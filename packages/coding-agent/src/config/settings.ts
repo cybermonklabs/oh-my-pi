@@ -767,7 +767,18 @@ export class Settings {
 			const value = overrides[key];
 			if (value !== undefined) setByPath(raw, key.split("."), value);
 		}
-		const layer = this.#migrateRawSettings(raw);
+		return this.#checkedLayer(raw);
+	}
+
+	/**
+	 * `raw` (changed in place) as a checked layer: legacy ids migrate first, then every path must belong
+	 * to a registered setting and every value is normalized and checked like a handle `override`. `null`
+	 * stays as an unset tombstone.
+	 *
+	 * @throws Error on an unknown setting or a value its definition rejects.
+	 */
+	#checkedLayer(raw: RawSettings, captureLegacyChangelogVersion = true): RawSettings {
+		const layer = this.#migrateRawSettings(raw, captureLegacyChangelogVersion);
 		assertKnownSettingPaths(layer);
 		for (const setting of allSettings()) {
 			const value = getByPath(layer, setting.segments);
@@ -904,13 +915,31 @@ export class Settings {
 		return structuredClone({ global: this.#global, overrides: this.#overrides, derived: this.#derived });
 	}
 
-	/** {@link overlay} of this instance whose own layers are `layers` (from {@link overlayLayers}). */
+	/**
+	 * {@link overlay} of this instance whose own layers are `layers` (from {@link overlayLayers}). Each layer
+	 * is checked as `overlay()` checks its overrides: layers another process kept (a transcript) hold
+	 * neither a setting this build does not know nor a value its definition rejects.
+	 *
+	 * @throws Error when a layer names an unknown setting or holds a value its definition rejects.
+	 */
 	restoreOverlay(layers: OverlayLayers): Settings {
 		const child = this.overlay({}, { derived: layers.derived });
-		child.#global = structuredClone(layers.global);
-		child.#overrides = structuredClone(layers.overrides);
+		child.#global = child.#checkedLayer(structuredClone(layers.global), false);
+		child.#overrides = child.#checkedLayer(structuredClone(layers.overrides), false);
 		child.#rebuildMerged();
 		return child;
+	}
+
+	/**
+	 * Checks `layers` as {@link restoreOverlay} checks them, without building the overlay: no child is made
+	 * and nothing of this instance changes.
+	 *
+	 * @throws Error where {@link restoreOverlay} throws: a layer names an unknown setting or holds a value its
+	 * definition rejects.
+	 */
+	assertOverlayLayers(layers: OverlayLayers): void {
+		this.#checkedLayer(structuredClone(layers.global), false);
+		this.#checkedLayer(structuredClone(layers.overrides), false);
 	}
 
 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */
