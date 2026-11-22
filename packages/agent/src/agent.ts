@@ -51,6 +51,7 @@ import {
 import {
 	type AppendOnlyContextManager,
 	sameToolKeys,
+	type ToolKey,
 	toolKeyForPrefix,
 	toolSpecsFingerprint,
 } from "./append-only-context";
@@ -467,7 +468,7 @@ export class Agent {
 	#declaredToolsMemo:
 		| {
 				model: Model | undefined;
-				toolKeys: readonly string[];
+				toolKeys: readonly ToolKey[];
 				intentTracing: boolean;
 				intentDescription: string | undefined;
 				pruneDescriptions: boolean;
@@ -482,7 +483,7 @@ export class Agent {
 	/** {@link declaredTools} under a kept declaration, with the inputs it was computed from (the tools by their keys). */
 	#declaredToolsListMemo:
 		| {
-				toolKeys: readonly string[];
+				toolKeys: readonly ToolKey[];
 				declaration: RecordedToolDeclaration;
 				sentRevision: number;
 				declared: readonly Tool[];

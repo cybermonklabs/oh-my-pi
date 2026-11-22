@@ -99,6 +99,8 @@ import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 import type { TextTap } from "../job-widgets/text-tap";
 import type { SubagentToolResult } from "./executor";
 import { appendToolResult, createTaskWidgetInputs } from "./widget-inputs";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
+import { renderInputsSnapshot, sameRenderInputs } from "../tools/render-inputs";
 
 import { cfgAsyncEnabled } from "../tools/settings";
 import {
@@ -949,10 +951,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/** Background-job lifecycle contract; inherited by extension replacements that delegate to Task. */
 	get delegationGuidance(): string {
 		if (!cfgAsyncEnabled.get(this.session.settings)) return "";
-		return prompt.render(taskAsyncContractTemplate, {
-			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-			waitTool: hasWaitTool(this.session),
-		});
+		const ircEnabled = isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0);
+		const waitTool = hasWaitTool(this.session);
+		return this.#delegationGuidance.get([ircEnabled, waitTool], () =>
+			prompt.render(taskAsyncContractTemplate, { ircEnabled, waitTool }),
+		);
 	}
 
 	/** Dynamic description that reflects current task settings. */
@@ -963,7 +966,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
 		const perCallModel = perCallModelEnabled(this.session.settings, "task");
-		return renderDescription({
+		const options: TaskDescriptionOptions = {
 			agents,
 			sessionAgents,
 			isolationEnabled: !planMode && isolationEnabled,
@@ -988,8 +991,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			planMode,
 			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
-		});
+		};
+		// Compared with a copy of the options the description was rendered from, so an agent list the embedder changes
+		// in place (a live session agent set) still renders it again.
+		if (!sameRenderInputs(this.#descriptionInputs, options)) {
+			this.#description = renderDescription(options);
+			this.#descriptionInputs = renderInputsSnapshot(options);
+		}
+		return this.#description;
 	}
+	readonly #delegationGuidance = new Memo<string>();
+	#descriptionInputs?: TaskDescriptionOptions;
+	#description = "";
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],

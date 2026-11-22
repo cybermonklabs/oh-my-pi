@@ -27,6 +27,21 @@ import type { AgentContext, AgentMessage } from "./types";
 // ---------------------------------------------------------------------------
 
 /**
+ * A tool's wire identity ({@link toolKeyForPrefix}), field by field: name, description, `strict`, `customWireName`,
+ * the intent mode or function, and by reference the resolved parameters, `customFormat` and `examples`.
+ */
+export type ToolKey = readonly [
+	name: string,
+	description: string,
+	strict: string,
+	customWireName: string,
+	intent: unknown,
+	parameters: object,
+	customFormat: object | undefined,
+	examples: object | undefined,
+];
+
+/**
  * Cheap per-tool wire-identity key: every field normalizeTools and
  * computeFingerprint read. The resolved parameters contribute by object
  * identity — the wire-schema memo is stamp-keyed on the parameters object,
@@ -38,49 +53,42 @@ import type { AgentContext, AgentMessage } from "./types";
  * same mode resolution. A tool that renders its description or schema from
  * live settings (getters) changes its key without a new tools array, so a
  * memo of anything the definitions decide keys on these, not on the array.
+ * The fields are compared one by one ({@link sameToolKeys}): a tool whose
+ * getters hand back the same string and objects while their inputs stay put
+ * costs a pointer compare per field.
  */
-export function toolKeyForPrefix(tool: AgentTool): string {
+export function toolKeyForPrefix(tool: AgentTool): ToolKey {
 	const params = toolWireSchema(tool);
 	const customFormat = tool.customFormat;
 	const examples = (tool as { examples?: unknown }).examples;
-	// Identity strings for objects (Map-assigned ids, no string-build cost
-	// on the hot path beyond the first sighting per object).
 	return [
 		tool.name ?? "",
 		tool.description ?? "",
 		String(tool.strict ?? ""),
 		tool.customWireName ?? "",
-		typeof tool.intent === "function" ? `fn:${objectId(tool.intent)}` : `mode:${tool.intent ?? "require"}`,
-		objectId(params),
-		objectId(customFormat),
-		objectId(examples),
-	].join("\u0000");
+		tool.intent ?? "require",
+		params,
+		objectOrUndefined(customFormat),
+		objectOrUndefined(examples),
+	];
 }
 
-/** Whether `recorded` holds the same per-tool keys as `keys` ({@link toolKeyForPrefix}), in order. */
-export function sameToolKeys(recorded: readonly string[] | undefined, keys: readonly string[]): boolean {
+/** Whether `recorded` holds the same per-tool keys as `keys` ({@link toolKeyForPrefix}), in order, field by field. */
+export function sameToolKeys(recorded: readonly ToolKey[] | undefined, keys: readonly ToolKey[]): boolean {
 	if (recorded === undefined || recorded.length !== keys.length) return false;
 	for (let i = 0; i < keys.length; i++) {
-		if (recorded[i] !== keys[i]) return false;
+		const before = recorded[i];
+		const now = keys[i];
+		for (let field = 0; field < now.length; field++) {
+			if (before[field] !== now[field]) return false;
+		}
 	}
 	return true;
 }
 
-const objectIds = new WeakMap<object, number>();
-let nextObjectId = 1;
-
-function objectId(obj: unknown): number {
-	if (obj === null || obj === undefined || (typeof obj !== "object" && typeof obj !== "function")) {
-		// Primitives contribute by value below via String(); the id path is
-		// only for reference-identity comparison of config objects.
-		return 0;
-	}
-	let id = objectIds.get(obj);
-	if (id === undefined) {
-		id = nextObjectId++;
-		objectIds.set(obj, id);
-	}
-	return id;
+/** `value` when it is an object or function, compared by reference; undefined for a primitive, `null` included. */
+function objectOrUndefined(value: unknown): object | undefined {
+	return (typeof value === "object" || typeof value === "function") && value !== null ? value : undefined;
 }
 
 /** Frozen system prompt + tool spec snapshot. */
@@ -148,7 +156,7 @@ export class StablePrefix {
 	// strict, customFormat, customWireName, intent mode, examples
 	// reference). A registry swap that keeps name/description/parameters
 	// but changes any of these must miss the fast path.
-	#lastToolKey: readonly string[] | undefined;
+	#lastToolKey: readonly ToolKey[] | undefined;
 	#lastIntentTracing: boolean | undefined;
 	#lastIntentDescription: string | undefined;
 	#lastPruneToolDescriptions: boolean | undefined;
@@ -178,7 +186,7 @@ export class StablePrefix {
 	}
 
 	/** True when the cheap key matches: prompt segments + per-tool identity. */
-	#fastPathHit(context: AgentContext, options: BuildOptions, toolKeys: readonly string[]): boolean {
+	#fastPathHit(context: AgentContext, options: BuildOptions, toolKeys: readonly ToolKey[]): boolean {
 		if (
 			this.#lastIntentTracing !== options.intentTracing ||
 			this.#lastIntentDescription !== options.intentDescription ||
@@ -200,7 +208,7 @@ export class StablePrefix {
 		return sameToolKeys(this.#lastToolKey, toolKeys);
 	}
 
-	#recordFastPathKey(context: AgentContext, options: BuildOptions, renderedToolKeys: readonly string[]): void {
+	#recordFastPathKey(context: AgentContext, options: BuildOptions, renderedToolKeys: readonly ToolKey[]): void {
 		this.#lastPromptSegments = [...context.systemPrompt];
 		this.#lastIntentTracing = options.intentTracing;
 		this.#lastIntentDescription = options.intentDescription;

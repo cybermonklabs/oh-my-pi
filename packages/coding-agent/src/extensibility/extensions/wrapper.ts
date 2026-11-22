@@ -12,6 +12,7 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
 	approvalRestrictions,
@@ -69,11 +70,14 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare name: string;
 	get description(): string {
 		const description = this.registeredTool.definition.description;
-		const guidance = this.runner.getNativeDelegationGuidance(this.name);
-		return guidance
-			? prompt.render(nativeDelegationTemplate, { description, name: this.name, guidance })
-			: description;
+		const name = this.name;
+		const guidance = this.runner.getNativeDelegationGuidance(name);
+		if (!guidance) return description;
+		return this.#description.get([description, name, guidance], () =>
+			prompt.render(nativeDelegationTemplate, { description, name, guidance }),
+		);
 	}
+	readonly #description = new Memo<string>();
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
