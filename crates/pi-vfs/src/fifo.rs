@@ -874,19 +874,32 @@ mod tests {
 	/// reaches the FIFO by its path, which names the other FIFO, so it leaves
 	/// the helper (see [`FifoOpen`], "What is left"). A helper the drop leaves
 	/// before its last check opens nothing; one past it waits on the old FIFO
-	/// (or on the new one, had it not opened before the rename) until a
-	/// writer of it opens, which this test then is. The old FIFO is moved
-	/// aside, not removed, so the new one cannot reuse its inode number and
-	/// pass for it.
+	/// (or on the new one, had it not opened before the turn) until a writer
+	/// of it opens, which this test then is. The path never names nothing: it
+	/// reaches its FIFO through a symbolic link to a directory, which turns
+	/// from the old FIFO's directory to the new one's in one `rename(2)`, so
+	/// the helper's open of the path finds one FIFO or the other. In a moment
+	/// with no file there, its open would fail with `ENOENT`, a result the
+	/// drop takes without leaving the helper. Both FIFOs keep their names, so
+	/// neither inode number can be reused for the other. (A hard link of a
+	/// FIFO, the other way to keep the old one's name, failed with
+	/// `EOPNOTSUPP` under gVisor.)
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_releases_a_helper_whose_path_now_names_another_fifo() {
-		let (_dir, path) = new_fifo();
+		let (dir, old) = new_fifo();
+		let other = dir.0.join("b");
+		fs::create_dir(&other).unwrap();
+		make_fifo(&other.join("f"));
+		// `l/f`, with `l` naming the directory itself: `old`.
+		let link = dir.0.join("l");
+		std::os::unix::fs::symlink(".", &link).unwrap();
+		let path = link.join("f");
 		let opened = opening(&path, false, read_end);
 		let shared = Arc::clone(&opened.shared);
-		let old = path.with_extension("old");
-		fs::rename(&path, &old).unwrap();
-		make_fifo(&path);
+		let turned = dir.0.join("l.b");
+		std::os::unix::fs::symlink("b", &turned).unwrap();
+		fs::rename(&turned, &link).unwrap();
 		drop(opened);
 		if Path::new("/proc/self/fd").is_dir() {
 			assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
