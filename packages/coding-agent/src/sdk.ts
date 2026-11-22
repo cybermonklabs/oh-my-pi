@@ -4536,7 +4536,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Pre-register in the global agent registry BEFORE building the system prompt,
 		// so that subagents launched in the same parallel batch can see each other in
 		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
-		// The session reference is attached after construction below.
+		// The session reference is attached after construction below; until then
+		// the ref names the storage that holds its transcript, so a kill in between
+		// writes its tombstone there and not in the process default storage.
 		const registrationInput = {
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
@@ -4545,6 +4547,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,
 			status: "running" as const,
+			storage: sessionManager.getStorage(),
 		};
 		registeredAgentRef =
 			options.expectedAgentRef === undefined

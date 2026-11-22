@@ -33,6 +33,17 @@ import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { RemoteObject } from "../rpc";
 import type { AgentLifecycleProtocol, AgentRegistryProtocol, IrcBusProtocol, UnansweredSend } from "./agents-protocol";
 
+/**
+ * No storage instance crosses the RPC: none encodes (RpcEncodeError, file
+ * storage included). Main's side records file storage for every ref a worker
+ * registers, since a worker run is always file-backed (see serveRegistry).
+ */
+function withoutStorage(input: RegisterInput): RegisterInput {
+	if (input.storage === undefined) return input;
+	const { storage: _storage, ...wire } = input;
+	return wire;
+}
+
 /** Local listeners fed by one lazily opened remote subscription. */
 class ForwardedListeners<A extends unknown[]> {
 	readonly #listeners = new Set<(...args: A) => void>();
@@ -103,11 +114,11 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 
 	register(input: RegisterInput): AgentRef {
-		return this.#remote.callSync("register", input);
+		return this.#remote.callSync("register", withoutStorage(input));
 	}
 
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
-		return this.#remote.callSync("registerIfAvailable", input, expected);
+		return this.#remote.callSync("registerIfAvailable", withoutStorage(input), expected);
 	}
 
 	reopen(id: string, expected: AgentRef): AgentRef | undefined {

@@ -828,6 +828,7 @@ async function registerPersistedSubagentsFromDir(
 					lastActivity: metadata.lastActivity,
 					history: { ...metadata.history, readOnly: true },
 					status: "parked",
+					storage,
 				});
 				owned?.set(advisorId, sessionFile);
 				transcripts.push({
@@ -928,6 +929,8 @@ async function registerPersistedSubagentsFromDir(
 					lastActivity: metadata.lastActivity,
 					history: metadata.history,
 					status: tombstoned ? ("aborted" as const) : ("parked" as const),
+					// A kill of the parked agent writes its sidecar beside the transcript this storage holds.
+					storage,
 				};
 				const vacated = stillUnclaimed || (expected !== null && registry.unregister(id, expected));
 				if (vacated && registry.registerIfAvailable(input, null)) {
