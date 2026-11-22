@@ -316,6 +316,56 @@ export async function until(check: () => Promise<boolean> | boolean, ms = 10_000
 	}
 }
 
+/**
+ * A connection that `reserve()` gives, typed as the store of
+ * cybermonklabs/oh-my-pi#59 types it (`SqlSessionStorageReservedConnection`);
+ * `Bun.SQL`'s reserved connection is one.
+ */
+interface ReservedConnection extends SqlSessionStorageTransaction {
+	release(): void | Promise<void>;
+	close(): Promise<void>;
+}
+
+/** A client that may reserve a connection, as `Bun.SQL` does; this store's own client type names no `reserve`. */
+interface ReservingClient extends SqlSessionStorageClient {
+	reserve?(): Promise<ReservedConnection>;
+}
+
+/**
+ * The `reserve` of a wrapper of `client`: each call reserves one real
+ * connection of `client` and hands the store that connection with its
+ * `unsafe` wrapped by `wrap`, as the wrapper wraps a transaction's, so a
+ * wrapper keeps what it records or injects on PostgreSQL, where a store of
+ * cybermonklabs/oh-my-pi#59 sends every statement on a reserved connection.
+ * `wrap` runs once per reserved connection. Empty when `client` has no
+ * `reserve`.
+ *
+ * It mirrors `reserveWrapped` in this file of the release that brought #59:
+ * the same name, parameters and body, with the two types above in place of
+ * the ones #59 adds to the store. It is here because this code predates #59:
+ * its store never calls `reserve()`, so it had no such helper, yet its tests'
+ * wrappers must pass `reserve()` on to record and intercept the same
+ * statements on the store of #59. Merged with that release, this copy and
+ * the two types give way to the release's.
+ */
+export function reserveWrapped(
+	client: ReservingClient,
+	wrap: (connection: SqlSessionStorageTransaction) => SqlSessionStorageTransaction,
+): Pick<ReservingClient, "reserve"> {
+	const reserve = client.reserve?.bind(client);
+	if (!reserve) return {};
+	return {
+		async reserve() {
+			const connection = await reserve();
+			return {
+				unsafe: wrap(connection).unsafe,
+				release: () => connection.release(),
+				close: () => connection.close(),
+			};
+		},
+	};
+}
+
 /** SQL words that open a parenthesis without calling a function. */
 const SQL_PAREN_WORDS: Record<string, true> = {
 	AND: true,

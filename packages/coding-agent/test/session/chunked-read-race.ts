@@ -19,7 +19,7 @@ import type {
 	SqlSessionStorageResult,
 	SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { type LeaseDb, transcript } from "./sql-session-lease-fixture";
+import { type LeaseDb, reserveWrapped, transcript } from "./sql-session-lease-fixture";
 
 export const MiB = 1024 * 1024;
 export const TIMESTAMP = "2026-11-18T00:00:00.000Z";
@@ -140,6 +140,7 @@ export function partRace(): PartRace {
 					callback({ unsafe: (query, values) => exec(transaction, query, values) }),
 				),
 			end: () => client.end?.() ?? Promise.resolve(),
+			...reserveWrapped(client, connection => ({ unsafe: (query, values) => exec(connection, query, values) })),
 		}),
 		arm(race) {
 			armed = race;

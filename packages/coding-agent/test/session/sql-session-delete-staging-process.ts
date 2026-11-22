@@ -11,6 +11,7 @@
 import { SqlSessionStorage } from "../../src/session/sql-session-storage";
 import type { SqlSessionStorageClient, SqlSessionStorageTransaction } from "../../src/session/sql-session-storage";
 import { SQL } from "bun";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 interface Config {
 	dsn: string;
@@ -29,12 +30,13 @@ const forever = new Promise<never>(() => {});
 
 /**
  * `inner`, which stops for good once the first transaction that wrote staging
- * parts committed: PostgreSQL and MySQL run a transaction through
- * `transaction()`, SQLite through `BEGIN IMMEDIATE` / `COMMIT` on `unsafe()`.
+ * parts committed: MySQL runs a transaction through `transaction()`, SQLite
+ * through `BEGIN IMMEDIATE` / `COMMIT` on `unsafe()`, and PostgreSQL through
+ * its `BEGIN …` / `COMMIT` on a connection it reserves (through
+ * `transaction()` where the store reserves none).
  */
 function stopAfterFirstStagingBatch(inner: SqlSessionStorageClient): SqlSessionStorageClient {
 	let staged = false;
-	let stagesInOpenSqliteTransaction = false;
 	const stop = (): Promise<never> => {
 		staged = true;
 		process.stdout.write(`${JSON.stringify({ staged: true })}\n`);
@@ -42,16 +44,23 @@ function stopAfterFirstStagingBatch(inner: SqlSessionStorageClient): SqlSessionS
 	};
 	const writesStaging = (values: unknown[] | undefined): boolean =>
 		values?.some(value => typeof value === "string" && value.includes(STAGING)) ?? false;
+	/** `executor`, on which a transaction is its statements from `BEGIN` to `COMMIT`. */
+	const statements = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => {
+		let stagesInOpenTransaction = false;
+		return {
+			async unsafe(query, values) {
+				if (staged) return forever;
+				if (/^\s*BEGIN/i.test(query)) stagesInOpenTransaction = false;
+				if (writesStaging(values)) stagesInOpenTransaction = true;
+				const result = await executor.unsafe(query, values);
+				if (/^\s*COMMIT/i.test(query) && stagesInOpenTransaction) return stop();
+				return result;
+			},
+		};
+	};
 	return {
 		options: inner.options,
-		async unsafe(query, values) {
-			if (staged) return forever;
-			if (/^\s*BEGIN/i.test(query)) stagesInOpenSqliteTransaction = false;
-			if (writesStaging(values)) stagesInOpenSqliteTransaction = true;
-			const result = await inner.unsafe(query, values);
-			if (/^\s*COMMIT/i.test(query) && stagesInOpenSqliteTransaction) return stop();
-			return result;
-		},
+		unsafe: statements(inner).unsafe,
 		async transaction(callback) {
 			if (staged) return forever;
 			let stages = false;
@@ -66,6 +75,7 @@ function stopAfterFirstStagingBatch(inner: SqlSessionStorageClient): SqlSessionS
 			return stages ? stop() : result;
 		},
 		end: () => inner.end?.() ?? Promise.resolve(),
+		...reserveWrapped(inner, statements),
 	};
 }
 

@@ -278,7 +278,10 @@ export interface SessionClaimOptions {
 export interface SessionAcquireOptions extends SessionClaimOptions {
 	/**
 	 * While another process holds the claim, wait up to this long for its
-	 * lease to go or expire, then claim. Without it a held claim refuses at once.
+	 * lease to go or expire, then claim. Without it a held claim refuses at
+	 * once. A SQLite claim, an OS lock that names no lease, does neither:
+	 * either way it tries the lock again for a moment, never past this (see
+	 * `SQLITE_CLAIM_RELEASE_WINDOW_MS` in sql-session-storage.ts).
 	 */
 	waitMs?: number;
 	/** Called once, when the claim must wait, with the process that holds it. */

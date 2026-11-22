@@ -35,13 +35,11 @@ import {
 	SqlSessionStorage,
 	type SqlSessionStorageAdapter,
 	type SqlSessionStorageClient,
-	type SqlSessionStorageResult,
-	type SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { getBlobsDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
-import { byteSize, Longest, recordStorage } from "../helpers/longest-value";
+import { Longest, recordClient, recordStorage } from "../helpers/longest-value";
 import { readOnlyDefault, readStoredSession } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
@@ -129,44 +127,6 @@ function expectBounded(longest: Longest): void {
 	expect({ largest: longest.what, bytes: longest.bytes, bounded: longest.bytes <= BOUND }).toMatchObject({
 		bounded: true,
 	});
-}
-
-/**
- * `client` behind a wrapper that notes every bound value, every returned value,
- * and every query's returned values together; `before` runs ahead of each
- * statement, inside its transaction.
- */
-function instrument(
-	client: SqlClient,
-	longest: Longest,
-	before?: (query: string, values: unknown[] | undefined) => Promise<void>,
-): SqlSessionStorageClient {
-	const exec = async (
-		executor: SqlSessionStorageTransaction,
-		query: string,
-		values: unknown[] | undefined,
-	): Promise<SqlSessionStorageResult> => {
-		await before?.(query, values);
-		for (const value of values ?? []) longest.note(byteSize(value), "a value bound to a statement");
-		const rows = await executor.unsafe(query, values);
-		let returned = 0;
-		for (const row of rows as Array<Record<string, unknown>>) {
-			for (const value of Object.values(row)) {
-				longest.note(byteSize(value), "a value a statement returned");
-				returned += byteSize(value);
-			}
-		}
-		longest.note(returned, "the values one statement returned");
-		return rows;
-	};
-	return {
-		options: client.options,
-		unsafe: (query, values) => exec(client, query, values),
-		transaction: callback =>
-			client.transaction(async transaction =>
-				callback({ unsafe: (query, values) => exec(transaction, query, values) }),
-			),
-	};
 }
 
 let tableSeq = 0;
@@ -302,7 +262,7 @@ for (const { adapter, url } of BACKENDS) {
 			"reads a transcript stored as parts not cut at line ends back byte for byte, a part at a time",
 			async () => {
 				const longest = new Longest();
-				const storage = await db.open(instrument(db.client, longest));
+				const storage = await db.open(recordClient(db.client, longest));
 				const hasher = new Bun.CryptoHasher("sha256");
 				let bytes = 0;
 				let largestChunk = 0;
@@ -325,7 +285,7 @@ for (const { adapter, url } of BACKENDS) {
 			"loads the entries a parse of the whole text gives, without a whole read",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const loaded = await loadSessionFile(readPath, storage);
 				expectBounded(longest);
 				expect(loaded.entries).toEqual(parseSessionContent(readContent).entries);
@@ -337,7 +297,7 @@ for (const { adapter, url } of BACKENDS) {
 			"scans every line without a whole read",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const hasher = new Bun.CryptoHasher("sha256");
 				let lines = 0;
 				await storage.scanLines(readPath, line => {
@@ -360,7 +320,7 @@ for (const { adapter, url } of BACKENDS) {
 			"builds the read-only transcript without a whole read",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const messages = await loadSessionMessagesReadOnly(readPath, storage);
 				expectBounded(longest);
 				expect(messages).toHaveLength(readLines.length - 2);
@@ -372,7 +332,7 @@ for (const { adapter, url } of BACKENDS) {
 			"peeks a subagent's recorded directory without a whole read",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const peek = await SessionManager.peekSessionInit(readPath, storage);
 				expectBounded(longest);
 				expect(peek).toMatchObject({ cwd: cwd.path(), init: null });
@@ -384,7 +344,7 @@ for (const { adapter, url } of BACKENDS) {
 			"copies a subagent transcript tree byte for byte, title included, without a whole read",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const copyDir = "/sessions/p/long-copy";
 				const copied = await copyTranscriptTree(storage, artifactsDir, copyDir);
 				expectBounded(longest);
@@ -403,7 +363,7 @@ for (const { adapter, url } of BACKENDS) {
 			"resumes through SessionManager.open without a value as long as the transcript",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const manager = await SessionManager.open(readPath, undefined, storage, { suppressBreadcrumb: true });
 				try {
 					expectBounded(longest);
@@ -421,7 +381,7 @@ for (const { adapter, url } of BACKENDS) {
 				const path = "/sessions/p/rewritten.jsonl";
 				await (await db.open()).writeText(path, transcriptLines(cwd.path(), WRITE_BYTES).join(""));
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const manager = await SessionManager.open(path, undefined, storage, { suppressBreadcrumb: true });
 				try {
 					longest.reset();
@@ -446,7 +406,7 @@ for (const { adapter, url } of BACKENDS) {
 				const reportsDir = spyOn(piUtils, "getReportsDir").mockReturnValue(reports.path());
 				try {
 					const longest = new Longest();
-					const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+					const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 					const bundle = await createReportBundle({ sessionFile: readPath, storage });
 					expectBounded(longest);
 					const members = await new Bun.Archive(await Bun.file(bundle.path).bytes()).files();
@@ -464,7 +424,7 @@ for (const { adapter, url } of BACKENDS) {
 			"pages an RPC subagent transcript read in windows that reach every entry",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				let fromByte = 0;
 				let messages = 0;
 				for (;;) {
@@ -486,7 +446,7 @@ for (const { adapter, url } of BACKENDS) {
 			"reads an Agent Hub transcript in windows that reach every entry",
 			async () => {
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const { transcript } = createAgentHubRuntime({ storage, registry: new AgentRegistry() });
 				let offset = 0;
 				let messages = 0;
@@ -512,7 +472,7 @@ for (const { adapter, url } of BACKENDS) {
 				const local = cwd.join("rollout.jsonl");
 				await Bun.write(local, readContent);
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				// A payload of a few head and tail windows, then one of most of the rollout.
 				for (const tokenLimit of [4_000, 4_000_000]) {
 					const built = await buildStage1RolloutItems(readPath, tokenLimit, storage);
@@ -541,7 +501,7 @@ for (const { adapter, url } of BACKENDS) {
 					await fs.utimes(blob, aged, aged);
 				}
 				const longest = new Longest();
-				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const storage = recordStorage(await db.open(recordClient(db.client, longest)), longest);
 				const resolve = spyOn(sessionStorageConfig, "resolveSessionStorage").mockResolvedValue(storage);
 				const stdout = spyOn(process.stdout, "write").mockImplementation(() => true);
 				try {
@@ -568,7 +528,7 @@ for (const { adapter, url } of BACKENDS) {
 					const streamed = `/sessions/p/${variant}-streamed.jsonl`;
 					await (await db.open()).writeText(reference, lines.join(""));
 					const longest = new Longest();
-					const storage = await db.open(instrument(db.client, longest));
+					const storage = await db.open(recordClient(db.client, longest));
 					if (variant === "writeLinesAtomic") {
 						await storage.writeLinesAtomic(streamed, lines, { expectedSize: null });
 					} else {
@@ -657,7 +617,7 @@ for (const { adapter, url } of BACKENDS) {
 					swept = true;
 					await db.sql(`DELETE FROM ${db.table}_parts WHERE path = ?`, [staging]);
 				};
-				const storage = await db.open(instrument(db.client, new Longest(), sweepStaging));
+				const storage = await db.open(recordClient(db.client, new Longest(), sweepStaging));
 				const rewrite = storage.writeLinesAtomic(path, transcriptLines(cwd.path(), 2 * MiB), {
 					expectedSize: Buffer.byteLength("kept\n"),
 				});
