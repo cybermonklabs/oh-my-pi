@@ -1590,9 +1590,11 @@ provider's `baseUrl` and key, for example a model gateway:
 GPT-Live's delegation names no task text, only its offset on the call's
 timeline, so omp builds each delegation's turn from the transcript: both
 speakers' words since the previous delegation, up to the delegation's
-`offset_ms`. It waits up to 3 s for the transcript to reach that offset and
-sends the turn either way; no delegation is dropped. The turn says that its text
-is recognized speech that may hold errors and asks for a short spoken reply.
+`offset_ms`. It waits up to 3 s for the user's own transcript to reach that
+offset (the voice's words can arrive before the user's earlier ones, so they do
+not end the wait) and sends the turn either way; no delegation is dropped. The
+turn says that its text is recognized speech that may hold errors and asks for
+a short spoken reply.
 Progress goes to the call as `session.thinking.append` (not spoken) and the
 turn's final reply as `session.commentary.append` (spoken). A turn no delegation
 started is not spoken.

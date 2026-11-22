@@ -498,8 +498,8 @@ export class LiveSessionController {
 
 	/**
 	 * A GPT-Live delegation names only its offset on the session timeline, and the transcript of the
-	 * words before it can still be on its way; it waits until the transcript reaches the offset, or
-	 * {@link DELEGATION_TRANSCRIPT_WAIT_MS}, and becomes a turn either way.
+	 * user's words before it can still be on its way; it waits until the user's own transcript reaches
+	 * the offset, or {@link DELEGATION_TRANSCRIPT_WAIT_MS}, and becomes a turn either way.
 	 */
 	#queueDelegation(id: string, offsetMs: number): void {
 		this.#callTranscript?.endLine();

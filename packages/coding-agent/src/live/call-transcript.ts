@@ -44,7 +44,8 @@ export class LiveCallTranscript {
 	readonly #onLine: (line: TranscriptLine, final: boolean) => void;
 	/** Fragments no request has taken yet, in arrival order. */
 	#unclaimed: TranscriptFragment[] = [];
-	#reachedMs = Number.NEGATIVE_INFINITY;
+	/** How far on the session timeline the user's fragments have reached; see {@link reached}. */
+	#userReachedMs = Number.NEGATIVE_INFINITY;
 	#line: OpenLine | undefined;
 	#writes: Promise<void> = Promise.resolve();
 	#writeFailed = false;
@@ -70,7 +71,7 @@ export class LiveCallTranscript {
 	/** Records a fragment: a request can take it, and it extends the open line or starts one. */
 	add(fragment: TranscriptFragment): void {
 		this.#unclaimed.push(fragment);
-		this.#reachedMs = Math.max(this.#reachedMs, fragment.endMs);
+		if (fragment.role === "user") this.#userReachedMs = Math.max(this.#userReachedMs, fragment.endMs);
 		const line = this.#line;
 		if (line && (line.role !== fragment.role || fragment.startMs - line.lastEndMs >= TRANSCRIPT_LINE_GAP_MS)) {
 			this.endLine();
@@ -84,9 +85,14 @@ export class LiveCallTranscript {
 		this.#onLine(this.#line, false);
 	}
 
-	/** Whether fragments have reached `offsetMs` on the session timeline, so the words before it are in. */
+	/**
+	 * Whether the user's words before `offsetMs` are all in: a user fragment has reached `offsetMs` on
+	 * the session timeline. Only the user's own fragments tell: the voice's words can reach omp before
+	 * the recognized words of the user that came earlier (the voice keeps talking once it delegates), so
+	 * a voice fragment past the offset says nothing about the user's words before it.
+	 */
 	reached(offsetMs: number): boolean {
-		return this.#reachedMs >= offsetMs;
+		return this.#userReachedMs >= offsetMs;
 	}
 
 	/**

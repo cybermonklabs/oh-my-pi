@@ -209,6 +209,27 @@ describe("GPT-Live delegations", () => {
 		await stopping;
 	});
 
+	test("the voice speaking past the offset does not send the turn before the user's late words", async () => {
+		const live = call({ closedAfterMs: 0 });
+		await live.controller.start();
+		const transport = live.transport();
+		transport.emit(voiceSaid("Should I deploy main?", 0, 1_200));
+		transport.emit({ type: "delegation.requested", id: "item_1", offsetMs: 2_600 });
+		// The voice keeps talking once it delegates, and its words reach omp before the user's.
+		transport.emit(voiceSaid("Okay, on it.", 2_650, 3_400));
+		await advance(1_000);
+		expect(live.turns()).toHaveLength(0);
+		transport.emit(userSaid("yes", 2_000, 2_300));
+		await advance(2_000);
+
+		expect(live.turns().map(turn => requestLines(turn.message.content))).toEqual([
+			["Voice: Should I deploy main?", "User: yes"],
+		]);
+		const stopping = live.controller.stop();
+		await advance(0);
+		await stopping;
+	});
+
 	test("a user word past the delegation's offset sends the turn at once", async () => {
 		const live = call({ closedAfterMs: 0 });
 		await live.controller.start();
