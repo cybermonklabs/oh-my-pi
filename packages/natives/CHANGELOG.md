@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `break` and `continue` in a forked pipeline element, a command or process substitution or a background simple command now act as bash and zsh run them: inside a loop they end that child without the `only meaningful in a loop` message (bash: a simple command, `$( )` and `<( )`; zsh: every fork), a count reaches loops past `eval`, and outside a loop the message is printed under the command's redirections, before its count is read, without dropping the rest of a `${ ;}` or `lastpipe` stage
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

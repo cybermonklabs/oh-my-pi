@@ -89,6 +89,13 @@ pub struct Vproc {
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:      u32,
+	/// Loops of the shell that forked this vproc that its code runs inside
+	/// (bash's inherited `loop_level`, zsh's `loops`), set by
+	/// [`super::exec::fork_loops`]: a `break` or `continue` that reaches
+	/// past this vproc's own loops ends the vproc, as the end of its code
+	/// would. Zero for the shell itself and for a fork bash runs through
+	/// `execute_in_subshell`, which zeroes the level.
+	pub outer_loops:   u32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
@@ -1754,8 +1761,10 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B. The forking shell's loop count
+// (`Vproc::outer_loops`, 4 B; `Vproc` 672 → 680 B): the bench measured
+// 1,848 B per idle vproc with it (1,840 B without).
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

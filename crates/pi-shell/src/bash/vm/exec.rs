@@ -426,7 +426,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Break { n, cont } if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_break(k, vp, cx, n, cont);
 			},
-			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
+			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont),
 			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
 			Flow::Exit(status) => exit_shell(k, vp, cx, status),
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
@@ -1937,13 +1937,105 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 	}
 }
 
-fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
-	let mut remaining = n.max(1);
+/// Whether a bash `break`/`continue` reaches through a frame of `kind` to
+/// the loops below it in the same vproc: `eval`, `${ ;}` and a `lastpipe`
+/// stage run inside their caller's loops. Any other frame stops it (a
+/// function call: bash zeroes `loop_level` there), as does a vproc's first
+/// frame, below which come the forking shell's loops.
+const fn bash_loop_frame(kind: &FrameKind) -> bool {
+	matches!(
+		kind,
+		FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
+	)
+}
+
+/// The loops a bash `break`/`continue` in `vp` may leave (bash's
+/// `loop_level`): those of its frames from the top down through the ones
+/// [`bash_loop_frame`] passes and, when that reaches the vproc's first
+/// frame, its forking shell's ([`Vproc::outer_loops`]).
+pub fn bash_loop_count(vp: &Vproc) -> u32 {
+	let mut n = 0u32;
+	for (i, f) in vp.frames.iter().enumerate().rev() {
+		n = n.saturating_add(u32::try_from(f.loops.len()).unwrap_or(u32::MAX));
+		if i == 0 {
+			return n.saturating_add(vp.outer_loops);
+		}
+		if !bash_loop_frame(&f.kind) {
+			break;
+		}
+	}
+	n
+}
+
+/// The loops a child forked from `vp` runs inside ([`Vproc::outer_loops`]):
+/// a zsh fork keeps all of them (zsh's `loops`); bash keeps them
+/// (`loop_level`) only when `keeps`, a fork made without
+/// `execute_in_subshell`: a simple command run as a pipeline element or a
+/// job of one pipeline, a command or process substitution. bash zeroes the
+/// level for `( … )`, a compound element, an and-or, compound or timed job
+/// and a coprocess.
+pub fn fork_loops(vp: &Vproc, keeps: bool) -> u32 {
+	if vp.mode.dialect() == Dialect::Zsh {
+		zsh_loop_count(vp)
+	} else if keeps {
+		bash_loop_count(vp)
+	} else {
+		0
+	}
+}
+
+/// Whether bash forks the job whose body starts at `entry` without
+/// `execute_in_subshell`, so that it keeps the loop level ([`fork_loops`]):
+/// a body of one pipeline, with or without `!`, whose simple commands bash
+/// forks from the shell itself. An and-or list, a compound command or a
+/// timed pipeline is run as a subshell (`CMD_FORCE_SUBSHELL`).
+fn bash_job_keeps(unit: &Unit, entry: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let after = match unit.ops.get(entry as usize) {
+		Some(op) if op.code == Opcode::Exec => entry + 1,
+		Some(op) if op.code == Opcode::Spawn => match unit.spawns.get(op.a as usize) {
+			Some(s) if s.kind == SpawnKind::Pipeline => s.end,
+			_ => return false,
+		},
+		_ => return false,
+	};
+	let after = if code(after) == Some(Opcode::Not) {
+		after + 1
+	} else {
+		after
+	};
+	code(after) == Some(Opcode::SubExit)
+}
+
+/// A `break`/`continue` that leaves this vproc's own loops for its forking
+/// shell's ([`Vproc::outer_loops`]): as bash's `breaking` and zsh's
+/// `breaks` skip the rest of a forked child's code, the vproc ends as at
+/// the end of its code, with the builtin's status. zsh runs its EXIT trap
+/// then (`zsh`); bash starts it too, but `breaking`, still set, skips each
+/// of its commands, so it does nothing.
+fn leave_outer_loop(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, zsh: bool) {
+	unwind(&mut k.root, cx.store, vp, 0);
+	if zsh {
+		start_exit_trap_once(k, vp, cx);
+	}
+}
+
+/// bash `break N` / `continue N`: leave N - 1 loops, at most as many as
+/// [`bash_loop_count`] reaches (bash caps N at `loop_level`), then break
+/// or continue the next; an `eval`, `${ ;}` or `lastpipe` stage in the way
+/// is left with them, and past the vproc's own loops it ends
+/// ([`leave_outer_loop`]). The builtin answers a `break` with no loop in
+/// reach itself and transfers nothing, so a loop is always in reach here.
+fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {
+	let reach = bash_loop_count(vp);
+	debug_assert!(reach > 0, "`break_` transfers only with a loop in reach");
+	let mut remaining = n.min(reach).max(1);
 	loop {
 		let f = top_frame(vp);
 		if let Some(rec) = f.loops.last().cloned() {
-			// More levels than loops: the outermost loop ends.
-			if remaining > 1 && f.loops.len() > 1 {
+			// A level beyond this loop: it ends, and the next one out goes on
+			// with the count.
+			if remaining > 1 {
 				f.loops.pop();
 				truncate(vp, rec.depth);
 				remaining -= 1;
@@ -1962,11 +2054,8 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			f.pc = if cont { rec.cont } else { rec.exit };
 			return;
 		}
-		let crossable = matches!(
-			f.kind,
-			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
-		);
-		if crossable && vp.frames.len() > 1 {
+		let passes = bash_loop_frame(&f.kind);
+		if passes && vp.frames.len() > 1 {
 			pop_frame(&mut k.root, cx.store, vp);
 			// The caller's op (`eval`) is abandoned with the loop.
 			clear_scratch(&mut k.root, cx.store, vp);
@@ -1974,15 +2063,7 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 		}
 		break;
 	}
-	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-		let line = line_of(vp, op.node);
-		let name = if cont { "continue" } else { "break" };
-		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
-		k.diag(cx, vp, line, diag.by(name));
-	}
-	vp.status = 0;
-	top_frame(vp).pc += 1;
+	leave_outer_loop(k, vp, cx, false);
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2326,6 +2407,8 @@ pub fn start_sub(
 			// bash keeps job control and the job list in `$( )`: `jobs`
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+			// bash and zsh keep the loop level: a `break` ends the substitution.
+			child.outer_loops = fork_loops(vp, true);
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -2400,6 +2483,7 @@ pub fn start_zsh_sub(
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+	child.outer_loops = fork_loops(vp, true);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
 	super::jobctl::set_leader(k, child.vpid, None);
@@ -2443,6 +2527,7 @@ pub fn start_zsh_procsub(
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	child.outer_loops = fork_loops(vp, true);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -2595,7 +2680,9 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash keeps the loop level in a process substitution.
+	child.outer_loops = fork_loops(vp, true);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -4061,6 +4148,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				let keeps =
+					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
+				child.outer_loops = fork_loops(vp, keeps);
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4160,6 +4250,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					// bash keeps the loop level in a simple command it forks.
+					let simple = unit
+						.ops
+						.get(stage.entry as usize)
+						.is_some_and(|op| op.code == Opcode::Exec);
+					child.outer_loops = fork_loops(vp, simple);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
@@ -4370,6 +4466,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.outer_loops = fork_loops(vp, false);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -5225,16 +5322,21 @@ fn restore_local_specials(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// The loops a zsh `break`/`continue` may leave (zsh's `loops`): every
 /// loop running in this vproc, across function calls and `eval`, up to the
-/// `.` file, trap action or script that runs them (which start at zero).
+/// `.` file, trap action or script that runs them (which start at zero),
+/// and, when that reaches the vproc's first frame, its forking shell's
+/// ([`Vproc::outer_loops`]: a zsh fork keeps `loops`).
 pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 	let mut n = 0u32;
-	for f in vp.frames.iter().rev() {
+	for (i, f) in vp.frames.iter().enumerate().rev() {
 		let here = f
 			.loops
 			.iter()
 			.filter(|r| !matches!(r.kind, LoopKind::Try { .. }))
 			.count();
 		n = n.saturating_add(u32::try_from(here).unwrap_or(u32::MAX));
+		if i == 0 {
+			return n.saturating_add(vp.outer_loops);
+		}
 		if !matches!(
 			f.kind,
 			FrameKind::Function { .. }
@@ -5251,7 +5353,8 @@ pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 /// zsh `break N` / `continue N` (`bin_break`, the loops' `breaks`
 /// handling): leave N loops (at most as many as run), across function
 /// calls unless `localloops` is set when the function returns; a try-list
-/// in the way runs its always-list first.
+/// in the way runs its always-list first; past the vproc's own loops it
+/// ends ([`leave_outer_loop`]).
 #[inline(never)]
 fn zsh_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {
 	let mut remaining = n.min(zsh_loop_count(vp)).max(1);
@@ -5317,7 +5420,12 @@ fn zsh_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool
 		// The caller's op (the call, `eval`) is abandoned with the loop.
 		clear_scratch(&mut k.root, cx.store, vp);
 	}
-	top_frame(vp).pc += 1;
+	// Past this vproc's own loops: the rest are its forking shell's.
+	if vp.frames.len() == 1 && vp.outer_loops > 0 {
+		leave_outer_loop(k, vp, cx, true);
+	} else {
+		top_frame(vp).pc += 1;
+	}
 }
 
 /// zsh `exit N` (`bin_break`): inside a function the functions return one

@@ -2808,6 +2808,7 @@ impl Vproc {
 			lineage: crate::bash::host::Lineage::default(),
 			trace_base: 0,
 			subshell: 0,
+			outer_loops: 0,
 			command: None,
 			spare: Vec::new(),
 			calls: Vec::new(),
