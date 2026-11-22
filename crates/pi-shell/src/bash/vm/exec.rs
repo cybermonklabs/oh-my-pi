@@ -5877,7 +5877,16 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		// Code a builtin runs (`ScriptKind::Code`): the builtin learns of
 		// the error (zsh's `errflag` after `execode`) when it runs again.
 		let code = matches!(vp.frames[i].kind, FrameKind::Script { what: ScriptKind::Code(_), .. });
+		let debug = matches!(vp.frames[i].kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
+			..
+		});
 		unwind(&mut k.root, cx.store, vp, i);
+		// A DEBUG trap the error ended ends as at its end ([`next_command`]):
+		// `ERR_EXIT`, off while it ran, comes back.
+		if debug && !vp.frames.is_empty() {
+			zsh_debug_done(k, vp, cx);
+		}
 		if code {
 			state::store_record(
 				&mut k.root,

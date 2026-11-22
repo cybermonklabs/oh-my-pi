@@ -627,6 +627,43 @@ const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap ':' USR1; kill -USR1 $$; ( : \
 		 in; echo s ); echo top:$?",
 	),
+	// An error that ends a DEBUG trap (a `break` with no loop, `${x?}`,
+	// a math error) ends it as its end would: `ERR_EXIT` comes back.
+	(
+		"debug-error-break-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; \
+		 false; echo after",
+	),
+	(
+		"debug-error-break-errexit-loop",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; for i \
+		 in 1; do echo a; done; false; echo after",
+	),
+	(
+		"debug-error-break",
+		"trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; false; echo \
+		 after:$?",
+	),
+	(
+		"debug-error-unset-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; : \
+		 hit; echo b; false; echo after",
+	),
+	(
+		"debug-error-unset-errexit-in-function",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; \
+		 f() { : hit; echo b; false; echo after; }; f; echo top",
+	),
+	(
+		"debug-error-math-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && (( 1/0 )); :' DEBUG; : hit; \
+		 echo b; false; echo after",
+	),
+	(
+		"debug-after-error-unset-errexit",
+		"setopt errexit nodebugbeforecmd; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : \
+		 ${x?unset}; }; :' DEBUG; : hit; echo b; false; echo after",
+	),
 ];
 
 /// The trap shape rows, `trap/x<loops>/<name>`, three at top level, and
