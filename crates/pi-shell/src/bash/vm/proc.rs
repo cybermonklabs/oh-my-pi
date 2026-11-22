@@ -803,15 +803,21 @@ impl Vproc {
 
 	/// Whether a trap for `sig` waits before it runs: while the vproc waits
 	/// for a foreground command ([`Self::waiting_foreground`]), and, for
-	/// `SIGCHLD`, while the command it would interrupt is part way in a
-	/// write ([`Self::writing_now`]). bash 5.2/5.3 and zsh 5.9 run a `CHLD`
-	/// trap after the command's write; inside another trap's action they
-	/// run it between that action's commands, so a trap that waits for the
-	/// `CHLD` trap's work goes on, and so does this shell. Another trap runs
-	/// at once, in bash and zsh and here, under a key of the trap's own
+	/// `SIGCHLD` and `SIGWINCH`, while the command it would interrupt is part
+	/// way in a write ([`Self::writing_now`]). bash 5.2/5.3 and zsh 5.9 run a
+	/// `CHLD` trap after the command's write; inside another trap's action
+	/// they run it between that action's commands, so a trap that waits for
+	/// the `CHLD` trap's work goes on, and so does this shell. They run a
+	/// `WINCH` trap after the write too: its bytes come after all of the
+	/// command's, and its marker on the terminal shows only once the reader
+	/// drains (bash 5.2.21 and 5.3.20 interactive and with `-c`, zsh 5.9
+	/// interactive, to a FIFO and through a multios). Another trap (`USR1`)
+	/// runs at once, in bash and zsh and here, under a key of the trap's own
 	/// ([`Self::trap_keys`]), so the interrupted write keeps its progress.
 	pub fn holds_trap(&self, sig: crate::bash::signal::Signal) -> bool {
-		self.waiting_foreground() || (sig == crate::bash::signal::Signal::Chld && self.writing_now())
+		use crate::bash::signal::Signal;
+		self.waiting_foreground()
+			|| (matches!(sig, Signal::Chld | Signal::Winch) && self.writing_now())
 	}
 
 	/// Whether the vproc is parked on a write ([`WaitKey::Write`]).

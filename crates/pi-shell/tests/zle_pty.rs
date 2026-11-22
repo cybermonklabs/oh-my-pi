@@ -207,8 +207,14 @@ fn ignoreeof_warns() {
 // WINCH trap then ran under the key of the command it interrupted. Through
 // a tee (`exec 3>fifo 3>/dev/null`) the tee took the command's progress as
 // the trap's: the trap's bytes were lost and the command's first bytes went
-// out twice. Each trap writes with a key of its own: its bytes come in the
-// middle of the command's, and each of the command's bytes comes once.
+// out twice. Failure mode (review of #111 at 5cf0e434, from #157's review):
+// the trap then ran at once and its bytes came at 65,536, inside the
+// command's. zsh 5.9 (interactive, through a multios and to a FIFO) and
+// bash 5.2.21 and 5.3.20 run a WINCH trap only once the command's write
+// ends: its marker shows when the reader drains, and its bytes come after
+// all of the command's. (zsh's multios is a process behind a pipe of its
+// own: with 131,072 bytes, the FIFO and that pipe hold them all, so zsh's
+// `printf` never waits there; with 262,144 it waits, and the trap waits.)
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
@@ -260,11 +266,14 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 		thread::sleep(Duration::from_millis(5));
 	}
 	thread::sleep(QUIET);
-	// WINCH to the shell; its trap starts, and its write waits on the full
-	// FIFO. The trap runs inside `printf`'s redirection (`>&3`), so it
-	// prints its marker to stderr, the terminal.
+	// WINCH to the shell. Its trap waits for `printf`'s write, so nothing
+	// shows on the terminal while the FIFO stays full.
 	pty.resize(30, 100).unwrap();
-	pty.wait_screen_contains("trap-42", TIMEOUT).unwrap();
+	thread::sleep(QUIET);
+	assert!(
+		!pty.screen().contents().contains("trap-42"),
+		"the WINCH trap ran while `printf`'s write waited"
+	);
 	let mut got = Vec::new();
 	let mut buf = vec![0u8; 4 << 10];
 	let start = Instant::now();
@@ -278,12 +287,13 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 		thread::sleep(Duration::from_micros(500));
 	}
 	pty.wait_screen_contains("printf-42", TIMEOUT).unwrap();
+	pty.wait_screen_contains("trap-42", TIMEOUT).unwrap();
 	let at = got.windows(MARK.len()).position(|w| w == MARK);
 	let zeros = got.iter().filter(|&&b| b == b'0').count();
 	assert_eq!(
-		(zeros, got.len(), at.is_some_and(|at| at > 0 && at < ZEROS)),
-		(ZEROS, ZEROS + MARK.len(), true),
-		"('0's, bytes, the trap's bytes inside the command's); trap's bytes at {at:?}"
+		(zeros, got.len(), at),
+		(ZEROS, ZEROS + MARK.len(), Some(ZEROS)),
+		"('0's, bytes, the trap's bytes at): the trap writes after all of the command's"
 	);
 }
 

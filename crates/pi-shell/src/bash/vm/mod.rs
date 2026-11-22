@@ -2453,14 +2453,14 @@ impl Shell {
 				if !ignored {
 					let process = &mut self.procs[i];
 					process.pending_traps = process.pending_traps.with(sig);
-					// A `CHLD` trap waits while the command it would interrupt
-					// writes; another runs now, under its own key
+					// A `CHLD` or `WINCH` trap waits while the command it would
+					// interrupt writes; another runs now, under its own key
 					// ([`Vproc::holds_trap`]).
 					if !process.holds_trap(sig) {
 						process.blocked = None;
 					}
 					#[cfg(test)]
-					if sig == Signal::Chld && process.writing_now() {
+					if matches!(sig, Signal::Chld | Signal::Winch) && process.writing_now() {
 						self
 							.k
 							.engine

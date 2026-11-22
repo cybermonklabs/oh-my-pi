@@ -80,8 +80,9 @@ pub struct Engine {
 	/// `$functions` bodies regenerated from function sources, by source
 	/// (regenerating means a parse; plugins scan `$functions` on every key).
 	bodies:       Mutex<HashMap<BString, BString>>,
-	/// Test only: `CHLD` traps this engine's shells held while the command
-	/// they would interrupt was part way in a write (they run after it).
+	/// Test only: `CHLD` and `WINCH` traps this engine's shells held while
+	/// the command they would interrupt was part way in a write (they run
+	/// after it).
 	/// One count per engine, so tests in one process do not see each
 	/// other's.
 	#[cfg(test)]
@@ -149,8 +150,8 @@ impl Engine {
 		&self.cfg
 	}
 
-	/// Test only: how many `CHLD` traps this engine's shells held for a
-	/// write.
+	/// Test only: how many `CHLD` and `WINCH` traps this engine's shells
+	/// held for a write.
 	#[cfg(test)]
 	pub(crate) const fn traps_held(&self) -> &std::sync::atomic::AtomicUsize {
 		&self.traps_held

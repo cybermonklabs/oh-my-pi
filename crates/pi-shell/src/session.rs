@@ -2259,8 +2259,8 @@ mod tests {
 		Line(&'static str),
 		/// Cancel the run, as the host does.
 		Cancel,
-		/// Wait until a `CHLD` trap of this run's shell has waited for a write
-		/// since the run began (its engine's test-only count,
+		/// Wait until a `CHLD` or `WINCH` trap of this run's shell has waited
+		/// for a write since the run began (its engine's test-only count,
 		/// [`Engine::traps_held`]).
 		Held,
 		/// Wait until `n` more polls of the run's stdout have waited for room
@@ -2273,8 +2273,8 @@ mod tests {
 		stdout:    Vec<u8>,
 		status:    i32,
 		cancelled: bool,
-		/// Whether a `CHLD` trap of the run's shell waited for a write
-		/// meanwhile.
+		/// Whether a `CHLD` or `WINCH` trap of the run's shell waited for a
+		/// write meanwhile.
 		held:      bool,
 	}
 
@@ -2578,19 +2578,95 @@ mod tests {
 		zeros_then_ts(&run.stdout, zeros, 10);
 	}
 
-	// The same as the USR1 case for WINCH, which a shell with a line editor
-	// first hands to the editor (`zle::signal`).
+	/// `printf` waits, the job sends WINCH and says `done`, and its trap
+	/// waits for `printf`'s write (`Vproc::holds_trap`).
+	const WINCH_STEPS: &[Step] =
+		&[Step::Pending(1), Step::Send("go"), Step::Line("done"), Step::Held];
+
+	/// A script whose WINCH trap runs `action` while `printf %0131072d 0`
+	/// waits; the job sends WINCH on `go`.
+	fn winch_script(prefix: &str, action: &str) -> String {
+		format!(
+			"{prefix}exec 3<&0\ntrap '{action}' WINCH\n{{ read -r go <&3; kill -WINCH $$; echo done \
+			 >&2; }} &\nprintf %0131072d 0\ns=$?\nwait\nexit $s"
+		)
+	}
+
+	// Failure mode (review of #111 at 5cf0e434, from #157's review): a WINCH
+	// trap ran at once while `printf`'s write waited, and its bytes came at
+	// 65,536, inside `printf`'s. bash 5.2.21 and 5.3.20 (interactive and
+	// `-c`) and zsh 5.9 (interactive and `-c`, to a FIFO and through a
+	// multios) run a WINCH trap once the write ends, as a `CHLD` trap:
+	// 131,072 '0's, then the 'T's. The trap waits; the run does not end
+	// before it runs.
 	#[test]
-	fn a_winch_trap_during_a_write_through_a_tee_runs_at_once_and_the_write_goes_on() {
+	fn a_winch_trap_during_a_write_through_a_tee_runs_after_it() {
 		let run = run_with_steps(
-			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' WINCH\n{ \
-			 read -r go <&3; kill -WINCH $$; echo done >&2; } &\nprintf %0131072d \
-			 0\ns=$?\nwait\nexit $s",
-			SIGNAL_STEPS,
+			&winch_script("emulate zsh -c 'exec >&1 >/dev/null'\n", "printf %s TTTTTTTTTT"),
+			WINCH_STEPS,
 			true,
 		);
 		assert_eq!(run.status, 0);
-		marker_mid_write(&run.stdout, 131_072, b"TTTTTTTTTT");
+		zeros_then_ts(&run.stdout, 131_072, 10);
+		assert!(run.held, "the trap did not wait for the write");
+	}
+
+	// The same through a plain pipe, in zsh mode: the trap waits there too.
+	#[test]
+	fn a_winch_trap_during_a_write_in_zsh_mode_runs_after_it() {
+		let run = run_with_steps(
+			"emulate zsh -c 'exec 3<&0; trap \"printf %s TTTTTTTTTT\" WINCH; { read -r go <&3; kill \
+			 -WINCH $$; echo done >&2; } & printf %0131072d 0; s=$?; wait; exit $s'",
+			WINCH_STEPS,
+			true,
+		);
+		assert_eq!(run.status, 0);
+		zeros_then_ts(&run.stdout, 131_072, 10);
+		assert!(run.held, "the trap did not wait for the write");
+	}
+
+	// A held WINCH trap that writes more than the pipe holds (204,800
+	// spaces): it runs once `printf`'s write ends and its own write then
+	// waits in turn; no deadlock, and the order is kept.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn a_held_winch_trap_writing_more_than_the_pipe_holds_comes_after_the_write() {
+		let run = run_with_steps(&winch_script("", "printf %204800s \"\""), WINCH_STEPS, true);
+		assert_eq!(run.status, 0);
+		let count = |c: u8| run.stdout.iter().filter(|&&b| b == c).count();
+		let first_space = run.stdout.iter().position(|&b| b == b' ');
+		assert_eq!(
+			(count(b'0'), count(b' '), run.stdout.len(), first_space),
+			(131_072, 204_800, 335_872, Some(131_072)),
+			"('0's, spaces, bytes, first space at)"
+		);
+		assert!(run.held, "the trap did not wait for the write");
+	}
+
+	// The run is cancelled while `printf` waits and the WINCH trap is held.
+	// The cancellation's TERM trap is the run's last action and drops
+	// `printf`'s rest; the held WINCH trap is no longer behind a write and
+	// runs too. Each trap's bytes come once, after the '0's written.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
+	fn a_held_winch_trap_of_a_cancelled_run_writes_its_bytes_once() {
+		let run = run_with_steps(
+			&winch_script("trap 'printf %s XXXXXXXXXX' TERM\n", "printf %s TTTTTTTTTT"),
+			&[Step::Pending(1), Step::Send("go"), Step::Line("done"), Step::Held, Step::Cancel],
+			true,
+		);
+		assert!(run.cancelled);
+		let zeros = run.stdout.iter().take_while(|&&b| b == b'0').count();
+		let tail = &run.stdout[zeros..];
+		let count = |c: u8| tail.iter().filter(|&&b| b == c).count();
+		assert!(zeros > 0 && zeros < 131_072, "{zeros} '0's first");
+		assert_eq!(
+			(count(b'X'), count(b'T'), tail.len()),
+			(10, 10, 20),
+			"after the '0's: {:?}",
+			String::from_utf8_lossy(tail)
+		);
+		assert!(run.held, "the trap did not wait for the write");
 	}
 
 	/// `got` is some '0's (more than none, fewer than `whole`), then exactly
@@ -2800,13 +2876,14 @@ mod tests {
 
 	/// Three runs of one session: the first makes fd 3 a tee of a FIFO and
 	/// `file` (`exec 3>fifo 3>file`; the tee outlives the run), the second
-	/// runs `second`, whose write through the tee fills the FIFO and waits,
-	/// and is cancelled (with `cancel`; else `second` ends the shell itself),
-	/// and the third runs `printf %s AFTER >&3`. Returns what the FIFO's
-	/// reader got, ending with `AFTER` unless that was lost, and the second
-	/// run's status.
+	/// runs `second(reader)`, whose write through the tee fills the FIFO and
+	/// waits, and is cancelled (with `cancel`; else it ends the shell
+	/// itself), and the third runs `printf %s AFTER >&3`. `second` gets the
+	/// FIFO's reader to size its write by ([`fifo_room`]). Returns what the
+	/// FIFO's reader got, ending with `AFTER` unless that was lost, and the
+	/// second run's status.
 	fn drop_a_write_through_a_fifo_tee(
-		second: &str,
+		second: impl FnOnce(&std::fs::File) -> String,
 		file: &std::path::Path,
 		cancel: bool,
 	) -> (Vec<u8>, i32) {
@@ -2850,6 +2927,7 @@ mod tests {
 			.await;
 			assert_eq!(made.expect("the tee was made").unwrap().status, 0);
 			let mut reader = opening.join().unwrap().unwrap();
+			let second = second(&reader);
 			// SAFETY: fcntl on a descriptor this test owns.
 			unsafe {
 				let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
@@ -2870,9 +2948,11 @@ mod tests {
 					token.cancel();
 				})
 			});
-			let cancelled =
-				tokio::time::timeout(STUCK, session.run_with(RunOptions::new(second), stdio(), token))
-					.await;
+			let cancelled = tokio::time::timeout(
+				STUCK,
+				session.run_with(RunOptions::new(second.as_str()), stdio(), token),
+			)
+			.await;
 			if let Some(canceller) = canceller {
 				canceller.join().unwrap();
 			}
@@ -2910,6 +2990,38 @@ mod tests {
 		})
 	}
 
+	/// The bytes a FIFO's buffer holds: 64 KiB, but on Linux 8 KiB once its
+	/// user's pipes pass `fs.pipe-user-pages-soft` (a whole-library run as
+	/// root in a pod, where root lacks `CAP_SYS_RESOURCE`).
+	fn fifo_room(reader: &std::fs::File) -> usize {
+		#[cfg(target_os = "linux")]
+		{
+			use std::os::fd::AsRawFd;
+			// SAFETY: fcntl on a descriptor the caller owns.
+			let room = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			usize::try_from(room).expect("F_GETPIPE_SZ")
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = reader;
+			65_536
+		}
+	}
+
+	/// Shrink a FIFO's buffer to `bytes` (Linux), as the kernel makes one
+	/// when its user's pipes pass `fs.pipe-user-pages-soft`.
+	#[cfg(target_os = "linux")]
+	fn shrink_fifo(reader: &std::fs::File, bytes: usize) {
+		use std::os::fd::AsRawFd;
+		let size = libc::c_int::try_from(bytes).expect("a pipe size");
+		// SAFETY: fcntl on a descriptor the caller owns.
+		let got = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETPIPE_SZ, size) };
+		assert_eq!(usize::try_from(got).ok(), Some(bytes), "F_SETPIPE_SZ");
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn shrink_fifo(_reader: &std::fs::File, _bytes: usize) {}
+
 	// Failure mode (review of #111 at 5773e4ed): a run cancelled while its
 	// write through a tee waited dropped the write, but the session's vproc
 	// kept its write key and the tee kept the write's progress under it, so
@@ -2918,7 +3030,7 @@ mod tests {
 	#[test]
 	fn a_run_cancelled_during_a_write_through_a_tee_leaves_the_next_run_whole() {
 		let (got, _) = drop_a_write_through_a_fifo_tee(
-			"printf %0131072d 0 >&3",
+			|_| "printf %0131072d 0 >&3".to_owned(),
 			std::path::Path::new("/dev/null"),
 			true,
 		);
@@ -2976,7 +3088,7 @@ mod tests {
 				let dir = tempfile::tempdir().unwrap();
 				let file = dir.path().join("tee-file");
 				let second = format!("{trap}exec 2>&3; {command}");
-				let (got, status) = drop_a_write_through_a_fifo_tee(&second, &file, true);
+				let (got, status) = drop_a_write_through_a_fifo_tee(|_| second, &file, true);
 				let written = std::fs::read(&file).unwrap();
 				let mut once = whole.clone();
 				once.extend_from_slice(b"AFTER");
@@ -3020,38 +3132,60 @@ mod tests {
 	// which goes with it. Each case: the file holds the '0's, the tool's
 	// whole message, then `AFTER`; the FIFO the '0's, a part of the message
 	// (none: a pipe takes a short write whole or not at all), then `AFTER`.
+	// The '0's fill the FIFO but for 4 bytes, whatever it holds: a FIFO of
+	// 8 KiB took them part way, and the cancel came before the tool ran.
 	#[test]
 	fn a_tools_write_dropped_part_way_through_a_tee_leaves_the_next_run_whole() {
 		let mut wrong = Vec::new();
+		// Each case twice: with the FIFO as it is, and shrunk to 8 KiB, as a
+		// FIFO is made when its user's pipes pass the soft limit.
+		let rooms: &[Option<usize>] = if cfg!(target_os = "linux") {
+			&[None, Some(8192)]
+		} else {
+			&[None]
+		};
 		for (how, ends, cancel) in
 			[("cancelled", "", true), ("killed", "{ sleep 0.3; kill -TERM $$; } & ", false)]
 		{
-			for tool in ["nohup", "timeout"] {
+			for (tool, shrunk) in ["nohup", "timeout"]
+				.into_iter()
+				.flat_map(|t| rooms.iter().map(move |r| (t, *r)))
+			{
 				let dir = tempfile::tempdir().unwrap();
 				let file = dir.path().join("tee-file");
-				// 65,532 '0's leave the FIFO room for 4 bytes of the message.
-				let second = format!("{ends}printf %065532d 0 >&3; {tool} --version >&3");
-				let (got, status) = drop_a_write_through_a_fifo_tee(&second, &file, cancel);
+				let mut zeros = 0;
+				let (got, status) = drop_a_write_through_a_fifo_tee(
+					|reader| {
+						if let Some(bytes) = shrunk {
+							shrink_fifo(reader, bytes);
+						}
+						zeros = fifo_room(reader) - 4;
+						format!("{ends}printf %0{zeros}d 0 >&3; {tool} --version >&3")
+					},
+					&file,
+					cancel,
+				);
 				let written = std::fs::read(&file).unwrap();
 				let message = written
-					.get(65_532..written.len().saturating_sub(5))
+					.get(zeros..written.len().saturating_sub(5))
 					.unwrap_or_default()
 					.to_vec();
-				let whole = written.len() > 65_532 + 5
-					&& written[..65_532].iter().all(|&b| b == b'0')
+				let whole = written.len() > zeros + 5
+					&& written[..zeros].iter().all(|&b| b == b'0')
 					&& written.ends_with(b"AFTER")
 					&& !message.contains(&b'0')
 					&& message.starts_with(tool.as_bytes());
 				let part = got
-					.get(65_532..)
+					.get(zeros..)
 					.and_then(|rest| rest.strip_suffix(b"AFTER"))
 					.is_some_and(|p| p.len() < message.len() && message.starts_with(p));
 				if !whole || !part {
 					wrong.push(format!(
-						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO {} \
-						 bytes ending {:?}",
+						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO (room \
+						 {}) {} bytes ending {:?}",
 						written.len(),
 						String::from_utf8_lossy(&written[written.len().saturating_sub(24)..]),
+						zeros + 4,
 						got.len(),
 						String::from_utf8_lossy(&got[got.len().saturating_sub(24)..]),
 					));
