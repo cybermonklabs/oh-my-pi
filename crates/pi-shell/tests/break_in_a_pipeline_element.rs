@@ -820,6 +820,100 @@ fn errs(dialect: Dialect) -> Vec<Row> {
 	rows
 }
 
+/// The `.` file shapes of both dialects, `source/<name>`: (name, the
+/// file's text, the code that sources it as `./s.sh` or a procsub). The
+/// file is made in a fresh directory, sourced by a relative name (a
+/// message names it), and removed after.
+const SOURCE_SHAPES: &[(&str, &str, &str)] = &[(
+	"file-own-loop-break2",
+	"for j in 1 2; do echo j$j; break 2; done; echo in",
+	"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+)];
+
+/// [`SOURCE_SHAPES`] only bash has: its `source` keeps `loop_level`, so a
+/// `break` or `continue` in a `.` file (a file or a procsub) leaves the
+/// caller's loop; a `.` file's RETURN trap runs inside the caller's loops
+/// too (its `break` leaves them, after the file returned, with the file's
+/// status), and a `break` that leaves the file runs no RETURN trap.
+const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
+	(
+		"file-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-continue",
+		"echo s; continue; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-source-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; source ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-break2",
+		"echo s; break 2; echo x",
+		"for o in X Y; do echo o$o; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done; echo \
+		 c$o:$?; done",
+	),
+	(
+		"procsub-break",
+		"",
+		"for i in 1 2; do echo a$i; . <(echo 'echo s; break; echo x'); echo b$i:$?; done",
+	),
+	(
+		"procsub-continue",
+		"",
+		"for i in 1 2; do echo a$i; . <(echo 'echo s; continue; echo x'); echo b$i:$?; done",
+	),
+	(
+		"return-trap-break",
+		"echo s",
+		"trap 'echo r; break' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"return-trap-continue",
+		"echo s",
+		"trap 'echo r; continue' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"return-trap-status",
+		"echo s; return 3",
+		"trap 'false; break' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-break-runs-no-return-trap",
+		"echo s; break; echo x",
+		"trap 'echo r' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+];
+
+/// [`SOURCE_SHAPES`] only zsh has.
+const ZSH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[];
+
+/// The `.` file rows, `source/<name>`.
+fn sources(dialect: Dialect) -> Vec<Row> {
+	let own = if dialect == Dialect::Bash {
+		BASH_SOURCE_SHAPES
+	} else {
+		ZSH_SOURCE_SHAPES
+	};
+	SOURCE_SHAPES
+		.iter()
+		.chain(own)
+		.map(|&(name, file, code)| {
+			(
+				format!("source/{name}"),
+				format!(
+					"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '{file}' > s.sh; {code}; echo e:$?; cd \
+					 /; rm -r \"$d\""
+				),
+			)
+		})
+		.collect()
+}
+
 /// stderr with the program's name before `: ` written `SH` (bash names
 /// itself by its path, and bash 5.2.21 a function's error `environment`).
 fn normalized_stderr(stderr: &[u8]) -> String {
@@ -1078,6 +1172,19 @@ fn bash_err_trap_runs_once() {
 #[test]
 fn zsh_err_trap_runs_once() {
 	assert_rows(Dialect::Zsh, "err/", &errs(Dialect::Zsh));
+}
+
+/// bash: a `break` or `continue` in a `.` file (a file or a procsub) and
+/// in its RETURN trap leaves the caller's loop.
+#[test]
+fn bash_source_matches_bash() {
+	assert_rows(Dialect::Bash, "source/", &sources(Dialect::Bash));
+}
+
+/// zsh: a `.` file does not see the caller's loops.
+#[test]
+fn zsh_source_matches_zsh() {
+	assert_rows(Dialect::Zsh, "source/", &sources(Dialect::Zsh));
 }
 
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert

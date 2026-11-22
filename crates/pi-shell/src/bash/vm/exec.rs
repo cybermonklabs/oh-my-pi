@@ -2055,14 +2055,16 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 
 /// Whether a bash `break`/`continue` reaches through a frame of `kind` to
 /// the loops below it in the same vproc: `eval`, `${ ;}`, a `lastpipe`
-/// stage and a trap action ([`loop_trap`]) run inside the loops around
-/// them. Any other frame stops it (a function call: bash zeroes
-/// `loop_level` there), as does a vproc's first frame, below which come
-/// the forking shell's loops.
+/// stage, a `.` file (bash's `source` keeps `loop_level`) and a trap
+/// action ([`loop_trap`]) run inside the loops around them. Any other
+/// frame stops it (a function call: bash zeroes `loop_level` there), as
+/// does a vproc's first frame, below which come the forking shell's loops.
 const fn bash_loop_frame(kind: &FrameKind) -> bool {
 	matches!(
 		kind,
-		FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
+		FrameKind::Script { what: ScriptKind::Eval | ScriptKind::Source, .. }
+			| FrameKind::NoFork
+			| FrameKind::Stage
 	) || loop_trap(kind)
 }
 
@@ -2333,9 +2335,10 @@ fn leave_outer_loop(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, zsh: bool) 
 
 /// bash `break N` / `continue N`: leave N - 1 loops, at most as many as
 /// [`bash_loop_count`] reaches (bash caps N at `loop_level`), then break
-/// or continue the next; an `eval`, `${ ;}`, `lastpipe` stage or trap
-/// action in the way is left with them, and past the vproc's own loops it
-/// ends ([`leave_outer_loop`]). The builtin answers a `break` with no loop
+/// or continue the next; an `eval`, `${ ;}`, `lastpipe` stage, `.` file or
+/// trap action in the way is left with them (a `.` file's RETURN trap does
+/// not run), and past the vproc's own loops it ends ([`leave_outer_loop`]).
+/// The builtin answers a `break` with no loop
 /// in reach itself and transfers nothing, so a loop is always in reach
 /// here.
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {

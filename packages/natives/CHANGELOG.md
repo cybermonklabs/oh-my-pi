@@ -12,6 +12,7 @@
 - The ERR trap (zsh: ZERR) and `set -e` judge a pipeline element or background job where bash and zsh do: the command a forked element or job runs (bash: a simple command with its pipes, a `( … )` element's status, a job of one pipeline; zsh: everything but the lists nested in it, and also the last element zsh runs in the shell) no longer runs the trap itself, and the pipeline's or job's status is judged once
 - zsh: `ERR_RETURN` in a trap action ends the action's list, not the function the trap interrupted, and every loop in reach of that code ends, as zsh runs it; in a DEBUG trap it does nothing; a call whose body already ran the ZERR trap is not judged again for `ERR_EXIT` or `ERR_RETURN`
 - zsh: no ZERR trap runs while another trap's action runs (a signal, DEBUG or EXIT trap and the functions it calls), and neither a ZERR nor a DEBUG trap runs in a subshell, command substitution or job started inside a trap action, as zsh keeps `intrap` across a fork
+- bash: `break` and `continue` in a `.` file (a file or a process substitution) and in its RETURN trap leave the loop around the `.` command, as bash's `source` keeps the loop level, instead of printing `only meaningful in a loop`
 
 ## [18.18.6] - 2026-11-09
 
