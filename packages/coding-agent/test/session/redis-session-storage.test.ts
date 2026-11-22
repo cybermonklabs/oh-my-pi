@@ -674,4 +674,77 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await hget(client, "meta", "/s/p/Late*[x].jsonl")).toBeNull();
 		expect(await client.get(`${prefix}file:/s/p-sibling.jsonl`)).toBe("sibling\n");
 	});
+
+	// The remove script's comparison of the key's head is the only guard against deleting a session that moved away
+	// or another session that took the key after the store checked it; these run it on the server.
+	describe("deleteSessionWithArtifacts of a listed session", () => {
+		const header = (id: string, rest = "") =>
+			`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-11-21T00:00:00.000Z", cwd: "/w" })}\n${rest}`;
+		const listed = (id: string): ListedSession => ({
+			id,
+			headBytes: SESSION_HEADER_READ_LIMIT,
+			headerId: sessionHeaderIdOfHead,
+		});
+		/** Run `change` once, right before `client`'s first remove script (after the store checked the head); count them. */
+		const beforeRemoveScript = (client: RedisClient, change: () => Promise<unknown>): (() => number) => {
+			const send = client.send.bind(client);
+			let scripts = 0;
+			client.send = async (command: string, args: string[]) => {
+				if (command === "EVAL" && String(args[0]).includes("OMP_REMOVE") && scripts++ === 0) await change();
+				return send(command, args);
+			};
+			return () => scripts;
+		};
+
+		it("refuses, removing nothing, when another client moves the key away after the store checked it", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1"));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			// Another client's move renames the session's key, not yet its subagent transcript.
+			beforeRemoveScript(client, () =>
+				other.client.send("RENAME", [`${prefix}file:/s/p.jsonl`, `${prefix}file:/s/q.jsonl`]),
+			);
+
+			await expect(storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/p.jsonl": the file no longer holds session S1 (it moved or was deleted). Nothing was deleted.',
+			);
+			expect([await client.get(`${prefix}file:/s/q.jsonl`), await client.get(`${prefix}file:/s/p/A.jsonl`)]).toEqual(
+				[header("S1"), header("A")],
+			);
+		});
+
+		it("refuses, removing nothing, when another session takes the key after the store checked it", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1"));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			beforeRemoveScript(client, () => other.client.send("SET", [`${prefix}file:/s/p.jsonl`, header("OTHER")]));
+
+			await expect(storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"))).rejects.toThrow(
+				'Cannot delete session "/s/p.jsonl": the file no longer holds session S1 (it holds OTHER). Nothing was deleted.',
+			);
+			expect([await client.get(`${prefix}file:/s/p.jsonl`), await client.get(`${prefix}file:/s/p/A.jsonl`)]).toEqual(
+				[header("OTHER"), header("A")],
+			);
+		});
+
+		it("deletes after a rewrite of the same session changed the head the store checked, running the script again", async () => {
+			const { client, storage } = await open();
+			const other = await open();
+			await storage.writeText("/s/p.jsonl", header("S1", '{"type":"custom","n":1}\n'));
+			await storage.writeText("/s/p/A.jsonl", header("A"));
+			const scripts = beforeRemoveScript(client, () =>
+				other.client.send("SET", [`${prefix}file:/s/p.jsonl`, header("S1", '{"type":"custom","n":2}\n')]),
+			);
+
+			await storage.deleteSessionWithArtifacts("/s/p.jsonl", listed("S1"));
+
+			expect([
+				scripts(),
+				await client.exists(`${prefix}file:/s/p.jsonl`),
+				await client.exists(`${prefix}file:/s/p/A.jsonl`),
+			]).toEqual([2, false, false]);
+		});
+	});
 });

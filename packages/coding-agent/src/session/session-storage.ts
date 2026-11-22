@@ -401,15 +401,19 @@ export interface SessionStorage {
 	renameNoReplace?(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	/**
-	 * Delete a session file and its artifacts. With `listed`, the session a
-	 * picker listed at `sessionPath`: refused, deleting nothing, with
-	 * {@link ListedSessionChangedError} unless the file still holds that
-	 * session when the delete runs. A shared store makes the check under the
-	 * delete's own locks, so a move of the session by another client that
-	 * holds no claim (an SDK host's store) cannot split it: the move renames
-	 * the session's file, then each subagent transcript under its artifacts
-	 * directory, and a delete of the old path between those steps would remove
-	 * the transcripts the move had not reached.
+	 * Delete a session file and its artifacts. With `listed`, the session the
+	 * caller expects at `sessionPath` (a picker's listed session, or the one
+	 * `SessionManager.deleteSessionFile` read in the header): refused, deleting
+	 * nothing, with {@link ListedSessionChangedError} unless the file still
+	 * holds that session when the delete runs. A move of the session by
+	 * another client that holds no claim (an SDK host's store) renames the
+	 * session's file, then each subagent transcript under its artifacts
+	 * directory; a delete of the old path between those steps would remove the
+	 * transcripts the move had not reached. A SQL store checks after the
+	 * delete's row locks (which wait for a move that holds the session's row),
+	 * a Redis store in its remove script, and the file store deletes the
+	 * session file before the artifacts, so a moved file fails the delete
+	 * first.
 	 */
 	deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void>;
 	/**
@@ -1636,10 +1640,14 @@ export class FileSessionStorage implements SessionStorage {
 	/**
 	 * Delete a session file and its artifacts directory.
 	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
-	 * With `listed`, the header check and the unlink run under the session
-	 * file's lock. The file goes first, so a move that renamed it already
-	 * fails this unlink, and a move that comes after it fails its own first
-	 * rename: neither removes the artifacts of a session that moved.
+	 * With `listed`, the file's header is read and the file unlinked only when
+	 * it names `listed.id`. The order is what keeps a move whole: the file goes
+	 * before the artifacts, so a move that renamed it already fails this
+	 * unlink and nothing is deleted, and a move that comes after it fails its
+	 * own first rename. The session file's lock held here excludes only the
+	 * first durable append and the draft clean-up; no move or rewrite takes
+	 * it, so a session another client renames onto the path between the read
+	 * and the unlink is not refused.
 	 */
 	async deleteSessionWithArtifacts(sessionPath: string, listed?: ListedSession): Promise<void> {
 		// Delete the session file itself

@@ -1,20 +1,25 @@
 /**
- * A picker's delete of a session it listed (`SessionManager.deleteListedSession`: the startup `--resume`
- * picker's and the in-session `/resume` picker's) while another client moves that session (`moveTo`). The mover
- * here is an SDK host's store: SQL storage built as `examples/sdk/13-sql-sessions.ts` builds it, which claims
- * nothing (`claims` is off by default), so no lease or write fence stands between it and the picker's claiming
- * store. The move renames the session's file, then each subagent transcript keyed under its artifacts directory.
- * A delete that finds the session still at its path before the move renames it waits for the session's row; once
- * the rename commits it must refuse, deleting nothing, instead of removing the subagent transcripts the move has
- * not reached. A delete once the file moved must refuse too, and a delete must refuse when the file at the path
- * no longer holds the listed session. SQLite and the file store always; PostgreSQL and MySQL (MariaDB) when
+ * A delete of a session through `SessionManager` while another client moves that session (`moveTo`): the pickers'
+ * delete (`deleteListedSession`), `deleteSessionFile` (`/delete`, `/tan`'s clean-up) and `/session delete`
+ * (`dropSession`, also AgentSession's `/delete`, the task executor's and the empty-move clean-ups). The mover here is
+ * an SDK host's store: SQL storage built as `examples/sdk/13-sql-sessions.ts` builds it, which claims nothing
+ * (`claims` is off by default), so no lease or write fence stands between it and the deleting claiming store. The
+ * move renames the session's file, then each subagent transcript keyed under its artifacts directory. A delete that
+ * found the session at its path before the move renamed it, and deletes after the rename, must refuse, deleting
+ * nothing, instead of removing the subagent transcripts the move has not reached: on PostgreSQL and MySQL the delete
+ * waits for the session's row, which the move holds; on SQLite it waits for the write lock while the move renames
+ * the file. A picker's delete once the file moved must refuse too, and must refuse when the file at the path no
+ * longer holds the listed session. SQLite and the file store always; PostgreSQL and MySQL (MariaDB) when
  * `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	LEASE_BACKENDS,
@@ -42,6 +47,11 @@ interface Backend extends AsyncDisposable {
 	paths(): Promise<string[]>;
 	/** How many transactions wait for a lock on the server (the row-lease servers only). */
 	readonly lockWaits?: () => Promise<number>;
+	/**
+	 * SQLite: hold the picker store's next `BEGIN IMMEDIATE` (a delete's remove; a SQLite claim opens no
+	 * transaction) before it is sent, until `release`. `reached` settles once a write waits there.
+	 */
+	readonly holdNextWrite?: () => { reached: Promise<void>; release: () => void };
 }
 
 async function openBackend(adapter: string, url: string): Promise<Backend> {
@@ -69,9 +79,29 @@ async function openBackend(adapter: string, url: string): Promise<Backend> {
 	}
 	const db = await openLeaseDb(adapter as "sqlite" | "postgres" | "mysql", url);
 	const count = async (query: string) => Number((await db.sql(query))[0]?.n ?? 0);
+	let hold: { reached: PromiseWithResolvers<void>; gate: PromiseWithResolvers<void> } | undefined;
+	const picker = await db.open(
+		adapter === "sqlite"
+			? {
+					wrap: client => ({
+						options: client.options,
+						transaction: callback => client.transaction(callback),
+						unsafe: async (query, values) => {
+							const held = hold;
+							if (held && query === "BEGIN IMMEDIATE") {
+								hold = undefined;
+								held.reached.resolve();
+								await held.gate.promise;
+							}
+							return client.unsafe(query, values);
+						},
+					}),
+				}
+			: {},
+	);
 	return {
 		name: adapter,
-		picker: await db.open(),
+		picker,
 		writer: await db.open({ claims: false }),
 		// The mover claims nothing, as an SDK host's store does.
 		config: { dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL, claims: false },
@@ -84,19 +114,23 @@ async function openBackend(adapter: string, url: string): Promise<Backend> {
 				: adapter === "postgres"
 					? () => count("SELECT COUNT(*) AS n FROM pg_locks WHERE NOT granted")
 					: undefined,
+		holdNextWrite:
+			adapter === "sqlite"
+				? () => {
+						const held = { reached: Promise.withResolvers<void>(), gate: Promise.withResolvers<void>() };
+						hold = held;
+						return { reached: held.reached.promise, release: () => held.gate.resolve() };
+					}
+				: undefined,
 		[Symbol.asyncDispose]: () => db[Symbol.asyncDispose](),
 	};
 }
 
 /**
  * A session the mover creates and holds, with two subagent transcripts, listed by the picker (its view is the one
- * a picker deletes from), then its move started and paused.
+ * a delete deletes from).
  */
-async function sessionBeingMoved(
-	backend: Backend,
-	mover: LeaseProcess,
-	pause: "file" | "session",
-): Promise<{ file: string; id: string }> {
+async function moverSession(backend: Backend, mover: LeaseProcess): Promise<{ file: string; id: string }> {
 	for (const dir of ["project", "moved"]) fs.mkdirSync(backend.dir.join(dir), { recursive: true });
 	const created = await mover.run({
 		op: "create",
@@ -107,6 +141,14 @@ async function sessionBeingMoved(
 	const children = await mover.run({ op: "children", names: ["A", "B"] });
 	if (children.error) throw new Error(`children: ${children.error}`);
 	await backend.picker.refresh?.();
+	return { file: created.sessionFile, id: created.sessionId };
+}
+
+/**
+ * Start the mover's move of its session and let it pause: inside the session file's rename, holding its row
+ * (`"session"`), or once the file's rename committed, before the subagent transcripts (`"file"`).
+ */
+async function startMove(backend: Backend, mover: LeaseProcess, pause: "file" | "session"): Promise<void> {
 	// The destination sorts after every row, so a delete whose lock scans the table (MySQL, MariaDB before 11.8.1)
 	// has not locked the gap the move inserts into when it waits for the session's row.
 	const moving = await mover.run({
@@ -116,7 +158,17 @@ async function sessionBeingMoved(
 		pause,
 	});
 	if (moving.paused !== true) throw new Error(`the move did not pause: ${JSON.stringify(moving)}`);
-	return { file: created.sessionFile, id: created.sessionId };
+}
+
+/** {@link moverSession}, then {@link startMove}. */
+async function sessionBeingMoved(
+	backend: Backend,
+	mover: LeaseProcess,
+	pause: "file" | "session",
+): Promise<{ file: string; id: string }> {
+	const session = await moverSession(backend, mover);
+	await startMove(backend, mover, pause);
+	return session;
 }
 
 /** `"deleted"`, or `"refused: <message>"`. */
@@ -132,6 +184,62 @@ function whole(movedFile: string): string[] {
 	const stem = movedFile.slice(0, -".jsonl".length);
 	return [movedFile, path.join(stem, "A.jsonl"), path.join(stem, "B.jsonl")].sort();
 }
+
+/** A delete's outcome when it refused because the session moved from `file`. */
+function refusedMoved(file: string, id: string): string {
+	return `refused: Cannot delete session "${file}": the file no longer holds session ${id} (it moved or was deleted). Nothing was deleted.`;
+}
+
+/** A delete as its callers make it: readied before the move starts (a caller's session may be open), then run. */
+interface DeleteShape {
+	readonly name: string;
+	prepare(backend: Backend, file: string, id: string): Promise<AsyncDisposable & { run(): Promise<string> }>;
+}
+
+const DELETES: readonly DeleteShape[] = [
+	{
+		name: "the resume pickers' delete (deleteListedSession)",
+		async prepare(backend, file, id) {
+			return {
+				run: () => outcome(SessionManager.deleteListedSession({ path: file, id }, backend.picker)),
+				async [Symbol.asyncDispose]() {},
+			};
+		},
+	},
+	{
+		name: "`/delete` and `/tan`'s clean-up (deleteSessionFile)",
+		async prepare(backend, file) {
+			return {
+				run: () => outcome(SessionManager.deleteSessionFile(file, backend.picker)),
+				async [Symbol.asyncDispose]() {},
+			};
+		},
+	},
+	{
+		// The command's own handler, on a SessionManager that has the session open; AgentSession's `/delete`, the
+		// task executor's and the empty-move clean-ups make the same `dropSession` call.
+		name: "`/session delete` (dropSession)",
+		async prepare(backend, file) {
+			const manager = await SessionManager.open(file, path.dirname(file), backend.picker, {
+				suppressBreadcrumb: true,
+			});
+			const output: string[] = [];
+			const runtime = {
+				session: { isStreaming: false } as unknown as AgentSession,
+				sessionManager: manager,
+				output: (text: string) => void output.push(text),
+			} as unknown as SlashCommandRuntime;
+			return {
+				async run() {
+					const result = await executeAcpBuiltinSlashCommand("/session delete", runtime);
+					const failed = typeof result === "object" && "failed" in result && result.failed === true;
+					return failed ? `refused: ${output.join("\n").replace(/^Failed to delete session: /, "")}` : "deleted";
+				},
+				[Symbol.asyncDispose]: () => manager.close(),
+			};
+		},
+	},
+];
 
 const BACKENDS: ReadonlyArray<{ adapter: string; url: string | undefined }> = [
 	...LEASE_BACKENDS,
@@ -159,38 +267,6 @@ for (const { adapter, url } of BACKENDS) {
 			});
 		}, 60_000);
 
-		// On SQLite a delete cannot wait out a move's open transaction: it fails with SQLITE_BUSY ("database is
-		// locked") and deletes nothing, before this fix as after it, so this race runs on the row-lock servers.
-		it.skipIf(!["mysql", "postgres"].includes(adapter))(
-			"refuses a session a client holding no claim is moving, while the move holds the session's file before renaming it (the reviewer's race), and the move keeps it whole",
-			async () => {
-				await using backend = await openBackend(adapter, url ?? "");
-				await using mover = await LeaseProcess.start(backend.config, backend.dir.join("mover"));
-				const { file, id } = await sessionBeingMoved(backend, mover, "session");
-				const deleting = outcome(SessionManager.deleteListedSession({ path: file, id }, backend.picker));
-				// The delete finds the session still at its path, then waits for the session's row, which the move
-				// holds: let it reach that wait before the move goes on. The server's lock tables are read 150 ms
-				// apart (they are refilled no faster), for at most 4 s; a refused delete settles first.
-				const until = Date.now() + 4000;
-				while (Date.now() < until) {
-					if (await Promise.race([deleting.then(() => true), Bun.sleep(150).then(() => false)])) break;
-					if (((await backend.lockWaits?.()) ?? 0) > 0) break;
-				}
-				const ended = await mover.run({ op: "moveGo" });
-				const deleted = await deleting;
-				expect({
-					deleted,
-					moveError: ended.error,
-					paths: await backend.paths(),
-				}).toEqual({
-					deleted: `refused: Cannot delete session "${file}": the file no longer holds session ${id} (it moved or was deleted). Nothing was deleted.`,
-					moveError: undefined,
-					paths: whole(String(ended.sessionFile)),
-				});
-			},
-			60_000,
-		);
-
 		it("refuses when the listed file now holds another session, and deletes nothing", async () => {
 			await using backend = await openBackend(adapter, url ?? "");
 			const listed = crypto.randomUUID();
@@ -212,4 +288,64 @@ for (const { adapter, url } of BACKENDS) {
 			});
 		}, 60_000);
 	});
+
+	for (const shape of DELETES) {
+		const title = `${shape.name} of a ${adapter} session another client is moving`;
+		describe.skipIf(!url || adapter === "file")(title, () => {
+			it.skipIf(!["mysql", "postgres"].includes(adapter))(
+				"refuses, deleting nothing, when it waited for the session's row while the move renamed its file (the reviewer's race), and the move keeps the session whole",
+				async () => {
+					await using backend = await openBackend(adapter, url ?? "");
+					await using mover = await LeaseProcess.start(backend.config, backend.dir.join("mover"));
+					const { file, id } = await moverSession(backend, mover);
+					await using deletion = await shape.prepare(backend, file, id);
+					await startMove(backend, mover, "session");
+					const deleting = deletion.run();
+					// The delete finds the session still at its path, then waits for the session's row, which the move
+					// holds: let it reach that wait before the move goes on. The server's lock tables are read 150 ms
+					// apart (they are refilled no faster), for at most 4 s; a refused delete settles first.
+					const until = Date.now() + 4000;
+					while (Date.now() < until) {
+						if (await Promise.race([deleting.then(() => true), Bun.sleep(150).then(() => false)])) break;
+						if (((await backend.lockWaits?.()) ?? 0) > 0) break;
+					}
+					const ended = await mover.run({ op: "moveGo" });
+					const deleted = await deleting;
+					expect({ deleted, moveError: ended.error, paths: await backend.paths() }).toEqual({
+						deleted: refusedMoved(file, id),
+						moveError: undefined,
+						paths: whole(String(ended.sessionFile)),
+					});
+				},
+				60_000,
+			);
+
+			// SQLite's write lock is the database's: a delete that read the session at its path waits for it while a
+			// move's short transaction renames the file, then runs between that rename and the transcripts' (it fails
+			// with SQLITE_BUSY, deleting nothing, only if the lock stays held past the 5 s busy timeout).
+			it.skipIf(adapter !== "sqlite")(
+				"refuses, deleting nothing, when it waited for the write lock while the move renamed its file, and the move keeps the session whole",
+				async () => {
+					await using backend = await openBackend(adapter, url ?? "");
+					await using mover = await LeaseProcess.start(backend.config, backend.dir.join("mover"));
+					const { file, id } = await moverSession(backend, mover);
+					await using deletion = await shape.prepare(backend, file, id);
+					const held = backend.holdNextWrite!();
+					const deleting = deletion.run();
+					// The delete reads the session at its path, then waits to begin its transaction.
+					await Promise.race([held.reached, deleting]);
+					await startMove(backend, mover, "file");
+					held.release();
+					const deleted = await deleting;
+					const ended = await mover.run({ op: "moveGo" });
+					expect({ deleted, moveError: ended.error, paths: await backend.paths() }).toEqual({
+						deleted: refusedMoved(file, id),
+						moveError: undefined,
+						paths: whole(String(ended.sessionFile)),
+					});
+				},
+				60_000,
+			);
+		});
+	}
 }

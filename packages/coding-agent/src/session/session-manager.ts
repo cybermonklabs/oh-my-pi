@@ -235,6 +235,11 @@ function artifactsDirectoryFor(sessionFile: string | undefined): string | null {
 	return sessionFile.slice(0, -JSONL_SUFFIX_LENGTH);
 }
 
+/** The session `id` as a delete's guard: the store compares it with the header it finds, read as the loader reads it. */
+function listedSession(id: string): ListedSession {
+	return { id, headBytes: SESSION_HEADER_READ_LIMIT, headerId: sessionHeaderIdOfHead };
+}
+
 /**
  * Copy a session's artifact directory to another session, matching interactive
  * `/fork`. Never overwrites: a destination file written while the copy runs
@@ -3288,31 +3293,36 @@ export class SessionManager {
 	 * that confirms claims (`acquireSessionClaim`, SQL storage) the claim is
 	 * taken before anything is deleted and held until the delete has run, so
 	 * the delete meets the write fence like any other write; a claim this
-	 * process holds already is shared. Other storages delete as before. ENOENT
-	 * propagates. With `listed`, the session a picker listed at `sessionPath`,
-	 * the storage refuses the delete unless the file still holds that session
-	 * (see {@link SessionStorage.deleteSessionWithArtifacts}).
+	 * process holds already is shared. ENOENT propagates.
+	 *
+	 * The storage refuses the delete with `ListedSessionChangedError`, deleting
+	 * nothing, unless the file still holds the session when the delete runs
+	 * (see {@link SessionStorage.deleteSessionWithArtifacts}): `listed`, the
+	 * session a picker listed, else the session the file's header names when
+	 * this delete reads it. So a move of the session by another client that
+	 * holds no claim (it renames the file, then each subagent transcript)
+	 * cannot be split by a delete of the old path, on any storage. A file
+	 * whose header names no session is deleted without that check.
 	 */
 	static async deleteSessionFile(
 		sessionPath: string,
 		storage: SessionStorage = defaultSessionStorage(),
 		listed?: ListedSession,
 	): Promise<void> {
+		const sessionId = await readSessionHeaderId(sessionPath, storage);
+		const guard = listed ?? (sessionId === undefined ? undefined : listedSession(sessionId));
 		let release = (): void => {};
-		if (storage.acquireSessionClaim) {
-			const sessionId = await readSessionHeaderId(sessionPath, storage);
-			if (sessionId) {
-				const claim = await storage.acquireSessionClaim(sessionId, sessionPath);
-				if (!claim) {
-					throw new Error(
-						`Cannot delete session "${sessionPath}": another live omp process writes it. Nothing was deleted.`,
-					);
-				}
-				release = claim;
+		if (storage.acquireSessionClaim && sessionId) {
+			const claim = await storage.acquireSessionClaim(sessionId, sessionPath);
+			if (!claim) {
+				throw new Error(
+					`Cannot delete session "${sessionPath}": another live omp process writes it. Nothing was deleted.`,
+				);
 			}
+			release = claim;
 		}
 		try {
-			await storage.deleteSessionWithArtifacts(sessionPath, listed);
+			await storage.deleteSessionWithArtifacts(sessionPath, guard);
 		} finally {
 			release();
 		}
@@ -3322,19 +3332,15 @@ export class SessionManager {
 	 * Delete a session a picker listed (the startup `--resume` picker's and the
 	 * in-session `/resume` picker's delete): {@link deleteSessionFile}, refused
 	 * with `ListedSessionChangedError`, deleting nothing, unless the file at
-	 * `session.path` still holds the session `session.id` when the delete runs.
-	 * A shared store checks that under the delete's own locks, so a move of the
-	 * session by another client that holds no claim cannot split it.
+	 * `session.path` still holds the session `session.id` when the delete runs,
+	 * so it never deletes another session that took the path after the picker
+	 * listed it.
 	 */
 	static async deleteListedSession(
 		session: { path: string; id: string },
 		storage: SessionStorage = defaultSessionStorage(),
 	): Promise<void> {
-		await SessionManager.deleteSessionFile(session.path, storage, {
-			id: session.id,
-			headBytes: SESSION_HEADER_READ_LIMIT,
-			headerId: sessionHeaderIdOfHead,
-		});
+		await SessionManager.deleteSessionFile(session.path, storage, listedSession(session.id));
 	}
 
 	/**

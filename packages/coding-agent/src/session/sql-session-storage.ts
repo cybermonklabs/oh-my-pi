@@ -4111,14 +4111,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Refuse a removal of a listed session unless its row at `listed.path` is
 	 * there and its header names `listed.id`, read after the removal's row
-	 * locks: a move of the session by a client that holds no claim (it renames
-	 * the session's row, then each subagent transcript under its directory)
-	 * either committed its row's rename before these locks, and the row is not
-	 * there, or waits for this removal. The row's existence is read with a
-	 * lock, so it is the latest committed (MySQL's REPEATABLE READ snapshot
-	 * plays no part); its header is in parts every writer changes only under
-	 * the row's lock, held here, read after the locks in the same
-	 * transaction.
+	 * locks. Those locks include the session's path, so they wait for a move
+	 * that holds its row: a move of the session by a client that holds no
+	 * claim (it renames the session's row, then each subagent transcript under
+	 * its directory) either committed its row's rename before these locks, and
+	 * the row is not there, or waits for this removal. The existence read
+	 * takes the row's lock too, which this transaction holds already; the
+	 * header is in parts every writer changes only under that lock, read after
+	 * it in the same transaction.
 	 */
 	async #assertListed(transaction: SqlSessionStorageTransaction, listed: ListedSessionGuard): Promise<void> {
 		const there = await run(transaction, this.#q.lockSize, { path: listed.path });
