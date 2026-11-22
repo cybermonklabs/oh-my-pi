@@ -2159,12 +2159,31 @@ pub fn fork_loops(vp: &Vproc, keeps: bool) -> u32 {
 	}
 }
 
+/// The first op at or after `at` that is not the jump over a command or
+/// process substitution's body: [`ir`] lowers a `$( )`, backtick or
+/// `<( )` word's body in place, ahead of its command's own op, as a `Jmp`
+/// to just past the body's `SubExit` (a child of its own runs it).
+fn skip_blocks(unit: &Unit, mut at: u32) -> u32 {
+	while let Some(op) = unit.ops.get(at as usize)
+		&& op.code == Opcode::Jmp
+		&& op.a > at
+		&& unit
+			.ops
+			.get(op.a as usize - 1)
+			.is_some_and(|end| end.code == Opcode::SubExit)
+	{
+		at = op.a;
+	}
+	at
+}
+
 /// Whether bash forks the job whose body starts at `entry` without
 /// `execute_in_subshell`, so that it keeps the loop level ([`fork_loops`]):
 /// a body of one pipeline, with or without `!`, whose simple commands bash
 /// forks from the shell itself. An and-or list, a compound command or a
 /// timed pipeline is run as a subshell (`CMD_FORCE_SUBSHELL`).
 fn bash_job_keeps(unit: &Unit, entry: u32) -> bool {
+	let entry = skip_blocks(unit, entry);
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	let after = match unit.ops.get(entry as usize) {
 		Some(op) if op.code == Opcode::Exec => entry + 1,
@@ -4164,9 +4183,13 @@ fn bash_case_hit(
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
-/// (bash's "not for pipes yet"); anything else is one more.
+/// (bash's "not for pipes yet"); anything else is one more. The bodies of
+/// its substitutions come first ([`skip_blocks`]).
 fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
-	let ops = unit.ops.get(entry as usize..).unwrap_or_default();
+	let ops = unit
+		.ops
+		.get(skip_blocks(unit, entry) as usize..)
+		.unwrap_or_default();
 	let ops = match ops.first() {
 		Some(op) if op.code == Opcode::Redir => &ops[1..],
 		_ => ops,
@@ -4438,10 +4461,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
-					// bash keeps the loop level in a simple command it forks.
+					// bash keeps the loop level in a simple command it forks
+					// (its words' substitution bodies come first).
 					let simple = unit
 						.ops
-						.get(stage.entry as usize)
+						.get(skip_blocks(unit, stage.entry) as usize)
 						.is_some_and(|op| op.code == Opcode::Exec);
 					child.outer_loops = fork_loops(vp, simple);
 					let level = stage_level(unit, stage.entry, false);
@@ -4612,7 +4636,7 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// Whether the pipeline stage starting at `entry` is a simple command
 /// named `jobs` (bash keeps the job list only for that builtin).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
-	let Some(op) = unit.ops.get(entry as usize) else {
+	let Some(op) = unit.ops.get(skip_blocks(unit, entry) as usize) else {
 		return false;
 	};
 	let text = node_text(unit, op.node);
