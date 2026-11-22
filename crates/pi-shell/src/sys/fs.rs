@@ -3093,6 +3093,20 @@ mod tests {
 			assert!(ebadf(regular.poll_write(&mut cx, b"foo\n")), "write to a read-only file");
 		}
 
+		/// The same through the writer thread, Darwin's only route, which this
+		/// test's child process forces on Linux.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn both_ends_of_a_fifo_on_one_thread_never_block_through_the_writer_thread() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::both_ends_of_a_fifo_on_one_thread_never_block_through_the_writer_thread"
+				),
+				both_ends_of_a_fifo_on_one_thread_never_block,
+			);
+		}
+
 		/// Reads `reader` to its end of file, which the test's own close of
 		/// the write end (just before) may not give at once: while a sibling
 		/// test of this process starts a child (`sys/spawn/unix.rs`: `fork`,
