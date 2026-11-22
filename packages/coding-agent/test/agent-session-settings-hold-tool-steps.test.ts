@@ -12,7 +12,13 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	editExtensionSources,
+	RELOAD_CALLS,
+	reloadOverlay,
+	setClock,
+} from "./helpers/agent-session-setup";
 import {
 	answer,
 	copiesIn,
@@ -101,18 +107,7 @@ describe("held tool-set steps of one settings change", () => {
 			contextFiles: [],
 			skills: [],
 		});
-		const edit = async (content: string): Promise<void> => {
-			const refreshed = Promise.withResolvers<void>();
-			const refresh = session.refreshSkillsAndCommands.bind(session);
-			const spy = vi.spyOn(session, "refreshSkillsAndCommands").mockImplementation(async options => {
-				await refresh(options);
-				refreshed.resolve();
-			});
-			await Bun.write(overlay, content);
-			await settings.reloadFromDisk();
-			await refreshed.promise;
-			spy.mockRestore();
-		};
+		const edit = (content: string): Promise<void> => editExtensionSources({ session, settings, overlay }, content);
 		try {
 			await session.settleMemoryBackend();
 			await steps(session, edit, overlay, settings);

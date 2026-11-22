@@ -6,7 +6,6 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -21,15 +20,14 @@ import {
 } from "./helpers/agent-session-setup";
 import {
 	answer,
-	GATEWAY,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
 	mockGatewayFetch,
+	mockHindsightGatewayFetch,
 	textOf,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-import { asGlobalFetch } from "./helpers/fetch-mock";
 
 /** The custom entries of `customType` a session file holds, by their data. */
 function customEntries(sessionFile: string, customType: string): Record<string, unknown>[] {
@@ -155,20 +153,7 @@ describe("the stored prompt's record of its build's reads", () => {
 			`providers:\n  cacheRetention: long\nmemory:\n  backend: hindsight\nhindsight:\n  apiUrl: http://127.0.0.1:1\n  apiToken: ${token}\n  bankId: fleet-bank\n  mentalModelsEnabled: false\n`,
 		);
 		const settings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.path(), configFiles: [overlay] });
-		const requests: MessagesRequest[] = [];
-		vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				const url = new URL(String(input));
-				if (url.href === `${GATEWAY}/v1/messages`) {
-					requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-					return answer(requests.length, { cacheWriteTokens: 100 });
-				}
-				if (url.pathname.endsWith("/memories/recall")) return Response.json({ results: [] });
-				const bank = /^\/v1\/default\/banks\/([^/]+)$/.exec(url.pathname);
-				if (bank) return Response.json({ bank_id: decodeURIComponent(bank[1]) });
-				return Response.json({});
-			}),
-		);
+		mockHindsightGatewayFetch([]);
 		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, dir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");

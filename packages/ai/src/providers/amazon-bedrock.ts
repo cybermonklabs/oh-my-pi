@@ -838,9 +838,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			let toolConfig = toolPlan.toolConfig;
 			const sentinelInjected = toolPlan.sentinelInjected;
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
-			const thinkingDisabled =
-				isRecord(additionalModelRequestFields?.thinking) &&
-				additionalModelRequestFields.thinking.type === "disabled";
+			const thinkingDisabled = sendsThinkingDisabled(model, options.reasoning);
 			const prefixMismatchBehavior =
 				!thinkingDisabled && model.thinking?.prefixBinding && model.compat.supportsThinkingBindingControls
 					? (options.anthropicPrefixMismatchBehavior ?? "drop_block")

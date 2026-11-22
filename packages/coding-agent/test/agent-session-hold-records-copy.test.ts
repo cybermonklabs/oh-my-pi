@@ -4,7 +4,10 @@
  * with the prompt keeping its bytes; a later process that resumes the session dates what it may keep from those
  * records. When the transcript is copied into another session file under a new id (a whole-session `/fork`, a fork at
  * an entry, an automatic move off a file another process owns), the conversation goes on in the copy, so the records
- * must go on in the copy too.
+ * must go on in the copy too. A copy of the branch cut before the end record (`/fork` at an earlier reply, `/tree` to
+ * it and a `/btw` answer promoted into a new file) holds the hold but not its end, so the end must go into the copy
+ * too: without it, a process that resumes the copy dates the change from the hold, finds it due, and sends its own
+ * build in place of the prompt the copy's cache entry holds.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -14,6 +17,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
+	createAssistantMessage,
 	createInMemoryAuthStorage,
 	OwnedElsewhereStorage,
 	RELOAD_CALLS,
@@ -31,7 +35,8 @@ import {
 
 /** One-hour cache entries, so requests minutes apart keep them warm. */
 const LONG_ENTRIES = "providers:\n  cacheRetention: long\n";
-
+/** A change only the bash definition renders: the system prompt keeps its bytes when it goes out. */
+const CHANGED = `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`;
 const MINUTE_MS = 60_000;
 
 interface ProcessInputs {
@@ -108,9 +113,7 @@ describe("hold records of a transcript copied into another session file", () => 
 			async (session, settings, overlay) => {
 				setClock(0);
 				await session.prompt("first");
-				await reloadOverlay({ session, settings, overlay }, `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`, [
-					"holdToolDeclarationChange",
-				]);
+				await reloadOverlay({ session, settings, overlay }, CHANGED, ["holdToolDeclarationChange"]);
 				setClock(MINUTE_MS);
 				await session.prompt("second");
 				await session.fork();
@@ -122,11 +125,7 @@ describe("hold records of a transcript copied into another session file", () => 
 		setClock(8 * MINUTE_MS);
 		const resumed = await runProcess(
 			dir,
-			{
-				overlay: `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`,
-				agentsMd: "Build with ninja.",
-				sessionFile: live.sessionFile,
-			},
+			{ overlay: CHANGED, agentsMd: "Build with ninja.", sessionFile: live.sessionFile },
 			async session => {
 				await session.prompt("fourth");
 			},
@@ -246,4 +245,69 @@ describe("hold records of a transcript copied into another session file", () => 
 		expect(withoutCacheControl(fourth.system)).toBe(withoutCacheControl(first.system));
 		expect(withoutCacheControl(resumed.requests[0]?.system)).toContain("Build with make.");
 	}, 60_000);
+
+	it.each([
+		{
+			copy: "/fork at the reply before the change went out",
+			make: async (session: AgentSession, replyId: string) => {
+				expect(await session.fork(replyId)).toBe(true);
+			},
+		},
+		{
+			copy: "/tree to that reply and a /btw answer promoted into a new file",
+			make: async (session: AgentSession, replyId: string) => {
+				await session.navigateTree(replyId);
+				const promoted = await session.branchFromBtw(
+					"which build tool?",
+					{ ...createAssistantMessage("It runs make."), model: "claude-opus-5-5" },
+					replyId,
+					session.sessionManager.getSessionId(),
+				);
+				expect(promoted.cancelled).toBe(false);
+			},
+		},
+	])(
+		"keeps the copy's stored prompt in a process that resumes it after $copy",
+		async ({ make }) => {
+			using dir = TempDir.createSync("@pi-hold-records-copy-");
+			await Bun.write(dir.join("models.yml"), gatewayModelsYml());
+			// A change only the bash definition renders is held; five minutes on it goes out with the system prompt as it
+			// was, which ends the hold. The branch is then copied up to the reply before that.
+			const live = await runProcess(
+				dir,
+				{ overlay: LONG_ENTRIES, agentsMd: "Build with make." },
+				async (session, settings, overlay) => {
+					setClock(0);
+					await session.prompt("first");
+					await reloadOverlay({ session, settings, overlay }, CHANGED, ["holdToolDeclarationChange"]);
+					setClock(MINUTE_MS);
+					await session.prompt("second");
+					const reply = session.sessionManager
+						.getBranch()
+						.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+					if (!reply) throw new Error("Expected the second reply");
+					setClock(6 * MINUTE_MS);
+					await session.prompt("third");
+					await make(session, reply.id);
+				},
+			);
+			// Two minutes later, the context file changed, a process resumes the copy while its cache entry is live, under
+			// the setting the copy's last request declared its tools with, so that request's entry is the one it reads.
+			setClock(8 * MINUTE_MS);
+			const resumed = await runProcess(
+				dir,
+				{ overlay: LONG_ENTRIES, agentsMd: "Build with ninja.", sessionFile: live.sessionFile },
+				async session => {
+					await session.prompt("fourth");
+				},
+			);
+
+			const [first, , third] = live.requests;
+			if (!first || !third) throw new Error("Expected the first process's requests");
+			// Precondition: the change went out with the system prompt as it was.
+			expect(withoutCacheControl(third.system)).toBe(withoutCacheControl(first.system));
+			expect(withoutCacheControl(resumed.requests[0]?.system)).toContain("Build with make.");
+		},
+		60_000,
+	);
 });

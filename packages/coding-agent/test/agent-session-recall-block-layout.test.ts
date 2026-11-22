@@ -6,7 +6,6 @@
  * expects the prompt to stay as cached past five minutes.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
@@ -17,16 +16,14 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay, setClock } from "./helpers/agent-session-setup";
 import {
-	answer,
 	copiesIn,
-	GATEWAY,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
+	mockHindsightGatewayFetch,
 	textOf,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-import { asGlobalFetch } from "./helpers/fetch-mock";
 
 /** The Hindsight server the settings name; the `fetch` spy answers it, so no request leaves the process. */
 const HINDSIGHT_URL = "http://127.0.0.1:1";
@@ -93,23 +90,9 @@ describe("a system prompt whose first-turn recall went out as its last block", (
 			agentDir: dir.path(),
 			configFiles: [overlayPath],
 		});
-		const requests: MessagesRequest[] = [];
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				const url = new URL(String(input));
-				if (url.href === `${GATEWAY}/v1/messages`) {
-					requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-					return answer(requests.length, { cacheWriteTokens: 100 });
-				}
-				if (url.origin !== HINDSIGHT_URL) throw new Error(`Unexpected request to ${url.href}`);
-				if (url.pathname.endsWith("/memories/recall")) {
-					return Response.json({ results: [{ id: "m1", text: MEMORY, type: "world" }] });
-				}
-				const bank = /^\/v1\/default\/banks\/([^/]+)$/.exec(url.pathname);
-				if (bank) return Response.json({ bank_id: decodeURIComponent(bank[1]) });
-				return Response.json({});
-			}),
-		);
+		const { requests, restore } = mockHindsightGatewayFetch([{ id: "m1", text: MEMORY, type: "world" }], {
+			origin: HINDSIGHT_URL,
+		});
 		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, dir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
@@ -139,7 +122,7 @@ describe("a system prompt whose first-turn recall went out as its last block", (
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			fetchSpy.mockRestore();
+			restore();
 		}
 	}
 
@@ -252,7 +235,7 @@ describe("a system prompt whose first-turn recall went out as its last block", (
 			await started.promise;
 			const state = getMnemopiSessionState(session);
 			if (!state) throw new Error("Expected Mnemopi to start");
-			state.rememberScoped("The deploy host is alpha-7.");
+			state.rememberScoped(MEMORY);
 			state.rememberScoped(`The deploy host runbook: ${"drain the queue, then rotate the keys. ".repeat(5)}`);
 			state.rememberScoped(`The deploy host checklist: ${"restart the workers, then watch the logs. ".repeat(5)}`);
 			await session.prompt("Where is the deploy host?");

@@ -14951,12 +14951,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * (a whole-session fork, a fork or branch at an entry, a `/btw` branch, a move off a file another process writes):
 	 * every copy path follows it the same way. The records of a change the prompt withholds follow it
 	 * ({@link SessionTools.followTranscriptCopy}), so do the cut rule's wait and refusal
-	 * ({@link SessionMaintenance.followBranchCopy}), and, where `imageDrops` holds the image drops the session recorded
-	 * before a copy of part of it, those of the conversations the copy holds ({@link carryImageDrops}).
+	 * ({@link SessionMaintenance.followTranscriptCopy}), and, where `imageDrops` holds the image drops the session
+	 * recorded before a copy of part of it, those of the conversations the copy holds ({@link carryImageDrops}).
 	 */
 	#followSessionCopy(fromSessionId: string, imageDrops?: ReadonlyMap<string, RecordedImageDrop>): void {
 		this.#tools.followTranscriptCopy(fromSessionId);
-		this.#maintenance.followBranchCopy();
+		this.#maintenance.followTranscriptCopy();
 		if (imageDrops && imageDrops.size > 0) {
 			const messages = this.#providerBoundary.buildDisplaySessionContext(this.model).messages;
 			carryImageDrops(this.sessionManager, imageDrops, convertToLlm(messages));

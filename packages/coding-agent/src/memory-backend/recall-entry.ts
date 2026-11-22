@@ -177,8 +177,8 @@ export function persistRecall(
 
 /**
  * The recall the branch delivered as a hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message since its
- * last context reset: the newest one. A loaded transcript's hidden recall, and the sign that a recall
- * the backend reuses from it went out that way.
+ * last context reset: the newest one. The sign that a recall the backend reuses went out as a hidden
+ * message.
  */
 export function findDeliveredRecall(branch: readonly SessionEntry[]): string | undefined {
 	for (let index = branch.length - 1; index >= 0; index--) {
@@ -204,6 +204,14 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
 export interface ConversationRecall {
 	text: string;
 	hidden: boolean;
+}
+
+/**
+ * `blocks` with `recall` as its own last block ({@link ConversationRecall}): `blocks` itself when it ends
+ * with that block already, else a copy with the block appended.
+ */
+export function appendRecallBlock(blocks: string[], recall: string): string[] {
+	return blocks.at(-1) === recall ? blocks : [...blocks, recall];
 }
 
 /**
@@ -268,10 +276,11 @@ export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): Rec
 }
 
 /**
- * A memory backend's `instructions` without `recall`, the recall the conversation carries as a hidden message, where
- * they carry it verbatim: the fallback for a backend that ignores `recallDelivered`. A backend that re-renders its
- * recall, as Mnemopi cuts its own to the current token budget on every render, may carry text this search misses, so
- * it leaves the recall out itself.
+ * A memory backend's `instructions` without `recall`, the recall the conversation carries itself
+ * ({@link ConversationRecall}), as a hidden message or as the prompt's own last block, where they carry it verbatim:
+ * the fallback for a backend that ignores `recallDelivered`. A backend that re-renders its recall, as Mnemopi cuts its
+ * own to the current token budget on every render, may carry text this search misses, so it leaves the recall out
+ * itself.
  */
 export function withoutDeliveredRecall(instructions: string | undefined, recall: string): string | undefined {
 	if (!instructions || !recall) return instructions;

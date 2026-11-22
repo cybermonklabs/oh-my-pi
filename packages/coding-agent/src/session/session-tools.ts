@@ -50,6 +50,7 @@ import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
 import {
+	appendRecallBlock,
 	type ConversationRecall,
 	findDeliveredRecall,
 	findDeliveredRecallChanges,
@@ -5299,7 +5300,7 @@ export class SessionTools {
 			// The recall goes out as the prompt's own last block, which every build appends once it is adopted: a build
 			// made after the session adopted it (a reused recall the transcript carries) ends with it already.
 			const preparedBase = refreshed?.systemPrompt ?? this.#baseSystemPrompt;
-			const stablePrompt = preparedBase.at(-1) === injected ? preparedBase : [...preparedBase, injected];
+			const stablePrompt = appendRecallBlock(preparedBase, injected);
 			return {
 				systemPrompt: stablePrompt,
 				memoryNotice: memory.notice,
@@ -5312,11 +5313,7 @@ export class SessionTools {
 					const currentBase = this.#baseSystemPrompt;
 					this.#host.captureMemoryPromotionSnapshot(currentBase);
 					this.#baseSystemPrompt =
-						currentBase === preparedBase
-							? stablePrompt
-							: currentBase.at(-1) === injected
-								? currentBase
-								: [...currentBase, injected];
+						currentBase === preparedBase ? stablePrompt : appendRecallBlock(currentBase, injected);
 					this.#applyAgentSystemPrompt(this.#baseSystemPrompt);
 					return true;
 				},

@@ -154,3 +154,24 @@ export async function reloadOverlay(
 	await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
 	for (const spy of spies) spy.mockRestore();
 }
+
+/**
+ * Rewrites the overlay file with `content`, an edit of the extension sources (`extensions`, `disabledExtensions`), and
+ * reloads it as the config watcher does, then waits for the skill and command refresh the edit starts once it has
+ * reconciled the extensions, whenever that refresh starts.
+ */
+export async function editExtensionSources(
+	{ session, settings, overlay }: OverlaySession,
+	content: string,
+): Promise<void> {
+	const refreshed = Promise.withResolvers<void>();
+	const refresh = session.refreshSkillsAndCommands.bind(session);
+	const spy = vi.spyOn(session, "refreshSkillsAndCommands").mockImplementation(async options => {
+		await refresh(options);
+		refreshed.resolve();
+	});
+	await Bun.write(overlay, content);
+	await settings.reloadFromDisk();
+	await refreshed.promise;
+	spy.mockRestore();
+}

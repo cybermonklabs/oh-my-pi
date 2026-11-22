@@ -1921,7 +1921,7 @@ function createRequestSetup(
 
 function resolveOpenAICompatForRequest(
 	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
 	hasTools: boolean,
 ): OpenAICompatPolicy {
 	return resolveOpenAICompatPolicy(model, {
@@ -2039,17 +2039,32 @@ function requestedToolChoice(
 
 /**
  * Whether a request with `toolChoice` sends a `tool_choice` other than the default `auto` under `compat`, the compat it
- * goes out with; {@link buildParams} decides the request's `tool_choice` by it: a host that takes no `tool_choice` gets
+ * resolves; {@link buildParams} decides the request's `tool_choice` by it: a host that takes no `tool_choice` gets
  * none, and a forced choice (`any`, `required`, a named tool) goes out as `auto` where the host takes no forced one; a
  * named choice a host takes only as a string goes out as `required`, still forced.
  */
-export function openAICompletionsSendsNonDefaultToolChoice(
+function sendsNonDefaultToolChoice(
 	compat: Pick<ResolvedOpenAICompat, "supportsToolChoice" | "supportsForcedToolChoice">,
 	toolChoice: ToolChoice | undefined,
 ): boolean {
 	const requested = requestedToolChoice(compat, toolChoice);
 	if (requested === undefined || requested === "auto") return false;
 	return !isForcedToolChoice(requested) || compat.supportsForcedToolChoice;
+}
+
+/**
+ * Whether a chat-completions request to `model` with `options`, offering tools when `hasTools`, sends a `tool_choice`
+ * other than the default `auto`, by the rule {@link buildParams} applies under the compat it resolves for the request:
+ * the `whenThinking` view on a request with thinking on. `options` are the ones the provider gets, its reasoning as
+ * `openAICompletionsReasoningOptions` (`stream.ts`) maps a request's.
+ */
+export function openAICompletionsSendsNonDefaultToolChoice(
+	model: Model<"openai-completions">,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
+	hasTools: boolean,
+): boolean {
+	const { compat } = resolveOpenAICompatForRequest(model, options, hasTools);
+	return sendsNonDefaultToolChoice(compat as ResolvedOpenAICompat, options?.toolChoice);
 }
 
 function buildParams(
@@ -2171,7 +2186,7 @@ function buildParams(
 	if (
 		params.tool_choice !== undefined &&
 		params.tool_choice !== "auto" &&
-		!openAICompletionsSendsNonDefaultToolChoice(initialCompat, options?.toolChoice)
+		!sendsNonDefaultToolChoice(initialCompat, options?.toolChoice)
 	) {
 		// Some thinking-required OpenAI-compatible models reject forced
 		// `tool_choice` while still accepting tools with the default auto

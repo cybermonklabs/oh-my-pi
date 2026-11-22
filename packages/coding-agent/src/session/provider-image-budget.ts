@@ -444,6 +444,21 @@ function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { versi
 	);
 }
 
+/** Whether `recorded`, a recorded drop's image keys, names exactly `keys`. */
+function sameImageKeys(recorded: readonly string[], keys: ReadonlySet<string>): boolean {
+	return recorded.length === keys.size && recorded.every(name => keys.has(name));
+}
+
+/** Appends `drop` to the session as an {@link IMAGE_DROP_ENTRY_TYPE} entry, on the branch current then. */
+function appendImageDrop(sessionManager: Pick<SessionManager, "appendCustomEntry">, drop: RecordedImageDrop): void {
+	sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, {
+		version: 1,
+		turn: drop.turn,
+		budget: drop.budget,
+		dropped: drop.dropped,
+	});
+}
+
 /**
  * The newest drop `entries` record for each conversation and image budget, by {@link conversationKey}, on every
  * branch ({@link IMAGE_DROP_ENTRY_TYPE}).
@@ -486,7 +501,7 @@ export function sessionImageDropRecord(
 		drops: read,
 		write(drop) {
 			read();
-			sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...drop });
+			appendImageDrop(sessionManager, drop);
 			drops.set(conversationKey(drop.turn, drop.budget), drop);
 		},
 	};
@@ -511,15 +526,8 @@ export function carryImageDrops(
 	for (const [key, drop] of source) {
 		if (!turns.has(drop.turn)) continue;
 		const held = copied.get(key);
-		if (
-			held &&
-			held.dropped.length === drop.dropped.length &&
-			held.dropped.every(name => drop.dropped.includes(name))
-		) {
-			continue;
-		}
-		const carried: RecordedImageDrop = { turn: drop.turn, budget: drop.budget, dropped: drop.dropped };
-		sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...carried });
+		if (held && sameImageKeys(held.dropped, new Set(drop.dropped))) continue;
+		appendImageDrop(sessionManager, drop);
 	}
 }
 
@@ -669,11 +677,7 @@ export class ProviderImageClamp {
 	#recordHolds(key: string, dropped: Set<string>): boolean {
 		if (!this.#record) return true;
 		const recorded = this.#record.drops().get(key);
-		return (
-			recorded !== undefined &&
-			recorded.dropped.length === dropped.size &&
-			recorded.dropped.every(name => dropped.has(name))
-		);
+		return recorded !== undefined && sameImageKeys(recorded.dropped, dropped);
 	}
 
 	/**

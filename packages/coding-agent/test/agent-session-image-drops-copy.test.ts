@@ -6,7 +6,7 @@
  * anything remembers no drop, and without the record its first request in the copy sends the dropped images again.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -14,7 +14,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -32,25 +32,6 @@ const MODELS_YML = gatewayModelsYml(1_000_000, 4);
 function images(count: number): ImageContent[] {
 	return Array.from({ length: count }, () => ({ type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" }));
 }
-
-/** A `/btw` answer to promote. */
-const BTW_ANSWER: AssistantMessage = {
-	role: "assistant",
-	content: [{ type: "text", text: "The screenshots show the same dialog." }],
-	api: "anthropic-messages",
-	provider: "anthropic",
-	model: "claude-opus-5-5",
-	stopReason: "stop",
-	usage: {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	},
-	timestamp: 0,
-};
 
 /** The newest message entry of `session`'s branch with `role`. */
 function newest(session: AgentSession, role: "user" | "assistant"): string {
@@ -105,7 +86,7 @@ describe("image count clamp drops recorded on another branch, across a copy of t
 				if (!leafId) throw new Error("Expected a leaf");
 				const promoted = await session.branchFromBtw(
 					"what do the screenshots show?",
-					{ ...BTW_ANSWER, timestamp: Date.now() },
+					{ ...createAssistantMessage("The screenshots show the same dialog."), model: "claude-opus-5-5" },
 					leafId,
 					session.sessionManager.getSessionId(),
 				);

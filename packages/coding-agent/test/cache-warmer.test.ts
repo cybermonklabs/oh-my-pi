@@ -863,4 +863,42 @@ describe("cache warmer lifecycle", () => {
 		expect(dispatched).toBeDefined();
 		h.warmer.cancel();
 	});
+
+	// Chat completions decides the request's `tool_choice` under the compat it resolves for the request: the
+	// `whenThinking` view when thinking is on. A forced choice that view takes none of goes out as `auto`.
+	test.each([
+		{ thinking: "on", options: { reasoning: Effort.High }, armed: true },
+		{ thinking: "off", options: {}, armed: false },
+	] satisfies { thinking: string; options: SimpleStreamOptions; armed: boolean }[])(
+		"on a chat completions host that takes no forced tool choice while thinking, with thinking $thinking, arms a forced tool choice only when it goes out as auto",
+		({ options, armed }) => {
+			const h = harness();
+			const model = buildModel({
+				id: "gpt-5",
+				name: "GPT-5",
+				api: "openai-completions",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+				promptCache: { short: 300 },
+				contextWindow: 400_000,
+				maxTokens: 8_192,
+				compat: { whenThinking: { supportsForcedToolChoice: false } },
+			});
+			// Precondition: the host takes a forced tool choice, except on a request with thinking on.
+			expect(model.compat).toMatchObject({
+				supportsForcedToolChoice: true,
+				whenThinking: { supportsForcedToolChoice: false },
+			});
+			const toolChoice: ToolChoice = { type: "tool", name: "write" };
+			const dispatched = h.warmer.start(
+				{ model, context: { messages: [] }, options: { ...options, toolChoice } },
+				() => change(h),
+			);
+			expect(dispatched !== undefined).toBe(armed);
+			h.warmer.cancel();
+		},
+	);
 });

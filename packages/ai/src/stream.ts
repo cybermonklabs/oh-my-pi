@@ -1753,6 +1753,22 @@ function normalizeMandatoryReasoningOptions<TApi extends Api>(
 	return { ...options, reasoning: floor, disableReasoning: undefined, forceReasoningOff: undefined };
 }
 
+/**
+ * The reasoning options a chat-completions request with `options` hands its provider: the effort it resolves after the
+ * mandatory-reasoning clamp ({@link normalizeMandatoryReasoningOptions}, which leaves clamped options as they are),
+ * and whether it turns reasoning off, `forceReasoningOff` folded in since `OpenAICompletionsOptions` carries none.
+ */
+export function openAICompletionsReasoningOptions<TApi extends Api>(
+	model: Model<TApi>,
+	options: SimpleStreamOptions | undefined,
+): Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning"> {
+	const sent = normalizeMandatoryReasoningOptions(model, options);
+	return {
+		reasoning: resolveOpenAiReasoningEffort(model, sent),
+		disableReasoning: sent?.disableReasoning || sent?.forceReasoningOff,
+	};
+}
+
 function supportsExplicitOpenAIResponsesPromptCache(compat: unknown): boolean {
 	return (
 		typeof compat === "object" &&
@@ -2038,9 +2054,7 @@ function mapOptionsForApi<TApi extends Api>(
 			}
 			return castApi<"openai-completions">({
 				...base,
-				reasoning: resolveOpenAiReasoningEffort(model, options),
-				// `OpenAICompletionsOptions` carries no forceReasoningOff; fold it.
-				disableReasoning: options?.disableReasoning || options?.forceReasoningOff,
+				...openAICompletionsReasoningOptions(model, options),
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
@@ -2052,9 +2066,7 @@ function mapOptionsForApi<TApi extends Api>(
 		case "openai-completions":
 			return castApi<"openai-completions">({
 				...base,
-				reasoning: resolveOpenAiReasoningEffort(model, options),
-				// `OpenAICompletionsOptions` carries no forceReasoningOff; fold it.
-				disableReasoning: options?.disableReasoning || options?.forceReasoningOff,
+				...openAICompletionsReasoningOptions(model, options),
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,

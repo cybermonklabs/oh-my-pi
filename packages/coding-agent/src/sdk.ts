@@ -168,7 +168,12 @@ import { mapPromptArguments } from "./mcp/prompt-args";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
-import { findConversationRecall, recallsIntoConversation, withoutDeliveredRecall } from "./memory-backend/recall-entry";
+import {
+	appendRecallBlock,
+	findConversationRecall,
+	recallsIntoConversation,
+	withoutDeliveredRecall,
+} from "./memory-backend/recall-entry";
 import { cfgMemoryBackend } from "./memory-backend/settings";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
@@ -4362,7 +4367,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
 			// revived task its stored one) carries it as the conversation sent it.
 			const withRecallBlock = (blocks: string[]): string[] =>
-				recallBlock === undefined || blocks.at(-1) === recallBlock ? blocks : [...blocks, recallBlock];
+				recallBlock === undefined ? blocks : appendRecallBlock(blocks, recallBlock);
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.

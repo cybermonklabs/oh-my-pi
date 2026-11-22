@@ -14,7 +14,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, setClock } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, editExtensionSources, setClock } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -104,20 +104,7 @@ describe("an extension-sources edit that brings back the built-in an extension r
 			contextFiles: [{ path: dir.join("AGENTS.md"), content: agentsMd }],
 			skills: [],
 		});
-		// Rewrites the overlay and reloads it as the config watcher does, then waits for the extension reconcile and
-		// the skill and command refresh the edit starts.
-		const edit = async (content: string): Promise<void> => {
-			const refreshed = Promise.withResolvers<void>();
-			const refresh = session.refreshSkillsAndCommands.bind(session);
-			const spy = vi.spyOn(session, "refreshSkillsAndCommands").mockImplementation(async options => {
-				await refresh(options);
-				refreshed.resolve();
-			});
-			await Bun.write(overlay, content);
-			await settings.reloadFromDisk();
-			await refreshed.promise;
-			spy.mockRestore();
-		};
+		const edit = (content: string): Promise<void> => editExtensionSources({ session, settings, overlay }, content);
 		try {
 			await steps(session, edit);
 			const file = sessionManager.getSessionFile();
