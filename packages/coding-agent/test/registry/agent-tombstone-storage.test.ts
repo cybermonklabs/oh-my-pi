@@ -413,6 +413,36 @@ describe("agent kill tombstone storage", () => {
 				expect(registry.get(workerId)).toMatchObject({ status: "aborted", session: null });
 			});
 
+			// The path a real spawn takes: executor.ts passes expectedAgentRef null, so sdk.ts calls
+			// registerIfAvailable, which main's side of the proxy answers.
+			it("fails the kill of a worker agent a spawn registered, whose transcript directory is gone, under a SQL default", async () => {
+				useDefault(await sqlStorage(backend));
+				const dir = tempDir("@omp-tombstone-worker-spawn-gone-");
+				const workerId = "Spawned-Sub";
+				const sessionFile = dir.join("gone", `${workerId}.jsonl`);
+				const registry = AgentRegistry.global() as AgentRegistry;
+				const ref = await serveRegistry({} as never).registerIfAvailable(
+					registry,
+					{
+						id: workerId,
+						displayName: "task",
+						kind: "sub",
+						parentId: MAIN_AGENT_ID,
+						session: null,
+						sessionFile,
+						status: "running",
+					},
+					null,
+				);
+				if (!ref) throw new Error("expected the id to be free");
+
+				await expect(
+					AgentLifecycleManager.global().release(workerId, ref, { tombstone: true }),
+				).rejects.toMatchObject({ code: "ENOENT" });
+				expect(fs.existsSync(dir.join("gone"))).toBe(false);
+				expect(registry.get(workerId)).toMatchObject({ status: "aborted", session: null });
+			});
+
 			// A registration that names both a live session and a storage takes the session's.
 			it("takes a live session's storage over the one its registration names", async () => {
 				const storage = await sqlStorage(backend);
