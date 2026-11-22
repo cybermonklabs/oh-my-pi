@@ -189,7 +189,8 @@ import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import {
-	findDeliveredRecall,
+	type ConversationRecall,
+	findConversationRecall,
 	findDeliveredRecallChanges,
 	MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
 	MEMORY_RECALL_MESSAGE_TYPE,
@@ -2537,7 +2538,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
-			hiddenRecall: () => findDeliveredRecall(this.sessionManager.getBranchView()),
+			recall: () => findConversationRecall(this.sessionManager.getBranchView()),
 			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
@@ -2737,7 +2738,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
-			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
+			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -7909,15 +7910,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
-	 * instead of a system block; a prompt rebuild leaves it out of the memory instructions.
+	 * The recall the memory backend adopted that the conversation carries itself: as a hidden `memory-recall` message
+	 * (each request sends it where its context lacks it), or as the system prompt's own last block (each prompt build
+	 * appends it). A prompt build leaves it out of the memory instructions.
 	 */
-	get hiddenMemoryRecall(): string | undefined {
-		return this.#memory.hiddenRecall;
+	get memoryRecall(): ConversationRecall | undefined {
+		return this.#memory.recall;
 	}
 
 	/**
-	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
+	 * Withdraws the recall the conversation carries and the reports of what changed in a reused
 	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state), then
 	 * rebuilds the base prompt: no later request sends them again, and the rebuild asks the backend for its whole
 	 * memory instructions. A rebuild for the memory settings a rebuilt state took in is held on a bound prompt
@@ -7929,7 +7931,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * The hidden messages a model call must carry that its context lacks, decided from the call's own context:
-	 * - the conversation's hidden recall ({@link hiddenMemoryRecall}) where neither the system prompt nor a
+	 * - the conversation's hidden recall ({@link memoryRecall}) where neither the system prompt nor a
 	 *   `memory-recall` message holds it: a branch the delivered message is not on (`/tree` to before it), a
 	 *   compaction that summarized it (before the turn or between its tool calls) and an older recall the context
 	 *   holds in its place each leave it out;

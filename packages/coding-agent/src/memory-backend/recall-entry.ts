@@ -11,8 +11,17 @@
  */
 import type { SessionEntry } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
+import type { MemoryBackendId } from "./types";
 
 export const MEMORY_RECALL_ENTRY_TYPE = "memory_recall";
+
+/**
+ * Whether `backend` recalls into the conversation (Hindsight, Mnemopi): only then is a transcript's recall the
+ * conversation's own, which the session sends again ({@link findConversationRecall}).
+ */
+export function recallsIntoConversation(backend: MemoryBackendId): boolean {
+	return backend === "hindsight" || backend === "mnemopi";
+}
 
 /**
  * Hidden message reporting what changed in a reused recall's memories. Its details
@@ -34,7 +43,7 @@ export interface RecallChangesReport {
  * Hidden message carrying a recall that first succeeded after the conversation's prompt had been
  * sent without one: delivered after the turn's newest content instead of as a new system block, so
  * the cached prompt holds. The session keeps that recall as the conversation's own
- * (`AgentSession.hiddenMemoryRecall`): a model call whose context holds no such message with it (a
+ * (`AgentSession.memoryRecall`): a model call whose context holds no such message with it (a
  * branch the message is not on, a compaction that summarized it, an older recall in its place) sends
  * it again after its newest content, a resume does not add it to the system prompt, and a prompt
  * rebuild asks the backend to leave it out of the memory instructions (`recallDelivered`).
@@ -181,6 +190,48 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
 			typeof entry.content === "string"
 		) {
 			return entry.content;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The recall a conversation carries since its last context reset, and how it rides: as a hidden
+ * {@link MEMORY_RECALL_MESSAGE_TYPE} message, or as the system prompt's own last block, as a recall
+ * the conversation's first request sent goes out. A prompt build leaves it out of the memory
+ * instructions (`recallDelivered`) and, for a block, appends it after the prompt as that block.
+ */
+export interface ConversationRecall {
+	text: string;
+	hidden: boolean;
+}
+
+/**
+ * The recall a loaded transcript's branch leaves the conversation carrying ({@link ConversationRecall}):
+ * the newest one it delivered as a hidden message since its last context reset, else the newest recall
+ * it recorded since then that a turn followed, whose request sent it as the system prompt's last block.
+ * Undefined without one, and when that recall found nothing.
+ */
+export function findConversationRecall(branch: readonly SessionEntry[]): ConversationRecall | undefined {
+	let turnFollowed = false;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "reset_boundary") return undefined;
+		if (entry.type === "message") {
+			turnFollowed = true;
+		} else if (
+			entry.type === "custom_message" &&
+			entry.customType === MEMORY_RECALL_MESSAGE_TYPE &&
+			typeof entry.content === "string"
+		) {
+			return { text: entry.content, hidden: true };
+		} else if (
+			turnFollowed &&
+			entry.type === "custom" &&
+			entry.customType === MEMORY_RECALL_ENTRY_TYPE &&
+			isMemoryRecallEntryData(entry.data)
+		) {
+			return entry.data.text ? { text: entry.data.text, hidden: false } : undefined;
 		}
 	}
 	return undefined;

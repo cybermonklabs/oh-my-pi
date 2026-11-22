@@ -50,6 +50,7 @@ import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
 import {
+	type ConversationRecall,
 	findDeliveredRecall,
 	findDeliveredRecallChanges,
 	type RecallChangesReport,
@@ -189,12 +190,13 @@ export interface SessionToolsHost {
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	/**
-	 * Records what the recall the memory backend adopted leaves the conversation carrying: `hidden` rides it as a
-	 * hidden `memory-recall` message (undefined when it is a system block or the backend adopted none), and `changes`
-	 * are the reports of what changed in a reused recall's memories it carries as hidden `memory-recall-changes`
-	 * messages, oldest first (none for a fresh recall). Each request sends one again where its context lacks it.
+	 * Records what the recall the memory backend adopted leaves the conversation carrying: `recall`, as a hidden
+	 * `memory-recall` message or as the system prompt's own last block (undefined when the backend adopted none), and
+	 * `changes`, the reports of what changed in a reused recall's memories it carries as hidden `memory-recall-changes`
+	 * messages, oldest first (none for a fresh recall). Each request sends a hidden one again where its context lacks
+	 * it, and each prompt build appends the block.
 	 */
-	adoptMemoryRecall(hidden: string | undefined, changes: readonly RecallChangesReport[]): void;
+	adoptMemoryRecall(recall: ConversationRecall | undefined, changes: readonly RecallChangesReport[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -413,7 +415,7 @@ interface StoredSystemPrompt {
 	digest: string;
 	/** Base prompt blocks, before a per-turn hook override. */
 	blocks: string[];
-	/** Top-level tools active when the blocks were stored. */
+	/** The top-level tools the blocks list ({@link PromptListing.toolNames}). */
 	toolNames: string[];
 	/** The `xd://` devices the blocks list ({@link PromptListing.xdevNames}). */
 	xdevNames: string[];
@@ -421,6 +423,12 @@ interface StoredSystemPrompt {
 	skills: Array<{ name: string; description: string }>;
 	/** {@link SessionToolsOptions.operatorPromptDigest} of the process that stored them. */
 	operatorDigest: string;
+	/**
+	 * Each setting the build of the blocks read, with the value it read ({@link heldSettingRecord}: a credential by id
+	 * only, an unset setting without a value): the values a resumed process that sends the blocks again names as the
+	 * ones they were built with. Absent from records written before it was added.
+	 */
+	settingsRead?: HeldSettingRecord[];
 }
 
 /**
@@ -751,16 +759,19 @@ function isListedSkills(value: unknown): value is StoredSystemPrompt["skills"] {
 
 /**
  * The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one: one without the
- * devices and skills it lists cannot tell the `xd://` and skill notices what the model holds.
+ * devices and skills it lists cannot tell the `xd://` and skill notices what the model holds. A record whose
+ * {@link StoredSystemPrompt.settingsRead} is missing or malformed is read without it.
  */
 function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefined {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_CUSTOM_TYPE || !isRecord(entry.data)) {
 		return undefined;
 	}
-	const { digest, blocks, toolNames, xdevNames, skills, operatorDigest } = entry.data;
+	const { digest, blocks, toolNames, xdevNames, skills, operatorDigest, settingsRead } = entry.data;
 	if (typeof digest !== "string" || typeof operatorDigest !== "string" || !isListedSkills(skills)) return undefined;
 	if (!isStringList(blocks) || !isStringList(toolNames) || !isStringList(xdevNames)) return undefined;
-	return { digest, blocks, toolNames, xdevNames, skills, operatorDigest };
+	const stored: StoredSystemPrompt = { digest, blocks, toolNames, xdevNames, skills, operatorDigest };
+	if (isHeldSettingRecords(settingsRead)) stored.settingsRead = settingsRead;
+	return stored;
 }
 
 /** The change a branch entry records as withheld, or `undefined` when it is no such record or a malformed one. */
@@ -3147,11 +3158,12 @@ export class SessionTools {
 	/**
 	 * Stores the base prompt blocks `digest` names on the current branch, once
 	 * per digest, for a resumed process to send again (see
-	 * {@link #restoreTranscriptPrompt}). Only the current base is at hand: a
-	 * reply produced under an older one (a forced rebuild committed while it
-	 * streamed) leaves its digest without blocks. Nothing reads them for a model
-	 * that does not bind its prefix, or when the operator inputs cannot be
-	 * compared, so nothing is stored then.
+	 * {@link #restoreTranscriptPrompt}), with the settings their build read
+	 * ({@link #promptSettingsRead}; a credential by id only). Only the current
+	 * base is at hand: a reply produced under an older one (a forced rebuild
+	 * committed while it streamed) leaves its digest without blocks. Nothing
+	 * reads them for a model that does not bind its prefix, or when the operator
+	 * inputs cannot be compared, so nothing is stored then.
 	 */
 	#storePromptBlocks(digest: string): void {
 		const operatorDigest = this.#operatorPromptDigest;
@@ -3160,10 +3172,11 @@ export class SessionTools {
 		const stored: StoredSystemPrompt = {
 			digest,
 			blocks: [...this.baseOfSystemPrompt(this.#host.agent.state.systemPrompt)],
-			toolNames: this.getActiveToolNames(),
+			toolNames: [...this.#basePromptListing.toolNames],
 			xdevNames: [...this.#basePromptListing.xdevNames],
 			skills: [...this.#basePromptSkills()].map(([name, description]) => ({ name, description })),
 			operatorDigest,
+			settingsRead: [...this.#promptSettingsRead].map(([setting, value]) => heldSettingRecord(setting, value)),
 		};
 		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_CUSTOM_TYPE, stored);
 	}
@@ -3416,6 +3429,8 @@ export class SessionTools {
 			settingsRead: this.#promptSettingsRead,
 		};
 		this.#baseSystemPrompt = stored.blocks;
+		// The values a change's notice and records name as the ones the prompt was built with are the stored build's.
+		if (stored.settingsRead) this.#promptSettingsRead = this.#storedSettingsRead(stored.settingsRead);
 		this.#basePromptRestored = true;
 		this.#restoredPrompt = restoredPrompt;
 		this.#applyAgentSystemPrompt(stored.blocks);
@@ -3427,6 +3442,23 @@ export class SessionTools {
 			skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
 		};
 		return true;
+	}
+
+	/**
+	 * The settings a stored prompt's build read, `records`, each with the value it read: a credential, whose value is
+	 * never stored, with the value this process's own build read, if it read it; a setting this process does not
+	 * know is left out.
+	 */
+	#storedSettingsRead(records: readonly HeldSettingRecord[]): Map<AnySetting, unknown> {
+		const own = this.#promptSettingsRead;
+		const read = new Map<AnySetting, unknown>();
+		for (const record of records) {
+			const setting = lookupSetting(record.id);
+			if (!setting) continue;
+			if (!setting.isCredential) read.set(setting, record.value);
+			else if (own.has(setting)) read.set(setting, own.get(setting));
+		}
+		return read;
 	}
 
 	/** {@link #restoredPrompt} while it is the base. */
@@ -4189,18 +4221,27 @@ export class SessionTools {
 	/**
 	 * Holds a tool-set apply that `settingsChange` started on a bound prompt, as {@link #holdRosterChange} holds a
 	 * reconcile's: an extension-sources edit that suspends an extension, which takes its tools off the registry or
-	 * brings back the built-in one it replaced, or resumes one. Against the set the hold leaves enabled (the enabled set
-	 * without the tools it disables, with the ones it enables), each tool `toolNames` leaves stays declared and its
-	 * calls are refused, each it adds waits for the rebuild or, disabled by the hold, runs again, and each that stays
-	 * runs the registry's current entry (the built-in brought back) under the declaration the hold keeps for it
-	 * ({@link #declaredAs}). False when nothing is held and the caller applies the set now.
+	 * brings back the built-in one it replaced, or resumes one. Each caller builds `toolNames` from the enabled set,
+	 * which a hold leaves as it is, so the tools it moves against that set are the step's own: each tool `toolNames`
+	 * leaves stays declared and its calls are refused, each it adds waits for the rebuild, and each that stays runs the
+	 * registry's current entry (the built-in brought back) under the declaration the hold keeps for it
+	 * ({@link #declaredAs}). A tool an earlier step moved stays moved unless the registry moved it back: one the hold
+	 * disables that is registered again (its extension resumed) runs again, and one it brings with the rebuild that left
+	 * the registry (its extension suspended again) no longer comes. False when nothing is held and the caller applies
+	 * the set now.
 	 */
 	async #holdToolSetChange(toolNames: readonly string[], settingsChange: readonly SettingChange[]): Promise<boolean> {
-		const wasEnabled = this.#enabledAfterHold(this.#heldSettingsRebuild);
+		const held = this.#heldSettingsRebuild;
+		const enabled = new Set(this.getEnabledToolNames());
 		const names = new Set(toolNames);
-		const removed = [...wasEnabled].filter(name => !names.has(name));
-		const added = toolNames.filter(name => !wasEnabled.has(name)).map(name => ({ name, activate: true }));
-		if (!(await this.#holdRosterChange(settingsChange, wasEnabled, removed, added))) return false;
+		const removed = [...enabled].filter(name => !names.has(name) && !held?.disabledTools.has(name));
+		for (const name of held?.enabledTools ?? []) {
+			if (!names.has(name) && !this.#toolRegistry.has(name)) removed.push(name);
+		}
+		const added = toolNames
+			.filter(name => !enabled.has(name) || (held?.disabledTools.has(name) && this.#toolRegistry.has(name)))
+			.map(name => ({ name, activate: true }));
+		if (!(await this.#holdRosterChange(settingsChange, enabled, removed, added))) return false;
 		this.#setAgentTools(
 			this.#withCurrentImplementations(
 				this.#host.agent.state.tools.map(tool => this.#declaredOwners.get(tool) ?? tool),
@@ -4460,21 +4501,30 @@ export class SessionTools {
 	}
 
 	/**
-	 * Adds to `held` each setting of `changes` it does not hold yet, with its previous value, and when one was added
-	 * and `held` is the session's hold, records the settings it holds that its records on the current branch do not
-	 * name yet.
+	 * Adds to `held` each setting of `changes` it does not hold yet, with the value the prompt was built with
+	 * ({@link #builtValue}), and when one was added and `held` is the session's hold, records the settings it holds
+	 * that its records on the current branch do not name yet.
 	 */
 	#holdMoreSettings(held: HeldSettingsRebuild, changes: readonly SettingChange[]): void {
 		let grown = false;
 		for (const { setting, previous } of changes) {
 			if (held.before.has(setting)) continue;
-			held.before.set(setting, previous);
+			held.before.set(setting, this.#builtValue(setting, previous));
 			grown = true;
 		}
 		if (!grown || this.#heldSettingsRebuild !== held) return;
 		// The branch's records may name fewer settings than the hold holds now.
 		held.recordedOn = undefined;
 		this.#recordWithheldChange(held);
+	}
+
+	/**
+	 * The value `setting` had when the base prompt was built: the one its build read ({@link #promptSettingsRead}; a
+	 * restored transcript prompt's, as its stored record gives it), else `previous`, its value before the change.
+	 */
+	#builtValue(setting: AnySetting, previous: unknown): unknown {
+		const read = this.#promptSettingsRead;
+		return read.has(setting) ? read.get(setting) : previous;
 	}
 
 	/**
@@ -4642,9 +4692,10 @@ export class SessionTools {
 		const held = this.#heldSettingsRebuild;
 		const changes = settingsChange.filter(({ setting }) => !held?.before.has(setting));
 		if (changes.length === 0) return { movers: [], kept: undefined };
-		// The settings the kept declarations were rendered under.
+		// The settings the kept declarations were rendered under: each changed one at the value the prompt was built
+		// with ({@link #builtValue}).
 		const before = new Map(held?.before);
-		for (const { setting, previous } of changes) before.set(setting, previous);
+		for (const { setting, previous } of changes) before.set(setting, this.#builtValue(setting, previous));
 		const kept = held?.declarations ?? this.#keptDeclarations(before);
 		if (!kept) return { movers: [], kept };
 		// Each tool that declares otherwise now, with what it declares under the session's settings.
@@ -4663,8 +4714,8 @@ export class SessionTools {
 			);
 		const live = altered.map(({ declaration }) => declaration);
 		let declared: string[] | undefined;
-		const movers = changes.filter(({ setting, previous }) => {
-			if (!sameItems(declarationsUnder(new Map([[setting, previous]])), live)) return true;
+		const movers = changes.filter(({ setting }) => {
+			if (!sameItems(declarationsUnder(new Map([[setting, before.get(setting)]])), live)) return true;
 			const others = new Map(before);
 			others.delete(setting);
 			declared ??= declarationsUnder(before);
@@ -4759,27 +4810,6 @@ export class SessionTools {
 		const restored = this.#keptRestoredPrompt();
 		if (!render || !restored || this.#heldSettingsRebuild || render.systemPrompt === restored.base) return false;
 		return sameItems(render.systemPrompt, restored.base) && render.commit?.() === true;
-	}
-
-	/**
-	 * Settles the kept restored transcript prompt when this process's own build, with the reused first-turn recall
-	 * `recall` as a system block after it as the transcript's first turn sent it (as
-	 * {@link buildSystemPromptForAgentStart} appends a fresh recall), reproduces that prompt while no settings rebuild
-	 * is held and the prompt holds no setting ({@link #committedBase}). That build, the one the prompt stands in for
-	 * ({@link #baseStandIn}) with `recall` after it, becomes the base as this process's own: the restored prompt is
-	 * dropped at the next reply ({@link #settleRestoredPrompt}), and nothing replaces it five minutes on. Returns
-	 * whether it did.
-	 */
-	#settleKeptPromptWithRecall(recall: string): boolean {
-		const restored = this.#keptRestoredPrompt();
-		const standIn = this.#baseStandIn;
-		if (!restored || this.#heldSettingsRebuild || standIn?.base !== restored.base) return false;
-		const built = [...standIn.build, recall];
-		if (!sameItems(built, restored.base) || this.#committedBase(built) !== built) return false;
-		this.#baseSystemPrompt = built;
-		this.#promptSettingsRead = standIn.settingsRead;
-		this.#applyAgentSystemPrompt(built);
-		return true;
 	}
 
 	/**
@@ -4908,8 +4938,14 @@ export class SessionTools {
 		let disabledTools: readonly string[];
 		let enabledTools: readonly string[];
 		if (rebuild) {
-			disabledTools = [...rebuild.disabledTools.keys()];
-			enabledTools = [...rebuild.enabledTools];
+			// What the notices told that the rebuild still does stays told (a hold begun on a kept restored prompt goes
+			// on from what that prompt's notices told): a tool given as disabled it does not bring back, and one given as
+			// available after the rebuild that it brings.
+			const after = this.#enabledAfterHold(rebuild);
+			disabledTools = [
+				...new Set([...rebuild.disabledTools.keys(), ...toldDisabled.filter(name => !after.has(name))]),
+			];
+			enabledTools = [...new Set([...rebuild.enabledTools, ...toldEnabled.filter(name => after.has(name))])];
 		} else {
 			// A kept restored prompt refuses no call and holds no tool back: a tool given as disabled runs again once it
 			// is enabled here, and one given as available after the rebuild comes only if it is.
@@ -5205,25 +5241,24 @@ export class SessionTools {
 					memoryNotice: memory.notice,
 					commit: () => {
 						if (!isCurrent() || !memory.commit()) return false;
-						this.#adoptMemoryRecall(memory, injected);
+						this.#adoptMemoryRecall(memory, { text: injected, hidden: true });
 						return true;
 					},
 				};
 			}
 			// A reused recall the branch delivered as a system block is in the kept restored transcript prompt already:
-			// that prompt goes out as stored, held changes stay held, and the recall is adopted as the prompt carries
-			// it. When this process's own build with the recall as that block reproduces the kept prompt, the prompt
-			// is this process's own and settles ({@link #settleKeptPromptWithRecall}). Otherwise the memory
-			// instructions render the recall from now on, so the build the restored prompt stands in for takes it in,
-			// and goes out with it ({@link refreshBaseSystemPrompt} with `joinsHeldChange`).
+			// that prompt goes out as stored, held changes stay held, and the recall is adopted as the block the prompt
+			// carries, which every build appends after the memory instructions from now on, as the transcript's first
+			// request sent it (the session adopts it from the transcript at startup, so the builds already carry it). The
+			// build the restored prompt stands in for takes it in: it goes out with that build, or settles the kept
+			// prompt it reproduces ({@link refreshBaseSystemPrompt} with `joinsHeldChange`).
 			if (memory.reused && this.#keptRestoredPrompt()) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
 					commit: () => {
 						if (!isCurrent() || !memory.commit()) return false;
-						this.#adoptMemoryRecall(memory, undefined);
-						if (this.#settleKeptPromptWithRecall(injected)) return true;
+						this.#adoptMemoryRecall(memory, { text: injected, hidden: false });
 						void this.refreshBaseSystemPrompt(undefined, { joinsHeldChange: true }).catch(error => {
 							logger.debug("Prompt rebuild after a reused recall failed", {
 								backend: backend.id,
@@ -5250,20 +5285,27 @@ export class SessionTools {
 			}
 			if (!isCurrent()) return { systemPrompt: this.#baseSystemPrompt };
 
+			// The recall goes out as the prompt's own last block, which every build appends once it is adopted: a build
+			// made after the session adopted it (a reused recall the transcript carries) ends with it already.
 			const preparedBase = refreshed?.systemPrompt ?? this.#baseSystemPrompt;
-			const stablePrompt = [...preparedBase, injected];
+			const stablePrompt = preparedBase.at(-1) === injected ? preparedBase : [...preparedBase, injected];
 			return {
 				systemPrompt: stablePrompt,
 				memoryNotice: memory.notice,
 				commit: () => {
 					if (!isCurrent() || !memory.commit()) return false;
-					this.#adoptMemoryRecall(memory, undefined);
+					this.#adoptMemoryRecall(memory, { text: injected, hidden: false });
 					refreshed?.commit?.();
 					// A handler may have refreshed tools or policy. Promote the recall onto
 					// that winning base, never replace it with the preparation's snapshot.
 					const currentBase = this.#baseSystemPrompt;
 					this.#host.captureMemoryPromotionSnapshot(currentBase);
-					this.#baseSystemPrompt = currentBase === preparedBase ? stablePrompt : [...currentBase, injected];
+					this.#baseSystemPrompt =
+						currentBase === preparedBase
+							? stablePrompt
+							: currentBase.at(-1) === injected
+								? currentBase
+								: [...currentBase, injected];
 					this.#applyAgentSystemPrompt(this.#baseSystemPrompt);
 					return true;
 				},
@@ -5278,19 +5320,19 @@ export class SessionTools {
 	}
 
 	/**
-	 * Records what the recall the backend just adopted leaves the conversation carrying: `hidden`, the recall a hidden
-	 * message holds (undefined when a system block holds it or it found nothing), and a reused recall's change reports,
-	 * the branch's and the one this turn delivers. A fresh recall carries none.
+	 * Records what the recall the backend just adopted leaves the conversation carrying: `recall`, as a hidden message
+	 * or as the system prompt's own last block (undefined when it found nothing), and a reused recall's change
+	 * reports, the branch's and the one this turn delivers. A fresh recall carries none.
 	 */
-	#adoptMemoryRecall(memory: MemoryPromptPreparation, hidden: string | undefined): void {
+	#adoptMemoryRecall(memory: MemoryPromptPreparation, recall: ConversationRecall | undefined): void {
 		if (!memory.reused) {
-			this.#host.adoptMemoryRecall(hidden, []);
+			this.#host.adoptMemoryRecall(recall, []);
 			return;
 		}
 		const changes = findDeliveredRecallChanges(this.#host.sessionManager.getBranchView());
 		const notice = memory.notice;
 		if (notice && !changes.some(report => report.content === notice.content)) changes.push(notice);
-		this.#host.adoptMemoryRecall(hidden, changes);
+		this.#host.adoptMemoryRecall(recall, changes);
 	}
 
 	/**
