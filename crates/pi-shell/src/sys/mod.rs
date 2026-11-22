@@ -44,6 +44,8 @@ mod ready;
 pub mod regex;
 mod relay;
 pub mod rlimit;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod room;
 pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
@@ -52,6 +54,7 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
 #[cfg(not(unix))]
 pub(crate) use fs::BLOCKING_WRITE_CHUNK;
@@ -67,6 +70,7 @@ pub use crate::sys::{
 	park::Parker,
 	relay::{ByteDecoder, OutputDecoding},
 	spawn::{Exits, Leftover, NativeSpawner, Sessions, SpawnConfig, dispositions_changed},
+	wakers::{WaitKey, Wakers},
 };
 pub(crate) use crate::sys::{pump::End, relay::Relays};
 
