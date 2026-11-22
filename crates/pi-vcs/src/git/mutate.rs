@@ -2480,12 +2480,21 @@ mod tests {
 		assert!(cafe.contains(&nfd), "{cafe:?}");
 	}
 
+	/// Writes the hook `body` at `path`. A hook the commit runs is written by
+	/// a child ([`crate::testprog`]): written here, a fork by another test's
+	/// thread could keep it open for writing, and running it would fail with
+	/// `ETXTBSY`. A hook that must not run is never run, so it is written
+	/// here.
 	#[cfg(unix)]
 	fn write_hook(path: &Path, body: &str, executable: bool) {
 		use std::os::unix::fs::PermissionsExt;
-		fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-		let mode = if executable { 0o755 } else { 0o644 };
-		fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+		let text = format!("#!/bin/sh\n{body}\n");
+		if executable {
+			crate::testprog::write(path, &text);
+		} else {
+			fs::write(path, text).unwrap();
+			fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+		}
 	}
 
 	#[cfg(windows)]

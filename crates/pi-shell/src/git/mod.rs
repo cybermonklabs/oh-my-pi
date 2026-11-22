@@ -745,8 +745,6 @@ mod tests {
 	/// `post-checkout` hook that records its arguments and directory.
 	#[cfg(unix)]
 	pub(super) fn fixture() -> (tempfile::TempDir, PathBuf) {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		let temp = tempfile::tempdir().expect("tempdir");
 		let repo = std::fs::canonicalize(temp.path())
 			.expect("canonical tempdir")
@@ -776,9 +774,7 @@ mod tests {
 		std::fs::create_dir(repo.join("cache")).expect("create cache");
 		std::fs::write(repo.join("cache/blob"), "warm").expect("write cache");
 		let hook = hooks.join("post-checkout");
-		std::fs::write(&hook, "#!/bin/sh\necho \"$* $PWD\" > ../hook.log\necho hook-out\n")
-			.expect("write hook");
-		std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+		crate::testprog::write(&hook, "#!/bin/sh\necho \"$* $PWD\" > ../hook.log\necho hook-out\n");
 		(temp, repo)
 	}
 

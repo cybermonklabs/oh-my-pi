@@ -45,6 +45,8 @@ pub mod vfs;
 
 #[cfg(test)]
 mod suites;
+#[cfg(all(test, unix))]
+mod testprog;
 
 pub mod cancel;
 mod child_session;

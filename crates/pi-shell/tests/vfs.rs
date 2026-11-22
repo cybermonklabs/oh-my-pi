@@ -477,17 +477,31 @@ async fn external_commands_start_in_backed_working_directories_only() {
 	);
 }
 
+/// Writes `text` to `path`, mode 0755, through a child `sh`, as the
+/// library's tests do (`src/testprog.rs`). This binary runs its tests as
+/// threads of one process: a child another thread forks while this process
+/// holds a program open for writing keeps a copy of that descriptor until it
+/// execs, and running the program meanwhile fails with `ETXTBSY` ("Text file
+/// busy").
+#[cfg(unix)]
+fn write_program(path: &Path, text: &str) {
+	let status = std::process::Command::new("/bin/sh")
+		.args(["-c", "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+		.arg(path)
+		.arg(text)
+		.status()
+		.unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+	assert!(status.success(), "writing {}: {status}", path.display());
+}
+
 /// A script the provider aliases is executable as itself: the child runs the
 /// file behind the URL rather than failing on a path the kernel cannot see.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_executable_url_runs_as_the_file_it_aliases() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	let tool = directory.path().join("tool");
-	fs::write(&tool, b"#!/bin/sh\nprintf tool-ran\n").expect("provider script");
-	fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable script");
+	write_program(&tool, "#!/bin/sh\nprintf tool-ran\n");
 	let run = run_virtual(directory.path(), "virtual://tool").await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
 	assert_eq!(run.stdout, "tool-ran");
