@@ -11,6 +11,7 @@ import {
 import {
 	FileSessionStorage,
 	SessionLockError,
+	type SessionStorageWriteOptions,
 	SessionWriteConflictError,
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -617,6 +618,26 @@ describe("FileSessionStorage line streaming", () => {
 		expect(seen).toEqual(["sync:a\nb\n", "atomic:c\nd\n"]);
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("c\nd\n");
 	});
+
+	it("streams the body it opened when another storage's atomic rewrite lands after the first chunk", async () => {
+		// If this regresses, a long file-backed session that another process compacts while it is loaded,
+		// copied or exported reads as the old transcript's first chunk followed by the new one's rest.
+		const sessionPath = path.join(tempDir, "session.jsonl");
+		const body = (fill: string) => Array.from({ length: 4 }, () => `${fill.repeat((1 << 20) - 1)}\n`).join("");
+		const reader = new FileSessionStorage();
+		const writer = new FileSessionStorage();
+		await writer.writeTextAtomic(sessionPath, body("a"));
+
+		const chunks: Uint8Array[] = [];
+		for await (const chunk of reader.readChunks(sessionPath)) {
+			chunks.push(chunk);
+			if (chunks.length === 1) await writer.writeTextAtomic(sessionPath, `${body("b")}appended\n`);
+		}
+
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(Buffer.concat(chunks).toString("utf8") === body("a")).toBe(true);
+		expect(fs.readFileSync(sessionPath, "utf8") === `${body("b")}appended\n`).toBe(true);
+	});
 });
 
 describe("FileSessionStorage.updateSessionTitle", () => {
@@ -794,5 +815,125 @@ describe("IndexedSessionStorage.writeTextAtomic commitGuard", () => {
 		await write;
 		expect(drained).toBe(true);
 		expect(backend.writeFullCalls.map(call => call.content)).toEqual(["pre-seal body"]);
+	});
+});
+
+/** A backend that keeps each session's text in memory and stores a full write as it is given. */
+class MemoryBackend implements SessionStorageBackend {
+	readonly sessions = new Map<string, string>();
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		return Promise.resolve([]);
+	}
+	readFull(path: string): Promise<string | null> {
+		return Promise.resolve(this.sessions.get(path) ?? null);
+	}
+	readSlices(): Promise<[string, string]> {
+		return Promise.resolve(["", ""]);
+	}
+	writeFull(path: string, content: string): Promise<void> {
+		this.sessions.set(path, content);
+		return Promise.resolve();
+	}
+	append(path: string, line: string): Promise<void> {
+		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
+		return Promise.resolve();
+	}
+	updateSessionTitle(): Promise<void> {
+		return Promise.resolve();
+	}
+	truncate(path: string): Promise<void> {
+		this.sessions.set(path, "");
+		return Promise.resolve();
+	}
+	remove(paths: string[]): Promise<void> {
+		for (const path of paths) this.sessions.delete(path);
+		return Promise.resolve();
+	}
+	move(): Promise<void> {
+		return Promise.resolve();
+	}
+}
+
+/** An indexed storage that records the whole text each full rewrite hands its own text writers. */
+class InterceptingIndexedStorage extends IndexedSessionStorage {
+	readonly intercepted: string[] = [];
+
+	override writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
+		this.intercepted.push(content);
+		super.writeTextSync(path, content, options);
+	}
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		this.intercepted.push(content);
+		await super.writeTextAtomic(path, content, options);
+	}
+}
+
+describe("IndexedSessionStorage full writes of lines a generator yields", () => {
+	// `SessionManager` hands a full rewrite its serialized lines as a lazy iterable, which can be read only once.
+	const lines = [
+		`${JSON.stringify({ type: "session", version: 3, id: "lazy", timestamp: "t0", cwd: "/cwd" })}\n`,
+		`${JSON.stringify({ type: "custom", customType: "n", id: "a", parentId: null, timestamp: "t1" })}\n`,
+		`${JSON.stringify({ type: "custom", customType: "n", id: "b", parentId: "a", timestamp: "t2" })}\n`,
+	];
+	const body = lines.join("");
+	function* serialized(): Generator<string> {
+		yield* lines;
+	}
+
+	it("spools the lines and stores their bytes through writeLinesAtomic and writeLinesSync", async () => {
+		const backend = new MemoryBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+
+		await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+		storage.writeLinesSync("/sessions/sync.jsonl", serialized(), { expectedSize: null });
+		await storage.drain();
+
+		expect(Object.fromEntries(backend.sessions)).toEqual({
+			"/sessions/atomic.jsonl": body,
+			"/sessions/sync.jsonl": body,
+		});
+	});
+
+	it.skipIf(process.getuid === undefined)(
+		"spools into a directory of this account's own under the OS temp directory, private to it",
+		async () => {
+			// Another account on the machine that ran omp first owns any shared name there.
+			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-dir-"));
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+			try {
+				const storage = new IndexedSessionStorage(new MemoryBackend());
+				await storage.initialize();
+				await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+
+				const spools = fs.readdirSync(tmp);
+				expect(spools).toEqual([`omp-spool-${process.getuid?.()}`]);
+				expect(fs.statSync(path.join(tmp, spools[0] ?? "")).mode & 0o777).toBe(0o700);
+			} finally {
+				vi.restoreAllMocks();
+				await fsp.rm(tmp, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("hands a subclass that intercepts writeTextAtomic and writeTextSync the joined lines, and stores them", async () => {
+		const backend = new MemoryBackend();
+		const storage = new InterceptingIndexedStorage(backend);
+		await storage.initialize();
+
+		await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+		storage.writeLinesSync("/sessions/sync.jsonl", serialized(), { expectedSize: null });
+		await storage.drain();
+
+		expect(storage.intercepted).toEqual([body, body]);
+		expect(Object.fromEntries(backend.sessions)).toEqual({
+			"/sessions/atomic.jsonl": body,
+			"/sessions/sync.jsonl": body,
+		});
 	});
 });

@@ -25,6 +25,31 @@ func TestKnownFrameWithBadPayloadDegradesToUnknown(t *testing.T) {
 	}
 }
 
+// If this regresses, a command whose response frame does not decode (a deep
+// get_tree answer did, before the decoders read any depth) waits out its whole
+// timeout instead of failing at once.
+func TestUndecodableResponseFailsItsCall(t *testing.T) {
+	c, s := startFake(t, readyV1, nil)
+	result := make(chan error, 1)
+	go func() {
+		_, err := c.GetState(context.Background())
+		result <- err
+	}()
+	command := s.recv()
+	s.send(fmt.Sprintf(`{"type":"response","id":%q,"command":"get_state","success":"yes"}`, command.str("id")))
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "get_state response") {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("get_state still waits for its response")
+	}
+	if c.Err() != nil {
+		t.Fatalf("connection closed: %v", c.Err())
+	}
+}
+
 func TestChunkReassembly(t *testing.T) {
 	c, s := startFake(t, readyV2, negotiateV2)
 	if c.ProtocolVersion() != 2 {

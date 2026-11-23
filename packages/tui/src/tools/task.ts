@@ -1612,6 +1612,50 @@ export function isTaskToolDetails(value: unknown): value is TaskToolDetails {
 }
 
 /**
+ * The details a settled background task frame keeps for later rebuilds, as
+ * plain data. A finished row (completed, failed, aborted) drops what its card
+ * draws only while the row runs ({@link renderAgentProgress},
+ * {@link describeProgressAgent}): the current tool, recent tools and output,
+ * stage, retry countdown and completion estimate, plus the last intent and the
+ * job widget's `watch`, which no card draws. It also drops the rendered `task`
+ * prompt when the card shows its `assignment` instead. Pending and running
+ * rows, results and the rest of the frame stay as they are.
+ */
+export function settledTaskDetails(details: TaskToolDetails): TaskToolDetails {
+	if (!details.progress) return details;
+	return { ...details, progress: details.progress.map(settledProgressRow) };
+}
+
+/**
+ * The recent lists of every finished row {@link settledProgressRow} keeps: a session keeps its settled frames for its
+ * life, and nothing writes a kept row's lists in place (only the executor writes its own live progress's), so every
+ * kept row shares these two frozen empty lists rather than holding two of its own.
+ */
+const SETTLED_RECENT_TOOLS = Object.freeze<AgentProgress["recentTools"]>([]) as AgentProgress["recentTools"];
+const SETTLED_RECENT_OUTPUT = Object.freeze<string[]>([]) as string[];
+
+function settledProgressRow(row: AgentProgress): AgentProgress {
+	if (row.status === "pending" || row.status === "running") return row;
+	const {
+		currentTool: _currentTool,
+		currentToolArgs: _currentToolArgs,
+		currentToolArgsKey: _currentToolArgsKey,
+		currentToolIntent: _currentToolIntent,
+		currentToolStartMs: _currentToolStartMs,
+		stage: _stage,
+		retryState: _retryState,
+		completionPercent: _completionPercent,
+		lastIntent: _lastIntent,
+		watch: _watch,
+		...kept
+	} = row;
+	if (kept.assignment) kept.task = "";
+	kept.recentTools = SETTLED_RECENT_TOOLS;
+	kept.recentOutput = SETTLED_RECENT_OUTPUT;
+	return kept;
+}
+
+/**
  * Subagent ids visible on a task tool card, for click-to-focus hit-testing.
  * Reads `progress[]` (in-flight) and `results[]` (settled) defensively — card
  * details arrive as `unknown` through the tool-result pipeline — and recurses

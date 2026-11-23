@@ -9,7 +9,10 @@
  */
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import type { SessionStorage } from "./session-storage";
+import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
+import { transcriptByteChunks } from "./session-loader";
+import { LINE_STREAM_CHUNK, retryRacedRead, type SessionStorage, type SessionStorageWriter } from "./session-storage";
+import { parseTitleSlotFromContent, titleUpdateFromSlot } from "./session-title-slot";
 
 /**
  * Every file `storage` holds under `dir` whose name matches `pattern`
@@ -56,18 +59,77 @@ export async function copyTranscriptTree(
 	for (const from of listTranscriptTree(storage, fromDir, pattern)) {
 		const to = path.join(toDir, path.relative(fromDir, from));
 		if (await storage.exists(to)) continue;
-		let content: string;
-		try {
-			content = await storage.readText(from);
-		} catch (err) {
-			// Removed since the listing: nothing left to copy.
-			if (isEnoent(err)) continue;
-			throw err;
-		}
-		await storage.writeText(to, content);
+		// Removed since the listing: nothing left to copy.
+		if (!(await copyTranscript(storage, from, to))) continue;
 		copied.push({ from, to });
 	}
 	return copied;
+}
+
+/**
+ * Copy `from` to `to` chunk by chunk, appending through a writer in batches of
+ * whole lines of about {@link LINE_STREAM_CHUNK}, so a transcript on a store that
+ * reads in chunks (file and SQL storage) is never held whole (a line at most), and
+ * a store that yields a chunk per stored part (SQL: about one per line) is not
+ * appended to once per part; a store without chunked reads (Redis, an SDK store)
+ * yields its text as one chunk, which is appended whole. A title slot at its
+ * head is set on `to` as a whole write would set it. Returns false, leaving
+ * nothing at `to`, when `from` is gone; any other failure removes the partial
+ * copy and throws. A full rewrite or delete of `from` between two chunks
+ * removes the partial copy and copies `from` again from its start, as often
+ * as {@link retryRacedRead} allows.
+ */
+export async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
+	let head: string;
+	try {
+		// Each pass removes its partial copy when it fails, so a rerun after a race starts from nothing at `to`.
+		head = await retryRacedRead(() => copyTranscriptPass(storage, from, to));
+	} catch (err) {
+		if (isEnoent(err)) return false;
+		throw err;
+	}
+	const title = titleUpdateFromSlot(parseTitleSlotFromContent(head));
+	if (title) await storage.updateSessionTitle(to, title);
+	return true;
+}
+
+/** One pass of {@link copyTranscript}: the head of `from` it copied; on any failure it removes the partial copy and throws. */
+async function copyTranscriptPass(storage: SessionStorage, from: string, to: string): Promise<string> {
+	const decoder = new TextDecoder();
+	let writer: SessionStorageWriter | undefined;
+	let head = "";
+	let batch = "";
+	// Just past the batch's last newline, 0 while it holds none. Only each new chunk is searched for it, so a line
+	// longer than a batch is not scanned again as each of its chunks arrives.
+	let cut = 0;
+	try {
+		for await (const chunk of transcriptByteChunks(from, storage)) {
+			writer ??= storage.openWriter(to, { flags: "w" });
+			const text = decoder.decode(chunk, { stream: true });
+			if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
+			const newline = text.lastIndexOf("\n");
+			if (newline !== -1) cut = batch.length + newline + 1;
+			batch += text;
+			if (batch.length < LINE_STREAM_CHUNK) continue;
+			// Whole lines only: a store that records the blobs each append names (SQL storage's references) then
+			// finds every reference whole, as a reference never spans lines.
+			if (cut === 0) continue;
+			await writer.append(batch.slice(0, cut));
+			batch = batch.slice(cut);
+			cut = 0;
+		}
+		writer ??= storage.openWriter(to, { flags: "w" });
+		batch += decoder.decode();
+		if (batch) await writer.append(batch);
+		await writer.close();
+		return head;
+	} catch (err) {
+		if (writer) {
+			await writer.close().catch(() => {});
+			await storage.unlink(to).catch(() => {});
+		}
+		throw err;
+	}
 }
 
 /**

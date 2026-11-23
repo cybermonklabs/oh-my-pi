@@ -389,7 +389,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 		}
 	});
 
-	it("reparents metadata children and keeps billed usage when durably discarding an entry", async () => {
+	it("carries metadata children onto the new branch and keeps billed usage when durably discarding an entry", async () => {
 		const cwd = makeTempDir("@pi-discard-metadata-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
 		const manager = SessionManager.create(cwd, sessionDir);
@@ -406,24 +406,28 @@ describe("SessionManager JSONL software-crash durability", () => {
 
 		const reloaded = await SessionManager.open(sessionFile, sessionDir);
 		const branch = reloaded.getBranch();
-		expect(branch.some(entry => entry.id === discardedId)).toBe(false);
-		expect(branch).toContainEqual(expect.objectContaining({ id: serviceTierId, parentId: priorId }));
+		expect(branch.some(entry => entry.id === discardedId || entry.id === serviceTierId)).toBe(false);
 		expect(branch.some(entry => entry.type === "model_usage")).toBe(false);
+		// The discarded turn stays in the journal off the branch and still carries its billed usage.
 		expect(reloaded.getEntries()).toContainEqual(
 			expect.objectContaining({
-				type: "model_usage",
-				parentId: serviceTierId,
-				provider: discarded.provider,
-				model: discarded.model,
-				usage: discarded.usage,
+				id: discardedId,
+				message: expect.objectContaining({
+					provider: discarded.provider,
+					model: discarded.model,
+					usage: discarded.usage,
+				}),
 			}),
 		);
-		expect(branch.at(-1)).toMatchObject({
-			type: "branch_summary",
-			summary: "",
-			details: { kind: "discarded-entry-branch", discardedEntryId: discardedId },
-			parentId: serviceTierId,
-		});
+		expect(branch.slice(-2)).toMatchObject([
+			{
+				type: "branch_summary",
+				summary: "",
+				details: { kind: "discarded-entry-branch", discardedEntryId: discardedId },
+				parentId: priorId,
+			},
+			{ type: "service_tier_change", serviceTier: null },
+		]);
 		expect(reloaded.getUsageStatistics()).toEqual(usageBefore);
 		await reloaded.close();
 	});

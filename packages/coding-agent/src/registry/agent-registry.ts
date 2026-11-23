@@ -9,6 +9,7 @@
  * revival) and are only removed on explicit release/teardown.
  */
 
+import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { SessionStorage } from "../session/session-storage";
@@ -41,6 +42,12 @@ export interface AgentRunLifecycle {
 	acceptedAt?: number;
 	/** When the ref last left `running` for a terminal status. */
 	terminalAt?: number;
+	/**
+	 * When the run's drive ended, with or without a result (a failure, an
+	 * aborted run kept for resuming): the run takes no further turn of its own,
+	 * though its cleanup may still hold the session until its terminal frame.
+	 */
+	endedAt?: number;
 }
 
 /** Historical identity and telemetry that remain available after the live session is disposed. */
@@ -54,7 +61,10 @@ export interface AgentHistorySummary {
 	/** Cumulative own-session assistant and model_usage cost, excluding nested task results. */
 	directCost?: number;
 	readOnly?: boolean;
-	/** Durable task output artifact, when the executor wrote one. */
+	/**
+	 * Durable task output artifact, when the executor wrote one. A record of a session file `<directory>/<id>.jsonl`
+	 * keeps the one beside it (`<directory>/<id>.md`) as a getter that derives it ({@link historyAsKept}).
+	 */
 	outputPath?: string;
 	/** Captured isolated-worktree patch, when patch capture succeeded. */
 	patchPath?: string;
@@ -80,6 +90,10 @@ export interface AgentRef {
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
 	session: AgentSessionHandle | null;
+	/**
+	 * The agent's transcript. A ref a registry minted keeps one of the form `<directory>/<id>.jsonl` as an accessor that
+	 * derives it from its id and a directory it shares with the other refs there ({@link keptSessionFile}).
+	 */
 	sessionFile: string | null;
 	createdAt: number;
 	lastActivity: number;
@@ -93,11 +107,125 @@ export interface AgentRef {
 
 export type AgentRefExpectation = AgentRef | AgentSessionHandle;
 
-const kMintedRef = Symbol("agent-registry.ref");
+/** The extension of a subagent's transcript, `<artifacts dir>/<id>.jsonl`. */
+export const SESSION_FILE_EXTENSION = ".jsonl";
+/** The extension of the output artifact the executor writes beside it, `<artifacts dir>/<id>.md`. */
+export const OUTPUT_FILE_EXTENSION = ".md";
+
+/**
+ * A directory minted refs' session files are in, as the prefix (the directory and its separator) of each such file,
+ * `<prefix><id>.jsonl`: one object for each directory a ref names, which every ref there shares
+ * ({@link sessionFileDirectory}).
+ */
+class SessionFileDirectory {
+	constructor(readonly prefix: string) {}
+
+	/** The path of the file `<id><extension>` in this directory. */
+	fileOf(id: string, extension: string): string {
+		return `${this.prefix}${id}${extension}`;
+	}
+}
+
+/** The {@link SessionFileDirectory} of each prefix a live ref names; an entry goes once no ref holds it. */
+const sessionFileDirectories = new Map<string, WeakRef<SessionFileDirectory>>();
+const sessionFileDirectoryFinalizer = new FinalizationRegistry<string>(prefix => {
+	if (!sessionFileDirectories.get(prefix)?.deref()) sessionFileDirectories.delete(prefix);
+});
+
+/** The one {@link SessionFileDirectory} of `prefix`, shared by every ref whose session file is in it. */
+function sessionFileDirectory(prefix: string): SessionFileDirectory {
+	const known = sessionFileDirectories.get(prefix)?.deref();
+	if (known) return known;
+	const directory = new SessionFileDirectory(prefix);
+	sessionFileDirectories.set(prefix, new WeakRef(directory));
+	sessionFileDirectoryFinalizer.register(directory, prefix);
+	return directory;
+}
+
+/**
+ * What the ref of agent `id` keeps of its session file `sessionFile`. Every subagent of a task call has its transcript
+ * at `<artifacts dir>/<id>.jsonl`, so a ref keeps a path of that form as the directory it shares with them, and its own
+ * id gives the path back; it keeps any other path as given.
+ */
+function keptSessionFile(sessionFile: string | null, id: string): SessionFileDirectory | string | null {
+	if (sessionFile === null) return null;
+	const prefixLength = sessionFile.length - id.length - SESSION_FILE_EXTENSION.length;
+	const separator = prefixLength > 0 ? sessionFile[prefixLength - 1] : undefined;
+	if ((separator !== "/" && separator !== path.sep) || !sessionFile.endsWith(`${id}${SESSION_FILE_EXTENSION}`)) {
+		return sessionFile;
+	}
+	return sessionFileDirectory(sessionFile.slice(0, prefixLength));
+}
+
+/**
+ * The session file a minted ref keeps ({@link keptSessionFile}), behind its `sessionFile` accessor. Only refs a
+ * registry minted have it, which tells them apart ({@link isMintedAgentRef}).
+ */
+const kSessionFile = Symbol("agent-registry.session-file");
 
 /** Whether `value` is a ref object minted by an {@link AgentRegistry} on this thread (thread bridges encode these). */
 export function isMintedAgentRef(value: unknown): value is AgentRef {
-	return typeof value === "object" && value !== null && Reflect.get(value, kMintedRef) === true;
+	return typeof value === "object" && value !== null && Object.hasOwn(value, kSessionFile);
+}
+
+/** `sessionFile` of a minted ref: the path it keeps, or the one in the directory it keeps named by its id. */
+function mintedSessionFile(this: AgentRef): string | null {
+	const kept: unknown = Reflect.get(this, kSessionFile);
+	if (kept instanceof SessionFileDirectory) return kept.fileOf(this.id, SESSION_FILE_EXTENSION);
+	return typeof kept === "string" ? kept : null;
+}
+
+function setMintedSessionFile(this: AgentRef, sessionFile: string | null): void {
+	Reflect.set(this, kSessionFile, keptSessionFile(sessionFile, this.id));
+}
+
+/**
+ * A minted ref's `sessionFile`: an enumerable accessor, so a spread, JSON (RPC clients) or a structured clone of the ref
+ * reads the same path a field would hold, and an assignment keeps it as {@link keptSessionFile} does.
+ */
+const SESSION_FILE_ACCESSOR: PropertyDescriptor = {
+	get: mintedSessionFile,
+	set: setMintedSessionFile,
+	enumerable: true,
+	configurable: true,
+};
+
+/** The directory and the id a history's derived `outputPath` names its artifact by; see {@link historyAsKept}. */
+const kOutputPathDirectory = Symbol("agent-registry.output-path-directory");
+const kOutputPathId = Symbol("agent-registry.output-path-id");
+
+/** `outputPath` of a history {@link historyAsKept} made: the artifact of its id in its directory. */
+function derivedOutputPath(this: AgentHistorySummary): string | undefined {
+	const directory: unknown = Reflect.get(this, kOutputPathDirectory);
+	const id: unknown = Reflect.get(this, kOutputPathId);
+	return directory instanceof SessionFileDirectory && typeof id === "string"
+		? directory.fileOf(id, OUTPUT_FILE_EXTENSION)
+		: undefined;
+}
+
+/**
+ * `history` as the minted ref `ref` keeps it. The executor writes a subagent's output artifact beside its session
+ * file, so when the ref keeps its session file as a shared directory ({@link keptSessionFile}), an `outputPath` equal
+ * to the artifact of its id in that directory is kept as an enumerable getter that derives it from them, not as a path
+ * string. Every read returns the same string, in a spread, JSON (RPC clients) or a structured clone (worker threads)
+ * of the history too, and a later change of the ref's session file leaves it unchanged. Any other history is kept as
+ * given.
+ */
+function historyAsKept(history: AgentHistorySummary | undefined, ref: AgentRef): AgentHistorySummary | undefined {
+	const directory: unknown = Reflect.get(ref, kSessionFile);
+	if (history === undefined || !(directory instanceof SessionFileDirectory)) return history;
+	if (Reflect.get(history, kOutputPathDirectory) === directory && Reflect.get(history, kOutputPathId) === ref.id) {
+		return history;
+	}
+	const outputPath = history.outputPath;
+	if (outputPath === undefined || outputPath !== directory.fileOf(ref.id, OUTPUT_FILE_EXTENSION)) {
+		return history;
+	}
+	const { outputPath: _outputPath, ...kept } = history;
+	Object.defineProperty(kept, kOutputPathDirectory, { value: directory });
+	Object.defineProperty(kept, kOutputPathId, { value: ref.id });
+	Object.defineProperty(kept, "outputPath", { get: derivedOutputPath, enumerable: true, configurable: true });
+	return kept;
 }
 
 /**
@@ -127,6 +255,11 @@ export function refSessionStorage(ref: AgentRef): SessionStorage | undefined {
 export function isResumable(ref: AgentRef | undefined): boolean {
 	if (ref?.status === "idle") return true;
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
+
+/** Whether `ref` is a live agent: `running` or `idle`. */
+export function isLive(ref: AgentRef | undefined): boolean {
+	return ref?.status === "running" || ref?.status === "idle";
 }
 
 /** {@link agentAncestors}' ids one at a time: `registry` is read only once every recorded one is passed. */
@@ -217,6 +350,10 @@ export interface AgentRegistryApi {
 	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean;
 	/** Record that the current run handed over its final result. */
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
+	/** Record that the current run's drive ended, whatever its outcome. */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean;
+	/** Start a new run on an existing ref: drop the previous run's milestones. */
+	startRun(id: string, expected?: AgentRefExpectation): boolean;
 	/** Accepted-but-running refs whose run already finished. */
 	staleAcceptedRuns(): AgentRef[];
 	/** Record a short activity gist for the work-aware roster. */
@@ -304,7 +441,9 @@ export class AgentRegistry implements AgentRegistryApi {
 	/** Mint and register the ref for `input.id`, with the ancestry it records. */
 	#mint(input: RegisterInput, ancestors: readonly string[]): AgentRef {
 		const now = Date.now();
-		const ref: AgentRef = {
+		// Built in a ref's field order, which a spread or JSON of it lists; its session file is an accessor
+		// ({@link keptSessionFile}).
+		const ref = {
 			id: input.id,
 			generation: ++this.#generation,
 			displayName: input.displayName,
@@ -313,14 +452,17 @@ export class AgentRegistry implements AgentRegistryApi {
 			ancestors,
 			status: input.status ?? "running",
 			session: input.session,
-			sessionFile: input.sessionFile ?? null,
-			createdAt: input.createdAt ?? now,
-			lastActivity: input.lastActivity ?? now,
-			activity: input.activity,
-			history: input.history,
-			lifecycle: input.lifecycle,
-		};
-		Object.defineProperty(ref, kMintedRef, { value: true });
+		} as AgentRef;
+		Object.defineProperty(ref, kSessionFile, {
+			value: keptSessionFile(input.sessionFile ?? null, input.id),
+			writable: true,
+		});
+		Object.defineProperty(ref, "sessionFile", SESSION_FILE_ACCESSOR);
+		ref.createdAt = input.createdAt ?? now;
+		ref.lastActivity = input.lastActivity ?? now;
+		ref.activity = input.activity;
+		ref.history = historyAsKept(input.history, ref);
+		ref.lifecycle = input.lifecycle;
 		// Before the ref is published. Test doubles and remote proxies may carry no session manager.
 		recordRefSessionStorage(ref, input.session?.sessionManager?.getStorage?.() ?? input.storage);
 		this.#refs.set(ref.id, ref);
@@ -397,7 +539,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		) {
 			definedHistory.directCost = Math.max(previousDirectCost, incomingDirectCost);
 		}
-		ref.history = { ...ref.history, ...definedHistory };
+		ref.history = historyAsKept({ ...ref.history, ...definedHistory }, ref);
 		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}
@@ -463,6 +605,43 @@ export class AgentRegistry implements AgentRegistryApi {
 		} else {
 			this.#emit({ type: "metadata_changed", ref });
 		}
+		return true;
+	}
+
+	/**
+	 * Stamp `lifecycle.endedAt`: the current run's drive ended, whatever its
+	 * outcome, so the ref takes no further turn for this run even while its
+	 * cleanup still holds the session. Run-scoped like the other milestones:
+	 * {@link setStatus} clears it when the ref re-enters `running`, and
+	 * {@link startRun} when the next run starts before its first turn does.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		ref.lifecycle = { ...ref.lifecycle, endedAt: Date.now() };
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/**
+	 * Start a new run (a follow-up turn) on an existing ref: drop the previous
+	 * run's milestones (its acceptance, its ended drive), as re-entering
+	 * `running` does, but without a status change. The run announces itself
+	 * before its first turn starts; between those, the idle ref must read as this
+	 * run's, not as the previous run that ended or was accepted.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	startRun(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		if (ref.lifecycle === undefined) return true;
+		ref.lifecycle = undefined;
+		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}
 
@@ -584,9 +763,7 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * Flat namespace: every other agent is visible.
 	 */
 	listVisibleTo(id: string): AgentRef[] {
-		return this.list().filter(
-			ref => ref.id !== id && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"),
-		);
+		return this.list().filter(ref => ref.id !== id && ref.kind !== "advisor" && isLive(ref));
 	}
 
 	/** Whether a ref's claimed running state is corroborated by its attached live session. */

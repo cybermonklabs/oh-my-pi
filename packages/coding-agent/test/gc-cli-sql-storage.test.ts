@@ -15,6 +15,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { collectGcErrors, runGcCommand } from "@oh-my-pi/pi-coding-agent/cli/gc-cli";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { SessionReadConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as sessionStorageConfig from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import {
 	getBlobsDir,
@@ -24,7 +26,8 @@ import {
 	hashPath,
 } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
-import { cliDatabase, LEASE_BACKENDS } from "./session/sql-session-lease-fixture";
+import { paddedTranscript, raceAfterFirstChunk, STILL } from "./session/chunked-read-race";
+import { cliDatabase, LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
 
 const CLI_ENTRY = path.join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -92,6 +95,20 @@ async function agedFile(file: string, content: string): Promise<string> {
 	const old = new Date(Date.now() - 3 * 86_400_000);
 	await fs.utimes(file, old, old);
 	return file;
+}
+
+/** A read of `path` that a concurrent rewrite raced before it yielded anything. */
+function racedRead(path: string): AsyncIterable<Uint8Array> {
+	return {
+		[Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new SessionReadConflictError(path)) }),
+	};
+}
+
+/** `chunks` cut into pieces of at most `size` bytes. */
+async function* smallChunks(chunks: AsyncIterable<Uint8Array>, size: number): AsyncGenerator<Uint8Array> {
+	for await (const chunk of chunks) {
+		for (let start = 0; start < chunk.byteLength; start += size) yield chunk.subarray(start, start + size);
+	}
 }
 
 describe("omp gc --blobs under session.storage: sql", () => {
@@ -166,6 +183,109 @@ describe("omp gc --blobs under session.storage: sql", () => {
 			.sort();
 		expect(left).toEqual([hashFor("named"), hashFor("fresh")].sort());
 		expect(result.blobs?.table).toMatchObject({ candidates: 1, deleted: 1, bytes: "orphan".length });
+	});
+
+	describe("reading the store's transcripts through gc's own reads", () => {
+		let resolve: { mockRestore(): void } | undefined;
+		beforeEach(() => {
+			resolve = spyOn(sessionStorageConfig, "resolveSessionStorage").mockResolvedValue(storage);
+		});
+		afterEach(() => {
+			resolve?.mockRestore();
+		});
+
+		test("--apply reads again a transcript whose read a concurrent rewrite raced, and keeps its blob", async () => {
+			const referenced = await agedBlob("raced");
+			const orphan = await agedBlob("orphan:raced");
+			const file = parent();
+			await storage.writeText(file, transcript("root", `blob:sha256:${hashFor("raced")}`));
+			const read = storage.readChunks;
+			let reads = 0;
+			spyOn(storage, "readChunks").mockImplementation((path, fromByte) =>
+				path === file && reads++ === 0 ? racedRead(path) : read(path, fromByte),
+			);
+
+			const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
+
+			expect(reads).toBe(2);
+			expect(await Bun.file(referenced).exists()).toBe(true);
+			expect(await Bun.file(orphan).exists()).toBe(false);
+			expect(result.blobs).toMatchObject({ referenced: 1, deleted: 1, errors: [] });
+		});
+
+		test("fails, deleting nothing, when every read of a transcript is raced", async () => {
+			const referenced = await agedBlob("always-raced");
+			const file = parent();
+			await storage.writeText(file, transcript("root", `blob:sha256:${hashFor("always-raced")}`));
+			const read = storage.readChunks;
+			let reads = 0;
+			spyOn(storage, "readChunks").mockImplementation((path, fromByte) => {
+				if (path !== file) return read(path, fromByte);
+				reads++;
+				return racedRead(path);
+			});
+
+			await expect(runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } })).rejects.toBeInstanceOf(
+				SessionReadConflictError,
+			);
+
+			// The first read and three more; never skipped, or the blob only it references would go.
+			expect(reads).toBe(4);
+			expect(await Bun.file(referenced).exists()).toBe(true);
+		});
+
+		test("--apply keeps a blob whose reference sits in a line the read splits across many chunks", async () => {
+			const referenced = await agedBlob("split");
+			const orphan = await agedBlob("orphan:split");
+			const file = parent();
+			const text = `${"x".repeat(5000)} blob:sha256:${hashFor("split")} ${"y".repeat(5000)}`;
+			await storage.writeText(file, transcript("root", text));
+			const read = storage.readChunks;
+			spyOn(storage, "readChunks").mockImplementation((path, fromByte) => smallChunks(read(path, fromByte), 7));
+
+			const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
+
+			expect(await Bun.file(referenced).exists()).toBe(true);
+			expect(await Bun.file(orphan).exists()).toBe(false);
+			expect(result.blobs).toMatchObject({ referenced: 1, deleted: 1, errors: [] });
+		});
+
+		for (const { adapter, url } of LEASE_BACKENDS) {
+			test.skipIf(!url)(
+				`--apply keeps a blob both bodies reference when another store rewrites the transcript after the scan's first chunk (${adapter})`,
+				async () => {
+					// If this regresses, gc run while another process compacts a long SQL session fails, or
+					// deletes an image blob the session still references and the session shows it as missing.
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const referenced = await agedBlob("raced by a store");
+					const orphan = await agedBlob("orphan:raced by a store");
+					const file = parent();
+					// The reference sits past the first chunk, in a line both bodies hold.
+					const body = (fill: string) => [
+						...paddedTranscript("root", "first", fill, 3),
+						`${JSON.stringify({ type: "message", id: "m2", parentId: "m1", timestamp: "2026-10-01T00:00:02.000Z", message: { role: "user", content: `blob:sha256:${hashFor("raced by a store")}`, timestamp: 2 } })}\n`,
+					];
+					const holder = await db.open({ lease: STILL });
+					await holder.writeLinesAtomic(file, body("a"));
+					await holder.drain();
+					const reader = await db.open({ lease: STILL });
+					resolve?.mockRestore();
+					resolve = spyOn(sessionStorageConfig, "resolveSessionStorage").mockResolvedValue(reader);
+					const race = raceAfterFirstChunk(reader, file, async () => {
+						await holder.writeLinesAtomic(file, body("b"), { expectedSize: holder.statSync(file).size });
+						await holder.drain();
+					});
+
+					const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
+
+					expect(race.ran).toBe(true);
+					expect(await Bun.file(referenced).exists()).toBe(true);
+					expect(await Bun.file(orphan).exists()).toBe(false);
+					expect(result.blobs).toMatchObject({ referenced: 1, deleted: 1, errors: [] });
+				},
+				120_000,
+			);
+		}
 	});
 });
 

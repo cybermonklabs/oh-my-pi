@@ -126,6 +126,16 @@ const RELEASE = /^DELETE FROM "public"\.omp_session_leases WHERE session_id = \$
 /** The heartbeat's own bounds, after the opening and the read-only check, in one message. */
 const HEARTBEAT_BOUNDS = "SET LOCAL lock_timeout = 500; SET LOCAL idle_in_transaction_session_timeout = 500";
 const HEARTBEAT = /^UPDATE "public"\.omp_session_leases SET heartbeat_at = .* RETURNING session_id$/;
+const GROW_ROW =
+	/^INSERT INTO "public"\.omp_session_files \(path, content, mtime_ms, byte_len\) VALUES .* RETURNING byte_len$/;
+const INSERT_PART = /^INSERT INTO "public"\.omp_session_files_parts \(path, start_offset, content\) VALUES /;
+const DELETE_STAGING = /^DELETE FROM "public"\.omp_session_files_parts WHERE path >= \$1 AND path < \$2 AND /;
+const STAGED_BYTES =
+	/^SELECT octet_length\(content\) AS len FROM "public"\.omp_session_files_parts WHERE path = \$1 FOR UPDATE$/;
+const RENAME_PARTS = /^UPDATE "public"\.omp_session_files_parts SET path = /;
+const CHUNKS_START = /^SELECT byte_len, octet_length\(content\) AS content_len, /;
+const CHUNKS_PAGE =
+	/^SELECT start_offset, content FROM "public"\.omp_session_files_parts WHERE path = \$1 AND start_offset >= /;
 
 /** The statements that make the store's tables, exactly as buildQueries gives them. */
 const SCHEMA = [
@@ -228,6 +238,12 @@ interface FakeServer {
 	blobs: Map<string, { content: Uint8Array; byteLen: number }>;
 	/** Reference rows. */
 	refs: Array<{ path: string; sha256: string }>;
+	/**
+	 * The UTF-8 bytes of the parts a part insert put under each path (a streamed full write's staging parts, an
+	 * append batch's), moved by a parts rename: what a streamed full write's swap reads back. A session's own
+	 * bytes are its `byte_len` in {@link sessions}, which a chunked read answers as one part of that many bytes.
+	 */
+	partBytes: Map<string, number>;
 	/** Statements every connection refuses with a server error of the SQLSTATE. */
 	refuse: Array<{ match: RegExp; sqlstate: string }>;
 	/** Statements at which the server ends the connection (a FATAL), each once, on whichever connection runs it first. */
@@ -394,6 +410,49 @@ function answer(
 		const size = server.sessions.get(first);
 		return reply(size === undefined ? [] : [{ byte_len: size }]);
 	}
+	if (GROW_ROW.test(sql)) {
+		// An append batch's row: values path, mtime, the lines' byte length.
+		const size = (server.sessions.get(first) ?? 0) + Number(bound[2]);
+		server.sessions.set(first, size);
+		return reply([{ byte_len: size }]);
+	}
+	if (CHUNKS_START.test(sql)) {
+		// A chunked read's first query: the session's bytes are one part at offset 0, none in the row.
+		if (session === undefined) return reply([]);
+		const size = server.sessions.get(session) ?? 0;
+		return reply([
+			{
+				byte_len: size,
+				content_len: 0,
+				head: new Uint8Array(),
+				first_part: size > 0 ? 0 : -1,
+				first_id: size > 0 ? "1" : null,
+			},
+		]);
+	}
+	if (CHUNKS_PAGE.test(sql)) {
+		// A page from `next` (the second value): the session's one part when the page starts at it.
+		const size = server.sessions.get(first) ?? 0;
+		return reply(size > 0 && Number(bound[1]) === 0 ? [{ start_offset: 0, content: "x".repeat(size) }] : []);
+	}
+	if (INSERT_PART.test(sql)) {
+		// Values path, offset, content.
+		server.partBytes.set(first, (server.partBytes.get(first) ?? 0) + Buffer.byteLength(String(bound[2])));
+		return reply([]);
+	}
+	if (STAGED_BYTES.test(sql)) {
+		const staged = server.partBytes.get(first);
+		return reply(staged === undefined ? [] : [{ len: staged }]);
+	}
+	if (RENAME_PARTS.test(sql)) {
+		// Values destination, source.
+		const moved = server.partBytes.get(String(bound[1]));
+		if (moved !== undefined) {
+			server.partBytes.delete(String(bound[1]));
+			server.partBytes.set(first, moved);
+		}
+		return reply([]);
+	}
 	if (sql.startsWith(`INSERT INTO ${SESSIONS} (path, content, `)) {
 		// A full write's row: values path, mtime, title, title source, title time, byte_len.
 		const onlyIfMissing = sql.endsWith(" RETURNING path");
@@ -553,6 +612,7 @@ function fakePostgres(server: Partial<FakeServer> = {}, { reserve = true } = {})
 		heartbeatFinds: true,
 		blobs: new Map(),
 		refs: [],
+		partBytes: new Map(),
 		refuse: [],
 		ends: [],
 		...server,
@@ -1475,7 +1535,7 @@ const OPERATIONS = {
 			[/^INSERT INTO "public"\.omp_session_files \(path, content, .* DO NOTHING RETURNING path$/, "write"],
 			[LOCK_SIZE, "write"],
 			[DELETE_PARTS, "write"],
-			[/^INSERT INTO "public"\.omp_session_files_parts \(path, start_offset, content\) VALUES /, "write"],
+			[INSERT_PART, "write"],
 			[/^SELECT sha256, path FROM "public"\.omp_session_files_refs WHERE path IN /, "write"],
 			[LOCK_BLOBS_SHARED, "write"],
 			[INSERT_REF, "write"],
@@ -1501,6 +1561,64 @@ const OPERATIONS = {
 		sites: [
 			[APPEND, "write"],
 			[LOCK_SIZE, "write"],
+			[LOCK_BLOBS_SHARED, "write"],
+			[INSERT_REF, "write"],
+		],
+	},
+	appendBatch: {
+		async drive(fake) {
+			const storage = await claiming(fake);
+			const release = await storage.acquireSessionClaim?.(ID, FILE);
+			storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
+			const writer = storage.openWriter(FILE);
+			// Lines queued together go to the database together: one size check, one row growth, their parts.
+			await Promise.all([writer.append(HEADER), writer.append(IMAGE_LINE)]);
+			await writer.close();
+			release?.();
+			await storage.drain();
+			expect(fake.server.sessions.get(FILE)).toBe(Buffer.byteLength(`${HEADER}${IMAGE_LINE}`));
+		},
+		sites: [
+			[LOCK_SIZE, "write"],
+			[GROW_ROW, "write"],
+			[INSERT_PART, "write"],
+			[LOCK_BLOBS_SHARED, "write"],
+			[INSERT_REF, "write"],
+		],
+	},
+	readChunks: {
+		async drive(fake) {
+			// A session of two bytes: the first query reads its size and where its parts start, a page reads them.
+			fake.server.sessions.set(FILE, 2);
+			const storage = await claiming(fake);
+			const chunks: Uint8Array[] = [];
+			for await (const chunk of storage.readChunks(FILE)) chunks.push(chunk);
+			expect(Buffer.concat(chunks).toString()).toBe("xx");
+		},
+		sites: [
+			[CHUNKS_START, "read"],
+			[CHUNKS_PAGE, "read"],
+		],
+	},
+	writeFullStream: {
+		async drive(fake) {
+			const storage = await claiming(fake);
+			const release = await storage.acquireSessionClaim?.(ID, FILE);
+			storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
+			// A rewrite from lines publishes through the spool: its staged parts first, then the swap.
+			await storage.writeLinesAtomic(FILE, [HEADER, IMAGE_LINE], { expectedSize: 0 });
+			release?.();
+			await storage.drain();
+			expect(fake.server.sessions.get(FILE)).toBe(Buffer.byteLength(`${HEADER}${IMAGE_LINE}`));
+		},
+		sites: [
+			[INSERT_PART, "write"],
+			[LOCK_SIZE, "write"],
+			[UPSERT, "write"],
+			[DELETE_STAGING, "write"],
+			[STAGED_BYTES, "write"],
+			[DELETE_PARTS, "write"],
+			[RENAME_PARTS, "write"],
 			[LOCK_BLOBS_SHARED, "write"],
 			[INSERT_REF, "write"],
 		],
@@ -1557,7 +1675,7 @@ const OPERATIONS = {
 				/^UPDATE "public"\.omp_session_files SET path = \$1, mtime_ms = \$2 WHERE path = \$3 RETURNING path$/,
 				"write",
 			],
-			[/^UPDATE "public"\.omp_session_files_parts SET path = /, "write"],
+			[RENAME_PARTS, "write"],
 			[/^DELETE FROM "public"\.omp_session_files WHERE path = \$1$/, "write"],
 			[LOCK_BLOBS_SHARED, "write"],
 			[/^DELETE FROM "public"\.omp_session_files_refs WHERE path = \$1 AND sha256 = \$2$/, "write"],

@@ -52,3 +52,16 @@ export async function readStoredSessions(
 	}
 	return sessions;
 }
+
+/**
+ * `default_transaction_read_only` on a PostgreSQL client's connection: `setting`
+ * is the default new transactions start from, `reset_val` the one the session
+ * began with (from the database, role, server or connection start), which a
+ * session `SET` leaves alone.
+ */
+export async function readOnlyDefault(client: SqlClient): Promise<{ setting: string; reset_val: string } | undefined> {
+	const rows = (await client.unsafe(
+		"SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'",
+	)) as Array<{ setting: string; reset_val: string }>;
+	return rows[0];
+}

@@ -361,11 +361,7 @@ export class AppendOnlyContextManager {
 	syncMessages(normalizedMessages: any[]): void {
 		// Compaction (array shrunk) — every previously-synced message is gone,
 		// so the log can't carry any byte-stable bytes forward.
-		if (normalizedMessages.length < this.#lastSyncCount) {
-			this.log.clear();
-			this.#lastSyncCount = 0;
-			this.#messageDigests = [];
-		}
+		if (normalizedMessages.length < this.#lastSyncCount) this.#clearLog(normalizedMessages);
 
 		// In-place rewrite: trim the log down to the longest byte-stable prefix
 		// that both the previous sync and the new messages share. Bound it by
@@ -375,7 +371,7 @@ export class AppendOnlyContextManager {
 		if (this.#lastSyncCount > 0) {
 			const stableCount = Math.min(this.#longestStablePrefix(normalizedMessages), this.log.length);
 			if (stableCount < this.#lastSyncCount) {
-				this.log.truncate(stableCount);
+				this.#truncateLog(stableCount, normalizedMessages);
 				this.#lastSyncCount = stableCount;
 				this.#messageDigests.length = stableCount;
 			}
@@ -390,6 +386,24 @@ export class AppendOnlyContextManager {
 		this.#lastSyncCount = normalizedMessages.length;
 	}
 
+	/**
+	 * Drop the log's entries from `count` on, and the memoized digest of each
+	 * one `next` does not send again. A session message can outlive the log: a
+	 * compaction drops it from the context while its session entry keeps it as
+	 * the transcript, so a memo slot keyed by its identity would last as long.
+	 */
+	#truncateLog(count: number, next: readonly unknown[]): void {
+		const entries = this.log.entries();
+		if (count >= entries.length) return;
+		const dropped = new Set(entries.slice(count));
+		for (const message of next) {
+			dropped.delete(message as Message);
+			if (dropped.size === 0) break;
+		}
+		for (const entry of dropped) this.#digestMemo.delete(entry);
+		this.log.truncate(count);
+	}
+
 	/** Reset prefix + log for a model/provider switch while mode stays active. */
 	invalidateForModelChange(): void {
 		this.prefix.invalidate();
@@ -398,9 +412,18 @@ export class AppendOnlyContextManager {
 		this.#messageDigests = [];
 	}
 
-	/** Reset the sync cursor AND clear the log. */
+	/**
+	 * Reset the sync cursor AND clear the log, with the memoized digest of each
+	 * entry; the next sync replays the whole history. A compaction calls it so
+	 * the messages before its cut leave the log at once, not at the next request.
+	 */
 	resetSyncCursor(): void {
-		this.log.clear();
+		this.#clearLog([]);
+	}
+
+	/** Empty the log and the sync cursor, keeping the memoized digest of each entry `next` sends again. */
+	#clearLog(next: readonly unknown[]): void {
+		this.#truncateLog(0, next);
 		this.#lastSyncCount = 0;
 		this.#messageDigests = [];
 	}

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -68,12 +68,17 @@ describe("AgentSession steer idle drain", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	async function createSession(messages: Parameters<typeof Agent.prototype.appendMessage>[0][]): Promise<void> {
+	async function createSession(
+		messages: Parameters<typeof Agent.prototype.appendMessage>[0][],
+		streamFn?: MockModel["stream"],
+	): Promise<void> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
 
 		const agent = new Agent({
+			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages },
+			streamFn,
 		});
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		session = new AgentSession({
@@ -192,5 +197,65 @@ describe("AgentSession steer idle drain", () => {
 		await session.abort();
 		await session.waitForIdle();
 		await running.catch(() => {});
+	});
+
+	it("keeps a next-run steer for the next prompt's request instead of starting a turn, and emits it when that run takes it", async () => {
+		const mock = createMockModel({ handler: { content: ["Done."] } });
+		await createSession(
+			[{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()],
+			mock.stream,
+		);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.clearAllQueues();
+		});
+		const emitted: unknown[] = [];
+		session.subscribe(event => {
+			if (event.type === "message_end") emitted.push(event.message);
+		});
+		let queued: readonly unknown[] = [];
+
+		await session.steer("Also check the README.", undefined, {
+			holdUntilNextRun: true,
+			onPromptQueued: messages => {
+				queued = messages;
+			},
+		});
+		vi.advanceTimersByTime(200);
+		await session.waitForIdle();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(mock.calls).toHaveLength(0);
+		expect(queued).toHaveLength(1);
+		expect(emitted.includes(queued[0])).toBe(false);
+
+		// Real timers: the prompt path awaits timers the fake clock would gate.
+		vi.useRealTimers();
+		await session.prompt("Submit your result.");
+		await session.waitForIdle();
+		expect(mock.calls).toHaveLength(1);
+		const request = mock.calls[0]!.context.messages.map(message =>
+			typeof message.content === "string"
+				? message.content
+				: message.content.map(part => (part.type === "text" ? part.text : "")).join(""),
+		);
+		expect(request.some(text => text.includes("Submit your result."))).toBe(true);
+		expect(request.some(text => text.includes("Also check the README."))).toBe(true);
+		// The run reports the queued message object itself as it takes it.
+		expect(emitted.includes(queued[0])).toBe(true);
+	});
+
+	it("starts no turn for a next-run steer when the session aborts", async () => {
+		await createSession([{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()]);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.clearAllQueues();
+		});
+
+		await session.steer("Also check the README.", undefined, { holdUntilNextRun: true });
+		await session.abort();
+		vi.advanceTimersByTime(200);
+		await session.waitForIdle();
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		// Still waiting for the next run, and its sender can take it back.
+		expect(session.removeQueuedMessage("Also check the README.", "steering")).toBe(true);
 	});
 });

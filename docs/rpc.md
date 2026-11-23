@@ -1111,8 +1111,16 @@ non-negative integer. Non-finite values fail. The result contains `sessionFile`,
 `fromByte`, `nextByte`, `reset`, raw transcript `entries`, and `messages` from
 message entries. Only complete newline-terminated records are consumed; reuse
 `nextByte` on the next request. A missing transcript returns empty arrays.
-If `fromByte` exceeds the current file size, reading restarts at byte zero and
-reports `reset: true`.
+If `fromByte` exceeds the current file size, or no record ends right before it
+(the transcript was rewritten since the last read), reading restarts at byte
+zero and reports `reset: true`; drop what the earlier reads returned.
+Entries and messages carry the fields that the
+`entry_patch` records among the entries read set (see
+[session format](./session.md)); a record that names an entry before
+`fromByte` is listed in `entries` as written, for the client to apply.
+One response returns at most 8 MiB of the transcript (more only when a single
+record is longer than 4 MiB), so a client reading a long transcript repeats
+the request from `nextByte` until `nextByte` stops advancing.
 
 ### Cancelling subagents
 
@@ -1133,42 +1141,72 @@ When `set_subagent_subscription` is `"progress"` or `"events"`, a
 
 `cancelled` is `false` when the id is not a running subagent of this session:
 unknown, another session's same-name agent, finished (including a subagent
-whose result the parent already accepted, even before its terminal lifecycle
-frame), or already cancelled, so hosts can treat it as idempotent. If the
+whose result the parent already accepted, or whose run failed or stopped and
+is only being cleaned up, even before its terminal lifecycle frame), or
+already cancelled, so hosts can treat it as idempotent. If the
 `aborted` tombstone cannot be persisted, the subagent is still aborted and
 disposed, and the command returns an error response with the write failure.
 
 ### Steering subagents
 
-`steer_subagent` sends a message to a running subagent as its user, the same
-way Agent Hub chat does: a mid-turn subagent is steered at its next step
-boundary, and one between turns starts its next turn. The message is recorded
-in the subagent's own transcript; it is not attributed to the parent agent,
-and the parent sees only the subagent's eventual result. Isolated (worktree)
-subagents run in-process and are steered the same way.
+`steer_subagent` sends a message to a subagent `get_subagents` lists as running,
+as its user. A mid-turn subagent is steered the same way Agent Hub chat does,
+at its next step boundary. A subagent between turns (for example a synchronous
+subagent waiting for its own eval `agent()` job) does not start a turn for the
+message: it is queued as a next-run steer, which waits on the subagent's queue
+and reaches its next turn, which its task executor starts (a yield reminder) or
+a finished job's result starts, before that turn's first model call. The
+subagent's own session decides which of the two applies, when the message
+reaches it; the parent's view of the subagent, which can lag behind a subagent
+running on a worker thread, does not decide. The
+message is recorded in the subagent's own transcript; it is not attributed to
+the parent agent, and the parent sees only the subagent's eventual result.
+Isolated (worktree) subagents run in-process and are steered the same way.
 
 ```json
 { "id": "req_1", "type": "steer_subagent", "subagentId": "OmpWorker", "message": "Drop the glob, keep the direct path." }
 { "id": "req_1", "type": "response", "command": "steer_subagent", "success": true }
 ```
 
-The response arrives once the message is accepted: queued into the running
-turn, or the subagent's new turn started. It does not wait for the turn to
-finish. Like `prompt`, the command starts in queue order but waits for
-acceptance in the background, so later commands (including `abort`) are not
-held behind it. As in Agent Hub chat (not RPC `steer`), the message goes
-through the subagent's `prompt()`: extension, custom and file slash commands
-run and prompt templates expand.
+The response arrives once the message is accepted: for a mid-turn subagent,
+once it is queued into the running turn; for a subagent between
+turns, once its next turn has taken the message into its context. A client
+must allow for that wait, which lasts until the subagent's next run: the
+Python, Go and Rust SDKs time a request out after 30 s by default, so give
+this command a longer timeout (the TypeScript `RpcClient.steerSubagent` sets
+none unless its `timeoutMs` option asks for one). Each
+`steer_subagent` answers for its own message: two sent with the same text are
+two messages, and a turn that takes one answers only that one. It does
+not wait for the turn to finish, except for an extension command that itself
+waits for one, since a mid-turn message answers once the subagent's `prompt()`
+has handled it. Like `prompt`, the command starts in queue
+order but waits for acceptance in the background, so later commands
+(including `abort`) are not held behind it. For a mid-turn subagent, as in
+Agent Hub chat (not RPC `steer`), the message goes through the subagent's
+`prompt()`: extension, custom and file slash commands run and prompt
+templates expand. For a subagent between turns it is queued like RPC `steer`:
+prompt templates expand and extension commands are refused.
 
 Failure responses:
 
 - missing/empty `subagentId` or blank `message` → validation error
 - `subagentId` not currently listed as running by `get_subagents` (unknown,
   finished, already cancelled, another session's agent, or one whose result
-  the parent already accepted) → `error: "Subagent not running: <id>"`
+  the parent already accepted or whose run already ended, even before its
+  terminal lifecycle frame) → `error: "Subagent not running: <id>"`
 - the subagent drops or rejects the message before accepting it (for example
   an abort or a usage-limit preflight denial lands first) →
   `error: "Subagent refused the message: <reason>"`
+- a subagent between turns stops before another turn takes the message (its
+  result is accepted, it is cancelled or aborted, or its run ends), or the RPC
+  session shuts down first (stdin closes, or an extension calls
+  `pi.shutdown()`) → the next-run steer is taken back off the subagent's queue,
+  so no later turn delivers it, and
+  `error: "Subagent's run ended before the message reached it: <id>"`
+- the RPC session's shutdown has already begun when the command runs, whatever the subagent's state (mid-turn or between turns) → nothing is sent, and `error: "Subagent's run ended before the message reached it: <id>"`
+- the subagent stops, and the message is no longer on its queue although no
+  turn took it (someone else removed it, or the subagent's session is gone) →
+  `error: "The message was not delivered to subagent: <id>"`
 
 ### Side questions (`/btw`)
 

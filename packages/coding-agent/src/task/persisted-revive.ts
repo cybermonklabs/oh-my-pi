@@ -179,7 +179,7 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
  * Build the factory the {@link AgentLifecycleManager} uses to cold-revive a
  * `parked` subagent ref restored from disk (Agent Hub scan, collab mirror, or a
  * resumed process). Such a ref carries a sessionFile but no in-memory adoption —
- * the executor's live reviver closure died with the process/turn that spawned
+ * the executor's warm revive state died with the process/turn that spawned
  * it — so `ensureLive` (IRC sends, hub focus) would otherwise refuse it.
  *
  * This rebuilds the subagent the same way `--resume` rebuilds a session: reopen

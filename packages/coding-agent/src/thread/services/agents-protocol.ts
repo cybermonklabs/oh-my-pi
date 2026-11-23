@@ -42,6 +42,8 @@ export type AgentRegistryProtocol = {
 	setHistory: RpcMethod<[id: string, history: AgentHistorySummary, expectedSessionFile?: string], boolean>;
 	setStatus: RpcMethod<[id: string, status: AgentStatus, expected?: AgentRefExpectation], boolean>;
 	markResultAccepted: RpcMethod<[id: string, expected?: AgentRefExpectation, responseAt?: number], boolean>;
+	markRunEnded: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
+	startRun: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
 	staleAcceptedRuns: RpcMethod<[], AgentRef[]>;
 	setActivity: RpcMethod<[id: string, activity: string], void>;
 	attachSession: RpcMethod<
@@ -105,4 +107,7 @@ export type IrcBusProtocol = {
 	take: RpcMethod<[agentId: string, from?: string], IrcMessage | undefined>;
 	unreadCount: RpcMethod<[agentId: string], number>;
 	recordReply: RpcMethod<[from: string, to: string], void>;
+	forgetAgent: RpcMethod<[agentId: string], void>;
+	/** Returns a sync release, which main also runs if the worker dies first. */
+	holdSentMarks: RpcMethod<[agentId: string], () => void>;
 };

@@ -9,7 +9,8 @@
  * `affectedRows` semantics: 0 when a matched row is unchanged, 1 when a row
  * is inserted, 2 when an upsert changes one. sql-session-storage-dialects.test.ts
  * covers the same replace against a live MySQL when `OMP_TEST_SQL_MYSQL_URL`
- * is set.
+ * is set. The same fake also drives a streamed full write's staging, whose
+ * staging path must fit MySQL's `VARCHAR(512)` path columns.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -30,10 +31,18 @@ function mysqlResult(affectedRows: number, rows: unknown[] = []): SqlSessionStor
 	return Object.assign(rows, { affectedRows });
 }
 
-/** In-memory session rows and parts speaking just enough MySQL wire behavior for the test. */
-function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): string | undefined } {
+/**
+ * In-memory session rows and parts speaking just enough MySQL wire behavior for the test, `path`
+ * columns of `VARCHAR(512)` included; `partPaths` lists the path of every part inserted, in order.
+ */
+function mysqlFake(): {
+	client: SqlSessionStorageClient;
+	stored(path: string): string | undefined;
+	partPaths: string[];
+} {
 	const rows = new Map<string, FakeRow>();
 	const parts = new Map<string, Map<number, string>>();
+	const partPaths: string[] = [];
 	const partsOf = (path: string): Map<number, string> => {
 		let byOffset = parts.get(path);
 		if (!byOffset) {
@@ -44,6 +53,10 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 	};
 	const orderedParts = (path: string): Array<[number, string]> =>
 		[...(parts.get(path) ?? new Map<number, string>())].sort(([a], [b]) => a - b);
+	// Strict mode, MySQL's default, refuses a value longer than the column (ER_DATA_TOO_LONG).
+	const assertFits = (path: string): void => {
+		if ([...path].length > 512) throw Object.assign(new Error("Data too long for column 'path'"), { errno: 1406 });
+	};
 
 	const client: SqlSessionStorageClient = {
 		options: { adapter: "mysql" },
@@ -88,8 +101,23 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 				const row = rows.get(values[0] as string);
 				return mysqlResult(0, row ? [{ byte_len: row.byteLen }] : []);
 			}
+			if (sql.startsWith("SELECT length(content) AS len")) {
+				const staged = orderedParts(values[0] as string);
+				return mysqlResult(
+					0,
+					staged.map(([, content]) => ({ len: Buffer.byteLength(content) })),
+				);
+			}
+			if (sql.startsWith("UPDATE omp_session_files_parts SET path")) {
+				const [dst, src] = values as [string, string];
+				const moved = parts.get(src);
+				parts.delete(src);
+				if (moved) parts.set(dst, moved);
+				return mysqlResult(moved?.size ?? 0);
+			}
 			if (sql.startsWith("INSERT IGNORE INTO omp_session_files ")) {
 				const [path, mtimeMs, title, source, updatedAt, byteLen] = values as [string, number, ...unknown[]];
+				assertFits(path);
 				if (rows.has(path)) return mysqlResult(0);
 				rows.set(path, { byteLen: byteLen as number, mtimeMs, title: [title, source, updatedAt] });
 				return mysqlResult(1);
@@ -102,6 +130,8 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 					return mysqlResult(row && byteLen > 0 ? 1 : 0);
 				}
 				const [path, offset, content] = values as [string, number, string];
+				assertFits(path);
+				partPaths.push(path);
 				partsOf(path).set(offset, content);
 				return mysqlResult(1);
 			}
@@ -150,6 +180,7 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 	};
 	return {
 		client,
+		partPaths,
 		stored: path =>
 			rows.has(path)
 				? orderedParts(path)
@@ -218,5 +249,35 @@ describe("SqlSessionStorage (MySQL no-op replace)", () => {
 			storage.writeTextAtomic("/s/gone.jsonl", BODY, { expectedSize: Buffer.byteLength(BODY, "utf8") }),
 		).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(stored("/s/gone.jsonl")).toBeUndefined();
+	});
+});
+
+describe("SqlSessionStorage (MySQL streamed rewrites)", () => {
+	// If this regresses, a session on MySQL storage whose path leaves no room for a staging path
+	// (longer than 473 characters) has its whole transcript decoded into one string at every full
+	// rewrite, or stages under a name past VARCHAR(512) and every full rewrite of it fails.
+	it("stages a streamed rewrite, under a hashed name of at most 512 characters when its staging path would not fit VARCHAR(512)", async () => {
+		const { client, stored, partPaths } = mysqlFake();
+		const storage = await SqlSessionStorage.create({ client });
+		const lines = ["title-slot-line\n", "header-line\n", "entry-one\n"];
+		const short = "/s/short.jsonl";
+		// 512 characters: its row fits, while `<path>#staging-<epoch>-<id>` would be 39 characters longer.
+		const long = `/s/${"l".repeat(512 - "/s/".length - ".jsonl".length)}.jsonl`;
+		const hash = new Bun.CryptoHasher("sha256").update(long).digest("hex");
+
+		for (const path of [short, long]) {
+			await storage.writeLinesAtomic(path, lines, { expectedSize: null });
+			expect(stored(path)).toBe(lines.join(""));
+		}
+		// Every part went in under a staging path that fits, and was swapped in from there.
+		expect(
+			partPaths.map(path => ({
+				name: path.replace(/#staging-\d{13}-[0-9a-f]{16}$/, "#staging-<epoch>-<id>"),
+				fits: [...path].length <= 512,
+			})),
+		).toEqual([
+			{ name: `${short}#staging-<epoch>-<id>`, fits: true },
+			{ name: `#omp-staging/${hash}#staging-<epoch>-<id>`, fits: true },
+		]);
 	});
 });

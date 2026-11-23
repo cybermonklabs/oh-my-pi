@@ -2,7 +2,8 @@
  * The store's lock order (see `#lockBlobRows` in `sql-session-storage.ts` and
  * docs/session.md, "Races"), checked from the statements each kind of
  * transaction sends, on every engine: (1) lease rows, (2) session rows and
- * their parts in path order, (3) blob rows in `sha256` order, parents and
+ * their parts in path order (a staging set's parts are parts of the path they
+ * are staged for), (3) blob rows in `sha256` order, parents and
  * parts in one pass, (4) reference rows. A statement that takes a lock is a
  * write (`INSERT`, `UPDATE`, `DELETE`) or a locking read (`FOR UPDATE`,
  * `FOR SHARE`, `LOCK IN SHARE MODE`). Within a transaction, a statement may
@@ -78,7 +79,13 @@ function lockOf(sql: string, values: unknown[], table: string, leaseTable: strin
 	const strings = values.filter((value): value is string => typeof value === "string");
 	if (found === leaseTable) return { step: 1, table: found, keys: [], sql: text };
 	if (found === table || found === `${table}_parts`) {
-		return { step: 2, table: found, keys: strings.filter(value => value.startsWith("/")), sql: text };
+		const paths = strings.filter(value => value.startsWith("/"));
+		// The directory delete's key range runs from `@dir` without its final "/" up to `@dir` with that "/" made
+		// "0": both bounds stand for `@dir`, whose rows the range holds.
+		const dirs = paths.filter(value => value.endsWith("/"));
+		const key = (value: string): string =>
+			dirs.find(dir => value === dir.slice(0, -1) || value === `${dir.slice(0, -1)}0`) ?? value;
+		return { step: 2, table: found, keys: paths.map(key), sql: text };
 	}
 	if (found === `${table}_blobs`) {
 		return { step: 3, table: found, keys: strings.filter(value => /^[0-9a-f]{64}$/.test(value)), sql: text };
@@ -86,7 +93,18 @@ function lockOf(sql: string, values: unknown[], table: string, leaseTable: strin
 	return { step: 4, table: found, keys: [], sql: text };
 }
 
-/** Each statement of `locks` (one transaction's, in order) that breaks the order. */
+/** The path a staging set's name (`<path>#staging-…`) holds parts for; any other key as it is. */
+function stagedFor(key: string): string {
+	return key.replace(/#staging-.*$/, "");
+}
+
+/**
+ * Each statement of `locks` (one transaction's, in order) that breaks the
+ * order. A staging set's parts are parts under the path they are staged for:
+ * they sort as that path, and once the transaction holds that path's row they
+ * may come in any order after it, but they are rows of their own, which a
+ * statement after step 2 may not lock.
+ */
 function violations(locks: readonly Lock[]): string[] {
 	const held = new Map<number, Set<string>>([
 		[2, new Set()],
@@ -100,9 +118,11 @@ function violations(locks: readonly Lock[]): string[] {
 		if (lock.step < reached && (lock.step === 1 || fresh.length > 0)) {
 			found.push(`step ${lock.step} after step ${reached}: ${lock.sql.slice(0, 90)}`);
 		}
-		if (mine && mine.size > 0 && fresh.length > 0) {
-			const highest = [...mine].sort().at(-1) ?? "";
-			const lowest = [...fresh].sort()[0] ?? "";
+		// Parts staged for a path whose row this transaction holds sort with that row, in any order after it.
+		const unheld = mine ? fresh.filter(key => !mine.has(stagedFor(key))) : [];
+		if (mine && mine.size > 0 && unheld.length > 0) {
+			const highest = [...mine].map(stagedFor).sort().at(-1) ?? "";
+			const lowest = unheld.map(stagedFor).sort()[0] ?? "";
 			if (lowest < highest)
 				found.push(`step ${lock.step} key ${short(lowest)} after ${short(highest)}: ${lock.sql.slice(0, 90)}`);
 		}
@@ -198,6 +218,17 @@ describe("SqlSessionStorage lock order", () => {
 					[
 						"full write, replacing references",
 						() => storage.writeText(b, naming(5, 0)).then(() => storage.drain()),
+					],
+					[
+						"streamed full write, staging, sweeping a stale staging set, replacing references",
+						async () => {
+							// A staging set a killed writer left more than an hour ago, which the swap deletes.
+							await db.sql(`INSERT INTO ${db.table}_parts (path, start_offset, content) VALUES (@1, 0, 'x')`, [
+								`${b}#staging-0000000000001-1`,
+							]);
+							await storage.writeLinesAtomic(b, naming(4, 1).split(/(?<=\n)/));
+							await storage.drain();
+						},
 					],
 					[
 						"open-time write-back",
