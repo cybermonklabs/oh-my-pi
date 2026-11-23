@@ -299,11 +299,12 @@ jobs:
           prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
           # A line per entry: id, key, creation time, bytes, group. The group
           # is the key without its -<64 hex lock hash>-<40 hex commit> end,
-          # so it names the ref and the target.
+          # so it names the ref and the target. A key without that end is
+          # UNGROUPED: it is never deleted, and it fails the step.
           list() {
             gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
               -f key="$prefix" -f ref="$GITHUB_REF" -F per_page=100 \
-              -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, (.key | sub("-[0-9a-f]{64}-[0-9a-f]{40}$"; ""))] | @tsv'
+              -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, (.key | if test("-[0-9a-f]{64}-[0-9a-f]{40}$") then sub("-[0-9a-f]{64}-[0-9a-f]{40}$"; "") else "UNGROUPED" end)] | @tsv'
           }
           list >caches.tsv
           echo "CACHES $(wc -l <caches.tsv) entries of this ref before"
@@ -311,8 +312,11 @@ jobs:
             echo "::warning title=Release build cache::CACHES UNKNOWN: no entry of $GITHUB_REF has a key that starts with $prefix, so nothing was pruned; the key format may have changed"
             exit 0
           fi
+          if cut -f5 caches.tsv | grep -qx UNGROUPED; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: an entry of $GITHUB_REF has a key without the -<lock hash>-<commit> end, so it is not pruned; the key format may have changed"
+          fi
           # Newest first: each entry after the first of its group is superseded.
-          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
+          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '$5 == "UNGROUPED" { next } ($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
           while IFS=$'\t' read -r id key created size _; do
             # The run of a later push may have deleted it first: that is done too.
             if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" >/dev/null 2>&1; then
@@ -322,9 +326,17 @@ jobs:
             fi
           done <superseded.tsv
           list >after.tsv
-          awk -F'\t' '{ n[$5]++; s += $4 } END {
-            for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], n[g] == 1 ? "y" : "ies"; if (n[g] > 1) bad = 1 }
-            printf "CACHES %d entries of this ref after, %.2f GB\n", NR, s / 1e9; exit bad }' after.tsv
+          # Only the entries listed before the deletes count: an entry a later
+          # push saved while this job ran is for that run's prune.
+          awk -F'\t' 'NR == FNR { seen[$1] = 1; next }
+            { total++; s += $4 }
+            !($1 in seen) { later++; next }
+            $5 == "UNGROUPED" { print "UNGROUPED " $2; bad = 1; next }
+            { n[$5]++ }
+            END {
+              for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], (n[g] == 1 ? "y" : "ies"); if (n[g] > 1) bad = 1 }
+              if (later) printf "LATER %d entries a later push saved while this job ran\n", later
+              printf "CACHES %d entries of this ref after, %.2f GB\n", total, s / 1e9; exit bad }' caches.tsv after.tsv
 
   rust_test:
     # Upstream runs these tests in ci.yml's rust_validate job, on upstream's
