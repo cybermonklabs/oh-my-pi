@@ -1,10 +1,10 @@
 /**
  * A subagent revived from its stored session builds in the directory its tools run in, project A, after the session
  * its live inputs come from moved to project B: it finds A's custom tools, project MCP servers, project extensions
- * and custom commands, and none of B's, and it keeps the user's extensions and the host's inline ones. A child of a
- * live subagent that works in the child's own directory keeps that subagent's tool sources. Each case spawns a real
- * subagent in A on a scripted model, parks it, revives it warm, drops its warm reviver as a worker's exit does, and
- * revives it cold through the persisted reviver factory.
+ * and custom commands, and none of B's, and it keeps the user's extensions, the root's explicit (`--extension`)
+ * ones and the host's inline ones. A child of a live subagent that works in the child's own directory keeps that
+ * subagent's tool sources. Each case spawns a real subagent in A on a scripted model, parks it, revives it warm,
+ * drops its warm reviver as a worker's exit does, and revives it cold through the persisted reviver factory.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { appendFileSync } from "node:fs";
@@ -13,8 +13,7 @@ import * as path from "node:path";
 import type { MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { discoverCustomToolPaths } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/loader";
-import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import { importExtensionModule } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { type ExtensionFactory, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { discoverAndLoadMCPTools } from "@oh-my-pi/pi-coding-agent/mcp/loader";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
@@ -49,6 +48,8 @@ const EB = "eb_probe";
 const EC = "ec_probe";
 const EU = "eu_probe";
 const EI = "ei_probe";
+/** The tool of the extension the root is started with by `--extension` (EX), a file outside every project. */
+const EX = "ex_probe";
 /** The tool names of the MCP servers that A's and B's project configs name (MA, MB). */
 const MA_PREFIX = "mcp__ma_";
 const MB_PREFIX = "mcp__mb_";
@@ -127,11 +128,13 @@ interface Projects {
 	readonly ranCb: string;
 	/** EU's file, in the user's agent directory. */
 	readonly userExtension: string;
+	/** EX's file, which the owner's extension roots name as explicit. */
+	readonly explicitExtension: string;
 	/** EI, the extension the host passes inline. */
 	readonly inline: PreparedExtension;
 }
 
-/** Writes A's and B's tool sources, the user's extension EU and the host's inline extension EI. */
+/** Writes A's and B's tool sources, the user's extension EU, the explicit extension EX and the host's inline one EI. */
 async function writeProjects(env: ReviveEnv): Promise<Projects> {
 	const a = env.cwd;
 	const b = path.join(env.root, "project-b");
@@ -158,6 +161,9 @@ async function writeProjects(env: ReviveEnv): Promise<Projects> {
 	}
 	const userExtension = path.join(getAgentDir(), "extensions", `${EU}.ts`);
 	await Bun.write(userExtension, extensionSource(EU, hookLog));
+	// EX's hook writes to a log of its own: the restricted case counts the hooks of EU, EI and EA only.
+	const explicitExtension = path.join(env.root, "explicit", `${EX}.ts`);
+	await Bun.write(explicitExtension, extensionSource(EX, path.join(env.root, "explicit-hooks.log")));
 	const inlineFactory: ExtensionFactory = pi => {
 		pi.on("session_start", () => appendFileSync(hookLog, `${EI}\n`));
 		pi.registerTool({
@@ -174,12 +180,13 @@ async function writeProjects(env: ReviveEnv): Promise<Projects> {
 	};
 	const inline: PreparedExtension = {
 		path: "<inline-0>",
+		scope: "inline",
 		resolvedPath: "<inline-0>",
 		factory: inlineFactory,
 		error: null,
 	};
 	await Bun.write(path.join(c, ".omp", "extensions", `${EC}.ts`), extensionSource(EC, hookLog));
-	return { a, b, c, realA: await fs.realpath(a), hookLog, ranCa, ranCb, userExtension, inline };
+	return { a, b, c, realA: await fs.realpath(a), hookLog, ranCa, ranCb, userExtension, explicitExtension, inline };
 }
 
 /** One test process: its env, its live root, its projects, and the MCP managers the root's scans connected. */
@@ -196,13 +203,21 @@ interface ToolSourceProcess {
 	startRootIn(dir: string): Promise<void>;
 }
 
-/** A test process whose root starts in A; `roots`, where given, is the owner's extension-root policy over its projects. */
+/**
+ * A test process whose root starts in A; `roots`, where given, is the owner's extension-root policy over its projects,
+ * else it names EX as explicit and merges the ambient sources.
+ */
 async function openToolSourceProcess(
-	roots?: (projects: Projects) => EffectiveExtensionRoots,
+	roots: (projects: Projects) => EffectiveExtensionRoots = projects => ({
+		explicit: [projects.explicitExtension],
+		mode: "merge",
+		configured: [],
+		configuredLevel: "user",
+	}),
 ): Promise<ToolSourceProcess> {
 	const env = await openReviveEnv({ "memory.backend": "local", "mcp.startupTimeoutMs": 0 });
 	const projects = await writeProjects(env);
-	const root = env.createLiveParent(undefined, undefined, roots?.(projects));
+	const root = env.createLiveParent(undefined, undefined, roots(projects));
 	const managers: MCPManager[] = [];
 	const tools = root.toolSession;
 	const startRootIn = async (dir: string): Promise<void> => {
@@ -214,7 +229,7 @@ async function openToolSourceProcess(
 			tools.settings,
 		);
 		tools.extensionPaths = extensionPaths;
-		const prepared = await Promise.all(extensionPaths.map(file => importExtensionModule(file, dir)));
+		const { preparedExtensions: prepared = [] } = await loadExtensions(extensionPaths, dir);
 		root.preparedExtensions?.splice(0, root.preparedExtensions.length, ...prepared, projects.inline);
 		const { manager } = await discoverAndLoadMCPTools(dir, { startupTimeoutMs: 0 });
 		managers.push(manager);
@@ -260,11 +275,16 @@ function probeTurn(request: RecordedRequest): MockResponse | undefined {
 
 /** The tool-source tools a session holds: the custom tools, the extensions' tools and the MCP servers' tools. */
 function sourceTools(session: AgentSession): string[] {
-	const named = [TA, TB, EA, EB, EC, EU, EI];
+	const named = [TA, TB, EA, EB, EC, EU, EI, EX];
 	return session
 		.getAllToolNames()
 		.filter(name => named.includes(name) || name.startsWith(MA_PREFIX) || name.startsWith(MB_PREFIX))
 		.sort();
+}
+
+/** The tools of B's sources (TB, EB, MB's) a tool-source list holds. */
+function fromB(tools: readonly string[]): string[] {
+	return tools.filter(name => name === TB || name === EB || name.startsWith(MB_PREFIX));
 }
 
 /** What the cold-revived subagent's tools, extensions and commands did. */
@@ -300,10 +320,13 @@ async function coldRun(process: ToolSourceProcess, id: string, warmTools: string
 	env.respond = probeTurn;
 	await env.wake(cold.session, id);
 	env.respond = undefined;
+	// Each message waits for the session to be idle, as a person's next message does: a message the session answers
+	// with a turn (a command it does not hold) keeps it busy past the prompt.
 	for (const command of ["/ca", "/cb"]) {
+		await cold.session.waitForIdle();
 		await cold.session.prompt(command);
-		await cold.session.agent.waitForIdle();
 	}
+	await cold.session.waitForIdle();
 	const lessons = (dir: string) => path.join(getMemoryRoot(getAgentDir(), dir), "learned.md");
 	return {
 		cold,
@@ -326,18 +349,30 @@ async function warmRevive(env: ReviveEnv, id: string): Promise<string[]> {
 	return tools;
 }
 
-/** The cases of row (p) that check every clause on the cold revive. */
+/**
+ * The cases of row (p) that check every clause on the cold revive. Each case asserts its clauses in one comparison of
+ * what the run observed, so a failing case reports every clause's value.
+ */
 function defineColdRunCases(title: string, result: () => ColdRun | undefined, projects: () => Projects | undefined) {
-	it(`${title}: the tool list holds A's tools (TA, MA's, ea), eu and ei, and none of B's, as the warm revive's does`, () => {
+	it(`${title}: the tool list holds A's tools (TA, MA's, ea), eu, ei and ex, and none of B's, as the warm revive's does`, () => {
 		const run = result();
 		if (!run) throw new Error("The test process did not start");
 		const tools = sourceTools(run.cold.session);
-		expect(tools.filter(name => [TB, EB].includes(name) || name.startsWith(MB_PREFIX))).toEqual([]);
-		expect(tools).toEqual(expect.arrayContaining([TA, EA, EU, EI]));
-		expect(tools.some(name => name.startsWith(MA_PREFIX))).toBe(true);
-		expect(run.warmTools.filter(name => [TB, EB].includes(name) || name.startsWith(MB_PREFIX))).toEqual([]);
-		expect(run.warmTools).toEqual(expect.arrayContaining([TA, EA, EU, EI]));
-		expect(run.cold.build.options.cwd).toBe(projects()?.a);
+		expect({
+			coldFromB: fromB(tools),
+			cold: tools,
+			coldHoldsMa: tools.some(name => name.startsWith(MA_PREFIX)),
+			warmFromB: fromB(run.warmTools),
+			warm: run.warmTools,
+			cwd: run.cold.build.options.cwd,
+		}).toEqual({
+			coldFromB: [],
+			cold: expect.arrayContaining([TA, EA, EU, EI, EX]),
+			coldHoldsMa: true,
+			warmFromB: [],
+			warm: expect.arrayContaining([TA, EA, EU, EI, EX]),
+			cwd: projects()?.a,
+		});
 	}, 30_000);
 
 	it(`${title}: a call of TA reads api.cwd as A and runs its exec command in A`, () => {
@@ -346,15 +381,16 @@ function defineColdRunCases(title: string, result: () => ColdRun | undefined, pr
 
 	it(`${title}: EA's pi.exec runs in A, and the lesson it saves through its memory context is under A's project`, () => {
 		const run = result();
-		expect(run?.ea).toEqual({ pwd: projects()?.realA, stored: 1 });
-		expect(run?.lessonInA).toContain(LESSON);
-		expect(run?.lessonInB).toBe(false);
+		expect({ ea: run?.ea, lessonInA: run?.lessonInA, lessonInB: run?.lessonInB }).toEqual({
+			ea: { pwd: projects()?.realA, stored: 1 },
+			lessonInA: expect.stringContaining(LESSON),
+			lessonInB: false,
+		});
 	}, 30_000);
 
 	it(`${title}: /ca from A runs in A, and /cb from B runs no command`, () => {
 		const run = result();
-		expect(run?.ranCa).toBe(projects()?.realA);
-		expect(run?.ranCb).toBe(false);
+		expect({ ranCa: run?.ranCa, ranCb: run?.ranCb }).toEqual({ ranCa: projects()?.realA, ranCb: false });
 	}, 30_000);
 }
 
@@ -385,9 +421,15 @@ describe("a live root restarted in B, whose custom-tool paths, extensions and MC
 
 	it("restarted root: the cold revive passes none of B's custom-tool paths and no MCP manager, and masks B's project secrets", () => {
 		const options = run?.cold.build.options;
-		expect(options?.preloadedCustomToolPaths).toBeUndefined();
-		expect(options?.mcpManager).toBeUndefined();
-		expect(options?.secretsProjectDirs).toEqual(process ? [process.projects.b] : []);
+		expect({
+			customToolPaths: options?.preloadedCustomToolPaths,
+			passesMcpManager: options?.mcpManager !== undefined,
+			secretsProjectDirs: options?.secretsProjectDirs,
+		}).toEqual({
+			customToolPaths: undefined,
+			passesMcpManager: false,
+			secretsProjectDirs: process ? [process.projects.b] : [],
+		});
 	}, 30_000);
 });
 
@@ -412,9 +454,14 @@ describe("a live root restarted in B and then moved to C, whose project extensio
 		await process?.close();
 	}, 30_000);
 
-	it("root in B, then C: the tool list holds ea, eu and ei, and neither eb nor ec", () => {
-		expect(coldTools).toEqual(expect.arrayContaining([EA, EU, EI]));
-		expect(coldTools.filter(name => name === EB || name === EC)).toEqual([]);
+	it("root in B, then C: the tool list holds ea, eu, ei and ex, and neither eb nor ec", () => {
+		expect({
+			tools: coldTools,
+			fromBOrC: coldTools.filter(name => name === EB || name === EC),
+		}).toEqual({
+			tools: expect.arrayContaining([EA, EU, EI, EX]),
+			fromBOrC: [],
+		});
 	}, 30_000);
 });
 
@@ -537,10 +584,10 @@ describe("an owner's explicit-only extension policy naming EU only, its root res
 	}, 30_000);
 
 	it("explicit-only: the tool list holds eu and neither ea nor eb, as the warm revive's does", () => {
-		for (const tools of [coldTools, warmTools]) {
-			expect(tools).toContain(EU);
-			expect(tools.filter(name => name === EA || name === EB)).toEqual([]);
-		}
+		expect({
+			cold: coldTools.filter(name => name === EU || name === EA || name === EB),
+			warm: warmTools.filter(name => name === EU || name === EA || name === EB),
+		}).toEqual({ cold: [EU], warm: [EU] });
 	}, 30_000);
 });
 
@@ -580,8 +627,7 @@ describe("a restricted (plan-mode) subagent, whose extensions are its parent's h
 	}, 30_000);
 
 	it("restricted: the cold revive runs the hooks of EU, EI and EA and none of EB's, as the warm revive does", () => {
-		expect(coldHooks).toEqual([EA, EI, EU].sort());
-		expect(warmHooks).toEqual([EA, EI, EU].sort());
+		expect({ cold: coldHooks, warm: warmHooks }).toEqual({ cold: [EA, EI, EU].sort(), warm: [EA, EI, EU].sort() });
 	}, 30_000);
 });
 
@@ -591,6 +637,7 @@ describe("worker mode on, the subagent placed in a worker, its root restarted in
 	let pool: SubagentWorkerPool | undefined;
 	let acquire: Mock<SubagentWorkerPool["acquire"]> | undefined;
 	let cold: RevivedSubagent | undefined;
+	let reviveError: string | undefined;
 
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
@@ -603,7 +650,11 @@ describe("worker mode on, the subagent placed in a worker, its root restarted in
 		acquire = vi.spyOn(pool, "acquire").mockRejectedValue(new Error("The revive was placed in a worker"));
 		setSubagentWorkerPoolForTests(pool);
 		env.dropWarmReviver(id);
-		cold = await env.revive(id);
+		// A revive placed in a worker fails here; the case's check reports where it was placed.
+		cold = await env.revive(id).catch((error: unknown) => {
+			reviveError = error instanceof Error ? error.message : String(error);
+			return undefined;
+		});
 	}, 90_000);
 
 	afterAll(async () => {
@@ -613,10 +664,13 @@ describe("worker mode on, the subagent placed in a worker, its root restarted in
 	}, 30_000);
 
 	it("worker-placed: the cold revive runs on the main thread, and its tool list holds MA's tools and not MB's", () => {
-		expect(acquire).not.toHaveBeenCalled();
 		const tools = cold ? sourceTools(cold.session) : [];
-		expect(tools.some(name => name.startsWith(MA_PREFIX))).toBe(true);
-		expect(tools.filter(name => name.startsWith(MB_PREFIX))).toEqual([]);
+		expect({
+			placedInWorker: acquire?.mock.calls.length,
+			reviveError,
+			holdsMa: tools.some(name => name.startsWith(MA_PREFIX)),
+			mbTools: tools.filter(name => name.startsWith(MB_PREFIX)),
+		}).toEqual({ placedInWorker: 0, reviveError: undefined, holdsMa: true, mbTools: [] });
 	}, 30_000);
 });
 
@@ -649,13 +703,23 @@ describe("a nested child of a live subagent that works in its own directory, the
 	}, 30_000);
 
 	it("worktree child: the cold revive takes the live parent's custom-tool paths, MCP manager and extensions, and no secretsProjectDirs, as the warm revive does", () => {
-		for (const revived of [cold, warm]) {
+		const observed = (revived: RevivedSubagent | undefined) => {
 			const options = revived?.build.options;
-			expect(options?.cwd).toBe(worktree);
-			expect(options?.preloadedCustomToolPaths).toBe(parent?.customToolPaths);
-			expect(options?.mcpManager).toBe(parent?.mcpManager);
-			expect(options?.preloadedPreparedExtensions).toBe(parent?.preparedExtensions);
-			expect(options?.secretsProjectDirs).toBeUndefined();
-		}
+			return {
+				cwd: options?.cwd,
+				parentCustomToolPaths: options?.preloadedCustomToolPaths === parent?.customToolPaths,
+				parentMcpManager: options?.mcpManager === parent?.mcpManager,
+				parentExtensions: options?.preloadedPreparedExtensions === parent?.preparedExtensions,
+				secretsProjectDirs: options?.secretsProjectDirs,
+			};
+		};
+		const expected = {
+			cwd: worktree,
+			parentCustomToolPaths: true,
+			parentMcpManager: true,
+			parentExtensions: true,
+			secretsProjectDirs: undefined,
+		};
+		expect({ cold: observed(cold), warm: observed(warm) }).toEqual({ cold: expected, warm: expected });
 	}, 30_000);
 });

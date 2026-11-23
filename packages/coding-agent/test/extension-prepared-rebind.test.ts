@@ -31,7 +31,11 @@ describe("prepared extension rebinding", () => {
 
 		const parentEventBus = new EventBus();
 		const childEventBus = new EventBus();
-		const parent = await loadExtensions([extensionPath], parentDirectory, parentEventBus);
+		const parent = await loadExtensions(
+			[{ path: extensionPath, scope: "explicit" }],
+			parentDirectory,
+			parentEventBus,
+		);
 		const prepared = parent.preparedExtensions;
 		expect(prepared).toHaveLength(1);
 		expect(Reflect.get(globalThis, counterKey)).toBe(1);

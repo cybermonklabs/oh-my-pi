@@ -14,7 +14,7 @@
  *   worker with synchronous getters (`rpcSync`), since `resolveLocalRoot` reads them synchronously;
  *   a worker-side one reaches main as a snapshot of its current values.
  * - **Prepared extensions** (`"prepared-extension"`): a `PreparedExtension` crosses as its module
- *   path; the receiver re-imports the module on first bind, so the factory runs in the receiving
+ *   path and scope; the receiver re-imports the module on first bind, so the factory runs in the receiving
  *   thread against that thread's `ExtensionAPI`. Model providers such factories register in a
  *   worker are dropped by the worker's model-registry mirror: the parent bound the same prepared
  *   extensions to main's registry, which the mirror follows (see `./auth`).
@@ -27,7 +27,7 @@ import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../../extensibility/custom-tools/types";
 import { importExtensionModule } from "../../extensibility/extensions/loader";
-import type { ExtensionFactory, PreparedExtension } from "../../extensibility/extensions/types";
+import type { ExtensionFactory, ExtensionScope, PreparedExtension } from "../../extensibility/extensions/types";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { MCPManager, type MCPManagerApi, type MCPManagerGlobal, type MCPToolScope } from "../../mcp/manager";
 import type { ExecutorOptions } from "../../task/executor";
@@ -244,6 +244,7 @@ const localProtocolOptionsCodec: RpcCodec<LocalProtocolOptions> = {
 
 interface WirePreparedExtension {
 	readonly path: string;
+	readonly scope: ExtensionScope;
 	readonly resolvedPath: string;
 	readonly error: string | null;
 	readonly loadable: boolean;
@@ -252,12 +253,25 @@ interface WirePreparedExtension {
 /** This thread's import of each extension module, by resolved path. */
 const extensionImports = new Map<string, Promise<PreparedExtension>>();
 
+/** Every extension scope: a wire value's scope is one of these, as a prepared extension's always is. */
+const EXTENSION_SCOPES: Readonly<Record<ExtensionScope, true>> = {
+	project: true,
+	user: true,
+	explicit: true,
+	inline: true,
+};
+
+function isExtensionScope(value: unknown): value is ExtensionScope {
+	return typeof value === "string" && Object.hasOwn(EXTENSION_SCOPES, value);
+}
+
 function isPreparedExtension(value: unknown): value is PreparedExtension {
 	if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) return false;
 	const factory: unknown = Reflect.get(value, "factory");
 	const error: unknown = Reflect.get(value, "error");
 	return (
 		typeof Reflect.get(value, "path") === "string" &&
+		isExtensionScope(Reflect.get(value, "scope")) &&
 		typeof Reflect.get(value, "resolvedPath") === "string" &&
 		(factory === null || typeof factory === "function") &&
 		(error === null || typeof error === "string")
@@ -265,11 +279,11 @@ function isPreparedExtension(value: unknown): value is PreparedExtension {
 }
 
 /** A factory that imports `resolvedPath` in the calling thread on first use and runs its export. */
-function threadLocalFactory(resolvedPath: string): ExtensionFactory {
+function threadLocalFactory(resolvedPath: string, scope: ExtensionScope): ExtensionFactory {
 	return async api => {
 		let pending = extensionImports.get(resolvedPath);
 		if (!pending) {
-			pending = importExtensionModule(resolvedPath, resolvedPath);
+			pending = importExtensionModule({ path: resolvedPath, scope }, resolvedPath);
 			extensionImports.set(resolvedPath, pending);
 		}
 		const prepared = await pending;
@@ -283,6 +297,7 @@ function isWirePreparedExtension(value: unknown): value is WirePreparedExtension
 		typeof value === "object" &&
 		value !== null &&
 		typeof Reflect.get(value, "path") === "string" &&
+		isExtensionScope(Reflect.get(value, "scope")) &&
 		typeof Reflect.get(value, "resolvedPath") === "string" &&
 		typeof Reflect.get(value, "loadable") === "boolean"
 	);
@@ -293,6 +308,7 @@ const preparedExtensionCodec: RpcCodec<PreparedExtension> = {
 	is: isPreparedExtension,
 	encode: prepared => ({
 		path: prepared.path,
+		scope: prepared.scope,
 		resolvedPath: prepared.resolvedPath,
 		error: prepared.error,
 		loadable: prepared.factory !== null,
@@ -301,9 +317,10 @@ const preparedExtensionCodec: RpcCodec<PreparedExtension> = {
 		if (!isWirePreparedExtension(data)) throw new Error("prepared-extension: malformed wire value");
 		return {
 			path: data.path,
+			scope: data.scope,
 			resolvedPath: data.resolvedPath,
 			error: data.error,
-			factory: data.loadable ? threadLocalFactory(data.resolvedPath) : null,
+			factory: data.loadable ? threadLocalFactory(data.resolvedPath, data.scope) : null,
 		};
 	},
 };

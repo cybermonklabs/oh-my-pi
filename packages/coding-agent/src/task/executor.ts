@@ -69,7 +69,7 @@ import { type OverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { PreparedExtension } from "../extensibility/extensions/types";
+import type { ExtensionPathEntry, PreparedExtension } from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionStateApi } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -596,11 +596,11 @@ export interface ExecutorOptions {
 	 */
 	extensionRoots?: () => EffectiveExtensionRoots;
 	/**
-	 * Parent's discovered extension source paths. Forwarded to skip the
+	 * Parent's discovered extension source paths, each with its scope. Forwarded to skip the
 	 * extension FS scan in the subagent; the subagent then re-binds each
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
-	preloadedExtensionPaths?: string[];
+	preloadedExtensionPaths?: ExtensionPathEntry[];
 	/** Parent-imported extension factories rebound to the child runtime. */
 	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	/**

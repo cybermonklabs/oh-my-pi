@@ -36,7 +36,7 @@ import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
+import type { ExtensionPathEntry, ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { CacheWarmer } from "./cache-warmer";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -189,12 +189,12 @@ export interface AgentSessionConfig {
 	 */
 	preparedExtensions?: readonly PreparedExtension[];
 	/**
-	 * Source paths of the parent's loaded extensions. Forwarded alongside
+	 * Source paths of the parent's loaded extensions, each with its scope. Forwarded alongside
 	 * {@link preparedExtensions} as the fallback the child rebinds from when a
 	 * parent construction path produced no prepared factories (mirrors the task
 	 * subagent forward) — keeps the child from building an empty extension set.
 	 */
-	extensionPaths?: readonly string[];
+	extensionPaths?: readonly ExtensionPathEntry[];
 	/** Raw SDK `additionalExtensionPaths`; used when no inherited root provider exists. */
 	additionalExtensionPaths?: readonly string[];
 	/** Mirror of `disableExtensionDiscovery`; used when no inherited root provider exists. */

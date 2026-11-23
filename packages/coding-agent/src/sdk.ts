@@ -117,6 +117,7 @@ import {
 	type ExtensionAgentIdentity,
 	type ExtensionContext,
 	type ExtensionFactory,
+	type ExtensionPathEntry,
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
@@ -780,16 +781,16 @@ export interface CreateAgentSessionOptions {
 	 *
 	 * @internal
 	 */
-	deferredExtensionPaths?: readonly string[];
+	deferredExtensionPaths?: readonly ExtensionPathEntry[];
 	/**
-	 * Pre-discovered extension source paths. When provided, the filesystem-scan
+	 * Pre-discovered extension source paths, each with its scope. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
 	 * `loadExtensions()` itself so each `Extension` is bound to THIS session's
 	 * `ExtensionAPI` (cwd, eventBus, runtime).
 	 *
 	 * Compatibility pass-through for callers that do not have prepared factories.
 	 */
-	preloadedExtensionPaths?: string[];
+	preloadedExtensionPaths?: ExtensionPathEntry[];
 	/**
 	 * Session-independent imported extension factories. Child sessions, including
 	 * restricted children, rebind these to their own ExtensionAPI without
@@ -1183,7 +1184,7 @@ export async function discoverSessionExtensionPaths(
 	options: ExtensionDiscoveryOptions,
 	cwd: string,
 	settings: Settings,
-): Promise<string[]> {
+): Promise<ExtensionPathEntry[]> {
 	const roots = options.extensionRoots?.();
 	const explicit = roots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const explicitOnly = roots ? roots.mode === "explicit-only" : options.disableExtensionDiscovery;
@@ -1196,6 +1197,17 @@ export async function discoverSessionExtensionPaths(
 		includeAmbientHooks: options.includeAmbientHooks,
 		level: options.level,
 	});
+}
+
+/**
+ * The source entries of the file-backed extensions `result` bound, each at the scope it was imported with: what a
+ * session forwards to its children. Inline factories (`<inline-N>`) are per-session and left out.
+ */
+function boundExtensionPaths(result: LoadExtensionsResult): ExtensionPathEntry[] {
+	const bound = new Set(result.extensions.map(extension => extension.resolvedPath));
+	return (result.preparedExtensions ?? [])
+		.filter(prepared => prepared.scope !== "inline" && bound.has(prepared.resolvedPath))
+		.map(prepared => ({ path: prepared.resolvedPath, scope: prepared.scope }));
 }
 
 /**
@@ -1217,7 +1229,7 @@ export async function loadSessionExtensions(
 	settings: Settings,
 	eventBus: EventBus,
 	loadOptions: { deferStartupSafe?: boolean } = {},
-): Promise<LoadExtensionsResult & { deferredPaths: string[] }> {
+): Promise<LoadExtensionsResult & { deferredPaths: ExtensionPathEntry[] }> {
 	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
 	const storage = settings.getStorage();
 	const { eager, deferred } =
@@ -3012,7 +3024,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		//   4. No preload: run the full session discovery.
 		// `disableExtensionDiscovery` is honored implicitly: a caller that set
 		// the flag and pre-resolved the result already reflects that choice.
-		let extensionPaths: string[];
+		let extensionPaths: ExtensionPathEntry[];
 		let extensionsResult: LoadExtensionsResult;
 		if (!restrictToolNames && options.preloadedExtensions) {
 			extensionsResult = {
@@ -3020,16 +3032,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				extensions: [...options.preloadedExtensions.extensions],
 				preparedExtensions: options.preloadedExtensions.preparedExtensions?.slice(),
 			};
-			// Capture paths for downstream forwarding; filter inline-factory
-			// entries (`<inline-N>`) — those are per-session, not source paths.
-			extensionPaths = extensionsResult.extensions
-				.map(ext => ext.resolvedPath)
-				.filter(p => !p.startsWith("<inline"));
+			// Capture paths for downstream forwarding; inline-factory entries
+			// (`<inline-N>`) are per-session, not source paths.
+			extensionPaths = boundExtensionPaths(extensionsResult);
 		} else if (restrictToolNames || options.preloadedPreparedExtensions) {
 			// Restricted children retain parent hooks, not ambient discovery, new
 			// extension inputs, or parent-bound instances. Tool admission stays clamped.
 			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
-			extensionPaths = preparedExtensions.map(prepared => prepared.path);
+			extensionPaths = preparedExtensions.map(prepared => ({ path: prepared.path, scope: prepared.scope }));
 			extensionsResult = await logger.time(
 				"bindPreparedExtensions",
 				bindPreparedExtensions,
@@ -3085,6 +3095,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					extensionsResult.preparedExtensions ??= [];
 					extensionsResult.preparedExtensions.push({
 						path: sourceId,
+						scope: "inline",
 						resolvedPath: sourceId,
 						factory,
 						error: null,
@@ -5453,8 +5464,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					discoverExtensionPaths([...roots.explicit, ...seenConfiguredExtensions], cwdNow, []),
 					discoverSessionExtensionPaths({ extensionRoots: () => roots }, cwdNow, settings),
 				]);
-				const governed = new Set(governedPaths.map(extensionPath => resolvePath(extensionPath, cwdNow)));
-				const enabled = new Set(enabledPaths.map(extensionPath => resolvePath(extensionPath, cwdNow)));
+				const governed = new Set(governedPaths.map(entry => resolvePath(entry.path, cwdNow)));
+				const enabled = new Set(enabledPaths.map(entry => resolvePath(entry.path, cwdNow)));
 				const { suspended, resumed } = extensionRunner.setSuspendedExtensions(
 					extension => governed.has(extension.resolvedPath) && !enabled.has(extension.resolvedPath),
 				);
@@ -5941,7 +5952,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.registerProvider(name, config, sourceId);
 				}
 				forwardedPreparedExtensions.push(...(loaded.preparedExtensions ?? []));
-				extensionPaths.push(...loaded.extensions.map(extension => extension.resolvedPath));
+				extensionPaths.push(...boundExtensionPaths(loaded));
 				await extensionRunner.addExtensions(loaded.extensions);
 			});
 		}

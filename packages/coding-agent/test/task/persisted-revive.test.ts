@@ -369,6 +369,7 @@ describe("persisted subagent revival", () => {
 		const preparedExtensions: PreparedExtension[] = [
 			{
 				path: "<owner-policy>",
+				scope: "inline",
 				resolvedPath: "<owner-policy>",
 				factory: pi => {
 					pi.registerTool({

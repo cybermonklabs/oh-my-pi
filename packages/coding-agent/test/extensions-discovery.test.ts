@@ -246,9 +246,8 @@ describe("extensions discovery", () => {
 		const permissionError = Object.assign(new Error("permission denied"), { code: "EACCES" });
 		const readdirSpy = vi.spyOn(fsPromises, "readdir").mockRejectedValueOnce(permissionError);
 		try {
-			await expect(
-				discoverExtensionPaths([packageDir], tempDir.path(), undefined, { ambient: false }),
-			).resolves.toEqual([path.join(sourceDir, "main.ts")]);
+			const entries = await discoverExtensionPaths([packageDir], tempDir.path(), undefined, { ambient: false });
+			expect(entries.map(entry => entry.path)).toEqual([path.join(sourceDir, "main.ts")]);
 		} finally {
 			readdirSpy.mockRestore();
 		}
@@ -695,10 +694,11 @@ describe("extensions discovery", () => {
 		const nativeExtensionPath = path.join(extensionsDir, "provider.ts");
 		fs.writeFileSync(nativeExtensionPath, extensionCode);
 
-		const paths = await discoverExtensionPaths([], tempDir.path(), undefined, {
+		const entries = await discoverExtensionPaths([], tempDir.path(), undefined, {
 			ambient: true,
 			includeAmbientHooks: false,
 		});
+		const paths = entries.map(entry => entry.path);
 
 		expect(paths).toContain(nativeExtensionPath);
 		expect(paths).not.toContain(hookPath);
@@ -744,7 +744,7 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(explicitPath, extensionCodeWithTool("explicit"));
 
 		// Use loadExtensions directly to skip discovery
-		const result = await loadExtensions([explicitPath], tempDir.path());
+		const result = await loadExtensions([{ path: explicitPath, scope: "explicit" }], tempDir.path());
 
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(1);

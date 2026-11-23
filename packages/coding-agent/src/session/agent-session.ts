@@ -151,6 +151,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type {
 	ExtensionCommandContext,
+	ExtensionPathEntry,
 	ExtensionRunner,
 	ExtensionUIContext,
 	PreparedExtension,
@@ -1047,10 +1048,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/** Source paths of the parent's loaded extensions; forwarded to `/tan` forks as the prepared-extension fallback. */
-	readonly #extensionPaths: readonly string[] | undefined;
+	readonly #extensionPaths: readonly ExtensionPathEntry[] | undefined;
 
-	/** Source paths of loaded extensions, forwarded to child sessions when prepared factories are unavailable. */
-	get extensionPaths(): readonly string[] | undefined {
+	/** Source entries of loaded extensions, forwarded to child sessions when prepared factories are unavailable. */
+	get extensionPaths(): readonly ExtensionPathEntry[] | undefined {
 		return this.#extensionPaths;
 	}
 

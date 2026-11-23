@@ -133,7 +133,7 @@ it.each([
 				authStorage,
 				modelRegistry,
 				preloadedPreparedExtensions: [
-					{ path: "<inline-0>", resolvedPath: "<inline-0>", factory: slowStart, error: null },
+					{ path: "<inline-0>", scope: "inline", resolvedPath: "<inline-0>", factory: slowStart, error: null },
 				],
 				settings,
 				enableLsp: false,

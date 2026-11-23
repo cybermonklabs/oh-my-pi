@@ -47,7 +47,9 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
+	ExtensionPathEntry,
 	ExtensionRuntime as IExtensionRuntime,
+	ExtensionScope,
 	LoadExtensionsResult,
 	MessageRenderer,
 	PreparedExtension,
@@ -493,8 +495,12 @@ async function runExtensionFactory(
 	}
 }
 
-/** Import one extension module and resolve its factory without binding it to a session. */
-export async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
+/**
+ * Import one extension module and resolve its factory without binding it to a session. The prepared extension keeps
+ * `entry`'s path and scope.
+ */
+export async function importExtensionModule(entry: ExtensionPathEntry, cwd: string): Promise<PreparedExtension> {
+	const { path: extensionPath, scope } = entry;
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
@@ -503,16 +509,23 @@ export async function importExtensionModule(extensionPath: string, cwd: string):
 		if (typeof factory !== "function") {
 			return {
 				path: extensionPath,
+				scope,
 				factory: null,
 				resolvedPath,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
 			};
 		}
 
-		return { path: extensionPath, factory, resolvedPath, error: null };
+		return { path: extensionPath, scope, factory, resolvedPath, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
+		return {
+			path: extensionPath,
+			scope,
+			factory: null,
+			resolvedPath,
+			error: `Failed to load extension: ${message}`,
+		};
 	}
 }
 
@@ -556,7 +569,7 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from paths.
+ * Load extensions from path entries; each prepared extension keeps its entry's scope.
  *
  * Module import (the dominant cold-start cost — file I/O plus module
  * evaluation) runs concurrently across extensions; factory binding then runs
@@ -564,12 +577,12 @@ export async function loadExtensionFromFactory(
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
 export async function loadExtensions(
-	paths: string[],
+	entries: readonly ExtensionPathEntry[],
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
 ): Promise<LoadExtensionsResult> {
-	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+	const preparedExtensions = await Promise.all(entries.map(entry => importExtensionModule(entry, cwd)));
 	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime);
 }
 
@@ -706,10 +719,10 @@ export async function listPackageExtensionModules(
 }
 
 /**
- * Discover absolute paths of extensions to load, without importing or
- * binding factories. Hot path on session startup — the scan walks native
- * `.omp`/`.pi` extension capabilities, JS/TS hook factories, the
- * installed-plugin tree, and any configured paths.
+ * Discover the extensions to load, each as its path and the scope it was found
+ * at, without importing or binding factories. Hot path on session startup — the
+ * scan walks native `.omp`/`.pi` extension capabilities, JS/TS hook factories,
+ * the installed-plugin tree, and any configured paths.
  *
  * The root session imports these paths once and forwards prepared factories to
  * subagents. Each child rebinds fresh Extension instances to its OWN
@@ -721,8 +734,8 @@ export interface DiscoverExtensionPathOptions {
 	/** Include ambient hook factories. Disable for read-only catalog commands. */
 	includeAmbientHooks?: boolean;
 	/**
-	 * `"project"`: only the project-level entries (native modules and hooks of the project, plugins of project scope),
-	 * and of those only the ones no user-level, plugin or configured entry also names.
+	 * `"project"`: only a project's own entries (native modules and hooks of the project, plugins of project scope),
+	 * without those also found at user level. Configured paths are not read: they are never a project's own.
 	 */
 	level?: "project";
 }
@@ -737,52 +750,31 @@ export async function extensionPathKey(extPath: string): Promise<string> {
 	return fs.realpath(resolved).catch(() => resolved);
 }
 
-/**
- * The keys of the extensions discovery found, in this process, at project level (a project's native module or hook,
- * a plugin of project scope) and at any other level (user, plugin, configured). Each path a discovery returns keeps
- * its scope here, so a session's forwarded lists and the prepared extensions imported from them carry it by path.
- */
-const projectLevelKeys = new Set<string>();
-const otherLevelKeys = new Set<string>();
-
-/**
- * Whether `extPath` is a project's own extension: discovery found it at project level and never at another, so a
- * file that is also a user, plugin or configured entry is not.
- */
-export async function isProjectExtension(extPath: string): Promise<boolean> {
-	const key = await extensionPathKey(extPath);
-	return projectLevelKeys.has(key) && !otherLevelKeys.has(key);
-}
-
 export async function discoverExtensionPaths(
 	configuredPaths: string[],
 	cwd: string,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
-): Promise<string[]> {
-	const entries: Array<{ path: string; key: string }> = [];
-	const seen = new Set<string>();
-	/** Keys of the entries found at project level, and of those found at any other level. */
-	const projectKeys = new Set<string>();
-	const otherKeys = new Set<string>();
+): Promise<ExtensionPathEntry[]> {
+	const entries: ExtensionPathEntry[] = [];
+	/** Each entry by its key, so a file found again keeps the one entry. */
+	const byKey = new Map<string, ExtensionPathEntry>();
+	const configured = options.level === "project" ? [] : configuredPaths;
 	const disabled = new Set(disabledExtensionIds ?? []);
 	const loadOptions = disabledExtensionIds ? { cwd, disabledExtensions: disabledExtensionIds } : { cwd };
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
-	const addPath = async (extPath: string, level: "user" | "project"): Promise<void> => {
+	const addPath = async (extPath: string, scope: ExtensionScope): Promise<void> => {
 		const key = await extensionPathKey(extPath);
-		(level === "project" ? projectKeys : otherKeys).add(key);
-		if (!seen.has(key)) {
-			seen.add(key);
-			entries.push({ path: extPath, key });
-		}
-	};
-
-	const addPaths = async (paths: string[]): Promise<void> => {
-		for (const extPath of paths) {
-			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
-			await addPath(extPath, "user");
+		const found = byKey.get(key);
+		if (!found) {
+			const entry = { path: extPath, scope };
+			byKey.set(key, entry);
+			entries.push(entry);
+		} else if (found.scope === "project") {
+			// A file found at project level and at another level is not a project's own.
+			found.scope = scope;
 		}
 	};
 
@@ -815,25 +807,27 @@ export async function discoverExtensionPaths(
 			}
 		}
 	} else {
-		for (const configuredPath of configuredPaths) {
-			await addPaths(await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd)));
+		for (const configuredPath of configured) {
+			for (const hookPath of await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd))) {
+				if (isDisabledName(getExtensionNameFromPath(hookPath))) continue;
+				await addPath(hookPath, "explicit");
+			}
 		}
 	}
 
-	// 3–4. Installed-plugin entries (ambient only), then explicitly configured
-	// paths. Configured file paths bypass the disabled-name filter.
-	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: ambient })) {
+	// 3. Installed-plugin entries (ambient only), at their plugin's scope.
+	for (const module of await listPackageExtensionModules([], cwd, { plugins: ambient })) {
 		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
 		await addPath(module.path, module.level);
 	}
+	// 4. Explicitly configured paths, never a project's own whatever level their setting came from. Configured file
+	// paths bypass the disabled-name filter.
+	for (const module of await listPackageExtensionModules(configured, cwd, { plugins: false })) {
+		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
+		await addPath(module.path, "explicit");
+	}
 
-	for (const key of projectKeys) projectLevelKeys.add(key);
-	for (const key of otherKeys) otherLevelKeys.add(key);
-	const kept =
-		options.level === "project"
-			? entries.filter(entry => projectKeys.has(entry.key) && !otherKeys.has(entry.key))
-			: entries;
-	return kept.map(entry => entry.path);
+	return options.level === "project" ? entries.filter(entry => entry.scope === "project") : entries;
 }
 
 /**

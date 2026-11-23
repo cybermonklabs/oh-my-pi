@@ -16,7 +16,8 @@ import { formatModelRoleAlias } from "../config/model-roles";
 import type { KeptOverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import { extensionPathKey, importExtensionModule, isProjectExtension } from "../extensibility/extensions/loader";
+import { extensionPathKey, importExtensionModule } from "../extensibility/extensions/loader";
+import type { ExtensionPathEntry } from "../extensibility/extensions/types";
 import { MCPManager } from "../mcp/manager";
 import unavailableCustomToolsPrompt from "../prompts/system/unavailable-custom-tools.md" with { type: "text" };
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
@@ -740,9 +741,10 @@ async function coldReviveLiveInputs(
 /**
  * `live` with its extensions moved to `storedCwd`, the stored session's cwd: of the prepared extensions and the
  * extension paths, each but the project-scoped ones of the session they came from (whatever directory that session
- * found them in), after the project-level extensions of `storedCwd`, found under `roots`, the owner's extension
- * roots, as a session's own discovery finds them, and each prepared there. A host's inline entry and a user, plugin
- * or configured entry stay; an entry both lists hold is bound once.
+ * found them in), after the project-scoped extensions of `storedCwd`, found under `roots`, the owner's extension
+ * roots, as a session's own discovery finds them, and each prepared there. A host's inline entry and a user,
+ * plugin or explicit entry stay; a file the kept entries hold is not added again, so it is bound once, at the scope
+ * the session it came from gave it.
  */
 async function storedDirectoryExtensions(
 	live: ColdReviveLiveInputs,
@@ -756,18 +758,21 @@ async function storedDirectoryExtensions(
 		storedCwd,
 		live.settingsParent,
 	);
-	const added = new Set(await Promise.all(project.map(extensionPathKey)));
-	const stays = async (file: string): Promise<boolean> =>
-		!added.has(await extensionPathKey(file)) && !(await isProjectExtension(file));
+	const projectKeys = await Promise.all(project.map(entry => extensionPathKey(entry.path)));
+	const notHeldBy = async (keptFiles: readonly string[]): Promise<ExtensionPathEntry[]> => {
+		const held = new Set(await Promise.all(keptFiles.map(extensionPathKey)));
+		return project.filter((_, index) => !held.has(projectKeys[index]));
+	};
 	const moved: ColdReviveLiveInputs = { ...live };
 	if (preparedExtensions) {
-		const kept = await Promise.all(preparedExtensions.map(entry => stays(entry.resolvedPath)));
-		const imported = await Promise.all(project.map(file => importExtensionModule(file, storedCwd)));
-		moved.preloadedPreparedExtensions = [...imported, ...preparedExtensions.filter((_, index) => kept[index])];
+		const kept = preparedExtensions.filter(entry => entry.scope !== "project");
+		const added = await notHeldBy(kept.map(entry => entry.resolvedPath));
+		const imported = await Promise.all(added.map(entry => importExtensionModule(entry, storedCwd)));
+		moved.preloadedPreparedExtensions = [...imported, ...kept];
 	}
 	if (extensionPaths) {
-		const kept = await Promise.all(extensionPaths.map(stays));
-		moved.preloadedExtensionPaths = [...project, ...extensionPaths.filter((_, index) => kept[index])];
+		const kept = extensionPaths.filter(entry => entry.scope !== "project");
+		moved.preloadedExtensionPaths = [...(await notHeldBy(kept.map(entry => entry.path))), ...kept];
 	}
 	return moved;
 }
