@@ -6,9 +6,13 @@
 #   - the pi-shell set, each test binary in a libtest process of its own at --test-threads=4 with
 #     the hang bound, over 4 shards per user; the lib binary's run is also the one-process lib row;
 #   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml;
+#   - the control of the host's map limit: the lib's testkit::suites::orphan_jobs module at 4
+#     threads, after the lib in the shard that holds it (it died of SIGSEGV at the runner's default
+#     vm.max_map_count);
 # each as uid 1000 and as root: one job per (user, set shard) and per (user, pi-builtins).
 #
-# How. Each job installs gVisor's runsc from a pinned release (gvisor-host.sh), registers it with
+# How. Each job raises the host's vm.max_map_count (gvisor-host.sh says why), installs gVisor's
+# runsc from a pinned release, registers it with
 # Docker on the systrap platform (no KVM needed), proves a runsc container runs on gVisor's kernel
 # (its dmesg banner, with runc as the control), and builds the test image sc-gv: ubuntu 24.04 (the
 # gate kit's image), the packages the tests call, the reference tools of the tools job at /, the

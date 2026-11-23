@@ -17,6 +17,15 @@ GV_SHA256=4eb0475337f119ae7411c1d99d3acd727f1278a0286a244dee8dac91c6db5355
 # ubuntu 24.04, the image the gate kit's gVisor Jobs ran (jobs-final/itrun-gvisor.yaml).
 UBUNTU=docker.io/library/ubuntu@sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec
 
+# The host's map limit. Under runsc, test threads that grow glibc arenas take one host mapping per
+# 4 KiB page, and the runner's vm.max_map_count of 262144 runs out: the pi-shell lib died of SIGSEGV
+# (exit 139) in every gVisor row. Measured: 262144 and 65530 die 5 of 5 times, 1048576 none of 5,
+# and the whole lib at 4 threads passes with 1048576 (run 45286380282). The orphan_jobs control row
+# (gvisor-run.sh) is the case that died.
+sudo sysctl -q -w vm.max_map_count=1048576
+[ "$(sysctl -n vm.max_map_count)" -ge 1048576 ] || fail "vm.max_map_count is $(sysctl -n vm.max_map_count), not 1048576 or more"
+echo "HOST $(sysctl vm.max_map_count)"
+
 d=$(mktemp -d)
 url=https://storage.googleapis.com/gvisor/releases/release/$GV_RELEASE/x86_64/gvisor.tar.zstd
 echo "STEP curl -fsSL -o gvisor.tar.zstd $url"

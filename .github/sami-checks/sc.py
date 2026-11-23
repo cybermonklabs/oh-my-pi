@@ -117,6 +117,8 @@ ROWS = (
     ("pi-shell lib, one process, 4 threads, gVisor (root)", "gv-lib4-root"),
     ("pi-builtins, nextest default profile, gVisor (uid 1000)", "gv-builtins-uid1000"),
     ("pi-builtins, nextest default profile, gVisor (root)", "gv-builtins-root"),
+    ("pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (uid 1000)", "gv-orphan-uid1000"),
+    ("pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (root)", "gv-orphan-root"),
 )
 
 
@@ -610,8 +612,9 @@ def expected_units(build_dir):
             exp += [(f"gv-set-{who}", ident, who) for ident, _ in bins]
             if any(i == PI_SHELL for i, _ in bins):
                 exp.append((f"gv-lib4-{who}", PI_SHELL, who))
+                exp.append((f"gv-orphan-{who}", "testkit::suites::orphan_jobs", who))
     else:
-        for key in ["set-runner", "set-root", "lib4"] + [f"gv-{r}-{w}" for r in ("set", "lib4") for w in GV_WHO]:
+        for key in ["set-runner", "set-root", "lib4"] + [f"gv-{r}-{w}" for r in ("set", "lib4", "orphan") for w in GV_WHO]:
             notes[key] = "the build gave no binary list, so the set could not run"
     for who in SET_WHO:
         exp.append(("builtins", "pi-builtins", who))
@@ -1242,7 +1245,10 @@ def selftest():
           {m["shard"] for m in gvisor_matrix() if m["part"] == "set" and m["who"] == "root"})
     check("the gVisor rows expect both users", {("gv-builtins-uid1000", "pi-builtins", "uid1000"), ("gv-lib4-root", "pi-shell", "root"),
                                                 ("gv-set-root", "pi-shell::zle_pty", "root")} <= set(exp), True)
-    gv_silent = [("gv-builtins-root", "pi-builtins", "root"), ("gv-set-uid1000", "pi-shell", "uid1000"), ("gv-lib4-uid1000", "pi-shell", "uid1000")]
+    check("the map-limit control row is expected for both users", {("gv-orphan-uid1000", "testkit::suites::orphan_jobs", "uid1000"),
+                                                                   ("gv-orphan-root", "testkit::suites::orphan_jobs", "root")} <= set(exp), True)
+    gv_silent = [("gv-builtins-root", "pi-builtins", "root"), ("gv-set-uid1000", "pi-shell", "uid1000"), ("gv-lib4-uid1000", "pi-shell", "uid1000"),
+                 ("gv-orphan-uid1000", "testkit::suites::orphan_jobs", "uid1000")]
     for k in gv_silent:
         if k in paths:
             os.rename(paths[k], paths[k] + ".planted")
@@ -1251,6 +1257,7 @@ def selftest():
     check("a silent gVisor builtins job reads UNKNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("a silent gVisor builtins job is named", "`pi-builtins` (root): UNKNOWN: no result" in out, True)
     check("a silent gVisor set shard reads UNKNOWN", "| pi-shell set, gVisor (uid 1000) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("its control row reads UNKNOWN", "| pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (uid 1000) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("its lib row reads UNKNOWN", "| pi-shell lib, one process, 4 threads, gVisor (uid 1000) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("the other gVisor rows pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** | 1 / 0 / 0 / 0 |" in out
           and "| pi-shell set, gVisor (root) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)

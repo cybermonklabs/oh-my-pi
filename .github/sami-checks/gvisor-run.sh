@@ -65,6 +65,16 @@ if [ "$part" = set ]; then
 		echo "BIN $ident $who exit=$rc ${secs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], "gVisor-environment", len(r["environment"]), r["note"])' "$res/$safe.json")"
 		if [ "$ident" = pi-shell ]; then
 			python3 "$tool/sc.py" gv-libtest "$log" "$rc" "$secs" "gv-lib4-$who" "$ident" "$who" > "$res/gv-lib4.json"
+			# The control of the host's map limit (gvisor-host.sh): the orphan_jobs module at 4 threads
+			# died of SIGSEGV under the runner's default vm.max_map_count, and must pass here.
+			olog=$res/logs/gv-orphan.log
+			s=$(date +%s.%N)
+			(cd "$SC_TREE/crates/pi-shell" && "${as[@]}" env -i "${envv[@]}" CARGO_PKG_NAME=pi-shell CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell" \
+				timeout --verbose -k 10 600 "$bin" -Z unstable-options --format json --report-time --show-output --test-threads=4 testkit::suites::orphan_jobs) > "$olog" 2>&1 < /dev/null
+			orc=$?
+			osecs=$(python3 -c "import time; print(f'{time.time() - $s:.1f}')")
+			python3 "$tool/sc.py" gv-libtest "$olog" "$orc" "$osecs" "gv-orphan-$who" testkit::suites::orphan_jobs "$who" > "$res/gv-orphan.json"
+			echo "CONTROL orphan_jobs $who exit=$orc ${osecs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], r["note"])' "$res/gv-orphan.json")"
 		fi
 	done < /scratch/shard.tsv
 	echo "SHARD $who $shard done: $n binaries"
