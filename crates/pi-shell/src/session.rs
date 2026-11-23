@@ -2906,8 +2906,8 @@ mod tests {
 			Ok(Ok(got)) => got,
 			Ok(Err(panicked)) => std::panic::resume_unwind(panicked),
 			Err(ended) => panic!(
-				"the runs through the tee did not end within {:?} ({ended}): a write blocked the \
-				 shell's thread",
+				"the runs through the tee did not end within {:?} ({ended}); likely a write blocking \
+				 the shell's thread",
 				2 * STUCK
 			),
 		}
