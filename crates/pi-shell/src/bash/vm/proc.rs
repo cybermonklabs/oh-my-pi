@@ -855,7 +855,12 @@ pub enum FrameKind {
 		autoload: bool,
 	},
 	/// The code of a child vproc: `SubExit`/`End` exits the vproc.
-	Subshell,
+	Subshell {
+		/// A background job's or pipeline stage's child: what bash's fork
+		/// for it would know ([`Fork`]). `None` for a `( … )`, coprocess or
+		/// substitution child. Held in the variant, where it costs no size.
+		fork: Option<Fork>,
+	},
 	/// `${ cmd; }` / `${| cmd; }` run in the current shell: `SubExit` pops.
 	NoFork,
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
@@ -869,6 +874,24 @@ pub enum FrameKind {
 		/// Where the job ends.
 		stop_at: u32,
 	},
+}
+
+/// A background job's or pipeline stage's child, as the spawn left it
+/// ([`FrameKind::Subshell`]): read in O(1) where bash's `stdin_redir`
+/// rules ask which command its fork runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fork {
+	/// The op the command bash's fork runs starts at: the body's first op,
+	/// past a job's `time` and past the substitution bodies the command's
+	/// words and redirections are lowered ahead of it
+	/// ([`super::exec::command_start`]).
+	pub cmd:   u32,
+	/// The stage reads a pipe (a pipeline stage after the first).
+	pub piped: bool,
+	/// bash: the job is a lone simple command whose `/dev/null` is still
+	/// to come on fd 0, after its words are expanded
+	/// ([`super::exec::deferred_job_null`]).
+	pub null:  bool,
 }
 
 /// Parser state a [`FrameKind::Script`] keeps between its commands.

@@ -8,8 +8,14 @@
 //! compound command run in the shell redirected stdin, or the job runs in a
 //! `( … )`, coprocess or pipeline stage fed by its own input. A script
 //! file's reader clears it before each command; a `-c` string never does.
+//! A lone simple command's `/dev/null` comes after its words are expanded,
+//! so their substitutions read the shell's stdin.
 //! zsh (`entersubsh`): without MONITOR, only a terminal on fd 0 becomes
-//! `/dev/null`, for a job and for a `<( … )`.
+//! `/dev/null` for a job. zsh does the same for a `<( … )`; pi-shell does
+//! not (zsh mode on a terminal is outside this change): a stated
+//! difference, [`a_zsh_process_substitution_keeps_a_terminal`].
+//!
+//! Rows that read `/proc/self/fd/0` or name `/dev/pts` run on Linux only.
 //!
 //! Each row runs in a fresh directory holding `in` ("file"): as `-c`
 //! (`c`), from a script file (`s`), on a terminal that is not the
@@ -33,6 +39,7 @@ use std::{
 };
 
 use obash_support::{LIMIT, finish, obash};
+#[cfg(target_os = "linux")]
 use pi_shell::{Shell, ShellRunOptions, cancel::CancelToken};
 
 /// Id, mode, script, status, stdout.
@@ -178,6 +185,10 @@ const BASH: &[Row] = &[
 	("stage2-group-out", 's', "echo piped | { { :; } >/dev/null; cat & wait; }", 0, ""),
 	("stage1-group", 'c', "{ cat & wait; } | cat", 0, ""),
 	("stage1-group", 's', "{ cat & wait; } | cat", 0, ""),
+	("stage1-subshell", 'c', "( cat & wait ) | cat", 0, ""),
+	("stage1-subshell", 's', "( cat & wait ) | cat", 0, ""),
+	("stage1-subshell-sticky", 'c', "{ :; } </dev/stdin; ( cat & wait ) | cat", 0, ""),
+	("stage1-subshell-sticky", 's', "{ :; } </dev/stdin; ( cat & wait ) | cat", 0, ""),
 	("stage1-fn", 'c', "f() { cat & wait; }; f | cat", 0, ""),
 	("stage1-fn", 's', "f() { cat & wait; }; f | cat", 0, ""),
 	("lastpipe", 'c', "shopt -s lastpipe; echo piped | { cat & wait; }", 0, ""),
@@ -282,8 +293,11 @@ const BASH: &[Row] = &[
 	("t-monitor-on", 't', "set -m; readlink /proc/self/fd/0 & wait", 0, "/dev/pts/N\n"),
 	("t-nomonitor-zsh", 't', "setopt nomonitor; readlink /proc/self/fd/0 & wait", 0, "/dev/null\n"),
 	("t-disown-zsh", 't', "readlink /proc/self/fd/0 &! sleep 0.3", 1, "/dev/null\n"),
-	("t-write-0", 't', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
+	("t-write-0", 't', "echo x >&0 & wait $!; echo s=$?", 0, "s=1\n"),
+	("t-write-0-ext", 't', "sh -c 'echo x >&0 2>/dev/null; echo s=$?' & wait", 0, "s=1\n"),
 	("t-procsub", 't', "cat <(readlink /proc/self/fd/0)", 0, "/dev/pts/N\n"),
+	("t-procsub-bg", 't', "cat <(readlink /proc/self/fd/0) & wait", 0, "/dev/pts/N\n"),
+	("t-procsub-bg-group", 't', "{ cat <(readlink /proc/self/fd/0); } & wait", 0, "/dev/null\n"),
 	("t-comsub-plain", 't', "echo \"[$(readlink /proc/self/fd/0)]\"", 0, "[/dev/pts/N]\n"),
 	(
 		"t-time-pipeline",
@@ -310,8 +324,52 @@ const BASH: &[Row] = &[
 	("close-3", 's', "cat 3<&- & wait", 0, ""),
 	("heredoc-dash-3", 'c', "cat 3<<-E &\n\tx\n\tE\nwait", 0, "hi\n"),
 	("heredoc-dash-3", 's', "cat 3<<-E &\n\tx\n\tE\nwait", 0, "hi\n"),
-	("write-0", 'c', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
-	("write-0", 's', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
+	("write-0", 'c', "echo x >&0 & wait $!; echo s=$?", 0, "s=1\n"),
+	("write-0", 's', "echo x >&0 & wait $!; echo s=$?", 0, "s=1\n"),
+	("procsub-word-bg", 'c', "cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-bg", 's', "cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-bg-group", 'c', "{ cat <(cat); } & wait", 0, ""),
+	("procsub-word-bg-group", 's', "{ cat <(cat); } & wait", 0, ""),
+	("procsub-word-andor", 'c', "cat <(cat) && true & wait", 0, ""),
+	("procsub-word-andor", 's', "cat <(cat) && true & wait", 0, ""),
+	("procsub-word-time", 'c', "TIMEFORMAT=; time cat <(cat) & wait", 0, ""),
+	("procsub-word-time", 's', "TIMEFORMAT=; time cat <(cat) & wait", 0, ""),
+	("procsub-word-not", 'c', "! cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-not", 's', "! cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-func", 'c', "f() { cat \"$1\"; }; f <(cat) & wait", 0, "hi\n"),
+	("procsub-word-func", 's', "f() { cat \"$1\"; }; f <(cat) & wait", 0, "hi\n"),
+	(
+		"procsub-word-builtin",
+		'c',
+		"read x < <(echo y); mapfile -t a < <(echo z); cat <(cat) 3>/dev/null & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"procsub-word-builtin",
+		's',
+		"read x < <(echo y); mapfile -t a < <(echo z); cat <(cat) 3>/dev/null & wait",
+		0,
+		"hi\n",
+	),
+	("comsub-word-bg", 'c', "echo \"[$(cat)]\" & wait", 0, "[hi]\n"),
+	("comsub-word-bg", 's', "echo \"[$(cat)]\" & wait", 0, "[hi]\n"),
+	("comsub-assign-bg", 'c', "x=$(cat) sh -c 'echo \"[$x]\"' & wait", 0, "[hi]\n"),
+	("comsub-assign-bg", 's', "x=$(cat) sh -c 'echo \"[$x]\"' & wait", 0, "[hi]\n"),
+	("comsub-redir-word-bg", 'c', "cat >\"$(cat)\" & wait; ls", 0, "in\n"),
+	("comsub-redir-word-bg", 's', "cat >\"$(cat)\" & wait; ls", 0, "in\ns.sh\n"),
+	("procsub-then-null", 'c', "cat <(cat) - & wait", 0, "hi\n"),
+	("procsub-then-null", 's', "cat <(cat) - & wait", 0, "hi\n"),
+	("procsub-own-in", 'c', "cat <(:) - <&0 & wait", 0, "hi\n"),
+	("procsub-own-in", 's', "cat <(:) - <&0 & wait", 0, "hi\n"),
+	("group-own-procsub-in", 'c', "{ cat; } < <(cat) & wait", 0, "hi\n"),
+	("group-own-procsub-in", 's', "{ cat; } < <(cat) & wait", 0, "hi\n"),
+	("group-procsub-in-job", 'c', "{ cat & wait; } < <(echo x) & wait", 0, ""),
+	("group-procsub-in-job", 's', "{ cat & wait; } < <(echo x) & wait", 0, ""),
+	("stage-subshell-procsub", 'c', "echo x | ( cat & wait ) 3< <(:)", 0, "x\n"),
+	("stage-subshell-procsub", 's', "echo x | ( cat & wait ) 3< <(:)", 0, "x\n"),
+	("stage-subshell-procsub-out", 'c', "echo x | ( cat & wait ) 2> >(:)", 0, "x\n"),
+	("stage-subshell-procsub-out", 's', "echo x | ( cat & wait ) 2> >(:)", 0, "x\n"),
 	("write-null-ro", 'c', "exec 4</dev/null; echo y >&4; echo t=$?", 0, "t=1\n"),
 	("write-null-ro", 's', "exec 4</dev/null; echo y >&4; echo t=$?", 0, "t=1\n"),
 	(
@@ -342,6 +400,106 @@ const BASH: &[Row] = &[
 	("redir-fail-sticky", 's', "{ :; } </nonexistent; cat & wait", 0, "hi\n"),
 	("nested-bash", 'c', "bash -c 'cat & wait' </dev/stdin", 0, ""),
 	("nested-bash", 's', "bash -c 'cat & wait' </dev/stdin", 0, ""),
+	(
+		"andor-group-sets",
+		'c',
+		"exec 3<&0; { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-group-sets",
+		's',
+		"exec 3<&0; { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-if-sets",
+		'c',
+		"exec 3<&0; if :; then :; fi <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-if-sets",
+		's',
+		"exec 3<&0; if :; then :; fi <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-or-sets",
+		'c',
+		"exec 3<&0; { false; } <&3 || { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-or-sets",
+		's',
+		"exec 3<&0; { false; } <&3 || { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-out-clears",
+		'c',
+		"exec 3<&0; { :; } >/dev/null && { exec <&3; cat & wait; } & wait",
+		0,
+		"",
+	),
+	(
+		"andor-out-clears",
+		's',
+		"exec 3<&0; { :; } >/dev/null && { exec <&3; cat & wait; } & wait",
+		0,
+		"",
+	),
+	("andor-simple-first", 'c', "exec 3<&0; : <&3 && { exec <&3; cat & wait; } & wait", 0, ""),
+	("andor-simple-first", 's', "exec 3<&0; : <&3 && { exec <&3; cat & wait; } & wait", 0, ""),
+	(
+		"andor-not-first",
+		'c',
+		"exec 3<&0; ! { false; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-not-first",
+		's',
+		"exec 3<&0; ! { false; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-time-first",
+		'c',
+		"exec 3<&0; TIMEFORMAT=; time { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-time-first",
+		's',
+		"exec 3<&0; TIMEFORMAT=; time { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-stage-first",
+		'c',
+		"exec 3<&0; { :; } <&3 | cat && { exec <&3; cat & wait; } & wait",
+		0,
+		"",
+	),
+	(
+		"andor-stage-first",
+		's',
+		"exec 3<&0; { :; } <&3 | cat && { exec <&3; cat & wait; } & wait",
+		0,
+		"",
+	),
 	("j-ext", 'j', "set -m; readlink /proc/self/fd/0 & wait", 0, "/dev/pts/N\n"),
 	("j-subshell-in", 'j', "set -m; ( readlink /proc/self/fd/0 & wait )", 0, "/dev/null\n"),
 	("j-comsub", 'j', "set -m; echo \"[$(readlink /proc/self/fd/0 & wait)]\"", 0, "[/dev/null]\n"),
@@ -501,6 +659,10 @@ const ZSH: &[Row] = &[
 	("stage2-group-out", 's', "echo piped | { { :; } >/dev/null; cat & wait; }", 0, "piped\n"),
 	("stage1-group", 'c', "{ cat & wait; } | cat", 0, "hi\n"),
 	("stage1-group", 's', "{ cat & wait; } | cat", 0, "hi\n"),
+	("stage1-subshell", 'c', "( cat & wait ) | cat", 0, "hi\n"),
+	("stage1-subshell", 's', "( cat & wait ) | cat", 0, "hi\n"),
+	("stage1-subshell-sticky", 'c', "{ :; } </dev/stdin; ( cat & wait ) | cat", 0, "hi\n"),
+	("stage1-subshell-sticky", 's', "{ :; } </dev/stdin; ( cat & wait ) | cat", 0, "hi\n"),
 	("stage1-fn", 'c', "f() { cat & wait; }; f | cat", 0, "hi\n"),
 	("stage1-fn", 's', "f() { cat & wait; }; f | cat", 0, "hi\n"),
 	("lastpipe", 'c', "shopt -s lastpipe; echo piped | { cat & wait; }", 0, "piped\n"),
@@ -605,7 +767,10 @@ const ZSH: &[Row] = &[
 	("t-monitor-on", 't', "set -m; readlink /proc/self/fd/0 & wait", 0, "/dev/pts/N\n"),
 	("t-nomonitor-zsh", 't', "setopt nomonitor; readlink /proc/self/fd/0 & wait", 0, "/dev/null\n"),
 	("t-disown-zsh", 't', "readlink /proc/self/fd/0 &! sleep 0.3", 0, "/dev/null\n"),
-	("t-write-0", 't', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
+	("t-write-0", 't', "echo x >&0 & wait $!; echo s=$?", 0, "s=0\n"),
+	("t-write-0-ext", 't', "sh -c 'echo x >&0 2>/dev/null; echo s=$?' & wait", 0, "s=0\n"),
+	("t-procsub-bg", 't', "cat <(readlink /proc/self/fd/0) & wait", 0, "/dev/null\n"),
+	("t-procsub-bg-group", 't', "{ cat <(readlink /proc/self/fd/0); } & wait", 0, "/dev/null\n"),
 	("t-comsub-plain", 't', "echo \"[$(readlink /proc/self/fd/0)]\"", 0, "[/dev/pts/N]\n"),
 	(
 		"t-time-pipeline",
@@ -632,8 +797,42 @@ const ZSH: &[Row] = &[
 	("close-3", 's', "cat 3<&- & wait", 0, "hi\n"),
 	("heredoc-dash-3", 'c', "cat 3<<-E &\n\tx\n\tE\nwait", 0, "hi\n"),
 	("heredoc-dash-3", 's', "cat 3<<-E &\n\tx\n\tE\nwait", 0, "hi\n"),
-	("write-0", 'c', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
-	("write-0", 's', "echo x >&0 & wait; echo s=$?", 0, "s=0\n"),
+	("write-0", 'c', "echo x >&0 & wait $!; echo s=$?", 0, "s=0\n"),
+	("write-0", 's', "echo x >&0 & wait $!; echo s=$?", 0, "s=0\n"),
+	("procsub-word-bg", 'c', "cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-bg", 's', "cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-bg-group", 'c', "{ cat <(cat); } & wait", 0, "hi\n"),
+	("procsub-word-bg-group", 's', "{ cat <(cat); } & wait", 0, "hi\n"),
+	("procsub-word-andor", 'c', "cat <(cat) && true & wait", 0, "hi\n"),
+	("procsub-word-andor", 's', "cat <(cat) && true & wait", 0, "hi\n"),
+	("procsub-word-time", 'c', "TIMEFORMAT=; time cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-time", 's', "TIMEFORMAT=; time cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-not", 'c', "! cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-not", 's', "! cat <(cat) & wait", 0, "hi\n"),
+	("procsub-word-func", 'c', "f() { cat \"$1\"; }; f <(cat) & wait", 0, "hi\n"),
+	("procsub-word-func", 's', "f() { cat \"$1\"; }; f <(cat) & wait", 0, "hi\n"),
+	(
+		"procsub-word-builtin",
+		'c',
+		"read x < <(echo y); mapfile -t a < <(echo z); cat <(cat) 3>/dev/null & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"procsub-word-builtin",
+		's',
+		"read x < <(echo y); mapfile -t a < <(echo z); cat <(cat) 3>/dev/null & wait",
+		0,
+		"hi\n",
+	),
+	("comsub-word-bg", 'c', "echo \"[$(cat)]\" & wait", 0, "[hi]\n"),
+	("comsub-word-bg", 's', "echo \"[$(cat)]\" & wait", 0, "[hi]\n"),
+	("comsub-assign-bg", 'c', "x=$(cat) sh -c 'echo \"[$x]\"' & wait", 0, "[hi]\n"),
+	("comsub-assign-bg", 's', "x=$(cat) sh -c 'echo \"[$x]\"' & wait", 0, "[hi]\n"),
+	("comsub-redir-word-bg", 'c', "cat >\"$(cat)\" & wait; ls", 0, "hi\nin\n"),
+	("comsub-redir-word-bg", 's', "cat >\"$(cat)\" & wait; ls", 0, "hi\nin\ns.sh\n"),
+	("procsub-then-null", 'c', "cat <(cat) - & wait", 0, "hi\n"),
+	("procsub-then-null", 's', "cat <(cat) - & wait", 0, "hi\n"),
 	("write-null-ro", 'c', "exec 4</dev/null; echo y >&4; echo t=$?", 0, "t=0\n"),
 	("write-null-ro", 's', "exec 4</dev/null; echo y >&4; echo t=$?", 0, "t=0\n"),
 	("procsub-in", 'c', "cat <(cat)", 0, "hi\n"),
@@ -648,6 +847,106 @@ const ZSH: &[Row] = &[
 	("redir-fail-sticky", 's', "{ :; } </nonexistent; cat & wait", 0, "hi\n"),
 	("nested-bash", 'c', "bash -c 'cat & wait' </dev/stdin", 0, ""),
 	("nested-bash", 's', "bash -c 'cat & wait' </dev/stdin", 0, ""),
+	(
+		"andor-group-sets",
+		'c',
+		"exec 3<&0; { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-group-sets",
+		's',
+		"exec 3<&0; { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-if-sets",
+		'c',
+		"exec 3<&0; if :; then :; fi <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-if-sets",
+		's',
+		"exec 3<&0; if :; then :; fi <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-or-sets",
+		'c',
+		"exec 3<&0; { false; } <&3 || { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-or-sets",
+		's',
+		"exec 3<&0; { false; } <&3 || { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-out-clears",
+		'c',
+		"exec 3<&0; { :; } >/dev/null && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-out-clears",
+		's',
+		"exec 3<&0; { :; } >/dev/null && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	("andor-simple-first", 'c', "exec 3<&0; : <&3 && { exec <&3; cat & wait; } & wait", 0, "hi\n"),
+	("andor-simple-first", 's', "exec 3<&0; : <&3 && { exec <&3; cat & wait; } & wait", 0, "hi\n"),
+	(
+		"andor-not-first",
+		'c',
+		"exec 3<&0; ! { false; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-not-first",
+		's',
+		"exec 3<&0; ! { false; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-time-first",
+		'c',
+		"exec 3<&0; TIMEFORMAT=; time { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-time-first",
+		's',
+		"exec 3<&0; TIMEFORMAT=; time { :; } <&3 && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-stage-first",
+		'c',
+		"exec 3<&0; { :; } <&3 | cat && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
+	(
+		"andor-stage-first",
+		's',
+		"exec 3<&0; { :; } <&3 | cat && { exec <&3; cat & wait; } & wait",
+		0,
+		"hi\n",
+	),
 	("j-ext", 'j', "set -m; readlink /proc/self/fd/0 & wait", 0, "/dev/pts/N\n"),
 	("j-subshell-in", 'j', "set -m; ( readlink /proc/self/fd/0 & wait )", 0, "/dev/null\n"),
 	("j-comsub", 'j', "set -m; echo \"[$(readlink /proc/self/fd/0 & wait)]\"", 0, "[/dev/null]\n"),
@@ -773,6 +1072,11 @@ fn run(dialect: &str, mode: char, script: &str) -> io::Result<(Option<i32>, Stri
 	Ok((out.status.code(), clean(&out.stdout)))
 }
 
+/// A row that reads Linux's `/proc` or names its terminals (`/dev/pts`).
+fn linux_only(&(_, _, script, _, stdout): &Row) -> bool {
+	script.contains("/proc/") || stdout.contains("/dev/pts/")
+}
+
 /// The row's failure, if it has one.
 fn differs(dialect: &str, &(id, mode, script, status, stdout): &Row) -> Option<String> {
 	// `finish` panics on a process past the obash tests' bound: the row
@@ -792,8 +1096,13 @@ fn differs(dialect: &str, &(id, mode, script, status, stdout): &Row) -> Option<S
 }
 
 /// Runs `rows` of `dialect` a few at once and asserts each is the real
-/// shell's, reporting every row that is not.
+/// shell's, reporting every row that is not. Off Linux, the Linux-only rows
+/// are left out ([`linux_only`]).
 fn check(dialect: &str, rows: &[Row]) {
+	let rows: Vec<&Row> = rows
+		.iter()
+		.filter(|r| cfg!(target_os = "linux") || !linux_only(r))
+		.collect();
 	let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
 	let failures = std::thread::scope(|scope| {
 		// Every worker starts before the first is joined.
@@ -836,9 +1145,25 @@ fn a_zsh_job_reads_the_stdin_zsh_gives_it() {
 	check("zsh", ZSH);
 }
 
+/// A stated difference from zsh 5.9: zsh's `<( … )` without MONITOR reads
+/// `/dev/null` in place of a terminal on fd 0 (`entersubsh` with
+/// `ESUB_ASYNC`); pi-shell's keeps the terminal, as at 9058ab9d. zsh mode on
+/// a terminal is outside this change.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zsh_process_substitution_keeps_a_terminal() {
+	let script = "cat <(readlink /proc/self/fd/0)";
+	assert_eq!(
+		run("zsh", 't', script).unwrap(),
+		(Some(0), "/dev/pts/N\n".to_owned()),
+		"zsh 5.9: /dev/null"
+	);
+}
+
 /// The omp bash tool's session (bash, stdin `/dev/null`, no job control):
 /// a job's program gets `/dev/null` as bash gives it, not an empty pipe,
 /// and a job reading the shell's stdin gets its end of file.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tool_commands_job_reads_dev_null() {
 	let (tx, rx) = flume::unbounded::<String>();

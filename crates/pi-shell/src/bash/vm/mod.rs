@@ -2856,7 +2856,7 @@ impl Vproc {
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
 			.map(|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift));
-		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
+		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell { fork: None });
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
 		frame.subshell_line = subshell_line;

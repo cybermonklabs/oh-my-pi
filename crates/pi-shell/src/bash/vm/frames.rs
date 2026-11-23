@@ -175,8 +175,10 @@ struct FdRebuild<'s> {
 	mems:  Vec<MemObj>,
 	built: Vec<Option<FdRef>>,
 	stdio: &'s mut [Option<FdRef>; 3],
-	/// The kernel's shared `/dev/null` objects ([`Kernel::dev_null`]): the
-	/// kernel's own when it holds them, else opened again on first use.
+	/// The kernel's shared `/dev/null` objects ([`Kernel::dev_null`]), opened
+	/// again on first use (a restore's kernel is new and holds none). Only
+	/// an open object is kept: the kernel takes these back, and a later job
+	/// opens `/dev/null` anew where the restore could not.
 	nulls: [Option<FdRef>; 2],
 }
 
@@ -184,15 +186,32 @@ impl FdRebuild<'_> {
 	/// Fd object `i`.
 	fn fd(&mut self, host: &mut dyn Host, i: u32) -> FdRef {
 		if let Some(&FdObjImage::DevNull { rw }) = self.objs.get(i as usize) {
-			let h = self.nulls[usize::from(rw)]
-				.get_or_insert_with(|| reopen_null(host, rw))
-				.clone();
-			if let Some(slot) = self.built.get_mut(i as usize) {
-				*slot = Some(h.clone());
+			if let Some(Some(h)) = self.built.get(i as usize) {
+				return h.clone();
+			}
+			let slot = &mut self.nulls[usize::from(rw)];
+			if slot.is_none() {
+				*slot = reopen_null(host, rw);
+			}
+			// Not reopened: lost (an external reads it as the null device),
+			// and reported by the restore ([`Self::lost_null`]).
+			let h = slot.clone().unwrap_or_else(|| FdRef::lost(FdOrigin::Host));
+			if let Some(built) = self.built.get_mut(i as usize) {
+				*built = Some(h.clone());
 			}
 			return h;
 		}
 		self.build(i, |s| host.stdio(s))
+	}
+
+	/// Whether fd object `i` is a shared `/dev/null` the restore could not
+	/// open again (after [`Self::fd`] built it).
+	fn lost_null(&self, i: u32) -> bool {
+		matches!(self.objs.get(i as usize), Some(FdObjImage::DevNull { .. }))
+			&& self
+				.built
+				.get(i as usize)
+				.is_some_and(|h| h.as_ref().is_some_and(|h| !h.is_open()))
 	}
 
 	/// Fd object `i`; a standard stream comes from `stream` (once).
@@ -258,18 +277,17 @@ impl FdRebuild<'_> {
 }
 
 /// The shared `/dev/null` ([`Kernel::dev_null`], `rw`: read-write), opened
-/// again for a restore. A restore cannot wait: an open the host's
-/// filesystem does not answer at once, or one that fails, leaves the object
-/// lost, which an external reads as the null device.
-fn reopen_null(host: &mut dyn Host, rw: bool) -> FdRef {
+/// again for a restore. A restore cannot wait: `None` when the host's
+/// filesystem does not answer at once or the open fails.
+fn reopen_null(host: &mut dyn Host, rw: bool) -> Option<FdRef> {
 	let flags = if rw {
 		OpenFlags::READ.with(OpenFlags::WRITE)
 	} else {
 		OpenFlags::READ
 	};
 	match host.fs().open(BStr::new(b"/dev/null"), flags, 0) {
-		FsPoll::Ready(Ok(file)) => FdRef::open(file, FdOrigin::Host),
-		_ => FdRef::lost(FdOrigin::Host),
+		FsPoll::Ready(Ok(file)) => Some(FdRef::open(file, FdOrigin::Host)),
+		_ => None,
 	}
 }
 
@@ -857,7 +875,7 @@ impl Shell {
 				.collect(),
 			built,
 			stdio,
-			nulls: k.dev_null.clone(),
+			nulls: [None, None],
 		};
 		let mut procs = Vec::with_capacity(img.procs.len());
 		for p in img.procs {
@@ -869,6 +887,11 @@ impl Shell {
 						report.lost.push(Lost::Fd { vpid, fd: fd as i32, kind });
 					}
 					fds.set(fd as i32, Some(objs.fd(cx.host, obj)));
+					if objs.lost_null(obj) {
+						report
+							.lost
+							.push(Lost::Fd { vpid, fd: fd as i32, kind: FileKind::Device });
+					}
 				}
 			}
 			let mut vp = if let Some(f) = p.fields {
@@ -1400,8 +1423,38 @@ fn valid(u: &Unit) -> bool {
 mod tests {
 	use std::task::{Context, Poll, Waker};
 
-	use super::{FdImager, FdRebuild};
-	use crate::bash::{fd::FdRef, mem::MemObj};
+	use super::{FdImager, FdObjImage, FdRebuild};
+	use crate::{
+		bash::{fd::FdRef, mem::MemObj},
+		testkit::{FakeHost, FaultKind, MemFs},
+	};
+
+	/// A restore that cannot open the shared `/dev/null` again (its
+	/// filesystem answers later, or fails) leaves the job's fd lost and keeps
+	/// nothing for the kernel, so a later job opens `/dev/null` anew; one it
+	/// can open is kept.
+	#[test]
+	fn a_dev_null_a_restore_cannot_open_is_lost_and_not_kept() {
+		for (what, fs, opened) in [
+			("answered later", MemFs::with_latency(1, 1.0, 1), false),
+			("failed", MemFs::new().with_faults(1.0, &[FaultKind::Eio]), false),
+			("opened", MemFs::new(), true),
+		] {
+			let mut host = FakeHost::new().with_fs(fs);
+			let mut stdio = [None, None, None];
+			let mut back = FdRebuild {
+				objs:  vec![FdObjImage::DevNull { rw: false }],
+				mems:  Vec::new(),
+				built: vec![None],
+				stdio: &mut stdio,
+				nulls: [None, None],
+			};
+			let h = back.fd(&mut host, 0);
+			assert_eq!(h.is_open(), opened, "{what}: the job's fd 0");
+			assert_eq!(back.nulls[0].is_some(), opened, "{what}: kept for the kernel");
+			assert!(back.nulls[0].as_ref().is_none_or(FdRef::is_open), "{what}: a lost one kept");
+		}
+	}
 
 	#[test]
 	fn a_pipe_and_its_shared_ends_survive_an_image() {
