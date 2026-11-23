@@ -1525,7 +1525,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	// Live frames go straight to `output`, so `set_event_filter` (session events only) never drops them.
-	const liveBridge = new RpcLiveBridge(session, output, createLiveSession);
+	// The start checks live in the bridge, so a `live_start` frame and a typed `/live on` both make them.
+	const liveBridge = new RpcLiveBridge(session, output, {
+		createSession: createLiveSession,
+		startRefusal: () => {
+			if (sessionDictationBridge.active) return "End dictation before starting live voice";
+			if (sessionChangesInProgress > 0 || shutdownState.requested) return "Session is changing or shutting down";
+			return undefined;
+		},
+	});
 	let lastDictationError: { message: string } | undefined;
 	const sessionDictationBridge = new RpcDictationBridge(
 		session,
@@ -1818,6 +1826,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		notifyConfigChanged: async () => {
 			output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
 		},
+		// `/live on|off|status` typed as a `prompt`, or sent through `sendUserInput`, drive this server's live call.
+		live: liveBridge,
 	};
 
 	// Output all agent events as JSON; prompt results follow the frame that settled them. Installed
@@ -2395,9 +2405,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (command.type === "live_connect" && (typeof sdpOffer !== "string" || !sdpOffer.trim())) {
 					return error(id, command.type, "live_connect requires a non-empty sdpOffer");
 				}
-				if (dictationBridge.active) return error(id, command.type, "End dictation before starting live voice");
-				if (sessionChangesInProgress > 0 || shutdownState.requested)
-					return error(id, command.type, "Session is changing or shutting down");
 				try {
 					return success(
 						id,
