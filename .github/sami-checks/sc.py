@@ -264,22 +264,26 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
 
 
 def junit_cases(path):
+    """Each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
+    cases would count a nested case once per enclosing suite."""
     root = ET.parse(path).getroot()
-    for suite in root.iter("testsuite"):
-        sname = suite.get("name", "")
-        for case in suite.iter("testcase"):
-            name = case.get("name", "?")
-            cls = case.get("classname", "") or sname
-            full = f"{cls}::{name}" if cls and not name.startswith(cls) else name
-            t = float(case.get("time") or 0)
-            if case.find("skipped") is not None:
-                kind = "skipped"
-            elif case.find("failure") is not None or case.find("error") is not None:
-                kind = "failed"
-            else:
-                kind = "ok"
-            out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
-            yield full, kind, t, out
+    parent = {c: p for p in root.iter() for c in p}
+    for case in root.iter("testcase"):
+        name = case.get("name", "?")
+        cls = case.get("classname", "")
+        if not cls:
+            p = parent.get(case)
+            cls = p.get("name", "") if p is not None and p.tag == "testsuite" else ""
+        full = f"{cls}::{name}" if cls and not name.startswith(cls) else name
+        t = float(case.get("time") or 0)
+        if case.find("skipped") is not None:
+            kind = "skipped"
+        elif case.find("failure") is not None or case.find("error") is not None:
+            kind = "failed"
+        else:
+            kind = "ok"
+        out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
+        yield full, kind, t, out
 
 
 def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits):
@@ -523,6 +527,13 @@ def selftest():
                 'skipped: no reflink here\n</system-out></testcase></testsuite></testsuites>')
     r = parse_junit(js, "0", 1, "b", "u", "r", (0,), (100,))
     check("nextest self-skip", (r["status"], r["self_skipped"]), ("UNKNOWN", ["p::t1"]))
+    jn = os.path.join(d, "n.xml")
+    with open(jn, "w") as f:
+        f.write('<testsuites><testsuite name="file.test.ts"><testsuite name="outer"><testcase classname="outer" '
+                'name="a" time="1"><failure/></testcase><testsuite name="inner"><testcase classname="outer inner" '
+                'name="b" time="1"/></testsuite></testsuite></testsuite></testsuites>')
+    r = parse_junit(jn, "100", 1, "b", "u", "r", (0,), (100,))
+    check("JUnit nested suites count each case once", (r["passed"], r["failed"], r["failures"]), (1, 1, ["outer::a"]))
     blog = os.path.join(d, "b.log")
     with open(blog, "w") as f:
         f.write("(pass) x\n")
