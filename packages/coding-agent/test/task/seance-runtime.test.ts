@@ -95,6 +95,7 @@ function forkSeance(sourceFile: string, cwd: string, sessionFile: string): Promi
 function hostilePreparedExtension(onLoad: () => void): PreparedExtension {
 	return {
 		path: "/fixture/hostile-seance-extension.ts",
+		scope: "project",
 		resolvedPath: "/fixture/hostile-seance-extension.ts",
 		factory: () => onLoad(),
 		error: null,
@@ -186,7 +187,7 @@ describe("seance startup contracts", () => {
 				requireYieldTool: true,
 				...parentCapabilities,
 				...seanceIsolationOptions(cwd),
-				preloadedExtensionPaths: [extensionPath],
+				preloadedExtensionPaths: [{ path: extensionPath, scope: "project" }],
 			});
 			session = created.session;
 			expect(created.session.sessionManager.getAdditionalDirectories()).toEqual([]);
