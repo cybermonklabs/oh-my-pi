@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MnemopiOptions } from "@oh-my-pi/pi-mnemopi";
-import { getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { ensureSqliteLockShim, getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { expandTilde } from "../tools/path-utils";
 
@@ -257,6 +257,9 @@ export function extendRecallWithLegacyBanks(
 function bankOnlyHasCwd(dbPath: string, cwd: string): boolean {
 	let db: Database | undefined;
 	try {
+		// A bank an omp process holds is locked with open-file-description locks (#15586); a read-only
+		// open cannot go through openSqliteDatabaseSync, so install the shim first.
+		ensureSqliteLockShim();
 		db = new Database(dbPath, { readonly: true });
 		// "Safe" = no row with a different/missing cwd AND at least one matching row. Both probes stop at
 		// the first hit, and CASE skips the matching probe once an unsafe row disqualifies the bank.

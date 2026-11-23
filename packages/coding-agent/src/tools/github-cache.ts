@@ -25,7 +25,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getGithubCacheDbPath, logger } from "@oh-my-pi/pi-utils";
+import { getGithubCacheDbPath, logger, openSqliteDatabaseSync } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { defaultGhHost, parseRepoRef } from "./gh-common";
 import { cfgGithubCacheEnabled, cfgGithubCacheHardTtlSec, cfgGithubCacheSoftTtlSec } from "./settings";
@@ -106,7 +106,7 @@ export function openDb(): Database | null {
 	try {
 		const dbPath = getGithubCacheDbPath();
 		ensureParentDir(dbPath);
-		const db = new Database(dbPath);
+		const db = openSqliteDatabaseSync(dbPath, db => db);
 		// Install the busy handler BEFORE any lock-taking statement. See #2421.
 		db.run("PRAGMA busy_timeout = 5000");
 		db.run(`

@@ -13,7 +13,13 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
-import { getAgentDir, logger, resolveEquivalentPath } from "@oh-my-pi/pi-utils";
+import {
+	ensureSqliteLockShim,
+	getAgentDir,
+	logger,
+	openSqliteDatabaseSync,
+	resolveEquivalentPath,
+} from "@oh-my-pi/pi-utils";
 
 /** File name of the approval cache inside the agent directory. */
 export const APPROVAL_CACHE_FILENAME = "approval-cache.db";
@@ -68,6 +74,8 @@ export class ApprovalCache implements ApprovalGrantStore {
 		if (keys.length === 0) return new Set();
 		let db: Database;
 		try {
+			// Read-only, so not through openSqliteDatabaseSync: install the lock shim first (#15586).
+			ensureSqliteLockShim();
 			db = new Database(this.filePath, { readonly: true });
 		} catch {
 			// No database yet: nothing was ever remembered "always".
@@ -89,7 +97,7 @@ export class ApprovalCache implements ApprovalGrantStore {
 	record(key: string, tool: string): void {
 		try {
 			fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-			const db = new Database(this.filePath, { create: true });
+			const db = openSqliteDatabaseSync(this.filePath, db => db);
 			try {
 				db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
 				db.run(
@@ -112,6 +120,8 @@ export class ApprovalCache implements ApprovalGrantStore {
 	clear(): void {
 		let db: Database;
 		try {
+			// Never creates the file, so not through openSqliteDatabaseSync: install the lock shim first.
+			ensureSqliteLockShim();
 			db = new Database(this.filePath, { readwrite: true });
 		} catch {
 			return;

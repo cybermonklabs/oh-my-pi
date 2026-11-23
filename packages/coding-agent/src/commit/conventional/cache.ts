@@ -1,7 +1,8 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
+import { openSqliteDatabaseSync } from "@oh-my-pi/pi-utils";
 
 const SCHEMA_VERSION = 3;
 const PRUNE_DIVISOR = 64;
@@ -46,7 +47,7 @@ export class CommitInferenceCache {
 	static async open(dbPath: string, ttlDays: number): Promise<CommitInferenceCache | null> {
 		try {
 			await fs.mkdir(path.dirname(dbPath), { recursive: true });
-			const db = new Database(dbPath, { create: true });
+			const db = openSqliteDatabaseSync(dbPath, db => db);
 			db.run("PRAGMA journal_mode=WAL");
 			db.run("PRAGMA synchronous=NORMAL");
 			db.exec(`

@@ -12,7 +12,6 @@
  * the same module identity as a direct `@oh-my-pi/pi-coding-agent` import.
  */
 
-import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -38,6 +37,7 @@ import {
 	getAgentDir,
 	getProjectDir,
 	isCompiledBinary,
+	openSqliteDatabaseSync,
 	parseFrontmatter as parseOmpFrontmatter,
 	prompt,
 } from "@oh-my-pi/pi-utils";
@@ -1498,7 +1498,7 @@ export class AuthStorage {
 	}
 
 	get(provider: string): AuthCredential | undefined {
-		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath()));
+		const store = new SqliteAuthCredentialStore(openSqliteDatabaseSync(getAgentDbPath(), db => db));
 		try {
 			return store.listAuthCredentials(provider)[0]?.credential;
 		} finally {
@@ -1507,7 +1507,7 @@ export class AuthStorage {
 	}
 
 	async set(provider: string, credential: AuthCredential): Promise<void> {
-		const store = new SqliteAuthCredentialStore(new Database(getAgentDbPath()));
+		const store = new SqliteAuthCredentialStore(openSqliteDatabaseSync(getAgentDbPath(), db => db));
 		try {
 			await store.upsertAuthCredential(provider, credential);
 		} finally {

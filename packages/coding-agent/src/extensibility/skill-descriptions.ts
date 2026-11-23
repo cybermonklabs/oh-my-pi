@@ -5,11 +5,13 @@ import { type AgentTelemetry, instrumentedCompleteSimple } from "@oh-my-pi/pi-ag
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import {
+	ensureSqliteLockShim,
 	getAgentDir,
 	getSkillDescriptionsDbPath,
 	isBunTestRuntime,
 	isEexist,
 	logger,
+	openSqliteDatabaseSync,
 	postmortem,
 	prompt,
 } from "@oh-my-pi/pi-utils";
@@ -263,6 +265,10 @@ function adoptLegacyDatabase(legacyPath: string, dbPath: string): void {
 	try {
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
 		fs.rmSync(staging, { force: true });
+		// Every omp process since the lock shim (#15586) holds this file with open-file-description locks;
+		// a read with the other kind does not see them under gVisor, where it waits about 10 s and the
+		// copy is lost. A read-only open cannot go through openSqliteDatabaseSync, so install it first.
+		ensureSqliteLockShim();
 		const legacy = new Database(legacyPath, { readonly: true });
 		try {
 			legacy.run("VACUUM INTO ?", [staging]);
@@ -309,7 +315,7 @@ export class SkillDescriptionStore {
 	 */
 	static open(dbPath: string = resolveSkillDescriptionsDbPath()): SkillDescriptionStore {
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-		const db = new Database(dbPath, { create: true });
+		const db = openSqliteDatabaseSync(dbPath, db => db);
 		try {
 			// Install before any lock-taking statement (SQLite cache contention, #2421).
 			db.run("PRAGMA busy_timeout = 100");

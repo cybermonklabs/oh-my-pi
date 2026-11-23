@@ -15,7 +15,7 @@
 import { Database } from "bun:sqlite";
 import { AuthBrokerClient, resolveAuthBrokerConfig } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ClientUsageClientSummary } from "@oh-my-pi/pi-ai/usage";
-import { getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
+import { ensureSqliteLockShim, getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { ProviderWindowInsight, UsageWindowPoint, UsageWindowSeries } from "./shared-types";
 
 /** Subset of a `usage_history` row consumed by the window analytics. */
@@ -72,6 +72,9 @@ const MAX_SERIES_POINTS = 400;
 export function readUsageSnapshots(sinceMs: number, dbPath = getAgentDbPath()): UsageSnapshotRow[] {
 	let db: Database | null = null;
 	try {
+		// agent.db is held by every omp process with open-file-description locks (#15586); a read-only
+		// open cannot go through openSqliteDatabaseSync, so install the shim first.
+		ensureSqliteLockShim();
 		db = new Database(dbPath, { readonly: true });
 		db.run("PRAGMA busy_timeout = 5000");
 		const rows = db

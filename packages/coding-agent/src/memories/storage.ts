@@ -1,4 +1,5 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
+import { openSqliteDatabaseSync } from "@oh-my-pi/pi-utils";
 
 export interface MemoryThread {
 	id: string;
@@ -65,7 +66,7 @@ function globalJobKey(cwd: string): string {
 }
 
 export function openMemoryDb(dbPath: string): Database {
-	const db = new Database(dbPath);
+	const db = openSqliteDatabaseSync(dbPath, db => db);
 	// Install the busy handler BEFORE any lock-taking statement. See #2421.
 	db.exec("PRAGMA busy_timeout = 5000");
 	db.exec(`
