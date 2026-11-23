@@ -7798,7 +7798,10 @@ mod tests {
 	/// rename that makes the backup does nothing, and GNU cp 9.4 and 9.7 then
 	/// replace `dest` with a hard link (`-l`), as they do under `-f`, and
 	/// refuse a symbolic link, a copied link and a regular file ("File
-	/// exists"), nothing changed.
+	/// exists"), nothing changed. Where the kernel's rename onto another link
+	/// of the same file removes the old name (gVisor's tmpfs and overlay; the
+	/// test probes its own directory), `dest` is gone after the backup, and
+	/// GNU 9.7 makes each of them there, exit 0 (measured under gVisor).
 	#[cfg(unix)]
 	#[test]
 	fn an_interactive_backup_onto_a_linked_destination_is_made_as_gnu_makes_it() {
@@ -7812,8 +7815,19 @@ mod tests {
 			(&["-i", "-b", "a", "dest"], 1, "cp: cannot create regular file 'dest': File exists\n", unchanged),
 		];
 		let root = tempdir().unwrap();
+		fs::write(root.path().join("probe-x"), "").unwrap();
+		fs::hard_link(root.path().join("probe-x"), root.path().join("probe-y")).unwrap();
+		fs::rename(root.path().join("probe-x"), root.path().join("probe-y")).unwrap();
+		let rename_removes = !root.path().join("probe-x").exists();
 		let mut failures = Vec::new();
 		for (index, (args, code, err, after)) in cases.into_iter().enumerate() {
+			// Where the rename removes `dest`, it is made anew; `-l` is the same.
+			let (code, err, after) = match (rename_removes, args[1]) {
+				(true, "-s") => (0, "", " a=A#1 dest=link:<W>/a dest~=old#1 l=link:a"),
+				(true, "-P") => (0, "", " a=A#1 dest=link:a dest~=old#1 l=link:a"),
+				(true, "-b") => (0, "", " a=A#1 dest=A#1 dest~=old#1 l=link:a"),
+				_ => (code, err, after),
+			};
 			let dir = root.path().join(index.to_string());
 			fs::create_dir(&dir).unwrap();
 			fs::write(dir.join("a"), "A").unwrap();
