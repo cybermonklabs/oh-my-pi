@@ -138,6 +138,15 @@ export interface BashPtyOptions {
 	onStdin?: (write: (data: string) => void) => void;
 }
 
+/**
+ * Heads the output when the embedded shell dropped part of it: the command
+ * finished before its timeout, but past the timeout nothing took its output
+ * for 2 s (5 s on Windows), so the shell stopped delivering it
+ * (`ShellRunResult.outputDropped`). The exit code is still the command's.
+ */
+export const OUTPUT_DROPPED_NOTICE =
+	"Output incomplete: the command finished before its timeout, but delivery of its output stalled after the timeout and the rest was dropped";
+
 /** A command's captured output (the sink's summary, column-cap and middle-elision fields included) and how it ended. */
 export interface BashResult extends OutputSummary {
 	exitCode: number | undefined;
@@ -946,14 +955,16 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			}
 		}
 
-		// Normal completion
+		// Normal completion. The command's own exit code stands even when the
+		// shell dropped part of its output (`outputDropped`); the notice line
+		// then heads what did arrive.
 		return {
 			exitCode: winner.result.exitCode,
 			cancelled: false,
 			workingDir: winner.result.workingDir,
 			...(minimizedMeta ? { minimized: minimizedMeta } : {}),
 			...settleTrace(),
-			...(await dump()),
+			...(await dump(winner.result.outputDropped ? OUTPUT_DROPPED_NOTICE : undefined)),
 		};
 	} catch (err) {
 		resetSession = true;

@@ -11,6 +11,7 @@ import {
 	buildMinimizerOptions,
 	executeBash,
 	isPersistentShellCdCommand,
+	OUTPUT_DROPPED_NOTICE,
 } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import * as direnvModule from "@oh-my-pi/pi-coding-agent/exec/direnv";
 import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -882,6 +883,26 @@ exit 64
 		});
 		expect(next.output.trim()).toBe("next");
 		expect(runCalls).toBe(2);
+	});
+
+	it("heads the output with a notice and keeps the exit code when the shell dropped output past the timeout", async () => {
+		// The shell's own side (a consumer that takes nothing for 2 s past the
+		// deadline) is pi-shell's run_deadline test; here the native result says so.
+		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "first\n");
+			return Promise.resolve({ exitCode: 0, cancelled: false, timedOut: false, outputDropped: true });
+		});
+
+		const result = await executeBash("printf 'first\\nsecond\\n'", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "output-dropped",
+		});
+
+		expect(result).toMatchObject({ exitCode: 0, cancelled: false });
+		expect(result.timedOut).toBeUndefined();
+		expect(result.output.split("\n")[0]).toBe(`[${OUTPUT_DROPPED_NOTICE}]`);
+		expect(result.output).toContain("first");
 	});
 
 	it("restores persistent sessions after native abort cleanup settles", async () => {

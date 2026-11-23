@@ -459,19 +459,25 @@ pub struct ShellRunResult {
 	/// original buffer + telemetry so the session layer can persist it as
 	/// an artifact and splice an `artifact://<id>` reference into the
 	/// minimized text shown to the agent. `None` when nothing was rewritten.
-	pub minimized:   Option<MinimizerResult>,
+	pub minimized:      Option<MinimizerResult>,
 	/// Shell working directory after command completion.
-	pub working_dir: Option<String>,
+	pub working_dir:    Option<String>,
+	/// True when output the command wrote was dropped: the command ended
+	/// within its timeout, but past the timeout the output consumer took
+	/// nothing for 2 s (5 s on Windows), so the shell stopped delivering it.
+	/// The exit code is still the command's. Absent otherwise.
+	pub output_dropped: Option<bool>,
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
 		Self {
-			exit_code:   value.exit_code,
-			cancelled:   value.cancelled,
-			timed_out:   value.timed_out,
-			minimized:   value.minimized.map(Into::into),
-			working_dir: value.working_dir,
+			exit_code:      value.exit_code,
+			cancelled:      value.cancelled,
+			timed_out:      value.timed_out,
+			minimized:      value.minimized.map(Into::into),
+			working_dir:    value.working_dir,
+			output_dropped: value.output_dropped.then_some(true),
 		}
 	}
 }
@@ -900,11 +906,12 @@ mod tests {
 			.expect("pump should be connected");
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   Some(0),
-			cancelled:   false,
-			timed_out:   false,
-			minimized:   None,
-			working_dir: None,
+			exit_code:      Some(0),
+			cancelled:      false,
+			timed_out:      false,
+			minimized:      None,
+			working_dir:    None,
+			output_dropped: None,
 		});
 
 		time::timeout(
@@ -936,11 +943,12 @@ mod tests {
 		));
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   None,
-			cancelled:   false,
-			timed_out:   true,
-			minimized:   None,
-			working_dir: None,
+			exit_code:      None,
+			cancelled:      false,
+			timed_out:      true,
+			minimized:      None,
+			working_dir:    None,
+			output_dropped: None,
 		});
 		let started = time::Instant::now();
 		time::timeout(
