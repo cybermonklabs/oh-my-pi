@@ -337,7 +337,7 @@ mod platform {
 			else {
 				continue;
 			};
-			let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+			let stat = match read_stat(pid) {
 				Ok(stat) => stat,
 				Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
 					continue;
@@ -365,6 +365,15 @@ mod platform {
 			}
 		}
 		complete.then_some(false)
+	}
+
+	/// `/proc/<pid>/stat`. A test can make the read fail for one process.
+	fn read_stat(pid: i32) -> std::io::Result<String> {
+		#[cfg(test)]
+		if super::proc_read_fault::stat_fails(pid) {
+			return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+		}
+		fs::read_to_string(format!("/proc/{pid}/stat"))
 	}
 
 	/// The entries of `/proc`. A test can make the listing fail for one group.
@@ -909,9 +918,15 @@ impl Process {
 	/// process that blocks the signal and sleeps or runs longer than that
 	/// before it forks still leaves its child running, and one that waits for
 	/// the signal with it blocked (tini) takes those 100 ms. Where no signal
-	/// masks are shown (gVisor), a stopped process is read as it is. Each
-	/// level of the tree waits up to 100 ms for its processes to stop; one
-	/// that has not stopped by then is read as it runs.
+	/// masks are shown (gVisor), a stopped process is read as it is, so one
+	/// stopped while it blocks the signal forks on after the wave resumes it
+	/// until it unblocks the signal, and those children outlive the
+	/// termination unless `group` ends them: `fork` in glibc 2.41 and later
+	/// blocks every signal around its `clone`, so a process stopped in that
+	/// window makes one more child. Each level of the tree waits up to
+	/// 100 ms for its processes to stop; one that has not stopped by then is
+	/// read as it runs. The walk holds a pidfd for each process it reads; a
+	/// child whose pidfd cannot be opened (out of descriptors) is not read.
 	///
 	/// A tree in the caller's own process group is not stopped, so it keeps
 	/// the plain walk and its race: a child forked while the walk reads can
@@ -1089,6 +1104,8 @@ impl Process {
 				}
 				if process.inner.kill(libc::SIGSTOP) {
 					frozen.stopped.push(process.clone());
+					#[cfg(all(test, target_os = "linux"))]
+					wave_hook::run_stop_sent(process.pid());
 				}
 			}
 			while !frozen.stopped[stopping..]
@@ -1319,8 +1336,8 @@ impl Drop for Frozen {
 	}
 }
 
-/// Lets a test act between a wave's walk and its signal, or right after the
-/// signal.
+/// Lets a test act right after a wave's SIGSTOP to a process, between a
+/// wave's walk and its signal, or right after the signal.
 #[cfg(all(test, target_os = "linux"))]
 mod wave_hook {
 	use std::{
@@ -1361,6 +1378,20 @@ mod wave_hook {
 		}
 	}
 
+	static STOP_SENT: LazyLock<Mutex<HashMap<i32, Hook>>> = LazyLock::new(Mutex::default);
+
+	/// Run `hook` once, right after a wave has sent SIGSTOP to `pid`.
+	pub fn set_stop_sent(pid: i32, hook: Hook) {
+		STOP_SENT.lock().expect("wave hooks").insert(pid, hook);
+	}
+
+	pub fn run_stop_sent(pid: i32) {
+		let hook = STOP_SENT.lock().expect("wave hooks").remove(&pid);
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
 	static STEPS: LazyLock<Mutex<HashMap<i32, usize>>> = LazyLock::new(Mutex::default);
 
 	/// Count one step taken by a wave on the tree under `root`.
@@ -1380,7 +1411,7 @@ mod wave_hook {
 }
 
 /// Lets a test make the listing of `/proc` fail for the group scan of one
-/// process group.
+/// process group, or the read of one process's stat file fail.
 #[cfg(all(test, target_os = "linux"))]
 mod proc_read_fault {
 	use std::{
@@ -1396,6 +1427,16 @@ mod proc_read_fault {
 
 	pub fn fails(pgid: i32) -> bool {
 		FAILING.lock().expect("faults").contains(&pgid)
+	}
+
+	static STAT: LazyLock<Mutex<HashSet<i32>>> = LazyLock::new(Mutex::default);
+
+	pub fn set_stat(pid: i32) {
+		STAT.lock().expect("faults").insert(pid);
+	}
+
+	pub fn stat_fails(pid: i32) -> bool {
+		STAT.lock().expect("faults").contains(&pid)
 	}
 }
 
@@ -2957,6 +2998,202 @@ mod tests {
 			status.signal(),
 			Some(libc::SIGKILL),
 			"the stopped root was resumed and died of the TERM"
+		);
+	}
+
+	/// Forks a root, in a process group of its own, whose one thread waits in
+	/// vfork until the first returned pipe gets a byte or is closed: a stop
+	/// sent to the root takes only once its vfork child has ended (the vfork
+	/// wait ends only for that, or for a fatal signal). Once released, the
+	/// vfork child, which blocks TERM, makes the root a new child (clone with
+	/// `CLONE_PARENT`) that runs `/bin/sleep 1000`, writes that child's pid to
+	/// the second pipe, and ends. Returns once the vfork child runs. Only raw
+	/// system calls run after the forks: the test process has other threads.
+	#[cfg(target_os = "linux")]
+	fn spawn_vfork_holder() -> (i32, std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+		use std::{ffi::CStr, os::fd::FromRawFd, ptr};
+
+		const SLEEP: &CStr = c"/bin/sleep";
+		let argv = [SLEEP.as_ptr(), c"1000".as_ptr(), ptr::null()];
+		let mut release = [0; 2];
+		let mut made = [0; 2];
+		let mut ready = [0; 2];
+		// SAFETY: each array has room for the two descriptors pipe2 writes.
+		unsafe {
+			assert_eq!(libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC), 0, "release pipe");
+			assert_eq!(libc::pipe2(made.as_mut_ptr(), libc::O_CLOEXEC), 0, "pid pipe");
+			assert_eq!(libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC), 0, "ready pipe");
+		}
+		// SAFETY: the child runs only raw system calls on memory made before the
+		// fork, and leaves by `_exit`, `execv` or never.
+		let root = unsafe { libc::fork() };
+		assert!(root >= 0, "fork the root");
+		if root == 0 {
+			// SAFETY: as above. The vfork child shares this memory and stack: it
+			// calls only system call wrappers and leaves by `_exit`.
+			unsafe {
+				libc::setpgid(0, 0);
+				libc::signal(libc::SIGTERM, libc::SIG_DFL);
+				let mut none: libc::sigset_t = std::mem::zeroed();
+				libc::sigemptyset(&raw mut none);
+				libc::sigprocmask(libc::SIG_SETMASK, &raw const none, ptr::null_mut());
+				libc::close(release[1]);
+				libc::close(made[0]);
+				libc::close(ready[0]);
+				#[allow(
+					deprecated,
+					reason = "the libc crate marks vfork deprecated; this test needs its wait"
+				)]
+				let holder = libc::vfork();
+				if holder == 0 {
+					let mut term: libc::sigset_t = std::mem::zeroed();
+					libc::sigemptyset(&raw mut term);
+					libc::sigaddset(&raw mut term, libc::SIGTERM);
+					libc::sigprocmask(libc::SIG_BLOCK, &raw const term, ptr::null_mut());
+					libc::write(ready[1], [1u8].as_ptr().cast(), 1);
+					let mut byte = 0u8;
+					if libc::read(release[0], (&raw mut byte).cast(), 1) != 1 {
+						libc::_exit(1);
+					}
+					let flags = libc::c_long::from(libc::CLONE_PARENT | libc::SIGCHLD);
+					let child = libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0);
+					if child == 0 {
+						libc::sigprocmask(libc::SIG_SETMASK, &raw const none, ptr::null_mut());
+						libc::execv(SLEEP.as_ptr(), argv.as_ptr());
+						libc::_exit(127);
+					}
+					let pid = libc::pid_t::try_from(child).unwrap_or(0);
+					libc::write(made[1], (&raw const pid).cast(), size_of::<libc::pid_t>());
+					libc::_exit(0);
+				}
+				loop {
+					libc::pause();
+				}
+			}
+		}
+		// Also from here, so the group exists before the test reads it.
+		// SAFETY: setpgid takes scalars; the root is this process's child.
+		unsafe { libc::setpgid(root, root) };
+		let mut byte = 0u8;
+		// SAFETY: the ends are this process's own descriptors, each closed once
+		// or owned from here; `byte` has room for the one byte read. The read
+		// returns at the vfork child's write, or at 0 if it ended first.
+		let got = unsafe {
+			libc::close(release[0]);
+			libc::close(made[1]);
+			libc::close(ready[1]);
+			let got = libc::read(ready[0], (&raw mut byte).cast(), 1);
+			libc::close(ready[0]);
+			got
+		};
+		assert_eq!(got, 1, "the vfork child runs");
+		// SAFETY: the release write end and the pid read end are this process's
+		// own descriptors, owned from here.
+		unsafe {
+			(
+				root,
+				std::os::fd::OwnedFd::from_raw_fd(release[1]),
+				std::os::fd::OwnedFd::from_raw_fd(made[0]),
+			)
+		}
+	}
+
+	/// The walk waits until a process it stopped has stopped before it reads
+	/// its children: a child the process makes between the SIGSTOP and its
+	/// stop is read too. This root is held in vfork, so its stop takes only
+	/// once its vfork child has ended; 40 ms after the wave's SIGSTOP the
+	/// child is let go, makes the root a new child, and ends. A walk that read
+	/// the root's children at once would miss that child, and the root, dying
+	/// of the TERM, would leave it running under init.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_reads_a_child_made_before_the_stop_takes() {
+		use std::os::fd::AsRawFd;
+
+		let (root, release, made) = spawn_vfork_holder();
+		let _guard = GroupGuard(root);
+		let process = Process::from_pid(root).expect("pin the root");
+		wave_hook::set_stop_sent(
+			root,
+			Box::new(move || {
+				std::thread::spawn(move || {
+					std::thread::sleep(Duration::from_millis(40));
+					// SAFETY: the descriptor is the release pipe's write end,
+					// owned by this closure; the buffer holds the one byte.
+					unsafe { libc::write(release.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+				});
+			}),
+		);
+
+		let exited = process
+			.terminate_tree(false, 1000, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = reap_pid(root);
+		let mut child: libc::pid_t = 0;
+		// SAFETY: the descriptor is the pid pipe's read end; `child` has room
+		// for the pid read. It returns 0 if the vfork child ended first.
+		let got =
+			unsafe { libc::read(made.as_raw_fd(), (&raw mut child).cast(), size_of::<libc::pid_t>()) };
+		let left = live_group_members(root);
+		assert_eq!(
+			usize::try_from(got).ok(),
+			Some(size_of::<libc::pid_t>()),
+			"the vfork child made the root a child"
+		);
+		assert!(exited, "the root must be gone");
+		assert!(
+			left.is_empty(),
+			"the child {child} the root made before its stop took outlived the termination: {left:?}"
+		);
+	}
+
+	/// In group mode, a group whose member's stat file cannot be read (out of
+	/// descriptors, say) counts as alive, though `/proc` itself lists: the
+	/// grace wait does not end early, and the hard wave's KILL reaches the
+	/// TERM-ignoring member that left the tree.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_kills_when_a_member_cannot_be_read() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "( (trap '' TERM; exec sleep 1000) & ); exec sleep 1000"])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		let mut member = 0;
+		wait_until("a TERM-ignoring member left the tree", || {
+			let others: Vec<(i32, String)> = group_members_now(root_pid)
+				.into_iter()
+				.filter(|(pid, _)| *pid != root_pid)
+				.collect();
+			if comm(root_pid) == "sleep"
+				&& process.children().is_empty()
+				&& let [(pid, name)] = &others[..]
+				&& name == "sleep"
+			{
+				member = *pid;
+				return true;
+			}
+			false
+		});
+		proc_read_fault::set_stat(member);
+		let member = Process::from_pid(member).expect("pin the member");
+
+		let _ = process
+			.terminate_tree(true, 200, 2000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = reap(&mut root);
+		let outlived = member.status() == ProcessStatus::Running;
+		assert!(
+			!outlived,
+			"the member outlived the termination: a group whose member could not be read was read as \
+			 empty"
 		);
 	}
 }
