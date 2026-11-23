@@ -1,0 +1,6722 @@
+[
+ {
+  "id": "k-assign-colon",
+  "file": false,
+  "script": "/bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assign-colon",
+  "file": true,
+  "script": "/bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assign",
+  "file": false,
+  "script": "/bin/true > ${f=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assign",
+  "file": true,
+  "script": "/bin/true > ${f=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-error",
+  "file": false,
+  "script": "/bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 127\n",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 127\n",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "k-error",
+  "file": true,
+  "script": "/bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "k-arith",
+  "file": false,
+  "script": "/bin/cat < /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "k-arith",
+  "file": true,
+  "script": "/bin/cat < /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "k-subscript",
+  "file": false,
+  "script": "a=(x y); /bin/true > nul${a[i++]}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-subscript",
+  "file": true,
+  "script": "a=(x y); /bin/true > nul${a[i++]}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-subscript-number",
+  "file": false,
+  "script": "a=(x y); /bin/true > nul${a[1]}; echo \"ok [$i]\"",
+  "bash53": [
+   0,
+   "ok []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok []\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-subscript-number",
+  "file": true,
+  "script": "a=(x y); /bin/true > nul${a[1]}; echo \"ok [$i]\"",
+  "bash53": [
+   0,
+   "ok []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok []\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assoc-key",
+  "file": false,
+  "script": "declare -A A; /bin/true > nul${A[$((i++))]}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assoc-key",
+  "file": true,
+  "script": "declare -A A; /bin/true > nul${A[$((i++))]}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assoc-plain",
+  "file": false,
+  "script": "declare -A A=([k]=v); /bin/true > nul${A[k]}; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assoc-plain",
+  "file": true,
+  "script": "declare -A A=([k]=v); /bin/true > nul${A[k]}; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-substr",
+  "file": false,
+  "script": "s=abc; /bin/true > nul${s:i++:0}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-substr",
+  "file": true,
+  "script": "s=abc; /bin/true > nul${s:i++:0}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-funsub",
+  "file": false,
+  "script": "x=0; /bin/cat < /dev/null${ x=5; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "bash: line 1: /dev/null${ x=5; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-funsub",
+  "file": true,
+  "script": "x=0; /bin/cat < /dev/null${ x=5; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "./s.sh: line 1: /dev/null${ x=5; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-valsub",
+  "file": false,
+  "script": "echo w > f; x=0; /bin/cat < ${| x=5; REPLY=f; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "w\n[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "bash: line 1: ${| x=5; REPLY=f; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-valsub",
+  "file": true,
+  "script": "echo w > f; x=0; /bin/cat < ${| x=5; REPLY=f; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "w\n[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "./s.sh: line 1: ${| x=5; REPLY=f; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-prompt",
+  "file": false,
+  "script": "p='$((y++))'; /bin/true > nul${p@P}; echo \"[$y]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-prompt",
+  "file": true,
+  "script": "p='$((y++))'; /bin/true > nul${p@P}; echo \"[$y]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-procsub-in",
+  "file": false,
+  "script": "/bin/true < <(:); [ -n \"$!\" ] && echo set || echo unset",
+  "bash53": [
+   0,
+   "unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-procsub-in",
+  "file": true,
+  "script": "/bin/true < <(:); [ -n \"$!\" ] && echo set || echo unset",
+  "bash53": [
+   0,
+   "unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-procsub-out",
+  "file": false,
+  "script": "/bin/true > >(:); [ -n \"$!\" ] && echo set || echo unset",
+  "bash53": [
+   0,
+   "unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-procsub-out",
+  "file": true,
+  "script": "/bin/true > >(:); [ -n \"$!\" ] && echo set || echo unset",
+  "bash53": [
+   0,
+   "unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-var",
+  "file": false,
+  "script": "/bin/true {fd}>/dev/null; echo \"[$fd]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-var",
+  "file": true,
+  "script": "/bin/true {fd}>/dev/null; echo \"[$fd]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-bashpid",
+  "file": false,
+  "script": "/bin/true > f$BASHPID; for x in f*; do [ \"$x\" = \"f$$\" ] && echo same || echo differ; done",
+  "bash53": [
+   0,
+   "differ\ndiffer\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "differ\ndiffer\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-bashpid",
+  "file": true,
+  "script": "/bin/true > f$BASHPID; for x in f*; do [ \"$x\" = \"f$$\" ] && echo same || echo differ; done",
+  "bash53": [
+   0,
+   "differ\ndiffer\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "differ\ndiffer\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-nameref-sub",
+  "file": false,
+  "script": "a=(1 2); declare -n r=\"a[i++]\"; /bin/true > nul$r; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-nameref-sub",
+  "file": true,
+  "script": "a=(1 2); declare -n r=\"a[i++]\"; /bin/true > nul$r; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-indirect",
+  "file": false,
+  "script": "n=\"a[i++]\"; a=(1 2); /bin/true > nul${!n}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-indirect",
+  "file": true,
+  "script": "n=\"a[i++]\"; a=(1 2); /bin/true > nul${!n}; echo \"[$i]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-badsubst",
+  "file": false,
+  "script": "/bin/true > ${a b}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: ${a b}: bad substitution\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: ${a b}: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-badsubst",
+  "file": true,
+  "script": "/bin/true > ${a b}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: ${a b}: bad substitution\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: ${a b}: bad substitution\n"
+  ]
+ },
+ {
+  "id": "k-comsub-syntax",
+  "file": false,
+  "script": "/bin/true > \"/dev/null${a-'$('\\'}\"; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: command substitution: line 3: unexpected EOF while looking for matching `)'\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: command substitution: line 2: unexpected EOF while looking for matching `\"'\n"
+  ]
+ },
+ {
+  "id": "k-comsub-syntax",
+  "file": true,
+  "script": "/bin/true > \"/dev/null${a-'$('\\'}\"; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: command substitution: line 3: unexpected EOF while looking for matching `)'\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: command substitution: line 2: unexpected EOF while looking for matching `\"'\n"
+  ]
+ },
+ {
+  "id": "k-nounset",
+  "file": false,
+  "script": "set -u; /bin/true > nul$nosuch; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 127\n",
+   "bash: line 1: nosuch: unbound variable\n"
+  ],
+  "bash52": [
+   0,
+   "after 127\n",
+   "bash: line 1: nosuch: unbound variable\n"
+  ]
+ },
+ {
+  "id": "k-nounset",
+  "file": true,
+  "script": "set -u; /bin/true > nul$nosuch; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: nosuch: unbound variable\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: nosuch: unbound variable\n"
+  ]
+ },
+ {
+  "id": "k-failglob",
+  "file": false,
+  "script": "shopt -s failglob; /bin/true > *.nomatch; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: no match: *.nomatch\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: no match: *.nomatch\n"
+  ]
+ },
+ {
+  "id": "k-failglob",
+  "file": true,
+  "script": "shopt -s failglob; /bin/true > *.nomatch; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: no match: *.nomatch\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: no match: *.nomatch\n"
+  ]
+ },
+ {
+  "id": "k-heredoc",
+  "file": false,
+  "script": "/bin/cat <<E\n${x:=5}\nE\necho \"[$x]\"",
+  "bash53": [
+   0,
+   "5\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "5\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-heredoc",
+  "file": true,
+  "script": "/bin/cat <<E\n${x:=5}\nE\necho \"[$x]\"",
+  "bash53": [
+   0,
+   "5\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "5\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-heredoc-quoted",
+  "file": false,
+  "script": "/bin/cat <<'E'\n${x:=5}\nE\necho \"[$x]\"",
+  "bash53": [
+   0,
+   "${x:=5}\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "${x:=5}\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-heredoc-quoted",
+  "file": true,
+  "script": "/bin/cat <<'E'\n${x:=5}\nE\necho \"[$x]\"",
+  "bash53": [
+   0,
+   "${x:=5}\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "${x:=5}\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-herestring",
+  "file": false,
+  "script": "/bin/cat <<< \"$((x+=2))\"; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "2\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "2\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-herestring",
+  "file": true,
+  "script": "/bin/cat <<< \"$((x+=2))\"; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "2\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "2\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-cat-body",
+  "file": false,
+  "script": "/bin/true > nul$(< /dev/null${f:=x}); echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/nullx: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/nullx: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "k-cat-body",
+  "file": true,
+  "script": "/bin/true > nul$(< /dev/null${f:=x}); echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/nullx: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/nullx: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "k-comsub",
+  "file": false,
+  "script": "/bin/true > nul$(x=1; echo); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-comsub",
+  "file": true,
+  "script": "/bin/true > nul$(x=1; echo); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin",
+  "file": false,
+  "script": "true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin",
+  "file": true,
+  "script": "true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-arith",
+  "file": false,
+  "script": ": < /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[1]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "c-builtin-arith",
+  "file": true,
+  "script": ": < /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[1]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "c-function",
+  "file": false,
+  "script": "g() { :; }; g > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-function",
+  "file": true,
+  "script": "g() { :; }; g > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-exec",
+  "file": false,
+  "script": "exec 3> ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-exec",
+  "file": true,
+  "script": "exec 3> ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-null-out",
+  "file": false,
+  "script": "> ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-null-out",
+  "file": true,
+  "script": "> ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-plain",
+  "file": false,
+  "script": "/bin/true > /dev/null; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-plain",
+  "file": true,
+  "script": "/bin/true > /dev/null; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-command-v",
+  "file": false,
+  "script": "command -v true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-command-v",
+  "file": true,
+  "script": "command -v true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-var",
+  "file": false,
+  "script": ": {fd}>/dev/null; [ -n \"$fd\" ] && echo set",
+  "bash53": [
+   0,
+   "set\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "set\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-var",
+  "file": true,
+  "script": ": {fd}>/dev/null; [ -n \"$fd\" ] && echo set",
+  "bash53": [
+   0,
+   "set\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "set\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-random",
+  "file": false,
+  "script": "RANDOM=5; : > nul$RANDOM; echo $RANDOM",
+  "bash53": [
+   0,
+   "29338\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "29338\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-random",
+  "file": true,
+  "script": "RANDOM=5; : > nul$RANDOM; echo $RANDOM",
+  "bash53": [
+   0,
+   "29338\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "29338\n",
+   ""
+  ]
+ },
+ {
+  "id": "c-builtin-error",
+  "file": false,
+  "script": "true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   127,
+   "",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   127,
+   "",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "c-builtin-error",
+  "file": true,
+  "script": "true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "p-command",
+  "file": false,
+  "script": "command /bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-command",
+  "file": true,
+  "script": "command /bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign",
+  "file": false,
+  "script": "A=1 /bin/true > ${f:=out}; echo \"[$f] [${A-unset}]\"",
+  "bash53": [
+   0,
+   "[] [unset]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [unset]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign",
+  "file": true,
+  "script": "A=1 /bin/true > ${f:=out}; echo \"[$f] [${A-unset}]\"",
+  "bash53": [
+   0,
+   "[] [unset]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [unset]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign-arith",
+  "file": false,
+  "script": "A=$((x++)) /bin/true > /dev/null; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign-arith",
+  "file": true,
+  "script": "A=$((x++)) /bin/true > /dev/null; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign-ref",
+  "file": false,
+  "script": "A=1 /bin/true > nul${A:+$((y=7))}; echo \"[$y] [${A-unset}]\"",
+  "bash53": [
+   0,
+   "[] [unset]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [unset]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-assign-ref",
+  "file": true,
+  "script": "A=1 /bin/true > nul${A:+$((y=7))}; echo \"[$y] [${A-unset}]\"",
+  "bash53": [
+   0,
+   "[] [unset]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [unset]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-notfound",
+  "file": false,
+  "script": "nosuch > ${f:=out} 2>/dev/null; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=127 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=127 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-notfound",
+  "file": true,
+  "script": "nosuch > ${f:=out} 2>/dev/null; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=127 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=127 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-notfound-arith",
+  "file": false,
+  "script": "nosuch 2> nul$((x=3)); echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=127 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=127 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-notfound-arith",
+  "file": true,
+  "script": "nosuch 2> nul$((x=3)); echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=127 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=127 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-pi-cat",
+  "file": false,
+  "script": "cat < /dev/null > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-pi-cat",
+  "file": true,
+  "script": "cat < /dev/null > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-noexec-script",
+  "file": false,
+  "script": "printf \"x=1; echo s\\n\" > s; chmod +x s; ./s > ${f:=out}; cat out; echo \"[$f] [$x]\"",
+  "bash53": [
+   0,
+   "s\n[] []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s\n[] []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-noexec-script",
+  "file": true,
+  "script": "printf \"x=1; echo s\\n\" > s; chmod +x s; ./s > ${f:=out}; cat out; echo \"[$f] [$x]\"",
+  "bash53": [
+   0,
+   "s\n[] []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s\n[] []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-dir",
+  "file": false,
+  "script": "mkdir dd; ./dd > ${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=126 []\n",
+   "bash: line 1: ./dd: Is a directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=126 []\n",
+   "bash: line 1: ./dd: Is a directory\n"
+  ]
+ },
+ {
+  "id": "p-dir",
+  "file": true,
+  "script": "mkdir dd; ./dd > ${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=126 []\n",
+   "./s.sh: line 1: ./dd: Is a directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=126 []\n",
+   "./s.sh: line 1: ./dd: Is a directory\n"
+  ]
+ },
+ {
+  "id": "p-in-function",
+  "file": false,
+  "script": "g() { /bin/true > ${f:=out}; echo \"in [$f]\"; }; g; echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in []\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in []\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-in-function",
+  "file": true,
+  "script": "g() { /bin/true > ${f:=out}; echo \"in [$f]\"; }; g; echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in []\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in []\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-time",
+  "file": false,
+  "script": "TIMEFORMAT=; time /bin/true > nul$((x=3)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-time",
+  "file": true,
+  "script": "TIMEFORMAT=; time /bin/true > nul$((x=3)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-not",
+  "file": false,
+  "script": "! /bin/true > nul$((x=3)); echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-not",
+  "file": true,
+  "script": "! /bin/true > nul$((x=3)); echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-bg",
+  "file": false,
+  "script": "/bin/true > ${f:=out} & wait; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-bg",
+  "file": true,
+  "script": "/bin/true > ${f:=out} & wait; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-pipeline",
+  "file": false,
+  "script": "/bin/true > ${f:=out} | /bin/cat; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-pipeline",
+  "file": true,
+  "script": "/bin/true > ${f:=out} | /bin/cat; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-subshell",
+  "file": false,
+  "script": "( /bin/true > ${f:=out}; echo \"in [$f]\" ); echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in []\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in []\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-subshell",
+  "file": true,
+  "script": "( /bin/true > ${f:=out}; echo \"in [$f]\" ); echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in []\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in []\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-comsub",
+  "file": false,
+  "script": "x=$(/bin/true > ${f:=out}; echo \"[$f]\"); echo \"$x [$f]\"",
+  "bash53": [
+   0,
+   "[] []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-comsub",
+  "file": true,
+  "script": "x=$(/bin/true > ${f:=out}; echo \"[$f]\"); echo \"$x [$f]\"",
+  "bash53": [
+   0,
+   "[] []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-group",
+  "file": false,
+  "script": "{ /bin/true > ${f:=out}; echo \"g [$f]\"; }; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "g []\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "g []\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-group",
+  "file": true,
+  "script": "{ /bin/true > ${f:=out}; echo \"g [$f]\"; }; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "g []\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "g []\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-loop",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > nul$((x++)); done; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-loop",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > nul$((x++)); done; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-if",
+  "file": false,
+  "script": "if /bin/true > ${f:=out}; then echo \"y [$f]\"; fi",
+  "bash53": [
+   0,
+   "y []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "y []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-if",
+  "file": true,
+  "script": "if /bin/true > ${f:=out}; then echo \"y [$f]\"; fi",
+  "bash53": [
+   0,
+   "y []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "y []\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-exec-program",
+  "file": false,
+  "script": "(exec /bin/cat in > ${f:=out}); cat out; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "hello\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hello\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "p-exec-program",
+  "file": true,
+  "script": "(exec /bin/cat in > ${f:=out}); cat out; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "hello\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hello\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "f-exit",
+  "file": false,
+  "script": "/bin/cat < ${| REPLY=/dev/null; exit 7; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 7\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: ${| REPLY=/dev/null; exit 7; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit",
+  "file": true,
+  "script": "/bin/cat < ${| REPLY=/dev/null; exit 7; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 7\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: ${| REPLY=/dev/null; exit 7; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-plain",
+  "file": false,
+  "script": "/bin/cat < /dev/null${| exit 3; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 3\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: /dev/null${| exit 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-plain",
+  "file": true,
+  "script": "/bin/cat < /dev/null${| exit 3; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 3\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: /dev/null${| exit 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-return",
+  "file": false,
+  "script": "f() { /bin/true > nul${| return 3; }; echo \"in $?\"; }; f; echo \"out $?\"",
+  "bash53": [
+   0,
+   "in 0\nout 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nout 0\n",
+   "environment: line 1: nul${| return 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-return",
+  "file": true,
+  "script": "f() { /bin/true > nul${| return 3; }; echo \"in $?\"; }; f; echo \"out $?\"",
+  "bash53": [
+   0,
+   "in 0\nout 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nout 0\n",
+   "./s.sh: line 1: nul${| return 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-break",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > nul${| break; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1\nin 2\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nin 2\nout\n",
+   "bash: line 1: nul${| break; }: bad substitution\nbash: line 1: nul${| break; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-break",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > nul${| break; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1\nin 2\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nin 2\nout\n",
+   "./s.sh: line 1: nul${| break; }: bad substitution\n./s.sh: line 1: nul${| break; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-continue",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > nul${| continue; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1\nin 2\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nin 2\nout\n",
+   "bash: line 1: nul${| continue; }: bad substitution\nbash: line 1: nul${| continue; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-continue",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > nul${| continue; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1\nin 2\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1\nin 2\nout\n",
+   "./s.sh: line 1: nul${| continue; }: bad substitution\n./s.sh: line 1: nul${| continue; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-return-top",
+  "file": false,
+  "script": "/bin/true > nul${| return 2; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: nul${| return 2; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-return-top",
+  "file": true,
+  "script": "/bin/true > nul${| return 2; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: nul${| return 2; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-trap",
+  "file": false,
+  "script": "trap \"echo T\" EXIT; /bin/true > nul${| exit 4; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 4\nT\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\nT\n",
+   "bash: line 1: nul${| exit 4; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-trap",
+  "file": true,
+  "script": "trap \"echo T\" EXIT; /bin/true > nul${| exit 4; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 4\nT\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\nT\n",
+   "./s.sh: line 1: nul${| exit 4; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-job",
+  "file": false,
+  "script": "/bin/true > nul${| sleep 0 & }; jobs | wc -l",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   "bash: line 1: nul${| sleep 0 & }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-job",
+  "file": true,
+  "script": "/bin/true > nul${| sleep 0 & }; jobs | wc -l",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   "./s.sh: line 1: nul${| sleep 0 & }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-null",
+  "file": false,
+  "script": "< /dev/null${| exit 3; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: /dev/null${| exit 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-exit-null",
+  "file": true,
+  "script": "< /dev/null${| exit 3; }; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: /dev/null${| exit 3; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-break-builtin",
+  "file": false,
+  "script": "for i in 1 2; do : > nul${| break; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "out\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: nul${| break; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-break-builtin",
+  "file": true,
+  "script": "for i in 1 2; do : > nul${| break; }; echo \"in $i\"; done; echo out",
+  "bash53": [
+   0,
+   "out\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: nul${| break; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-local",
+  "file": false,
+  "script": "f() { local v=1; /bin/true > nul${| v=2; }; echo \"[$v]\"; }; f",
+  "bash53": [
+   0,
+   "[1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   "environment: line 1: nul${| v=2; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-local",
+  "file": true,
+  "script": "f() { local v=1; /bin/true > nul${| v=2; }; echo \"[$v]\"; }; f",
+  "bash53": [
+   0,
+   "[1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[1]\n",
+   "./s.sh: line 1: nul${| v=2; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-trap",
+  "file": false,
+  "script": "/bin/true > nul${| trap \"echo T\" EXIT; }; echo after",
+  "bash53": [
+   0,
+   "after\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after\n",
+   "bash: line 1: nul${| trap \"echo T\" EXIT; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-trap",
+  "file": true,
+  "script": "/bin/true > nul${| trap \"echo T\" EXIT; }; echo after",
+  "bash53": [
+   0,
+   "after\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after\n",
+   "./s.sh: line 1: nul${| trap \"echo T\" EXIT; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-cd",
+  "file": false,
+  "script": "mkdir d; /bin/true > nul${| cd d; }; case $PWD in */d) echo in-d;; *) echo not-d;; esac",
+  "bash53": [
+   0,
+   "not-d\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "not-d\n",
+   "bash: line 1: nul${| cd d; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-cd",
+  "file": true,
+  "script": "mkdir d; /bin/true > nul${| cd d; }; case $PWD in */d) echo in-d;; *) echo not-d;; esac",
+  "bash53": [
+   0,
+   "not-d\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "not-d\n",
+   "./s.sh: line 1: nul${| cd d; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-set",
+  "file": false,
+  "script": "/bin/true > nul${| set -f; }; [[ $- == *f* ]] && echo f || echo nof",
+  "bash53": [
+   0,
+   "nof\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "nof\n",
+   "bash: line 1: nul${| set -f; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-set",
+  "file": true,
+  "script": "/bin/true > nul${| set -f; }; [[ $- == *f* ]] && echo f || echo nof",
+  "bash53": [
+   0,
+   "nof\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "nof\n",
+   "./s.sh: line 1: nul${| set -f; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-output",
+  "file": false,
+  "script": "/bin/cat < /dev/null${ echo hi; x=1; }; echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /dev/nullhi: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /dev/null${ echo hi; x=1; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-output",
+  "file": true,
+  "script": "/bin/cat < /dev/null${ echo hi; x=1; }; echo \"st=$? [$x]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /dev/nullhi: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /dev/null${ echo hi; x=1; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-hook",
+  "file": false,
+  "script": "command_not_found_handle() { echo \"hook $1\"; x=5; return 9; }; nosuch > ${f:=out}; echo \"st=$? [$x] [$f]\"; cat out",
+  "bash53": [
+   0,
+   "st=9 [] []\nhook nosuch\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=9 [] []\nhook nosuch\n",
+   ""
+  ]
+ },
+ {
+  "id": "f-hook",
+  "file": true,
+  "script": "command_not_found_handle() { echo \"hook $1\"; x=5; return 9; }; nosuch > ${f:=out}; echo \"st=$? [$x] [$f]\"; cat out",
+  "bash53": [
+   0,
+   "st=9 [] []\nhook nosuch\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "st=9 [] []\nhook nosuch\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-set-e",
+  "file": false,
+  "script": "set -e; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-set-e",
+  "file": true,
+  "script": "set -e; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-set-e-false",
+  "file": false,
+  "script": "set -e; /bin/false > ${f:=x}; echo after",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "e-set-e-false",
+  "file": true,
+  "script": "set -e; /bin/false > ${f:=x}; echo after",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "e-set-e-if",
+  "file": false,
+  "script": "set -e; if /bin/true 2> ${u?m}; then echo yes; else echo \"no $?\"; fi",
+  "bash53": [
+   0,
+   "no 1\n",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "no 1\n",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-set-e-if",
+  "file": true,
+  "script": "set -e; if /bin/true 2> ${u?m}; then echo yes; else echo \"no $?\"; fi",
+  "bash53": [
+   0,
+   "no 1\n",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "no 1\n",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-posix",
+  "file": false,
+  "script": "set -o posix; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 127\n",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 127\n",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-posix",
+  "file": true,
+  "script": "set -o posix; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-arith-div",
+  "file": false,
+  "script": "/bin/true > nul$((1/0)); echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ]
+ },
+ {
+  "id": "e-arith-div",
+  "file": true,
+  "script": "/bin/true > nul$((1/0)); echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ]
+ },
+ {
+  "id": "e-exit-trap",
+  "file": false,
+  "script": "trap \"echo bye\" EXIT; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 127\nbye\n",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 127\nbye\n",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-exit-trap",
+  "file": true,
+  "script": "trap \"echo bye\" EXIT; /bin/true 2> ${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\nbye\n",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\nbye\n",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "e-redirect-fails",
+  "file": false,
+  "script": "/bin/true > /nonexistent/${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /nonexistent/out: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /nonexistent/out: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "e-redirect-fails",
+  "file": true,
+  "script": "/bin/true > /nonexistent/${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /nonexistent/out: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /nonexistent/out: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "e-ambiguous",
+  "file": false,
+  "script": "/bin/true > ${f:=a b}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: ${f:=a b}: ambiguous redirect\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: ${f:=a b}: ambiguous redirect\n"
+  ]
+ },
+ {
+  "id": "e-ambiguous",
+  "file": true,
+  "script": "/bin/true > ${f:=a b}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: ${f:=a b}: ambiguous redirect\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: ${f:=a b}: ambiguous redirect\n"
+  ]
+ },
+ {
+  "id": "e-status-in",
+  "file": false,
+  "script": "false; /bin/true > ${f:=$?}; echo \"[$f]\"; [ -e 1 ] && echo file1",
+  "bash53": [
+   0,
+   "[]\nfile1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nfile1\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-status-in",
+  "file": true,
+  "script": "false; /bin/true > ${f:=$?}; echo \"[$f]\"; [ -e 1 ] && echo file1",
+  "bash53": [
+   0,
+   "[]\nfile1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nfile1\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-pipestatus",
+  "file": false,
+  "script": "/bin/false > ${f:=out}; echo \"${PIPESTATUS[*]} [$f]\"",
+  "bash53": [
+   0,
+   "1 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "1 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-pipestatus",
+  "file": true,
+  "script": "/bin/false > ${f:=out}; echo \"${PIPESTATUS[*]} [$f]\"",
+  "bash53": [
+   0,
+   "1 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "1 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-err-trap",
+  "file": false,
+  "script": "trap \"echo err\" ERR; /bin/false > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "err\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "err\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-err-trap",
+  "file": true,
+  "script": "trap \"echo err\" ERR; /bin/false > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "err\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "err\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-err-trap-E",
+  "file": false,
+  "script": "set -E; trap \"echo err\" ERR; /bin/false > ${f:=x}; echo \"after [$f]\"",
+  "bash53": [
+   0,
+   "err\nafter []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "err\nafter []\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-err-trap-E",
+  "file": true,
+  "script": "set -E; trap \"echo err\" ERR; /bin/false > ${f:=x}; echo \"after [$f]\"",
+  "bash53": [
+   0,
+   "err\nafter []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "err\nafter []\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-debug-trap",
+  "file": false,
+  "script": "trap \"echo dbg\" DEBUG; /bin/true > ${f:=out}; trap - DEBUG; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "dbg\ndbg\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "dbg\ndbg\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-debug-trap",
+  "file": true,
+  "script": "trap \"echo dbg\" DEBUG; /bin/true > ${f:=out}; trap - DEBUG; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "dbg\ndbg\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "dbg\ndbg\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-xtrace",
+  "file": false,
+  "script": "set -x; /bin/true > ${f:=out}; set +x; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "+ /bin/true\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "+ /bin/true\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "e-xtrace",
+  "file": true,
+  "script": "set -x; /bin/true > ${f:=out}; set +x; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "+ /bin/true\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "+ /bin/true\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "e-hash",
+  "file": false,
+  "script": "env > nul${f:=}; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "hashed\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hashed\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-hash",
+  "file": true,
+  "script": "env > nul${f:=}; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "hashed\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hashed\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-hash-fail",
+  "file": false,
+  "script": "env > /nonexistent/x 2>/dev/null; echo \"st=$?\"; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "st=1\nhashed\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1\nhashed\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "e-hash-fail",
+  "file": true,
+  "script": "env > /nonexistent/x 2>/dev/null; echo \"st=$?\"; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "st=1\nhashed\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1\nhashed\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "e-hash-fork-fail",
+  "file": false,
+  "script": "env > /nonexistent/${f:=x} 2>/dev/null; echo \"st=$? [$f]\"; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "st=1 []\nhashed\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\nhashed\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "e-hash-fork-fail",
+  "file": true,
+  "script": "env > /nonexistent/${f:=x} 2>/dev/null; echo \"st=$? [$f]\"; hash -t env > /dev/null && echo hashed",
+  "bash53": [
+   0,
+   "st=1 []\nhashed\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\nhashed\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "c-jobspec",
+  "file": false,
+  "script": "%1 > ${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: fg: no job control\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: fg: no job control\n"
+  ]
+ },
+ {
+  "id": "c-jobspec",
+  "file": true,
+  "script": "%1 > ${f:=out}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: fg: no job control\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: fg: no job control\n"
+  ]
+ },
+ {
+  "id": "e-lineno",
+  "file": false,
+  "script": "/bin/true > f$LINENO; echo f*",
+  "bash53": [
+   0,
+   "f1 fifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f1 fifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-lineno",
+  "file": true,
+  "script": "/bin/true > f$LINENO; echo f*",
+  "bash53": [
+   0,
+   "f1 fifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f1 fifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-bash-subshell",
+  "file": false,
+  "script": "/bin/true > f$BASH_SUBSHELL; echo f*",
+  "bash53": [
+   0,
+   "f0 fifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0 fifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-bash-subshell",
+  "file": true,
+  "script": "/bin/true > f$BASH_SUBSHELL; echo f*",
+  "bash53": [
+   0,
+   "f0 fifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0 fifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-chld-trap",
+  "file": false,
+  "script": "trap \"echo chld\" CHLD; /bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "chld\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "chld\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-chld-trap",
+  "file": true,
+  "script": "trap \"echo chld\" CHLD; /bin/true > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "chld\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "chld\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-var",
+  "file": false,
+  "script": "{PATH}</dev/null cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-var",
+  "file": true,
+  "script": "{PATH}</dev/null cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-bash-cmds",
+  "file": false,
+  "script": "{BASH_CMDS}</dev/null cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-bash-cmds",
+  "file": true,
+  "script": "{BASH_CMDS}</dev/null cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-command",
+  "file": false,
+  "script": "{PATH}</dev/null command cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-command",
+  "file": true,
+  "script": "{PATH}</dev/null command cat </dev/null; echo $?",
+  "bash53": [
+   0,
+   "0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "0\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-builtin",
+  "file": false,
+  "script": "{PATH}</dev/null true; echo \"${PATH//[0-9]/N}\"",
+  "bash53": [
+   0,
+   "NN\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "NN\n",
+   ""
+  ]
+ },
+ {
+  "id": "a-path-builtin",
+  "file": true,
+  "script": "{PATH}</dev/null true; echo \"${PATH//[0-9]/N}\"",
+  "bash53": [
+   0,
+   "NN\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "NN\n",
+   ""
+  ]
+ },
+ {
+  "id": "r156-fg",
+  "file": false,
+  "script": "/bin/cat < ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-fg",
+  "file": true,
+  "script": "/bin/cat < ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-var-fails",
+  "file": false,
+  "script": "/bin/cat {v}<in < nonexist; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "v=unset\n",
+   "bash: line 1: nonexist: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "v=unset\n",
+   "bash: line 1: nonexist: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "r156-var-fails",
+  "file": true,
+  "script": "/bin/cat {v}<in < nonexist; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "v=unset\n",
+   "./s.sh: line 1: nonexist: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "v=unset\n",
+   "./s.sh: line 1: nonexist: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "r156-var-runs",
+  "file": false,
+  "script": "/bin/cat {v}<in < in; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "hello\nv=unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hello\nv=unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "r156-var-runs",
+  "file": true,
+  "script": "/bin/cat {v}<in < in; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "hello\nv=unset\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "hello\nv=unset\n",
+   ""
+  ]
+ },
+ {
+  "id": "r156-async",
+  "file": false,
+  "script": "/bin/cat < ${x:?u} & wait $!; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-async",
+  "file": true,
+  "script": "/bin/cat < ${x:?u} & wait $!; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-pipe",
+  "file": false,
+  "script": "/bin/cat < ${x:?u} | /bin/cat; echo \"s=${PIPESTATUS[0]}\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-pipe",
+  "file": true,
+  "script": "/bin/cat < ${x:?u} | /bin/cat; echo \"s=${PIPESTATUS[0]}\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-sub",
+  "file": false,
+  "script": "( echo g ) < ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-sub",
+  "file": true,
+  "script": "( echo g ) < ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-dup",
+  "file": false,
+  "script": "/bin/cat <&7-; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "bash: line 1: 7: Bad file descriptor\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "bash: line 1: 7: Bad file descriptor\n"
+  ]
+ },
+ {
+  "id": "r156-dup",
+  "file": true,
+  "script": "/bin/cat <&7-; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: 7: Bad file descriptor\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: 7: Bad file descriptor\n"
+  ]
+ },
+ {
+  "id": "r156-null-var",
+  "file": false,
+  "script": "{v}< ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-null-var",
+  "file": true,
+  "script": "{v}< ${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "r156-local-var",
+  "file": false,
+  "script": "f() { local v=y; /bin/cat {v}<in < nonexist; echo \"v=$v\"; }; f; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "v=y\nv=unset\n",
+   "bash: line 1: nonexist: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "v=y\nv=unset\n",
+   "environment: line 1: nonexist: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "r156-local-var",
+  "file": true,
+  "script": "f() { local v=y; /bin/cat {v}<in < nonexist; echo \"v=$v\"; }; f; echo \"v=${v-unset}\"",
+  "bash53": [
+   0,
+   "v=y\nv=unset\n",
+   "./s.sh: line 1: nonexist: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "v=y\nv=unset\n",
+   "./s.sh: line 1: nonexist: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-in-assign",
+  "file": false,
+  "script": "touch gx; < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-in-assign",
+  "file": true,
+  "script": "touch gx; < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-out-assign",
+  "file": false,
+  "script": "> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-out-assign",
+  "file": true,
+  "script": "> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-var",
+  "file": false,
+  "script": "{v}< /dev/null; echo \"[$v]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-var",
+  "file": true,
+  "script": "{v}< /dev/null; echo \"[$v]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-in-arith",
+  "file": false,
+  "script": "< /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-in-arith",
+  "file": true,
+  "script": "< /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-dup-then-in",
+  "file": false,
+  "script": "touch gx; 2>&1 < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-dup-then-in",
+  "file": true,
+  "script": "touch gx; 2>&1 < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-out-then-in",
+  "file": false,
+  "script": "touch gx; > /dev/null < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-out-then-in",
+  "file": true,
+  "script": "touch gx; > /dev/null < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-valsub",
+  "file": false,
+  "script": "x=0; < /dev/null${| x=5; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "bash: line 1: /dev/null${| x=5; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "n-valsub",
+  "file": true,
+  "script": "x=0; < /dev/null${| x=5; }; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[0]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[0]\n",
+   "./s.sh: line 1: /dev/null${| x=5; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "n-0-arith",
+  "file": false,
+  "script": "0< /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "bash: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-0-arith",
+  "file": true,
+  "script": "0< /dev/null$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   "./s.sh: line 1: /dev/null0: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-rw-assign",
+  "file": false,
+  "script": "touch gx; <> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-rw-assign",
+  "file": true,
+  "script": "touch gx; <> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-herestring",
+  "file": false,
+  "script": "<<< \"${f:=x}\"; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-herestring",
+  "file": true,
+  "script": "<<< \"${f:=x}\"; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-heredoc",
+  "file": false,
+  "script": "<<E\n${f:=x}\nE\necho \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-heredoc",
+  "file": true,
+  "script": "<<E\n${f:=x}\nE\necho \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-error",
+  "file": false,
+  "script": "< /dev/null${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 127\n",
+   "bash: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "n-error",
+  "file": true,
+  "script": "< /dev/null${u?m}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: u: m\n"
+  ]
+ },
+ {
+  "id": "n-empty-word",
+  "file": false,
+  "script": "touch gx; e=; $e < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-empty-word",
+  "file": true,
+  "script": "touch gx; e=; $e < g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-assign-word",
+  "file": false,
+  "script": "touch gx; A=1 < g${f:=x}; echo \"[$f] [$A]\"",
+  "bash53": [
+   0,
+   "[] [1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [1]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-assign-word",
+  "file": true,
+  "script": "touch gx; A=1 < g${f:=x}; echo \"[$f] [$A]\"",
+  "bash53": [
+   0,
+   "[] [1]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[] [1]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-1-out",
+  "file": false,
+  "script": "1> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-1-out",
+  "file": true,
+  "script": "1> g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-3-in",
+  "file": false,
+  "script": "touch gx; 3< g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-3-in",
+  "file": true,
+  "script": "touch gx; 3< g${f:=x}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[x]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[x]\n",
+   ""
+  ]
+ },
+ {
+  "id": "n-status",
+  "file": false,
+  "script": "< /nonexist${f:=x}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /nonexistx: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "bash: line 1: /nonexistx: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "n-status",
+  "file": true,
+  "script": "< /nonexist${f:=x}; echo \"st=$? [$f]\"",
+  "bash53": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /nonexistx: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\n",
+   "./s.sh: line 1: /nonexistx: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "s-assign",
+  "file": false,
+  "script": "( : ) > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-assign",
+  "file": true,
+  "script": "( : ) > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-status",
+  "file": false,
+  "script": "( exit 3 ) > ${f:=x}; echo \"$? ${PIPESTATUS[*]} [$f]\"",
+  "bash53": [
+   0,
+   "3 3 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "3 3 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-status",
+  "file": true,
+  "script": "( exit 3 ) > ${f:=x}; echo \"$? ${PIPESTATUS[*]} [$f]\"",
+  "bash53": [
+   0,
+   "3 3 []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "3 3 []\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-error",
+  "file": false,
+  "script": "( echo in ) > nul${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "s-error",
+  "file": true,
+  "script": "( echo in ) > nul${x:?u}; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "s-fails",
+  "file": false,
+  "script": "( echo in ) > /nonexistent/${f:=x}; echo \"s=$? [$f]\"",
+  "bash53": [
+   0,
+   "s=1 []\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "s=1 []\n",
+   "bash: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "s-fails",
+  "file": true,
+  "script": "( echo in ) > /nonexistent/${f:=x}; echo \"s=$? [$f]\"",
+  "bash53": [
+   0,
+   "s=1 []\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ],
+  "bash52": [
+   0,
+   "s=1 []\n",
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "s-body-sees",
+  "file": false,
+  "script": "( echo \"in [$f]\" ) 2> ${f:=x}; echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in [x]\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in [x]\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-body-sees",
+  "file": true,
+  "script": "( echo \"in [$f]\" ) 2> ${f:=x}; echo \"out [$f]\"",
+  "bash53": [
+   0,
+   "in [x]\nout []\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in [x]\nout []\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-level",
+  "file": false,
+  "script": "( echo \"$BASH_SUBSHELL\" ) 2> nul$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "1\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "1\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-level",
+  "file": true,
+  "script": "( echo \"$BASH_SUBSHELL\" ) 2> nul$((x++)); echo \"[$x]\"",
+  "bash53": [
+   0,
+   "1\n[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "1\n[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-exit-trap",
+  "file": false,
+  "script": "( trap \"echo T\" EXIT; echo in ) > nul${f:=}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-exit-trap",
+  "file": true,
+  "script": "( trap \"echo T\" EXIT; echo in ) > nul${f:=}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-funsub-exit",
+  "file": false,
+  "script": "( echo in ) > nul${| exit 6; }; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=6\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "bash: line 1: nul${| exit 6; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "s-funsub-exit",
+  "file": true,
+  "script": "( echo in ) > nul${| exit 6; }; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=6\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: nul${| exit 6; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "s-plain-ctl",
+  "file": false,
+  "script": "( echo in ) > /dev/null; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-plain-ctl",
+  "file": true,
+  "script": "( echo in ) > /dev/null; echo ok",
+  "bash53": [
+   0,
+   "ok\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok\n",
+   ""
+  ]
+ },
+ {
+  "id": "adj-group-assign",
+  "file": false,
+  "script": "{ :; } > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "adj-group-assign",
+  "file": true,
+  "script": "{ :; } > ${f:=out}; echo \"[$f]\"",
+  "bash53": [
+   0,
+   "[out]\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[out]\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-program-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; /bin/true 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-notfound-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; nosuch 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\ns=127\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=127\nexit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-subshell-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; ( : ) 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assign-word",
+  "file": false,
+  "script": "/bin/true > f${x:=5}; echo \"[$x]\"; ls f*",
+  "bash53": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "k-assign-word",
+  "file": true,
+  "script": "/bin/true > f${x:=5}; echo \"[$x]\"; ls f*",
+  "bash53": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-assign-word",
+  "file": false,
+  "script": "( : ) > f${x:=5}; echo \"[$x]\"; ls f*",
+  "bash53": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "s-assign-word",
+  "file": true,
+  "script": "( : ) > f${x:=5}; echo \"[$x]\"; ls f*",
+  "bash53": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "[]\nf5\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "t-program",
+  "file": false,
+  "script": "trap '/bin/cat < ${x:?u}; echo \"in=$?\"' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nin=0\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "body\nin=0\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-program",
+  "file": true,
+  "script": "trap '/bin/cat < ${x:?u}; echo \"in=$?\"' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nin=0\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "body\nin=0\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-program-assign",
+  "file": false,
+  "script": "trap '/bin/cat < in${f:=}${x:?u}; echo \"in=$? [$f]\"' EXIT; false",
+  "bash53": [
+   1,
+   "in=1 []\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   1,
+   "in=1 []\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-program-assign",
+  "file": true,
+  "script": "trap '/bin/cat < in${f:=}${x:?u}; echo \"in=$? [$f]\"' EXIT; false",
+  "bash53": [
+   1,
+   "in=1 []\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   1,
+   "in=1 []\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-subshell",
+  "file": false,
+  "script": "trap '( : ) < ${x:?u}; echo \"in=$?\"' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nin=0\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "body\nin=0\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-subshell",
+  "file": true,
+  "script": "trap '( : ) < ${x:?u}; echo \"in=$?\"' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nin=0\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   0,
+   "body\nin=0\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-subshell-status",
+  "file": false,
+  "script": "trap '( : ) < ${x:?u}; echo \"in=$?\"' EXIT; (exit 4)",
+  "bash53": [
+   4,
+   "in=4\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   4,
+   "in=4\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t-subshell-status",
+  "file": true,
+  "script": "trap '( : ) < ${x:?u}; echo \"in=$?\"' EXIT; (exit 4)",
+  "bash53": [
+   4,
+   "in=4\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   4,
+   "in=4\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "x-subscript-octal",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-subscript-octal",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-subscript-octal-quoted-cat",
+  "file": false,
+  "script": "a=(x); /bin/cat < /dev/null${a[\"09\"]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 09: value too great for base (error token is \"09\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 09: value too great for base (error token is \"09\")\n"
+  ]
+ },
+ {
+  "id": "x-subscript-octal-quoted-cat",
+  "file": true,
+  "script": "a=(x); /bin/cat < /dev/null${a[\"09\"]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 09: value too great for base (error token is \"09\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 09: value too great for base (error token is \"09\")\n"
+  ]
+ },
+ {
+  "id": "x-null-octal",
+  "file": false,
+  "script": "a=(x); < /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-null-octal",
+  "file": true,
+  "script": "a=(x); < /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-notfound-octal",
+  "file": false,
+  "script": "a=(x); nosuch > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-notfound-octal",
+  "file": true,
+  "script": "a=(x); nosuch > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-default-octal",
+  "file": false,
+  "script": "a=(x); /bin/true > ${b:-/dev/null${a[08]}}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-default-octal",
+  "file": true,
+  "script": "a=(x); /bin/true > ${b:-/dev/null${a[08]}}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-func-octal",
+  "file": false,
+  "script": "a=(x); f() { /bin/true > /dev/null${a[08]}; echo \"in $?\"; }; f; echo \"out $?\"",
+  "bash53": [
+   0,
+   "in 1\nout 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in 1\nout 0\n",
+   "environment: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "x-func-octal",
+  "file": true,
+  "script": "a=(x); f() { /bin/true > /dev/null${a[08]}; echo \"in $?\"; }; f; echo \"out $?\"",
+  "bash53": [
+   0,
+   "in 1\nout 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in 1\nout 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-herestring",
+  "file": false,
+  "script": "a=(x); /bin/cat <<< ${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-herestring",
+  "file": true,
+  "script": "a=(x); /bin/cat <<< ${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-quoted-word",
+  "file": false,
+  "script": "a=(x); /bin/true > \"/dev/null${a[08]}\"; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-quoted-word",
+  "file": true,
+  "script": "a=(x); /bin/true > \"/dev/null${a[08]}\"; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-008",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[008]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 008: value too great for base (error token is \"008\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 008: value too great for base (error token is \"008\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-008",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[008]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 008: value too great for base (error token is \"008\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 008: value too great for base (error token is \"008\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-set-e",
+  "file": false,
+  "script": "set -e; a=(x); /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-set-e",
+  "file": true,
+  "script": "set -e; a=(x); /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-or",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} || echo \"failed $?\"; echo end",
+  "bash53": [
+   0,
+   "failed 1\nend\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "failed 1\nend\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-or",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} || echo \"failed $?\"; echo end",
+  "bash53": [
+   0,
+   "failed 1\nend\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "failed 1\nend\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-not",
+  "file": false,
+  "script": "a=(x); ! /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-not",
+  "file": true,
+  "script": "a=(x); ! /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-loop",
+  "file": false,
+  "script": "a=(x); for i in 1 2; do /bin/true > /dev/null${a[08]}; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\nbash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\nbash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-loop",
+  "file": true,
+  "script": "a=(x); for i in 1 2; do /bin/true > /dev/null${a[08]}; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-err-trap",
+  "file": false,
+  "script": "a=(x); trap \"echo err\" ERR; /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "err\nafter 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "err\nafter 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-err-trap",
+  "file": true,
+  "script": "a=(x); trap \"echo err\" ERR; /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "err\nafter 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "err\nafter 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-null-out",
+  "file": false,
+  "script": "a=(x); > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-null-out",
+  "file": true,
+  "script": "a=(x); > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-command",
+  "file": false,
+  "script": "a=(x); command /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-command",
+  "file": true,
+  "script": "a=(x); command /bin/true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-assign-prefix",
+  "file": false,
+  "script": "a=(x); A=1 /bin/true > /dev/null${a[08]}; echo \"after $? [${A-unset}]\"",
+  "bash53": [
+   0,
+   "after 1 [unset]\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1 [unset]\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-assign-prefix",
+  "file": true,
+  "script": "a=(x); A=1 /bin/true > /dev/null${a[08]}; echo \"after $? [${A-unset}]\"",
+  "bash53": [
+   0,
+   "after 1 [unset]\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1 [unset]\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-pipestatus",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[08]}; echo \"${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-pipestatus",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[08]}; echo \"${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-builtin",
+  "file": false,
+  "script": "a=(x); true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-builtin",
+  "file": true,
+  "script": "a=(x); true > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-function",
+  "file": false,
+  "script": "a=(x); g() { :; }; g > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-function",
+  "file": true,
+  "script": "a=(x); g() { :; }; g > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-subshell",
+  "file": false,
+  "script": "a=(x); ( : ) > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-subshell",
+  "file": true,
+  "script": "a=(x); ( : ) > /dev/null${a[08]}; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-async",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} & wait $!; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-async",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} & wait $!; echo \"after $?\"",
+  "bash53": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-pipe",
+  "file": false,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} | /bin/cat; echo \"after ${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "after 1 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "y-octal-pipe",
+  "file": true,
+  "script": "a=(x); /bin/true > /dev/null${a[08]} | /bin/cat; echo \"after ${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "after 1 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "after 1 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-valsub",
+  "file": false,
+  "script": "/bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-valsub",
+  "file": true,
+  "script": "/bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-funsub",
+  "file": false,
+  "script": "/bin/true > ${ break; echo /dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${ break; echo /dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-funsub",
+  "file": true,
+  "script": "/bin/true > ${ break; echo /dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${ break; echo /dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-continue-noloop-valsub",
+  "file": false,
+  "script": "/bin/true > ${| continue; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 1: continue: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${| continue; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-continue-noloop-valsub",
+  "file": true,
+  "script": "/bin/true > ${| continue; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 1: continue: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| continue; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-in-func-in-loop",
+  "file": false,
+  "script": "f() { /bin/true > ${| break; REPLY=/dev/null; }; echo \"in $?\"; }; for i in 1 2; do f; echo \"it $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 0\nit 1\nin 0\nit 2\nout\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\nbash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1\nit 1\nin 1\nit 2\nout\n",
+   "environment: line 1: ${| break; REPLY=/dev/null; }: bad substitution\nenvironment: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-in-func-in-loop",
+  "file": true,
+  "script": "f() { /bin/true > ${| break; REPLY=/dev/null; }; echo \"in $?\"; }; for i in 1 2; do f; echo \"it $i\"; done; echo out",
+  "bash53": [
+   0,
+   "in 0\nit 1\nin 0\nit 2\nout\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1\nit 1\nin 1\nit 2\nout\n",
+   "./s.sh: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n./s.sh: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-in-loop",
+  "file": false,
+  "script": "while :; do /bin/true > nul${| break; REPLY=x; }; echo in; break; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in\nout\n",
+   "bash: line 1: nul${| break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-in-loop",
+  "file": true,
+  "script": "while :; do /bin/true > nul${| break; REPLY=x; }; echo in; break; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in\nout\n",
+   "./s.sh: line 1: nul${| break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-null",
+  "file": false,
+  "script": "< ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-null",
+  "file": true,
+  "script": "< ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-null",
+  "file": false,
+  "script": "touch nul nulx; for i in 1 2; do < nul${| break; REPLY=y; }; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: nul${| break; REPLY=y; }: bad substitution\nbash: line 1: nul${| break; REPLY=y; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-null",
+  "file": true,
+  "script": "touch nul nulx; for i in 1 2; do < nul${| break; REPLY=y; }; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: nul${| break; REPLY=y; }: bad substitution\n./s.sh: line 1: nul${| break; REPLY=y; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-eval",
+  "file": false,
+  "script": "/bin/true > ${| eval break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${| eval break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-eval",
+  "file": true,
+  "script": "/bin/true > ${| eval break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| eval break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-eval",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > nul${| eval break; REPLY=x; }; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: nul${| eval break; REPLY=x; }: bad substitution\nbash: line 1: nul${| eval break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-eval",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > nul${| eval break; REPLY=x; }; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: nul${| eval break; REPLY=x; }: bad substitution\n./s.sh: line 1: nul${| eval break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-after-inner",
+  "file": false,
+  "script": "/bin/true > ${| for j in 1; do :; done; break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "bash: line 4: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "bash: line 1: ${| for j in 1; do :; done; break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-after-inner",
+  "file": true,
+  "script": "/bin/true > ${| for j in 1; do :; done; break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   "./s.sh: line 4: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| for j in 1; do :; done; break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-inner",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > ${| for j in 1; do break; done; REPLY=/dev/null; }; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: ${| for j in 1; do break; done; REPLY=/dev/null; }: bad substitution\nbash: line 1: ${| for j in 1; do break; done; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-inner",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > ${| for j in 1; do break; done; REPLY=/dev/null; }; echo \"in $i $?\"; done; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: ${| for j in 1; do break; done; REPLY=/dev/null; }: bad substitution\n./s.sh: line 1: ${| for j in 1; do break; done; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-after-inner",
+  "file": false,
+  "script": "for i in 1 2; do /bin/true > nul${| for j in 1; do :; done; break; REPLY=x; }; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: nul${| for j in 1; do :; done; break; REPLY=x; }: bad substitution\nbash: line 1: nul${| for j in 1; do :; done; break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-after-inner",
+  "file": true,
+  "script": "for i in 1 2; do /bin/true > nul${| for j in 1; do :; done; break; REPLY=x; }; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: nul${| for j in 1; do :; done; break; REPLY=x; }: bad substitution\n./s.sh: line 1: nul${| for j in 1; do :; done; break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-posix-noloop",
+  "file": false,
+  "script": "set -o posix; /bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok 127\n",
+   "bash: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-posix-noloop",
+  "file": true,
+  "script": "set -o posix; /bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"",
+  "bash53": [
+   0,
+   "ok 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ok 1\n",
+   "./s.sh: line 1: ${| break; REPLY=/dev/null; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "z-break-in-eval-loop",
+  "file": false,
+  "script": "for i in 1 2; do eval '/bin/true > nul${| break; REPLY=x; }'; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: nul${| break; REPLY=x; }: bad substitution\nbash: line 1: nul${| break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-in-eval-loop",
+  "file": true,
+  "script": "for i in 1 2; do eval '/bin/true > nul${| break; REPLY=x; }'; echo \"in $i $?\"; done; ls nul*; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\nnul\nout\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: nul${| break; REPLY=x; }: bad substitution\n./s.sh: line 1: nul${| break; REPLY=x; }: bad substitution\nls: cannot access 'nul*': No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-subshell",
+  "file": false,
+  "script": "( echo s ) > ${| break; REPLY=f; }; echo \"ok $?\"; cat f",
+  "bash53": [
+   0,
+   "ok 0\ns\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   1,
+   "ok 1\n",
+   "bash: line 1: ${| break; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-noloop-subshell",
+  "file": true,
+  "script": "( echo s ) > ${| break; REPLY=f; }; echo \"ok $?\"; cat f",
+  "bash53": [
+   0,
+   "ok 0\ns\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   1,
+   "ok 1\n",
+   "./s.sh: line 1: ${| break; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-subshell",
+  "file": false,
+  "script": "for i in 1 2; do ( echo \"s $i\" ) > ${| break; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\ns 2\nout\n",
+   "bash: line 1: break: only meaningful in a `for', `while', or `until' loop\nbash: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: ${| break; REPLY=f; }: bad substitution\nbash: line 1: ${| break; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-break-loop-subshell",
+  "file": true,
+  "script": "for i in 1 2; do ( echo \"s $i\" ) > ${| break; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\ns 2\nout\n",
+   "./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: ${| break; REPLY=f; }: bad substitution\n./s.sh: line 1: ${| break; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-continue-loop-subshell",
+  "file": false,
+  "script": "for i in 1 2; do ( echo \"s $i\" ) > ${| continue; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\ns 2\nout\n",
+   "bash: line 1: continue: only meaningful in a `for', `while', or `until' loop\nbash: line 1: continue: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "bash: line 1: ${| continue; REPLY=f; }: bad substitution\nbash: line 1: ${| continue; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "z-continue-loop-subshell",
+  "file": true,
+  "script": "for i in 1 2; do ( echo \"s $i\" ) > ${| continue; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out",
+  "bash53": [
+   0,
+   "in 1 0\nin 2 0\ns 2\nout\n",
+   "./s.sh: line 1: continue: only meaningful in a `for', `while', or `until' loop\n./s.sh: line 1: continue: only meaningful in a `for', `while', or `until' loop\n"
+  ],
+  "bash52": [
+   0,
+   "in 1 1\nin 2 1\nout\n",
+   "./s.sh: line 1: ${| continue; REPLY=f; }: bad substitution\n./s.sh: line 1: ${| continue; REPLY=f; }: bad substitution\ncat: f: No such file or directory\n"
+  ]
+ },
+ {
+  "id": "d-depth",
+  "file": false,
+  "script": "/bin/true > f$BASH_SUBSHELL${z:=}; ls f*",
+  "bash53": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "d-depth",
+  "file": true,
+  "script": "/bin/true > f$BASH_SUBSHELL${z:=}; ls f*",
+  "bash53": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "d-depth-sub",
+  "file": false,
+  "script": "( /bin/true > f$BASH_SUBSHELL${z:=}; ls f* )",
+  "bash53": [
+   0,
+   "f1\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f1\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "d-depth-sub",
+  "file": true,
+  "script": "( /bin/true > f$BASH_SUBSHELL${z:=}; ls f* )",
+  "bash53": [
+   0,
+   "f1\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f1\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "d-depth-null",
+  "file": false,
+  "script": "< /dev/null${z:=} > f$BASH_SUBSHELL; ls f*",
+  "bash53": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "d-depth-null",
+  "file": true,
+  "script": "< /dev/null${z:=} > f$BASH_SUBSHELL; ls f*",
+  "bash53": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "f0\nfifo\n",
+   ""
+  ]
+ },
+ {
+  "id": "j-jobspec-file",
+  "file": false,
+  "script": "%1 > ${f:=out}; echo \"st=$? [$f]\"; [ -e out ] && echo made || echo none",
+  "bash53": [
+   0,
+   "st=1 []\nnone\n",
+   "bash: line 1: fg: no job control\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\nnone\n",
+   "bash: line 1: fg: no job control\n"
+  ]
+ },
+ {
+  "id": "j-jobspec-file",
+  "file": true,
+  "script": "%1 > ${f:=out}; echo \"st=$? [$f]\"; [ -e out ] && echo made || echo none",
+  "bash53": [
+   0,
+   "st=1 []\nnone\n",
+   "./s.sh: line 1: fg: no job control\n"
+  ],
+  "bash52": [
+   0,
+   "st=1 []\nnone\n",
+   "./s.sh: line 1: fg: no job control\n"
+  ]
+ },
+ {
+  "id": "j-jobspec-pipe-file",
+  "file": false,
+  "script": "%1 > out3 2>/dev/null | /bin/cat; [ -e out3 ] && echo made || echo none",
+  "bash53": [
+   0,
+   "made\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "made\n",
+   ""
+  ]
+ },
+ {
+  "id": "j-jobspec-pipe-file",
+  "file": true,
+  "script": "%1 > out3 2>/dev/null | /bin/cat; [ -e out3 ] && echo made || echo none",
+  "bash53": [
+   0,
+   "made\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "made\n",
+   ""
+  ]
+ },
+ {
+  "id": "t2-fatal-fork-trap",
+  "file": false,
+  "script": "trap '/bin/true > nul${x:?u}; echo \"in=$?\"' EXIT; (exit 3)",
+  "bash53": [
+   3,
+   "in=3\n",
+   "bash: line 1: x: u\n"
+  ],
+  "bash52": [
+   3,
+   "in=3\n",
+   "bash: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t2-fatal-fork-trap",
+  "file": true,
+  "script": "trap '/bin/true > nul${x:?u}; echo \"in=$?\"' EXIT; (exit 3)",
+  "bash53": [
+   3,
+   "in=3\n",
+   "./s.sh: line 1: x: u\n"
+  ],
+  "bash52": [
+   3,
+   "in=3\n",
+   "./s.sh: line 1: x: u\n"
+  ]
+ },
+ {
+  "id": "t2-arith-builtin-trap",
+  "file": false,
+  "script": "trap ': > nul$((1/0)); echo \"in=$?\"' EXIT; (exit 3)",
+  "bash53": [
+   3,
+   "",
+   "bash: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ],
+  "bash52": [
+   3,
+   "",
+   "bash: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ]
+ },
+ {
+  "id": "t2-arith-builtin-trap",
+  "file": true,
+  "script": "trap ': > nul$((1/0)); echo \"in=$?\"' EXIT; (exit 3)",
+  "bash53": [
+   3,
+   "",
+   "./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ],
+  "bash52": [
+   3,
+   "",
+   "./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n"
+  ]
+ },
+ {
+  "id": "t2-octal-int-trap",
+  "file": false,
+  "script": "a=(x); trap '/bin/true > /dev/null${a[08]}; echo \"in=$?\"' USR1; kill -USR1 $$; echo \"after $?\"",
+  "bash53": [
+   0,
+   "in=1\nafter 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in=1\nafter 0\n",
+   "bash: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ },
+ {
+  "id": "t2-octal-int-trap",
+  "file": true,
+  "script": "a=(x); trap '/bin/true > /dev/null${a[08]}; echo \"in=$?\"' USR1; kill -USR1 $$; echo \"after $?\"",
+  "bash53": [
+   0,
+   "in=1\nafter 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ],
+  "bash52": [
+   0,
+   "in=1\nafter 0\n",
+   "./s.sh: line 1: 08: value too great for base (error token is \"08\")\n"
+  ]
+ }
+]

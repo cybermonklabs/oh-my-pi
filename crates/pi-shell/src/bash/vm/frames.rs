@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -960,13 +960,12 @@ impl Shell {
 									| Awaited::Frame
 									| Awaited::Jobs { .. }
 									| Awaited::AllJobs
-									| Awaited::AnyJob,
+									| Awaited::AnyJob
+									| Awaited::Fork,
 								)
 								| None => {},
 							}
-							if matches!(state.stage, Stage::Lookup | Stage::FailedLookup)
-								&& state.target == Some(Target::Search)
-							{
+							if state.stage == Stage::Lookup && state.target == Some(Target::Search) {
 								report.reissued_fs += 1;
 							}
 							state

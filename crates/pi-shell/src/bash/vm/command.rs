@@ -21,8 +21,8 @@ use super::{
 	probe::{self, Search, absolute, candidates},
 	proc::{
 		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		Live, OneCommand, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
+		Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -73,7 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
-			var_fds: None,
+			apart: false,
 		}
 	}
 
@@ -105,7 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
-			var_fds,
+			apart,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -132,7 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
-		*var_fds = None;
+		*apart = false;
 	}
 }
 
@@ -260,6 +260,15 @@ pub fn exec(
 				s.stage = Stage::Finish;
 			},
 			Stage::Redirect => {
+				let bash = unit.mode.dialect() == crate::bash::ids::Dialect::Bash;
+				// bash looks the name up in the shell (hashing it) before it
+				// makes any of the command's redirections: a program's are then
+				// made in the child it forks for it, a builtin's or function's
+				// here (`Stage::Dispatch`).
+				if bash && cmd.redirs.is_some() && st(vp).target.is_none() && !st(vp).argv.is_empty() {
+					st(vp).stage = Stage::Lookup;
+					continue;
+				}
 				if let Some(list) = cmd.redirs {
 					// Opens: `CmdExpanded` reads the clock after them.
 					k.clock_stale();
@@ -273,19 +282,31 @@ pub fn exec(
 					};
 					let null = st(vp).argv.is_empty();
 					let null_forks = null && super::redir::null_forks(&unit.redirs[list as usize]);
-					let owner = super::redir::Owner::Simple { null_forks };
-					let res = super::redir::apply(k, vp, cx, unit, list, line, owner);
-					// Where the hidden scope goes back, for `forget_var_fds`.
-					let scoped = hidden.is_some().then_some(at);
+					// A null command bash forks for (`execute_null_command`'s
+					// `forcefork`) makes its redirections in that child when they
+					// can change the shell (a `$(< file)` reads in its own).
+					let fork = bash
+						&& null_forks
+						&& op.flags & ir::Op::CAT == 0
+						&& !st(vp).apart
+						&& !forked_for_it(vp)
+						&& super::redir::changes_shell(k, vp, cx, unit, list);
+					let res = if fork {
+						Ok(())
+					} else {
+						let owner = super::redir::Owner::Simple { null_forks };
+						super::redir::apply(k, vp, cx, unit, list, line, owner)
+					};
 					if let Some(scope) = hidden {
 						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
+					}
+					if fork {
+						return fork_redirections(k, vp, cx, unit, op, true);
 					}
 					// The command the job's own fork was made for (an async
 					// command, a pipeline stage: `exec::forked_for`) in bash code
 					// (zsh code keeps its own rule).
-					let entry = unit.mode.dialect() == crate::bash::ids::Dialect::Bash
-						&& vp.frames.len() == 1
-						&& vp.fork().at_entry();
+					let entry = bash && forked_for_it(vp);
 					// bash forks a null command it forks for once more there
 					// (`execute_null_command` under the job's early fork) and the
 					// job's fork exits 0 without waiting, whatever the
@@ -316,7 +337,9 @@ pub fn exec(
 						// error or a bad substitution with 1, and nothing after the
 						// command runs (a `!` included). The fork ends after its
 						// message is written to stderr as the redirections so far
-						// left it (`2>/dev/null < ${x:?}` prints none).
+						// left it (`2>/dev/null < ${x:?}` prints none). The fork made
+						// for a program's redirections is marked the same way
+						// (`fork_redirections`).
 						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
 							if entry =>
 						{
@@ -331,30 +354,22 @@ pub fn exec(
 						},
 						// A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in
 						// the redirections of a command bash runs in a fork of its
-						// own (an external, a null command that redirects fd 0) ends
-						// that fork, not the shell: the command fails with the
-						// status the fork exits with, as the shell itself would (127
-						// or 1; 1 after an arithmetic error; 1 for a null command,
-						// whose fork bash 5.3 gives a catcher of its own).
+						// own (a program, a null command that redirects fd 0 or a
+						// `{var}`) ends that fork, not the shell: the command fails
+						// with the status the fork exits with (127 or 1; 1 after an
+						// arithmetic error; 1 for a null command, whose fork bash 5.3
+						// gives a catcher of its own). So it does in the fork made
+						// for a null command's redirections, and here, in the shell,
+						// when they were made here: no word could change the shell
+						// (`redir::changes_shell`), yet one failed (`${a[08]}`). The
+						// message goes to stderr as the redirections so far left it
+						// (`2>/dev/null < ${x:?}` prints none).
 						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
-							if if null {
-								null_forks
-							} else {
-								forks_for(k, cx, vp)
-							} =>
+							if if null { null_forks } else { runs_apart(vp) } =>
 						{
-							forget_var_fds(k, vp, cx, scoped);
 							let s = st(vp);
 							s.status = if null { 1 } else { code };
-							// bash looks the name up (and hashes it) in the shell
-							// before it forks; a null command has none.
-							s.stage = if null {
-								Stage::Finish
-							} else {
-								Stage::FailedLookup
-							};
-							// The message goes to stderr as the redirections so far
-							// left it (`2>/dev/null < ${x:?}` prints none).
+							s.stage = Stage::Finish;
 							if let Some(fd) = exec::flush_out(k, vp) {
 								return Flow::Block(WaitKey::Write { fd });
 							}
@@ -382,22 +397,9 @@ pub fn exec(
 									)
 									.unwrap_or(false)
 								};
-							// A command bash forks for fails in its fork (bash's
-							// `execute_disk_command`, `execute_null_command`'s
-							// `forcefork`), after the shell looked its name up with
-							// the values before its `{var}`s (`{PATH}<f` too): they go
-							// before the lookup; a null command's go at `Finish`.
-							let forks = !null && forks_for(k, cx, vp);
-							if forks {
-								forget_var_fds(k, vp, cx, scoped);
-							}
 							let s = st(vp);
 							s.status = 1;
-							s.stage = if forks {
-								Stage::FailedLookup
-							} else {
-								Stage::Finish
-							};
+							s.stage = Stage::Finish;
 							if fatal {
 								s.control = Some(Transfer::Exit(1));
 							}
@@ -432,8 +434,9 @@ pub fn exec(
 				{
 					return flow;
 				}
-				// The rest of a deferred list ran (or was collected) after the
-				// name resolved: the command dispatches.
+				// The name resolved before the redirections (bash), or the rest
+				// of a deferred list ran (or was collected) after it did: the
+				// command dispatches.
 				let resolved = k
 					.deferrals
 					.iter()
@@ -441,13 +444,13 @@ pub fn exec(
 				let s = st(vp);
 				s.stage = if s.argv.is_empty() {
 					Stage::Finish
-				} else if resolved {
+				} else if resolved || s.target.is_some() {
 					Stage::Dispatch
 				} else {
 					Stage::Lookup
 				};
 			},
-			Stage::Lookup | Stage::FailedLookup => {
+			Stage::Lookup => {
 				if let Some(flow) = lookup(k, vp, cx, op, cmd.typeset) {
 					return flow;
 				}
@@ -461,6 +464,26 @@ pub fn exec(
 				deferred_resolved(k, vp);
 			},
 			Stage::Dispatch => {
+				// The name resolved before the redirections (`Stage::Redirect`):
+				// a program makes them in the child bash forks for it when they
+				// can change the shell; a jobspec run in the shell runs `fg`
+				// without them (bash's `execute_simple_command` never makes them;
+				// in the job's own fork it is a name like any other); anything
+				// else makes them here, now.
+				if let Some(list) = cmd.redirs
+					&& redirections_wait(vp, unit, list)
+					&& (forked_for_it(vp) || !current_exec(vp).is_some_and(runs_fg))
+				{
+					if !st(vp).apart
+						&& !forked_for_it(vp)
+						&& runs_apart(vp)
+						&& redirections_change_shell(k, vp, cx, unit, cmd, list)
+					{
+						return fork_redirections(k, vp, cx, unit, op, false);
+					}
+					st(vp).stage = Stage::Redirect;
+					continue;
+				}
 				if matches!(st(vp).target, Some(Target::Intrinsic(_))) {
 					catch_builtin(vp);
 				}
@@ -489,15 +512,6 @@ pub fn exec(
 			},
 			Stage::Finish => {
 				k.forget_deferral(vp.vpid);
-				// A command bash forks for made its `{var}`s in its fork: once
-				// it has run, the shell keeps none (its temporary scope hidden,
-				// as when they were made).
-				if st(vp).var_fds.is_some() {
-					let scoped = st(vp)
-						.scoped
-						.then(|| state::scope_count(&k.root, vp).saturating_sub(1));
-					forget_var_fds(k, vp, cx, scoped);
-				}
 				return finish(k, vp, cx, op);
 			},
 		}
@@ -1944,77 +1958,127 @@ const fn catch_builtin(vp: &mut Vproc) {
 	}
 }
 
-/// [`super::redir::forget_var_fds`] for a simple command whose temporary
-/// scope went back at `scoped` after its redirections: they assigned their
-/// `{var}`s with that scope hidden (bash's `expanding_redir`), so the old
-/// values go back with it hidden again, not into it.
-fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, scoped: Option<usize>) {
-	let Some(at) = scoped else {
-		super::redir::forget_var_fds(k, vp, cx);
-		return;
-	};
-	let scope = state::pop_scope(&mut k.root, cx.store, vp);
-	super::redir::forget_var_fds(k, vp, cx);
-	if let Some(scope) = scope {
-		state::insert_scope(&mut k.root, cx.store, vp, at, scope);
-	}
+/// Whether bash runs the simple command on top of `vp`, its name looked
+/// up, in a fork that makes its redirections itself
+/// (`execute_disk_command`): a program, also behind `command`, or a name
+/// not found but a jobspec ([`runs_fg`]); not a function or a builtin.
+pub(super) fn runs_apart(vp: &Vproc) -> bool {
+	vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
+		&& current_exec(vp).is_some_and(|e| match &e.target {
+			None | Some(Target::Function(_) | Target::Intrinsic(_)) => false,
+			Some(Target::NotFound | Target::Search) => !runs_fg(e),
+			Some(_) => true,
+		})
 }
 
-/// Whether bash runs the simple command on top of `vp` (its words
-/// expanded, its name not yet looked up) in a fork that makes its
-/// redirections itself (`execute_disk_command`): a name that is not a
-/// function or a builtin (an external, one not found), also behind
-/// `command`. Read only: [`lookup`] still resolves it.
-pub(super) fn forks_for(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
-	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-		return false;
+/// A jobspec as the command (`%1`): bash runs `fg` (as [`dispatch`] does)
+/// and makes none of its redirections.
+fn runs_fg(e: &ExecState) -> bool {
+	matches!(e.target, Some(Target::NotFound | Target::Search))
+		&& e.exec_as.is_none()
+		&& e.argv.first().is_some_and(|a| a.starts_with(b"%"))
+}
+
+/// `vp` is the fork made for the one command at its base frame (an async
+/// command, a pipeline stage: `exec::forked_for`; a program's
+/// redirections: [`fork_redirections`]): bash makes no other fork for it.
+const fn forked_for_it(vp: &Vproc) -> bool {
+	vp.frames.len() == 1 && vp.fork().at_entry()
+}
+
+/// The bash command's redirection list `list` is still to be made: its
+/// name resolved first (`Stage::Redirect`).
+fn redirections_wait(vp: &Vproc, unit: &Unit, list: u32) -> bool {
+	unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& vp
+			.frames
+			.last()
+			.and_then(|f| f.scratch.as_ref())
+			.and_then(|s| s.io.as_ref())
+			.map_or(0, |io| io.redir.done)
+			< unit.redirs.get(list as usize).map_or(0, Vec::len)
+}
+
+/// [`super::redir::changes_shell`] as the redirections will expand: without
+/// the command's temporary environment (bash `expanding_redir`).
+fn redirections_change_shell(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Unit,
+	cmd: &ir::Cmd,
+	list: u32,
+) -> bool {
+	let at = state::scope_count(&k.root, vp).saturating_sub(1);
+	let hidden = if st(vp).scoped && !cmd.assigns.is_empty() {
+		state::pop_scope(&mut k.root, cx.store, vp)
+	} else {
+		None
+	};
+	let changes = super::redir::changes_shell(k, vp, cx, unit, list);
+	if let Some(scope) = hidden {
+		state::insert_scope(&mut k.root, cx.store, vp, at, scope);
 	}
-	let mode = exec::mode_of(vp);
-	let posix =
-		state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false);
-	let argv = current_argv(vp);
-	let mut at = 0;
-	let mut via = Via::Plain;
-	while let Some(name) = argv.get(at) {
-		let has_slash = name.contains(&b'/')
-			|| (k.engine.config().platform == crate::bash::ids::Platform::Windows
-				&& name.contains(&b'\\'));
-		let rctx = ResolveCtx { has_slash, via };
-		let Ok(resolved) = resolve(k, cx, vp, name, mode, rctx) else {
-			return false;
-		};
-		let special =
-			posix && !has_slash && matches!(resolved, Resolved::Intrinsic(id) if is_special(id));
-		// Outside posix mode a function name may contain a slash.
-		if via == Via::Plain
-			&& (!has_slash || !posix)
-			&& !special
-			&& matches!(
-				state::record(cx.store, vp, Key::Func(BStr::new(name))),
-				Ok(Some(Record::Func { .. }))
-			) {
-			return false;
-		}
-		match resolved {
-			// `command NAME`: NAME, never a function.
-			Resolved::Intrinsic(IntrinsicId::Command) => {
-				at += 1;
-				while argv
-					.get(at)
-					.is_some_and(|a| matches!(a.as_slice(), b"-p" | b"--"))
-				{
-					at += 1;
-				}
-				if argv.get(at).is_none_or(|a| a.starts_with(b"-")) {
-					return false;
-				}
-				via = Via::Command;
-			},
-			Resolved::Intrinsic(_) => return false,
-			_ => return true,
-		}
+	changes
+}
+
+/// bash's fork for a program whose redirections can change the shell
+/// (`execute_disk_command`; `null`: a null command's `forcefork`): the
+/// command goes on from its redirections in a child vproc, its name looked
+/// up here already. The redirections and the program are the child's,
+/// which ends with the command ([`ExecState::apart`]); the shell waits for
+/// it and reports the command with its status.
+#[cold]
+#[inline(never)]
+fn fork_redirections(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	op: Op,
+	null: bool,
+) -> Flow {
+	// The fork is the job's command now: its virtual pid stays `$!`, as
+	// for a subshell ([`super::proc::Bang`]).
+	k.settle_bang(vp.vpid, None);
+	let pc = vp.frames.last().map_or(0, |f| f.pc);
+	// The fork keeps the shell's loop level (`make_child`, no
+	// `execute_in_subshell`).
+	let one = OneCommand { trap_exit: exec::exit_trap_status(vp), in_loop: exec::in_loop(vp) };
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), pc, vp.fds.clone());
+	// One command's fork: `$BASH_SUBSHELL` stays the shell's, a fatal
+	// error reaches what the shell's reach (a null command's fork catches
+	// its own), and no EXIT trap runs (bash `exit`s the fork, or `exec`s).
+	super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+	child.set_fork(if null {
+		super::proc::Fork::CHILD
+	} else {
+		super::proc::Fork::entry(vp.fork())
+	});
+	child.exit_trap_run = true;
+	let mut e = Box::new(st(vp).clone());
+	e.stage = Stage::Redirect;
+	e.control = Some(Transfer::Exec);
+	e.apart = true;
+	// bash's null command fork exits 0 when its redirections succeed.
+	if null {
+		e.status = 0;
 	}
-	false
+	let mut sc = Box::<Scratch>::default();
+	sc.exec = Some(e);
+	let frame = &mut child.frames[0];
+	frame.kind = FrameKind::Job { stop_at: pc + 1, one: Some(one) };
+	// The shell ran the command's DEBUG trap.
+	frame.debug_pc = Some(pc);
+	frame.scratch = Some(sc);
+	let vpid = child.vpid;
+	k.emit_op(cx, vp, op.node, EventData::Subshell { child: vpid });
+	k.spawned.push(Box::new(child));
+	let s = st(vp);
+	s.wait_for = vec![vpid];
+	s.waiting = Some(Awaited::Fork);
+	s.stage = Stage::Await;
+	Flow::Block(WaitKey::Proc(vpid))
 }
 
 /// Resolve the command name: `command`/`builtin` prefixes, functions,
@@ -2293,15 +2357,8 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			return flow;
 		}
 	}
-	// A command whose redirections failed in its fork runs nothing more.
-	let failed = st(vp).stage == Stage::FailedLookup;
-	st(vp).stage = if failed {
-		Stage::Finish
-	} else {
-		Stage::Dispatch
-	};
-	if !failed
-		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
+	st(vp).stage = Stage::Dispatch;
+	if k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
 	{
 		// Borrowed from the command's state, stamped with its start when
@@ -4602,6 +4659,30 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			last
 		},
+		Some(Awaited::Fork) => {
+			let status = match st(vp).wait_for.first().copied() {
+				Some(v) => match k.proc_collect(cx.store, v) {
+					Some(status) => status,
+					None => return Some(Flow::Block(WaitKey::Proc(v))),
+				},
+				None => st(vp).status,
+			};
+			st(vp).wait_for.clear();
+			// A null command's fork exits with success or failure alone, a
+			// `${| exit 3; }` there too (bash 5.3's `execute_null_command`).
+			let status = if st(vp).argv.is_empty() {
+				i32::from(status != 0)
+			} else {
+				status
+			};
+			// The root's foreground command under job control: its group is
+			// done with and the terminal comes back, as after a subshell (a
+			// status alone does not tell a signal's death from an `exit`).
+			if vp.parent.is_none() && k.jobctl.has_pgrp() {
+				super::jobctl::fg_done(k, cx, vp, None, b"");
+			}
+			status
+		},
 		Some(Awaited::AllJobs) => {
 			while let Some(&v) = st(vp).wait_for.first() {
 				if k.proc_collect(cx.store, v).is_some() {
@@ -4903,12 +4984,13 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 /// Report the command and leave the op (or transfer control).
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
-	let (status, t0, control) = (e.status, e.t0, e.control);
+	let (status, t0, control, apart) = (e.status, e.t0, e.control, e.apart);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
-	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
+	// The fork made for a program's redirections: the shell reports it.
+	if !apart && k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.
 		let end = k.read_clock(cx);

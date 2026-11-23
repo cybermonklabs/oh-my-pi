@@ -40,9 +40,12 @@ use crate::bash::{
 	fs::{File, FileKind, FsOp, FsPoll, OpenFlags, SeekFrom, StatKind},
 	host::{ChildRedir, OsHandle},
 	ids::Dialect,
-	ir::{RedirFdIr, RedirIr, RedirTargetIr, SpawnKind, Unit},
+	ir::{
+		ComsubForm, Op, OpIr, Opcode, ParamIr, ParamRef, Part, RedirFdIr, RedirIr, RedirTargetIr,
+		SpawnKind, SubIr, Unit,
+	},
 	mem::MemBuf,
-	store::{OptId, VarValue},
+	store::{Attrs, OptId, VarValue},
 	zshopt::ZshOpt,
 };
 
@@ -85,7 +88,7 @@ pub enum Owner {
 		/// Made in the shell and undone after the command.
 		undo: bool,
 		/// A bash `( … )`'s own, which bash makes in the subshell's fork:
-		/// the shell keeps none of their `{var}`s ([`forgets_vars`]).
+		/// the shell keeps none of their `{var}`s ([`forget_var_fds`]).
 		fork: bool,
 	},
 }
@@ -241,6 +244,211 @@ pub(super) fn null_forks(list: &[RedirIr]) -> bool {
 		RedirFdIr::Num(n) => n == 0,
 		RedirFdIr::Default => default_fd(r.op) == 0,
 	})
+}
+
+/// Whether expanding redirection list `list` of `unit` can change the shell
+/// rather than only open files. bash expands a program's redirections in
+/// the child it forks for it (`execute_disk_command`, and a null command's
+/// `forcefork`), so none of this reaches the shell there; the command stage
+/// then makes them in a child vproc. A word changes the shell when it can
+/// assign (`${x=}`, `${x:=}`, arithmetic, an indexed subscript that is not
+/// a number, a substring offset, `{var}`), run commands in the shell
+/// (`${ ;}`, `${| ;}`, `${x@P}`), start a process the shell would own
+/// (`<( )`, `>( )`: `$!`), draw `$RANDOM` or read `$BASHPID`, follow a name
+/// reference (it may lead to any of these), or fail in a way that ends the
+/// shell or its line (`${x?}`, an indirection, a bad substitution, a `$( )`
+/// that does not parse, any parameter under `set -u`, a pattern under
+/// `failglob`). An unquoted here-document is read as its text compiles. A
+/// `$( )` runs in a child of its own and changes nothing here, but for a
+/// `$(< file)`, which the shell may read without one: its own redirection
+/// is walked.
+pub(super) fn changes_shell(
+	k: &mut Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Unit,
+	list: u32,
+) -> bool {
+	Watch { k, cx, vp, nounset: None, failglob: None }.list(unit, list)
+}
+
+/// The walk of [`changes_shell`], with the options it reads at most once.
+struct Watch<'a, 'c> {
+	k:        &'a mut Kernel,
+	cx:       &'a mut Cx<'c>,
+	vp:       &'a Vproc,
+	nounset:  Option<bool>,
+	failglob: Option<bool>,
+}
+
+impl Watch<'_, '_> {
+	fn list(&mut self, unit: &Unit, list: u32) -> bool {
+		let Some(redirs) = unit.redirs.get(list as usize) else {
+			return true;
+		};
+		redirs.iter().any(|r| {
+			matches!(r.fd, RedirFdIr::Var(_))
+				|| match &r.target {
+					RedirTargetIr::Word(w) => self.word(unit, *w),
+					RedirTargetIr::HereDoc { quoted: true, .. } => false,
+					RedirTargetIr::HereDoc { text, quoted: false } => self.heredoc(text),
+				}
+		})
+	}
+
+	/// An option as the expansion will read it, read once into `slot`; one
+	/// that cannot be read counts as on (the walk then forks, which changes
+	/// nothing it should not).
+	fn option(&mut self, opt: OptId, slot: Option<bool>) -> bool {
+		slot.unwrap_or_else(|| {
+			state::option(&mut self.k.root, self.cx.store, self.vp, opt).unwrap_or(true)
+		})
+	}
+
+	fn nounset(&mut self) -> bool {
+		let on = self.option(OptId::Nounset, self.nounset);
+		self.nounset = Some(on);
+		on
+	}
+
+	fn failglob(&mut self) -> bool {
+		let on = self.option(OptId::Failglob, self.failglob);
+		self.failglob = Some(on);
+		on
+	}
+
+	/// An unquoted here-document, as [`target_text`] compiles it; one that
+	/// does not parse fails the redirection, in the child as here.
+	fn heredoc(&mut self, text: &[u8]) -> bool {
+		let observed = self
+			.k
+			.mask
+			.contains(crate::bash::event::EventKind::UnitCompiled);
+		let mode = super::exec::mode_of(self.vp);
+		match self
+			.k
+			.engine
+			.text_unit(text, TextKind::HereDoc, mode, observed)
+		{
+			Ok(doc) => doc
+				.words
+				.len()
+				.checked_sub(1)
+				.and_then(|w| u32::try_from(w).ok())
+				.is_some_and(|w| self.word(&doc, w)),
+			Err(_) => false,
+		}
+	}
+
+	fn word(&mut self, unit: &Unit, w: u32) -> bool {
+		let Some(word) = unit.words.get(w as usize) else {
+			return true;
+		};
+		if word
+			.braces
+			.as_deref()
+			.is_some_and(|alts| alts.iter().any(|&a| self.word(unit, a)))
+		{
+			return true;
+		}
+		if !word.noglob && self.failglob() {
+			return true;
+		}
+		word.parts.iter().any(|p| self.part(unit, p))
+	}
+
+	fn part(&mut self, unit: &Unit, p: &Part) -> bool {
+		match p {
+			Part::Lit(_) | Part::Quoted(_) | Part::AnsiC(_) => false,
+			Part::Comsub { kind: ComsubForm::Fork, entry, .. } => self.cat_body(unit, *entry),
+			Part::Param(p) => self.param(unit, p),
+			Part::Comsub { .. }
+			| Part::Arith { .. }
+			| Part::ProcSub { .. }
+			| Part::BadSubst(_)
+			| Part::ComsubSyntax { .. }
+			| Part::Compound(_)
+			| Part::Zsh(_) => true,
+		}
+	}
+
+	/// The body of a `$( )` at `entry`: a lone `$(< file)` (an `Exec` with
+	/// the `CAT` flag) by its own redirection, anything else not at all.
+	fn cat_body(&mut self, unit: &Unit, entry: u32) -> bool {
+		let Some(op) = unit.ops.get(entry as usize) else {
+			return false;
+		};
+		op.code == Opcode::Exec
+			&& op.flags & Op::CAT != 0
+			&& unit
+				.cmds
+				.get(op.a as usize)
+				.and_then(|cmd| cmd.redirs)
+				.is_some_and(|list| self.list(unit, list))
+	}
+
+	fn param(&mut self, unit: &Unit, p: &ParamIr) -> bool {
+		if p.indirect || self.nounset() {
+			return true;
+		}
+		let words = match &p.op {
+			OpIr::Assign { .. }
+			| OpIr::Error { .. }
+			| OpIr::Substr { .. }
+			| OpIr::Indirect
+			| OpIr::Transform(b'P') => return true,
+			OpIr::Default { word, .. }
+			| OpIr::Alt { word, .. }
+			| OpIr::Trim { pat: word, .. }
+			| OpIr::Replace { pat: word, rep: None, .. }
+			| OpIr::Case { pat: Some(word), .. } => [Some(*word), None],
+			OpIr::Replace { pat, rep: Some(rep), .. } => [Some(*pat), Some(*rep)],
+			OpIr::None
+			| OpIr::Length
+			| OpIr::PrefixNames { .. }
+			| OpIr::Transform(_)
+			| OpIr::Case { pat: None, .. } => [None, None],
+		};
+		if words.into_iter().flatten().any(|w| self.word(unit, w)) {
+			return true;
+		}
+		let ParamRef::Var(name) = &p.param else {
+			return false;
+		};
+		if let Some(SubIr::Expr(w)) = p.index
+			&& self.subscript(unit, name, w)
+		{
+			return true;
+		}
+		matches!(name.as_slice(), b"RANDOM" | b"BASHPID") || self.nameref(name)
+	}
+
+	/// `name[w]`: an associative array's key is a word like any other; an
+	/// indexed array's is arithmetic, which can assign (`a[i++]`), read a
+	/// variable that holds an expression, or fail, unless it is a number.
+	fn subscript(&mut self, unit: &Unit, name: &[u8], w: u32) -> bool {
+		let assoc = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name).map(|v| {
+			v.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC))
+		});
+		match assoc {
+			Ok(true) => self.word(unit, w),
+			Ok(false) => !unit.words.get(w as usize).is_some_and(|word| {
+				!word.parts.is_empty()
+					&& word.parts.iter().all(|p| {
+						matches!(p, Part::Lit(t) | Part::Quoted(t)
+							if !t.is_empty() && t.iter().all(u8::is_ascii_digit))
+					})
+			}),
+			Err(_) => true,
+		}
+	}
+
+	/// A name reference: what it names (`RANDOM`, `a[i++]`) is read when it
+	/// is.
+	fn nameref(&mut self, name: &[u8]) -> bool {
+		state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
+			.map_or(true, |v| v.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF)))
+	}
 }
 
 /// Source text of word `w` (for `ambiguous redirect`).
@@ -416,10 +624,9 @@ fn target_fd(
 }
 
 /// Store `fd` in the `{var}` named `name`. With `record` (bash makes the
-/// redirection in a fork, [`forgets_vars`]) the variable's binding before
-/// is noted for the shell to put back: a simple command's in
-/// [`super::proc::ExecState::var_fds`], a `( … )`'s `Redir` op's in
-/// [`super::proc::ScratchIo::var_fds`].
+/// redirection in a `( … )`'s fork, [`Owner::Compound`]'s `fork`) the
+/// variable's binding before is noted in
+/// [`super::proc::ScratchIo::var_fds`] for the shell to put back.
 fn assign_fd_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -456,10 +663,7 @@ fn assign_fd_var(
 	}
 	if let Some(var) = before {
 		let var = VarFd { fd, ..var };
-		match super::exec::scratch(vp).exec.as_mut() {
-			Some(e) => e.var_fds.get_or_insert_with(Box::default).push(var),
-			None => io(vp).var_fds.get_or_insert_with(Box::default).push(var),
-		}
+		io(vp).var_fds.get_or_insert_with(Box::default).push(var);
 	}
 	Ok(())
 }
@@ -484,27 +688,11 @@ fn var_before(k: &Kernel, vp: &Vproc, cx: &mut Cx<'_>, name: &[u8]) -> Option<Va
 	Some(VarFd { fd: -1, name: base, prior })
 }
 
-/// Whether bash makes the redirections `owner` makes in a fork of its own,
-/// so that the shell keeps none of their `{var}`s: a simple command bash
-/// forks for before its redirections (an external, a name not found,
-/// `command X`, a null command that [`null_forks`]), a bash `( … )`'s own.
-/// Only theirs are recorded ([`assign_fd_var`]).
-fn forgets_vars(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, owner: Owner) -> bool {
-	match owner {
-		Owner::Compound { fork, .. } => fork,
-		Owner::Simple { null_forks } => null_forks || super::command::forks_for(k, cx, vp),
-	}
-}
-
-/// Undo the `{var}` redirections made so far that bash made in a fork
-/// ([`forgets_vars`]), when they fail or the command ends: neither the fd
-/// nor the variable reaches the shell.
+/// Undo the `{var}` redirections a bash `( … )`'s own list made so far
+/// ([`Owner::Compound`]'s `fork`), when they fail: neither the fd nor the
+/// variable reaches the shell.
 pub(super) fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
-	let vars = match super::exec::scratch(vp).exec.as_mut() {
-		Some(e) => e.var_fds.take(),
-		None => io(vp).var_fds.take(),
-	};
-	if let Some(vars) = vars {
+	if let Some(vars) = io(vp).var_fds.take() {
 		forget_vars(k, vp, cx, *vars);
 	}
 }
@@ -562,8 +750,10 @@ fn install(
 	line: u32,
 	owner: Owner,
 ) -> Result<(), Halt> {
-	// A `{var}` bash makes in a fork is recorded, for the shell to forget.
-	let record = matches!(r.fd, RedirFdIr::Var(_)) && forgets_vars(k, cx, vp, owner);
+	// A `{var}` bash makes in a `( … )`'s fork is recorded, for the shell
+	// to forget.
+	let record =
+		matches!(r.fd, RedirFdIr::Var(_)) && matches!(owner, Owner::Compound { fork: true, .. });
 	match r.op {
 		RedirKind::HereDoc | RedirKind::HereString => {
 			let fd =
@@ -598,7 +788,7 @@ fn install(
 					if var
 						|| (moving
 							&& dup_fd(r).is_some_and(|fd| vp.fds.get(fd).is_some_and(FdRef::is_open))
-							&& undone(k, cx, vp, owner))
+							&& undone(vp, owner))
 					{
 						k.diag(cx, vp, line, Diag::CannotDuplicateFd);
 					}
@@ -724,13 +914,13 @@ fn dup_name(unit: &Unit, r: &RedirIr, src: i32, target: &BString) -> BString {
 /// Whether the shell undoes the redirections `owner` makes (bash's
 /// `RX_UNDOABLE`): a compound's as [`apply`]'s caller says; a simple
 /// command's unless bash forks for it before them (the command a fork was
-/// made for, an external, a null command that [`null_forks`]).
-fn undone(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, owner: Owner) -> bool {
+/// made for, a program, a null command that [`null_forks`]).
+fn undone(vp: &Vproc, owner: Owner) -> bool {
 	match owner {
 		Owner::Compound { undo, .. } => undo,
 		Owner::Simple { null_forks } => {
 			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
-			!forked && !null_forks && !super::command::forks_for(k, cx, vp)
+			!forked && !null_forks && !super::command::runs_apart(vp)
 		},
 	}
 }

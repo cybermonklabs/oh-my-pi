@@ -850,7 +850,7 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	jf.loops = loops;
 	jf.cases = cases;
 	jf.redirs = redirs;
-	jf.kind = FrameKind::Job { stop_at: end };
+	jf.kind = FrameKind::Job { stop_at: end, one: None };
 	job.frames.extend(moved);
 	job.trap_frames = u32::try_from(
 		job.frames
