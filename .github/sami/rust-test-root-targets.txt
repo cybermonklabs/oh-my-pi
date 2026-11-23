@@ -1,0 +1,7 @@
+# Bazel test targets the rust_test job in .github/workflows/sami-build.yml runs
+# as root: a second `bazel test` with --run_under="sudo -E". Each must be tagged
+# no-sandbox, since linux-sandbox maps a single uid. The job fails when a test
+# in one of them prints `not run:`, since root is its precondition, and when it
+# passes any number of tests but the one named here.
+# One per line: <bazel test target> <tests it must pass>  <why it needs root>.
+//crates/pi-builtins:pi-builtins_foreign_owner_test 3  rsync's foreign-owner tests give a file to uid 65534 to check a symlink another user owns is refused (0c81ee6c)

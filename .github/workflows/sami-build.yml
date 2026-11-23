@@ -1,13 +1,60 @@
 name: Build sami branch
 
+# How the release owner cuts a release:
+#   1. Push the composed candidate to sami-candidate. That push runs every
+#      job here but publish: carry, version, release_binary (it builds,
+#      smoke-tests and uploads the archives), attest (it attests the
+#      archives, their sidecars and the release notes), release_cache_prune,
+#      rust_test and rust_test_macos.
+#   2. Wait for that run to go green.
+#   3. Fast-forward sami to exactly that commit.
+#   4. The push to sami runs only publish, which publishes that run's
+#      attested archives. It never rebuilds.
+# For a pushed sami commit that carries this file and
+# .github/sami/release-candidate.sh as they are here: with no green
+# sami-candidate run of that commit, publish fails and publishes nothing. An
+# archive whose sha256 is not the one the candidate run attested is refused
+# and named with both digests, and nothing is published. A candidate whose
+# carry check named a release older than the newest one is refused too: a
+# release published after that check was not compared with it. A run on sami
+# other than that push (a dispatch) runs no job. A dispatch on another ref
+# builds and tests, and attests nothing, while that ref carries this file:
+# GitHub runs the dispatched ref's own sami-build.yml, so a ref whose copy
+# was changed can attest. publish's checks keep that run's files out of a
+# release (see the attest job).
+# The release build cache is saved only on a push to sami-candidate, where
+# release_cache_prune keeps one entry per target; sami, where nothing is
+# built, keeps none.
+# Known limit: a push to sami runs the pushed commit's own sami-build.yml and
+# release-candidate.sh. One from before this workflow (a72018dd, sami's head
+# on 2026-11-23, among them) builds and publishes at once, and one whose
+# copies were changed publishes what its own copies allow. For the same
+# reason, a push of any branch whose own workflow asks for contents: write
+# can create a release directly, and a ruleset on sami would not stop it.
+# Any identity of the agent App sjawhar-agent[bot] can push sami and
+# sami-candidate. No ruleset guards either ref, by the decision of
+# 2026-11-23: no wrong push has been seen, and a protection against a risk
+# nobody has seen waits for a person's request.
+
 on:
   push:
     branches:
       - sami
+      - sami-candidate
   workflow_dispatch:
 
+# Each job that needs more than reading the repository says so itself.
 permissions:
-  contents: write
+  contents: read
+
+# Only release_binary may restore or save GitHub Actions caches: it sets
+# cache-mode: write, and every other job gets a cache token that can do
+# neither. rust_test and rust_test_macos run test code with root on their
+# runners; that code therefore cannot write an entry that release_binary
+# restores. Harness cases W1 to W27 and W38 (.github/sami/tests/run.sh) keep
+# it so.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
+cache-mode: none
 
 jobs:
   carry:
@@ -16,32 +63,39 @@ jobs:
     # drops or reverts what the previous release carried (v18.16.0 lost two
     # commits of v18.13.3 that way). Fails unless every previous-release commit
     # is carried or named in .github/sami/carried-drops.txt.
+    # A run on sami (a push or a dispatch) builds nothing: publish takes the
+    # candidate run's archives and notes.
+    if: ${{ github.ref != 'refs/heads/sami' }}
     name: Carries the previous release
     runs-on: ubuntu-22.04
+    # The attest job downloads the notes by this id, so a later replacement
+    # of the artifact (it gets a new id) is not what it attests.
     outputs:
-      notes: ${{ steps.check.outputs.notes }}
+      notes-artifact-id: ${{ steps.upload-notes.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           fetch-tags: true
       - name: Fetch upstream trunk
         run: git fetch --no-tags https://github.com/can1357/oh-my-pi.git main:refs/remotes/upstream/main
       - name: Check carriage against the newest v*-sami.* tag
-        id: check
         run: |
           bash .github/sami/carry-check.sh --new HEAD --upstream upstream/main --notes "$RUNNER_TEMP/carry-notes.md"
-          # sami-release pastes its body into a double-quoted shell echo, so the
-          # notes must not carry quotes, backquotes, dollars or backslashes.
-          {
-            echo "notes<<CARRY_NOTES_EOF"
-            tr -d '"`$\\' <"$RUNNER_TEMP/carry-notes.md"
-            echo "CARRY_NOTES_EOF"
-          } >>"$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/carry-notes.md" >>"$GITHUB_STEP_SUMMARY"
+      # publish takes the release notes from this artifact, and publishes
+      # them only if the attest job of the candidate run attested them.
+      - name: Upload the release notes
+        id: upload-notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/carry-notes.md
+          if-no-files-found: error
 
   version:
     needs: carry
+    if: ${{ github.ref != 'refs/heads/sami' }}
     name: Compute version
     runs-on: ubuntu-22.04
     outputs:
@@ -49,7 +103,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       timestamp: ${{ steps.version.outputs.timestamp }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: sjawhar/.github/.github/actions/sami-version@v1
         id: version
         with:
@@ -58,6 +112,41 @@ jobs:
 
   release_binary:
     needs: version
+    if: ${{ github.ref != 'refs/heads/sami' }}
+    cache-mode: write
+    # rust_test checks the addon it downloads against this sha256. Only the
+    # linux-x64 leg sets it: the macOS leg skips the step, so the output is
+    # empty there, and an empty output is not set and does not clear the
+    # linux-x64 leg's value (GitHub's workflow syntax, "Using Job Outputs in
+    # a Matrix Job"). In the same way each leg sets the id of its own mise-*
+    # artifact, which the attest job downloads by id.
+    outputs:
+      addon-linux-x64-modern-sha256: ${{ steps.addon.outputs.sha256 }}
+      mise-linux-x64-artifact-id: ${{ matrix.target == 'linux-x64' && steps.upload-mise.outputs.artifact-id || '' }}
+      mise-darwin-arm64-artifact-id: ${{ matrix.target == 'darwin-arm64' && steps.upload-mise.outputs.artifact-id || '' }}
+    env:
+      # The release build cache. The restore and save steps must name the
+      # same paths. The bounds keep one entry per target small next to
+      # GitHub's 10 GB cache limit for the whole repository: Bazel's disk
+      # cache (its garbage collection deletes the least recently used
+      # actions), and the downloads (Bazel's repository cache and the cargo
+      # registry), which are emptied when they grow past theirs. Each push
+      # to sami-candidate saves a new entry per target (the key ends in the
+      # commit, and GitHub never overwrites a key), and release_cache_prune
+      # then deletes the entries it supersedes. So on sami-candidate the
+      # cache holds one entry per target, about 1.40 GB for linux-x64 and
+      # 0.95 GB for darwin-arm64 (about 2.35 GB), and up to twice that in the
+      # minutes between a save and the prune; sami, where nothing is built,
+      # holds none. Without the prune the ref would gain about 2.35 GB a
+      # push, and past 10 GB GitHub deletes the least recently used entries
+      # of every workflow in the repository.
+      RELEASE_CACHE_PATHS: |
+        ~/.cache/omp-release-bazel
+        ~/.cargo/registry/index
+        ~/.cargo/registry/cache
+        ~/.cargo/git/db
+      BAZEL_DISK_CACHE_MAX_BYTES: "3221225472" # 3 GiB
+      DOWNLOADS_MAX_BYTES: "1610612736" # 1.5 GiB
     strategy:
       fail-fast: false
       matrix:
@@ -73,19 +162,109 @@ jobs:
             native_targets: darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Bun version follows package.json "packageManager" (exact pin or floor),
       # the same way upstream's CI does; a hard pin here lags upstream's floor
       # and produced a binary that crashed at startup under 18.2.0's bytecode.
+      # bun's store is not restored here (cache: "false"): bun-install saves
+      # it on a run on main, and this job saves only the release build cache
+      # below. A harness case (W2) keeps it so.
       - uses: ./.github/actions/bun-install
+        with:
+          cache: "false"
       - id: bazel
         uses: ./.github/actions/bazel-cache
+      # .github/actions/bazel-cache gives Bazel a cache only on upstream's vmon
+      # runners. On these GitHub-hosted runners it says "Not a vmon runner;
+      # building uncached", so every release compiled every native crate from
+      # nothing: "Build native addons" took a median of 36 min on ubuntu-22.04
+      # and 27 min on macos-15 over the 19 pushes of 2026-11-19 to 11-22. The
+      # steps below keep Bazel's disk cache and repository cache, and the
+      # cargo registry that crate_universe reads (CARGO_BAZEL_ISOLATED=0 in
+      # .bazelrc), in GitHub's Actions cache: each push to sami-candidate, the
+      # ref the release is built on, restores the newest entry for its ref and
+      # target and saves a new one. Whoever can push sami-candidate can seed
+      # what this job restores; the same identities can push sami, which
+      # publishes, so the cache gives them nothing they lack. A candidate's
+      # own code also runs here before the save, red or green, so its
+      # outputs reach the entry the next candidate restores. When a candidate
+      # is dropped because its code is not trusted, delete sami-candidate's
+      # entries before the next candidate push (or bump v1 in all four
+      # places: the key, both restore-keys, and release_cache_prune's prefix):
+      #   gh api --paginate 'repos/cybermonklabs/oh-my-pi/actions/caches?ref=refs/heads/sami-candidate&key=omp-release-bazel-v1-' -q '.actions_caches[].id' |
+      #     xargs -I{} gh api -X DELETE repos/cybermonklabs/oh-my-pi/actions/caches/{}
+      - name: Restore the release build cache
+        id: release-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.RELEASE_CACHE_PATHS }}
+          # Each key names the run's ref, so an entry that a run on another
+          # ref wrote (a restore also looks in main's scope) cannot match by
+          # accident. A run elsewhere that writes a key with this name on
+          # purpose still could; no enabled workflow on main does.
+          key: omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
+          # An upstream version bump rewrites Cargo.lock, so most releases
+          # take the last fallback, the newest entry for this ref and target.
+          # Bazel keys each action by the digests of its inputs, so an older
+          # entry gives fewer hits, never a wrong output.
+          restore-keys: |
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-
+      - name: Point Bazel at the release build cache
+        env:
+          RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          cache="$HOME/.cache/omp-release-bazel"
+          mkdir -p "$cache/disk" "$cache/repo"
+          {
+            echo "common --disk_cache=$cache/disk"
+            echo "common --repository_cache=$cache/repo"
+            # Extracted repositories would go to <repository_cache>/contents,
+            # which nothing bounds; keep them out of the saved entry.
+            echo "common --repo_contents_cache=$RUNNER_TEMP/bazel-repo-contents"
+            # Bazel 9.2 has only the experimental_ names of these flags. Its
+            # server collects disk cache garbage after it has been idle for
+            # the delay, 5 minutes by default, which this job never is; at 0
+            # the collection starts when the build's last command ends.
+            echo "common --experimental_disk_cache_gc_max_size=$BAZEL_DISK_CACHE_MAX_BYTES"
+            echo "common --experimental_disk_cache_gc_idle_delay=0s"
+          } >>"$RC"
       - name: Build native addons
+        id: natives
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           bun scripts/bazel-natives.ts ${{ matrix.native_targets }} --dest packages/natives/native
+      # rust_test's omp-rpc smoke tests load this linux-x64-modern addon
+      # instead of one rust_test builds: its build was the same Bazel target
+      # with the same flags and took 23 min 39 s of its runner (job
+      # 137144188310). rust_test fails unless the bytes it downloads name this
+      # commit and have this sha256. The artifact is kept 30 days, as long as
+      # GitHub lets a job be re-run, so rust_test can be re-run alone.
+      - name: Hash the addon rust_test loads
+        id: addon
+        if: ${{ matrix.target == 'linux-x64' }}
+        shell: bash
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          file=pi_natives.linux-x64-modern.node
+          dir="$RUNNER_TEMP/natives-linux-x64-modern"
+          sha256="$(sha256sum "packages/natives/native/$file" | cut -d ' ' -f 1)"
+          mkdir -p "$dir"
+          cp "packages/natives/native/$file" "$dir/$file"
+          printf 'commit %s\nfile %s\nsha256 %s\n' "$COMMIT" "$file" "$sha256" >"$dir/manifest.txt"
+          cat "$dir/manifest.txt"
+          echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
+      - name: Upload the addon rust_test loads
+        if: ${{ matrix.target == 'linux-x64' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: natives-linux-x64-modern
+          path: ${{ runner.temp }}/natives-linux-x64-modern
+          retention-days: 30
+          if-no-files-found: error
       - name: Build binary
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
@@ -110,30 +289,817 @@ jobs:
           mkdir -p "release/${asset}/bin"
           cp "packages/coding-agent/binaries/omp-${TARGET}" "release/${asset}/bin/omp"
           tar -C release -czf "release/${asset}.tar.gz" "$asset"
-      - uses: actions/upload-artifact@v4
+          # The sidecar, one sha256sum line, is attested with the archive. It
+          # lets publish name the digest this run attested when an archive it
+          # downloads differs: GitHub has no API that lists attestations by
+          # run or by name. macos-15 has shasum, which writes the same line.
+          if command -v sha256sum >/dev/null; then sum=(sha256sum); else sum=(shasum -a 256); fi
+          (cd release && "${sum[@]}" "${asset}.tar.gz" >"${asset}.tar.gz.sha256")
+          cat "release/${asset}.tar.gz.sha256"
+      # The attest job attests these files, by this artifact's id, once both
+      # legs have uploaded them.
+      - name: Upload the archive and its sidecar
+        id: upload-mise
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mise-${{ matrix.target }}
-          path: release/*.tar.gz
+          path: |
+            release/*.tar.gz
+            release/*.tar.gz.sha256
           if-no-files-found: error
+      # Only a push to sami-candidate saves the cache; a dispatch or any other
+      # event only restores. cache-mode takes no expression, so this condition
+      # on the bound and save steps enforces it (harness cases W14 to W19, W26,
+      # W27 and W38). A failed build's finished actions are still valid results,
+      # so the cache is saved whenever the native build ran. A re-run of the
+      # same commit restored its exact key and has nothing to save.
+      - name: Bound the release build cache
+        id: release-cache-bound
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
+        shell: python3 {0}
+        run: |
+          import os, shutil, time
 
-  release_github:
-    needs: [carry, version, release_binary]
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/download-artifact@v4
+          home = os.path.expanduser("~")
+          disk = os.path.join(home, ".cache/omp-release-bazel/disk")
+          downloads = [os.path.join(home, p) for p in (
+              ".cache/omp-release-bazel/repo",
+              ".cargo/registry/index",
+              ".cargo/registry/cache",
+              ".cargo/git/db",
+          )]
+          disk_max = int(os.environ["BAZEL_DISK_CACHE_MAX_BYTES"])
+          downloads_max = int(os.environ["DOWNLOADS_MAX_BYTES"])
+
+          def size(root, skip=()):
+              """Bytes in regular files under root, as Bazel's collection counts them."""
+              skip = {os.path.join(root, name) for name in skip}
+              total, dirs = 0, [root]
+              while dirs:
+                  try:
+                      entries = list(os.scandir(dirs.pop()))
+                  except FileNotFoundError:
+                      continue
+                  for entry in entries:
+                      try:
+                          if entry.is_file(follow_symlinks=False):
+                              total += entry.stat(follow_symlinks=False).st_size
+                          elif entry.is_dir(follow_symlinks=False) and entry.path not in skip:
+                              dirs.append(entry.path)
+                      except FileNotFoundError:  # the collection deleted it
+                          pass
+              return total
+
+          # The collection runs in Bazel's server after the build, while the
+          # steps above run; wait for it to bring the disk cache under the
+          # bound. Bazel leaves tmp/ and gc/ out of its count.
+          deadline = time.monotonic() + 120
+          while size(disk, ("tmp", "gc")) > disk_max and time.monotonic() < deadline:
+              time.sleep(5)
+          # Files in tmp/ are writes that never finished (Bazel renames a
+          # finished write into place), and the collection never deletes
+          # them: drop them, then count everything the save would archive.
+          shutil.rmtree(os.path.join(disk, "tmp"), ignore_errors=True)
+          disk_size = size(disk)
+          downloads_size = sum(size(path) for path in downloads)
+          if downloads_size > downloads_max:
+              # Downloads are found by their content, and a miss downloads
+              # again: empty them, and the next build keeps what it fetches.
+              for path in downloads:
+                  shutil.rmtree(path, ignore_errors=True)
+              print(f"::notice title=Release build cache::The downloads held {downloads_size} bytes, over their bound; emptying them.")
+              downloads_size = sum(size(path) for path in downloads)
+          print(f"Bazel disk cache: {disk_size} bytes, bound {disk_max}")
+          print(f"Downloads: {downloads_size} bytes, bound {downloads_max}")
+          save = 0 < disk_size <= disk_max and downloads_size <= downloads_max
+          if not save:
+              print(f"::warning title=Release build cache::Not saved: the Bazel disk cache holds {disk_size} bytes (bound {disk_max}, and it must not be empty) and the downloads {downloads_size} bytes (bound {downloads_max}).")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"save={'true' if save else 'false'}\n")
+      - name: Save the release build cache
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
+          path: ${{ env.RELEASE_CACHE_PATHS }}
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
+
+  attest:
+    # The only job that can sign: no other job, and not the workflow, holds
+    # id-token: write. It attests the archives and their sidecars that both
+    # legs of release_binary uploaded, and the release notes carry uploaded,
+    # once all three succeeded, and runs no repository code: no checkout and
+    # no run step, only actions/download-artifact and
+    # actions/attest-build-provenance, pinned by commit. It downloads the
+    # three artifacts by the ids their upload steps gave: a job of this run
+    # (rust_test runs test code with root beside it) can delete an artifact
+    # and upload another under its name, but not under its id, so what it
+    # attests is what carry and release_binary uploaded. Each file has its
+    # own attest step, so a missing file fails this job and the candidate
+    # run is red before sami moves. Harness cases W39 to W67
+    # (.github/sami/tests/run.sh) keep it so. It runs only on a push to
+    # sami-candidate, so the public transparency log gets no trial entries.
+    # This if: does not keep a dispatch run's files out of a release: GitHub
+    # runs the workflow file of the ref a run is on, and that file can attest
+    # anything. publish's checks do (.github/sami/release-candidate.sh): find
+    # takes only a run of a push to sami-candidate at the pushed commit, the
+    # downloads take that run's artifacts by its run id, and verify accepts a
+    # file only with an attestation whose certificate names that run
+    # (runInvocationURI), a push (buildTrigger) and sami-build.yml at
+    # refs/heads/sami-candidate (its subject and buildSignerURI), from the
+    # pushed commit on that ref.
+    name: Attest the release archives and notes
+    needs: [carry, release_binary]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # Each artifact goes to a directory of its own, named for the artifact
+      # (merge-multiple is off). An id that no longer exists is only a
+      # warning here; the attest steps below then find no file there.
+      - name: Download the archives and the release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.carry.outputs.notes-artifact-id }},${{ needs.release_binary.outputs.mise-linux-x64-artifact-id }},${{ needs.release_binary.outputs.mise-darwin-arm64-artifact-id }}
+          path: ${{ runner.temp }}/attest
+      # One step per file: a subject-path that matches no file fails its
+      # step ("Could not find subject at path", actions/attest's
+      # src/subject.ts at 508db95d, which this action runs), so a missing
+      # archive, sidecar or notes file fails the job.
+      - name: Attest the linux-x64 archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-linux-x64/*.tar.gz
+      - name: Attest the linux-x64 sidecar
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-linux-x64/*.tar.gz.sha256
+      - name: Attest the darwin-arm64 archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-darwin-arm64/*.tar.gz
+      - name: Attest the darwin-arm64 sidecar
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-darwin-arm64/*.tar.gz.sha256
+      - name: Attest the release notes
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/release-notes/carry-notes.md
+
+  release_cache_prune:
+    # Keeps the newest release build cache entry of each target in this
+    # ref and deletes the rest (see release_binary's env). It runs on a push
+    # to sami-candidate, the only run that saves an entry; a push to sami
+    # builds and saves nothing. No checkout and no member code: it only
+    # lists and deletes this ref's entries whose key starts with
+    # omp-release-bazel-v1-<ref>-, and this job alone may delete cache
+    # entries. Harness cases W28 to W37 check that it names no action,
+    # listed interpreter or downloader, git or repository path and calls gh
+    # only on actions/caches or `gh cache`, and that no other job's line
+    # grants actions write.
+    name: Keep one release build cache per target
+    needs: release_binary
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+    # The run's conclusion, which publish reads, follows the build and the
+    # tests; a failed prune shows only on this job. The step, not the job,
+    # has the 10-minute limit: past it the step fails, which continue-on-error
+    # covers, whereas at a job's limit GitHub cancels the job.
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded release build caches of this ref
+        timeout-minutes: 10
+        run: |
+          prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
+          # A line per entry: id, key, creation time, bytes, group. The group
+          # is the key without its -<64 hex lock hash>-<40 hex commit> end,
+          # so it names the ref and the target. A key without that end is
+          # UNGROUPED: it is never deleted, and it fails the step.
+          list() {
+            gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
+              -f key="$prefix" -f ref="$GITHUB_REF" -F per_page=100 \
+              -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, (.key | if test("-[0-9a-f]{64}-[0-9a-f]{40}$") then sub("-[0-9a-f]{64}-[0-9a-f]{40}$"; "") else "UNGROUPED" end)] | @tsv'
+          }
+          list >caches.tsv
+          echo "CACHES $(wc -l <caches.tsv) entries of this ref before"
+          if [ ! -s caches.tsv ]; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: no entry of $GITHUB_REF has a key that starts with $prefix, so nothing was pruned; the key format may have changed"
+            exit 0
+          fi
+          if cut -f5 caches.tsv | grep -qx UNGROUPED; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: an entry of $GITHUB_REF has a key without the -<lock hash>-<commit> end, so it is not pruned; the key format may have changed"
+          fi
+          # Newest first: each entry after the first of its group is superseded.
+          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '$5 == "UNGROUPED" { next } ($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
+          while IFS=$'\t' read -r id key created size _; do
+            # The run of a later push may have deleted it first: that is done too.
+            if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" >/dev/null 2>&1; then
+              echo "DELETED $key ($((size / 1000000)) MB, created $created)"
+            else
+              echo "GONE $key (deleted elsewhere, or the delete failed)"
+            fi
+          done <superseded.tsv
+          list >after.tsv
+          # Only the entries listed before the deletes count: an entry a later
+          # push saved while this job ran is for that run's prune.
+          awk -F'\t' 'NR == FNR { seen[$1] = 1; next }
+            { total++; s += $4 }
+            !($1 in seen) { later++; next }
+            $5 == "UNGROUPED" { print "UNGROUPED " $2; bad = 1; next }
+            { n[$5]++ }
+            END {
+              for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], (n[g] == 1 ? "y" : "ies"); if (n[g] > 1) bad = 1 }
+              if (later) printf "LATER %d entries a later push saved while this job ran\n", later
+              printf "CACHES %d entries of this ref after, %.2f GB\n", total, s / 1e9; exit bad }' caches.tsv after.tsv
+
+  rust_test:
+    # Upstream runs these tests in ci.yml's rust_validate job, on upstream's
+    # self-hosted vmon runners, which the fork has no access to; so every fork
+    # run of it is cancelled and no sami release ran a Rust test. This job runs
+    # the same `bazel test //crates/...` on a GitHub-hosted runner, uncached;
+    # a candidate run is green, and publish takes it, only when it passes.
+    # The omp-rpc smoke tests' server loads the linux-x64-modern native addon
+    # release_binary's linux-x64 leg installed (its step "Hash the addon
+    # rust_test loads"), so this job starts when release_binary's legs end,
+    # and it needs that leg: a trial run that skips release_binary fails
+    # here. Re-running a failed release_binary leg re-runs this job and
+    # rust_test_macos too.
+    # The parity step fails while a test target of the repository's own Rust
+    # suite has no Bazel test target. The test step, .github/sami/rust-test.sh,
+    # fails when a test fails that .github/sami/rust-test-known-failures.txt
+    # does not name (or a named one passes), when a target fails to build or
+    # has no result, when a test of a binary runs in no invocation, when an
+    # #[ignore]d test runs nowhere (each is run alone, as root where it needs
+    # root, or is a child entry point, or runs in rust_test_macos), and when a
+    # test skips itself. It sees a skip in what a passing test prints: the
+    # marker `skipped: <reason>` or a word the tree's tests used before it
+    # (`skipping`, `SKIP`, `not run`, `UNCOMPARED`) is a skip, and any other
+    # output fails unless .github/sami/rust-test-known-output.txt names the
+    # test. A line a test's child or thread writes outside libtest's record
+    # fails unless .github/sami/rust-test-known-raw-output.txt names it. The
+    # sticky-directory FIFO tests run alone out of the sandbox, as the
+    # runner's user given the FIFO the precondition step makes, and as root.
+    # A test that returns early and prints nothing passes: no log shows it,
+    # so each test that can skip prints the marker before it returns.
+    needs: release_binary
+    # It runs whatever release_binary's verdict, so a run without the addon
+    # fails here instead of skipping the tests. The ref test keeps it off
+    # sami, where release_binary is skipped.
+    if: ${{ !cancelled() && github.ref != 'refs/heads/sami' }}
+    name: Rust tests (bazel)
+    runs-on: ubuntu-22.04
+    # Uncached, the build and the tests took 17 to 25 minutes (runs
+    # 44696018007, 44841451861), and run 44879022489's 35 with the #[ignore]d
+    # tests that run alone (each bounded at 1200 s); the cargo doctests and
+    # the omp-rpc smoke tests come on top.
+    timeout-minutes: 150
+    # Test code and dev-dependency build scripts run here, so the job gets a
+    # read-only token, and checkout keeps no credential in .git/config.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The omp-rpc smoke tests' server loads packages/natives/native's
+      # pi_natives.linux-x64-modern.node: the one release_binary's linux-x64
+      # leg installed in this run. It has the flags this job's own build had:
+      # the //:natives-linux-x64-modern target through the transition in
+      # bazel/defs.bzl, and the same --config=ci; release_binary's rc adds
+      # only cache locations and cache collection bounds. Nothing here builds
+      # it again: a missing artifact fails the download, and the next step
+      # fails when the artifact names another commit, or its bytes' sha256
+      # differs from release_binary's output or from the artifact's manifest.
+      # They run first, so a run without the addon fails in a minute.
+      - name: Download the addon release_binary built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: natives-linux-x64-modern
+          path: ${{ runner.temp }}/release-natives/natives-linux-x64-modern
+      - name: Check the addon release_binary built
+        shell: bash
+        env:
+          COMMIT: ${{ github.sha }}
+          WANT_SHA256: ${{ needs.release_binary.outputs.addon-linux-x64-modern-sha256 }}
+        run: |
+          fail() { echo "::error title=Native addon::$1"; exit 1; }
+          # The loader takes the modern addon only where /proc/cpuinfo names
+          # avx2 (detectAvx2Support, packages/natives/native/loader-state.js);
+          # elsewhere it looks for a baseline addon, which this job has not.
+          grep -qiw avx2 /proc/cpuinfo ||
+            fail "this runner's CPU has no AVX2, so the loader would not load the linux-x64-modern addon, and the job has no baseline addon"
+          file=pi_natives.linux-x64-modern.node
+          dir="$RUNNER_TEMP/release-natives/natives-linux-x64-modern"
+          [ -f "$dir/$file" ] && [ -f "$dir/manifest.txt" ] ||
+            fail "the natives-linux-x64-modern artifact holds no $file or no manifest.txt"
+          cat "$dir/manifest.txt"
+          [ -n "$WANT_SHA256" ] || fail "release_binary gave no addon-linux-x64-modern-sha256 output"
+          got="$(sha256sum "$dir/$file" | cut -d ' ' -f 1)"
+          [ "$(sed -n 's/^commit //p' "$dir/manifest.txt")" = "$COMMIT" ] ||
+            fail "the artifact's manifest names another commit than this run's $COMMIT"
+          [ "$(sed -n 's/^file //p' "$dir/manifest.txt")" = "$file" ] ||
+            fail "the artifact's manifest names another file than $file"
+          [ "$got" = "$WANT_SHA256" ] ||
+            fail "$file has sha256 $got; release_binary's output gives $WANT_SHA256"
+          [ "$(sed -n 's/^sha256 //p' "$dir/manifest.txt")" = "$got" ] ||
+            fail "$file has sha256 $got; the artifact's manifest gives another"
+      # The test step's decisions, the download helper and the parity
+      # script's argument checks, against stubs; a minute, before the build.
+      - name: The gate's own regression tests
+        shell: bash
+        run: bash .github/sami/tests/run.sh
+      - id: bazel
+        uses: ./.github/actions/bazel-cache
+      # The reference rsync, zsh and bash below are built from pinned
+      # tarballs on every run, never restored from a GitHub Actions cache: the
+      # tests run in this job, on a runner whose user has passwordless sudo,
+      # and code they run could save a cache entry for this ref (one no run
+      # has written yet, such as the next runner image's) that a later run
+      # would restore and judge the tests with. The three builds take about
+      # 2 min 15 s (run 44987520746). A harness case (W6) keeps the gate's
+      # jobs off the cache.
+      # pi-builtins' rsync conformance and daemon tests compare the builtin
+      # byte for byte with rsync 3.5.1 built with every checksum and
+      # compressor the builtin offers, and skip without one; the runner's
+      # rsync is 3.2.7, so they ran nowhere. The test step puts this build
+      # first on the tests' PATH and sets RSYNC_REFERENCE_REQUIRED, with which
+      # a missing or incomplete reference fails them instead.
+      # The -dev packages are needed only to build; the built binary's shared
+      # libraries are on the image (the check step proves it loads).
+      - name: Libraries of the reference rsync
+        run: |
+          sudo apt-get -q -o Acquire::Retries=5 update
+          sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
+      - name: Build the reference rsync 3.5.1
+        shell: bash
+        run: |
+          # download.samba.org has timed out or answered 504 for hours at a
+          # time (2026-11-20), so the UK mirror of rsync.samba.org comes first.
+          bash .github/sami/fetch-verified.sh "Reference rsync" "$RUNNER_TEMP/rsync-3.5.1.tar.gz" \
+            c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef \
+            https://www.mirrorservice.org/sites/rsync.samba.org/src/rsync-3.5.1.tar.gz \
+            https://download.samba.org/pub/rsync/src/rsync-3.5.1.tar.gz
+          mkdir -p "$RUNNER_TEMP/rsync-build" "$HOME/rsync-ref/bin"
+          tar -xzf "$RUNNER_TEMP/rsync-3.5.1.tar.gz" -C "$RUNNER_TEMP/rsync-build"
+          cd "$RUNNER_TEMP/rsync-build/rsync-3.5.1" || exit 1
+          ./configure --disable-md2man
+          make -j "$(nproc)"
+          cp rsync "$HOME/rsync-ref/bin/rsync"
+      - name: Check the reference rsync
+        shell: bash
+        run: |
+          version="$("$HOME/rsync-ref/bin/rsync" --version)"
+          printf '%s\n' "$version" | head -n 1
+          checksums="$(printf '%s\n' "$version" | sed -n '/Checksum list/{n;p}')"
+          compressors="$(printf '%s\n' "$version" | sed -n '/Compress list/{n;p}')"
+          echo "checksums: $checksums"
+          echo "compressors: $compressors"
+          case "$version" in "rsync  version 3.5.1  protocol version 33"*) ;; *)
+            echo "::error title=Reference rsync::$HOME/rsync-ref/bin/rsync is not rsync 3.5.1"
+            exit 1
+            ;;
+          esac
+          for need in xxh128 xxh3 xxh64; do
+            case " $checksums " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need checksum"; exit 1 ;; esac
+          done
+          for need in zstd lz4; do
+            case " $compressors " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need compressor"; exit 1 ;; esac
+          done
+      # pi-shell's zsh completion and zsh-oracle tests compare obash with zsh
+      # 5.9: its own completion functions (/usr/share/zsh/5.9/functions, or
+      # the real zsh's $fpath) and /bin/zsh itself, which must print
+      # `zsh 5.9 `. The runner has no zsh, so they skipped. zsh 5.9 is built
+      # from the tarball whose sha256 SourceForge and Debian's orig tarball
+      # agree on, into ~/zsh-ref, and linked in as /usr/bin/zsh (/bin is
+      # /usr/bin) and /usr/share/zsh/5.9. A test that still skips fails the
+      # job (the skip scan in the test step).
+      - name: Build zsh 5.9
+        shell: bash
+        run: |
+          sudo apt-get -q -o Acquire::Retries=5 update
+          sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends libncurses-dev
+          bash .github/sami/fetch-verified.sh "zsh 5.9" "$RUNNER_TEMP/zsh-5.9.tar.xz" \
+            9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5 \
+            https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz \
+            https://deb.debian.org/debian/pool/main/z/zsh/zsh_5.9.orig.tar.xz
+          mkdir -p "$RUNNER_TEMP/zsh-build"
+          tar -xJf "$RUNNER_TEMP/zsh-5.9.tar.xz" -C "$RUNNER_TEMP/zsh-build"
+          cd "$RUNNER_TEMP/zsh-build/zsh-5.9" || exit 1
+          # The runner has no controlling tty, so configure cannot probe
+          # tcsetpgrp (run 44806741441); Linux has it, as Debian's build says.
+          ./configure --prefix="$HOME/zsh-ref" --enable-multibyte --with-tcsetpgrp
+          make -j "$(nproc)"
+          make install.bin install.modules install.fns
+      - name: Install and check zsh 5.9
+        shell: bash
+        run: |
+          sudo ln -sfn "$HOME/zsh-ref/bin/zsh" /usr/bin/zsh
+          sudo mkdir -p /usr/share/zsh
+          sudo ln -sfn "$HOME/zsh-ref/share/zsh/5.9" /usr/share/zsh/5.9
+          version="$(/bin/zsh --version)"
+          echo "$version"
+          case "$version" in "zsh 5.9 "*) ;; *)
+            echo "::error title=zsh 5.9::/bin/zsh is not zsh 5.9"
+            exit 1
+            ;;
+          esac
+          for f in _main_complete compinit; do
+            [ -f "/usr/share/zsh/5.9/functions/$f" ] || { echo "::error title=zsh 5.9::no $f in /usr/share/zsh/5.9/functions"; exit 1; }
+          done
+          /bin/zsh -f -c 'print -rl -- $fpath'
+      # pi-shell's bash-oracle tests compare obash with bash 5.2 or later
+      # (they were measured with 5.2.21), and report a bash older than that
+      # as uncompared, which the skip scan fails; the runner's /bin/bash is
+      # 5.1.16. bash 5.2.21 is built from the GNU tarball whose sha256 is
+      # pinned here (ftp.gnu.org and its mirror network gave the same bytes,
+      # signed by its maintainer's key 7C0135FB088AAF6C66C650B9BB5869F064EA74AB),
+      # into ~/bash-ref, and the tests get it as PI_TEST_REAL_BASH; the
+      # runner's own bash, which runs every step, stays as it is.
+      - name: Build bash 5.2.21
+        shell: bash
+        run: |
+          bash .github/sami/fetch-verified.sh "bash 5.2.21" "$RUNNER_TEMP/bash-5.2.21.tar.gz" \
+            c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8 \
+            https://ftpmirror.gnu.org/gnu/bash/bash-5.2.21.tar.gz \
+            https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz
+          mkdir -p "$RUNNER_TEMP/bash-build"
+          tar -xzf "$RUNNER_TEMP/bash-5.2.21.tar.gz" -C "$RUNNER_TEMP/bash-build"
+          cd "$RUNNER_TEMP/bash-build/bash-5.2.21" || exit 1
+          ./configure --prefix="$HOME/bash-ref"
+          make -j "$(nproc)"
+          make install
+      - name: Check bash 5.2.21
+        shell: bash
+        run: |
+          version="$("$HOME/bash-ref/bin/bash" --version | sed -n 1p)"
+          echo "$version"
+          case "$version" in "GNU bash, version 5.2.21("*) ;; *)
+            echo "::error title=bash 5.2.21::$HOME/bash-ref/bin/bash is not bash 5.2.21"
+            exit 1
+            ;;
+          esac
+          echo "the runner's bash: $(/bin/bash --version | sed -n 1p)"
+      # pi-vcs's jj tests compare its jj-lib with the jj CLI, and return
+      # without a word where there is no `jj`. jj 0.46.0, the jj-lib version
+      # Cargo.lock pins (checked here), is the release's static Linux build,
+      # pinned by the sha256 GitHub gives for that asset; the test step puts
+      # ~/jj-ref/bin on the tests' PATH.
+      - name: jj 0.46.0
+        shell: bash
+        run: |
+          echo "the runner's jj: $(command -v jj || echo none)"
+          locked="$(awk '$0 == "name = \"jj-lib\"" { getline; print }' Cargo.lock)"
+          if [ "$locked" != 'version = "0.46.0"' ]; then
+            echo "::error title=jj 0.46.0::Cargo.lock pins jj-lib [$locked], not 0.46.0: pin the jj CLI of that version here"
+            exit 1
+          fi
+          bash .github/sami/fetch-verified.sh "jj 0.46.0" "$RUNNER_TEMP/jj-0.46.0.tar.gz" \
+            fce0271158e665ceb82dc66c5eb95b1728649094e9133074f3b5baece345fc08 \
+            https://github.com/jj-vcs/jj/releases/download/v0.46.0/jj-v0.46.0-x86_64-unknown-linux-musl.tar.gz
+          mkdir -p "$HOME/jj-ref/bin"
+          tar -xzf "$RUNNER_TEMP/jj-0.46.0.tar.gz" -C "$HOME/jj-ref/bin" ./jj
+          version="$("$HOME/jj-ref/bin/jj" --version)"
+          echo "$version"
+          case "$version" in "jj 0.46.0-"*) ;; *)
+            echo "::error title=jj 0.46.0::$HOME/jj-ref/bin/jj is not jj 0.46.0"
+            exit 1
+            ;;
+          esac
+      # pi-builtins' sort tests compare collation and numbers under
+      # sv_SE.UTF-8, en_US.UTF-8 and de_DE.UTF-8, and skipped the locales the
+      # runner had not generated (run 44803069963).
+      - name: Locales the tests compare under
+        run: |
+          sudo locale-gen sv_SE.UTF-8 en_US.UTF-8 de_DE.UTF-8
+          locale -a
+      # pi-iso clones a tree with reflinks (FICLONE), and pi-vcs's
+      # worktree_clone_carry tests skip without them; the runner's ext4 has
+      # none. The tests' temporary files go on a loop-mounted XFS with
+      # reflink=1, checked here; the test step gives each test action a
+      # TMPDIR of its own on it.
+      - name: A reflink filesystem for the tests' temporary files
+        shell: bash
+        run: |
+          if ! command -v mkfs.xfs >/dev/null; then
+            sudo apt-get -q -o Acquire::Retries=5 update
+            sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends xfsprogs
+          fi
+          truncate -s 12G "$RUNNER_TEMP/reflink.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/reflink.img"
+          sudo mkdir -p /mnt/reflink
+          sudo mount -o loop "$RUNNER_TEMP/reflink.img" /mnt/reflink
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /mnt/reflink/tmp
+          echo probe >/mnt/reflink/tmp/reflink-probe
+          cp --reflink=always /mnt/reflink/tmp/reflink-probe /mnt/reflink/tmp/reflink-probe.clone
+          rm /mnt/reflink/tmp/reflink-probe /mnt/reflink/tmp/reflink-probe.clone
+          findmnt /mnt/reflink
+      # The other preconditions the tests read, checked here, so a runner
+      # image without one fails by name rather than through tests that print
+      # `skipped:`.
+      - name: The other preconditions the tests read
+        shell: bash
+        run: |
+          fail() { echo "::error title=Test precondition::$1"; exit 1; }
+          # pi-shell's zftp tests listen on a TCP port in 20000-60000 that
+          # /etc/services names (zftp opens only named services).
+          n="$(awk '$2 ~ /\/tcp$/ { split($2, p, "/"); if (p[1] >= 20000 && p[1] <= 60000) n++ } END { print n + 0 }' /etc/services)"
+          [ "$n" -gt 0 ] || fail "/etc/services names no TCP port in 20000-60000"
+          echo "/etc/services: $n TCP ports in 20000-60000"
+          # The collation tests (zsh_parity's and the sort tests) need the
+          # generated locales.
+          for l in en_US.utf8 sv_SE.utf8 de_DE.utf8; do
+            locale -a | grep -qx "$l" || fail "locale $l is not generated"
+          done
+          # pi-builtins' locale tests build their own locales with localedef.
+          d="$(mktemp -d)"
+          localedef -i en_US -f ISO-8859-1 "$d/probe" || fail "localedef cannot build en_US ISO-8859-1"
+          rm -rf -- "$d"
+          # rsync's xattr and fake-super tests set user xattrs in their
+          # TMPDIR, which is on /mnt/reflink/tmp.
+          f=/mnt/reflink/tmp/xattr-probe
+          : >"$f"
+          python3 -c 'import os, sys; os.setxattr(sys.argv[1], "user.probe", b"1"); assert os.getxattr(sys.argv[1], "user.probe") == b"1"' "$f" ||
+            fail "/mnt/reflink/tmp takes no user xattrs"
+          rm -f -- "$f"
+          # du's and rm's unreadable-entry tests need a user that is not root
+          # (the main invocation runs as the runner's user).
+          [ "$(id -u)" != 0 ] || fail "the job runs as root, so nothing is unreadable to it"
+          echo "user: $(id -un) ($(id -u)); user xattrs and localedef work"
+          # The sticky-directory FIFO tests (pi-shell's and pi-vfs's) check
+          # that fs.protected_fifos refuses an open that may create of a FIFO
+          # another user owns in a world-writable sticky directory that user
+          # does not own. The test step runs each as root, and as the
+          # runner's user given this FIFO: mode 0666, of uid 65534, in a 1777
+          # directory of root's. The probe opens it as the tests' plain open
+          # does, and the kernel must refuse it.
+          sudo sysctl -w fs.protected_fifos=1
+          [ "$(cat /proc/sys/fs/protected_fifos)" -ge 1 ] || fail "fs.protected_fifos is not 1 or more"
+          sudo install -d -o root -g root -m 1777 /mnt/reflink/sticky
+          sudo mkfifo -m 0666 /mnt/reflink/sticky/report.txt
+          sudo chown 65534:65534 /mnt/reflink/sticky/report.txt
+          ls -ld /mnt/reflink/sticky /mnt/reflink/sticky/report.txt
+          python3 -c 'import os, sys
+          try:
+              os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK, 0o666)
+          except PermissionError:
+              sys.exit(0)
+          except OSError as err:
+              sys.exit(f"the open gave {err}, not EACCES")
+          sys.exit("the open went ahead")' /mnt/reflink/sticky/report.txt ||
+            fail "an open that may create of /mnt/reflink/sticky/report.txt was not refused, so fs.protected_fifos does not hold here"
+          echo "fs.protected_fifos: $(cat /proc/sys/fs/protected_fifos); the sticky directory's FIFO is refused to $(id -un)"
+      # sdk/rust/omp-rpc's two #[ignore]d smoke tests run the repository's
+      # omp server (`bun packages/coding-agent/src/cli.ts --mode rpc`), so the
+      # test step runs them alone with --ignored (rust-test-ignored.txt), with
+      # the dependencies and the native addon in place. package.json's
+      # packageManager names only a floor (bun@>=1.4.4), with which
+      # .github/actions/bun-install runs bun.sh's installer for whatever bun
+      # is latest. Test code runs in this job, so it gets one exact bun
+      # instead: the release zip whose sha256 is pinned here (the release's
+      # own digest and its SHASUMS256.txt give the same). bun-install then
+      # finds a bun that meets the floor on PATH and runs no installer, and
+      # the addon step checks the version it runs. Its packages, which run
+      # in this job before the test step, come from the registry, not from a
+      # GitHub Actions cache another job of this ref could have written
+      # (cache: "false"; W6).
+      - name: bun 1.4.5
+        shell: bash
+        run: |
+          bash .github/sami/fetch-verified.sh "bun 1.4.5" "$RUNNER_TEMP/bun-linux-x64.zip" \
+            94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-linux-x64.zip
+          unzip -q -d "$RUNNER_TEMP/bun" "$RUNNER_TEMP/bun-linux-x64.zip"
+          mkdir -p "$HOME/.bun/bin"
+          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" "$HOME/.bun/bin/bun"
+          echo "$HOME/.bun/bin" >>"$GITHUB_PATH"
+      - uses: ./.github/actions/bun-install
+        with:
+          cache: "false"
+      # The addon checked above. bazel-natives.ts installs it as it installs a
+      # build: it writes this tree's version into the addon's version slot,
+      # which release_binary wrote with the same version, and loads the addon
+      # in a child process. The installed bytes must stay release_binary's.
+      - name: The native addon the smoke tests' server loads
+        shell: bash
+        env:
+          WANT_SHA256: ${{ needs.release_binary.outputs.addon-linux-x64-modern-sha256 }}
+        run: |
+          if [ "$(bun --version)" != 1.4.5 ]; then
+            echo "::error title=bun::$(command -v bun) is bun $(bun --version), not the pinned 1.4.5"
+            exit 1
+          fi
+          bun scripts/bazel-natives.ts linux-x64-modern --source "$RUNNER_TEMP/release-natives" --dest packages/natives/native
+          installed="$(sha256sum packages/natives/native/pi_natives.linux-x64-modern.node | cut -d ' ' -f 1)"
+          if [ "$installed" != "$WANT_SHA256" ]; then
+            echo "::error title=Native addon::the installed pi_natives.linux-x64-modern.node has sha256 $installed, not release_binary's $WANT_SHA256"
+            exit 1
+          fi
+          ls -l packages/natives/native
+      - name: Rust tests against the known-failure list
+        shell: bash
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+          # sdk/rust/omp-rpc's smoke_real_server starts the omp server, which
+          # will not start with no model configured ("No default model
+          # selected", run 44889772803). The test sends no prompt, so a
+          # placeholder key, which is no credential, selects a model that is
+          # never called. The cargo tests see it; Bazel's tests do not (its
+          # strict action env passes only the --test_env variables). The omp
+          # server reaches a dozen hosts as it starts (run 44898771348), so the
+          # #[ignore]d cargo tests, which start it, run with no network but
+          # loopback (.github/sami/rust-test-offline.sh).
+          ANTHROPIC_API_KEY: placeholder-no-model-call
+          RUST_TEST_OFFLINE_UNDER: ${{ github.workspace }}/.github/sami/rust-test-offline.sh
+        run: |
+          RUST_TEST_PATH="$HOME/rsync-ref/bin:$HOME/jj-ref/bin:/usr/local/bin:/usr/bin:/bin" \
+            RUST_TEST_TMPDIR=/mnt/reflink/tmp \
+            RUST_TEST_STICKY_FIFO=/mnt/reflink/sticky/report.txt \
+            PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
+            PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
+            bash .github/sami/rust-test.sh
+      # Each Linux test binary's listing, for rust_test_macos's inventory.
+      - name: The test binaries' listings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-listings
+          path: ${{ runner.temp }}/rust-test/listings
+          retention-days: 3
+          if-no-files-found: error
+      - name: Every Rust test has a Bazel test target
+        # `bazel test //crates/...` runs only Bazel test targets, and most of
+        # pi-edit's, pi-shell's and pi-vcs's tests/*.rs files, obash's unit
+        # tests and every doctest had none, so they ran nowhere. This fails
+        # while any target of the repo's own suite (`bun run test:rs`) lacks
+        # one, and names it. It runs after the tests, even when they failed,
+        # so one run shows both.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash .github/sami/rust-test-parity.sh
+
+  rust_test_macos:
+    # The tests only macOS can run: those compiled only on macOS (in a macOS
+    # test binary's listing and not in the Linux binary's of the same target,
+    # the rust_test job's listings), and the twelve pi-shell tests that
+    # expect macOS's libc, libm or terminfo and are #[ignore]d on other
+    # targets (.github/sami/rust-test-macos.txt). This job builds every test
+    # target on macos-15, the host release_binary builds darwin-arm64 on,
+    # lists them (.github/sami/rust-test-macos-inventory.sh), and runs those
+    # tests through the same test step with the same failure, skip and output
+    # rules; it fails unless each of them ran. A known printing test runs
+    # beside them as the skip scan's canary.
+    needs: rust_test
+    # It runs whatever rust_test's verdict, once its listings are uploaded,
+    # but not on sami, where rust_test is skipped.
+    if: ${{ !cancelled() && github.ref != 'refs/heads/sami' }}
+    name: Rust tests (bazel, macOS-only tests)
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The test step and its harness need bash 4 or later (associative
+      # arrays), and macOS's /bin/bash is 3.2 (run 44875114140). bash 5.2.21
+      # is built from the GNU tarball whose sha256 rust_test pins for its
+      # reference bash, on every run and never from a GitHub Actions cache
+      # (as rust_test's tools: about 51 s, run 44987520746), and goes first
+      # on PATH for every later step; the tests' own bash stays /bin/bash.
+      # The step runs here on macOS's own awk, sed and sort.
+      - name: Build bash 5.2.21
+        shell: bash
+        run: |
+          bash .github/sami/fetch-verified.sh "bash 5.2.21" "$RUNNER_TEMP/bash-5.2.21.tar.gz" \
+            c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8 \
+            https://ftpmirror.gnu.org/gnu/bash/bash-5.2.21.tar.gz \
+            https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz
+          mkdir -p "$RUNNER_TEMP/bash-build"
+          tar -xzf "$RUNNER_TEMP/bash-5.2.21.tar.gz" -C "$RUNNER_TEMP/bash-build"
+          cd "$RUNNER_TEMP/bash-build/bash-5.2.21" || exit 1
+          ./configure --prefix="$HOME/bash-ref"
+          make -j "$(sysctl -n hw.ncpu)"
+          make install
+      - name: Check bash 5.2.21
+        shell: bash
+        run: |
+          version="$("$HOME/bash-ref/bin/bash" --version | sed -n 1p)"
+          echo "$version"
+          case "$version" in "GNU bash, version 5.2.21("*) ;; *)
+            echo "::error title=bash 5.2.21::$HOME/bash-ref/bin/bash is not bash 5.2.21"
+            exit 1
+            ;;
+          esac
+          echo "$HOME/bash-ref/bin" >>"$GITHUB_PATH"
+      - name: The gate's own regression tests
+        shell: bash
+        run: bash .github/sami/tests/run.sh
+      - id: bazel
+        uses: ./.github/actions/bazel-cache
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rust-test-listings
+          path: ${{ runner.temp }}/linux-listings
+      - name: The tests only macOS can run
+        shell: bash
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: bash .github/sami/rust-test-macos-inventory.sh "$RUNNER_TEMP/linux-listings" "$RUNNER_TEMP/macos-inventory.txt"
+      - name: The macOS-only Rust tests
+        shell: bash
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tests"
+          RUST_TEST_ONLY="$RUNNER_TEMP/macos-inventory.txt" \
+            RUST_TEST_CANARY="//crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_a_short_grace" \
+            RUST_TEST_PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            RUST_TEST_TMPDIR="$RUNNER_TEMP/tests" \
+            PI_TEST_REAL_BASH=/bin/bash \
+            PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
+            bash .github/sami/rust-test.sh
+
+  publish:
+    # A push to sami runs only this job, and it builds nothing. It takes the
+    # green sami-build run of sami-candidate at the same commit, downloads
+    # that run's archives and release notes, and publishes them only after
+    # .github/sami/release-candidate.sh checks that each one is a file that
+    # run attested (its attest job, on the push, signed by sami-build.yml at
+    # refs/heads/sami-candidate) and that there is exactly one archive per
+    # release target. A red rust_test, rust_test_macos or attest leaves the
+    # candidate run red, so no run is found and nothing is published. The
+    # checkout has the tags: the check names the newest release, which the
+    # candidate's notes must name.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami' }}
+    runs-on: ubuntu-22.04
+    # One publish at a time: a second push to sami waits for the first, and
+    # then its notes check sees the release the first one published. GitHub
+    # keeps one waiting run per group; a third push cancels the waiting one,
+    # which then publishes nothing.
+    concurrency:
+      group: sami-publish
+      cancel-in-progress: false
+    # contents: write creates the release; actions: read downloads another
+    # run's artifacts; attestations: read reads the attestations.
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    env:
+      CANDIDATE_BRANCH: sami-candidate
+      # release_binary's matrix targets: one archive of each is published.
+      RELEASE_TARGETS: linux-x64 darwin-arm64
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Find the candidate run
+        id: candidate
+        run: bash .github/sami/release-candidate.sh find
+      # Each artifact goes to a directory of its own (merge-multiple is off),
+      # so the check below sees which artifact gave which file.
+      - name: Download the candidate run's archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          github-token: ${{ github.token }}
           pattern: mise-*
-          path: release
-          merge-multiple: true
+          path: ${{ runner.temp }}/candidate
+      - name: Download the candidate run's release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: release-notes
+          path: ${{ runner.temp }}/candidate/release-notes
+      - name: Check the archives and notes against the candidate run's attestations
+        id: verify
+        env:
+          RUN_ID: ${{ steps.candidate.outputs.run_id }}
+        run: bash .github/sami/release-candidate.sh verify
       - uses: sjawhar/.github/.github/actions/sami-release@v1
         with:
-          tag: ${{ needs.version.outputs.tag }}
-          files: release/*.tar.gz
+          tag: ${{ steps.verify.outputs.tag }}
+          files: ${{ steps.verify.outputs.files }}
           body: |
             Automated build from the sami branch.
 
             Commit: ${{ github.sha }}
 
-            ${{ needs.carry.outputs.notes }}
+            ${{ steps.verify.outputs.notes }}
 
             Also excluded: #17964 (per-provider prompt-cache retention and cache warming). No member carries it. The earlier warming implementation was removed after a replay measured only 0.8% benefit. The reworked change remains in upstream review.
