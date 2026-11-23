@@ -1116,11 +1116,47 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
 		),
 	];
+	// The rows whose bash output depends on bash's own timing, each with
+	// bash's other output: bash reaps a job this shell's `kill` ended in its
+	// `SIGCHLD` handler before the `wait` or inside it, as the job's
+	// processes die before bash reaches the `wait` or after. Reaped before,
+	// the `wait` reports nothing, and the job stays for the next line's
+	// notice and for `jobs` (a job `TERM` ended too). bash 5.3.20 and
+	// 5.2.21 print the other output when a loop before the `wait` holds
+	// until bash reaped the job (as the `{GONE}` rows do). obash's output is
+	// the golden; the live bash may give either.
+	let raced = [
+		(format!("{PIPE}; wait; echo st=$?"), "st=0\n".to_owned()),
+		("/bin/sleep 5 & kill -KILL %1; wait; echo st=$?".to_owned(), "st=0\n".to_owned()),
+		("{ /bin/sleep 30; } & kill -KILL %1; wait; echo st=$?".to_owned(), "st=0\n".to_owned()),
+		(
+			"/bin/sleep 30 & kill -TERM $!; wait; jobs; echo end".to_owned(),
+			format!("[1]+  {:<27}/bin/sleep 30\nend\n", desc(libc::SIGTERM)),
+		),
+		(
+			"/bin/sleep 5 | /bin/sleep 6 & kill -KILL %1; wait; echo st=$?\necho next\njobs; echo end"
+				.to_owned(),
+			format!(
+				"st=0\n{}next\nend\n",
+				at(2, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])
+			),
+		),
+	];
+	assert!(
+		raced
+			.iter()
+			.all(|(row, _)| cases.iter().any(|(script, _)| script == row)),
+		"each raced row is a row of the table"
+	);
 	let dir = tempfile::tempdir().expect("a directory for `jobs -r`");
 	let file = dir.path().join("running");
 	let masked = masked_stages;
 	let mut wrong = Vec::new();
 	for (script, out) in cases {
+		let other = raced
+			.iter()
+			.find(|(row, _)| *row == script)
+			.map(|(_, other)| other);
 		let script = format!("exec 2>&1; {script}");
 		let run = |shell: &OsStr| Run::script(shell, "bash", &script).env("F", &file).go();
 		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
@@ -1132,7 +1168,11 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
 		}
 		if let Some(bash) = real_bash_golden() {
-			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "{script:?}");
+			let (ours, theirs) = (masked(&ours), masked(&run(bash.as_os_str())));
+			let other = other.map(|o| Outcome { stdout: mask_names(o.as_bytes()), ..ours.clone() });
+			if other.as_ref() != Some(&theirs) {
+				assert_eq!(ours, theirs, "{script:?}");
+			}
 		}
 	}
 	// A script file in posix mode: an exit shows as `Done(N)`.
