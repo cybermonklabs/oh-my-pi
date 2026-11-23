@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads a file whose sha256 is pinned, from the first of its URLs that
-# gives exactly those bytes: in .github/workflows/sami-build.yml, the rust_test
+# gives exactly those bytes: in .github/workflows/sami-rust-test.yml, the rust_test
 # job's reference rsync, zsh and bash and its bun, and the bash that
 # rust_test_macos runs its steps with.
 #

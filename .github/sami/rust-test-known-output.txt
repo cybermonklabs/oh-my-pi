@@ -1,5 +1,5 @@
 # Tests that pass and print, for the rust_test jobs in
-# .github/workflows/sami-build.yml. A passing test's output can be a skip in
+# .github/workflows/sami-rust-test.yml. A passing test's output can be a skip in
 # words the skip scan does not know ("nothing to test"), so the job fails for
 # every passing test that prints and is not named here. A test that prints
 # the skip marker `skipped: <reason>` (or a word the scan knows) skipped

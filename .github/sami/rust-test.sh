@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The test step of the rust_test jobs in .github/workflows/sami-build.yml: a
-# red Rust test stops a sami release.
+# The test step of the rust_test jobs in .github/workflows/sami-rust-test.yml,
+# which sami-checks.yml runs on each release candidate: a red Rust test is
+# reported there, and holds no release.
 #
 # On Linux (the rust_test job) it runs every Bazel test target under
 # //crates, every test target of the cargo workspaces Bazel does not build,

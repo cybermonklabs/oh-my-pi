@@ -1,4 +1,4 @@
-# Bazel test targets the rust_test job in .github/workflows/sami-build.yml runs
+# Bazel test targets the rust_test job in .github/workflows/sami-rust-test.yml runs
 # as root: a second `bazel test` with --run_under="sudo -E". Each must be tagged
 # no-sandbox, since linux-sandbox maps a single uid. The job fails when a test
 # in one of them prints `not run:`, since root is its precondition, and when it
