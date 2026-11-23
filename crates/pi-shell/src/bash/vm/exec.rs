@@ -211,19 +211,24 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			&& pseudo_trap_maybe(k, cx, TrapKey::Debug)
 		{
 			let done = spawn_debug_done(vp.frames[fi].debug_pc);
+			// A new run of this Spawn's stage traps: a skip list this vproc
+			// left at this frame or deeper (its `Spawn` never ran, as after
+			// a trap's `return`) is stale, and bash keeps a skip only for the
+			// command whose trap failed. Dropped also when this Spawn has no
+			// simple stage (each stage compound, no trap runs here), whose
+			// `Spawn` would otherwise take that list; kept for the pipeline a
+			// background job is, which takes the list the shell recorded for
+			// it ([`shell_ran_stage_traps`]). This runs also once the trap is
+			// gone: `pseudo_trap_maybe` keeps answering yes after a DEBUG
+			// trap was set, and no skip list exists before one was.
+			if done == 0 && !shell_ran_stage_traps(k, vp, unit, op, vp.frames[fi].pc) {
+				drop_debug_skips(k, vp.vpid, fi);
+			}
 			let next = shell_debug_stages(k, vp, unit, op, vp.frames[fi].pc)
 				.into_iter()
 				.enumerate()
 				.nth(done);
 			if let Some((i, entry)) = next {
-				// A new run of this Spawn's stage traps: a skip list this vproc
-				// left at this frame or deeper (its `Spawn` never ran, as after
-				// a trap's `return`) is stale. This runs also once the trap is
-				// gone: `pseudo_trap_maybe` keeps answering yes after a DEBUG
-				// trap was set, and no skip list exists before one was.
-				if done == 0 {
-					drop_debug_skips(k, vp.vpid, fi);
-				}
 				vp.frames[fi].debug_pc = Some(SPAWN_DEBUG - u32::try_from(i + 1).unwrap_or(MAX_STAGES));
 				let stage_op = unit.ops[entry as usize];
 				note_command(vp, unit, stage_op);
@@ -4123,24 +4128,31 @@ fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
 
 /// [`debug_stage_entries`] the shell runs now: none for the pipeline a
 /// background job is, whose traps the shell ran before it forked the job
-/// (its [`Bang`] still waits on the pipeline), unless the job forked first
-/// for its `time` (the `TimeStart` before `pc`).
+/// ([`shell_ran_stage_traps`]).
 fn shell_debug_stages(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> Vec<u32> {
+	if shell_ran_stage_traps(k, vp, unit, op, pc) {
+		return Vec::new();
+	}
+	debug_stage_entries(unit, op).0
+}
+
+/// Whether this `Spawn` is the pipeline a background job is, whose stage
+/// traps the shell ran before it forked the job (its [`Bang`] still waits
+/// on the pipeline), unless the job forked first for its `time` (the
+/// `TimeStart` before `pc`). Such a job carries the skip list the shell
+/// recorded for it ([`DebugSkip`]).
+fn shell_ran_stage_traps(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> bool {
 	let info = &unit.spawns[op.a as usize];
 	let timed = pc
 		.checked_sub(1)
 		.and_then(|at| unit.ops.get(at as usize))
 		.is_some_and(|o| o.code == Opcode::TimeStart);
-	let shell_ran = info.kind == SpawnKind::Pipeline
+	info.kind == SpawnKind::Pipeline
 		&& !timed
 		&& k
 			.bangs
 			.iter()
-			.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-	if shell_ran {
-		return Vec::new();
-	}
-	debug_stage_entries(unit, op).0
+			.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline)
 }
 
 /// The shell ran the DEBUG trap of the simple command a child starts with

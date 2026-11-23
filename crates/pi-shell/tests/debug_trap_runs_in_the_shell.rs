@@ -377,6 +377,43 @@ async fn extdebug_skips_a_job_or_a_stage_before_it_forks() {
 	assert_bash_outputs(&rows).await;
 }
 
+/// `extdebug`: a stage's skip belongs to the pipeline whose trap failed.
+/// Here `f`'s trap fails for `: mark`, then `return`s at `echo second`, so
+/// `f`'s pipeline never forks. A later pipeline at the same depth whose
+/// stages are all compound (no stage trap runs in the shell for it) starts
+/// every stage, as in bash 5.3.20. Before, it took `f`'s skip and dropped
+/// its first stage (`end` alone). Last row: the same with no stale skip.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_extdebug_skip_reaches_no_other_pipeline() {
+	let trap = r#"trap 'case $BASH_COMMAND in *mark*) if (( n++ == 0 )); then false; fi;; "echo second") if (( n == 1 )); then n=2; return; fi;; esac' DEBUG"#;
+	let stale = |rest: &str| {
+		format!(r"shopt -s extdebug; n=0; f() {{ : mark | echo second; }}; {trap}; f; {rest}")
+	};
+	let pair = "{ echo kept; :; } | { /bin/cat; :; }";
+	let rows = [
+		(stale(&format!("trap - DEBUG; g() {{ {pair}; }}; g; echo end")), "kept\nend\n"),
+		(stale(&format!("g() {{ {pair}; }}; g; echo end")), "kept\nend\n"),
+		(stale(&format!("trap - DEBUG; f() {{ {pair}; }}; f; echo end")), "kept\nend\n"),
+		(
+			stale(
+				"trap - DEBUG; g() { { echo kept; :; } | { /bin/cat; :; } | { /bin/cat; echo two; }; \
+				 }; g; echo end",
+			),
+			"kept\ntwo\nend\n",
+		),
+		(stale(&format!("trap - DEBUG; g() {{ {pair} & wait; }}; g; echo end")), "kept\nend\n"),
+		(
+			format!(
+				r#"D=$(mktemp -d); echo ': mark | echo second' > "$D/a"; echo '{pair}' > "$D/b"; shopt -s extdebug; n=0; {trap}; . "$D/a"; trap - DEBUG; . "$D/b"; echo end; rm -r "$D""#
+			),
+			"kept\nend\n",
+		),
+		(format!("g() {{ {pair}; }}; g; echo end"), "kept\nend\n"),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
 /// The process `$!` names for a lone job whose DEBUG trap runs a program,
 /// calls a function, or runs a builtin the staged path runs: the program,
 /// as bash names it, since the shell ran the trap before it forked. The
