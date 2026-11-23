@@ -8291,7 +8291,14 @@ mod tests {
 	/// directory, removed once the row is checked. A row that has not ended
 	/// two minutes after any other row did fails the test, naming the rows
 	/// still running.
-	#[cfg(unix)]
+	///
+	/// The rows are GNU's answers on a Linux kernel, so the test runs on
+	/// Linux. macOS answers otherwise for the source and destination kinds
+	/// the matrix holds: a device node is refused (`EPERM`), `/dev/null` is
+	/// on another filesystem (`EXDEV` for a hard link to it), a clone is
+	/// `clonefile`'s, and setting attributes on a device is refused; 5,545
+	/// rows differ there.
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn cp_does_what_gnu_does_across_the_probe_matrix() {
 		use std::{
