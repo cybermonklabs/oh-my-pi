@@ -131,7 +131,8 @@ const OPTION_COMPARES = {
 	// Derived from the stored per-call flag.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
-	// Set at a cold revive only, to the root's cwd where it is not the stored session's: no route here moves the root.
+	// Set at a cold revive only, to the cwd of the session its live inputs come from (the live parent, else the root)
+	// where it is not the stored session's cwd, so a mask entry is only added: on no route here do the two differ.
 	secretsProjectDirs: "data",
 	// Set by no subagent build, so the SDK default holds on every path.
 	additionalExtensionPaths: "data",
@@ -608,23 +609,15 @@ function defineRouteCases(result: () => ParityRun, accepted: readonly OptionName
 		expect(differing).toEqual([]);
 	}, 30_000);
 
-	it("on a route that changes no live state, cwd, secretsProjectDirs and the values accepted difference 8 names are equal on both revives", () => {
-		// Both revives build in the stored session's cwd; the cold revive names the root's project secrets only where
-		// the root's cwd is another directory, so a mask entry is only added.
+	it("on a route that changes no live state, maxRuntimeMs and softRequestBudget are equal on both revives", () => {
+		// The wake-turn monitor's limits, which no build option carries: the cold revive holds them to the live
+		// settings (accepted difference 8), which no route here changes since the spawn.
 		const { warm, cold } = result();
-		const liveHeld = (revived: RevivedSubagent) => {
-			const { options } = revived.build;
+		const wakeLimits = (revived: RevivedSubagent) => {
 			if (!revived.wake) throw new Error("The revive attached no wake-turn monitor");
-			return {
-				cwd: options.cwd,
-				secretsProjectDirs: options.secretsProjectDirs,
-				additionalDirectories: options.additionalDirectories,
-				credentialSourceSessionId: options.credentialSourceSessionId,
-				maxRuntimeMs: revived.wake.maxRuntimeMs,
-				softRequestBudget: revived.wake.softRequestBudget,
-			};
+			return { maxRuntimeMs: revived.wake.maxRuntimeMs, softRequestBudget: revived.wake.softRequestBudget };
 		};
-		expect(liveHeld(cold)).toEqual(liveHeld(warm));
+		expect(wakeLimits(cold)).toEqual(wakeLimits(warm));
 	}, 30_000);
 }
 

@@ -135,13 +135,13 @@ describe("a session's task tool after another session in its directory discovere
 		});
 	}, 60_000);
 
-	it("a cold-revived vibe worker's roots (the first session's without the explicit list): its task tool neither offers nor spawns that agent", async () => {
+	it("a session's task tool offers its own roots' agents: under the first session's mode and configured list but no explicit list, it neither offers nor spawns the first session's explicit agent", async () => {
 		if (!first) throw new Error("The first session was not built");
-		const parentRoots = first.effectiveExtensionRoots;
-		const revived = await build({ extensionRoots: () => ({ ...parentRoots, explicit: [] }) });
-		expect({ first: firstView, revived: await view(revived, true) }).toEqual({
+		const firstRoots = first.effectiveExtensionRoots;
+		const ownRoots = await build({ extensionRoots: () => ({ ...firstRoots, explicit: [] }) });
+		expect({ first: firstView, ownRoots: await view(ownRoots, true) }).toEqual({
 			first: { offers: true },
-			revived: { offers: false, spawn: "unknown agent" },
+			ownRoots: { offers: false, spawn: "unknown agent" },
 		});
 	}, 60_000);
 });

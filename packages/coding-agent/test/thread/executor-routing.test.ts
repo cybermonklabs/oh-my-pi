@@ -840,11 +840,7 @@ describe("subagent runs routed into pooled workers", () => {
 			expect(receipt.outcome).toBe("revived");
 			const woken = mirrorOf(AgentRegistry.global().get("MirrorChild")?.session);
 			// The revived child's live parent, read on main: the main settings below its worker-local layers.
-			let parentSettings: Settings | undefined;
-			expect(() => {
-				parentSettings = parent.settings;
-			}).not.toThrow();
-			expect(parentSettings).toBeInstanceOf(Settings);
+			expect(parent.settings).toBeInstanceOf(Settings);
 			expect(rejected).toHaveBeenCalled();
 			const tookRoot = warnings.filter(message =>
 				message.startsWith("Revived subagent could not read its live parent's inputs; it takes the root's"),

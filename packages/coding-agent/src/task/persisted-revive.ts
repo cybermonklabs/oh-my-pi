@@ -1102,10 +1102,9 @@ async function coldReviveModel(
  * part of a record an older omp wrote, or of a seance consult) or holds in a shape no spawn writes what the
  * cold revive built before spawn specs, with the values every spawn gives (`cacheWarming: false`). The build runs
  * in `cwd`, the stored session's cwd. A stored value never widens what the live process allows, except the values
- * that the cold revive also took from the stored session before spawn specs existed: the cwd in which its tools
- * run, the tool names, the mounted tools, `restrictToolNames`, the spawn allowlist, the agent and display names,
- * the advisor, the service tier, the model roles and the retry-fallback chains. The other fields of a stored part
- * that select a place, an authority or a limit take the live value, or the narrower of the stored and the live one.
+ * that the cold revive also took from the stored session before spawn specs existed, which the `spawnSpec`
+ * paragraph of `docs/session.md` lists with what the stored cwd chooses. The other fields of a stored part that
+ * select a place, an authority or a limit take the live value, or the narrower of the stored and the live one.
  */
 function coldReviveSpawnSpec(
 	spec: PersistedReviveSpec,

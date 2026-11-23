@@ -454,7 +454,11 @@ value never widens what the live process allows, except the values that the revi
 file also took from the stored session before spawn specs existed: the working directory in
 which its tools run, the tool names, the mounted tools, `restrictToolNames`, the spawn
 allowlist, the agent and display names, the advisor, the service tier, the model roles and the
-retry-fallback chains. The values that it took from the live process stay live: the ids, the
+retry-fallback chains. The stored working directory also chooses which project's extension code,
+custom tools, custom TS commands and MCP servers load into the process; before spawn specs it did
+not, as the revive from the file built the session in the root session's working directory, so a
+writer of the session store now chooses these too. The values that the revive took from the live
+process stay live: the ids, the
 task depth, the credential source, the workspace roots, the wake limit, the soft request budget
 and the settings that grant authority; and a stored LSP, IRC or MCP value never turns on what
 the live process has off. So the revive from the file builds the session in the working
