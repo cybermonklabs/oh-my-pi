@@ -38,6 +38,46 @@ export interface OpenAIAnthropicShimConfig {
 }
 
 /**
+ * The model a request on `model` goes out as in `format` (`config.defaultFormat` when undefined): on the
+ * Anthropic-compatible endpoint, a messages model of the same id and limits, under `config.anthropicThinkingMode`
+ * when the config names one; on the OpenAI-compatible endpoint, `model` rebuilt for `config.openaiBaseUrl`, or `model`
+ * itself without one. `headers` ride the model a stream sends.
+ */
+export function openAIAnthropicShimModel(
+	model: Model<"openai-completions">,
+	format: OpenAIAnthropicApiFormat | undefined,
+	config: OpenAIAnthropicShimConfig,
+	headers?: Record<string, string>,
+): Model<"anthropic-messages"> | Model<"openai-completions"> {
+	if ((format ?? config.defaultFormat) === "anthropic") {
+		return buildModel({
+			id: model.id,
+			name: model.name,
+			api: "anthropic-messages",
+			provider: model.provider,
+			baseUrl: config.anthropicBaseUrl,
+			headers,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			reasoning: model.reasoning,
+			...(config.anthropicThinkingMode && model.thinking
+				? { thinking: { ...model.thinking, mode: config.anthropicThinkingMode } }
+				: {}),
+			input: model.input,
+			cost: model.cost,
+		} as ModelSpec<"anthropic-messages">);
+	}
+	return config.openaiBaseUrl
+		? buildModel({
+				...model,
+				baseUrl: config.openaiBaseUrl,
+				headers,
+				compat: model.compatConfig,
+			} as ModelSpec<"openai-completions">)
+		: model;
+}
+
+/**
  * Stream from an OpenAI-or-Anthropic compatible provider. Returns synchronously;
  * async header fetching and stream piping happen internally.
  */
@@ -48,7 +88,6 @@ export function streamOpenAIAnthropicShim(
 	config: OpenAIAnthropicShimConfig,
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
-	const format = options?.format ?? config.defaultFormat;
 	// The resolver form of `apiKey` is resolved upstream in `streamSimple`;
 	// this shim only ever receives a static bearer string.
 	const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
@@ -60,31 +99,15 @@ export function streamOpenAIAnthropicShim(
 				...options?.headers,
 			};
 
-			if (format === "anthropic") {
-				const anthropicModel = buildModel({
-					id: model.id,
-					name: model.name,
-					api: "anthropic-messages",
-					provider: model.provider,
-					baseUrl: config.anthropicBaseUrl,
-					headers: mergedHeaders,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-					reasoning: model.reasoning,
-					...(config.anthropicThinkingMode && model.thinking
-						? { thinking: { ...model.thinking, mode: config.anthropicThinkingMode } }
-						: {}),
-					input: model.input,
-					cost: model.cost,
-				} as ModelSpec<"anthropic-messages">);
-
+			const requestModel = openAIAnthropicShimModel(model, options?.format, config, mergedHeaders);
+			if (requestModel.api === "anthropic-messages") {
 				const reasoningEffort = options?.reasoning;
 				const thinkingEnabled = !!reasoningEffort && model.reasoning && !options?.disableReasoning;
 				const thinkingBudget = reasoningEffort
 					? (options?.thinkingBudgets?.[reasoningEffort] ?? ANTHROPIC_THINKING[reasoningEffort])
 					: undefined;
 
-				const innerStream = streamAnthropic(anthropicModel, context, {
+				const innerStream = streamAnthropic(requestModel, context, {
 					apiKey,
 					temperature: options?.temperature,
 					topP: options?.topP,
@@ -116,17 +139,8 @@ export function streamOpenAIAnthropicShim(
 					stream.push(event);
 				}
 			} else {
-				const openaiModel: Model<"openai-completions"> = config.openaiBaseUrl
-					? buildModel({
-							...model,
-							baseUrl: config.openaiBaseUrl,
-							headers: mergedHeaders,
-							compat: model.compatConfig,
-						} as ModelSpec<"openai-completions">)
-					: model;
-
 				const reasoningEffort = options?.reasoning;
-				const innerStream = streamOpenAICompletions(openaiModel, context, {
+				const innerStream = streamOpenAICompletions(requestModel, context, {
 					apiKey,
 					temperature: options?.temperature,
 					topP: options?.topP,

@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { isEnoent, logger, prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
@@ -106,12 +107,25 @@ export class TanCommandController {
 		const parentPromptCacheKey =
 			session.agent.promptCacheKey ?? (taskPromptCacheKey === undefined ? parentSessionId : undefined);
 		const thinkingLevel = session.configuredThinkingLevel();
-		const systemPrompt = [...session.systemPrompt];
+		// While the parent withholds a change, the clone sends the parent's build, the prompt that goes out with that
+		// change, as its fixed prompt. Otherwise the clone sends the parent's prompt as it stands.
+		const withheldPromptBuild = session.withheldPromptBuild;
+		const systemPrompt = withheldPromptBuild ?? [...session.systemPrompt];
 		// The copied prompt carries the parent's memory recall; the clone inherits it as delivered.
 		const parentMnemopiSessionState = session.getMnemopiSessionState?.();
-		const toolNames = session.getEnabledToolNames();
-		const activeToolNames = session.getActiveToolNames();
-		const mountedToolNames = session.getMountedXdevToolNames();
+		// The clone's tools: the parent's, or while the parent withholds a change the ones it has once that change goes
+		// out, which the build lists and the change's copied notices give as available after the rebuild.
+		const afterHold = withheldPromptBuild ? session.toolSetAfterHold() : undefined;
+		const toolNames = afterHold?.enabled ?? session.getEnabledToolNames();
+		const parentActiveToolNames = session.getActiveToolNames();
+		const activeToolNames = afterHold?.active ?? parentActiveToolNames;
+		const mountedToolNames = afterHold?.mounted ?? session.getMountedXdevToolNames();
+		// A clone that declares the tools the parent's requests declare starts on the parent's prompt as sent, which
+		// its copied transcript stores, and sends the build once the change goes out: the parent's operator inputs
+		// decide the restore (`tanParent`). One that declares other tools cannot read the parent's cached prompt (the
+		// tools come first in the cache order), so it holds nothing: it sends the build from its first request, and its
+		// first settings notice tells its model the change is no longer held.
+		const restoresParentPrompt = sameItems(afterHold?.active, parentActiveToolNames);
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
 		// The child rebinds these (skipping discovery) so it re-registers the
@@ -197,6 +211,7 @@ export class TanCommandController {
 								model,
 								thinkingLevel,
 								systemPrompt,
+								tanParent: restoresParentPrompt ? session : undefined,
 								toolNames,
 								mountedToolNames,
 								advertiseHeadlessAsk: activeToolNames.includes("ask"),

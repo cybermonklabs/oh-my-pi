@@ -17,6 +17,7 @@
 import type { AgentTool } from "./types";
 import type { Context, Message, Tool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
+import type { AnthropicHashedTool } from "@oh-my-pi/pi-ai/providers/anthropic-tool-schema";
 import { normalizeTools } from "./agent-loop";
 import { messageEstimateVersion } from "./compaction/message-cache";
 import type { AgentContext, AgentMessage } from "./types";
@@ -24,6 +25,21 @@ import type { AgentContext, AgentMessage } from "./types";
 // ---------------------------------------------------------------------------
 // StablePrefix (formerly ImmutablePrefix)
 // ---------------------------------------------------------------------------
+
+/**
+ * A tool's wire identity ({@link toolKeyForPrefix}), field by field: name, description, `strict`, `customWireName`,
+ * the intent mode or function, and by reference the resolved parameters, `customFormat` and `examples`.
+ */
+export type ToolKey = readonly [
+	name: string,
+	description: string,
+	strict: string,
+	customWireName: string,
+	intent: unknown,
+	parameters: object,
+	customFormat: object | undefined,
+	examples: object | undefined,
+];
 
 /**
  * Cheap per-tool wire-identity key: every field normalizeTools and
@@ -34,41 +50,45 @@ import type { AgentContext, AgentMessage } from "./types";
  * `examples` contribute by reference: both are treated as immutable config
  * (a registry swap replaces the object), matching how the snapshot consumes
  * them. `intent` functions are compared by reference — same closure means
- * same mode resolution.
+ * same mode resolution. A tool that renders its description or schema from
+ * live settings (getters) changes its key without a new tools array, so a
+ * memo of anything the definitions decide keys on these, not on the array.
+ * The fields are compared one by one ({@link sameToolKeys}): a tool whose
+ * getters hand back the same string and objects while their inputs stay put
+ * costs a pointer compare per field.
  */
-function toolKeyForPrefix(tool: AgentTool): string {
+export function toolKeyForPrefix(tool: AgentTool): ToolKey {
 	const params = toolWireSchema(tool);
 	const customFormat = tool.customFormat;
 	const examples = (tool as { examples?: unknown }).examples;
-	// Identity strings for objects (Map-assigned ids, no string-build cost
-	// on the hot path beyond the first sighting per object).
 	return [
 		tool.name ?? "",
 		tool.description ?? "",
 		String(tool.strict ?? ""),
 		tool.customWireName ?? "",
-		typeof tool.intent === "function" ? `fn:${objectId(tool.intent)}` : `mode:${tool.intent ?? "require"}`,
-		objectId(params),
-		objectId(customFormat),
-		objectId(examples),
-	].join("\u0000");
+		tool.intent ?? "require",
+		params,
+		objectOrUndefined(customFormat),
+		objectOrUndefined(examples),
+	];
 }
 
-const objectIds = new WeakMap<object, number>();
-let nextObjectId = 1;
+/** Whether `recorded` holds the same per-tool keys as `keys` ({@link toolKeyForPrefix}), in order, field by field. */
+export function sameToolKeys(recorded: readonly ToolKey[] | undefined, keys: readonly ToolKey[]): boolean {
+	if (recorded === undefined || recorded.length !== keys.length) return false;
+	for (let i = 0; i < keys.length; i++) {
+		const before = recorded[i];
+		const now = keys[i];
+		for (let field = 0; field < now.length; field++) {
+			if (before[field] !== now[field]) return false;
+		}
+	}
+	return true;
+}
 
-function objectId(obj: unknown): number {
-	if (obj === null || obj === undefined || (typeof obj !== "object" && typeof obj !== "function")) {
-		// Primitives contribute by value below via String(); the id path is
-		// only for reference-identity comparison of config objects.
-		return 0;
-	}
-	let id = objectIds.get(obj);
-	if (id === undefined) {
-		id = nextObjectId++;
-		objectIds.set(obj, id);
-	}
-	return id;
+/** `value` when it is an object or function, compared by reference; undefined for a primitive, `null` included. */
+function objectOrUndefined(value: unknown): object | undefined {
+	return (typeof value === "object" || typeof value === "function") && value !== null ? value : undefined;
 }
 
 /** Frozen system prompt + tool spec snapshot. */
@@ -136,7 +156,7 @@ export class StablePrefix {
 	// strict, customFormat, customWireName, intent mode, examples
 	// reference). A registry swap that keeps name/description/parameters
 	// but changes any of these must miss the fast path.
-	#lastToolKey: readonly string[] | undefined;
+	#lastToolKey: readonly ToolKey[] | undefined;
 	#lastIntentTracing: boolean | undefined;
 	#lastIntentDescription: string | undefined;
 	#lastPruneToolDescriptions: boolean | undefined;
@@ -166,7 +186,7 @@ export class StablePrefix {
 	}
 
 	/** True when the cheap key matches: prompt segments + per-tool identity. */
-	#fastPathHit(context: AgentContext, options: BuildOptions, toolKeys: readonly string[]): boolean {
+	#fastPathHit(context: AgentContext, options: BuildOptions, toolKeys: readonly ToolKey[]): boolean {
 		if (
 			this.#lastIntentTracing !== options.intentTracing ||
 			this.#lastIntentDescription !== options.intentDescription ||
@@ -185,19 +205,10 @@ export class StablePrefix {
 		for (let i = 0; i < cachedSegments.length; i++) {
 			if (cachedSegments[i] !== liveSegments[i]) return false;
 		}
-		const recorded = this.#lastToolKey;
-		if (recorded === undefined || recorded.length !== toolKeys.length) {
-			return false;
-		}
-		for (let i = 0; i < toolKeys.length; i++) {
-			if (recorded[i] !== toolKeys[i]) {
-				return false;
-			}
-		}
-		return true;
+		return sameToolKeys(this.#lastToolKey, toolKeys);
 	}
 
-	#recordFastPathKey(context: AgentContext, options: BuildOptions, renderedToolKeys: readonly string[]): void {
+	#recordFastPathKey(context: AgentContext, options: BuildOptions, renderedToolKeys: readonly ToolKey[]): void {
 		this.#lastPromptSegments = [...context.systemPrompt];
 		this.#lastIntentTracing = options.intentTracing;
 		this.#lastIntentDescription = options.intentDescription;
@@ -493,8 +504,13 @@ function normalizeWireTools(tools: AgentContext["tools"], options: BuildOptions)
 	);
 }
 
-/** The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the description. */
-function wireToolFields(t: Tool) {
+/**
+ * The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the
+ * description. A provider that defers a declared tool's loading marks it `deferLoading`. JSON keeps a `strict: null`
+ * (a tool sent without the flag it has by default) apart from an unset `strict`, which it leaves out, and so an
+ * Anthropic tool's `eagerInputStreaming: null` (sent without its default `eager_input_streaming`).
+ */
+function wireToolFields(t: AnthropicHashedTool) {
 	return {
 		n: t.name,
 		d: t.description,
@@ -502,7 +518,18 @@ function wireToolFields(t: Tool) {
 		s: t.strict,
 		cf: t.customFormat,
 		cw: t.customWireName,
+		dl: t.deferLoading,
+		e: t.eagerInputStreaming,
 	};
+}
+
+/**
+ * Fingerprint of provider-bound tool specs as a request declares them, in order: a same-name tool whose description,
+ * schema, `strict`, `customFormat`, `customWireName`, deferral or eager input streaming changed, or another order,
+ * makes another one.
+ */
+export function toolSpecsFingerprint(tools: readonly AnthropicHashedTool[]): string {
+	return hashPayload(JSON.stringify(tools.map(wireToolFields)));
 }
 
 /**
@@ -512,7 +539,7 @@ function wireToolFields(t: Tool) {
  * `strict`, `customFormat` or `customWireName` changed makes another one.
  */
 export function wireToolsFingerprint(tools: AgentContext["tools"], options: BuildOptions): string {
-	return hashPayload(JSON.stringify(normalizeWireTools(tools, options).map(wireToolFields)));
+	return toolSpecsFingerprint(normalizeWireTools(tools, options));
 }
 
 function computeFingerprint(systemPrompt: string[], tools: Tool[], options: BuildOptions): string {

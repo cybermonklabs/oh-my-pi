@@ -1469,6 +1469,12 @@ async function runLoopBody(
 						await config.syncContextBeforeModelCall(currentContext, signal);
 					}
 					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
+					// A message the call must carry that the context lacks joins this turn's inputs.
+					for (const message of (await config.getMissingContextMessages?.(currentContext)) ?? []) {
+						currentContext.messages.push(message);
+						newMessages.push(message);
+						turnMessages.push(message);
+					}
 
 					if (!directiveResolvedForTurn) {
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
@@ -2007,6 +2013,11 @@ interface PreparedProviderCall {
 	ownedDialect: Dialect | undefined;
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
+	/**
+	 * Records this call's per-call messages as the previous main request's; called as the provider dispatches the
+	 * request (its `beforeDispatch`), past the stream function's own gates.
+	 */
+	perCallMessagesSent?: () => void;
 }
 
 /**
@@ -2106,6 +2117,14 @@ async function prepareProviderCall(
 			}),
 		};
 	}
+	// After the append-only log, which keeps the object it first synced for each byte-stable position: a repeated
+	// per-call message it holds from an earlier request still goes out as history.
+	let perCallMessagesSent: (() => void) | undefined;
+	if (config.repeatedPerCallMessages) {
+		const settled = config.repeatedPerCallMessages.settle(llmContext.messages);
+		if (settled.messages !== llmContext.messages) llmContext = { ...llmContext, messages: settled.messages };
+		perCallMessagesSent = settled.sent;
+	}
 	// Before the transform too, so a request-size clamp in it measures the withdrawn definitions the provider
 	// re-declares; recomputed below against what the transform returns.
 	if (config.sentToolDefinitions) llmContext = config.sentToolDefinitions.withInactiveTools(llmContext);
@@ -2128,7 +2147,7 @@ async function prepareProviderCall(
 		if (llmContext.tools) config.sentToolDefinitions.record(llmContext.tools);
 		llmContext = config.sentToolDefinitions.withInactiveTools(llmContext);
 	}
-	return { model, context: llmContext, promptToolWireTools, ownedDialect };
+	return { model, context: llmContext, promptToolWireTools, ownedDialect, perCallMessagesSent };
 }
 
 /**
@@ -2300,7 +2319,11 @@ async function streamAssistantResponse(
 	// provider. Holding here covers those awaits and the retries the stream
 	// layer dispatches itself (re-sample, rotated credential). The caller's
 	// own hold is asked again after each wait on the gate, so what it checks
-	// is checked after the pause rather than before it.
+	// is checked after the pause rather than before it. Past every hold the
+	// provider sends: only a request that gets there becomes the one the next
+	// request compares its per-call messages with, and one a stream function's
+	// own gate stopped (a spend cap, a model check) or an abort ended sends
+	// nothing and leaves that record as it was.
 	const callerHold = config.beforeDispatch;
 	const beforeDispatch: DispatchHold = async () => {
 		for (;;) {
@@ -2314,6 +2337,7 @@ async function streamAssistantResponse(
 			await waitForProcessPause(config, finalRequestSignal);
 		}
 		finalRequestSignal?.throwIfAborted();
+		providerCall.perCallMessagesSent?.();
 	};
 	// Awaiting the hold proves only that the gate was open when it answered.
 	// The transport reads this in the same synchronous step that sends, so a

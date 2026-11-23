@@ -12,14 +12,7 @@ import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
-import {
-	$env,
-	$flag,
-	logger,
-	parseJsonWithRepair,
-	parseStreamingJsonThrottled,
-	readSseEvents,
-} from "@oh-my-pi/pi-utils";
+import { $env, logger, parseJsonWithRepair, parseStreamingJsonThrottled, readSseEvents } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
@@ -103,8 +96,6 @@ import {
 } from "./anthropic-slow-mode";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
-import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
-import { spillToDescription } from "../utils/schema/spill";
 import { createSdkStreamRequestOptions } from "../utils/sdk-stream-timeout";
 import { notifyRawSseEvent } from "../utils/sse-debug";
 import { isForcedToolChoice } from "../utils/tool-choice";
@@ -116,7 +107,6 @@ import {
 	calculateAnthropicRetryDelayMs,
 } from "./anthropic-client";
 import {
-	type ToolInputSchema as AnthropicToolInputSchema,
 	type Tool as AnthropicWireTool,
 	type Usage as AnthropicWireUsage,
 	COMPACTION_BETA,
@@ -212,6 +202,19 @@ import {
 	isAnthropicFastModeFallbackDisabled,
 	normalizeAnthropicBaseUrl,
 } from "./anthropic-state";
+import { experimentalBetasDisabled, withoutDisabledExperimentalBetas } from "./anthropic-beta-kill-switch";
+import {
+	type AnthropicToolControls,
+	anthropicKeepsToolDeclaration,
+	declareAnthropicTools,
+} from "./anthropic-tool-declaration";
+import {
+	ANTHROPIC_BUFFERED_INPUT_TOOLS,
+	anthropicEagerInputStreaming,
+	anthropicToolsRequest,
+	anthropicWireToolFields,
+} from "./anthropic-tool-schema";
+import { ANTHROPIC_FALLBACK_FLAGS, type AnthropicFallback, reportProviderFallback } from "./provider-fallbacks";
 
 export {
 	applyClaudeToolPrefix,
@@ -530,6 +533,24 @@ function getAnthropicProviderSessionState(
 	// fresh state has nothing to lower and only takes the stamp.
 	if (anchor !== undefined) observeAnthropicFastModeRearm(state, anchor.fastModeRearmGeneration);
 	return state;
+}
+
+/**
+ * Puts back a fallback an earlier process of the session kept for an endpoint and model (see
+ * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): the requests there leave out what the endpoint rejected, as the
+ * requests after its 400 did.
+ */
+export function restoreAnthropicFallback(
+	providerSessionState: Map<string, ProviderSessionState>,
+	fallback: AnthropicFallback,
+): void {
+	const state = getAnthropicProviderSessionState(providerSessionState, undefined, fallback.baseUrl, fallback.modelId);
+	if (!state) return;
+	if (fallback.off === "thinking-blocks") {
+		for (const key of fallback.blocks) state.prefixDroppedThinkingBlocks.add(key);
+	} else {
+		state[ANTHROPIC_FALLBACK_FLAGS[fallback.off]] = true;
+	}
 }
 
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
@@ -920,25 +941,6 @@ export type AnthropicClientOptionsResult = {
 	fetch?: FetchImpl;
 	fetchOptions?: AnthropicFetchOptions;
 };
-
-function resolveEagerToolInputStreamingSupport(
-	model: Model<"anthropic-messages">,
-	effectiveBaseUrl: string | undefined,
-): boolean {
-	if (!model.compat.supportsEagerToolInputStreaming) return false;
-	// First-party Anthropic endpoints accept the per-tool flag.
-	if (isOfficialAnthropicApiUrl(effectiveBaseUrl)) return true;
-	// Non-official effective endpoint. `supportsEagerToolInputStreaming` may be
-	// stale-true here because compat is materialized once at build time and is
-	// never rebuilt for a baseUrl-only reroute — either a runtime provider
-	// override (`pi.registerProvider("anthropic", { baseUrl })`) or Foundry
-	// (`CLAUDE_CODE_USE_FOUNDRY`). Both leave the canonical model's resolved
-	// compat in place. `officialEndpoint` records whether compat was built for
-	// the canonical Anthropic URL, so only endpoints whose compat was authored
-	// for a non-official host (an explicit `compat.supportsEagerToolInputStreaming`
-	// opt-in on a custom `baseUrl`) still send the field.
-	return !model.compat.officialEndpoint;
-}
 
 function resolveAnthropicCustomHeaders(
 	model: Model<"anthropic-messages">,
@@ -1962,7 +1964,6 @@ const streamAnthropicOnce = (
 				output.usage.premiumRequests = copilotDynamicHeaders.premiumRequests;
 			}
 			const baseUrl = copilotBaseUrl ?? resolveAnthropicBaseUrl(model, apiKey) ?? "https://api.anthropic.com";
-			const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
 			// A caller-owned client decides the endpoint itself (its `baseURL`, or an
 			// explicit opt-in); it receives the compaction beta per request. A transport
 			// exists only to compact, so its endpoint supports the beta.
@@ -1977,8 +1978,9 @@ const streamAnthropicOnce = (
 				baseUrl,
 				model.id,
 			);
-			let disableStrictTools =
-				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
+			const toolsRequest = anthropicToolsRequest(model, baseUrl, providerSessionState?.strictToolsDisabled ?? false);
+			const supportsEagerToolInputStreaming = toolsRequest.eagerInputStreaming === true;
+			let disableStrictTools = toolsRequest.disableStrictTools === true;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let forceDemoteUnsignedThinking = providerSessionState?.replayUnsignedThinkingDisabled ?? false;
 			let droppedAllThinkingForSignature = providerSessionState?.thinkingReplayDisabled ?? false;
@@ -3335,6 +3337,7 @@ const streamAnthropicOnce = (
 						});
 						if (providerSessionState) {
 							providerSessionState.strictToolsDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						disableStrictTools = true;
 						params = await rebuildParams(streamFailure);
@@ -3438,7 +3441,9 @@ const streamAnthropicOnce = (
 						});
 						prefixBindingRetryAttempted = true;
 						prefixMismatchBehavior = undefined;
-						dropAllThinking = !rememberPrefixBindingFailure(params, streamFailureMessage, providerSessionState);
+						const droppedBound = rememberPrefixBindingFailure(params, streamFailureMessage, providerSessionState);
+						if (droppedBound) reportProviderFallback(options?.providerSessionState);
+						dropAllThinking = !droppedBound;
 						params = await rebuildParams(streamFailure);
 						providerRetryAttempt = 0;
 						output.content.length = 0;
@@ -3479,6 +3484,7 @@ const streamAnthropicOnce = (
 							latestTurnThinkingRetryAttempted = true;
 							if (providerSessionState) {
 								for (const key of keys) providerSessionState.prefixDroppedThinkingBlocks.add(key);
+								reportProviderFallback(options?.providerSessionState);
 							} else {
 								dropAllThinking = true;
 							}
@@ -3515,6 +3521,7 @@ const streamAnthropicOnce = (
 						);
 						if (providerSessionState) {
 							providerSessionState.replayUnsignedThinkingDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						forceDemoteUnsignedThinking = true;
 						params = await rebuildParams(streamFailure);
@@ -3556,6 +3563,7 @@ const streamAnthropicOnce = (
 						);
 						if (providerSessionState) {
 							providerSessionState.thinkingReplayDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						droppedAllThinkingForSignature = true;
 						dropAllThinking = true;
@@ -3810,12 +3818,14 @@ const streamAnthropicOnce = (
 			if (providerSessionState) {
 				if (cacheControlRejectionReplayed) {
 					providerSessionState.cacheControlUnsupported = true;
+					reportProviderFallback(options?.providerSessionState);
 				} else if (cacheControlOptionRejectionReplayed) {
 					// The narrow latch, so the rest of the session keeps sending
 					// breakpoints. Exclusive with the one above: when both rungs ran,
 					// the field refusal is what carried the turn and what the next turn
 					// must start from.
 					providerSessionState.cacheControlOptionsUnsupported = true;
+					reportProviderFallback(options?.providerSessionState);
 				}
 			}
 			stream.push({
@@ -3864,11 +3874,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, con
 	withReplaySafeStreamRetry(withoutDisabledExperimentalBetas(model), context, options, streamAnthropicOnce, {
 		retryEmptyCompletion: true,
 	});
-
-/** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
-function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean {
-	return model.compat.honorsClaudeCodeBetaKillSwitch === true && $flag("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
-}
 
 /**
  * Whether a request body carries a field the kill switch withholds. A frozen
@@ -3920,37 +3925,6 @@ function withholdKillSwitchControls(holder: { thinking?: ThinkingConfigParam; ou
 	delete holder.output_config.task_budget;
 	delete holder.output_config.format;
 	if (Object.keys(holder.output_config).length === 0) delete holder.output_config;
-}
-
-/**
- * Honor Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` kill switch on
- * providers whose compat opts in (`honors-claude-code-beta-kill-switch`).
- * Gateways behind `ANTHROPIC_BASE_URL` often reject pre-release body fields,
- * so the switch withholds what Claude Code's gateway contract lists — context
- * management, beta tool fields (`strict`, `defer_loading`,
- * `eager_input_streaming`), tool search (mid-conversation tool changes),
- * structured-output format, task budgets — plus `thinking.block_binding` and
- * server compaction (whose legacy replay needs a `context_management` edit),
- * together with their betas. Effort, adaptive thinking, interleaved thinking
- * and extended context stay, as in Claude Code. Applied through compat so every
- * request builder and retry rung sees one decision; {@link withholdKillSwitchFields}
- * and {@link killSwitchBetas} cover the rest where bodies and betas are finalized.
- */
-function withoutDisabledExperimentalBetas(model: Model<"anthropic-messages">): Model<"anthropic-messages"> {
-	if (!experimentalBetasDisabled(model)) return model;
-	return {
-		...model,
-		compat: {
-			...model.compat,
-			supportsContextManagement: false,
-			supportsThinkingBindingControls: false,
-			supportsServerCompaction: false,
-			supportsMessageThreads: false,
-			disableStrictTools: true,
-			supportsEagerToolInputStreaming: false,
-			supportsMidConversationToolChanges: false,
-		},
-	};
 }
 
 export type AnthropicSystemBlock = {
@@ -4054,7 +4028,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	// opaque proxies are authoritative even when the URL isn't recognized.
 	// Stale-official compat never qualifies: a canonical model rerouted to an
 	// unrecognized proxy keeps `officialEndpoint: true` (see
-	// resolveEagerToolInputStreamingSupport), and signing there is unknowable.
+	// anthropicEagerInputStreaming), and signing there is unknowable.
 	// Two signing routes still can't take the beta as this `anthropic-beta` HTTP
 	// header, so they're excluded: Vertex rawPredict accepts betas only in the
 	// JSON body (`anthropic_beta`) and 400s on the header (#5614), and GitHub
@@ -4070,7 +4044,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 				!isVertexRawPredictUrl(baseUrl ?? "") &&
 				!hostMatchesUrl(baseUrl, "githubCopilot")));
 	const oauthToken = isOAuth ?? isAnthropicOAuthToken(apiKey);
-	const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
+	const supportsEagerToolInputStreaming = anthropicEagerInputStreaming(model, baseUrl);
 	// The beta streams every tool eagerly, so it is skipped when a tool needs buffered input.
 	const needsFineGrainedToolStreamingBeta =
 		hasTools && !hasBufferedInputTools && isOfficialAnthropicApiUrl(baseUrl) && !supportsEagerToolInputStreaming;
@@ -4752,7 +4726,6 @@ type AnthropicControlRecord = { index: number; live: boolean; controls: Anthropi
 /** A control to splice in before `context.messages[index]`. */
 type AnthropicControlInsert = { index: number; spec: AnthropicControlSpec };
 
-type AnthropicToolControls = NonNullable<AnthropicRequestControls["tools"]>;
 type AnthropicEffortControls = NonNullable<AnthropicRequestControls["effort"]>;
 
 function anthropicControlOf(message: Message): AnthropicControlSpec | undefined {
@@ -4826,8 +4799,7 @@ function diffAnthropicActiveTools(
 
 /**
  * Keep top-level `tools` byte-stable across a conversation. The declared list
- * is the latest record's, minus names with no definition in `tools` or
- * `inactiveTools`, plus newly active tools appended with `defer_loading`.
+ * is the latest record's ({@link declareAnthropicTools}).
  * Every recorded active-set change is replayed as a control before the
  * response of the request that made it; the change this request makes goes
  * at the tail. Records at a different index than they were written at are
@@ -4845,11 +4817,6 @@ function planAnthropicToolControls(
 	ownChange: boolean,
 ): { tools: Tool[] | undefined; inserts: AnthropicControlInsert[]; record: AnthropicToolControls | undefined } {
 	if (!enabled || !context.tools) return { tools: context.tools, inserts: [], record: undefined };
-	const definitions = new Map<string, Tool>();
-	for (const tool of context.tools) definitions.set(tool.name, tool);
-	for (const tool of context.inactiveTools ?? []) {
-		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
-	}
 	const activeNames = context.tools.map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
@@ -4859,26 +4826,13 @@ function planAnthropicToolControls(
 		}
 	}
 	const inserts: AnthropicControlInsert[] = [];
-	let declared = activeNames;
-	const deferred = new Set<string>();
 	const latest = toolRecords.at(-1);
+	const { declared, declaredSet, deferred, tools } = declareAnthropicTools(
+		context.tools,
+		context.inactiveTools,
+		latest?.tools,
+	);
 	if (latest) {
-		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
-		declared = latest.tools.declared.filter(name => definitions.has(name));
-		const declaredSet = new Set(declared);
-		for (const name of latest.tools.deferred) {
-			if (declaredSet.has(name)) deferred.add(name);
-		}
-		for (const name of activeNames) {
-			if (declaredSet.has(name)) continue;
-			declared.push(name);
-			declaredSet.add(name);
-			deferred.add(name);
-		}
-		// The API rejects a declaration whose tools are all deferred (a tool-less
-		// conversation gaining tools, or a resume that kept none of the loaded
-		// ones), so load them all and let the controls below replay availability.
-		if (declared.every(name => deferred.has(name))) deferred.clear();
 		// The chain starts from what the top-level declaration makes active, so a
 		// rewritten history converges on the current roster instead of trusting a
 		// record whose earlier controls were summarized away.
@@ -4893,16 +4847,11 @@ function planAnthropicToolControls(
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
 	}
 
-	const tools: Tool[] = [];
-	for (const name of declared) {
-		const tool = definitions.get(name);
-		if (tool) tools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
-	}
 	return {
 		tools,
 		inserts,
 		record: {
-			declared: tools.map(tool => tool.name),
+			declared,
 			deferred: tools.filter(tool => tool.deferLoading === true).map(tool => tool.name),
 			active: activeNames,
 		},
@@ -5242,7 +5191,7 @@ function buildParams(
 	const toolPlan = planAnthropicToolControls(
 		context,
 		records,
-		model.compat.supportsMidConversationToolChanges === true,
+		anthropicKeepsToolDeclaration(model),
 		!compactionRequest,
 	);
 
@@ -6361,641 +6310,6 @@ export function convertAnthropicMessages(
 	return params;
 }
 
-/**
- * JSON Schema whitelist for Anthropic tool `input_schema` nodes.
- *
- * Tracks the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`,
- * with live Messages API guardrails for keywords the SDK preserves but the API rejects.
- * We keep only structural/metadata keywords Anthropic's validator honors, and demote
- * anything else into the node's `description` as `\n\n{key: value, ...}` so the model
- * still sees the constraint as a natural-language hint.
- *
- * `Set` (not `Record<string, true>`) because membership is probed against arbitrary
- * user/Zod-derived schema keys: a literal Record would falsely match prototype names
- * like `"toString"` and silently strip valid properties.
- */
-const ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP = new Set([
-	"$ref",
-	"$defs",
-	"$schema",
-	"definitions",
-	"type",
-	"anyOf",
-	"allOf",
-	"enum",
-	"const",
-	"description",
-	"title",
-	"default",
-	"nullable",
-]);
-/** Keys preserved on `type: "object"` nodes (in addition to the universal set). */
-const ANTHROPIC_TOOL_SCHEMA_OBJECT_KEEP = new Set(["properties", "required", "additionalProperties"]);
-/** Keys preserved on `type: "array"` nodes; `minItems` only when its value is 0 or 1. */
-const ANTHROPIC_TOOL_SCHEMA_ARRAY_KEEP = new Set(["items", "prefixItems", "minItems"]);
-/** Keys preserved on `type: "string"` nodes; `format` only when its value is in the supported list. */
-const ANTHROPIC_TOOL_SCHEMA_STRING_KEEP = new Set(["format"]);
-/**
- * String `format` values Anthropic accepts; everything else (including `pattern`-style
- * format hints) gets demoted into `description`. Matches `SupportedStringFormats` in the
- * Anthropic SDK's `_transform.py`.
- */
-const ANTHROPIC_TOOL_SCHEMA_STRING_FORMATS = new Set([
-	"date-time",
-	"time",
-	"date",
-	"duration",
-	"email",
-	"hostname",
-	"uri",
-	"ipv4",
-	"ipv6",
-	"uuid",
-]);
-// Not `bash`: strict decoding fixes property order, so an optional key declared
-// before one the model has already written can no longer be emitted, and bash's
-// `timeout` vanished from every `async`-first call.
-// `yield` carries a subagent's whole structured result. Its properties (`type`,
-// `data`, `error`) are declared in the order callers write them; schema-less and
-// workpool yields report `strict: false`. Strict only holds together with buffered
-// input streaming (see ANTHROPIC_BUFFERED_INPUT_TOOLS).
-const ANTHROPIC_STRICT_TOOL_ALLOWLIST = new Set(["python", "edit", "find", "yield"]);
-const MAX_ANTHROPIC_STRICT_TOOLS = 20;
-const MAX_ANTHROPIC_STRICT_OPTIONAL_PARAMETERS = 24;
-const MAX_ANTHROPIC_STRICT_UNION_PARAMETERS = 16;
-// Tools sent with `eager_input_streaming: false`, so the API buffers and validates
-// their input. Eagerly streamed `yield` input from Claude Haiku arrived as invalid
-// JSON (a large nested result closed with one brace too many) even with `strict`
-// set; buffered, it did not. Where the per-tool flag is unsupported, their presence
-// drops the request-wide fine-grained streaming beta instead.
-const ANTHROPIC_BUFFERED_INPUT_TOOLS = new Set(["yield"]);
-
-/** `minItems` / `maxItems` apply to arrays; Anthropic rejects them on `type: "object"` (including `minItems: 0`/`1`). */
-function isJsonSchemaArrayNode(schema: Record<string, unknown>): boolean {
-	const t = schema.type;
-	if (t === "array") return true;
-	if (Array.isArray(t) && t.includes("array") && !t.includes("object")) return true;
-	if (schema.items !== undefined || Array.isArray(schema.prefixItems)) return true;
-	return false;
-}
-
-function isJsonSchemaObjectNode(schema: Record<string, unknown>): boolean {
-	if (isJsonSchemaArrayNode(schema)) return false;
-	if (schema.type === "object") return true;
-	if (Array.isArray(schema.type) && schema.type.includes("object")) return true;
-	if (isRecord(schema.properties)) return true;
-	return false;
-}
-
-/**
- * Pick the principal non-null scalar type from a `type` keyword. Anthropic accepts
- * `type` as either a single string or an array (e.g. `["number", "null"]` for a
- * nullable value); the SDK whitelist is keyed off the scalar type, with `"null"`
- * ignored so nullable variants are normalized as their underlying type.
- */
-function pickAnthropicScalarType(type: unknown): string | undefined {
-	if (typeof type === "string") return type;
-	if (Array.isArray(type)) {
-		for (const entry of type) {
-			if (typeof entry === "string" && entry !== "null") return entry;
-		}
-	}
-	return undefined;
-}
-function pickAnthropicEffectiveScalarType(schema: Record<string, unknown>): string | undefined {
-	const explicit = pickAnthropicScalarType(schema.type);
-	if (explicit) return explicit;
-	if (isRecord(schema.properties)) return "object";
-	if (schema.items !== undefined || Array.isArray(schema.prefixItems)) return "array";
-	return undefined;
-}
-
-function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | undefined {
-	switch (scalarType) {
-		case "object":
-			return ANTHROPIC_TOOL_SCHEMA_OBJECT_KEEP;
-		case "array":
-			return ANTHROPIC_TOOL_SCHEMA_ARRAY_KEEP;
-		case "string":
-			return ANTHROPIC_TOOL_SCHEMA_STRING_KEEP;
-		default:
-			return undefined;
-	}
-}
-
-/**
- * Normalize a JSON Schema node for Anthropic tool `input_schema`.
- *
- * Applies the full whitelist semantics from the Anthropic Python SDK's
- * `lib/_parse/_transform.py::transform_schema`:
- *
- * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`, `allOf`, `enum`, `const`,
- *    `description`, `title`, `default`, `nullable`) are preserved on every node, with
- *    one position-dependent exception: the combinator keys. Root `anyOf`/`allOf` are
- *    spilled (recent Anthropic Messages validators reject combinators at the tool
- *    `input_schema` root) but kept when nested; `oneOf` is spilled at every position
- *    (it is not in the documented supported subset).
- * 2. Per-type keys are kept additively (object → `properties`/`required`/`additionalProperties`,
- *    array → `items`/`prefixItems` plus `minItems` only when 0 or 1, string → `format`
- *    only when in the supported value set).
- * 3. Everything else is demoted into the node's `description` as `\n\n{key: value, ...}`
- *
- * Object nodes default to `additionalProperties: false`, but explicit open-map
- * declarations (`additionalProperties: true` or a schema literal — Zod's
- * `z.record(z.string(), z.unknown())` produces `{}`) are preserved. The strict-mode
- * pass downstream demotes those shapes to non-strict instead of fabricating a closed
- * object, so callers like the resolve tool keep working open-map semantics.
- */
-function normalizeAnthropicToolSchemaNode(
-	schema: unknown,
-	cache: WeakMap<Record<string, unknown>, Record<string, unknown>>,
-	isRoot = false,
-): unknown {
-	if (Array.isArray(schema)) return schema.map(entry => normalizeAnthropicToolSchemaNode(entry, cache));
-	if (!isRecord(schema)) return schema;
-
-	const existing = cache.get(schema);
-	if (existing !== undefined) return existing;
-
-	const result: Record<string, unknown> = {};
-	cache.set(schema, result);
-
-	const scalarType = pickAnthropicEffectiveScalarType(schema);
-	const perTypeKeep = anthropicPerTypeKeep(scalarType);
-	const spill: Array<[string, unknown]> = [];
-
-	for (const key in schema) {
-		if (!Object.hasOwn(schema, key)) continue;
-		const value = schema[key];
-		const isRootCombinator = isRoot && COMBINATOR_KEYS.includes(key as (typeof COMBINATOR_KEYS)[number]);
-		if (!isRootCombinator && (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key))) {
-			result[key] = value;
-		} else {
-			spill.push([key, value]);
-		}
-	}
-
-	// Per-type conditional keys: prune within the kept set.
-	if (scalarType === "string") {
-		const format = result.format;
-		if (typeof format === "string" && !ANTHROPIC_TOOL_SCHEMA_STRING_FORMATS.has(format)) {
-			spill.push(["format", format]);
-			delete result.format;
-		}
-	}
-	if (scalarType === "array" && result.minItems !== undefined) {
-		const minItems = result.minItems;
-		if (!(typeof minItems === "number" && (minItems === 0 || minItems === 1))) {
-			spill.push(["minItems", minItems]);
-			delete result.minItems;
-		}
-	}
-	if (scalarType === "object" && result.additionalProperties === undefined) {
-		result.additionalProperties = false;
-	}
-
-	// Recurse on structural keys.
-	if (isRecord(result.properties)) {
-		const normalizedProperties: Record<string, unknown> = {};
-		const sourceProperties = result.properties as Record<string, unknown>;
-		for (const propName in sourceProperties) {
-			if (!Object.hasOwn(sourceProperties, propName)) continue;
-			normalizedProperties[propName] = normalizeAnthropicToolSchemaNode(sourceProperties[propName], cache);
-		}
-		result.properties = normalizedProperties;
-	}
-	if (isRecord(result.additionalProperties)) {
-		const normalized = normalizeAnthropicToolSchemaNode(result.additionalProperties, cache);
-		if (isRecord(normalized) && Object.keys(normalized).length === 0) {
-			result.additionalProperties = true;
-		} else {
-			result.additionalProperties = normalized;
-		}
-	}
-	if (Array.isArray(result.items)) {
-		result.items = result.items.map(item => normalizeAnthropicToolSchemaNode(item, cache));
-	} else if (isRecord(result.items)) {
-		result.items = normalizeAnthropicToolSchemaNode(result.items, cache);
-	}
-	if (Array.isArray(result.prefixItems)) {
-		result.prefixItems = result.prefixItems.map(item => normalizeAnthropicToolSchemaNode(item, cache));
-	}
-	for (const key of COMBINATOR_KEYS) {
-		const variants = result[key];
-		if (Array.isArray(variants)) {
-			result[key] = variants.map(variant => normalizeAnthropicToolSchemaNode(variant, cache));
-		}
-	}
-	for (const defsKey of ["$defs", "definitions"] as const) {
-		const definitions = result[defsKey];
-		if (!isRecord(definitions)) continue;
-		const normalizedDefs: Record<string, unknown> = {};
-		const sourceDefs = definitions as Record<string, unknown>;
-		for (const name in sourceDefs) {
-			if (!Object.hasOwn(sourceDefs, name)) continue;
-			normalizedDefs[name] = normalizeAnthropicToolSchemaNode(sourceDefs[name], cache);
-		}
-		result[defsKey] = normalizedDefs;
-	}
-
-	spillToDescription(result, spill);
-	return result;
-}
-
-function stringEntries(value: unknown): string[] {
-	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
-}
-
-/**
- * Whether a root combinator variant can merge into the root object. `allOf` branches
- * may be open (every branch must hold, so an open one loosens nothing); an open
- * `anyOf`/`oneOf` variant admits any value for keys other variants declare.
- */
-function isFoldableAnthropicRootVariant(variant: unknown, conjunctive: boolean): variant is Record<string, unknown> {
-	if (!isRecord(variant)) return false;
-	const type = pickAnthropicEffectiveScalarType(variant);
-	if (type !== undefined && type !== "object") return false;
-	if (variant.$ref !== undefined || variant.not !== undefined || variant.if !== undefined) return false;
-	if (COMBINATOR_KEYS.some(key => variant[key] !== undefined)) return false;
-	return conjunctive || variant.additionalProperties === undefined || variant.additionalProperties === false;
-}
-
-/**
- * Fold root `anyOf`/`oneOf`/`allOf` object variants into the root object.
- *
- * Messages rejects combinators at the tool `input_schema` root, so
- * {@link normalizeAnthropicToolSchemaNode} spills them into `description`. Without
- * this fold a pure root union reaches the wire as a closed object with no
- * properties, which admits only `{}`. The folded root admits every value the
- * union admits:
- * - properties merge; a key declared differently by several variants keeps every
- *   declaration under a nested `anyOf` (`allOf` for a root `allOf`);
- * - `required` gains the keys every `anyOf`/`oneOf` variant requires, or every
- *   key any `allOf` branch requires;
- * - variants that cannot merge (non-object, `$ref`, nested combinators, open
- *   `anyOf`/`oneOf` members) open the root with `additionalProperties: true`.
- *
- * The exact union still reaches the model through the spilled description, and
- * {@link validateToolArguments} enforces it against the original tool schema.
- */
-function foldAnthropicRootCombinators(schema: Record<string, unknown>): Record<string, unknown> {
-	const rootType = pickAnthropicEffectiveScalarType(schema);
-	if (rootType !== undefined && rootType !== "object") return schema;
-	if (!COMBINATOR_KEYS.some(key => Array.isArray(schema[key]) && schema[key].length > 0)) return schema;
-
-	const properties: Record<string, unknown> = isRecord(schema.properties) ? { ...schema.properties } : {};
-	const required = new Set(stringEntries(schema.required));
-	let open = false;
-	for (const key of COMBINATOR_KEYS) {
-		const variants = schema[key];
-		if (!Array.isArray(variants) || variants.length === 0) continue;
-		const conjunctive = key === "allOf";
-		if (!variants.every(variant => isFoldableAnthropicRootVariant(variant, conjunctive))) {
-			open = true;
-			continue;
-		}
-
-		const declared = new Map<string, unknown[]>();
-		let shared: Set<string> | undefined;
-		for (const variant of variants) {
-			if (isRecord(variant.properties)) {
-				for (const name in variant.properties) {
-					if (!Object.hasOwn(variant.properties, name)) continue;
-					const propertySchema = variant.properties[name];
-					const declarations = declared.get(name) ?? [];
-					if (!declarations.some(entry => Bun.deepEquals(entry, propertySchema)))
-						declarations.push(propertySchema);
-					declared.set(name, declarations);
-				}
-			}
-			const variantRequired = stringEntries(variant.required);
-			if (conjunctive) {
-				for (const name of variantRequired) required.add(name);
-			} else {
-				shared = new Set(shared ? variantRequired.filter(name => shared?.has(name)) : variantRequired);
-			}
-			if (variant.additionalProperties !== undefined && variant.additionalProperties !== false) open = true;
-		}
-		for (const name of shared ?? []) required.add(name);
-		// A key the root (or an earlier combinator) already declares keeps that
-		// declaration: both must hold, so either alone admits every valid value.
-		for (const [name, declarations] of declared) {
-			if (Object.hasOwn(properties, name)) continue;
-			properties[name] =
-				declarations.length === 1 ? declarations[0] : { [conjunctive ? "allOf" : "anyOf"]: declarations };
-		}
-	}
-
-	const folded: Record<string, unknown> = { ...schema };
-	if (Object.keys(properties).length > 0 || isRecord(schema.properties)) folded.properties = properties;
-	if (required.size > 0) folded.required = [...required];
-	if (open && folded.additionalProperties === undefined && isRecord(folded.properties)) {
-		folded.additionalProperties = true;
-	}
-	return folded;
-}
-
-/**
- * Normalize a tool parameter schema into an Anthropic `input_schema`: root
- * combinators fold into the root object ({@link foldAnthropicRootCombinators}),
- * then {@link normalizeAnthropicToolSchemaNode} applies the keyword whitelist.
- */
-export function normalizeAnthropicToolSchema(schema: unknown): unknown {
-	const root = isRecord(schema) ? foldAnthropicRootCombinators(schema) : schema;
-	return normalizeAnthropicToolSchemaNode(root, new WeakMap(), true);
-}
-
-type AnthropicToolSchemaPlan = {
-	inputSchema: AnthropicToolInputSchema;
-	strict: boolean;
-};
-
-type AnthropicStrictBudget = {
-	optionalRemaining: number;
-	unionRemaining: number;
-	optionalCount: number;
-	unionCount: number;
-};
-
-type AnthropicStrictSchemaResult = {
-	schema: Record<string, unknown>;
-	optionalCount: number;
-	unionCount: number;
-};
-
-function hasAnthropicUnionType(schema: Record<string, unknown>): boolean {
-	return Array.isArray(schema.type) || Array.isArray(schema.anyOf);
-}
-
-function hasNullVariant(schema: Record<string, unknown>): boolean {
-	if (Array.isArray(schema.type) && schema.type.includes("null")) return true;
-	return Array.isArray(schema.anyOf) && schema.anyOf.some(variant => isRecord(variant) && variant.type === "null");
-}
-function hasAnthropicSchemaDefiningKeyword(schema: Record<string, unknown>): boolean {
-	if (
-		schema.type !== undefined ||
-		schema.properties !== undefined ||
-		schema.additionalProperties !== undefined ||
-		schema.items !== undefined ||
-		schema.prefixItems !== undefined ||
-		schema.enum !== undefined ||
-		schema.const !== undefined ||
-		schema.$ref !== undefined
-	) {
-		return true;
-	}
-	for (const key of COMBINATOR_KEYS) {
-		if (schema[key] !== undefined) return true;
-	}
-	return schema.$defs !== undefined || schema.definitions !== undefined;
-}
-
-function makeAnthropicNullableSchema(schema: unknown, budget: AnthropicStrictBudget): unknown | undefined {
-	if (isRecord(schema)) {
-		if (hasNullVariant(schema)) return schema;
-		if (Array.isArray(schema.anyOf)) {
-			return { ...schema, anyOf: [...schema.anyOf, { type: "null" }] };
-		}
-		if (Array.isArray(schema.type)) {
-			return { ...schema, type: [...schema.type, "null"] };
-		}
-	}
-
-	if (budget.unionRemaining <= 0) return undefined;
-	budget.unionRemaining--;
-	budget.unionCount++;
-	return { anyOf: [schema, { type: "null" }] };
-}
-
-function normalizeAnthropicStrictSchemaNode(
-	schema: unknown,
-	budget: AnthropicStrictBudget,
-	cache: WeakMap<Record<string, unknown>, AnthropicStrictSchemaResult | null>,
-): unknown | undefined {
-	if (Array.isArray(schema)) {
-		const result: unknown[] = [];
-		for (const entry of schema) {
-			const normalized = normalizeAnthropicStrictSchemaNode(entry, budget, cache);
-			if (normalized === undefined) return undefined;
-			result.push(normalized);
-		}
-		return result;
-	}
-
-	if (!isRecord(schema)) return schema;
-
-	const cached = cache.get(schema);
-	if (cached === null) return undefined;
-	if (
-		cached !== undefined &&
-		cached.optionalCount <= budget.optionalRemaining &&
-		cached.unionCount <= budget.unionRemaining
-	) {
-		// JSON repeats shared nodes; Anthropic charges every serialized occurrence.
-		budget.optionalRemaining -= cached.optionalCount;
-		budget.optionalCount += cached.optionalCount;
-		budget.unionRemaining -= cached.unionCount;
-		budget.unionCount += cached.unionCount;
-		return cached.schema;
-	}
-
-	// Re-normalize an overflowing occurrence so optionals can become nullable-required.
-	if (!hasAnthropicSchemaDefiningKeyword(schema)) return undefined;
-
-	// Strict tool use only supports closed objects. Open maps stay available on
-	// the non-strict schema plan instead of producing an Anthropic 400.
-	if (isJsonSchemaObjectNode(schema) && schema.additionalProperties !== false) {
-		return undefined;
-	}
-
-	const result: Record<string, unknown> = { ...schema };
-	const optionalCountBefore = budget.optionalCount;
-	const unionCountBefore = budget.unionCount;
-	// An unfinished entry denotes a cycle, not a reusable serialized subtree.
-	cache.set(schema, null);
-
-	if (hasAnthropicUnionType(result)) {
-		if (budget.unionRemaining <= 0) return undefined;
-		budget.unionRemaining--;
-		budget.unionCount++;
-	}
-
-	if (isRecord(result.properties)) {
-		const originalRequired = new Set(
-			Array.isArray(result.required)
-				? result.required.filter((entry): entry is string => typeof entry === "string")
-				: [],
-		);
-		const properties: Record<string, unknown> = {};
-		const required: string[] = [];
-
-		for (const [propertyName, propertySchema] of Object.entries(result.properties)) {
-			const normalizedProperty = normalizeAnthropicStrictSchemaNode(propertySchema, budget, cache);
-			if (normalizedProperty === undefined) return undefined;
-
-			if (originalRequired.has(propertyName)) {
-				properties[propertyName] = normalizedProperty;
-				required.push(propertyName);
-				continue;
-			}
-
-			if (budget.optionalRemaining > 0) {
-				budget.optionalRemaining--;
-				budget.optionalCount++;
-				properties[propertyName] = normalizedProperty;
-				continue;
-			}
-
-			const nullableProperty = makeAnthropicNullableSchema(normalizedProperty, budget);
-			if (nullableProperty === undefined) return undefined;
-			properties[propertyName] = nullableProperty;
-			required.push(propertyName);
-		}
-
-		result.properties = properties;
-		result.required = required;
-	}
-
-	if (Array.isArray(result.items)) {
-		const items = normalizeAnthropicStrictSchemaNode(result.items, budget, cache);
-		if (items === undefined) return undefined;
-		result.items = items;
-	} else if (isRecord(result.items)) {
-		const items = normalizeAnthropicStrictSchemaNode(result.items, budget, cache);
-		if (items === undefined) return undefined;
-		result.items = items;
-	}
-	if (Array.isArray(result.prefixItems)) {
-		const prefixItems = normalizeAnthropicStrictSchemaNode(result.prefixItems, budget, cache);
-		if (prefixItems === undefined) return undefined;
-		result.prefixItems = prefixItems;
-	}
-
-	for (const key of COMBINATOR_KEYS) {
-		const variants = result[key];
-		if (!Array.isArray(variants)) continue;
-		const normalizedVariants = normalizeAnthropicStrictSchemaNode(variants, budget, cache);
-		if (normalizedVariants === undefined) return undefined;
-		result[key] = normalizedVariants;
-	}
-
-	for (const defsKey of ["$defs", "definitions"] as const) {
-		const definitions = result[defsKey];
-		if (!isRecord(definitions)) continue;
-		const normalizedDefinitions: Record<string, unknown> = {};
-		for (const [definitionName, definitionSchema] of Object.entries(definitions)) {
-			const normalizedDefinition = normalizeAnthropicStrictSchemaNode(definitionSchema, budget, cache);
-			if (normalizedDefinition === undefined) return undefined;
-			normalizedDefinitions[definitionName] = normalizedDefinition;
-		}
-		result[defsKey] = normalizedDefinitions;
-	}
-
-	cache.set(schema, {
-		schema: result,
-		optionalCount: budget.optionalCount - optionalCountBefore,
-		unionCount: budget.unionCount - unionCountBefore,
-	});
-	return result;
-}
-
-const ANTHROPIC_STRICT_INCOMPATIBLE_KEYWORDS = [
-	"oneOf",
-	"allOf",
-	"$ref",
-	"patternProperties",
-	"propertyNames",
-] as const;
-
-/**
- * Anthropic's strict grammar subset supports anyOf/type-array unions only.
- * oneOf/allOf/$ref compile unpredictably (rejections arrive as 400s the
- * grammar-too-large fallback does not recognize, so they would hard-fail the
- * turn), and patternProperties/propertyNames describe open key sets that the
- * strict pipeline's injected `additionalProperties: false` would contradict.
- * Runs against the raw wire schema — the base normalizer spills several of
- * these keywords into the description, erasing the evidence.
- */
-function hasAnthropicStrictIncompatibleKeyword(schema: unknown, seen = new Set<object>()): boolean {
-	if (Array.isArray(schema)) {
-		if (seen.has(schema)) return false;
-		seen.add(schema);
-		return schema.some(entry => hasAnthropicStrictIncompatibleKeyword(entry, seen));
-	}
-	if (!isRecord(schema)) return false;
-	if (seen.has(schema)) return false;
-	seen.add(schema);
-	for (const keyword of ANTHROPIC_STRICT_INCOMPATIBLE_KEYWORDS) {
-		if (schema[keyword] !== undefined) return true;
-	}
-	return Object.values(schema).some(value => hasAnthropicStrictIncompatibleKeyword(value, seen));
-}
-
-function normalizeAnthropicStrictSchema(
-	schema: Record<string, unknown>,
-	optionalRemaining: number,
-	unionRemaining: number,
-): AnthropicStrictSchemaResult | undefined {
-	const budget: AnthropicStrictBudget = {
-		optionalRemaining,
-		unionRemaining,
-		optionalCount: 0,
-		unionCount: 0,
-	};
-	const normalized = normalizeAnthropicStrictSchemaNode(schema, budget, new WeakMap());
-	if (!isRecord(normalized)) return undefined;
-	return { schema: normalized, optionalCount: budget.optionalCount, unionCount: budget.unionCount };
-}
-
-function buildAnthropicBaseToolInputSchema(tool: Tool): Record<string, unknown> {
-	const jsonSchema = toolWireSchema(tool);
-	return normalizeAnthropicToolSchema({
-		...jsonSchema,
-		type: "object",
-		properties: isRecord(jsonSchema.properties) ? jsonSchema.properties : {},
-		required: stringEntries(jsonSchema.required),
-	}) as Record<string, unknown>;
-}
-
-function buildAnthropicToolSchemaPlans(tools: Tool[], disableStrictTools = false): AnthropicToolSchemaPlan[] {
-	const plans = tools.map((tool): AnthropicToolSchemaPlan => ({
-		inputSchema: buildAnthropicBaseToolInputSchema(tool) as AnthropicToolInputSchema,
-		strict: false,
-	}));
-	if (NO_STRICT || disableStrictTools) return plans;
-
-	const candidateIndexes = tools.flatMap((tool, index) => {
-		if (!ANTHROPIC_STRICT_TOOL_ALLOWLIST.has(tool.name)) return [];
-		if (tool.strict === false) return [];
-		if (hasAnthropicStrictIncompatibleKeyword(toolWireSchema(tool))) return [];
-		return [index];
-	});
-
-	let strictToolCount = 0;
-	let strictOptionalParameterCount = 0;
-	let strictUnionParameterCount = 0;
-	for (const index of candidateIndexes) {
-		if (strictToolCount >= MAX_ANTHROPIC_STRICT_TOOLS) break;
-
-		const strictResult = normalizeAnthropicStrictSchema(
-			plans[index].inputSchema as Record<string, unknown>,
-			MAX_ANTHROPIC_STRICT_OPTIONAL_PARAMETERS - strictOptionalParameterCount,
-			MAX_ANTHROPIC_STRICT_UNION_PARAMETERS - strictUnionParameterCount,
-		);
-		if (!strictResult) continue;
-
-		plans[index] = {
-			inputSchema: strictResult.schema as AnthropicToolInputSchema,
-			strict: true,
-		};
-		strictToolCount++;
-		strictOptionalParameterCount += strictResult.optionalCount;
-		strictUnionParameterCount += strictResult.unionCount;
-	}
-
-	return plans;
-}
-
 function convertTools(
 	tools: Tool[],
 	isOAuthToken: boolean,
@@ -7005,21 +6319,19 @@ function convertTools(
 	useUmansGatewayWebSearch = false,
 ): AnthropicWireTool[] {
 	if (!tools) return [];
-	const schemaPlans = buildAnthropicToolSchemaPlans(tools, disableStrictTools);
+	const fields = anthropicWireToolFields(
+		{ disableStrictTools, eagerInputStreaming: supportsEagerToolInputStreaming },
+		tools,
+	);
 
 	return tools.map((tool, index) => {
-		const plan = schemaPlans[index];
-		const baseTool = {
+		const { inputSchema, strict, eagerInputStreaming } = fields[index];
+		return {
 			name: encodeAnthropicToolName(tool.name, isOAuthToken, escapeBuiltinToolNames, useUmansGatewayWebSearch),
 			description: tool.description || "",
-			input_schema: plan.inputSchema,
-		};
-		return {
-			...baseTool,
-			...(supportsEagerToolInputStreaming
-				? { eager_input_streaming: !ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name) }
-				: {}),
-			...(plan.strict ? { strict: true } : {}),
+			input_schema: inputSchema,
+			...(eagerInputStreaming !== undefined ? { eager_input_streaming: eagerInputStreaming } : {}),
+			...(strict ? { strict: true } : {}),
 			...(tool.deferLoading ? { defer_loading: true } : {}),
 		};
 	});

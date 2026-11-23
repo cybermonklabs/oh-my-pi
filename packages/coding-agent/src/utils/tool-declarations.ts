@@ -5,7 +5,7 @@ import type { Tool } from "@oh-my-pi/pi-ai";
  * declaration cannot drift from what providers serialize. Anything else on a live tool object (sessions, runners,
  * caches) is execution state that never reaches the wire (#17819).
  */
-const TOOL_DECLARATION_KEYS = Object.keys({
+export const TOOL_DECLARATION_KEYS = Object.keys({
 	name: true,
 	description: true,
 	parameters: true,
@@ -16,7 +16,7 @@ const TOOL_DECLARATION_KEYS = Object.keys({
 	native: true,
 	examples: true,
 	lenientArgValidation: true,
-} satisfies Record<keyof Tool, true>) as (keyof Tool)[];
+} satisfies Record<keyof Tool, true>) as readonly (keyof Tool)[];
 
 /**
  * `tools` as providers declare them: each tool's {@link Tool} fields only. The agent loop spreads live tool objects

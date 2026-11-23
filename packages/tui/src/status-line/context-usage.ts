@@ -120,20 +120,31 @@ export function computeCompactionBoundaries(
 	};
 }
 
+/** An agent's tool roster and the tool definitions its next request declares (`Agent`). */
+export interface ToolDeclarationSource {
+	readonly state?: {
+		readonly tools?: readonly ContextTool[];
+	};
+	/**
+	 * Whether requests to `model` ship description-stripped tool specs because
+	 * the catalog rides in the system prompt (`Agent.prunesToolDescriptions`).
+	 */
+	prunesToolDescriptions?(model: Model | undefined): boolean;
+	/**
+	 * The tools the next request to `model` declares (`Agent.declaredTools`): the
+	 * roster (the `state.tools` array itself when the request declares nothing
+	 * else) and, on a provider that keeps its tool declaration across a
+	 * conversation, each tool taken off the roster that the request still
+	 * declares, as it was last sent.
+	 */
+	declaredTools?(model: Model | undefined): readonly ContextTool[];
+}
+
 /** Stable inputs used to cache non-message token estimates. */
 export interface NonMessageTokenSource {
 	readonly model?: Model;
 	readonly systemPrompt?: readonly string[];
-	readonly agent?: {
-		readonly state?: {
-			readonly tools?: readonly ContextTool[];
-		};
-		/**
-		 * Whether requests to `model` ship description-stripped tool specs because
-		 * the catalog rides in the system prompt (`Agent.prunesToolDescriptions`).
-		 */
-		prunesToolDescriptions?(model: Model | undefined): boolean;
-	};
+	readonly agent?: ToolDeclarationSource;
 	readonly skills?: readonly ContextSkill[];
 	/** Provider-facing, session-frozen descriptions when available. */
 	readonly renderedSkills?: readonly ContextSkill[];
@@ -316,20 +327,143 @@ export function estimateToolSchemaTokens(
 	return tokens;
 }
 
-/** Count schemas carried on every request, excluding server-side deferred catalogs. */
-export function estimateContextToolSchemaTokens(
+/** What {@link withdrawnToolDefinitions} took from one declared list: the roster it filtered by and the result. */
+interface WithdrawnToolDefinitions {
+	tools: ToolSchemaSource;
+	withdrawn: readonly ContextTool[];
+}
+
+/**
+ * Per declared list ({@link ToolDeclarationSource.declaredTools}), the withdrawn
+ * definitions last taken from it. An agent gives the same list until its
+ * tools, its declaration or its sent definitions change, so a repeated call
+ * compares references only. Lists are caller-owned, so a WeakMap keeps the
+ * state off them.
+ */
+const WITHDRAWN_TOOL_DEFINITIONS = new WeakMap<readonly ContextTool[], WithdrawnToolDefinitions>();
+
+/**
+ * The definitions the next request to `model` declares for tools not on
+ * `tools`, `agent`'s roster: on a provider that keeps its tool declaration
+ * across a conversation, a tool taken off the roster goes out, as it was last
+ * sent, with every request that declares a tool on the roster. Converts no
+ * schema, so a cyclic one cannot throw here.
+ */
+function withdrawnToolDefinitions(
+	agent: ToolDeclarationSource | undefined,
 	tools: ToolSchemaSource,
+	model: Model | undefined,
+): readonly ContextTool[] {
+	const declared = agent?.declaredTools?.(model);
+	if (!declared || declared === tools) return EMPTY_TOOLS;
+	const cached = WITHDRAWN_TOOL_DEFINITIONS.get(declared);
+	if (cached?.tools === tools) return cached.withdrawn;
+	const active = new Set(tools.map(tool => tool.name));
+	const filtered = declared.filter(tool => !active.has(tool.name));
+	const withdrawn = filtered.length > 0 ? filtered : EMPTY_TOOLS;
+	WITHDRAWN_TOOL_DEFINITIONS.set(declared, { tools, withdrawn });
+	return withdrawn;
+}
+
+/**
+ * Whether two lists of definitions carry the same names, descriptions and
+ * schemas in the same order. A declared list is built again each time the
+ * agent's tools, its declaration or its sent definitions change (a deferred
+ * tool as a copy), so lists of two builds compare by field, not by object.
+ */
+function sameToolDefinitions(left: readonly ContextTool[], right: readonly ContextTool[]): boolean {
+	if (left === right) return true;
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index++) {
+		const a = left[index];
+		const b = right[index];
+		if (a?.name !== b?.name || a?.description !== b?.description || a?.parameters !== b?.parameters) return false;
+	}
+	return true;
+}
+
+/** What {@link withdrawnToolTokens} counted for one agent: the withdrawn definitions and the tokenizer. */
+interface WithdrawnToolTokens {
+	definitions: readonly ContextTool[];
+	tokenizer: Tokenizer;
+	tokens: number;
+}
+
+/**
+ * Per agent, the last count of the withdrawn tools its declaration still sends.
+ * Agents are caller-owned, so a WeakMap keeps the state off them.
+ */
+const WITHDRAWN_TOOL_TOKENS = new WeakMap<ToolDeclarationSource, WithdrawnToolTokens>();
+
+/**
+ * Tokens of `definitions`, the withdrawn tools `agent`'s next request still
+ * declares ({@link withdrawnToolDefinitions}), each as it was sent. Counted
+ * again only when those definitions or the tokenizer change.
+ */
+function withdrawnToolTokens(
+	agent: ToolDeclarationSource,
+	definitions: readonly ContextTool[],
+	tokenizer: Tokenizer,
+): number {
+	if (definitions.length === 0) return 0;
+	const cached = WITHDRAWN_TOOL_TOKENS.get(agent);
+	if (cached?.tokenizer === tokenizer && sameToolDefinitions(cached.definitions, definitions)) return cached.tokens;
+	// A sent description already carries the rendered examples, so they are not rendered again.
+	const fragments = definitions.flatMap(
+		({ name, description, parameters }) => toolSchemaFragments({ name, description, parameters }).fragments,
+	);
+	const tokens = tokenizer.countTokens(fragments);
+	WITHDRAWN_TOOL_TOKENS.set(agent, { definitions, tokenizer, tokens });
+	return tokens;
+}
+
+/**
+ * Count the tool definitions the next request to `model` carries in context:
+ * `agent`'s roster, as {@link estimateToolSchemaTokens} counts and caches it,
+ * description-stripped where `agent` prunes the descriptions it sends
+ * ({@link ToolDeclarationSource.prunesToolDescriptions}), and each withdrawn
+ * tool a kept declaration still sends ({@link ToolDeclarationSource.declaredTools}),
+ * counted from its sent definition, again only when those definitions change.
+ * A server-side deferred catalog counts nothing.
+ */
+export function estimateContextToolSchemaTokens(
+	agent: ToolDeclarationSource | undefined,
 	tokenizer: Tokenizer,
 	model: Model | undefined,
-	options: ToolSchemaEstimateOptions = {},
+	options: Pick<ToolSchemaEstimateOptions, "sourceRevision"> = {},
 ): number {
-	return model?.toolSchemasInContext === false ? 0 : estimateToolSchemaTokens(tools, tokenizer, options);
+	if (model?.toolSchemasInContext === false) return 0;
+	const tools = agent?.state?.tools ?? EMPTY_TOOLS;
+	return declaredToolSchemaTokens(agent, tools, withdrawnToolDefinitions(agent, tools, model), tokenizer, model, {
+		sourceRevision: options.sourceRevision,
+		pruneDescriptions: agent?.prunesToolDescriptions?.(model) === true,
+	});
+}
+
+/**
+ * {@link estimateContextToolSchemaTokens} from what its caller computed
+ * already: `tools`, `agent`'s roster, `withdrawn`, the definitions
+ * {@link withdrawnToolDefinitions} gives, and the prune mode in `options`.
+ */
+function declaredToolSchemaTokens(
+	agent: ToolDeclarationSource | undefined,
+	tools: ToolSchemaSource,
+	withdrawn: readonly ContextTool[],
+	tokenizer: Tokenizer,
+	model: Model | undefined,
+	options: ToolSchemaEstimateOptions,
+): number {
+	if (model?.toolSchemasInContext === false) return 0;
+	const tokens = estimateToolSchemaTokens(tools, tokenizer, options);
+	return agent ? tokens + withdrawnToolTokens(agent, withdrawn, tokenizer) : tokens;
 }
 
 /**
  * Compute just the NON-MESSAGE token total: system prompt (with its skills
  * section subtracted, since skills are tokenized separately) + system context
- * (the rest of the system-prompt array) + tools + skills.
+ * (the rest of the system-prompt array) + tools + skills. The tools are those
+ * the next request declares ({@link estimateContextToolSchemaTokens}), a
+ * withdrawn tool a kept declaration still sends included.
  *
  * Exposed so callers like `StatusLineComponent` can cache the non-message
  * total separately from the growing message total. A model switch can change
@@ -337,11 +471,14 @@ export function estimateContextToolSchemaTokens(
  * change (`Agent.prunesToolDescriptions`) changes how much of each spec ships.
  */
 // The per-turn threshold and compaction paths call these helpers repeatedly.
-// Cache by prompt, roster, skills, tokenizer, revision, model schema policy, and
-// prune mode; setSystemPrompt/setTools replace their arrays rather than mutating them.
+// Cache by prompt, roster, the withdrawn definitions the next request still
+// declares, skills, tokenizer, revision, model schema policy, and prune mode;
+// setSystemPrompt/setTools replace their arrays rather than mutating them.
 interface NonMessageTokenCache {
 	systemPromptRef: readonly string[];
 	toolsRef: ToolSchemaSource;
+	/** {@link withdrawnToolDefinitions}: they change with a new declaration as well as with the roster. */
+	withdrawnTools: readonly ContextTool[];
 	toolSchemasInContext: boolean;
 	pruneToolDescriptions: boolean;
 	toolsRevision: number;
@@ -376,6 +513,7 @@ function nonMessageTokenCacheEntry(
 	const cachedSession: CachedNonMessageTokenSource = session;
 	const systemPromptRef = session.systemPrompt ?? EMPTY_STRING_PARTS;
 	const toolsRef = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const withdrawnTools = withdrawnToolDefinitions(session.agent, toolsRef, session.model);
 	const toolSchemasInContext = session.model?.toolSchemasInContext !== false;
 	const pruneToolDescriptions = session.agent?.prunesToolDescriptions?.(session.model) === true;
 	const toolsRevision = getToolSchemaMetadataRevision(toolsRef);
@@ -385,6 +523,7 @@ function nonMessageTokenCacheEntry(
 		entry &&
 		entry.systemPromptRef === systemPromptRef &&
 		entry.toolsRef === toolsRef &&
+		sameToolDefinitions(entry.withdrawnTools, withdrawnTools) &&
 		entry.toolSchemasInContext === toolSchemasInContext &&
 		entry.pruneToolDescriptions === pruneToolDescriptions &&
 		entry.toolsRevision === toolsRevision &&
@@ -397,6 +536,7 @@ function nonMessageTokenCacheEntry(
 	entry = {
 		systemPromptRef,
 		toolsRef,
+		withdrawnTools,
 		toolSchemasInContext,
 		pruneToolDescriptions,
 		toolsRevision,
@@ -419,10 +559,9 @@ export function computeNonMessageTokens(
 	const entry = nonMessageTokenCacheEntry(session, tokenizer, sourceRevision);
 	if (entry.tokens !== undefined) return entry.tokens;
 	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
-	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
 	const tokens =
 		tokenizer.countTokens(Array.from(systemPromptParts, part => part ?? "")) +
-		estimateContextToolSchemaTokens(tools, tokenizer, session.model, {
+		declaredToolSchemaTokens(session.agent, entry.toolsRef, entry.withdrawnTools, tokenizer, session.model, {
 			sourceRevision,
 			pruneDescriptions: entry.pruneToolDescriptions,
 		});
@@ -449,7 +588,7 @@ export function computeNonMessageBreakdown(
 } {
 	const entry = nonMessageTokenCacheEntry(session, tokenizer, sourceRevision);
 	if (entry.breakdown && entry.skillful === skillful) return entry.breakdown;
-	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const tools = entry.toolsRef;
 	const skillsTokens =
 		skillful === false
 			? 0
@@ -457,7 +596,7 @@ export function computeNonMessageBreakdown(
 					renderedSkills(session.renderedSkills ?? session.skills ?? EMPTY_SKILLS, tools),
 					tokenizer,
 				);
-	const toolsTokens = estimateContextToolSchemaTokens(tools, tokenizer, session.model, {
+	const toolsTokens = declaredToolSchemaTokens(session.agent, tools, entry.withdrawnTools, tokenizer, session.model, {
 		sourceRevision,
 		pruneDescriptions: entry.pruneToolDescriptions,
 	});

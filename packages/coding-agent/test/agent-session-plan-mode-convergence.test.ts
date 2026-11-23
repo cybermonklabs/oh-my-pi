@@ -279,6 +279,21 @@ describe("AgentSession plan-mode convergence", () => {
 		expect(harness.mock.calls.length).toBe(0);
 	});
 
+	it("T2b: an idle IRC message folded into context in plan mode is stored under the time it was sent", async () => {
+		const harness = await createPlanSession([]);
+		// The peer sent the message a moment before it reached this session.
+		const msg: IrcMessage = { id: "m1", from: "peer", to: "me", body: "ping", ts: Date.now() - 1_000 };
+
+		expect(await harness.session.deliverIrcMessage(msg)).toBe("injected");
+
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's drops,
+		// the date/cwd reminder's placements): it must find the turn the agent holds.
+		const isIrc = (message: AgentMessage) => message.role === "custom" && message.customType === "irc:incoming";
+		const held = harness.session.agent.state.messages.find(isIrc);
+		const reread = harness.session.sessionManager.buildSessionContext().messages.find(isIrc);
+		expect({ held: held?.timestamp, reread: reread?.timestamp }).toEqual({ held: msg.ts, reread: msg.ts });
+	});
+
 	it("T3a: convergence reminders are bounded by the cap, then yield to the user", async () => {
 		const harness = await createPlanSession([
 			{ content: ["planning A"] },

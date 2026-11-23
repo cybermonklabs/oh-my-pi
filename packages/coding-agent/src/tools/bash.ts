@@ -87,6 +87,7 @@ import { cfgWorktreeClone, ovnfsCommand } from "../task/settings";
 import { nativeShapingOff, shapeToolText, shapingExperiment } from "../spotlight";
 import { SPOTLIGHT_FULL_OUTPUT_MAX_BYTES } from "../spotlight/types";
 import type { SpotlightDetails } from "@oh-my-pi/pi-tui/chat/spotlight";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 
 const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	"\n": true,
@@ -689,7 +690,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	get description(): string {
 		const evalBackends = resolveEvalBackends(this.session);
 		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
-		return prompt.render(bashDescription, {
+		const context = {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
 			defaultTimeoutSec: clampTimeout("bash", undefined, cfgToolsMaxTimeout.get(this.session.settings)),
@@ -711,8 +712,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
 			isWindows: process.platform === "win32",
-		});
+		};
+		// Every render input is read above; the template renders again only when one of them changed.
+		return this.#description.get(Object.values(context), () => prompt.render(bashDescription, context));
 	}
+	readonly #description = new Memo<string>();
 	/** Schema variant for the live `async.enabled` and `launch.enabled` settings. */
 	get parameters(): BashToolSchema {
 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);

@@ -139,6 +139,8 @@ export function streamProxy(model: Model, context: Context, options: ProxyStream
 		}
 
 		try {
+			// As a transport does: the dispatch hook runs as the request goes out, and a refusal it throws sends nothing.
+			await options.beforeDispatch?.();
 			response = await (options.fetch ?? fetch)(`${options.proxyUrl}/api/stream`, {
 				method: "POST",
 				headers: {

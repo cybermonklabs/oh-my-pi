@@ -174,10 +174,10 @@ function memoryConversationStarted(session: MemoryInstructionSession): boolean {
 	return (session.agent?.state.messages.length ?? 0) > 0;
 }
 
+/** A session's consolidated memory, read once per session file ({@link buildMemoryToolDeveloperInstructions}). */
 interface CachedMemoryToolDeveloperInstructions {
 	sessionFile: string | undefined;
 	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined;
-	value: string | undefined;
 }
 
 const memoryToolDeveloperInstructionsBySession = new WeakMap<
@@ -194,8 +194,7 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 	memoryRoot: string,
 	settings: Settings,
 ): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
-	const cfg = loadMemoryConfig(settings);
-	if (!cfg.enabled) return undefined;
+	if (cfgMemoryBackend.get(settings) !== "local") return undefined;
 
 	let summary = "";
 	try {
@@ -213,20 +212,18 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 	settings: Settings,
 ): string | undefined {
 	if (!snapshot) return undefined;
-	const cfg = loadMemoryConfig(settings);
-	if (!cfg.enabled) return undefined;
+	if (cfgMemoryBackend.get(settings) !== "local") return undefined;
 	if (!snapshot.summary && !snapshot.learned) return undefined;
 
-	const summaryOut = snapshot.summary
-		? truncateByApproxTokens(snapshot.summary, cfg.summaryInjectionTokenLimit).trim()
-		: "";
+	const limit = cfgMemoriesSummaryInjectionTokenLimit.get(settings);
+	const summaryOut = snapshot.summary ? truncateByApproxTokens(snapshot.summary, limit).trim() : "";
 	// Lessons share ONE injection budget with the summary so the combined block
 	// stays within `summaryInjectionTokenLimit` (~4 chars/token, matching
 	// truncateByApproxTokens). With no summary, lessons get the whole budget.
 	// Clamp to 0: truncateByApproxTokens appends a marker, so a truncated summary
 	// can exceed `limit * 4` chars and drive the remainder negative — when the
 	// summary already fills the budget, lessons are simply dropped.
-	const learnedBudget = Math.max(0, cfg.summaryInjectionTokenLimit - Math.ceil(summaryOut.length / 4));
+	const learnedBudget = Math.max(0, limit - Math.ceil(summaryOut.length / 4));
 	const learnedOut =
 		snapshot.learned && learnedBudget > 0 ? truncateByApproxTokens(snapshot.learned, learnedBudget).trim() : "";
 	if (!summaryOut && !learnedOut) return undefined;
@@ -235,17 +232,6 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 		memory_summary: summaryOut,
 		learned: learnedOut,
 	});
-}
-
-function cacheMemoryToolDeveloperInstructions(
-	session: MemoryInstructionSession,
-	sessionFile: string | undefined,
-	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
-	settings: Settings,
-): string | undefined {
-	const value = renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
-	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot, value });
-	return value;
 }
 
 /**
@@ -283,7 +269,7 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
 	const learned = cachedLearned ?? baseline?.learned ?? "";
 	const snapshot = current ? { summary: current.summary, learned } : undefined;
-	cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot });
 }
 
 /**
@@ -292,6 +278,11 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
  * `cwd` is the session's project directory, the same scope consolidation and
  * `learn` write to; never `settings.getCwd()`, which an embedding host may pin
  * to one directory for sessions spanning several projects.
+ *
+ * A session reads its consolidated memory once per session file, so the prompt
+ * keeps its bytes; each build renders it under the live
+ * `memories.summaryInjectionTokenLimit`, whose change a bound prompt holds as it
+ * holds any setting its build reads.
  */
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
@@ -308,10 +299,13 @@ export async function buildMemoryToolDeveloperInstructions(
 
 	const sessionFile = getMemoryInstructionSessionFile(session);
 	const cached = memoryToolDeveloperInstructionsBySession.get(session);
-	if (cached && cached.sessionFile === sessionFile) return cached.value;
+	if (cached && cached.sessionFile === sessionFile) {
+		return renderMemoryToolDeveloperInstructionsSnapshot(cached.snapshot, settings);
+	}
 
 	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
-	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot });
+	return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 }
 
 /**

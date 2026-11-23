@@ -42,7 +42,13 @@ import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
-import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy } from "./spawn-policy";
+import {
+	isAgentSpawnable,
+	isScoutSpawnable,
+	type ResolvedSpawnPolicy,
+	resolveSpawnPolicy,
+	spawnableAgents,
+} from "./spawn-policy";
 import { isBundledSeance, seanceTaskGuidance, seanceTaskSchemaFields, validateSeanceParams } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
 import {
@@ -60,6 +66,12 @@ import { InternalUrlRouter } from "../internal-urls/router";
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { sessionTreeStorage } from "../session/session-storage";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
+import {
+	clearPublishedAgentDiscovery,
+	discoveryCacheKey,
+	publishAgentDiscovery,
+	publishedAgentDiscovery,
+} from "./discovery-snapshots";
 import { borrowEvalToolKernels, createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import {
 	approvedTaskFile,
@@ -88,6 +100,8 @@ import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 import type { TextTap } from "../job-widgets/text-tap";
 import type { SubagentToolResult } from "./executor";
 import { appendToolResult, createTaskWidgetInputs } from "./widget-inputs";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
+import { renderInputsSnapshot, sameRenderInputs } from "../tools/render-inputs";
 
 import { cfgAsyncEnabled } from "../tools/settings";
 import {
@@ -162,7 +176,7 @@ export {
 } from "./types";
 
 interface TaskDescriptionOptions {
-	agents: AgentDefinition[];
+	agents: readonly AgentDefinition[];
 	sessionAgents: readonly AgentDefinition[];
 	isolationEnabled: boolean;
 	applyIsolatedChanges: boolean;
@@ -191,15 +205,11 @@ function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): s
 function renderDescription(options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
-	const agents = [...options.agents, ...options.sessionAgents];
-	let filteredAgents =
-		options.disabledAgents.length > 0 ? agents.filter(agent => !options.disabledAgents.includes(agent.name)) : agents;
-	if (spawningDisabled) {
-		filteredAgents = [];
-	} else if (spawnPolicy.allowedAgents !== null) {
-		const allowed = new Set(spawnPolicy.allowedAgents);
-		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
-	}
+	let filteredAgents = spawnableAgents(
+		[...options.agents, ...options.sessionAgents],
+		options.disabledAgents,
+		spawnPolicy,
+	);
 	if (options.planMode) {
 		filteredAgents = filteredAgents.filter(agent => !isBundledSeance(agent));
 	}
@@ -212,7 +222,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		structured: !options.structured && agent.structured === true,
 	}));
 	const seanceAgent = filteredAgents.find(agent => agent.name === SEANCE_AGENT_NAME);
-	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
+	const scoutAvailable = isAgentSpawnable("scout", options.disabledAgents, spawnPolicy);
 	return prompt.render(taskDescriptionTemplate, {
 		agents: renderedAgents,
 		scoutAvailable,
@@ -854,8 +864,9 @@ export function composeSpawnAdvisory(args: {
 class TaskJobError extends AsyncJobError {}
 
 /**
- * Process-level create-time discovery memo and published reload snapshots,
- * keyed by resolved cwd plus the exact effective `extensions` array.
+ * Process-level create-time discovery memo, keyed by resolved cwd plus the
+ * exact effective `extensions` array; each settled scan is published to
+ * `./discovery-snapshots` under the same key.
  *
  * `TaskTool.create` runs for every (sub)agent session in this process. Sessions
  * may share a cwd while carrying different overlay/runtime extension settings,
@@ -866,42 +877,36 @@ class TaskJobError extends AsyncJobError {}
  * both caches automatically.
  */
 const discoveryMemo = new Map<string, Promise<DiscoveryResult>>();
-const discoverySnapshots = new Map<string, AgentDefinition[]>();
 let discoveryMemoFn: typeof discoverAgents | undefined;
-
-/** Stable cache identity for the filesystem root and the full effective extension-root struct. */
-function discoveryCacheKey(cwd: string, extensionRoots?: EffectiveExtensionRoots): string {
-	return `${path.resolve(cwd)}\0${JSON.stringify(extensionRoots ?? null)}`;
-}
 
 function discoverAgentsForCreate(cwd: string, extensionRoots?: EffectiveExtensionRoots): Promise<DiscoveryResult> {
 	const fn = discoverAgents;
 	if (discoveryMemoFn !== fn) {
 		discoveryMemoFn = fn;
 		discoveryMemo.clear();
-		discoverySnapshots.clear();
+		clearPublishedAgentDiscovery();
 	}
 	const key = discoveryCacheKey(cwd, extensionRoots);
-	let pending = discoveryMemo.get(key);
-	if (!pending) {
-		pending = fn(cwd, undefined, extensionRoots);
-		discoveryMemo.set(key, pending);
-		pending.catch(() => {
+	const memoized = discoveryMemo.get(key);
+	if (memoized) return memoized;
+	const pending = fn(cwd, undefined, extensionRoots);
+	discoveryMemo.set(key, pending);
+	// Registered before any caller awaits `pending`, so a creation or rescan sees its scan published.
+	pending.then(
+		({ agents }) => {
+			if (discoveryMemo.get(key) === pending) publishAgentDiscovery(key, agents);
+		},
+		() => {
 			if (discoveryMemo.get(key) === pending) discoveryMemo.delete(key);
-		});
-	}
+		},
+	);
 	return pending;
 }
 
 /** Rescan one cwd and publish its definitions to existing and future task tools. */
 export async function refreshAgentDiscovery(cwd: string, extensionRoots?: EffectiveExtensionRoots): Promise<void> {
-	const key = discoveryCacheKey(cwd, extensionRoots);
-	discoveryMemo.delete(key);
-	const pending = discoverAgentsForCreate(cwd, extensionRoots);
-	const { agents } = await pending;
-	if (discoveryMemo.get(key) === pending) {
-		discoverySnapshots.set(key, agents);
-	}
+	discoveryMemo.delete(discoveryCacheKey(cwd, extensionRoots));
+	await discoverAgentsForCreate(cwd, extensionRoots);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1106,23 +1111,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/** Background-job lifecycle contract; inherited by extension replacements that delegate to Task. */
 	get delegationGuidance(): string {
 		if (!cfgAsyncEnabled.get(this.session.settings)) return "";
-		return prompt.render(taskAsyncContractTemplate, {
-			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-			waitTool: hasWaitTool(this.session),
-		});
+		const ircEnabled = isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0);
+		const waitTool = hasWaitTool(this.session);
+		return this.#delegationGuidance.get([ircEnabled, waitTool], () =>
+			prompt.render(taskAsyncContractTemplate, { ircEnabled, waitTool }),
+		);
 	}
 
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
-		const agents =
-			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
-			this.#discoveredAgents;
+		const agents = this.#advertisedAgents();
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
 		const perCallModel = perCallModelEnabled(this.session.settings, "task");
-		return renderDescription({
+		const options: TaskDescriptionOptions = {
 			agents,
 			sessionAgents,
 			isolationEnabled: !planMode && isolationEnabled,
@@ -1132,11 +1136,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
 			perCallModelEnabled: perCallModel,
 			perCallModelAdvertisement: perCallModel
-				? getPerCallModelAdvertisement(
+				? (this.session.advertisedPerCallModels?.() ??
+					getPerCallModelAdvertisement(
 						this.session.settings,
 						this.session.getActiveModel?.(),
 						this.session.modelRegistry,
-					)
+					))
 				: undefined,
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			structured: this.#isStructured(),
@@ -1146,8 +1151,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			planMode,
 			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
-		});
+		};
+		// Compared with a copy of the options the description was rendered from, so an agent list the embedder changes
+		// in place (a live session agent set) still renders it again.
+		if (!sameRenderInputs(this.#descriptionInputs, options)) {
+			this.#description = renderDescription(options);
+			this.#descriptionInputs = renderInputsSnapshot(options);
+		}
+		return this.#description;
 	}
+	readonly #delegationGuidance = new Memo<string>();
+	#descriptionInputs?: TaskDescriptionOptions;
+	#description = "";
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
@@ -1193,20 +1208,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const spawnPolicy = resolveSpawnPolicy(this.session.getSessionSpawns());
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
-		if (
-			planMode ||
-			!spawnPolicy.enabled ||
-			disabledAgents.includes(SEANCE_AGENT_NAME) ||
-			(spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(SEANCE_AGENT_NAME))
-		) {
-			return undefined;
-		}
-		const agents =
-			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
-			this.#discoveredAgents;
+		if (planMode || !isAgentSpawnable(SEANCE_AGENT_NAME, disabledAgents, spawnPolicy)) return undefined;
+		const agents = this.#advertisedAgents();
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
 		const seanceAgent = [...agents, ...sessionAgents].find(agent => agent.name === SEANCE_AGENT_NAME);
 		return seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskSchemaFields : undefined;
+	}
+
+	/**
+	 * Discovered agents the description and schema list: the prompt surface's snapshot, so a rescan
+	 * leaves the tool's bytes alone and reaches the model by a hidden notice. Embedders without a
+	 * prompt surface list the latest scan.
+	 */
+	#advertisedAgents(): readonly AgentDefinition[] {
+		return (
+			this.session.advertisedDiscoveredAgents?.() ??
+			publishedAgentDiscovery(this.session.cwd, this.session.effectiveExtensionRoots?.()) ??
+			this.#discoveredAgents
+		);
 	}
 
 	#defaultAgent(): string {

@@ -22,6 +22,30 @@
  * requests are built outside this planner and never carry the items.
  */
 
+import type { Api, Model } from "../types";
+
+/** The APIs whose providers plan effort changes as `configuration_update` items. */
+type ConfigurationUpdateApi = "openai-responses" | "openai-codex-responses";
+
+function isConfigurationUpdateApiModel(model: Model<Api>): model is Model<ConfigurationUpdateApi> {
+	return model.api === "openai-responses" || model.api === "openai-codex-responses";
+}
+
+/**
+ * Whether requests to `model` keep the request-level `reasoning.effort` of the conversation's first request and carry
+ * each later change as a `configuration_update` item: GPT-6 models (`compat.supportsConfigurationUpdate`) on the
+ * platform Responses API outside its `pro` reasoning mode, and on Codex. Both providers plan the effort only under
+ * this predicate (and only for a request with a session to keep the baseline in); every other API, Azure Responses
+ * among them, sends each request's own effort.
+ */
+export function sendsConfigurationUpdates(model: Model<Api>): boolean {
+	return (
+		isConfigurationUpdateApiModel(model) &&
+		model.compat.supportsConfigurationUpdate === true &&
+		!(model.api === "openai-responses" && model.reasoningMode === "pro")
+	);
+}
+
 /** `configuration_update` input item; only `reasoning.effort` is updatable. */
 export interface ConfigurationUpdateItem {
 	type: "configuration_update";

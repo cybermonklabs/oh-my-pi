@@ -23,7 +23,6 @@ import type {
 	Message,
 	MessageAttribution,
 	Model,
-	ProviderSessionState,
 	ServiceTier,
 	StopReason,
 	StreamFunction,
@@ -51,21 +50,17 @@ import {
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
-import {
-	adaptSchemaForStrict,
-	findStrictToolSchemaViolation,
-	flattenExclusiveRequiredRootUnion,
-	NO_STRICT,
-	normalizeSchemaForMoonshot,
-	sanitizeSchemaForGrammar,
-	toolWireSchema,
-} from "../utils/schema";
+import { findStrictToolSchemaViolation, normalizeSchemaForMoonshot, sanitizeSchemaForGrammar } from "../utils/schema";
 import {
 	type HealedToolCall,
 	StreamMarkupHealing,
 	type StreamMarkupHealingEvent,
 } from "../utils/stream-markup-healing";
-import { isForcedToolChoice, mapToOpenAICompletionsToolChoice } from "../utils/tool-choice";
+import {
+	isForcedToolChoice,
+	mapToOpenAICompletionsToolChoice,
+	type OpenAICompletionsToolChoice,
+} from "../utils/tool-choice";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -80,12 +75,9 @@ import type {
 } from "./openai-chat-wire";
 import {
 	applyOpenAIReasoningEffortFallback,
-	clearOpenAIReasoningEffortFallbackState,
 	createOpenAIReasoningEffortFallbackKey,
-	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
-	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
 	resolveOpenAIReasoningEffortFallback,
 } from "./openai-reasoning-fallback";
@@ -101,9 +93,7 @@ import {
 	applyProviderReportedCost,
 	applyWireModelIdTransform,
 	calculateOpenAIUsageAccounting,
-	clearOpenAIStrictToolsState,
 	createInitialResponsesAssistantMessage,
-	createOpenAIStrictToolsState,
 	disableStrictToolsForScope,
 	getOpenAIPromptCacheKey,
 	getOpenAIStrictToolsScope,
@@ -113,7 +103,6 @@ import {
 	type OpenAICompletionsParams,
 	type OpenAIPromptCacheOptions,
 	type OpenAIRequestSetup,
-	type OpenAIStrictToolsState,
 	parseAzureDeploymentNameMap,
 	readOpenRouterRawMetadata,
 	resolveOpenAICompatPolicy,
@@ -123,6 +112,9 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { getOpenAICompletionsProviderSessionState } from "./openai-completions-state";
+import { openAIFunctionTools } from "./openai-tool-strict";
+import { reportProviderFallback } from "./provider-fallbacks";
 import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
@@ -697,49 +689,11 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	omitStainlessTimeoutHeader?: boolean;
 }
 
-type AppliedToolStrictMode = "mixed" | "all_strict" | "none";
-type ToolStrictModeOverride = Exclude<ResolvedOpenAICompat["toolStrictMode"], "mixed"> | undefined;
-
 type BuiltOpenAICompletionTools = {
 	tools: ChatCompletionTool[];
-	toolStrictMode: AppliedToolStrictMode;
 	/** True when at least one wire tool was sent with `strict: true`. */
 	strictToolsApplied: boolean;
 };
-
-const OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX = "openai-completions:";
-
-type OpenAICompletionsProviderSessionState = ProviderSessionState &
-	OpenAIStrictToolsState &
-	OpenAIReasoningEffortFallbackState;
-
-function createOpenAICompletionsProviderSessionState(): OpenAICompletionsProviderSessionState {
-	const strictToolsState = createOpenAIStrictToolsState();
-	const reasoningEffortFallbackState = createOpenAIReasoningEffortFallbackState();
-	const state: OpenAICompletionsProviderSessionState = {
-		...strictToolsState,
-		...reasoningEffortFallbackState,
-		close: () => {
-			clearOpenAIStrictToolsState(state);
-			clearOpenAIReasoningEffortFallbackState(state);
-		},
-	};
-	return state;
-}
-
-function getOpenAICompletionsProviderSessionState(
-	model: Model<"openai-completions">,
-	baseUrl: string | undefined,
-	providerSessionState: Map<string, ProviderSessionState> | undefined,
-): OpenAICompletionsProviderSessionState | undefined {
-	if (!providerSessionState) return undefined;
-	const key = `${OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX}${model.provider}:${baseUrl ?? ""}:${model.id}`;
-	const existing = providerSessionState.get(key) as OpenAICompletionsProviderSessionState | undefined;
-	if (existing) return existing;
-	const created = createOpenAICompletionsProviderSessionState();
-	providerSessionState.set(key, created);
-	return created;
-}
 
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
 // `<｜DSML｜tool_calls｜>`) into visible `content` deltas when hosted behind providers
@@ -920,14 +874,16 @@ const streamOpenAICompletionsOnce = (
 			const attemptedReasoningEffortFallbacks = new Set<string>();
 			let activeReasoningEffortFallbackKey: string | undefined;
 			let activeRequestParams: OpenAICompletionsParams | undefined;
+			// The state and the strict-tools scope name the endpoint as the request reaches it: a trailing slash in the
+			// configured URL is no other endpoint.
+			const trimmedBaseUrl = baseUrl.replace(/\/+$/, "");
 			const providerSessionState = getOpenAICompletionsProviderSessionState(
 				model,
-				baseUrl,
+				trimmedBaseUrl,
 				options?.providerSessionState,
 			);
-			const strictToolsScope = getOpenAIStrictToolsScope(model, baseUrl);
+			const strictToolsScope = getOpenAIStrictToolsScope(model, trimmedBaseUrl);
 			let disableStrictTools = isStrictToolsDisabledForScope(providerSessionState, strictToolsScope);
-			const trimmedBaseUrl = baseUrl.replace(/\/+$/, "");
 			const completionsUrl = query
 				? `${trimmedBaseUrl}/chat/completions?${new URLSearchParams(query)}`
 				: `${trimmedBaseUrl}/chat/completions`;
@@ -935,9 +891,8 @@ const streamOpenAICompletionsOnce = (
 			// request guard spends the part before headers, and the chunk iterator
 			// below waits on what it left, not on a fresh budget.
 			let firstEventBudgetLeftMs = firstEventTimeoutMs;
-			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
-				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
+			const createCompletionsStream = async () => {
+				const builtParams = buildParams(model, context, options, disableStrictTools);
 				appliedStrictTools = builtParams.strictToolsApplied;
 				let params = builtParams.params;
 				// Tool-triggered suppression is a hard wire constraint; cached
@@ -1056,8 +1011,9 @@ const streamOpenAICompletionsOnce = (
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
 				) {
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
+					reportProviderFallback(options?.providerSessionState);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
+					openaiStream = await createCompletionsStream();
 				} else {
 					if (
 						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
@@ -1071,8 +1027,9 @@ const streamOpenAICompletionsOnce = (
 					// Remember the rejection for the rest of the session so every
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
+					reportProviderFallback(options?.providerSessionState);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
+					openaiStream = await createCompletionsStream();
 				}
 			}
 			if (premiumRequestsTotal !== undefined) {
@@ -1972,7 +1929,7 @@ function createRequestSetup(
 
 function resolveOpenAICompatForRequest(
 	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
 	hasTools: boolean,
 ): OpenAICompatPolicy {
 	return resolveOpenAICompatPolicy(model, {
@@ -2080,14 +2037,51 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
 }
 
+/** The `tool_choice` a request with `toolChoice` asks of a host under `compat`: none where the host takes none. */
+function requestedToolChoice(
+	compat: Pick<ResolvedOpenAICompat, "supportsToolChoice">,
+	toolChoice: ToolChoice | undefined,
+): OpenAICompletionsToolChoice {
+	return compat.supportsToolChoice ? mapToOpenAICompletionsToolChoice(toolChoice) : undefined;
+}
+
+/**
+ * Whether a request with `toolChoice` sends a `tool_choice` other than the default `auto` under `compat`, the compat it
+ * resolves; {@link buildParams} decides the request's `tool_choice` by it: a host that takes no `tool_choice` gets
+ * none, and a forced choice (`any`, `required`, a named tool) goes out as `auto` where the host takes no forced one; a
+ * named choice a host takes only as a string goes out as `required`, still forced.
+ */
+function sendsNonDefaultToolChoice(
+	compat: Pick<ResolvedOpenAICompat, "supportsToolChoice" | "supportsForcedToolChoice">,
+	toolChoice: ToolChoice | undefined,
+): boolean {
+	const requested = requestedToolChoice(compat, toolChoice);
+	if (requested === undefined || requested === "auto") return false;
+	return !isForcedToolChoice(requested) || compat.supportsForcedToolChoice;
+}
+
+/**
+ * Whether a chat-completions request to `model` with `options`, offering tools when `hasTools`, sends a `tool_choice`
+ * other than the default `auto`, by the rule {@link buildParams} applies under the compat it resolves for the request:
+ * the `whenThinking` view on a request with thinking on. `options` are the ones the provider gets, its reasoning as
+ * `openAICompletionsReasoningOptions` (`stream.ts`) maps a request's.
+ */
+export function openAICompletionsSendsNonDefaultToolChoice(
+	model: Model<"openai-completions">,
+	options: Pick<OpenAICompletionsOptions, "reasoning" | "disableReasoning" | "toolChoice"> | undefined,
+	hasTools: boolean,
+): boolean {
+	const { compat } = resolveOpenAICompatForRequest(model, options, hasTools);
+	return sendsNonDefaultToolChoice(compat as ResolvedOpenAICompat, options?.toolChoice);
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
-	toolStrictModeOverride?: ToolStrictModeOverride,
+	disableStrictTools = false,
 ): {
 	params: OpenAICompletionsParams;
-	toolStrictMode: AppliedToolStrictMode;
 	strictToolsApplied: boolean;
 	reasoningEffortFallbackAllowed: boolean;
 } {
@@ -2101,7 +2095,6 @@ function buildParams(
 		messages: [],
 		stream: true,
 	};
-	let toolStrictMode: AppliedToolStrictMode = "none";
 	let strictToolsApplied = false;
 
 	if (initialCompat.supportsUsageInStreaming !== false) {
@@ -2146,9 +2139,8 @@ function buildParams(
 	applyOpenAIServiceTier(params, options?.serviceTier, model);
 
 	if (context.tools?.length) {
-		const builtTools = convertTools(context.tools, initialCompat, toolStrictModeOverride);
+		const builtTools = convertTools(context.tools, initialCompat, disableStrictTools);
 		params.tools = builtTools.tools;
-		toolStrictMode = builtTools.toolStrictMode;
 		strictToolsApplied = builtTools.strictToolsApplied;
 	} else if (context.tools === undefined && hasToolHistory(context.messages)) {
 		// Anthropic (via LiteLLM/proxy) requires the `tools` param when the conversation
@@ -2161,9 +2153,8 @@ function buildParams(
 		params.tools = [];
 	}
 
-	if (options?.toolChoice && initialCompat.supportsToolChoice) {
-		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
-	}
+	const requestedChoice = requestedToolChoice(initialCompat, options?.toolChoice);
+	if (requestedChoice !== undefined) params.tool_choice = requestedChoice;
 	const forcedToolName =
 		typeof params.tool_choice === "object" && params.tool_choice !== null && "function" in params.tool_choice
 			? params.tool_choice.function.name
@@ -2200,7 +2191,11 @@ function buildParams(
 		// Preserve the hard tool-use contract while letting K3 choose among tools.
 		params.tool_choice = "required";
 	}
-	if (isForcedToolChoice(params.tool_choice) && !initialCompat.supportsForcedToolChoice) {
+	if (
+		params.tool_choice !== undefined &&
+		params.tool_choice !== "auto" &&
+		!sendsNonDefaultToolChoice(initialCompat, options?.toolChoice)
+	) {
 		// Some thinking-required OpenAI-compatible models reject forced
 		// `tool_choice` while still accepting tools with the default auto
 		// selector. Keep the tool available and let the model choose it.
@@ -2286,7 +2281,6 @@ function buildParams(
 
 	return {
 		params,
-		toolStrictMode,
 		strictToolsApplied,
 		reasoningEffortFallbackAllowed: finalPolicy.reasoning.disableReason !== "tools",
 	};
@@ -2940,46 +2934,16 @@ export function convertMessages(
 function convertTools(
 	tools: Tool[],
 	compat: ResolvedOpenAICompat,
-	toolStrictModeOverride?: ToolStrictModeOverride,
+	disableStrictTools = false,
 ): BuiltOpenAICompletionTools {
 	const rejectRootObjectUnion = compat.rejectRootObjectUnion;
-	const adaptedTools = tools.map(tool => {
-		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false;
-		const baseParameters = rejectRootObjectUnion
-			? flattenExclusiveRequiredRootUnion(toolWireSchema(tool))
-			: toolWireSchema(tool);
-		const adapted = adaptSchemaForStrict(baseParameters, strict);
-		return {
-			tool,
-			baseParameters,
-			parameters: adapted.schema,
-			strict: adapted.strict,
-		};
-	});
-
-	const requestedStrictMode = toolStrictModeOverride ?? compat.toolStrictMode;
-	const toolStrictMode =
-		requestedStrictMode === "none"
-			? "none"
-			: requestedStrictMode === "all_strict"
-				? adaptedTools.every(tool => tool.strict)
-					? "all_strict"
-					: "none"
-				: "mixed";
-
+	// `openAIFunctionTools` decides between `strict: false` and no flag, which some backends read differently.
+	const declared = openAIFunctionTools({ api: "openai-completions", compat, disableStrictTools }, tools);
 	const wireTools: ChatCompletionTool[] = [];
 	let anyStrictEmitted = false;
-	for (const { tool, baseParameters, parameters, strict } of adaptedTools) {
-		const includeStrict = toolStrictMode === "all_strict" || (toolStrictMode === "mixed" && strict);
-		// `strict: false` is semantically distinct from omitted `strict` on some
-		// backends: with it absent, optional properties may be over-filled with
-		// placeholder values (#4336). Preserve the author's explicit `false`,
-		// but only in "mixed" mode against a provider that understands the
-		// field — the `all_strict → none` collapse and `supportsStrictMode:
-		// false` paths deliberately keep the wire flag uniformly absent.
-		const includeExplicitFalse =
-			!includeStrict && tool.strict === false && toolStrictMode === "mixed" && compat.supportsStrictMode !== false;
-		const wireParameters = includeStrict ? parameters : baseParameters;
+	for (let index = 0; index < tools.length; index++) {
+		const tool = tools[index]!;
+		const { strict, parameters } = declared[index]!;
 		// Moonshot/Kimi native hosts validate against the stricter MFJS subset
 		// (const→enum, typed enums, no validators) and 400 otherwise.
 		// Grammar-constrained local backends (llama.cpp, LM Studio, vLLM)
@@ -2988,10 +2952,10 @@ function convertTools(
 		// `toolWireSchema` emits for open fields (issue #5914).
 		const emittedParameters =
 			compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(wireParameters) as Record<string, unknown>)
+				? (normalizeSchemaForMoonshot(parameters) as Record<string, unknown>)
 				: compat.toolSchemaFlavor === "grammar"
-					? sanitizeSchemaForGrammar(wireParameters)
-					: wireParameters;
+					? sanitizeSchemaForGrammar(parameters)
+					: parameters;
 		const violation = findStrictToolSchemaViolation(emittedParameters, "#", { rejectRootObjectUnion });
 		if (violation) {
 			logger.warn(
@@ -2999,7 +2963,7 @@ function convertTools(
 			);
 			continue;
 		}
-		if (includeStrict) anyStrictEmitted = true;
+		if (strict === true) anyStrictEmitted = true;
 		wireTools.push({
 			type: "function",
 			function: {
@@ -3007,14 +2971,13 @@ function convertTools(
 				description: tool.description || "",
 				parameters: emittedParameters,
 				// Only include strict if provider supports it. Some reject unknown fields.
-				...(includeStrict ? { strict: true } : includeExplicitFalse ? { strict: false } : {}),
+				...(strict === undefined ? {} : { strict }),
 			},
 		});
 	}
 
 	return {
 		tools: wireTools,
-		toolStrictMode,
 		strictToolsApplied: wireTools.length > 0 && anyStrictEmitted,
 	};
 }

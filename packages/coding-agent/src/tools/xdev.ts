@@ -305,11 +305,14 @@ export function xdevEntries(state: XdevState): Array<{ name: string; summary: st
 	});
 }
 
-/** `read xd://` listing with one device per line. */
+/**
+ * `read xd://` listing with one device per line. A mounted name with no tool in the canonical map (a device a held
+ * settings change disabled, until the rebuild) is left out, of the count too.
+ */
 export function xdevListing(state: XdevState): string {
 	const rows = xdevEntries(state).map(({ name, summary }) => `${XD_URL_PREFIX}${name.padEnd(14)} ${summary}`);
 	return [
-		`${XD_URL_PREFIX} ${state.mountedNames.size} mounted tool devices.`,
+		`${XD_URL_PREFIX} ${rows.length} mounted tool devices.`,
 		...rows,
 		"",
 		`Read ${XD_URL_PREFIX}<tool> for docs + JSON schema; write the JSON args object to ${XD_URL_PREFIX}<tool> to execute. Active top-level tools accept the same dispatch.`,
@@ -422,8 +425,10 @@ function shouldInlineXdevTool(
 function resolveRequiredXdevTool(state: XdevState, name: string): Tool {
 	const inst = resolveXdevTool(state, name);
 	if (!inst) {
+		// The devices the listing shows: a held one refuses every call, so it is not named as one to call.
+		const mounted = listXdevTools(state).map(tool => tool.name);
 		throw new ToolError(
-			`No such tool: ${XD_URL_PREFIX}${name}. Mounted devices: ${[...state.mountedNames].join(", ")}. Active top-level tools are also dispatchable via ${XD_URL_PREFIX}<tool>.`,
+			`No such tool: ${XD_URL_PREFIX}${name}. Mounted devices: ${mounted.join(", ")}. Active top-level tools are also dispatchable via ${XD_URL_PREFIX}<tool>.`,
 		);
 	}
 	return inst;

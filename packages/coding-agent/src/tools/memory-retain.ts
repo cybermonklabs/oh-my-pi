@@ -2,6 +2,7 @@ import type { MemoryRetainDetails } from "@oh-my-pi/pi-tui/tools/memory";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import retainDescription from "../prompts/tools/retain.md" with { type: "text" };
 import type { ToolSession } from ".";
@@ -43,8 +44,10 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		(args as Partial<MemoryRetainParams>).items?.some(item => item.scope === "global") ? "write" : "read";
 	readonly label = "Retain";
 	get description(): string {
-		return prompt.render(retainDescription, { globalScope: isGlobalMemoryScopeAvailable(this.session) });
+		const globalScope = isGlobalMemoryScopeAvailable(this.session);
+		return this.#description.get([globalScope], () => prompt.render(retainDescription, { globalScope }));
 	}
+	readonly #description = new Memo<string>();
 	get parameters(): MemoryRetainSchema {
 		return isGlobalMemoryScopeAvailable(this.session) ? memoryRetainSchemaWithScope : memoryRetainSchemaBase;
 	}

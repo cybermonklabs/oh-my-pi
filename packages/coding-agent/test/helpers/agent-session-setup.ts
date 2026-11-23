@@ -1,8 +1,13 @@
 import { Database } from "bun:sqlite";
+import { vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
+import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 
 /**
  * Shared factory for building a minimal mock `AssistantMessage`
@@ -51,4 +56,132 @@ export function activateTodoTool(session: AgentSession, cwd: string): void {
 			settings: session.settings,
 		}),
 	]);
+}
+
+/** A session whose settings load a `--config` overlay file. */
+export interface OverlaySession {
+	session: AgentSession;
+	settings: Settings;
+	/** Path of the overlay file. */
+	overlay: string;
+}
+
+/** A `--config` overlay with one-hour cache entries and `personality` as given. */
+export function personalityOverlay(personality: string): string {
+	return `providers:\n  cacheRetention: long\npersonality: ${personality}\n`;
+}
+
+/** The real clock, read before any test moves it. */
+const realNow = Date.now.bind(Date);
+
+/** Moves the clock `offsetMs` ahead of real time from now on. */
+export function setClock(offsetMs: number): void {
+	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+}
+
+/** The opening of the hidden settings notice. */
+export const SETTINGS_NOTICE = '<system-notice id="settings">';
+
+/** The time a settings notice in `text` gives for its change to go out; throws when `text` gives none. */
+export function noticeDeadline(text: string): number {
+	const deadline = text.match(/at the first request made at (\S+) or later/)?.[1];
+	if (!deadline) throw new Error("Expected the notice's deadline");
+	return Date.parse(deadline);
+}
+
+/** Session storage of a process that may not write the session another omp process owns. */
+export class OwnedElsewhereStorage extends FileSessionStorage {
+	readonly #ownedId: string;
+
+	constructor(ownedId: string) {
+		super();
+		this.#ownedId = ownedId;
+	}
+
+	override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+		return sessionId === this.#ownedId ? null : super.claimSession(sessionId, sessionPath);
+	}
+}
+
+/** The context `messages` send on `session`: its tools and system prompt, and the messages. */
+export function sessionContextTokens(session: AgentSession, messages: readonly AgentMessage[]): number {
+	return (
+		computeNonMessageTokens(session, session.agent.tokenizer, session.settings.revision) +
+		session.agent.tokenizer.countMessages(messages, { excludeEncryptedReasoning: true })
+	);
+}
+
+/**
+ * A call of the session a settings reload may start, which {@link reloadOverlay} waits for: a rebuild, or the hold of a
+ * change no rebuild takes.
+ */
+export type OverlayRebuild =
+	| "refreshBaseSystemPrompt"
+	| "reconcileBuiltinTools"
+	| "refreshSkillsAndCommands"
+	| "holdToolDeclarationChange";
+
+/**
+ * The calls of the session a reload that changes the prompt or the tools may start (a memory switch among them): the
+ * prompt rebuild, the tool reconcile, and the hold of a change no rebuild takes.
+ */
+export const RELOAD_CALLS: readonly OverlayRebuild[] = [
+	"refreshBaseSystemPrompt",
+	"reconcileBuiltinTools",
+	"holdToolDeclarationChange",
+];
+
+/** How {@link reloadOverlay} waits for the calls a reload starts. */
+export interface ReloadOverlayOptions {
+	/**
+	 * Wait one turn of the event loop, with no delay, before collecting the calls, instead of one microtask: a listener
+	 * that awaits before its call (the auto-QA one awaits the workspace roots) reaches it within that turn, and exposes
+	 * no promise to await.
+	 */
+	eventLoopTurn?: boolean;
+}
+
+/**
+ * Rewrites the overlay file with `content` and reloads it as the config watcher does, then waits for each call of the
+ * session's `rebuilds` the change starts.
+ */
+export async function reloadOverlay(
+	{ session, settings, overlay }: OverlaySession,
+	content: string,
+	rebuilds: readonly OverlayRebuild[] = [
+		"refreshBaseSystemPrompt",
+		"reconcileBuiltinTools",
+		"refreshSkillsAndCommands",
+	],
+	{ eventLoopTurn = false }: ReloadOverlayOptions = {},
+): Promise<void> {
+	const spies = rebuilds.map(rebuild => vi.spyOn(session, rebuild));
+	await Bun.write(overlay, content);
+	await settings.reloadFromDisk();
+	// The settings listeners run in the microtask the reload queued for them.
+	if (eventLoopTurn) await Bun.sleep(0);
+	else await Promise.resolve();
+	await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
+	for (const spy of spies) spy.mockRestore();
+}
+
+/**
+ * Rewrites the overlay file with `content`, an edit of the extension sources (`extensions`, `disabledExtensions`), and
+ * reloads it as the config watcher does, then waits for the skill and command refresh the edit starts once it has
+ * reconciled the extensions, whenever that refresh starts.
+ */
+export async function editExtensionSources(
+	{ session, settings, overlay }: OverlaySession,
+	content: string,
+): Promise<void> {
+	const refreshed = Promise.withResolvers<void>();
+	const refresh = session.refreshSkillsAndCommands.bind(session);
+	const spy = vi.spyOn(session, "refreshSkillsAndCommands").mockImplementation(async options => {
+		await refresh(options);
+		refreshed.resolve();
+	});
+	await Bun.write(overlay, content);
+	await settings.reloadFromDisk();
+	await refreshed.promise;
+	spy.mockRestore();
 }

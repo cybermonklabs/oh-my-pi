@@ -28,6 +28,7 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { SessionAccountPoolScope } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
+import type { AnySetting } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { SkillsSettings } from "../extensibility/settings";
 import type { CursorMcpResourceAdapter } from "../cursor";
@@ -37,6 +38,7 @@ import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
+import type { AgentSession } from "./agent-session";
 import type { CacheWarmer } from "./cache-warmer";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -210,8 +212,8 @@ export interface AgentSessionConfig {
 	disableExtensionDiscovery?: boolean;
 	/** Cost gate of the session tree; refuses this session's model requests at `session.maxCost`. */
 	costGate?: CostGateApi;
-	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
-	scoutAllowedBySpawnPolicy?: boolean;
+	/** The session's spawn policy (an agent's `spawns` frontmatter): which agents it may spawn. Defaults to `*`, any. */
+	spawns?: string;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
 	/** User-authorized model agents inherited from the parent session for nested delegation. */
@@ -366,6 +368,19 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. */
 	rebuildSystemPrompt?: SystemPromptRebuilder;
+	/** Each setting the startup system prompt's build read, with the value it read: a bound prompt holds their changes. */
+	baseSettingsRead?: ReadonlyMap<AnySetting, unknown>;
+	/**
+	 * Digest of the prompt inputs the operator gives explicitly, or undefined when they cannot be compared; a
+	 * resumed transcript's stored prompt is sent again only while it is unchanged.
+	 */
+	operatorPromptDigest?: string;
+	/**
+	 * The session a `/tan` clone forks while that session withholds a change (`TanCommandController`): the clone's
+	 * fixed system prompt is that session's build, so a prompt the copied transcript stores is restored under that
+	 * session's operator inputs, not the clone's.
+	 */
+	tanParent?: AgentSession;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
 	/** `xd://` presentation state backed by the canonical tool map. */

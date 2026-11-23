@@ -59,6 +59,15 @@ export function anthropicProviderSessionStateKey(baseUrl: string, modelId: strin
 	return `${ANTHROPIC_PROVIDER_SESSION_STATE_KEY}:${baseUrl}\u0000${modelId}`;
 }
 
+/** The endpoint and model an {@link anthropicProviderSessionStateKey} names; `undefined` for another key. */
+export function parseAnthropicProviderSessionStateKey(key: string): { baseUrl: string; modelId: string } | undefined {
+	const prefix = `${ANTHROPIC_PROVIDER_SESSION_STATE_KEY}:`;
+	if (!key.startsWith(prefix)) return undefined;
+	const separator = key.indexOf("\u0000", prefix.length);
+	if (separator < 0) return undefined;
+	return { baseUrl: key.slice(prefix.length, separator), modelId: key.slice(separator + 1) };
+}
+
 /** Re-arm fast mode across materialized Anthropic session-state entries. */
 export function clearAnthropicFastModeFallback(
 	providerSessionState: Map<string, ProviderSessionState> | undefined,

@@ -19,12 +19,23 @@ import {
 	streamSimple,
 	type TextContent,
 	type ThinkingBudgets,
+	type Tool,
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { experimentalBetasDisabled } from "@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch";
+import {
+	anthropicDeclaredTools,
+	anthropicKeepsToolDeclaration,
+} from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
+import { anthropicStrictnessHashedTools } from "@oh-my-pi/pi-ai/providers/anthropic-tool-schema";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { isOpenAIToolsModel, openAIStrictnessHashedTools } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import { strictToolsFallbackHolds } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
+import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -39,10 +50,17 @@ import {
 	steeringQueueState,
 	unpairedToolCallTail,
 } from "./agent-loop";
-import type { AppendOnlyContextManager } from "./append-only-context";
+import {
+	type AppendOnlyContextManager,
+	sameToolKeys,
+	type ToolKey,
+	toolKeyForPrefix,
+	toolSpecsFingerprint,
+} from "./append-only-context";
 import { agentPauseGate } from "./pause";
+import { RepeatedPerCallMessages } from "./repeated-per-call-messages";
 import { isProviderRefusalMessage } from "./replay-policy";
-import { SentToolDefinitions } from "./sent-tool-definitions";
+import { latestToolDeclaration, type RecordedToolDeclaration, SentToolDefinitions } from "./sent-tool-definitions";
 import { Tokenizer } from "./tokenizer";
 import {
 	createAdditionalContextMessage,
@@ -63,6 +81,7 @@ import type {
 	AsideBoundary,
 	AsideMessage,
 	PrepareQueuedMessages,
+	ProviderContextRequest,
 	QueuedMessageGate,
 	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
@@ -71,6 +90,9 @@ import type {
 	ToolChoiceDirective,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
+
+/** The request {@link Agent.buildSideRequestContext} passes its provider-context transform. */
+const SIDE_REQUEST: ProviderContextRequest = { sideRequest: true };
 
 /**
  * Default convertToLlm: Keep only LLM-compatible replay messages.
@@ -128,9 +150,14 @@ export interface AgentOptions {
 
 	/**
 	 * Optional transform applied after provider context assembly and before
-	 * telemetry capture/provider send.
+	 * telemetry capture/provider send. A side request ({@link Agent.buildSideRequestContext})
+	 * passes `{ sideRequest: true }`; the loop's own requests pass no `request`.
 	 */
-	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 
 	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
@@ -153,6 +180,12 @@ export interface AgentOptions {
 	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
 	 */
 	kimiApiFormat?: "openai" | "anthropic";
+	/**
+	 * Kimi Code API format read at each main request, for the request and for the model it goes out as
+	 * ({@link Agent.declaredToolsFingerprint}); authoritative when set (replaces {@link kimiApiFormat}), so a host
+	 * setting changed mid-session reaches the next request. Undefined leaves the model's catalog format.
+	 */
+	kimiApiFormatResolver?: () => "openai" | "anthropic" | undefined;
 
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
@@ -428,8 +461,44 @@ export class Agent {
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
+	/**
+	 * {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from, the tools
+	 * by their per-tool keys ({@link toolKeyForPrefix}): a tool that renders its definition from live settings changes
+	 * it under the same array. `strictWire` is the model where the tools go out on Anthropic's messages API or an
+	 * OpenAI API, undefined under an owned dialect, which is resolved per request.
+	 */
+	#declaredToolsMemo:
+		| {
+				model: Model | undefined;
+				toolKeys: readonly ToolKey[];
+				intentTracing: boolean;
+				intentDescription: string | undefined;
+				pruneDescriptions: boolean;
+				declaration: RecordedToolDeclaration | undefined;
+				sentRevision: number;
+				strictWire: Model | undefined;
+				betasDisabled: boolean;
+				strictFallback: boolean;
+				fingerprint: string;
+		  }
+		| undefined;
+	/** {@link declaredTools} under a kept declaration, with the inputs it was computed from (the tools by their keys). */
+	#declaredToolsListMemo:
+		| {
+				toolKeys: readonly ToolKey[];
+				declaration: RecordedToolDeclaration;
+				sentRevision: number;
+				declared: readonly Tool[];
+		  }
+		| undefined;
+	/** What this Agent's previous main request sent per call; side requests leave it alone. */
+	#repeatedPerCallMessages = new RepeatedPerCallMessages();
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#queuedMessageClaims: Partial<Record<QueuedMessageQueue, QueuedMessageClaim>> = {};
@@ -492,6 +561,7 @@ export class Agent {
 	}
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
+	#kimiApiFormatResolver?: () => "openai" | "anthropic" | undefined;
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 	#speculativeToolExecution?: SpeculativeToolExecutionConfig;
@@ -518,6 +588,7 @@ export class Agent {
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>;
+	#missingContextMessageProvider?: AgentLoopConfig["getMissingContextMessages"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
@@ -608,6 +679,7 @@ export class Agent {
 		this.#cwd = opts.cwd;
 		this.#cwdResolver = opts.cwdResolver;
 		this.#kimiApiFormat = opts.kimiApiFormat;
+		this.#kimiApiFormatResolver = opts.kimiApiFormatResolver;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
 		this.#speculativeToolExecution = opts.speculativeToolExecution;
@@ -667,6 +739,150 @@ export class Agent {
 	 */
 	copySentToolDefinitions(keep?: (name: string) => boolean): SentToolDefinitions {
 		return this.#sentToolDefinitions.copy(keep);
+	}
+
+	/**
+	 * Fingerprint of the tool definitions the next main request on `model` declares, as the wire carries them: the
+	 * active tools, normalized as that request sends them, and on a provider that keeps its tool declaration
+	 * across a conversation, in the order and with the deferral that declaration gives them, each withdrawn tool it
+	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}) while a tool is
+	 * active. Withdrawing such a tool beside an active one leaves the fingerprint as it was; it changes when the last
+	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
+	 * process's) leaves the declaration. Where the request sends a tool with another `strict` or `eager_input_streaming`
+	 * flag than it would under default settings, the tool counts with the flag it goes out with, read on the model the
+	 * request goes out as ({@link wireModel}: a wrapper transport's inner model, as Factory Droid's route, GitLab Duo's
+	 * upstream model, Kimi Code's Anthropic format or Cloudflare AI Gateway's reroute sends it): on Anthropic's messages
+	 * API through {@link anthropicStrictnessHashedTools}, which reads the flags the provider builds its tools with, so
+	 * turning `PI_NO_STRICT` or Claude Code's experimental-beta kill switch on or off, or the provider's strict-tools
+	 * fallback after the endpoint rejected strict tools ({@link strictToolsFallbackHolds}, kept under that model's id),
+	 * changes it exactly where it changes the wire (a tool the provider never sends strict counts as it is); on an OpenAI
+	 * API (an `openrouter` model's included) through {@link openAIStrictnessHashedTools}, `PI_NO_STRICT` and the fallback
+	 * alike. Neither applies under an owned dialect, which carries the tools in the prompt. Under default settings it is
+	 * what it was before the flags counted; a change of the model's compat is not seen. With `tools`, the fingerprint
+	 * the request would declare with them in place of the active tools.
+	 */
+	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
+		const intentTracing = this.#intentTracing;
+		const intentDescription = this.#intentDescription;
+		const pruneDescriptions = this.prunesToolDescriptions(model);
+		const wire = this.#wireModel(model);
+		const declaration = this.#toolDeclaration(wire);
+		// The sent definitions change the fingerprint only through a declaration.
+		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
+		const anthropicWire = wire !== undefined && isAnthropicMessagesModel(wire) ? wire : undefined;
+		const openAIWire = wire !== undefined && isOpenAIToolsModel(wire) ? wire : undefined;
+		const strictWire = anthropicWire ?? openAIWire;
+		const strictFallback =
+			strictWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, strictWire);
+		const betasDisabled = anthropicWire !== undefined && experimentalBetasDisabled(anthropicWire);
+		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
+		const toolKeys = tools === this.#state.tools ? tools.map(toolKeyForPrefix) : undefined;
+		const memo = this.#declaredToolsMemo;
+		if (
+			toolKeys !== undefined &&
+			memo !== undefined &&
+			memo.model === model &&
+			sameToolKeys(memo.toolKeys, toolKeys) &&
+			memo.intentTracing === intentTracing &&
+			memo.intentDescription === intentDescription &&
+			memo.pruneDescriptions === pruneDescriptions &&
+			memo.declaration === declaration &&
+			memo.sentRevision === sentRevision &&
+			memo.strictWire === strictWire &&
+			memo.betasDisabled === betasDisabled &&
+			memo.strictFallback === strictFallback
+		) {
+			return memo.fingerprint;
+		}
+		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
+		const declared = this.#declaredFrom(active, declaration);
+		const fingerprint = toolSpecsFingerprint(
+			anthropicWire
+				? anthropicStrictnessHashedTools(anthropicWire, declared, { disableStrictTools: strictFallback })
+				: openAIWire
+					? openAIStrictnessHashedTools(openAIWire, declared, { disableStrictTools: strictFallback })
+					: declared,
+		);
+		if (toolKeys !== undefined) {
+			this.#declaredToolsMemo = {
+				model,
+				toolKeys,
+				intentTracing,
+				intentDescription,
+				pruneDescriptions,
+				declaration,
+				sentRevision,
+				strictWire,
+				betasDisabled,
+				strictFallback,
+				fingerprint,
+			};
+		}
+		return fingerprint;
+	}
+
+	/**
+	 * The tools the next main request on `model` declares, in wire order, as {@link declaredToolsFingerprint} hashes
+	 * them (the `strict` and `eager_input_streaming` flags it counts aside): the active tools as they are (not
+	 * normalized for the wire), and on a provider that keeps its tool declaration across a conversation, while a tool
+	 * is active, each withdrawn tool it still holds as this agent last sent it, a newly active tool as a copy with
+	 * `deferLoading`. The same list, copies included, until the active tools or their definitions, the declaration or
+	 * the sent definitions change; the active tools' array itself where no declaration is kept.
+	 */
+	declaredTools(model: Model | undefined): readonly Tool[] {
+		const tools = this.#state.tools;
+		const declaration = this.#toolDeclaration(this.#wireModel(model));
+		if (!declaration) return tools;
+		const sentRevision = this.#sentToolDefinitions.revision;
+		const toolKeys = tools.map(toolKeyForPrefix);
+		const memo = this.#declaredToolsListMemo;
+		if (
+			memo !== undefined &&
+			sameToolKeys(memo.toolKeys, toolKeys) &&
+			memo.declaration === declaration &&
+			memo.sentRevision === sentRevision
+		) {
+			return memo.declared;
+		}
+		const declared = this.#declaredFrom(tools, declaration);
+		this.#declaredToolsListMemo = { toolKeys, declaration, sentRevision, declared };
+		return declared;
+	}
+
+	/**
+	 * The tools a main request with the `active` tools declares: under a kept `declaration`, in its wire order, each
+	 * withdrawn tool it holds as this agent last sent it, none when `active` is empty
+	 * ({@link SentToolDefinitions.inactiveFor}, {@link anthropicDeclaredTools}); `active` itself without one.
+	 */
+	#declaredFrom(active: readonly Tool[], declaration: RecordedToolDeclaration | undefined): readonly Tool[] {
+		return declaration
+			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
+			: active;
+	}
+
+	/**
+	 * The declaration the next main request going out as `wire` keeps ({@link latestToolDeclaration}): undefined off
+	 * Anthropic's messages API and on a model that keeps none there ({@link anthropicKeepsToolDeclaration}, which Claude
+	 * Code's experimental-beta kill switch turns off).
+	 */
+	#toolDeclaration(wire: Model | undefined): RecordedToolDeclaration | undefined {
+		return wire !== undefined && isAnthropicMessagesModel(wire) && anthropicKeepsToolDeclaration(wire)
+			? latestToolDeclaration(this.#state.messages)
+			: undefined;
+	}
+
+	/**
+	 * The model the next main request on `model` goes out as ({@link wireModel}, in the Kimi Code API format that
+	 * request goes out in); undefined under an owned dialect, which carries the tools in the prompt.
+	 */
+	#wireModel(model: Model | undefined): Model | undefined {
+		if (model === undefined || this.#ownedDialect(model)) return undefined;
+		return wireModel(model, { kimiApiFormat: this.#requestKimiApiFormat() });
+	}
+
+	/** The Kimi Code API format the next main request goes out in. */
+	#requestKimiApiFormat(): "openai" | "anthropic" | undefined {
+		return this.#kimiApiFormatResolver ? this.#kimiApiFormatResolver() : this.#kimiApiFormat;
 	}
 
 	/**
@@ -868,7 +1084,7 @@ export class Agent {
 		);
 	}
 
-	/** Inject/strip the intent field on tool calls; applies from the next prompt run. */
+	/** Inject/strip the intent field on tool calls; applies from the next model call. */
 	get intentTracing(): boolean {
 		return this.#intentTracing;
 	}
@@ -969,7 +1185,9 @@ export class Agent {
 	 * cache. Never touches the append-only log or the tool-choice queue. Owned/
 	 * in-band dialect sessions stay tools-less (matching their no-native-tools wire
 	 * shape and avoiding tool-markup leakage). `llmMessages` is already converted
-	 * (and, in production, obfuscated) by the caller.
+	 * (and, in production, obfuscated) by the caller. The provider-context transform
+	 * is told the request is a side request, so state it keeps for the conversation's
+	 * requests (image drops) stays as the loop's requests left it.
 	 *
 	 * `systemPrompt` defaults to the live agent prompt so the side request hits the
 	 * same cached prefix as the main loop. Callers that must pin a different prompt
@@ -995,7 +1213,9 @@ export class Agent {
 		// Side requests reuse the main loop's sent definitions without recording their own; attached before the
 		// transform too, so a request-size clamp in it measures them.
 		context = this.#sentToolDefinitions.withInactiveTools(context);
-		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
+		if (this.#transformProviderContext) {
+			context = await this.#transformProviderContext(context, model, SIDE_REQUEST);
+		}
 		context = this.#sentToolDefinitions.withInactiveTools(context);
 		return context;
 	}
@@ -1284,6 +1504,14 @@ export class Agent {
 		fn: ((boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>) | undefined,
 	): void {
 		this.#asideMessageProvider = fn;
+	}
+
+	/**
+	 * Provide the messages each model call must carry that its context lacks; they join the inputs of the turn the
+	 * call opens. See `AgentLoopConfig.getMissingContextMessages`.
+	 */
+	setMissingContextMessageProvider(fn: AgentLoopConfig["getMissingContextMessages"]): void {
+		this.#missingContextMessageProvider = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -2047,11 +2275,12 @@ export class Agent {
 			providerSessionState: this.#providerSessionState,
 			thinkingBudgets: this.#thinkingBudgets,
 			maxRetryDelayMs: this.#maxRetryDelayMs,
-			kimiApiFormat: this.#kimiApiFormat,
+			kimiApiFormat: this.#requestKimiApiFormat(),
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
 			transformProviderContext: this.#transformProviderContext,
 			sentToolDefinitions: this.#sentToolDefinitions,
+			repeatedPerCallMessages: this.#repeatedPerCallMessages,
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
@@ -2066,7 +2295,15 @@ export class Agent {
 				context.systemPrompt = this.#state.systemPrompt;
 				this.#onModelCallSystemPrompt?.(context.systemPrompt);
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
+				// The intent field and description pruning follow the agent's switches at each call, as the prompt and
+				// tools above do, so a rebuild that changes them all changes them at the same request. A response's
+				// calls are stripped by the switch of the request that produced it: the next sync runs after them.
+				config.intentTracing = this.#intentTracing;
+				config.pruneToolDescriptions = this.#pruneToolDescriptions;
+				// The request goes out in the Kimi Code format the declared tools read it in.
+				config.kimiApiFormat = this.#requestKimiApiFormat();
 			},
+			getMissingContextMessages: context => this.#missingContextMessageProvider?.(context) ?? [],
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
 					? async (context, signal) => {
