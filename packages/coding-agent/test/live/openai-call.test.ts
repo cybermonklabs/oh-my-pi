@@ -269,6 +269,39 @@ describe("GPT-Live delegations", () => {
 		}
 	}, 10_000);
 
+	test("a fragment from before a delegation that went is logged, and the next turn holds only the words after it", async () => {
+		// The review's probe E: item_1's words, then words after its offset, then a late fragment of item_1's.
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "deploy main", 4_000, 4_800),
+				delegated("d1", "item_1", 5_000),
+				userSaid("t2", " next", 5_100, 5_500),
+				// Late: item_1 went when the user's transcript passed 5000.
+				userSaid("t3", " LATE", 4_800, 4_900),
+				delegated("d2", "item_2", 9_000),
+				userSaid("t4", " second", 8_000, 9_200),
+			],
+		});
+		const warn = vi.spyOn(logger, "warn");
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 2);
+			expect(call.turns).toEqual([heard("deploy main"), heard("next second")]);
+			expect(warn).toHaveBeenCalledWith(
+				"GPT-Live transcribed the user's words after their delegation was handed over",
+				{
+					startMs: 4_800,
+					delegationOffsetMs: 5_000,
+					words: " LATE",
+				},
+			);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
 	test("a turn holds the user's words of the minute before its delegation, labelled as speech", async () => {
 		const stub = gptLiveStub({
 			frames: [
