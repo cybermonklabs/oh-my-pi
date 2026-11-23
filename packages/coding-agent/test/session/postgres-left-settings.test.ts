@@ -125,7 +125,7 @@ type TemporaryTable = (typeof TEMPORARY_TABLES)[number];
 
 const READ_ONLY_LOGIN_CASE = "a login whose read-only default the session keeps";
 const READ_ONLY_DATABASE_CASE = "a database whose read-only default the session keeps";
-const REPAIRLESS_THEN_CLEAN_CASE = "three repairless connections, then a clean one";
+const REPAIRLESS_THEN_CLEAN_CASE = `${PG_REPAIR_RETRIES} repairless connections, then a clean one`;
 const ONLY_REPAIRLESS_CASE = "only repairless connections";
 const NO_RESERVE_CASE = "a PostgreSQL client without reserve()";
 const POOL_OF_ONE_CASE = "a pool of one server connection left without rights";
