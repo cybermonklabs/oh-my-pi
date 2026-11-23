@@ -21,6 +21,15 @@
 //! a lone command is just that command), and the shell goes on after it
 //! with `$?` 128 + the signal. Stops and continues of other jobs reach the
 //! job table after the scheduler turn that saw them ([`Shell::job_events`]).
+//!
+//! **Without a terminal.** bash's `set -m` in a script whose standard
+//! error is no terminal (bash `set_job_control`) runs every job in a
+//! process group of its own too, and hands no terminal to anyone
+//! ([`set_monitor`]): the shell stays in its group, which it records as
+//! its own ([`Pgrp`]), and has no terminal handle. Its own dispositions
+//! stay (bash leaves `TSTP`, `TTIN` and `TTOU` at their defaults), it
+//! prints no job notice (bash 5.3 holds a script's), and a command of its
+//! own that stops is waited for as before job control.
 
 use std::{
 	fmt::Write as _,
@@ -46,7 +55,9 @@ use crate::bash::{
 	zshopt::ZshOpt,
 };
 
-/// The interactive shell's process groups (zsh `mypgrp`, `origpgrp`).
+/// The process groups of a shell doing job control (zsh `mypgrp`,
+/// `origpgrp`); for bash's `set -m` without a terminal, the group it was
+/// started in, both times ([`set_monitor`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pgrp {
 	/// The group the shell leads and that owns the terminal between jobs.
@@ -68,7 +79,9 @@ pub struct JobCtl {
 	shtty:       Option<FdRef>,
 	/// Its handle for the [`crate::bash::Terminal`] seam.
 	handle:      Option<OsHandle>,
-	/// `MONITOR` acquired the terminal (zsh `jobbing` with a terminal).
+	/// Job control's process groups: `MONITOR` acquired the terminal (zsh
+	/// `jobbing` with a terminal), or bash's `set -m` started it without
+	/// one ([`set_monitor`]: no [`Self::handle`]).
 	pgrp:        Option<Pgrp>,
 	/// The shell's terminal modes (zsh `shttyinfo`).
 	modes:       Option<Termios>,
@@ -114,8 +127,8 @@ impl JobCtl {
 		self.fg_stop.is_some()
 	}
 
-	/// The shell acquired the terminal for job control (`MONITOR` with a
-	/// terminal at some point).
+	/// The shell does job control: `MONITOR` acquired the terminal at some
+	/// point, or bash's `set -m` started it without one.
 	pub const fn has_pgrp(&self) -> bool {
 		self.pgrp.is_some()
 	}
@@ -324,10 +337,11 @@ pub fn catches(k: &Kernel, sig: Signal) -> bool {
 
 /// Whether the root ignores `sig` itself (zsh `init_signals`,
 /// `acquire_pgrp`): [`IGNORED`] when interactive, and [`STOPS`] while it
-/// does job control.
+/// does job control on a terminal (bash's `set -m` without one leaves them
+/// at their defaults).
 pub fn ignores(k: &Kernel, sig: Signal) -> bool {
 	(k.jobctl.interactive && IGNORED.contains(&sig))
-		|| (k.jobctl.pgrp.is_some() && STOPS.contains(&sig))
+		|| (k.jobctl.pgrp.is_some() && k.jobctl.handle.is_some() && STOPS.contains(&sig))
 }
 
 /// zsh `acquire_pgrp`: wait until the shell's group owns the terminal (a
@@ -416,6 +430,61 @@ pub fn enable_monitor(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	true
 }
 
+/// bash `set -m` and `set +m` (`set -o monitor`, `shopt -so monitor`;
+/// `set_job_control`) run by the root `vp` of a script: when its standard
+/// error is no terminal (the `shell_tty` of a non-interactive bash), job
+/// control starts without one. The shell stays in its process group, which
+/// it records as its own, and its jobs get groups of their own from then
+/// on ([`pgroup`]); `set +m` ends it for the jobs started after it, while
+/// each job started before keeps its group ([`kept`]). Nothing changes for
+/// an interactive shell (its job control began at [`init_io`]), a
+/// subshell, a host without terminals (it manages no process groups), or a
+/// standard error on a terminal, which bash hands to its foreground jobs.
+pub fn set_monitor(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, on: bool) {
+	if vp.parent.is_some() || k.jobctl.interactive || k.jobctl.handle.is_some() {
+		return;
+	}
+	if !on {
+		k.jobctl.pgrp = None;
+		return;
+	}
+	if k.jobctl.pgrp.is_some() {
+		return;
+	}
+	let err = vp.fds.get(2).and_then(FdRef::os_handle);
+	let Some(term) = cx.host.terminal() else {
+		return;
+	};
+	if err.is_some_and(|h| term.is_terminal(h)) {
+		return;
+	}
+	let mine = term.process_group();
+	k.jobctl.root = Some(vp.vpid);
+	k.jobctl.fg = Some(vp.vpid);
+	k.jobctl.pgrp = Some(Pgrp { mine, orig: mine });
+}
+
+/// Whether the shell does job control without a terminal (bash's `set -m`
+/// in a script, [`set_monitor`]).
+pub const fn without_terminal(k: &Kernel) -> bool {
+	k.jobctl.pgrp.is_some() && k.jobctl.handle.is_none()
+}
+
+/// The process group of the job of `vp`'s table that vproc `owner` runs a
+/// program of (bash `kill_pid`'s `find_pipeline`: `kill -- -PID` of a
+/// process of a job signals the job's group, whether job control is on now
+/// or not), in a script without a terminal: a job started under `set -m`
+/// keeps its group after `set +m` ([`kept`]). `None` for any other vproc,
+/// a job in the shell's group, or a shell with a terminal.
+pub fn job_group(k: &Kernel, vp: &Vproc, owner: Vpid) -> Option<i32> {
+	if k.jobctl.handle.is_some() || k.jobctl.interactive {
+		return None;
+	}
+	let leader = leader_of(k, owner)?;
+	vp.jobs.by_vpid(leader).filter(|j| !j.inherited)?;
+	group(k, leader).and_then(|g| i32::try_from(g).ok())
+}
+
 /// The interactive root got `sig` with no trap set: what zsh's handler
 /// does. `INT` abandons the command being run (`errflag |=
 /// ERRFLAG_INT`; `$?` 130); `ALRM`, `QUIT` and `TERM` are ignored.
@@ -461,8 +530,8 @@ fn interrupt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	vp.blocked = None;
 }
 
-/// Whether the shell does job control now: it acquired the terminal and
-/// `MONITOR` is on.
+/// Whether the shell does job control now: it has process groups to manage
+/// ([`Pgrp`]) and `MONITOR` is on.
 pub fn jobbing(k: &mut Kernel, cx: &mut Cx<'_>) -> bool {
 	k.jobctl.pgrp.is_some() && k.root.option(cx.store, OptId::Monitor).unwrap_or(false)
 }
@@ -506,9 +575,27 @@ pub fn leader_of(k: &Kernel, vpid: Vpid) -> Option<Vpid> {
 	}
 }
 
-/// Set vproc `vpid`'s job ([`leader_of`]); kept only under job control.
+/// The background job vproc `vpid` runs in, when job control is off now
+/// (bash's `set +m` in a script with no terminal) and that job was started
+/// under it ([`own_job`]): bash forked the job's processes into a group of
+/// their own when the job started, and they stay there, as do the
+/// processes the job starts later. `None` for any other vproc, while job
+/// control is on, with a terminal and in an interactive shell.
+fn kept(k: &Kernel, vpid: Vpid) -> Option<Vpid> {
+	if k.jobctl.pgrp.is_some() || k.jobctl.handle.is_some() || k.jobctl.interactive {
+		return None;
+	}
+	k.jobctl
+		.leaders
+		.iter()
+		.find(|(v, _)| *v == vpid)
+		.and_then(|&(_, job)| job)
+}
+
+/// Set vproc `vpid`'s job ([`leader_of`]); kept only under job control, or
+/// for a vproc of a job that keeps its group ([`kept`]).
 pub fn set_leader(k: &mut Kernel, vpid: Vpid, leader: Option<Vpid>) {
-	if k.jobctl.pgrp.is_none() {
+	if k.jobctl.pgrp.is_none() && kept(k, vpid).is_none() {
 		return;
 	}
 	let foreground = leader.is_some() && leader == k.jobctl.root;
@@ -522,9 +609,13 @@ pub fn set_leader(k: &mut Kernel, vpid: Vpid, leader: Option<Vpid>) {
 	}
 }
 
-/// New child `child` of vproc `parent` belongs to the parent's job.
+/// New child `child` of vproc `parent` belongs to the parent's job; with
+/// job control off, only when that job keeps its group ([`kept`]).
 pub fn inherit(k: &mut Kernel, child: Vpid, parent: Vpid) {
 	if k.jobctl.pgrp.is_none() {
+		if let Some(job) = kept(k, parent) {
+			k.jobctl.leaders.push((child, Some(job)));
+		}
 		return;
 	}
 	let leader = leader_of(k, parent);
@@ -548,13 +639,16 @@ pub fn forget_vproc(k: &mut Kernel, vpid: Vpid) {
 
 /// Placement of an external `vp` spawns ([`crate::bash::SpawnSpec::pgroup`]):
 /// with job control, its job's group (a new one for the job's first
-/// process), taking the terminal when the job is in the foreground; else
-/// the host's plain placement.
+/// process), taking the terminal when the job is in the foreground; the
+/// same for a job that keeps its group with job control off ([`kept`]);
+/// else the host's plain placement.
 pub fn pgroup(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, job: JobId) -> PgroupSpec {
-	if k.jobctl.pgrp.is_none() || !jobbing(k, cx) {
-		return PgroupSpec::New(job);
-	}
-	let Some(leader) = leader_of(k, vp.vpid) else {
+	let leader = if jobbing(k, cx) {
+		leader_of(k, vp.vpid)
+	} else {
+		kept(k, vp.vpid)
+	};
+	let Some(leader) = leader else {
 		return PgroupSpec::New(job);
 	};
 	PgroupSpec::Job {
@@ -567,13 +661,16 @@ pub fn pgroup(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, job: JobId) -> Pgroup
 	}
 }
 
-/// `vp` spawned `ext`: under job control its group is its job's (the first
-/// process's, or the one it had to lead when the old one had emptied).
+/// `vp` spawned `ext`: under job control, or in a job that keeps its group
+/// ([`kept`]), its group is its job's (the first process's, or the one it
+/// had to lead when the old one had emptied).
 pub fn spawned(k: &mut Kernel, vp: &Vproc, ext: &dyn ExtProc) {
-	if k.jobctl.pgrp.is_none() {
-		return;
-	}
-	if let (Some(leader), Some(pgid)) = (leader_of(k, vp.vpid), ext.pgid()) {
+	let leader = if k.jobctl.pgrp.is_some() {
+		leader_of(k, vp.vpid)
+	} else {
+		kept(k, vp.vpid)
+	};
+	if let (Some(leader), Some(pgid)) = (leader, ext.pgid()) {
 		set_group(k, leader, pgid);
 	}
 }
@@ -624,11 +721,15 @@ pub fn pipeline_started(k: &mut Kernel, job: Vpid, stages: &[(Vpid, bool)]) {
 
 /// An external `vp` waits for stopped or continued ([`ExtProc::poll_event`]).
 /// The root's own foreground job stopping is suspended at once (`Some`:
-/// the flow of the op that waited); any other change is applied to the job
-/// table after the turn. `None`: the vproc goes on waiting.
+/// the flow of the op that waited), but in a script doing job control
+/// without a terminal, which waits on for it as without job control (a
+/// known difference: bash goes on, with the command a stopped job); any
+/// other change is applied to the job table after the turn. `None`: the
+/// vproc goes on waiting.
 pub fn ext_event(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, ev: ProcEvent) -> Option<Flow> {
 	k.jobctl.pgrp?;
 	match ev {
+		ProcEvent::Stopped(_) if vp.parent.is_none() && without_terminal(k) => None,
 		ProcEvent::Stopped(sig) if vp.parent.is_none() => Some(suspend(k, cx, vp, sig)),
 		ProcEvent::Exited(_) => None,
 		ProcEvent::Continued if vp.parent.is_none() => None,
@@ -981,7 +1082,9 @@ pub fn give_terminal(k: &mut Kernel, cx: &mut Cx<'_>, leader: Vpid) {
 /// its group is done with, the terminal comes back. One killed by a signal
 /// other than `INT` or `PIPE` is reported (`zsh: terminated  cmd`); `INT`
 /// moves to a new line (zsh `printjob`'s `doputnl`). A pipeline's last
-/// stage running here ends only with the pipeline.
+/// stage running here ends only with the pipeline. Without a terminal
+/// (bash's `set -m` in a script) the notice of a killed command is bash's
+/// own ([`super::killed`]).
 pub fn fg_done(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -997,6 +1100,9 @@ pub fn fg_done(
 	}
 	take_group(k, vp.vpid);
 	reclaim(k, cx, None, super::zle::active(vp));
+	if without_terminal(k) {
+		return;
+	}
 	match killed {
 		Some(Signal::Int) => notice(k, vp, b"\n"),
 		Some(Signal::Pipe) | None => {},
@@ -1015,7 +1121,10 @@ pub fn fg_done(
 /// `fg` resumed gives the terminal back (reported like the shell's own
 /// foreground commands when a signal other than `INT`/`PIPE` killed it);
 /// a background job is reported at once under `notify`, else before the
-/// next prompt ([`notices_before_prompt`]). Its group is forgotten.
+/// next prompt ([`notices_before_prompt`]). Its group is forgotten. A
+/// script doing job control without a terminal prints nothing here (bash
+/// 5.3 holds the notice of a `-c` string's job and of a script file's that
+/// no signal ended).
 pub fn job_done(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, vpid: Vpid) {
 	take_group(k, vpid);
 	k.jobctl.job_modes.retain(|(j, _)| *j != vpid);
@@ -1026,6 +1135,12 @@ pub fn job_done(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, vpid: Vpid) {
 		}
 	}
 	if k.jobctl.pgrp.is_none() || vp.parent.is_some() {
+		return;
+	}
+	if without_terminal(k) {
+		if k.jobctl.fg == Some(vpid) {
+			k.jobctl.fg = k.jobctl.root;
+		}
 		return;
 	}
 	let platform = k.engine.config().platform;
@@ -1402,7 +1517,9 @@ impl Shell {
 	/// job join it, stops and continues of jobs reach the job tables (a
 	/// stop of the shell's own foreground job suspends it, [`suspend`]; of
 	/// the job `fg` resumed, gives the terminal back and ends the `fg`),
-	/// and settled background jobs get their `[n] pid` line.
+	/// and settled background jobs get their `[n] pid` line. Without a
+	/// terminal (bash's `set -m` in a script) a stop is not reported, and
+	/// the shell's own foreground job is waited for on ([`ext_event`]).
 	pub(super) fn job_events(&mut self, cx: &mut Cx<'_>) {
 		let jc = &self.k.jobctl;
 		if jc.events.is_empty() && jc.reparent.is_empty() {
@@ -1429,6 +1546,8 @@ impl Shell {
 				continue;
 			}
 			match ev {
+				ProcEvent::Stopped(_)
+					if Some(leader) == self.k.jobctl.root && without_terminal(&self.k) => {},
 				ProcEvent::Stopped(sig) if Some(leader) == self.k.jobctl.root => {
 					self.k.jobctl.fg_stop = Some(sig);
 					if let Some(root) = self.procs.iter_mut().find(|p| p.parent.is_none()) {
@@ -1462,8 +1581,11 @@ impl Shell {
 					let Some(number) = number else {
 						continue;
 					};
+					let quiet = without_terminal(&self.k);
 					if fg {
 						reclaim(&mut self.k, cx, Some(leader), false);
+					}
+					if fg && !quiet {
 						let mut line = Vec::new();
 						if sig == Signal::Tstp {
 							line.push(b'\n');
@@ -1477,13 +1599,10 @@ impl Shell {
 						if let Some(job) = self.procs[owner].jobs.get_mut(number) {
 							job.notified = true;
 						}
-					} else if state::option(
-						&mut self.k.root,
-						cx.store,
-						&self.procs[owner],
-						OptId::Notify,
-					)
-					.unwrap_or(false)
+					} else if !fg
+						&& !quiet
+						&& state::option(&mut self.k.root, cx.store, &self.procs[owner], OptId::Notify)
+							.unwrap_or(false)
 					{
 						report_async(&mut self.k, cx, &mut self.procs[owner], number, platform);
 					}

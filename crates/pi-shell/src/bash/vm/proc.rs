@@ -906,7 +906,9 @@ impl LastBg {
 /// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
 /// (a builtin, a native task, a subshell, a non-`exec` external in a
 /// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// pid (`$!`, `jobs -l`/`-p`/`-x`, `wait -p` of a stopped job, `disown`'s
+/// warning of a stopped job) wait for the decision; a stop of the job
+/// before it is held until then (`Shell::holds_stop`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of

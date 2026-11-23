@@ -565,6 +565,11 @@ pub struct Kernel {
 	/// pipeline a vproc waits for ([`proc::JobProc`]), by the scheduler after
 	/// it (`Shell::adopt`); empty between turns, not imaged.
 	pub settled:            Vec<(Vpid, u32)>,
+	/// `(vproc, job)`: bangs settled during the step ([`Self::settle_bang`]),
+	/// whose job a stop held for them may reach now
+	/// (`Shell::release_held_stops`, which every step ends with); empty
+	/// between steps, not imaged.
+	pub decided:            Vec<(Vpid, Vpid)>,
 	/// `(OS pid, vproc, job)`: a job's `$!` names a program a vproc other
 	/// than the job's own runs (a background pipeline's last stage), so
 	/// `kill` of that pid signals that vproc, and finds no process once it
@@ -726,6 +731,7 @@ impl Kernel {
 			killed_by: None,
 			bangs: Vec::new(),
 			settled: Vec::new(),
+			decided: Vec::new(),
 			pid_owners: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
@@ -753,12 +759,14 @@ impl Kernel {
 	}
 
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
-	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
+	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers; a stop
+	/// held for it reaches the job after the turn ([`Self::decided`]).
 	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
 			return;
 		};
 		let bang = self.bangs.swap_remove(i);
+		self.decided.push((bang.vproc, bang.job));
 		if let Some(pid) = os {
 			self.settled.push((bang.job, pid));
 			if bang.vproc != bang.job {
@@ -1846,6 +1854,15 @@ impl Shell {
 				state::set_zsh_option(&mut k.root, cx.store, &mut root, zle, true)
 					.map_err(ShellError::Store)?;
 			}
+		} else if !zsh
+			&& state::option(&mut k.root, cx.store, &root, OptId::Monitor)
+				.map_err(ShellError::Store)?
+		{
+			// A script's job control from the start: an imported `SHELLOPTS`
+			// naming `monitor` (bash `set_job_control`), or `-m` with a
+			// terminal on standard error ([`jobctl::set_monitor`] leaves that
+			// alone).
+			jobctl::set_monitor(&mut k, cx, &root, true);
 		}
 		Ok(Self {
 			k,
@@ -2058,7 +2075,9 @@ impl Shell {
 		// Subshells a host submitted since the last step.
 		self.adopt(cx);
 		self.settle_callouts();
+		self.release_held_stops();
 		let step = self.step_inner(cx, budget);
+		self.release_held_stops();
 		self.k.sync_root(cx.store, &self.procs[0]);
 		step
 	}
@@ -2114,7 +2133,13 @@ impl Shell {
 			if cont.is_none() {
 				self.rr = (i + 1) % self.procs.len();
 			}
-			let slice = left.min(budget.max_ops - ops).max(1);
+			// A vproc stopped while it decides its job's pid runs one op at a
+			// time: it stops after the op that decides ([`Self::holds_stop`]).
+			let slice = if self.procs[i].stopped {
+				1
+			} else {
+				left.min(budget.max_ops - ops).max(1)
+			};
 			let before = ops;
 			exec::run_slice(&mut self.k, &mut self.procs[i], cx, slice, &mut ops);
 			let used = ops - before;
@@ -2185,6 +2210,7 @@ impl Shell {
 				i += 1;
 			}
 		}
+		self.release_held_stops();
 	}
 
 	/// The children the turn spawned may be the stages of the pipeline that
@@ -2467,8 +2493,7 @@ impl Shell {
 		}
 	}
 
-	/// Next vproc to run, round-robin: has work, not stopped, not parked at
-	/// the current wake count.
+	/// Next vproc to run, round-robin ([`Self::runnable`]).
 	fn pick(&self, wakes: u64) -> Option<usize> {
 		let n = self.procs.len();
 		(0..n)
@@ -2477,10 +2502,57 @@ impl Shell {
 	}
 
 	/// Vproc `i` has work and is neither stopped nor waiting for a wake that
-	/// has not come.
+	/// has not come; a stopped one runs on while it decides its job's pid
+	/// ([`Self::holds_stop`]).
 	fn runnable(&self, i: usize, wakes: u64) -> bool {
 		let p = &self.procs[i];
-		p.has_work() && !p.stopped && p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+		p.has_work()
+			&& (!p.stopped || self.holds_stop(i))
+			&& p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+	}
+
+	/// Whether a stop of vproc `i` is held: `i` decides the pid of a job
+	/// that is still to be settled ([`proc::Bang`]), or runs below the vproc
+	/// that does (a command substitution in the words of a function's `exec`
+	/// when the function is the job's command; one in the job's own simple
+	/// command makes its code come first, so that job keeps its virtual pid
+	/// at once, [`exec::bang_stage`]). bash's job has its pid from its fork,
+	/// stopped or not, so the readers of the pid (`$!`, `jobs -l`, `jobs
+	/// -p`, `wait -p`) wait for the decision: the vproc runs on to it, and
+	/// what it runs stops then ([`Self::release_held_stops`]): neither
+	/// [`Self::take`] pauses it nor [`Self::deliver`] signals it.
+	fn holds_stop(&self, i: usize) -> bool {
+		let vpid = self.procs[i].vpid;
+		self.k.bangs.iter().any(|b| self.in_job(vpid, b.vproc))
+	}
+
+	/// A stop held while a job's pid was still to be settled
+	/// ([`Self::holds_stop`]) reaches what the job became once it is
+	/// ([`Kernel::decided`]): each vproc of the deciding one's that the stop
+	/// reached stops its programs now ([`pause_handles`]; a program reports
+	/// its stop as any other, [`jobctl::ext_event`]), and when the job's own
+	/// vproc is stopped, every vproc of the job stops (the stages its
+	/// pipeline started meanwhile). One that still decides another pid holds
+	/// its stop on.
+	fn release_held_stops(&mut self) {
+		if self.k.decided.is_empty() {
+			return;
+		}
+		let decided = std::mem::take(&mut self.k.decided);
+		if !self.procs.iter().any(|p| p.stopped) {
+			return;
+		}
+		for (vproc, job) in decided {
+			let whole = self.procs.iter().any(|p| p.vpid == job && p.stopped);
+			for i in 0..self.procs.len() {
+				let v = self.procs[i].vpid;
+				let reached =
+					(whole && self.in_job(v, job)) || (self.procs[i].stopped && self.in_job(v, vproc));
+				if reached && !self.holds_stop(i) {
+					set_stopped(&mut self.procs[i], true);
+				}
+			}
+		}
 	}
 
 	/// A finished script or an outgoing callout, if any.
@@ -3042,9 +3114,16 @@ impl Shell {
 				DefaultAction::Terminate => self.kill(cx, i, sig, status),
 				DefaultAction::Stop | DefaultAction::Continue => {
 					let stop = sig.default_action() == DefaultAction::Stop;
+					// A stop of a vproc that decides its job's pid waits for the
+					// decision: what it runs stops then ([`Self::holds_stop`]).
+					let held = stop && self.holds_stop(i);
 					let p = &mut self.procs[i];
 					let change = (p.stopped != stop).then_some((p.vpid, stop.then_some(sig)));
-					set_stopped(p, stop);
+					if held {
+						p.stopped = true;
+					} else {
+						set_stopped(p, stop);
+					}
 					return Ok(change);
 				},
 				DefaultAction::Ignore => {},
@@ -3180,7 +3259,11 @@ impl Shell {
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
-			if target != SigTarget::Vpid(root.0) && !terminating {
+			// A stop held for a job's pid reaches its programs once the pid is
+			// settled ([`Self::release_held_stops`]).
+			let held =
+				trap.is_none() && sig.default_action() == DefaultAction::Stop && self.holds_stop(i);
+			if target != SigTarget::Vpid(root.0) && !terminating && !held {
 				signal_lives(&mut self.procs[i], sig, false);
 			}
 			// A vproc that is just its program (bash would have `exec`'d it:
@@ -3229,9 +3312,32 @@ impl Shell {
 		if let Some(targets) = foreground {
 			self.int_to_foreground(cx, n, targets);
 		}
+		// bash learns that a job it did not continue itself (`kill -CONT
+		// PID`, where `%job` marks it running) runs again only from its wait
+		// status (`waitchld`'s `WCONTINUED`): until then the job is stopped in
+		// its table (`wait` warns of it). In a script doing job control
+		// without a terminal, a job whose program reports its continue
+		// ([`jobctl::ext_event`]) waits for that report.
+		let by_pid = sig == Signal::Cont
+			&& sender == Sender::Shell
+			&& matches!(target, SigTarget::Vpid(_))
+			&& jobctl::without_terminal(&self.k);
 		for (vpid, stop) in changed {
+			if by_pid && stop.is_none() && self.runs_external(vpid) {
+				continue;
+			}
 			self.job_changed(cx, vpid, stop);
 		}
+	}
+
+	/// Whether vproc `vpid` waits for an external, whose stops and
+	/// continues it learns of ([`crate::bash::host::ExtProc::poll_event`]).
+	fn runs_external(&self, vpid: Vpid) -> bool {
+		self.procs.iter().find(|p| p.vpid == vpid).is_some_and(|p| {
+			p.frames
+				.iter()
+				.any(|f| matches!(f.scratch.as_deref().map(|sc| &sc.live), Some(Live::Ext(_))))
+		})
 	}
 
 	fn set_paused(&mut self, cx: &mut Cx<'_>, on: bool) {

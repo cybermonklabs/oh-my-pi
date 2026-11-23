@@ -19,7 +19,7 @@ use crate::bash::{
 		Cx, Kernel,
 		exec::{self, Flow},
 		expand::{self, arith_value, attr_letters},
-		is_ident,
+		is_ident, jobctl,
 		proc::{AssignValue, Vproc},
 		quote,
 		state::{self, Level, Var, VarEdit},
@@ -3146,7 +3146,8 @@ pub fn set(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// Set an option with bash's variable side effects: `ignoreeof` binds
 /// `IGNOREEOF=10` (unbinds it when off), `posix` binds
 /// `POSIXLY_CORRECT=y` and turns `expand_aliases` on (off sets it back
-/// to the interactive shell's default).
+/// to the interactive shell's default); `monitor` starts or ends job
+/// control without a terminal ([`jobctl::set_monitor`]).
 fn change_option(ctx: &mut Ctx<'_, '_>, opt: OptId, on: bool) {
 	ctx.set_option(opt, on);
 	// bash 5.3's `array_expand_once` and `assoc_expand_once` are one
@@ -3154,6 +3155,7 @@ fn change_option(ctx: &mut Ctx<'_, '_>, opt: OptId, on: bool) {
 	match opt {
 		OptId::ArrayExpandOnce => ctx.set_option(OptId::AssocExpandOnce, on),
 		OptId::AssocExpandOnce => ctx.set_option(OptId::ArrayExpandOnce, on),
+		OptId::Monitor => jobctl::set_monitor(ctx.k, ctx.cx, ctx.vp, on),
 		_ => {},
 	}
 	// POSIX mode reports shift errors (bash's `print_shift_error`).

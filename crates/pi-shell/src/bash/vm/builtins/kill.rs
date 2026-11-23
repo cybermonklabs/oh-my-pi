@@ -9,7 +9,9 @@ use strum::IntoEnumIterator;
 
 use super::{Ctx, R, done};
 use crate::bash::{
-	ControlHandle, Platform, SigTarget, Signal, Vpid, diag::Diag, vm::proc::JobState,
+	ControlHandle, Platform, SigTarget, Signal, Vpid,
+	diag::Diag,
+	vm::{jobctl, proc::JobState},
 };
 
 /// What `kill` sends.
@@ -179,6 +181,20 @@ pub(super) fn target(
 		.ok()
 		.and_then(|s| s.parse::<i32>().ok())
 		.ok_or(TargetError::NotAnId)?;
+	// bash `kill_pid`: `-PID` of a process of a job with a group of its own
+	// signals the job's group (a pipeline's `$!` names its last process,
+	// the group is its first's).
+	let owner = u32::try_from(-i64::from(pid))
+		.ok()
+		.filter(|_| pid < -1)
+		.and_then(|p| {
+			ctx.k
+				.pid_owner(p)
+				.or_else(|| ctx.vp.jobs.by_pid(p).map(|j| j.vpid))
+		});
+	let pid = owner
+		.and_then(|v| jobctl::job_group(ctx.k, ctx.vp, v))
+		.map_or(pid, |group| -group);
 	let base = ctx.k.engine.config().vpid_base;
 	// A job's (or `$!`'s) program OS pid names the job's vproc: the signal
 	// reaches the program through it, and the job's state follows. A

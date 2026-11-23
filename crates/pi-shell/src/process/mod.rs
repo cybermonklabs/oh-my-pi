@@ -648,7 +648,28 @@ pub fn shell_init(
 	cwd: BString,
 ) -> ShellInit {
 	let interactive = args.is_interactive(io::stdin().is_terminal() && io::stderr().is_terminal());
-	let mut options = args.startup_options(&env, interactive);
+	// bash `initialize_job_control (jobs_m_flag)`: a non-interactive bash
+	// started with job control (`-m`, `-o monitor`) takes over the terminal
+	// of its standard error. With none there it cannot (reported below) and
+	// turns `m` off, before an imported `SHELLOPTS` turns it on again
+	// (`set_job_control`, which needs no terminal). With one it starts as
+	// before (no job control of its own: a known difference).
+	let no_job_control = args.mode.dialect() == Dialect::Bash
+		&& !interactive
+		&& args
+			.options
+			.iter()
+			.rev()
+			.find(|(opt, _)| *opt == OptId::Monitor)
+			.is_some_and(|&(_, on)| on)
+		&& !io::stderr().is_terminal();
+	let mut options = if no_job_control {
+		let mut off = args.clone();
+		off.options.push((OptId::Monitor, false));
+		off.startup_options(&env, interactive)
+	} else {
+		args.startup_options(&env, interactive)
+	};
 	// The startup files' `~` expands as any other: `HOME`, else the home the
 	// password database names (bash `sh_get_home_dir`, zsh's default `HOME`;
 	// `/` for a uid without an entry, as both give).
@@ -667,6 +688,20 @@ pub fn shell_init(
 		line.push(b'\n');
 		let _ = io::stderr().write_all(&line);
 	};
+	if no_job_control {
+		// The group bash names is -1 when it leads its own (`tcgetpgrp` of
+		// its standard error failed), else the one it went back to.
+		let group = own_group();
+		let shown = if u32::try_from(group).is_ok_and(|g| g == std::process::id()) {
+			-1
+		} else {
+			group
+		};
+		let msg =
+			format!("cannot set terminal process group ({shown}): Inappropriate ioctl for device");
+		report(b"", msg.as_bytes());
+		report(b"", b"no job control in this shell");
+	}
 	let mut startup = Vec::new();
 	match args.startup_files(&env, &home, interactive) {
 		Ok(mut files) => {
@@ -740,6 +775,16 @@ pub fn shell_init(
 		profile: Profile::User,
 		login_home,
 	}
+}
+
+/// The process group of this process (`getpgrp`).
+fn own_group() -> i32 {
+	#[cfg(unix)]
+	// SAFETY: getpgrp has no preconditions.
+	let group = unsafe { libc::getpgrp() };
+	#[cfg(not(unix))]
+	let group = i32::try_from(std::process::id()).unwrap_or(0);
+	group
 }
 
 /// The home the startup files are found in where the environment has no

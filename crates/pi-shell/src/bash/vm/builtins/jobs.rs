@@ -297,7 +297,8 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 
 /// Wait until each job of `numbers` has settled on the pid it is known by
 /// (its program's OS pid or its virtual pid, [`crate::bash::vm::proc::Bang`])
-/// before `jobs -l`/`-p`/`-x` shows it: the builtin runs again then.
+/// before `jobs -l`/`-p`/`-x` shows it, or `disown`'s warning of a stopped
+/// job names it: the builtin runs again then.
 fn settled(ctx: &Ctx<'_, '_>, numbers: &[u32]) -> Result<(), Need> {
 	let pending = numbers
 		.iter()
@@ -525,7 +526,9 @@ fn background(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> i32 {
 
 /// `disown [-h] [-ar] [jobspec … | pid …]`: drop jobs from the table, or
 /// with `-h` mark them not to get a `SIGHUP`; no operand means the current
-/// job (all with `-a`, the running ones with `-r`).
+/// job (all with `-a`, the running ones with `-r`). Deleting a stopped job
+/// warns with its pid, so each stopped job's pid is settled first
+/// ([`settled`]).
 pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let o = match opts(ctx, args, b"ahr", b"", false) {
 		Ok(o) => o,
@@ -533,6 +536,16 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	};
 	let nohup = o.has(b'h');
 	let running_only = o.has(b'r');
+	if !nohup {
+		let stopped: Vec<u32> = ctx
+			.vp
+			.jobs
+			.iter()
+			.filter(|j| matches!(j.state, JobState::Stopped(_)))
+			.map(|j| j.number)
+			.collect();
+		settled(ctx, &stopped)?;
+	}
 	if o.rest.is_empty() && (o.has(b'a') || running_only) {
 		let picked: Vec<u32> = ctx
 			.vp
