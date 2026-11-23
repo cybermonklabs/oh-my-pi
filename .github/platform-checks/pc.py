@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Platform checks: plan a dispatch, classify its nextest results, and scan logs before upload.
 
-  pc.py plan               check the dispatch inputs (PC_* environment variables) as given,
-                           and write the build and leg matrices as step outputs
+  pc.py plan               check the inputs of a dispatch or a call (PC_* environment
+                           variables) as given, tell a dispatch from a call, and write the
+                           build and leg matrices as step outputs
   pc.py selftest           the controls on hand-made inputs: classifier rows with known
-                           verdicts, and planted tokens the scan must find; exit 1 on a miss
-                           (controls.sh runs the same classifier on real nextest output)
+                           verdicts, planted tokens the scan must find, and the plan's scope
+                           rows; exit 1 on a miss (controls.sh runs the same classifier on real
+                           nextest output)
   pc.py scan PATH...       exit 1 when a file under PATH holds a private key block, a token
                            shape, the run's own token or an ACTIONS_* value; prints file, line
                            and pattern name only, never the text. Runs the planted-token
@@ -77,13 +79,34 @@ def whole(name, value, lo, hi):
 
 # ---------------------------------------------------------------- plan
 
+THIS_FILE = ".github/workflows/platform-checks.yml"
+
+
+def scope(env):
+    """(called, refusal) for this run.
+
+    A dispatch of this file runs only from the ref platform-checks, whose caches no release ref
+    reads. A call is told apart by github.workflow_ref, which names the caller's file: it runs in
+    the caller's ref with the cache access the caller gives it (cache-mode), and the cache-prune
+    job, which deletes this ref's superseded caches, does not run.
+    """
+    workflow = env.get("GITHUB_WORKFLOW_REF", "").split("@", 1)[0]
+    if not workflow:
+        return False, "GITHUB_WORKFLOW_REF is empty, so a dispatch cannot be told from a call"
+    if not workflow.endswith("/" + THIS_FILE):
+        return True, ""
+    if env.get("GITHUB_REF") != "refs/heads/platform-checks":
+        return False, (f"dispatch this workflow with --ref platform-checks, not {env.get('GITHUB_REF')}: "
+                       "its caches and its permissions are scoped to that ref")
+    return False, ""
+
 
 def plan():
     """Check each input exactly as the jobs will use it (nothing is stripped or rewritten)."""
     env = os.environ
-    if env.get("GITHUB_REF") != "refs/heads/platform-checks":
-        die(f"dispatch this workflow with --ref platform-checks, not {env.get('GITHUB_REF')}: "
-            "its caches and its permissions are scoped to that ref")
+    called, refusal = scope(env)
+    if refusal:
+        die(refusal)
     head, base, plant = env.get("PC_HEAD", ""), env.get("PC_BASE", ""), env.get("PC_PLANT", "")
     if not SHA.fullmatch(head):
         die("head must be a full 40-character commit id")
@@ -135,7 +158,9 @@ def plan():
         print(f"{k}={json.dumps(v, **compact)}")
     print(f"builds={json.dumps([b for p in RUNNERS for b in out[f'builds_{p}']], **compact)}")
     print(f"legs={json.dumps([l for p in RUNNERS for l in out[f'legs_{p}']], **compact)}")
-    print(f"PLAN {sum(len(out[f'builds_{p}']) for p in RUNNERS)} build jobs, {total} test legs", file=sys.stderr)
+    print(f"called={str(called).lower()}")
+    print(f"PLAN {sum(len(out[f'builds_{p}']) for p in RUNNERS)} build jobs, {total} test legs; "
+          + (f"called by {env.get('GITHUB_WORKFLOW_REF')}" if called else "a dispatch"), file=sys.stderr)
 
 
 # ---------------------------------------------------------------- nextest results
@@ -765,8 +790,31 @@ def classifier_selftest():
     return bad
 
 
+def scope_selftest():
+    """The plan's scope rows: a dispatch runs only from platform-checks; a call runs anywhere."""
+    caller = "cybermonklabs/oh-my-pi/.github/workflows/sami-checks.yml"
+    rows = [
+        ("a dispatch from platform-checks", (False, False),
+         {"GITHUB_WORKFLOW_REF": f"cybermonklabs/oh-my-pi/{THIS_FILE}@refs/heads/platform-checks", "GITHUB_REF": "refs/heads/platform-checks"}),
+        ("a dispatch from another ref is refused", (False, True),
+         {"GITHUB_WORKFLOW_REF": f"cybermonklabs/oh-my-pi/{THIS_FILE}@refs/heads/sami-candidate", "GITHUB_REF": "refs/heads/sami-candidate"}),
+        ("a call from a push to sami-candidate", (True, False),
+         {"GITHUB_WORKFLOW_REF": f"{caller}@refs/heads/sami-candidate", "GITHUB_REF": "refs/heads/sami-candidate"}),
+        ("a call from a dispatch of another branch", (True, False),
+         {"GITHUB_WORKFLOW_REF": f"{caller}@refs/heads/feat/x", "GITHUB_REF": "refs/heads/feat/x"}),
+        ("no workflow ref is refused", (False, True), {"GITHUB_REF": "refs/heads/platform-checks"}),
+    ]
+    bad = 0
+    for name, want, env in rows:
+        called, refusal = scope(env)
+        got = (called, bool(refusal))
+        print(f"{'OK      ' if got == want else 'MISMATCH'} scope: {name}: called={called} refused={bool(refusal)}")
+        bad |= got != want
+    return int(bad)
+
+
 def selftest():
-    bad = classifier_selftest()
+    bad = classifier_selftest() | scope_selftest()
     problems = scan_selftest()
     for p in problems:
         print(f"MISMATCH scan control: {p}")

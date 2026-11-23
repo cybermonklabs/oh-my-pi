@@ -1,6 +1,8 @@
 # One platform of platform-checks.yml: build each tree once, then the test legs that run the
 # archives. Called once per platform, so each platform's legs start as soon as its own builds
-# are done. See platform-checks.yml for how to dispatch and for the security boundary.
+# are done. See platform-checks.yml for how to dispatch and for the security boundary. Every
+# input comes from platform-checks.yml's call, never from github.event: when sami-checks.yml
+# calls platform-checks.yml, the event is sami-checks' own push or dispatch.
 name: platform checks (one platform)
 
 on:
@@ -19,12 +21,36 @@ on:
         required: false
         default: ""
         type: string
+      head:
+        required: true
+        type: string
+      base:
+        required: false
+        default: ""
+        type: string
+      plant:
+        required: false
+        default: ""
+        type: string
+      crates:
+        required: true
+        type: string
+      filter:
+        required: true
+        type: string
+      retries:
+        required: true
+        type: string
+      timeout_minutes:
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# Only the build job writes cargo's cache; the test legs may only read it.
-cache-mode: read
+# Only the build job may write cargo's cache. It declares no cache-mode, so it takes the calling
+# job's (write on a dispatch of platform-checks.yml, none from sami-checks.yml); the test legs,
+# which run member tests, declare none.
 
 defaults:
   run:
@@ -35,13 +61,13 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
   NEXTEST_VERSION: "0.9.151"
-  PC_HEAD: ${{ github.event.inputs.head }}
-  PC_BASE: ${{ github.event.inputs.base }}
-  PC_PLANT: ${{ github.event.inputs.plant }}
-  PC_CRATES: ${{ github.event.inputs.crates }}
-  PC_FILTER: ${{ github.event.inputs.filter }}
-  PC_RETRIES: ${{ github.event.inputs.retries }}
-  PC_TIMEOUT_MINUTES: ${{ github.event.inputs.timeout_minutes }}
+  PC_HEAD: ${{ inputs.head }}
+  PC_BASE: ${{ inputs.base }}
+  PC_PLANT: ${{ inputs.plant }}
+  PC_CRATES: ${{ inputs.crates }}
+  PC_FILTER: ${{ inputs.filter }}
+  PC_RETRIES: ${{ inputs.retries }}
+  PC_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
   PC_PLANT_TREE: ${{ inputs.plant_tree }}
 
 jobs:
@@ -53,7 +79,6 @@ jobs:
         include: ${{ fromJSON(inputs.builds) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
-    cache-mode: write
     env:
       PC_PLATFORM: ${{ matrix.platform }}
       PC_TREE: ${{ matrix.tree }}
@@ -139,6 +164,8 @@ jobs:
         include: ${{ fromJSON(inputs.legs) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 345
+    # A leg runs member tests and restores no cache, so it gets no cache access at all.
+    cache-mode: none
     env:
       PC_PLATFORM: ${{ matrix.platform }}
       PC_TREE: ${{ matrix.tree }}

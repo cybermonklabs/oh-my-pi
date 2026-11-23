@@ -8,15 +8,20 @@
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
+  sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
+  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result
+  sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD              the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py selftest                           the counters and the summary against hand-made inputs
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
-with no JUnit report or no summary line, a command the time bound or a signal ended, and a unit
-the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
-they belong to. A test that passed after printing a skip marker compared nothing: it is counted
-apart, named, and its unit is UNKNOWN. A test that started and never ended is named.
+with no JUnit report or no summary line, a command the time bound or a signal ended, a clippy run
+whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
+gives no verdict for, and a unit the plan expects that no job reported, or that two jobs reported,
+are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
+compared nothing: it is counted apart, named, and its unit is UNKNOWN. A test that started and
+never ended is named.
 """
 
 import json
@@ -47,6 +52,14 @@ DEFAULT_WEIGHT = 5.0
 # A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
 # a line that only mentions the word later (`the host half is skipped: ...`) does not.
 SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
+# The platform rows: platform-checks.yml, called on the candidate, tests these crates on these
+# platforms (the fork's hand-run platform rows: pi-shell, macOS and Windows).
+PLATFORMS = ("macos", "windows")
+PLATFORM_CRATES = "pi-shell"
+# The clippy row: the crates the fork's hand-run clippy gate linted, one unit each.
+CLIPPY_CRATES = ("pi-shell", "pi-vcs", "pi-vfs", "pi-walker", "pi-builtins", "pi-natives")
+# The name of the unused import clippy.sh plants as the clippy row's control.
+CLIPPY_CONTROL = "ScClippyControl"
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -57,6 +70,9 @@ ROWS = (
     ("TypeScript suites", "ts-small"),
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
+    ("macOS: pi-shell, platform checks", "macos"),
+    ("Windows: pi-shell, platform checks", "windows"),
+    ("clippy --tests -D warnings, per crate (failed: findings)", "clippy"),
 )
 
 
@@ -78,7 +94,8 @@ def ts_matrix():
 
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
-    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts"]
+    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()]
+    names += ["ts-small", "checkts", "platforms", "clippy"]
     return names
 
 
@@ -107,6 +124,9 @@ def cmd_plan():
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
+        "platforms": ",".join(PLATFORMS),
+        "platform_crates": PLATFORM_CRATES,
+        "clippy_crates": " ".join(CLIPPY_CRATES),
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -355,6 +375,178 @@ def parse_plain(exit_code, secs, row, unit, log):
                   failures=[] if ok else [f"{unit}: exit {exit_code}: " + " / ".join(l.strip() for l in tail if l.strip())[-600:]])
 
 
+# A finding: `file:line:col: warning|error[code]: message`, as cargo prints it with
+# --message-format=short (the kit's finding_lines pattern).
+FINDING = re.compile(r"^(?P<file>\S+?):\d+:\d+: (?:warning|error)(?:\[[^\]]*\])?: (?P<msg>.*)$")
+
+
+def read_lines(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return None
+
+
+def findings(lines):
+    return [(m["file"], m["msg"]) for m in map(FINDING.match, lines) if m]
+
+
+def clippy_crates(metadata, crates):
+    """Each crate's directory and library root, relative to the workspace root, from
+    `cargo metadata --no-deps`; "-" for what the tree does not have."""
+    meta = json.load(open(metadata, encoding="utf-8"))
+    root = meta["workspace_root"]
+    pkgs = {p["name"]: p for p in meta["packages"]}
+    for c in crates:
+        p = pkgs.get(c)
+        if p is None:
+            print(f"{c}\t-\t-")
+            continue
+        lib = next((t["src_path"] for t in p["targets"] if any(k.endswith("lib") or k == "proc-macro" for k in t["kind"])), None)
+        print(f"{c}\t{os.path.relpath(os.path.dirname(p['manifest_path']), root)}\t{os.path.relpath(lib, root) if lib else '-'}")
+
+
+def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file):
+    """One crate's clippy result. Its findings are the lines in files under its own directory: a
+    dependency's warnings, which --no-deps leaves at their own level, are not this crate's.
+    FAIL: exit 101 and findings, each named with its count. PASS: exit 0, no finding, and the
+    control run read the unused import clippy.sh planted in the crate's library root as a
+    finding. Anything else is UNKNOWN."""
+    def r(status, own=(), note=""):
+        counts = {}
+        for f, m in own:
+            counts[f"{f}: {m}"] = counts.get(f"{f}: {m}", 0) + 1
+        named = [k if n == 1 else f"{k} ({n} times)" for k, n in sorted(counts.items())]
+        return result("clippy", crate, "runner", status, exit_code, secs, failed=len(own), failures=named, note=note)
+
+    if crate_dir == "-":
+        return r("UNKNOWN", note=f"the tree has no package {crate}")
+    lines = read_lines(log)
+    if lines is None:
+        return r("UNKNOWN", note="no log")
+    own = [(f, m) for f, m in findings(lines) if f.startswith(crate_dir.rstrip("/") + "/")]
+    try:
+        code = int(exit_code)
+    except ValueError:
+        code = None
+    if code not in (0, 101):
+        return r("UNKNOWN", own, f"exit {exit_code}: clippy did not finish" + (" (the time bound ended it)" if code == 124 else ""))
+    if code == 101 and not own:
+        first = next((l for l in lines if l.startswith("error")), "no error line")
+        return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
+    if code == 0 and own:
+        return r("UNKNOWN", own, f"exit 0 with {len(own)} findings under -D warnings")
+    if own:
+        return r("FAIL", own)
+    ctl = read_lines(ctl_log)
+    if ctl is None:
+        return r("UNKNOWN", note="the control left no log, so a clean result proves nothing")
+    if not any(f == ctl_file and CLIPPY_CONTROL in m for f, m in findings(ctl)):
+        return r("UNKNOWN", note=f"the control's unused import planted in {ctl_file} was not read as a finding, so a clean result proves nothing")
+    return r("PASS")
+
+
+def read_kv(path):
+    out = {}
+    for line in read_lines(path) or ():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def read_tsv(path):
+    rows = [l.split("\t") for l in read_lines(path) or ()]
+    return [dict(zip(rows[0], r)) for r in rows[1:]] if rows else None
+
+
+def platform_results(pc_dir, commit):
+    """One result per platform in PLATFORMS from the platform checks' own report (pc-report:
+    summary.md, verdicts.tsv, tests.tsv) and each leg's meta.env and JUnit report, all found
+    under pc_dir. The verdict is the report's own, for the head tree and the runner's user: PASS
+    reads PASS; FAIL, TIMEOUT and FLAKY read FAIL with each test that did not pass named; any
+    other verdict, a report of another commit, or a platform it gives no verdict for reads UNKNOWN.
+    An UNKNOWN names the head build's failure on that platform, when its build record
+    (pc-build-<platform>-head) shows one, with the first compiler error."""
+    where = {}
+    for dirpath, _, names in os.walk(pc_dir):
+        for n in names:
+            where.setdefault(n, []).append(os.path.join(dirpath, n))
+    unit = PLATFORM_CRATES
+
+    def unknown(note):
+        return [result(p, unit, "runner", "UNKNOWN", "-", 0, note=note) for p in PLATFORMS]
+
+    if len(where.get("verdicts.tsv", ())) != 1:
+        return unknown(f"the platform checks' report (pc-report) was not read: {len(where.get('verdicts.tsv', ()))} verdicts.tsv found")
+    report = os.path.dirname(where["verdicts.tsv"][0])
+    summary = "\n".join(read_lines(os.path.join(report, "summary.md")) or ())
+    verdicts = read_tsv(os.path.join(report, "verdicts.tsv"))
+    tests = read_tsv(os.path.join(report, "tests.tsv"))
+    if verdicts is None or tests is None:
+        return unknown("the platform checks' report has no verdicts.tsv or tests.tsv to read")
+    m = re.search(r"^\| head \| `([0-9a-f]{40})` \|$", summary, re.M)
+    if not m or m.group(1) != commit:
+        return unknown(f"the platform checks' report is of head {m.group(1) if m else '(none named)'}, not {commit}")
+    legs = {}
+    for path in where.get("meta.env", ()):
+        kv = read_kv(path)
+        if (kv.get("tree"), kv.get("who")) == ("head", "user"):
+            legs.setdefault(kv.get("platform"), []).append((kv, os.path.dirname(path)))
+
+    def build_failure(p):
+        for path in where.get("build.env", ()):
+            d = os.path.dirname(path)
+            kv = read_kv(path)
+            if os.path.basename(d) != f"pc-build-{p}-head" or kv.get("exit") in (None, "0"):
+                continue
+            log = read_lines(os.path.join(d, "build-head.log")) or []
+            for i, l in enumerate(log):
+                if re.match(r"error(\[E\d+\])?: ", l):
+                    at = next((x.split("-->", 1)[1].strip() for x in log[i + 1:i + 3] if "-->" in x), "")
+                    return f"the head's test build failed (exit {kv['exit']}): {l.strip()}" + (f" at {at}" if at else "")
+            return f"the head's test build failed (exit {kv['exit']})"
+        return ""
+
+    out = []
+    for p in PLATFORMS:
+        key = lambda row: (row.get("platform"), row.get("tree"), row.get("user")) == (p, "head", "user")
+        lines = [v.get("verdict", "") for v in verdicts if key(v)]
+        if len(lines) != 1:
+            bf = build_failure(p)
+            out.append(result(p, unit, "runner", "UNKNOWN", "-", 0, note=f"the platform checks' report gives {len(lines)} verdicts "
+                              f"for the head on {p}, not 1" + (f"; {bf}" if bf else "")))
+            continue
+        line = lines[0]
+        mine = [t for t in tests if key(t)]
+        bad = [f"{t.get('binary')} {t.get('test')}: {t.get('verdict')}, passed {t.get('passed')}" for t in mine if t.get("verdict") != "PASS"]
+        times = []
+        for _, d in legs.get(p, ()):
+            try:
+                times += [(c[0], c[2]) for c in junit_cases(os.path.join(d, "junit.xml")) if c[1] != "skipped"]
+            except (OSError, ET.ParseError):
+                pass
+        secs = max((int(kv.get("run_seconds") or 0) for kv, _ in legs.get(p, ())), default=0)
+        exit_code = ",".join(kv.get("run_exit", "?") for kv, _ in legs.get(p, ())) or "-"
+        ign = re.search(r"\bignored=(\d+)", line)
+        status = {"PASS": "PASS", "FAIL": "FAIL", "TIMEOUT": "FAIL", "FLAKY": "FAIL"}.get(line.split(" ", 1)[0], "UNKNOWN")
+        note = line if status == "UNKNOWN" else ""
+        if (status == "PASS" and (bad or not mine)) or (status == "FAIL" and not bad):
+            status, note = "UNKNOWN", f"the verdict ({line}) and the report's test list disagree"
+        if status == "UNKNOWN" and build_failure(p):
+            note += "; " + build_failure(p)
+        out.append(result(p, unit, "runner", status, exit_code, secs, len(mine) - len(bad), len(bad),
+                          int(ign.group(1)) if ign else 0, bad, times, note))
+    return out
+
+
+def cmd_platforms(pc_dir, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    for r in platform_results(pc_dir, os.environ.get("SC_COMMIT", "")):
+        json.dump(r, open(os.path.join(out_dir, f"{r['row']}.json"), "w", encoding="utf-8"))
+        print(f"PLATFORM {r['row']} {r['status']}: {r['passed']} passed, {r['failed']} not passed {r['note']}")
+
+
 def load_results(results_dir):
     out = []
     for dirpath, _, files in os.walk(results_dir):
@@ -390,6 +582,10 @@ def expected_units(build_dir):
     for s in range(1, CODING_AGENT_SHARDS + 1):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
+    for p in PLATFORMS:
+        exp.append((p, PLATFORM_CRATES, "runner"))
+    for c in CLIPPY_CRATES:
+        exp.append(("clippy", c, "runner"))
     return exp, notes
 
 
@@ -419,8 +615,9 @@ def cmd_summary(results_dir, build_dir):
     lines.append("")
     lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed. "
                  "A unit is UNKNOWN when its runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with "
-                 "its summary line), when a passing test printed a skip marker, or when no job (or more than one) "
-                 "reported it; its row is then UNKNOWN too.")
+                 "its summary line, clippy 0/101), when a passing test printed a skip marker, when a clean clippy "
+                 "crate's planted control was not caught, when the platform checks gave its platform no verdict, or "
+                 "when no job (or more than one) reported it; its row is then UNKNOWN too.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -591,7 +788,72 @@ def selftest():
         f.write("# c\n10 x\n600 x root\n")
     check("weights per user", (read_weights(wf, "runner")["x"], read_weights(wf, "root")["x"]), (10.0, 600.0))
 
-    # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control).
+    # clippy: a crate's own findings fail it; a clean crate passes only when its control was caught.
+    def write(name, text):
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    own_f = "crates/pi-vfs/src/a.rs:3:5: error: redundant clone\n"
+    dep_f = "crates/pi-shell/src/b.rs:1:1: warning: unused variable: `x`\n"
+    ctl = write("ctl.log", f"crates/pi-vfs/src/lib.rs:90:1: error: unused import: `std::collections::BTreeMap as {CLIPPY_CONTROL}`\n")
+    noctl = write("noctl.log", "    Checking pi-vfs v0.1.0\n")
+
+    def cl(text, ex, c=ctl):
+        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs")
+
+    r = cl(dep_f + own_f + own_f + "error: could not compile `pi-vfs`\n", 101)
+    check("clippy fail names its own findings only", (r["status"], r["failures"], r["failed"]),
+          ("FAIL", ["crates/pi-vfs/src/a.rs: redundant clone (2 times)"], 2))
+    check("clippy clean with its control caught", cl(dep_f + "    Finished\n", 0)["status"], "PASS")
+    check("clippy clean with its control not caught", cl("    Finished\n", 0, noctl)["status"], "UNKNOWN")
+    check("clippy clean with no control log", cl("    Finished\n", 0, os.path.join(d, "absent"))["status"], "UNKNOWN")
+    check("clippy killed", cl(own_f, 137)["status"], "UNKNOWN")
+    check("clippy ended by its bound", "time bound" in cl("", 124)["note"], True)
+    check("clippy 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
+    check("clippy 0 with a finding", cl(own_f, 0)["status"], "UNKNOWN")
+    check("clippy crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-")["status"], "UNKNOWN")
+
+    # The platform rows: the platform checks' own report, read per platform.
+    commit = "c" * 40
+    pc = os.path.join(d, "pc")
+    rep = os.path.join(pc, "pc-report")
+    leg = os.path.join(pc, "pc-results-macos-head-user-1")
+    os.makedirs(rep)
+    os.makedirs(leg)
+
+    def pc_report(head, verdicts):
+        write("pc/pc-report/summary.md", f"| what | commit |\n|---|---|\n| head | `{head}` |\n| base | `-` |\n")
+        write("pc/pc-report/verdicts.tsv", "platform\ttree\tuser\tverdict\n" + "".join(f"{p}\thead\tuser\t{v}\n" for p, v in verdicts))
+
+    write("pc/pc-report/tests.tsv", "platform\ttree\tuser\tbinary\ttest\tverdict\tpassed\tflaky\tfailed\ttimed_out\tnot_run\n"
+          "macos\thead\tuser\tpi-shell\ta::x\tPASS\t1/1\t0\t0\t0\t0\nmacos\thead\tuser\tpi-shell\ta::y\tTIMEOUT\t0/1\t0\t0\t1\t0\n")
+    write("pc/pc-results-macos-head-user-1/meta.env", "platform=macos\ntree=head\nwho=user\nleg=1\nrun_exit=100\nrun_seconds=2220\n")
+    pc_report(commit, [("macos", "TIMEOUT (1 past the time bound: pi-shell a::y) run=2 ignored=1")])
+    got = {r["row"]: r for r in platform_results(pc, commit)}
+    check("platform timeout reads FAIL with its test named",
+          (got["macos"]["status"], got["macos"]["failures"], got["macos"]["passed"], got["macos"]["ignored"], got["macos"]["seconds"]),
+          ("FAIL", ["pi-shell a::y: TIMEOUT, passed 0/1"], 1, 1, 2220.0))
+    check("platform the report gives no verdict for", got["windows"]["status"], "UNKNOWN")
+    # A platform whose head build failed: its UNKNOWN names the first compiler error.
+    os.makedirs(os.path.join(pc, "pc-build-windows-head"))
+    write("pc/pc-build-windows-head/build.env", "sha=x\nexit=101\nseconds=898\n")
+    write("pc/pc-build-windows-head/build-head.log", "   Compiling pi-shell v1.0.0\r\nerror[E0063]: missing field `on_busy`\r\n"
+          "   --> crates\\pi-shell\\src\\sys\\spawn\\windows\\tests.rs:688:11\r\nerror: could not compile `pi-shell`\r\n")
+    note = {r["row"]: r for r in platform_results(pc, commit)}["windows"]["note"]
+    check("platform build failure named", "failed (exit 101): error[E0063]: missing field `on_busy` at crates\\pi-shell\\src\\sys\\spawn\\windows\\tests.rs:688:11" in note, True)
+    pc_report(commit, [("macos", "UNKNOWN (no test list: no archive) run=? ignored=?")])
+    check("platform UNKNOWN verdict", platform_results(pc, commit)[0]["status"], "UNKNOWN")
+    pc_report(commit, [("macos", "PASS (2 passed in 1 of 1 repeats) run=2 ignored=0")])
+    check("platform PASS beside a test that did not pass", platform_results(pc, commit)[0]["status"], "UNKNOWN")
+    pc_report("d" * 40, [("macos", "TIMEOUT (1 past the time bound: pi-shell a::y) run=2 ignored=1")])
+    check("platform report of another commit", {r["status"] for r in platform_results(pc, commit)}, {"UNKNOWN"})
+    check("no platform report", {r["status"] for r in platform_results(os.path.join(d, "nopc"), commit)}, {"UNKNOWN"})
+
+    # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control):
+    # a pi-shell binary, a clippy crate and a platform.
+    silent = {("set-root", "pi-shell::zle_pty", "root"), ("clippy", "pi-vfs", "runner"), ("windows", PLATFORM_CRATES, "runner")}
     res = os.path.join(d, "res")
     build = os.path.join(d, "build")
     os.makedirs(res)
@@ -605,8 +867,8 @@ def selftest():
     json.dump(meta, open(os.path.join(build, "binaries-metadata.json"), "w"))
     exp, _ = expected_units(build)
     for i, (row, unit, who) in enumerate(exp):
-        if (row, unit, who) == ("set-root", "pi-shell::zle_pty", "root"):
-            continue  # the planted silent unit
+        if (row, unit, who) in silent:
+            continue
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
                   open(os.path.join(res, f"{i}.json"), "w"))
 
@@ -621,9 +883,13 @@ def selftest():
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
     check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 |" in out, True)
+    check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
+    check("summary row of the silent clippy crate", "| clippy --tests -D warnings, per crate (failed: findings) | **UNKNOWN** | 5 / 0 / 1 |" in out, True)
+    check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
+    check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
-    json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1),
-              open(os.path.join(res, "silent.json"), "w"))
+    for i, (row, unit, who) in enumerate(sorted(silent)):
+        json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res, f"silent-{i}.json"), "w"))
     rc, _ = summary()
     check("summary exit when every unit passed", rc, 0)
     # A unit two jobs reported is UNKNOWN.
@@ -656,8 +922,9 @@ def selftest():
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
-    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
-          "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported")
+    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest, bun and clippy counters, the "
+          "platform report reader, the shard assignment and per-user weights, and the summary's UNKNOWN for a "
+          "unit no job or two jobs reported")
 
 
 def main(argv):
@@ -679,6 +946,12 @@ def main(argv):
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":
         print(json.dumps(parse_plain(*a)))
+    elif c == "clippy-crates":
+        clippy_crates(a[0], a[1:])
+    elif c == "clippy":
+        print(json.dumps(parse_clippy(*a)))
+    elif c == "platforms":
+        cmd_platforms(*a)
     elif c == "summary":
         sys.exit(cmd_summary(*a))
     elif c == "selftest":

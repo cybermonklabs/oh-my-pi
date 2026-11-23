@@ -1,7 +1,8 @@
 # Platform checks: a fork member's Rust tests on macos-15, windows-2025 and ubuntu-24.04
 # (ubuntu also as root, on a real kernel with fs.protected_* set), head against an optional
-# base, with an optional planted fault. Started by hand (workflow_dispatch); a push that
-# changes this tool runs only its own controls.
+# base, with an optional planted fault. Started by hand (workflow_dispatch), or called by
+# another workflow of this repository (workflow_call, the same inputs; sami-checks.yml calls it
+# for each release candidate); a push that changes this tool runs only its own controls.
 #
 # How to dispatch. Push every commit you name first (a plant goes on a scratch branch you
 # have scanned); give commits as full 40-character ids; always dispatch with --ref
@@ -43,7 +44,9 @@
 # the job part of the key; the rustc version, the environment and the Cargo.lock hashes stay in
 # it, so a check restores the newest cache of the same platform and toolchain (the lock hash
 # falls back to a key prefix), and the workspace crates themselves always rebuild. Only the
-# build jobs may write the cache (cache-mode).
+# build jobs may write the cache: every job that needs no cache declares cache-mode none, and
+# the build jobs (and cache-prune, which deletes through the REST API) declare nothing, so they
+# take the run's own mode: write on a dispatch, the caller's mode on a call.
 #
 # Limits. Doctests do not run: nextest cannot run them, least of all from an archive, so they
 # would need a cargo build of their own per tree. pi-shell at 9058ab9d has at most 4 (about 6 s
@@ -63,8 +66,17 @@
 # runner gives passwordless sudo), so a hostile member could write this ref's cargo cache from
 # a build job, which the release refs never read, or upload a forged results artifact under
 # another leg's name before that leg does. The log scan detects leaks; it does not contain them.
-# The plan job refuses any ref but platform-checks, so these caches never share a scope with
-# the release refs.
+# A dispatch runs only from the ref platform-checks (the plan job refuses any other), so its
+# caches never share a scope with the release refs.
+#
+# Called by another workflow. The plan tells a call from a dispatch by github.workflow_ref,
+# which names the caller's file, and skips the ref check: the run is in the caller's ref. Its
+# cache access is the caller's: GitHub passes the calling job's cache-mode down as the limit, and
+# these two files declare no read or write that could exceed it (a called workflow that asks for
+# more than its caller allows does not start). sami-checks.yml calls it with cache-mode none, so
+# its builds restore and save nothing. The cache-prune job runs only on a dispatch of this file,
+# never on a call. A caller must still grant it actions: write, because GitHub checks each job's
+# permissions against the caller's before the run starts, whether or not the job would run.
 name: platform checks
 
 run-name: >-
@@ -73,7 +85,7 @@ run-name: >-
 
 on:
   workflow_dispatch:
-    inputs:
+    inputs: &inputs
       head:
         description: "Commit to test: a full 40-character id, pushed to this repository"
         required: true
@@ -133,6 +145,9 @@ on:
         required: false
         default: false
         type: boolean
+  # A call from another workflow of this repository: the same inputs.
+  workflow_call:
+    inputs: *inputs
   # GitHub dispatches only a workflow it has seen run, and this file lives off the default
   # branch: a push that changes the tool runs it once, which registers it. That run is the
   # tool's own test: the classifier and scan controls, and the controls on real nextest output
@@ -146,10 +161,6 @@ on:
 
 permissions:
   contents: read
-
-# Only the build jobs (in platform-checks-platform.yml) write cargo's cache; the platform
-# jobs below pass write access to that workflow, which grants it to its build job alone.
-cache-mode: read
 
 # One group per dispatch: a dispatch never cancels another.
 concurrency:
@@ -181,6 +192,7 @@ jobs:
   plan:
     name: plan
     runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 15
     outputs:
       builds: ${{ steps.plan.outputs.builds }}
@@ -192,22 +204,25 @@ jobs:
       builds_ubuntu: ${{ steps.plan.outputs.builds_ubuntu }}
       legs_ubuntu: ${{ steps.plan.outputs.legs_ubuntu }}
       plant_tree: ${{ steps.trees.outputs.plant_tree }}
+      called: ${{ steps.plan.outputs.called }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Controls of the classifier and the scan (hand-made inputs)
         run: python3 .github/platform-checks/pc.py selftest
+      # Every run but a push of this tool checks its inputs, so a dispatch with an empty head fails
+      # here and never reads as the controls' green run.
       - name: Inputs
         id: plan
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'push' || inputs.head != ''
         run: python3 .github/platform-checks/pc.py plan >> "$GITHUB_OUTPUT"
       - name: Runner paths
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.head != ''
         run: bash .github/platform-checks/tree.sh setup
       - name: Commits exist, and the plant changes the head
         id: trees
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.head != ''
         run: |
           bash .github/platform-checks/tree.sh checkout "$PC_HEAD"
           if [ -n "$PC_BASE" ]; then
@@ -224,8 +239,9 @@ jobs:
     # pass, failure, hang, flake and ignored test through leg.sh and the classifier.
     name: controls on real nextest output
     needs: plan
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && inputs.head == ''
     runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -257,44 +273,64 @@ jobs:
   macos:
     name: macos
     needs: plan
-    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_macos != '[]'
-    # The most the called workflow may grant: there, only its build job writes.
-    cache-mode: write
+    if: inputs.head != '' && needs.plan.outputs.legs_macos != '[]'
+    # No cache-mode: the build job there takes this run's mode (write on a dispatch, the
+    # caller's on a call); the test legs there declare none.
     uses: ./.github/workflows/platform-checks-platform.yml
     with:
       builds: ${{ needs.plan.outputs.builds_macos }}
       legs: ${{ needs.plan.outputs.legs_macos }}
       plant_tree: ${{ needs.plan.outputs.plant_tree }}
+      head: ${{ inputs.head }}
+      base: ${{ inputs.base }}
+      plant: ${{ inputs.plant }}
+      crates: ${{ inputs.crates }}
+      filter: ${{ inputs.filter }}
+      retries: ${{ inputs.retries }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
   windows:
     name: windows
     needs: plan
-    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_windows != '[]'
-    # The most the called workflow may grant: there, only its build job writes.
-    cache-mode: write
+    if: inputs.head != '' && needs.plan.outputs.legs_windows != '[]'
+    # No cache-mode: as for macos.
     uses: ./.github/workflows/platform-checks-platform.yml
     with:
       builds: ${{ needs.plan.outputs.builds_windows }}
       legs: ${{ needs.plan.outputs.legs_windows }}
       plant_tree: ${{ needs.plan.outputs.plant_tree }}
+      head: ${{ inputs.head }}
+      base: ${{ inputs.base }}
+      plant: ${{ inputs.plant }}
+      crates: ${{ inputs.crates }}
+      filter: ${{ inputs.filter }}
+      retries: ${{ inputs.retries }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
   ubuntu:
     name: ubuntu
     needs: plan
-    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_ubuntu != '[]'
-    # The most the called workflow may grant: there, only its build job writes.
-    cache-mode: write
+    if: inputs.head != '' && needs.plan.outputs.legs_ubuntu != '[]'
+    # No cache-mode: as for macos.
     uses: ./.github/workflows/platform-checks-platform.yml
     with:
       builds: ${{ needs.plan.outputs.builds_ubuntu }}
       legs: ${{ needs.plan.outputs.legs_ubuntu }}
       plant_tree: ${{ needs.plan.outputs.plant_tree }}
+      head: ${{ inputs.head }}
+      base: ${{ inputs.base }}
+      plant: ${{ inputs.plant }}
+      crates: ${{ inputs.crates }}
+      filter: ${{ inputs.filter }}
+      retries: ${{ inputs.retries }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
 
   report:
     name: report
     needs: [plan, macos, windows, ubuntu]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.plan.result == 'success' }}
+    if: ${{ always() && inputs.head != '' && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
+    cache-mode: none
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -343,7 +379,9 @@ jobs:
     # may delete cache entries.
     name: keep one cargo cache per platform
     needs: [plan, macos, windows, ubuntu]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.plan.result == 'success' }}
+    # Only on a dispatch of this file: a call runs in the caller's ref, whose caches are not this
+    # job's to delete.
+    if: ${{ always() && inputs.head != '' && needs.plan.result == 'success' && needs.plan.outputs.called == 'false' }}
     # The run's conclusion follows the verdicts; a failed cleanup shows only on this job.
     continue-on-error: true
     runs-on: ubuntu-24.04
