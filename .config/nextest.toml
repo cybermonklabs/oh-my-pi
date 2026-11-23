@@ -53,6 +53,14 @@ threads-required = "num-test-threads"
 # reference's output already varies with scheduling, and a saturated machine
 # starves its daemons past their readiness deadline. Each takes every test
 # thread, so it runs alone.
+[[profile.default.overrides]]
+filter = 'test(/^rsync::conformance::/)'
+threads-required = "num-test-threads"
+
+[[profile.ci.overrides]]
+filter = 'test(/^rsync::conformance::/)'
+threads-required = "num-test-threads"
+
 # cp's probe matrix (`cp::tests::cp_does_what_gnu_does_across_the_probe_matrix`)
 # runs 138,725 rows of cp against GNU's recorded answers, on every CPU. It takes
 # about 15 s on runc and 230 to 500 s under gVisor (GKE Sandbox), past the 240 s
@@ -65,11 +73,3 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 [[profile.ci.overrides]]
 filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix)'
 slow-timeout = { period = "60s", terminate-after = 20 }
-
-[[profile.default.overrides]]
-filter = 'test(/^rsync::conformance::/)'
-threads-required = "num-test-threads"
-
-[[profile.ci.overrides]]
-filter = 'test(/^rsync::conformance::/)'
-threads-required = "num-test-threads"
