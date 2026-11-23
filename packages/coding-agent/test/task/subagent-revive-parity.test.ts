@@ -87,9 +87,10 @@ type Compare =
  * when `createAgentSession` gains an option this table does not class.
  */
 const OPTION_COMPARES = {
+	// Stored: the stored session's cwd, where its tools run, on every build.
+	cwd: "data",
 	// Stored for the spawn and a warm revive; held to the live process at a cold revive (accepted difference 8,
 	// where live state changed since the spawn: no route here changes it).
-	cwd: "data",
 	additionalDirectories: "data",
 	credentialSourceSessionId: "data",
 	// Stored in the spawn spec.
@@ -124,7 +125,7 @@ const OPTION_COMPARES = {
 	// Derived from the stored per-call flag.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
-	// The session file's cwd, on every build: both revives pass the header's.
+	// Set at a cold revive only, to the root's cwd where it is not the stored session's: no route here moves the root.
 	secretsProjectDirs: "data",
 	// Set by no subagent build, so the SDK default holds on every path.
 	additionalExtensionPaths: "data",
@@ -553,14 +554,16 @@ function defineRouteCases(result: () => ParityRun): void {
 		expect(differing).toEqual([]);
 	}, 30_000);
 
-	it("on a route that changes no live state, the values accepted difference 8 names are equal on both revives", () => {
-		// Both builds of the secret mask load the project secrets of the tools' directory, so a mask entry is only added.
+	it("on a route that changes no live state, cwd, secretsProjectDirs and the values accepted difference 8 names are equal on both revives", () => {
+		// Both revives build in the stored session's cwd; the cold revive names the root's project secrets only where
+		// the root's cwd is another directory, so a mask entry is only added.
 		const { warm, cold } = result();
 		const liveHeld = (revived: RevivedSubagent) => {
 			const { options } = revived.build;
 			if (!revived.wake) throw new Error("The revive attached no wake-turn monitor");
 			return {
 				cwd: options.cwd,
+				secretsProjectDirs: options.secretsProjectDirs,
 				additionalDirectories: options.additionalDirectories,
 				credentialSourceSessionId: options.credentialSourceSessionId,
 				maxRuntimeMs: revived.wake.maxRuntimeMs,

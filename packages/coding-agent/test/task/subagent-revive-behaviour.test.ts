@@ -1,9 +1,10 @@
 /**
  * A revived subagent runs on the spawn's model, thinking level, LSP and cache-warming values and wake-turn
- * limit, wherever the cold revive runs; after the root session moved it still masks the project secrets of
- * the directory its tools run in, and with its parent parked it takes the root session's workspace roots and
- * credential source. Unless a case says other, it spawns a real subagent on a scripted model, parks it, drops
- * its warm reviver as a subagent worker's exit does, and revives it cold through the persisted reviver factory;
+ * limit, wherever the cold revive runs; after the root session moved it builds in the directory its tools run in,
+ * finds its project's tool sources there and still masks the root project's secrets, and with its parent parked
+ * it takes the root session's workspace roots and credential source. Unless a case says other, it spawns a real
+ * subagent on a scripted model, parks it, drops its warm reviver as a subagent worker's exit does, and revives it
+ * cold through the persisted reviver factory;
  * `createAgentSession`'s options are read through the harness's call-through spy and every request as the
  * provider received it.
  */
@@ -1684,7 +1685,9 @@ describe("project secrets after the root session moved to another directory", ()
 	}, 30_000);
 
 	it("project secrets: after the root moved, the first request after the cold revive carries SA masked, and the request after a tool result holding SB carries SB masked", () => {
-		expect(cold?.build.options.cwd).toBe(projectB);
+		// The cold revive builds in A, where its tools run, and loads B's project secrets beside A's.
+		expect(cold?.build.options.cwd).toBe(env?.cwd);
+		expect(cold?.build.options.secretsProjectDirs).toEqual([projectB]);
 		expect(carries(coldFirst, ALPHA_ROW)).toBe(true);
 		expect(carries(coldFirst, SECRET_A)).toBe(false);
 		expect(coldNext).not.toBe(coldFirst);

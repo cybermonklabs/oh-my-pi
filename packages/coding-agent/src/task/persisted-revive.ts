@@ -16,10 +16,12 @@ import { formatModelRoleAlias } from "../config/model-roles";
 import type { KeptOverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import { extensionPathKey, importExtensionModule, isProjectExtension } from "../extensibility/extensions/loader";
 import { MCPManager } from "../mcp/manager";
 import unavailableCustomToolsPrompt from "../prompts/system/unavailable-custom-tools.md" with { type: "text" };
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { discoverSessionExtensionPaths } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import { type AgentSessionHandle, isLocalAgentSession } from "../session/agent-session-handle";
 import type { AuthStorage } from "../session/auth-storage";
@@ -94,9 +96,9 @@ const UNAVAILABLE_CUSTOM_TOOLS_NOTICE = "unavailable-custom-tools";
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is kept LIVE and read at each
- * revive rather than snapshotted: a revived subagent discovers its context in the root's current cwd, so a
- * later `/new` or cwd move is followed, and its tools run in the cwd its record's header holds; a seance
- * consult does both in the cwd its record holds. A revive takes the artifact manager of its live parent
+ * revive rather than snapshotted, so a later `/new` or cwd move is followed. A revived subagent builds in the
+ * cwd its record's header holds, as the reopened session manager reads it, where its tools run; a seance
+ * consult builds in the cwd its record holds. A revive takes the artifact manager of its live parent
  * session (the root's where the parent is not live) where its spawn passed one (a spec names the live inputs
  * its spawn passed; a record with no spawn spec always takes it) and where that manager can reach the main
  * thread; a seance consult takes none. Auth/models/settings are process-stable and captured by reference.
@@ -151,6 +153,8 @@ export interface SubagentParentInputs {
 	readonly policy: ParentPolicy;
 	/** The tools of the requested descriptors its kernels define now, as cross-thread views. */
 	readonly customTools: CustomTool[];
+	/** Its cwd: the directory its custom-tool paths, MCP manager and project extensions serve. */
+	readonly cwd: string;
 }
 
 /**
@@ -160,13 +164,14 @@ export interface SubagentParentInputs {
 type ParentPolicy = Pick<SpawnSpecPolicy, "credentialSourceSessionId" | "additionalDirectories">;
 
 /**
- * A live parent's inputs for a child's build, its policy fields, and the tools of the child's descriptors its
- * kernels define now.
+ * A live parent's inputs for a child's build, its policy fields, the tools of the child's descriptors its
+ * kernels define now, and its cwd.
  */
 interface LiveParent {
 	readonly inputs: ParentLiveInputs;
 	readonly policy: ParentPolicy;
 	readonly customTools: readonly CustomTool[];
+	readonly cwd: string;
 }
 
 /** The model a cold revive builds on: never the patterns of a spawn's deferred model resolution. */
@@ -177,8 +182,17 @@ export type PerCallGrantInputs = Omit<PerCallModelGrants, "settings" | "parentMo
 
 /** What the main thread prepares for one cold revive before anything is reopened ({@link prepareColdRevive}). */
 export interface PreparedColdRevive {
-	/** The live parent session's inputs: the parent ref's while it holds a session, else the root's. */
+	/**
+	 * The live parent session's inputs: the parent ref's while it holds a session, else the root's. Where that
+	 * session's cwd is not the stored session's, its tool sources are narrowed to the stored session's directory
+	 * ({@link coldReviveLiveInputs}).
+	 */
 	readonly live: ColdReviveLiveInputs;
+	/**
+	 * The cwd of the session {@link live} came from, where it is not the stored session's: such a revive builds on
+	 * the main thread, where a session given no MCP manager discovers the project's MCP servers. Undefined elsewhere.
+	 */
+	readonly foreignSourceCwd: string | undefined;
 	/** The model a spawn spec's model or a per-call worker starts on; absent, the record's patterns decide. */
 	readonly model: ExplicitBuildModel | undefined;
 	/**
@@ -200,8 +214,6 @@ export interface PreparedColdRevive {
 	readonly customTools: readonly CustomTool[];
 	/** Names of the custom tools no live kernel serves. */
 	readonly unavailableTools: readonly string[];
-	/** The root session's cwd, where a revived subagent discovers its context (its tools run in its header's). */
-	readonly rootCwd: string;
 	/**
 	 * The policy fields a spawn takes from its spawner: the live parent's, else the root tool session's (the parent
 	 * is not live, or its home cannot answer); undefined where neither holds a tool session (a host's root).
@@ -219,6 +231,8 @@ export interface PersistedReviveSpec {
 	readonly displayName: string;
 	readonly parentId: string | undefined;
 	readonly sessionFile: string;
+	/** The cwd its file's header holds, as the factory read it: where its tools run. */
+	readonly storedCwd: string;
 	/** Depth derived from the persisted parent chain (drives capability gating). */
 	readonly taskDepth: number;
 	/** The consulted source of a persisted seance session. */
@@ -339,6 +353,7 @@ export function createPersistedSubagentReviverFactory(
 				displayName: ref.displayName,
 				parentId: ref.parentId,
 				sessionFile,
+				storedCwd: peek.cwd,
 				taskDepth,
 				restoredSeance,
 				root: ctx.session,
@@ -346,8 +361,10 @@ export function createPersistedSubagentReviverFactory(
 				settings: ctx.settings,
 			};
 			const spec: PersistedReviveSpec = { ...target, prepared: await prepareColdRevive(ctx, target, init) };
-			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker).
-			const pool = subagentWorkerPool(ctx.settings);
+			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker), except one whose live
+			// inputs came from a session in another directory: in a worker, a session given no MCP manager takes the
+			// process's shared one, so that revival builds on main, where it discovers the stored directory's servers.
+			const pool = spec.prepared.foreignSourceCwd === undefined ? subagentWorkerPool(ctx.settings) : undefined;
 			return pool
 				? revivePersistedPlaced(pool, spec, expectedRef, revivePersistedSubagent)
 				: revivePersistedSubagent(spec, expectedRef);
@@ -375,15 +392,17 @@ export async function prepareColdRevive(
 	const descriptors = parts.tools?.customTools ?? [];
 	const parent = await liveParent(target.id, parentSession, descriptors);
 	const agentName = persistedAgentName(target.displayName, init);
-	const live = coldReviveLiveInputs(
+	const { live, foreignSourceCwd } = await coldReviveLiveInputs(
 		ctx,
-		parent?.inputs,
+		parent,
 		{
 			id: target.id,
 			name: parts.wake?.agent.name ?? agentName,
 			description: parts.wake?.agent.description ?? "",
 		},
 		parts.liveInputs,
+		// A seance consult takes the seance isolation, whatever directory its source ran in.
+		target.restoredSeance ? undefined : target.storedCwd,
 	);
 	const settingsParent = coldReviveSettingsParent(target, parts, live);
 	const modelRegistry = live.modelRegistry;
@@ -447,6 +466,7 @@ export async function prepareColdRevive(
 	const rootTools = root.evalToolSession;
 	return {
 		live,
+		foreignSourceCwd,
 		model,
 		prewalkTarget,
 		discoveryRan: models.discoveryRan,
@@ -454,7 +474,6 @@ export async function prepareColdRevive(
 		grants,
 		customTools: tools.customTools,
 		unavailableTools: tools.unavailable,
-		rootCwd: root.sessionManager.getCwd(),
 		parentPolicy: parent ? parent.policy : rootTools && parentPolicy(rootTools),
 	};
 }
@@ -504,6 +523,7 @@ async function liveParent(
 			},
 			policy: served.policy,
 			customTools: served.customTools,
+			cwd: served.cwd,
 		};
 	}
 	const tools = session && isLocalAgentSession(session) ? session.evalToolSession : undefined;
@@ -512,6 +532,7 @@ async function liveParent(
 		inputs: parentLiveInputs(tools),
 		policy: parentPolicy(tools),
 		customTools: await parentEvalCustomTools(id, tools, descriptors),
+		cwd: tools.cwd,
 	};
 }
 
@@ -545,6 +566,7 @@ export async function serveSubagentParentInputs(
 		settings: sessionSettingsSource(tools.settings),
 		policy: parentPolicy(tools),
 		customTools: customTools.map(tool => toWorkerCustomTool(tool)),
+		cwd: tools.cwd,
 	};
 }
 
@@ -631,27 +653,33 @@ function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boo
 
 /**
  * Live inputs a cold revive passes whatever its record's list names, since leaving one out lets the subagent do
- * more than the live process allows. Without the tree's cost gate it starts its own, which `session.maxCost` does
- * not reach; without the prepared extensions it discovers extensions itself, under the default roots where its
- * extension roots are left out too, so an owner's explicit-only policy no longer holds. Every spawner passes both.
+ * more than the live process allows: without the tree's cost gate it starts its own, which `session.maxCost` does
+ * not reach. Every spawner passes it. The owner's extension roots pass whatever the list names where the subagent
+ * gets no extensions of its own ({@link coldReviveLiveInputs}).
  */
 const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
 	costGate: true,
-	preloadedPreparedExtensions: true,
 };
 
 /**
  * The live inputs of a subagent build: the live parent's (`parent`), else the root tool session's, as a spawn
  * of either reads them, limited to those the spawn passed where its spec names them, except the inputs of
- * {@link KEPT_LIVE_INPUTS}. A root built without a tool session (a host's root) gives its own objects, as cold
- * revives took them before spawn specs.
+ * {@link KEPT_LIVE_INPUTS}. Where it then passes no extensions of its own, the subagent discovers them, under the
+ * owner's extension roots whatever the list names. A root built without a tool session (a host's root) gives its
+ * own objects, as cold revives took them before spawn specs. Where the cwd of the session they come from is not
+ * `storedCwd`, the stored session's (undefined for a seance consult), that session's own tool sources serve another
+ * directory: its custom-tool paths and its MCP manager do not pass, so the SDK discovers the custom tools and the
+ * project's MCP servers in the stored directory; its extensions follow the stored directory
+ * ({@link storedDirectoryExtensions}); and the secret mask loads its project secrets beside the stored directory's.
+ * That session's cwd is then returned as `foreignSourceCwd`.
  */
-function coldReviveLiveInputs(
+async function coldReviveLiveInputs(
 	ctx: PersistedSubagentReviveContext,
-	parent: ParentLiveInputs | undefined,
+	parent: LiveParent | undefined,
 	agent: AgentIdentity,
 	names: readonly SpawnLiveInputName[] | undefined,
-): ColdReviveLiveInputs {
+	storedCwd: string | undefined,
+): Promise<{ live: ColdReviveLiveInputs; foreignSourceCwd: string | undefined }> {
 	const root = ctx.session;
 	// What the process allows: the root's policy, whichever session the other inputs come from.
 	const rootTools = root.evalToolSession;
@@ -660,15 +688,20 @@ function coldReviveLiveInputs(
 		enableIrc: rootTools?.enableIrc,
 		enableMCP: rootTools?.enableMCP,
 	};
-	const inputs = parent ?? (rootTools ? parentLiveInputs(rootTools) : undefined);
+	// The session the inputs come from: the live parent, else the root.
+	const sourceCwd = parent ? parent.cwd : root.sessionManager.getCwd();
+	const elsewhere = storedCwd !== undefined && path.resolve(sourceCwd) !== path.resolve(storedCwd);
+	const inputs = parent?.inputs ?? (rootTools ? parentLiveInputs(rootTools) : undefined);
 	let live: ColdReviveLiveInputs;
 	if (inputs) {
 		live = {
 			...spawnerLiveInputs(inputs, agent),
+			// The source session's own custom-tool paths and MCP manager serve its directory only.
+			preloadedCustomToolPaths: elsewhere ? undefined : inputs.preloadedCustomToolPaths,
 			authStorage: inputs.authStorage ?? ctx.authStorage,
 			modelRegistry: inputs.modelRegistry ?? ctx.modelRegistry,
 			subagentEventBus: inputs.subagentEventBus ?? ctx.subagentEventBus,
-			mcpManager: inputs.mcpManager ?? MCPManager.instance(),
+			mcpManager: elsewhere ? undefined : (inputs.mcpManager ?? MCPManager.instance()),
 			settingsParent: inputs.settings ?? ctx.settings,
 			eventBus: inputs.eventBus ?? ctx.eventBus,
 			parentArtifactManager: inputs.parentArtifactManager,
@@ -683,7 +716,7 @@ function coldReviveLiveInputs(
 			// Owner policy, read when the session asks, never extension authority from a transcript.
 			extensionRoots: () => root.effectiveExtensionRoots,
 			preloadedPreparedExtensions: root.preparedExtensions,
-			mcpManager: MCPManager.instance(),
+			mcpManager: elsewhere ? undefined : MCPManager.instance(),
 			subagentEventBus: ctx.subagentEventBus,
 			settingsParent: ctx.settings,
 			eventBus: ctx.eventBus,
@@ -691,13 +724,52 @@ function coldReviveLiveInputs(
 			policy,
 		};
 	}
+	const ownerRoots = live.extensionRoots;
 	if (names) {
 		const passed = new Set<string>(names);
 		for (const name of SPAWN_LIVE_INPUT_NAMES) {
 			if (!passed.has(name) && KEPT_LIVE_INPUTS[name] !== true) live[name] = undefined;
 		}
 	}
-	return live;
+	if (!live.preloadedPreparedExtensions && !live.preloadedExtensionPaths) live.extensionRoots = ownerRoots;
+	if (!elsewhere || storedCwd === undefined) return { live, foreignSourceCwd: undefined };
+	live.secretsProjectDirs = [sourceCwd];
+	return { live: await storedDirectoryExtensions(live, ownerRoots, storedCwd), foreignSourceCwd: sourceCwd };
+}
+
+/**
+ * `live` with its extensions moved to `storedCwd`, the stored session's cwd: of the prepared extensions and the
+ * extension paths, each but the project-scoped ones of the session they came from (whatever directory that session
+ * found them in), after the project-level extensions of `storedCwd`, found under `roots`, the owner's extension
+ * roots, as a session's own discovery finds them, and each prepared there. A host's inline entry and a user, plugin
+ * or configured entry stay; an entry both lists hold is bound once.
+ */
+async function storedDirectoryExtensions(
+	live: ColdReviveLiveInputs,
+	roots: ColdReviveLiveInputs["extensionRoots"],
+	storedCwd: string,
+): Promise<ColdReviveLiveInputs> {
+	const { preloadedPreparedExtensions: preparedExtensions, preloadedExtensionPaths: extensionPaths } = live;
+	if (!preparedExtensions && !extensionPaths) return live;
+	const project = await discoverSessionExtensionPaths(
+		{ extensionRoots: roots, level: "project" },
+		storedCwd,
+		live.settingsParent,
+	);
+	const added = new Set(await Promise.all(project.map(extensionPathKey)));
+	const stays = async (file: string): Promise<boolean> =>
+		!added.has(await extensionPathKey(file)) && !(await isProjectExtension(file));
+	const moved: ColdReviveLiveInputs = { ...live };
+	if (preparedExtensions) {
+		const kept = await Promise.all(preparedExtensions.map(entry => stays(entry.resolvedPath)));
+		const imported = await Promise.all(project.map(file => importExtensionModule(file, storedCwd)));
+		moved.preloadedPreparedExtensions = [...imported, ...preparedExtensions.filter((_, index) => kept[index])];
+	}
+	if (extensionPaths) {
+		const kept = await Promise.all(extensionPaths.map(stays));
+		moved.preloadedExtensionPaths = [...project, ...extensionPaths.filter((_, index) => kept[index])];
+	}
+	return moved;
 }
 
 /**
@@ -924,10 +996,12 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			`Cannot revive subagent "${spec.id}": session file "${spec.sessionFile}" has no persisted session contract. The agent was not revived.`,
 		);
 	}
+	// Where the subagent's tools run, as the reopened manager reads it: the build and the tools share one directory.
+	const cwd = reopened.getCwd();
 	// The settings overlay as the main thread checked it, once per revive; the other parts as the record holds them.
 	const parts: SpawnSpecParts = { ...coldReviveSpecParts(spec, init), settings: prepared.settings };
 	const settingsParent = coldReviveSettingsParent(spec, parts, prepared.live);
-	const { spawnSpec, legacy } = coldReviveSpawnSpec(spec, parts, init, settingsParent);
+	const { spawnSpec, legacy } = coldReviveSpawnSpec(spec, parts, init, settingsParent, cwd);
 	const approve = prepared.grants
 		? perCallApproval(spec, prepared.grants, settingsParent, prepared.live.modelRegistry)
 		: undefined;
@@ -1012,15 +1086,19 @@ async function coldReviveModel(
 /**
  * The spawn spec the build starts from: each part of the record's spec, and for each part it lacks (every
  * part of a record an older omp wrote, or of a seance consult) or holds in a shape no spawn writes what the
- * cold revive built before spawn specs, with the values every spawn gives (`cacheWarming: false`). A stored
- * value never widens what the live process allows: the fields of a stored part that select a place, an
- * authority or a limit take the live value, or the narrower of the stored and the live one.
+ * cold revive built before spawn specs, with the values every spawn gives (`cacheWarming: false`). The build runs
+ * in `cwd`, the stored session's cwd. A stored value never widens what the live process allows, except the values
+ * that the cold revive also took from the stored session before spawn specs existed: the cwd in which its tools
+ * run, the tool names, the mounted tools, `restrictToolNames`, the spawn allowlist, the agent and display names,
+ * the advisor, the service tier, the model roles and the retry-fallback chains. The other fields of a stored part
+ * that select a place, an authority or a limit take the live value, or the narrower of the stored and the live one.
  */
 function coldReviveSpawnSpec(
 	spec: PersistedReviveSpec,
 	parts: SpawnSpecParts,
 	init: PersistedSessionInit,
 	settingsParent: Settings,
+	cwd: string,
 ): { spawnSpec: SubagentSpawnSpec; legacy: SubagentLegacyRevive | undefined } {
 	const { id, displayName, restoredSeance } = spec;
 	const agentName = persistedAgentName(displayName, init);
@@ -1076,9 +1154,8 @@ function coldReviveSpawnSpec(
 					...parts.policy,
 					// The constant every spawn writes.
 					cacheWarming: false,
-					// Discovery runs in the root's cwd, as for a record with no spec; the tools run in the cwd of
-					// the record's header.
-					cwd: spec.prepared.rootCwd,
+					// The stored session's cwd, where its tools run, never the stored policy's.
+					cwd,
 					// Never shallower than the live parent chain, so `task.maxRecursionDepth` holds.
 					taskDepth: Math.max(parts.policy.taskDepth ?? spec.taskDepth, spec.taskDepth),
 					// Where the spawn passed them, the spawner's as the live parent holds them now (the root's where the
@@ -1093,7 +1170,7 @@ function coldReviveSpawnSpec(
 							: spec.prepared.parentPolicy?.additionalDirectories,
 				}
 			: {
-					cwd: restoredSeance?.cwd ?? spec.prepared.rootCwd,
+					cwd: restoredSeance?.cwd ?? cwd,
 					enableLsp: spec.prepared.live.policy.enableLsp,
 					// The constant every spawn writes, for a record with no spec and for a spec whose policy part is
 					// missing or malformed alike.

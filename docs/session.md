@@ -451,22 +451,35 @@ call id and `maxRuntimeMs`), and the names of the live inputs the spawn passed. 
 `session_init` carries it. The in-memory revive and the revive from this file both build the
 subagent from it, so a subagent revived from its file runs on its spawn's settings. A stored
 value never widens what the live process allows, except the values that the revive from the
-file also took from the stored session before spawn specs existed: the tool names, the mounted
-tools, `restrictToolNames`, the spawn allowlist, the agent and display names, the advisor, the
-service tier, the model roles and the retry-fallback chains. The values that it took from the
-live process stay live: the ids, the task depth, the credential source, the workspace roots,
-the working directory for discovery, the wake limit, the soft request budget and the settings
-that grant authority; and a stored LSP, IRC or MCP value never turns on what the live process
-has off. So the revive from the file takes the subagent's ids from its registry entry; a task
-depth never shallower than its live parent chain; the credential source and workspace roots of
-its live parent where its spawn passed them (the root session's where the parent is not live);
-the tree's cost gate and the live parent's prepared extensions whatever the stored list of
-live inputs names; the SDK's own discovery in the root session's working directory (the slash
-commands and the custom TS commands it finds there, and the extensions only where no prepared
-extensions are passed), while the context files, skills, rules, prompt templates and workspace
-tree come from the live parent or the root; the cache-warming value every spawn writes (off);
-its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the soft request
-budget) never looser than the live settings. Before it builds the session, a revive
+file also took from the stored session before spawn specs existed: the working directory in
+which its tools run, the tool names, the mounted tools, `restrictToolNames`, the spawn
+allowlist, the agent and display names, the advisor, the service tier, the model roles and the
+retry-fallback chains. The values that it took from the live process stay live: the ids, the
+task depth, the credential source, the workspace roots, the wake limit, the soft request budget
+and the settings that grant authority; and a stored LSP, IRC or MCP value never turns on what
+the live process has off. So the revive from the file builds the session in the working
+directory of the file's header, as the reopened session manager reads it: where its tools run,
+and where the spawn and the in-memory revive build it. It takes the subagent's ids from its
+registry entry; a task depth never shallower than its live parent chain; the credential source
+and workspace roots of its live parent where its spawn passed them (the root session's where
+the parent is not live); the tree's cost gate whatever the stored list of live inputs names; the
+SDK's own discovery in the file's working directory (the slash commands and the custom TS
+commands it finds there), while the context files, skills, rules, prompt templates and
+workspace tree come from the live parent or the root; the cache-warming value every spawn
+writes (off); its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the soft
+request budget) never looser than the live settings. Where it passes no extensions of its own,
+it passes the owner's extension roots, so the session discovers its extensions under the
+owner's policy. Where the working directory of the session its live inputs come from (the live
+parent, or the root session where the parent is not live) is not the file's, it builds on the
+main thread, not in a worker, and that session's tool sources follow the file's directory: no
+custom-tool paths and no MCP manager are passed, so the SDK discovers the custom tools and the
+project's MCP servers there; of the prepared extensions and extension paths, each that
+discovery found as a project's own (in whatever directory that session found it) is left out,
+and those of the file's directory, found under the owner's policy, are added first (a host's
+inline extensions and the user's, plugin and configured ones stay, a file that is also one of
+those included, and an extension both lists hold is bound once). A per-call worker's
+agent definition is still looked up in the live parent's working directory (the root
+session's where the parent is not live). Before it builds the session, a revive
 of a file with `spawnSpec`, the in-memory one too, writes the workspace roots of the file's
 header once, as the roots the session uses: those of the spawn's policy (on the revive from
 the file, as named above) together with those of the live `workspace.additionalDirectories`
@@ -475,10 +488,10 @@ subagent took from a live edit of that setting during its run stays while the se
 it, and a root that only the header holds is not kept. A spec whose policy part is missing or
 holds a shape that no spawn writes takes the policy of a file without `spawnSpec`, with the
 cache-warming value off, and its header's roots are written as above, from the live setting
-alone. The subagent's tools run in the cwd of the file's header. Where discovery runs in
-another directory (the root session moved since the spawn), both builds of the secret mask,
-when the session is created and when `secrets.enabled` turns on later, load the project secrets
-(`.omp/secrets.yml`) of the tools' directory beside those of the root session's cwd. The stored
+alone. Where the working directory of the session its live inputs come from is not the file's,
+both builds of the secret mask, when the session is created and when `secrets.enabled` turns on
+later, load the project secrets (`.omp/secrets.yml`) of that session's directory beside those
+of the file's, so a mask entry is only added. The stored
 settings overlay restores over the live parent's settings as a derived overlay, whatever
 flag the file holds, so the file's settings never become grant authority, and each stored
 setting is checked as a settings override is; an overlay that fails the check is replaced

@@ -720,6 +720,38 @@ export interface DiscoverExtensionPathOptions {
 	ambient?: boolean;
 	/** Include ambient hook factories. Disable for read-only catalog commands. */
 	includeAmbientHooks?: boolean;
+	/**
+	 * `"project"`: only the project-level entries (native modules and hooks of the project, plugins of project scope),
+	 * and of those only the ones no user-level, plugin or configured entry also names.
+	 */
+	level?: "project";
+}
+
+/**
+ * The key discovery counts an extension path once by: its real file, so a symlink and its target load once (an
+ * extensions/ symlink plus the same file passed with --extension); a missing path keeps its lexical key so the
+ * loader still reports it.
+ */
+export async function extensionPathKey(extPath: string): Promise<string> {
+	const resolved = path.resolve(extPath);
+	return fs.realpath(resolved).catch(() => resolved);
+}
+
+/**
+ * The keys of the extensions discovery found, in this process, at project level (a project's native module or hook,
+ * a plugin of project scope) and at any other level (user, plugin, configured). Each path a discovery returns keeps
+ * its scope here, so a session's forwarded lists and the prepared extensions imported from them carry it by path.
+ */
+const projectLevelKeys = new Set<string>();
+const otherLevelKeys = new Set<string>();
+
+/**
+ * Whether `extPath` is a project's own extension: discovery found it at project level and never at another, so a
+ * file that is also a user, plugin or configured entry is not.
+ */
+export async function isProjectExtension(extPath: string): Promise<boolean> {
+	const key = await extensionPathKey(extPath);
+	return projectLevelKeys.has(key) && !otherLevelKeys.has(key);
 }
 
 export async function discoverExtensionPaths(
@@ -728,29 +760,29 @@ export async function discoverExtensionPaths(
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
 ): Promise<string[]> {
-	const allPaths: string[] = [];
+	const entries: Array<{ path: string; key: string }> = [];
 	const seen = new Set<string>();
+	/** Keys of the entries found at project level, and of those found at any other level. */
+	const projectKeys = new Set<string>();
+	const otherKeys = new Set<string>();
 	const disabled = new Set(disabledExtensionIds ?? []);
 	const loadOptions = disabledExtensionIds ? { cwd, disabledExtensions: disabledExtensionIds } : { cwd };
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
-	// Key on the real file so a symlink and its target load once, e.g. an
-	// extensions/ symlink plus the same file passed with --extension. Missing
-	// paths keep their lexical key so the loader still reports them.
-	const addPath = async (extPath: string): Promise<void> => {
-		const resolved = path.resolve(extPath);
-		const key = await fs.realpath(resolved).catch(() => resolved);
+	const addPath = async (extPath: string, level: "user" | "project"): Promise<void> => {
+		const key = await extensionPathKey(extPath);
+		(level === "project" ? projectKeys : otherKeys).add(key);
 		if (!seen.has(key)) {
 			seen.add(key);
-			allPaths.push(extPath);
+			entries.push({ path: extPath, key });
 		}
 	};
 
 	const addPaths = async (paths: string[]): Promise<void> => {
 		for (const extPath of paths) {
 			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
-			await addPath(extPath);
+			await addPath(extPath, "user");
 		}
 	};
 
@@ -767,7 +799,7 @@ export async function discoverExtensionPaths(
 			providers: ["native"],
 		});
 		for (const ext of discovered.items) {
-			await addPath(ext.path);
+			await addPath(ext.path, ext.level);
 		}
 	}
 
@@ -778,10 +810,8 @@ export async function discoverExtensionPaths(
 	if (ambient) {
 		if (options.includeAmbientHooks !== false) {
 			const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
-			for (const hookPath of hooks.items
-				.map(hook => hook.path)
-				.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
-				await addPath(hookPath);
+			for (const hook of hooks.items.filter(item => isExtensionFile(path.basename(item.path)))) {
+				await addPath(hook.path, hook.level);
 			}
 		}
 	} else {
@@ -794,10 +824,16 @@ export async function discoverExtensionPaths(
 	// paths. Configured file paths bypass the disabled-name filter.
 	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: ambient })) {
 		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
-		await addPath(module.path);
+		await addPath(module.path, module.level);
 	}
 
-	return allPaths;
+	for (const key of projectKeys) projectLevelKeys.add(key);
+	for (const key of otherKeys) otherLevelKeys.add(key);
+	const kept =
+		options.level === "project"
+			? entries.filter(entry => projectKeys.has(entry.key) && !otherKeys.has(entry.key))
+			: entries;
+	return kept.map(entry => entry.path);
 }
 
 /**

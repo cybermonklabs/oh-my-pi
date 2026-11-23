@@ -4,9 +4,10 @@
  * artifacts dir, settings overlay, list of live inputs and wake limits, the shape of its policy part, and the
  * workspace roots of its file's header); the cold revive builds the subagent from the live values instead: the
  * depth of the live parent chain, the ids of the registry ref, the live parent's credential source, roots, cost
- * gate and extensions, discovery at the live root's cwd, the constants every spawn writes, and limits no looser
- * than the live settings. A revive writes the header's workspace roots once, as the roots its session uses, so a
- * warm revive rewrites no file for unchanged roots and a root the run took from the live settings stays.
+ * gate and extensions, the constants every spawn writes, and limits no looser than the live settings. It builds in
+ * the cwd of its file's header, where its tools run, not the cwd of the edited policy. A revive writes the header's
+ * workspace roots once, as the roots its session uses, so a warm revive rewrites no file for unchanged roots and a
+ * root the run took from the live settings stays.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -111,13 +112,14 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 	let warn: Mock<typeof logger.warn> | undefined;
 	let changed = 0;
 	let wakeFrames: LifecycleFrame[] = [];
+	let elsewhere = "";
 
 	beforeAll(async () => {
 		const opened = await spawnAndPark(id, { "task.maxRecursionDepth": 2 });
 		env = opened.env;
 		root = opened.root;
 		const frames = recordFrames(env.eventBus);
-		const elsewhere = path.join(env.root, "elsewhere");
+		elsewhere = path.join(env.root, "elsewhere");
 		await fs.mkdir(elsewhere, { recursive: true });
 		changed = await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const policy = part(spec, "policy");
@@ -158,8 +160,10 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 		expect(revived?.build.options.credentialSourceSessionId).not.toBe(STOLEN_CREDENTIAL_SOURCE);
 	});
 
-	it("policy.cwd: discovery runs at the live root's cwd", () => {
+	it("policy.cwd: the build runs in the stored session's cwd, where its tools run, never the stored policy's", () => {
+		expect(revived?.build.options.cwd).toBe(revived?.session.sessionManager.getCwd());
 		expect(revived?.build.options.cwd).toBe(env?.cwd);
+		expect(revived?.build.options.cwd).not.toBe(elsewhere);
 	});
 
 	it("policy.additionalDirectories: the live parent's", () => {
@@ -193,7 +197,7 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 	});
 });
 
-describe("a cold revive of a record whose stored list of live inputs leaves out the cost gate and the prepared extensions", () => {
+describe("a cold revive of a record whose stored list of live inputs leaves out the cost gate, the extensions and the extension roots", () => {
 	const id = "StoredLiveInputs";
 	let env: ReviveEnv | undefined;
 	let root: LiveParent | undefined;
@@ -207,9 +211,10 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 		});
 		env = opened.env;
 		root = opened.root;
+		const dropped = ["costGate", "preloadedPreparedExtensions", "preloadedExtensionPaths", "extensionRoots"];
 		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const names = Array.isArray(spec.liveInputs) ? spec.liveInputs : [];
-			spec.liveInputs = names.filter(name => name !== "costGate" && name !== "preloadedPreparedExtensions");
+			spec.liveInputs = names.filter(name => !dropped.includes(name));
 		});
 		({ revived, failure } = await reviveCold(env, id));
 	}, 60_000);
@@ -224,9 +229,11 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 		expect(revived?.build.options.costGate).toBe(root?.toolSession.costGate);
 	});
 
-	it("preloadedPreparedExtensions: the live parent's, so the revive discovers no extensions of its own", () => {
-		expect(failure).toBeUndefined();
-		expect(revived?.build.options.preloadedPreparedExtensions).toBe(root?.toolSession.preparedExtensions);
+	it("extensionRoots: with no extensions of its own the revive discovers them under the owner's extension roots", () => {
+		if (!root || !revived) throw new Error(`The revive built no session: ${failure}`);
+		expect(revived.build.options.preloadedPreparedExtensions).toBeUndefined();
+		expect(revived.build.options.preloadedExtensionPaths).toBeUndefined();
+		expect(revived.build.options.extensionRoots?.()).toEqual(root.toolSession.effectiveExtensionRoots?.());
 	});
 });
 

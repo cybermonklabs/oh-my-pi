@@ -31,6 +31,7 @@ import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "..
 import { createPersistedSubagentReviverFactory } from "../../src/task/persisted-revive";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
 import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
+import * as sessionMirror from "../../src/thread/session-mirror";
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
 import type { ToolSession } from "../../src/tools";
@@ -791,6 +792,64 @@ describe("subagent runs routed into pooled workers", () => {
 			const results = server.toolResults.slice(resultsBefore).join("\n");
 			expect(results).not.toContain(KERNEL_ANSWER);
 			expect(results).toMatch(/unavailable/i);
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive whose worker-homed live parent's mirrored settings fail the main-side check reads that parent's settings as the main settings below them, with a warning",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			const parentRun = await runSubprocess(runOptions("MirrorParent", "ping"));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("MirrorParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			const childRun = await runSubprocess(runOptions("MirrorChild", "ping", { parentAgentId: "MirrorParent" }));
+			expect(childRun.output).toBe("pong");
+			const child = mirrorOf(AgentRegistry.global().get("MirrorChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("MirrorChild", undefined, { tombstone: true })).toBe(true);
+			// From here on, main rejects the parent's worker-local settings layers, as it rejects a layer the check fails.
+			const rejected = vi.spyOn(sessionMirror, "settingsFromSource").mockImplementation(() => {
+				throw new Error("The layer names no setting of this build");
+			});
+			cleanups.push(() => rejected.mockRestore());
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const receipt = await IrcBus.global().send({
+				from: MAIN_AGENT_ID,
+				to: "MirrorChild",
+				body: "hello from main",
+			});
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("MirrorChild")?.session);
+			// The revived child's live parent, read on main: the main settings below its worker-local layers.
+			let parentSettings: Settings | undefined;
+			expect(() => {
+				parentSettings = parent.settings;
+			}).not.toThrow();
+			expect(parentSettings).toBeInstanceOf(Settings);
+			expect(rejected).toHaveBeenCalled();
+			const fellBack = warnings.filter(message =>
+				message.startsWith("Worker-homed session's settings do not restore"),
+			);
+			expect(fellBack).toHaveLength(1);
 			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},
 		TEST_TIMEOUT_MS,

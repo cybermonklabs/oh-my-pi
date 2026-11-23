@@ -129,6 +129,7 @@ import {
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
+import type { DiscoverExtensionPathOptions } from "./extensibility/extensions/loader";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { partitionStartupExtensions, recordStartupVerdicts } from "./extensibility/extensions/startup-deferral";
@@ -586,8 +587,8 @@ export interface CreateAgentSessionOptions {
 	additionalDirectories?: string[];
 	/**
 	 * Project directories whose `.omp/secrets.yml` the secret mask loads besides cwd's (each directory once, cwd
-	 * included; the global secrets load once either way): a session whose tools run in another directory than cwd
-	 * masks its secrets too.
+	 * included; the global secrets load once either way): a subagent revived from its file whose live inputs come
+	 * from a session in another directory passes that directory, so the secrets of both projects stay masked.
 	 */
 	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
@@ -1163,7 +1164,8 @@ export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsRe
 type ExtensionDiscoveryOptions = Pick<
 	CreateAgentSessionOptions,
 	"disableExtensionDiscovery" | "additionalExtensionPaths" | "extensionRoots"
-> & { includeAmbientHooks?: boolean };
+> &
+	Pick<DiscoverExtensionPathOptions, "includeAmbientHooks" | "level">;
 
 type CliExtensionProviderOptions = ExtensionDiscoveryOptions & {
 	/** Discover extension model catalogs after registration (default true); usage-only commands skip it. */
@@ -1192,6 +1194,7 @@ export async function discoverSessionExtensionPaths(
 	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
 		ambient: !explicitOnly,
 		includeAmbientHooks: options.includeAmbientHooks,
+		level: options.level,
 	});
 }
 

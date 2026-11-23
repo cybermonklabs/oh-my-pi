@@ -158,6 +158,8 @@ export interface LiveParent {
 	readonly toolSession: ToolSession;
 	/** The root session the cold reviver factory is built over. */
 	readonly session: AgentSession;
+	/** The prepared extensions both of them hold: one array, which a test fills as the parent's scan does. */
+	readonly preparedExtensions?: PreparedExtension[];
 }
 
 /** What a parent's process allows its subagents; each is on where absent. */
@@ -762,10 +764,13 @@ export class ReviveEnv {
 	 * the live parent's inputs. `policy` is what the parent's process allows (each on by default).
 	 * Its session manager holds its working directory and workspace roots, which its tool session
 	 * reads, as a session's does; `moveTo` and `addWorkspaceDirectory` change them as `/move` (or
-	 * `/wt`) and `/add-dir` do.
+	 * `/wt`) and `/add-dir` do. `roots` is the owner's extension-root policy.
 	 */
-	createLiveParent(settings: Settings = this.settings, policy: LivePolicy = {}): LiveParent {
-		const roots: EffectiveExtensionRoots = { explicit: [], mode: "merge", configured: [], configuredLevel: "user" };
+	createLiveParent(
+		settings: Settings = this.settings,
+		policy: LivePolicy = {},
+		roots: EffectiveExtensionRoots = { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
+	): LiveParent {
 		const preparedExtensions: PreparedExtension[] = [];
 		const sessionAgents: AgentDefinition[] = [];
 		let cwd = this.cwd;
@@ -833,7 +838,13 @@ export class ReviveEnv {
 			getAgentId: () => MAIN_AGENT_ID,
 			evalToolSession: toolSession,
 		} as unknown as AgentSession;
-		return { toolSession, session };
+		return { toolSession, session, preparedExtensions };
+	}
+
+	/** `parent`'s root session as a host's root that holds no tool session, with the same live state. */
+	hostRoot(parent: LiveParent): LiveParent {
+		const session: AgentSession = Object.create(parent.session, { evalToolSession: { value: undefined } });
+		return { toolSession: parent.toolSession, session, preparedExtensions: parent.preparedExtensions };
 	}
 
 	/**

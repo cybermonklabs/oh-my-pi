@@ -191,8 +191,6 @@ export interface SubagentSpawnSpec {
  * - `N`: set by no subagent build, so the SDK default holds on every path.
  * - `S+L`: stored descriptors rebuilt over a live input (custom tools over the parent's eval kernel).
  * - `S over L`: stored layers applied over a live base (the overlay over the parent `Settings`).
- * - `S, cold L root`: stored for the spawn's first build and a warm revive; at a cold revive the root
- *   session's live value.
  * - `S, cold L parent`: stored for the spawn's first build and a warm revive; at a cold revive the live
  *   parent session's value, the root session's where the parent is not live.
  * - `S+held+L`: built from the stored prompt inputs, the transcript's held base prompt and the live
@@ -212,7 +210,6 @@ export type InputClass =
 	| "N"
 	| "S+L"
 	| "S over L"
-	| "S, cold L root"
 	| "S, cold L parent"
 	| "S+held+L"
 	| "S+P"
@@ -223,11 +220,11 @@ export type InputClass =
 type InputClasses<T> = Readonly<Record<keyof T, InputClass>>;
 
 const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> = {
-	// Where discovery runs; at a cold revive the root session's cwd, as before spawn specs.
-	cwd: "S, cold L root",
+	// The stored session's cwd, where its tools run; a cold revive reads it from the reopened session manager.
+	cwd: "S",
 	additionalDirectories: "S, cold L parent",
-	// The session file's cwd, where its tools run, on every build (read once where it is `cwd`).
-	secretsProjectDirs: "D",
+	// Set at a cold revive only: the cwd of the session its live inputs came from, where it is not the stored one.
+	secretsProjectDirs: "L",
 	agentDir: "N",
 	spawns: "S",
 	inheritedSessionAgents: "L",
@@ -279,8 +276,11 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	extensionRoots: "L",
 	preloadedExtensions: "N",
 	deferredExtensionPaths: "N",
+	// At a cold revive whose live inputs came from a session in another directory: that session's, without the
+	// entries discovery found as a project's own, after the stored directory's project-level ones.
 	preloadedExtensionPaths: "L",
 	preloadedPreparedExtensions: "L",
+	// At a cold revive only where the live session's cwd is the stored session's; else the SDK discovers them there.
 	preloadedCustomToolPaths: "L",
 	eventBus: "N",
 	subagentEventBus: "L",
@@ -293,6 +293,7 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	promptTemplates: "L",
 	slashCommands: "N",
 	enableMCP: "S",
+	// At a cold revive only where the live session's cwd is the stored session's; else the SDK discovers MCP there.
 	mcpManager: "L",
 	mcpTools: "L",
 	mcpToolScope: "L",

@@ -4173,7 +4173,8 @@ type SubagentLiveOptionKeys =
 	| "mcpManager"
 	| "localProtocolOptions"
 	| "telemetry"
-	| "customTools";
+	| "customTools"
+	| "secretsProjectDirs";
 
 /**
  * The live inputs of a subagent build: the spawner's objects at the spawn and at a warm revive, the
@@ -4652,9 +4653,8 @@ function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
 	const enableMCP = restricted ? false : narrowedToLive(policy.enableMCP, live.policy.enableMCP);
 	return {
 		cwd: policy.cwd,
-		// The cwd of the session file, where its tools run: the mask loads its project secrets too (once where it is
-		// `cwd`), so a cold revive after the root session moved still masks them.
-		secretsProjectDirs: [input.sessionManager.getCwd()],
+		// Set by a cold revive only: the cwd of the session its live inputs came from, where it is not the stored one.
+		secretsProjectDirs: live.secretsProjectDirs,
 		costGate: live.costGate,
 		additionalDirectories: policy.additionalDirectories,
 		authStorage: live.authStorage,
