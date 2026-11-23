@@ -1,17 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	OpenAILiveTransport,
 	openAILiveAttachUrl,
 	openAILiveSessionsUrl,
 	resolveOpenAILiveRoute,
 } from "@oh-my-pi/pi-coding-agent/live/openai-transport";
-import {
-	buildOpenAILiveSessionRequest,
-	type LiveServerEvent,
-	parseOpenAILiveServerEvent,
-} from "@oh-my-pi/pi-coding-agent/live/protocol";
+import { type LiveServerEvent, parseOpenAILiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
 
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; the API route must never send one. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
@@ -70,7 +65,6 @@ function transportFor(base: string, onEvent: (event: LiveServerEvent) => void = 
 	return new OpenAILiveTransport({
 		route: { baseUrl: base, apiKey: "sk-test", model: "gpt-live-1.1" },
 		instructions: "Be brief.",
-		voice: "marin",
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },
 	});
@@ -90,7 +84,7 @@ describe("GPT-Live route", () => {
 		expect(openAILiveAttachUrl("http://gw:4000/v1", "live_1")).toBe("ws://gw:4000/v1/live/sessions/live_1/attach");
 	});
 
-	test("takes the openai provider's base URL and key, and live.model", async () => {
+	test("takes the openai provider's base URL and key, and asks for gpt-live-1.1", async () => {
 		const asked: string[] = [];
 		const registry = {
 			getProviderBaseUrl: (provider: string) => {
@@ -102,25 +96,19 @@ describe("GPT-Live route", () => {
 				return "sk-test";
 			},
 		};
-		expect(await resolveOpenAILiveRoute(registry, Settings.isolated({ "live.model": "gpt-live-9" }), "s1")).toEqual({
+		expect(await resolveOpenAILiveRoute(registry, "s1")).toEqual({
 			baseUrl: "http://model-gateway:4000/v1",
 			apiKey: "sk-test",
-			model: "gpt-live-9",
+			model: "gpt-live-1.1",
 		});
 		expect(asked).toEqual(["openai key for s1", "openai"]);
 	});
 
-	test("defaults to OpenAI's API and gpt-live-1.1, and refuses to start without a key", async () => {
+	test("defaults to OpenAI's API, and refuses to start without a key", async () => {
 		const keyed = { getProviderBaseUrl: () => undefined, getApiKeyForProvider: async () => "sk-test" };
-		expect(await resolveOpenAILiveRoute(keyed, Settings.isolated(), "s1")).toEqual({
-			baseUrl: "https://api.openai.com/v1",
-			apiKey: "sk-test",
-			model: "gpt-live-1.1",
-		});
+		expect((await resolveOpenAILiveRoute(keyed, "s1")).baseUrl).toBe("https://api.openai.com/v1");
 		const keyless = { ...keyed, getApiKeyForProvider: async () => undefined };
-		await expect(resolveOpenAILiveRoute(keyless, Settings.isolated(), "s1")).rejects.toThrow(
-			/openai provider has no key/,
-		);
+		await expect(resolveOpenAILiveRoute(keyless, "s1")).rejects.toThrow(/openai provider has no key/);
 	});
 });
 
@@ -133,17 +121,10 @@ describe("GPT-Live transport", () => {
 			expect(transport.sdpAnswer).toBe("v=0 answer");
 			expect(api.posts).toHaveLength(1);
 			const post = api.posts[0]!;
-			expect(post.body).toEqual(
-				buildOpenAILiveSessionRequest({
-					model: "gpt-live-1.1",
-					instructions: "Be brief.",
-					voice: "marin",
-					sdp: "v=0 offer",
-				}),
-			);
-			expect(post.body).toMatchObject({
-				session: { delegation: { type: "client" }, idle_timeout_s: 60, wake_policy: { type: "speech" } },
-				transport: { type: "webrtc" },
+			// The body the gateway's route answered 201 to (INFRA-5156, 20:49Z and 20:51Z on 2026-11-22).
+			expect(post.body).toEqual({
+				session: { model: "gpt-live-1.1", instructions: "Be brief.", delegation: { type: "client" } },
+				transport: { type: "webrtc", sdp: "v=0 offer" },
 			});
 			expect(post.request.headers.get("authorization")).toBe("Bearer sk-test");
 			expectNoCodexHeaders(post.request);
@@ -185,25 +166,23 @@ describe("GPT-Live transport", () => {
 				delegation,
 				usage,
 				{ type: "error", event_id: "e5", error: { message: "content too long", code: "invalid_value" } },
-				{ type: "session.closed", event_id: "e6", reason: "expired" },
 			],
 		});
 		const events: LiveServerEvent[] = [];
-		const closed = Promise.withResolvers<void>();
+		const done = Promise.withResolvers<void>();
 		const transport = transportFor(api.base, event => {
 			events.push(event);
-			if (event.type === "session.closed") closed.resolve();
+			if (event.type === "warning") done.resolve();
 		});
 		try {
 			await transport.connect();
-			await closed.promise;
+			await done.promise;
 			expect(events).toEqual([
 				{ type: "transcript.delta", role: "user", text: "deploy ", startMs: 900, endMs: 1200 },
 				{ type: "transcript.delta", role: "assistant", text: "On it.", startMs: 1500, endMs: 1900 },
 				{ type: "delegation.requested", id: "item_9", offsetMs: 1300 },
 				{ type: "unknown", wireType: "session.usage.updated" },
 				{ type: "warning", message: "content too long" },
-				{ type: "session.closed", reason: "expired" },
 			]);
 		} finally {
 			await transport.close();

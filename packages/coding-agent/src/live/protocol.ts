@@ -59,7 +59,6 @@ export type LiveServerEvent =
 	// GPT-Live's public API; see {@link parseOpenAILiveServerEvent}.
 	| { type: "transcript.delta"; role: "user" | "assistant"; text: string; startMs: number; endMs: number }
 	| { type: "delegation.requested"; id: string; offsetMs: number }
-	| { type: "session.closed"; reason?: string }
 	/** A rejected command or a moderation cut: the call stays open. */
 	| { type: "warning"; message: string }
 	| { type: "unknown"; wireType: string };
@@ -207,42 +206,20 @@ export function buildSessionClose(): LiveClientMessage {
 	return { type: "session.close" };
 }
 
-/**
- * Seconds without speech after which GPT-Live puts a call on standby, which OpenAI bills at its lower
- * rate; 60 is the largest value the API takes.
- */
-export const OPENAI_LIVE_IDLE_TIMEOUT_S = 60;
-
 /** Body of `POST {base}/live/sessions`, GPT-Live's public WebRTC session request. */
 export interface OpenAILiveSessionRequest {
-	session: {
-		model: string;
-		instructions: string;
-		audio: { output: { voice: string } };
-		delegation: { type: "client" };
-		idle_timeout_s: number;
-		/** OpenAI pauses inference while idle only under a speech wake policy. */
-		wake_policy: { type: "speech" };
-	};
+	session: { model: string; instructions: string; delegation: { type: "client" } };
 	transport: { type: "webrtc"; sdp: string };
 }
 
-/** Build the GPT-Live session request: client delegation, standby after silence, the caller's SDP offer. */
+/** Build the GPT-Live session request: the model, the instructions, client delegation, and the caller's SDP offer. */
 export function buildOpenAILiveSessionRequest(options: {
 	model: string;
 	instructions: string;
-	voice: string;
 	sdp: string;
 }): OpenAILiveSessionRequest {
 	return {
-		session: {
-			model: options.model,
-			instructions: options.instructions,
-			audio: { output: { voice: options.voice } },
-			delegation: { type: "client" },
-			idle_timeout_s: OPENAI_LIVE_IDLE_TIMEOUT_S,
-			wake_policy: { type: "speech" },
-		},
+		session: { model: options.model, instructions: options.instructions, delegation: { type: "client" } },
 		transport: { type: "webrtc", sdp: options.sdp },
 	};
 }
@@ -255,7 +232,7 @@ function isFiniteNumber(value: unknown): value is number {
  * Map a GPT-Live public event onto the controller's events. Transcript deltas keep their text exactly
  * (spaces included) and their interval on the call's timeline; a delegation names no task text, only
  * its id and timeline offset; an `error` in a running call is a warning, since a rejected command or a
- * moderation cut leaves the call open (`session.closed` says when it ends).
+ * moderation cut leaves the call open.
  */
 export function parseOpenAILiveServerEvent(payload: unknown): LiveServerEvent | null {
 	const parsed = parseLiveRecord(payload);
@@ -274,8 +251,6 @@ export function parseOpenAILiveServerEvent(payload: unknown): LiveServerEvent | 
 			if (!isFiniteNumber(parsed.offset_ms)) return null;
 			return { type: "delegation.requested", id: delegation.id, offsetMs: parsed.offset_ms };
 		}
-		case "session.closed":
-			return { type: "session.closed", ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}) };
 		case "error": {
 			const error = parseErrorEvent(parsed);
 			return error?.type === "error" ? { type: "warning", message: error.message } : null;

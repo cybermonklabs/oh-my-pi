@@ -111,18 +111,16 @@ function voiceSaid(text: string, startMs: number, endMs: number): LiveServerEven
 	return { type: "transcript.delta", role: "assistant", text, startMs, endMs };
 }
 
-/** The transcript lines of a delegation turn, without its preamble. */
+/** The lines of a delegation turn. */
 function requestLines(content: unknown): string[] {
-	const text = String(content);
-	const body = text.slice(text.indexOf("<transcript>") + "<transcript>".length, text.indexOf("</transcript>"));
-	return body
+	return String(content)
 		.split("\n")
 		.map(line => line.trim())
 		.filter(Boolean);
 }
 
 describe("live.provider", () => {
-	test("openai calls GPT-Live with the openai provider's base URL and key, and the voice marin", async () => {
+	test("openai calls GPT-Live with the openai provider's base URL and key", async () => {
 		const live = call();
 		await live.controller.start();
 		expect(live.codex).toEqual([]);
@@ -133,7 +131,6 @@ describe("live.provider", () => {
 			apiKey: "sk-test",
 			model: "gpt-live-1.1",
 		});
-		expect(options.voice).toBe("marin");
 		await live.controller.stop();
 	});
 
@@ -162,7 +159,6 @@ describe("GPT-Live delegations", () => {
 		expect(live.turns().map(turn => requestLines(turn.content))).toEqual([
 			["Voice: Should I deploy main?", "User: yes"],
 		]);
-		expect(String(live.turns()[0]!.content)).toMatch(/speech/i);
 		await live.controller.stop();
 	});
 

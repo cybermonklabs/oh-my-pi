@@ -24,18 +24,6 @@ export const cfgLiveProvider = register({
 	},
 });
 
-export const cfgLiveModel = register({
-	id: "live.model",
-	type: "string",
-	default: "gpt-live-1.1",
-	ui: {
-		tab: "providers",
-		group: "Services",
-		label: "Live Model",
-		description: "GPT-Live model of realtime voice calls on OpenAI's API (live.provider: openai)",
-	},
-});
-
 export const cfgLiveVoice = register({
 	id: "live.voice",
 	type: "enum",

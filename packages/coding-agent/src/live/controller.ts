@@ -10,7 +10,6 @@ import { LiveCallTranscript } from "./call-transcript";
 import { OpenAILiveTransport, resolveOpenAILiveRoute } from "./openai-transport";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
-import liveSpokenRequestTemplate from "./prompts/live-spoken-request.md" with { type: "text" };
 import {
 	buildDelegationContextAppend,
 	buildSessionClose,
@@ -22,7 +21,7 @@ import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { cfgLiveProvider } from "./settings";
 import { CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
-import { DEFAULT_LIVE_VOICE, OPENAI_LIVE_VOICE } from "./voices";
+import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
@@ -202,13 +201,8 @@ export class LiveSessionController {
 			const viaOpenAI = cfgLiveProvider.get(this.#session.settings) === "openai";
 			const transport = viaOpenAI
 				? new OpenAILiveTransport({
-						route: await resolveOpenAILiveRoute(
-							this.#session.modelRegistry,
-							this.#session.settings,
-							this.#session.sessionId,
-						),
+						route: await resolveOpenAILiveRoute(this.#session.modelRegistry, this.#session.sessionId),
 						instructions,
-						voice: OPENAI_LIVE_VOICE,
 						sdpOffer: this.#sdpOffer,
 						callbacks,
 					})
@@ -367,9 +361,6 @@ export class LiveSessionController {
 			case "delegation.requested":
 				this.#queueDelegation(event.id, event.offsetMs);
 				break;
-			case "session.closed":
-				this.#reportFailure(new Error(`GPT-Live closed the live call: ${event.reason ?? "no reason given"}`));
-				break;
 			case "warning":
 				logger.warn("GPT-Live rejected a command or cut its speech", { message: event.message });
 				break;
@@ -422,9 +413,8 @@ export class LiveSessionController {
 			this.#pendingDelegations.shift();
 			clearTimeout(next.timer);
 			const lines = transcript.takeRequest(next.offsetMs);
-			const request = prompt.render(liveSpokenRequestTemplate, {
-				transcript: lines.length > 0 ? lines.join("\n") : NO_WORDS_REQUEST,
-			});
+			// GPT-Live's delegation carries no text: the request is the words said before its offset.
+			const request = lines.length > 0 ? lines.join("\n") : NO_WORDS_REQUEST;
 			this.#startDelegatedTurn(next.id, request);
 		}
 	}

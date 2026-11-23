@@ -12,7 +12,6 @@ import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
 import { isRecord, toError } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { kNoAuth } from "../config/model-provider-discovery";
-import type { ScopeLike } from "../config/registry";
 import {
 	buildOpenAILiveSessionRequest,
 	type LiveClientMessage,
@@ -20,12 +19,13 @@ import {
 	parseLiveRecord,
 	parseOpenAILiveServerEvent,
 } from "./protocol";
-import { cfgLiveModel } from "./settings";
 import type { CodexLiveTransport, LiveTransportCallbacks } from "./transport";
 
 /** The provider whose key (and base URL, when models.yml sets one) the route uses; also its proxy scope. */
 const OPENAI_PROVIDER = "openai";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+/** The GPT-Live model a call asks for. */
+const OPENAI_LIVE_MODEL = "gpt-live-1.1";
 const MAX_ERROR_BODY_LENGTH = 2_048;
 /** How much of a redirect's `Location` an error repeats. */
 const MAX_LOCATION_LENGTH = 256;
@@ -44,7 +44,7 @@ export interface OpenAILiveRoute {
 	baseUrl: string;
 	/** The `openai` provider's key, the bearer of the session request and the sideband. */
 	apiKey: string;
-	/** GPT-Live model (`live.model`). */
+	/** GPT-Live model. */
 	model: string;
 }
 
@@ -53,12 +53,11 @@ export type OpenAILiveRegistry = Pick<ModelRegistry, "getProviderBaseUrl" | "get
 
 /**
  * The route of a GPT-Live call: the `openai` provider's key as omp resolves it for any OpenAI model
- * (a stored key, `apiKey` in models.yml, else `OPENAI_API_KEY`), its base URL when models.yml sets
- * one (else `https://api.openai.com/v1`), and `live.model`.
+ * (a stored key, `apiKey` in models.yml, else `OPENAI_API_KEY`), and its base URL when models.yml sets
+ * one (else `https://api.openai.com/v1`).
  */
 export async function resolveOpenAILiveRoute(
 	registry: OpenAILiveRegistry,
-	scope: ScopeLike,
 	sessionId: string,
 ): Promise<OpenAILiveRoute> {
 	const apiKey = await registry.getApiKeyForProvider(OPENAI_PROVIDER, sessionId);
@@ -68,7 +67,7 @@ export async function resolveOpenAILiveRoute(
 		);
 	}
 	const baseUrl = registry.getProviderBaseUrl(OPENAI_PROVIDER)?.trim() || DEFAULT_OPENAI_BASE_URL;
-	return { baseUrl, apiKey, model: cfgLiveModel.get(scope).trim() || "gpt-live-1.1" };
+	return { baseUrl, apiKey, model: OPENAI_LIVE_MODEL };
 }
 
 /** Appends `path` to the base URL's path, keeping its query. */
@@ -98,7 +97,6 @@ function bounded(text: string, limit: number): string {
 export interface OpenAILiveTransportOptions {
 	route: OpenAILiveRoute;
 	instructions: string;
-	voice: string;
 	callbacks: LiveTransportCallbacks;
 	/** SDP offer from a caller-owned WebRTC peer; unset makes a native peer (see `LiveTransportOptions.sdpOffer`). */
 	sdpOffer?: string;
@@ -199,7 +197,6 @@ export class OpenAILiveTransport implements Pick<
 		const body = buildOpenAILiveSessionRequest({
 			model: route.model,
 			instructions: this.#options.instructions,
-			voice: this.#options.voice,
 			sdp: offer,
 		});
 		const response = await fetch(url, {
