@@ -1,4 +1,7 @@
-# Prints of the tree that say skip, not run or nothing checked and are NOT a test skipping itself.
-# sc.py skip-forms fails on any such print SKIP_MARKER does not read unless it is named here.
+# Prints of the tree that say skip, not run, gave up or nothing checked and are NOT a test skipping itself.
+# sc.py skip-forms fails on any such print SKIP_MARKER does not read unless it is named here, and
+# sc.py skip-lines fails on any such line a passing test printed unless it matches an entry here
+# (from the line's start, each x any text).
 # One per line, tab-separated: <path under the tree> <start of the printed text, arguments as x> <reason>.
 crates/pi-builtins/src/file_backup/tests.rs	x: the host half is skipped	a partial check: the test still checks the in-process half and passes on it
+crates/pi-shell/src/bash/vm/builtins/zsh_mod_zftp/io.rs	this system carries no TCP urgent data: the mark is not checked	a partial check: the test still checks the abort and the IAC IP IAC bytes it sends
