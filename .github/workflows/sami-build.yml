@@ -17,19 +17,24 @@ name: Build sami branch
 # and named with both digests, and nothing is published. A candidate whose
 # carry check named a release older than the newest one is refused too: a
 # release published after that check was not compared with it. A run on sami
-# other than that push (a dispatch) runs no job; a dispatch on another ref
-# builds and tests, and attests nothing.
+# other than that push (a dispatch) runs no job. A dispatch on another ref
+# builds and tests, and attests nothing, while that ref carries this file:
+# GitHub runs the dispatched ref's own sami-build.yml, so a ref whose copy
+# was changed can attest. publish's checks keep that run's files out of a
+# release (see the attest job).
 # The release build cache is saved only on a push to sami-candidate, where
 # release_cache_prune keeps one entry per target; sami, where nothing is
 # built, keeps none.
 # Known limit: a push to sami runs the pushed commit's own sami-build.yml and
 # release-candidate.sh. One from before this workflow (a72018dd, sami's head
 # on 2026-11-23, among them) builds and publishes at once, and one whose
-# copies were changed publishes what its own copies allow. Any identity of
-# the agent App sjawhar-agent[bot] can push sami and sami-candidate. No
-# ruleset guards either ref, by the decision of 2026-11-23: no wrong push has
-# been seen, and a protection against a risk nobody has seen waits for a
-# person's request.
+# copies were changed publishes what its own copies allow. For the same
+# reason, a push of any branch whose own workflow asks for contents: write
+# can create a release directly, and a ruleset on sami would not stop it.
+# Any identity of the agent App sjawhar-agent[bot] can push sami and
+# sami-candidate. No ruleset guards either ref, by the decision of
+# 2026-11-23: no wrong push has been seen, and a protection against a risk
+# nobody has seen waits for a person's request.
 
 on:
   push:
@@ -388,8 +393,10 @@ jobs:
     # three artifacts by the ids their upload steps gave: a job of this run
     # (rust_test runs test code with root beside it) can delete an artifact
     # and upload another under its name, but not under its id, so what it
-    # attests is what carry and release_binary uploaded. Harness cases W39 to
-    # W53 (.github/sami/tests/run.sh) keep it so. It runs only on a push to
+    # attests is what carry and release_binary uploaded. Each file has its
+    # own attest step, so a missing file fails this job and the candidate
+    # run is red before sami moves. Harness cases W39 to W62
+    # (.github/sami/tests/run.sh) keep it so. It runs only on a push to
     # sami-candidate, so the public transparency log gets no trial entries.
     # This if: does not keep a dispatch run's files out of a release: GitHub
     # runs the workflow file of the ref a run is on, and that file can attest
@@ -411,20 +418,36 @@ jobs:
     steps:
       # Each artifact goes to a directory of its own, named for the artifact
       # (merge-multiple is off). An id that no longer exists is only a
-      # warning: that file then has no attestation of this run, and publish
-      # refuses it.
+      # warning here; the attest steps below then find no file there.
       - name: Download the archives and the release notes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           artifact-ids: ${{ needs.carry.outputs.notes-artifact-id }},${{ needs.release_binary.outputs.mise-linux-x64-artifact-id }},${{ needs.release_binary.outputs.mise-darwin-arm64-artifact-id }}
           path: ${{ runner.temp }}/attest
-      - name: Attest the archives, their sidecars and the release notes
+      # One step per file: a subject-path that matches no file fails its
+      # step ("Could not find subject at path", actions/attest's
+      # src/subject.ts at 508db95d, which this action runs), so a missing
+      # archive, sidecar or notes file fails the job.
+      - name: Attest the linux-x64 archive
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            ${{ runner.temp }}/attest/mise-*/*.tar.gz
-            ${{ runner.temp }}/attest/mise-*/*.tar.gz.sha256
-            ${{ runner.temp }}/attest/release-notes/carry-notes.md
+          subject-path: ${{ runner.temp }}/attest/mise-linux-x64/*.tar.gz
+      - name: Attest the linux-x64 sidecar
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-linux-x64/*.tar.gz.sha256
+      - name: Attest the darwin-arm64 archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-darwin-arm64/*.tar.gz
+      - name: Attest the darwin-arm64 sidecar
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/mise-darwin-arm64/*.tar.gz.sha256
+      - name: Attest the release notes
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/release-notes/carry-notes.md
 
   release_cache_prune:
     # Keeps the newest release build cache entry of each target in this

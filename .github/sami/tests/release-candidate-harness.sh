@@ -1,6 +1,8 @@
 # Independent harness for .github/sami/release-candidate.sh (the PR #232 reviewer's), with a stub gh. run.sh runs it.
 set -u
-RC="$1"; pass=0; failn=0
+# The script's path, made absolute before any cd, so a relative one works.
+[ -f "${1:-}" ] || { echo "release-candidate.sh harness: no script at [${1:-}]"; echo "release-candidate.sh harness: 0 passed, 1 failed"; exit 2; }
+RC="$(cd "$(dirname -- "$1")" && pwd)/$(basename -- "$1")"; pass=0; failn=0
 W=$(mktemp -d); mkdir -p "$W/bin" "$W/repo"
 cat > "$W/bin/gh" <<'GH'
 #!/usr/bin/env bash
@@ -14,7 +16,13 @@ if [ "$1" = attestation ] && [ "$2" = verify ]; then
   repo=o/r; case " ${STUB_FOREIGN:-} " in *" $b "*) repo=x/r;; esac
   trigger=push; case " ${STUB_DISPATCH:-} " in *" $b "*) trigger=workflow_dispatch;; esac
   ref=sami-candidate; case " ${STUB_SIGNER_REF:-} " in *" $b "*) ref=other;; esac
-  printf '[{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"https://github.com/%s/actions/runs/%s/attempts/1","buildTrigger":"%s","buildSignerURI":"https://github.com/o/r/.github/workflows/sami-build.yml@refs/heads/%s"}}},"attestation":{"bundle":{"x":"%s"}}}]\n' "$repo" "$run" "$trigger" "$ref" "${STUB_PLANT:-}"
+  att() { printf '{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"https://github.com/%s/actions/runs/%s/attempts/1","buildTrigger":"%s","buildSignerURI":"https://github.com/o/r/.github/workflows/sami-build.yml@refs/heads/%s"}}},"attestation":{"bundle":{"x":"%s"}}}' "$1" "$2" "$3" "$4" "${STUB_PLANT:-}"; }
+  # An empty answer; two JSON documents, the one that does not match first;
+  # the three certificate fields split over two attestations of one answer.
+  case " ${STUB_EMPTY:-} " in *" $b "*) exit 0;; esac
+  case " ${STUB_TWO:-} " in *" $b "*) printf '[%s]\n[%s]\n' "$(att o/r 999 push sami-candidate)" "$(att o/r "$run" push sami-candidate)"; exit 0;; esac
+  case " ${STUB_SPLIT:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch other)" "$(att o/r 999 push sami-candidate)"; exit 0;; esac
+  printf '[%s]\n' "$(att "$repo" "$run" "$trigger" "$ref")"
   exit 0
 fi
 if [ "$1" = api ]; then cat "$STUB_RUNS"; exit 0; fi
@@ -34,7 +42,7 @@ setup() { # fresh candidate dir
   printf 'Previous release: v18.18.6-sami.20261123-024918 (%s).\n\nnotes body\n' "${PREVC:0:12}" > "$RUNNER_TEMP/candidate/release-notes/carry-notes.md"
   export GITHUB_OUTPUT="$W/out"; : > "$GITHUB_OUTPUT"; export GITHUB_STEP_SUMMARY="$W/sum"; : > "$GITHUB_STEP_SUMMARY"
   export GITHUB_REPOSITORY=o/r GITHUB_SHA="$SHA" CANDIDATE_BRANCH=sami-candidate RUN_ID=4242 RELEASE_TARGETS="linux-x64 darwin-arm64"
-  unset STUB_REFUSE STUB_OTHER STUB_PLANT STUB_RUN STUB_FOREIGN STUB_DISPATCH STUB_SIGNER_REF; : > "$STUB_LOG"
+  unset STUB_REFUSE STUB_OTHER STUB_PLANT STUB_RUN STUB_FOREIGN STUB_DISPATCH STUB_SIGNER_REF STUB_EMPTY STUB_TWO STUB_SPLIT; : > "$STUB_LOG"
 }
 case_() { # name want(0|1) msg-regex  -- runs verify in the repo
   local name="$1" want="$2" msg="$3" out rc ok=1
@@ -68,6 +76,13 @@ setup; export STUB_OTHER="omp-$TAG-linux-x64.tar.gz" STUB_PLANT="https://github.
 setup; export STUB_DISPATCH="omp-$TAG-linux-x64.tar.gz"; case_ V15-dispatch-triggered-attestation 1 'linux-x64.tar.gz: it has no attestation that run 4242 made'
 setup; export STUB_FOREIGN="omp-$TAG-darwin-arm64.tar.gz.sha256"; case_ V16-run-url-of-another-repository 1 'darwin-arm64.tar.gz.sha256: it has no attestation that run 4242 made'
 setup; export STUB_SIGNER_REF="carry-notes.md"; case_ V17-signer-workflow-at-another-ref 1 'carry-notes.md: it has no attestation that run 4242 made'
+# gh's answer: empty (gh exits 0 and prints nothing); two JSON documents, the
+# matching one last, which the script refuses because it reads exactly one
+# document and cannot tell which one gh meant; and the three certificate
+# fields split over two attestations, so that no single one has them all.
+setup; export STUB_EMPTY="omp-$TAG-linux-x64.tar.gz"; case_ V18-empty-answer 1 'linux-x64.tar.gz: it has no attestation that run 4242 made'
+setup; export STUB_TWO="omp-$TAG-darwin-arm64.tar.gz"; case_ V19-two-json-documents 1 'darwin-arm64.tar.gz: it has no attestation that run 4242 made'
+setup; export STUB_SPLIT="carry-notes.md"; case_ V20-fields-split-over-two-attestations 1 'carry-notes.md: it has no attestation that run 4242 made'
 # find
 fcase() { # name want msg json
   local name="$1" want="$2" msg="$3" out rc ok=1; printf '%s' "$4" > "$W/runs.json"; export STUB_RUNS="$W/runs.json"
