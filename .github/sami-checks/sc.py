@@ -63,7 +63,9 @@ GV_ENVIRONMENT = {
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing (the markers sami-build's
 # rust_test reads, .github/sami/rust-test.sh): a passing test that prints one did not pass.
-SKIP_MARKER = re.compile(r"^\s*(skipped:|skipping\b|SKIP\b|not run:|UNKNOWN:)|UNCOMPARED", re.M)
+# A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
+# a line that only mentions the word later (`the host half is skipped: ...`) does not.
+SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -87,8 +89,12 @@ def set_matrix():
     return [{"who": w, "shard": s, "name": f"set-{w}-{s}"} for w in SET_WHO for s in range(1, SET_SHARDS + 1)]
 
 
+def builtins_matrix():
+    return [{"who": w, "name": f"builtins-{w}"} for w in SET_WHO]
+
+
 def workspace_matrix():
-    return [{"part": p, "name": f"workspace-{p}"} for p in range(1, WORKSPACE_PARTS + 1)]
+    return [{"who": w, "part": p, "name": f"workspace-{w}-{p}"} for w in SET_WHO for p in range(1, WORKSPACE_PARTS + 1)]
 
 
 def ts_matrix():
@@ -105,7 +111,7 @@ def gvisor_matrix():
 
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
-    names += [m["name"] for m in ts_matrix()] + ["builtins", "ts-small", "checkts"]
+    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts"]
     names += [m["name"] for m in gvisor_matrix()]
     return names
 
@@ -131,6 +137,7 @@ def cmd_plan():
         "set": json.dumps(set_matrix()),
         "set_shards": SET_SHARDS,
         "workspace": json.dumps(workspace_matrix()),
+        "builtins": json.dumps(builtins_matrix()),
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
@@ -225,6 +232,7 @@ def skip_verdict(res):
         res["passed"] -= len(s)
         if res["status"] == "PASS":
             res["status"] = "UNKNOWN"
+            res["skip_only"] = True
             res["note"] = f"{len(s)} passing test(s) printed a skip marker and checked nothing: " + ", ".join(s[:12])
     return res
 
@@ -367,6 +375,7 @@ def gv_environment(res, outputs, slow=()):
                                         (res["status"] == "UNKNOWN" and "printed a skip marker" in res["note"])):
         res["status"], res["note"] = "PASS", ("past 60 s: " + ", ".join(list(slow)[:10]) if slow else "")
         res["passed"] += len(res["self_skipped"])
+        res.pop("skip_only", None)
         skip_verdict(res)
     return res
 
@@ -433,6 +442,13 @@ def parse_bun(junit, log, exit_code, secs, row, unit):
     if res["status"] != "UNKNOWN" and not m:
         res["status"] = "UNKNOWN"
         res["note"] = "bun ended without its summary line (`Ran N tests across M files.`), so the files after its last output never ran"
+        return res
+    # bun's own counts must agree with what the JUnit reader counted.
+    own = {k: int(n) for n, k in re.findall(r"^\s*(\d+) (pass|fail)\s*$", text, re.M)}
+    if res["status"] != "UNKNOWN" and (own.get("pass"), own.get("fail", 0)) != (res["passed"] + len(res["self_skipped"]), res["failed"]):
+        res["status"] = "UNKNOWN"
+        res["note"] = (f"bun counts {own.get('pass')} pass and {own.get('fail', 0)} fail, the JUnit report "
+                       f"{res['passed'] + len(res['self_skipped'])} and {res['failed']}")
     return res
 
 
@@ -441,7 +457,7 @@ def parse_plain(exit_code, secs, row, unit, log):
         tail = open(log, encoding="utf-8", errors="replace").read().splitlines()[-15:]
     except OSError:
         return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note="no log")
-    if exit_code in ("124", "137") or (exit_code.isdigit() and int(exit_code) > 128):
+    if exit_code in ("124", "125", "126", "127", "137") or (exit_code.isdigit() and int(exit_code) > 128):
         return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: the time bound or a signal ended it")
     ok = exit_code == "0"
     return result(row, unit, "runner", "PASS" if ok else "FAIL", exit_code, secs, int(ok), int(not ok),
@@ -478,9 +494,11 @@ def expected_units(build_dir):
     else:
         for key in ["set-runner", "set-root", "lib4"] + [f"gv-{r}-{w}" for r in ("set", "lib4") for w in GV_WHO]:
             notes[key] = "the build gave no binary list, so the set could not run"
-    exp.append(("builtins", "pi-builtins", "runner"))
-    for p in range(1, WORKSPACE_PARTS + 1):
-        exp.append(("workspace", f"part {p}/{WORKSPACE_PARTS}", "runner"))
+    for who in SET_WHO:
+        exp.append(("builtins", "pi-builtins", who))
+    for who in SET_WHO:
+        for p in range(1, WORKSPACE_PARTS + 1):
+            exp.append(("workspace", f"part {p}/{WORKSPACE_PARTS}", who))
     for unit, _, _, _ in TS_SMALL:
         exp.append(("ts-small", unit, "runner"))
     for s in range(1, CODING_AGENT_SHARDS + 1):
@@ -504,6 +522,16 @@ def cmd_summary(results_dir, build_dir):
         if k in got:
             dup.add(k)
         got[k] = r
+    # The tests each (unit, user) passed without a skip marker: a test that skipped itself as one
+    # user is covered when the same test passed as the other, on the same runtime (a gVisor row's
+    # self-skip only by a gVisor row's pass).
+    def runtime(row):
+        return "gvisor" if row.startswith("gv-") else "host"
+
+    passed_as = {}
+    for r in results:
+        bad = set(r["failures"]) | set(r.get("self_skipped", []))
+        passed_as.setdefault((runtime(r["row"]), r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
@@ -527,6 +555,13 @@ def cmd_summary(results_dir, build_dir):
                 r = result(key, e[1], e[2], "UNKNOWN", "-", 0, note="no result: its job reported nothing (it failed before its upload, did not run, or its upload was planted away)")
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
+            elif r.get("skip_only") and r["status"] == "UNKNOWN":
+                others = [w for w in (GV_WHO if runtime(key) == "gvisor" else SET_WHO) if w != r["who"]]
+                open_ = [s for s in r["self_skipped"] if not any(s in passed_as.get((runtime(key), r["unit"], w), ()) for w in others)]
+                if open_:
+                    r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
+                else:
+                    r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
             rs.append(r)
         if key in notes and not units:
             verdict, counts = "UNKNOWN", "-"
@@ -661,10 +696,20 @@ def selftest():
         f.write("(pass) x\n")
     check("bun without its summary line", parse_bun(ju, blog, "1", 1, "ts-small", "u")["status"], "UNKNOWN")
     with open(blog, "a") as f:
-        f.write("Ran 3 tests across 1 file. [2.00s]\n")
+        f.write(" 1 pass\n 1 skip\n 1 fail\nRan 3 tests across 1 file. [2.00s]\n")
     check("bun fail", parse_bun(ju, blog, "1", 1, "ts-small", "u")["status"], "FAIL")
+    blog2 = os.path.join(d, "b2.log")
+    with open(blog2, "w") as f:
+        f.write(" 2 pass\n 1 fail\nRan 3 tests across 1 file. [2.00s]\n")
+    check("bun counts that differ from the JUnit report", parse_bun(ju, blog2, "1", 1, "ts-small", "u")["status"], "UNKNOWN")
     check("check:ts timed out", parse_plain("124", 1, "checkts", "check:ts", blog)["status"], "UNKNOWN")
+    check("check:ts could not run", parse_plain("127", 1, "checkts", "check:ts", blog)["status"], "UNKNOWN")
     check("check:ts failed", parse_plain("2", 1, "checkts", "check:ts", blog)["status"], "FAIL")
+    for line, want in (("t: not run: this process cannot give a file to uid 65534", True),
+                       ("fifo-case: skipped: no FIFO", True), ("skipped: bare", True),
+                       ("cp --reflink=always: the host half is skipped: no reflink", False),
+                       ("running 1 test", False), ("test result: ok. 1 passed", False)):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), want)
 
     check("assign is longest-first", assign(["a", "b", "c", "d"], {"a": 100, "b": 60, "c": 50, "d": 10}, 2),
           {"a": 1, "b": 2, "c": 2, "d": 1})
@@ -715,6 +760,22 @@ def selftest():
     rc, out = summary()
     check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (1, True))
     os.remove(os.path.join(res, "dup.json"))
+    # A test that skipped itself as the runner's user and passed as root is covered; one that
+    # skipped itself as both users is not.
+    def nx(who, skipped, passed):
+        return dict(result("builtins", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
+                           tests=[(n, 1.0) for n in passed + skipped], self_skipped=skipped), skip_only=bool(skipped))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"] == "builtins":
+            os.remove(os.path.join(res, f))
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    rc, out = summary()
+    check("a self-skip covered by root", ("| pi-builtins, nextest default profile | **PASS** |" in out, rc), (True, 0))
+    json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
+    rc, out = summary()
+    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
     # A gVisor job that reports nothing: gv-builtins-root (its one unit), and the uid 1000 set shard
     # that holds the lib binary (its set unit and the lib row both come from that job).
     check("the plan names the gVisor jobs", {"gv-builtins-root", "gv-set-uid1000-1", "gv-set-root-4"} <= set(all_job_names()), True)
@@ -792,6 +853,23 @@ def selftest():
     json.dump(gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0), open(os.path.join(res, "gv-env.json"), "w"))
     rc, out = summary()
     check("the summary lists the gVisor environment test", f"skipped itself `{envt}`: \"UNKNOWN: fs.protected_fifos" in out, True)
+    # A gVisor self-skip is covered by the other user's gVisor pass, never by a host row's.
+    def gnx(who, skipped, passed):
+        return dict(result(f"gv-builtins-{who}", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
+                           tests=[(n, 1.0) for n in passed + skipped], self_skipped=skipped), skip_only=bool(skipped))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"].startswith("gv-builtins") or r["row"] == "builtins":
+            os.remove(os.path.join(res, f))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    json.dump(gnx("uid1000", ["c"], ["a"]), open(os.path.join(res, "gb-uid1000.json"), "w"))
+    json.dump(gnx("root", ["c"], ["a"]), open(os.path.join(res, "gb-root.json"), "w"))
+    rc, out = summary()
+    check("a gVisor self-skip is not covered by a host pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **UNKNOWN** |" in out, True)
+    json.dump(gnx("root", [], ["a", "c"]), open(os.path.join(res, "gb-root.json"), "w"))
+    rc, out = summary()
+    check("a gVisor self-skip is covered by the other user's gVisor pass",
+          "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** |" in out, True)
 
     if fails:
         for f in fails:
