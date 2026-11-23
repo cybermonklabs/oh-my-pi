@@ -315,6 +315,28 @@ mod platform {
 			.filter_map(Process::from_pid)
 			.collect()
 	}
+
+	/// Whether process group `pgid` holds a process that has not ended and
+	/// that this process may signal, both read of the same process. A zombie
+	/// does not count: it has ended, and waits only for its parent to collect
+	/// its status.
+	pub fn group_has_live_member(pgid: i32) -> bool {
+		sys::pids().any(|pid| {
+			let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+				return false;
+			};
+			// The state and the group follow the command name, which may itself hold `)`.
+			let Some(end) = stat.rfind(')') else {
+				return false;
+			};
+			let mut fields = stat[end + 1..].split_whitespace();
+			let state = fields.next();
+			let group = fields.nth(1).and_then(|field| field.parse::<i32>().ok());
+			// SAFETY: kill with signal 0 takes scalars and only checks that the
+			// process exists and may be signalled.
+			group == Some(pgid) && !matches!(state, Some("Z" | "X")) && unsafe { libc::kill(pid, 0) } == 0
+		})
+	}
 }
 
 #[cfg(target_os = "macos")]
@@ -547,6 +569,22 @@ mod platform {
 			.filter(|pid| *pid > 0 && sys::executable_path(*pid, &mut path) == Some(target.as_bytes()))
 			.filter_map(Process::from_pid)
 			.collect()
+	}
+
+	/// Whether process group `pgid` holds a process that has not ended and
+	/// that this process may signal, both read of the same process. A zombie
+	/// (`SZOMB`) does not count: it has ended, and waits only for its parent to
+	/// collect its status.
+	pub fn group_has_live_member(pgid: i32) -> bool {
+		const SZOMB: u32 = 5;
+		sys::pids().into_iter().any(|pid| {
+			let member = sys::bsdinfo(pid).is_some_and(|info| {
+				i32::try_from(info.pbi_pgid).ok() == Some(pgid) && info.pbi_status != SZOMB
+			});
+			// SAFETY: kill with signal 0 takes scalars and only checks that the
+			// process exists and may be signalled.
+			member && unsafe { libc::kill(pid, 0) } == 0
+		})
 	}
 }
 #[cfg(target_os = "windows")]
@@ -838,12 +876,20 @@ impl Process {
 	///
 	/// The hard wave signals every process the polite wave signalled that
 	/// still runs, besides the tree it reads again, so a child that outlived
-	/// its parent's TERM (one that ignores TERM, or was stopped) is ended. A
-	/// process that forks during the grace period and then exits (in a TERM
-	/// handler, say) still leaves a child no walk can reach: it moves to the
-	/// nearest subreaper or to init before the hard wave reads the tree. A
-	/// caller that needs that child ended runs the tree in a process group of
-	/// its own and waits for the group to empty, or under a subreaper.
+	/// its parent's TERM (one that ignores TERM, or was stopped) is ended.
+	///
+	/// With `group`, both waits also last until the process group holds no
+	/// process that has not ended, so the grace period runs in full while any
+	/// member ignores TERM, and the hard wave's wait sends the group its KILL
+	/// again on each tick (every 50 ms, each a scan of the process table) while
+	/// one is left. A process that left the tree is ended through the group:
+	/// one forked during the grace period by a process that then exited (in a
+	/// TERM handler, say), which moved to the nearest subreaper or to init
+	/// where no walk reads it; one orphaned before the walk; and one the
+	/// group's signal missed as it was forked (seen under gVisor). A process
+	/// that left the group (`setsid`, `setpgid`) is reached by neither; a
+	/// subreaper reaches it. Without `group`, a child forked during the grace
+	/// period by a process that then exited still outlives the termination.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -858,7 +904,7 @@ impl Process {
 
 	/// Wait until this process exits, optionally bounded by `timeout`.
 	pub async fn wait_for_exit(&self, timeout: Option<Duration>, ct: CancelToken) -> Result<bool> {
-		wait_for_exit(self, &[], timeout, ct).await
+		wait_for_exit(self, &[], None, timeout, ct).await
 	}
 }
 
@@ -1087,6 +1133,7 @@ impl Process {
 			let exited = wait_for_exit(
 				self,
 				&polite,
+				process_group.map(|pgid| GroupWait { pgid, resend: None }),
 				Some(Duration::from_millis(graceful_ms as u64)),
 				ct.clone(),
 			)
@@ -1104,7 +1151,8 @@ impl Process {
 		frozen.add_survivors(polite);
 		let descendants = frozen.signal(self, KILL_SIGNAL, process_group, &protected);
 
-		wait_for_exit(self, &descendants, Some(timeout), ct).await
+		let group = process_group.map(|pgid| GroupWait { pgid, resend: Some(KILL_SIGNAL) });
+		wait_for_exit(self, &descendants, group, Some(timeout), ct).await
 	}
 }
 
@@ -1167,6 +1215,8 @@ impl Frozen {
 		if !protected.contains(&root.pid()) {
 			let _ = root.inner.kill(signal);
 		}
+		#[cfg(all(test, target_os = "linux"))]
+		wave_hook::run_after(root.pid(), signal);
 		std::mem::take(&mut self.descendants)
 	}
 }
@@ -1182,7 +1232,8 @@ impl Drop for Frozen {
 	}
 }
 
-/// Lets a test act between a wave's walk and its signal.
+/// Lets a test act between a wave's walk and its signal, or right after the
+/// signal.
 #[cfg(all(test, target_os = "linux"))]
 mod wave_hook {
 	use std::{
@@ -1193,6 +1244,7 @@ mod wave_hook {
 	type Hook = Box<dyn FnOnce() + Send>;
 
 	static HOOKS: LazyLock<Mutex<HashMap<i32, Hook>>> = LazyLock::new(Mutex::default);
+	static AFTER: LazyLock<Mutex<HashMap<(i32, i32), Hook>>> = LazyLock::new(Mutex::default);
 
 	/// Run `hook` once, in the next wave on the tree under `root`.
 	pub fn set(root: i32, hook: Hook) {
@@ -1201,6 +1253,19 @@ mod wave_hook {
 
 	pub fn run(root: i32) {
 		let hook = HOOKS.lock().expect("wave hooks").remove(&root);
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	/// Run `hook` once, right after the next wave on the tree under `root`
+	/// that sends `signal` has sent it.
+	pub fn set_after(root: i32, signal: i32, hook: Hook) {
+		AFTER.lock().expect("wave hooks").insert((root, signal), hook);
+	}
+
+	pub fn run_after(root: i32, signal: i32) {
+		let hook = AFTER.lock().expect("wave hooks").remove(&(root, signal));
 		if let Some(hook) = hook {
 			hook();
 		}
@@ -1251,25 +1316,39 @@ fn pid_in_protected_subtree(
 	false
 }
 
+/// The process group a wait for a terminated tree also waits on, and the
+/// signal the wait sends the group again while a member is left.
+#[derive(Clone, Copy)]
+struct GroupWait {
+	pgid:   i32,
+	resend: Option<i32>,
+}
+
+/// Whether the root and the descendants have ended.
+fn tree_ended(root: &Process, descendants: &[Process]) -> bool {
+	root.status() != ProcessStatus::Running
+		&& descendants
+			.iter()
+			.all(|process| process.status() != ProcessStatus::Running)
+}
+
 async fn wait_for_exit(
 	root: &Process,
 	descendants: &[Process],
+	group: Option<GroupWait>,
 	timeout: Option<Duration>,
 	ct: CancelToken,
 ) -> Result<bool> {
 	ct.heartbeat()?;
-	if root.status() != ProcessStatus::Running
-		&& descendants
-			.iter()
-			.all(|process| process.status() != ProcessStatus::Running)
-	{
+	if tree_ended(root, descendants) && group.is_none_or(|group| !group_alive(group.pgid)) {
 		return Ok(true);
 	}
 
 	// A lone process is awaited through the OS exit notification. Polling woke
 	// every waiter 20 times a second, and IPC workers wait on their parent for
-	// their whole life. Trees still poll: their membership changes.
+	// their whole life. Trees and groups still poll: their membership changes.
 	if descendants.is_empty()
+		&& group.is_none()
 		&& let Some(result) = wait_for_root_exit(root, timeout, &ct).await
 	{
 		return result;
@@ -1287,16 +1366,35 @@ async fn wait_for_exit(
 		tokio::time::sleep(sleep_for).await;
 		elapsed += sleep_for;
 
-		if root.status() != ProcessStatus::Running
-			&& descendants
-				.iter()
-				.all(|process| process.status() != ProcessStatus::Running)
-		{
+		let group_left = group.filter(|group| group_alive(group.pgid));
+		if tree_ended(root, descendants) && group_left.is_none() {
 			return Ok(true);
+		}
+		// Only while the group still holds a live member: an empty group's id
+		// can be reused.
+		if let Some(GroupWait { pgid, resend: Some(signal) }) = group_left {
+			let _ = kill_process_group(pgid, signal);
 		}
 	}
 
 	Ok(false)
+}
+
+/// Whether process group `pgid` still holds a process that has not ended and
+/// that this process may signal. There are no process groups on Windows.
+fn group_alive(pgid: i32) -> bool {
+	#[cfg(unix)]
+	{
+		// A cheap first answer: fails once the group is empty, zombies
+		// included, or holds no process this one may signal, and refuses the
+		// caller's own group. The scan then reads the members themselves.
+		kill_process_group(pgid, 0) && platform::group_has_live_member(pgid)
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = pgid;
+		false
+	}
 }
 
 /// Waits for `root` to exit through the platform's exit notification:
@@ -2370,5 +2468,167 @@ mod tests {
 		let outlived = child.status() == ProcessStatus::Running;
 		assert!(exited, "the tree must be gone");
 		assert!(!outlived, "the stopped child outlived the termination once its parent died");
+	}
+
+	/// The processes of process group `pgid` and their command names, read
+	/// once.
+	#[cfg(target_os = "linux")]
+	fn group_members_now(pgid: i32) -> Vec<(i32, String)> {
+		std::fs::read_dir("/proc")
+			.into_iter()
+			.flatten()
+			.flatten()
+			.filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+			// SAFETY: getpgid takes a scalar; a pid that ended reads -1.
+			.filter(|pid| unsafe { libc::getpgid(*pid) } == pgid)
+			.map(|pid| (pid, comm(pid)))
+			.collect()
+	}
+
+	/// In group mode, a process of the group that left the tree before the
+	/// walk (its parent exited, so it moved to init) and ignores TERM is
+	/// ended through the group: the grace wait lasts while the group holds a
+	/// live member, and the hard wave's group KILL reaches it.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_ends_a_member_that_left_the_tree() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		// The subshell forks a TERM-ignoring sleep and exits, so the sleep
+		// moves to init, out of the tree but still in the root's group; the
+		// root then runs a plain sleep, which dies of the polite wave's TERM.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "( (trap '' TERM; exec sleep 1000) & ); exec sleep 1000"])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		let mut member = 0;
+		// The member runs sleep once its trap is set, and has left the tree
+		// once the root has no child.
+		wait_until("a TERM-ignoring member left the tree", || {
+			let others: Vec<(i32, String)> =
+				group_members_now(root_pid).into_iter().filter(|(pid, _)| *pid != root_pid).collect();
+			if comm(root_pid) == "sleep"
+				&& process.children().is_empty()
+				&& let [(pid, name)] = &others[..]
+				&& name == "sleep"
+			{
+				member = *pid;
+				return true;
+			}
+			false
+		});
+		let member = Process::from_pid(member).expect("pin the member");
+
+		let exited = process
+			.terminate_tree(true, 200, 5000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = reap(&mut root);
+		let outlived = member.status() == ProcessStatus::Running;
+		assert!(exited, "the group must be gone");
+		assert!(!outlived, "the member that left the tree outlived the termination");
+	}
+
+	/// In group mode, the hard wave's wait sends the group its KILL again
+	/// while a member is left. The helper joins the group right after the
+	/// hard wave's KILL, as a stand-in for a process that signal missed as it
+	/// was forked (seen under gVisor; Linux does not let a group signal miss
+	/// a concurrent fork).
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_ends_a_member_that_joins_after_the_kill() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		// The root ignores TERM, so the polite wave leaves it running and the
+		// hard wave's KILL ends it.
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "trap '' TERM; exec sleep 1000"])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		wait_until("the root runs sleep with TERM ignored", || comm(root_pid) == "sleep");
+		// SAFETY: the child only calls pause, which is async-signal-safe; the
+		// test process has other threads.
+		let helper = unsafe { libc::fork() };
+		assert!(helper >= 0, "fork the helper");
+		if helper == 0 {
+			loop {
+				// SAFETY: pause takes no arguments.
+				unsafe { libc::pause() };
+			}
+		}
+		let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		{
+			let joined = std::sync::Arc::clone(&joined);
+			wave_hook::set_after(
+				root_pid,
+				KILL_SIGNAL,
+				Box::new(move || {
+					// SAFETY: setpgid takes scalars; the helper is this process's
+					// child, has not exec'd, and the group is in this session.
+					let ok = unsafe { libc::setpgid(helper, root_pid) } == 0;
+					joined.store(ok, std::sync::atomic::Ordering::SeqCst);
+				}),
+			);
+		}
+
+		let exited = process
+			.terminate_tree(true, 100, 3000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let mut status = 0;
+		// SAFETY: `status` is a valid out-pointer; WNOHANG returns at once.
+		let reaped = unsafe { libc::waitpid(helper, &raw mut status, libc::WNOHANG) } == helper;
+		if !reaped {
+			// SAFETY: kill and waitpid take scalars and a valid out-pointer.
+			unsafe {
+				libc::kill(helper, libc::SIGKILL);
+				libc::waitpid(helper, &raw mut status, 0);
+			}
+		}
+		let _ = reap(&mut root);
+		assert!(joined.load(std::sync::atomic::Ordering::SeqCst), "the helper joined the group after the KILL");
+		assert!(exited, "the group must be gone");
+		assert!(
+			reaped && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+			"the member that joined after the group KILL outlived the termination",
+		);
+	}
+
+	/// In group mode, a loop that forks as fast as it can leaves no process of
+	/// its group running once terminated: the walk holds the tree, and both
+	/// waits last until the group is empty. Several runs, as one run can miss
+	/// a window.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_leaves_no_child_of_a_forking_loop() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		for run in 0..5 {
+			let mut root = Command::new("/bin/sh")
+				.args(["-c", "while :; do sleep 1000 & done"])
+				.process_group(0)
+				.spawn()
+				.expect("spawn the root");
+			let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+			let _guard = GroupGuard(root_pid);
+			let process = Process::from_pid(root_pid).expect("pin the root");
+			wait_until("the loop forked", || process.children().len() >= 3);
+			let exited = process
+				.terminate_tree(true, 1000, 5000, CancelToken::default())
+				.await
+				.expect("terminate");
+			let _ = reap(&mut root);
+			let left = live_group_members(root_pid);
+			assert!(exited, "run {run}: the group must be gone");
+			assert!(left.is_empty(), "run {run}: processes of the loop's group outlived the termination: {left:?}");
+		}
 	}
 }
