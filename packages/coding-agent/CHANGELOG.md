@@ -20,6 +20,8 @@
 - `OMP_SESSION_EXCLUSIVE=1` keeps a launcher's recorded session id: a session still held after the wait, a lease taken over or gone, or a file another writer changed or replaced ends the process non-zero, naming the reason, instead of moving to a new id; a `departed` entry is logged and the session opens as it is.
 - `OMP_SESSION_SQL_CREATE_TABLE=0` opens SQL session storage without creating its tables, for a login that may not create objects. On PostgreSQL a login without `CREATE` on the schema can also open the store on tables that exist without it: start-up looks for the tables first and makes none that exists.
 - Session storages can implement an optional `readChunks(path, fromByte?)` that streams a transcript's bytes, and an `IndexedSessionStorage` backend (`SessionStorageBackend`, which SDK stores may implement) optional `readChunks` and `writeFullStream` methods, so long sessions resume and rewrite without holding the whole transcript in memory
+- An `IndexedSessionStorage` backend (`SessionStorageBackend`) can implement an optional `appendBatch(path, lines, mtimeMs, expectedSize?)` that stores the lines a session queued while one of its appends was in flight in one write; it throws `SessionAppendBatchRolledBackError` when that write stored none of them, and the lines are then appended again one at a time. A backend without it gets one `append` per line, as before
+- Session storages can implement an optional `waitForAppendAdmission(signal?)` that resolves once the process's queued transcript appends are within the storage's bound, or when `signal` fires; `IndexedSessionStorage` (SQL and Redis session storage) bounds them at 64 MiB across every session of the process, and its writers' async `append` resolves only once its line is stored and the bound admits more
 
 ### Changed
 
@@ -28,6 +30,7 @@
 
 ### Fixed
 
+- A busy process on SQL session storage, such as one running many subagents inline, no longer holds its queued transcript lines in memory while the database falls behind: the lines a session queues while one of its appends is in flight go to the database in one transaction, and the process queues at most 64 MiB of appends before a session waits for earlier ones to land
 - Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
 - Debug reports, `omp gc --blobs` and memories stage 1 read long transcripts from SQL session storage chunk by chunk instead of whole, and RPC `get_subagent_messages` and the Agent Hub transcript viewer read at most 8 MiB of a transcript at a time (an RPC client repeats the request from `nextByte` to read on; when no record ends right before `fromByte`, as after a rewrite of the transcript, the reply reads again from byte 0 and reports `reset: true`)
 - RPC `get_subagent_messages` and the Agent Hub transcript viewer fetch only the window they read from Redis session storage instead of the whole transcript
