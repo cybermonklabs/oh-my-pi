@@ -104,7 +104,7 @@ jobs:
             native_targets: darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Bun version follows package.json "packageManager" (exact pin or floor),
       # the same way upstream's CI does; a hard pin here lags upstream's floor
       # and produced a binary that crashed at startup under 18.2.0's bytecode.
@@ -192,7 +192,7 @@ jobs:
           mkdir -p "release/${asset}/bin"
           cp "packages/coding-agent/binaries/omp-${TARGET}" "release/${asset}/bin/omp"
           tar -C release -czf "release/${asset}.tar.gz" "$asset"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mise-${{ matrix.target }}
           path: release/*.tar.gz
