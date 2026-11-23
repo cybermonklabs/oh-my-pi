@@ -3,7 +3,8 @@
 # tests/*.rs one) in a libtest process of its own, straight from the build's archive, as the
 # runner's user or as root, --test-threads=4, with the hang bound SC_BIN_BOUND (seconds) per
 # binary. libtest reports in JSON (nightly's -Z unstable-options --format json --report-time),
-# and sc.py libtest reads each binary's result. Writes $SC/res/<unit>.json and $SC/res/logs/.
+# with each passing test's output (--show-output) so sc.py libtest can see a test that skipped
+# itself. Writes $SC/res/<unit>.json and $SC/res/logs/.
 #   set.sh WHO SHARD
 # Nothing is built here; the archive was unpacked at $GITHUB_WORKSPACE, the path it was built at.
 set -uo pipefail
@@ -21,18 +22,19 @@ mkdir -p "$home"
 [ "$who" = root ] && sudo chown root:root "$home"
 # The tests' environment: nothing of the runner's but what is named here.
 envv=(HOME="$home" USER="$who" LOGNAME="$who" TMPDIR="$tmp" PATH="$SC_TEST_PATH" RUST_BACKTRACE=1
-	RSYNC_REFERENCE_REQUIRED=1 CARGO_PKG_NAME=pi-shell CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell")
+	RSYNC_REFERENCE_REQUIRED=1 PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO"
+	CARGO_PKG_NAME=pi-shell CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell")
 n=0
 while IFS=$'\t' read -r ident bin; do
 	n=$((n + 1))
 	safe=$(printf '%s' "$ident" | tr -c 'A-Za-z0-9_.-' '_')
 	log=$SC/res/logs/$safe.log
 	if [ ! -x "$bin" ]; then
-		echo "{\"row\": \"set-$who\", \"unit\": \"$ident\", \"who\": \"$who\", \"status\": \"UNKNOWN\", \"exit\": \"-\", \"seconds\": 0, \"passed\": 0, \"failed\": 0, \"ignored\": 0, \"failures\": [], \"tests\": [], \"note\": \"the archive has no executable at $bin\"}" > "$SC/res/$safe.json"
+		echo "{\"row\": \"set-$who\", \"unit\": \"$ident\", \"who\": \"$who\", \"status\": \"UNKNOWN\", \"exit\": \"-\", \"seconds\": 0, \"passed\": 0, \"failed\": 0, \"ignored\": 0, \"self_skipped\": [], \"failures\": [], \"tests\": [], \"note\": \"the archive has no executable at $bin\"}" > "$SC/res/$safe.json"
 		continue
 	fi
 	s=$(date +%s.%N)
-	cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --test-threads=4)
+	cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --show-output --test-threads=4)
 	if [ "$who" = root ]; then
 		(cd "$SC_TREE/crates/pi-shell" && sudo env -i "${envv[@]}" "${cmd[@]}") > "$log" 2>&1 < /dev/null
 	else
