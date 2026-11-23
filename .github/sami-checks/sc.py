@@ -519,7 +519,10 @@ def platform_results(pc_dir, commit):
             continue
         line = lines[0]
         mine = [t for t in tests if key(t)]
-        bad = [f"{t.get('binary')} {t.get('test')}: {t.get('verdict')}, passed {t.get('passed')}" for t in mine if t.get("verdict") != "PASS"]
+        # A failure is named as the JUnit report names the test (binary::test), so the known-failure
+        # list can name it; a verdict other than FAIL is added, so a timeout is another failure.
+        bad = [f"{t.get('binary')}::{t.get('test')}" + ("" if t.get("verdict") == "FAIL" else f" ({t.get('verdict')})")
+               for t in mine if t.get("verdict") != "PASS"]
         times = []
         for _, d in legs.get(p, ()):
             try:
@@ -594,7 +597,22 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def cmd_summary(results_dir, build_dir):
+def read_known(path):
+    """known-failures.txt: (row, user, unit, test) -> reason."""
+    known = {}
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            if not line.strip() or line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 5:
+                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
+            known[tuple(f[:4])] = f[4]
+    return known
+
+
+def cmd_summary(results_dir, build_dir, known_path=None):
+    known = read_known(known_path)
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -613,13 +631,14 @@ def cmd_summary(results_dir, build_dir):
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
     lines.append("")
-    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed. "
-                 "A unit is UNKNOWN when its runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with "
-                 "its summary line, clippy 0/101), when a passing test printed a skip marker, when a clean clippy "
+    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed, "
+                 "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
+                 "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
+                 "0/101), when a passing test printed a skip marker and passed as no other user, when a clean clippy "
                  "crate's planted control was not caught, when the platform checks gave its platform no verdict, or "
                  "when no job (or more than one) reported it; its row is then UNKNOWN too.")
     lines.append("")
-    lines.append("| Row | Verdict | Units: pass / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
+    lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
     all_ok = True
     details = []
@@ -639,14 +658,16 @@ def cmd_summary(results_dir, build_dir):
                     r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
                 else:
                     r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+            if r["status"] == "FAIL" and r["failures"] and all((key, r["who"], r["unit"], f) in known for f in r["failures"]):
+                r = dict(r, status="KNOWN")
             rs.append(r)
         if key in notes and not units:
             verdict, counts = "UNKNOWN", "-"
             details.append(f"- **{title}**: UNKNOWN: {notes[key]}")
         else:
-            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "FAIL", "UNKNOWN")}
-            verdict = "UNKNOWN" if n["UNKNOWN"] or not rs else ("FAIL" if n["FAIL"] else "PASS")
-            counts = f"{n['PASS']} / {n['FAIL']} / {n['UNKNOWN']}"
+            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "KNOWN", "FAIL", "UNKNOWN")}
+            verdict = ("UNKNOWN" if n["UNKNOWN"] or not rs else "FAIL" if n["FAIL"] else "KNOWN" if n["KNOWN"] else "PASS")
+            counts = f"{n['PASS']} / {n['KNOWN']} / {n['FAIL']} / {n['UNKNOWN']}"
         tp = sum(r["passed"] for r in rs)
         tf = sum(r["failed"] for r in rs)
         ti = sum(r["ignored"] for r in rs)
@@ -654,16 +675,35 @@ def cmd_summary(results_dir, build_dir):
         longest = max(rs, key=lambda r: r["seconds"], default=None)
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
-        if verdict != "PASS":
+        if verdict not in ("PASS", "KNOWN"):
             all_ok = False
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`")
+                why = known.get((key, r["who"], r["unit"], f))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
+                               + (f"KNOWN ({why})" if why else "**NEW**"))
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
     lines.append("")
+    # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
+    # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
+    # neither: it stays.
+    stale = []
+    for (row, who, unit, test), why in sorted(known.items()):
+        r = got.get((row, unit, who))
+        if r is None or r["status"] == "UNKNOWN" or test in r["failures"]:
+            continue
+        names = {n for n, _ in r["tests"]}
+        stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else "no longer in its unit")
+                     + f" (listed for: {why})")
+    if stale:
+        all_ok = False
+        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("")
+        lines.extend(stale)
+        lines.append("")
     if details:
         lines.append("### Each failing test and each UNKNOWN")
         lines.append("")
@@ -834,7 +874,7 @@ def selftest():
     got = {r["row"]: r for r in platform_results(pc, commit)}
     check("platform timeout reads FAIL with its test named",
           (got["macos"]["status"], got["macos"]["failures"], got["macos"]["passed"], got["macos"]["ignored"], got["macos"]["seconds"]),
-          ("FAIL", ["pi-shell a::y: TIMEOUT, passed 0/1"], 1, 1, 2220.0))
+          ("FAIL", ["pi-shell::a::y (TIMEOUT)"], 1, 1, 2220.0))
     check("platform the report gives no verdict for", got["windows"]["status"], "UNKNOWN")
     # A platform whose head build failed: its UNKNOWN names the first compiler error.
     os.makedirs(os.path.join(pc, "pc-build-windows-head"))
@@ -872,21 +912,24 @@ def selftest():
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
                   open(os.path.join(res, f"{i}.json"), "w"))
 
+    known_file = os.path.join(d, "known.txt")
+    open(known_file, "w").write("# none\n")
+
     def summary():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = cmd_summary(res, build)
+            rc = cmd_summary(res, build, known_file)
         return rc, buf.getvalue()
 
     rc, out = summary()
     check("summary exit with a silent unit", rc, 1)
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
-    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
-    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 |" in out, True)
+    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
-    check("summary row of the silent clippy crate", "| clippy --tests -D warnings, per crate (failed: findings) | **UNKNOWN** | 5 / 0 / 1 |" in out, True)
-    check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
-    check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 |" in out, True)
+    check("summary row of the silent clippy crate", "| clippy --tests -D warnings, per crate (failed: findings) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
+    check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
     for i, (row, unit, who) in enumerate(sorted(silent)):
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res, f"silent-{i}.json"), "w"))
@@ -913,6 +956,44 @@ def selftest():
     json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
     rc, out = summary()
     check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # The known-failure list: a failure it names reads KNOWN, one it does not is NEW, and an entry
+    # whose test passed is listed for removal and fails the summary.
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=1,
+                     failures=["k"], tests=[("k", 1.0), ("p", 1.0)]),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"], r["who"]) == ("set-runner", "pi-shell::zle_pty", "runner") and f != "zle-runner.json":
+            os.remove(os.path.join(res, f))
+    rc, out = summary()
+    check("an unlisted failure is NEW", ("FAILED `k`: **NEW**" in out, "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("a listed failure is KNOWN", ("FAILED `k`: KNOWN (the host's zsh)" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, True, 0))
+    open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
+    rc, out = summary()
+    check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
+    open(known_file, "w").write("# none\n")
+    # A platform failure on the list reads KNOWN too; a timeout of the same test is another failure.
+    for f in os.listdir(res):
+        if json.load(open(os.path.join(res, f)))["row"] == "macos":
+            os.remove(os.path.join(res, f))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "FAIL", "100", 1, passed=1, failed=1,
+                     failures=["pi-shell::a::y"], tests=[("pi-shell::a::y", 1.0), ("pi-shell::a::x", 1.0)]),
+              open(os.path.join(res, "macos.json"), "w"))
+    open(known_file, "w").write("macos\trunner\tpi-shell\tpi-shell::a::y\tmacOS's own bash\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("a listed platform failure is KNOWN", ("| macOS: pi-shell, platform checks | **KNOWN** |" in out, rc), (True, 0))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "FAIL", "100", 1, passed=1, failed=1,
+                     failures=["pi-shell::a::y (TIMEOUT)"], tests=[("pi-shell::a::x", 1.0)]),
+              open(os.path.join(res, "macos.json"), "w"))
+    rc, out = summary()
+    check("a platform timeout of a listed failure is NEW", ("| macOS: pi-shell, platform checks | **FAIL** |" in out, rc), (True, 1))
+    os.remove(os.path.join(res, "macos.json"))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "macos.json"), "w"))
+    open(known_file, "w").write("# none\n")
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()

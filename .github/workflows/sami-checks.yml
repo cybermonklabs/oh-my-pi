@@ -48,6 +48,11 @@
 # reported, is UNKNOWN, and so is its row. The summary job fails unless every row passed, so the
 # run's colour is the result. Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result
 # and log), sc-build, and the platform checks' own (pc-report, pc-results-*, pc-build-*).
+# Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
+# reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
+# row whose only failures are known reads KNOWN, and an entry whose test passed is listed for removal
+# and fails the summary. The browser tests run against the Chrome for Testing build the tree's
+# puppeteer-core pins (bun.sh chrome), not the runner's google-chrome.
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
@@ -413,6 +418,11 @@ jobs:
           path: ${{ github.workspace }}/tree/packages/natives/native
       - name: The only addon a workspace load reads
         run: bash tool/.github/sami-checks/bun.sh addon
+      - name: The Chrome the tree's puppeteer-core pins
+        run: bash tool/.github/sami-checks/bun.sh chrome
+      - name: WebMCP probe (the runner's Chrome and the pinned one; a diagnostic)
+        continue-on-error: true
+        run: bash tool/.github/sami-checks/ts.sh webmcp-probe
       - name: Tests
         run: bash tool/.github/sami-checks/ts.sh small
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -456,6 +466,8 @@ jobs:
           path: ${{ github.workspace }}/tree/packages/natives/native
       - name: The only addon a workspace load reads
         run: bash tool/.github/sami-checks/bun.sh addon
+      - name: The Chrome the tree's puppeteer-core pins
+        run: bash tool/.github/sami-checks/bun.sh chrome
       - name: Tests
         run: bash tool/.github/sami-checks/ts.sh ca "${{ matrix.shard }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -614,7 +626,7 @@ jobs:
               echo "::error::the platform report reader failed, so the platform rows read UNKNOWN"
           fi
           rc=0
-          python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" > "$SC/report/summary.md" || rc=$?
+          python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" tool/.github/sami-checks/known-failures.txt > "$SC/report/summary.md" || rc=$?
           cat "$SC/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json,os,sys; sys.path.insert(0, "tool/.github/sami-checks"); import sc; json.dump(sc.load_results(sys.argv[1]), open(sys.argv[2], "w"))' "$SC/results" "$SC/report/results.json"
           exit "$rc"
