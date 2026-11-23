@@ -751,7 +751,7 @@ fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
 #[test]
 fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	use std::sync::mpsc;
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	if !crate::own_process::own_process() {
 		return;
@@ -769,13 +769,40 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	// environment, so this is the only way to aim the holding thread at the
 	// FIFO.
 	unsafe { std::env::set_var("LOCPATH", &blocking) };
-	std::thread::spawn(|| {
+	let (started, holding) = mpsc::channel();
+	let holder = std::thread::spawn(move || {
+		// SAFETY: gettid takes no arguments.
+		started.send(unsafe { libc::gettid() }).unwrap();
 		// SAFETY: a valid NUL-terminated name; the call blocks and the handle,
 		// if it ever returns one, is leaked with the thread.
 		unsafe { libc::newlocale(libc::LC_CTYPE_MASK, c"omp_rsync_fifo".as_ptr(), std::ptr::null_mut()) };
 	});
-	// The lock is taken inside `newlocale`; give the thread time to reach it.
-	std::thread::sleep(Duration::from_millis(300));
+	// `newlocale` takes the lock before it opens the locale's files (glibc
+	// 2.39 and 2.41 `locale/newlocale.c:161`, then `loadlocale.c`'s open),
+	// and the open of the FIFO is where it sleeps: the thread asleep (`S`)
+	// after it sent its id holds the lock. A query started before that
+	// passes without the lock held, which a fixed sleep allowed under load.
+	let holder_tid = holding.recv().unwrap();
+	let stat = format!("/proc/self/task/{holder_tid}/stat");
+	let deadline = Instant::now() + Duration::from_secs(30);
+	let ended = "newlocale returned: the holding thread never waited in its open of the FIFO";
+	loop {
+		assert!(!holder.is_finished(), "{ended}");
+		let state = match fs::read_to_string(&stat) {
+			Ok(state) => state,
+			// The thread's directory goes only once the thread has ended.
+			Err(_) if holder.is_finished() => panic!("{ended}"),
+			Err(error) => panic!("{stat}: {error}"),
+		};
+		if state.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) {
+			break;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"the holding thread was not asleep in its open of the FIFO in 30 s: {state}"
+		);
+		std::thread::sleep(Duration::from_millis(1));
+	}
 
 	let (answered, answer) = mpsc::channel();
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -1016,6 +1043,36 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 		let mut line = String::new();
 		std::io::BufReader::new(utility.stdout.take().unwrap()).read_line(&mut line).unwrap();
 		let member: i32 = line.trim().parse().unwrap();
+		// The member is signalled only once its `execve` of `sleep` is done.
+		// gVisor discards every stop signal still queued when a process
+		// reaches its new image (`pkg/sentry/kernel/task_exec.go`,
+		// `execveWithImage`, its `endGroupStopLocked`); Linux keeps it
+		// pending. A `SIGSTOP` sent in that window was lost, and a member
+		// left alone read `S`: on gVisor, 170 of 500 sent right after the
+		// fork were lost, none on runc. gVisor names the process `sleep` only
+		// once past that point, and none of 500 sent after that was lost.
+		let comm = format!("/proc/{member}/comm");
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		let running = loop {
+			if fs::read_to_string(&comm).is_ok_and(|name| name.trim_end() == "sleep") {
+				break Ok(());
+			}
+			let (state, _) = state_and_threads(member);
+			if matches!(state, b'Z' | b'X' | b'?') {
+				break Err(format!("ended before it ran sleep: state {}", char::from(state)));
+			}
+			if std::time::Instant::now() >= deadline {
+				break Err("did not run sleep within 30 s".to_owned());
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		};
+		if let Err(why) = running {
+			// SAFETY: the test cleans up what it started.
+			unsafe { libc::kill(member, libc::SIGKILL) };
+			let _ = utility.kill();
+			let _ = utility.wait();
+			panic!("the member {member} {why}");
+		}
 		// SAFETY: a handle on this test's own unreaped child, owned from here.
 		let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
 		let handle = super::ChildHandle(
@@ -1028,12 +1085,40 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 		}
 		handle.end_group();
 		if reaped_elsewhere {
-			std::thread::sleep(std::time::Duration::from_millis(200));
-			// SAFETY: a signal-free existence probe for this test's process.
-			let alive = unsafe { libc::kill(member, 0) } == 0;
+			// `end_group` has sent every signal it sends by the time it
+			// returns, and a process a `SIGKILL` has reached takes no later
+			// signal: Linux marks it exiting as the `SIGKILL` is sent and then
+			// drops what follows (7.0 `kernel/signal.c:1003-1017`, `:877-883`),
+			// and gVisor stops no thread group that is exiting. So a member
+			// left alone takes this stop and reads `T`; one that was ended
+			// never does, and reads `Z` or `X` until it is reaped, then
+			// nothing. A sleep and then `kill(member, 0)` passed for such a
+			// zombie.
+			// SAFETY: a stop for this test's own process, ended below.
+			unsafe { libc::kill(member, libc::SIGSTOP) };
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let (state, in_time) = loop {
+				let (state, _) = state_and_threads(member);
+				if matches!(state, b'T' | b'Z' | b'X' | b'?') {
+					break (state, true);
+				}
+				if std::time::Instant::now() >= deadline {
+					break (state, false);
+				}
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			};
 			// SAFETY: the test cleans up what it started.
 			unsafe { libc::kill(member, libc::SIGKILL) };
-			assert!(alive, "a member of a group whose utility was reaped elsewhere was signalled");
+			assert!(
+				in_time,
+				"the member neither stopped nor ended within 30 s of its SIGSTOP: state {}",
+				char::from(state)
+			);
+			assert_eq!(
+				char::from(state),
+				'T',
+				"a member of a group whose utility was reaped elsewhere was signalled: it did not stop"
+			);
 		} else {
 			utility.wait().unwrap();
 			assert_ended(member);
