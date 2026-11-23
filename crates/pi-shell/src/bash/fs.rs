@@ -404,6 +404,19 @@ pub trait File: Send {
 		let _ = key;
 		self.poll_write_tagged(cx, bytes, tag)
 	}
+	/// [`Self::poll_flush`] for a task that may wait beside others, as
+	/// [`Self::poll_read_keyed`]: a host task closing its handle of an engine
+	/// fd (a native extra), a pump, a relay. The default ignores the key, as
+	/// there; an object whose flush can wait on another [`File`] must pass
+	/// the key on to it.
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<()>> {
+		let _ = key;
+		self.poll_flush(cx)
+	}
 	/// Duplicate (`n>&m` into an external, `exec 3>&1`).
 	fn dup(&self) -> io::Result<Box<dyn File>>;
 }
@@ -716,5 +729,85 @@ mod tests {
 		assert_eq!(plain(r"\\?\C:\dir\com10"), r"C:\dir\com10");
 		let long = format!(r"\\?\C:\{}", "a".repeat(260));
 		assert_eq!(plain(&long), long);
+	}
+}
+
+/// Test files for the tests of the objects that forward to a [`File`].
+#[cfg(test)]
+pub(crate) mod test_files {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
+
+	use super::*;
+	use crate::sys::{WaitKey, Wakers};
+
+	/// A file whose flush answers at once and records how it was asked: a
+	/// keyed flush waits in `set` with the key it was given, so a test reads
+	/// whose key reached it; both kinds are counted.
+	#[derive(Clone, Default)]
+	pub(crate) struct FlushProbe {
+		set:     Arc<Wakers>,
+		keyed:   Arc<AtomicUsize>,
+		keyless: Arc<AtomicUsize>,
+	}
+
+	impl FlushProbe {
+		/// Whether a flush with `key` reached this file.
+		pub(crate) fn reached_by(&self, key: &WaitKey) -> bool {
+			key.id_in(&self.set).is_some()
+		}
+
+		/// How many flushes with a key reached this file.
+		pub(crate) fn keyed(&self) -> usize {
+			self.keyed.load(Ordering::SeqCst)
+		}
+
+		/// How many flushes without a key reached this file.
+		pub(crate) fn keyless(&self) -> usize {
+			self.keyless.load(Ordering::SeqCst)
+		}
+	}
+
+	impl File for FlushProbe {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			self.keyless.fetch_add(1, Ordering::SeqCst);
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_flush_keyed(
+			&mut self,
+			cx: &mut Context<'_>,
+			key: &mut WaitKey,
+		) -> Poll<io::Result<()>> {
+			self.keyed.fetch_add(1, Ordering::SeqCst);
+			self.set.wait(key, cx.waker());
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> io::Result<Box<dyn File>> {
+			Ok(Box::new(self.clone()))
+		}
 	}
 }

@@ -58,6 +58,17 @@
 //! - A write moves at most 1 MiB per call and reports only what the provider
 //!   wrote. Dropping a file aborts a read in flight; a write or flush in flight
 //!   finishes in the background.
+//! - Several tasks can poll one open provider file: every holder of the engine
+//!   fd (the engine's vprocs, a native extra's thread, a pump). Each waits by
+//!   its key ([`WaitKey`]; a vproc writes with its own, a host callout with a
+//!   key of the call's own, a flush is keyed too, [`File::poll_flush_keyed`]),
+//!   and the operation in flight wakes them all. A write's or flush's result
+//!   goes only to the task that started it, which takes it when it polls again
+//!   (it is dropped once that task's key is gone: a killed vproc's too, a
+//!   command's the shell dropped while its write waited, after which the vproc
+//!   writes with a new key, and a callout's dropped with the call); the others
+//!   go on meanwhile. A read's bytes go to whichever reader polls, as from a
+//!   shared description. Keyless polls wait under the file's own key.
 //!
 //! # Running out of descriptors
 //!
@@ -80,7 +91,7 @@ use std::{
 	path::{Path, PathBuf},
 	pin::Pin,
 	sync::Arc,
-	task::{Context, Poll, ready},
+	task::{Context, Poll, Waker, ready},
 };
 
 use bstr::{BStr, BString};
@@ -96,7 +107,7 @@ use crate::{
 		DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, OpenFlags, OsHandle, Stat,
 		fs::{Access, SeekFrom, StatKind, TempNode, TempPurpose},
 	},
-	sys::{StdFile, StdFs},
+	sys::{StdFile, StdFs, WaitKey, Wakers},
 };
 
 /// Most bytes one provider read or write moves.
@@ -717,28 +728,86 @@ impl Drop for Description {
 	}
 }
 
-/// A provider operation in flight on a [`VfsFile`].
+/// A provider operation in flight on a [`VfsFile`]. A write or flush is
+/// for the task that started it (the id of its key in [`VfsFile::tasks`]).
 enum Op {
 	Read(JoinHandle<io::Result<Vec<u8>>>),
-	Write(JoinHandle<io::Result<usize>>),
-	Flush(JoinHandle<io::Result<()>>),
+	Write(JoinHandle<io::Result<usize>>, u64),
+	Flush(JoinHandle<io::Result<()>>, u64),
+}
+
+/// The result of a write or flush that finished before the task it was for
+/// polled again.
+enum Done {
+	Write(io::Result<usize>),
+	Flush(io::Result<()>),
+}
+
+impl Done {
+	const fn kind(&self) -> Want {
+		match self {
+			Self::Write(_) => Want::Write,
+			Self::Flush(_) => Want::Flush,
+		}
+	}
+}
+
+/// What a poll asks of a [`VfsFile`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+	Write,
+	Flush,
+}
+
+/// Keep `done` for task `owner` (by its key's id in `tasks`) until it polls
+/// again, unless its key is gone; drop the results kept for tasks whose keys
+/// are gone since.
+fn keep(kept: &mut Vec<(u64, Done)>, tasks: &Wakers, owner: u64, done: Done) {
+	kept.retain(|(id, _)| tasks.holds(*id));
+	if tasks.holds(owner) {
+		kept.push((owner, done));
+	}
 }
 
 /// A provider file as an engine [`File`].
+///
+/// Every holder of the engine fd polls this one object: the engine's vprocs
+/// (with the engine's one waker), a native extra writing through a handle of
+/// its own, a pump. Each task waits by its key in `tasks`, whose waker the
+/// operation in flight is polled with, so it wakes them all (a `JoinHandle`
+/// keeps one waker). A write's or a flush's result goes only to the task it
+/// was for: kept in `kept` until that task polls again, or dropped once its
+/// key is gone. No task waits for another to take its result. A read's bytes
+/// are read-ahead any reader takes, as they would be from a shared file
+/// description.
 struct VfsFile {
 	desc:     Arc<Description>,
 	op:       Option<Op>,
+	/// Results kept for the tasks they were for, by their keys' ids.
+	kept:     Vec<(u64, Done)>,
 	/// Bytes a provider read returned beyond the buffer the engine polled
 	/// with last (it polled again with a smaller one); the provider's cursor
 	/// is past them.
 	ahead:    Vec<u8>,
 	/// How much of `ahead` was handed out.
 	ahead_at: usize,
+	/// The tasks polling this file.
+	tasks:    Arc<Wakers>,
+	/// The wait of keyless polls: the file's owner's, the engine's.
+	own:      WaitKey,
 }
 
 impl VfsFile {
-	const fn new(desc: Arc<Description>) -> Self {
-		Self { desc, op: None, ahead: Vec::new(), ahead_at: 0 }
+	fn new(desc: Arc<Description>) -> Self {
+		Self {
+			desc,
+			op: None,
+			kept: Vec::new(),
+			ahead: Vec::new(),
+			ahead_at: 0,
+			tasks: Arc::default(),
+			own: WaitKey::default(),
+		}
 	}
 
 	/// Hand out read-ahead into `buf`.
@@ -749,30 +818,6 @@ impl VfsFile {
 		self.ahead_at += n;
 		self.desc.advance(n, false);
 		n
-	}
-
-	/// Wait for the operation in flight, whatever it is, keeping a read's
-	/// bytes as read-ahead and accounting for a write's.
-	fn settle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-		let Some(op) = &mut self.op else {
-			return Poll::Ready(());
-		};
-		match op {
-			Op::Read(task) => {
-				if let Ok(data) = ready!(poll_task(task, cx)) {
-					self.ahead = data;
-					self.ahead_at = 0;
-				}
-			},
-			Op::Write(task) => {
-				if let Ok(n) = ready!(poll_task(task, cx)) {
-					self.desc.advance(n, true);
-				}
-			},
-			Op::Flush(task) => drop(ready!(poll_task(task, cx))),
-		}
-		self.op = None;
-		Poll::Ready(())
 	}
 
 	/// Give read-ahead back to the provider before writing: seek back to the
@@ -787,7 +832,159 @@ impl VfsFile {
 		self.ahead.clear();
 		self.ahead_at = 0;
 	}
+
+	/// `key`'s task (the owner's for `None`) waits with `cx`'s waker; returns
+	/// its key's id in `tasks`.
+	fn wait(&mut self, cx: &Context<'_>, key: Option<&mut WaitKey>) -> u64 {
+		let key = match key {
+			Some(key) => key,
+			None => &mut self.own,
+		};
+		self.tasks.wait(key, cx.waker());
+		key.id_in(&self.tasks)
+			.expect("a key that waits here has an id here")
+	}
+
+	/// Poll the operation in flight with the waker that wakes every waiting
+	/// task. Once it finishes, a read's bytes become read-ahead (its error is
+	/// returned), and a write's or flush's result is kept for its task.
+	fn finish_op(&mut self) -> Poll<io::Result<()>> {
+		let fanout = Waker::from(Arc::clone(&self.tasks));
+		let cx = &mut Context::from_waker(&fanout);
+		let finished = match &mut self.op {
+			None => return Poll::Ready(Ok(())),
+			Some(Op::Read(task)) => match ready!(poll_task(task, cx)) {
+				Ok(data) => {
+					self.ahead = data;
+					self.ahead_at = 0;
+					Ok(())
+				},
+				Err(err) => Err(err),
+			},
+			Some(Op::Write(task, owner)) => {
+				let owner = *owner;
+				let written = ready!(poll_task(task, cx));
+				if let Ok(n) = &written {
+					self.desc.advance(*n, true);
+				}
+				keep(&mut self.kept, &self.tasks, owner, Done::Write(written));
+				Ok(())
+			},
+			Some(Op::Flush(task, owner)) => {
+				let owner = *owner;
+				let flushed = ready!(poll_task(task, cx));
+				keep(&mut self.kept, &self.tasks, owner, Done::Flush(flushed));
+				Ok(())
+			},
+		};
+		self.op = None;
+		Poll::Ready(finished)
+	}
+
+	/// Take the result kept for task `me` of the kind it asks for.
+	fn take(&mut self, me: u64, want: Want) -> Option<Done> {
+		let at = self
+			.kept
+			.iter()
+			.position(|(owner, done)| *owner == me && done.kind() == want)?;
+		Some(self.kept.swap_remove(at).1)
+	}
+
+	fn read_as(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &mut [u8],
+		key: Option<&mut WaitKey>,
+	) -> Poll<io::Result<usize>> {
+		if buf.is_empty() {
+			return probe(self.desc.read);
+		}
+		self.wait(cx, key);
+		loop {
+			if self.ahead_at < self.ahead.len() {
+				return Poll::Ready(Ok(self.take_ahead(buf)));
+			}
+			match &self.op {
+				Some(Op::Read(_)) => {
+					ready!(self.finish_op())?;
+					if self.ahead.is_empty() {
+						return Poll::Ready(Ok(0));
+					}
+				},
+				// Its result is kept for the task it is for.
+				Some(_) => drop(ready!(self.finish_op())),
+				None => {
+					let len = buf.len().min(MAX_CHUNK);
+					self.op = Some(Op::Read(self.desc.spawn(|file| async move {
+						let mut data = vec![0; len];
+						let n = file.read_async(&mut data).await?;
+						data.truncate(n);
+						Ok(data)
+					})));
+				},
+			}
+		}
+	}
+
+	fn write_as(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &[u8],
+		key: Option<&mut WaitKey>,
+	) -> Poll<io::Result<usize>> {
+		if buf.is_empty() {
+			return probe(self.desc.write);
+		}
+		let me = self.wait(cx, key);
+		loop {
+			if let Some(done) = self.take(me, Want::Write) {
+				let Done::Write(written) = done else {
+					unreachable!("take gives the kind asked for")
+				};
+				return Poll::Ready(written);
+			}
+			if self.op.is_some() {
+				// A read's error is its reader's; another task's result is
+				// kept for it.
+				drop(ready!(self.finish_op()));
+			} else {
+				self.drop_ahead();
+				let data = buf[..buf.len().min(MAX_CHUNK)].to_vec();
+				let task = self
+					.desc
+					.spawn(|file| async move { file.write_async(&data).await });
+				self.op = Some(Op::Write(task, me));
+			}
+		}
+	}
+
+	fn flush_as(&mut self, cx: &Context<'_>, key: Option<&mut WaitKey>) -> Poll<io::Result<()>> {
+		let me = self.wait(cx, key);
+		loop {
+			if let Some(done) = self.take(me, Want::Flush) {
+				let Done::Flush(flushed) = done else {
+					unreachable!("take gives the kind asked for")
+				};
+				return Poll::Ready(flushed);
+			}
+			if self.op.is_some() {
+				#[cfg(test)]
+				FLUSH_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				drop(ready!(self.finish_op()));
+			} else {
+				let file = Arc::clone(&self.desc.file);
+				let task = self.desc.rt.spawn(async move { file.flush_async().await });
+				self.op = Some(Op::Flush(task, me));
+			}
+		}
+	}
 }
+
+/// Test only: flushes that found an operation under way (a test forces the
+/// order of a close and a held write by it).
+#[cfg(test)]
+pub(crate) static FLUSH_WAITS: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
 
 fn poll_task<T>(task: &mut JoinHandle<io::Result<T>>, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
 	Pin::new(task).poll(cx).map(joined)
@@ -805,93 +1002,46 @@ fn probe(allowed: bool) -> Poll<io::Result<usize>> {
 
 impl File for VfsFile {
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
-		if buf.is_empty() {
-			return probe(self.desc.read);
-		}
-		loop {
-			if self.ahead_at < self.ahead.len() {
-				return Poll::Ready(Ok(self.take_ahead(buf)));
-			}
-			match &mut self.op {
-				Some(Op::Read(task)) => {
-					let data = ready!(poll_task(task, cx));
-					self.op = None;
-					match data {
-						Ok(data) => {
-							self.ahead = data;
-							self.ahead_at = 0;
-							if self.ahead.is_empty() {
-								return Poll::Ready(Ok(0));
-							}
-						},
-						Err(err) => return Poll::Ready(Err(err)),
-					}
-				},
-				Some(_) => ready!(self.settle(cx)),
-				None => {
-					let len = buf.len().min(MAX_CHUNK);
-					self.op = Some(Op::Read(self.desc.spawn(|file| async move {
-						let mut data = vec![0; len];
-						let n = file.read_async(&mut data).await?;
-						data.truncate(n);
-						Ok(data)
-					})));
-				},
-			}
-		}
+		self.read_as(cx, buf, None)
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.read_as(cx, buf, Some(key))
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		if buf.is_empty() {
-			return probe(self.desc.write);
-		}
-		loop {
-			match &mut self.op {
-				Some(Op::Write(task)) => {
-					let written = ready!(poll_task(task, cx));
-					self.op = None;
-					if let Ok(n) = written {
-						self.desc.advance(n, true);
-					}
-					return Poll::Ready(written);
-				},
-				Some(_) => ready!(self.settle(cx)),
-				None => {
-					self.drop_ahead();
-					let data = buf[..buf.len().min(MAX_CHUNK)].to_vec();
-					self.op = Some(Op::Write(
-						self
-							.desc
-							.spawn(|file| async move { file.write_async(&data).await }),
-					));
-				},
-			}
-		}
+		self.write_as(cx, buf, None)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		_tag: Option<crate::bash::CmdTag>,
+		key: &mut WaitKey,
+	) -> Poll<io::Result<(usize, Option<crate::bash::Mark>)>> {
+		// A provider write takes its bytes itself: no writer thread, no mark.
+		self.write_as(cx, bytes, Some(key)).map_ok(|n| (n, None))
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		loop {
-			match &mut self.op {
-				Some(Op::Flush(task)) => {
-					let flushed = ready!(poll_task(task, cx));
-					self.op = None;
-					return Poll::Ready(flushed);
-				},
-				Some(_) => ready!(self.settle(cx)),
-				None => {
-					let file = Arc::clone(&self.desc.file);
-					self.op =
-						Some(Op::Flush(self.desc.rt.spawn(async move { file.flush_async().await })));
-				},
-			}
-		}
+		self.flush_as(cx, None)
+	}
+
+	fn poll_flush_keyed(&mut self, cx: &mut Context<'_>, key: &mut WaitKey) -> Poll<io::Result<()>> {
+		self.flush_as(cx, Some(key))
 	}
 
 	/// Records the target for the next read or write; see the module docs.
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
 		match &self.op {
 			Some(Op::Read(task)) => task.abort(),
-			Some(Op::Write(_) | Op::Flush(_)) => return Err(io::ErrorKind::WouldBlock.into()),
+			Some(Op::Write(..) | Op::Flush(..)) => return Err(io::ErrorKind::WouldBlock.into()),
 			None => {},
 		}
 		let mut cursor = self.desc.cursor.lock();
@@ -931,5 +1081,30 @@ impl Drop for VfsFile {
 		if let Some(Op::Read(task)) = &self.op {
 			task.abort();
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Failure mode: a task dropped while its write ran (a native extra that
+	// was cancelled) would leave its result kept for good, one more for each
+	// such task over the file's life.
+	#[test]
+	fn results_of_tasks_whose_keys_are_gone_are_not_kept() {
+		let tasks = Arc::new(Wakers::default());
+		let (mut live, mut gone) = (WaitKey::default(), WaitKey::default());
+		tasks.wait(&mut live, Waker::noop());
+		tasks.wait(&mut gone, Waker::noop());
+		let (live_id, gone_id) = (live.id_in(&tasks).unwrap(), gone.id_in(&tasks).unwrap());
+		let mut kept = Vec::new();
+		keep(&mut kept, &tasks, gone_id, Done::Write(Ok(1)));
+		drop(gone);
+		keep(&mut kept, &tasks, live_id, Done::Write(Ok(2)));
+		let ids = |kept: &[(u64, Done)]| kept.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		assert_eq!(ids(&kept), [live_id], "the gone task's result was dropped");
+		keep(&mut kept, &tasks, gone_id, Done::Flush(Ok(())));
+		assert_eq!(ids(&kept), [live_id], "nothing is kept for a gone task");
 	}
 }

@@ -860,6 +860,14 @@ impl File for LockedFile {
 		self.file.poll_flush(cx)
 	}
 
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<()>> {
+		self.file.poll_flush_keyed(cx, key)
+	}
+
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
 		self.file.seek(pos)
 	}
@@ -905,6 +913,24 @@ mod tests {
 				}
 			},
 		}
+	}
+
+	// Failure mode: a task flushing a locked file with its key had the lock
+	// flush the file without it, as the engine.
+	#[test]
+	fn a_locked_file_flushes_with_the_callers_key() {
+		use crate::{bash::fs::test_files::FlushProbe, sys::WaitKey};
+		let probe = FlushProbe::default();
+		let mut locked = LockedFile {
+			file:  Box::new(probe.clone()),
+			locks: Arc::default(),
+			path:  BString::from("/locked"),
+		};
+		let mut key = WaitKey::default();
+		let cx = &mut Context::from_waker(Waker::noop());
+		assert!(matches!(locked.poll_flush_keyed(cx, &mut key), Poll::Ready(Ok(()))));
+		assert!(probe.reached_by(&key), "the file was flushed without the caller's key");
+		assert_eq!(probe.keyless(), 0);
 	}
 
 	#[test]

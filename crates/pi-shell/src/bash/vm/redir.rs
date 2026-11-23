@@ -1522,6 +1522,17 @@ impl TeeState {
 			Poll::Pending
 		}
 	}
+
+	/// Flush every target, each with the tee's own key for it, as it is
+	/// written ([`Self::drive`]).
+	fn flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		for (t, key) in self.targets.iter().zip(&mut self.keys) {
+			if t.poll_flush_keyed(cx, key).is_pending() {
+				return Poll::Pending;
+			}
+		}
+		Poll::Ready(Ok(()))
+	}
 }
 
 impl File for Tee {
@@ -1563,13 +1574,19 @@ impl File for Tee {
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
 		self.with(cx, |s, tcx| {
 			std::task::ready!(s.drive(tcx));
-			for t in &s.targets {
-				if t.poll_flush(tcx).is_pending() {
-					return Poll::Pending;
-				}
-			}
-			Poll::Ready(Ok(()))
+			s.flush(tcx)
 		})
+	}
+
+	/// The tee flushes its targets with keys of its own and wakes every
+	/// caller ([`Waiters`]): the caller's key changes nothing.
+	fn poll_flush_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<std::io::Result<()>> {
+		let _ = key;
+		self.poll_flush(cx)
 	}
 
 	/// Ready once every target has taken every byte the tee took, its last
@@ -2589,6 +2606,24 @@ mod keyed {
 		drain(&mut drain_b);
 		extra.wait("the extra, settling the tee, woken by its second target's drain");
 		assert!(matches!(tee.poll_settle(&mut Context::from_waker(&xw)), Poll::Ready(Ok(()))));
+	}
+
+	// Failure mode: a native extra closing its handle of a zsh multios tee
+	// flushed each target with no key, as the engine: on a provider file
+	// (`>&1 >mem://f`) its thread's waker replaced the engine's. The tee
+	// flushes each target with a key of its own.
+	#[test]
+	fn a_tee_flushes_each_target_with_a_key_of_its_own() {
+		use crate::bash::fs::test_files::FlushProbe;
+		let (a, b) = (FlushProbe::default(), FlushProbe::default());
+		let targets =
+			vec![FdRef::from_file(Box::new(a.clone())), FdRef::from_file(Box::new(b.clone()))];
+		let mut tee = Tee::new(targets);
+		let mut key = WaitKey::default();
+		let cx = &mut Context::from_waker(Waker::noop());
+		assert!(matches!(tee.poll_flush_keyed(cx, &mut key), Poll::Ready(Ok(()))));
+		assert!(a.keyed() > 0 && b.keyed() > 0, "a target was flushed without a key");
+		assert_eq!(a.keyless() + b.keyless(), 0);
 	}
 
 	// Failure mode (review of #111 at bd60965e): a tee kept one progress for
