@@ -308,7 +308,6 @@ struct RunImage {
 	env:               Vec<(BString, BString)>,
 	started:           bool,
 	exit_trap_started: bool,
-	callout:           bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -904,7 +903,12 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
-					callout:           r.callout,
+					// Not in the image: a run starts its first frame from this flag
+					// (`Frame::no_debug_trap`, which is imaged). Only obash's fault
+					// injector, the testkit and the benches take images
+					// (`Shell::externalize`), and none with a callout's subshell
+					// still queued.
+					callout:           false,
 				});
 			}
 			report.runs += vp.runs.len() as u32;
@@ -1144,7 +1148,6 @@ fn run_image(r: &Run) -> RunImage {
 		env:               r.env.clone(),
 		started:           r.started,
 		exit_trap_started: r.exit_trap_started,
-		callout:           r.callout,
 	}
 }
 

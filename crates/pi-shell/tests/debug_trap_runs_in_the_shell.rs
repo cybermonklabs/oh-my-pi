@@ -233,23 +233,50 @@ async fn a_debug_trap_action_runs_no_return_trap() {
 	assert_bash_outputs(&rows).await;
 }
 
-/// The process `$!` names for a negated or `time`d background pipeline, by
-/// the pid probe ([`pid_row`]), as bash names it: `! a | PROG &` is known by
-/// its last program; bash runs an asynchronous timed command as a subshell
-/// of its own (`CMD_FORCE_SUBSHELL`), so `$!` of `time a | PROG &` (also
-/// `time ! …`) is not the program's: here the job keeps its own pid.
-/// `kill` of `$!` ends the job in each. The negated row prints no `wait`
+/// The process `$!` names for a negated background pipeline, by the pid
+/// probe ([`pid_row`]), as bash names it: `! a | PROG &` is known by its
+/// last program. `kill` of `$!` ends the job. The row prints no `wait`
 /// status: `wait` of that `$!` gives the job's negated status here (0)
 /// where bash gives the program's (143), an older difference.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_negated_or_timed_pipelines_bang_names_what_bash_names() {
+async fn a_negated_pipelines_bang_names_what_bash_names() {
+	let row = pid_row("! : | PROG").replace(r#"echo "st=$?"; "#, "");
+	assert_bash_outputs(&[(row.as_str(), "program\n")]).await;
+}
+
+/// A `time`d background pipeline (`time a | PROG &`, `time ! a | PROG &`)
+/// is known by its last program (`body_pipeline` unwraps `time`), as before
+/// this change and as #171 names it: `program`, then the status of `wait`
+/// after `kill` of `$!`. Kept differences from bash 5.2.21 and 5.3.20,
+/// whose `$!` is the timed job's own subshell (`CMD_FORCE_SUBSHELL`): they
+/// print `other`; and under `!`, `wait` gives the job's negated status here
+/// (0) where bash gives its subshell's (143), as for `! a | PROG &`.
+#[test]
+fn a_timed_pipelines_bang_is_its_last_program() {
 	let rows = [
-		(pid_row("! : | PROG").replace(r#"echo "st=$?"; "#, ""), "program\n"),
-		(pid_row("TIMEFORMAT=; time : | PROG"), "other\nst=143\n"),
-		(pid_row("TIMEFORMAT=; time ! : | PROG"), "other\nst=143\n"),
+		("TIMEFORMAT=; time : | PROG", "program\nst=143\n", "other\nst=143\n"),
+		("TIMEFORMAT=; time ! : | PROG", "program\nst=0\n", "other\nst=143\n"),
 	];
-	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
-	assert_bash_outputs(&rows).await;
+	let mut mismatches = Vec::new();
+	for (start, want, bash) in rows {
+		let row = pid_row(start);
+		let out = output(obash().args(["-c", row.as_str()]));
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		if (out.status.code(), stdout.as_ref()) != (Some(0), want) {
+			mismatches.push(format!(
+				"`{start}`\n  want: Some(0) {want:?} (bash 5.2.21 and 5.3.20: {bash:?})\n  omp:  {:?} \
+				 {stdout:?}",
+				out.status.code()
+			));
+		}
+	}
+	assert!(
+		mismatches.is_empty(),
+		"{} of {} rows differ from the stated difference:\n{}",
+		mismatches.len(),
+		rows.len(),
+		mismatches.join("\n")
+	);
 }
 
 /// `nohup` and `timeout` run their command in a subshell standing for the
@@ -545,6 +572,57 @@ fn debug_trap_state_survives_a_restored_snapshot() {
 	assert!(
 		mismatches.is_empty(),
 		"{} of {runs} faulted runs differ from bash:\n{}",
+		mismatches.len(),
+		mismatches.join("\n")
+	);
+}
+
+/// A DEBUG trap set inside a `lastpipe` stage (which bash runs in the shell
+/// itself) runs for the commands after it there and in the shell, as in
+/// bash 5.2.21 and 5.3.20; the shell does not run the pipeline's stage
+/// traps again when the stage ends (the `Spawn` is under way then).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debug_trap_set_in_a_lastpipe_stage_runs_from_then_on() {
+	let row = r#"shopt -s lastpipe; set +m; echo x | { trap 'echo "dbg:$BASH_COMMAND"' DEBUG; read -r v; }; trap - DEBUG; echo "v=$v""#;
+	assert_bash_outputs(&[(row, "dbg:read -r v\ndbg:trap - DEBUG\nv=x\n")]).await;
+}
+
+/// A background pipeline whose first stage `extdebug` skips is named by its
+/// last stage as without the skip: here a `{ … }` stage with two commands,
+/// which keeps the job's own pid at once (`virtual`, with `kill` and `wait`
+/// of `$!`: `st=143`). Kept difference: bash 5.2.21 and 5.3.20 print
+/// `program`, as their `$!` is that stage's subshell, which `exec`s it.
+/// The stages that ran are paired with their own entries, not with every
+/// stage's.
+#[test]
+fn a_skipped_stage_does_not_change_which_stage_names_the_job() {
+	let kind = |start: &str| {
+		format!(
+			r#"D=$(mktemp -d); T=$D/pid; {start} & p=$!; trap - DEBUG; until [ -s "$T" ]; do :; done; [ "$p" = "$(cat "$T")" ] && echo program || {{ [ "$p" -ge 1073741824 ] && echo virtual || echo os-other; }}; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
+		)
+	};
+	let last = r#"{ /bin/true; exec /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 30' sh "$T"; }"#;
+	let rows = [
+		kind(&format!(": | {last}")),
+		kind(&format!(
+			"shopt -s extdebug; trap '! [[ $BASH_COMMAND == *mark* ]]' DEBUG; : mark | {last}"
+		)),
+	];
+	let mut mismatches = Vec::new();
+	for row in &rows {
+		let out = output(obash().args(["-c", row.as_str()]));
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		if (out.status.code(), stdout.as_ref()) != (Some(0), "virtual\nst=143\n") {
+			mismatches.push(format!(
+				"`{row}`\n  want: Some(0) \"virtual\\nst=143\\n\" (bash 5.3.20: \
+				 \"program\\nst=143\\n\")\n  omp:  {:?} {stdout:?}",
+				out.status.code()
+			));
+		}
+	}
+	assert!(
+		mismatches.is_empty(),
+		"{} of 2 rows differ from the stated difference:\n{}",
 		mismatches.len(),
 		mismatches.join("\n")
 	);

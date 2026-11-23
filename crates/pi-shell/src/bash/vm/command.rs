@@ -2550,9 +2550,7 @@ fn spawned_external(
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
 			if !k.bangs.is_empty() {
-				// A trap action's program is not the job's and ends first:
-				// the job keeps its virtual pid.
-				k.settle_bang(vp.vpid, (vp.trap_frames == 0).then_some(pid));
+				k.settle_bang(vp.vpid, Some(pid));
 			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);
