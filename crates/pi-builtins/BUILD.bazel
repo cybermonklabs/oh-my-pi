@@ -104,6 +104,7 @@ rust_library(
     aliases = aliases(),
     compile_data = glob([
         "src/*.txt",
+        "src/*.txt.zst",
         # `include_bytes!` wire captures for the rsync sender tests.
         "src/rsync/sender/testdata/*",
     ]),
