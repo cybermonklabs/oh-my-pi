@@ -81,4 +81,19 @@ describe("live.provider", () => {
 		expect(live.codex).toHaveLength(1);
 		await live.controller.stop();
 	});
+
+	test("OMP_LIVE_PROVIDER picks the route when no setting does", async () => {
+		const saved = Bun.env.OMP_LIVE_PROVIDER;
+		Bun.env.OMP_LIVE_PROVIDER = "openai";
+		try {
+			const live = call({});
+			await live.controller.start();
+			expect(live.codex).toEqual([]);
+			expect(live.openai).toHaveLength(1);
+			await live.controller.stop();
+		} finally {
+			if (saved === undefined) delete Bun.env.OMP_LIVE_PROVIDER;
+			else Bun.env.OMP_LIVE_PROVIDER = saved;
+		}
+	});
 });

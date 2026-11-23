@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
+import { kNoAuth } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import {
 	OpenAILiveTransport,
 	openAILiveAttachUrl,
 	openAILiveSessionsUrl,
 	resolveOpenAILiveRoute,
 } from "@oh-my-pi/pi-coding-agent/live/openai-transport";
-import { buildDelegationContextAppend, type LiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
+import {
+	buildDelegationContextAppend,
+	buildSessionContextAppend,
+	type LiveServerEvent,
+} from "@oh-my-pi/pi-coding-agent/live/protocol";
 
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; the API route must never send one. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
@@ -108,8 +113,10 @@ describe("GPT-Live route", () => {
 	test("defaults to OpenAI's API, and refuses to start without a key", async () => {
 		const keyed = { getProviderBaseUrl: () => undefined, getApiKeyForProvider: async () => "sk-test" };
 		expect((await resolveOpenAILiveRoute(keyed, "s1")).baseUrl).toBe("https://api.openai.com/v1");
-		const keyless = { ...keyed, getApiKeyForProvider: async () => undefined };
-		await expect(resolveOpenAILiveRoute(keyless, "s1")).rejects.toThrow(/openai provider has no key/);
+		for (const key of [undefined, kNoAuth]) {
+			const keyless = { ...keyed, getApiKeyForProvider: async () => key };
+			await expect(resolveOpenAILiveRoute(keyless, "s1")).rejects.toThrow(/openai provider has no key/);
+		}
 	});
 });
 
@@ -133,27 +140,37 @@ describe("GPT-Live transport", () => {
 			expect(new URL(upgrade.url).pathname).toBe("/v1/live/sessions/live_123/attach");
 			expect(upgrade.headers.get("authorization")).toBe("Bearer sk-test");
 			expectNoCodexHeaders(upgrade);
-			// The controller's delegation messages, in Codex's form: progress on the commentary channel, the result
-			// spoken. Each has an event_id, which an error about it names.
-			let sent = api.message();
-			await transport.send(buildDelegationContextAppend("item_1", "Reading the log.", "commentary"));
-			expect(await sent).toEqual({
-				type: "session.thinking.append",
-				delegation_id: "item_1",
-				content: "Reading the log.",
-				event_id: expect.stringMatching(/^omp_\d+$/),
-			});
-			sent = api.message();
-			await transport.send(buildDelegationContextAppend("item_1", "CI is green."));
-			expect(await sent).toEqual({
-				type: "session.commentary.append",
-				delegation_id: "item_1",
-				content: "CI is green.",
-				event_id: expect.stringMatching(/^omp_\d+$/),
-			});
-			sent = api.message();
+			// The controller's messages, in Codex's form: a delegation's progress on the commentary channel and
+			// its result spoken; context outside a delegation the same, with no delegation id. Each has an event_id.
+			const cases = [
+				[
+					buildDelegationContextAppend("item_1", "Reading.", "commentary"),
+					"session.thinking.append",
+					"item_1",
+					"Reading.",
+				],
+				[
+					buildDelegationContextAppend("item_1", "CI is green."),
+					"session.commentary.append",
+					"item_1",
+					"CI is green.",
+				],
+				[buildSessionContextAppend("Heads up.", "commentary"), "session.thinking.append", null, "Heads up."],
+				[buildSessionContextAppend("Build done."), "session.commentary.append", null, "Build done."],
+			] as const;
+			for (const [message, type, delegationId, content] of cases) {
+				const sent = api.message();
+				await transport.send(message);
+				expect(await sent).toEqual({
+					type,
+					delegation_id: delegationId,
+					content,
+					event_id: expect.stringMatching(/^omp_\d+$/),
+				});
+			}
+			const closing = api.message();
 			await transport.send({ type: "session.close" });
-			expect(await sent).toEqual({ type: "session.close", event_id: expect.stringMatching(/^omp_\d+$/) });
+			expect(await closing).toEqual({ type: "session.close", event_id: expect.stringMatching(/^omp_\d+$/) });
 		} finally {
 			await transport.close();
 			api.server.stop(true);
@@ -241,6 +258,7 @@ describe("GPT-Live transport", () => {
 	test("refuses a 201 without a session id or SDP answer, and a session id that could move the sideband path", async () => {
 		for (const [session, pattern] of [
 			[{}, /no session id/],
+			[{ id: "." }, /invalid session id/],
 			[{ id: ".." }, /invalid session id/],
 		] as const) {
 			const api = liveApiServer({

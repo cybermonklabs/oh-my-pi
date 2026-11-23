@@ -14,7 +14,13 @@ import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
 import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { kNoAuth } from "../config/model-provider-discovery";
-import { type LiveClientMessage, type LiveServerEvent, parseLiveServerEvent } from "./protocol";
+import {
+	type LiveClientMessage,
+	type LiveContextChannel,
+	type LiveInputTextContent,
+	type LiveServerEvent,
+	parseLiveServerEvent,
+} from "./protocol";
 import type { CodexLiveTransport, LiveTransportCallbacks } from "./transport";
 
 /** The provider whose key (and base URL, when models.yml sets one) the route uses; also its proxy scope. */
@@ -27,8 +33,6 @@ const MAX_ERROR_BODY_LENGTH = 2_048;
 const MAX_LOCATION_LENGTH = 256;
 const SIDEBAND_CONNECT_ATTEMPTS = 5;
 const SIDEBAND_CONNECT_TIMEOUT_MS = 15_000;
-/** The session ids GPT-Live hands out: letters, digits, `_` and `-`; anything else could move the sideband path. */
-const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 /** Event ids remembered to drop the 3 s the sideband replays from the data channel when it attaches. */
 const SEEN_EVENT_IDS_LIMIT = 1_024;
 /** How many sent messages' `event_id`s are remembered, to name the message an `error` refers to. */
@@ -101,18 +105,33 @@ function parseRecord(payload: string): Record<string, unknown> | undefined {
 	}
 }
 
+/** One of GPT-Live's appends: Codex's commentary channel is progress (silent thinking), the rest is spoken. */
+function toOpenAIAppend(
+	channel: LiveContextChannel | undefined,
+	delegationId: string | null,
+	content: LiveInputTextContent[],
+): { type: string; delegation_id: string | null; content: string } {
+	return {
+		type: channel === "commentary" ? "session.thinking.append" : "session.commentary.append",
+		delegation_id: delegationId,
+		content: content.map(part => part.text).join(""),
+	};
+}
+
 /**
  * A controller message in GPT-Live's form. The controller writes a delegation's progress to Codex's
  * commentary channel and its result to the spoken one; GPT-Live takes progress as silent thinking and
- * the result as commentary, which it speaks. `session.close` is the same on both routes.
+ * the result as commentary, which it speaks. Context outside a delegation has `delegation_id: null`.
  */
 function toOpenAIMessage(message: LiveClientMessage): { type: string } {
-	if (message.type !== "delegation.context.append") return message;
-	return {
-		type: message.channel === "commentary" ? "session.thinking.append" : "session.commentary.append",
-		delegation_id: message.delegation_item_id,
-		content: message.content.map(part => part.text).join(""),
-	};
+	switch (message.type) {
+		case "delegation.context.append":
+			return toOpenAIAppend(message.channel, message.delegation_item_id, message.content);
+		case "session.context.append":
+			return toOpenAIAppend(message.channel, null, message.content);
+		case "session.close":
+			return { type: "session.close" };
+	}
 }
 
 /** Configuration of one GPT-Live call. */
@@ -251,14 +270,17 @@ export class OpenAILiveTransport implements Pick<
 		}
 		const text = await response.text();
 		if (!response.ok) {
-			const detail = bounded(text.trim().replaceAll(/\s+/g, " ") || response.statusText, MAX_ERROR_BODY_LENGTH);
+			// A server that echoes the request's headers must not put the key into the error.
+			const reply = text.trim().replaceAll(/\s+/g, " ").replaceAll(route.apiKey, "[key]");
+			const detail = bounded(reply || response.statusText, MAX_ERROR_BODY_LENGTH);
 			throw new Error(`GPT-Live session failed (${response.status}): ${detail}`);
 		}
 		const answer = parseRecord(text);
 		const id = isRecord(answer?.session) ? answer.session.id : undefined;
 		if (typeof id !== "string" || !id) throw new Error("GPT-Live session returned no session id");
-		if (!SESSION_ID_PATTERN.test(id)) {
-			throw new Error(`GPT-Live session returned an invalid session id (${JSON.stringify(id.slice(0, 64))})`);
+		// The id is opaque and percent-encoded into the sideband path; only `.` and `..` could move that path.
+		if (id === "." || id === "..") {
+			throw new Error(`GPT-Live session returned an invalid session id (${JSON.stringify(id)})`);
 		}
 		const sdp = isRecord(answer?.transport) ? answer.transport.sdp : undefined;
 		if (typeof sdp !== "string" || !sdp.trim()) throw new Error("GPT-Live session returned no SDP answer");

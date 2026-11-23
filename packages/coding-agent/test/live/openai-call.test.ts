@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import type { ServerWebSocket } from "bun";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
@@ -20,7 +19,7 @@ interface StubOptions {
 	/** Frames the sideband sends once attached. */
 	frames?: unknown[];
 	/** Called with each message omp writes on the sideband. */
-	onMessage?: (message: Record<string, unknown>, socket: ServerWebSocket<unknown>) => void;
+	onMessage?: (message: Record<string, unknown>, socket: { send(data: string): unknown }) => void;
 	/** Closes the sideband this long after it opens. */
 	closeAfterMs?: number;
 }
@@ -41,8 +40,9 @@ function gptLiveStub(options: StubOptions = {}) {
 					Response.json({ session: { id: sessionId }, transport: { sdp: "v=0 answer" } }, { status: 201 })
 				);
 			}
-			if (url.pathname === `/v1/live/sessions/${encodeURIComponent(sessionId)}/attach` && srv.upgrade(request)) {
-				upgrades.push(url.pathname);
+			const attach = decodeURIComponent(url.pathname) === `/v1/live/sessions/${sessionId}/attach`;
+			if (attach && srv.upgrade(request)) {
+				upgrades.push(decodeURIComponent(url.pathname));
 				return undefined;
 			}
 			return new Response("not found", { status: 404 });
@@ -184,6 +184,54 @@ describe("GPT-Live call lifecycle", () => {
 			call.answer();
 			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
 			expect(String(ended)).toMatch(/GPT-Live refused omp's session\.commentary\.append: Unknown delegation/);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("a refused session's error does not repeat a key the server echoes", async () => {
+		const stub = gptLiveStub({
+			answer: request =>
+				Response.json(
+					{ error: { message: `bad header ${request.headers.get("authorization")}` } },
+					{ status: 401 },
+				),
+		});
+		const call = liveCall(stub.base);
+		try {
+			const error = await call.controller.start().then(
+				() => "started",
+				(cause: unknown) => String(cause),
+			);
+			expect(error).toContain("GPT-Live session failed (401)");
+			expect(error).toContain("Bearer [key]");
+			expect(error).not.toContain(KEY);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	});
+
+	test("an opaque session id with `.` and `:` is accepted", async () => {
+		const stub = gptLiveStub({ sessionId: "sess.1:a" });
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			expect(stub.upgrades).toEqual(["/v1/live/sessions/sess.1:a/attach"]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	});
+
+	test("a sideband that closes ends a connected call", async () => {
+		const stub = gptLiveStub({ closeAfterMs: 200 });
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(String(ended)).toMatch(/GPT-Live sideband closed \(1011\)/);
 		} finally {
 			await call.controller.stop();
 			stub.server.stop(true);
