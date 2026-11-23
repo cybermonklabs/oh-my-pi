@@ -1435,9 +1435,12 @@ impl Process {
 	/// was stopped) is ended, and so are the children it forked since.
 	///
 	/// A wave whose walk could not read the whole tree also signals the
-	/// process group the root leads, if any (it needs no read); and the call
-	/// fails once the hard wave is sent if its walk was incomplete, since a
-	/// descendant it could not read may still run.
+	/// process group the root led when the call began, if any (it needs no
+	/// read), and the call fails once the hard wave is sent, since a
+	/// descendant it could not read may still run. The hard wave counts as
+	/// incomplete when the polite one was: a process the polite walk could
+	/// not read may have left the tree since (its parent ended), where no
+	/// walk reaches it.
 	///
 	/// Without a grace period (`graceful_ms < 0`) the polite wave steps no
 	/// process: the signal has no time to act before the KILL.
@@ -1694,15 +1697,18 @@ impl Process {
 		std::future::ready(Frozen { walk: self.signalable_descendants(protected) })
 	}
 
-	/// One signal wave on the tree `frozen` read: the group (`group`, or the
-	/// one the root leads when the walk is incomplete), every live descendant,
-	/// then the root. Returns the walk, for the wait. The processes the walk
-	/// stopped resume once it is dropped, here, and act on the signal then.
+	/// One signal wave on the tree `frozen` read: the group (`group`, or
+	/// `own_group`, the one the root led when the call began, when the walk
+	/// is incomplete), every live descendant, then the root. Returns the walk,
+	/// for the wait. The processes the walk stopped resume once it is dropped,
+	/// here, and act on the signal then. `own_group` is read before the root
+	/// is signalled: a root that has ended leads no group any more.
 	fn signal_wave(
 		&self,
 		mut frozen: Frozen,
 		signal: i32,
 		group: Option<i32>,
+		own_group: Option<i32>,
 		protected: &HashSet<i32>,
 	) -> Walk<Self> {
 		#[cfg(all(test, target_os = "linux"))]
@@ -1719,7 +1725,7 @@ impl Process {
 		}
 		if descendants.complete.is_err()
 			&& group.is_none()
-			&& let Some(pgid) = self.own_group()
+			&& let Some(pgid) = own_group
 		{
 			let _ = kill_process_group(pgid, signal);
 		}
@@ -1740,13 +1746,14 @@ impl Process {
 		}
 
 		let process_group = if group { self.group_id() } else { None };
+		let own_group = self.own_group();
 		let protected = host_protected_pids();
 
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
 		// It is sent even when `ct` has already fired: cancellation ends the
 		// waits, not the signal.
 		let frozen = self.freeze(TERM_SIGNAL, &protected, graceful_ms >= 0).await;
-		let polite = self.signal_wave(frozen, TERM_SIGNAL, process_group, &protected);
+		let polite = self.signal_wave(frozen, TERM_SIGNAL, process_group, own_group, &protected);
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
@@ -1771,6 +1778,11 @@ impl Process {
 		// and the tree under each: one whose parent died has left the tree,
 		// and no walk from the root reaches it or what it forked since.
 		let mut frozen = self.freeze(KILL_SIGNAL, &protected, true).await;
+		// A process the polite walk could not read may have left the tree
+		// since: no walk reaches it now, so this wave is incomplete too.
+		if let Err(error) = polite.complete {
+			frozen.walk.fail(error);
+		}
 		for survivor in frozen.survivors(polite.processes) {
 			if frozen.holds(survivor.pid()) {
 				continue;
@@ -1778,7 +1790,7 @@ impl Process {
 			let subtree = survivor.freeze(KILL_SIGNAL, &protected, true).await;
 			frozen.absorb(subtree, survivor);
 		}
-		let hard = self.signal_wave(frozen, KILL_SIGNAL, process_group, &protected);
+		let hard = self.signal_wave(frozen, KILL_SIGNAL, process_group, own_group, &protected);
 		let group = process_group.map(|pgid| GroupWait { pgid, resend: Some(KILL_SIGNAL) });
 		let exited = wait_for_exit(
 			self,
@@ -1791,7 +1803,7 @@ impl Process {
 		match hard.complete {
 			Ok(()) => Ok(exited),
 			Err(error) => {
-				let group = process_group.or_else(|| self.own_group());
+				let group = process_group.or(own_group);
 				Err(
 					partly_signalled(
 						&error,
@@ -4568,5 +4580,144 @@ mod tests {
 			"the member outlived the termination: a group whose member could not be read was read as \
 			 empty"
 		);
+	}
+
+	/// Waits up to 2 s for `process` to end; whether it did.
+	#[cfg(target_os = "linux")]
+	fn ends(process: &Process) -> bool {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+		while process.status() == ProcessStatus::Running {
+			if std::time::Instant::now() >= deadline {
+				return false;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		true
+	}
+
+	/// Spawns `script` under `/bin/sh -c` as a root that leads a process group
+	/// of its own, pins it, and waits until its one child runs `sleep`.
+	/// Returns the root, its pid, its pin and the child's pin.
+	#[cfg(target_os = "linux")]
+	fn root_with_a_sleeping_child(script: &str) -> (std::process::Child, i32, Process, Process) {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let root = Command::new("/bin/sh")
+			.args(["-c", script])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		wait_until("the child runs sleep", || {
+			process
+				.children()
+				.unwrap_or_default()
+				.first()
+				.is_some_and(|child| comm(child.pid()) == "sleep")
+		});
+		let child = process.children().unwrap_or_default().remove(0);
+		(root, root_pid, process, child)
+	}
+
+	/// The polite walk cannot read the root's child, which ignores TERM; the
+	/// root ends at TERM, so the grace wait sees every process it knows of
+	/// gone. The hard wave still counts as incomplete, kills the process group
+	/// the root led (the child is in it), and the call fails. The faults are
+	/// this thread's, and the call runs on it.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn terminate_kills_the_roots_group_after_an_incomplete_polite_walk() {
+		let (mut root, root_pid, process, child) =
+			root_with_a_sleeping_child("(trap '' TERM; exec sleep 1000) & wait");
+		let _guard = GroupGuard(root_pid);
+
+		let fails = crate::sys::proc::fail_pidfds(vec![(child.pid(), libc::EMFILE)]);
+		let result = process
+			.terminate_tree(false, 200, 2000, CancelToken::default())
+			.await;
+		drop(fails);
+		let _ = reap(&mut root);
+		assert!(ends(&child), "the child the polite walk could not read outlived the termination");
+		assert!(result.is_err(), "a call whose polite walk was incomplete reported {result:?}");
+	}
+
+	/// The hard walk cannot read the root's child (the fault starts once the
+	/// polite wave was sent, which read it): the call fails once the hard
+	/// wave is sent, and the child, a survivor of the polite wave, is ended.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn terminate_fails_after_an_incomplete_hard_walk() {
+		let (mut root, root_pid, process, child) =
+			root_with_a_sleeping_child("trap '' TERM; (exec sleep 1000) & wait");
+		let _guard = GroupGuard(root_pid);
+		let child_pid = child.pid();
+		wave_hook::set_after(
+			root_pid,
+			TERM_SIGNAL,
+			Box::new(move || {
+				std::mem::forget(crate::sys::proc::fail_pidfds(vec![(child_pid, libc::EMFILE)]));
+			}),
+		);
+
+		let result = process
+			.terminate_tree(false, 200, 2000, CancelToken::default())
+			.await;
+		drop(crate::sys::proc::fail_pidfds(Vec::new()));
+		let _ = reap(&mut root);
+		assert!(ends(&child), "the child outlived the termination");
+		assert!(result.is_err(), "a call whose hard walk was incomplete reported {result:?}");
+	}
+
+	/// The hard wave's walk of a survivor's tree cannot read the survivor's
+	/// child: a subshell that ignores TERM outlives its parent, and the fault
+	/// on its `sleep` starts once the polite wave, which read both, was sent.
+	/// That walk being incomplete makes the call fail, though the root's own
+	/// walk (of an ended root) is complete.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn terminate_fails_after_an_incomplete_walk_of_a_survivor() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "(trap '' TERM; sleep 1000 & wait) & wait"])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		wait_until("the subshell forked its sleep", || {
+			process
+				.children()
+				.unwrap_or_default()
+				.first()
+				.is_some_and(|subshell| {
+					subshell
+						.children()
+						.unwrap_or_default()
+						.first()
+						.is_some_and(|sleep| comm(sleep.pid()) == "sleep")
+				})
+		});
+		let subshell = process.children().unwrap_or_default().remove(0);
+		let sleep = subshell.children().unwrap_or_default().remove(0);
+		let sleep_pid = sleep.pid();
+		wave_hook::set_after(
+			root_pid,
+			TERM_SIGNAL,
+			Box::new(move || {
+				std::mem::forget(crate::sys::proc::fail_pidfds(vec![(sleep_pid, libc::EMFILE)]));
+			}),
+		);
+
+		let result = process
+			.terminate_tree(false, 200, 2000, CancelToken::default())
+			.await;
+		drop(crate::sys::proc::fail_pidfds(Vec::new()));
+		let _ = reap(&mut root);
+		assert!(ends(&subshell), "the subshell outlived the termination");
+		assert!(ends(&sleep), "the subshell's sleep outlived the termination");
+		assert!(result.is_err(), "a call whose survivor walk was incomplete reported {result:?}");
 	}
 }
