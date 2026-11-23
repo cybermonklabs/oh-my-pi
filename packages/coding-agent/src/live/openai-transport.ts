@@ -167,13 +167,13 @@ interface PendingDelegation {
 	timer: NodeJS.Timeout;
 }
 
-/** A delegation's turn: the user's words before it, labelled, or a line that none were transcribed. */
-function delegationText(words: UserWords[]): string {
-	const said = words
-		.toSorted((a, b) => a.startMs - b.startMs)
-		.map(part => part.text)
-		.join("")
-		.trim();
+/**
+ * A delegation's turn: the user's words before it, labelled, or a line that none were transcribed. Words
+ * with a place on the session timeline come in its order, then words without one in the order they came.
+ */
+function delegationText(words: UserWords[], untimed: readonly string[]): string {
+	const timed = words.toSorted((a, b) => a.startMs - b.startMs).map(part => part.text);
+	const said = [...timed, ...untimed].join("").trim();
 	if (!said) return DELEGATION_NO_WORDS;
 	const quoted = said
 		.split("\n")
@@ -215,6 +215,8 @@ export class OpenAILiveTransport implements Pick<
 	#sentCount = 0;
 	/** The user's words not yet in a delegation's turn; see {@link #releaseDelegations}. */
 	#userWords: UserWords[] = [];
+	/** The user's words with no timing, as they came (`performance.now()`); see {@link #addUntimedWords}. */
+	#untimedWords: { arrivedAt: number; text: string }[] = [];
 	/** How far each speaker's transcript has reached on the session timeline (the latest `end_ms`). */
 	readonly #transcriptEndMs = { user: Number.NEGATIVE_INFINITY, assistant: Number.NEGATIVE_INFINITY };
 	/** Client delegations waiting for their words, oldest first. */
@@ -471,7 +473,8 @@ export class OpenAILiveTransport implements Pick<
 	 *   speaker starts.
 	 * - Its delegation carries only an id and its `offset_ms` on the session timeline: OpenAI's client
 	 *   delegation guide says to use the transcript events for what the user wants. Its turn is the user's
-	 *   words before that offset; see {@link #releaseDelegations}.
+	 *   words before that offset; see {@link #releaseDelegations}. A user's delta with no timing has no
+	 *   place on the timeline and joins the next delegation's turn; see {@link #addUntimedWords}.
 	 * - Its `error` reports a problem in the session "such as an invalid client command", and names that
 	 *   command by its `client_event_id` (OpenAI's Live reference); the session stays open (the delegation
 	 *   guide, on `responses_validation_failed`). An error that names omp's spoken answer
@@ -490,6 +493,8 @@ export class OpenAILiveTransport implements Pick<
 				if (typeof startMs === "number" && typeof endMs === "number" && Number.isFinite(endMs)) {
 					this.#transcriptEndMs[role] = Math.max(this.#transcriptEndMs[role], endMs);
 					if (role === "user") this.#addUserWords(startMs, delta);
+				} else if (role === "user") {
+					this.#addUntimedWords(delta);
 				}
 				const events: LiveServerEvent[] = [];
 				const previous = this.#line;
@@ -558,6 +563,26 @@ export class OpenAILiveTransport implements Pick<
 	}
 
 	/**
+	 * Keeps a fragment of the user's words that has no `start_ms` and `end_ms`, so no place on the session
+	 * timeline. It joins the next delegation handed over, after the words that have one, if it came within
+	 * {@link DELEGATION_WORDS_WINDOW_MS} of that hand-over. It cannot show that the user's transcript has
+	 * reached an offset, so a delegation waiting on such words alone goes after {@link DELEGATION_WAIT_CAP_MS}.
+	 */
+	#addUntimedWords(text: string): void {
+		const oldest = performance.now() - DELEGATION_WORDS_WINDOW_MS;
+		this.#untimedWords = this.#untimedWords.filter(words => words.arrivedAt >= oldest);
+		this.#untimedWords.push({ arrivedAt: performance.now(), text });
+	}
+
+	/** Takes the words without a place on the timeline for one delegation's turn; see {@link #addUntimedWords}. */
+	#takeUntimedWords(): string[] {
+		const oldest = performance.now() - DELEGATION_WORDS_WINDOW_MS;
+		const taken = this.#untimedWords.filter(words => words.arrivedAt >= oldest).map(words => words.text);
+		this.#untimedWords = [];
+		return taken;
+	}
+
+	/**
 	 * Hands the waiting delegations over in order, each as a turn of the user's words before its offset.
 	 * GPT-Live may send a delegation before the transcript of the words that led to it, and sends no
 	 * event that ends the user's transcript. So a delegation goes once the transcript has reached its
@@ -578,13 +603,14 @@ export class OpenAILiveTransport implements Pick<
 			this.#pendingDelegations.shift();
 			this.#userWords = this.#userWords.filter(part => part.startMs >= offsetMs);
 			this.#handedOverOffsetMs = Math.max(this.#handedOverOffsetMs, offsetMs);
+			const untimed = this.#takeUntimedWords();
 			events.push({
 				type: "delegation.created",
 				item: {
 					type: "delegation",
 					target: "client",
 					id: next.id,
-					content: [{ type: "input_text", text: delegationText(words) }],
+					content: [{ type: "input_text", text: delegationText(words, untimed) }],
 				},
 			});
 		}

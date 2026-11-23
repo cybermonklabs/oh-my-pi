@@ -1572,6 +1572,12 @@ note; any other `error` is logged too. The session id is opaque: any id but `.`
 and `..` is accepted and percent-encoded into the attach path. No voice is sent,
 so GPT-Live uses its default; `live.voice` names Codex voices only.
 
+A user's transcript delta without `start_ms` and `end_ms` has no place on the
+timeline. It joins the turn of the next delegation handed over, after the words
+that have one, if it came within the minute before. It cannot show that the
+user's transcript has reached an offset, so a delegation waiting on such words
+alone goes after 1 s.
+
 ## Dictation Sub-Protocol
 
 Draft-only dictation captures from the machine's microphone using the session's

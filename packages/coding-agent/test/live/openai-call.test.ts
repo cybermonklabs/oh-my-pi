@@ -217,6 +217,27 @@ describe("GPT-Live delegations", () => {
 			stub.server.stop(true);
 		}
 	}, 10_000);
+
+	test("the user's words with no timing join the next delegation's turn, before or after it arrives", async () => {
+		// OpenAI's SDKs type `start_ms` and `end_ms` as required; a gateway that rewrites events can drop them.
+		const untimed = (eventId: string, delta: string) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+		});
+		const stub = gptLiveStub({
+			frames: [untimed("t1", "deploy"), delegated("d1", "item_1", 5_000), untimed("t2", " main")],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
 });
 
 describe("GPT-Live call lifecycle", () => {
