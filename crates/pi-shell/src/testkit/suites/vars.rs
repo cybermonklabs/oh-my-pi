@@ -309,11 +309,18 @@ fn seconds_arithmetic_assignment_sets_the_clock() {
 /// `SECONDS` makes it a plain array (bash's `convert_var_to_array`): the
 /// lookup before it reads the clock, so element 0 is the count and the
 /// variable is integer, and it counts no more. A local `SECONDS` is only
-/// that local's. Goldens from bash 5.2.21 and 5.3.20.
+/// that local's: `local -a`, `local -A`, `declare -a` and a compound value
+/// in a function leave the shell's clock counting. Goldens from bash
+/// 5.2.21 and 5.3.20.
 #[test]
 fn seconds_array_forms_make_it_a_plain_array() {
 	let stopped = format!("SECONDS[0]=60; {WAIT_2S}echo $SECONDS");
 	let counting = format!("SECONDS=60; {WAIT_2S}echo $SECONDS");
+	let local_a =
+		format!("f() {{ local -a SECONDS=(1 2); echo \"$SECONDS\"; }}; f; {WAIT_2S}echo $SECONDS");
+	let declare_a = format!("f() {{ declare -a SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
+	let local_assoc = format!("f() {{ local -A SECONDS; }}; f; {WAIT_2S}echo $SECONDS");
+	let local_compound = format!("f() {{ local SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
 	for (src, want) in [
 		(
 			"SECONDS[0]=60; echo \"$SECONDS\"; declare -p SECONDS",
@@ -348,6 +355,10 @@ fn seconds_array_forms_make_it_a_plain_array() {
 		("f() { local SECONDS; SECONDS[0]=60; echo \"$SECONDS\"; }; f; echo \"$SECONDS\"", "60\n0\n"),
 		(stopped.as_str(), "60\n"),
 		(counting.as_str(), "62\n"),
+		(local_a.as_str(), "1\n2\n"),
+		(declare_a.as_str(), "2\n"),
+		(local_assoc.as_str(), "2\n"),
+		(local_compound.as_str(), "2\n"),
 	] {
 		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
 	}
@@ -371,18 +382,60 @@ fn seconds_unset_of_an_element() {
 }
 
 /// A readonly `SECONDS` refuses `SECONDS=` and an element assignment, which
-/// end the script, and the arithmetic forms, which fail the command with
-/// status 1; the clock is unmoved. Goldens from bash 5.2.21 and 5.3.20.
+/// end the script, the arithmetic forms, which fail the command with status
+/// 1, and `declare -a`/`-A`, which fail with status 1 (bash 5.3.20; 5.2.21
+/// converts it); the clock is unmoved and counts on. Goldens from bash
+/// 5.3.20 (and 5.2.21 but for `declare`).
 #[test]
 fn seconds_readonly_is_refused() {
-	for (src, want) in [
-		("readonly SECONDS; SECONDS=5; echo next", ""),
-		("readonly SECONDS; ((SECONDS=5)); echo \"st=$? $SECONDS\"", "st=1 0\n"),
-		("readonly SECONDS; SECONDS[0]=60; echo next", ""),
+	let element =
+		format!("readonly SECONDS; ((SECONDS[0]=5)); echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_a =
+		format!("readonly SECONDS; declare -a SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_assoc =
+		format!("readonly SECONDS; declare -A SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	for (src, want, diag) in [
+		("readonly SECONDS; SECONDS=5; echo next", "", "SECONDS: readonly variable"),
+		(
+			"readonly SECONDS; ((SECONDS=5)); echo \"st=$? $SECONDS\"",
+			"st=1 0\n",
+			"SECONDS: readonly variable",
+		),
+		("readonly SECONDS; SECONDS[0]=60; echo next", "", "SECONDS: readonly variable"),
+		(element.as_str(), "st=1\n2\n", "SECONDS: readonly variable"),
+		(declare_a.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
+		(declare_assoc.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
 	] {
 		let (out, err) = run(src);
 		assert_eq!(out, want, "{src}");
-		assert!(err.contains("SECONDS: readonly variable"), "{src}: {err}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
+/// `declare` gives or takes no array, integer or case attribute of a
+/// readonly variable (bash 5.3.20's `invalid_readonly_attrs`): it fails
+/// with status 1 and the variable stays as it was; the export and trace
+/// attributes still change. bash 5.2.21 changes them all. Goldens from bash
+/// 5.3.20.
+#[test]
+fn declare_keeps_a_readonly_variables_array_integer_and_case_attributes() {
+	for flag in ["-a", "-A", "-i", "-l", "-u", "-c", "+i", "+a", "-ai"] {
+		let src = format!("readonly x=1; declare {flag} x; echo st=$?; declare -p x");
+		let (out, err) = run(&src);
+		assert_eq!(out, "st=1\ndeclare -r x=\"1\"\n", "{src}");
+		assert!(err.contains("declare: x: readonly variable"), "{src}: {err}");
+	}
+	for (src, want) in [
+		("readonly x=1; declare -x x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; declare -t x; echo st=$?; declare -p x", "st=0\ndeclare -rt x=\"1\"\n"),
+		(
+			"readonly -a a=(1); declare -a a; echo st=$?; declare -p a",
+			"st=1\ndeclare -ar a=([0]=\"1\")\n",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert_eq!(err.is_empty(), want.starts_with("st=0"), "{src}: {err}");
 	}
 }
 

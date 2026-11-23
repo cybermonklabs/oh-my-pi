@@ -2985,7 +2985,8 @@ pub(crate) fn seconds_lookup(
 /// `convert_var_to_assoc` drop the dynamic value and the assign function).
 /// The lookup before it (`find_variable`) reads the clock, so the array's
 /// element 0 is the count and the variable is integer. A readonly
-/// `SECONDS` is refused before it is converted, so it stays the clock.
+/// `SECONDS` stays the clock: the assignment, or the `declare -a`/`-A`
+/// (bash 5.3.20's `invalid_readonly_attrs`), that follows refuses it.
 pub(crate) fn seconds_to_plain(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,

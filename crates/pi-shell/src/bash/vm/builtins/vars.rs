@@ -571,19 +571,15 @@ fn set_value_plain(
 	// An element or compound assignment to the shell's `SECONDS`
 	// (`SECONDS[i]=`, `SECONDS=(…)`, `read -a`, `mapfile`) makes it a plain
 	// array first, as bash's `convert_var_to_array` does; element 0 is the
-	// count then. A local `SECONDS` is only that local's.
-	if name == b"SECONDS" && (lhs.index.is_some() || matches!(value, AssignValue::Array(_))) {
-		let global = match state::assigns_global(&k.root, cx.store, vp, name, level) {
-			Ok(global) => global,
-			Err(e) => {
-				k.fail(e);
-				return Err(Diag::StoreFailed);
-			},
-		};
-		if global && let Err(e) = seconds_to_plain(k, cx, vp) {
-			k.fail(e);
-			return Err(Diag::StoreFailed);
-		}
+	// count then. A local `SECONDS` is only that local's (`seconds_to_plain`
+	// leaves the clock alone while a local or temporary is in scope, and
+	// `declare` binds a new local before it assigns it).
+	if name == b"SECONDS"
+		&& (lhs.index.is_some() || matches!(value, AssignValue::Array(_)))
+		&& let Err(e) = seconds_to_plain(k, cx, vp)
+	{
+		k.fail(e);
+		return Err(Diag::StoreFailed);
 	}
 	// bash's `SECONDS=` (`assign_seconds`) on the shell's clock: not after
 	// `unset SECONDS`, and not on a local or temporary `SECONDS` (plain
@@ -2114,10 +2110,22 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				Some(Var { attrs: cur.as_ref().map_or(Attrs::NONE, |v| v.attrs), value: temp.value });
 			binds_value = true;
 		}
+		// bash 5.3.20 also refuses to give or take a readonly variable's
+		// array, integer and case attributes (`invalid_readonly_attrs`:
+		// `declare -a x` on a readonly `x` fails, `x` stays as it was);
+		// 5.2.21 changes them.
+		let fixed = Attrs::INDEXED.bits()
+			| Attrs::ASSOC.bits()
+			| Attrs::INTEGER.bits()
+			| Attrs::LOWER.bits()
+			| Attrs::UPPER.bits()
+			| Attrs::CAPITALIZE.bits();
 		if cur
 			.as_ref()
 			.is_some_and(|v| v.attrs.contains(Attrs::READONLY))
-			&& (value.is_some() || off.contains(Attrs::READONLY))
+			&& (value.is_some()
+				|| off.contains(Attrs::READONLY)
+				|| (on.bits() | off.bits()) & fixed != 0)
 		{
 			let d = Diag::Readonly { name: name.into() };
 			let array_flag = on.contains(Attrs::INDEXED) || on.contains(Attrs::ASSOC);
