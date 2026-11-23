@@ -186,7 +186,7 @@ jobs:
           echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
       - name: Upload the addon rust_test loads
         if: ${{ matrix.target == 'linux-x64' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: natives-linux-x64-modern
           path: ${{ runner.temp }}/natives-linux-x64-modern
