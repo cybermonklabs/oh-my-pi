@@ -92,6 +92,7 @@ const session = new AgentSession({
 class FakeLiveSession implements RpcLiveSession {
 	muted = false;
 	#stopped: Promise<void> | undefined;
+	readonly #stopRequested = Promise.withResolvers<void>();
 	constructor(readonly options: LiveSessionControllerOptions) {}
 
 	get sdpAnswer(): string | undefined {
@@ -103,6 +104,11 @@ class FakeLiveSession implements RpcLiveSession {
 		callbacks.onPhase("connecting");
 		callbacks.onTranscript(undefined);
 		await Bun.sleep(1);
+		// `OMP_LIVE_CONNECT_UNTIL_STOP` keeps the call connecting until a stop, as a server that never answers does.
+		if (process.env.OMP_LIVE_CONNECT_UNTIL_STOP === "1") {
+			await this.#stopRequested.promise;
+			throw new Error("The live call was stopped while it connected");
+		}
 		callbacks.onTranscript({ role: "user", turn: 1, text: "hello", final: true });
 		callbacks.onPhase("listening");
 	}
@@ -112,6 +118,7 @@ class FakeLiveSession implements RpcLiveSession {
 	}
 
 	stop(): Promise<void> {
+		this.#stopRequested.resolve();
 		this.#stopped ??= (async () => {
 			await Bun.write(
 				path.join(cwd, "live-stopped.json"),

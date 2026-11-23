@@ -408,4 +408,76 @@ describe("live commands over RPC", () => {
 			await removeWithRetries(dir);
 		}
 	}, 60_000);
+
+	test("/live on sent as an RPC prompt leaves the input queue free while it connects; /live off and abort cancel it", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-live-prompt-"));
+		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "live-rpc-agent.ts")], {
+			cwd: dir,
+			// Every call stays connecting until something stops it.
+			env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_NO_TITLE: "1", OMP_LIVE_CONNECT_UNTIL_STOP: "1" },
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stderr = new Response(child.stderr).text();
+		// A prompt that waited for the connect would never be answered: the read ends at this deadline.
+		const lines = readLines(child.stdout, AbortSignal.timeout(20_000));
+		const decoder = new TextDecoder();
+		const outputs: string[] = [];
+		const receive = async (): Promise<Record<string, unknown>> => {
+			const line = await lines.next();
+			if (line.done) throw new Error(`RPC agent ended: ${await stderr}`);
+			const frame = JSON.parse(decoder.decode(line.value)) as Record<string, unknown>;
+			if (frame.type === "command_output") outputs.push(String(frame.text));
+			return frame;
+		};
+		let id = 0;
+		const command = async (fields: object): Promise<Record<string, unknown>> => {
+			const requestId = String(++id);
+			child.stdin.write(`${JSON.stringify({ ...fields, id: requestId })}\n`);
+			await child.stdin.flush();
+			for (;;) {
+				const frame = await receive();
+				if (frame.type === "response" && frame.id === requestId) return frame;
+			}
+		};
+		const output = async (pattern: RegExp): Promise<string> => {
+			for (;;) {
+				const found = outputs.find(text => pattern.test(text));
+				if (found) return found;
+				await receive();
+			}
+		};
+		try {
+			while ((await receive()).type !== "ready") {}
+			expect(await command({ type: "prompt", message: "/live on" })).toMatchObject({
+				command: "prompt",
+				success: true,
+				data: { agentInvoked: false },
+			});
+			expect(await command({ type: "prompt", message: "/live status" })).toMatchObject({ success: true });
+			expect(await output(/^Live call starting since /)).toMatch(/^Live call starting since \S+Z: codex, voice sol/);
+			expect(await command({ type: "prompt", message: "/live off" })).toMatchObject({ success: true });
+			expect(await output(/^Live call ended\.$/)).toBe("Live call ended.");
+			expect(await output(/^Live call did not start: /)).toBe(
+				"Live call did not start: The live call was stopped while it connected",
+			);
+			expect(await Bun.file(path.join(dir, "live-stopped.json")).exists()).toBe(true);
+
+			// RPC `abort` stops a call that is still connecting.
+			outputs.length = 0;
+			expect(await command({ type: "prompt", message: "/live on" })).toMatchObject({ success: true });
+			expect(await command({ type: "abort" })).toMatchObject({ command: "abort", success: true });
+			expect(await output(/^Live call did not start: /)).toBe(
+				"Live call did not start: The live call was stopped while it connected",
+			);
+			expect(await command({ type: "prompt", message: "/live status" })).toMatchObject({ success: true });
+			expect(await output(/^No live call is open\.$/)).toBe("No live call is open.");
+		} finally {
+			child.kill();
+			await child.exited;
+			await stderr;
+			await removeWithRetries(dir);
+		}
+	}, 60_000);
 });

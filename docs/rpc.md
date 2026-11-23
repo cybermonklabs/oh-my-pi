@@ -1532,6 +1532,35 @@ Live frames are not session events: `set_event_filter` never drops them.
 Closing stdin, or `pi.shutdown()`, stops an active live session before the
 process exits.
 
+### `/live` as typed input
+
+A `prompt` whose text is `/live on`, `/live off` or `/live status` drives the
+same session as `live_start` (host audio) and `live_stop`, the way a chat
+bridge relays a person's line. It runs at once, also while a turn runs (with
+or without `streamingBehavior`), never reaches the model, and answers in one
+`command_output` line:
+
+- `/live on`: `Live call open: <provider>, voice <voice>.` (no voice on
+  GPT-Live's API: `Live call open: openai.`); while a call is starting or
+  open, `A live call is already starting|open (since <UTC time>).`; on a
+  failure (dictation running, the session changing, no credential, the
+  server's refusal, a stop while it connects), `Live call did not start: <reason>`.
+- `/live off`: `Live call ended.`, or `No live call is open.`
+- `/live status` (or a bare `/live`): `Live call starting|open since <UTC time>:
+  <provider>, voice <voice>, microphone on|muted.` (no voice part on GPT-Live's
+  API), or `No live call is open.`
+
+A call can take a while to connect. A `prompt` frame's `/live on` therefore
+runs in the background: its response (`agentInvoked: false`) comes at once, and
+the one-line answer follows as a `command_output` when the start ends, so the
+input queue stays free meanwhile. `/live off` or `abort` sent while the call
+connects stops it, and the start answers `Live call did not start: …`.
+
+The live frames above are sent as for `live_start`. The checks `live_start`
+makes (dictation, a session change or shutdown) apply to `/live on` too. ACP,
+print mode and subagents run no live session and answer `/live` as not
+available; the interactive terminal's `/live` opens its own live view.
+
 ### API billing (`live.provider: openai`)
 
 Live sessions run on Codex with the session's ChatGPT (Codex) sign-in. With

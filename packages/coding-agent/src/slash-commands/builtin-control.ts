@@ -6,7 +6,7 @@ import { clearApprovalGrants } from "../tools/approval-cache";
 import { clearSubmittedText } from "./helpers/draft";
 import { shutdownHandlerTui } from "./builtin-lifecycle";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
-import type { LiveCallStatus, SlashCommandRuntime, SlashCommandSpec } from "./types";
+import type { LiveCallStatus, SlashCommandLiveHost, SlashCommandRuntime, SlashCommandSpec } from "./types";
 
 /** A call's provider and, where it has one, its voice (GPT-Live's API gets none from omp). */
 function describeLiveSource(provider: string | undefined, voice: string | undefined): string {
@@ -19,6 +19,30 @@ function describeLiveCall(status: LiveCallStatus): string {
 	if (status.state === "off") return "No live call is open.";
 	const microphone = status.muted ? "muted" : "on";
 	return `Live call ${status.state} since ${status.since.toISOString()}: ${describeLiveSource(status.provider, status.voice)}, microphone ${microphone}.`;
+}
+
+/**
+ * Starts the host's live call and says in one line how the start ended. An abort of `signal` (RPC's
+ * `abort`, or the client going away) while the call connects stops it.
+ */
+async function startLiveCall(
+	live: SlashCommandLiveHost,
+	signal: AbortSignal | undefined,
+): Promise<{ line: string; failed: boolean }> {
+	const stop = (): void => {
+		void live.stop();
+	};
+	signal?.addEventListener("abort", stop, { once: true });
+	try {
+		const { voice } = await live.start();
+		const started = live.status();
+		const source = describeLiveSource(started.state === "off" ? undefined : started.provider, voice);
+		return { line: source ? `Live call open: ${source}.` : "Live call open.", failed: false };
+	} catch (error) {
+		return { line: `Live call did not start: ${errorMessage(error)}`, failed: true };
+	} finally {
+		signal?.removeEventListener("abort", stop);
+	}
 }
 
 /**
@@ -38,15 +62,20 @@ async function handleLiveText(args: string, runtime: SlashCommandRuntime) {
 				await runtime.output(`A live call is already ${status.state} (since ${status.since.toISOString()}).`);
 				return commandConsumed();
 			}
-			try {
-				const { voice } = await live.start();
-				const started = live.status();
-				const source = describeLiveSource(started.state === "off" ? undefined : started.provider, voice);
-				await runtime.output(source ? `Live call open: ${source}.` : "Live call open.");
+			// The connect can take a minute (the session request, the media channel, the sideband's
+			// attempts). An RPC `prompt` runs it in the background, so its input queue stays free for
+			// `/live off`, `/live status` and `abort`, and the answer comes when the start ends.
+			if (runtime.runCommandInBackground) {
+				const signal = runtime.signal;
+				runtime.runCommandInBackground(async () => {
+					await runtime.output((await startLiveCall(live, signal)).line);
+				});
 				return commandConsumed();
-			} catch (error) {
-				return usage(`Live call did not start: ${errorMessage(error)}`, runtime);
 			}
+			const started = await startLiveCall(live, runtime.signal);
+			if (started.failed) return usage(started.line, runtime);
+			await runtime.output(started.line);
+			return commandConsumed();
 		}
 		case "off":
 			if (status.state === "off") {
