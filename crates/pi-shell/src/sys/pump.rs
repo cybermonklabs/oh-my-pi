@@ -1395,4 +1395,57 @@ mod tests {
 		);
 		assert_eq!(read_all(&read, &[&feed], bytes.len()), bytes, "the pump's bytes, once");
 	}
+
+	// Failure mode: the drain's one readiness registration fires once and is
+	// then forgotten by the readiness thread. A wait that comes after it
+	// fired must register again; if it keeps the fired registration (or
+	// registers only when it holds none), the next bytes wake nobody. Two
+	// rounds of wait, bytes, read: the reader is woken in each.
+	#[test]
+	fn a_wait_after_the_drains_registration_fired_is_woken_too() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let mut key = WaitKey::default();
+		let mut buf = [0u8; 64];
+		let hold = |on: bool| {
+			feed
+				.state
+				.lock()
+				.pipe
+				.as_mut()
+				.expect("the pump's end")
+				.hold_writes(on);
+		};
+		for round in 0..2u8 {
+			let bytes = [b'a' + round; 8];
+			assert!(matches!(write.poll_write(&mut cx, &bytes), Poll::Ready(Ok(8))));
+			hold(true);
+			feed.poll(&cx, &mut key);
+			assert_eq!(
+				feed.state.lock().chunk.pending(),
+				&bytes[..],
+				"round {round}: the pump holds the bytes"
+			);
+			let woken = Arc::new(Woken::default());
+			let waker = Waker::from(Arc::clone(&woken));
+			let mut rcx = Context::from_waker(&waker);
+			assert!(
+				read.poll_read(&mut rcx, &mut buf).is_pending(),
+				"round {round}: nothing in the pipe yet"
+			);
+			hold(false);
+			feed.poll(&cx, &mut key);
+			let woke = || woken.0.load(std::sync::atomic::Ordering::SeqCst);
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+			while !woke() && std::time::Instant::now() < deadline {
+				std::thread::sleep(std::time::Duration::from_millis(5));
+			}
+			assert!(woke(), "round {round}: the reader was woken within 5 s");
+			assert_eq!(
+				read_all(&read, &[&feed], bytes.len()),
+				bytes.to_vec(),
+				"round {round}: the bytes, once"
+			);
+		}
+	}
 }
