@@ -2750,6 +2750,17 @@ fn call_function(
 			return Some(Flow::Discard(1));
 		},
 	};
+	// A timed job's function call: a body whose only command may run a
+	// program decides at that command, else the job keeps its virtual pid at
+	// once ([`BangStage::First`]).
+	if k
+		.bangs
+		.iter()
+		.any(|b| b.vproc == vp.vpid && b.stage == BangStage::First)
+		&& !super::exec::program_only(&body, 0)
+	{
+		k.settle_bang(vp.vpid, None);
+	}
 	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	let s = st(vp);
 	let args = s.argv[1..].to_vec();
@@ -4221,9 +4232,15 @@ fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, 
 	match (target, bang.stage) {
 		// A refused spawn is retried (`Refused`, `Script`): that decides.
 		(Target::Intrinsic(IntrinsicId::Exec) | Target::Refused { .. }, _)
-		| (Target::External(_) | Target::Interp(_), BangStage::Lone) => {},
+		| (Target::External(_) | Target::Interp(_), BangStage::Lone | BangStage::First) => {},
 		(Target::External(_) | Target::Interp(_), _) if exec => {},
+		// A timed job's function call: the function's first command decides
+		// ([`BangStage::First`], checked where the call loads the body).
+		(Target::Function(_), BangStage::Lone) if bang.timed => bang.stage = BangStage::First,
 		(Target::Function(_), BangStage::Lone | BangStage::Exec) => bang.stage = BangStage::Exec,
+		// A timed function call: its first command decides
+		// ([`BangStage::First`]).
+		(Target::Function(_), BangStage::First) => {},
 		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
 		_ => k.settle_bang(vpid, None),
 	}
@@ -4377,9 +4394,32 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
-				if let Some(s) = k.proc_collect(cx.store, v) {
+				// A child whose job left the table answers at once with the
+				// status kept for it (bash `wait_for_single_pid`'s
+				// `bgp_search`); a posix shell forgets it (`bgp_delete`).
+				if vp.jobs.by_vpid(v).is_none()
+					&& let Some(s) = vp.jobs.bgp_search(v)
+				{
 					last = s;
+					if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+						.unwrap_or(false)
+					{
+						state::forget_status(&mut k.root, cx.store, vp, v);
+					}
+				} else if let Some(s) = k.proc_collect(cx.store, v) {
+					last = s;
+					// bash's `wait PID` only marks a job in the table notified:
+					// it leaves later with its status kept (`delete_job`'s
+					// `bgp_add`), so a second `wait PID` returns it again; a
+					// posix shell forgets it (`bgp_delete`).
+					let kept = vp.jobs.by_vpid(v).filter(|j| !j.inherited).map(|j| j.pid());
 					forget_job(vp, v);
+					if let Some(pid) = kept
+						&& !state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+							.unwrap_or(false)
+					{
+						state::save_status(&mut k.root, cx.store, vp, v, pid, s);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
@@ -4430,13 +4470,25 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				k.proc_collect(cx.store, v);
 				forget_job(vp, v);
 			}
+			// And bash forgets every status kept (`wait_for_background_pids`'
+			// `bgp_clear`).
+			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
 		Some(Awaited::AnyJob) => {
-			let finished = st(vp).wait_for.iter().find_map(|v| {
-				k.proc_state(cx.store, *v)
+			let waiting_for = st(vp).wait_for.clone();
+			let finished = waiting_for.iter().find_map(|&v| {
+				k.proc_state(cx.store, v)
 					.and_then(super::ProcState::exited)
-					.map(|s| (*v, s))
+					// A job that left the table: the status kept for it.
+					.or_else(|| {
+						vp.jobs
+							.by_vpid(v)
+							.is_none()
+							.then(|| vp.jobs.bgp_search(v))
+							.flatten()
+					})
+					.map(|s| (v, s))
 			});
 			let Some((v, status)) = finished else {
 				if let Some(&v) = st(vp).wait_for.first() {

@@ -218,9 +218,10 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		Ok(n) => Signal::from_number(n, platform).map(Send::Signal),
 		Err(_) => None,
 	};
-	// The job a `%n` names is judged by its state: the exits already
-	// available count.
-	if rest.iter().any(|a| a.first() == Some(&b'%')) {
+	// The job a `%n` names is judged by its state, and a pid by whether that
+	// process ended: the exits already available count first (see bash
+	// `kill`).
+	if rest.iter().any(|a| a.first() == Some(&b'%') || isanum(a)) {
 		super::jobs::take_in_exits(ctx)?;
 	}
 	let mut status: i32 = 0;
