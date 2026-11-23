@@ -2386,6 +2386,9 @@ impl Shell {
 				if self.procs[i].lineage.detached {
 					continue;
 				}
+				// Its builtin parked on a take-in never runs again.
+				let vpid = self.procs[i].vpid;
+				self.drop_take_in(vpid);
 				let key = crate::bash::store::TrapKey::Signal(sig);
 				let trapped = sig != Signal::Kill
 					&& self.procs[i].has_work()
@@ -2481,6 +2484,8 @@ impl Shell {
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
 	/// scripts. Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
+		let vpid = self.procs[i].vpid;
+		self.drop_take_in(vpid);
 		let p = &mut self.procs[i];
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
@@ -2733,6 +2738,16 @@ impl Shell {
 		for i in (0..self.procs.len()).rev() {
 			self.kill(cx, i, Signal::Term, 1);
 		}
+	}
+
+	/// `vpid`'s command ended early (a cancel, a kill, a store failure): a
+	/// builtin of it parked on its take-in will not run again to use the
+	/// answer, so its ask and its answer go. Kept, either would hold every
+	/// later signal trap of the vproc for good ([`Kernel::asking`]).
+	fn drop_take_in(&mut self, vpid: Vpid) {
+		self.k.exits_asked.retain(|&v| v != vpid);
+		self.k.exits_taken.retain(|&v| v != vpid);
+		self.taking_in.retain(|t| t.asker != vpid);
 	}
 
 	/// Whether a vproc carrying lineage label `label` still exists (running,
@@ -3203,5 +3218,109 @@ pub const fn assign_scope(vp: &Vproc) -> AssignScope {
 		AssignScope::Subshell
 	} else {
 		AssignScope::Global
+	}
+}
+
+// Failure mode: a run cancelled, or ended by a signal to the shell, while
+// its `jobs` waited on its take-in (the ask made, or made and answered)
+// left the ask in `Kernel::exits_asked` or the answer in
+// `Kernel::exits_taken`; `Kernel::asking` then held every later signal trap
+// of the root for good: the next run's `USR1` trap never ran (the
+// reviewer's probe at 2bfc6ca3: `tail` alone). In the bash tool's shell a
+// timed-out command would silence the session's traps.
+#[cfg(test)]
+mod cancelled_take_in {
+	use super::*;
+	use crate::testkit::{FakeHost, Fault, Rig, fault::skeleton_init};
+
+	/// What ends the run while its `jobs` waits on the take-in.
+	#[derive(Clone, Copy, Debug)]
+	enum End {
+		/// The host cancels the run (a timeout): the cancel's handling.
+		Cancel(Signal),
+		/// A signal sent to the shell's pid: `Shell::kill` of the root.
+		Signal(Signal),
+	}
+
+	/// `while :; do :; done & jobs` one op per step until the root's `jobs`
+	/// has its answer (`answered`), or has asked and waits for it; then
+	/// `end`; then `USR1` is pending for the next run. That run's output.
+	/// The ask waits only when the loop has had a turn before it (`(:)`
+	/// first): a job that has not run yet is owed none, so an ask right
+	/// after `&` is answered in the step that makes it.
+	fn end_at_the_ask(answered: bool, end: End) -> Vec<u8> {
+		let mut rig = Rig::new(FakeHost::default(), skeleton_init(&[]));
+		assert_eq!(rig.run(Script::command(b"trap 'echo signal' USR1".to_vec()), Fault::None), 0);
+		let root = rig.shell().procs[0].vpid;
+		let src: &[u8] = if answered {
+			b"while :; do :; done & jobs"
+		} else {
+			b"while :; do :; done & (:); jobs"
+		};
+		let run = rig.shell().submit(Script::command(src.to_vec()));
+		let one = Budget { max_ops: 1, max_ns: u64::MAX };
+		let mut reached = false;
+		for _ in 0..50_000 {
+			let (shell, host, store) = rig.parts();
+			let step = shell.step(&mut Cx { host, store }, one);
+			let k = &shell.k;
+			if (answered && k.exits_taken.contains(&root))
+				|| (!answered && k.exits_asked.contains(&root) && !k.exits_taken.contains(&root))
+			{
+				reached = true;
+				break;
+			}
+			assert!(!matches!(step, Step::Done { run: id, .. } if id == run), "the run ended first");
+		}
+		assert!(reached, "`jobs` asked (answered: {answered})");
+		match end {
+			End::Cancel(sig) => rig.shell().k.ctl.request_cancel(sig),
+			End::Signal(sig) => rig.shell().control().signal(SigTarget::Vpid(root), sig),
+		}
+		let mut ended = false;
+		for _ in 0..50_000 {
+			let (shell, host, store) = rig.parts();
+			if matches!(shell.step(&mut Cx { host, store }, one), Step::Done { run: id, .. } if id == run)
+			{
+				ended = true;
+				break;
+			}
+		}
+		assert!(ended, "the run ends ({end:?})");
+		let n = rig.host.stdout.bytes().len();
+		let p = &mut rig.shell().procs[0];
+		p.pending_traps = p.pending_traps.with(Signal::Usr1);
+		assert_eq!(rig.run(Script::command(b"echo tail".to_vec()), Fault::None), 0);
+		rig.host.stdout.bytes()[n..].to_vec()
+	}
+
+	#[test]
+	fn a_cancel_after_the_answer_leaves_no_ask() {
+		for sig in [Signal::Kill, Signal::Term] {
+			let out = end_at_the_ask(true, End::Cancel(sig));
+			assert_eq!(String::from_utf8_lossy(&out), "signal\ntail\n", "{sig:?}");
+		}
+	}
+
+	#[test]
+	fn a_cancel_before_the_answer_leaves_no_ask() {
+		for sig in [Signal::Kill, Signal::Term] {
+			let out = end_at_the_ask(false, End::Cancel(sig));
+			assert_eq!(String::from_utf8_lossy(&out), "signal\ntail\n", "{sig:?}");
+		}
+	}
+
+	#[test]
+	fn a_signal_that_ends_the_run_at_the_ask_leaves_no_ask() {
+		for answered in [true, false] {
+			for sig in [Signal::Kill, Signal::Term] {
+				let out = end_at_the_ask(answered, End::Signal(sig));
+				assert_eq!(
+					String::from_utf8_lossy(&out),
+					"signal\ntail\n",
+					"{sig:?} (answered: {answered})"
+				);
+			}
+		}
 	}
 }
