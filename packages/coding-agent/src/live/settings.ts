@@ -5,6 +5,37 @@
 import { register, type ScopeLike } from "../config/registry";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "./voices";
 
+export const cfgLiveProvider = register({
+	id: "live.provider",
+	type: "enum",
+	values: ["codex", "openai"] as const,
+	default: "codex",
+	env: "OMP_LIVE_PROVIDER",
+	ui: {
+		tab: "providers",
+		group: "Services",
+		label: "Live Provider",
+		description:
+			"Where realtime voice calls go: Codex on the ChatGPT subscription, or GPT-Live on OpenAI's API, billed to the openai provider's key",
+		options: [
+			{ value: "codex", label: "Codex", description: "ChatGPT (Codex) subscription" },
+			{ value: "openai", label: "OpenAI API", description: "GPT-Live with the openai provider's base URL and key" },
+		],
+	},
+});
+
+export const cfgLiveModel = register({
+	id: "live.model",
+	type: "string",
+	default: "gpt-live-1.1",
+	ui: {
+		tab: "providers",
+		group: "Services",
+		label: "Live Model",
+		description: "GPT-Live model of realtime voice calls on OpenAI's API (live.provider: openai)",
+	},
+});
+
 export const cfgLiveVoice = register({
 	id: "live.voice",
 	type: "enum",

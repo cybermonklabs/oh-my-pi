@@ -16,3 +16,6 @@ export const LIVE_VOICE_VALUES = LIVE_VOICE_OPTIONS.map(({ value }) => value);
 
 /** Voice used when no live voice preference is configured. */
 export const DEFAULT_LIVE_VOICE = "sol";
+
+/** Voice of GPT-Live calls on OpenAI's API (`live.provider: openai`); the Codex voices are not GPT-Live's. */
+export const OPENAI_LIVE_VOICE = "marin";

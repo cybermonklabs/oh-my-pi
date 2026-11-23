@@ -1530,6 +1530,36 @@ Live frames are not session events: `set_event_filter` never drops them.
 Closing stdin, or `pi.shutdown()`, stops an active live session before the
 process exits.
 
+### API billing (`live.provider: openai`)
+
+Live sessions run on Codex with the session's ChatGPT (Codex) sign-in. With
+`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`) every live session
+(`/live`, `live_start`, `live_connect`, extension `startLive`) runs GPT-Live on
+OpenAI's API instead, billed to the key of the `openai` provider: the key omp
+uses for any OpenAI model (a stored key, `apiKey` in `models.yml`, else
+`OPENAI_API_KEY`), sent to the provider's `baseUrl` from `models.yml`, else
+`https://api.openai.com/v1`. A model gateway that serves GPT-Live there works
+the same way.
+
+1. `POST {base}/live/sessions` with `Authorization: Bearer <key>` and
+   `{ "session": { "model": <live.model>, "instructions", "audio": { "output": { "voice": "marin" } }, "delegation": { "type": "client" }, "idle_timeout_s": 60, "wake_policy": { "type": "speech" } }, "transport": { "type": "webrtc", "sdp": <offer> } }`,
+   answered by `201 { "session": { "id" }, "transport": { "sdp" } }`. No Codex
+   header is sent and no redirect is followed.
+2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
+   bearer carries the call's events and omp's messages.
+
+`live.model` names the model (default `gpt-live-1.1`); the voice is `marin`,
+since the `live.voice` choices are Codex voices. GPT-Live's delegation names no
+task text, only its offset on the call's timeline, so each delegation's turn is
+built from both speakers' words since the previous delegation, up to that
+offset, under a note that the text is recognized speech wanting a short spoken
+reply. It waits up to 3 s for the user's words before the offset, and since
+GPT-Live sends no event that ends the user's transcript, a spoken request
+usually waits the full 3 s. A turn's progress goes to the call as
+`session.thinking.append` (not spoken) and its final reply as
+`session.commentary.append` (spoken). After 60 s without speech the call goes to
+GPT-Live's lower standby rate.
+
 ## Dictation Sub-Protocol
 
 Draft-only dictation captures from the machine's microphone using the session's
