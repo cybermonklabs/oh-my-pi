@@ -13,7 +13,9 @@
 //! Ported from zsh 5.9 (MIT-style licence, Copyright (c) 1992-1997 Paul
 //! Falstad and the zsh development group).
 
-use bstr::{BStr, BString};
+use std::sync::Arc;
+
+use bstr::{BStr, BString, ByteSlice as _};
 
 use super::{
 	arith, brace,
@@ -27,18 +29,24 @@ use super::{
 };
 use crate::bash::{
 	diag::Diag,
-	ir::WordKind,
+	event::RedirKind,
+	ir::{Opcode, RedirFdIr, RedirTargetIr, Unit, WordKind},
 	pattern::zsh::{Captures, SubFlags},
-	syntax::zsh::tok::{
-		BNULL, BNULLKEEP, DASH, DNULL, EQUALS, HAT, INANG, INBRACE, INBRACK, INPAR, INPARMATH,
-		MARKER, META, NULARG, OUTANGPROC, OUTBRACE, OUTBRACK, OUTPAR, OUTPARMATH, POUND, QSTRING,
-		QTICK, QUEST, SNULL, STAR, STRING, TICK, TILDE, at, head, is_null, is_tok, metafy, span,
-		tail, tok_char, unmetafy, untokenize,
+	syntax::{
+		AliasLookup, NO_ALIASES, Parser,
+		zsh::tok::{
+			BNULL, BNULLKEEP, DASH, DNULL, EQUALS, HAT, INANG, INBRACE, INBRACK, INPAR, INPARMATH,
+			MARKER, META, NULARG, OUTANGPROC, OUTBRACE, OUTBRACK, OUTPAR, OUTPARMATH, POUND, QSTRING,
+			QTICK, QUEST, SNULL, STAR, STRING, TICK, TILDE, at, head, is_null, is_tok, metafy, span,
+			tail, tok_char, unmetafy, untokenize,
+		},
 	},
 	vm::{
-		builtins::zsh_quote,
+		builtins::{alias_table, zsh_quote},
+		exec::features,
 		expand::{Expander, Stop, X},
-		proc::Atom,
+		probe,
+		proc::{Atom, Probe},
 		state,
 	},
 	zshopt::ZshOpt,
@@ -340,8 +348,12 @@ fn once(
 
 /// zsh `getoutput`: the output of the command substitution `body` (raw
 /// zsh source, metafied). On the first pass it parks the op
-/// ([`Stop::ZshSub`]); on the replay it is the logged output.
+/// ([`Stop::ZshSub`]); on the replay it is the logged output. `$(< word)`
+/// reads the file in the shell itself ([`read_subst`]).
 pub(super) fn getoutput(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Vec<u8>> {
+	if let Some((unit, word)) = read_subst_word(ex, body)? {
+		return read_subst(ex, &unit, word);
+	}
 	let atom = if ex.record {
 		replay(ex)
 	} else {
@@ -357,6 +369,118 @@ pub(super) fn getoutput(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Vec<u8>> {
 		},
 		_ => Err(Stop::ZshSub { text: BString::from(unmetafy(body)), here: false }),
 	}
+}
+
+/// zsh `getoutput`'s `simple_redir_name`: when command substitution `body`
+/// (raw zsh source, metafied) is one simple command made of a lone `<` on
+/// fd 0 (`< f`, `0< f`) and nothing else, its compiled unit and the
+/// redirection's word (a `words` index). zsh parses the body as it runs it,
+/// with the aliases then in effect; so does this, once per pass (a body
+/// that does not start with `<` or `0<` is not parsed).
+fn read_subst_word(ex: &mut Expander<'_, '_>, body: &[u8]) -> X<Option<(Arc<Unit>, u32)>> {
+	let src = unmetafy(body);
+	let start = src.trim_ascii_start();
+	if !(start.starts_with(b"<") || start.starts_with(b"0<")) {
+		return Ok(None);
+	}
+	let feat = features(ex.k, ex.cx.store, ex.vp)?;
+	let aliases = alias_table(ex.k, ex.cx, ex.vp)?;
+	let lookup: &dyn AliasLookup = aliases.as_ref().map_or(NO_ALIASES, |a| a);
+	let mut parser = Parser::new(&src, feat, lookup);
+	let Some(Ok(cc)) = parser.next_command() else {
+		return Ok(None);
+	};
+	// Anything after the command (`< f; x`) is no simple redirection.
+	if parser.next_command().is_some() {
+		return Ok(None);
+	}
+	let (unit, _) = ex.k.engine.compile(cc, &src, ex.vp.mode, feat, false);
+	// The list markers (`Nop`s) aside: the command, then the unit's end.
+	let mut ops = unit.ops.iter().filter(|op| op.code != Opcode::Nop);
+	let (Some(exec), Some(end), None) = (ops.next(), ops.next(), ops.next()) else {
+		return Ok(None);
+	};
+	if exec.code != Opcode::Exec || end.code != Opcode::End {
+		return Ok(None);
+	}
+	let Some(cmd) = unit.cmds.get(exec.a as usize) else {
+		return Ok(None);
+	};
+	let no_words = unit.lists.get(cmd.words as usize).is_none_or(Vec::is_empty);
+	let word = cmd
+		.redirs
+		.and_then(|l| unit.redirs.get(l as usize))
+		.and_then(|rs| match rs.as_slice() {
+			[r] if r.op == RedirKind::In && matches!(r.fd, RedirFdIr::Default | RedirFdIr::Num(0)) => {
+				match r.target {
+					RedirTargetIr::Word(w) => Some(w),
+					RedirTargetIr::HereDoc { .. } => None,
+				}
+			},
+			_ => None,
+		});
+	Ok(word
+		.filter(|_| no_words && cmd.assigns.is_empty())
+		.map(|w| (unit, w)))
+}
+
+/// zsh `getoutput`'s `$(< word)`: the word substituted as one string, not
+/// globbed (`singsub`), and that file read in the shell, as zsh does
+/// without a fork. On success `$?` and the command's status stay as they
+/// were (zsh sets `lastval` only on failure). A file that does not open is
+/// `zsh: %e: NAME` and one that does not read (a directory) `zsh: error
+/// when reading NAME: %e`, each with status 1 and an empty value. The read
+/// is a probe of the op ([`Probe::Read`]); its message is printed once.
+fn read_subst(ex: &mut Expander<'_, '_>, unit: &Arc<Unit>, word: u32) -> X<Vec<u8>> {
+	let name = ex.scalar(unit, &unit.words[word as usize])?;
+	// zsh opens the name as it is: an empty one is no file.
+	let path = if name.is_empty() {
+		name.clone()
+	} else {
+		probe::absolute(&ex.vp.cwd, &name)
+	};
+	let answer = if let Some(atom) = ex.log.get(ex.cursor).cloned() {
+		ex.cursor += 1;
+		atom
+	} else {
+		return Err(Stop::Probe(Probe::Read { path }));
+	};
+	match answer {
+		Atom::Str(Some(data)) => Ok(data.to_vec()),
+		// The read failed: its `strerror` text ([`exec::probe_atom`]).
+		Atom::List(err) => {
+			// Printed on the pass that first reads the answer; the replays
+			// find the mark.
+			match replay(ex) {
+				Some(Atom::Done) => {},
+				other => {
+					ex.cursor -= usize::from(other.is_some());
+					let err = err.into_iter().next().unwrap_or_default();
+					let msg = if err.as_slice() == b"Is a directory" {
+						format!("error when reading {}: is a directory", name.as_bstr())
+					} else {
+						format!("{}: {}", lower_first(&err.to_str_lossy()), name.as_bstr())
+					};
+					let line = ex.line;
+					ex.k
+						.diag(ex.cx, ex.vp, line, Diag::Usage { msg: msg.into() });
+					note(ex, || Atom::Done);
+				},
+			}
+			ex.sub_status = Some(1);
+			ex.vp.status = 1;
+			Ok(Vec::new())
+		},
+		_ => Ok(Vec::new()),
+	}
+}
+
+/// zsh's `%e`: `strerror` text with its first letter in lower case.
+fn lower_first(text: &str) -> String {
+	let mut chars = text.chars();
+	chars
+		.next()
+		.map_or_else(String::new, |c| c.to_lowercase().chain(chars).collect())
 }
 
 /// zsh `subst_string_by_func`'s call of hook function code `call` (raw zsh
