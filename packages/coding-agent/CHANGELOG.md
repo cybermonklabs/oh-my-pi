@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `omp -p` and other starts exiting with `database is locked` while other omp processes write `agent.db`: a start that finds the agent and memory schema current no longer writes to it ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+- Fixed the judgment cache staying open after `close()` until the process exited, where its final checkpoint took the shared store's write lock ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
@@ -367,11 +372,6 @@
 - Out-of-credit provider errors now fail immediately instead of retrying for long periods; Retry works promptly once the account is funded.
 - DeepSeek-style `*** End` and `*** End Patch` markers are no longer written into files or truncate later edits
 - Composer prediction ghost text no longer vanishes when advisor messages arrive
-
-### Fixed
-
-- Fixed `omp -p` and other starts exiting with `database is locked` while other omp processes write `agent.db`: a start that finds the agent and memory schema current no longer writes to it ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
-- Fixed the judgment cache staying open after `close()` until the process exited, where its final checkpoint took the shared store's write lock ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
 
 ## [18.16.0] - 2026-11-02
 

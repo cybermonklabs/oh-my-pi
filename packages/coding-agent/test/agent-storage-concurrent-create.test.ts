@@ -18,35 +18,40 @@ afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) await dir.remove();
 });
 
+/** Reads an opener's whole stdout once: resolves `ready` at its READY line and `result` with its last line. */
+function watch(opener: Bun.Subprocess<"ignore", "pipe", "pipe">): { ready: Promise<void>; result: Promise<string> } {
+	const ready = Promise.withResolvers<void>();
+	const result = (async () => {
+		let last = "";
+		for await (const raw of readLines(opener.stdout)) {
+			const line = new TextDecoder().decode(raw).trim();
+			if (line === "READY") ready.resolve();
+			else if (line) last = line;
+		}
+		ready.resolve();
+		const [stderr] = await Promise.all([new Response(opener.stderr).text(), opener.exited]);
+		return last || `no result: ${stderr.slice(-200)}`;
+	})();
+	return { ready: ready.promise, result };
+}
+
 async function round(dir: string, index: number): Promise<string[]> {
 	const dbPath = path.join(dir, `agent-${index}.db`);
 	const startFile = path.join(dir, `start-${index}`);
 	const openers = Array.from({ length: PROCESSES }, () =>
-		Bun.spawn([process.execPath, fixture, dbPath, startFile], {
-			cwd: path.join(import.meta.dir, ".."),
-			stdout: "pipe",
-			stderr: "pipe",
-		}),
+		watch(
+			Bun.spawn([process.execPath, fixture, dbPath, startFile], {
+				cwd: path.join(import.meta.dir, ".."),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		),
 	);
 	// Each opener has loaded its modules and waits on the start file before any of them begins.
-	await Promise.all(
-		openers.map(async opener => {
-			for await (const line of readLines(opener.stdout)) {
-				if (new TextDecoder().decode(line).trim() === "READY") return;
-			}
-		}),
-	);
+	await Promise.all(openers.map(opener => opener.ready));
 	fs.writeFileSync(startFile, "");
-	return Promise.all(
-		openers.map(async opener => {
-			const [rest, stderr] = await Promise.all([
-				new Response(opener.stdout).text(),
-				new Response(opener.stderr).text(),
-				opener.exited,
-			]);
-			return rest.trim().split("\n").at(-1) || `no result: ${stderr.slice(-200)}`;
-		}),
-	);
+	return Promise.all(openers.map(opener => opener.result));
 }
 
 test("processes that create agent.db at the same moment all open it", async () => {

@@ -39,20 +39,26 @@ describe("initDb under a peer's write lock", () => {
 		const release = `${dbPath}.release`;
 		// The peer holds the write lock until the open sleeps before a retry, so the first attempt
 		// always fails on it whatever the host's load; an opener with no retry never releases it.
+		// It takes the lock kind every omp process takes (the SQLite lock shim, #15586): with the other
+		// kind, gVisor fails the open with "locking protocol" instead of "database is locked". pi-utils
+		// exports only an `import` entry, so the peer loads it with import(), not require().
 		const script = `
 			const fs = require("node:fs");
 			const { Database } = require("bun:sqlite");
-			const db = new Database(${JSON.stringify(dbPath)});
-			db.run("PRAGMA journal_mode = WAL");
-			db.run("BEGIN IMMEDIATE");
-			db.run("CREATE TABLE peer (id INTEGER)");
-			console.log("held");
-			const poll = setInterval(() => {
-				if (!fs.existsSync(${JSON.stringify(release)})) return;
-				clearInterval(poll);
-				db.run("COMMIT");
-				db.close();
-			}, 10);
+			import("@oh-my-pi/pi-utils").then(({ ensureSqliteLockShim }) => {
+				ensureSqliteLockShim();
+				const db = new Database(${JSON.stringify(dbPath)});
+				db.run("PRAGMA journal_mode = WAL");
+				db.run("BEGIN IMMEDIATE");
+				db.run("CREATE TABLE peer (id INTEGER)");
+				console.log("held");
+				const poll = setInterval(() => {
+					if (!fs.existsSync(${JSON.stringify(release)})) return;
+					clearInterval(poll);
+					db.run("COMMIT");
+					db.close();
+				}, 10);
+			});
 		`;
 		const peer = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "inherit" });
 		try {
