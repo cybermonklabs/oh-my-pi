@@ -720,6 +720,101 @@ impl Driver {
 	}
 }
 
+/// Test support: seeing a session's shell wait on output that a writer thread
+/// holds (fd 2 a full pipe on the writer-thread route).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod held {
+	use std::{
+		collections::HashSet,
+		time::{Duration, Instant},
+	};
+
+	/// The tids of this process's writer threads (`obash-write`, the
+	/// `BlockingWriter` of [`crate::sys::StdFile`]).
+	pub(crate) fn writer_threads() -> HashSet<u32> {
+		std::fs::read_dir("/proc/self/task")
+			.expect("this process's threads in /proc/self/task")
+			.flatten()
+			.filter(|task| {
+				std::fs::read_to_string(task.path().join("comm"))
+					.is_ok_and(|comm| comm.trim() == "obash-write")
+			})
+			.filter_map(|task| task.file_name().to_str()?.parse().ok())
+			.collect()
+	}
+
+	/// How many processes have this one as their parent, running or not yet
+	/// reaped. A scan that saw no process would count no child, so it must
+	/// see this process itself.
+	fn children() -> usize {
+		let me = std::process::id();
+		let (mut seen_me, mut children) = (false, 0);
+		for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+			let Some(pid) = entry
+				.file_name()
+				.to_str()
+				.and_then(|name| name.parse::<u32>().ok())
+			else {
+				continue;
+			};
+			let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+				continue;
+			};
+			// `pid (comm) state ppid ...`; the name may hold spaces.
+			let ppid = stat
+				.rsplit_once(") ")
+				.and_then(|(_, rest)| rest.split(' ').nth(1)?.parse::<u32>().ok());
+			seen_me |= pid == me;
+			children += usize::from(ppid == Some(me));
+		}
+		assert!(seen_me, "/proc does not list this process ({me}), so it would show no child");
+		children
+	}
+
+	/// Each worker's park/unpark count, odd while the worker is parked with
+	/// no task to run (`RuntimeMetrics::worker_park_unpark_count`).
+	fn parks(runtime: &tokio::runtime::Handle) -> Vec<u64> {
+		let metrics = runtime.metrics();
+		(0..metrics.num_workers())
+			.map(|worker| metrics.worker_park_unpark_count(worker))
+			.collect()
+	}
+
+	/// `look`'s result once the shell is seen waiting on output a writer
+	/// thread holds: a writer thread not in `before` took that output, no
+	/// child process runs, and every worker of `runtime` (the session's
+	/// driver runs there) is parked before and after `look`, with no park or
+	/// unpark between. A shell that waits for that output to be out sleeps
+	/// there until the output is out; a shell that does not wait has by then
+	/// run what comes next. `Err` names what was seen last once 10 s pass.
+	pub(crate) fn once_the_shell_waits<T>(
+		runtime: &tokio::runtime::Handle,
+		before: &HashSet<u32>,
+		mut look: impl FnMut() -> T,
+	) -> Result<T, String> {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			let parked = parks(runtime);
+			let writer = !writer_threads().is_subset(before);
+			let children = children();
+			if parked.iter().all(|n| !n.is_multiple_of(2)) && writer && children == 0 {
+				let seen = look();
+				if parks(runtime) == parked {
+					return Ok(seen);
+				}
+			}
+			if Instant::now() >= deadline {
+				return Err(format!(
+					"the shell was never seen waiting on its held output within 10 s: worker \
+					 park/unpark counts {parked:?} (odd: parked), a new writer thread: {writer}, \
+					 {children} child processes"
+				));
+			}
+			std::thread::sleep(Duration::from_millis(1));
+		}
+	}
+}
+
 #[cfg(all(test, unix))]
 mod tests {
 	use std::{io, io::Read, os::unix::ffi::OsStrExt, time::Instant};
@@ -1169,9 +1264,11 @@ mod tests {
 	}
 
 	/// Runs `script` with fd 2 a full pipe, on the writer-thread route (the
-	/// test's child process). For the first 2 s nothing reads that pipe, so
+	/// test's child process), and fd 1 a regular file, which holds a
+	/// command's line as soon as the command wrote it. Nothing reads the pipe
+	/// until the shell is seen waiting ([`held::once_the_shell_waits`]), so
 	/// what a command hands to its writer thread stays there: a later
-	/// command's line on fd 1 then shows that the later command ran before
+	/// command's line on fd 1 by then shows that the later command ran before
 	/// the earlier command's output was out. Then the pipe is drained, and the
 	/// later command must run. Returns fd 1 while the pipe was held, fd 1 at
 	/// the end, and what the drained pipe held after its fill.
@@ -1189,42 +1286,32 @@ mod tests {
 		let capacity =
 			usize::try_from(unsafe { libc::fcntl(held_w.as_raw_fd(), libc::F_GETPIPE_SZ) }).unwrap();
 		std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
-		let (mut out_r, out_w) = io::pipe().unwrap();
-		let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-		let seen = std::sync::Arc::clone(&out);
-		let out_thread = std::thread::spawn(move || {
-			let mut buf = [0u8; 4096];
-			while let Ok(n) = out_r.read(&mut buf) {
-				if n == 0 {
-					break;
-				}
-				seen.lock().extend_from_slice(&buf[..n]);
-			}
-		});
-		let snapshot = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
-		let (held_out, held_tail) = (std::sync::Arc::clone(&out), std::sync::Arc::clone(&snapshot));
+		let dir = tempfile::tempdir().unwrap();
+		let out = dir.path().join("out");
+		let out_w = std::fs::File::create(&out).unwrap();
+		let (driver, writers, seen) = (runtime.handle().clone(), held::writer_threads(), out.clone());
 		let held_thread = std::thread::spawn(move || {
-			std::thread::sleep(std::time::Duration::from_secs(2));
-			*held_tail.lock() = String::from_utf8_lossy(&held_out.lock()).into_owned();
+			let while_held = held::once_the_shell_waits(&driver, &writers, || {
+				std::fs::read_to_string(&seen).unwrap()
+			});
 			let mut all = Vec::new();
 			held_r.read_to_end(&mut all).unwrap();
-			all
+			(while_held, all)
 		});
 		runtime.block_on(async {
 			let mut s = session();
 			let stdio = RunStdio {
 				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
-				stdout: Some(std::fs::File::from(OwnedFd::from(out_w))),
+				stdout: Some(out_w),
 				stderr: Some(std::fs::File::from(OwnedFd::from(held_w))),
 			};
 			let run = s.run(script, stdio, CancellationToken::new());
 			let _ = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
 		});
 		drop(runtime);
-		let all = held_thread.join().unwrap();
-		out_thread.join().unwrap();
-		let held = snapshot.lock().clone();
-		let end = String::from_utf8_lossy(&out.lock()).into_owned();
+		let (while_held, all) = held_thread.join().unwrap();
+		let held = while_held.unwrap_or_else(|missed| panic!("{missed}"));
+		let end = std::fs::read_to_string(&out).unwrap();
 		(held, end, String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned())
 	}
 

@@ -1297,7 +1297,25 @@ mod tests {
 			assert!(start.elapsed() < BOUND, "the shell wrote nothing");
 			std::thread::sleep(Duration::from_millis(10));
 		}
-		std::thread::sleep(Duration::from_millis(500));
+		// Then the builtin's write waits for room: nothing on the runtime can
+		// run, and its only worker parks (its park/unpark count is odd while
+		// it is parked). A write that waited in the kernel would hold the
+		// worker instead; the runtime is then left behind, as below.
+		let metrics = host.metrics();
+		let parked = || !metrics.worker_park_unpark_count(0).is_multiple_of(2);
+		let start = Instant::now();
+		let mut idle = parked();
+		while !idle && start.elapsed() < BOUND {
+			std::thread::sleep(Duration::from_millis(1));
+			idle = parked();
+		}
+		if !idle {
+			drop(undrained);
+			host.shutdown_background();
+			panic!(
+				"the runtime's only worker never went idle: the shell's write to the full pipe held it"
+			);
+		}
 		let shared = Arc::new(shared_with_finished_patch(&tree.0, UPDATE_PATCH));
 		let (done_tx, done_rx) = std::sync::mpsc::channel();
 		host.spawn(async move {

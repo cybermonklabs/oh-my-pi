@@ -3088,6 +3088,73 @@ mod testing {
 		tree
 	}
 
+	/// A chain of directories named `d` below `top`, as deep as paths may go,
+	/// made for a test; dropping it removes the chain deepest first, by path,
+	/// with the files in its deepest directory. A tempdir dropped with the
+	/// chain still in it removes it with `std::fs::remove_dir_all`, which
+	/// keeps a descriptor open for each level it is inside: about 2,000 for
+	/// this chain. The tests running beside it in this process share the
+	/// descriptor limit (1,024 by default on Linux), and theirs then fail with
+	/// `EMFILE`.
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	pub(crate) struct DeepChain {
+		top:     PathBuf,
+		deepest: PathBuf,
+		depth:   usize,
+	}
+
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	impl DeepChain {
+		/// Makes `top` and the levels below it. The drop removes each level by
+		/// its path, which must stay under `PATH_MAX`: the depth keeps a
+		/// one-byte name in the deepest level 96 bytes under it, and a test's
+		/// names there must fit in that.
+		pub(crate) fn create(top: PathBuf) -> Self {
+			#[cfg(unix)]
+			let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
+			#[cfg(not(unix))]
+			let path_max = 4096;
+			// Every level adds "/d".
+			let depth = (path_max - 96 - top.join("f").as_os_str().len()) / 2;
+			let mut deepest = top.clone();
+			for _ in 0..depth {
+				deepest.push("d");
+			}
+			std::fs::create_dir_all(&deepest).unwrap();
+			Self { top, deepest, depth }
+		}
+
+		/// The levels below `top`.
+		pub(crate) fn depth(&self) -> usize {
+			self.depth
+		}
+
+		#[cfg(feature = "util.find")]
+		pub(crate) fn deepest(&self) -> &std::path::Path {
+			&self.deepest
+		}
+	}
+
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	impl Drop for DeepChain {
+		fn drop(&mut self) {
+			for entry in std::fs::read_dir(&self.deepest).into_iter().flatten().flatten() {
+				let _ = std::fs::remove_file(entry.path());
+			}
+			let mut level = self.deepest.clone();
+			while level.starts_with(&self.top) && std::fs::remove_dir(&level).is_ok() {
+				level.pop();
+			}
+			if !std::thread::panicking() {
+				assert!(
+					std::fs::symlink_metadata(&self.top).is_err(),
+					"DeepChain left {} behind",
+					self.top.display()
+				);
+			}
+		}
+	}
+
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
 	/// with `stdin` on fd 0 and the process environment plus `env`, returning
 	/// its status, stdout, and stderr.
@@ -3822,36 +3889,91 @@ mod testing {
 		(std::fs::File::from(OwnedFd::from(reader)), writer, capacity)
 	}
 
+	/// Whether this process holds a non-blocking, write-only description of
+	/// the pipe `pipe` describes: the private reopen a gated write makes
+	/// (`Descriptor::gated` in `stdio.rs`, from `Native::open`) right before
+	/// it waits for the pipe to take its bytes.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) fn has_a_private_writer(pipe: &std::fs::Metadata) -> bool {
+		use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+		let flags = |fd: &std::ffi::OsStr| -> Option<libc::c_int> {
+			let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.to_str()?)).ok()?;
+			let flags = info.lines().find_map(|line| line.strip_prefix("flags:"))?;
+			libc::c_int::from_str_radix(flags.trim(), 8).ok()
+		};
+		std::fs::read_dir("/proc/self/fd").expect("/proc/self/fd").flatten().any(|fd| {
+			std::fs::metadata(fd.path())
+				.is_ok_and(|m| m.file_type().is_fifo() && m.dev() == pipe.dev() && m.ino() == pipe.ino())
+				&& flags(fd.file_name().as_os_str())
+					.is_some_and(|f| f & libc::O_NONBLOCK != 0 && f & libc::O_ACCMODE == libc::O_WRONLY)
+		})
+	}
+
+	/// Reads the `capacity` bytes the fill left in the full pipe `reader`
+	/// reads, once the write into that pipe is seen waiting for room
+	/// ([`has_a_private_writer`]; polled beside the write on one thread, so
+	/// the write is `Pending` then). Read before that, the write would find
+	/// room, and a write that waits in the kernel would pass too.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) async fn drain_once_the_write_waits(mut reader: std::fs::File, capacity: usize) -> std::fs::File {
+		use std::time::{Duration, Instant};
+
+		let pipe = reader.metadata().expect("the pipe's inode");
+		let start = Instant::now();
+		while !has_a_private_writer(&pipe) {
+			assert!(
+				start.elapsed() < Duration::from_secs(4),
+				"the write into the full pipe was never seen waiting for room"
+			);
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		reader.read_exact(&mut vec![0; capacity]).unwrap();
+		reader
+	}
+
+	/// What a test's runtime thread sent on `finished` within 5 s. Panics
+	/// with `DEADLINE fired: {deadline}` when it sent nothing by then, and
+	/// says so when the thread ended without sending: it panicked, and its
+	/// message is above.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) fn sent_within_5s<T>(finished: &std::sync::mpsc::Receiver<T>, deadline: &str) -> T {
+		use std::sync::mpsc::RecvTimeoutError;
+
+		match finished.recv_timeout(std::time::Duration::from_secs(5)) {
+			Ok(sent) => sent,
+			Err(RecvTimeoutError::Timeout) => panic!("DEADLINE fired: {deadline}"),
+			Err(RecvTimeoutError::Disconnected) => {
+				panic!("the runtime's thread panicked before it sent its result; its message is above")
+			},
+		}
+	}
+
 	/// Runs `run` on a current-thread runtime while a task on the same
-	/// thread drains the full stdout pipe, and returns its status; ends the
-	/// test naming `what` once 5 s pass. A write that waits in the kernel
-	/// holds the only thread, so the drain never runs.
+	/// thread drains the full stdout pipe ([`drain_once_the_write_waits`]),
+	/// and returns its status; ends the test naming `what` once 5 s pass. A
+	/// write that waits in the kernel holds the only thread, so the drain
+	/// never runs.
 	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
 	fn status_while_a_reader_drains<F: Future<Output = i32>>(
 		what: &'static str,
-		mut reader: std::fs::File,
+		reader: std::fs::File,
 		capacity: usize,
 		run: impl FnOnce() -> F + Send + 'static,
 	) -> i32 {
-		use std::{sync::mpsc::channel, time::Duration};
+		use std::sync::mpsc::channel;
 
 		let (done, finished) = channel();
 		std::thread::spawn(move || {
 			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 			let status = runtime.block_on(async {
-				let drain = async {
-					tokio::time::sleep(Duration::from_millis(100)).await;
-					reader.read_exact(&mut vec![0; capacity]).unwrap();
-					reader
-				};
+				let drain = drain_once_the_write_waits(reader, capacity);
 				let (status, _reader) = tokio::join!(run(), drain);
 				status
 			});
 			let _ = done.send(status);
 		});
-		finished
-			.recv_timeout(Duration::from_secs(5))
-			.unwrap_or_else(|_| panic!("DEADLINE fired: {what} did not return"))
+		sent_within_5s(&finished, &format!("{what} did not return"))
 	}
 
 	/// `argv` as an invocation in a scratch directory with a file `f`
@@ -3884,13 +4006,18 @@ mod testing {
 	}
 
 	/// Usage text to a pipe nothing drains ends once the run is cancelled
-	/// (its timeout): the report must not keep the run.
+	/// (its timeout): the report must not keep the run. The cancel comes
+	/// once the report is seen waiting for room ([`has_a_private_writer`]).
 	#[cfg(all(target_os = "linux", feature = "util.cat"))]
 	#[test]
 	fn help_to_a_pipe_nothing_drains_ends_when_the_run_is_cancelled() {
-		use std::{sync::mpsc::channel, time::Duration};
+		use std::{
+			sync::mpsc::channel,
+			time::{Duration, Instant},
+		};
 
 		let (reader, writer, _) = full_pipe();
+		let pipe = reader.metadata().expect("the pipe's inode");
 		let (mut invocation, _tree) = invocation_to(&["cat", "--help"], writer);
 		let token = tokio_util::sync::CancellationToken::new();
 		invocation.cancel = Some(token.clone());
@@ -3899,7 +4026,14 @@ mod testing {
 			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 			let status = runtime.block_on(async {
 				let cancel = async {
-					tokio::time::sleep(Duration::from_millis(200)).await;
+					let start = Instant::now();
+					while !has_a_private_writer(&pipe) {
+						assert!(
+							start.elapsed() < Duration::from_secs(4),
+							"the report was never seen waiting for room"
+						);
+						tokio::time::sleep(Duration::from_millis(1)).await;
+					}
 					token.cancel();
 				};
 				let (status, ()) = tokio::join!(run_utility::<crate::cat::Cat>(invocation), cancel);
@@ -3907,9 +4041,7 @@ mod testing {
 			});
 			let _ = done.send(status);
 		});
-		finished
-			.recv_timeout(Duration::from_secs(5))
-			.expect("DEADLINE fired: cat --help outlived the run's cancellation");
+		sent_within_5s(&finished, "cat --help outlived the run's cancellation");
 		drop(reader);
 	}
 
@@ -4029,4 +4161,10 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
+#[cfg(all(test, target_os = "linux", feature = "util.rg"))]
+pub(crate) use testing::drain_once_the_write_waits;
+#[cfg(all(test, target_os = "linux", any(feature = "util.rg", feature = "util.find")))]
+pub(crate) use testing::sent_within_5s;
+#[cfg(all(test, any(feature = "util.du", feature = "util.find")))]
+pub(crate) use testing::DeepChain;
 

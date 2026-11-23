@@ -2319,14 +2319,15 @@ mod tests {
 
 	/// Both explicit buffering flags must keep output in AsyncOut until the
 	/// host drains it. Their old raw StreamWriter wrote from this runtime
-	/// worker and blocked before the reader below could run.
+	/// worker and blocked before the reader below could run; the reader
+	/// drains once the write is seen waiting for room
+	/// ([`crate::host::drain_once_the_write_waits`]).
 	#[cfg(target_os = "linux")]
 	fn explicit_buffering_to_a_full_pipe_yields_to_the_reader(flag: &str) {
 		use std::{
-			io::{Read as _, Write as _},
+			io::Write as _,
 			os::fd::{AsRawFd, OwnedFd},
 			sync::mpsc::channel,
-			time::Duration,
 		};
 
 		let tree = tempfile::tempdir().unwrap();
@@ -2348,22 +2349,14 @@ mod tests {
 				host.set_test_stdout(OpenFile::from(writer));
 				let parsed = Rg::try_parse_from(["rg", flag.as_str(), "hit", "f"]).unwrap();
 				let run = run_caught_async::<Rg>(parsed, &mut host);
-				let drain = async {
-					tokio::time::sleep(Duration::from_millis(100)).await;
-					let mut reader = std::fs::File::from(OwnedFd::from(reader));
-					reader.read_exact(&mut vec![0; capacity]).unwrap();
-					reader
-				};
+				let reader = std::fs::File::from(OwnedFd::from(reader));
+				let drain = crate::host::drain_once_the_write_waits(reader, capacity);
 				let (status, _reader) = tokio::join!(run, drain);
 				status
 			});
 			let _ = done.send(status);
 		});
-		assert_eq!(
-			finished.recv_timeout(Duration::from_secs(5)).expect("DEADLINE fired: rg did not return"),
-			0,
-			"{label}"
-		);
+		assert_eq!(crate::host::sent_within_5s(&finished, "rg did not return"), 0, "{label}");
 	}
 
 	#[cfg(target_os = "linux")]
