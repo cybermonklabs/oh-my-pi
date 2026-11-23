@@ -891,9 +891,10 @@ fi
 # itself) on a line that is not a comment is a case here, named RC-<its
 # name>, and fails unless the harness reports it exactly once, as PASS, and
 # reaches its summary line. RC-harness-summary fails unless that line counts
-# 0 failed, so a case this list misses cannot fail unseen. verify needs GNU
-# find (-printf) and sha256sum; a runner that lacks either (macOS's find has
-# no -printf) skips the cases, counts them, and names what it lacks.
+# at least one passed and 0 failed, so a case this list misses cannot fail
+# unseen. verify needs GNU find (-printf) and sha256sum; a runner that lacks
+# either (macOS's find has no -printf) skips the cases, counts them, and
+# names what it lacks.
 rc_harness="$here/release-candidate-harness.sh"
 rc_names="$(grep -vE '^[[:space:]]*#' "$rc_harness" | grep -oE '(case_|fcase) [A-Za-z0-9-]+|echo "PASS [A-Za-z0-9-]+"' | sed -E 's/^(case_|fcase) //; s/^echo "PASS //; s/"$//' | sort -u)
 harness-summary"
@@ -922,7 +923,7 @@ if [ "${#rc_want[@]}" -gt 0 ]; then
 $got"
 			elif [ "$n" = harness-summary ]; then
 				got="$(printf '%s\n' "$out" | grep -E '^release-candidate\.sh harness: ')"
-				if printf '%s\n' "$got" | grep -qE ', 0 failed$'; then rc=0; fi
+				if printf '%s\n' "$got" | grep -qE ': [1-9][0-9]* passed, 0 failed$'; then rc=0; fi
 			elif [ "$(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ')" != 1 ]; then
 				got="UNKNOWN: the harness reported $n $(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ') times, not once
 $got"
@@ -1085,8 +1086,9 @@ cache_lint() {
 					echo "attest names another run, repository or token, so it could attest files this run did not build: $(printf '%s\n' "$foreign" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
-				# Each download step, comments aside, as one line.
-				byname="$(grep -vE '^ *#' "$scratch/job.yml" | awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 " " } END { if (s != "") print s }' | grep -F 'actions/download-artifact@' | grep -vE $'(^|[^[:alnum:]_-])["\']?artifact-ids["\']?[[:space:]]*:' || true)"
+				# Each download step, comments aside, as one line. artifact-ids
+				# must name a needs output: an empty value downloads by pattern.
+				byname="$(grep -vE '^ *#' "$scratch/job.yml" | sed -E 's/[[:space:]]+#.*$//' | awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 " " } END { if (s != "") print s }' | grep -F 'actions/download-artifact@' | grep -vE $'(^|[^[:alnum:]_-])["\']?artifact-ids["\']?[[:space:]]*:[[:space:]]*["\']?\\$\\{\\{[[:space:]]*needs\\.' || true)"
 				if [ -n "$byname" ]; then
 					echo "attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: $(printf '%s\n' "$byname" | sed -E 's/ {2,}/ /g' | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
@@ -1215,7 +1217,8 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # download-artifact and attest-build-provenance (W40), each pinned by commit
 # (W51), no run step (W41, W48 in flow style), no download of another run's
 # artifacts (W42, W49 in flow style), and no download by name or pattern
-# (W50). No other job (W43, W45 by write-all, W46 with the value on the next
+# (W50; W52 with artifact-ids only in a comment, W53 with an empty one). No
+# other job (W43, W45 by write-all, W46 with the value on the next
 # line, W47) and not the workflow (W44) names an id-token permission other
 # than read or none.
 wlint W39-attest-rule 0 'attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id' '' ''
@@ -1228,9 +1231,11 @@ wlint W45-release-binary-write-all 1 'release_binary names an id-token permissio
 wlint W46-rust-test-id-token-on-the-next-line 1 'rust_test names an id-token permission other than read or none, which only attest may hold: \[      id-token:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      id-token:\n        write/' ''
 wlint W47-release-cache-prune-id-token-write 1 'release_cache_prune names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' '/^  release_cache_prune:$/,/^  rust_test:$/s/^      contents: read$/&\n      id-token: write/' ''
 wlint W48-attest-run-step-in-flow-style 1 'attest has a run step, so it could run member code: \[      - \{ name: x, run: bash \.github/sami/carry-check\.sh \}\]' 's|^      - name: Download the archives and the release notes$|      - { name: x, run: bash .github/sami/carry-check.sh }\n&|' ''
-wlint W49-attest-another-run-in-flow-style 1 'attest names another run, repository or token, so it could attest files this run did not build: \[        with: \{ artifact-ids: "1,2,3", path: x, run-id: 1 \}\]' '/^  attest:$/,/^  release_cache_prune:$/{/^          artifact-ids: /d;/^          path: \${{ runner.temp }}\/attest$/d;s/^        with:$/        with: { artifact-ids: "1,2,3", path: x, run-id: 1 }/;}' ''
+wlint W49-attest-another-run-in-flow-style 1 'attest names another run, repository or token, so it could attest files this run did not build: \[        with: \{ artifact-ids: "1,2,3", path: x, run-id: 1 \}\]' '/^  attest:$/,/^  release_cache_prune:$/{/^        with:$/{N;s/^        with:\n          artifact-ids: .*$/        with: { artifact-ids: "1,2,3", path: x, run-id: 1 }/;};/^          path: \${{ runner.temp }}\/attest$/d;}' ''
 wlint W50-attest-download-by-pattern 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          pattern: mise-*/' ''
 wlint W51-attest-action-by-tag 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[        uses: actions/download-artifact@v4\]' '/^  attest:$/,/^  release_cache_prune:$/s|actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0|actions/download-artifact@v4|' ''
+wlint W52-attest-artifact-ids-only-in-a-comment 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          pattern: mise-*  # artifact-ids: later/' ''
+wlint W53-attest-artifact-ids-empty 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          artifact-ids: ""\n          pattern: mise-*/' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

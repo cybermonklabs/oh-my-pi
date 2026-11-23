@@ -389,7 +389,7 @@ jobs:
     # (rust_test runs test code with root beside it) can delete an artifact
     # and upload another under its name, but not under its id, so what it
     # attests is what carry and release_binary uploaded. Harness cases W39 to
-    # W51 (.github/sami/tests/run.sh) keep it so. It runs only on a push to
+    # W53 (.github/sami/tests/run.sh) keep it so. It runs only on a push to
     # sami-candidate, so the public transparency log gets no trial entries.
     # This if: does not keep a dispatch run's files out of a release: GitHub
     # runs the workflow file of the ref a run is on, and that file can attest
