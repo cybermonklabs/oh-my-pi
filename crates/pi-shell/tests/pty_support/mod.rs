@@ -1200,7 +1200,22 @@ pub fn differential(
 }
 
 /// Bytes typed on terminal `tty` that no reader has taken yet.
+///
+/// On Linux a write to the pty's other side reaches the terminal's input
+/// queue through a kernel worker, later: `FIONREAD` counts only what
+/// reached the queue, so right after a write it can read 0 while keys are
+/// still on their way. A `poll` that finds the queue empty first waits for
+/// the worker's pending run (`n_tty_poll` calls `tty_buffer_flush_work`),
+/// so for the short writes of these tests (far below the queue's 4096
+/// bytes) the count after it includes what was written before. It is not a
+/// fence in general: a worker stopped for a full queue goes on later.
+/// Elsewhere the poll changes nothing.
 fn unread(tty: &fs::File) -> io::Result<usize> {
+	let mut fd = libc::pollfd { fd: tty.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+	// SAFETY: one valid pollfd, no wait.
+	if unsafe { libc::poll(&raw mut fd, 1, 0) } == -1 {
+		return Err(io::Error::last_os_error());
+	}
 	let mut n: libc::c_int = 0;
 	// The ioctl request's integer type differs between platforms.
 	let fionread = libc::FIONREAD as _;

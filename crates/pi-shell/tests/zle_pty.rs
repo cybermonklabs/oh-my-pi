@@ -282,10 +282,17 @@ fn vared_edits_a_parameter() {
 }
 
 /// A byte read past a key sequence (`^X` bound, `^Xe` not) is pushed back
-/// and starts the next line (zsh's `kungetbuf` outlives the line).
+/// and starts the next line (zsh's `kungetbuf` outlives the line). The `e`
+/// goes with `^X`, so the editor reads it looking for a longer sequence;
+/// the rest of the next line goes once the accepted line has run: on macOS
+/// obash's screen showed keys still unread while the line ran echoed in
+/// front of its output ([`Pty::type_lines`]).
 #[test]
 fn bytes_after_an_accepting_prefix_key_start_the_next_line() {
-	same("bindkey '^X' accept-line\n", |pty| keys(pty, "echo one\x18echo two\r"));
+	same("bindkey '^X' accept-line\n", |pty| {
+		keys(pty, "echo one\x18e")?;
+		keys(pty, "cho two\r")
+	});
 }
 
 /// `read -k` in a widget takes its key through the editor.
