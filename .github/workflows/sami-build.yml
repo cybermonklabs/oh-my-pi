@@ -51,7 +51,7 @@ permissions:
 
 # Only release_binary may restore or save GitHub Actions caches: it sets
 # cache-mode: write, and every other job gets a cache token that can do
-# neither. Harness cases W1 to W5, W10, W11, W13 to W22, W26, W27 and W38
+# neither. Harness cases W1 to W5, W9 to W11, W13 to W22, W26, W27 and W38
 # (.github/sami/tests/run.sh) keep it so. The Rust tests, which run test code
 # with root on their runners on the same push, are in sami-rust-test.yml,
 # whose jobs have cache-mode none (its header says which cases keep it so),

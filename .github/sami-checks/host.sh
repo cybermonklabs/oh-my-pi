@@ -3,7 +3,7 @@
 # terminfo entry the tests read, fs.protected_* as a hardened host sets them, a temporary
 # directory per user on a loop-mounted XFS with reflinks (pi-iso and pi-vcs clone with FICLONE),
 # and the sticky-directory FIFO the FIFO tests open as the runner's user (PI_TEST_STICKY_FIFO:
-# mode 0666, uid 65534, in a 1777 directory of root's, as sami-build's rust_test sets it up).
+# mode 0666, uid 65534, in a 1777 directory of root's, as sami-rust-test.yml's rust_test sets it up).
 # Then the reference environment's checks (the gate kit's refenv.sh check): a host that misses a
 # part fails here by name, so its tests do not return early and pass having compared nothing.
 #   host.sh TOOLS_TGZ

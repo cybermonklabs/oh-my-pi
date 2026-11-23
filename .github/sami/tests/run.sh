@@ -1030,7 +1030,7 @@ cache_lint() {
 		ok=1
 		awk -v j="  $job:" '$0 == j { on = 1; next } on && (/^  [A-Za-z_][A-Za-z0-9_-]*:$/ || /^[^ #]/) { exit } on' "$wf" >"$scratch/job.yml"
 		steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$scratch/job.yml")"
-		bun="$(printf '%s\n' "$steps" | grep -F 'uses: ./.github/actions/bun-install' || true)"
+		bun="$(printf '%s\n' "$steps" | grep -E 'uses: *\./(tool/)?\.github/actions/bun-install' || true)"
 		n="$(printf '%s' "$bun" | grep -c . || true)"
 		if [ "$job" = release_binary ] && [ "$n" = 0 ]; then
 			echo "UNKNOWN: release_binary has no bun-install step"
@@ -1275,13 +1275,17 @@ wlint W5-action-cache-step-ungated 1 'has a cache step that does not need cache=
 # rsync, zsh and bash, the macOS step bash) and bun's packages come from the
 # build, not a cache, and their tokens can neither restore nor save one: the
 # workflow has cache-mode none (W68) and no job sets another (W12, W23 to
-# W25). (W9, a bun-install step without cache: "false", is gone: rust_test
-# runs `bun install` itself, with no store, since bun-install reads
-# package.json at the workspace root, where that job keeps no tree.)
+# W25). rust_test runs `bun install` itself, with no store, since
+# bun-install reads package.json at the workspace root, where that job keeps
+# no tree; a bun-install step without cache: "false" fails the lint in any
+# job (W9 in sami-build.yml's carry, W69 spelled as these jobs spell their
+# actions, under tool/).
 WF=sami-rust-test.yml wlint W6-gate-jobs-no-cache-access 0 'rust_test_macos: cache-mode none; no actions/cache step; bun-install steps: 0, each with cache: "false"' '' ''
 WF=sami-rust-test.yml wlint W7-rust-test-cache-step 1 'rust_test has an actions/cache step' 's|^      - name: Libraries of the reference rsync$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 WF=sami-rust-test.yml wlint W8-rust-test-macos-cache-step 1 'rust_test_macos has an actions/cache step' 's|^      - name: The tests only macOS can run$|      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+wlint W9-carry-bun-install-with-cache 1 'carry has a bun-install step without cache: "false"' 's|^      - name: Fetch upstream trunk$|      - uses: ./.github/actions/bun-install\n&|' ''
 WF=sami-rust-test.yml wlint W68-rust-test-workflow-cache-mode-not-none 1 'sami-rust-test.yml has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: write/' ''
+WF=sami-rust-test.yml wlint W69-rust-test-tool-bun-install-with-cache 1 'rust_test has a bun-install step without cache: "false"' 's|^      - name: bun install$|      - uses: ./tool/.github/actions/bun-install\n&|' ''
 # Any cache access outside release_binary: the workflow's default, a job's own
 # mode, a cache step in a job none of the cases above names.
 wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: read/' ''

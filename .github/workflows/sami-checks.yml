@@ -251,7 +251,9 @@ jobs:
         with:
           name: sc-natives
           path: ${{ github.workspace }}/tree/packages/natives/native/*.node
-          retention-days: 1
+          # 30 days, as long as GitHub lets a job be re-run: a re-run of the failed Rust tests
+          # (sami-rust-test.yml) downloads it again, and does not run this job again.
+          retention-days: 30
           if-no-files-found: error
 
   set:
@@ -524,6 +526,7 @@ jobs:
 
   summary:
     name: summary
+    # rust-test is here so that the summary runs last; it reads no unit of rust-test's.
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, rust-test]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
