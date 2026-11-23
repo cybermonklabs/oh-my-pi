@@ -897,17 +897,19 @@ fi
 # since bun-install's own save runs on main. release_binary may restore, and
 # saves only on a push to sami: cache-mode takes no expression, so each of
 # its actions/cache/save steps starts its `if:` with that condition, has no
-# `||` and nothing after the expression's `}}` (GitHub reads an `if:` with
-# text outside `${{ }}` as a string, and a string that is not empty is
-# true), and it has no actions/cache step (which saves in its post step,
-# under no condition of the job's). Its steps use only the actions it uses
+# `||` and nothing after the expression's `}}`, on its line or on a deeper
+# line that YAML folds into the value (GitHub reads an `if:` with text
+# outside `${{ }}` as a string, and a string that is not empty is true): the
+# line after it is the step's next key or the end of the step. And it has
+# no actions/cache step (which saves in its post step, under no condition
+# of the job's). Its steps use only the actions it uses
 # today, and .github/actions/bazel-cache calls no action, so no other caching
 # action can save under release_binary's token. A line under jobs: that is
 # not a plain `  <id>:` stops the lint, because its steps would be read as
 # the job above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others
-	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\$}]*\}\}\\n'
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\$}]*\}\}\\n(        [^ \\]|$)'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -1036,8 +1038,10 @@ wlint W23-rust-test-cache-mode-on-the-next-line 1 'rust_test has a cache-mode li
 wlint W24-rust-test-cache-mode-quoted-key 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    "cache-mode": write\]' 's/^  rust_test:$/&\n    "cache-mode": write/' ''
 wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[      cache-mode: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^    /      /;s/^  rust_test:$/&\n      cache-mode: write/' ''
 # GitHub reads an if: with text outside ${{ }} as a string, which is true,
-# so nothing may follow the save guard's expression.
+# so nothing may follow the save guard's expression, on its line (W26) or
+# on a deeper line that YAML folds into the value (W27).
 wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
+wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

@@ -13,7 +13,7 @@ permissions:
 # cache-mode: write, and every other job gets a cache token that can do
 # neither. rust_test and rust_test_macos run test code with root on their
 # runners; that code therefore cannot write an entry that release_binary
-# restores. Harness cases W1 to W26 (.github/sami/tests/run.sh) keep it so.
+# restores. Harness cases W1 to W27 (.github/sami/tests/run.sh) keep it so.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
 cache-mode: none
 
@@ -199,9 +199,9 @@ jobs:
           if-no-files-found: error
       # Only a push to sami saves the cache; a dispatch or any other event
       # only restores. cache-mode takes no expression, so this condition on
-      # the bound and save steps enforces it (harness cases W14 to W19 and
-      # W26). A failed build's finished actions are still valid results, so
-      # the cache is saved whenever the native build ran. A re-run of the
+      # the bound and save steps enforces it (harness cases W14 to W19, W26
+      # and W27). A failed build's finished actions are still valid results,
+      # so the cache is saved whenever the native build ran. A re-run of the
       # same commit restored its exact key and has nothing to save.
       - name: Bound the release build cache
         id: release-cache-bound
