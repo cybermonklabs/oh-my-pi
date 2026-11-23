@@ -456,7 +456,8 @@ impl Child {
 /// Output a tool writes to the caller's fds, in order, without blocking:
 /// each entry's fd, the bytes still to write, and the mark of the chunk a
 /// writer thread took last; written under a key of the call's own
-/// ([`ShellApi::write_keyed`]), which goes with the call, so a call dropped
+/// ([`ShellApi::write_marked`], each mark waited for with
+/// [`ShellApi::settle_marked`]), which goes with the call, so a call dropped
 /// while its write waits (a cancelled run, a killed shell) leaves nothing
 /// behind for the vproc's next write.
 #[derive(Default)]

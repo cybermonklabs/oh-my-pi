@@ -18,6 +18,16 @@ use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
 const KEY: Duration = Duration::from_millis(60);
 /// How long output must stay quiet before the screen is read.
 const QUIET: Duration = Duration::from_millis(300);
+/// What a write through a tee on a FIFO must exceed to wait for room: the
+/// FIFO's room, the 64 KiB the tee holds that a target has not taken (the
+/// crate's `TEE_HOLD`), and the up to 64 KiB a FIFO target's writer thread
+/// takes into its hand. zsh's multios is a process behind a pipe of its
+/// own, which holds bytes the same way.
+const TEE_TAKES: usize = 2 * (64 << 10);
+/// The bytes the tee tests write: past what a tee on a FIFO of 64 KiB
+/// takes ([`TEE_TAKES`] beside the FIFO's room), so the write waits for
+/// room part way, as `session.rs`'s `TEE_WAITS` does.
+const TEE_WAITS: usize = 262_144;
 
 /// `zsh -f -i` with `PS1`/`RPS1` and the rc file `rc` (sourced with `.`
 /// as the first command, since `-f` skips `.zshrc`).
@@ -217,7 +227,8 @@ fn ignoreeof_warns() {
 // ends: its marker shows when the reader drains, and its bytes come after
 // all of the command's. (zsh's multios is a process behind a pipe of its
 // own: with 131,072 bytes, the FIFO and that pipe hold them all, so zsh's
-// `printf` never waits there; with 262,144 it waits, and the trap waits.)
+// `printf` never waits there; with 262,144 it waits, and the trap waits.
+// The tee here takes as much: [`TEE_WAITS`].)
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
@@ -227,7 +238,7 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 		os::{fd::AsRawFd, unix::ffi::OsStrExt},
 		time::Instant,
 	};
-	const ZEROS: usize = 131_072;
+	const ZEROS: usize = TEE_WAITS;
 	const MARK: &[u8] = b"TTTTTTTTTT";
 	let s = Spawn::zsh()
 		.args(["-f", "-i"])
@@ -255,6 +266,7 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 		let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
 		libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
 	}
+	assert_the_write_waits(&reader);
 	pty.write(format!("printf %0{ZEROS}d 0 >&3; print -r -- printf-$((6*7))\r"))
 		.unwrap();
 	// `printf` filled the FIFO and waits for room.
@@ -302,7 +314,8 @@ fn a_winch_trap_during_a_write_through_a_tee_writes_each_byte_once() {
 
 /// A `zsh -f -i` with fd 3 a tee (`exec 3>fifo 3>/dev/null`), and the
 /// FIFO's reader (non-blocking); `command` is typed, and its write through
-/// fd 3 waits for room in the full FIFO.
+/// fd 3 waits for room in the full FIFO: it writes [`TEE_WAITS`] bytes,
+/// more than the FIFO and the tee take.
 fn tee_fifo_writer(command: &str) -> (Pty, std::fs::File) {
 	let (pty, reader, _) = tee_fifo_and_file_writer(command, false);
 	(pty, reader)
@@ -345,6 +358,7 @@ fn tee_fifo_and_file_writer(command: &str, file: bool) -> (Pty, std::fs::File, s
 		let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
 		libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
 	}
+	assert_the_write_waits(&reader);
 	pty.write(format!("{command}\r")).unwrap();
 	let queued = || {
 		let mut n: libc::c_int = 0;
@@ -358,6 +372,26 @@ fn tee_fifo_and_file_writer(command: &str, file: bool) -> (Pty, std::fs::File, s
 	}
 	thread::sleep(QUIET);
 	(pty, reader, second)
+}
+
+/// The tee tests' precondition: a write of [`TEE_WAITS`] bytes waits for
+/// room, since the FIFO `reader` reads and the tee take less ([`TEE_TAKES`]
+/// beside the FIFO's room).
+fn assert_the_write_waits(reader: &std::fs::File) {
+	#[cfg(target_os = "linux")]
+	{
+		use std::os::fd::AsRawFd;
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; the caller owns `reader`.
+		let room = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let room = usize::try_from(room).expect("the FIFO's size");
+		assert!(
+			room + TEE_TAKES < TEE_WAITS,
+			"a write of {TEE_WAITS} bytes must wait: the FIFO holds {room}, the tee takes \
+			 {TEE_TAKES} more"
+		);
+	}
+	#[cfg(not(target_os = "linux"))]
+	let _ = reader;
 }
 
 /// Drain `reader` 4 KiB at a time on a thread until it is empty after
@@ -394,6 +428,8 @@ fn drain_fifo(
 // the tee started at those offsets and was lost (`AFTER-42` never reached
 // the FIFO). It was so at 9058ab9d too. The dropped command takes the key
 // with it: the FIFO gets the '0's written before Ctrl-C, then `AFTER-42`.
+// `printf` writes [`TEE_WAITS`] '0's: fewer, the FIFO and the tee take them
+// all, `printf` never waits, and Ctrl-C drops nothing.
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn ctrl_c_during_a_write_through_a_tee_leaves_the_next_write_whole() {
@@ -401,7 +437,7 @@ fn ctrl_c_during_a_write_through_a_tee_leaves_the_next_write_whole() {
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	};
-	let (mut pty, reader) = tee_fifo_writer("printf %0131072d 0 >&3");
+	let (mut pty, reader) = tee_fifo_writer(&format!("printf %0{TEE_WAITS}d 0 >&3"));
 	pty.write("\x03").unwrap();
 	pty.write("print -r -- int-$((40+2))\r").unwrap();
 	pty.wait_screen_contains("int-42", TIMEOUT).unwrap();
@@ -414,7 +450,7 @@ fn ctrl_c_during_a_write_through_a_tee_leaves_the_next_write_whole() {
 	let got = draining.join().unwrap();
 	let zeros = got.iter().filter(|&&b| b == b'0').count();
 	assert!(
-		got.ends_with(b"AFTER-42") && zeros + 8 == got.len() && zeros > 0 && zeros < 131_072,
+		got.ends_with(b"AFTER-42") && zeros + 8 == got.len() && zeros > 0 && zeros < TEE_WAITS,
 		"{zeros} '0's of {} bytes, ending {:?}",
 		got.len(),
 		String::from_utf8_lossy(&got[got.len().saturating_sub(16)..])
@@ -428,7 +464,8 @@ fn ctrl_c_during_a_write_through_a_tee_leaves_the_next_write_whole() {
 // bytes again, and the shell's next write through the tee, under the old
 // key, started at the moved write's offsets and was lost. The job takes
 // the keys its ops write with, and the shell goes on with a new one: each
-// '0' once, and `AFTER-42` once.
+// '0' once, and `AFTER-42` once. `printf` writes [`TEE_WAITS`] '0's, so
+// Ctrl-Z finds its write part way.
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn ctrl_z_during_a_write_through_a_tee_keeps_each_byte_once() {
@@ -436,7 +473,7 @@ fn ctrl_z_during_a_write_through_a_tee_keeps_each_byte_once() {
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	};
-	let (mut pty, reader) = tee_fifo_writer("cat | printf %0131072d 0 >&3");
+	let (mut pty, reader) = tee_fifo_writer(&format!("cat | printf %0{TEE_WAITS}d 0 >&3"));
 	pty.write("\x1a").unwrap();
 	pty.wait_screen_contains("suspended", TIMEOUT).unwrap();
 	let stop = Arc::new(AtomicBool::new(false));
@@ -454,7 +491,11 @@ fn ctrl_z_during_a_write_through_a_tee_keeps_each_byte_once() {
 	let got = draining.join().unwrap();
 	let zeros = got.iter().filter(|&&b| b == b'0').count();
 	let afters = got.windows(8).filter(|w| *w == b"AFTER-42").count();
-	assert_eq!((zeros, afters, got.len()), (131_072, 1, 131_072 + 8), "('0's, AFTER-42s, bytes)");
+	assert_eq!(
+		(zeros, afters, got.len()),
+		(TEE_WAITS, 1, TEE_WAITS + 8),
+		"('0's, AFTER-42s, bytes)"
+	);
 }
 
 // Failure mode (found in round 8): Ctrl-Z stopped `cat` in `cat | nosuch 2>&3`
@@ -465,7 +506,8 @@ fn ctrl_z_during_a_write_through_a_tee_keeps_each_byte_once() {
 // zsh's stopped child finishes its write where it started, once continued.
 // The job takes the part-way queued write with its key: the FIFO gets the
 // message once, with `AFTER-42` (written while the job is stopped) inside
-// it, and the terminal gets none of it.
+// it, and the terminal gets none of it. The name is [`TEE_WAITS`] '0's, so
+// the message waits part way.
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn ctrl_z_during_a_queued_diagnostic_through_a_tee_writes_it_once() {
@@ -473,7 +515,7 @@ fn ctrl_z_during_a_queued_diagnostic_through_a_tee_writes_it_once() {
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	};
-	let (mut pty, reader) = tee_fifo_writer("cat | $(printf %0131072d 0) 2>&3");
+	let (mut pty, reader) = tee_fifo_writer(&format!("cat | $(printf %0{TEE_WAITS}d 0) 2>&3"));
 	pty.write("\x1a").unwrap();
 	// Lost to the terminal, the message scrolls `suspended` off the screen:
 	// this wait times out on a screen of '0's (5773e4ed).
@@ -493,10 +535,10 @@ fn ctrl_z_during_a_queued_diagnostic_through_a_tee_writes_it_once() {
 	let got = draining.join().unwrap();
 	let zeros = got.iter().filter(|&&b| b == b'0').count();
 	let count = |what: &[u8]| got.windows(what.len()).filter(|w| *w == what).count();
-	let message = b"zsh: command not found: ".len() + 131_072 + 1;
+	let message = b"zsh: command not found: ".len() + TEE_WAITS + 1;
 	assert_eq!(
 		(zeros, count(b"command not found"), count(b"AFTER-42"), got.len()),
-		(131_072, 1, 1, message + 8),
+		(TEE_WAITS, 1, 1, message + 8),
 		"('0's, messages, AFTER-42s, bytes)"
 	);
 }
@@ -509,7 +551,7 @@ fn ctrl_z_during_a_queued_diagnostic_through_a_tee_writes_it_once() {
 // after `fg`. A job without the interrupted key went on with the trap's,
 // and the tee wrote `printf`'s rest to the file again. The file holds the
 // '0's once, the trap's spaces once, then `AFTER-42`; the FIFO the same
-// bytes.
+// bytes. Each write is [`TEE_WAITS`] bytes, so both wait part way.
 #[test]
 #[expect(clippy::naive_bytecount, reason = "a test's bytes; no bytecount dependency")]
 fn ctrl_z_during_a_traps_write_through_a_tee_keeps_each_byte_once() {
@@ -518,7 +560,7 @@ fn ctrl_z_during_a_traps_write_through_a_tee_keeps_each_byte_once() {
 		atomic::{AtomicBool, Ordering},
 	};
 	let (mut pty, reader, file) = tee_fifo_and_file_writer(
-		"trap 'cat | printf %131072s \"\" >&3' USR1; printf %0131072d 0 >&3",
+		&format!("trap 'cat | printf %{TEE_WAITS}s \"\" >&3' USR1; printf %0{TEE_WAITS}d 0 >&3"),
 		true,
 	);
 	// The trap runs while `printf` waits; its own write waits on the full
@@ -550,7 +592,7 @@ fn ctrl_z_during_a_traps_write_through_a_tee_keeps_each_byte_once() {
 			b.len(),
 		)
 	};
-	let want = (131_072, 131_072, 1, 262_144 + 8);
+	let want = (TEE_WAITS, TEE_WAITS, 1, 2 * TEE_WAITS + 8);
 	assert_eq!(
 		(counts(&written), counts(&got)),
 		(want, want),

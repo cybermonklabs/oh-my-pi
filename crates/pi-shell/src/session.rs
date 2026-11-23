@@ -3740,10 +3740,11 @@ mod tests {
 	// `AFTER`, and the run exited 0. A call writes with a key of its own,
 	// which goes with it. Each case: the FIFO and the file both hold the
 	// '0's, the same part of the tool's message (none: a short write goes
-	// into a tee whole or not at all, `TEE_WHOLE`), then `AFTER`. The '0's
-	// fill the tee but for 4 bytes ([`tee_fill`]), so `printf` has ended and
-	// the tool's message waits when the run ends. (#111's tee gave the file
-	// the whole message.)
+	// into a tee whole or not at all, `TEE_WHOLE`), then `AFTER`; the part
+	// is a prefix of what the tool writes in a run of its own, so a message
+	// written twice fails. The '0's fill the tee but for 4 bytes
+	// ([`tee_fill`]), so `printf` has ended and the tool's message waits when
+	// the run ends. (#111's tee gave the file the whole message.)
 	#[test]
 	fn a_tools_write_dropped_part_way_through_a_tee_leaves_the_next_run_whole() {
 		let mut wrong = Vec::new();
@@ -3754,6 +3755,15 @@ mod tests {
 		} else {
 			&[None]
 		};
+		let messages =
+			["nohup", "timeout"].map(|tool| (tool, stderr_of(&format!("{tool} --version >&2"))));
+		for (tool, whole) in &messages {
+			assert!(
+				whole.starts_with(format!("{tool} (pi) ").as_bytes()),
+				"`{tool} --version` in a run of its own: {:?}",
+				String::from_utf8_lossy(whole)
+			);
+		}
 		for (how, ends, cancel) in
 			[("cancelled", "", true), ("killed", "{ sleep 0.3; kill -TERM $$; } & ", false)]
 		{
@@ -3781,13 +3791,17 @@ mod tests {
 				);
 				let zeros = counted.load(Ordering::SeqCst);
 				let written = std::fs::read(&file).unwrap();
-				let message = format!("{tool} (pi) ");
+				let whole = &messages
+					.iter()
+					.find(|(t, _)| *t == tool)
+					.expect("the tool's message")
+					.1;
 				let same = written == got
 					&& got.len() >= zeros + 5
 					&& got[..zeros].iter().all(|&b| b == b'0')
 					&& got[zeros..]
 						.strip_suffix(b"AFTER")
-						.is_some_and(|p| p.is_empty() || p.starts_with(message.as_bytes()));
+						.is_some_and(|p| whole.starts_with(p));
 				if !same {
 					wrong.push(format!(
 						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO {} \
