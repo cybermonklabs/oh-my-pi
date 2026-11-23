@@ -850,6 +850,16 @@ pub enum FrameKind {
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
 	/// `SubExit` pops, and the `Spawn` op collects its status.
 	Stage,
+	/// The body of a bash `$(< file)` run in the current shell (bash
+	/// `optimize_cat_file`): its `< file` reads the file into `capture`,
+	/// the substitution's own buffer, and leaves the shell's fds alone;
+	/// `SubExit` pops.
+	Cat {
+		/// The substitution's buffer. The frames image keeps it by its memory
+		/// object (`FrameImage::capture`), not here.
+		#[serde(skip)]
+		capture: crate::bash::mem::Capture,
+	},
 	/// The base frame of a job the shell suspended
 	/// ([`super::jobctl::suspend`]): a subshell frame that also ends its
 	/// vproc when its pc reaches `stop_at` (the end of the top-level

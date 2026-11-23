@@ -3,8 +3,9 @@
 //! `zsh -f`) in a directory holding `f` (`hello` and two blank lines), `e`
 //! (empty), `n` (`x`, no newline) and the directory `dd`, and checks stdout,
 //! stderr and the status against what bash 5.3.20 or zsh 5.9 print for the
-//! same script there (bash 5.2.21 agrees with 5.3.20 on every bash row but
-//! the last, where it names the function's line `environment: line 1:`).
+//! same script there. bash 5.2.21 agrees with 5.3.20 on every bash row but
+//! those the rows mark: two name a function's line `environment: line 1:`,
+//! two use 5.3's `${| }`, and two end the shell under `set -e`.
 
 mod obash_support;
 
@@ -109,6 +110,26 @@ fn bash_reads_a_file_substitution_in_the_shell() {
 			missing,
 			0,
 		),
+		// The shell's fds are left alone while the word expands: an EXIT trap
+		// that a fatal error in it runs inside a function writes to stdout
+		// (bash 5.2.21 prints `environment: line 1:` here).
+		(
+			"set -u; trap 'echo bye' EXIT; f() { x=$(< $undef); }; f",
+			"bye\n",
+			"bash: line 1: undef: unbound variable\n",
+			127,
+		),
+		// …and what the word's own `${| cmd; }` writes is no part of the
+		// value (bash 5.3 syntax; 5.2.21 has no `${| }`).
+		("x=$(< ${| echo hi; REPLY=f; }); echo \"[$x]\"", "hi\n[hello]\n", "", 0),
+		("f() { x=$(< ${| echo hi; REPLY=f; }); echo \"[$x]\"; }; f", "hi\n[hello]\n", "", 0),
+		// The `< file` runs no command: `PIPESTATUS` stays the pipeline's.
+		("false | true; echo \"$(< f)\" \"${PIPESTATUS[@]}\"", "hello 1 0\n", "", 0),
+		("false | true; x=$(< f); echo \"${PIPESTATUS[@]}\"", "0\n", "", 0),
+		// A failed read inside a command whose own status is 0 does not end
+		// the shell under `set -e` (bash 5.3.20; 5.2.21 exits there).
+		("set -e; echo \"[$(< missing)] done\"; echo after", "[] done\nafter\n", missing, 0),
+		("set -e; f() { echo \"[$(< missing)]\"; }; f; echo after", "[]\nafter\n", missing, 0),
 	]);
 }
 

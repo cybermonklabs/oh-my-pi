@@ -1151,10 +1151,12 @@ fn expand(
 }
 
 /// `$(< file)` (bash, in the shell: [`exec::start_sub`]): read fd 0 (the
-/// redirected file) to its end and queue it as the command's output. A
-/// read error is no failure, as in bash's `read_comsub`: `$(< dir)` is
-/// empty with status 0 and no message. (bash keeps what it read before an
-/// error; the engine's read answers nothing then.)
+/// redirected file) to its end and append it to the substitution's capture,
+/// which the [`FrameKind::Cat`] frame running this command holds; the
+/// shell's fd 1 is not used. A read error is no failure, as in bash's
+/// `read_comsub`: `$(< dir)` is empty with status 0 and no message. (bash
+/// keeps what it read before an error; the engine's read answers nothing
+/// then.)
 fn cat_stdin(k: &Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<Flow> {
 	let req = Probe::Read { path: BString::from("/dev/stdin") };
 	let mut sc = exec::take_scratch(vp);
@@ -1162,16 +1164,17 @@ fn cat_stdin(k: &Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<Flow> {
 		Some(r) => Ok(r.clone()),
 		None => probe::perform(k, cx, vp, &mut sc, &req),
 	};
-	vp.frames.last_mut().expect("frame").scratch = Some(sc);
+	let frame = vp.frames.last_mut().expect("frame");
+	frame.scratch = Some(sc);
 	let text = match answer {
 		Err(key) => return Some(Flow::Block(key)),
 		Ok(ProbeResult::Bytes(Ok(text))) => text,
 		Ok(_) => BString::default(),
 	};
-	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
-	s.stage = Stage::Output;
+	if let FrameKind::Cat { capture } = &frame.kind {
+		capture.append(&text);
+	}
+	st(vp).stage = Stage::Finish;
 	None
 }
 
@@ -4664,8 +4667,13 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
-	vp.pipestatus.clear();
-	vp.pipestatus.push(status);
+	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
+	// stays the last pipeline's (`false | true; echo "$(< f)"
+	// "${PIPESTATUS[@]}"` prints `… 1 0`).
+	if op.flags & ir::Op::CAT == 0 {
+		vp.pipestatus.clear();
+		vp.pipestatus.push(status);
+	}
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.

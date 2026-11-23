@@ -1627,7 +1627,9 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 				pop_frame(&mut k.root, cx.store, vp);
 			}
 		},
-		FrameKind::NoFork | FrameKind::Stage => pop_frame(&mut k.root, cx.store, vp),
+		FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. } => {
+			pop_frame(&mut k.root, cx.store, vp);
+		},
 		FrameKind::Subshell | FrameKind::Job { .. } => {
 			unwind(&mut k.root, cx.store, vp, 0);
 			start_exit_trap_once(k, vp, cx);
@@ -1966,7 +1968,10 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 		}
 		let crossable = matches!(
 			f.kind,
-			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
+			FrameKind::Script { what: ScriptKind::Eval, .. }
+				| FrameKind::NoFork
+				| FrameKind::Stage
+				| FrameKind::Cat { .. }
 		);
 		if crossable && vp.frames.len() > 1 {
 			pop_frame(&mut k.root, cx.store, vp);
@@ -2280,16 +2285,16 @@ pub fn start_sub(
 		// subshell (`optimize_cat_file`): the redirection's word expands as
 		// the shell's own (`set -u` ends the shell; no DEBUG trap, xtrace or
 		// ERR trap for the `< file`, which is no command bash runs). The body
-		// runs here in a frame of its own whose stdout is the capture; its
-		// `Exec` ([`ir::Op::CAT`]) outputs the file. A failure inside does
-		// not count for `set -e`.
+		// runs here in a frame of its own ([`FrameKind::Cat`]) that holds the
+		// capture; its `Exec` ([`ir::Op::CAT`]) appends the file to it. The
+		// shell's fds are left alone, so what the word's expansion writes
+		// (`${| cmd; }`) and an EXIT trap a fatal error in it runs write
+		// where the shell does. A failure inside does not count for `set -e`.
 		ComsubForm::Fork if unit.cat_exec(entry).is_some() => {
-			let mut frame = Frame::new(Some(unit), entry, FrameKind::Stage);
+			let kind = FrameKind::Cat { capture: capture.clone() };
+			let mut frame = Frame::new(Some(unit), entry, kind);
 			frame.line_shift = shift;
 			frame.ignore_errexit = true;
-			let prev = vp.fds.get(1).cloned();
-			vp.fds.set(1, Some(out));
-			frame.redirs.push(vec![Saved { fd: 1, prev }]);
 			vp.frames.push(frame);
 			sc.sub = Some(PendingSub::NoFork { capture, value: false });
 			Flow::Call
@@ -3031,7 +3036,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Spawn => spawn(k, vp, cx, unit, op),
 		Opcode::SubExit => {
-			if matches!(top_frame(vp).kind, FrameKind::NoFork | FrameKind::Stage) {
+			if matches!(
+				top_frame(vp).kind,
+				FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. }
+			) {
 				pop_frame(&mut k.root, cx.store, vp);
 			} else {
 				// A subshell, pipeline stage or job ends: its EXIT trap runs.
