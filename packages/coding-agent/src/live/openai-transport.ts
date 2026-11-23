@@ -27,7 +27,7 @@ import type { CodexLiveTransport, LiveTransportCallbacks } from "./transport";
 const OPENAI_PROVIDER = "openai";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 /** The GPT-Live model a call asks for. */
-const OPENAI_LIVE_MODEL = "gpt-live-1.1";
+export const OPENAI_LIVE_MODEL = "gpt-live-1.1";
 const MAX_ERROR_BODY_LENGTH = 2_048;
 /** How much of a redirect's `Location` an error repeats. */
 const MAX_LOCATION_LENGTH = 256;

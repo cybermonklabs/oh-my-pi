@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionLiveStartOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
@@ -6,6 +7,8 @@ import type { LiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
 import * as liveTransport from "@oh-my-pi/pi-coding-agent/live/transport";
 import type { LiveTransportOptions } from "@oh-my-pi/pi-coding-agent/live/transport";
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
+import type { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import * as contextHelpers from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
@@ -78,6 +81,35 @@ describe("LiveCommandController", () => {
 		try {
 			await controller.handleCommand();
 			expect(receivedVoice).toBe("vale");
+		} finally {
+			await controller.stop();
+		}
+	});
+
+	it("labels GPT-Live's spoken lines with the openai provider and its model, not Codex's", async () => {
+		const { ctx } = createContext({ "live.provider": "openai" });
+		const shown: AssistantMessage[] = [];
+		vi.spyOn(contextHelpers, "createAssistantMessageComponent").mockImplementation(
+			() =>
+				({
+					setTextColorTransform: () => {},
+					updateContent: (message: AssistantMessage) => shown.push(message),
+					markTranscriptBlockFinalized: () => {},
+				}) as unknown as AssistantMessageComponent,
+		);
+		const controller = new LiveCommandController(ctx, options => {
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockImplementation(async () => {
+				options.callbacks.onTranscript({ role: "assistant", turn: 1, text: "On it.", final: true });
+			});
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+		try {
+			await controller.handleCommand();
+			expect(shown.map(({ api, provider, model }) => ({ api, provider, model }))).toEqual([
+				{ api: "openai-responses", provider: "openai", model: "gpt-live-1.1" },
+			]);
 		} finally {
 			await controller.stop();
 		}
