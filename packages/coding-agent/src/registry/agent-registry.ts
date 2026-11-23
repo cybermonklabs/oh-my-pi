@@ -167,9 +167,6 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 	return typeof value === "object" && value !== null && Object.hasOwn(value, kSessionFile);
 }
 
-/** The ancestry of every ref with none; see the registry's mint. */
-const NO_ANCESTORS: readonly string[] = Object.freeze([]);
-
 /** `sessionFile` of a minted ref: the path it keeps, or the one in the directory it keeps named by its id. */
 function mintedSessionFile(this: AgentRef): string | null {
 	const kept: unknown = Reflect.get(this, kSessionFile);
@@ -414,11 +411,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		return this.#mint(input, ancestors);
 	}
 
-	/**
-	 * Mint and register the ref for `input.id`, with the ancestry it records. An empty ancestry is one frozen list
-	 * shared by every such ref: a ref's ancestry never changes, and a parked subagent keeps its ref for as long as it
-	 * can be revived.
-	 */
+	/** Mint and register the ref for `input.id`, with the ancestry it records. */
 	#mint(input: RegisterInput, ancestors: readonly string[]): AgentRef {
 		const now = Date.now();
 		// Built in a ref's field order, which a spread or JSON of it lists; its session file is an accessor
@@ -429,7 +422,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
-			ancestors: ancestors.length === 0 ? NO_ANCESTORS : ancestors,
+			ancestors,
 			status: input.status ?? "running",
 			session: input.session,
 		} as AgentRef;
