@@ -254,7 +254,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
 				try {
-					// Typed by a person or client (TUI, RPC, ACP, print): the runtime says so with its origin.
+					// Typed by a client or a person over RPC, ACP or print: the runtime says so with its origin. The TUI's
+					// `/compact` runs `handleTui` below, which passes the origin itself.
 					await runtime.session.compact(parsed.instructions, {
 						...(parsed.mode ? { mode: parsed.mode } : {}),
 						origin: runtime.origin,
