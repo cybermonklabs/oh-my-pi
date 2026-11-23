@@ -786,6 +786,45 @@ describe("session blobs in the SQL session storage", () => {
 				expect(await blobHashes(db)).toEqual([sha256(image)]);
 			});
 
+			// Lines a writer queues on a path before its next append starts go to the database in one batch of appends
+			// (`appendBatch`), which references the blobs its lines name as each line's own append does.
+			it("references the blobs every line of a batch of appends names, so deleting another session that names them keeps them", async () => {
+				// If this regresses, a session whose lines were stored in one batch (a busy session's, or a copy of
+				// another's transcript) keeps no reference to its images: deleting another session that names the same
+				// image deletes the image's row, and the session, resumed on another machine, shows the image as missing.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const queries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, queries) });
+				const source = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				// The source's lines as the store wrote them: its header, the user turn naming the image, the reply.
+				const lines = ((await db.row(source))?.content ?? "").split(/(?<=\n)/);
+				expect(lines.length).toBeGreaterThan(1);
+				const batched = path.join(path.dirname(source), "batched.jsonl");
+
+				queries.length = 0;
+				const writer = storage.openWriter(batched);
+				const appendSync = writer.appendSync?.bind(writer);
+				if (!appendSync) throw new Error("the SQL store's writer appends synchronously");
+				// Queued in one tick: they join the path's batch before its append operation starts.
+				for (const line of lines) appendSync(line);
+				await writer.close();
+				// One batch stored every line: one part insert of a batch's, and no single line's append (PostgreSQL's
+				// inside its `WITH`).
+				expect(queries.filter(query => /^INSERT INTO \S*_parts \([^)]*\) VALUES/.test(query))).toHaveLength(1);
+				expect(queries.filter(query => /INSERT INTO \S*_parts \([^)]*\) SELECT/.test(query))).toEqual([]);
+				expect((await db.row(batched))?.content).toBe(lines.join(""));
+
+				await storage.unlink(source);
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				const refs = await db.sql(`SELECT sha256 FROM ${db.table}_refs WHERE path = @1`, [batched]);
+				expect(refs.map(row => String(row.sha256))).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(batched, path.dirname(batched), await db.open());
+				expect(imagesOf(resumed)).toEqual([IMAGE]);
+				await resumed.close();
+			});
+
 			// A streamed load keeps entries before a compaction's kept start out of memory; the open still writes back,
 			// and references from the session, every blob the whole session names.
 			it("writes back and references, when a session opens, a blob only an entry the load keeps out of memory names", async () => {

@@ -284,4 +284,36 @@ describe("SubagentWorkerPool", () => {
 		vi.advanceTimersByTime(400);
 		expect(worker.exitReason).toBe("idle");
 	});
+
+	it("logs each placement and each worker exit with its runs in flight and its live workers", async () => {
+		// If this regresses, the omp log no longer shows where each subagent ran, how many runs were in
+		// flight, or when the pool had no live worker left: the record of c-subagent-memory configuration
+		// (B) cannot show placement, so a (B) run cannot be counted.
+		const records: Array<[string, Record<string, unknown> | undefined]> = [];
+		cleanups.push(
+			logger.registerLogSink(event => {
+				if (event.message === "Subagent run placed" || event.message === "Subagent worker exited") {
+					records.push([event.message, event.context]);
+				}
+			}),
+		);
+		// Threshold 2: the second concurrent run opens the first worker slot.
+		const pool = startPool(4, { idleMs: 1_000, threshold: 2 });
+		const placements = [pool.place(), pool.place(), pool.place()];
+		const worker = placements[1]?.worker;
+		if (!worker) throw new Error("the second run started no worker");
+		const id = worker.threadId;
+		expect(placements.map(placement => placement.worker?.threadId ?? "main")).toEqual(["main", id, id]);
+		await worker.ready;
+		useFakeTimers();
+		for (const placement of placements) placement.release();
+		vi.advanceTimersByTime(1_000);
+		expect(worker.exitReason).toBe("idle");
+		expect(records).toEqual([
+			["Subagent run placed", { where: "main", mainRuns: 1, workerRuns: {}, liveWorkers: 0 }],
+			["Subagent run placed", { where: id, mainRuns: 1, workerRuns: { [id]: 1 }, liveWorkers: 1 }],
+			["Subagent run placed", { where: id, mainRuns: 1, workerRuns: { [id]: 2 }, liveWorkers: 1 }],
+			["Subagent worker exited", { threadId: id, reason: "idle", liveWorkers: 0 }],
+		]);
+	});
 });

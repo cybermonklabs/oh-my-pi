@@ -8,6 +8,7 @@ import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob
 import {
 	IndexedSessionStorage,
 	STALE_STAGING_MS,
+	SessionAppendBatchRolledBackError,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 	utf8PartEnd,
@@ -192,6 +193,14 @@ interface DialectQueries {
 	 * every dialect runs its list in one transaction.
 	 */
 	append: readonly Statement[];
+	/**
+	 * A batch of appends' row: grow the session row's `byte_len` by `@len`
+	 * (taking its row lock, inserting the row when it is missing) and set its
+	 * `mtime_ms`. PostgreSQL and SQLite return the new `byte_len`; on MySQL,
+	 * which returns no rows from a write, {@link lockSize} reads it after. The
+	 * batch then inserts its parts ({@link insertPart}) from the old length.
+	 */
+	growRow: Statement;
 	/** The session's `byte_len`, row-locked for the rest of the transaction where the dialect can. */
 	lockSize: Statement;
 	/** Insert or replace the session row of a full write. */
@@ -810,7 +819,11 @@ const LEASE_WAIT_POLL_MS = 1000;
 const SQLITE_CLAIM_RETRY_MS = 5;
 /** How often a write waiting for its claim's heartbeat to be confirmed again looks. */
 const LAPSE_POLL_MS = 50;
-/** Largest part a full write stores; an append stores its line as one part. */
+/**
+ * Largest part a full write, or a batch of appends, stores: a batch's short
+ * lines share a part and a long one spans several. A line appended alone is
+ * one part of its own length.
+ */
 const PART_BYTES = 1024 * 1024;
 /** The largest rowid SQLite has, 2^63 - 1 (see `DialectQueries.partRowids`). */
 const SQLITE_MAX_ROWID = 2n ** 63n - 1n;
@@ -826,9 +839,10 @@ const FIRST_PAGE_SPAN_BYTES = 1024 * 1024;
 /**
  * Most bytes one `readChunks` page spans: a later page holds the parts that
  * start within its span of where the read is, so at most this much plus the
- * part that starts last. A full write's parts are at most {@link PART_BYTES};
- * an appended line is one part of its own length, so a page stays within
- * 16 MiB while no appended line is longer than 4 MiB.
+ * part that starts last. The parts of a full write and of a batch of appends
+ * are at most {@link PART_BYTES}; a line appended alone is one part of its own
+ * length, so a page stays within 16 MiB while no line appended alone is
+ * longer than 4 MiB.
  */
 const PAGE_SPAN_BYTES = 12 * 1024 * 1024;
 /**
@@ -1443,7 +1457,12 @@ function buildQueries(
 	const bigint = (expr: string): string => (adapter === "postgres" ? `CAST(${expr} AS bigint)` : expr);
 	const rowColumns = "path, content, mtime_ms, title, title_source, title_updated_at, byte_len";
 	const rowValues = "@path, '', @mtime, @title, @title_source, @title_updated_at, @len";
-	const appendRow = `INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) `;
+	// Grow the session row by `@len` bytes, inserting it when missing: the first step of an append and of a batch.
+	const growRow =
+		`INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) ` +
+		(mysql
+			? "ON DUPLICATE KEY UPDATE byte_len = byte_len + @len, mtime_ms = @mtime"
+			: `ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, mtime_ms = excluded.mtime_ms`);
 	// Scalar subqueries rather than a CTE, so MySQL 5.7 runs this too.
 	const tailStart = `(SELECT byte_len FROM ${table} WHERE path = @path) - @suffix`;
 	// The parts of `r`'s session that start at or before where a chunked read
@@ -1565,21 +1584,13 @@ function buildQueries(
 			adapter === "postgres"
 				? [
 						sql(
-							`WITH s AS (${appendRow}` +
-								`ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
-								`mtime_ms = excluded.mtime_ms RETURNING byte_len) ` +
+							`WITH s AS (${growRow} RETURNING byte_len) ` +
 								`INSERT INTO ${parts} (path, start_offset, content) ` +
 								`SELECT @path, s.byte_len - @len, @content FROM s WHERE @len > 0`,
 						),
 					]
 				: [
-						sql(
-							appendRow +
-								(mysql
-									? "ON DUPLICATE KEY UPDATE byte_len = byte_len + @len, mtime_ms = @mtime"
-									: `ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
-										"mtime_ms = excluded.mtime_ms"),
-						),
+						sql(growRow),
 						sql(
 							mysql
 								? `INSERT INTO ${parts} (path, start_offset, content) ` +
@@ -1589,6 +1600,7 @@ function buildQueries(
 										`FROM ${table} WHERE path = @path AND @len > 0`,
 						),
 					],
+		growRow: sql(mysql ? growRow : `${growRow} RETURNING byte_len`),
 		lockSize: sql(`SELECT byte_len FROM ${table} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`),
 		upsertRow: sql(
 			`INSERT INTO ${table} (${rowColumns}) VALUES (${rowValues}) ` +
@@ -2061,11 +2073,46 @@ function addChunkDigest(digest: Buffer, offset: number, bytes: Uint8Array): void
 }
 
 /**
+ * The parts a batch of appends stores for `lines`, in order, each at most
+ * {@link PART_BYTES}: whole lines share a part while they fit, and a longer
+ * line is cut at character boundaries, its last piece starting the next part.
+ * No part, and no string made, is longer than that.
+ */
+function* appendedParts(lines: readonly string[]): Generator<{ content: string; bytes: number }> {
+	let pieces: string[] = [];
+	let size = 0;
+	for (const line of lines) {
+		const bytes = Buffer.byteLength(line, "utf8");
+		if (size > 0 && size + bytes > PART_BYTES) {
+			yield { content: pieces.join(""), bytes: size };
+			pieces = [];
+			size = 0;
+		}
+		if (bytes <= PART_BYTES) {
+			pieces.push(line);
+			size += bytes;
+			continue;
+		}
+		const encoded = Buffer.from(line, "utf8");
+		let start = 0;
+		for (let end = utf8PartEnd(encoded, start, PART_BYTES); end < encoded.byteLength;) {
+			yield { content: encoded.toString("utf8", start, end), bytes: end - start };
+			start = end;
+			end = utf8PartEnd(encoded, start, PART_BYTES);
+		}
+		pieces.push(encoded.toString("utf8", start));
+		size = encoded.byteLength - start;
+	}
+	if (size > 0) yield { content: pieces.join(""), bytes: size };
+}
+
+/**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file is a row of the session table keyed by `path`, holding
  * its metadata (`byte_len`, `mtime_ms`, title fields), plus rows of
- * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts one
- * part, a full write replaces them with parts of at most 1 MiB (a streamed
+ * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts its
+ * line as one part, a batch of appends its lines as parts of at most 1 MiB,
+ * a full write replaces them with parts of at most 1 MiB (a streamed
  * one stages them under `<path>#staging-…`, or on MySQL for a path too long
  * for that a name made from its hash, first and swaps them in). A
  * session's content is the row's `content` (non-empty only for rows an older
@@ -4508,16 +4555,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#withBlobRefs(named, allowGone =>
 			this.#fencedTransaction(fences, async transaction => {
 				this.#wrote(path);
-				// A store that claims sessions refuses to append onto bytes it did not
-				// write (another writer that claims nothing, such as an older omp,
-				// changed or replaced the file), so `SessionManager` can read the file
-				// back and keep that writer's entries, or move off, instead of mixing
-				// this session's lines into whatever the file now holds.
-				if (expectedSize !== undefined && this.#gate) {
-					const actualSize = await this.#lockSize(transaction, path);
-					if ((actualSize ?? 0) !== expectedSize)
-						throw new SessionWriteConflictError(path, expectedSize, actualSize);
-				}
+				await this.#checkAppendSize(transaction, path, expectedSize);
 				// On SQLite the part's rowid comes from the clock read here, after any delete it follows (see partRowids).
 				for (const query of this.#q.append) await run(transaction, query, { ...values, now: Date.now() });
 				await this.#addRefs(transaction, path, named, allowGone);
@@ -4831,6 +4869,84 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 		}
 		return sweep;
+	}
+
+	/**
+	 * {@link SessionStorageBackend.appendBatch}: as {@link append} does for
+	 * one line, the blobs the lines name land first, then one transaction
+	 * behind the write fence checks the size once, grows the session row by
+	 * the bytes of every line, inserts the lines from its old length as parts
+	 * ({@link appendedParts}) and references the blobs they name. It throws
+	 * {@link SessionAppendBatchRolledBackError} when a statement of the
+	 * transaction failed, which rolled it back before COMMIT. Any other
+	 * failure (the COMMIT's own, which may have landed; the fence's or the
+	 * claim's, which have their own errors) is thrown as it is.
+	 */
+	async appendBatch(path: string, lines: readonly string[], mtimeMs: number, expectedSize?: number): Promise<void> {
+		// The blobs these lines name land first (see SqlBlobTier), as each line's own append lands its own.
+		const named = new Set<string>();
+		for (const line of lines) for (const hash of namedBlobHashes(line)) named.add(hash);
+		await this.blobs.land(named);
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		// What a statement of the transaction's last attempt threw, which rolled it back before COMMIT.
+		let statementFailure: { error: unknown } | undefined;
+		try {
+			await this.#withBlobRefs(named, allowGone =>
+				this.#fencedTransaction(fences, async transaction => {
+					statementFailure = undefined;
+					try {
+						this.#wrote(path);
+						await this.#checkAppendSize(transaction, path, expectedSize);
+						let len = 0;
+						for (const line of lines) len += Buffer.byteLength(line, "utf8");
+						const [grown] = (await run(transaction, this.#q.growRow, { path, mtime: mtimeMs, len })) as SizeRow[];
+						const size =
+							this.#adapter === "mysql"
+								? await this.#lockSize(transaction, path)
+								: grown
+									? rowNumber(grown.byte_len)
+									: null;
+						if (size === null) throw new Error(`SqlSessionStorage: an append batch found no row of ${path}`);
+						let offset = size - len;
+						for (const part of appendedParts(lines)) {
+							// On SQLite each part's rowid comes from the clock read here (see partRowids).
+							await run(transaction, this.#q.insertPart, {
+								path,
+								offset,
+								content: part.content,
+								now: Date.now(),
+							});
+							offset += part.bytes;
+						}
+						await this.#addRefs(transaction, path, named, allowGone);
+					} catch (err) {
+						statementFailure = { error: err };
+						throw err;
+					}
+				}),
+			);
+		} catch (err) {
+			if (statementFailure?.error === err) throw new SessionAppendBatchRolledBackError(path, err);
+			throw err;
+		}
+	}
+
+	/**
+	 * A store that claims sessions refuses to append onto bytes it did not
+	 * write (another writer that claims nothing, such as an older omp, changed
+	 * or replaced the file), so `SessionManager` can read the file back and
+	 * keep that writer's entries, or move off, instead of mixing this
+	 * session's lines into whatever the file now holds.
+	 */
+	async #checkAppendSize(
+		transaction: SqlSessionStorageTransaction,
+		path: string,
+		expectedSize: number | undefined,
+	): Promise<void> {
+		if (expectedSize === undefined || !this.#gate) return;
+		const actualSize = await this.#lockSize(transaction, path);
+		if ((actualSize ?? 0) !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
