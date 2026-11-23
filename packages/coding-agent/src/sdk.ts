@@ -74,12 +74,13 @@ import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mo
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	type ModelMatchPreferences,
+	modelNotFoundMessage,
 	parseModelPattern,
 	pickDefaultAvailableModel,
-	providerModelHint,
 	resolveAllowedModels,
 	resolveCliModel,
 	type ResolveCliModelResult,
@@ -634,6 +635,12 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
+	/**
+	 * Project directories whose `.omp/secrets.yml` the secret mask loads besides cwd's (each directory once, cwd
+	 * included; the global secrets load once either way): a session whose tools run in another directory than cwd
+	 * masks its secrets too.
+	 */
+	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
@@ -878,7 +885,7 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Root-scoped bus carrying `task:subagent:*` observability frames for this
 	 * session and every subagent it spawns. Default: creates a new bus per
-	 * root session; `buildSubagentSessionOptions` inherits the spawner's.
+	 * root session; `buildSubagentSession` inherits the spawner's.
 	 */
 	subagentEventBus?: EventBus;
 
@@ -2309,7 +2316,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// reflect actual loaded secrets, not just the setting toggle. Reassigned when
 	// `secrets.enabled` first turns on mid-session (see the watch after session creation).
 	let obfuscator: SecretObfuscator | undefined = cfgSecretsEnabled.get(settings)
-		? await buildSecretObfuscator(cwd, agentDir, options.agentDir)
+		? await buildSecretObfuscator(cwd, agentDir, options.agentDir, options.secretsProjectDirs)
 		: undefined;
 
 	// An abnormal process exit after a non-terminal message tail is durable
@@ -3448,14 +3455,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allEnabledModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAll()
-					: modelRegistry.getAll().filter(candidate => !disabledProviders.has(candidate.provider));
-			const availableModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAvailable()
-					: modelRegistry.getAvailable().filter(candidate => !disabledProviders.has(candidate.provider));
+			const allEnabledModels = enabledProviderModels(modelRegistry.getAll(), disabledProviders);
+			const availableModels = enabledProviderModels(modelRegistry.getAvailable(), disabledProviders);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -3701,15 +3702,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				break;
 			}
 			if (!model) {
-				const requested =
-					deferredModelPatterns.length === 1
-						? `"${deferredModelPatterns[0]}"`
-						: `one of ${deferredModelPatterns.map(pattern => `"${pattern}"`).join(", ")}`;
-				// A single provider-qualified selector names its closest siblings, the same
-				// hint `resolveCliModel` gives before the selector was deferred here.
-				const hint =
-					deferredModelPatterns.length === 1 ? providerModelHint(deferredModelPatterns[0], allEnabledModels) : "";
-				modelFallbackMessage = `Model ${requested} not found${hint ? `.${hint}` : ""}`;
+				modelFallbackMessage = modelNotFoundMessage(deferredModelPatterns, allEnabledModels);
 				// A subagent whose own patterns match nothing runs on its parent's model
 				// rather than starting with none; the message names the substitution.
 				const parentFallback = options.modelPatternParentFallback
@@ -5638,7 +5631,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (next.secretsEnabled !== previous.secretsEnabled) {
 				try {
 					if (cfgSecretsEnabled.get(settings) && !obfuscator) {
-						const built = await buildSecretObfuscator(cwd, agentDir, options.agentDir);
+						const built = await buildSecretObfuscator(
+							cwd,
+							agentDir,
+							options.agentDir,
+							options.secretsProjectDirs,
+						);
 						if (!obfuscator && built) {
 							obfuscator = built;
 							session.setObfuscator(built);
