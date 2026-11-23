@@ -258,6 +258,8 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		const phases: string[] = [];
 		const agentSession = {
 			modelRegistry: { authStorage: {} },
+			// The controller reads `live.provider` from the session's settings, as every AgentSession has.
+			settings: Settings.isolated(),
 			sessionId: "s1",
 			subscribe: () => () => {},
 			sendCustomMessage: async (message: { content: string }) => {

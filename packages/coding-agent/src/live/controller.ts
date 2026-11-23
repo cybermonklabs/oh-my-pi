@@ -15,7 +15,9 @@ import {
 	type LiveClientMessage,
 	type LiveServerEvent,
 } from "./protocol";
+import { OpenAILiveTransport } from "./openai-transport";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
+import { cfgLiveProvider } from "./settings";
 import { CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
@@ -106,7 +108,7 @@ export class LiveSessionController {
 	readonly #instructionsTemplate: string;
 	readonly #sdpOffer: string | undefined;
 
-	#transport: CodexLiveTransport | undefined;
+	#transport: CodexLiveTransport | OpenAILiveTransport | undefined;
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -181,17 +183,27 @@ export class LiveSessionController {
 		try {
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
-			const transport = new CodexLiveTransport({
-				authStorage: this.#session.modelRegistry.authStorage,
-				sessionId: this.#session.sessionId,
-				instructions,
-				voice: this.#voice,
-				sdpOffer: this.#sdpOffer,
-				callbacks: {
-					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
-					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
-				},
-			});
+			const callbacks = {
+				onEvent: (event: LiveServerEvent) => this.#guardEvent(() => this.#handleLiveEvent(event)),
+				onOutputLevel: (level: number) => this.#guardEvent(() => this.#handleOutputLevel(level)),
+			};
+			const transport =
+				cfgLiveProvider.get(this.#session.settings) === "openai"
+					? new OpenAILiveTransport({
+							registry: this.#session.modelRegistry,
+							sessionId: this.#session.sessionId,
+							instructions,
+							sdpOffer: this.#sdpOffer,
+							callbacks,
+						})
+					: new CodexLiveTransport({
+							authStorage: this.#session.modelRegistry.authStorage,
+							sessionId: this.#session.sessionId,
+							instructions,
+							voice: this.#voice,
+							sdpOffer: this.#sdpOffer,
+							callbacks,
+						});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {

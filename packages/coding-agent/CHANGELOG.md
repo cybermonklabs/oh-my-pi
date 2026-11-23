@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`, which takes precedence over the setting in the settings files): live voice (`/live`, RPC `live_start`/`live_connect`, extension `startLive`) runs GPT-Live on OpenAI's API, billed to the `openai` provider's key (a stored key, `apiKey` in `models.yml`, else `OPENAI_API_KEY`) at its `baseUrl` (default `https://api.openai.com/v1`), instead of the ChatGPT (Codex) subscription. Since GPT-Live's delegation carries no text, a delegation's turn is the user's transcribed words before its `offset_ms`, labelled as speech-to-text; it waits for the user's transcript to reach that offset (at most 1 s) and is never dropped. `live.provider: codex` stays the default
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

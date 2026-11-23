@@ -1,0 +1,358 @@
+import { describe, expect, test } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
+import { LIVE_DELEGATION_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+
+/**
+ * A whole call on `live.provider: openai`: the controller with the real GPT-Live transport, against a
+ * local server speaking GPT-Live's public API. The session stands in for the agent: it records each
+ * delegated turn.
+ */
+
+const KEY = "sk-call-test";
+const LABEL =
+	"The user's words for this request, from speech-to-text. They can hold recognition errors and speech that was not a request:";
+const NO_WORDS = "No words of the user were transcribed for this request. Say so, and ask the user to say it again.";
+
+/** A delegated turn holding `words`, as the transport labels them. */
+function heard(words: string): string {
+	return `${LABEL}\n\n> ${words}`;
+}
+
+interface StubOptions {
+	/** Answer to the session POST; defaults to a 201 for `sessionId`. */
+	answer?: (request: Request) => Response;
+	/** The session id of the default answer; defaults to `live_1`. */
+	sessionId?: string;
+	/** Frames the sideband sends once attached. */
+	frames?: unknown[];
+	/** Called with each message omp writes on the sideband. */
+	onMessage?: (message: Record<string, unknown>, socket: { send(data: string): unknown }) => void;
+	/** Closes the sideband this long after it opens. */
+	closeAfterMs?: number;
+}
+
+function gptLiveStub(options: StubOptions = {}) {
+	const posts: unknown[] = [];
+	const upgrades: string[] = [];
+	const sessionId = options.sessionId ?? "live_1";
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request, srv) {
+			const url = new URL(request.url);
+			if (request.method === "POST" && url.pathname === "/v1/live/sessions") {
+				posts.push(await request.json());
+				return (
+					options.answer?.(request) ??
+					Response.json({ session: { id: sessionId }, transport: { sdp: "v=0 answer" } }, { status: 201 })
+				);
+			}
+			const attach = decodeURIComponent(url.pathname) === `/v1/live/sessions/${sessionId}/attach`;
+			if (attach && srv.upgrade(request)) {
+				upgrades.push(decodeURIComponent(url.pathname));
+				return undefined;
+			}
+			return new Response("not found", { status: 404 });
+		},
+		websocket: {
+			open(socket) {
+				for (const frame of options.frames ?? []) socket.send(JSON.stringify(frame));
+				if (options.closeAfterMs !== undefined) setTimeout(() => socket.close(1011, "gone"), options.closeAfterMs);
+			},
+			message(socket, data) {
+				options.onMessage?.(JSON.parse(String(data)), socket);
+			},
+		},
+	});
+	return { server, posts, upgrades, base: `http://127.0.0.1:${server.port}/v1` };
+}
+
+function liveCall(base: string, apiKey: () => Promise<string> = async () => KEY) {
+	const turns: string[] = [];
+	let listener: ((event: AgentSessionEvent) => void) | undefined;
+	const session = {
+		modelRegistry: { authStorage: {}, getProviderBaseUrl: () => base, getApiKeyForProvider: apiKey },
+		settings: Settings.isolated({ "live.provider": "openai" }),
+		sessionId: "s1",
+		subscribe: (next: (event: AgentSessionEvent) => void) => {
+			listener = next;
+			return () => {
+				listener = undefined;
+			};
+		},
+		sendCustomMessage: async (message: { customType?: string; content?: unknown }) => {
+			if (message.customType === LIVE_DELEGATION_MESSAGE_TYPE) turns.push(String(message.content));
+			return false;
+		},
+	} as unknown as LiveSessionControllerOptions["session"];
+	const ended = Promise.withResolvers<Error | undefined>();
+	const controller = new LiveSessionController({
+		session,
+		extractAssistantText: () => "CI is green.",
+		sdpOffer: "v=0 offer",
+		callbacks: {
+			onPhase: () => {},
+			onLevels: () => {},
+			onTranscript: () => {},
+			onTerminal: error => ended.resolve(error),
+		},
+	});
+	return {
+		controller,
+		turns,
+		ended: ended.promise,
+		/** The agent's turn ends: the controller sends its answer to the call. */
+		answer: () =>
+			listener?.({
+				type: "agent_end",
+				isTerminal: true,
+				messages: [{ role: "assistant" }],
+			} as unknown as AgentSessionEvent),
+	};
+}
+
+/** Waits until `check` holds, for at most `ms`; the test's own expectations say what went wrong. */
+async function until(check: () => boolean, ms = 4_000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (!check() && Date.now() < deadline) await Bun.sleep(10);
+}
+
+function userSaid(eventId: string, delta: string, startMs: number, endMs: number) {
+	return { type: "session.input_transcript.delta", event_id: eventId, delta, start_ms: startMs, end_ms: endMs };
+}
+
+function voiceSaid(eventId: string, delta: string, startMs: number, endMs: number) {
+	return { type: "session.output_transcript.delta", event_id: eventId, delta, start_ms: startMs, end_ms: endMs };
+}
+
+function delegated(eventId: string, id: string, offsetMs: number) {
+	return {
+		type: "session.delegation.created",
+		event_id: eventId,
+		offset_ms: offsetMs,
+		delegation: { id, type: "delegation", target: "client" },
+	};
+}
+
+describe("GPT-Live delegations", () => {
+	test("each turn is the user's words before its delegation, also when they arrive after it", async () => {
+		// The review's probe: each delegation comes before the transcript of the words that led to it.
+		const stub = gptLiveStub({
+			frames: [
+				delegated("d1", "item_1", 1_300),
+				userSaid("t1", "deploy main", 900, 1_200),
+				voiceSaid("t2", "On it.", 1_500, 1_900),
+				delegated("d2", "item_2", 2_600),
+				userSaid("t3", "and run the tests", 2_000, 2_500),
+				delegated("d3", "item_3", 4_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 3);
+			expect(call.turns).toEqual([heard("deploy main"), heard("and run the tests"), NO_WORDS]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("two delegations with no words between them both become turns", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "check the build", 100, 900),
+				delegated("d1", "item_1", 1_000),
+				voiceSaid("t2", "Checking.", 1_100, 1_400),
+				delegated("d2", "item_2", 5_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 2);
+			expect(call.turns).toEqual([heard("check the build"), NO_WORDS]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("a turn holds the user's words of the minute before its delegation, labelled as speech", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "tell me a joke", 0, 900),
+				voiceSaid("t2", "Why did the build fail?", 1_000, 2_500),
+				userSaid("t3", "deploy main", 70_000, 70_600),
+				delegated("d1", "item_1", 71_000),
+				voiceSaid("t4", "On it.", 71_100, 71_500),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("the voice speaking past a delegation does not send its turn before the user's words for it", async () => {
+		// The review's probe A: old words, the voice past the offset, then the request's words.
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "thanks", 100, 400),
+				voiceSaid("t2", "You're welcome.", 500, 1_000),
+				delegated("d1", "item_1", 5_000),
+				voiceSaid("t3", "On it.", 5_100, 5_400),
+				userSaid("t4", " deploy main", 4_000, 4_800),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("thanks deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("the rest of a request that arrives after the voice's words still joins its turn", async () => {
+		// The review's probe B: part of the request, the voice past the offset, then the rest.
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "deploy main", 4_000, 4_400),
+				delegated("d1", "item_1", 5_000),
+				voiceSaid("t2", "On it.", 5_100, 5_400),
+				userSaid("t3", " and run the tests", 4_400, 4_900),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main and run the tests")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+});
+
+describe("GPT-Live call lifecycle", () => {
+	test("a stop while the key resolves sends no session request and leaves no call open", async () => {
+		const stub = gptLiveStub();
+		const key = Promise.withResolvers<string>();
+		let asked = false;
+		const call = liveCall(stub.base, () => {
+			asked = true;
+			return key.promise;
+		});
+		try {
+			const starting = call.controller.start().then(
+				() => "started",
+				(error: unknown) => `refused: ${String(error)}`,
+			);
+			await until(() => asked);
+			// The stop ends while the key is still resolving (an OAuth pick, a key command, an auth broker).
+			await call.controller.stop();
+			key.resolve(KEY);
+			expect(await starting).toStartWith("refused");
+			await Bun.sleep(100);
+			expect(stub.posts).toEqual([]);
+			expect(stub.upgrades).toEqual([]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("GPT-Live refusing the agent's answer ends the call with its reason; another error does not", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				{
+					type: "error",
+					event_id: "e0",
+					error: { type: "invalid_request_error", message: "about nothing omp sent" },
+				},
+				userSaid("t1", "is CI green", 100, 900),
+				delegated("d1", "item_1", 1_000),
+				voiceSaid("t2", "Checking.", 1_100, 1_400),
+			],
+			onMessage: (message, socket) => {
+				if (message.type !== "session.commentary.append") return;
+				const error = {
+					type: "invalid_request_error",
+					message: "Unknown delegation",
+					client_event_id: message.event_id,
+				};
+				socket.send(JSON.stringify({ type: "error", event_id: "e1", error }));
+			},
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			call.answer();
+			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(String(ended)).toMatch(/GPT-Live refused omp's session\.commentary\.append: Unknown delegation/);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("a refused session's error does not repeat a key the server echoes", async () => {
+		const stub = gptLiveStub({
+			answer: request =>
+				Response.json(
+					{ error: { message: `bad header ${request.headers.get("authorization")}` } },
+					{ status: 401 },
+				),
+		});
+		const call = liveCall(stub.base);
+		try {
+			const error = await call.controller.start().then(
+				() => "started",
+				(cause: unknown) => String(cause),
+			);
+			expect(error).toContain("GPT-Live session failed (401)");
+			expect(error).toContain("Bearer [key]");
+			expect(error).not.toContain(KEY);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	});
+
+	test("an opaque session id with `.` and `:` is accepted", async () => {
+		const stub = gptLiveStub({ sessionId: "sess.1:a" });
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			expect(stub.upgrades).toEqual(["/v1/live/sessions/sess.1:a/attach"]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	});
+
+	test("a sideband that closes ends a connected call", async () => {
+		const stub = gptLiveStub({ closeAfterMs: 200 });
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(String(ended)).toMatch(/GPT-Live sideband closed \(1011\)/);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+});

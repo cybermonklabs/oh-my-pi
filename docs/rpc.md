@@ -1530,6 +1530,44 @@ Live frames are not session events: `set_event_filter` never drops them.
 Closing stdin, or `pi.shutdown()`, stops an active live session before the
 process exits.
 
+### API billing (`live.provider: openai`)
+
+Live sessions run on Codex with the session's ChatGPT (Codex) sign-in. With
+`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`, which takes precedence
+over `live.provider` in the settings files) every live session
+(`/live`, `live_start`, `live_connect`, extension `startLive`) runs GPT-Live
+(`gpt-live-1.1`) on OpenAI's API instead, billed to the key of the `openai`
+provider: the key omp uses for any OpenAI model (a stored key, `apiKey` in
+`models.yml`, else `OPENAI_API_KEY`), sent to the provider's `baseUrl` from
+`models.yml`, else `https://api.openai.com/v1`. A model gateway that serves
+GPT-Live there works the same way.
+
+1. `POST {base}/live/sessions` with `Authorization: Bearer <key>` and
+   `{ "session": { "model": "gpt-live-1.1", "instructions", "delegation": { "type": "client" } }, "transport": { "type": "webrtc", "sdp": <offer> } }`,
+   answered by `201 { "session": { "id" }, "transport": { "sdp" } }`. No Codex
+   header is sent and no redirect is followed.
+2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
+   bearer carries the call's events and omp's messages.
+
+The rest of the call is the same as on Codex. GPT-Live's delegation event names
+no task text, only its `offset_ms` on the session timeline, so its turn is the
+user's transcribed words before that offset (at most the minute before it), under
+a line saying they are speech-to-text that can hold recognition errors and speech
+that was not a request. GPT-Live can send a delegation before the transcript of
+the words that led to it, so a delegation goes once the user's transcript has
+reached its offset, or after 1 s with the words that have arrived; the voice's
+transcript does not release it. A user's word that arrives for a delegation
+already handed over is logged, not given to the next one. A delegation is never
+dropped: with no words, its turn says none were transcribed. A turn's progress
+goes to the call as `session.thinking.append`
+(not spoken) and its final reply as `session.commentary.append` (spoken); context
+outside a delegation goes the same way with `delegation_id: null`. Each message
+carries an `event_id`; a GPT-Live `error` that names one ends the call with that
+error, as a failed send does on Codex, and any other `error` is logged while the
+call stays open. The session id is opaque: any id but `.` and `..` is accepted
+and percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
+default; `live.voice` names Codex voices only.
+
 ## Dictation Sub-Protocol
 
 Draft-only dictation captures from the machine's microphone using the session's
