@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `omp worktree add --lock [--reason <reason>]`, which locks the new worktree as `git worktree add --lock` does; `git worktree add --lock`/`--reason` in bash now keep the clone rewrite, and the `worktree.lockReason` setting locks every worktree a bash `git worktree add` creates through the rewrite with that reason
+
+### Fixed
+
+- A clone-backed `omp worktree add` (and `git worktree add` in bash) no longer copies the source's untracked, unignored files unless keeping changes, never copies another checkout below the root (a directory holding `.git`: a submodule, a linked worktree, a cloned dependency, ignored or not), and no longer copies a destination inside the source into itself; a checkout with a checked-out submodule now clones instead of falling back to a plain checkout. Keeping changes no longer reads or writes a path through a symlink that replaced one of its directories
+- A worktree add (`omp worktree add`, `git worktree add` in bash, `/wt`, `github pr_checkout`) that fails no longer leaves its tree and a registration behind, locked or not: it removes both, as `git worktree add` does. One killed or terminated midway (a bash timeout) leaves its registration locked `initializing`, as git's own add does. On Linux, with user extended attributes, an add of the same path then empties the partial tree, with any file written or change staged there after the kill, and removes the registration, and says so, while nobody has unlocked it, moved its `HEAD` or written a reflog or refs of its own there (a commit or a checkout), made the directory again (`mkdir`), put a repository anywhere in it (a `.git` entry below the root, or a bare repository the add's commit does not track) or mounted a filesystem or a file in it; symlinks in the tree are removed, never followed; a tree more than 256 directories deep, or one on a system that reports no mount ids (neither `statx` nor `/proc/self/fdinfo`) or where reading them fails, is refused; a mount made during the emptying, or an entry the system will not remove (an NFS client's `.nfs…` name for a deleted file still open, an `EBUSY` from a FUSE daemon or an SMB server), stops the emptying there with the entry, the error and what the emptying did at that entry named and the registration kept, what the emptying reached before it being gone; otherwise it refuses, as git refuses a path that exists. `omp worktree clear` keeps a locked registration, as `git worktree prune` does
+- Keeping changes on the clone path now carries the untracked files git reports below a directory holding a `.git` that git treats as ordinary content (a tracked directory someone ran `git init` in, a `.git` naming nothing), as the ordinary checkout already did
+- The bash rewrite of `git worktree add` leaves to git a command holding a backslash-newline, whose bytes bash changes, and one combining `-b`/`-B` with `--detach`, which git refuses
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
