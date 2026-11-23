@@ -805,16 +805,18 @@ pub(crate) fn fork_message(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 
 /// Whether the expansion stopped at `stop` for a substitution that needs a
 /// vproc, and no vpid is left for one ([`Kernel::vpids_left`]): a `$( )`
-/// that forks, a zsh `$(…)` that is not a hook call run in the shell, or a
-/// process substitution that already found none ([`Stop::ForkFailed`]).
-/// The interactive reader fails such a prompt expansion instead of
-/// starting it ([`super::zle::reader`]).
-pub(crate) const fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
+/// that forks (not a `$(< file)`, which [`start_sub`] reads in the shell), a
+/// zsh `$(…)` that is not a hook call run in the shell, or a process
+/// substitution that already found none ([`Stop::ForkFailed`]). The
+/// interactive reader fails such a prompt expansion instead of starting it
+/// ([`super::zle::reader`]).
+pub(crate) fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
 	match stop {
 		Stop::ForkFailed => true,
-		Stop::Sub { form: ComsubForm::Fork, .. } | Stop::ZshSub { here: false, .. } => {
-			k.vpids_left() == 0
+		Stop::Sub { form: ComsubForm::Fork, unit, entry, .. } => {
+			unit.cat_exec(*entry).is_none() && k.vpids_left() == 0
 		},
+		Stop::ZshSub { here: false, .. } => k.vpids_left() == 0,
 		_ => false,
 	}
 }
