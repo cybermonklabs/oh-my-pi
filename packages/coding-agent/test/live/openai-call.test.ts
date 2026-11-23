@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
+import {
+	LiveSessionController,
+	type LiveSessionControllerOptions,
+	type LiveTranscript,
+} from "@oh-my-pi/pi-coding-agent/live/controller";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -82,6 +86,7 @@ function gptLiveStub(options: StubOptions = {}) {
 
 function liveCall(base: string, apiKey: () => Promise<string> = async () => KEY) {
 	const turns: string[] = [];
+	const transcripts: LiveTranscript[] = [];
 	let listener: ((event: AgentSessionEvent) => void) | undefined;
 	const session = {
 		modelRegistry: { authStorage: {}, getProviderBaseUrl: () => base, getApiKeyForProvider: apiKey },
@@ -106,13 +111,17 @@ function liveCall(base: string, apiKey: () => Promise<string> = async () => KEY)
 		callbacks: {
 			onPhase: () => {},
 			onLevels: () => {},
-			onTranscript: () => {},
+			onTranscript: transcript => {
+				if (transcript) transcripts.push(transcript);
+			},
 			onTerminal: error => ended.resolve(error),
 		},
 	});
 	return {
 		controller,
 		turns,
+		/** Every transcript the controller reported, in order. */
+		transcripts,
 		ended: ended.promise,
 		/** The agent's turn ends: the controller sends its answer to the call. */
 		answer: () =>
@@ -558,6 +567,32 @@ describe("GPT-Live call lifecycle", () => {
 			await call.controller.start();
 			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
 			expect(String(ended)).toMatch(/GPT-Live sideband closed \(1011\)/);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+});
+
+describe("GPT-Live transcript", () => {
+	test("a speaker saying the same short line again shows it as a new line", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "yes", 0, 300),
+				voiceSaid("t2", "Sure.", 400, 800),
+				userSaid("t3", "yes", 900, 1_200),
+				voiceSaid("t4", "Done.", 1_300, 1_600),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.transcripts.some(line => line.text === "Done."));
+			const userLines = call.transcripts.filter(line => line.role === "user" && line.final);
+			expect(userLines.map(({ turn, text }) => ({ turn, text }))).toEqual([
+				{ turn: 1, text: "yes" },
+				{ turn: 2, text: "yes" },
+			]);
 		} finally {
 			await call.controller.stop();
 			stub.server.stop(true);
