@@ -18,7 +18,7 @@ use bstr::{BStr, BString};
 use hashbrown::DefaultHashBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::proc::{GetoptsState, JobTable, LastBg, Vproc};
+use super::proc::{GetoptsState, JobTable, LastBg, SavedStatus, Vproc};
 pub use crate::bash::store::Var;
 use crate::bash::{
 	Image,
@@ -346,6 +346,10 @@ pub struct Root {
 	synced:            Synced,
 	/// zsh's history events as last written (mirrors their store record).
 	pub hist_events:   parking_lot::Mutex<super::builtins::history::model::EventsCache>,
+	/// The engine's platform ([`crate::bash::EngineConfig::platform`]), for
+	/// code that holds the root but not the kernel (a zsh function's trap
+	/// scope ending as its frame pops names its `TRAPNAL` functions by it).
+	platform:          crate::bash::ids::Platform,
 }
 
 /// The root vproc's fields the interpreter updates in place (`vp.status = …`
@@ -490,6 +494,16 @@ impl Root {
 	/// The store epoch these facts were derived at.
 	pub const fn epoch(&self) -> u64 {
 		self.epoch
+	}
+
+	/// The engine's platform ([`Self::set_platform`]).
+	pub const fn platform(&self) -> crate::bash::ids::Platform {
+		self.platform
+	}
+
+	/// Record the engine's platform (the kernel does, as it starts).
+	pub const fn set_platform(&mut self, platform: crate::bash::ids::Platform) {
+		self.platform = platform;
 	}
 
 	/// Write the lazy empty scopes ([`Self::lazy`]) as store records: before
@@ -3013,7 +3027,11 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 /// Write the root job table's changes since the last sync: each job is
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted.
+/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
+/// written with the job's record when it changes, and when they change
+/// without it (a pipeline's processes start and end while the job runs,
+/// [`Job::procs`]): those of a job that has any are compared with their
+/// record too. A job's facts never go, so one without any has none written.
 fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
 	let same_ids =
@@ -3022,6 +3040,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		for id in &ids {
 			if !jobs.list.iter().any(|j| j.id == *id) {
 				root.write(store, Change::Del(Key::Job(*id)));
+				root.write(store, Change::Del(Key::JobFacts(*id)));
 			}
 		}
 		ids.clear();
@@ -3030,7 +3049,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_ids = ids;
 	for job in &jobs.list {
 		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => have == job,
+			Ok(Some(Record::Job(have))) => job.same_record(have),
 			Ok(_) => false,
 			Err(err) => {
 				root.fail(err);
@@ -3038,7 +3057,32 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 			},
 		};
 		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.clone())));
+			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
+		}
+		let facts_written = if !written {
+			false
+		} else if !job.has_facts() {
+			true
+		} else {
+			match store.get(Key::JobFacts(job.id)) {
+				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+				Ok(_) => false,
+				Err(err) => {
+					root.fail(err);
+					return;
+				},
+			}
+		};
+		if !facts_written {
+			let facts = job.facts();
+			root.write(
+				store,
+				if facts.is_empty() {
+					Change::Del(Key::JobFacts(job.id))
+				} else {
+					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+				},
+			);
 		}
 	}
 	let (current, previous, chld) = root.synced.job_marks;
@@ -3052,6 +3096,45 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		}
 	}
 	root.synced.job_marks = (jobs.current, jobs.previous, jobs.chld);
+}
+
+/// Keep the status `status` that `vp`'s `wait` collected for child `vpid`,
+/// shown as `pid` ([`JobTable::bgp`], bash `bgp_add`); the root's is written
+/// to the store at once ([`Key::BgPid`], `STATUS:PID:SEQ`), one record each.
+pub fn save_status(
+	root: &mut Root,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	vpid: Vpid,
+	pid: u32,
+	status: i32,
+) {
+	let (saved, gone) = vp.jobs.bgp_add(vpid, pid, status);
+	if vp.image.is_none() {
+		if let Some(gone) = gone {
+			root.write(store, Change::Del(Key::BgPid(gone.vpid)));
+		}
+		let rec =
+			Record::Misc(BString::from(format!("{}:{}:{}", saved.status, saved.pid, saved.seq)));
+		root.write(store, Change::Put(Key::BgPid(saved.vpid), rec));
+	}
+}
+
+/// Forget the status `vp` kept for child `vpid` (bash `bgp_delete`).
+pub fn forget_status(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, vpid: Vpid) {
+	if vp.jobs.bgp_delete(vpid).is_some() && vp.image.is_none() {
+		root.write(store, Change::Del(Key::BgPid(vpid)));
+	}
+}
+
+/// Forget every status `vp` kept (bash `bgp_clear`).
+pub fn clear_statuses(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
+	let gone = vp.jobs.bgp_clear();
+	if vp.image.is_none() {
+		for saved in gone {
+			root.write(store, Change::Del(Key::BgPid(saved.vpid)));
+		}
+	}
 }
 
 /// Write the root vproc's in-place fields that changed since the last call
@@ -3146,7 +3229,29 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	store.scan(Table::JobFacts, &mut |key, rec| {
+		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
+			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+		{
+			job.set_facts(facts);
+		}
+	})?;
 	list.sort_by_key(|j| j.number);
+	let mut bgp = Vec::new();
+	store.scan(Table::BgPid, &mut |key, rec| {
+		if let (Key::BgPid(vpid), Record::Misc(text)) = (key, rec) {
+			let mut parts = text.splitn(3, |&c| c == b':');
+			if let (Some(status), Some(pid), Some(seq)) = (
+				parts.next().and_then(parse),
+				parts.next().and_then(parse),
+				parts.next().and_then(parse),
+			) {
+				bgp.push(SavedStatus { vpid, pid, status, seq });
+			}
+		}
+	})?;
+	bgp.sort_by_key(|s| s.seq);
+	let bgp = (!bgp.is_empty()).then(|| Box::new(bgp.into_iter().collect()));
 	vp.jobs = JobTable {
 		list,
 		current: misc(store, MiscKey::JobCurrent)?.and_then(|s| parse(&s)),
@@ -3155,6 +3260,8 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		comsub: super::proc::Comsub::No,
+		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
 	vp.rlimits = decode_rlimits(&words(store, MiscKey::Rlimits)?);

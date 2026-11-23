@@ -217,10 +217,12 @@ impl BlockingWriter {
 		let (jobs, queue) = std::sync::mpsc::channel::<(Mark, Vec<u8>)>();
 		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
 		let shared = Arc::clone(&state);
-		std::thread::Builder::new()
-			.name("obash-write".into())
-			.stack_size(64 << 10)
-			.spawn(move || {
+		// A helper thread: it never takes the shell's signals (`sys::thread`).
+		crate::sys::thread::spawn_helper(
+			std::thread::Builder::new()
+				.name("obash-write".into())
+				.stack_size(64 << 10),
+			move || {
 				// Ends once the `StdFile` is dropped and the last chunk is done.
 				while let Ok((mark, bytes)) = queue.recv() {
 					#[cfg(all(test, target_os = "linux"))]
@@ -242,7 +244,8 @@ impl BlockingWriter {
 						waker.wake();
 					}
 				}
-			})?;
+			},
+		)?;
 		Ok(Self { jobs, state })
 	}
 

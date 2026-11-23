@@ -300,6 +300,14 @@ impl Capture {
 		Arc::as_ptr(&self.0).addr()
 	}
 
+	/// Whether anything but this handle still holds the buffer: an fd of
+	/// the substitution (its standard output, or a copy), or a program
+	/// writing into it. Asked by the one that reads it, holding one handle:
+	/// `false` is the end of its read (bash's `read_comsub` at end of file).
+	pub fn has_writers(&self) -> bool {
+		Arc::strong_count(&self.0) > 1
+	}
+
 	/// Image of the shared buffer.
 	pub fn image(&self) -> MemImage {
 		MemImage::Capture { data: self.0.lock().clone() }

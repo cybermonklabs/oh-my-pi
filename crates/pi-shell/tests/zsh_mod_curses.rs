@@ -6,8 +6,9 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
-use std::{io, time::Duration};
+use std::io;
 
 use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
 
@@ -27,13 +28,21 @@ fn both(
 	.map(Some)
 }
 
-const QUIET: Duration = Duration::from_millis(300);
+/// What a script prints once it has drawn its screen, before it waits for
+/// a key: an OSC string, which terminals and the harness' screen ignore.
+/// It comes on the terminal after everything the script drew before it,
+/// so once it is read the screen is complete.
+const DRAWN: &str = "\x1b]9999;drawn\x07";
+
+/// The script line that prints [`DRAWN`].
+const PRINT_DRAWN: &str = "print -rn -- $'\\e]9999;drawn\\a'";
 
 /// Windows, a border, attributes, colors and wide characters, shown while
 /// `zcurses input` waits.
 #[test]
 fn zsh_mod_curses_draws_windows_like_ncurses() -> io::Result<()> {
-	let script = "zmodload zsh/curses
+	let script = format!(
+		"zmodload zsh/curses
 zcurses init
 zcurses addwin w 6 24 2 4
 zcurses border w
@@ -46,12 +55,10 @@ zcurses string w 'wide: 漢字 ok'
 zcurses addwin s 2 10 5 6 w
 zcurses string s sub
 zcurses refresh w s
-zcurses input w key";
-	let Some((obash, zsh)) = both(script, |pty| {
-		pty.wait_screen_contains("sub", TIMEOUT)?;
-		pty.settle(QUIET, TIMEOUT)
-	})?
-	else {
+{PRINT_DRAWN}
+zcurses input w key"
+	);
+	let Some((obash, zsh)) = both(&script, |pty| pty.read_until(DRAWN, TIMEOUT).map(drop))? else {
 		return Ok(());
 	};
 	assert_eq!(obash, zsh);
@@ -63,7 +70,8 @@ zcurses input w key";
 /// stay, and a refresh after `end` redraws curses' screen.
 #[test]
 fn zsh_mod_curses_end_and_resume() -> io::Result<()> {
-	let script = "zmodload zsh/curses
+	let script = format!(
+		"zmodload zsh/curses
 print before
 zcurses init
 zcurses addwin w 3 10 1 1
@@ -78,12 +86,13 @@ read -r line
 zcurses refresh
 zcurses touch w
 zcurses refresh w
-zcurses input w";
-	let Some((obash, zsh)) = both(script, |pty| {
+{PRINT_DRAWN}
+zcurses input w"
+	);
+	let Some((obash, zsh)) = both(&script, |pty| {
 		pty.wait_screen_contains("colors=", TIMEOUT)?;
 		pty.write("\r")?;
-		pty.wait_screen_contains("abc", TIMEOUT)?;
-		pty.settle(QUIET, TIMEOUT)
+		pty.read_until(DRAWN, TIMEOUT).map(drop)
 	})?
 	else {
 		return Ok(());
@@ -92,7 +101,9 @@ zcurses input w";
 	Ok(())
 }
 
-/// `input` reads characters and, with a key parameter, keypad keys.
+/// `input` reads characters and, with a key parameter, keypad keys. The
+/// keys are typed once curses has the terminal (no canonical mode, no
+/// echo); they wait in its input until each `input` reads them.
 #[test]
 fn zsh_mod_curses_reads_keys() -> io::Result<()> {
 	let script = "zmodload zsh/curses
@@ -105,15 +116,12 @@ zcurses input stdscr c4; s4=$?
 zcurses end
 print -r -- \"[$c][$c2|$k2][$c3|$k3][$c4|$s4]\"";
 	let Some((obash, zsh)) = both(script, |pty| {
-		pty.settle(QUIET, TIMEOUT)?;
+		pty.wait_raw(TIMEOUT)?;
 		pty.write("x")?;
-		pty.settle(QUIET, TIMEOUT)?;
 		// The cursor-up key in keypad (application) mode.
 		pty.write("\x1bOA")?;
-		pty.settle(QUIET, TIMEOUT)?;
 		pty.write("é")?;
-		pty.wait_screen_contains("]", TIMEOUT)?;
-		pty.settle(QUIET, TIMEOUT)
+		pty.wait(TIMEOUT).map(drop)
 	})?
 	else {
 		return Ok(());
@@ -143,13 +151,11 @@ print -rl -- $r";
 		b"\x1b[Z",
 	];
 	let Some((obash, zsh)) = both(script, |pty| {
-		pty.settle(QUIET, TIMEOUT)?;
+		pty.wait_raw(TIMEOUT)?;
 		for k in keys {
 			pty.write(k)?;
-			pty.settle(QUIET, TIMEOUT)?;
 		}
-		pty.wait_screen_contains("BTAB", TIMEOUT)?;
-		pty.settle(QUIET, TIMEOUT)
+		pty.wait(TIMEOUT).map(drop)
 	})?
 	else {
 		return Ok(());
@@ -161,7 +167,8 @@ print -rl -- $r";
 /// Scrolling, clearing and backgrounds change what the window shows.
 #[test]
 fn zsh_mod_curses_scrolls_and_clears() -> io::Result<()> {
-	let script = "zmodload zsh/curses
+	let script = format!(
+		"zmodload zsh/curses
 zcurses init
 zcurses addwin w 4 12 1 2
 zcurses scroll w on
@@ -173,12 +180,10 @@ zcurses string v dots
 zcurses move v 0 2
 zcurses clear v eol
 zcurses refresh w v
-zcurses input w";
-	let Some((obash, zsh)) = both(script, |pty| {
-		pty.wait_screen_contains("four", TIMEOUT)?;
-		pty.settle(QUIET, TIMEOUT)
-	})?
-	else {
+{PRINT_DRAWN}
+zcurses input w"
+	);
+	let Some((obash, zsh)) = both(&script, |pty| pty.read_until(DRAWN, TIMEOUT).map(drop))? else {
 		return Ok(());
 	};
 	assert_eq!(obash, zsh);

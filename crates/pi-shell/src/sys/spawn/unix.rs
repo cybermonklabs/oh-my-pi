@@ -113,11 +113,13 @@ fn watch(pid: i32, tracker: Arc<Tracker>, shared: Arc<Shared>) -> io::Result<()>
 	}
 	let mb =
 		Arc::new(Mailbox { job: Mutex::new(Some((pid, tracker, shared))), ready: Condvar::new() });
-	thread::Builder::new()
-		.name("obash-wait".into())
-		.stack_size(SMALL_STACK)
-		.spawn(move || waiter(&mb))
-		.map(drop)
+	crate::sys::thread::spawn_helper(
+		thread::Builder::new()
+			.name("obash-wait".into())
+			.stack_size(SMALL_STACK),
+		move || waiter(&mb),
+	)
+	.map(drop)
 }
 
 /// A waiter thread: wait for each external handed to `mb`, park in
@@ -1678,8 +1680,9 @@ struct UnixProc {
 	scope:    Scope,
 	tracker:  Arc<Tracker>,
 	shared:   Arc<Shared>,
-	/// [`crate::bash::Lineage::detached`]: dropping it while it runs releases
-	/// the process instead of escalating TERM → KILL.
+	/// [`crate::bash::Lineage::detached`], or [`ExtProc::release`]d: dropping
+	/// it while it runs releases the process instead of escalating TERM →
+	/// KILL.
 	detached: bool,
 	/// The child's pumps and the shared input feeds it holds (kept open
 	/// while this lives), driven by `poll_wait`.
@@ -1778,6 +1781,13 @@ impl ExtProc for UnixProc {
 	fn cont(&mut self) -> io::Result<()> {
 		self.scope.signal(Signal::Cont)
 	}
+
+	/// Drop then releases it as a detached one ([`Self::detached`]). Its
+	/// scope stays recorded: [`kill_leftovers`] (which only the test kit
+	/// calls) still reaches it; nothing else ends it.
+	fn release(&mut self) {
+		self.detached = true;
+	}
 }
 
 impl Drop for UnixProc {
@@ -1845,10 +1855,12 @@ impl Drop for UnixProc {
 fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant, journal: Journal) {
 	let waiter = Arc::clone(tracker);
 	let fallback = journal.clone();
-	let started = thread::Builder::new()
-		.name("obash-kill".into())
-		.stack_size(SMALL_STACK)
-		.spawn(move || escalate(&waiter, scope, kill_at, &journal));
+	let started = crate::sys::thread::spawn_helper(
+		thread::Builder::new()
+			.name("obash-kill".into())
+			.stack_size(SMALL_STACK),
+		move || escalate(&waiter, scope, kill_at, &journal),
+	);
 	if started.is_err() {
 		let now = Instant::now();
 		tracker.lock().schedule_kill(now);

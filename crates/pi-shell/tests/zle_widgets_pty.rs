@@ -10,15 +10,14 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{io, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// How long output must stay quiet before the screen is read.
-const QUIET: Duration = Duration::from_millis(300);
 
 /// Bindings for the widgets emacs mode leaves unbound.
 const BINDS: &str =
@@ -32,26 +31,53 @@ const BINDS: &str =
 
 /// `zsh -f -i` with `PS1`/`RPS1` and the rc file (the bindings, then
 /// `rc`), sourced with `.` as the first command since `-f` skips
-/// `.zshrc`.
+/// `.zshrc`, in its own home directory: the prompt (`%~`) reads `~`
+/// wherever the tests run.
 fn spawn(real: bool, rc: &str) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
 	} else {
 		Spawn::zsh()
 	};
+	let home = s.home().to_owned();
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
 		.env_remove("EDITOR")
 		.env_remove("VISUAL")
-		.rc_file(".zshrc", format!("{BINDS}{rc}"))
+		.rc_file(".zshrc", format!("{BINDS}{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
+		.zle_sync()
+		.cwd(home)
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.zle_sync(TIMEOUT)
+}
+
+/// One step of a case: keys, and what to wait for once they are typed.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+	/// The line editor has handled the keys ([`keys`]).
+	Keys(&'a str),
+	/// The keys end at zsh's question before a long listing (`zsh: do you
+	/// wish to see all …?`), shown in full. The [`Pty::zle_sync`] handler
+	/// does not run while the question waits for its answer: zsh redraws
+	/// the line then (`raw_getbyte` after a handler), which uses up the
+	/// redraw the listing asked for, so after the listing zsh would wait in
+	/// the cooked mode the listing printed in.
+	Asks(&'a str),
+	/// [`Step::Asks`], then the [`Pty::zle_sync`] handler runs while the
+	/// question waits for its answer, and the line editor redraws the line
+	/// after it (its display was invalidated by the question). Each wait
+	/// is for an event: the question on the screen, the handler's answer,
+	/// then the redraw's bytes (the first output after the answer), then the
+	/// editor waiting for a key again (a second answer: the whole redraw
+	/// was written). Each is bounded by [`TIMEOUT`], as every wait of the
+	/// harness is: an editor that does not redraw fails the test there.
+	AsksThenHandler(&'a str),
 }
 
 /// Run `drive` against both shells after sourcing the rc file; the final
@@ -61,8 +87,12 @@ fn screens(
 	drive: impl Fn(&mut Pty) -> io::Result<()>,
 ) -> io::Result<(String, Option<String>)> {
 	let run = |pty: &mut Pty| -> io::Result<()> {
-		pty.settle(QUIET, TIMEOUT)?;
-		keys(pty, ". ~/.zshrc\r")?;
+		// Do not send input until the line editor, rather than the kernel's
+		// canonical/echoing line discipline, owns the terminal.
+		pty.wait_raw(TIMEOUT)?;
+		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.
 		keys(pty, "\x0c")?;
 		drive(pty)
@@ -76,11 +106,33 @@ fn screens(
 	Ok((ours, Some(real)))
 }
 
-/// Assert both screens are the same after typing each of `lines`.
-fn same(rc: &str, lines: &[&str]) {
+/// Assert both screens are the same after typing each of `lines`, each
+/// read once the line editor has handled the keys and waits for the next
+/// one ([`Step::Keys`]); obash's screen.
+fn same(rc: &str, lines: &[&str]) -> String {
+	let steps: Vec<Step<'_>> = lines.iter().map(|l| Step::Keys(l)).collect();
+	same_steps(rc, &steps)
+}
+
+/// [`same`] for cases with [`Step::Asks`] steps.
+fn same_steps(rc: &str, steps: &[Step<'_>]) -> String {
 	let drive = |pty: &mut Pty| -> io::Result<()> {
-		for l in lines {
-			keys(pty, l)?;
+		for step in steps {
+			match *step {
+				Step::Keys(k) => keys(pty, k)?,
+				Step::Asks(k) => {
+					pty.type_keys(k, KEY)?;
+					// The screen drops trailing blanks: the question ends `?`.
+					pty.wait_screen_contains(" lines)?", TIMEOUT)?;
+				},
+				Step::AsksThenHandler(k) => {
+					pty.type_keys(k, KEY)?;
+					pty.wait_screen_contains(" lines)?", TIMEOUT)?;
+					pty.zle_sync(TIMEOUT)?;
+					pty.read_some(TIMEOUT)?;
+					pty.zle_sync(TIMEOUT)?;
+				},
+			}
 		}
 		Ok(())
 	};
@@ -91,6 +143,7 @@ fn same(rc: &str, lines: &[&str]) {
 	if let Some(real) = real {
 		assert_eq!(ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
 	}
+	ours
 }
 
 #[test]
@@ -239,21 +292,22 @@ fn undo_redo_and_split_undo() {
 
 #[test]
 fn execute_named_cmd() {
-	same("", &[
+	use Step::{Asks, Keys};
+	same_steps("", &[
 		// A unique prefix completes on accept.
-		"echo aa bb\x01\x1bxforward-wo\r,\x1bz,\r",
+		Keys("echo aa bb\x01\x1bxforward-wo\r,\x1bz,\r"),
 		// Space completes as far as it is unique; ^D lists the matches.
-		"\x1bxkill-\x04",
-		"\x07",
-		"\x1bxup \x07",
-		"\x1bxkill-w\x17\x08\x08",
-		"\x07echo end\r",
+		Keys("\x1bxkill-\x04"),
+		Keys("\x07"),
+		Keys("\x1bxup \x07"),
+		Keys("\x1bxkill-w\x17\x08\x08"),
+		Keys("\x07echo end\r"),
 		// Every name: too many for the screen, so zsh asks first.
-		"\x1bx\x04",
-		"n",
-		"\x04",
-		"y",
-		"\x07echo after\r",
+		Asks("\x1bx\x04"),
+		Keys("n"),
+		Asks("\x04"),
+		Keys("y"),
+		Keys("\x07echo after\r"),
 	]);
 }
 
@@ -322,11 +376,27 @@ fn zle_bracketed_paste_parameter() {
 fn bracketed_paste_magic() {
 	// `bracketed-paste-magic` replays the paste through `zle -U`,
 	// `.read-command` and `.self-insert`, with `split-undo` and `.undo`.
-	// Sourced: the file only defines the functions.
-	let rc = "source /usr/share/zsh/5.9/functions/bracketed-paste-magic\nzle -N bracketed-paste \
-	          bracketed-paste-magic\nzstyle ':bracketed-paste-magic' active-widgets '.self-*' \
-	          'backward-kill-word'\n";
-	same(rc, BPM_KEYS);
+	// Sourced: the file only defines the functions. The file is the real
+	// zsh's own, wherever this machine installed it.
+	let Some(file) = zsh_oracle::function_file("bracketed-paste-magic") else {
+		return;
+	};
+	let rc = format!(
+		"source '{}'\nzle -N bracketed-paste bracketed-paste-magic\nzstyle ':bracketed-paste-magic' \
+		 active-widgets '.self-*' 'backward-kill-word'\n",
+		file.display()
+	);
+	// The rc file's own messages are cleared from the screen: the first
+	// line asks whether the function was defined, on the compared screen
+	// (the pastes end inside a quote, so a line after them would not run).
+	let mut keys = vec!["whence -w bracketed-paste-magic\r"];
+	keys.extend_from_slice(BPM_KEYS);
+	let ours = same(&rc, &keys);
+	assert!(
+		ours.contains("bracketed-paste-magic: function"),
+		"{} did not define bracketed-paste-magic:\n{ours}",
+		file.display()
+	);
 }
 
 /// Pastes with an active widget inside, then one undone.
@@ -378,6 +448,22 @@ fn pound_insert_and_unmeta() {
 
 #[test]
 fn read_command_from_a_widget() {
+	// The second `read-command` reads `execute-named-cmd`; an empty name
+	// lists every widget, so zsh asks first.
 	let rc = "rcw() { zle read-command; BUFFER+=\"<$REPLY>\" }\nzle -N rcw\nbindkey '^Xq' rcw\n";
-	same(rc, &["echo \x18q\x01\x18q\x1bx\r"]);
+	same_steps(rc, &[Step::Asks("echo \x18q\x01\x18q\x1bx\r")]);
+}
+
+/// A `zle -F` handler that runs while the question before a long listing
+/// waits for its answer (here the harness's own, [`Pty::zle_sync`]) makes
+/// the line editor redraw the line after it, as zsh 5.9 does
+/// (`raw_getbyte`: `trashzle` left `resetneeded`). Both shells write the
+/// same bytes for it; the test waits for them ([`Step::AsksThenHandler`]).
+/// (After the listing zsh then waits in cooked mode where obash waits in
+/// raw mode; no test compares the terminal modes.)
+#[test]
+fn a_handler_while_the_listing_question_waits_redraws_as_zsh() {
+	let rc = "rcw() { zle read-command; BUFFER+=\"<$REPLY>\" }\nzle -N rcw\nbindkey '^Xq' rcw\n";
+	same_steps(rc, &[Step::AsksThenHandler("echo \x18q\x01\x18q\x1bx\r")]);
+	same_steps("", &[Step::AsksThenHandler("echo x\x1bx\x04")]);
 }

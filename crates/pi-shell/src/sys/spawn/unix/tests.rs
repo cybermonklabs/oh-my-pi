@@ -826,6 +826,32 @@ fn dropped_detached_external_runs_on_and_is_no_leftover() {
 	until("reaped after its exit", || !proc::exists(pid));
 }
 
+/// A released external ([`ExtProc::release`]: the shell's end after bash's
+/// EXIT trap or zsh's `HUP` handler) dropped while it runs goes on, as a
+/// detached one does, but stays a leftover: the tool's sweep of what the
+/// shell left still ends it. The control: one not released is ended at its
+/// drop.
+#[test]
+fn a_released_external_runs_on_and_the_leftover_sweep_still_ends_it() {
+	let env = EnvView::default();
+	let s = spawner(Sessions::Detach, Duration::from_millis(100));
+	let a = argv(&["/bin/sleep", "30"]);
+	let mut released = s.spawn(spec(&a, &env, NEW)).unwrap();
+	let pid = released.pid() as i32;
+	released.release();
+	drop(released);
+	thread::sleep(Duration::from_millis(400));
+	assert!(live(pid), "released, not killed after the grace");
+	let left = s.leftovers().unwrap();
+	assert_eq!(left.iter().map(|l| l.pid as i32).collect::<Vec<_>>(), [pid], "{left:?}");
+	assert_eq!(s.kill_leftovers().unwrap(), left);
+	until("swept", || proc::info(pid).is_none());
+	let kept = s.spawn(spec(&a, &env, NEW)).unwrap();
+	let pid = kept.pid() as i32;
+	drop(kept);
+	until("ended at its drop", || proc::info(pid).is_none());
+}
+
 /// The shell tears down while a detached external runs: its `ExtProc` is
 /// dropped, but what it writes after that still reaches the engine object,
 /// as a pipe would carry it, and its end of file completes the work. With no

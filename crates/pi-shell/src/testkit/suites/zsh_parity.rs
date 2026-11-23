@@ -814,6 +814,7 @@ fn expandmb_sorting_follows_lc_collate() {
 	// The expected order is en_US.UTF-8's; hosts without that locale sort
 	// bytewise.
 	if crate::sys::langinfo::Collator::new(b"en_US.UTF-8").is_none() {
+		eprintln!("skipped: no en_US.UTF-8 collator on this host");
 		return;
 	}
 	let (out, err, st) = zsh(

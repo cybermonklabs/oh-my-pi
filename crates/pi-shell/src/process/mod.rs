@@ -2,11 +2,12 @@
 //!
 //! [`main`] takes a shell's command line (`zsh [zsh options] …`,
 //! `bash [GNU long option] [option] …`, `sh …`; `argv[0]`'s base name picks
-//! the dialect) to its exit status, the way the real shell does: bash's or
-//! zsh's option parsing and messages, `--help`/`--version`, the startup
-//! files, a `-c` command, a script operand or a script read from stdin a
-//! line at a time, run over this process's own terminal, signals and
-//! descriptors by [`NativeHost`].
+//! the dialect) to how it ends ([`Exit`]), the way the real shell does:
+//! bash's or zsh's option parsing and messages, `--help`/`--version`, the
+//! startup files, a `-c` command, a script operand or a script read from
+//! stdin a line at a time, run over this process's own terminal, signals and
+//! descriptors by [`NativeHost`]. The caller ends its process so
+//! ([`Exit::end`]).
 //!
 //! Two callers: the `obash` binary (a standalone process; it adds its test
 //! modes on top of the pieces here) and `omp zsh|bash|sh`, which runs the
@@ -34,6 +35,8 @@ use bstr::BString;
 
 pub use self::host::{NativeHost, ignored_on_entry, inherited_fds};
 use self::signals::RuntimeSignals;
+#[cfg(unix)]
+use self::signals::{Death, die_of};
 use crate::{
 	bash::{
 		Budget, CallOutcome, Cx, Dialect, Engine, EngineConfig, EventMask, MemStore, ModeId, Origin,
@@ -50,13 +53,17 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessOptions {
 	/// The shell runs inside another runtime's process (Bun, for
-	/// `omp zsh`), which keeps running or exits after [`main`] returns:
+	/// `omp zsh`), which ends as the shell ends ([`Exit::end`]) or keeps
+	/// running after [`main`] returns:
 	///
 	/// - signals: of HUP, INT, QUIT, TERM, PIPE, ALRM, TSTP, TTIN, TTOU, CHLD,
 	///   WINCH and CONT, those the runtime caught with a handler (and `SIGPIPE`,
 	///   which it ignores) are reset to `SIG_DFL` for the run and restored after
-	///   it; no other disposition is touched. `SIGPIPE` is therefore not
-	///   reported as ignored on entry: externals start with the default action;
+	///   it. The shell catches no other signal by its own rules (a bash EXIT
+	///   trap's catches are of these signals alone), so the runtime's fault
+	///   handlers stay; only a trap the script sets changes another disposition.
+	///   `SIGPIPE` is therefore not reported as ignored on entry: externals
+	///   start with the default action;
 	/// - descriptors: the inherited ones above 2 (`3>file`) are duplicated,
 	///   never taken over, and the runtime's own are left alone;
 	/// - exits of externals are observed by a waiter thread each, beside the
@@ -473,22 +480,63 @@ fn zsh_version_text() -> Vec<u8> {
 	format!("zsh 5.9 ({host})\n").into_bytes()
 }
 
+/// How the process shell ended ([`main`]): its exit status, or (Unix) the
+/// signal it died of; elsewhere a process dies of no signal, and the status
+/// says how the shell ended.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "the process ends as the shell ended: `Exit::end`"]
+pub struct Exit {
+	/// The exit status (0–255).
+	status: i32,
+	/// The signal the shell died of ([`Shell::killed_by`],
+	/// [`Shell::exec_signal`]).
+	#[cfg(unix)]
+	death:  Option<Death>,
+}
+
+impl Exit {
+	/// An end by exit status `status` alone.
+	const fn with_status(status: i32) -> Self {
+		Self {
+			status,
+			#[cfg(unix)]
+			death: None,
+		}
+	}
+
+	/// End the process as the shell ended: a shell that died of a signal
+	/// (`kill -TERM $$` without a trap, an `INT` it acts on, an `exec`ed
+	/// program killed by one) does not return, the process dies of the same
+	/// signal, as zsh's and bash's do, so that its parent sees
+	/// `WIFSIGNALED`; else the status the process should exit with. Called
+	/// once [`main`] has returned: an embedded shell's runtime has its
+	/// dispositions back, and the signal's default action ends it.
+	#[must_use]
+	pub fn end(self) -> i32 {
+		#[cfg(unix)]
+		if let Some(death) = self.death {
+			die_of(death);
+		}
+		self.status
+	}
+}
+
 /// The process shell: the command line `argv` (`argv[0]` names the shell)
-/// to the exit status (0–255) the process should exit with. Standard
+/// to how it ended ([`Exit`]: the caller ends its process so). Standard
 /// output is flushed before it returns.
-pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOptions) -> i32 {
+pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOptions) -> Exit {
 	let argv: Vec<BString> = argv.into_iter().map(Into::into).collect();
 	let mut launch = match start(&argv, false) {
 		Start::Run(launch) => launch,
-		Start::Exit(status) => return status,
+		Start::Exit(status) => return Exit::with_status(status),
 	};
 	if let Some(status) = pretty_print_mode(&mut launch) {
-		return status;
+		return Exit::with_status(status);
 	}
 	let Launch { args, env, input } = *launch;
-	let status = run(&args, env, input, opts);
+	let exit = run(&args, env, input, opts);
 	let _ = io::stdout().flush();
-	status
+	exit
 }
 
 /// bash's `--pretty-print` instead of running: the status when `launch`
@@ -512,8 +560,9 @@ pub fn pretty_print_mode(launch: &mut Launch) -> Option<i32> {
 }
 
 /// Run the shell `args` describes on `input`, with the process environment
-/// `env`; the exit status (0–255).
-fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: ProcessOptions) -> i32 {
+/// `env`: how it ended, its exit status (0–255) and the signal it died of
+/// ([`Shell::killed_by`], [`Shell::exec_signal`]).
+fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: ProcessOptions) -> Exit {
 	// Declared first, dropped last: the runtime gets its dispositions back
 	// after the host has put its trap handlers back.
 	let _runtime = if opts.embedded {
@@ -521,7 +570,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 			Ok(saved) => Some(saved),
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return 2;
+				return Exit::with_status(2);
 			},
 		}
 	} else {
@@ -545,7 +594,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 			Ok(shell) => shell,
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return 2;
+				return Exit::with_status(2);
 			},
 		};
 	let root = Vpid(cfg.vpid_base);
@@ -554,6 +603,15 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 	shell.set_event_mask(EventMask::NONE);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
+	#[cfg(unix)]
+	let death = shell
+		.killed_by()
+		.map(|signal| Death { signal, passed_on: false })
+		.or_else(|| {
+			shell
+				.exec_signal(run)
+				.map(|signal| Death { signal, passed_on: true })
+		});
 	// zsh `zexit`: hang up running jobs, give the terminal back.
 	shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
 	// Standalone, the process exits next: let the OS reclaim the engine's
@@ -569,7 +627,11 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 		mem::forget(store);
 		mem::forget(engine);
 	}
-	status & 0xff
+	Exit {
+		status: status & 0xff,
+		#[cfg(unix)]
+		death,
+	}
 }
 
 /// The new shell's initial state from the command line `args`.
@@ -587,10 +649,13 @@ pub fn shell_init(
 ) -> ShellInit {
 	let interactive = args.is_interactive(io::stdin().is_terminal() && io::stderr().is_terminal());
 	let mut options = args.startup_options(&env, interactive);
+	// The startup files' `~` expands as any other: `HOME`, else the home the
+	// password database names (bash `sh_get_home_dir`, zsh's default `HOME`;
+	// `/` for a uid without an entry, as both give).
 	let home = env
 		.iter()
 		.find(|(n, _)| n.as_slice() == b"HOME")
-		.map_or_else(BString::default, |(_, v)| v.clone());
+		.map_or_else(startup_home, |(_, v)| v.clone());
 	let report = |what: &[u8], msg: &[u8]| {
 		let mut line = args.shell_name.to_vec();
 		if !what.is_empty() {
@@ -659,6 +724,7 @@ pub fn shell_init(
 	let zsh_fpath = (args.mode.dialect() == Dialect::Zsh)
 		.then(|| system_fpath(&env))
 		.flatten();
+	let login_home = args.login_home(&env);
 	ShellInit {
 		mode: args.mode,
 		argv0,
@@ -672,6 +738,19 @@ pub fn shell_init(
 		zsh_params: zsh_params(args),
 		zsh_fpath,
 		profile: Profile::User,
+		login_home,
+	}
+}
+
+/// The home the startup files are found in where the environment has no
+/// `HOME`: the password database's ([`crate::sys::user::read_user`]), or `/`
+/// for a uid without an entry.
+fn startup_home() -> BString {
+	let home = crate::sys::user::read_user().home;
+	if home.is_empty() {
+		BString::from("/")
+	} else {
+		home
 	}
 }
 

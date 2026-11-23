@@ -323,17 +323,19 @@ impl<T: Send + 'static> Threaded<T> {
 	fn start(name: &str, f: impl FnOnce() -> io::Result<T> + Send + 'static) -> FsPoll<T> {
 		let slot = Arc::new(Mutex::new(Slot { result: None, waker: None }));
 		let theirs = Arc::clone(&slot);
-		let spawned = thread::Builder::new()
-			.name(name.into())
-			.stack_size(256 << 10)
-			.spawn(move || {
+		let spawned = crate::sys::thread::spawn_helper(
+			thread::Builder::new()
+				.name(name.into())
+				.stack_size(256 << 10),
+			move || {
 				let r = f();
 				let mut s = theirs.lock();
 				s.result = Some(r);
 				if let Some(w) = s.waker.take() {
 					w.wake();
 				}
-			});
+			},
+		);
 		match spawned {
 			Ok(_) => FsPoll::Pending(Box::new(Self(slot))),
 			Err(e) => FsPoll::Ready(Err(e)),

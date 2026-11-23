@@ -1416,6 +1416,161 @@ async fn exit_trap_fires_once_per_session_run() {
 	assert_eq!(run(&mut shell, "echo h").await, (0, "h\n".into()));
 }
 
+/// A command the session's shell runs in place of itself (an external, the
+/// last command of a run) leaves the shell's own signal rules once it ends,
+/// and so does one whose run was cancelled while it ran (the agent's shell
+/// cancels a run at each timeout): the next run ignores `kill -QUIT $$` and
+/// runs its EXIT trap on `kill -TERM $$`, as with no command before or a
+/// builtin, and as the real bash runs the command alone ([`real_bash`]:
+/// `QUIT` ignored; with an EXIT trap, `TERM` runs it, then ends the shell,
+/// 143). The cancelled command makes a file once it runs, and the run is
+/// cancelled once the file exists.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_run_in_place_leaves_the_shells_signal_rules() {
+	async fn run(shell: &mut ShellSessionCore, command: &str) -> (i32, String) {
+		let output = tempfile::tempfile().expect("capture file");
+		let result = shell
+			.run_test(command, &TestStdio::null().stdout(&output))
+			.await
+			.expect("run");
+		(exit_code(&result), read_capture(&output))
+	}
+	/// Run `command`, which makes `ready` once it runs, and cancel the run
+	/// once `ready` exists: its status.
+	async fn cancelled(shell: &mut ShellSessionCore, command: &str, ready: &std::path::Path) -> i32 {
+		let token = CancellationToken::new();
+		let canceller = tokio::spawn({
+			let (token, ready) = (token.clone(), ready.to_owned());
+			async move {
+				while !ready.exists() {
+					time::sleep(Duration::from_millis(5)).await;
+				}
+				token.cancel();
+			}
+		});
+		let result = shell
+			.run_test_with(command, &TestStdio::null(), token)
+			.await
+			.expect("run");
+		canceller.await.expect("the canceller");
+		assert!(result.cancelled, "{command}: the run was cancelled");
+		exit_code(&result)
+	}
+
+	let cases: [(&str, (i32, &str)); 2] = [
+		("kill -QUIT $$; echo alive", (0, "alive\n")),
+		("trap 'echo x' EXIT; kill -TERM $$; echo after", (143, "x\n")),
+	];
+	for (command, expected) in cases {
+		if let Some(theirs) = real_bash(command) {
+			assert_eq!((theirs.0, theirs.1.as_str()), expected, "the real bash: {command}");
+		}
+	}
+	let dir = tempfile::tempdir().expect("a directory for the ready file");
+	let ready = dir.path().join("ready");
+	let runs_on = format!(
+		"'{}' -c ': > \"$1\"; exec \"$2\" 30' sh '{}' '{}'",
+		test_executable("sh").display(),
+		ready.display(),
+		test_executable("sleep").display()
+	);
+	let external = test_executable("true").display().to_string();
+	let firsts = [None, Some("echo builtin"), Some(external.as_str()), Some(runs_on.as_str())];
+	for first in firsts {
+		for (command, (status, stdout)) in cases {
+			let mut shell = default_session().await;
+			match first {
+				Some(first) if first == runs_on => {
+					let _ = std::fs::remove_file(&ready);
+					assert_eq!(cancelled(&mut shell, first, &ready).await, 143, "{first}");
+				},
+				Some(first) => assert_eq!(run(&mut shell, first).await.0, 0, "{first}"),
+				None => {},
+			}
+			assert_eq!(
+				run(&mut shell, command).await,
+				(status, stdout.into()),
+				"after {first:?}: {command}"
+			);
+		}
+	}
+}
+
+/// `command` as the real bash 5.2 or later runs it alone (`bash -c`, with
+/// `$PI_TEST_REAL_BASH` or `/bin/bash`): its status, 128 + n for a death by
+/// signal n, and its standard output. `None` where there is no such bash,
+/// which it says (`UNCOMPARED:`).
+#[cfg(unix)]
+fn real_bash(command: &str) -> Option<(i32, String)> {
+	let bash = std::env::var_os("PI_TEST_REAL_BASH")
+		.filter(|path| !path.is_empty())
+		.unwrap_or_else(|| "/bin/bash".into());
+	let version = std::process::Command::new(&bash).arg("--version").output();
+	let first = version.as_ref().map_or_else(
+		|err| err.to_string(),
+		|out| {
+			String::from_utf8_lossy(&out.stdout)
+				.lines()
+				.next()
+				.unwrap_or_default()
+				.to_owned()
+		},
+	);
+	let found = first.split("version ").nth(1).and_then(|v| {
+		let mut numbers = v.split(|c: char| !c.is_ascii_digit());
+		Some((numbers.next()?.parse::<u32>().ok()?, numbers.next()?.parse::<u32>().ok()?))
+	});
+	if found.is_none_or(|v| v < (5, 2)) {
+		let test = std::thread::current().name().unwrap_or_default().to_owned();
+		eprintln!("UNCOMPARED: {test}: {} is not bash 5.2 or later ({first})", bash.display());
+		return None;
+	}
+	let out = std::process::Command::new(&bash)
+		.args(["-c", command])
+		.stdin(std::process::Stdio::null())
+		.output()
+		.expect("run the real bash");
+	let status = out
+		.status
+		.code()
+		.unwrap_or_else(|| 128 + out.status.signal().unwrap_or_default());
+	Some((status, String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// A session's shell runs in its host's process (the agent's bash tool in
+/// omp), so a signal it dies of ends the run, never the host: `kill -TERM
+/// $$`, `kill -INT $$` and an `INT` death after the EXIT trap each end the
+/// run with 128 + the signal's number, as the real bash's process would
+/// end, and the same session runs the next command. Only the process
+/// shell's entry (`process::Exit::end`, `omp bash`) ends its process by the
+/// signal. This test's own process going on is the host's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_the_session_shell_dies_of_ends_the_run_not_the_host() {
+	async fn run(shell: &mut ShellSessionCore, command: &str) -> (i32, String) {
+		let output = tempfile::tempfile().expect("capture file");
+		let result = shell
+			.run_test(command, &TestStdio::null().stdout(&output))
+			.await
+			.expect("run");
+		(exit_code(&result), read_capture(&output))
+	}
+
+	let mut shell = default_session().await;
+	for (command, ended) in [
+		("kill -TERM $$; echo after", (143, "")),
+		("kill -INT $$; echo after", (130, "")),
+		("trap 'echo x' EXIT; kill -INT $$; echo after", (130, "x\n")),
+	] {
+		assert_eq!(run(&mut shell, command).await, (ended.0, ended.1.into()), "{command}");
+		if let Some(theirs) = real_bash(command) {
+			assert_eq!((theirs.0, theirs.1.as_str()), ended, "the real bash: {command}");
+		}
+		assert_eq!(run(&mut shell, "echo alive").await, (0, "alive\n".into()), "after {command}");
+	}
+}
+
 /// `Shell::pids` reports the in-flight run's live external children without
 /// waiting on the session lock that the running command holds, and goes
 /// empty once the run returns — including through cancellation.

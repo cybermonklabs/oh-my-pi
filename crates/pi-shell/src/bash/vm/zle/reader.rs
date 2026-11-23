@@ -986,15 +986,7 @@ impl Reader {
 	fn drive_zle(&mut self, k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Result<Line, Pause> {
 		if std::mem::take(&mut self.winch) {
 			adjust_winsize(k, cx, vp, true);
-			if let Some(z) = vp.zle.as_deref_mut()
-				&& let Some(ed) = z.ed.as_deref_mut()
-			{
-				ed.winch = false;
-				z.display.winchanged = true;
-				z.display.resetneeded = true;
-			}
-			// zsh `adjustwinsize`: a line being edited is drawn again at once.
-			super::display::zle_refresh(k, cx, vp, None, false);
+			super::display::resized(k, cx, vp);
 		}
 		let owner = vp.frames.len();
 		let Some(base) = super::editor(vp).and_then(|ed| exec::resume_base(ed, owner)) else {

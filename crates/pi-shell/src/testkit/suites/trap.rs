@@ -239,3 +239,117 @@ fn bash_command_kept_inside_trap_and_resumed_after() {
 	assert_eq!(out.stdout, b"usr1 kill -USR1 $$\nafter echo \"after $BASH_COMMAND\"\n");
 	assert_eq!(out.status, 0);
 }
+
+/// A signal whose disposition the host cannot change (as for one ignored
+/// on entry) has its trap recorded as ignored, whatever sets it: bash's
+/// `trap`, zsh's `trap`, or a zsh `TRAPNAL` function, which stays defined.
+#[test]
+fn a_signal_the_host_keeps_ignored_has_its_trap_recorded_as_ignored() {
+	use crate::{
+		bash::{ModeId, Script, ShellInit, SigSet, Signal},
+		testkit::Rig,
+	};
+	let run = |zsh: bool, src: &str| {
+		let mut host = FakeHost::new();
+		host.fixed = SigSet::EMPTY.with(Signal::Usr1);
+		let init = if zsh {
+			ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..ShellInit::default() }
+		} else {
+			ShellInit::default()
+		};
+		let mut rig = Rig::new(host, init);
+		rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+		String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned()
+	};
+	assert_eq!(
+		run(false, "trap 'echo caught' USR1; kill -USR1 $$; trap -p USR1; echo done"),
+		"trap -- '' SIGUSR1\ndone\n"
+	);
+	assert_eq!(
+		run(true, "trap 'print caught' USR1; kill -USR1 $$; trap; print done"),
+		"trap -- '' USR1\ndone\n"
+	);
+	assert_eq!(
+		run(true, "TRAPUSR1() { print caught }; kill -USR1 $$; whence -w TRAPUSR1; print done"),
+		"TRAPUSR1: function\ndone\n"
+	);
+}
+
+/// A restore in a new process starts with default dispositions, so the root
+/// asks the host again for every signal's: a trap's, a zsh `TRAPNAL`
+/// function's, and those of the shell's own rules: zsh's `HUP` catch,
+/// bash's EXIT-trap catches, `QUIT` ignored; and for none the platform
+/// lacks (number 0). A disposition is compared as the host reads it: the
+/// default, ignored (an empty action) or caught (any other).
+#[test]
+fn a_restore_asks_the_host_again_for_every_signals_disposition() {
+	use crate::{
+		bash::{
+			Budget, Cx, Engine, EngineConfig, MemStore, ModeId, RestoreOpts, Script, Shell, ShellInit,
+			Signal,
+		},
+		testkit::run::{Stop, advance},
+	};
+	/// A disposition as the host reads it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum Class {
+		Ignored,
+		Caught,
+	}
+	let engine = Engine::new(EngineConfig::default());
+	let platform = engine.config().platform;
+	let after_restore = |init: ShellInit, src: &str| {
+		let mut host = FakeHost::new();
+		let mut store = MemStore::new();
+		let mut shell =
+			Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, init).unwrap();
+		// Externalized while it runs: the traps are set, the EXIT trap not run.
+		let id = shell.submit(Script::command(format!("{src}; while :; do :; done").into_bytes()));
+		let budget = Budget { max_ops: 200, max_ns: u64::MAX };
+		assert_eq!(advance(&mut shell, &mut host, &mut store, id, budget), Stop::Yield);
+		shell
+			.externalize(&mut Cx { host: &mut host, store: &mut store })
+			.unwrap();
+		drop(shell);
+		let mut fresh = FakeHost::new();
+		let _restored = Shell::restore(
+			&engine,
+			&mut Cx { host: &mut fresh, store: &mut store },
+			RestoreOpts::default(),
+		)
+		.unwrap();
+		let missing: Vec<Signal> = fresh
+			.asked
+			.iter()
+			.map(|&(sig, _)| sig)
+			.filter(|sig| sig.number(platform) == 0)
+			.collect();
+		assert!(missing.is_empty(), "asked for signals the platform lacks: {missing:?}");
+		fresh
+			.asked
+			.into_iter()
+			.filter_map(|(sig, action)| {
+				let class = if action?.is_empty() {
+					Class::Ignored
+				} else {
+					Class::Caught
+				};
+				Some((sig, class))
+			})
+			.collect::<Vec<_>>()
+	};
+	let has = |asked: &[(Signal, Class)], sig, class| {
+		assert!(asked.contains(&(sig, class)), "{sig:?} not asked for as {class:?}: {asked:?}");
+	};
+	let zsh = ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..ShellInit::default() };
+	let asked = after_restore(zsh, "TRAPUSR1() print u; trap 'print t' TERM");
+	for sig in [Signal::Hup, Signal::Usr1, Signal::Term] {
+		has(&asked, sig, Class::Caught);
+	}
+	has(&asked, Signal::Quit, Class::Ignored);
+	let asked = after_restore(ShellInit::default(), "trap 'echo x' EXIT; trap 'echo t' USR2");
+	has(&asked, Signal::Quit, Class::Ignored);
+	for sig in [Signal::Hup, Signal::Term, Signal::Usr1, Signal::Segv, Signal::Usr2] {
+		has(&asked, sig, Class::Caught);
+	}
+}

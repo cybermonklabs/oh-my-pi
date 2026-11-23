@@ -216,6 +216,12 @@ pub enum Table {
 	/// [`Record::Alias`]); regular aliases are [`Table::Alias`] in every
 	/// dialect.
 	ZshAlias,
+	/// What a root job holds outside its [`Record::Job`]'s layout
+	/// ([`Key::JobFacts`], [`Record::JobFacts`]).
+	JobFacts,
+	/// The statuses the root shell's `wait` collected, kept after their jobs
+	/// left the table (bash's bgp list; [`Key::BgPid`]).
+	BgPid,
 }
 
 crate::bash::packed_names::packed_names!(Table, Display);
@@ -263,6 +269,13 @@ pub enum Key<'a> {
 		/// Alias name or suffix.
 		name:   &'a BStr,
 	},
+	/// The [`JobFact`]s of root job [`Key::Job`] `id`, when it has any.
+	JobFacts(JobId),
+	/// A status the root shell's `wait` collected for its child vproc,
+	/// `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed it;
+	/// `SEQ` its place in the kept order, oldest first): `wait PID` finds it
+	/// once the job left the table (bash `bgp_search`).
+	BgPid(Vpid),
 }
 
 impl Key<'_> {
@@ -283,13 +296,15 @@ impl Key<'_> {
 			Self::Local { .. } => Table::Local,
 			Self::ZshOpt(_) => Table::ZshOpt,
 			Self::ZshAlias { .. } => Table::ZshAlias,
+			Self::JobFacts(_) => Table::JobFacts,
+			Self::BgPid(_) => Table::BgPid,
 		}
 	}
 
 	/// Whether a fork copies this record into the child's
 	/// [`crate::bash::Image`] (see [`MiscKey::forked`]). The process table,
-	/// the root's job table (a field of each vproc) and the root's scopes
-	/// are not.
+	/// the root's job table (a field of each vproc) with its jobs' facts and
+	/// the statuses its `wait` kept, and the root's scopes are not.
 	pub const fn forked(&self) -> bool {
 		match self {
 			Self::Var(_)
@@ -302,7 +317,12 @@ impl Key<'_> {
 			| Self::ZshOpt(_)
 			| Self::ZshAlias { .. } => true,
 			Self::Misc(m) => m.forked(),
-			Self::Job(_) | Self::Proc(_) | Self::Scope(_) | Self::Local { .. } => false,
+			Self::Job(_)
+			| Self::JobFacts(_)
+			| Self::BgPid(_)
+			| Self::Proc(_)
+			| Self::Scope(_)
+			| Self::Local { .. } => false,
 		}
 	}
 
@@ -323,6 +343,8 @@ impl Key<'_> {
 			Self::Local { depth, name } => KeyBuf::Local { depth, name: name.into() },
 			Self::ZshOpt(o) => KeyBuf::ZshOpt(o),
 			Self::ZshAlias { suffix, name } => KeyBuf::ZshAlias { suffix, name: name.into() },
+			Self::JobFacts(j) => KeyBuf::JobFacts(j),
+			Self::BgPid(p) => KeyBuf::BgPid(p),
 		}
 	}
 }
@@ -378,6 +400,10 @@ pub enum KeyBuf {
 		/// Alias name or suffix.
 		name:   BString,
 	},
+	/// See [`Key::JobFacts`].
+	JobFacts(JobId),
+	/// See [`Key::BgPid`].
+	BgPid(Vpid),
 }
 
 impl KeyBuf {
@@ -400,6 +426,8 @@ impl KeyBuf {
 			Self::ZshAlias { suffix, name } => {
 				Key::ZshAlias { suffix: *suffix, name: BStr::new(name) }
 			},
+			Self::JobFacts(j) => Key::JobFacts(*j),
+			Self::BgPid(p) => Key::BgPid(*p),
 		}
 	}
 }
@@ -480,6 +508,9 @@ pub enum Record {
 	/// A list-valued [`MiscKey`] value (positional parameters, `enable`
 	/// lists, history, …).
 	Words(Vec<BString>),
+	/// A root job's [`JobFact`]s ([`Key::JobFacts`]): a record of their
+	/// own, so that [`Record::Job`] keeps its layout.
+	JobFacts(Vec<JobFact>),
 }
 
 /// zsh sticky emulation (zsh `struct emulation_options`): the emulation
@@ -605,6 +636,46 @@ pub struct Job {
 	/// and `disown` accept it). `None` for a compound job, a builtin, a
 	/// function, a failed spawn, and while the job has not decided yet.
 	pub os_pid:    Option<u32>,
+	/// The signal that ended the job (bash `WIFSIGNALED` of its status,
+	/// `raw_job_exit_status`), set with [`JobState::Done`]: `None` for one
+	/// that exited, with 137 too. A job of one process takes that process's;
+	/// one of [`Self::procs`] that of the process whose end is its status
+	/// ([`JobProcs::status_process`]). Not part of this record's layout,
+	/// which a store written before it was kept must still decode: the store
+	/// keeps it in the job's [`Record::JobFacts`] ([`Job::facts`]), the frames
+	/// image next to a subshell's job table.
+	#[serde(skip)]
+	pub signal:    Option<Signal>,
+	/// The job's processes (bash's job's `PROCESS` list), when it has
+	/// several: the stages of the pipeline that is the job's whole command
+	/// (`a | b &`), which bash forks as it starts the job. Recorded as the
+	/// job starts, each naming the job's vproc until that vproc starts the
+	/// stages; a process it never started ends with it. `None` for a job of
+	/// one process, which is the job's own vproc ([`Self::pid`],
+	/// [`Self::state`], [`Self::signal`]), and for a pipeline whose last
+	/// stage the job's vproc runs itself (`lastpipe`). Boxed: most jobs have
+	/// none. A fact ([`Job::facts`]), as [`Self::signal`] is.
+	#[serde(skip)]
+	pub procs:     Option<Box<JobProcs>>,
+	/// This shell's `kill` ended the job with no OS status for obash to reap,
+	/// and nothing showed its end since: bash's process of it is still
+	/// unreaped, so bash's next plain `wait` waits for it, reaps it and
+	/// reports it (`wait_for_background_pids`, `jobs.c:2809-2836`). obash
+	/// takes a job's end in when the host reaps its program's OS status: the
+	/// job runs until then, as bash's does until `waitchld` reaps it. But
+	/// `kill` ends a job, or a process of it, that is no program obash
+	/// spawned ([`Self::os_pid`], [`JobProc::os_pid`] unset: `kill %1` right
+	/// after `&`, or a subshell or group, which is no OS process here) at
+	/// once, in obash's kernel. Set by that `kill`; cleared where bash would
+	/// have reaped it: as the shell waits for a foreground program or child
+	/// (bash's `waitchld` takes in every child that ended), once a `kill`
+	/// finds the job gone (bash's `kill -0` answers for a zombie until bash
+	/// reaps it) or `jobs` finds it done (bash shows a job done only once it
+	/// reaped it). Read by `wait` (`builtins::flow`'s `wait_all`).
+	/// Kept in memory only: a job restored from the store or the frames image
+	/// counts as reaped.
+	#[serde(skip)]
+	pub unreaped:  bool,
 }
 
 impl Job {
@@ -620,6 +691,226 @@ impl Job {
 	/// `pid` names this job: its virtual pid or its program's OS pid.
 	pub const fn named_by(&self, pid: u32) -> bool {
 		self.vpid.0 == pid || matches!(self.os_pid, Some(os) if os == pid)
+	}
+
+	/// What the job holds outside its record's layout ([`JobFact`]), in
+	/// order; empty for most jobs.
+	pub fn facts(&self) -> Vec<JobFact> {
+		let mut facts = Vec::new();
+		if let Some(sig) = self.signal {
+			facts.push(JobFact::Signal(sig));
+		}
+		if let Some(procs) = &self.procs {
+			facts.push(JobFact::Procs((**procs).clone()));
+		}
+		facts
+	}
+
+	/// Whether the job has any facts ([`Job::facts`]). A job's facts never
+	/// go: a job that had some has some.
+	pub const fn has_facts(&self) -> bool {
+		self.signal.is_some() || self.procs.is_some()
+	}
+
+	/// Whether `have` are this job's facts ([`Job::facts`]), compared in
+	/// place.
+	pub fn same_facts(&self, have: &[JobFact]) -> bool {
+		let mut have = have.iter();
+		self
+			.signal
+			.is_none_or(|sig| have.next() == Some(&JobFact::Signal(sig)))
+			&& self
+				.procs
+				.as_deref()
+				.is_none_or(|procs| matches!(have.next(), Some(JobFact::Procs(p)) if p == procs))
+			&& have.next().is_none()
+	}
+
+	/// Take `facts` ([`Job::facts`]) back; what they do not name is unset.
+	pub fn set_facts(&mut self, facts: &[JobFact]) {
+		self.signal = None;
+		self.procs = None;
+		for fact in facts {
+			match fact {
+				JobFact::Signal(sig) => self.signal = Some(*sig),
+				JobFact::Procs(procs) => self.procs = Some(Box::new(procs.clone())),
+			}
+		}
+	}
+
+	/// The job as its [`Record::Job`] holds it: without its facts.
+	pub fn record(&self) -> Self {
+		Self {
+			id:        self.id,
+			number:    self.number,
+			vpid:      self.vpid,
+			text:      self.text.clone(),
+			state:     self.state,
+			control:   self.control,
+			notified:  self.notified,
+			nohup:     self.nohup,
+			inherited: self.inherited,
+			wd:        self.wd.clone(),
+			os_pid:    self.os_pid,
+			signal:    None,
+			procs:     None,
+			unreaped:  false,
+		}
+	}
+
+	/// Whether `have`, a [`Record::Job`], is this job's record
+	/// ([`Job::record`]), compared in place.
+	pub fn same_record(&self, have: &Self) -> bool {
+		let Self {
+			id,
+			number,
+			vpid,
+			text,
+			state,
+			control,
+			notified,
+			nohup,
+			inherited,
+			wd,
+			os_pid,
+			signal: _,
+			procs: _,
+			unreaped: _,
+		} = self;
+		have.signal.is_none()
+			&& have.procs.is_none()
+			&& *id == have.id
+			&& *number == have.number
+			&& *vpid == have.vpid
+			&& *text == have.text
+			&& *state == have.state
+			&& *control == have.control
+			&& *notified == have.notified
+			&& *nohup == have.nohup
+			&& *inherited == have.inherited
+			&& *wd == have.wd
+			&& *os_pid == have.os_pid
+	}
+}
+
+/// A fact about a job that [`Job`]'s record layout does not hold.
+///
+/// It is kept in a record of its own ([`Record::JobFacts`] under
+/// [`Key::JobFacts`]) so that a store written before the fact existed still
+/// decodes. A later fact is a new variant at the end: an older store has
+/// none of it, and postcard numbers the variants in order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobFact {
+	/// [`Job::signal`].
+	Signal(Signal),
+	/// [`Job::procs`].
+	Procs(JobProcs),
+}
+
+/// The processes of a job that has several (bash's job's `PROCESS` list).
+///
+/// With its `J_PIPEFAIL`: those of a background job ([`Job::procs`]), or of
+/// a pipeline the shell waits for. A job's notice names each, how it ended
+/// and its command.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProcs {
+	/// The processes, in order, each with how it ended as it is reaped.
+	pub list:     Vec<JobProc>,
+	/// `pipefail` was on as the job started (bash `J_PIPEFAIL`): its status
+	/// is that of the last of them that did not succeed.
+	pub pipefail: bool,
+}
+
+impl JobProcs {
+	/// The process whose end is the job's status (bash
+	/// `raw_job_exit_status`): the last one, or under [`Self::pipefail`] the
+	/// last one that did not succeed, none if all did.
+	pub fn status_process(&self) -> Option<&JobProc> {
+		if self.pipefail {
+			self.list.iter().rev().find(|p| p.state.failed())
+		} else {
+			self.list.last()
+		}
+	}
+
+	/// The signal that ended the process whose end is the job's status
+	/// ([`Self::status_process`]).
+	pub fn signal(&self) -> Option<Signal> {
+		self.status_process().and_then(|p| p.state.signal())
+	}
+
+	/// The process of vproc `vpid`.
+	pub fn get_mut(&mut self, vpid: Vpid) -> Option<&mut JobProc> {
+		self.list.iter_mut().find(|p| p.vpid == vpid)
+	}
+}
+
+/// One process of a job (bash's `PROCESS`; [`JobProcs`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProc {
+	/// Its vproc.
+	pub vpid:   Vpid,
+	/// The OS pid of the program it is, once it spawned it: bash's process
+	/// for a stage `exec`s the stage's lone simple command, so it is known
+	/// by that program's pid. `None` for a stage that is not just a program.
+	pub os_pid: Option<u32>,
+	/// Its command as bash prints it (bash's `p->command`); a pipeline the
+	/// shell waits for fills it only for a notice.
+	pub text:   BString,
+	/// Running, or how it ended.
+	pub state:  ProcState,
+}
+
+impl JobProc {
+	/// A process of vproc `vpid`, just started: its command `text`.
+	pub const fn started(vpid: Vpid, text: BString) -> Self {
+		Self { vpid, os_pid: None, text, state: ProcState::Running }
+	}
+
+	/// The pid bash shows for it: its program's OS pid ([`Self::os_pid`]),
+	/// else its vproc's virtual pid.
+	pub const fn pid(&self) -> u32 {
+		match self.os_pid {
+			Some(pid) => pid,
+			None => self.vpid.0,
+		}
+	}
+}
+
+/// How a job's process is ([`JobProc::state`]; bash's `PROCESS`'s `running`
+/// and `status`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcState {
+	/// Not reaped yet.
+	Running,
+	/// It exited with this status (bash `WIFEXITED`), 137 too.
+	Exited(i32),
+	/// A signal ended it (bash `WIFSIGNALED`).
+	Killed(Signal),
+}
+
+impl ProcState {
+	/// How a process that ended with `status` ended: killed by `died_of`,
+	/// else exited.
+	pub fn ended(status: i32, died_of: Option<Signal>) -> Self {
+		died_of.map_or(Self::Exited(status), Self::Killed)
+	}
+
+	/// The signal that ended it.
+	pub const fn signal(self) -> Option<Signal> {
+		match self {
+			Self::Killed(sig) => Some(sig),
+			Self::Running | Self::Exited(_) => None,
+		}
+	}
+
+	/// It ended and did not succeed (bash: its status is not
+	/// `EXECUTION_SUCCESS`).
+	pub const fn failed(self) -> bool {
+		match self {
+			Self::Running | Self::Exited(0) => false,
+			Self::Exited(_) | Self::Killed(_) => true,
+		}
 	}
 }
 
@@ -1358,6 +1649,14 @@ pub enum MiscKey {
 	/// (`Record::Misc`); absent for a user's shell. Nested shells see the
 	/// root's record.
 	Profile,
+	/// The signals the root shell ignores while it has no trap for them
+	/// (`Record::Words` of signal names). bash: `QUIT`, "in all cases",
+	/// whatever trap comes and goes. zsh: `QUIT`, which its `init_signals`
+	/// ignores, and the signals ignored when the shell started, which a
+	/// non-interactive zsh leaves ignored; a trap set or removed for one
+	/// takes it out (zsh `settrap`, `removetrap`: a handler, then the
+	/// default). An interactive zsh has none: its own handlers decide.
+	HeldIgnored,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);
@@ -1446,7 +1745,8 @@ impl MiscKey {
 			| Self::ZshStartedSh
 			| Self::ZshMathFuncs
 			| Self::ZshPathChecked
-			| Self::Profile => true,
+			| Self::Profile
+			| Self::HeldIgnored => true,
 		}
 	}
 }
@@ -1785,6 +2085,8 @@ mod tests {
 			Key::Local { depth: 1, name: BStr::new("x") },
 			Key::ZshOpt(ZshOpt::Extendedglob),
 			Key::ZshAlias { suffix: true, name: BStr::new("txt") },
+			Key::JobFacts(JobId(3)),
+			Key::BgPid(Vpid(9)),
 		];
 		for key in keys {
 			assert_eq!(s.hash_one(key), s.hash_one(key.to_buf()), "{key:?}");

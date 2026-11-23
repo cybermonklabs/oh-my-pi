@@ -632,10 +632,23 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
-/// finished child whose status is kept (bash's `bgpids`), or the running
-/// process substitution or coprocess `$!` names.
+/// finished child whose status is kept (its process's, or one `wait`
+/// collected, bash's bgp list), or the running process substitution or
+/// coprocess `$!` names. zsh 5.9: not the job whose end runs the `CHLD`
+/// trap, while it runs ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its
+/// status reaches zsh's list of background statuses once the trap is over);
+/// another finished job is one.
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
+		&& ctx.vp.zsh.as_ref().is_some_and(|z| z.chld_own == Some(pid))
+		&& in_chld_trap(ctx.vp)
+	{
+		return false;
+	}
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
+		return true;
+	}
+	if ctx.vp.jobs.bgp_search(pid).is_some() {
 		return true;
 	}
 	// A subshell copies `$!`, not its parent's children.
@@ -649,10 +662,25 @@ fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	}
 }
 
+/// Whether `vp` runs a `CHLD` trap (its action or a `TRAPCHLD` function).
+fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
+	use crate::bash::vm::proc::{FrameKind, ScriptKind};
+	let chld = crate::bash::store::TrapKey::Signal(crate::bash::signal::Signal::Chld);
+	vp.trap_frames != 0
+		&& vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
+		})
+}
+
 /// `wait` without operands: every running job (bash
 /// `wait_for_background_pids`); with job control a stopped job is skipped
 /// with a warning. A command substitution's copies of its parent's jobs
-/// are not its children.
+/// are not its children. A job this shell's `kill` ended with no OS status
+/// for obash to reap is still running for bash, which has not reaped it
+/// ([`crate::bash::store::Job::unreaped`]): it takes its place in the list,
+/// as bash waits for the first job still running. `Awaited::AllJobs`
+/// reports the first job it waits for, drops each other one that ended
+/// meanwhile (bash reaps them as it waits) and keeps `$!`'s.
 fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	let control = super::jobs::active(ctx)?;
 	let foreign: Vec<u32> = ctx
@@ -666,6 +694,14 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 		ctx.usage(format!("pid {pid} is not a child of this shell"));
 	}
 	ctx.vp.jobs.remove_where(|j| j.inherited);
+	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	let held = |j: &crate::bash::vm::proc::Job| {
+		bash
+			&& j.unreaped
+			&& j.signal.is_some()
+			&& !j.notified
+			&& matches!(j.state, crate::bash::vm::proc::JobState::Done(_))
+	};
 	let mut list = Vec::new();
 	let mut stopped = Vec::new();
 	for job in ctx.vp.jobs.iter() {
@@ -673,6 +709,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 			crate::bash::vm::proc::JobState::Stopped(_) if control => {
 				stopped.push((job.number, job.pid()));
 			},
+			_ if held(job) => list.push(job.vpid),
 			crate::bash::vm::proc::JobState::Done(_) => {},
 			_ => list.push(job.vpid),
 		}
@@ -698,19 +735,20 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R {
 	let mut list = Vec::new();
 	if args.is_empty() {
+		// bash `wait_for_any_job` takes a finished job already reported only
+		// once it waited for a child (`Awaited::AnyJob`).
 		list.extend(ctx.vp.jobs.iter().filter(|j| !j.inherited).map(|j| j.vpid));
 	} else {
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
 			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
-			(ctx.vp.jobs.by_vpid(pid).is_none()
-				&& matches!(
+			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
+				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
 					Some(crate::bash::vm::ProcState::Exited(_))
-				)
-				&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid))
-			.then_some(pid)
+				) && ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid));
+			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
 			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };

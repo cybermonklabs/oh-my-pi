@@ -357,11 +357,24 @@ fn remove(ctx: &mut Ctx<'_, '_>, ht: Ht, name: &[u8]) -> Result<bool, Need> {
 			found
 		},
 		Ht::Func => {
-			let found = ctx.function(name)?.is_some();
+			let platform = ctx.k.engine.config().platform;
+			// A `TRAPxxx` function is its signal's trap, under any of the
+			// signal's names: removing one name removes the trap function
+			// there is (zsh's `removeshfuncnode` calls `removetrap`), which
+			// `func_changing` does for a trap name.
+			let names = super::trap::func_key(name, platform).map_or_else(
+				|| vec![BString::from(name)],
+				|key| super::trap::func_names(key, platform),
+			);
+			let mut found = false;
+			for n in &names {
+				found |= ctx.function(n)?.is_some();
+			}
 			if found {
-				// A `TRAPxxx` function is its trap.
-				super::trap::func_changing(ctx.k, ctx.cx.store, ctx.vp, name, false)?;
-				ctx.store_record(KeyBuf::Func(name.into()), None);
+				let removed = super::trap::FuncChange::Removed;
+				if super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, removed)?.is_none() {
+					ctx.store_record(KeyBuf::Func(BString::from(name)), None);
+				}
 			}
 			found
 		},
@@ -1130,7 +1143,8 @@ fn add_autoload_function(ctx: &mut Ctx<'_, '_>, arg: &[u8], on: Attrs) -> Result
 		attrs,
 		file,
 	};
-	super::trap::func_changing(ctx.k, ctx.cx.store, ctx.vp, &name, false)?;
+	let autoloaded = super::trap::FuncChange::Autoloaded;
+	super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, &name, autoloaded)?;
 	ctx.store_record(KeyBuf::Func(name.clone()), Some(rec));
 	Ok(name)
 }

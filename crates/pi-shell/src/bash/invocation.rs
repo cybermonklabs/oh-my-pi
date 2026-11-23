@@ -654,6 +654,16 @@ impl ShellArgs {
 		self.interactive || (matches!(self.input, Input::Stdin) && ttys)
 	}
 
+	/// Whether bash sets `HOME` from the password database when `env` has
+	/// none: its `login_shell == 1` outside posix mode (`variables.c`:
+	/// `set_home_var`). That is `argv[0]` starting with `-`, without `-l`
+	/// (which makes `login_shell` negative: `-bash -l` sets none), with posix
+	/// mode off at startup ([`Self::posix_at_start`]; an `sh`'s posix mode
+	/// starts after, so `-sh` sets it). Measured with bash 5.2.21.
+	pub fn login_home(&self, env: &[(BString, BString)]) -> bool {
+		self.login_name && !self.login_flag && !self.posix_at_start(env)
+	}
+
 	/// Posix mode at startup: `--posix`, `-o posix`, or `POSIXLY_CORRECT` /
 	/// `POSIX_PEDANTIC` in `env` (`sh` turns it on after the startup files).
 	pub fn posix_at_start(&self, env: &[(BString, BString)]) -> bool {
@@ -1161,6 +1171,33 @@ mod tests {
 			a.startup_options(&[], false)
 				.contains(&(OptId::LoginShell, true))
 		);
+	}
+
+	// The one rule of the root shell and the nested one: bash 5.2.21 sets
+	// `HOME` from the password database for `-bash -c` and `-sh -c` (an
+	// `sh`'s posix mode starts after), not for `-l` (`login_shell`
+	// negative), posix mode at startup or a `$0` that starts with `-`.
+	#[test]
+	fn login_home_is_argv0_without_l_or_posix() {
+		let pair = |name: &str| (BString::from(name), BString::from("1"));
+		for (words, env, home) in [
+			(&["-bash", "-c", ":"][..], None, true),
+			(&["-sh", "-c", ":"], None, true),
+			(&["-bash", "s.sh"], None, true),
+			(&["-bash", "+o", "posix", "-c", ":"], None, true),
+			(&["bash", "-c", ":", "-x"], None, false),
+			(&["bash", "-l", "-c", ":"], None, false),
+			(&["-bash", "-l", "-c", ":"], None, false),
+			(&["-bash", "--login", "-c", ":"], None, false),
+			(&["-bash", "-o", "posix", "-c", ":"], None, false),
+			(&["-bash", "--posix", "-c", ":"], None, false),
+			(&["-bash", "-c", ":"], Some("POSIXLY_CORRECT"), false),
+			(&["-bash", "-c", ":"], Some("POSIX_PEDANTIC"), false),
+		] {
+			let a = ShellArgs::parse(&argv(words)).unwrap();
+			let env: Vec<(BString, BString)> = env.map(pair).into_iter().collect();
+			assert_eq!(a.login_home(&env), home, "{words:?} {env:?}");
+		}
 	}
 
 	// Imported SHELLOPTS/BASHOPTS turn their options on after the
