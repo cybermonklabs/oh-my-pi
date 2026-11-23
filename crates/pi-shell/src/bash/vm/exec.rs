@@ -2297,24 +2297,45 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 /// (`execute_in_subshell`, `command_substitute`), and so does a builtin that
 /// a forked simple command runs (`execute_subshell_builtin_or_function`). A
 /// forked pipeline element's or async command's own expansion, and a
-/// function it runs, reach the shell's (bash's `top_level` is the forking
-/// shell's, copied by the fork). A nested shell (depth 0) is its own shell.
-fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
-	let forked_simple = vp.parent.is_some()
-		&& vp.frames.first().is_some_and(|f| {
-			f.unit.as_deref().is_some_and(|unit| {
-				simple_stage(unit, f.pc).is_some_and(|si| {
-					matches!(unit.spawns[si].kind, SpawnKind::Pipeline | SpawnKind::Background)
-				})
-			})
+/// function it runs, reach the `top_level` its fork copied from its forking
+/// shell ([`Frame::command_loop`] of its base frame, this answer for the
+/// forking shell when it forked): the command loop only when the forking
+/// shell's error would reach it too, so not for an element forked inside
+/// `( … )`, `$( )` or `<( )`. A background job that is one async pipeline
+/// passes its stored answer on: bash forks that pipeline's elements from
+/// the shell itself ([`async_pipeline`]), so obash's job vproc stands for
+/// no fork of bash's. A nested shell (depth 0) is its own shell.
+pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
+	let Some(base) = vp.frames.first() else {
+		return super::subshell_depth(vp) == 0;
+	};
+	if vp.parent.is_some()
+		&& let Some(unit) = base.unit.as_deref()
+	{
+		let forked_simple = simple_stage(unit, base.pc).is_some_and(|si| {
+			matches!(unit.spawns[si].kind, SpawnKind::Pipeline | SpawnKind::Background)
 		});
-	if forked_simple {
-		vp.frames
-			.get(1)
-			.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }))
-	} else {
-		super::subshell_depth(vp) == 0
+		if forked_simple {
+			return base.command_loop
+				&& vp
+					.frames
+					.get(1)
+					.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }));
+		}
+		let async_job = vp.frames.len() == 1
+			&& unit.ops.get(base.pc as usize).is_some_and(|op| {
+				op.code == Opcode::Spawn
+					&& unit
+						.spawns
+						.get(op.a as usize)
+						.is_some_and(|s| s.kind == SpawnKind::Pipeline)
+					&& async_pipeline(unit, op.a as usize)
+			});
+		if async_job {
+			return base.command_loop;
+		}
 	}
+	super::subshell_depth(vp) == 0
 }
 
 /// Answer the expansion probe `p` ([`Stop::Probe`]) of the op whose scratch

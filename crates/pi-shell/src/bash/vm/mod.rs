@@ -2941,6 +2941,9 @@ impl Vproc {
 		}
 		vp.calls = callstack::inherited(self);
 		vp.trace_base = xtrace::level(self) - 1;
+		// bash's fork copies `top_level`: a fatal error in a forked simple
+		// command ends where its forking shell's would have.
+		frame.command_loop = exec::fatal_reaches_command_loop(self);
 		// Started from a context where `set -e` is ignored (the parent's op
 		// is a condition, or its frame runs in one): so is the child.
 		frame.ignore_errexit = self.frames.last().is_some_and(|f| {

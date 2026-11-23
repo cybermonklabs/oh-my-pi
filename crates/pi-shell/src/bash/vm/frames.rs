@@ -330,6 +330,7 @@ struct FrameImage {
 	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
+	command_loop:      bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
 }
@@ -559,6 +560,7 @@ impl Shell {
 					debug_errexit: f.debug_errexit,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
+					command_loop: f.command_loop,
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
@@ -1035,6 +1037,7 @@ impl Shell {
 				frame.debug_errexit = f.debug_errexit;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
+				frame.command_loop = f.command_loop;
 				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));

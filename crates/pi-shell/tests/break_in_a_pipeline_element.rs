@@ -9,7 +9,9 @@
 //! element). The forks: the other children that carry the loop level or
 //! not (jobs, process substitutions, backticks, coprocesses, the
 //! not-found hook), a child's own loops beside its parent's, counts
-//! through `eval`, and the message's redirections and order. Each row
+//! through `eval`, and the message's redirections and order. The fatal
+//! rows (bash): where a fatal error in a forked simple command ends, run
+//! with `-c` and from a script file. Each row
 //! prints where it is (`a<n>` per iteration, `b<n>:$?` after the element,
 //! `e:$?` after the loop), so its output says whether the body and the
 //! loop went on. A few rows also run under obash's fault injector, which
@@ -35,7 +37,7 @@ use std::{
 	fmt::Write as _,
 	fs,
 	os::unix::process::CommandExt,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::atomic::{AtomicUsize, Ordering},
 	thread,
 };
@@ -378,6 +380,133 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	),
 ];
 
+/// The fatal-error shapes (bash only), each run with `-c` (`fatal/c/<name>`)
+/// and from a script file (`fatal/s/<name>`). A fatal error (`${x?}`,
+/// `set -u`) in a forked simple element or async command ends where its
+/// forking shell's would (bash's fork copies `top_level`): at the `-c`
+/// command loop (127) only when that shell's error reaches it, so not in
+/// an element forked inside `( … )`, `$( )` or `<( )`, nor inside a builtin
+/// element (each has its own `top_level`: 1). From a script it is 1.
+const FATALS: &[(&str, &str)] = &[
+	(
+		"cmdsub-element",
+		"f() { echo ${x?boom}; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"",
+	),
+	(
+		"subshell-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+	(
+		"procsub-element",
+		"f() { echo ${x?boom}; }; cat <(f | cat; echo in:${PIPESTATUS[*]}); echo st=$?",
+	),
+	("subshell-async", "f() { echo ${x?boom}; }; ( f & wait $!; echo in:$? ); echo st=$?"),
+	(
+		"bg-subshell-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) & wait $!; echo st=$?",
+	),
+	(
+		"function-cmdsub-element",
+		"f() { echo ${x?boom}; }; g() { x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x\"; }; \
+		 g; echo st=$?",
+	),
+	(
+		"cmdsub-group-element",
+		"f() { echo ${x?boom}; }; x=$({ f | cat; echo in:${PIPESTATUS[*]}; }); echo \"x=$x st=$?\"",
+	),
+	("cmdsub-async", "f() { echo ${x?boom}; }; x=$(f & wait $!; echo in:$?); echo \"x=$x st=$?\""),
+	// The control: at top level the error reaches the `-c` command loop.
+	("top-element", "f() { echo ${x?boom}; }; f | cat; echo ps=${PIPESTATUS[*]}"),
+	(
+		"subshell-in-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	("cmdsub-last-element", "f() { echo ${x?boom}; }; x=$(: | f; echo in:$?); echo \"x=$x st=$?\""),
+	(
+		"cmdsub-element-cmdsub-word",
+		"f() { echo ${x?boom}; }; x=$(f $(:) | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"",
+	),
+	("subshell-last-element", "f() { echo ${x?boom}; }; ( : | f; echo in:$? ); echo st=$?"),
+	(
+		"group-in-element",
+		"f() { echo ${x?boom}; }; { f | cat; echo in:${PIPESTATUS[*]}; } | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"cmdsub-in-cmdsub-element",
+		"f() { echo ${x?boom}; }; x=$(y=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"y=$y\"); echo \
+		 \"x=$x st=$?\"",
+	),
+	(
+		"cmdsub-element-set-u",
+		"set -u; f() { echo $nosuch_q; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x \
+		 st=$?\"",
+	),
+	(
+		"cmdsub-element-pipefail",
+		"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat; echo in:$?); echo \"x=$x st=$?\"",
+	),
+	(
+		"subshell-element-set-u",
+		"set -u; f() { echo $nosuch_q; }; ( f | cat; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+	// A builtin element has its own `top_level`; a function element (also
+	// one running `eval`) has its forking shell's, and passes it on.
+	(
+		"eval-element-inner",
+		"f() { echo ${x?boom}; }; : | eval 'f | cat; echo in:${PIPESTATUS[*]}'; echo st=$?",
+	),
+	(
+		"eval-in-function-element-inner",
+		"f() { echo ${x?boom}; }; g() { eval 'f | cat; echo in:${PIPESTATUS[*]}'; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-inner",
+		"f() { echo ${x?boom}; }; g() { f | cat; echo in:${PIPESTATUS[*]}; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"async-in-async",
+		"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g & wait $!; echo st=$?",
+	),
+	(
+		"async-in-element",
+		"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	// An async pipeline's elements are forked from the shell that runs it
+	// (obash's job vproc for the pipeline passes that shell's answer on).
+	("top-bg-pipeline", "set -o pipefail; f() { echo ${x?boom}; }; f | cat & wait $!; echo st=$?"),
+	(
+		"cmdsub-bg-pipeline",
+		"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat & wait $!; echo in:$?); echo \"x=$x \
+		 st=$?\"",
+	),
+	(
+		"subshell-bg-pipeline",
+		"set -o pipefail; f() { echo ${x?boom}; }; ( f | cat & wait $!; echo in:$? ); echo st=$?",
+	),
+	// No program runs (an external in flight skips a snapshot): these two
+	// also run under snapshots.
+	("top-element-builtin-reader", "f() { echo ${x?boom}; }; f | :; echo ps=${PIPESTATUS[*]}"),
+	(
+		"subshell-element-builtin-reader",
+		"f() { echo ${x?boom}; }; ( f | :; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+];
+
+/// The fatal rows: each [`FATALS`] shape with `-c` and from a script.
+fn fatals() -> Vec<Row> {
+	FATALS
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("fatal/c/{name}"), x.to_owned()), (format!("fatal/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
 /// The fork shapes only zsh runs.
 const ZSH_FORKS: &[(&str, &str)] = &[
 	("procsub-file", "cat =(break; echo s)"),
@@ -505,8 +634,9 @@ enum Runner<'a> {
 	Oracle(&'a str),
 }
 
-/// Run `script` as `dialect` with `runner`.
-fn run_row(dialect: Dialect, runner: Runner<'_>, script: &str) -> Outcome {
+/// Run row `id`'s `script` as `dialect` with `runner`: with `-c`, or for a
+/// `fatal/s/` row from the script file `s.sh` in a directory of its own.
+fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outcome {
 	let mut cmd = match runner {
 		Runner::Oracle(program) => command(program),
 		Runner::Obash | Runner::ObashSnapshots => obash(),
@@ -520,12 +650,31 @@ fn run_row(dialect: Dialect, runner: Runner<'_>, script: &str) -> Outcome {
 		}
 		cmd.arg("-f");
 	}
-	let out = output(cmd.args(["-c", script]));
+	let out = if id.starts_with("fatal/s/") {
+		static NEXT: AtomicUsize = AtomicUsize::new(0);
+		let dir = env::temp_dir().join(format!(
+			"pi-loop-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::Relaxed)
+		));
+		fs::create_dir(&dir).unwrap();
+		fs::write(dir.join("s.sh"), format!("{script}\n")).unwrap();
+		let out = output(cmd.current_dir(&dir).arg("s.sh"));
+		remove_dir(&dir);
+		out
+	} else {
+		output(cmd.args(["-c", script]))
+	};
 	(
 		String::from_utf8_lossy(&out.stdout).into_owned(),
 		normalized_stderr(&out.stderr),
 		out.status.code().unwrap_or(-1),
 	)
+}
+
+/// Remove a row's directory, which only it used.
+fn remove_dir(dir: &Path) {
+	fs::remove_dir_all(dir).unwrap();
 }
 
 fn fixture(dialect: Dialect) -> PathBuf {
@@ -559,10 +708,10 @@ fn run_all(dialect: Dialect, runner: Runner<'_>, rows: &[Row]) -> Vec<Outcome> {
 					let mut mine = Vec::new();
 					loop {
 						let i = next.fetch_add(1, Ordering::Relaxed);
-						let Some((_, script)) = rows.get(i) else {
+						let Some((id, script)) = rows.get(i) else {
 							break;
 						};
-						mine.push((i, run_row(dialect, runner, script)));
+						mine.push((i, run_row(dialect, runner, id, script)));
 					}
 					mine
 				})
@@ -646,8 +795,9 @@ const BASH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/cmdsub/continue/2/last/lastpipe",
 	"fork/x1/cmdsub-own-loop-break2",
 	"fork/x1/bg-simple",
-	"fork/x2/cmdsub-nested",
 	"fork/lines/cmdsub",
+	"fatal/c/top-element-builtin-reader",
+	"fatal/c/subshell-element-builtin-reader",
 ];
 
 /// [`BASH_SNAPSHOT_ROWS`] for zsh.
@@ -689,13 +839,26 @@ fn zsh_forks_match_zsh() {
 	assert_rows(Dialect::Zsh, "fork/", &forks(Dialect::Zsh));
 }
 
+/// The fatal errors of forked simple commands in bash ([`FATALS`]).
+#[test]
+fn bash_fatal_errors_match_bash() {
+	assert_rows(Dialect::Bash, "fatal/", &fatals());
+}
+
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
 /// the recorded outcome of each: a forked child's loops
-/// (`Vproc::outer_loops`) survive the frames image.
+/// (`Vproc::outer_loops`) and where its fatal error ends
+/// (`Frame::command_loop`) survive the frames image.
 fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
+	let fatal = if dialect == Dialect::Bash {
+		fatals()
+	} else {
+		Vec::new()
+	};
 	let rows: Vec<Row> = grid(dialect)
 		.into_iter()
 		.chain(forks(dialect))
+		.chain(fatal)
 		.filter(|(id, _)| ids.contains(&id.as_str()))
 		.collect();
 	assert_eq!(rows.len(), ids.len(), "a snapshot row id names no row");
