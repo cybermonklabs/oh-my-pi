@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A cancelled or timed-out `Shell.run` no longer ends the `&` jobs earlier runs left running, and the shell keeps its session (variables, working directory, jobs) for the next run; only what the cancelled run started is stopped
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
