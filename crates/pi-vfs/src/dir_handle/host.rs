@@ -32,6 +32,20 @@ pub fn open_dir(path: &Path, follow: bool) -> io::Result<DirHandle> {
 	DirHandle::open_host(path, follow, &Scope::default())
 }
 
+/// Opens the host directory at `path`, following symlinks, only to reach
+/// what is below it.
+///
+/// The handle opens children and identifies the directory. On Linux it is
+/// opened `O_PATH`, so it needs only the directory's search permission and
+/// cannot be listed; elsewhere it opens as [`open_dir`] does.
+///
+/// # Errors
+///
+/// The open's errors; `path` not naming a directory.
+pub fn open_dir_to_search(path: &Path) -> io::Result<DirHandle> {
+	DirHandle::open_host_to_search(path, &Scope::default())
+}
+
 /// Opens the regular file at `path`, following symlinks, and describes it.
 ///
 /// # Errors

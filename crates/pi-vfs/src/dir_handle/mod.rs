@@ -468,6 +468,14 @@ impl DirHandle {
 		Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
 	}
 
+	/// Opens the host directory at `path`, following symlinks, only to reach
+	/// what is below it, for a facade with `scope`
+	/// ([`host::open_dir_to_search`]).
+	pub(crate) fn open_host_to_search(path: &Path, scope: &Scope) -> io::Result<Self> {
+		let handle = with_scratch(|s| native::open_dir_to_search(s, path))?;
+		Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
+	}
+
 	/// Opens the provider directory at `path` on `fs`, checking that it is
 	/// one (without following a final symlink unless `follow`).
 	pub(crate) async fn open_provider(
@@ -747,7 +755,10 @@ impl DirHandle {
 
 	/// Opens the directory `..` of this one, which is its parent only while
 	/// this directory has not moved: callers check the identity of what they
-	/// get ([`Self::identity`]).
+	/// get ([`Self::identity`]). The handle only reaches what is below the
+	/// parent: it opens children and identifies the parent, and on Linux,
+	/// where it is opened `O_PATH` and so needs only the parent's search
+	/// permission, it cannot be listed.
 	///
 	/// # Errors
 	///
@@ -1371,6 +1382,32 @@ impl DirHandle {
 		match &self.repr {
 			DirRepr::Host { handle, scope } => {
 				let handle = with_scratch(|s| native::open_dir_beneath(s, handle, rel))?;
+				Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
+			},
+			DirRepr::Provider(provided) => {
+				let path = provider::beneath(&provided.path, rel);
+				provider::open_dir(&provided.fs, &path, false).await?;
+				Ok(provided.dir(path))
+			},
+		}
+	}
+
+	/// Opens the directory at the walk-relative `rel` below this one as
+	/// [`Self::open_dir_beneath_async`] does, only to reach what is below it:
+	/// the handle opens children and identifies the directory, and on Linux,
+	/// where it is opened `O_PATH` and so needs only the directory's search
+	/// permission (also each directory on the way, where the kernel has no
+	/// `openat2`), it cannot be listed. A provider's directory opens as
+	/// [`Self::open_dir_beneath_async`] opens it.
+	///
+	/// # Errors
+	///
+	/// As for [`Self::open_dir_beneath_async`].
+	pub async fn open_dir_beneath_to_search_async(&self, rel: &[u8]) -> io::Result<Self> {
+		check_relative(rel)?;
+		match &self.repr {
+			DirRepr::Host { handle, scope } => {
+				let handle = with_scratch(|s| native::open_dir_beneath_to_search(s, handle, rel))?;
 				Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
 			},
 			DirRepr::Provider(provided) => {

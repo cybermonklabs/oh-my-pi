@@ -2621,6 +2621,65 @@ mod unix {
 		let opened = helper_opened.recv_timeout(HELPER_BOUND);
 		assert!(opened.is_ok(), "the helper's open was not released");
 	}
+
+	/// A directory opened only to reach what is below it needs only its
+	/// search permission on Linux, where it is opened `O_PATH`: by path
+	/// ([`crate::dir_handle::host::open_dir_to_search`]), as `..` of a child
+	/// ([`DirHandle::open_parent`]), and below another
+	/// ([`DirHandle::open_dir_beneath_to_search_async`]). Each opens the
+	/// subdirectory below it and has its identity, where a listing open of
+	/// the directory is refused. Elsewhere each is refused as the listing
+	/// open is. As root, which needs no permission, the test says it
+	/// is skipped.
+	#[test]
+	fn a_directory_opened_to_search_needs_only_its_search_permission() {
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!("skipped: root needs no permission to read a directory");
+			return;
+		}
+		let tree = TempDir::new("search-only");
+		let top = tree.0.join("top");
+		std::fs::create_dir_all(top.join("mid/sub")).unwrap();
+		let top_id = std::fs::metadata(&top).unwrap().ino();
+		let mid_id = std::fs::metadata(top.join("mid")).unwrap().ino();
+		let root = crate::dir_handle::host::open_dir(&tree.0, false).unwrap();
+		let mid = crate::dir_handle::host::open_dir(&top.join("mid"), false).unwrap();
+		// Search, no read.
+		std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o311)).unwrap();
+		std::fs::set_permissions(top.join("mid"), std::fs::Permissions::from_mode(0o311)).unwrap();
+		let restore =
+			|path: &Path| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap();
+		let listing = crate::dir_handle::host::open_dir(&top, true).map(drop);
+		let by_path = crate::dir_handle::host::open_dir_to_search(&top);
+		let parent = mid.open_parent();
+		let beneath = rt.block_on(root.open_dir_beneath_to_search_async(b"top/mid"));
+		restore(&top.join("mid")).unwrap();
+		restore(&top).unwrap();
+		assert_eq!(listing.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "the listing open");
+		if cfg!(target_os = "linux") {
+			for (how, opened, id) in
+				[("by path", by_path, top_id), ("as ..", parent, top_id), ("beneath", beneath, mid_id)]
+			{
+				let opened = opened.unwrap_or_else(|e| panic!("{how}: {e}"));
+				assert_eq!(opened.identity().unwrap().ino(), id, "{how}: the identity");
+				opened
+					.open_dir_at(OsStr::new(if id == top_id { "mid" } else { "sub" }))
+					.unwrap_or_else(|e| panic!("{how}: the child: {e}"));
+			}
+		} else {
+			for (how, opened) in [("by path", by_path), ("as ..", parent), ("beneath", beneath)] {
+				assert_eq!(
+					opened.map(drop).unwrap_err().kind(),
+					io::ErrorKind::PermissionDenied,
+					"{how}"
+				);
+			}
+		}
+	}
 }
 
 #[cfg(windows)]
