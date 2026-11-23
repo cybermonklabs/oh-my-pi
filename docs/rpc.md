@@ -1081,7 +1081,15 @@ and returns `{ entries, leafId }`. Without `since` it returns all entries in
 append order; with `since` it returns entries strictly after the matching
 durable entry id. An unknown `since` fails explicitly with
 `code: "unknown_since"`. `get_tree` returns the raw session tree as
-`{ tree, leafId }` straight from `SessionManager`, not a UI projection.
+`{ tree, leafId }` straight from `SessionManager`, not a UI projection. Each
+node lists its child nodes in `children`, two JSON levels under it, so the
+answer for a long session nests tens of thousands of levels deep: a chain of
+50,000 entries nests about 100,000 levels. Many JSON readers stop at a depth
+limit (Rust's `serde_json` at 128 levels, Go's `encoding/json` at 10,000,
+Python's `json` at its recursion limit), and a reader, walk or free that
+recurses once per level can overflow its stack, so a host must read, walk and
+free this answer without recursion. The Python, Go and Rust SDKs read it at
+any depth.
 
 `get_available_thinking_levels` returns `{ levels }`: the selectable levels
 for the live model with `"off"` first (it is accepted by
@@ -1151,10 +1159,13 @@ disposed, and the command returns an error response with the write failure.
 
 `steer_subagent` sends a message to a subagent `get_subagents` lists as running,
 as its user. A mid-turn subagent is steered the same way Agent Hub chat does,
-at its next step boundary. A subagent between turns (for example a synchronous
-subagent waiting for its own eval `agent()` job) does not start a turn for the
-message: it is queued as a next-run steer, which waits on the subagent's queue
-and reaches its next turn, which its task executor starts (a yield reminder) or
+at its next step boundary; a message that lands after the running turn's last
+steering poll, as that turn ends, is not taken by that turn and may start one
+turn of its own once the turn ends. A subagent between turns (for example a
+synchronous subagent waiting for its own eval `agent()` job) does not start a
+turn for the message: it is queued as a next-run steer, which waits on the
+subagent's queue and reaches its next turn, which its task executor starts (a
+yield reminder) or
 a finished job's result starts, before that turn's first model call. The
 subagent's own session decides which of the two applies, when the message
 reaches it; the parent's view of the subagent, which can lag behind a subagent
@@ -1171,10 +1182,24 @@ Isolated (worktree) subagents run in-process and are steered the same way.
 The response arrives once the message is accepted: for a mid-turn subagent,
 once it is queued into the running turn; for a subagent between
 turns, once its next turn has taken the message into its context. A client
-must allow for that wait, which lasts until the subagent's next run: the
-Python, Go and Rust SDKs time a request out after 30 s by default, so give
-this command a longer timeout (the TypeScript `RpcClient.steerSubagent` sets
-none unless its `timeoutMs` option asks for one). Each
+must allow for that wait, which lasts until the subagent's next run. The
+TypeScript `RpcClient.steerSubagent` sets no deadline unless its `timeoutMs`
+option asks for one. The Python, Go and Rust SDKs time a request out after
+30 s by default, and each has one way to give this command longer:
+
+- Python: the `RpcClient` constructor's `request_timeout`, which applies to
+  every command that sets no timeout of its own; `steer_subagent()` takes none.
+- Go: `Client.Call(ctx, "steer_subagent", omprpc.SteerSubagentCommand{…}, timeout)`;
+  the generated `SteerSubagent` always waits `DefaultTimeout` (30 s).
+- Rust: the client's default deadline, `ClientOptions::default_timeout` at
+  spawn or `Client::set_default_timeout`, which applies to every command that
+  declares no timeout of its own; `Client::call` takes none.
+
+A client timeout only stops the wait: the message stays on the subagent's
+queue, and its next turn still takes it unless the subagent stops first (see
+the failure responses below); the response then arrives with no call waiting
+for it. Do not send the message again after a timeout: the subagent would get
+it twice. Each
 `steer_subagent` answers for its own message: two sent with the same text are
 two messages, and a turn that takes one answers only that one. It does
 not wait for the turn to finish, except for an extension command that itself
