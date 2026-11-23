@@ -190,6 +190,7 @@
 - The bash rewrite of `git worktree add` leaves to git a command holding a backslash-newline, whose bytes bash changes, and one combining `-b`/`-B` with `--detach`, which git refuses
 - Fixed background jobs (`&`), subshells and command substitutions in the `bash` tool seeing changes the parent shell made after they started; they now keep the variables, positional parameters (`$1`, `$@`), functions, aliases and shell options they started with, as in bash ([#19072](https://github.com/can1357/oh-my-pi/pull/19072) by [@H4vC](https://github.com/H4vC); reported in [#18990](https://github.com/can1357/oh-my-pi/pull/18990) by [@alphastorm](https://github.com/alphastorm))
 - The SSH control directory and the eval runner staging directory are refused when a symlink stands in their place under gVisor releases before 20261109.0 (GKE Sandbox among them) too, whose `open` with `O_NOFOLLOW | O_DIRECTORY` follows a final symlink (google/gvisor#14786); before, there a symlink to one of your own 0700 directories passed the check
+- An aborted `ssh://` transfer (a read, write, stat, directory listing or `HOME` lookup) no longer leaves a process of its ssh command running: on POSIX each transfer's ssh runs in a process group of its own, so the abort holds and reads its tree before signalling it and waits until the group is empty. These ssh calls run with `BatchMode=yes`, so the controlling terminal they lose this way never had a prompt to show
 
 ### Breaking Changes
 
