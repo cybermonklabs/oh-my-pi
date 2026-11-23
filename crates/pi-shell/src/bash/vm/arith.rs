@@ -1229,10 +1229,19 @@ impl Walk<'_> {
 					self.env.warn(Diag::BadSubscript { shown });
 					return Ok(0);
 				}
+				if self.all_elements(lv) {
+					self.warn_all(lv);
+					return Ok(0);
+				}
 				let key = self.subscript(lv)?;
 				self.var_value(lv, key.as_ref().map(|k| k.as_slice()))
 			},
 			Node::PostInc(lv, delta) => {
+				if self.all_elements(lv) {
+					self.warn_all(lv);
+					self.warn_all(lv);
+					return Ok(0);
+				}
 				let key = self.subscript(lv)?;
 				let key = key.as_ref().map(|k| k.as_slice());
 				let v = self.var_value(lv, key)?;
@@ -1240,6 +1249,11 @@ impl Walk<'_> {
 				Ok(v)
 			},
 			Node::PreInc(lv, delta) => {
+				if self.all_elements(lv) {
+					self.warn_all(lv);
+					self.warn_all(lv);
+					return Ok(*delta);
+				}
 				let key = self.subscript(lv)?;
 				let key = key.as_ref().map(|k| k.as_slice());
 				let v = self.var_value(lv, key)?.wrapping_add(*delta);
@@ -1251,6 +1265,10 @@ impl Walk<'_> {
 				// that of `OP=` once, before it.
 				if *op == Bin::Set {
 					let v = self.eval(rhs)?;
+					if self.all_elements(lv) {
+						self.warn_all(lv);
+						return Ok(v);
+					}
 					// `a[]=v` (an empty subscript, as `a[""]` becomes after
 					// the text's quote removal) names no element: bash
 					// reports it and assigns nothing.
@@ -1262,6 +1280,13 @@ impl Walk<'_> {
 					}
 					let key = self.subscript(lv)?;
 					self.store(lv, key.as_ref().map(|k| k.as_slice()), v)?;
+					return Ok(v);
+				}
+				if self.all_elements(lv) {
+					self.warn_all(lv);
+					let r = self.eval(rhs)?;
+					let v = self.apply(*op, 0, r, *tok)?;
+					self.warn_all(lv);
 					return Ok(v);
 				}
 				let key = self.subscript(lv)?;
@@ -1347,6 +1372,31 @@ impl Walk<'_> {
 			self.noeval -= 1;
 		}
 		r
+	}
+
+	/// Whether `lv` is `x[@]` or `x[*]` of a variable that is no
+	/// associative array (whose `@` and `*` are keys), outside a skipped
+	/// branch: it names no one element, so each lookup of it warns (bash's
+	/// `array_value_internal` without `AV_ALLOWALL`), a read is 0 and an
+	/// assignment assigns nothing.
+	fn all_elements(&mut self, lv: &Lv) -> bool {
+		self.noeval == 0
+			&& lv
+				.index
+				.as_ref()
+				.is_some_and(|i| matches!(i.as_slice(), b"@" | b"*"))
+			&& !self.env.is_assoc(&lv.name)
+	}
+
+	/// bash's `x[@]: bad array subscript` for one lookup of `lv`.
+	fn warn_all(&mut self, lv: &Lv) {
+		let mut shown = lv.name.clone();
+		shown.push(b'[');
+		if let Some(i) = &lv.index {
+			shown.extend_from_slice(i);
+		}
+		shown.push(b']');
+		self.env.warn(Diag::BadSubscript { shown });
 	}
 
 	/// The subscript of `lv` as [`Env`] takes it: an associative array's

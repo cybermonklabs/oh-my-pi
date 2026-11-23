@@ -142,9 +142,24 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 					return Ok(v.is_some_and(|v| !v.values().is_empty()));
 				}
 				// bash evaluates an index even when the variable is unset
-				// (`array_value_internal`).
+				// (`array_value_internal`); a negative one counts back from
+				// the end of an indexed array, and one before its start, or
+				// of a scalar or an unset variable, warns `name: bad array
+				// subscript` and names no element.
 				return match super::vars::subscript_value(ctx.k, ctx.cx, ctx.vp, i) {
-					Ok(n) => Ok(v.is_some_and(|v| v.index(n).is_some())),
+					Ok(n) => {
+						let n = match v.as_ref() {
+							Some(v) if n < 0 && matches!(v.value, VarValue::Indexed(_)) => {
+								v.next_index() + n
+							},
+							_ => n,
+						};
+						if n < 0 {
+							ctx.err(Diag::BadSubscript { shown: BString::from(name) });
+							return Ok(false);
+						}
+						Ok(v.is_some_and(|v| v.index(n).is_some()))
+					},
 					Err(d @ Diag::ArithSubscript { .. }) => Err(Fail::Discard(d)),
 					Err(_) => Ok(false),
 				};

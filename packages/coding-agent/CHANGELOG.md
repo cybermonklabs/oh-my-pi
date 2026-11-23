@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed array subscripts in the `bash` tool's bash code behaving unlike bash's: a negative subscript of a scalar (`x=abc; ${x[-1]}`) now warns `bad array subscript` and is unset; arithmetic counts a negative subscript back from the end of an array (`$((a[-1]))` read 0 and `((a[-1]=7))` made an element -1); `$((x[@]))` warns and is 0 instead of a syntax error; `${x[1]:?}` names `x[1]`; a scalar's `${x[@]@A}`, `@K` and `@k` print its quoted value; and `${r@a}`/`${r@A}` of a name reference describe its target
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

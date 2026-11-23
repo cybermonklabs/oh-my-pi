@@ -177,6 +177,11 @@ pub struct Expander<'e, 'c> {
 	/// The command evaluating arithmetic here (`((` for `(( ))` and the
 	/// arith-`for` header): it prefixes non-fatal arithmetic warnings.
 	pub arith_cmd:  Option<&'static str>,
+	/// How many times a read of a missing element warns `name: bad array
+	/// subscript` ([`Self::var_value`]): bash's `@a` and `@A` look the
+	/// element up twice (`parameter_brace_transform`), every other
+	/// expansion once.
+	sub_looks:      u8,
 	ifs:            IfsCache,
 	/// `set -f` and `shopt extglob`, looked up once per expansion.
 	glob_opts:      Option<GlobOpts>,
@@ -267,6 +272,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			line,
 			sub_status: None,
 			arith_cmd: None,
+			sub_looks: 1,
 			ifs: IfsCache::Unknown,
 			glob_opts: None,
 			pool: Vec::new(),
@@ -1224,7 +1230,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 						None if *colon => BString::from("parameter null or not set"),
 						None => BString::from("parameter not set"),
 					};
-					return Err(Stop::Fatal(Diag::ParamUnset { name: Self::param_name(p), msg }));
+					// bash names the parameter as written: `x[$i]`, `u[@]`,
+					// `!v` (`parameter_brace_expand_error`).
+					let mut name = Self::unbound_name(unit, p, p.indirect);
+					match p.index {
+						Some(SubIr::At) => name.extend_from_slice(b"[@]"),
+						Some(SubIr::Star) => name.extend_from_slice(b"[*]"),
+						_ => {},
+					}
+					return Err(Stop::Fatal(Diag::ParamUnset { name, msg }));
 				}
 				self.push(sink, v, quoted, rhs)?;
 			},
@@ -1405,7 +1419,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 					None
 				};
 				let q = target.as_ref().unwrap_or(p);
-				let v = self.value(unit, q)?;
+				if matches!(*op, b'a' | b'A') {
+					self.sub_looks = 2;
+				}
+				let v = self.value(unit, q);
+				self.sub_looks = 1;
+				let v = v?;
 				// `set -u`: an unset value is an error, except that `@a` and
 				// `@A` of a whole variable need only some element
 				// (`declare -a a=([1]=x); ${a@a}` is fine, `${a@Q}`,
@@ -2242,13 +2261,20 @@ impl<'e, 'c> Expander<'e, 'c> {
 	}
 
 	/// The plain reference `${!v@op}` turns into: `name` taken from `v`'s
-	/// value; `None` when `v` is no plain variable or names no variable
-	/// name (the general indirection path handles those).
+	/// value; `None` when `v` is a name reference or no plain variable, or
+	/// names no variable name (the general indirection path handles those:
+	/// a reference's `${!r@op}` applies the operator to `${!r}`, the name it
+	/// refers to, and `@a`/`@A` describe the target).
 	fn indirect_target(&mut self, p: &ParamIr) -> X<Option<ParamIr>> {
 		let (ParamRef::Var(n), None) = (&p.param, &p.index) else {
 			return Ok(None);
 		};
 		let n = n.clone();
+		if state::lookup_declared(&self.k.root, self.cx.store, self.vp, &n)?
+			.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
+		{
+			return Ok(None);
+		}
 		let Val::Str(target) = self.read_atom(|ex| ex.var_value(&n, None, false))? else {
 			return Ok(None);
 		};
@@ -2424,16 +2450,24 @@ impl<'e, 'c> Expander<'e, 'c> {
 	/// `list`), including bash's dynamic variables.
 	fn var_value(&mut self, name: &[u8], index: Option<&[u8]>, list: bool) -> X<Val> {
 		if let Some(v) = self.dynamic(name)? {
+			let n: i64 = index
+				.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
+				.unwrap_or(0);
 			return Ok(match (v, list) {
 				(DynVal::Str(s), true) => Val::List { items: vec![s], star: false },
 				(DynVal::Str(s), false) if index.is_none_or(|i| i == b"0") => Val::Str(s),
+				// A scalar has no element to count back from.
+				(DynVal::Str(_), false) if n < 0 => {
+					self.warn_bad_sub(name);
+					Val::Unset
+				},
 				(DynVal::Str(_), false) => Val::Unset,
 				(DynVal::List(items), true) => Val::List { items, star: false },
 				(DynVal::List(items), false) => {
-					let i: i64 = index
-						.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
-						.unwrap_or(0);
-					let i = if i < 0 { items.len() as i64 + i } else { i };
+					let i = if n < 0 { items.len() as i64 + n } else { n };
+					if i < 0 {
+						self.warn_bad_sub(name);
+					}
 					usize::try_from(i)
 						.ok()
 						.and_then(|i| items.get(i).cloned())
@@ -2499,10 +2533,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 				&& i.starts_with(b"-")
 				&& !self.is_assoc(name)?
 			{
-				let msg = format!("{}: bad array subscript", name.as_bstr()).into();
-				self
-					.k
-					.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+				let shown = self.resolved_name(name)?;
+				self.warn_bad_sub(&shown);
 			}
 			return Ok(Val::Unset);
 		};
@@ -2522,20 +2554,59 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.ok()
 						.and_then(|i| i.parse().ok())
 						.unwrap_or(0);
-					let n = if n < 0 { var.next_index() + n } else { n };
+					// bash counts a negative subscript back from the end of an
+					// array; a scalar has none, so it warns and expands to
+					// nothing (`x=abc; ${x[-1]}`), as for one before the start
+					// of an array (`${c[-4]}` of a 2-element array).
+					let n = match &var.value {
+						VarValue::Indexed(_) if n < 0 => var.next_index() + n,
+						_ => n,
+					};
 					if n < 0 {
-						// bash warns and expands to nothing (`${c[-4]}` of a
-						// 2-element array).
-						let msg = format!("{}: bad array subscript", name.as_bstr()).into();
-						self
-							.k
-							.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+						let shown = self.resolved_name(name)?;
+						self.warn_bad_sub(&shown);
 						return Ok(Val::Unset);
 					}
 					var.index(n)
 						.map_or(Val::Unset, |s| Val::Str(BString::from(s)))
 				}
 			},
+		})
+	}
+
+	/// bash's `name: bad array subscript` for a read of an element `name`
+	/// cannot have, once per lookup the expansion makes
+	/// ([`Self::sub_looks`]).
+	fn warn_bad_sub(&mut self, name: &[u8]) {
+		for _ in 0..self.sub_looks {
+			let msg = format!("{}: bad array subscript", name.as_bstr()).into();
+			self
+				.k
+				.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+		}
+	}
+
+	/// The variable `name` stands for: a name reference's target (bash
+	/// names it in messages), else `name`.
+	fn resolved_name(&mut self, name: &[u8]) -> X<BString> {
+		Ok(match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: target, index: None } => target,
+			_ => BString::from(name),
+		})
+	}
+
+	/// The variable `${name@a}` and `${name@A}` describe: a name reference's
+	/// target (bash's `find_variable` follows it); `None` when the reference
+	/// names no variable (none set, an array element, a loop).
+	fn described(&mut self, name: &[u8]) -> X<Option<BString>> {
+		if !state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?
+			.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
+		{
+			return Ok(Some(BString::from(name)));
+		}
+		Ok(match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: target, index: None } => Some(target),
+			_ => None,
 		})
 	}
 
@@ -2670,13 +2741,17 @@ impl<'e, 'c> Expander<'e, 'c> {
 			b'U' => map_val(v, |s| BString::from(s.to_uppercase())),
 			b'L' => map_val(v, |s| BString::from(s.to_lowercase())),
 			b'u' => map_val(v, |s| case_convert(s, CaseIr::Upper, false, None)),
-			// Declared-but-unset variables keep their attributes here.
+			// Declared-but-unset variables keep their attributes here; a name
+			// reference's are its target's.
 			b'a' => {
-				let attrs = match &p.param {
-					ParamRef::Var(n) => {
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, n)?.map(attr_letters)
-					},
+				let target = match &p.param {
+					ParamRef::Var(n) => self.described(n)?,
 					_ => None,
+				};
+				let attrs = match target {
+					Some(t) => state::lookup_declared(&self.k.root, self.cx.store, self.vp, &t)?
+						.map(attr_letters),
+					None => None,
 				};
 				let attrs = attrs.unwrap_or_default();
 				// One copy per element of `${a[@]@a}`.
@@ -2687,7 +2762,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 					_ => Val::Str(attrs),
 				}
 			},
-			// bash `string_var_assignment` / `array_var_assignment`.
+			// bash `string_var_assignment` / `array_var_assignment`, of a name
+			// reference's target.
 			b'A' => match (&p.param, &p.index) {
 				(ParamRef::At | ParamRef::Star, _) => {
 					let Val::List { items, .. } = v else {
@@ -2700,21 +2776,26 @@ impl<'e, 'c> Expander<'e, 'c> {
 					}
 					Val::Str(out)
 				},
-				(ParamRef::Var(name), Some(SubIr::At | SubIr::Star)) => {
+				(ParamRef::Var(name), sub) => {
+					let Some(name) = self.described(name)? else {
+						return Ok(Val::Unset);
+					};
 					let Some(var) =
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?.cloned()
+						state::lookup_declared(&self.k.root, self.cx.store, self.vp, &name)?.cloned()
 					else {
 						return Ok(Val::Unset);
 					};
-					let mut out = Vec::new();
-					super::builtins::declare_line(name, Some(&var), &mut out);
-					Val::Str(BString::from(out))
-				},
-				(ParamRef::Var(name), _) => {
-					let Some(var) =
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?.cloned()
-					else {
-						return Ok(Val::Unset);
+					let whole = matches!(sub, Some(SubIr::At | SubIr::Star));
+					// A scalar's `${x[@]@A}` is its `${x@A}`.
+					if whole && !matches!(var.value, VarValue::Str(_)) {
+						let mut out = Vec::new();
+						super::builtins::declare_line(&name, Some(&var), &mut out);
+						return Ok(Val::Str(BString::from(out)));
+					}
+					let value = match v {
+						Val::Str(s) => Some(s),
+						Val::List { items, .. } if whole => items.into_iter().next(),
+						_ => None,
 					};
 					let letters = attr_letters(&var);
 					let mut out = BString::default();
@@ -2723,14 +2804,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 						out.extend_from_slice(&letters);
 						out.push(b' ');
 					}
-					match v {
-						Val::Str(s) => {
-							out.extend_from_slice(name);
+					match value {
+						Some(s) => {
+							out.extend_from_slice(&name);
 							out.push(b'=');
 							out.extend_from_slice(&quote::single(&s));
 						},
-						_ if !letters.is_empty() => out.extend_from_slice(name),
-						_ => return Ok(Val::Unset),
+						None if !letters.is_empty() => out.extend_from_slice(&name),
+						None => return Ok(Val::Unset),
 					}
 					Val::Str(out)
 				},
@@ -2756,6 +2837,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 				else {
 					return Ok(Val::Unset);
 				};
+				// A scalar's one value, quoted as `@Q` quotes it.
+				if matches!(var.value, VarValue::Str(_)) {
+					return Ok(map_val(v, quote::single));
+				}
 				let assoc = matches!(var.value, VarValue::Assoc(_));
 				let pairs: Vec<(BString, BString)> = var.keys().into_iter().zip(var.values()).collect();
 				if op == b'K' {
@@ -4000,22 +4085,34 @@ impl arith::Env for Vars<'_, '_> {
 		if is_dynamic(name) {
 			let line = super::exec::current_line(self.vp);
 			if let Ok(Some(v)) = dynamic_value(self.k, self.cx, self.vp, line, name) {
-				let text = match v {
-					DynVal::Str(s) => index.is_none_or(|i| i == b"0").then_some(s),
+				let n: i64 = index
+					.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
+					.unwrap_or(0);
+				// A negative index counts back from the end of an array; a
+				// scalar has none (as for [`arith_element`]).
+				let (text, bad) = match v {
+					DynVal::Str(s) => (index.is_none_or(|i| i == b"0").then_some(s), n < 0),
 					DynVal::List(items) => {
-						let i: usize = index
-							.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
-							.unwrap_or(0);
-						items.into_iter().nth(i)
+						let i = if n < 0 { items.len() as i64 + n } else { n };
+						(
+							usize::try_from(i)
+								.ok()
+								.and_then(|i| items.into_iter().nth(i)),
+							i < 0,
+						)
 					},
 					DynVal::Assoc(pairs) => {
 						let key = index.unwrap_or(b"0");
-						pairs
+						let v = pairs
 							.into_iter()
 							.find(|(k, _)| k.as_slice() == key)
-							.map(|(_, v)| v)
+							.map(|(_, v)| v);
+						(v, false)
 					},
 				};
+				if bad {
+					self.warn_bad_sub(name);
+				}
 				return Ok(text.map(|t| arith::Value::of(&t)));
 			}
 		}
@@ -4027,19 +4124,22 @@ impl arith::Env for Vars<'_, '_> {
 		let target = if declared.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF)) {
 			state::deref(&self.k.root, self.cx.store, self.vp, name).unwrap_or(state::Deref::Plain)
 		} else {
-			let value = declared
-				.filter(|v| !v.attrs.contains(Attrs::INVISIBLE))
-				.and_then(|v| arith_element(v, index))
-				.map(arith::Value::of);
+			let (text, bad) = arith_element(declared, index);
+			let value = text.map(arith::Value::of);
+			if bad {
+				self.warn_bad_sub(name);
+			}
 			return self.unbound_checked(name, value);
 		};
 		let (name, index) = deref_target(&target, name, index);
-		let var = state::lookup(&self.k.root, self.cx.store, self.vp, name)
+		let var = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
 			.flatten();
-		let value = var
-			.and_then(|v| arith_element(v, index))
-			.map(arith::Value::of);
+		let (text, bad) = arith_element(var, index);
+		let value = text.map(arith::Value::of);
+		if bad {
+			self.warn_bad_sub(name);
+		}
 		self.unbound_checked(name, value)
 	}
 
@@ -4065,6 +4165,36 @@ impl arith::Env for Vars<'_, '_> {
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
 			return Ok(());
 		}
+		// A negative index counts back from the end of an indexed array (a
+		// scalar is its element 0); before its start, or of an unset
+		// variable, it names no element: bash reports `name[i]: bad array
+		// subscript` and assigns nothing (`assign_array_element`).
+		let mut counted = NumBuffer::new();
+		let assoc = cur
+			.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
+		let index = match index {
+			Some(i) if i.first() == Some(&b'-') && !assoc => {
+				let n: i64 = std::str::from_utf8(i)
+					.ok()
+					.and_then(|s| s.parse().ok())
+					.unwrap_or(0);
+				let next = cur
+					.filter(|v| !v.attrs.contains(Attrs::INVISIBLE))
+					.map(Var::next_index);
+				match next.map(|next| next + n) {
+					Some(j) if j >= 0 => Some(j.format_into(&mut counted).as_bytes()),
+					_ => {
+						let mut shown = BString::from(name);
+						shown.push(b'[');
+						shown.extend_from_slice(i);
+						shown.push(b']');
+						arith::Env::warn(self, Diag::BadSubscript { shown });
+						return Ok(());
+					},
+				}
+			},
+			other => other,
+		};
 		// In place where the variable is bound (`edit_var` at the dynamic
 		// level is where `lookup_declared` found it): the store gets the
 		// element or value, not a copy of the variable (an array element
@@ -4140,21 +4270,34 @@ fn func_binds(
 	Ok(false)
 }
 
-/// The text of `v` (element `index`) arithmetic evaluates.
-fn arith_element<'v>(v: &'v Var, index: Option<&[u8]>) -> Option<&'v [u8]> {
-	match index {
-		None => v.as_scalar(),
-		Some(i) => {
-			if let VarValue::Assoc(_) = &v.value {
-				v.key(i)
-			} else {
-				let n: i64 = std::str::from_utf8(i)
-					.ok()
-					.and_then(|s| s.parse().ok())
-					.unwrap_or(0);
-				v.index(n)
-			}
+/// The text of `v` (element `index`) arithmetic evaluates, from the
+/// declared variable `v` (`None`: undeclared), and whether the index names
+/// no element bash can count back to: a negative index counts back from
+/// the end of an indexed array, but one before its start, or any of a
+/// scalar or an unset variable, reads as unset and bash warns `name: bad
+/// array subscript` (`array_value_internal`).
+fn arith_element<'v>(v: Option<&'v Var>, index: Option<&[u8]>) -> (Option<&'v [u8]>, bool) {
+	let assoc =
+		v.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
+	let v = v.filter(|v| !v.attrs.contains(Attrs::INVISIBLE));
+	let Some(i) = index else {
+		return (v.and_then(Var::as_scalar), false);
+	};
+	if assoc {
+		return (v.and_then(|v| v.key(i)), false);
+	}
+	let n: i64 = std::str::from_utf8(i)
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(0);
+	if n >= 0 {
+		return (v.and_then(|v| v.index(n)), false);
+	}
+	match v {
+		Some(v) if matches!(v.value, VarValue::Indexed(_)) && v.next_index() + n >= 0 => {
+			(v.index(v.next_index() + n), false)
 		},
+		_ => (None, true),
 	}
 }
 
@@ -4201,6 +4344,12 @@ impl Vars<'_, '_> {
 			return Err(arith::Error::Unbound { name: BString::from(name) });
 		}
 		Ok(value)
+	}
+
+	/// bash's `name: bad array subscript` for a read of an element `name`
+	/// cannot have.
+	fn warn_bad_sub(&mut self, name: &[u8]) {
+		arith::Env::warn(self, Diag::BadSubscript { shown: BString::from(name) });
 	}
 }
 

@@ -737,3 +737,103 @@ fn extdebug_sets_errtrace_and_functrace() {
 	let (out, _) = run("shopt -s extdebug; echo $-; shopt -u extdebug; echo $-");
 	assert_eq!(out, "hBETc\nhBc\n");
 }
+
+// Goldens: bash 5.3.20 (5.2.21 agrees). A scalar has no element to count a
+// negative subscript back from: every expansion of it warns `x: bad array
+// subscript` and is unset (`array_value_internal`); `@a` and `@A` look it
+// up twice. A dynamic scalar is one too.
+#[test]
+fn negative_subscript_of_a_scalar_warns_and_is_unset() {
+	let (out, err) = run(
+		r#"x=abc; echo "[${x[-1]}] [${x[-1]:-u}] [${x[-1]#a}] [${x[-1]@a}]"; declare -i n=4; echo "[${n[-1]}]"; echo "[${BASHPID[-1]:+s}]"; a=(1); echo "[${a[-3]@a}]""#,
+	);
+	assert_eq!(out, "[] [u] [] []\n[]\n[]\n[a]\n");
+	let bad = |name: &str| format!("bash: line 1: {name}: bad array subscript\n");
+	let want = [bad("x").repeat(5), bad("n"), bad("BASHPID"), bad("a").repeat(2)].concat();
+	assert_eq!(err, want);
+}
+
+// Goldens: bash 5.3.20 (5.2.21 agrees). Arithmetic counts a negative
+// subscript back from the end of an indexed array (a scalar is its element
+// 0 when assigned); a read before the start warns `a: bad array subscript`
+// and is 0, an assignment there warns `a[-3]: …` and assigns nothing.
+#[test]
+fn negative_subscript_in_arithmetic_counts_back() {
+	let (out, err) = run(
+		"a=(1 2); echo $((a[-1])) $((a[-3])); x=5; ((x[-1]=7)); declare -p x; ((a[-1]=7)); \
+		 ((a[-3]=9)); declare -p a; ((u[-1]=1)); declare -p u",
+	);
+	assert_eq!(out, "2 0\ndeclare -a x=([0]=\"7\")\ndeclare -a a=([0]=\"1\" [1]=\"7\")\n");
+	assert_eq!(
+		err,
+		"bash: line 1: a: bad array subscript\nbash: line 1: a[-3]: bad array subscript\nbash: line \
+		 1: u[-1]: bad array subscript\nbash: line 1: declare: u: not found\n"
+	);
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `-v` counts a negative subscript
+// back too; a scalar's warns.
+#[test]
+fn negative_subscript_in_test_v_counts_back() {
+	let (out, err) = run(r"a=(1 2); [[ -v a[-1] ]] && echo s1; x=abc; [[ -v x[-1] ]] || echo u");
+	assert_eq!(out, "s1\nu\n");
+	assert_eq!(err, "bash: line 1: x: bad array subscript\n");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `${p:?}` names the parameter as
+// written, subscript and `!` included (`parameter_brace_expand_error`).
+#[test]
+fn error_operator_names_the_parameter_as_written() {
+	let (out, err) = run(
+		r#"x=abc; ( : "${x[1]:?}" ); ( : "${x[$i]?}" ); ( : "${u[@]:?msg}" ); v=u; ( : "${!v:?}" ); echo after"#,
+	);
+	assert_eq!(out, "after\n");
+	assert_eq!(
+		err,
+		"bash: line 1: x[1]: parameter null or not set\nbash: line 1: u[@]: msg\nbash: line 1: !v: \
+		 parameter null or not set\n"
+	);
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): a scalar's `[@]` with `@A` is its
+// `@A`, with `@K` or `@k` its value quoted (one word).
+#[test]
+fn scalar_all_elements_transforms_quote_the_value() {
+	let (out, err) = run(
+		r#"x=abc; declare -i z=7; y="a b"; echo "${x[@]@A}" "${z[*]@A}" "${x[@]@K}" "${y[@]@k}"; set -- "${y[@]@k}"; echo $#"#,
+	);
+	assert_eq!(out, "x='abc' declare -i z='7' 'abc' 'a b'\n1\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `@a` and `@A` of a name reference
+// describe its target (`find_variable` follows it); one naming no
+// variable describes nothing. `${!r@op}` applies the operator to `${!r}`,
+// the name the reference holds, and describes the target.
+#[test]
+fn name_reference_transforms_describe_the_target() {
+	let (out, err) = run(
+		r#"declare -i n=4; declare -n r=n; echo "[${r@a}] [${r[@]@a}] [${!r@a}] [${r@A}]"; declare -n u=nosuch e; echo "[${u@a}] [${u@A}] [${e@a}]""#,
+	);
+	assert_eq!(out, "[i] [i] [i] [declare -i n='4']\n[] [] []\n");
+	assert_eq!(err, "");
+	let (out, err) = run(
+		r#"declare -i n=4; declare -n r=n; echo "[${!r@Q}] [${!r@A}] [${!r@U}]"; x=abc; declare -n s=x; echo "[${!s@Q}] [${!s@A}]""#,
+	);
+	assert_eq!(out, "['n'] [declare -i n='n'] [N]\n['x'] [x='x']\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `x[@]` and `x[*]` name no one
+// element in arithmetic: each lookup warns, a read is 0, an assignment
+// assigns nothing; an associative array's `@` is a key.
+#[test]
+fn all_elements_in_arithmetic_warn_and_read_zero() {
+	let (out, err) = run(
+		"x=abc; echo $((x[@])) $(( x[*] + 1 )); echo $((x[@]=5)) $((x[@]++)); declare -p x; declare \
+		 -A A=([k]=1); echo $((A[@]))",
+	);
+	assert_eq!(out, "0 1\n5 0\ndeclare -- x=\"abc\"\n0\n");
+	let bad = |s: &str| format!("bash: line 1: {s}: bad array subscript\n");
+	assert_eq!(err, [bad("x[@]"), bad("x[*]"), bad("x[@]").repeat(3)].concat());
+}
