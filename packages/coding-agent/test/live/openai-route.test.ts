@@ -440,6 +440,48 @@ describe("GPT-Live transport", () => {
 		}
 	});
 
+	test("one delta over 8,192 characters is not cut inside a surrogate pair", async () => {
+		// 8,192 characters before the end of the delta falls between the two halves of the emoji.
+		const head = `${"a".repeat(100)}😀`;
+		const tail = `${"b".repeat(8_181)}ENDOFWORDS`;
+		const delta = `${head}${tail}`;
+		expect(delta.charCodeAt(delta.length - 8_192)).toBe("😀".charCodeAt(1));
+		const api = liveApiServer({
+			events: [
+				{ type: "session.input_transcript.delta", event_id: "e1", delta, start_ms: 0, end_ms: 100 },
+				{
+					type: "session.delegation.created",
+					event_id: "e2",
+					offset_ms: 100,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			const pieces = events.flatMap(event => (event.type === "input_transcript.added" ? [event.item.text] : []));
+			// No piece starts or ends with half of a surrogate pair, and the pieces join back to the delta.
+			expect(pieces.map(piece => piece.isWellFormed())).toEqual([true, true]);
+			expect(pieces.join("")).toBe(delta);
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: head } },
+				{ type: "turn.done", turn: { role: "user", transcript: head } },
+				{ type: "input_transcript.added", item: { text: tail } },
+				heard("item_1", tail),
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
 	test("follows no redirect, so the key never leaves the provider's origin", async () => {
 		const elsewhere = liveApiServer();
 		const redirecting = Bun.serve({
