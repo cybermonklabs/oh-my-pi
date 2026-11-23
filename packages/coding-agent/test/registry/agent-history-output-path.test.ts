@@ -9,8 +9,8 @@ import * as path from "node:path";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ARTIFACTS_DIR, registerSubagent } from "./registry-test-helpers";
 
-const ARTIFACTS_DIR = path.join(path.sep, "artifacts", "main");
 const SESSION_FILE = path.join(ARTIFACTS_DIR, "Worker.jsonl");
 /** Where the executor writes Worker's output: `<artifactsDir>/<id>.md`, beside its `<id>.jsonl`. */
 const OUTPUT_PATH = path.join(ARTIFACTS_DIR, "Worker.md");
@@ -24,24 +24,13 @@ function sessionStub(): AgentSession {
 	return stub as unknown as AgentSession;
 }
 
-function registerWorker(registry: AgentRegistry, session: AgentSession | null, sessionFile: string | null) {
-	return registry.register({
-		id: "Worker",
-		displayName: "task",
-		kind: "sub",
-		session,
-		sessionFile,
-		status: session ? "idle" : "parked",
-	});
-}
-
 describe("a subagent record's output artifact", () => {
 	it("reads as written through park, kill and reopen, and in every copy of the record", async () => {
 		// If this regresses, a parked or reopened subagent's record loses its output artifact or names another file:
 		// the Agent Hub shows no Output for it, and an RPC client (JSON) or worker thread (structured clone) copying
 		// the record gets none.
 		const registry = new AgentRegistry();
-		const ref = registerWorker(registry, sessionStub(), SESSION_FILE);
+		const ref = registerSubagent(registry, "Worker", SESSION_FILE, sessionStub());
 		expect(registry.setHistory("Worker", { outputPath: OUTPUT_PATH })).toBe(true);
 		const lifecycle = new AgentLifecycleManager(registry);
 		lifecycle.adopt("Worker", { idleTtlMs: 0 }, ref);
@@ -64,7 +53,7 @@ describe("a subagent record's output artifact", () => {
 		// If this regresses, a subagent whose session moved to another transcript names an artifact beside the new
 		// transcript, which its executor never wrote, as its output.
 		const registry = new AgentRegistry();
-		const ref = registerWorker(registry, null, SESSION_FILE);
+		const ref = registerSubagent(registry, "Worker", SESSION_FILE);
 		registry.setHistory("Worker", { outputPath: OUTPUT_PATH });
 
 		// No cost to reset: the record keeps its history object.
@@ -91,7 +80,7 @@ describe("a subagent record's output artifact", () => {
 		const elsewhere = path.join(path.sep, "elsewhere", "Worker.md");
 		for (const sessionFile of [SESSION_FILE, null]) {
 			const registry = new AgentRegistry();
-			registerWorker(registry, null, sessionFile);
+			registerSubagent(registry, "Worker", sessionFile);
 			registry.setHistory("Worker", { outputPath: elsewhere });
 			registry.setHistory("Worker", { directCost: 0.2 });
 			expect(registry.get("Worker")?.history?.outputPath).toBe(elsewhere);

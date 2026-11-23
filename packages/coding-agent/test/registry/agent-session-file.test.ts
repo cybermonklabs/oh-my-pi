@@ -9,13 +9,9 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ARTIFACTS_DIR, registerSubagent } from "./registry-test-helpers";
 
-const ARTIFACTS_DIR = path.join(path.sep, "artifacts", "main");
 const OTHER_DIR = path.join(path.sep, "artifacts", "other");
-
-function register(registry: AgentRegistry, id: string, sessionFile: string | null) {
-	return registry.register({ id, displayName: "task", kind: "sub", session: null, sessionFile, status: "parked" });
-}
 
 /** The session file of `ref` as each copy of it reads it: the record, a spread, and JSON of it (an RPC client's). */
 function readings(ref: { sessionFile: string | null }): (string | null)[] {
@@ -37,7 +33,7 @@ describe("a registry record's session file", () => {
 			["Root", path.join(ARTIFACTS_DIR, "2026-11-22_root.jsonl")],
 			["Unsaved", null],
 		];
-		for (const [id, sessionFile] of given) register(registry, id, sessionFile);
+		for (const [id, sessionFile] of given) registerSubagent(registry, id, sessionFile);
 		for (const [id, sessionFile] of given) {
 			expect(readings(registry.get(id)!)).toEqual([sessionFile, sessionFile, sessionFile]);
 		}
@@ -47,7 +43,7 @@ describe("a registry record's session file", () => {
 		// If this regresses, a subagent whose session moved to another transcript, or one reopened after a kill, is
 		// revived from the transcript it had before, or from none.
 		const registry = new AgentRegistry();
-		const ref = register(registry, "Worker", path.join(ARTIFACTS_DIR, "Worker.jsonl"));
+		const ref = registerSubagent(registry, "Worker", path.join(ARTIFACTS_DIR, "Worker.jsonl"));
 		const session = {} as AgentSession;
 		for (const sessionFile of [
 			path.join(OTHER_DIR, "Worker.jsonl"),

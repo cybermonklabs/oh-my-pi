@@ -584,6 +584,52 @@ for (const { where, secret, fields } of [
 	}, 30_000);
 }
 
+/** Sets `modelUndefinedFields` in the newest revive inputs of the transcript at `sessionFile`, as a forged file would. */
+async function forgeModelUndefinedFields(sessionFile: string, fieldPaths: string[][]): Promise<void> {
+	const lines = (await Bun.file(sessionFile).text()).split("\n");
+	const index = lines.findLastIndex(line => line.includes('"customType":"subagent-revive-state"'));
+	const entry: unknown = index === -1 ? undefined : JSON.parse(lines[index]!);
+	if (
+		!isRecord(entry) ||
+		!isRecord(entry.data) ||
+		!isRecord(entry.data.options) ||
+		!isRecord(entry.data.options.model)
+	) {
+		throw new Error("The park recorded no revive inputs holding the model");
+	}
+	entry.data.modelUndefinedFields = fieldPaths;
+	lines[index] = JSON.stringify(entry);
+	await Bun.write(sessionFile, lines.join("\n"));
+}
+
+// If this regresses, a session file whose revive inputs name a model field through `__proto__` (forged or damaged)
+// adds that field to every object of the process when its subagent is woken for a follow-up, and settings then fail to
+// load with `Unknown setting`.
+it("revives from revive inputs naming a model field through `__proto__` without changing Object.prototype", async () => {
+	const models: Model<Api>[] = [];
+	registerCustomApi(SECRET_MODEL_API, answeringStream(models), MOCK_API_SOURCE);
+	const run = await runKeptAliveSubagent({ model: providerModel({ baseUrl: "https://llm.example.test/v1" }) });
+	try {
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+		const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+		if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+		await forgeModelUndefinedFields(sessionFile, [["__proto__", "polluted"]]);
+
+		const followUp = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: TASK_AGENT,
+			message: "anything else?",
+			storeMaskCwd: path.join(root, "home", "work"),
+		});
+		expect(followUp.exitCode).toBe(0);
+		expect(Object.hasOwn(Object.prototype, "polluted")).toBe(false);
+	} finally {
+		Reflect.deleteProperty(Object.prototype, "polluted");
+		run.close();
+	}
+}, 30_000);
+
 const REGISTRY_MODEL_API = "test-parked-release-registry-model";
 const REGISTRY_PROVIDER = "registry-provider";
 const REGISTRY_MODEL_ID = "registry-model";

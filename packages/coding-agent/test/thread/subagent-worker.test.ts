@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { RpcClosedError } from "../../src/thread/rpc";
@@ -6,23 +6,13 @@ import type { ThreadService, WorkerPeer } from "../../src/thread/services";
 import { THREAD_SERVICES } from "../../src/thread/services/index";
 import {
 	allowedSubagentWorkers,
-	SubagentWorker,
-	type SubagentWorkerOptions,
+	type SubagentWorker,
 	SubagentWorkerPool,
 	type SubagentWorkerPoolOptions,
 } from "../../src/thread/subagent-worker";
+import { useWorkerTests } from "./worker-test-helpers";
 
-const cleanups: Array<() => void> = [];
-
-afterEach(() => {
-	for (const cleanup of cleanups.splice(0)) cleanup();
-});
-
-function startWorker(options: SubagentWorkerOptions = {}): SubagentWorker {
-	const worker = new SubagentWorker(options);
-	cleanups.push(() => worker.terminate());
-	return worker;
-}
+const { cleanups, startWorker, nextRecord } = useWorkerTests();
 
 /** Resolves after a prewarm's spawn (setImmediate callbacks run in FIFO order). */
 function nextImmediate(): Promise<void> {
@@ -122,14 +112,10 @@ describe("SubagentWorker", () => {
 			logger.setTransports({ file: true });
 			void dir.remove();
 		});
-		const after = Promise.withResolvers<void>();
 		const worker = startWorker({ entry: new URL("../fixtures/early-log-worker.ts", import.meta.url) });
-		const unregisterAfter = logger.registerLogSink(event => {
-			if (event.message === "early-log: after init") after.resolve();
-		});
-		cleanups.push(unregisterAfter);
+		const after = nextRecord("early-log: after init");
 		await worker.ready;
-		await after.promise;
+		await after;
 		expect(events.map(event => [event.message, event.context])).toEqual([
 			["early-log: during evaluation", { phase: "evaluation", thread: worker.threadId }],
 			["early-log: after init", { phase: "init", thread: worker.threadId }],
@@ -149,15 +135,10 @@ describe("SubagentWorker", () => {
 		Bun.env.PI_PROXY = `http://127.0.0.1:${proxy.port}`;
 		delete Bun.env.NO_PROXY;
 		delete Bun.env.no_proxy;
-		const probed = Promise.withResolvers<logger.LogEvent>();
-		cleanups.push(
-			logger.registerLogSink(event => {
-				if (event.message.startsWith("proxy-probe:")) probed.resolve(event);
-			}),
-		);
+		const probed = nextRecord(event => event.message.startsWith("proxy-probe:"));
 		const worker = startWorker({ entry: new URL("../fixtures/proxy-probe-worker.ts", import.meta.url) });
 		await worker.ready;
-		const event = await probed.promise;
+		const event = await probed;
 		expect([event.message, event.context?.body]).toEqual(["proxy-probe: done", "via http://proxied.invalid/probe"]);
 	});
 });

@@ -181,11 +181,19 @@ function reviveWithClosure(expected: AgentRef, revive: unknown): Promise<AgentSe
 	return (revive as AgentReviver)(expected);
 }
 
-/** Whether `adopted` holds `revive`: the same closure, or the same plain-data reviver and state. */
-function holdsReviver(adopted: AdoptedAgent, revive: AdoptedReviver): boolean {
-	return typeof revive === "function"
-		? adopted.reviver === reviveWithClosure && adopted.reviveState === revive
-		: adopted.reviver === revive.reviver && adopted.reviveState === revive.state;
+/** The {@link HeldReviver} an adoption holds for `revive`: {@link reviveWithClosure} for a closure, else its `reviver`. */
+function heldReviver(revive: AdoptedReviver): HeldReviver {
+	return typeof revive === "function" ? reviveWithClosure : revive.reviver;
+}
+
+/** The revive state an adoption holds for `revive`: the closure itself, else its `state`. */
+function heldReviveState(revive: AdoptedReviver): unknown {
+	return typeof revive === "function" ? revive : revive.state;
+}
+
+/** Whether `adopted` holds `reviver` with the revive state `state`. */
+function holdsReviver(adopted: AdoptedAgent, reviver: HeldReviver, state: unknown): boolean {
+	return adopted.reviver === reviver && adopted.reviveState === state;
 }
 
 /** Fire (at most once) the adoption's reviver-dropped hook. */
@@ -425,8 +433,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		const adopted: AdoptedAgent = {
 			ref,
 			idleTtlMs: opts.idleTtlMs,
-			reviver: revive === undefined ? undefined : typeof revive === "function" ? reviveWithClosure : revive.reviver,
-			reviveState: typeof revive === "function" ? revive : revive?.state,
+			reviver: revive === undefined ? undefined : heldReviver(revive),
+			reviveState: revive === undefined ? undefined : heldReviveState(revive),
 			onRelease: opts.onRelease,
 			onReviverDropped: opts.onReviverDropped,
 		};
@@ -444,7 +452,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 */
 	forgetReviver(id: string, revive: AdoptedReviver): boolean {
 		const adopted = this.#adopted.get(id);
-		if (!adopted || !holdsReviver(adopted, revive)) return false;
+		if (!adopted || !holdsReviver(adopted, heldReviver(revive), heldReviveState(revive))) return false;
 		forgetAdoptedReviver(adopted);
 		return true;
 	}
@@ -877,8 +885,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				error instanceof WarmReviveInputsMissingError &&
 				adoption === prior &&
 				this.#adopted.get(id) === prior &&
-				prior.reviver === reviver &&
-				prior.reviveState === reviveState
+				holdsReviver(prior, reviver, reviveState)
 			) {
 				forgetAdoptedReviver(prior);
 				return this.#resolveAndRevive(id, ref, coldRevive);
