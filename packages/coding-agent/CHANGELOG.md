@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The bash tool's `read` and `select` report a failed read as bash does (`read: 0: read error: Bad file descriptor` for a write-only, closed or directory descriptor, status 1, the variables left as they were), and `echo`, `printf` and the other builtins report a write to a read-only `/dev/null` descriptor (`echo: write error: Bad file descriptor`, status 1) instead of dropping the output
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

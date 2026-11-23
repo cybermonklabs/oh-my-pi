@@ -1472,6 +1472,10 @@ pub enum ProbeResult {
 		eof:       bool,
 		/// The timeout passed first (`data` holds the partial input).
 		timed_out: bool,
+		/// A read failed: the `strerror` text of its error. `eof` is set
+		/// too and `data` holds the bytes read before it, so a reader that
+		/// does not report the error takes it as the end of the input.
+		error:     Option<BString>,
 	},
 	/// Matching paths, sorted (empty: no match).
 	Paths(Vec<BString>),

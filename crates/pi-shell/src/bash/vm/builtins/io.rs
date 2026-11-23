@@ -528,7 +528,7 @@ fn split_all(ifs: &Ifs<'_>, m: &Line) -> Vec<BString> {
 }
 
 /// How a `read` ended.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Ended {
 	/// The delimiter or the character count was reached.
 	Complete,
@@ -536,6 +536,9 @@ enum Ended {
 	Eof,
 	/// The timeout passed first (status 142).
 	TimedOut,
+	/// A read failed: the `strerror` text of its error (bash's `read
+	/// error`, status 1, nothing assigned).
+	Failed(BString),
 }
 
 /// What [`read_line`] reads: the fd, where to stop, and how long to wait.
@@ -581,9 +584,12 @@ fn read_line(
 				return Err(need);
 			},
 		};
-		let ProbeResult::Input { data, eof, timed_out } = answer else {
+		let ProbeResult::Input { data, eof, timed_out, error } = answer else {
 			return Ok((st.finish(), Ended::Eof));
 		};
+		if let Some(text) = error {
+			return Ok((st.finish(), Ended::Failed(text)));
+		}
 		let ended = st.feed(&data, raw, delim, cs);
 		if timed_out {
 			return Ok((st.finish(), Ended::TimedOut));
@@ -721,6 +727,11 @@ pub fn read(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			Ended::Eof => 1,
 			// 128 + SIGALRM, as bash reports a `read` timeout.
 			Ended::TimedOut => 142,
+			// bash `read_builtin`: the error, status 1, no variable set.
+			Ended::Failed(text) => {
+				ctx.usage(format!("{fd}: read error: {}", text.as_bstr()));
+				return done(1);
+			},
 		};
 		(marked, status)
 	};
@@ -862,7 +873,7 @@ pub fn select_next(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
-	_line: u32,
+	line: u32,
 ) -> Result<Option<(BString, BString)>, Flow> {
 	let Some(rec) = vp.frames.last().and_then(|f| f.loops.last()) else {
 		return Ok(None);
@@ -920,10 +931,17 @@ pub fn select_next(
 				},
 			}
 		};
-		let ProbeResult::Input { data, eof, .. } = answer else {
+		let ProbeResult::Input { data, eof, error, .. } = answer else {
 			break None;
 		};
-		if eof && data.is_empty() {
+		// bash's select reports a failed read (`0: read error: ...`) and ends
+		// as at end of input; zsh takes it as the end of input.
+		let failed = !zsh && error.is_some();
+		if let Some(text) = error.filter(|_| failed) {
+			let msg = format!("0: read error: {}", text.as_bstr());
+			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
+		}
+		if failed || (eof && data.is_empty()) {
 			if zsh {
 				// zsh `execselect`: `REPLY` empty, a newline on stderr; the
 				// loop's status is its last command's.
