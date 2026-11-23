@@ -983,6 +983,24 @@ export interface SessionPersistenceNotice {
 }
 
 /**
+ * What {@link SessionManager.flush}, {@link SessionManager.flushSync} and {@link SessionManager.close} reject with
+ * once an `OMP_SESSION_EXCLUSIVE=1` stop sealed a session whose storage does not hold every entry: the stop writes
+ * nothing more, so those entries are never saved, and the process ends.
+ */
+export class SessionExclusiveStopError extends Error {
+	constructor(
+		readonly sessionId: string,
+		readonly reason: SessionPersistenceNotice["reason"],
+		why: string,
+	) {
+		super(
+			`Session ${sessionId} stops (${reason}): ${why}. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id, so the entries its storage does not hold are not saved.`,
+		);
+		this.name = "SessionExclusiveStopError";
+	}
+}
+
+/**
  * Thrown by {@link SessionManager.forkFrom} when the fork source is missing.
  * The CLI maps this to a clean session-resolution failure at its own boundary
  * (this module must not import `main.ts`, where `SessionResolutionError` lives).
@@ -1162,8 +1180,12 @@ export class SessionManager {
 	 * {@link close} gave the claim up, and once the claim was lost.
 	 */
 	#sessionClaim: { sessionId: string; release: (() => void) | undefined } | undefined;
-	/** Set once an `OMP_SESSION_EXCLUSIVE=1` session began to stop (see {@link #stopExclusive}). */
-	#exclusiveStopping = false;
+	/**
+	 * Set once an `OMP_SESSION_EXCLUSIVE=1` session began to stop (see {@link #stopExclusive}): what a flush or close
+	 * that finds an entry unsaved rejects with, once `announced` (the stop line is on stderr), and whether the seal
+	 * dropped an entry appended after the stop.
+	 */
+	#exclusiveStop: { error: SessionExclusiveStopError; announced: Promise<void>; dropped: boolean } | undefined;
 	/** How many times {@link close} has begun: a file-lease wait that began before a close ends without the claim. */
 	#closes = 0;
 	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
@@ -1625,52 +1647,86 @@ export class SessionManager {
 	 * and pid. The launcher that named the session restarts it under the
 	 * same id. The holder is looked up for at most
 	 * {@link EXCLUSIVE_STOP_HOLDER_LOOKUP_MS}: a database that stopped
-	 * answering must not keep a sealed session's process alive.
+	 * answering must not keep a sealed session's process alive. Until the
+	 * process ends, a flush or close that finds an entry storage does not hold
+	 * rejects with the stop instead of reporting it saved.
 	 */
 	#stopExclusive(
 		reason: SessionPersistenceNotice["reason"],
 		detail: { holder?: SessionClaimHolder; why?: string },
 	): void {
-		if (this.#exclusiveStopping) return;
-		this.#exclusiveStopping = true;
-		this.seal();
+		if (this.#exclusiveStop) return;
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
+		const why =
+			detail.why ??
+			{
+				contested: "another writer changed its file",
+				replaced: "its file now holds another session",
+				"open-elsewhere": "another omp process holds it",
+			}[reason];
+		const announced = Promise.withResolvers<void>();
+		this.#exclusiveStop = {
+			error: new SessionExclusiveStopError(sessionId, reason, why),
+			announced: announced.promise,
+			dropped: false,
+		};
+		this.seal();
 		void (async () => {
-			const lookup =
-				detail.holder === undefined && reason === "open-elsewhere"
-					? this.#storage.sessionClaimHolder?.(this.#leaseId())
-					: undefined;
-			const holder =
-				detail.holder ??
-				(lookup &&
-					(await Promise.race([
-						lookup.catch(() => undefined),
-						Bun.sleep(EXCLUSIVE_STOP_HOLDER_LOOKUP_MS).then(() => undefined),
-					])));
-			const why =
-				detail.why ??
-				{
-					contested: "another writer changed its file",
-					replaced: "its file now holds another session",
-					"open-elsewhere": "another omp process holds it",
-				}[reason];
-			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
-			logger.error("Session stops: OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id", {
-				sessionId,
-				sessionFile,
-				reason,
-				holder,
-			});
-			process.stderr.write(
-				`Session ${sessionId} stops (${reason}): ${why}${by}. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id.\n`,
-			);
+			try {
+				const lookup =
+					detail.holder === undefined && reason === "open-elsewhere"
+						? this.#storage.sessionClaimHolder?.(this.#leaseId())
+						: undefined;
+				const holder =
+					detail.holder ??
+					(lookup &&
+						(await Promise.race([
+							lookup.catch(() => undefined),
+							Bun.sleep(EXCLUSIVE_STOP_HOLDER_LOOKUP_MS).then(() => undefined),
+						])));
+				const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
+				logger.error("Session stops: OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id", {
+					sessionId,
+					sessionFile,
+					reason,
+					holder,
+				});
+				process.stderr.write(
+					`Session ${sessionId} stops (${reason}): ${why}${by}. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id.\n`,
+				);
+			} finally {
+				announced.resolve();
+			}
 			// The stop ends the process at once, without postmortem's cleanup, so nothing more of the session runs; a
 			// claim the store still holds (a subagent's, the session's own when a write found the file changed) goes
 			// back first, within the release's bound. The session's lost or refused claim deletes nothing.
 			await this.#storage.releaseHeldClaims?.().catch(() => undefined);
 			process.exit(1);
 		})();
+	}
+
+	/**
+	 * Whether the `OMP_SESSION_EXCLUSIVE=1` stop `stop` left an entry storage does not hold: one whose write failed
+	 * (the file no longer reflects the session), or one appended after the stop, which the seal dropped. Nothing
+	 * writes either once the session stopped.
+	 */
+	#stopLeftEntriesUnsaved(stop: { dropped: boolean }): boolean {
+		return stop.dropped || (this.#shouldHaveSessionFile() && !this.#fileIsCurrent);
+	}
+
+	/**
+	 * After an `OMP_SESSION_EXCLUSIVE=1` stop, reject with it when storage does not hold every entry, once the
+	 * writes still queued settled and the stop line is on stderr: no caller may take an entry for saved while the
+	 * process ends without it, and none acts on the rejection before the stop is named.
+	 */
+	async #rejectIfStopLeftEntriesUnsaved(): Promise<void> {
+		const stop = this.#exclusiveStop;
+		if (!stop) return;
+		await this.#storage.drain().catch(() => undefined);
+		if (!this.#stopLeftEntriesUnsaved(stop)) return;
+		await stop.announced;
+		throw stop.error;
 	}
 
 	/**
@@ -1694,7 +1750,7 @@ export class SessionManager {
 			!this.#persist ||
 			this.#released ||
 			this.#sessionFileRelocating ||
-			this.#exclusiveStopping ||
+			this.#exclusiveStop ||
 			(this.#storage.defersSyncPublish && !(queued && this.#recoversQueuedConflicts()))
 		) {
 			return undefined;
@@ -1854,7 +1910,7 @@ export class SessionManager {
 		const recoveries = this.#queuedConflictRecoveries++;
 		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true)
 			.then(async retryPath => {
-				if (this.#exclusiveStopping || this.#entriesReleased) return;
+				if (this.#exclusiveStop || this.#entriesReleased) return;
 				if (!retryPath) {
 					this.#takenOverConflicts.delete(error);
 					this.#noteDiskFailure(error);
@@ -2844,6 +2900,8 @@ export class SessionManager {
 	#recordEntry(entry: SessionEntry): void {
 		if (this.#released) {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
+			// A flush or close of a stopped session reports it unsaved (see #stopLeftEntriesUnsaved).
+			if (this.#exclusiveStop) this.#exclusiveStop.dropped = true;
 			return;
 		}
 		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
@@ -3747,7 +3805,10 @@ export class SessionManager {
 		});
 	}
 
-	/** Flush pending writes. Call before switching sessions or on shutdown. */
+	/**
+	 * Flush pending writes. Call before switching sessions or on shutdown. After an `OMP_SESSION_EXCLUSIVE=1` stop
+	 * it rejects with the stop ({@link SessionExclusiveStopError}) while storage does not hold every entry.
+	 */
 	async flush(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		// A refused write found while draining may start a parent follow (see
@@ -3767,6 +3828,7 @@ export class SessionManager {
 			await this.#parentMoveFollow;
 			await this.#queuedConflictRecovery;
 		}
+		await this.#rejectIfStopLeftEntriesUnsaved();
 		if (this.#diskFailure) throw this.#diskFailure;
 	}
 
@@ -3774,10 +3836,13 @@ export class SessionManager {
 	 * Synchronously makes the current append-only session durable. Avoid rewriting
 	 * an already-current file: large restored sessions can contain GiB of compacted
 	 * history, and Ctrl+C must not rebuild the whole JSONL string just to flush.
+	 * After an `OMP_SESSION_EXCLUSIVE=1` stop that left an entry unsaved it throws the stop.
 	 */
 	flushSync(): void {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#atomicEntryBatch) throw new Error("Cannot synchronously flush during an atomic session batch.");
+		const stop = this.#exclusiveStop;
+		if (stop && this.#stopLeftEntriesUnsaved(stop)) throw stop.error;
 		if (this.#diskFailure) throw this.#diskFailure;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) {
 			this.#writer?.flushSync?.();
@@ -3841,7 +3906,10 @@ export class SessionManager {
 		}
 	}
 
-	/** Flush, then close the append writer. */
+	/**
+	 * Flush, then close the append writer. After an `OMP_SESSION_EXCLUSIVE=1` stop it rejects with the stop
+	 * ({@link SessionExclusiveStopError}) while storage does not hold every entry.
+	 */
 	async close(): Promise<void> {
 		this.#closes++;
 		if (!this.#persist) return;
@@ -3852,7 +3920,11 @@ export class SessionManager {
 				async () => {
 					const hadWriter = this.#writer !== undefined;
 					await this.#closeWriterHandle();
-					if (hadWriter || (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)))
+					// A stopped session's file stays as its last write left it: nothing more is written.
+					if (
+						!this.#exclusiveStop &&
+						(hadWriter || (this.#sessionFile && this.#storage.existsSync(this.#sessionFile)))
+					)
 						this.#fileIsCurrent = true;
 				},
 				{ ignorePriorError: true },
@@ -3886,7 +3958,7 @@ export class SessionManager {
 				!this.#entriesReleased &&
 				// A session that stopped under OMP_SESSION_EXCLUSIVE=1 writes nothing more: another process holds its
 				// file, and a signal's teardown may close it during the stop's wait.
-				!this.#exclusiveStopping &&
+				!this.#exclusiveStop &&
 				this.#shouldHaveSessionFile()
 			) {
 				// Deferred-publish only: a synchronous backend's drain() is a
@@ -3907,6 +3979,7 @@ export class SessionManager {
 					{ ignorePriorError: true },
 				).catch(() => undefined);
 			}
+			await this.#rejectIfStopLeftEntriesUnsaved();
 			if (this.#diskFailure) throw this.#diskFailure;
 		} finally {
 			// Closing gives up this process's ownership claim; a later write
