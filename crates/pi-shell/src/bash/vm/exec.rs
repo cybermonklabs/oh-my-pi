@@ -16,8 +16,8 @@ use super::{
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe, ProbeResult,
+		Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -169,6 +169,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let unit = held.as_ref().expect("just set");
 		let op = unit.ops[frame.pc as usize];
 		let fi = vp.frames.len() - 1;
+		// A `break` or `continue` that ran inside `${ }` or `${| }` waits
+		// for a loop (bash's `breaking`): the command holding it has
+		// finished, and no other command runs before a loop takes it.
+		if vp.pending_break.is_some()
+			&& vp.frames[fi].scratch.is_none()
+			&& unit.mode.dialect() == Dialect::Bash
+			&& pending_break(k, vp, cx, op)
+		{
+			continue;
+		}
 		// Control flow of a bash unit: it starts no command, cannot fail as
 		// one or block, and keeps the clock, so none of the bookkeeping
 		// below applies to it.
@@ -1941,55 +1951,143 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 	}
 }
 
+/// Whether a `break` at the top of `frames` reaches a loop: the innermost
+/// frame holding one, past `eval`, `${ }`, a pipeline stage and `$(< file)`
+/// only (a function is a boundary, as bash's `loop_level` is).
+fn loop_reachable(frames: &[Frame]) -> bool {
+	for (i, f) in frames.iter().enumerate().rev() {
+		if !f.loops.is_empty() {
+			return true;
+		}
+		if i == 0 || !breaks_through(&f.kind) {
+			return false;
+		}
+	}
+	false
+}
+
+/// A frame a `break` crosses to reach the loops outside it.
+const fn breaks_through(kind: &FrameKind) -> bool {
+	matches!(
+		kind,
+		FrameKind::Script { what: ScriptKind::Eval, .. }
+			| FrameKind::NoFork
+			| FrameKind::Stage
+			| FrameKind::Cat { .. }
+	)
+}
+
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
+	// bash's `check_loop_level`: with no loop to take it, `break` only
+	// complains (outside posix mode) and the commands after it run. Decided
+	// before any frame goes, so a `${ }` holding it goes on.
+	if !loop_reachable(&vp.frames) {
+		if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
+			let line = line_of(vp, op.node);
+			let name = if cont { "continue" } else { "break" };
+			let diag =
+				Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
+			k.diag(cx, vp, line, diag.by(name));
+		}
+		vp.status = 0;
+		top_frame(vp).pc += 1;
+		return;
+	}
 	let mut remaining = n.max(1);
 	loop {
-		let f = top_frame(vp);
-		if let Some(rec) = f.loops.last().cloned() {
-			// More levels than loops: the outermost loop ends.
-			if remaining > 1 && f.loops.len() > 1 {
-				f.loops.pop();
+		let depth = vp.frames.len();
+		let top = &vp.frames[depth - 1];
+		if let Some(rec) = top.loops.last().cloned() {
+			// More levels than loops: the next loop out ends too, in this
+			// frame or past an `eval`, `${ }` or stage that holds this one
+			// (bash's `breaking` counts down at each loop); with none left,
+			// the outermost ends.
+			let further = top.loops.len() > 1
+				|| (depth > 1 && breaks_through(&top.kind) && loop_reachable(&vp.frames[..depth - 1]));
+			if remaining > 1 && further {
+				top_frame(vp).loops.pop();
 				truncate(vp, rec.depth);
 				remaining -= 1;
-				continue;
+				if !top_frame(vp).loops.is_empty() {
+					continue;
+				}
+			} else {
+				truncate(vp, rec.depth);
+				// The status is the builtin's: 0, or 1 for `break 0` (which
+				// leaves every loop); for a `break` that waited in a `${ }`,
+				// the status of the command that held it.
+				let status = vp.status;
+				let f = top_frame(vp);
+				// `continue` ends the body with its status too: the loop's
+				// status if no other body command runs.
+				if let Some(r) = f.loops.last_mut() {
+					r.status = status;
+				}
+				f.pc = if cont { rec.cont } else { rec.exit };
+				return;
 			}
-			truncate(vp, rec.depth);
-			// The status is the builtin's: 0, or 1 for `break 0` (which
-			// leaves every loop).
-			let status = vp.status;
-			let f = top_frame(vp);
-			// `continue` ends the body with its status too: the loop's
-			// status if no other body command runs.
-			if let Some(r) = f.loops.last_mut() {
-				r.status = status;
-			}
-			f.pc = if cont { rec.cont } else { rec.exit };
+		}
+		if top_frame(vp).kind == FrameKind::NoFork {
+			// bash's `break` only sets `breaking`: the body of `${ }` or
+			// `${| }` ends here as at its end (`REPLY` passed on), the
+			// command holding it runs, and a loop takes the levels left
+			// after it ([`pending_break`]).
+			pop_frame(&mut k.root, cx.store, vp);
+			let depth = vp
+				.frames
+				.iter()
+				.rposition(|f| !matches!(f.kind, FrameKind::Cat { .. }))
+				.map_or(0, |i| i + 1);
+			vp.pending_break =
+				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32 }));
 			return;
 		}
-		let crossable = matches!(
-			f.kind,
-			FrameKind::Script { what: ScriptKind::Eval, .. }
-				| FrameKind::NoFork
-				| FrameKind::Stage
-				| FrameKind::Cat { .. }
-		);
-		if crossable && vp.frames.len() > 1 {
-			pop_frame(&mut k.root, cx.store, vp);
-			// The caller's op (`eval`) is abandoned with the loop.
-			clear_scratch(&mut k.root, cx.store, vp);
-			continue;
+		pop_frame(&mut k.root, cx.store, vp);
+		// The caller's op (`eval`) is abandoned with the loop.
+		clear_scratch(&mut k.root, cx.store, vp);
+	}
+}
+
+/// bash's `breaking` ([`Vproc::pending_break`]) at an op that would start:
+/// `true` when it moved control (a loop took it, or a frame the waiting
+/// command entered ended), `false` to run the op.
+fn pending_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> bool {
+	let Some(p) = vp.pending_break.as_deref().copied() else {
+		return false;
+	};
+	let top = vp.frames.len() - 1;
+	if vp.frames.len() > p.depth as usize {
+		let kind = &vp.frames[top].kind;
+		if matches!(kind, FrameKind::Cat { .. }) {
+			// The command's own `$(< file)`: it reads its file and ends, and
+			// the command finishes with its value.
+			return false;
 		}
-		break;
+		if matches!(kind, FrameKind::Function { .. }) {
+			// A function the command called runs none of its commands (nor
+			// its RETURN trap).
+			unwind(&mut k.root, cx.store, vp, top);
+			return true;
+		}
+		let frame = &mut vp.frames[top];
+		if let FrameKind::Script { src, pos, stdin, .. } = &mut frame.kind {
+			// Nor does an `eval` or `.` it started: its text ends here.
+			pos.0 = src.len() as u32;
+			*stdin = false;
+			frame.unit = None;
+			return true;
+		}
+		vp.pending_break = None;
+		return false;
 	}
-	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-		let line = line_of(vp, op.node);
-		let name = if cont { "continue" } else { "break" };
-		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
-		k.diag(cx, vp, line, diag.by(name));
+	vp.pending_break = None;
+	if loop_reachable(&vp.frames) {
+		break_loops(k, vp, cx, p.levels, p.cont, op);
+		return true;
 	}
-	vp.status = 0;
-	top_frame(vp).pc += 1;
+	// No loop is left to take it (a `return` carried it out of every
+	// loop): bash would skip each command after it; this shell goes on.
+	false
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2264,6 +2362,13 @@ pub fn start_sub(
 	sc: &mut Scratch,
 	sub: Sub,
 ) -> Flow {
+	// bash's `breaking`: while a `break` in an earlier `${ }` or `${| }` of
+	// the command waits for its loop, no later substitution runs a command
+	// (`execute_command_internal` returns at once); each expands to nothing.
+	if vp.pending_break.is_some() {
+		sc.sub = Some(PendingSub::NoFork { capture: Capture::default(), value: false });
+		return Flow::Call;
+	}
 	let Sub { unit, entry, form, text, line } = sub;
 	let first = unit
 		.ops
@@ -4664,6 +4769,11 @@ fn zsh_debug_done(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// Run a configured trap in the interrupted shell, without re-entering it.
 pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey) -> bool {
+	// bash's `breaking`: while a `break` from `${ }` waits for its loop, a
+	// trap's action runs none of its commands (an EXIT trap too).
+	if vp.pending_break.is_some() {
+		return false;
+	}
 	// A subshell lists its parent's EXIT trap but runs only its own.
 	if key == TrapKey::Exit && vp.parent.is_some() && !vp.own_traps.has(key) {
 		return false;

@@ -5,7 +5,7 @@
 //! stderr and the status against what bash 5.3.20 or zsh 5.9 print for the
 //! same script there. bash 5.2.21 agrees with 5.3.20 on every bash row but
 //! those the rows mark: two name a function's line `environment: line 1:`,
-//! two use 5.3's `${| }`, and two end the shell under `set -e`.
+//! six use 5.3's `${| }`, and two end the shell under `set -e`.
 
 mod obash_support;
 
@@ -123,6 +123,36 @@ fn bash_reads_a_file_substitution_in_the_shell() {
 		// value (bash 5.3 syntax; 5.2.21 has no `${| }`).
 		("x=$(< ${| echo hi; REPLY=f; }); echo \"[$x]\"", "hi\n[hello]\n", "", 0),
 		("f() { x=$(< ${| echo hi; REPLY=f; }); echo \"[$x]\"; }; f", "hi\n[hello]\n", "", 0),
+		// A `break` or `continue` in the word waits until the command that
+		// holds the `$(< …)` is over (bash 5.3's `breaking`): the word
+		// expands to nothing, the redirection fails with the word as bash
+		// stores it, then the loop ends. One that sets `REPLY` first reads
+		// the file. A `return` there leaves only the `${| }`.
+		(
+			"for i in 1 2; do x=$(< ${| break; }); echo in; done; echo \"out $?\"",
+			"out 1\n",
+			"bash: line 1: ${|break; }: ambiguous redirect\n",
+			0,
+		),
+		(
+			"for i in 1 2; do x=$(< ${| continue; }); echo in; done; echo out",
+			"out\n",
+			"bash: line 1: ${|continue; }: ambiguous redirect\nbash: line 1: ${|continue; }: \
+			 ambiguous redirect\n",
+			0,
+		),
+		(
+			"for i in 1 2; do x=$(< ${| REPLY=f; break; }); echo \"in [$x]\"; done; echo \"out [$x]\"",
+			"out [hello]\n",
+			"",
+			0,
+		),
+		(
+			"f() { x=$(< ${| return 3; }); echo no; }; f; echo \"st=$?\"",
+			"no\nst=0\n",
+			"bash: line 1: ${|return 3; }: ambiguous redirect\n",
+			0,
+		),
 		// The `< file` runs no command: `PIPESTATUS` stays the pipeline's.
 		("false | true; echo \"$(< f)\" \"${PIPESTATUS[@]}\"", "hello 1 0\n", "", 0),
 		("false | true; x=$(< f); echo \"${PIPESTATUS[@]}\"", "0\n", "", 0),

@@ -265,6 +265,9 @@ struct ProcImage {
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
 	own_traps:     super::proc::OwnTraps,
+	/// A `break` from `${ }` or `${| }` waiting for its loop: its command
+	/// may be parked.
+	pending_break: Option<super::proc::PendingBreak>,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,
 	/// zsh state (sticky emulation, frames' restores).
@@ -623,6 +626,7 @@ impl Shell {
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
+				pending_break: p.pending_break.as_deref().copied(),
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
@@ -854,6 +858,7 @@ impl Shell {
 			vp.subshell = p.subshell;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
+			vp.pending_break = p.pending_break.map(Box::new);
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;

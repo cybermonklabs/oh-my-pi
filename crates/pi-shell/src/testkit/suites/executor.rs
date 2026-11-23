@@ -1,6 +1,7 @@
 //! Executor behaviour: `set -k`, prefix-assignment errors, `case` status,
 //! the EXIT trap of an `exit` in a function, discarded commands, `${ ;}`
-//! re-parsing, `set -x` headers of compound commands and the status of
+//! re-parsing, a `break` inside `${ ;}`, the word an ambiguous redirection
+//! names, `set -x` headers of compound commands and the status of
 //! `command -v`/`-V`. Goldens: bash 5.3.20 (`/opt/homebrew/bin/bash -c
 //! '…'`).
 
@@ -174,4 +175,216 @@ fn path_misses_run_the_hosts_fallback() {
 		Fault::None,
 	);
 	assert_eq!(String::from_utf8_lossy(&out.stdout), "install mytool\n3\n");
+}
+
+/// bash's complaint about a `break` outside a loop.
+const ONLY_IN_A_LOOP: &str =
+	"bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n";
+
+/// Every `(script, stdout, stderr, status)` row run plainly and with the
+/// shell externalized and restored after every op and after every third;
+/// the mismatches together.
+fn check_rows(rows: &[(&str, &str, &str, i32)]) {
+	let mut bad = Vec::new();
+	for &(src, out, err, status) in rows {
+		for (every, fault) in
+			[(0, Fault::None), (1, Fault::Snapshot { every: 1 }), (3, Fault::Snapshot { every: 3 })]
+		{
+			let got = run_script(FakeHost::new(), src.as_bytes(), &[], fault);
+			let got = (
+				String::from_utf8_lossy(&got.stdout).into_owned(),
+				String::from_utf8_lossy(&got.stderr).into_owned(),
+				got.status,
+			);
+			if got != (out.to_owned(), err.to_owned(), status) {
+				bad.push(format!(
+					"{src:?} (restored every {every} ops)\n  want {:?}\n  got  {got:?}",
+					(out, err, status)
+				));
+			}
+		}
+	}
+	assert!(bad.is_empty(), "{} of {} runs differ:\n{}", bad.len(), rows.len() * 3, bad.join("\n"));
+}
+
+/// bash 5.3's `break` (or `continue`) inside `${| }` or `${ }` only sets
+/// `breaking`: the substitution's body ends there, later substitutions of
+/// the command give nothing, the command itself runs, and the next loop out
+/// takes the levels left (in the caller after a `return`); a function, an
+/// `eval` or a trap the waiting command reaches runs none of its commands.
+/// With no loop: the complaint, and the command runs. The runs restored
+/// between the `break` and its loop check the waiting break is in the image.
+#[test]
+fn a_break_in_a_value_substitution_waits_for_its_command() {
+	let only = ONLY_IN_A_LOOP;
+	let twice = format!("{only}{only}");
+	check_rows(&[
+		("for i in 1 2; do echo a ${| break; } b; echo in; done; echo out", "a b\nout\n", "", 0),
+		(
+			"for i in 1; do echo \"[${| break; }][$(echo x)][${ echo y; }][${| REPLY=z; }]\"; echo \
+			 in; done; echo out",
+			"[][][][]\nout\n",
+			"",
+			0,
+		),
+		("echo a ${| break; } b; echo \"after $?\"", "a b\nafter 0\n", only, 0),
+		(
+			"for i in 1 2; do if echo c ${| break; }; then echo yes; fi; echo in; done; echo out",
+			"c\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do echo ${| ${| break; }; echo inner; REPLY=v; }; echo in; done; echo out",
+			"\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do x=${| break; } y=$(echo q); echo \"in $y\"; done; echo \"out [$x] \
+			 [$y]\"",
+			"out [] []\n",
+			"",
+			0,
+		),
+		(
+			"n=0; while echo w ${| break; }; do echo body; n=$((n+1)); [ $n -gt 2 ] && break; done; \
+			 echo out",
+			"w\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do case ${| break; } in *) echo arm;; esac; echo in; done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for j in a ${| break; } b; do echo \"j=$j\"; done; echo in; done; echo \
+			 out",
+			"in\nin\nout\n",
+			"",
+			0,
+		),
+		("for i in 1 2; do echo ${| continue; } c; echo in; done; echo out", "c\nc\nout\n", "", 0),
+		(
+			"for i in 1 2; do eval \"echo \\${| break; } e; echo after\"; echo in; done; echo out",
+			"e\nout\n",
+			"",
+			0,
+		),
+		("for i in 1 2; do echo a ${ break; } b; echo in; done; echo out", "a b\nout\n", "", 0),
+		("for i in 1 2; do false ${| break; }; done; echo \"out $?\"", "out 1\n", "", 0),
+		(
+			"for i in 1 2; do echo x > ${| break; }; done; echo \"out $?\"",
+			"out 1\n",
+			"bash: line 1: ${|break; }: ambiguous redirect\n",
+			0,
+		),
+		(
+			"for i in 1 2; do printf \"%s\\n\" p ${| break; } q; echo in; done; echo out",
+			"p\nq\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do echo a ${| break 0; } b; echo in; done; echo \"out $?\"",
+			"a b\nout 0\n",
+			"bash: line 1: break: 0: loop count out of range\n",
+			0,
+		),
+		("f() { echo a ${| break; } b; echo after; }; f; echo out", "a b\nafter\nout\n", only, 0),
+		(
+			"for i in 1 2; do echo a ${| break; } && echo and; echo in; done; echo out",
+			"a\nout\n",
+			"",
+			0,
+		),
+		(
+			"f() { echo a ${| break; } b; echo after; }; for i in 1 2; do f; echo in; done; echo out",
+			"a b\nafter\nin\na b\nafter\nin\nout\n",
+			&twice,
+			0,
+		),
+		(
+			"f() { echo \"f $*\"; }; for i in 1 2; do f a ${| break; } b; echo \"in $?\"; done; echo \
+			 \"out $?\"",
+			"out 0\n",
+			"",
+			0,
+		),
+		(
+			"g() { for i in 1; do return ${| break; }; done; }; for j in 1 2; do for k in a b; do g; \
+			 echo \"k $k\"; done; echo \"j $j\"; done; echo out",
+			"j 1\nj 2\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do eval \"for j in 1; do break 2; done; echo e\"; echo in; done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do eval \"for j in 1; do continue 2; done; echo e\"; echo in; done; echo \
+			 out",
+			"out\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do echo ${| for j in 1; do break 2; done; REPLY=v; }; echo in; done; echo \
+			 out",
+			"\nout\n",
+			"",
+			0,
+		),
+		(
+			"set -e; trap \"echo ERR\" ERR; for i in 1 2; do false ${| break; }; echo in; done; echo \
+			 out",
+			"",
+			"",
+			1,
+		),
+		(
+			"trap \"echo RET\" RETURN; set -T; f() { :; }; for i in 1 2; do f ${| break; }; echo in; \
+			 done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		("for i in 1 2; do eval \"echo e\" ${| break; }; echo in; done; echo out", "out\n", "", 0),
+		("trap \"echo EXIT\" EXIT; for i in 1; do exit ${| break; }; done", "", "", 0),
+	]);
+}
+
+/// `ambiguous redirect` names the word as bash stores it: each command
+/// substitution re-printed by the parser (also in a function body and in
+/// an operator's word), `$'…'` decoded in single quotes, `$"…"` as `"…"`;
+/// backquotes and the rest as written.
+#[test]
+fn an_ambiguous_redirect_names_the_word_as_bash_stores_it() {
+	let at = |word: &str| format!("bash: line 1: {word}: ambiguous redirect\n");
+	let rows = [
+		(": > ${|   return   3 ;   }", "", at("${|return 3; }"), 1),
+		("x=\"1 2\"; : > $'a\\tb'$x", "", at("'a\tb'$x"), 1),
+		("x=\"1 2\"; : > $\"a\"$x", "", at("\"a\"$x"), 1),
+		("x=\"1 2\"; : > \"a\"\\b$x", "", at("\"a\"\\b$x"), 1),
+		(": > $(  true;false  )", "", at("$(true; false)"), 1),
+		("x=\"1 2\"; : > ${x:-$(  echo  a  )}", "", at("${x:-$(echo a)}"), 1),
+		("x=\"1 2\"; : > \"$(  echo  a  )\"$x", "", at("\"$(echo a)\"$x"), 1),
+		(": > ${  true;false ; }", "", at("${ true; false; }"), 1),
+		("x=\"1 2\"; : > $x${| REPLY=f;}", "", at("$x${|REPLY=f; }"), 1),
+		(": > ${| echo  a   b; }", "a b\n", at("${|echo a b; }"), 1),
+		(": > ${| true\n false; }", "", at("${|true\nfalse; }"), 1),
+		("f() { : > $(  true;false  ); }; f; echo \"st=$?\"", "st=1\n", at("$(true; false)"), 0),
+		("x=\"1 2\"; : > `echo   1    2`", "", at("`echo   1    2`"), 1),
+	];
+	let rows: Vec<(&str, &str, &str, i32)> = rows
+		.iter()
+		.map(|(src, out, err, status)| (*src, *out, err.as_str(), *status))
+		.collect();
+	check_rows(&rows);
 }
