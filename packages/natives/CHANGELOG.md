@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- The bash and zsh shells' own reads of a process substitution or coprocess pipe that a program also holds take the next bytes, as bash's shell and its children read one pipe: `exec 4< <(…); prog <&4 & read v <&4` no longer waits for `prog` to end before it sees the bytes `prog` left unread. This needs a second read description of the pipe: Linux opens one through `/proc`, and macOS makes the pipe as a FIFO in the temporary directory. Where neither works (Linux without `/proc`, macOS when the FIFO cannot be made) and on Windows, the earlier behaviour stays.
 - On Linux under gVisor, the bash and zsh shells no longer spin a CPU while they feed a slow reader through their pump (a process substitution, a here-document, a pipe the bash tool mirrors as a pipe stream): a write the pipe cannot take now is made by a thread of the pipe's own, which the kernel wakes once the write fits, where the pump retried it each time the pipe had room for any byte.
 
 ## [18.18.6] - 2026-11-09
