@@ -1,22 +1,22 @@
 # Seconds each pi-shell test binary takes in one sami-checks shard (one libtest process,
 # --test-threads=4, on ubuntu-24.04), for the shard assignment (sc.py assign: longest first onto
-# the lightest shard). A binary not named here counts 10 s. Update from a run's "Units by time"
-# table when a shard grows past the others.
-# First figures: Cut7's gate (8 threads on a larger host) times 3, and a guess for the lib.
-900 pi-shell
-486 pi-shell::zsh_computil_args_pty
-363 pi-shell::zle_vi_pty
-183 pi-shell::zle_widgets_pty
-117 pi-shell::zle_hist_pty
-66 pi-shell::zsh_comp_pty
-63 pi-shell::zsh_comp_y03
-51 pi-shell::zsh_computil_pty
-51 pi-shell::zsh_compctl_pty
-51 pi-shell::zle_pty
-39 pi-shell::zsh_comp_y02
-33 pi-shell::zsh_jobs_pty
-21 pi-shell::zsh_parity_pty
-18 pi-shell::zsh_comp_y01
-15 pi-shell::history_write
-12 pi-shell::zsh_mod_curses
-12 pi-shell::streaming_smoke
+# the lightest shard). `<seconds> <binary id>` for both users; `<seconds> <binary id> root` where
+# root's time differs. A binary not named here counts 5 s. Update from a run's "Units by time".
+# Measured: run 45231893264 (509a2d77, 2026-11-23); binaries under 5 s are left out.
+270 pi-shell::zsh_computil_args_pty
+203 pi-shell::zle_vi_pty
+106 pi-shell::zle_widgets_pty
+84 pi-shell::zsh_comp_y03
+72 pi-shell::zle_hist_pty
+67 pi-shell
+41 pi-shell::zsh_comp_pty
+26 pi-shell::zle_pty
+26 pi-shell::zsh_computil_pty
+26 pi-shell::zsh_compctl_pty
+24 pi-shell::zsh_comp_y02
+24 pi-shell::zsh_comp_y01
+20 pi-shell::feed_reads
+8 pi-shell::deferred_spawn_fds
+7 pi-shell::zsh_parity_pty
+5 pi-shell::history_write
+600 pi-shell::zsh_comp_pty root
