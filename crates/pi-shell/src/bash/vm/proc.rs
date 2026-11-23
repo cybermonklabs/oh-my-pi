@@ -142,6 +142,13 @@ pub struct PendingBreak {
 	/// frame is one that command entered: its `$(< file)` frame runs on;
 	/// a function, `eval` or `.` runs none of its commands.
 	pub depth:  u32,
+	/// The frame count of the command whose redirections were being expanded
+	/// when the `break` ran (0: not in a redirection). bash expands the
+	/// redirections of a program it runs (an external, a command it cannot
+	/// find) in the forked child, so the break is lost with that child: it is
+	/// dropped once that command's name resolves to one ([`super::command`]'s
+	/// `drop_childs_break`).
+	pub redir:  u32,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

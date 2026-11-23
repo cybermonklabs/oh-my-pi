@@ -163,6 +163,107 @@ fn bash_reads_a_file_substitution_in_the_shell() {
 	]);
 }
 
+/// bash expands the redirections of a program it runs (an external, a name
+/// it cannot find) after the fork, in the child: a `break` or `continue` in
+/// a `${ }` there (a here-document, a here-string, a file word) ends with
+/// that child, and the loop goes on. The redirections of a builtin, a
+/// function or a compound command are expanded in the shell, and the break
+/// waits for the command there, as does one in a program's arguments.
+#[cfg(unix)]
+#[test]
+fn a_break_in_a_programs_redirection_stays_in_its_child() {
+	let twice = "bash: line 1: nosuch: command not found\nbash: line 1: nosuch: command not found\n";
+	check("bash", &[
+		(
+			"for i in 1 2; do cat <<E\nh ${| break; } t\nE\necho in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do cat <<E\nh ${| continue; } t\nE\necho in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do cat <<E\nh ${ break; } t\nE\necho in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do cat <<< \"h ${| break; } t\"; echo in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do cat < ${| REPLY=f; break; }; echo in; done; echo out",
+			"hello\n\n\nin\nhello\n\n\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do nosuch < ${| REPLY=f; break; }; echo in; done; echo out",
+			"in\nin\nout\n",
+			twice,
+			0,
+		),
+		(
+			"for i in 1 2; do A=1 cat <<E\nh ${| break; } t\nE\necho in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do command cat <<E\nh ${| break; } t\nE\necho in; done; echo out",
+			"h  t\nin\nh  t\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"for j in 1; do for i in 1 2; do cat <<E\nh ${| break 2; } t\nE\necho in; done; echo \
+			 mid; done; echo out",
+			"h  t\nin\nh  t\nin\nmid\nout\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do cat /dev/null 2> ${| REPLY=/dev/null; break; }; echo in; done; echo out",
+			"in\nin\nout\n",
+			"",
+			0,
+		),
+		// In the shell: the break waits for the command, then the loop ends.
+		(
+			"for i in 1 2; do read v <<E\n${| break; }x\nE\necho \"in [$v]\"; done; echo \"out [$v]\"",
+			"out [x]\n",
+			"",
+			0,
+		),
+		(
+			"f() { cat; }; for i in 1 2; do f <<E\nh ${| break; } t\nE\necho in; done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do { cat; } <<E\nh ${| break; } t\nE\necho in; done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do echo e > ${| REPLY=/dev/null; break; }; echo in; done; echo out",
+			"out\n",
+			"",
+			0,
+		),
+		("for i in 1 2; do cat /dev/null ${| break; }; echo in; done; echo out", "out\n", "", 0),
+	]);
+}
+
 #[cfg(unix)]
 #[test]
 fn zsh_reads_a_file_substitution_in_the_shell() {

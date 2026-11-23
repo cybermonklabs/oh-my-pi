@@ -2038,8 +2038,17 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 				.iter()
 				.rposition(|f| !matches!(f.kind, FrameKind::Cat { .. }))
 				.map_or(0, |i| i + 1);
+			// A `${ }` in a redirection word or here-document of the command
+			// now on top (see `PendingBreak::redir`).
+			let in_redir = vp
+				.frames
+				.last()
+				.and_then(|f| f.scratch.as_ref())
+				.and_then(|s| s.exec.as_deref())
+				.is_some_and(|e| e.stage == super::proc::Stage::Redirect);
+			let redir = if in_redir { vp.frames.len() as u32 } else { 0 };
 			vp.pending_break =
-				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32 }));
+				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32, redir }));
 			return;
 		}
 		pop_frame(&mut k.root, cx.store, vp);

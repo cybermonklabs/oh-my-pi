@@ -345,6 +345,9 @@ pub fn exec(
 				if let Some(flow) = lookup(k, vp, cx, op, cmd.typeset) {
 					return flow;
 				}
+				if vp.pending_break.is_some() {
+					drop_childs_break(vp);
+				}
 			},
 			Stage::Dispatch
 				if k
@@ -700,6 +703,29 @@ fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) {
 		};
 	}
 	st(vp).stage = Stage::Redirect;
+}
+
+/// bash expands the redirections of a program it runs (an external, or a
+/// name it cannot find) after the fork, in the child (`execute_disk_command`
+/// runs `do_redirections` there). A `break` or `continue` in a `${ }` of
+/// those redirections sets `breaking` in that child, which then runs the
+/// program or fails: the shell's loop never sees it. This shell expands them
+/// before the name resolves, so a break that waits from this command's
+/// redirections ([`super::proc::PendingBreak::redir`]) is dropped here once
+/// the name resolves to anything but a function or a builtin. (A pi utility
+/// stands for the program of its name: bash would fork for that too.)
+#[cold]
+#[inline(never)]
+fn drop_childs_break(vp: &mut Vproc) {
+	let here = vp.frames.len() as u32;
+	let from_redir = vp.pending_break.as_deref().is_some_and(|p| p.redir == here);
+	let program = !matches!(
+		st(vp).target,
+		None | Some(Target::Function(_) | Target::Intrinsic(_) | Target::Search)
+	);
+	if from_redir && program {
+		vp.pending_break = None;
+	}
 }
 
 /// Expand words, then assignment values. Assignment-only commands assign
