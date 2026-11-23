@@ -31,7 +31,9 @@ use crate::bash::{
 	syntax::zsh::tok,
 	vm::{
 		Cx, Kernel,
-		exec::{Flow, Sub, settle_sub, start_sub, start_zsh_sub},
+		exec::{
+			Flow, Sub, ZshSubFailure, fork_message, no_vpid_for, settle_sub, start_sub, start_zsh_sub,
+		},
 		expand::{Expander, Stop},
 		jobctl, probe,
 		proc::{FrameKind, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Vproc},
@@ -416,8 +418,19 @@ impl Reader {
 				self.sc.recycle();
 				Ok(Some(v))
 			},
+			// A substitution that needs a vproc when no vpid is left fails as
+			// an expansion: its message once, nothing in its place, and the
+			// line is read (zsh 5.9 under `ulimit -u 1`). Starting it would
+			// end in a flow that pushes no frame, and the reader would expand
+			// the prompt again at once, without end.
+			Err(stop) if no_vpid_for(k, &stop) => {
+				self.sc.recycle();
+				fork_message(k, vp, cx, 0);
+				Ok(None)
+			},
 			Err(Stop::ZshSub { text, here }) => {
-				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, 0).into())
+				let fail = ZshSubFailure::Other;
+				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, fail, 0).into())
 			},
 			// A math function (`functions -M`) called from a prompt: its
 			// frame runs above, the expansion replays with its value.
@@ -834,6 +847,14 @@ impl Reader {
 					let mut prompt =
 						|raw: &[u8]| match super::display::expand_prompt(ex, raw, status, &stack) {
 							Ok(p) => Ok(p),
+							// A prompt whose substitution finds no vpid is empty
+							// and prints the message; zsh expands `PS1` and
+							// `RPS1` apart, so each that has one does (zsh 5.9
+							// under `ulimit -u 1`).
+							Err(stop) if no_vpid_for(ex.k, &stop) => {
+								fork_message(ex.k, ex.vp, ex.cx, 0);
+								Ok(Default::default())
+							},
 							Err(
 								e @ (Stop::ZshSub { .. }
 								| Stop::MathCall(_)

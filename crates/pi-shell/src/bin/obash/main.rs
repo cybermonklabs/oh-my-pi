@@ -19,6 +19,8 @@
 //!                       pause: pause/resume after each op with p = 1/K;
 //!                       exec: every K ops a snapshot restored in a new
 //!                       process (Unix)
+//! --next-vpid=N         start the shell with N as its next vpid (tests of
+//!                       the last vpid, `Vpid::CEILING`)
 //! --ir                  print the IR of every command instead of running
 //! --print               print every command (`declare -f` layout) instead of running
 //! --json=DIALECT        print the parse as JSON (`native`, or `shfmt` for bash-viz)
@@ -59,8 +61,11 @@ use bstr::BString;
 use clap::Parser;
 use pi_shell::{
 	bash::{
-		Cx, Engine, EngineConfig, EventMask, EventSink, MemStore, ModeId, Origin, RestoreOpts,
-		Script, Shell, ir, syntax::Features, trace::RunTrace,
+		Budget, Cx, Engine, EngineConfig, EventMask, EventSink, MemStore, ModeId, Origin,
+		RestoreOpts, Script, Shell, Step, ir,
+		store::{Change, Key, MiscKey, Record, StateStore},
+		syntax::Features,
+		trace::RunTrace,
 	},
 	process::{self, Input, Launch, NativeHost, ProcessOptions, Start},
 };
@@ -104,6 +109,11 @@ struct Cli {
 	/// in conformance-harness vocabulary) and exit.
 	#[arg(long)]
 	supported:    bool,
+	/// Start the shell with N as its next vpid: it is created, then
+	/// restored from its store with the counter rewritten (the vpid
+	/// ceiling's tests start near `Vpid::CEILING` this way).
+	#[arg(long, value_name = "N")]
+	next_vpid:    Option<u32>,
 }
 
 /// obash's own long options without a value.
@@ -120,6 +130,7 @@ const OBASH_WITH_VALUE: &[&str] = &[
 	"--fault-resume",
 	"--json",
 	"--parse-corpus",
+	"--next-vpid",
 ];
 
 /// Split `args` (program name first) into obash's own options (for clap)
@@ -362,6 +373,9 @@ fn run(cli: &Cli, launch: Launch, modes: EnvModes) -> Result<i32, Box<dyn std::e
 		host.set_event_sink(Some(Arc::clone(trace) as Arc<dyn EventSink>));
 	}
 	let mut shell = Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, init)?;
+	if let Some(next) = cli.next_vpid {
+		shell = with_next_vpid(shell, &engine, &mut host, &mut store, next)?;
+	}
 	host.bind_signals(shell.control(), pi_shell::bash::Vpid(cfg.vpid_base));
 	shell.set_event_mask(mask);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
@@ -371,6 +385,32 @@ fn run(cli: &Cli, launch: Launch, modes: EnvModes) -> Result<i32, Box<dyn std::e
 		fs::write(path, trace.snapshot_json())?;
 	}
 	Ok(status?)
+}
+
+/// `--next-vpid`: suspend the new shell, rewrite its stored next vpid as
+/// `next`, and restore it from the store, as a host restores a shell.
+fn with_next_vpid(
+	mut shell: Shell,
+	engine: &Arc<Engine>,
+	host: &mut NativeHost,
+	store: &mut MemStore,
+	next: u32,
+) -> Result<Shell, Box<dyn std::error::Error>> {
+	shell.control().request_suspend();
+	{
+		let mut cx = Cx { host: &mut *host, store: &mut *store };
+		match shell.step(&mut cx, Budget::default()) {
+			Step::SuspendReady => {},
+			other => {
+				return Err(format!("--next-vpid: the new shell did not suspend: {other:?}").into());
+			},
+		}
+		shell.externalize(&mut cx)?;
+	}
+	drop(shell);
+	store.apply(Change::Put(Key::Misc(MiscKey::NextVpid), Record::Misc(next.to_string().into())))?;
+	let (shell, _) = Shell::restore(engine, &mut Cx { host, store }, RestoreOpts::default())?;
+	Ok(shell)
 }
 
 /// obash's own options an `exec`-mode fault run passes to the process it
@@ -423,5 +463,6 @@ impl Cli {
 			|| self.ir
 			|| self.print
 			|| self.json.is_some()
+			|| self.next_vpid.is_some()
 	}
 }

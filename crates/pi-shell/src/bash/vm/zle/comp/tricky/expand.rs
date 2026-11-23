@@ -16,7 +16,7 @@ use crate::bash::{
 	pattern::zsh::{haswilds, remnulargs},
 	syntax::zsh::tok::{DNULL, SNULL, TILDE, metafy, unmetafy, untokenize},
 	vm::{
-		exec::{Flow, settle_probe, settle_sub, start_zsh_sub},
+		exec::{Flow, ZshSubFailure, settle_probe, settle_sub, start_zsh_sub},
 		expand::{Expander, Stop, X},
 		proc::{Scratch, Slot},
 		state,
@@ -73,7 +73,8 @@ where
 			},
 			Err(Stop::ZshSub { text, here }) => {
 				let depth = zw.vp.frames.len();
-				match start_zsh_sub(zw.k, zw.vp, zw.cx, &mut sc, &text, here, 0) {
+				let fail = ZshSubFailure::Other;
+				match start_zsh_sub(zw.k, zw.vp, zw.cx, &mut sc, &text, here, fail, 0) {
 					Flow::Block(key) => return then(Await::Wait(key), move |zw, _| run(zw, sc, f, k)),
 					Flow::Call => return then(Await::Frame { depth }, move |zw, _| run(zw, sc, f, k)),
 					_ => {

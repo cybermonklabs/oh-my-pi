@@ -135,8 +135,16 @@ impl Extra {
 		let running = self.running.as_ref()?;
 		while let Ok(Request { command, program, reply }) = running.requests.try_recv() {
 			let lineage = Lineage { label: self.child.label, detached: false };
-			let run = api.run_subshell_in(script(command, &program, &running.env_names), lineage);
-			self.runs.push((run, reply));
+			match api.run_subshell_in(script(command, &program, &running.env_names), lineage) {
+				Some(run) => self.runs.push((run, reply)),
+				// No vpid left: the utility sees its fork fail (EAGAIN).
+				None => {
+					let _ = reply.send(Err(io::Error::new(
+						io::ErrorKind::WouldBlock,
+						"Resource temporarily unavailable",
+					)));
+				},
+			}
 		}
 		match running.done.poll(&Context::from_waker(turn.waker)) {
 			// The utility waits for every command it started; one whose

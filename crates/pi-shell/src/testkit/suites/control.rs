@@ -3,7 +3,8 @@
 use crate::{
 	bash::{
 		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		Script, Shell, SigTarget, Signal, StateStore, Step, store::BlobSlot,
+		Script, Shell, ShellError, SigTarget, Signal, StateStore, Step, Vpid, os_pid_limit,
+		store::BlobSlot,
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -84,6 +85,85 @@ fn subshell_runs_do_not_leak_into_the_root() {
 	r.run(sub, Fault::Snapshot { every: 2 });
 	r.run(Script::command(&b"echo $x $E $1"[..]), Fault::None);
 	assert_eq!(r.host.stdout.bytes(), b"sub env p1\nroot\n");
+}
+
+/// A vpid base an OS pid can take is refused, by `create` and by
+/// `restore` (a vpid would name a real process to `kill`, `wait` and the
+/// user's tools); the system's limit itself, the least number no process
+/// has, is taken. Shells built on any base below it ran.
+#[test]
+fn a_vpid_base_an_os_pid_can_take_is_refused() {
+	let Some(limit) = os_pid_limit() else {
+		return;
+	};
+	let low = Engine::new(EngineConfig { vpid_base: limit - 1, ..EngineConfig::default() });
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	let err =
+		Shell::create(&low, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[])).err();
+	assert!(
+		matches!(err, Some(ShellError::VpidBase { base, limit: l }) if base == limit - 1 && l == limit),
+		"create refuses base {}: {err:?}",
+		limit - 1
+	);
+
+	let at = Engine::new(EngineConfig { vpid_base: limit, ..EngineConfig::default() });
+	let shell =
+		Shell::create(&at, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]));
+	assert!(shell.is_ok(), "the limit itself is taken: {:?}", shell.err());
+	drop(shell);
+	let err =
+		Shell::restore(&low, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default())
+			.err();
+	assert!(
+		matches!(err, Some(RestoreError::VpidBase { base, limit: l }) if base == limit - 1 && l == limit),
+		"restore refuses base {}: {err:?}",
+		limit - 1
+	);
+	let restored =
+		Shell::restore(&at, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default());
+	assert!(restored.is_ok(), "restore takes the limit: {:?}", restored.err());
+}
+
+/// A vpid base at the last vpid ([`Vpid::CEILING`]) or above it leaves no
+/// vpid for any child (the shell itself takes the base): `create` and
+/// `restore` refuse it. One below the last vpid leaves the last one for a
+/// child, and is taken.
+#[test]
+fn a_vpid_base_that_leaves_no_vpid_is_refused() {
+	let top = Engine::new(EngineConfig { vpid_base: Vpid::CEILING - 1, ..EngineConfig::default() });
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	for base in [Vpid::CEILING, u32::MAX] {
+		let high = Engine::new(EngineConfig { vpid_base: base, ..EngineConfig::default() });
+		let err =
+			Shell::create(&high, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+				.err();
+		assert!(
+			matches!(err, Some(ShellError::VpidBaseAtCeiling { base: b }) if b == base),
+			"create refuses base {base}: {err:?}"
+		);
+	}
+	let shell =
+		Shell::create(&top, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]));
+	assert!(shell.is_ok(), "one below the last vpid is taken: {:?}", shell.err());
+	drop(shell);
+	for base in [Vpid::CEILING, u32::MAX] {
+		let high = Engine::new(EngineConfig { vpid_base: base, ..EngineConfig::default() });
+		let err = Shell::restore(
+			&high,
+			&mut Cx { host: &mut host, store: &mut store },
+			RestoreOpts::default(),
+		)
+		.err();
+		assert!(
+			matches!(err, Some(RestoreError::VpidBaseAtCeiling { base: b }) if b == base),
+			"restore refuses base {base}: {err:?}"
+		);
+	}
+	let restored =
+		Shell::restore(&top, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default());
+	assert!(restored.is_ok(), "restore takes one below the last vpid: {:?}", restored.err());
 }
 
 #[test]

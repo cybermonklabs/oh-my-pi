@@ -37,6 +37,10 @@ pub struct Vpid(pub u32);
 impl Vpid {
 	/// First vpid (`EngineConfig::vpid_base` default).
 	pub const BASE: u32 = 1 << 30;
+	/// Last vpid: a pid is a positive `pid_t` (`kill` and `wait` take an
+	/// `i32`). No vpid past it is given and none is used twice: a command
+	/// that would need one fails as bash's does when it cannot fork.
+	pub const CEILING: u32 = i32::MAX as u32;
 }
 
 /// Job number (`%1`); a pipeline or a single command is one job.
