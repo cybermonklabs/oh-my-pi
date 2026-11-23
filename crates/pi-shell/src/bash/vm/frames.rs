@@ -719,10 +719,9 @@ impl Shell {
 				.and_then(state::Random::decode)
 				.unwrap_or_default()
 		};
-		k.start_ns = match parse_misc(cx.store, MiscKey::StartNs)? {
-			Some(ns) => ns,
-			None => cx.host.now_ns(),
-		};
+		let clock = parse_misc::<super::StartRecord>(cx.store, MiscKey::StartNs)?;
+		k.start_ns = clock.map_or_else(|| cx.host.now_ns(), |c| c.start);
+		k.seconds = clock.map_or(0, |c| c.seconds);
 		// The images restored below may hold DEBUG/ERR/RETURN actions a
 		// subshell set: `start_trap` takes its full path for them.
 		k.pseudo_traps.note_all();

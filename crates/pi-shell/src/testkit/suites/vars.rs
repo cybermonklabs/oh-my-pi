@@ -164,10 +164,49 @@ fn seconds_assignment_counts_from_the_value_in_each_process() {
 		 SECONDS=1; echo $SECONDS ); echo $x $SECONDS; ( (( SECONDS < 7000 )) && echo kept ) & \
 		 SECONDS=7000; wait; echo $SECONDS; SECONDS=-5; echo $SECONDS",
 	);
-	assert_eq!(
-		(out.as_str(), err.as_str()),
-		("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", "")
+	assert_eq!((out.as_str(), err.as_str()), ("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", ""));
+}
+
+/// bash's `SECONDS=` takes a decimal number (`valid_number`, else 0) until
+/// the variable is an integer: after `declare -i SECONDS`, or once
+/// `$SECONDS` was read (`get_seconds` sets the attribute), the value is
+/// arithmetic, and an arithmetic error is reported, counts as 0 and the
+/// script goes on with status 0. Each `$(…)` below is a shell that has not
+/// read `$SECONDS` before its assignment. Goldens from bash 5.2.21 and
+/// 5.3.20.
+#[test]
+fn seconds_assignment_takes_a_decimal_number_until_seconds_is_an_integer() {
+	let (out, err) = run(
+		"x=7; for v in 1+1 x 0x10 ' 7 ' abc 5.5 -3; do r=$(SECONDS=$v; echo \"$SECONDS st=$?\"); \
+		 echo \"[$v] $r\"; done; r=$(: $SECONDS; SECONDS=1+1; a=$SECONDS; SECONDS=x; b=$SECONDS; \
+		 SECONDS=0x10; echo $a $b $SECONDS); echo \"after a read: $r\"; r=$(: $SECONDS; \
+		 SECONDS=5.5; echo \"st=$? $SECONDS\"; f() { SECONDS=5.5; echo \"f st=$?\"; }; f; echo \
+		 \"after f st=$?\"); echo $r; declare -i SECONDS; SECONDS=1+1; echo $SECONDS",
 	);
+	assert_eq!(
+		out,
+		"[1+1] 0 st=0\n[x] 0 st=0\n[0x10] 0 st=0\n[ 7 ] 7 st=0\n[abc] 0 st=0\n[5.5] 0 st=0\n[-3] -3 \
+		 st=0\nafter a read: 2 7 16\nst=0 0 f st=0 after f st=0\n2\n"
+	);
+	assert_eq!(err.matches("5.5: arithmetic syntax error").count(), 2, "{err}");
+}
+
+/// bash's `SECONDS=` keeps the value apart and moves the start to now
+/// (`assign_seconds`): `printf '%(%s)T' -2` then gives the assignment's
+/// time, and posix `time` with no pipeline counts from it. The host's clock
+/// starts at 1,000 s: a start moved back by the value would not wrap past
+/// 0, where these readers saturate.
+#[test]
+fn seconds_assignment_moves_the_start_to_now() {
+	let out = run_script(
+		FakeHost::new().with_clock_at(1_000_000_000_000),
+		b"SECONDS=100; a=$(printf '%(%s)T' -2); b=$(printf '%(%s)T' -1); [ \"$a\" = \"$b\" ] && \
+		  echo now; echo $SECONDS; set -o posix; TIMEFORMAT=%0R; SECONDS=100; { time; } 2>&1",
+		&[],
+		Fault::None,
+	);
+	let (out, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+	assert_eq!((&*out, &*err), ("now\n100\n0\n", ""));
 }
 
 #[test]

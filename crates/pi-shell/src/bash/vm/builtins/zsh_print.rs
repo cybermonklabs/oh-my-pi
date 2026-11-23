@@ -217,10 +217,9 @@ pub fn prompt_env_for(
 	// `%D`, `%T`, `%*`: the wall clock; `now_ns` is monotonic.
 	let wall = ex.cx.host.wall();
 	let (secs, nanos) = (wall.secs, wall.nanos);
-	let elapsed = i64::try_from(
-		ex.cx.host.now_ns().saturating_sub(ex.k.start_of(ex.vp)) / 1_000_000_000,
-	)
-	.unwrap_or(0);
+	let elapsed =
+		i64::try_from(ex.cx.host.now_ns().saturating_sub(ex.k.start_of(ex.vp)) / 1_000_000_000)
+			.unwrap_or(0);
 	let mb = params::mb(ex)?;
 	let tz = params::getparam(ex, b"TZ")?
 		.filter(|p| p.flags.bits() & super::zsh_typeset::PM_EXPORTED != 0)

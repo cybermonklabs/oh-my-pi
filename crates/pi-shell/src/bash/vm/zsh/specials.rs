@@ -808,7 +808,7 @@ pub fn make_local(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8], scope: us
 			PmFlags::FFLOAT => 'F',
 			_ => 'i',
 		};
-		VarValue::Str(BString::from(format!("{}:{c}{base}", ex.k.start_of(ex.vp))))
+		VarValue::Str(BString::from(format!("{}:{c}{base}", ex.k.seconds_origin(ex.vp))))
 	} else {
 		match get(ex, sp)? {
 			Some(PValue::Scalar(s)) => VarValue::Str(s),
@@ -853,7 +853,7 @@ pub fn restore_locals(ex: &mut Expander<'_, '_>) -> X<()> {
 			let text = var.as_scalar().unwrap_or_default();
 			let (start, ty) = text.split_once_str(":").unwrap_or((text, &b"i"[..]));
 			if let Some(start) = std::str::from_utf8(start).ok().and_then(|s| s.parse().ok()) {
-				ex.k.set_start(ex.cx.store, ex.vp, start);
+				ex.k.set_seconds(ex.cx.store, ex.vp, start, 0);
 			}
 			let flags = match ty.first() {
 				Some(b'E') => PmFlags::EFLOAT,
@@ -1012,7 +1012,7 @@ pub fn get(ex: &mut Expander<'_, '_>, sp: Special) -> X<Option<PValue>> {
 		Special::Seconds => {
 			// Wrapping: an assignment may put the start before the host
 			// clock's origin (or after it: a negative value).
-			let ns = ex.cx.host.now_ns().wrapping_sub(ex.k.start_of(ex.vp)) as i64;
+			let ns = ex.cx.host.now_ns().wrapping_sub(ex.k.seconds_origin(ex.vp)) as i64;
 			let (ty, base) = seconds_type(ex)?;
 			if ty == PmFlags::INTEGER {
 				let secs = ns.div_euclid(1_000_000_000);
@@ -1714,7 +1714,8 @@ pub fn set(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8], value: PValue) -
 				(d * 1e9) as i64
 			};
 			let now = ex.cx.host.now_ns();
-			ex.k.set_start(ex.cx.store, ex.vp, now.wrapping_sub(ns as u64));
+			ex.k
+				.set_seconds(ex.cx.store, ex.vp, now.wrapping_sub(ns as u64), 0);
 		},
 		Special::Example(p) => {
 			crate::bash::vm::builtins::zsh_mod_example::param_set(ex, p, value)?;

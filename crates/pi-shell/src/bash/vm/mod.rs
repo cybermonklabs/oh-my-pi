@@ -399,6 +399,34 @@ pub struct Shell {
 	orphans: Vec<Vpid>,
 }
 
+/// The shell's `$SECONDS` clock as `MiscKey::StartNs` keeps it: the start
+/// in host clock ns, then `:` and bash's assigned value when it is not 0
+/// (`123`, `123:5`), so a record no `SECONDS=` in bash code changed is the
+/// plain number it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartRecord {
+	pub start:   u64,
+	pub seconds: i64,
+}
+
+impl std::fmt::Display for StartRecord {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.seconds {
+			0 => write!(f, "{}", self.start),
+			s => write!(f, "{}:{s}", self.start),
+		}
+	}
+}
+
+impl std::str::FromStr for StartRecord {
+	type Err = std::num::ParseIntError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let (start, seconds) = s.split_once(':').unwrap_or((s, "0"));
+		Ok(Self { start: start.parse()?, seconds: seconds.parse()? })
+	}
+}
+
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
 /// borrow a vproc and the kernel at once).
 pub struct Kernel {
@@ -466,10 +494,14 @@ pub struct Kernel {
 	/// [`Kernel::seed_random`]); a forked vproc draws from its own copy
 	/// ([`proc::Clock`]).
 	pub rand:               state::Random,
-	/// The host clock reading the shell's `$SECONDS` counts from (`now_ns`
-	/// at shell creation, moved by `SECONDS=`; `MiscKey::StartNs`); a forked
-	/// vproc counts from its own ([`proc::Clock`], [`Kernel::start_of`]).
+	/// The host clock reading of the shell's start or of its last `SECONDS=`
+	/// in bash code (bash's `shellstart`; `MiscKey::StartNs`); a forked
+	/// vproc has its own ([`proc::Clock`], [`Kernel::start_of`]).
 	pub start_ns:           u64,
+	/// The shell's last `SECONDS=` value in bash code (bash's
+	/// `seconds_value_assigned`), which `$SECONDS` adds to the seconds since
+	/// `start_ns` (kept in `MiscKey::StartNs` with it, [`StartRecord`]).
+	pub seconds:            i64,
 	/// Startup files (`path`, contents) the root vproc sources when its
 	/// first run starts ([`ShellInit::startup`]); not imaged (the first run
 	/// starts at the first step).
@@ -633,6 +665,7 @@ impl Kernel {
 			async_ignored: None,
 			rand: state::Random::new(1),
 			start_ns: 0,
+			seconds: 0,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
 			nofork_units: HashMap::new(),
@@ -726,23 +759,42 @@ impl Kernel {
 			.set_misc(store, MiscKey::Random, self.rand.encode());
 	}
 
-	/// The host clock reading `vp`'s `$SECONDS` counts from: a forked
+	/// The host clock reading of `vp`'s start or last `SECONDS=` in bash
+	/// code (bash's `shellstart`: `printf '%(…)T' -2`, `time`): a forked
 	/// vproc's own ([`proc::Clock`]), else the shell's.
 	pub fn start_of(&self, vp: &Vproc) -> u64 {
 		vp.clock.as_ref().map_or(self.start_ns, |c| c.start_ns)
 	}
 
-	/// `SECONDS=…` in `vp`: its `$SECONDS` counts from `start` on; the
-	/// shell's is written through.
-	pub fn set_start(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, start: u64) {
+	/// The host clock reading `vp`'s `$SECONDS` counts from: its start, moved
+	/// back by the value of its last `SECONDS=` in bash code.
+	pub fn seconds_origin(&self, vp: &Vproc) -> u64 {
+		let (start, seconds) = vp
+			.clock
+			.as_ref()
+			.map_or((self.start_ns, self.seconds), |c| (c.start_ns, c.seconds));
+		start.wrapping_sub((seconds as u64).wrapping_mul(1_000_000_000))
+	}
+
+	/// `SECONDS=…` in `vp`: its start is `start` and `$SECONDS` adds
+	/// `seconds` (bash code: now and the value, as bash's `assign_seconds`;
+	/// zsh code: the moved origin and 0). The shell's are written through.
+	pub fn set_seconds(
+		&mut self,
+		store: &mut dyn StateStore,
+		vp: &mut Vproc,
+		start: u64,
+		seconds: i64,
+	) {
 		if let Some(clock) = vp.clock.as_mut() {
 			clock.start_ns = start;
+			clock.seconds = seconds;
 			return;
 		}
 		self.start_ns = start;
-		self
-			.root
-			.set_misc(store, MiscKey::StartNs, start.to_string());
+		self.seconds = seconds;
+		let record = StartRecord { start, seconds }.to_string();
+		self.root.set_misc(store, MiscKey::StartNs, record);
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
@@ -1862,6 +1914,7 @@ impl Shell {
 			rand:     p.clock.map_or(self.k.rand, |c| c.rand),
 			reseed:   true,
 			start_ns: self.k.start_of(p),
+			seconds:  p.clock.map_or(self.k.seconds, |c| c.seconds),
 		};
 		// The parent's global state now; a host's submission (no store) to
 		// the root takes it when the scheduler adopts the subshell, before
@@ -3035,6 +3088,7 @@ impl Vproc {
 			rand:     self.clock.map_or(k.rand, |c| c.rand),
 			reseed:   true,
 			start_ns: k.start_of(self),
+			seconds:  self.clock.map_or(k.seconds, |c| c.seconds),
 		});
 		vp.set_sticky(self.sticky().cloned());
 		// zsh forks keep `scriptname`: diagnostics of the child name the

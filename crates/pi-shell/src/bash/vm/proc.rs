@@ -133,11 +133,12 @@ pub struct Vproc {
 	pub clock:         Option<Clock>,
 }
 
-/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+/// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
 /// ([`Vproc::clock`]). Both are process state that a fork copies, as
 /// `fork(2)` copies memory, so neither side's draws, `RANDOM=` or
 /// `SECONDS=` reach the other. The shell's own are the kernel's
-/// (`Kernel::rand`, `Kernel::start_ns`), which the store keeps.
+/// (`Kernel::rand`, `Kernel::start_ns`, `Kernel::seconds`), which the store
+/// keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clock {
 	pub rand:     Random,
@@ -145,8 +146,15 @@ pub struct Clock {
 	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
 	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
 	pub reseed:   bool,
-	/// The host clock reading `$SECONDS` counts from.
+	/// The host clock reading of the shell's start, or of the last
+	/// `SECONDS=` in bash code (bash's `shellstart`, which `assign_seconds`
+	/// resets to now): `printf '%(…)T' -2` and the shell's `time` report
+	/// count from it.
 	pub start_ns: u64,
+	/// The value of the last `SECONDS=` in bash code (bash's
+	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
+	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
+	pub seconds:  i64,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

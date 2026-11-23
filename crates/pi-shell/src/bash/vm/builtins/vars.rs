@@ -566,19 +566,34 @@ fn set_value_plain(
 		k.seed_random(cx.store, vp, seed);
 		return Ok(());
 	}
-	// bash's `SECONDS` is an integer variable whose assignment restarts the
-	// count from the value (`assign_seconds`): reads add the seconds since.
-	// A forked vproc's count is its own.
+	// bash's `SECONDS=` (`assign_seconds`): the value is a decimal number
+	// (`valid_number`, else 0) until the variable has the integer attribute
+	// (`declare -i SECONDS`, or any read of `$SECONDS`, which sets it); then
+	// it is arithmetic, whose error `evalexp` reports and counts as 0, the
+	// assignment going on. The value is kept as the count's base and the
+	// start moves to now, so `$SECONDS` is the value plus the seconds since
+	// and `printf '%(…)T' -2` and the shell's `time` count from the
+	// assignment. A forked vproc's are its own.
 	if name == b"SECONDS"
 		&& lhs.index.is_none()
 		&& let AssignValue::Scalar(v) = &value
 	{
-		let secs = arith_value(k, cx, vp, v)?;
-		let start = cx
-			.host
-			.now_ns()
-			.wrapping_sub((secs as u64).wrapping_mul(1_000_000_000));
-		k.set_start(cx.store, vp, start);
+		let integer =
+			current(k, cx, vp, name, level)?.is_some_and(|v| v.attrs.contains(Attrs::INTEGER));
+		let secs = if !integer {
+			super::number(v).unwrap_or(0)
+		} else {
+			match arith_value(k, cx, vp, v) {
+				Ok(n) => n,
+				Err(Diag::StoreFailed) => return Err(Diag::StoreFailed),
+				Err(d) => {
+					k.diag(cx, vp, exec::current_line(vp), d);
+					0
+				},
+			}
+		};
+		let now = cx.host.now_ns();
+		k.set_seconds(cx.store, vp, now, secs);
 		return Ok(());
 	}
 	let Some(value) = assign_in_place(k, cx, vp, lhs, value, level)? else {

@@ -238,9 +238,12 @@ fn restore_keeps_a_jobs_own_random_and_seconds() {
 		.externalize(&mut Cx { host: &mut host, store: &mut store })
 		.unwrap();
 	drop(shell);
-	let (mut shell, report) =
-		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default())
-			.unwrap();
+	let (mut shell, report) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.unwrap();
 	assert!(report.abandoned.is_empty());
 	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(0));
 	assert_eq!(host.stdout.bytes(), b"19344 500\n");

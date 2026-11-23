@@ -427,6 +427,7 @@ fn fresh_shell(
 		rand:     state::Random::new((cx.host.random() & 0xffff_ffff) as u32),
 		reseed:   false,
 		start_ns: cx.host.now_ns(),
+		seconds:  0,
 	});
 	child.rlimits.clone_from(&vp.rlimits);
 	child.lineage = vp.lineage;
