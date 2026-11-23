@@ -135,6 +135,14 @@ impl CancelToken {
 		}
 	}
 
+	/// Waits for an explicit abort (the flag), never for the deadline.
+	pub async fn wait_abort(&self) -> AbortReason {
+		let Some(flag) = self.flag.as_ref() else {
+			return std::future::pending().await;
+		};
+		flag.wait().await
+	}
+
 	pub fn abort_token(&self) -> AbortToken {
 		AbortToken(self.flag.as_ref().map(Arc::downgrade))
 	}

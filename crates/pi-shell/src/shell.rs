@@ -11,7 +11,7 @@ use std::{
 	path::Path,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU8, Ordering},
 	},
 	time::Duration,
 };
@@ -202,11 +202,17 @@ pub struct MinimizerResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellRunResult {
-	pub exit_code:   Option<i32>,
-	pub cancelled:   bool,
-	pub timed_out:   bool,
-	pub minimized:   Option<MinimizerResult>,
-	pub working_dir: Option<String>,
+	pub exit_code:      Option<i32>,
+	pub cancelled:      bool,
+	pub timed_out:      bool,
+	pub minimized:      Option<MinimizerResult>,
+	pub working_dir:    Option<String>,
+	/// Output the command wrote was dropped: past the run's deadline, the
+	/// consumer of its output took no chunk for `DRAIN_STALL` (2 s, 5 s on
+	/// Windows), and what it had not taken was dropped. The exit status is
+	/// still the command's.
+	#[serde(default)]
+	pub output_dropped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -477,11 +483,12 @@ struct CommandResult {
 impl CommandResult {
 	fn into_run_result(self) -> ShellRunResult {
 		ShellRunResult {
-			exit_code:   Some(self.status),
-			cancelled:   false,
-			timed_out:   false,
-			minimized:   self.minimized,
-			working_dir: Some(self.working_dir),
+			exit_code:      Some(self.status),
+			cancelled:      false,
+			timed_out:      false,
+			minimized:      self.minimized,
+			working_dir:    Some(self.working_dir),
+			output_dropped: false,
 		}
 	}
 }
@@ -489,11 +496,165 @@ impl CommandResult {
 /// The result of a run cancelled by `reason`.
 const fn cancelled_result(reason: AbortReason) -> ShellRunResult {
 	ShellRunResult {
-		exit_code:   None,
-		cancelled:   matches!(reason, AbortReason::Signal),
-		timed_out:   matches!(reason, AbortReason::Timeout),
-		minimized:   None,
-		working_dir: None,
+		exit_code:      None,
+		cancelled:      matches!(reason, AbortReason::Signal),
+		timed_out:      matches!(reason, AbortReason::Timeout),
+		minimized:      None,
+		working_dir:    None,
+		output_dropped: false,
+	}
+}
+
+/// What a run's deadline still stops. The deadline bounds the command, not
+/// the reading of what it wrote: when it passes while a command runs (or
+/// before the first one starts), the run is stopped and reports a timeout;
+/// when it passes after a command ended, while the run reads that
+/// command's output, the run goes on and reports the command's status, its
+/// drain bounded by [`DRAIN_STALL`], and no further command of the run
+/// (a later segment of a chain) starts.
+#[derive(Default)]
+struct RunDeadline {
+	phase:   AtomicU8,
+	/// Cancelled once the deadline has passed.
+	past:    CancellationToken,
+	/// A drain stalled past the deadline and its output was dropped.
+	dropped: AtomicBool,
+}
+
+impl RunDeadline {
+	/// Setting up, or a command runs.
+	const ACTIVE: u8 = 0;
+	/// A command ended; its output is read.
+	const DRAINING: u8 = 1;
+	/// The deadline has passed.
+	const PAST: u8 = 2;
+
+	/// Before a command starts: false once the deadline has passed.
+	fn start_command(&self) -> bool {
+		let phase = self
+			.phase
+			.compare_exchange(Self::DRAINING, Self::ACTIVE, Ordering::SeqCst, Ordering::SeqCst)
+			.unwrap_or_else(|phase| phase);
+		phase != Self::PAST
+	}
+
+	/// When a command has ended.
+	fn end_command(&self) {
+		let _ = self.phase.compare_exchange(
+			Self::ACTIVE,
+			Self::DRAINING,
+			Ordering::SeqCst,
+			Ordering::SeqCst,
+		);
+	}
+
+	/// When the deadline passes: true when it stops the run, false when it
+	/// found a command ended and its output being read.
+	fn pass(&self) -> bool {
+		let phase = self.phase.swap(Self::PAST, Ordering::SeqCst);
+		self.past.cancel();
+		phase != Self::DRAINING
+	}
+}
+
+/// A run that a passed deadline kept from starting its next command.
+#[derive(Debug)]
+struct DeadlinePassed;
+
+impl std::fmt::Display for DeadlinePassed {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("the run's deadline passed before its next command")
+	}
+}
+
+impl std::error::Error for DeadlinePassed {}
+
+/// Once a run's deadline has passed, how long its stopped readers may wait
+/// for their consumer to take a chunk; a consumer that takes nothing for
+/// that long ends the drain, and the rest of the output is dropped. Before
+/// the deadline, and in a run with none, the drain waits at its consumer's
+/// pace.
+const DRAIN_STALL: Duration = CANCEL_RUN_GRACE;
+
+/// Waits for stopped readers (`readers`) to deliver what their pipes held.
+/// `activity` hears each read, which comes after the consumer took the
+/// chunk before it. `None` when the drain stalled past the deadline (then
+/// recorded in `deadline`): the caller then drops the readers.
+async fn drain_readers<F: Future>(
+	readers: F,
+	activity: &flume::Receiver<()>,
+	deadline: &RunDeadline,
+) -> Option<F::Output> {
+	tokio::pin!(readers);
+	let mut armed = false;
+	let mut stall = Box::pin(time::sleep(DRAIN_STALL));
+	loop {
+		tokio::select! {
+			output = &mut readers => return Some(output),
+			msg = activity.recv_async() => {
+				if msg.is_err() {
+					return Some(readers.await);
+				}
+				if armed {
+					stall.as_mut().reset(time::Instant::now() + DRAIN_STALL);
+				}
+			}
+			() = deadline.past.cancelled(), if !armed => {
+				armed = true;
+				stall.as_mut().reset(time::Instant::now() + DRAIN_STALL);
+			}
+			() = &mut stall, if armed => {
+				deadline.dropped.store(true, Ordering::SeqCst);
+				return None;
+			}
+		}
+	}
+}
+
+/// What a run task gave: its value, or the reason tokio could not join it.
+type Joined<T> = std::result::Result<T, tokio::task::JoinError>;
+
+/// Waits for the run `task` under `ct`. A deadline that finds the command
+/// ended lets the run go on ([`RunDeadline`]), and only an abort still stops
+/// it. A stopped run is given `CANCEL_RUN_GRACE` after `cancel`, then
+/// dropped (its command killed with `KILL`). `Err` is the reason the run was
+/// stopped, with the run's own result when it wound down within the grace
+/// (`None`: dropped): a caller keeps a session only that run left usable.
+async fn await_run<T>(
+	task: &mut tokio::task::JoinHandle<T>,
+	ct: &CancelToken,
+	deadline: &RunDeadline,
+	cancel: &CancellationToken,
+) -> std::result::Result<Joined<T>, (AbortReason, Option<Joined<T>>)> {
+	let mut reason = tokio::select! {
+		res = &mut *task => return Ok(res),
+		reason = ct.wait() => reason,
+	};
+	if matches!(reason, AbortReason::Timeout) && !deadline.pass() {
+		reason = tokio::select! {
+			res = &mut *task => return Ok(res),
+			reason = ct.wait_abort() => reason,
+		};
+	}
+	cancel.cancel();
+	let ended = time::timeout(CANCEL_RUN_GRACE, &mut *task).await.ok();
+	if ended.is_none() {
+		task.abort();
+		let _ = (&mut *task).await;
+	}
+	Err((reason, ended))
+}
+
+/// A finished run's result: a run whose deadline kept its next command from
+/// starting timed out; one whose drain stalled past it reports the dropped
+/// output.
+fn run_result(res: Result<CommandResult>, deadline: &RunDeadline) -> Result<ShellRunResult> {
+	match res {
+		Err(err) if err.is::<DeadlinePassed>() => Ok(cancelled_result(AbortReason::Timeout)),
+		res => Ok(ShellRunResult {
+			output_dropped: deadline.dropped.load(Ordering::SeqCst),
+			..res?.into_run_result()
+		}),
 	}
 }
 
@@ -508,11 +669,13 @@ async fn run_shell_session(
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
+	let deadline = Arc::new(RunDeadline::default());
 	let mut run_task = tokio::spawn({
 		let session = session.clone();
 		let abort_state = abort_state.clone();
 		let active = active.clone();
 		let tokio_cancel = tokio_cancel.clone();
+		let deadline = deadline.clone();
 		let at = ct.emplace_abort_token();
 		async move {
 			let mut session_guard = session.lock().await;
@@ -524,35 +687,28 @@ async fn run_shell_session(
 				session_guard.insert(core)
 			};
 			abort_state.set(at).await;
-			run_shell_command(core, &run_config, on_chunk, tokio_cancel).await
+			run_shell_command(core, &run_config, on_chunk, tokio_cancel, deadline).await
 		}
 	});
 
-	let res = tokio::select! {
-		res = &mut run_task => res,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut run_task).await;
+	let res = match await_run(&mut run_task, ct, &deadline, &tokio_cancel).await {
+		Ok(res) => res,
+		Err((reason, ended)) => {
+			abort_state.clear().await;
 			// A run that wound down by itself leaves the session usable, with
 			// the background jobs earlier commands left running (a cancel
 			// spares them). One that had to be dropped, or that failed, leaves
 			// the session in an unknown state: end it.
-			let usable = matches!(graceful, Ok(Ok(Ok(_))));
-			if graceful.is_err() {
-				// Dropping the run stops the command with `KILL`.
-				run_task.abort();
-				let _ = run_task.await;
-			}
-			abort_state.clear().await;
+			let usable = matches!(ended, Some(Ok(Ok(_))));
 			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
+			// If we can't acquire the lock, the session will be cleaned up when
+			// the holding task finishes.
 			if !usable && let Ok(mut guard) = session.try_lock() {
 				*guard = None;
 				*active.lock() = None;
 			}
 			return Ok(cancelled_result(reason));
-		}
+		},
 	};
 	let res =
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
@@ -565,7 +721,7 @@ async fn run_shell_session(
 		*session.lock().await = None;
 		*active.lock() = None;
 	}
-	Ok(res?.into_run_result())
+	run_result(res, &deadline)
 }
 
 async fn run_shell_oneshot(
@@ -575,31 +731,25 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let deadline = Arc::new(RunDeadline::default());
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let deadline = deadline.clone();
 		async move {
 			// The session ends with this task: its background jobs end with it.
 			let mut session = create_session_for_run(&config, Some(&tokio_cancel), None).await?;
-			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
+			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel, deadline).await
 		}
 	});
 
-	let run_result = tokio::select! {
-		result = &mut task => result,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(cancelled_result(reason));
-		},
+	let joined = match await_run(&mut task, &ct, &deadline, &tokio_cancel).await {
+		Ok(result) => result,
+		Err((reason, _)) => return Ok(cancelled_result(reason)),
 	};
 
-	let res = run_result
-		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	Ok(res?.into_run_result())
+	let res =
+		joined.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
+	run_result(res, &deadline)
 }
 
 async fn run_shell_oneshot_streams(
@@ -609,30 +759,24 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let deadline = Arc::new(RunDeadline::default());
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let deadline = deadline.clone();
 		async move {
 			let mut session = create_session_for_run(&config, Some(&tokio_cancel), None).await?;
-			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
+			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel, deadline).await
 		}
 	});
 
-	let run_result = tokio::select! {
-		result = &mut task => result,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(cancelled_result(reason));
-		},
+	let joined = match await_run(&mut task, &ct, &deadline, &tokio_cancel).await {
+		Ok(result) => result,
+		Err((reason, _)) => return Ok(cancelled_result(reason)),
 	};
 
-	let res = run_result
-		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	Ok(res?.into_run_result())
+	let res =
+		joined.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
+	run_result(res, &deadline)
 }
 
 /// The null device, for a stream a command must not see.
@@ -1046,9 +1190,10 @@ struct CommandRunOutput {
 
 /// What every session run of one command shares.
 struct CommandScope<'a> {
-	options: &'a ShellRunConfig,
-	env:     Vec<(BString, BString)>,
-	cancel:  CancellationToken,
+	options:  &'a ShellRunConfig,
+	env:      Vec<(BString, BString)>,
+	cancel:   CancellationToken,
+	deadline: Arc<RunDeadline>,
 }
 
 impl CommandScope<'_> {
@@ -1192,9 +1337,11 @@ async fn run_shell_command(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
+	deadline: Arc<RunDeadline>,
 ) -> Result<CommandResult> {
 	install_run_filesystem(session, options, &cancel_token);
-	let result = run_shell_command_in_filesystem(session, options, on_chunk, cancel_token).await;
+	let result =
+		run_shell_command_in_filesystem(session, options, on_chunk, cancel_token, deadline).await;
 	restore_session_filesystem(session);
 	result
 }
@@ -1204,10 +1351,15 @@ async fn run_shell_command_in_filesystem(
 	options: &ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
+	deadline: Arc<RunDeadline>,
 ) -> Result<CommandResult> {
 	let cwd = requested_cwd(session, options.cwd.as_deref()).await?;
-	let scope =
-		CommandScope { options, env: command_env(options.env.as_ref()), cancel: cancel_token };
+	let scope = CommandScope {
+		options,
+		env: command_env(options.env.as_ref()),
+		cancel: cancel_token,
+		deadline,
+	};
 
 	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
 		minimizer::engine::mode_for(&options.command, config)
@@ -1464,6 +1616,9 @@ async fn run_shell_command_once(
 	events: Option<Arc<dyn crate::bash::EventSink>>,
 ) -> Result<CommandRunOutput> {
 	let cancel_token = scope.cancel.clone();
+	if !scope.deadline.start_command() {
+		return Err(DeadlinePassed.into());
+	}
 	let (reader_file, writer_file) = pipe_to_files("output")?;
 
 	let stdout_file = writer_file
@@ -1531,22 +1686,28 @@ async fn run_shell_command_once(
 		session.cwd.clone_from(&outcome.cwd);
 	}
 
+	// Closing the files the command dropped (a provider's close can take a
+	// while) is part of the command: the deadline still stops the run until
+	// they are closed, and only then does the command end.
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
 		report_close_failure(&mut diagnostics, &err, &mut result, &cancel_token).await;
 	}
+	scope.deadline.end_command();
 	// Release the extra writer so the reader can reach EOF.
 	drop(diagnostics);
 
 	// The foreground command can complete while background jobs keep the
 	// stdout/stderr pipe open. Don't hang forever waiting for EOF: once the
 	// pipe has been quiet for a short period, stop waiting for more. That
-	// cancel ends the wait, not the read of what the command wrote: on Unix the
-	// reader then takes what the pipe holds and ends (`next_read`), so it is
-	// awaited with no bound, and output written before the end is kept however
-	// late the reader runs. A cancelled run is the exception: the processes its
-	// cancel signalled may still be running their TERM traps, so the reader
-	// stays open until they close the pipe or the cancel bridge releases it
-	// (`CANCEL_READER_GRACE`).
+	// cancel ends the wait, not the read of what the command wrote: the reader
+	// then takes what the pipe holds and ends (`next_read`), so it is
+	// awaited at its consumer's pace, and output written before the end is
+	// kept however late the reader runs. The run's deadline no longer stops
+	// it; past the deadline, a consumer that takes nothing for `DRAIN_STALL`
+	// ends it (`drain_readers`). A cancelled run is the exception: the
+	// processes its cancel signalled may still be running their TERM traps,
+	// so the reader stays open until they close the pipe or the cancel bridge
+	// releases it (`CANCEL_READER_GRACE`).
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
@@ -1578,8 +1739,13 @@ async fn run_shell_command_once(
 
 	if !reader_finished {
 		reader_cancel.cancel();
-		if let Ok(Ok(output)) = (&mut reader_handle).await {
-			reader_output = Some(output);
+		match drain_readers(&mut reader_handle, &activity_rx, &scope.deadline).await {
+			Some(Ok(Ok(output))) => reader_output = Some(output),
+			Some(_) => {},
+			None => {
+				reader_handle.abort();
+				let _ = (&mut reader_handle).await;
+			},
 		}
 	}
 	cancel_bridge.abort();
@@ -1599,10 +1765,12 @@ async fn run_shell_command_streams(
 	options: &ShellRunConfig,
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
+	deadline: Arc<RunDeadline>,
 ) -> Result<CommandResult> {
 	install_run_filesystem(session, options, &cancel_token);
 	let result =
-		run_shell_command_streams_in_filesystem(session, options, streams, cancel_token).await;
+		run_shell_command_streams_in_filesystem(session, options, streams, cancel_token, deadline)
+			.await;
 	restore_session_filesystem(session);
 	result
 }
@@ -1612,13 +1780,18 @@ async fn run_shell_command_streams_in_filesystem(
 	options: &ShellRunConfig,
 	streams: StreamSinks,
 	cancel_token: CancellationToken,
+	deadline: Arc<RunDeadline>,
 ) -> Result<CommandResult> {
 	let cwd = requested_cwd(session, options.cwd.as_deref()).await?;
 	let scope = CommandScope {
 		options,
 		env: command_env(options.env.as_ref()),
 		cancel: cancel_token.clone(),
+		deadline,
 	};
+	if !scope.deadline.start_command() {
+		return Err(DeadlinePassed.into());
+	}
 
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
 	let (stderr_reader, stderr_writer) = pipe_to_files("stderr")?;
@@ -1671,17 +1844,20 @@ async fn run_shell_command_streams_in_filesystem(
 		session.cwd.clone_from(&outcome.cwd);
 	}
 
+	// As in `run_shell_command_once`: the dropped files are closed under the
+	// deadline, and only then does the command end.
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
 		report_close_failure(&mut diagnostics, &err, &mut result, &cancel_token).await;
 	}
+	scope.deadline.end_command();
 	// Release the extra writer so the stderr reader can reach EOF.
 	drop(diagnostics);
 
 	// As in `run_shell_command_once`: a short wait for more after the run
-	// (250 ms of quiet, and at most 2 s), which a cancel ends. On Unix it ends
-	// it without losing what the pipes hold; elsewhere the readers stop at the
-	// cancel. A cancelled run's readers stay open for its TERM traps until the
-	// cancel bridge releases them.
+	// (250 ms of quiet, and at most 2 s), which a cancel ends without losing
+	// what the pipes hold, and a drain the deadline does not stop (bounded by
+	// `DRAIN_STALL` past it). A cancelled run's readers stay open for its TERM
+	// traps until the cancel bridge releases them.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
@@ -1717,14 +1893,22 @@ async fn run_shell_command_streams_in_filesystem(
 
 	if !stdout_finished || !stderr_finished {
 		reader_cancel.cancel();
-	}
-	// On Unix each cancelled reader takes what its pipe holds, then ends;
-	// elsewhere it stops at the cancel.
-	if !stdout_finished {
-		let _ = (&mut stdout_handle).await;
-	}
-	if !stderr_finished {
-		let _ = (&mut stderr_handle).await;
+		// Each cancelled reader takes what its pipe holds, then ends.
+		let readers = async {
+			if !stdout_finished {
+				let _ = (&mut stdout_handle).await;
+			}
+			if !stderr_finished {
+				let _ = (&mut stderr_handle).await;
+			}
+		};
+		if drain_readers(readers, &activity_rx, &scope.deadline)
+			.await
+			.is_none()
+		{
+			stdout_handle.abort();
+			stderr_handle.abort();
+		}
 	}
 	cancel_bridge.abort();
 	let _ = cancel_bridge.await;
@@ -1735,6 +1919,29 @@ async fn run_shell_command_streams_in_filesystem(
 		minimized:   None,
 		working_dir: session.cwd.to_str_lossy().into_owned(),
 	})
+}
+
+/// How many bytes one read of a run's output pipe takes: `len`, the
+/// reader's buffer.
+#[cfg(not(test))]
+const fn read_len(len: usize) -> usize {
+	len
+}
+
+/// How many bytes one read of a run's output pipe takes: `len`, or less
+/// where a test has lowered `READ_LEN` on its thread to have each line of a
+/// command's output read, and handed on, as a chunk of its own, whatever
+/// the pipe holds.
+#[cfg(test)]
+fn read_len(len: usize) -> usize {
+	READ_LEN.get().min(len)
+}
+
+#[cfg(test)]
+thread_local! {
+	/// The most bytes one read of an output pipe takes on this thread
+	/// ([`read_len`]).
+	static READ_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 async fn read_output_bytes(
@@ -1750,34 +1957,27 @@ async fn read_output_bytes(
 		return;
 	};
 	#[cfg(not(unix))]
-	let mut reader = tokio::fs::File::from_std(reader);
+	let mut reader = PipeReader::new(reader);
 
 	#[cfg(unix)]
 	let mut drain = None;
 	loop {
-		let mut buf = vec![0u8; BUF];
+		let mut buf = vec![0u8; read_len(BUF)];
 		#[cfg(unix)]
 		let Some(n) = next_read(&reader, &mut buf, &cancel_token, &mut drain).await else {
 			break;
 		};
 		#[cfg(not(unix))]
-		let n = {
-			let read_future = reader.read(&mut buf);
-			tokio::pin!(read_future);
-			match tokio::select! {
-				res = &mut read_future => res,
-				() = cancel_token.cancelled() => break,
-			} {
-				Ok(0) => break,
-				Ok(n) => n,
-				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(_) => break,
-			}
+		let n = match reader.next(&mut buf, &cancel_token, false).await {
+			PipeRead::Read(n) => n,
+			PipeRead::LineIdle | PipeRead::End => break,
 		};
 		let _ = activity.try_send(());
 		buf.truncate(n);
+		// A bounded sink parks the reader until its consumer takes the chunk,
+		// without holding the runtime's thread, as `emit_chunk` does.
 		if let Some(sink) = sink.as_ref()
-			&& sink.send(Bytes::from(buf)).is_err()
+			&& sink.send_async(Bytes::from(buf)).await.is_err()
 		{
 			// Receiver dropped — stop forwarding and let the pipe close.
 			break;
@@ -1830,7 +2030,7 @@ async fn read_output(
 	activity: Sender<()>,
 ) {
 	const BUF: usize = 65536;
-	let mut buf = vec![0u8; BUF];
+	let mut buf = vec![0u8; read_len(BUF)];
 	let mut decoder = CaptureDecoder::new();
 
 	#[cfg(unix)]
@@ -1838,9 +2038,7 @@ async fn read_output(
 		return;
 	};
 	#[cfg(not(unix))]
-	let reader = tokio::fs::File::from_std(reader);
-	#[cfg(not(unix))]
-	tokio::pin!(reader);
+	let mut reader = PipeReader::new(reader);
 
 	#[cfg(unix)]
 	let mut drain = None;
@@ -1850,27 +2048,16 @@ async fn read_output(
 			break;
 		};
 		#[cfg(not(unix))]
-		let n = {
-			let read_future = reader.read(&mut buf);
-			tokio::pin!(read_future);
-			let res = loop {
-				tokio::select! {
-					res = &mut read_future => break Some(res),
-					() = cancel_token.cancelled() => break None,
-					() = capture_line_idle(decoder.holds_line()) => {
-						emit_chunk(decoder.flush_line(), on_chunk.as_ref()).await;
-					}
-				}
-			};
-			let Some(res) = res else {
-				break;
-			};
-			match res {
-				Ok(0) => break, // EOF
-				Ok(n) => n,
-				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(_) => break,
-			}
+		let n = match reader
+			.next(&mut buf, &cancel_token, decoder.holds_line())
+			.await
+		{
+			PipeRead::Read(n) => n,
+			PipeRead::LineIdle => {
+				emit_chunk(decoder.flush_line(), on_chunk.as_ref()).await;
+				continue;
+			},
+			PipeRead::End => break,
 		};
 		if n > 0 {
 			let _ = activity.try_send(());
@@ -1909,9 +2096,7 @@ async fn read_output_buffered(
 		return BufferedOutput { text: String::new(), input_bytes: 0, exceeded: true };
 	};
 	#[cfg(not(unix))]
-	let reader = tokio::fs::File::from_std(reader);
-	#[cfg(not(unix))]
-	tokio::pin!(reader);
+	let mut reader = PipeReader::new(reader);
 
 	#[cfg(unix)]
 	let mut drain = None;
@@ -1921,31 +2106,20 @@ async fn read_output_buffered(
 			break;
 		};
 		#[cfg(not(unix))]
-		let n = {
-			let read_future = reader.read(&mut buf);
-			tokio::pin!(read_future);
-			let res = loop {
-				tokio::select! {
-					res = &mut read_future => break Some(res),
-					() = cancel_token.cancelled() => break None,
-					() = capture_line_idle(decoder.holds_line()) => {
-						let text = decoder.flush_line();
-						if !exceeded {
-							captured.push_str(&text);
-						}
-						emit_chunk(text, on_chunk.as_ref()).await;
-					}
+		let n = match reader
+			.next(&mut buf, &cancel_token, decoder.holds_line())
+			.await
+		{
+			PipeRead::Read(n) => n,
+			PipeRead::LineIdle => {
+				let text = decoder.flush_line();
+				if !exceeded {
+					captured.push_str(&text);
 				}
-			};
-			let Some(res) = res else {
-				break;
-			};
-			match res {
-				Ok(0) => break,
-				Ok(n) => n,
-				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(_) => break,
-			}
+				emit_chunk(text, on_chunk.as_ref()).await;
+				continue;
+			},
+			PipeRead::End => break,
 		};
 		if n > 0 {
 			let _ = activity.try_send(());
@@ -2097,6 +2271,143 @@ async fn emit_chunk(text: String, callback: Option<&Sender<String>>) {
 	if let Some(callback) = callback {
 		let _ = callback.send_async(text).await;
 	}
+}
+
+/// The read end of an output pipe on Windows, where its reads are blocking
+/// `ReadFile` calls on the blocking pool (`tokio::fs::File`), one in flight at
+/// a time. As `next_read` on Unix, a cancel (the run's post-exit wait, or the
+/// cancel bridge) ends the wait for more output, never the read of output
+/// already written: the read in flight is ended (`CancelIoEx`) and taken with
+/// the bytes it read before its end, then the reader takes the bytes the pipe
+/// holds at that moment (`PeekNamedPipe`) without waiting, and stops.
+#[cfg(not(unix))]
+struct PipeReader {
+	file:  tokio::fs::File,
+	/// Once cancelled: the bytes still to read.
+	drain: Option<usize>,
+}
+
+/// What [`PipeReader::next`] got.
+#[cfg(not(unix))]
+enum PipeRead {
+	/// Bytes read.
+	Read(usize),
+	/// The decoder has held a line for [`CAPTURE_LINE_IDLE`] with no byte
+	/// read.
+	LineIdle,
+	/// End of file, an error, or a cancelled reader has read what the pipe
+	/// held.
+	End,
+}
+
+#[cfg(not(unix))]
+impl PipeReader {
+	fn new(file: fs::File) -> Self {
+		Self { file: tokio::fs::File::from_std(file), drain: None }
+	}
+
+	/// The next read into `buf`; `holds_line` says the decoder holds a line,
+	/// which [`PipeRead::LineIdle`] releases.
+	async fn next(
+		&mut self,
+		buf: &mut [u8],
+		cancel_token: &CancellationToken,
+		holds_line: bool,
+	) -> PipeRead {
+		loop {
+			if let Some(left) = &mut self.drain {
+				let want = (*left).min(buf.len());
+				if want == 0 {
+					return PipeRead::End;
+				}
+				// The pipe holds `want` bytes, so this read does not wait.
+				return match self.file.read(&mut buf[..want]).await {
+					Ok(0) | Err(_) => PipeRead::End,
+					Ok(n) => {
+						*left -= n;
+						PipeRead::Read(n)
+					},
+				};
+			}
+			// The cancel first, as in `next_read`.
+			let res = tokio::select! {
+				biased;
+				() = cancel_token.cancelled() => {
+					// The read in flight may hold bytes it took from the pipe.
+					let settled = self.settle(buf).await;
+					self.drain = Some(pipe_queued_bytes(&self.file));
+					let aborted = windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
+					if settled.as_ref().is_err_and(|e| e.raw_os_error() == Some(aborted as i32)) {
+						// Ended before it read: what the pipe holds is next.
+						continue;
+					}
+					settled
+				}
+				res = self.file.read(buf) => res,
+				() = capture_line_idle(holds_line) => return PipeRead::LineIdle,
+			};
+			match res {
+				Ok(0) => return PipeRead::End,
+				Ok(n) => return PipeRead::Read(n),
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+				Err(_) => return PipeRead::End,
+			}
+		}
+	}
+
+	/// Ends the read in flight and takes its result: the bytes it read before
+	/// its end, or `ERROR_OPERATION_ABORTED`. With no read in flight this
+	/// starts one, which the pipe answers at once if it holds bytes and which
+	/// is ended otherwise. A read that has not reached `ReadFile` yet is not
+	/// ended by the cancel, so the cancel is sent again until the read returns.
+	async fn settle(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		use std::os::windows::io::AsRawHandle as _;
+		// The handle as a number: a raw pointer held across the await would
+		// keep this future on one thread.
+		let handle = self.file.as_raw_handle().expose_provenance();
+		let read = self.file.read(buf);
+		tokio::pin!(read);
+		loop {
+			// SAFETY: `handle` is the open handle of `self.file`, which the read
+			// in flight keeps open; a null OVERLAPPED ends every read on it.
+			unsafe {
+				windows_sys::Win32::System::IO::CancelIoEx(
+					std::ptr::with_exposed_provenance_mut(handle),
+					std::ptr::null(),
+				)
+			};
+			tokio::select! {
+				biased;
+				res = &mut read => return res,
+				() = time::sleep(SETTLE_RETRY) => {},
+			}
+		}
+	}
+}
+
+/// How soon [`PipeReader::settle`] sends its cancel again.
+#[cfg(not(unix))]
+const SETTLE_RETRY: Duration = Duration::from_millis(1);
+
+/// How many bytes the pipe `file` reads holds (`PeekNamedPipe`); 0 if that
+/// cannot be read.
+#[cfg(not(unix))]
+fn pipe_queued_bytes(file: &tokio::fs::File) -> usize {
+	use std::os::windows::io::AsRawHandle as _;
+	let mut queued = 0u32;
+	// SAFETY: a zero-size peek of the open pipe handle takes no buffer and
+	// writes only the count of bytes waiting.
+	let ok = unsafe {
+		windows_sys::Win32::System::Pipes::PeekNamedPipe(
+			file.as_raw_handle(),
+			std::ptr::null_mut(),
+			0,
+			std::ptr::null_mut(),
+			&raw mut queued,
+			std::ptr::null_mut(),
+		)
+	};
+	if ok == 0 { 0 } else { queued as usize }
 }
 
 fn pipe_to_files(label: &str) -> Result<(fs::File, fs::File)> {
