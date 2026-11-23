@@ -43,7 +43,7 @@ function call(settings: Record<string, unknown>) {
 	const session = {
 		modelRegistry: {
 			authStorage: {} as AuthStorage,
-			getProviderBaseUrl: () => "http://model-gateway:4000/v1",
+			getProviderBaseUrl: () => "https://gateway.example/v1",
 			getApiKeyForProvider: async () => "sk-test",
 		},
 		settings: Settings.isolated(settings),
@@ -68,7 +68,7 @@ describe("live.provider", () => {
 		expect(live.openai).toHaveLength(1);
 		const options = live.openai[0]!.options as OpenAILiveTransportOptions;
 		expect(options.route).toEqual({
-			baseUrl: "http://model-gateway:4000/v1",
+			baseUrl: "https://gateway.example/v1",
 			apiKey: "sk-test",
 			model: "gpt-live-1.1",
 		});

@@ -89,7 +89,7 @@ describe("GPT-Live route", () => {
 		const registry = {
 			getProviderBaseUrl: (provider: string) => {
 				asked.push(provider);
-				return "http://model-gateway:4000/v1";
+				return "https://gateway.example/v1";
 			},
 			getApiKeyForProvider: async (provider: string, sessionId?: string) => {
 				asked.push(`${provider} key for ${sessionId}`);
@@ -97,7 +97,7 @@ describe("GPT-Live route", () => {
 			},
 		};
 		expect(await resolveOpenAILiveRoute(registry, "s1")).toEqual({
-			baseUrl: "http://model-gateway:4000/v1",
+			baseUrl: "https://gateway.example/v1",
 			apiKey: "sk-test",
 			model: "gpt-live-1.1",
 		});
@@ -121,7 +121,7 @@ describe("GPT-Live transport", () => {
 			expect(transport.sdpAnswer).toBe("v=0 answer");
 			expect(api.posts).toHaveLength(1);
 			const post = api.posts[0]!;
-			// The body the gateway's route answered 201 to (INFRA-5156, 20:49Z and 20:51Z on 2026-11-22).
+			// The body a GPT-Live gateway route answered 201 to (2026-11-22).
 			expect(post.body).toEqual({
 				session: { model: "gpt-live-1.1", instructions: "Be brief.", delegation: { type: "client" } },
 				transport: { type: "webrtc", sdp: "v=0 offer" },
