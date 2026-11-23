@@ -454,21 +454,30 @@ fn assignment_statement(
 			Err(stop) => return Some(exec::stop_flow(k, vp, cx, line, stop)),
 		};
 		if let Err(d) = assign_now(k, vp, cx, &a.name, None, a.append, AssignValue::Scalar(value)) {
-			k.diag(cx, vp, line, d);
-			// bash abandons the rest of the command line after a failed
-			// assignment statement; a posix shell exits.
-			if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-				.unwrap_or(false)
-			{
-				return Some(Flow::Exit(1));
-			}
-			return Some(Flow::Discard(1));
+			return Some(assign_failed(k, vp, cx, line, d));
 		}
 	}
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
 	Some(Flow::Next)
+}
+
+/// A failed assignment statement: bash reports it and abandons the rest of
+/// the command line; a posix shell exits ([`exec::jump_out`]: an
+/// arithmetic subscript error's jump comes after `top_level_cleanup`).
+fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
+	let cleanup = exec::cleanup_jump(vp, &d);
+	k.diag(cx, vp, line, d);
+	let flow = if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+		.unwrap_or(false)
+	{
+		Flow::Exit(1)
+	} else {
+		Flow::Discard(1)
+	};
+	exec::jump_out(k, cx, vp, cleanup, &flow);
+	flow
 }
 
 /// A simple command of plain words (`[ "$i" -lt 9 ]`, `f "$x"`,
@@ -1067,15 +1076,7 @@ fn expand(
 			if let Err(d) =
 				assign_now(k, vp, cx, &name, index.as_ref().map(|i| i.as_slice()), append, value)
 			{
-				k.diag(cx, vp, line, d);
-				// bash abandons the rest of the command line after a failed
-				// assignment statement; a posix shell exits.
-				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-					.unwrap_or(false)
-				{
-					return Some(Flow::Exit(1));
-				}
-				return Some(Flow::Discard(1));
+				return Some(assign_failed(k, vp, cx, line, d));
 			}
 			if k.mask.contains(crate::bash::event::EventKind::Assign)
 				&& matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS" | b"DIRSTACK" | b"RANDOM")
@@ -4711,6 +4712,12 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		let data = EventData::CmdEnd { status, dur_ns, pipestatus: &[] };
 		k.emit_op_at(cx, vp, op.node, data, end);
 	}
+	// `exit` jumps while its own redirections are in effect: bash's
+	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
+	// nothing), so the report goes out before they are undone below.
+	if matches!(control, Some(Transfer::Exit(_))) {
+		exec::report_jump(k, vp, cx, 0);
+	}
 	let sc = vp
 		.frames
 		.last_mut()
@@ -4743,18 +4750,17 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			// (always-lists run, the builtin's status stays); `Abort` is the
 			// parse-error path.
 			let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-			if !zsh {
-				// A builtin abandoned the line: an arithmetic subscript error
-				// (bash's `top_level_cleanup` restores the outer jump target
-				// first) or `suspend`'s usage error. bash's `time_command`
-				// never sees that jump and prints no report.
-				exec::drop_times(vp);
-			}
-			if command && in_run && !zsh {
+			let flow = if command && in_run && !zsh {
 				Flow::Abort(n)
 			} else {
 				Flow::Discard(n)
+			};
+			if !zsh {
+				// A builtin abandoned the line: an arithmetic subscript error
+				// or `suspend`'s usage error, after bash's `top_level_cleanup`.
+				exec::jump_out(k, cx, vp, true, &flow);
 			}
+			flow
 		},
 		Some(Transfer::Exec) => {
 			// The program replaced the shell (or `exec` failed and the shell

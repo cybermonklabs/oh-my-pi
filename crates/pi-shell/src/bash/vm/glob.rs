@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 
 use super::{
 	Cx,
-	exec::Flow,
+	exec::{self, Flow},
 	probe::absolute,
 	proc::{Live, Probe, ProbeResult, Scratch, Vproc},
 	state,
@@ -865,7 +865,9 @@ fn expand_globs_with<T>(
 			&& let Some(item) = items.get(i)
 		{
 			k.diag(cx, vp, line, Diag::NoMatch { pattern: BString::from(word(item)) });
-			return Err(Flow::Discard(1));
+			let flow = Flow::Discard(1);
+			exec::jump_out(k, cx, vp, false, &flow);
+			return Err(flow);
 		}
 		found.push((i, paths));
 	}

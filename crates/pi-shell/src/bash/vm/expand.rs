@@ -1627,7 +1627,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 		// arithmetic syntax error). Only such text differs from the word.
 		let src = word_source(unit, wi);
 		if src.iter().any(|c| matches!(c, b'\'' | b'\\')) {
-			let n = self.arith(src).map_err(subscript_error)?;
+			// An error of the text's own expansion (`$((1/0))` in it) is not
+			// the subscript's: bash reports it as such.
+			let text = self.expand_text(src)?;
+			let n = self.arith_eval(&text).map_err(subscript_error)?;
 			return Ok(BString::from(n.format_into(&mut NumBuffer::new())));
 		}
 		// bash expands no tilde-prefix in an arithmetic subscript (`${b[~]}`
@@ -1656,7 +1659,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 			}
 			return self.expand_arith_text(&subscript_as_arith_text(sub));
 		}
-		let n = self.arith(sub).map_err(subscript_error)?;
+		let text = self.expand_text(sub)?;
+		let n = self.arith_eval(&text).map_err(subscript_error)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
 	}
 

@@ -991,6 +991,12 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// The base frame of a child that runs inside one of bash's
+	/// `parse_and_execute` levels from its start: one forked inside an
+	/// `eval`, `.` or trap action (bash's fork keeps
+	/// `parse_and_execute_level`), and a command or process substitution,
+	/// whose text bash runs with `parse_and_execute`.
+	pub parse_level:       bool,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1024,6 +1030,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
+			parse_level: false,
 			subshell_line: None,
 			getopts: None,
 		}

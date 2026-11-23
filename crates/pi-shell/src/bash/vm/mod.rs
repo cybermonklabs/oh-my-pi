@@ -989,13 +989,6 @@ impl Kernel {
 
 	/// Queue a diagnostic on the vproc's stderr and emit a `Diag` event.
 	pub fn diag(&mut self, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, diag: Diag) {
-		// bash's arithmetic subscript error runs `top_level_cleanup` before it
-		// jumps (`array_expand_index`), so a `time` around it never reports.
-		if matches!(diag, Diag::ArithSubscript { .. })
-			&& vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
-		{
-			exec::drop_times(vp);
-		}
 		zle::display::trash_for_message(self, cx, vp);
 		let bytes = self.render_diag(cx, vp, line, &diag);
 		vp.out
@@ -2957,6 +2950,10 @@ impl Vproc {
 					.and_then(|u| u.ops.get(f.pc as usize))
 					.is_some_and(|op| op.flags & ir::Op::COND != 0)
 		});
+		// bash's fork keeps `parse_and_execute_level`: a child started
+		// inside an `eval`, `.` or trap action (or a child of one) runs
+		// inside that level.
+		frame.parse_level = self.frames.iter().any(exec::parse_and_execute);
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
 		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
 		vp.frames.reserve_exact(1);
