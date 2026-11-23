@@ -205,6 +205,73 @@ fn events_assign_preview_cuts_on_a_char_boundary() {
 	assert_eq!(previews, [("v", prefix.as_str(), 258), ("a", prefix.as_str(), 260)]);
 }
 
+/// bash's notice of a command a signal killed is a `Diag` event that holds
+/// the whole notice, the command too, as standard error does (bash 5.3: the
+/// C library's description padded to 27 columns).
+#[test]
+fn events_diag_of_a_killed_command_holds_the_command() {
+	use std::task::{Context, Poll};
+
+	use crate::bash::{ExitStatus, ExtProc, Signal, SpawnSpec};
+
+	/// An external that a `KILL` has ended.
+	struct Killed;
+	impl ExtProc for Killed {
+		fn pid(&self) -> u32 {
+			77
+		}
+
+		fn poll_wait(&mut self, _: &mut Context<'_>) -> Poll<ExitStatus> {
+			Poll::Ready(ExitStatus::Signaled(Signal::Kill))
+		}
+
+		fn signal(&mut self, _: Signal) -> std::io::Result<()> {
+			Ok(())
+		}
+
+		fn stop(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+
+		fn cont(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+	let host = FakeHost::new()
+		.with_spawner(Box::new(|_: SpawnSpec<'_>| Ok(Box::new(Killed) as Box<dyn ExtProc>)));
+	let mut rig = Rig::new(host, skeleton_init(&[]));
+	rig.shell().set_event_mask(EventMask::of(EventKind::Diag));
+	assert_eq!(rig.run(Script::command(&b"/x/k one; echo st=$?"[..]), Fault::None), 0);
+	// The description is the C library's `strsignal` text, as bash prints it
+	// (`j_strsignal`) and obash on this platform: glibc's `Killed`, Darwin's
+	// `Killed: 9`. Windows has no `strsignal`: obash prints glibc's there.
+	#[cfg(unix)]
+	let desc = {
+		// SAFETY: strsignal returns null or a NUL-terminated string, copied
+		// out at once; nothing else in this process calls it.
+		let desc = unsafe { libc::strsignal(libc::SIGKILL) };
+		assert!(!desc.is_null(), "strsignal(SIGKILL) returned null");
+		// SAFETY: a NUL-terminated string, read before any other call.
+		unsafe { std::ffi::CStr::from_ptr(desc) }
+			.to_string_lossy()
+			.into_owned()
+	};
+	#[cfg(not(unix))]
+	let desc = "Killed";
+	let notice = format!("   77 {desc:<27}/x/k one");
+	assert_eq!(
+		String::from_utf8_lossy(&rig.host.stderr.bytes()),
+		format!("bash: line 1: {notice}\n")
+	);
+	let messages: Vec<&str> = rig
+		.host
+		.events
+		.iter()
+		.map(|e| e["data"]["message"].as_str().unwrap_or_default())
+		.collect();
+	assert_eq!(messages, [notice]);
+}
+
 /// `Verdict::Pause` from the host stops the shell at that safepoint; the
 /// rest of the run is unchanged after resume.
 #[test]

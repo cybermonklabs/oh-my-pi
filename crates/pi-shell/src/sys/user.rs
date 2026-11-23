@@ -1,5 +1,5 @@
 //! The current user as the shell reports it (`UID`, `EUID`, `GID`,
-//! `GROUPS`, `USER`/`HOME`).
+//! `GROUPS`, the user name and home directory).
 //!
 //! Windows has no numeric ids: the user's and primary group's ids are the
 //! relative ids (RIDs, the last sub-authority) of their SIDs, as MSYS2 and
@@ -11,23 +11,51 @@ use bstr::BString;
 
 use crate::bash::UserInfo;
 
-/// The current user: ids, groups, and `USER`/`HOME` (`USERNAME`/
-/// `USERPROFILE` on Windows) of the process environment.
+/// The current user: ids, groups, and the name and home directory.
+///
+/// On Unix the name and home are the real uid's password database entry,
+/// as zsh (`USERNAME`, the default `HOME`) and bash (`\u`, `~` without
+/// `HOME`) take them, whatever `USER` and `HOME` the environment holds; a
+/// uid without an entry has [`no_entry`]'s. On Windows, `USERNAME` and
+/// `USERPROFILE`.
 pub fn read_user() -> UserInfo {
-	let var = |k: &str| {
-		std::env::var_os(k).map_or_else(BString::default, |v| BString::from(v.as_encoded_bytes()))
-	};
 	#[cfg(unix)]
 	// SAFETY: getuid/geteuid/getgid have no preconditions.
 	let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
 	#[cfg(windows)]
 	let (uid, euid, gid) = windows::ids();
-	let (name, home) = if cfg!(windows) {
+	#[cfg(unix)]
+	let (name, home) = passwd_entry(uid).map_or_else(no_entry, |pw| (pw.name, pw.dir));
+	#[cfg(windows)]
+	let (name, home) = {
+		let var = |k: &str| {
+			std::env::var_os(k).map_or_else(BString::default, |v| BString::from(v.as_encoded_bytes()))
+		};
 		(var("USERNAME"), var("USERPROFILE"))
-	} else {
-		(var("USER"), var("HOME"))
 	};
 	UserInfo { uid, euid, gid, groups: groups(), name, home }
+}
+
+/// The name and home of a uid without a password database entry: none
+/// known, and `USER` and `HOME` are not read for them (neither zsh nor
+/// bash does). Each shell gives its own defaults then: zsh an empty
+/// `USERNAME` and `HOME=/`, bash `I have no name!` for `\u` and `/` for
+/// `~`.
+#[cfg(unix)]
+fn no_entry() -> (BString, BString) {
+	(BString::default(), BString::default())
+}
+
+/// `uid`'s password database entry (`getpwuid_r`, [`user_db`]); `None`
+/// without one, or when the database cannot be read.
+///
+/// [`user_db`]: crate::sys::fs_ops::user_db
+#[cfg(unix)]
+pub fn passwd_entry(uid: libc::uid_t) -> Option<crate::bash::fs::PwEntry> {
+	crate::sys::fs_ops::user_db(&crate::bash::fs::PwQuery::Uid(uid))
+		.ok()?
+		.into_iter()
+		.next()
 }
 
 /// The effective uid and gid files read as owned by. Windows reports no

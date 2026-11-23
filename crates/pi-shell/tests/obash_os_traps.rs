@@ -19,12 +19,17 @@ fn external_signal_runs_trap_in_a_busy_function() {
 	assert_eq!(out.stdout, b"trapped\nstatus=23\n");
 }
 
+/// A signal that comes while a foreground command runs is trapped after the
+/// command ends. The foreground command sends the signal to the shell
+/// itself (`$$` is the shell's pid, expanded before the command starts)
+/// and goes on: the signal is pending while the command still runs, with
+/// nothing to wait for, so a loaded machine cannot send it before the
+/// command starts or after the shell has exited.
 #[test]
 fn trapped_signal_waits_for_foreground_command() {
 	let out = output(obash().args([
 		"-c",
-		"trap 'echo trapped' USR1; (/bin/sleep .05; /bin/kill -USR1 $$) & /bin/sh -c '/bin/sleep \
-		 .2; echo child'; echo done",
+		"trap 'echo trapped' USR1; /bin/sh -c \"/bin/kill -USR1 $$; echo child\"; echo done",
 	]));
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	assert_eq!(out.stdout, b"child\ntrapped\ndone\n");

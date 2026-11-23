@@ -224,6 +224,22 @@ fn a_trapped_signal_still_runs_its_trap_after_exec() {
 	assert_eq!(plain.stdout, b"caught\nafter 20\n");
 }
 
+/// A bash EXIT trap makes the restored process catch bash's terminating
+/// signals again, every one the platform has: `EMT`, which Linux lacks
+/// (number 0), is not asked for, or the restore fails with `could not
+/// restore the trap of SIGEMT`.
+#[test]
+fn an_exit_trap_survives_exec_with_its_terminating_signals() {
+	let (plain, line) = same_as_plain(
+		"trap 'echo x' EXIT; echo a; echo b; echo c; echo d; echo e",
+		"1:3",
+		"exec",
+		&[],
+	);
+	assert_eq!(String::from_utf8_lossy(&plain.stdout), "a\nb\nc\nd\ne\nx\n");
+	assert!(num(&line, "restored") > 0, "{line:?}");
+}
+
 /// obash forwards caught OS signals to the engine between steps; the step
 /// that reaps `/bin/kill` must not run `echo after` before the USR1 the
 /// child sent is delivered (the exit hands it over first). Lost about one

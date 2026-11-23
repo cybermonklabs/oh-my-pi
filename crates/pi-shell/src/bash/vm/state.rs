@@ -353,6 +353,10 @@ pub struct Root {
 	synced:            Synced,
 	/// zsh's history events as last written (mirrors their store record).
 	pub hist_events:   parking_lot::Mutex<super::builtins::history::model::EventsCache>,
+	/// The engine's platform ([`crate::bash::EngineConfig::platform`]), for
+	/// code that holds the root but not the kernel (a zsh function's trap
+	/// scope ending as its frame pops names its `TRAPNAL` functions by it).
+	platform:          crate::bash::ids::Platform,
 }
 
 /// The root vproc's fields the interpreter updates in place (`vp.status = …`
@@ -497,6 +501,16 @@ impl Root {
 	/// The store epoch these facts were derived at.
 	pub const fn epoch(&self) -> u64 {
 		self.epoch
+	}
+
+	/// The engine's platform ([`Self::set_platform`]).
+	pub const fn platform(&self) -> crate::bash::ids::Platform {
+		self.platform
+	}
+
+	/// Record the engine's platform (the kernel does, as it starts).
+	pub const fn set_platform(&mut self, platform: crate::bash::ids::Platform) {
+		self.platform = platform;
 	}
 
 	/// Write the lazy empty scopes ([`Self::lazy`]) as store records: before
@@ -3047,7 +3061,11 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 /// Write the root job table's changes since the last sync: each job is
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted.
+/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
+/// written with the job's record when it changes, and when they change
+/// without it (a pipeline's processes start and end while the job runs,
+/// [`Job::procs`]): those of a job that has any are compared with their
+/// record too. A job's facts never go, so one without any has none written.
 fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
 	let same_ids =
@@ -3056,6 +3074,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		for id in &ids {
 			if !jobs.list.iter().any(|j| j.id == *id) {
 				root.write(store, Change::Del(Key::Job(*id)));
+				root.write(store, Change::Del(Key::JobFacts(*id)));
 			}
 		}
 		ids.clear();
@@ -3064,7 +3083,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_ids = ids;
 	for job in &jobs.list {
 		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => have == job,
+			Ok(Some(Record::Job(have))) => job.same_record(have),
 			Ok(_) => false,
 			Err(err) => {
 				root.fail(err);
@@ -3072,7 +3091,32 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 			},
 		};
 		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.clone())));
+			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
+		}
+		let facts_written = if !written {
+			false
+		} else if !job.has_facts() {
+			true
+		} else {
+			match store.get(Key::JobFacts(job.id)) {
+				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+				Ok(_) => false,
+				Err(err) => {
+					root.fail(err);
+					return;
+				},
+			}
+		};
+		if !facts_written {
+			let facts = job.facts();
+			root.write(
+				store,
+				if facts.is_empty() {
+					Change::Del(Key::JobFacts(job.id))
+				} else {
+					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+				},
+			);
 		}
 	}
 	let (current, previous, chld) = root.synced.job_marks;
@@ -3220,6 +3264,13 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	store.scan(Table::JobFacts, &mut |key, rec| {
+		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
+			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+		{
+			job.set_facts(facts);
+		}
+	})?;
 	list.sort_by_key(|j| j.number);
 	let mut bgp = Vec::new();
 	store.scan(Table::BgPid, &mut |key, rec| {
@@ -3244,6 +3295,7 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		comsub: super::proc::Comsub::No,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);

@@ -5,6 +5,7 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{io, time::Duration};
 
@@ -56,6 +57,30 @@ fn drives_the_real_zsh_interactively() -> io::Result<()> {
 	Ok(())
 }
 
+/// Readiness requires both non-canonical input and disabled kernel echo;
+/// otherwise a first key can be echoed before the editor draws its prompt.
+#[test]
+fn waits_until_line_editor_disables_echo() -> io::Result<()> {
+	let mut pty = Spawn::new("/bin/sh")
+		.args([
+			"-c",
+			"stty -icanon echo; printf half; read line; stty -icanon -echo; printf ready; read line; \
+			 printf 'got:%s\\n' \"$line\"",
+		])
+		.spawn()?;
+	pty.read_until("half", TIMEOUT)?;
+	let err = pty.wait_raw(Duration::from_millis(100)).unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+	pty.write("go\r")?;
+	pty.read_until("ready", TIMEOUT)?;
+	pty.wait_raw(TIMEOUT)?;
+	pty.write("last\r")?;
+	pty.read_until("got:last", TIMEOUT)?;
+	assert_eq!(pty.output().matches("last").count(), 1, "the kernel echoed a key");
+	assert!(pty.wait(TIMEOUT)?.success());
+	Ok(())
+}
+
 /// The same `-c` session on obash-as-zsh and the real zsh: a terminal on
 /// stdin, its size, a line read in canonical mode (echoed by the tty)
 /// leave the same screen.
@@ -93,7 +118,8 @@ fn a_resize_is_seen_by_both() -> io::Result<()> {
 		Spawn::zsh().args(["-f", "-c", script]),
 		Spawn::real_zsh().args(["-f", "-c", script]),
 		|pty| {
-			pty.settle(Duration::from_millis(200), TIMEOUT)?;
+			// `stty size` reads the size once `read` returns: the resize
+			// may come before the shell even started.
 			pty.resize(30, 100)?;
 			pty.write("\r")?;
 			pty.read_until("30 100", TIMEOUT)?;

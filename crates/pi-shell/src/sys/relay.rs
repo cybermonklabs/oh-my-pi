@@ -375,6 +375,10 @@ impl ExtProc for Relayed {
 	fn cont(&mut self) -> io::Result<()> {
 		self.child.cont()
 	}
+
+	fn release(&mut self) {
+		self.child.release();
+	}
 }
 
 impl Drop for Relayed {

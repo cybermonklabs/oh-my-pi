@@ -801,10 +801,11 @@ mod fifo {
 		}
 		let slot = Arc::new(Mutex::new(Slot::default()));
 		let (opts, target, helper) = (options(flags, mode), host.to_path_buf(), Arc::clone(&slot));
-		let spawned = thread::Builder::new()
-			.name("obash-fifo".into())
-			.stack_size(64 << 10)
-			.spawn(move || {
+		let spawned = crate::sys::thread::spawn_helper(
+			thread::Builder::new()
+				.name("obash-fifo".into())
+				.stack_size(64 << 10),
+			move || {
 				let opened = opts.open(&target);
 				let mut s = helper.lock();
 				if s.cancelled {
@@ -816,7 +817,8 @@ mod fifo {
 				if let Some(w) = waker {
 					w.wake();
 				}
-			});
+			},
+		);
 		if let Err(e) = spawned {
 			slot.lock().result = Some(Err(e));
 		}
@@ -1424,7 +1426,9 @@ mod tests {
 		fn pending(p: FsPoll<Box<dyn File>>) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
 			match p {
 				FsPoll::Pending(p) => p,
-				FsPoll::Ready(_) => panic!("a one-way FIFO open must not complete synchronously"),
+				FsPoll::Ready(_) => {
+					panic!("a one-way FIFO open with no other end must not complete synchronously")
+				},
 			}
 		}
 
@@ -1492,53 +1496,64 @@ mod tests {
 
 		/// `mkfifo f; echo x > f & . f` in one engine thread: both ends live
 		/// on this thread, so neither read nor write may wait in the kernel.
+		/// The writer opens first, as the background `echo` does; each open
+		/// is pending, as every one-way FIFO open is.
 		#[test]
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
 			let path = fifo();
-			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut reader = finish(&mut r);
 			let mut writer = finish(&mut w);
 			assert_eq!(reader.kind(), FileKind::Pipe);
-			let flag = Arc::new(Flag::default());
-			let waker = Waker::from(Arc::clone(&flag));
-			let mut cx = Context::from_waker(&waker);
+			// The reader and the writer each have a waker of their own, so a
+			// wait for one never takes the other's wake.
+			let read_flag = Arc::new(Flag::default());
+			let read_waker = Waker::from(Arc::clone(&read_flag));
+			let mut rcx = Context::from_waker(&read_waker);
+			let write_flag = Arc::new(Flag::default());
+			let write_waker = Waker::from(Arc::clone(&write_flag));
+			let mut wcx = Context::from_waker(&write_waker);
 			let mut buf = [0u8; 8192];
 			assert!(
-				reader.poll_read(&mut cx, &mut buf).is_pending(),
+				reader.poll_read(&mut rcx, &mut buf).is_pending(),
 				"no data yet: Pending, not a wait"
 			);
-			assert!(matches!(writer.poll_write(&mut cx, b"echo four - OK\n"), Poll::Ready(Ok(15))));
-			flag.wait("reader woken by the write");
-			let Poll::Ready(Ok(n)) = reader.poll_read(&mut cx, &mut buf) else {
+			assert!(matches!(writer.poll_write(&mut wcx, b"echo four - OK\n"), Poll::Ready(Ok(15))));
+			read_flag.wait("reader woken by the write");
+			let Poll::Ready(Ok(n)) = reader.poll_read(&mut rcx, &mut buf) else {
 				panic!("readable after the write");
 			};
 			assert_eq!(&buf[..n], b"echo four - OK\n");
 
-			// Fill the pipe: the writer gets Pending instead of waiting.
+			// Fill the pipe: the writer gets Pending instead of waiting. A
+			// write that is `Ready` is taken: in the pipe, or, where writes go
+			// through a writer thread of the descriptor's own, handed to that
+			// thread, whose bytes reach the pipe as the reader makes room.
 			let chunk = vec![b'z'; 1 << 16];
 			let mut written = 0usize;
 			loop {
-				match writer.poll_write(&mut cx, &chunk) {
+				match writer.poll_write(&mut wcx, &chunk) {
 					Poll::Ready(Ok(n)) => written += n,
 					Poll::Ready(Err(e)) => panic!("{e}"),
 					Poll::Pending => break,
 				}
 				assert!(written < 64 << 20, "the pipe never filled");
 			}
+			// Read it all back. A read that finds the pipe empty while a
+			// writer thread still holds bytes is `Pending`, and the reader is
+			// woken when they arrive.
 			let mut read = 0usize;
 			while read < written {
-				match reader.poll_read(&mut cx, &mut buf) {
+				match reader.poll_read(&mut rcx, &mut buf) {
 					Poll::Ready(Ok(n)) => read += n,
+					Poll::Pending => read_flag.wait("reader woken as the written bytes arrive"),
 					other => panic!("data is buffered: {other:?}"),
 				}
 			}
-			flag.wait("writer woken once space freed up");
+			write_flag.wait("writer woken once space freed up");
 			drop(writer);
-			assert!(
-				matches!(reader.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))),
-				"end of file after the writer closed"
-			);
+			end_of_file(&mut reader, &mut rcx, &read_flag, || {});
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
 		}
 
@@ -1561,6 +1576,75 @@ mod tests {
 			let file = fs::File::open("/etc/passwd").unwrap();
 			let mut regular = StdFile::new(file);
 			assert!(ebadf(regular.poll_write(&mut cx, b"foo\n")), "write to a read-only file");
+		}
+
+		/// Reads `reader` to its end of file, which the test's own close of
+		/// the write end (just before) may not give at once: while a sibling
+		/// test of this process starts a child (`sys/spawn/unix.rs`: `fork`,
+		/// `Command::pre_exec`, `posix_spawn`), the child holds a copy of
+		/// every descriptor of the process until its `exec` closes them, and
+		/// a writer thread of the descriptor's own, where writes go through
+		/// one, holds a copy until it ends. The end of file comes with the
+		/// last close, so it is awaited as the event it is, the reader's wake
+		/// through `flag`; `pending` runs at each `Pending`, before the wait.
+		/// The verdict is the event; the 10 s bound only ends a test that
+		/// never sees it.
+		fn end_of_file(
+			reader: &mut Box<dyn File>,
+			cx: &mut Context<'_>,
+			flag: &Flag,
+			mut pending: impl FnMut(),
+		) {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let mut buf = [0u8; 64];
+			loop {
+				match reader.poll_read(cx, &mut buf) {
+					Poll::Ready(Ok(0)) => return,
+					Poll::Pending => {
+						assert!(Instant::now() < deadline, "no end of file within 10 s of the close");
+						pending();
+						flag.wait("reader woken when the last write end closed");
+					},
+					other => panic!("end of file after the writer closed: {other:?}"),
+				}
+			}
+		}
+
+		/// The end of file comes once the last copy of the write end is
+		/// closed. Here a copy outlives the test's own close, as a sibling
+		/// test's child holds one until its `exec`, and another thread closes
+		/// it only once the wait for the end of file has begun: a read made
+		/// once after the test's close gets `Pending`, every time.
+		#[test]
+		fn the_end_of_file_waits_for_the_last_copy_of_the_write_end() {
+			use std::os::fd::{AsFd, OwnedFd};
+
+			let path = fifo();
+			let host = host_path(&path).unwrap().to_path_buf();
+			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			// The read open's helper waits in `open(2)` until this open.
+			let writer = fs::OpenOptions::new().write(true).open(&host).unwrap();
+			let mut reader = finish(&mut r);
+			let copy: OwnedFd = writer.as_fd().try_clone_to_owned().unwrap();
+			drop(writer);
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let mut cx = Context::from_waker(&waker);
+			let (release, released) = std::sync::mpsc::channel::<()>();
+			let closer = thread::spawn(move || {
+				// Ends with the test: a send, or the sender dropped.
+				let _ = released.recv();
+				drop(copy);
+			});
+			let mut release = Some(release);
+			end_of_file(&mut reader, &mut cx, &flag, || {
+				if let Some(release) = release.take() {
+					release.send(()).unwrap();
+				}
+			});
+			assert!(release.is_none(), "the end of file came while a copy of the write end was open");
+			closer.join().unwrap();
+			fs::remove_file(&host).unwrap();
 		}
 
 		/// `read -t 0.00001 var` with a terminal on stdin: the terminal read
