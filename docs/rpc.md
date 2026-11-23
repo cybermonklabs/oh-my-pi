@@ -1554,11 +1554,12 @@ no task text, only its `offset_ms` on the session timeline, so its turn is the
 user's transcribed words before that offset (at most the minute before it), under
 a line saying they are speech-to-text that can hold recognition errors and speech
 that was not a request. GPT-Live can send a delegation before the transcript of
-the words that led to it, so a delegation goes once the transcript has reached
-its offset: the user's transcript, or the voice's once some of the user's words
-before the offset are in. Failing both, it goes after 1 s with the words that
-have arrived. A delegation is never dropped: with no words, its turn says none
-were transcribed. A turn's progress goes to the call as `session.thinking.append`
+the words that led to it, so a delegation goes once the user's transcript has
+reached its offset, or after 1 s with the words that have arrived; the voice's
+transcript does not release it. A user's word that arrives for a delegation
+already handed over is logged, not given to the next one. A delegation is never
+dropped: with no words, its turn says none were transcribed. A turn's progress
+goes to the call as `session.thinking.append`
 (not spoken) and its final reply as `session.commentary.append` (spoken); context
 outside a delegation goes the same way with `delegation_id: null`. Each message
 carries an `event_id`; a GPT-Live `error` that names one ends the call with that
