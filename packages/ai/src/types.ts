@@ -1396,6 +1396,14 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 	/** Local wall-clock time the response finished streaming (ms since epoch); stamped by the session at message_end so prompt→yield timing never depends on provider-reported duration. */
 	completedAt?: number;
+	/**
+	 * The model the request went out as, as the host's prompt cache keys it (provider, id, wire API and endpoint);
+	 * stamped by the session at message_end and persisted with the message, so a resumed process tells a cache entry
+	 * another endpoint holds from its own. Providers build their wire messages from named fields and never send it
+	 * (the pi-native transport hands its gateway whole messages, `completedAt` among them, and the gateway's provider
+	 * builds the upstream request the same way).
+	 */
+	promptCacheModelKey?: string;
 }
 
 export interface ToolResultMessage<TDetails = unknown> {

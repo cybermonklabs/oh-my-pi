@@ -31,7 +31,7 @@ export class BankManager {
 	}
 
 	createBank(name: string): string {
-		this.validateName(name);
+		validateBankName(name);
 		const bankDir = join(this.banksDir, name);
 		if (existsSync(bankDir)) throw new ValueError(`Bank '${name}' already exists`);
 		mkdirSync(bankDir, { recursive: true });
@@ -41,7 +41,7 @@ export class BankManager {
 		return dbPath;
 	}
 	deleteBank(name: string, force = false): boolean {
-		this.validateName(name);
+		validateBankName(name);
 		if (name === "default" && !force) throw new ValueError("Cannot delete 'default' bank without force=True");
 		const bankDir = join(this.banksDir, name);
 		if (!existsSync(bankDir)) return false;
@@ -62,13 +62,11 @@ export class BankManager {
 		return existsSync(join(this.banksDir, name));
 	}
 	getBankDbPath(name: string): string {
-		if (name.length === 0 || name === "default") return join(this.dataDir, DB_FILENAME);
-		this.validateName(name);
-		return join(this.banksDir, name, DB_FILENAME);
+		return bankDbPathIn(this.dataDir, name);
 	}
 	renameBank(oldName: string, newName: string): string {
 		if (oldName === "default") throw new ValueError("Cannot rename 'default' bank");
-		this.validateName(newName);
+		validateBankName(newName);
 		const oldDir = join(this.banksDir, oldName);
 		const newDir = join(this.banksDir, newName);
 		if (!existsSync(oldDir)) throw new ValueError(`Bank '${oldName}' does not exist`);
@@ -82,21 +80,33 @@ export class BankManager {
 		const size = present ? statSync(dbPath).size : 0;
 		return { name, exists: present, db_path: dbPath, dbSizeBytes: size, db_size_bytes: size };
 	}
-	private validateName(name: string): void {
-		if (name.length === 0) throw new ValueError("Bank name cannot be empty");
-		if (name === "default") return;
-		if (name.length > 64) throw new ValueError(`Bank name '${name}' exceeds 64 characters`);
-		for (let i = 0; i < name.length; i++) {
-			const code = name.charCodeAt(i);
-			const ok =
-				(code >= 48 && code <= 57) ||
-				(code >= 65 && code <= 90) ||
-				(code >= 97 && code <= 122) ||
-				code === 45 ||
-				code === 95;
-			if (!ok) throw new ValueError(`Invalid bank name '${name}'. Use alphanumeric, hyphens, underscores only.`);
-		}
+}
+
+function validateBankName(name: string): void {
+	if (name.length === 0) throw new ValueError("Bank name cannot be empty");
+	if (name === "default") return;
+	if (name.length > 64) throw new ValueError(`Bank name '${name}' exceeds 64 characters`);
+	for (let i = 0; i < name.length; i++) {
+		const code = name.charCodeAt(i);
+		const ok =
+			(code >= 48 && code <= 57) ||
+			(code >= 65 && code <= 90) ||
+			(code >= 97 && code <= 122) ||
+			code === 45 ||
+			code === 95;
+		if (!ok) throw new ValueError(`Invalid bank name '${name}'. Use alphanumeric, hyphens, underscores only.`);
 	}
+}
+
+/**
+ * The database file bank `name` lives in under the data directory `dataDir`, as {@link BankManager} lays banks out:
+ * the data directory's own for `default` (or an empty name), else the bank's directory under `banks/`. Reads and
+ * creates nothing; throws {@link ValueError} for a name a bank cannot have.
+ */
+export function bankDbPathIn(dataDir: string, name: string): string {
+	if (name.length === 0 || name === "default") return join(dataDir, DB_FILENAME);
+	validateBankName(name);
+	return join(dataDir, "banks", name, DB_FILENAME);
 }
 
 let defaultBank = "default";

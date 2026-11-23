@@ -1945,7 +1945,10 @@ interface PreparedProviderCall {
 	ownedDialect: Dialect | undefined;
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
-	/** Records this call's per-call messages as the previous main request's; called once the request goes out. */
+	/**
+	 * Records this call's per-call messages as the previous main request's; called as the provider dispatches the
+	 * request (its `beforeDispatch`), past the stream function's own gates.
+	 */
 	perCallMessagesSent?: () => void;
 }
 
@@ -2239,11 +2242,21 @@ async function streamAssistantResponse(
 		});
 	};
 
+	// The provider calls `beforeDispatch` as it sends, past the stream function's own gates (a spend cap or a model
+	// check applied again as the request goes out) and any wait for a provider slot. Only a request that gets there
+	// becomes the one the next request compares its per-call messages with; one aborted by then sends nothing.
+	const callerBeforeDispatch = config.beforeDispatch;
+	const perCallMessagesSent = providerCall.perCallMessagesSent;
+	const beforeDispatch = perCallMessagesSent
+		? () => {
+				callerBeforeDispatch?.();
+				if (!finalRequestSignal?.aborted) perCallMessagesSent();
+			}
+		: callerBeforeDispatch;
+
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			onProviderStart?.();
-			// Past every gate: the request goes out, so the next one compares its per-call messages with this one's.
-			providerCall.perCallMessagesSent?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,
@@ -2258,6 +2271,7 @@ async function streamAssistantResponse(
 				onResponse: captureOnResponse,
 				cursorOnToolResult: collectCursorToolResult,
 				liveSteering: providerCall.liveSteering,
+				beforeDispatch,
 			});
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks

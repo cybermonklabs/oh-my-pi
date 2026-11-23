@@ -6331,6 +6331,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const warmingOptions = {
 			...options,
 			cacheRetention: options.cacheRetention ?? (retentionSetting === "auto" ? undefined : retentionSetting),
+			// The loop's dispatch hook records what its own request sent (its per-call messages); a refresh is no main
+			// request and leaves that record as the main requests left it.
+			beforeDispatch: undefined,
 		};
 		const arm: PromptCacheArm = {
 			model,
@@ -6482,9 +6485,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
 	 * model declares for the tier the reply wrote. Thinking level and
-	 * credential at the time are unknown; model, the API the reply went out
-	 * on (a Kimi Code API format switch since moves it to another endpoint
-	 * and its cache), compaction and the digests of the tool definitions and
+	 * credential at the time are unknown; the model its request went out as
+	 * (the prompt cache's key the reply records, `promptCacheModelKey`, with
+	 * the endpoint among it: another server keeps a cache of its own; a reply
+	 * without the record compares by model and the API it went out on, where
+	 * a Kimi Code API format switch since moves it to another endpoint and its
+	 * cache), compaction and the digests of the tool definitions and
 	 * system prompt recorded for that reply are not,
 	 * and the next request is taken to send the current tool definitions and
 	 * base prompt. `promptDigest` names another base prompt for it, the one a
@@ -6513,12 +6519,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const seconds = model.promptCache?.[tier];
 		const current = this.model;
 		// The model the next request goes out as, named as a change names it, with the API its wire model goes out on.
-		const next = promptCacheModelLabel(current, resolveKimiApiFormat(this.settings));
+		const kimiApiFormat = resolveKimiApiFormat(this.settings);
+		const next = promptCacheModelLabel(current, kimiApiFormat);
 		let change: ObservedPromptCacheEntry["change"];
 		if (
-			current?.provider !== model.provider ||
-			current.id !== model.id ||
-			repliedOnOtherWire(current, reply.api, next.api)
+			current === undefined ||
+			(reply.promptCacheModelKey !== undefined
+				? reply.promptCacheModelKey !== promptCacheModelKey(current, kimiApiFormat)
+				: current.provider !== model.provider ||
+					current.id !== model.id ||
+					repliedOnOtherWire(current, reply.api, next.api))
 		) {
 			change = modelCacheChange({ modelName: model.name, api: reply.api }, next);
 		} else if (requestedTier !== tier) {

@@ -271,7 +271,7 @@ import {
 } from "./session/session-tools";
 import { anthropicSlowModeHasNoSiblingHeadroom } from "./session/anthropic-slow-mode";
 import { CacheWarmer } from "./session/cache-warmer";
-import { createSettingsAwareStreamFn, resolveKimiApiFormat } from "./session/settings-stream-fn";
+import { createSettingsAwareStreamFn, promptCacheModelKey, resolveKimiApiFormat } from "./session/settings-stream-fn";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
 import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
 import { createSpeculativeToolExecutionConfig } from "./speculation/host";
@@ -5010,7 +5010,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// a session recreate. The single shared host keeps its evidence across
 		// toggles; per-turn coordinator close never touches it.
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
-		let mainRequestProvider: string | undefined;
+		/** The main request in flight: the provider it went to, and the model it went out as (the prompt cache's key). */
+		let mainRequest: { provider: string; cacheModelKey: string } | undefined;
 
 		agent = new Agent({
 			initialState: {
@@ -5044,7 +5045,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: effectiveGetApiKey,
 			streamFn: (streamModel, context, streamOptions) => {
-				mainRequestProvider = undefined;
+				mainRequest = undefined;
 				options.assertDispatchModel?.(streamModel);
 				// The loop checks the cap before each request, but a side request can finish
 				// in between: refuse here, as this run's refusal, before announcing a dispatch.
@@ -5080,7 +5081,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.
 				const onPayload = merged.onPayload;
-				mainRequestProvider = streamModel.provider;
+				mainRequest = {
+					provider: streamModel.provider,
+					cacheModelKey: promptCacheModelKey(streamModel, merged.kimiApiFormat),
+				};
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
@@ -5148,13 +5152,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		});
 		// The main Agent's issued provider is available before AgentSession accounts
 		// for the finalized message, including errors synthesized after a stream throws.
+		// The reply carries the model its request went out as, as the prompt cache keys
+		// it, into the transcript the session writes: a resumed process compares it with
+		// the key its own requests go out under.
 		agent.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "assistant" && mainRequestProvider !== undefined) {
+			if (event.type === "message_end" && event.message.role === "assistant" && mainRequest !== undefined) {
 				(event.message as typeof event.message & { [kUsageLimitRequestProvider]?: string })[
 					kUsageLimitRequestProvider
-				] = mainRequestProvider;
+				] = mainRequest.provider;
+				event.message.promptCacheModelKey = mainRequest.cacheModelKey;
 			} else if (event.type === "turn_end" || event.type === "agent_end") {
-				mainRequestProvider = undefined;
+				mainRequest = undefined;
 			}
 		});
 		// Catalog rows carry the registry settings' extended-window opt-ins; this

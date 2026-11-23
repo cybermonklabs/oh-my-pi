@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `bankDbPathIn()` to `@oh-my-pi/pi-mnemopi/core/banks`: the database file a bank lives in under a data directory, as `BankManager` lays banks out, without creating the `banks` directory a `BankManager` creates
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed
