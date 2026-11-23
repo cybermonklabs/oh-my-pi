@@ -942,7 +942,12 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 
 /// fg on a job whose stages were stopped and then continued from outside
 /// the shell waits for the pipeline to complete: no stop report of any
-/// selected stage is left to end the wait early.
+/// selected stage is left to end the wait early. A stage waits for the
+/// release file until its parent, this test process, is gone: a stage leads
+/// a session of its own, and one that waited for the file alone lived on
+/// after a killed test. A stage still stopped when the test is killed stays
+/// stopped: it runs nothing until continued, and the kernel continues no
+/// group of a session of its own.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn resumed_pipeline_drains_every_selected_stop_report() {
@@ -958,7 +963,8 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 	}
 
 	let script = "echo $$ > \"$1\"; : > \"$2\"; if test \"$3\" -eq 1; then kill -STOP $$; fi; \
-	              while ! test -e \"$4\"; do sleep 0.01; done";
+	              while ! test -e \"$4\"; do kill -0 \"$PPID\" 2>/dev/null || exit 97; sleep 0.01; \
+	              done";
 	let (_pty_master, pty_slave) = pseudo_terminal_session();
 	for stage_count in [2_usize, 3] {
 		for stopped_subset in 1..(1_usize << stage_count) {
