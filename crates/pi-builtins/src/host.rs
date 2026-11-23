@@ -3082,6 +3082,13 @@ mod testing {
 			self.env.insert(key.to_string(), value.to_string());
 		}
 
+		/// Gives a test host the filesystem `fs` (a provider's, say), keeping
+		/// its working directory.
+		pub(crate) fn set_test_fs(&mut self, fs: &pi_vfs::Fs) {
+			self.paths =
+				ShellPaths::new(self.paths.cwd().to_path_buf(), fs, None, std::iter::empty::<(i32, OpenFile)>());
+		}
+
 		/// Requests cancellation on a test host.
 		pub(crate) fn cancel_for_test(&self) {
 			self.cancel.store(true, super::Ordering::Relaxed);
@@ -3165,6 +3172,26 @@ mod testing {
 		(code, capture)
 	}
 
+	/// [`run_util`] on the filesystem `fs` (a provider, say) instead of the
+	/// host's own. Only Unix tests use it.
+	#[cfg(unix)]
+	pub(crate) fn run_util_on<U: Utility>(
+		fs: &pi_vfs::Fs,
+		argv: &[&str],
+		stdin: &str,
+		cwd: impl Into<PathBuf>,
+	) -> (i32, Capture) {
+		let cwd = cwd.into();
+		let spec = Spec::of_sync::<U>();
+		let (mut host, capture) = test_host(spec, stdin, cwd.clone());
+		host.paths = ShellPaths::new(cwd, fs, None, std::iter::empty());
+		let code = match parse_for_test::<U>(spec, argv, &mut host) {
+			Ok(parsed) => run_caught::<U>(parsed, &mut host),
+			Err(code) => code,
+		};
+		(code, capture)
+	}
+
 	/// [`run_util`] for an [`AsyncUtility`]: the body is awaited in place and
 	/// its output drained into the [`Capture`] before it returns.
 	pub(crate) async fn run_async_util<U: AsyncUtility>(
@@ -3229,30 +3256,55 @@ mod testing {
 		tree
 	}
 
-	/// Hooks keyed by path, each run once by the first [`run_hook`] for its
-	/// path ([`SwapTree::swap_at`] and [`hook_at`] register them).
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	/// Hooks keyed by path, each run once by a [`run_hook`] for its path, in
+	/// the order registered ([`SwapTree::swap_at`] and [`hook_at`] register
+	/// them).
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
-	/// Runs `hook` at the first [`run_hook`] for `path`.
-	#[cfg(all(unix, feature = "util.rm"))]
+	/// Runs `hook` at a later [`run_hook`] for `path`: the first one, or the
+	/// one after those that run the hooks registered before it for `path`.
+	#[cfg(all(unix, any(feature = "util.cp", feature = "util.rm")))]
 	pub(crate) fn hook_at(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
 		HOOKS.lock().push((path, Box::new(hook)));
 	}
 
 	/// Runs (once) the hook a test registered for `path`, if any: the seam
-	/// where a test swaps an entry a walk listed before the utility reaches it.
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	/// where a test swaps an entry a walk listed before the utility reaches
+	/// it, or a source cp is about to open.
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	pub(crate) fn run_hook(path: &std::path::Path) {
 		let hook = {
 			let mut hooks = HOOKS.lock();
 			let found = hooks.iter().position(|(hooked, _)| hooked == path);
-			found.map(|index| hooks.swap_remove(index).1)
+			found.map(|index| hooks.remove(index).1)
 		};
 		if let Some(hook) = hook {
 			hook();
+		}
+	}
+
+	/// Errors keyed by path, each returned once by a [`fault`] for its path
+	/// ([`fault_at`] registers them).
+	#[cfg(all(unix, feature = "util.cp"))]
+	static FAULTS: Mutex<Vec<(PathBuf, i32)>> = Mutex::new(Vec::new());
+
+	/// Makes the next [`fault`] for `path` fail with the OS error `errno`.
+	#[cfg(all(unix, feature = "util.cp"))]
+	pub(crate) fn fault_at(path: PathBuf, errno: i32) {
+		FAULTS.lock().push((path, errno));
+	}
+
+	/// Fails (once) with the error a test registered for `path`, if any: the
+	/// seam where a test makes a step of cp past the extended attributes fail.
+	#[cfg(all(unix, feature = "util.cp"))]
+	pub(crate) fn fault(path: &std::path::Path) -> std::io::Result<()> {
+		let mut faults = FAULTS.lock();
+		match faults.iter().position(|(faulted, _)| faulted == path) {
+			Some(index) => Err(std::io::Error::from_raw_os_error(faults.remove(index).1)),
+			None => Ok(()),
 		}
 	}
 
@@ -4111,12 +4163,17 @@ mod testing {
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
+#[cfg(all(test, unix))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::run_util_on;
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 #[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm")))]
 pub(crate) use testing::run_hook;
 #[cfg(all(test, unix, feature = "util.rm"))]
 pub(crate) use testing::hook_at;
+#[cfg(all(test, unix, feature = "util.cp"))]
+pub(crate) use testing::{fault, fault_at};
 #[cfg(all(test, unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
 pub(crate) use testing::SwapTree;
 

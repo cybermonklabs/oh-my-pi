@@ -150,9 +150,19 @@ const _: () = assert!(size_of::<Statx>() == 256);
 /// disabled for the process only when that retry opens: then the flag was
 /// the cause (not the file's owner). An `EPERM` the retry repeats has
 /// another cause, such as a sandbox policy or the file's own refusal, and is
-/// returned with the flag left on.
-fn with_noatime(mut open: impl FnMut(c_int) -> io::Result<RawFd>) -> io::Result<OwnedFd> {
-	let noatime = NOATIME.load(Ordering::Relaxed);
+/// returned with the flag left on. An open with `flags` that hold `O_PATH`
+/// gets no flag: it reads nothing, so there is no access time to keep, and
+/// `openat2` refuses `O_NOATIME` beside it (`EINVAL`), which would read as a
+/// kernel without `openat2`.
+fn with_noatime(
+	flags: c_int,
+	mut open: impl FnMut(c_int) -> io::Result<RawFd>,
+) -> io::Result<OwnedFd> {
+	let noatime = if flags & libc::O_PATH == 0 {
+		NOATIME.load(Ordering::Relaxed)
+	} else {
+		0
+	};
 	let mut extra = noatime;
 	loop {
 		match open(extra) {
@@ -184,7 +194,7 @@ fn opened(ret: c_long) -> io::Result<RawFd> {
 pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
 	#[cfg(test)]
 	let flags = seam::openat_flags(flags);
-	with_noatime(|extra| {
+	with_noatime(flags, |extra| {
 		#[cfg(test)]
 		if let Some(err) = seam::failed(seam::Call::Openat, flags | extra) {
 			return Err(err);
@@ -305,7 +315,7 @@ pub(super) fn open_beneath(
 		return walk_beneath(s, dir, rel, flags);
 	}
 	let path = s.cstr(rel)?;
-	let openat2 = with_noatime(|extra| {
+	let openat2 = with_noatime(flags, |extra| {
 		#[cfg(test)]
 		if let Some(err) = seam::failed(seam::Call::Openat2, flags | extra) {
 			return Err(err);
@@ -646,7 +656,10 @@ mod tests {
 		fs, io,
 		os::{
 			fd::{AsRawFd, FromRawFd, OwnedFd},
-			unix::{ffi::OsStrExt, fs::MetadataExt},
+			unix::{
+				ffi::OsStrExt,
+				fs::{MetadataExt, PermissionsExt},
+			},
 		},
 		path::{Path, PathBuf},
 		sync::atomic::Ordering,
@@ -658,6 +671,7 @@ mod tests {
 		DIRECTORY_LINKS, FOLLOWED, NO_OPENAT2, NOATIME, OpenHow, REFUSED, RESOLVE, Scratch, UNPROBED,
 		open_beneath, openat, openat_dir, probe_directory_links,
 		seam::{Call, before_open, fail_opens, follow_directory_links},
+		walk_beneath,
 	};
 
 	/// A file open below a root.
@@ -704,6 +718,8 @@ mod tests {
 	/// process's: a walk of any other test of this process sets them when its
 	/// kernel refuses `openat2` (gVisor) or `O_NOATIME` (a file of another
 	/// owner), and a test that reads them would read that walk's decision.
+	/// What that process wrote to standard error, a line saying the test
+	/// checked nothing among it, is written to this test's.
 	fn alone(name: &str) -> bool {
 		const ALONE: &str = "PI_WALKER_TEST_ALONE";
 		if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
@@ -721,6 +737,7 @@ mod tests {
 			out.contains("1 passed"),
 			"{name} ran no test in a process of its own:\n{out}\n{err}"
 		);
+		eprint!("{err}");
 		true
 	}
 
@@ -837,6 +854,58 @@ mod tests {
 			NO_OPENAT2.load(Ordering::SeqCst),
 			"an openat2 the kernel does not know stays in use"
 		);
+		reset();
+	}
+
+	/// A search-only open below a directory (`O_PATH`, as the tree opens a
+	/// parent again) is one `openat2`, and leaves `openat2` in use: the
+	/// process's `O_NOATIME` is left out of it, because `openat2` refuses
+	/// `O_NOATIME` beside `O_PATH` (`EINVAL`), which the open would read as a
+	/// kernel without `openat2`. Where the open walks one component at a time
+	/// ([`walk_beneath`], a kernel without `openat2`), each directory on the
+	/// way opens search-only too, so one that cannot be read is passed
+	/// through as the kernel passes it. It runs in a process of its own
+	/// ([`alone`]): another test's walk could set `openat2` aside for this
+	/// kernel, or put `O_NOATIME` back, while it runs.
+	#[test]
+	fn a_search_only_open_below_a_directory_keeps_openat2() {
+		if alone("fs::native::sys::tests::a_search_only_open_below_a_directory_keeps_openat2") {
+			return;
+		}
+		let _serial = SWITCHES.lock();
+		let tree = Tree::new("search-only");
+		let root = fs::File::open(&tree.0).expect("open the root");
+		let mut s = Scratch::default();
+		const SEARCH: c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
+		fs::create_dir(tree.0.join("a/b")).expect("make a/b");
+		let a = tree.0.join("a");
+		fs::set_permissions(&a, fs::Permissions::from_mode(0o311)).expect("take read from a");
+		let walked = walk_beneath(&mut s, root.as_raw_fd(), b"a/b", SEARCH);
+		let privileged = fs::read_dir(&a).is_ok();
+		fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).expect("give read back to a");
+		if privileged {
+			eprintln!("skipped: this process reads a directory without read permission");
+		} else {
+			let fd = walked.expect("walk to a/b through a, which cannot be read");
+			assert_eq!(id_of(fd), id_at(&tree.0.join("a/b")));
+		}
+
+		if !openat2_works(root.as_raw_fd()) {
+			eprintln!(
+				"UNKNOWN: this kernel has no openat2; a search-only open's flags were not checked"
+			);
+			return;
+		}
+		reset();
+		let fd = open_beneath(&mut s, root.as_raw_fd(), b"a", SEARCH).expect("open a to search");
+		assert!(!NO_OPENAT2.load(Ordering::SeqCst), "a search-only open set openat2 aside");
+		assert_eq!(
+			NOATIME.load(Ordering::SeqCst),
+			libc::O_NOATIME,
+			"a search-only open turned O_NOATIME off"
+		);
+		assert_eq!(id_of(fd), id_at(&tree.0.join("a")));
 		reset();
 	}
 
