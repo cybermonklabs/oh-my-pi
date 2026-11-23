@@ -117,7 +117,15 @@ pub fn apply(
 			io(vp).redir.target = Some(t.clone());
 			t
 		} else {
-			let t = target_text(k, vp, cx, unit, r, line)?;
+			let t = match target_text(k, vp, cx, unit, r, line)? {
+				Ok(t) => t,
+				Err(d) if collecting(k, vp) => {
+					fail_in_child(k, vp, cx, line, &d);
+					end_collect(vp, redirs.len());
+					return Ok(());
+				},
+				Err(d) => return Err(fail(k, vp, cx, line, d)),
+			};
 			io(vp).redir.target = Some(t.clone());
 			t
 		};
@@ -138,12 +146,11 @@ pub fn apply(
 				},
 				res => res?,
 			}
-		} else if k
-			.deferrals
-			.iter()
-			.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect)
-		{
-			collect(k, vp, cx, r, &target, line)?;
+		} else if collecting(k, vp) {
+			if !collect(k, vp, cx, r, &target, line) {
+				end_collect(vp, redirs.len());
+				return Ok(());
+			}
 		} else {
 			// A FIFO the job's process will open itself is decided before any
 			// open starts: an in-flight open that is dropped wakes its helper by
@@ -235,7 +242,10 @@ fn word_text(unit: &Unit, w: u32) -> BString {
 		})
 }
 
-/// The expanded target (a path, an fd number, or document bytes).
+/// The expanded target (a path, an fd number, or document bytes). `Ok(Err(d))`:
+/// a file or dup word that expands to no field or several (`$word:
+/// ambiguous redirect`), which fails the redirection (the caller prints `d`,
+/// or leaves it to the process that applies the redirection, [`collect`]).
 fn target_text(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -243,11 +253,12 @@ fn target_text(
 	unit: &Arc<Unit>,
 	r: &RedirIr,
 	line: u32,
-) -> Result<BString, Halt> {
+) -> Result<Result<BString, Diag>, Halt> {
 	match &r.target {
-		RedirTargetIr::HereDoc { text, quoted: true } => Ok(text.clone()),
+		RedirTargetIr::HereDoc { text, quoted: true } => Ok(Ok(text.clone())),
 		RedirTargetIr::HereDoc { text, quoted: false } if unit.mode.dialect() == Dialect::Zsh => {
 			expanding(k, vp, cx, Slot::Redirs, true, line, |ex| ex.zsh_heredoc(text))
+				.map(Ok)
 				.map_err(Halt::Flow)
 		},
 		RedirTargetIr::HereDoc { text, quoted: false } => {
@@ -272,6 +283,7 @@ fn target_text(
 			};
 			let w = tunit.words.last().cloned().unwrap_or_default();
 			expanding(k, vp, cx, Slot::Redirs, true, line, |ex| ex.scalar(&tunit, &w))
+				.map(Ok)
 				.map_err(Halt::Flow)
 		},
 		RedirTargetIr::Word(w) => {
@@ -281,7 +293,7 @@ fn target_text(
 					expanding(k, vp, cx, Slot::Redirs, word.parks, line, |ex| ex.scalar(unit, word))
 						.map_err(Halt::Flow)?;
 				s.push(b'\n');
-				Ok(s)
+				Ok(Ok(s))
 			} else {
 				// Files and dup targets: no field or several is
 				// `$word: ambiguous redirect` with the source text. Outside
@@ -303,12 +315,9 @@ fn target_text(
 					super::glob::expand_globs(k, vp, cx, &mut fields, &globs, line)
 						.map_err(Halt::Flow)?;
 				}
-				if let Ok([one]) = <[BString; 1]>::try_from(fields) {
-					Ok(one)
-				} else {
-					k.diag(cx, vp, line, Diag::AmbiguousRedirect { word: word_text(unit, *w) });
-					Err(Halt::Failed)
-				}
+				Ok(<[BString; 1]>::try_from(fields)
+					.map(|[one]| one)
+					.map_err(|_| Diag::AmbiguousRedirect { word: word_text(unit, *w) }))
 			}
 		},
 	}
@@ -331,10 +340,10 @@ fn zsh_target(
 	line: u32,
 ) -> Result<Vec<BString>, Halt> {
 	let RedirTargetIr::Word(w) = r.target else {
-		return target_text(k, vp, cx, unit, r, line).map(|t| vec![t]);
+		return document(k, vp, cx, unit, r, line);
 	};
 	if r.op == RedirKind::HereString {
-		return target_text(k, vp, cx, unit, r, line).map(|t| vec![t]);
+		return document(k, vp, cx, unit, r, line);
 	}
 	let word = &unit.words[w as usize];
 	if !multios {
@@ -356,6 +365,22 @@ fn zsh_target(
 		return Err(fail(k, vp, cx, line, zsh_msg("file number expected".into())));
 	}
 	Ok(fields)
+}
+
+/// The one word of a here-document or here-string ([`target_text`], which
+/// finds no ambiguity in a document).
+fn document(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	r: &RedirIr,
+	line: u32,
+) -> Result<Vec<BString>, Halt> {
+	match target_text(k, vp, cx, unit, r, line)? {
+		Ok(t) => Ok(vec![t]),
+		Err(d) => Err(fail(k, vp, cx, line, d)),
+	}
 }
 
 /// Set fd `fd` to `h` (or close it), saving the previous object.
@@ -700,10 +725,19 @@ pub fn diag_prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, line: u32, what:
 	BString::from(text)
 }
 
+/// Whether the redirections are being collected for the process of a
+/// command that applies them itself ([`DeferPhase::Collect`]).
+fn collecting(k: &Kernel, vp: &Vproc) -> bool {
+	k.deferrals
+		.iter()
+		.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Collect)
+}
+
 /// Redirection `r` to `target` of a command whose process applies its
 /// redirections itself ([`DeferPhase::Collect`]): added to what the process
-/// gets; nothing changes here. Errors found here (a bad fd, an ambiguous
-/// target) fail the redirection as [`install`] does.
+/// gets; nothing changes here. A bad one (a dup of no fd of the process, an
+/// ambiguous target) is the process's step that fails it
+/// ([`fail_in_child`]): `false`, and the stage ends ([`end_collect`]).
 fn collect(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -711,12 +745,36 @@ fn collect(
 	r: &RedirIr,
 	target: &BString,
 	line: u32,
-) -> Result<(), Halt> {
+) -> bool {
+	match child_steps(k, vp, cx, r, target, line) {
+		Ok(add) => {
+			if let Some(d) = k.deferral(vp.vpid) {
+				d.list.extend(add);
+			}
+			true
+		},
+		Err(d) => {
+			fail_in_child(k, vp, cx, line, &d);
+			false
+		},
+	}
+}
+
+/// The steps of redirection `r` to `target` for the process ([`collect`]),
+/// or what makes it bad.
+fn child_steps(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	r: &RedirIr,
+	target: &BString,
+	line: u32,
+) -> Result<Vec<ChildRedir>, Diag> {
 	let mut add = Vec::with_capacity(2);
 	match r.op {
-		RedirKind::Close => add.push(ChildRedir::Close { fd: fd_number(k, vp, cx, r, true, line)? }),
+		RedirKind::Close => add.push(ChildRedir::Close { fd: target_fd(k, vp, cx, r, true, line)? }),
 		RedirKind::DupIn | RedirKind::DupOut if target.as_slice() == b"-" => {
-			add.push(ChildRedir::Close { fd: fd_number(k, vp, cx, r, true, line)? });
+			add.push(ChildRedir::Close { fd: target_fd(k, vp, cx, r, true, line)? });
 		},
 		RedirKind::DupIn | RedirKind::DupOut => {
 			let (digits, moving) = match target.strip_suffix(b"-") {
@@ -730,9 +788,9 @@ fn collect(
 					.unwrap_or(-1);
 				if !child_fd_open(k, vp, src) {
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
-					return Err(fail(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
+					return Err(Diag::Io { path: target.clone(), err });
 				}
-				let fd = fd_number(k, vp, cx, r, false, line)?;
+				let fd = target_fd(k, vp, cx, r, false, line)?;
 				let diag = diag_prefix(k, cx, vp, line, digits);
 				add.push(ChildRedir::Dup { fd, src, diag });
 				if moving && src != fd {
@@ -741,45 +799,53 @@ fn collect(
 			} else if r.op == RedirKind::DupOut && matches!(r.fd, RedirFdIr::Default) {
 				// `>&file` is `&>file`.
 				let flags = open_flags(k, vp, cx, RedirKind::OutErr, target);
-				add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line));
+				add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line)?);
 			} else {
-				let d = Diag::AmbiguousRedirect { word: target.clone() };
-				return Err(fail(k, vp, cx, line, d));
+				return Err(Diag::AmbiguousRedirect { word: target.clone() });
 			}
 		},
 		RedirKind::OutErr | RedirKind::AppendErr => {
 			let flags = open_flags(k, vp, cx, r.op, target);
-			add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line));
+			add.push(child_open(k, vp, cx, vec![1, 2], target, flags, line)?);
 		},
 		RedirKind::In
 		| RedirKind::Out
 		| RedirKind::Append
 		| RedirKind::Clobber
 		| RedirKind::ReadWrite => {
-			let fd = fd_number(k, vp, cx, r, false, line)?;
+			let fd = target_fd(k, vp, cx, r, false, line)?;
 			let flags = open_flags(k, vp, cx, r.op, target);
-			add.push(child_open(k, vp, cx, vec![fd], target, flags, line));
+			add.push(child_open(k, vp, cx, vec![fd], target, flags, line)?);
 		},
 		RedirKind::HereDoc | RedirKind::HereString => {
 			unreachable!("a here-document is never left to the process (`childable`)")
 		},
 	}
-	if let Some(d) = k.deferral(vp.vpid) {
-		d.list.extend(add);
-	}
-	Ok(())
+	Ok(add)
 }
 
-/// The fd redirection `r` sets ([`target_fd`]); a bad one fails it.
-fn fd_number(
-	k: &mut Kernel,
-	vp: &mut Vproc,
-	cx: &mut Cx<'_>,
-	r: &RedirIr,
-	closing: bool,
-	line: u32,
-) -> Result<i32, Halt> {
-	target_fd(k, vp, cx, r, closing, line).map_err(|d| fail(k, vp, cx, line, d))
+/// A redirection the engine finds bad (`d`) while it collects them for the
+/// process ([`collect`]): the process's last step, which prints `d` and
+/// exits with status 1 ([`ChildRedir::Fail`]) after the steps before it, as
+/// bash's child fails it in its place. Refused here instead, it would leave
+/// an earlier open never made: a FIFO's, whose other end would then wait for
+/// ever.
+fn fail_in_child(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, line: u32, d: &Diag) {
+	let text = BString::from(k.render_quiet(cx, vp, line, d));
+	if let Some(def) = k.deferral(vp.vpid) {
+		def.list.push(ChildRedir::Fail { text });
+	}
+}
+
+/// The end of the redirection stage at a step the process fails
+/// ([`fail_in_child`]): it applies none after it, as bash's child stops at
+/// its first failed redirection, so no word after it is expanded either.
+fn end_collect(vp: &mut Vproc, len: usize) {
+	let sc = scratch(vp);
+	let progress = &mut sc.io().redir;
+	progress.done = len;
+	progress.target = None;
+	sc.logs[Slot::Redirs as usize].clear();
 }
 
 /// Whether `fd` is open in the process a command spawns at this point of
@@ -801,7 +867,10 @@ fn child_fd_open(k: &Kernel, vp: &Vproc, fd: i32) -> bool {
 }
 
 /// The open of `target` onto `fds` by the process ([`ChildRedir::Open`]),
-/// or the duplication `/dev/fd/N` (`/dev/stdin`, …) stands for.
+/// or the duplication `/dev/fd/N` (`/dev/stdin`, …) stands for. A
+/// `/dev/fd/N` that names no fd of the process (not the shell's, not set by
+/// an earlier redirection) is bad as a dup of it is (`3<&N`): the process
+/// would take a descriptor of the host's own.
 fn child_open(
 	k: &mut Kernel,
 	vp: &Vproc,
@@ -810,15 +879,20 @@ fn child_open(
 	target: &BString,
 	flags: OpenFlags,
 	line: u32,
-) -> ChildRedir {
-	let diag = diag_prefix(k, cx, vp, line, target);
-	if let Some(src) = dev_fd(target)
-		&& let [fd] = fds.as_slice()
-	{
-		return ChildRedir::Dup { fd: *fd, src, diag };
+) -> Result<ChildRedir, Diag> {
+	if let Some(src) = dev_fd(target) {
+		if !child_fd_open(k, vp, src) {
+			let err = std::io::Error::other(crate::bash::fd::BadFd);
+			return Err(Diag::Io { path: target.clone(), err });
+		}
+		if let [fd] = fds.as_slice() {
+			let diag = diag_prefix(k, cx, vp, line, target);
+			return Ok(ChildRedir::Dup { fd: *fd, src, diag });
+		}
 	}
+	let diag = diag_prefix(k, cx, vp, line, target);
 	let umask = state::umask(cx.store, vp).unwrap_or(0o022);
-	ChildRedir::Open { fds, path: absolute(&vp.cwd, target), flags, mode: 0o666 & !umask, diag }
+	Ok(ChildRedir::Open { fds, path: absolute(&vp.cwd, target), flags, mode: 0o666 & !umask, diag })
 }
 
 /// Print `d` and fail the redirection.

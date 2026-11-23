@@ -1083,6 +1083,7 @@ enum ChildStep {
 	Open { fds: Vec<i32>, path: CString, flags: libc::c_int, mode: libc::mode_t, diag: Vec<u8> },
 	Dup { fd: i32, src: i32, diag: Vec<u8> },
 	Close { fd: i32 },
+	Fail { text: Vec<u8> },
 }
 
 impl ChildStep {
@@ -1115,6 +1116,7 @@ impl ChildStep {
 				Self::Dup { fd: *fd, src: *src, diag: diag.to_vec() }
 			},
 			ChildRedir::Close { fd } => Self::Close { fd: *fd },
+			ChildRedir::Fail { text } => Self::Fail { text: text.to_vec() },
 		})
 	}
 }
@@ -1127,7 +1129,12 @@ fn child_fail(diag: &[u8], errno: i32, status: i32, texts: &[Vec<u8>]) -> ! {
 		.ok()
 		.and_then(|n| texts.get(n))
 		.map_or(&b"Unknown error"[..], Vec::as_slice);
-	for part in [diag, text, b"\n"] {
+	child_exit(&[diag, text, b"\n"], status)
+}
+
+/// Write `parts` to fd 2 and exit with `status`. Async-signal-safe.
+fn child_exit(parts: &[&[u8]], status: i32) -> ! {
+	for part in parts {
 		// SAFETY: write(2) of a valid buffer; a failure is ignored (nowhere
 		// to report it).
 		unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
@@ -1166,6 +1173,23 @@ fn fork_redirs(
 	let limits = limits(prog);
 	let raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
 	let closed = prog.closed;
+	// What the child keeps of the descriptors it inherits from the host
+	// ([`close_all_but`]), how it closes the rest, and the bound of its
+	// counting loop, decided here: the child must not allocate.
+	let keep = kept_fds(&raw, closed, &open_without_cloexec());
+	// The kept ones that are the host's own, not placed: listed before the
+	// fork, so the child checks each again ([`close_reused`]).
+	let inherited: Vec<i32> = keep
+		.iter()
+		.copied()
+		.filter(|&fd| !raw.iter().any(|&(target, _)| target == fd))
+		.collect();
+	let open_max = open_max();
+	let sweep = sweep();
+	#[cfg(test)]
+	if let Some(f) = BEFORE_FORK.with(|b| b.borrow_mut().take()) {
+		f();
+	}
 	// Every signal stays blocked across the fork: the child runs with the
 	// host's handlers until it resets them, and a signal delivered then (a
 	// `kill $!` right after the spawn) would run host code and be lost
@@ -1219,6 +1243,14 @@ fn fork_redirs(
 			for &target in closed {
 				libc::close(target);
 			}
+			// Before any redirection, close what the exec would close (every
+			// host descriptor with close-on-exec but the placed ones), as bash's
+			// child holds none of them: an open that waits (a FIFO's other end)
+			// would otherwise hold the host's own descriptors until the exec,
+			// other jobs' pipe ends among them, so their readers would wait for
+			// this open (bash's parent keeps no end of another job's pipe).
+			close_all_but(&keep, open_max, sweep);
+			close_reused(&inherited);
 			libc::umask(mask);
 			for (n, &ign) in ignore.iter().enumerate().skip(1) {
 				let n = n as i32;
@@ -1259,6 +1291,7 @@ fn fork_redirs(
 					ChildStep::Close { fd } => {
 						libc::close(*fd);
 					},
+					ChildStep::Fail { text } => child_exit(&[text.as_slice()], 1),
 				}
 			}
 			libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
@@ -1286,6 +1319,309 @@ fn fork_redirs(
 		other => other,
 	};
 	Ok((pid, place))
+}
+
+/// The descriptors the child of [`fork_redirs`] keeps, as bash's child
+/// does: the placed `targets` (stdio and extra fds) and every host
+/// descriptor without close-on-exec (`inherited`, listed before the fork; a
+/// `posix_spawn` or fork+exec child keeps those too, such as a make
+/// jobserver's pipe), but the `closed` ones. So the child closes early only
+/// what its exec would close. Every source a redirection may read is one of
+/// these or an fd an earlier redirection opened. Sorted, unique.
+fn kept_fds(targets: &[(i32, RawFd)], closed: &[i32], inherited: &[i32]) -> Vec<i32> {
+	let mut keep: Vec<i32> = targets
+		.iter()
+		.map(|&(target, _)| target)
+		.chain(inherited.iter().copied())
+		.filter(|fd| !closed.contains(fd))
+		.collect();
+	keep.sort_unstable();
+	keep.dedup();
+	keep
+}
+
+/// Close each of `inherited` (the host's descriptors the child of
+/// [`fork_redirs`] keeps, listed before the fork) that has close-on-exec
+/// now: another thread closed the one listed, and a new descriptor took the
+/// number before the fork (another job's pipe end, say). The exec would
+/// close it, so the child must not hold it while its open waits.
+/// Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// Only in the forked child of [`fork_redirs`].
+unsafe fn close_reused(inherited: &[i32]) {
+	for &fd in inherited {
+		// SAFETY: F_GETFD only reads the descriptor's flags.
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		if flags != -1 && flags & libc::FD_CLOEXEC != 0 {
+			// SAFETY: closes a descriptor of the child's own table.
+			unsafe { libc::close(fd) };
+		}
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	static BEFORE_FORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the next [`fork_redirs`] on this thread runs `f` after it lists
+/// the host's descriptors and before it forks, the window [`close_reused`]
+/// covers.
+#[cfg(test)]
+fn before_fork(f: impl FnOnce() + 'static) {
+	BEFORE_FORK.with(|b| *b.borrow_mut() = Some(Box::new(f)));
+}
+
+/// The host's open descriptors above 2 without close-on-exec, now (Linux:
+/// `/proc/self/fd`; elsewhere `/dev/fd`). None where neither can be read:
+/// the child then closes those too.
+fn open_without_cloexec() -> Vec<i32> {
+	let mut fds = Vec::new();
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{
+		// SAFETY: the path is terminated; open makes a descriptor of ours.
+		let dir = unsafe {
+			libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+		};
+		if dir >= 0 {
+			let mut buf = [0u8; 1024];
+			// SAFETY: `dir` is an open directory descriptor of ours.
+			while let Some(n) = unsafe { fd_batch(dir, &mut buf, |fd| fds.push(fd)) }
+				&& n > 0
+			{}
+			// SAFETY: closes the descriptor opened above.
+			unsafe { libc::close(dir) };
+			fds.retain(|&fd| fd != dir);
+		}
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	if let Ok(entries) = std::fs::read_dir("/dev/fd") {
+		fds.extend(entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok()));
+	}
+	fds.retain(|&fd| {
+		// SAFETY: F_GETFD only reads the descriptor flags (fails for the
+		// listing's own descriptor, closed by now).
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		fd > 2 && flags != -1 && flags & libc::FD_CLOEXEC == 0
+	});
+	fds
+}
+
+/// The bound of [`count_close`]'s loop: the process's descriptor limit.
+fn open_max() -> i32 {
+	// SAFETY: sysconf takes a constant and reads no memory of ours.
+	let n = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+	if n <= 0 {
+		1 << 16
+	} else {
+		i32::try_from(n).unwrap_or(i32::MAX)
+	}
+}
+
+/// How the child of [`fork_redirs`] closes the host's descriptors:
+/// `close_range` over the gaps between the kept ones (Linux 5.9 and later);
+/// else each descriptor `/proc/self/fd` lists (a kernel without
+/// `close_range`, or a seccomp profile that refuses it); else every number
+/// below the descriptor limit (no `/proc`, and macOS). Tests force the
+/// slower ways ([`force_sweep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+	CloseRange,
+	#[cfg_attr(not(test), allow(dead_code, reason = "only tests start the sweep past close_range"))]
+	Walk,
+	#[cfg_attr(not(test), allow(dead_code, reason = "only tests start the sweep past close_range"))]
+	Count,
+}
+
+#[cfg(test)]
+thread_local! {
+	static FORCED_SWEEP: std::cell::Cell<Sweep> = const { std::cell::Cell::new(Sweep::CloseRange) };
+}
+
+/// Tests: the children this thread spawns next start their sweep at
+/// `sweep` (each falls back from there as in production).
+#[cfg(test)]
+fn force_sweep(sweep: Sweep) {
+	FORCED_SWEEP.with(|s| s.set(sweep));
+}
+
+/// Where the next child's sweep starts ([`Sweep`]).
+#[cfg_attr(
+	not(test),
+	allow(clippy::missing_const_for_fn, reason = "tests read a thread-local here")
+)]
+fn sweep() -> Sweep {
+	#[cfg(test)]
+	return FORCED_SWEEP.with(std::cell::Cell::get);
+	#[cfg(not(test))]
+	Sweep::CloseRange
+}
+
+/// Close every descriptor above 2 but those in `keep` (sorted), in the
+/// forked child of [`fork_redirs`], starting at `sweep` ([`Sweep`]).
+/// Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// For the forked child only: it closes descriptors other code of this
+/// process may hold.
+unsafe fn close_all_but(keep: &[i32], open_max: i32, sweep: Sweep) {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{
+		// SAFETY: as this function's.
+		if sweep == Sweep::CloseRange && unsafe { close_range_all_but(keep) } {
+			return;
+		}
+		// SAFETY: as this function's.
+		if sweep != Sweep::Count && unsafe { walk_close(keep) } {
+			return;
+		}
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	let _ = sweep;
+	// SAFETY: as this function's.
+	unsafe { count_close(keep, open_max) };
+}
+
+/// `close_range` over each gap between the descriptors in `keep` (sorted);
+/// false as soon as the kernel refuses it.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn close_range_all_but(keep: &[i32]) -> bool {
+	let range = |first: i32, last: i32| {
+		first > last
+			// SAFETY: close_range takes scalars; it only closes descriptors.
+			|| unsafe {
+				libc::syscall(libc::SYS_close_range, first as libc::c_uint, last as libc::c_uint, 0 as libc::c_uint)
+			} == 0
+	};
+	let mut first = 3;
+	for &kept in keep {
+		if kept >= first {
+			if !range(first, kept - 1) {
+				return false;
+			}
+			first = kept + 1;
+		}
+	}
+	range(first, i32::MAX)
+}
+
+/// Close each descriptor above 2 that `/proc/self/fd` lists but those in
+/// `keep` (sorted), reading the directory with `getdents64` into a buffer on
+/// the stack (glibc's `closefrom` fallback works this way); false when the
+/// directory cannot be read. A pass that closed something reads the
+/// directory again from the start, so no entry is skipped.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn walk_close(keep: &[i32]) -> bool {
+	// SAFETY: the path is terminated; open makes a descriptor of ours.
+	let dir = unsafe {
+		libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+	};
+	if dir < 0 {
+		return false;
+	}
+	let mut buf = [0u8; 1024];
+	let read = loop {
+		let mut closed = false;
+		let pass = loop {
+			// SAFETY: `dir` is an open directory descriptor; close takes a
+			// scalar.
+			let batch = unsafe {
+				fd_batch(dir, &mut buf, |fd| {
+					if fd > 2 && fd != dir && keep.binary_search(&fd).is_err() {
+						libc::close(fd);
+						closed = true;
+					}
+				})
+			};
+			match batch {
+				Some(0) => break true,
+				Some(_) => {},
+				None => break false,
+			}
+		};
+		if !pass || !closed {
+			break pass;
+		}
+		// SAFETY: rewinds the directory descriptor opened above.
+		unsafe { libc::lseek(dir, 0, libc::SEEK_SET) };
+	};
+	// SAFETY: closes the descriptor opened above.
+	unsafe { libc::close(dir) };
+	read
+}
+
+/// One `getdents64` batch of the descriptor directory `dir` read into
+/// `buf`, calling `each` with every descriptor number it lists: `Some` of
+/// the bytes read (0 at the end), `None` on an error. Allocates nothing: the
+/// forked child walks with it.
+///
+/// # Safety
+///
+/// `dir` must be an open directory descriptor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn fd_batch(dir: RawFd, buf: &mut [u8], mut each: impl FnMut(i32)) -> Option<usize> {
+	let n = loop {
+		// SAFETY: getdents64 writes at most `buf.len()` bytes into `buf`.
+		let n = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+		if n < 0 && errno() == libc::EINTR {
+			continue;
+		}
+		break n;
+	};
+	let n = usize::try_from(n).ok()?;
+	let mut entries = &buf[..n];
+	// linux_dirent64: two u64 fields, a u16 record length, a u8 type, then
+	// the NUL-terminated name, whatever the userspace ABI.
+	while entries.len() >= 20 {
+		let len = usize::from(u16::from_ne_bytes([entries[16], entries[17]]));
+		if len < 20 || len > entries.len() {
+			return None;
+		}
+		let mut fd: i32 = 0;
+		let mut digits = 0;
+		for &b in &entries[19..len] {
+			if !b.is_ascii_digit() {
+				break;
+			}
+			fd = fd.saturating_mul(10).saturating_add(i32::from(b - b'0'));
+			digits += 1;
+		}
+		if digits > 0 && entries[..len].get(19 + digits) == Some(&0) {
+			each(fd);
+		}
+		entries = &entries[len..];
+	}
+	Some(n)
+}
+
+/// Close every number above 2 below `open_max` but those in `keep`
+/// (sorted): the last resort, where no descriptor list can be read.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+unsafe fn count_close(keep: &[i32], open_max: i32) {
+	let mut kept = keep.iter().peekable();
+	for fd in 3..open_max {
+		while kept.next_if(|&&k| k < fd).is_some() {}
+		if kept.peek() == Some(&&fd) {
+			continue;
+		}
+		// SAFETY: close takes a scalar.
+		unsafe { libc::close(fd) };
+	}
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
