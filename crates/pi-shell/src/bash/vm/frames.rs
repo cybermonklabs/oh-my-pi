@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 38;
+pub const FRAMES_VERSION: u32 = 40;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -100,6 +100,19 @@ struct Image {
 	/// The processes of pipeline jobs `disown` deleted
 	/// ([`Kernel::disowned_procs`]).
 	disowned:  Vec<(Vpid, Box<super::proc::JobProcs>)>,
+	/// The take-in's state ([`Kernel::exits_asked`], [`Kernel::exits_taken`],
+	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
+	/// parked across a snapshot, so its ask and its answer go with it.
+	take_in:   TakeInImage,
+}
+
+/// The take-in's state, as the image keeps it ([`Image::take_in`]).
+#[derive(Serialize, Deserialize)]
+struct TakeInImage {
+	asked: Vec<Vpid>,
+	taken: Vec<Vpid>,
+	asks:  Vec<super::TakeIn>,
+	fresh: Vec<Vpid>,
 }
 
 /// One fd object.
@@ -675,6 +688,12 @@ impl Shell {
 			deferrals: k.deferrals.clone(),
 			deaths: k.deaths.clone(),
 			disowned: k.disowned_procs.clone(),
+			take_in: TakeInImage {
+				asked: k.exits_asked.clone(),
+				taken: k.exits_taken.clone(),
+				asks:  self.taking_in.clone(),
+				fresh: self.fresh.clone(),
+			},
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -1107,6 +1126,18 @@ impl Shell {
 		self.procs = procs;
 		self.rr = (img.rr as usize).min(self.procs.len() - 1);
 		self.slice = img.slice;
+		// The take-in of the vprocs restored: a builtin parked on its ask is
+		// answered as it would have been without the snapshot.
+		let restored = |v: &Vpid| self.procs.iter().any(|p| p.vpid == *v);
+		let ti = img.take_in;
+		let asked = ti.asked.into_iter().filter(|v| restored(v)).collect();
+		let taken = ti.taken.into_iter().filter(|v| restored(v)).collect();
+		let asks = ti.asks.into_iter().filter(|t| restored(&t.asker)).collect();
+		let fresh = ti.fresh.into_iter().filter(|v| restored(v)).collect();
+		self.k.exits_asked = asked;
+		self.k.exits_taken = taken;
+		self.taking_in = asks;
+		self.fresh = fresh;
 		Ok(())
 	}
 
