@@ -607,18 +607,13 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	}
 
 	/**
-	 * Identifies the server, account, bank and tags a transcript retain writes to, so a
-	 * retain marker only counts for the same ones and a change of bank starts that bank's
-	 * position afresh. The account is a hash of the API token.
+	 * Identifies the server, bank and tags a transcript retain writes to, so a retain marker
+	 * only counts for the same ones and a change of bank starts that bank's position afresh.
+	 * Nothing in it derives from the API token: the marker is written into the session, which
+	 * is stored, copied and read wherever the transcript is.
 	 */
 	#retainScope(): string {
-		return JSON.stringify([
-			"hindsight",
-			this.config.hindsightApiUrl,
-			Bun.hash(this.config.hindsightApiToken ?? "").toString(16),
-			this.bankId,
-			this.retainTags ?? [],
-		]);
+		return JSON.stringify(["hindsight", this.config.hindsightApiUrl, this.bankId, this.retainTags ?? []]);
 	}
 
 	async beforeAgentStartPrompt(

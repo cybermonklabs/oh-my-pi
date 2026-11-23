@@ -518,6 +518,66 @@ describe("Hindsight last-turn retain position", () => {
 		await process.exit();
 	});
 
+	it("the marker's scope holds nothing derived from the API token", async () => {
+		// The marker is written into the session, which is stored, copied and read wherever the transcript is.
+		const tokens = ["hsk-first-account-token", "hsk-second-account-token"];
+		const scopes: unknown[] = [];
+		for (const token of tokens) {
+			const process = new Process(newSession(tempDir()), new FakeBank(), { hindsightApiToken: token });
+			process.userTurn("question one");
+			await process.endTurn();
+			const markers = process.sessionManager
+				.getEntries()
+				.flatMap(entry => (entry.type === "custom" && entry.customType === "hindsight_retain" ? [entry.data] : []));
+			expect(markers).toHaveLength(1);
+			const data = markers[0];
+			if (!data || typeof data !== "object" || !("scope" in data)) throw new Error("the marker has no scope");
+			scopes.push(data.scope);
+			const file = sessionFileOf(process.sessionManager);
+			await process.exit();
+			const text = await Bun.file(file).text();
+			const hash = Bun.hash(token);
+			for (const derived of [token, hash.toString(16), hash.toString(36), hash.toString(10)]) {
+				expect(text).not.toContain(derived);
+			}
+		}
+		// A field derived from the token in any form differs between the two accounts.
+		expect(scopes[0]).toBe(scopes[1]);
+	});
+
+	it("a marker of the earlier scope format (with a token hash) reads as none: today's window once, then the new marker", async () => {
+		const dir = tempDir();
+		const token = "hsk-first-account-token";
+		const writer = new Process(newSession(dir), new FakeBank(), { autoRetain: false, hindsightApiToken: token });
+		writer.userTurn("old question one");
+		writer.userTurn("old question two");
+		writer.userTurn("old question three");
+		const lastEntryId = writer.sessionManager.getEntries().at(-1)?.id;
+		if (!lastEntryId) throw new Error("no entry");
+		writer.sessionManager.appendCustomEntry("hindsight_retain", {
+			version: 1,
+			scope: JSON.stringify(["hindsight", "http://localhost:8888", Bun.hash(token).toString(16), "bank", []]),
+			lastEntryId,
+		});
+		const file = sessionFileOf(writer.sessionManager);
+		await writer.exit();
+
+		const bank = new FakeBank();
+		const resumed = new Process(await reopen(dir, file), bank, { hindsightApiToken: token });
+		await resumed.endTurn();
+		// A card turn alone starts no retain (the turn gate is unchanged); the next user turn's retain sends it.
+		resumed.cardTurn("new card");
+		await resumed.endTurn();
+		resumed.userTurn("new question");
+		await resumed.endTurn();
+
+		expect(bank.sent()).toEqual([
+			["old question three", "reply to old question three"],
+			["reply to new card", "new question", "reply to new question"],
+		]);
+		await resumed.exit();
+	});
+
 	it("full-session mode neither reads nor writes a marker", async () => {
 		const bank = new FakeBank();
 		const process = new Process(newSession(tempDir()), bank, { retainMode: "full-session" });
