@@ -38,14 +38,19 @@
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
 # and the units by time. A unit whose runner did not end normally (libtest 0 or 101, nextest 0 or
 # 100, bun 0 or 1 with its summary line, JUnit report and matching counts), in which a passing test
-# printed a skip marker (unless the same test passed as the other user), or that no job or two
-# jobs reported, is UNKNOWN, and so is its row. The summary job fails unless every row passed, so the run's colour is the
-# result. Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
+# printed a skip marker (unless the same test passed as the other user, or each skip line is a
+# sub-case .github/sami-checks/partial-skips.txt lets that test skip and its witness line is in its
+# output: a partial pass, listed), or that no job or two jobs reported, is UNKNOWN, and so is its
+# row. The summary job fails unless every row passed, so the run's colour is the result.
+# Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
 # Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
 # row whose only failures are known reads KNOWN, and an entry whose test passed is listed for removal
-# and fails the summary. The browser tests run against the Chrome for Testing build the tree's
-# puppeteer-core pins (bun.sh chrome), not the runner's google-chrome.
+# and fails the summary, unless its reason starts `flaky: `. The browser tests run against the
+# Chrome for Testing build the tree's puppeteer-core pins (bun.sh chrome), not the runner's
+# google-chrome. Skip prints: the skip-forms job fails on a print of the tree that says skip and that
+# the summary's rule does not read; the summary job runs the same check on every line a passing test
+# printed (sc.py skip-lines), and both are units of the row "skip prints the summary reads".
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
@@ -536,8 +541,12 @@ jobs:
         env:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
-          mkdir -p "$SC/report" "$SC/results" "$SC/build"
+          mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build"
           rc=0
+          # The run-time half of skip-forms, a unit of its row: a result the summary reads like any other
+          # (no file, as when this command fails, reads UNKNOWN).
+          python3 tool/.github/sami-checks/sc.py skip-lines "$SC/results" tool/.github/sami-checks/skip-forms-not-markers.txt \
+            > "$SC/results/sc-skip-lines/skip-lines.json" || echo "::error title=skip-lines::sc.py skip-lines failed; its unit reads UNKNOWN"
           python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" tool/.github/sami-checks/known-failures.txt > "$SC/report/summary.md" || rc=$?
           cat "$SC/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json,os,sys; sys.path.insert(0, "tool/.github/sami-checks"); import sc; json.dump(sc.load_results(sys.argv[1]), open(sys.argv[2], "w"))' "$SC/results" "$SC/report/results.json"
@@ -550,7 +559,7 @@ jobs:
           retention-days: 30
 
   skip-forms:
-    # Every print of the tree that says skip, not run or nothing checked is read by sc.py's
+    # Every print of the tree that says skip, not run, gave up or nothing checked is read by sc.py's
     # SKIP_MARKER or named in skip-forms-not-markers.txt; a new form fails this job and its row.
     name: skip prints the summary reads
     needs: plan
