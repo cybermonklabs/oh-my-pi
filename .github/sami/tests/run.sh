@@ -888,12 +888,15 @@ fi
 # --- release-candidate.sh ------------------------------------------------------
 # release-candidate-harness.sh checks publish's find and verify against a stub
 # gh. Each case it declares (case_, fcase, or a check that prints PASS or FAIL
-# itself) is a case here, named RC-<its name>, and fails unless the harness
-# reports it exactly once, as PASS, and ends with its summary line. verify
-# needs GNU find (-printf) and sha256sum; a runner that lacks either (macOS's
-# find has no -printf) skips the cases, counts them, and names what it lacks.
+# itself) on a line that is not a comment is a case here, named RC-<its
+# name>, and fails unless the harness reports it exactly once, as PASS, and
+# reaches its summary line. RC-harness-summary fails unless that line counts
+# 0 failed, so a case this list misses cannot fail unseen. verify needs GNU
+# find (-printf) and sha256sum; a runner that lacks either (macOS's find has
+# no -printf) skips the cases, counts them, and names what it lacks.
 rc_harness="$here/release-candidate-harness.sh"
-rc_names="$(grep -oE '^[^#]*(case_|fcase) [A-Za-z0-9-]+|echo "PASS [A-Za-z0-9-]+"' "$rc_harness" | sed -E 's/.*(case_|fcase) //; s/^echo "PASS //; s/"$//' | sort -u)"
+rc_names="$(grep -vE '^[[:space:]]*#' "$rc_harness" | grep -oE '(case_|fcase) [A-Za-z0-9-]+|echo "PASS [A-Za-z0-9-]+"' | sed -E 's/^(case_|fcase) //; s/^echo "PASS //; s/"$//' | sort -u)
+harness-summary"
 rc_want=()
 for n in $rc_names; do
 	if [ -z "$only" ] || [[ "RC-$n" =~ $only ]]; then rc_want+=("$n"); fi
@@ -917,6 +920,9 @@ if [ "${#rc_want[@]}" -gt 0 ]; then
 			if [ "$ended" = 0 ]; then
 				got="UNKNOWN: the harness did not reach its summary line
 $got"
+			elif [ "$n" = harness-summary ]; then
+				got="$(printf '%s\n' "$out" | grep -E '^release-candidate\.sh harness: ')"
+				if printf '%s\n' "$got" | grep -qE ', 0 failed$'; then rc=0; fi
 			elif [ "$(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ')" != 1 ]; then
 				got="UNKNOWN: the harness reported $n $(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ') times, not once
 $got"
@@ -971,14 +977,16 @@ fi
 # token permissions. attest holds id-token: write, with which it signs the
 # release's attestations, so it must not run member code either: its only
 # actions are actions/download-artifact and actions/attest-build-provenance,
-# it has no run step, and it names no run-id, repository or github-token (so
-# it downloads this run's artifacts only). No other job, and not the
-# workflow, has a line with write-all or with an id-token key that does not
-# read read or none on that line. A line under jobs: that is not a plain
-# `  <id>:` stops the lint, because its steps would be read as the job
-# above's.
+# each pinned by a 40-hex commit; it has no run step (in block or flow
+# style); it names no run-id, repository or github-token, so it downloads
+# this run's artifacts only; and each download step gives artifact-ids, so it
+# takes the artifacts its upload steps made, not whatever a job of this run
+# uploaded under their names later. No other job, and not the workflow, has
+# a line with write-all or with an id-token key that does not read read or
+# none on that line. A line under jobs: that is not a plain `  <id>:` stops
+# the lint, because its steps would be read as the job above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	# These four read each line with a space added at its end (and the first
 	# two at its start too), so no pattern needs an anchor inside a group.
@@ -1062,19 +1070,25 @@ cache_lint() {
 				fi
 			fi
 			if [ "$job" = attest ]; then
-				acts="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E 'uses.?[[:space:]]*:' | grep -vE '^ *(- )?uses: *(actions/download-artifact|actions/attest-build-provenance)@[^ ]+( +#.*)?$' || true)"
+				acts="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E 'uses.?[[:space:]]*:' | grep -vE '^ *(- )?uses: *(actions/download-artifact|actions/attest-build-provenance)@[0-9a-f]{40}( +#.*)?$' || true)"
 				if [ -n "$acts" ]; then
-					echo "attest uses an action other than actions/download-artifact and actions/attest-build-provenance, so it could run member code: $(printf '%s\n' "$acts" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					echo "attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: $(printf '%s\n' "$acts" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
-				runs="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'^ *(- )?["\']?(run|shell)["\']?[[:space:]]*:' || true)"
+				runs="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'(^|[^[:alnum:]_-])["\']?(run|shell)["\']?[[:space:]]*:' || true)"
 				if [ -n "$runs" ]; then
 					echo "attest has a run step, so it could run member code: $(printf '%s\n' "$runs" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
-				foreign="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'^ *["\']?(run-id|repository|github-token)["\']?[[:space:]]*:' || true)"
+				foreign="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'(^|[^[:alnum:]_-])["\']?(run-id|repository|github-token)["\']?[[:space:]]*:' || true)"
 				if [ -n "$foreign" ]; then
 					echo "attest names another run, repository or token, so it could attest files this run did not build: $(printf '%s\n' "$foreign" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				# Each download step, comments aside, as one line.
+				byname="$(grep -vE '^ *#' "$scratch/job.yml" | awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 " " } END { if (s != "") print s }' | grep -F 'actions/download-artifact@' | grep -vE $'(^|[^[:alnum:]_-])["\']?artifact-ids["\']?[[:space:]]*:' || true)"
+				if [ -n "$byname" ]; then
+					echo "attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: $(printf '%s\n' "$byname" | sed -E 's/ {2,}/ /g' | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
 			fi
@@ -1085,7 +1099,7 @@ cache_lint() {
 				echo "release_cache_prune: no action; no listed interpreter or downloader, git, ./, ../ or .github/ path or GITHUB_WORKSPACE; each gh call names actions/caches or gh cache outside a comment"
 			fi
 			if [ "$ok" = 1 ] && [ "$job" = attest ]; then
-				echo "attest: only actions/download-artifact and actions/attest-build-provenance; no run step; no other run, repository or token"
+				echo "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id"
 			fi
 		fi
 		[ "$ok" = 1 ] || rc=1
@@ -1198,19 +1212,25 @@ wlint W37-release-cache-prune-gh-caches-in-a-comment 1 'release_cache_prune call
 # sami-candidate (W38).
 wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.ref == 'refs\/heads\/sami-candidate' \&\& !cancelled() \&\& steps.release-cache-bound/github.ref == 'refs\/heads\/sami' \&\& !cancelled() \&\& steps.release-cache-bound/" ''
 # attest holds id-token: write, so it runs no member code: no action but
-# download-artifact and attest-build-provenance (W40), no run step (W41),
-# and no download of another run's artifacts (W42). No other job (W43, W45
-# by write-all, W46 with the value on the next line, W47) and not the
-# workflow (W44) names an id-token permission other than read or none.
-wlint W39-attest-rule 0 'attest: only actions/download-artifact and actions/attest-build-provenance; no run step; no other run, repository or token' '' ''
-wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
-wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives$|      - run: bash .github/sami/carry-check.sh\n&|' ''
-wlint W42-attest-download-of-another-run 1 'attest names another run, repository or token, so it could attest files this run did not build: \[          run-id: 1\]' '/^  attest:$/,/^  release_cache_prune:$/s/^          pattern: mise-\*$/&\n          run-id: 1/' ''
+# download-artifact and attest-build-provenance (W40), each pinned by commit
+# (W51), no run step (W41, W48 in flow style), no download of another run's
+# artifacts (W42, W49 in flow style), and no download by name or pattern
+# (W50). No other job (W43, W45 by write-all, W46 with the value on the next
+# line, W47) and not the workflow (W44) names an id-token permission other
+# than read or none.
+wlint W39-attest-rule 0 'attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id' '' ''
+wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives and the release notes$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
+wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives and the release notes$|      - run: bash .github/sami/carry-check.sh\n&|' ''
+wlint W42-attest-download-of-another-run 1 'attest names another run, repository or token, so it could attest files this run did not build: \[          run-id: 1\]' '/^  attest:$/,/^  release_cache_prune:$/s|^          path: \${{ runner.temp }}/attest$|&\n          run-id: 1|' ''
 wlint W43-carry-id-token-write 1 'carry names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' 's/^  carry:$/&\n    permissions:\n      id-token: write/' ''
 wlint W44-workflow-id-token-write 1 'the workflow names an id-token permission other than read or none, which only attest may hold: \[  id-token: write\]' 's/^  contents: read$/&\n  id-token: write/' ''
 wlint W45-release-binary-write-all 1 'release_binary names an id-token permission other than read or none, which only attest may hold: \[    permissions: write-all\]' 's/^  release_binary:$/&\n    permissions: write-all/' ''
 wlint W46-rust-test-id-token-on-the-next-line 1 'rust_test names an id-token permission other than read or none, which only attest may hold: \[      id-token:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      id-token:\n        write/' ''
 wlint W47-release-cache-prune-id-token-write 1 'release_cache_prune names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' '/^  release_cache_prune:$/,/^  rust_test:$/s/^      contents: read$/&\n      id-token: write/' ''
+wlint W48-attest-run-step-in-flow-style 1 'attest has a run step, so it could run member code: \[      - \{ name: x, run: bash \.github/sami/carry-check\.sh \}\]' 's|^      - name: Download the archives and the release notes$|      - { name: x, run: bash .github/sami/carry-check.sh }\n&|' ''
+wlint W49-attest-another-run-in-flow-style 1 'attest names another run, repository or token, so it could attest files this run did not build: \[        with: \{ artifact-ids: "1,2,3", path: x, run-id: 1 \}\]' '/^  attest:$/,/^  release_cache_prune:$/{/^          artifact-ids: /d;/^          path: \${{ runner.temp }}\/attest$/d;s/^        with:$/        with: { artifact-ids: "1,2,3", path: x, run-id: 1 }/;}' ''
+wlint W50-attest-download-by-pattern 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          pattern: mise-*/' ''
+wlint W51-attest-action-by-tag 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[        uses: actions/download-artifact@v4\]' '/^  attest:$/,/^  release_cache_prune:$/s|actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0|actions/download-artifact@v4|' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

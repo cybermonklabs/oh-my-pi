@@ -22,14 +22,14 @@ name: Build sami branch
 # The release build cache is saved only on a push to sami-candidate, where
 # release_cache_prune keeps one entry per target; sami, where nothing is
 # built, keeps none.
-# Known limit: GitHub runs the workflow file of the commit that is pushed, so
-# these checks bind only a pushed commit that carries them. A push to sami of
-# a commit from before this workflow (a72018dd, sami's head on 2026-11-23,
-# among them), or of a commit whose sami-build.yml or release-candidate.sh
-# was changed, builds and publishes at once. Any identity of the agent App
-# sjawhar-agent[bot] can push sami and sami-candidate. No ruleset guards
-# either ref, by the decision of 2026-11-23: no wrong push has been seen, and
-# a protection against a risk nobody has seen waits for a person's request.
+# Known limit: a push to sami runs the pushed commit's own sami-build.yml and
+# release-candidate.sh. One from before this workflow (a72018dd, sami's head
+# on 2026-11-23, among them) builds and publishes at once, and one whose
+# copies were changed publishes what its own copies allow. Any identity of
+# the agent App sjawhar-agent[bot] can push sami and sami-candidate. No
+# ruleset guards either ref, by the decision of 2026-11-23: no wrong push has
+# been seen, and a protection against a risk nobody has seen waits for a
+# person's request.
 
 on:
   push:
@@ -63,6 +63,10 @@ jobs:
     if: ${{ github.ref != 'refs/heads/sami' }}
     name: Carries the previous release
     runs-on: ubuntu-22.04
+    # The attest job downloads the notes by this id, so a later replacement
+    # of the artifact (it gets a new id) is not what it attests.
+    outputs:
+      notes-artifact-id: ${{ steps.upload-notes.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -77,6 +81,7 @@ jobs:
       # publish takes the release notes from this artifact, and publishes
       # them only if the attest job of the candidate run attested them.
       - name: Upload the release notes
+        id: upload-notes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-notes
@@ -108,9 +113,12 @@ jobs:
     # linux-x64 leg sets it: the macOS leg skips the step, so the output is
     # empty there, and an empty output is not set and does not clear the
     # linux-x64 leg's value (GitHub's workflow syntax, "Using Job Outputs in
-    # a Matrix Job").
+    # a Matrix Job"). In the same way each leg sets the id of its own mise-*
+    # artifact, which the attest job downloads by id.
     outputs:
       addon-linux-x64-modern-sha256: ${{ steps.addon.outputs.sha256 }}
+      mise-linux-x64-artifact-id: ${{ matrix.target == 'linux-x64' && steps.upload-mise.outputs.artifact-id || '' }}
+      mise-darwin-arm64-artifact-id: ${{ matrix.target == 'darwin-arm64' && steps.upload-mise.outputs.artifact-id || '' }}
     env:
       # The release build cache. The restore and save steps must name the
       # same paths. The bounds keep one entry per target small next to
@@ -283,8 +291,11 @@ jobs:
           if command -v sha256sum >/dev/null; then sum=(sha256sum); else sum=(shasum -a 256); fi
           (cd release && "${sum[@]}" "${asset}.tar.gz" >"${asset}.tar.gz.sha256")
           cat "release/${asset}.tar.gz.sha256"
-      # The attest job attests these files once both legs have uploaded them.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # The attest job attests these files, by this artifact's id, once both
+      # legs have uploaded them.
+      - name: Upload the archive and its sidecar
+        id: upload-mise
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mise-${{ matrix.target }}
           path: |
@@ -372,9 +383,13 @@ jobs:
     # id-token: write. It attests the archives and their sidecars that both
     # legs of release_binary uploaded, and the release notes carry uploaded,
     # once all three succeeded, and runs no repository code: no checkout and
-    # no run step, only actions/download-artifact (this run's artifacts, by
-    # name) and actions/attest-build-provenance. Harness cases W39 to W47
-    # (.github/sami/tests/run.sh) keep it so. It runs only on a push to
+    # no run step, only actions/download-artifact and
+    # actions/attest-build-provenance, pinned by commit. It downloads the
+    # three artifacts by the ids their upload steps gave: a job of this run
+    # (rust_test runs test code with root beside it) can delete an artifact
+    # and upload another under its name, but not under its id, so what it
+    # attests is what carry and release_binary uploaded. Harness cases W39 to
+    # W51 (.github/sami/tests/run.sh) keep it so. It runs only on a push to
     # sami-candidate, so the public transparency log gets no trial entries.
     # This if: does not keep a dispatch run's files out of a release: GitHub
     # runs the workflow file of the ref a run is on, and that file can attest
@@ -394,18 +409,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # Each archive artifact goes to a directory of its own (merge-multiple
-      # is off).
-      - name: Download the archives
+      # Each artifact goes to a directory of its own, named for the artifact
+      # (merge-multiple is off). An id that no longer exists is only a
+      # warning: that file then has no attestation of this run, and publish
+      # refuses it.
+      - name: Download the archives and the release notes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: mise-*
+          artifact-ids: ${{ needs.carry.outputs.notes-artifact-id }},${{ needs.release_binary.outputs.mise-linux-x64-artifact-id }},${{ needs.release_binary.outputs.mise-darwin-arm64-artifact-id }}
           path: ${{ runner.temp }}/attest
-      - name: Download the release notes
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-notes
-          path: ${{ runner.temp }}/attest/release-notes
       - name: Attest the archives, their sidecars and the release notes
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

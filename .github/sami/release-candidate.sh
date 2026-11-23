@@ -100,10 +100,11 @@ attested() {
 		return 1
 	fi
 	rm -f -- "$err"
-	if ! jq -e --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/" --arg signer "$signer" '
-		any(.[]; .verificationResult.signature.certificate
+	# -s: an empty answer is [] and fails here (jq 1.6 -e exits 0 on no input).
+	if ! jq -e -s --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/" --arg signer "$signer" '
+		length == 1 and (.[0] | any(.[]; .verificationResult.signature.certificate
 			| ((.runInvocationURI // "") | startswith($run))
-			  and .buildTrigger == "push" and .buildSignerURI == $signer)' <<<"$out" >/dev/null; then
+			  and .buildTrigger == "push" and .buildSignerURI == $signer))' <<<"$out" >/dev/null; then
 		why="it has no attestation that run $RUN_ID made on a push, signed by $signer"
 		return 1
 	fi
