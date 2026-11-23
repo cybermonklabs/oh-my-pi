@@ -137,6 +137,11 @@ function pyLiteral(value: unknown): string {
 	throw new Error(`Unsupported default ${String(value)}`);
 }
 
+/** `annotation` admitting `None`, for a field a payload may omit. */
+function orNone(annotation: string): string {
+	return annotation.split(" | ").includes("None") ? annotation : `${annotation} | None`;
+}
+
 function docstring(text: string | undefined, indent: string): string {
 	if (!text) return "";
 	const escaped = text.replaceAll("\\", "\\\\").replaceAll('"""', '\\"\\"\\"');
@@ -422,8 +427,7 @@ class PythonEmitter {
 			} else if (field.hasDefault) {
 				lines.push(`    ${name}: ${annotation} = ${this.#defaultExpression(field)}\n${fieldDoc}`);
 			} else {
-				const optional = annotation.split(" | ").includes("None") ? annotation : `${annotation} | None`;
-				lines.push(`    ${name}: ${optional} = None\n${fieldDoc}`);
+				lines.push(`    ${name}: ${orNone(annotation)} = None\n${fieldDoc}`);
 			}
 		}
 		// Required fields come first in omptype's emission, so defaults never precede them; kw_only keeps
@@ -453,30 +457,33 @@ class PythonEmitter {
 		for (const field of def.fields) {
 			const name = this.#fieldName(def.name, field.key);
 			const { decoder } = this.#fieldDecoder(def.name, field);
-			if (field.required && field.type.kind === "literal") {
-				this.#runtime.add("required");
-				checks.push(`    required(payload, ${pyString(field.key)}, ${decoder}, path)\n`);
-			} else if (field.required) {
-				this.#runtime.add("required");
-				args.push(`        ${name}=required(payload, ${pyString(field.key)}, ${decoder}, path),\n`);
-			} else if (field.hasDefault) {
-				this.#runtime.add("defaulted");
-				args.push(
-					`        ${name}=defaulted(payload, ${pyString(field.key)}, ${decoder}, path, ${this.#defaultValue(field)}),\n`,
-				);
-			} else {
-				this.#runtime.add("optional");
-				args.push(`        ${name}=optional(payload, ${pyString(field.key)}, ${decoder}, path),\n`);
-			}
+			const read = this.#fieldRead(field, decoder, "payload", "path");
+			if (field.required && field.type.kind === "literal") checks.push(`    ${read}\n`);
+			else args.push(`        ${name}=${read},\n`);
 		}
 		return `def parse_${snake(def.name)}(value: object, path: str = ${pyString(def.name)}) -> ${def.name}:\n    payload = expect_object(value, path)\n${checks.join("")}    return ${def.name}(\n${args.join("")}    )\n`;
 	}
 
-	#defaultValue(field: WireField): string {
+	/** The runtime call reading `field` from `payload`: required, defaulted, or optional, as the field is. */
+	#fieldRead(field: WireField, decoder: string, payload: string, path: string): string {
+		const key = pyString(field.key);
+		if (field.required) {
+			this.#runtime.add("required");
+			return `required(${payload}, ${key}, ${decoder}, ${path})`;
+		}
+		if (field.hasDefault) {
+			this.#runtime.add("defaulted");
+			return `defaulted(${payload}, ${key}, ${decoder}, ${path}, ${this.#defaultValue(field, path)})`;
+		}
+		this.#runtime.add("optional");
+		return `optional(${payload}, ${key}, ${decoder}, ${path})`;
+	}
+
+	#defaultValue(field: WireField, path: string): string {
 		const value = field.default;
 		if (Array.isArray(value)) return "()";
 		if (value !== null && typeof value === "object") {
-			return `${this.#decoder(field.type, field.key)}(${pyLiteral(value)}, path)`;
+			return `${this.#decoder(field.type, field.key)}(${pyLiteral(value)}, ${path})`;
 		}
 		return pyLiteral(value);
 	}
@@ -584,15 +591,22 @@ class PythonEmitter {
 			const envelope = this.#def(command.result);
 			const field = envelope.kind === "object" ? envelope.fields.find(f => f.key === command.unwrap) : undefined;
 			if (!field) throw new Error(`${command.name}: unwrap field ${command.unwrap} not in ${command.result}`);
-			this.#runtime.add("required");
 			this.#runtime.add("expect_object");
 			const decoder = this.#decoder(field.type, `${command.result}.${field.key}`);
-			const value = `required(expect_object(${call}, ${pyString(command.name)}), ${pyString(field.key)}, ${decoder}, ${pyString(command.name)})`;
+			const value = this.#fieldRead(
+				field,
+				decoder,
+				`expect_object(${call}, ${pyString(command.name)})`,
+				pyString(command.name),
+			);
+			const annotation = this.#annotation(field.type, "record");
+			const omittable = !field.required && !field.hasDefault;
 			if (this.#binding.pathResults.includes(command.name)) {
+				if (omittable) throw new Error(`${command.name}: an optional path result is not supported`);
 				this.#usesPath = true;
 				return { returns: "Path", statement: `return Path(${value})` };
 			}
-			return { returns: this.#annotation(field.type, "record"), statement: `return ${value}` };
+			return { returns: omittable ? orNone(annotation) : annotation, statement: `return ${value}` };
 		}
 		const decoder = this.#decoder({ kind: "ref", name: command.result }, command.name);
 		if (command.nullable) {

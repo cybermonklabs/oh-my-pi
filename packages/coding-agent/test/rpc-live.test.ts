@@ -38,10 +38,10 @@ class FakeLiveSession implements RpcLiveSession {
 	}
 }
 
-function harness(levelsIntervalMs = 40) {
+function harness(levelsIntervalMs = 40, settings: Record<string, unknown> = { "live.voice": "sol" }) {
 	const frames: RpcLiveFrame[] = [];
 	const sessions: FakeLiveSession[] = [];
-	const agentSession = { settings: Settings.isolated({ "live.voice": "sol" }) } as unknown as AgentSession;
+	const agentSession = { settings: Settings.isolated(settings) } as unknown as AgentSession;
 	const bridge = new RpcLiveBridge(
 		agentSession,
 		frame => frames.push(frame),
@@ -130,6 +130,16 @@ describe("RpcLiveBridge", () => {
 		live.started.resolve();
 		expect(await starting).toEqual({ voice: "sol", sdpAnswer: "v=0 answer" });
 		expect(bridge.active).toBe(true);
+	});
+
+	test("on GPT-Live's API (`live.provider: openai`) no voice is sent or reported", async () => {
+		const { bridge, sessions } = harness(undefined, { "live.voice": "sol", "live.provider": "openai" });
+		const starting = bridge.start({ voice: "cove", sdpOffer: "v=0 offer" });
+		const live = sessions[0]!;
+		expect(live.options.voice).toBeUndefined();
+		live.sdpAnswer = "v=0 answer";
+		live.started.resolve();
+		expect(await starting).toEqual({ sdpAnswer: "v=0 answer" });
 	});
 
 	test("an sdpOffer session that ends before its answer exists rejects and releases the slot", async () => {

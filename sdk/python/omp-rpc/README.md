@@ -303,8 +303,9 @@ be parsed).
 ## Live Voice, Login, Handoff, and Word Prediction
 
 - `live_start(voice=None, instructions=None)` starts a GPT live voice session
-  bound to this session and returns the voice in use; `live_mute(muted=None)`
-  sets or toggles the microphone; `live_stop()` ends it. `on_live_phase()`,
+  bound to this session and returns the voice in use (`None` with
+  `live.provider: openai`); `live_mute(muted=None)` sets or toggles the
+  microphone; `live_stop()` ends it. `on_live_phase()`,
   `on_live_levels()`, `on_live_transcript()`, and `on_live_end()` receive the
   live frames.
 - `get_login_providers()` lists OAuth providers; `login(provider_id)` blocks

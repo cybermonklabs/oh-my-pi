@@ -1483,18 +1483,20 @@ session runs per RPC server.
 
 ### Commands
 
-- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice: string }`
-- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice: string, sdpAnswer: string }`
+- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice?: string }`
+- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice?: string, sdpAnswer: string }`
 - `{ id?, type: "live_stop" }`
 - `{ id?, type: "live_mute", muted?: boolean }` → `data: { muted: boolean }`
 
 `live_start` responds once the session is connected and recording, so it is
 dispatched concurrently like `bash`; `live_stop` sent meanwhile cancels the
 connection and the pending `live_start` then fails. `voice` defaults to the
-`live.voice` setting and the response reports the voice used. `instructions`
-replaces the bundled live prompt; it is rendered as a Handlebars template with
-`{{username}}` and `{{firstName}}` of the local OS account. Starting while a
-session is connecting, active, or closing, or while dictation is active, fails.
+`live.voice` setting and the response reports the voice used; with
+`live.provider: openai`, which sends GPT-Live no voice, the response has none and
+`voice` is ignored. `instructions` replaces the bundled live prompt; it is
+rendered as a Handlebars template with `{{username}}` and `{{firstName}}` of the
+local OS account. Starting while a session is connecting, active, or closing, or
+while dictation is active, fails.
 
 `live_connect` starts the same session with the audio on the client's own
 WebRTC peer instead of the host's microphone and speakers. `sdpOffer` is that
@@ -1549,6 +1551,10 @@ GPT-Live there works the same way.
 2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
    bearer carries the call's events and omp's messages.
 
+The key goes nowhere else. Where the server's text could repeat it (a redirect's
+`Location`, an error body or `error` event, the sideband's close reason, a
+session id in the attach URL), every error and log line has `[key]` instead.
+
 The rest of the call is the same as on Codex. GPT-Live's delegation event names
 no task text, only its `offset_ms` on the session timeline, so its turn is the
 user's transcribed words before that offset (at most the minute before it), under
@@ -1559,14 +1565,28 @@ reached its offset, or after 1 s with the words that have arrived; the voice's
 transcript does not release it. A user's word that arrives for a delegation
 already handed over is logged, not given to the next one. A delegation is never
 dropped: with no words, its turn says none were transcribed. A turn's progress
-goes to the call as `session.thinking.append`
-(not spoken) and its final reply as `session.commentary.append` (spoken); context
-outside a delegation goes the same way with `delegation_id: null`. Each message
-carries an `event_id`; a GPT-Live `error` that names one ends the call with that
-error, as a failed send does on Codex, and any other `error` is logged while the
-call stays open. The session id is opaque: any id but `.` and `..` is accepted
-and percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
+goes to the call as `session.thinking.append` (not spoken) and its final reply
+as `session.commentary.append` (spoken), both with the delegation's
+`delegation_id`. omp sends no context outside a delegation
+(`session.context.append` on Codex). Each message carries an `event_id`; a
+GPT-Live `error` that names the spoken reply ends the call with that error, as a
+failed send does on Codex. One that names a progress note is logged and the call
+stays open, since the user never hears a progress note; any other `error` is
+logged too. The session id is opaque: any id but `.` and `..` is accepted and
+percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
 default; `live.voice` names Codex voices only.
+
+A user's transcript delta without `start_ms` and `end_ms` has no place on the
+timeline. It joins the turn of the next delegation handed over, after the words
+that have one, if it came within the minute before. It cannot show that the
+user's transcript has reached an offset, so a delegation waiting on such words
+alone goes after 1 s.
+
+What the server sends is bounded: omp reads at most 256 KiB of the session
+response, ends a transcript line that would pass 8,192 characters and begins a
+new one (a longer delta is split, its latest characters filling the last
+piece), and keeps for a turn at most the latest 8,192 characters of the user's
+words with timing, and as many of those without. It logs the words it drops.
 
 ## Dictation Sub-Protocol
 

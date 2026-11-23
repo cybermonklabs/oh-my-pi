@@ -132,6 +132,12 @@ export class LiveSessionController {
 	#userTranscriptTurn = 0;
 	#assistantTranscriptTurn = 0;
 	#lastTranscript: LiveTranscript | undefined;
+	/**
+	 * Whether the route can repeat a line it has finished (Codex), so the same text right after it is
+	 * dropped. GPT-Live's transport delivers each event once and finishes a line only when the other
+	 * speaker starts, so there the same text again is a new line, such as a second "yes".
+	 */
+	#finishedLinesRepeat = true;
 	readonly #outputActivity = new OutputActivity(() =>
 		this.#guardEvent(() => {
 			if (!this.#activeDelegationId) this.#refreshAudioPhase();
@@ -187,23 +193,24 @@ export class LiveSessionController {
 				onEvent: (event: LiveServerEvent) => this.#guardEvent(() => this.#handleLiveEvent(event)),
 				onOutputLevel: (level: number) => this.#guardEvent(() => this.#handleOutputLevel(level)),
 			};
-			const transport =
-				cfgLiveProvider.get(this.#session.settings) === "openai"
-					? new OpenAILiveTransport({
-							registry: this.#session.modelRegistry,
-							sessionId: this.#session.sessionId,
-							instructions,
-							sdpOffer: this.#sdpOffer,
-							callbacks,
-						})
-					: new CodexLiveTransport({
-							authStorage: this.#session.modelRegistry.authStorage,
-							sessionId: this.#session.sessionId,
-							instructions,
-							voice: this.#voice,
-							sdpOffer: this.#sdpOffer,
-							callbacks,
-						});
+			const openai = cfgLiveProvider.get(this.#session.settings) === "openai";
+			this.#finishedLinesRepeat = !openai;
+			const transport = openai
+				? new OpenAILiveTransport({
+						registry: this.#session.modelRegistry,
+						sessionId: this.#session.sessionId,
+						instructions,
+						sdpOffer: this.#sdpOffer,
+						callbacks,
+					})
+				: new CodexLiveTransport({
+						authStorage: this.#session.modelRegistry.authStorage,
+						sessionId: this.#session.sessionId,
+						instructions,
+						voice: this.#voice,
+						sdpOffer: this.#sdpOffer,
+						callbacks,
+					});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {
@@ -432,7 +439,7 @@ export class LiveSessionController {
 			this.#startTranscriptTurn(role);
 			next = text;
 		} else if (wasFinal) {
-			if (text === current || current.endsWith(text)) return;
+			if (this.#finishedLinesRepeat && (text === current || current.endsWith(text))) return;
 			this.#startTranscriptTurn(role);
 			next = text;
 		} else if (text.startsWith(current)) {
@@ -452,7 +459,7 @@ export class LiveSessionController {
 		if (!current) {
 			this.#startTranscriptTurn(role);
 		} else if (wasFinal) {
-			if (text === current) return;
+			if (this.#finishedLinesRepeat && text === current) return;
 			this.#startTranscriptTurn(role);
 		}
 		const next = !wasFinal && current.startsWith(text) && current.length > text.length ? current : text;

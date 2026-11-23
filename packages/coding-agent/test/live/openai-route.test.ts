@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
 import { kNoAuth } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import {
 	OpenAILiveTransport,
+	type OpenAILiveTransportOptions,
 	openAILiveAttachUrl,
 	openAILiveSessionsUrl,
 	resolveOpenAILiveRoute,
@@ -12,6 +13,12 @@ import {
 	buildSessionContextAppend,
 	type LiveServerEvent,
 } from "@oh-my-pi/pi-coding-agent/live/protocol";
+import * as natives from "@oh-my-pi/pi-natives";
+import { logger } from "@oh-my-pi/pi-utils";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; the API route must never send one. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
@@ -66,14 +73,51 @@ function liveApiServer(options: ApiServerOptions = {}) {
 	return { server, posts, upgrades, received, message, base: `http://127.0.0.1:${server.port}/v1` };
 }
 
-function transportFor(base: string, onEvent: (event: LiveServerEvent) => void = () => {}): OpenAILiveTransport {
+function transportFor(
+	base: string,
+	onEvent: (event: LiveServerEvent) => void = () => {},
+	options: Partial<OpenAILiveTransportOptions> = {},
+): OpenAILiveTransport {
 	return new OpenAILiveTransport({
 		registry: { getProviderBaseUrl: () => base, getApiKeyForProvider: async () => "sk-test" },
 		sessionId: "s1",
 		instructions: "Be brief.",
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },
+		...options,
 	});
+}
+
+/** A native media peer the transport made (a stand-in). */
+interface NativePeer {
+	/** Delivers `event` on the peer's data channel. */
+	emit(event: unknown): void;
+}
+
+/**
+ * Replaces the native media peer with a stand-in whose data channel opens at once, after `onOpen`
+ * runs; returns each one made.
+ */
+function nativePeers(onOpen: (peer: NativePeer) => void = () => {}): NativePeer[] {
+	const made: NativePeer[] = [];
+	// bun's spyOn types a class export's implementation as `never`; a plain function (called with `new`) stands in.
+	const spy = vi.spyOn(natives, "LiveWebRtcPeer") as unknown as {
+		mockImplementation(implementation: (onEvent: (error: Error | null, payload: string) => void) => object): void;
+	};
+	spy.mockImplementation(function (onEvent) {
+		const peer = {
+			emit: (event: unknown) => onEvent(null, JSON.stringify(event)),
+			createOffer: async () => "v=0 native offer",
+			acceptAnswer: async () => {},
+			waitForOpen: async () => onOpen(peer),
+			setMuted: () => {},
+			pushAudio: () => {},
+			close: async () => {},
+		};
+		made.push(peer);
+		return peer;
+	});
+	return made;
 }
 
 /** A delegated turn holding `words`, as the transport labels them. */
@@ -289,6 +333,155 @@ describe("GPT-Live transport", () => {
 		}
 	});
 
+	test("refuses a session response over 256 KiB, and attaches nothing", async () => {
+		const sdp = `v=0 ${"a".repeat(300 * 1024)}`;
+		const api = liveApiServer({
+			answer: () => Response.json({ session: { id: "live_123" }, transport: { sdp } }, { status: 201 }),
+		});
+		const transport = transportFor(api.base);
+		try {
+			await expect(transport.connect()).rejects.toThrow(/GPT-Live session response is over 262144 bytes/);
+			expect(api.upgrades).toEqual([]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("ends a transcript line before 8,192 characters, and a turn keeps the latest 8,192 of the user's", async () => {
+		const a = "a".repeat(4_000);
+		const b = "b".repeat(4_000);
+		const c = "c".repeat(4_000);
+		const user = (eventId: string, delta: string, startMs: number) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+			start_ms: startMs,
+			end_ms: startMs + 100,
+		});
+		const api = liveApiServer({
+			events: [
+				user("e1", a, 0),
+				user("e2", b, 100),
+				user("e3", c, 200),
+				{
+					type: "session.delegation.created",
+					event_id: "e4",
+					offset_ms: 300,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: a } },
+				{ type: "input_transcript.added", item: { text: `${a}${b}` } },
+				{ type: "turn.done", turn: { role: "user", transcript: `${a}${b}` } },
+				{ type: "input_transcript.added", item: { text: c } },
+				heard("item_1", `${b}${c}`),
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("one delta over 8,192 characters ends a line where it would pass them, and the turn keeps its end", async () => {
+		const head = "a".repeat(3_808);
+		const tail = `${"b".repeat(8_182)}ENDOFWORDS`;
+		const api = liveApiServer({
+			events: [
+				{
+					type: "session.input_transcript.delta",
+					event_id: "e1",
+					delta: `${head}${tail}`,
+					start_ms: 0,
+					end_ms: 100,
+				},
+				{
+					type: "session.delegation.created",
+					event_id: "e2",
+					offset_ms: 100,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const warn = vi.spyOn(logger, "warn");
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: head } },
+				{ type: "turn.done", turn: { role: "user", transcript: head } },
+				{ type: "input_transcript.added", item: { text: tail } },
+				heard("item_1", tail),
+			]);
+			expect(warn).toHaveBeenCalledWith("Dropped the oldest of the user's words waiting for a GPT-Live delegation", {
+				droppedCharacters: 3_808,
+				limit: 8_192,
+			});
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("one delta over 8,192 characters is not cut inside a surrogate pair", async () => {
+		// 8,192 characters before the end of the delta falls between the two halves of the emoji.
+		const head = `${"a".repeat(100)}😀`;
+		const tail = `${"b".repeat(8_181)}ENDOFWORDS`;
+		const delta = `${head}${tail}`;
+		expect(delta.charCodeAt(delta.length - 8_192)).toBe("😀".charCodeAt(1));
+		const api = liveApiServer({
+			events: [
+				{ type: "session.input_transcript.delta", event_id: "e1", delta, start_ms: 0, end_ms: 100 },
+				{
+					type: "session.delegation.created",
+					event_id: "e2",
+					offset_ms: 100,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			const pieces = events.flatMap(event => (event.type === "input_transcript.added" ? [event.item.text] : []));
+			// No piece starts or ends with half of a surrogate pair, and the pieces join back to the delta.
+			expect(pieces.map(piece => piece.isWellFormed())).toEqual([true, true]);
+			expect(pieces.join("")).toBe(delta);
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: head } },
+				{ type: "turn.done", turn: { role: "user", transcript: head } },
+				{ type: "input_transcript.added", item: { text: tail } },
+				heard("item_1", tail),
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
 	test("follows no redirect, so the key never leaves the provider's origin", async () => {
 		const elsewhere = liveApiServer();
 		const redirecting = Bun.serve({
@@ -304,6 +497,99 @@ describe("GPT-Live transport", () => {
 			await transport.close();
 			redirecting.stop(true);
 			elsewhere.server.stop(true);
+		}
+	});
+
+	test("a close while the key resolves makes no native peer and sends no session request", async () => {
+		const api = liveApiServer();
+		const peers = nativePeers();
+		const key = Promise.withResolvers<string>();
+		const transport = transportFor(api.base, undefined, {
+			registry: { getProviderBaseUrl: () => api.base, getApiKeyForProvider: () => key.promise },
+			sdpOffer: undefined,
+		});
+		try {
+			const connecting = transport.connect().then(
+				() => "connected",
+				(error: unknown) => `refused: ${String(error)}`,
+			);
+			await transport.close();
+			key.resolve("sk-test");
+			expect(await connecting).toStartWith("refused");
+			expect(peers).toEqual([]);
+			expect(api.posts).toEqual([]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("takes the data channel's events until the sideband attaches, then only the sideband's", async () => {
+		const user = (eventId: string, delta: string) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+			start_ms: 0,
+			end_ms: 100,
+		});
+		// The sideband replays what the data channel delivered before it attached.
+		const api = liveApiServer({ events: [user("e1", "deploy"), user("e2", " main")] });
+		const peers = nativePeers(peer => peer.emit(user("e1", "deploy")));
+		const events: LiveServerEvent[] = [];
+		const attached = Promise.withResolvers<void>();
+		const transport = transportFor(
+			api.base,
+			event => {
+				events.push(event);
+				if (event.type === "input_transcript.added" && event.item.text === "deploy main") attached.resolve();
+			},
+			{ sdpOffer: undefined },
+		);
+		try {
+			await transport.connect();
+			await attached.promise;
+			peers[0]!.emit(user("e3", " now"));
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: "deploy" } },
+				{ type: "input_transcript.added", item: { text: "deploy main" } },
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("closing the call stops the timer of a delegation still waiting for the user's words", async () => {
+		const api = liveApiServer({
+			events: [
+				{
+					type: "session.delegation.created",
+					event_id: "e1",
+					offset_ms: 5_000,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+				{ type: "session.input_transcript.delta", event_id: "e2", delta: "deploy", start_ms: 100, end_ms: 400 },
+			],
+		});
+		const setTimer = vi.spyOn(globalThis, "setTimeout");
+		const clearTimer = vi.spyOn(globalThis, "clearTimeout");
+		const heardWords = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			if (event.type === "input_transcript.added") heardWords.resolve();
+		});
+		try {
+			await transport.connect();
+			// The words end before the delegation's offset, so it waits for more, at most its 1 s cap.
+			await heardWords.promise;
+			const cap = setTimer.mock.calls.findIndex(([, ms]) => ms === 1_000);
+			expect(cap).toBeGreaterThanOrEqual(0);
+			const timer = setTimer.mock.results[cap]?.value;
+			await transport.close();
+			// By identity: every Timeout equals every other under `toHaveBeenCalledWith`'s deep equality.
+			expect(clearTimer.mock.calls.some(([cleared]) => cleared === timer)).toBe(true);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
 		}
 	});
 });

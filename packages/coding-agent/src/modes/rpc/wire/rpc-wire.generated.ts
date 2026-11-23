@@ -1701,7 +1701,7 @@ export interface LiveStartParams {
 }
 
 export interface LiveStartResult {
-	voice: string;
+	voice?: string;
 }
 
 export interface LiveConnectParams {
@@ -1711,8 +1711,8 @@ export interface LiveConnectParams {
 }
 
 export interface LiveConnectResult {
-	voice: string;
 	sdpAnswer: string;
+	voice?: string;
 }
 
 export interface LiveMuteParams {
