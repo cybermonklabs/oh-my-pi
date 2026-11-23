@@ -254,7 +254,10 @@ export interface BasePromptRebuildOptions extends SettingsChangeOptions {
 /**
  * Renders the base prompt for an active tool set. `xdev` is the `xd://` state
  * to render: the live state, or a frozen prefix's committed roster when a
- * rebuild re-renders it. Supplied by `sdk.ts`; called on every prompt rebuild.
+ * rebuild re-renders it. `skills` are the skills the prompt lists, the
+ * session's prompt skills (`SessionTools.promptSkills`) unless given: a build
+ * under a held settings rebuild lists the skills that rebuild brings. Supplied
+ * by `sdk.ts`; called on every prompt rebuild.
  * `settingsRead` holds each setting the render read from the session's own
  * settings, with the value it read (`trackSettingsReads`): a bound prompt holds
  * a change of one of them that moves the prompt. A setting the prompt renders
@@ -267,6 +270,7 @@ export type SystemPromptRebuilder = (
 	toolNames: string[],
 	tools: Map<string, AgentTool>,
 	xdev: XdevState | undefined,
+	skills?: readonly Skill[],
 ) => Promise<{
 	systemPrompt: string[];
 	xdevCatalogNames?: readonly string[];
@@ -1102,11 +1106,17 @@ interface SettingsNoticeDetails {
 	settings: string[];
 	/** Each setting it names but a credential, with the value it gives now: what a resumed process counts as told. */
 	values: HeldSettingRecord[];
-	/** Tools it gives as disabled that no notice before it on its branch did. */
+	/**
+	 * Tools it gives as disabled that no notice before it on its branch did; in a notice that the change is no longer
+	 * held, tools a notice before it gave so that are gone now: the prompt does not list them, no request declares them.
+	 */
 	disabledTools: string[];
 	/** Tools a notice before it on its branch gave as disabled that run again. */
 	reenabledTools: string[];
-	/** Tools it gives as enabled after the rebuild that no notice before it on its branch did. */
+	/**
+	 * Tools it gives as enabled after the rebuild that no notice before it on its branch did; in a notice that the
+	 * change is no longer held, tools a notice before it gave so that are available now.
+	 */
 	enabledTools: string[];
 	/** Tools a notice before it on its branch gave as enabled after the rebuild that no longer are. */
 	noLongerEnabledTools: string[];
@@ -1320,6 +1330,13 @@ interface SentDeclarations {
 interface RestoredTranscript {
 	readonly reply: AgentMessage;
 	readonly promptDigest: string | undefined;
+	/**
+	 * That prompt holds a change the session records whose time has not come, and this process does not keep it: the
+	 * prompt was built from other operator inputs (a `/tan` clone that declares other tools than its parent, which
+	 * sends its own build from its first request). Set until the next settings notice tells the model the change its
+	 * notices describe is no longer held ({@link SessionTools.#releasedSettingsNotice}).
+	 */
+	readonly unkeptHold?: boolean;
 }
 
 /**
@@ -1911,11 +1928,12 @@ export class SessionTools {
 	/**
 	 * Derives the candidate surface from live state without publishing it. Discovered agents fall back to the
 	 * committed list while no scan is published under the current cwd and extension roots, so a scan a subagent
-	 * publishes there later reaches the model by {@link takeTaskAgentNotice} instead of the task description.
+	 * publishes there later reaches the model by {@link takeTaskAgentNotice} instead of the task description. The
+	 * skill hints follow `skills`, the skills the prompt lists: the session's prompt skills unless given.
 	 */
-	#derivePromptSurface(): PromptSurface {
+	#derivePromptSurface(skills: readonly Skill[] = this.#promptSkills): PromptSurface {
 		return {
-			skillHintVisible: cfgSkillful.get(this.#host.settings) === true && this.#promptSkills.length > 0,
+			skillHintVisible: cfgSkillful.get(this.#host.settings) === true && skills.length > 0,
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
 			evalToolNames: this.getEvalBridgeToolNames(),
@@ -2780,6 +2798,32 @@ export class SessionTools {
 		);
 	}
 
+	/**
+	 * The tools of `selected`, an apply's tool set as the registry gives it, that the apply mounts under `xd://`: with
+	 * the `xd://` state on, a built-in `read` among them and a `write` transport (`builtInWriteAvailable`, with `write`
+	 * among them or the device-only transport), each one that may live there and that no presentation pins to the top
+	 * level ({@link #applyToolSet}).
+	 */
+	#xdevMountNames(
+		selected: readonly { readonly name: string; readonly tool: AgentTool }[],
+		builtInWriteAvailable: boolean,
+	): Set<string> {
+		const xdevReadAvailable = this.#builtInToolNames.has("read") && selected.some(({ name }) => name === "read");
+		const xdevWriteAvailable =
+			builtInWriteAvailable &&
+			(selected.some(({ name }) => name === "write") || this.#deviceOnlyWriteTransportAvailable);
+		if (this.#xdev === undefined || !xdevReadAvailable || !xdevWriteAvailable) return new Set();
+		return new Set(
+			selected.flatMap(({ name, tool }) =>
+				this.#presentationPinnedToolNames?.has(name) !== true &&
+				this.#runtimeSelectedToolNames?.has(name) !== true &&
+				isMountableUnderXdev(tool)
+					? [name]
+					: [],
+			),
+		);
+	}
+
 	async #applyToolSet(toolNames: string[], forcePromptRefresh: boolean, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
@@ -2813,21 +2857,9 @@ export class SessionTools {
 			const tool = this.#toolRegistry.get(name);
 			return tool ? [{ name, tool }] : [];
 		});
-		const xdevReadAvailable = this.#builtInToolNames.has("read") && selectedTools.some(({ name }) => name === "read");
-		const xdevWriteAvailable =
-			builtInWriteAvailable &&
-			(selectedTools.some(({ name }) => name === "write") || this.#deviceOnlyWriteTransportAvailable);
 		const isPresentationPinned = (name: string): boolean =>
 			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true;
-		const mountCandidates = selectedTools.filter(
-			({ name, tool }) =>
-				this.#xdev !== undefined &&
-				xdevReadAvailable &&
-				xdevWriteAvailable &&
-				!isPresentationPinned(name) &&
-				isMountableUnderXdev(tool),
-		);
-		const mountNames = new Set(mountCandidates.map(({ name }) => name));
+		const mountNames = this.#xdevMountNames(selectedTools, builtInWriteAvailable);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const { name, tool } of selectedTools) {
@@ -2940,9 +2972,7 @@ export class SessionTools {
 						signal,
 						this.#renderBasePrompt(
 							rebuildSystemPrompt,
-							validToolNames,
-							this.#toolRegistry,
-							this.#xdev,
+							{ toolNames: validToolNames, tools: this.#toolRegistry, xdev: this.#xdev },
 							candidate,
 						),
 					);
@@ -3512,15 +3542,23 @@ export class SessionTools {
 	 * they called refused that runs again): the stored prompt is restored all
 	 * the same, so the settings notice puts them right; a hold that holds no
 	 * setting, or one on a prompt that is not restored, is spent
-	 * ({@link #spentHold}). Models that do not bind their prefix keep the
-	 * fresh build: they rebuild freely mid-session as well.
+	 * ({@link #spentHold}). A stored prompt built from other operator inputs
+	 * (a `/tan` clone that declares other tools than its parent) is not
+	 * restored: when the session records a hold on it whose time has not
+	 * come, this process's own build goes out with that change from the first
+	 * request, so the next settings notice tells the model the change is no
+	 * longer held ({@link RestoredTranscript.unkeptHold}). Models that do not
+	 * bind their prefix keep the fresh build: they rebuild freely mid-session
+	 * as well.
 	 */
 	#restoreTranscriptPrompt(): void {
-		const promptDigest = this.#restoredTranscript?.promptDigest;
+		const restored = this.#restoredTranscript;
+		const promptDigest = restored?.promptDigest;
 		// The operator inputs the stored prompt must have been built from: this process's own, or a `/tan` clone's
 		// parent's, whose build the clone's fixed prompt is. A prompt function cannot be compared, so it restores none.
 		const operatorDigest = this.#storedPromptOperatorDigest;
 		if (
+			!restored ||
 			!promptDigest ||
 			this.#operatorPromptDigest === undefined ||
 			operatorDigest === undefined ||
@@ -3529,7 +3567,13 @@ export class SessionTools {
 			return;
 		}
 		if (systemPromptDigest(this.#baseSystemPrompt) !== promptDigest) {
-			this.#restoreStoredPrompt(promptDigest, operatorDigest);
+			if (this.#restoreStoredPrompt(promptDigest, operatorDigest)) return;
+			const stored = this.#storedPrompt(promptDigest);
+			const recorded =
+				stored && stored.operatorDigest !== operatorDigest ? this.#recordedHold(promptDigest) : undefined;
+			if (recorded && Date.now() < recorded.since + WITHHELD_CHANGE_MAX_AGE_MS) {
+				this.#restoredTranscript = { ...restored, unkeptHold: true };
+			}
 			return;
 		}
 		const recorded = this.#recordedHold(promptDigest);
@@ -3636,14 +3680,38 @@ export class SessionTools {
 
 	/**
 	 * While the base withholds a change ({@link withholdsPromptChange}), the base prompt that goes out with it: the
-	 * build the base stands in for ({@link #baseStandIn}), else the base itself (a change only the tool definitions
-	 * move with). Undefined while the base withholds nothing. A copy, so nothing a caller does to it reaches the
-	 * session.
+	 * build the base stands in for ({@link #baseStandIn}), which under a held settings rebuild lists the tools and the
+	 * skills that rebuild brings ({@link #basePromptListed}), else the base itself (a change only the tool definitions
+	 * move with, or a kept restored transcript prompt whose held settings were all set back, which is its own build:
+	 * {@link #restoredSettingsSetBack}). Undefined while the base withholds nothing. A copy, so nothing a caller does
+	 * to it reaches the session.
 	 */
 	get withheldPromptBuild(): string[] | undefined {
 		if (!this.withholdsPromptChange) return undefined;
 		const standIn = this.#baseStandIn;
-		return [...(standIn?.base === this.#baseSystemPrompt ? standIn.build : this.#baseSystemPrompt)];
+		const restored = this.#keptRestoredPrompt();
+		const built = standIn?.base === this.#baseSystemPrompt && !(restored && this.#restoredSettingsSetBack(restored));
+		return [...(built ? standIn.build : this.#baseSystemPrompt)];
+	}
+
+	/**
+	 * The tools the session has once the change its base withholds goes out: under a held settings rebuild that
+	 * reapplies the enabled set, the ones that rebuild enables, each at the top level (`active`) or under `xd://`
+	 * (`mounted`) as its apply places it ({@link #basePromptListed}); otherwise the session's own. `enabled` holds
+	 * both. A copy of the session that holds no change (a `/tan` clone) starts with them: the tools the build it sends
+	 * lists ({@link withheldPromptBuild}).
+	 */
+	toolSetAfterHold(): { enabled: string[]; active: string[]; mounted: string[] } {
+		if (!this.#heldSettingsRebuild?.reconcile) {
+			return {
+				enabled: this.getEnabledToolNames(),
+				active: this.getActiveToolNames(),
+				mounted: this.getMountedXdevToolNames(),
+			};
+		}
+		const { toolNames, xdev } = this.#basePromptListed();
+		const mounted = [...(xdev?.mountedNames ?? [])];
+		return { enabled: [...toolNames, ...mounted], active: toolNames, mounted };
 	}
 
 	/** {@link SessionToolsOptions.operatorPromptDigest}: what a `/tan` clone compares a stored prompt against. */
@@ -3658,12 +3726,28 @@ export class SessionTools {
 	}
 
 	/**
+	 * Whether `restored`, the restored transcript prompt, withholds no setting any more: it holds settings, no settings
+	 * rebuild is held, and each setting it holds has the value that prompt was built with again (a sync set it back).
+	 * The stored prompt is then the build that goes out with it ({@link withheldPromptBuild}), and its release keeps
+	 * it ({@link replaceRestoredPromptIfDue}).
+	 */
+	#restoredSettingsSetBack(restored: RestoredPrompt): boolean {
+		if (this.#heldSettingsRebuild || restored.before.size === 0) return false;
+		const settings = this.#host.settings;
+		for (const [setting, value] of restored.before) {
+			if (!settingValuesEqual(value, setting.get(settings))) return false;
+		}
+		return true;
+	}
+
+	/**
 	 * Replaces the kept restored transcript prompt with this process's own build once keeping it buys nothing or the
 	 * change it withholds has waited long enough: `lapsed` (the prompt cache entry the cut rule reads has lapsed or
 	 * cannot be read, so no cached prefix is left to keep), a cut the cut rule admitted that rewrites every message
 	 * ({@link noteRewritingCutAdmitted}), a move to another transcript ({@link leaveRestoredTranscript}), or
 	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} after the change. The rebuild renders the live settings, so a held settings
-	 * rebuild runs with it.
+	 * rebuild runs with it. A restored prompt whose held settings were all set back ({@link #restoredSettingsSetBack})
+	 * is its own build: the release keeps it as the base, and the change it withheld ends.
 	 */
 	replaceRestoredPromptIfDue(lapsed: boolean): Promise<void> {
 		// Nothing runs: no wait behind the registry mutations in flight.
@@ -3671,12 +3755,13 @@ export class SessionTools {
 		return this.runToolRegistryMutation(async () => {
 			const restored = this.#restoredPrompt;
 			if (!restored || this.#host.isDisposed() || !this.#restoredPromptDue(lapsed)) return;
+			const setBack = this.#restoredSettingsSetBack(restored);
 			this.#restoredPrompt = undefined;
 			if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
 			try {
 				if (this.#heldSettingsRebuild) {
 					await this.#absorbHeldSettingsRebuild();
-				} else {
+				} else if (!setBack) {
 					const prepared = await this.#prepareBaseSystemPrompt();
 					prepared?.commit?.();
 				}
@@ -5520,20 +5605,27 @@ export class SessionTools {
 	 * has, each tool they gave as disabled that is enabled now, and each tool they gave as available after the rebuild
 	 * that is not, under the newest notice's change, so the next request counts it as told. Undefined when nothing
 	 * they told is contradicted; a credential, whose value no notice records, and a setting this process does not know
-	 * are left out ({@link noticedSettingStarts}).
+	 * are left out ({@link noticedSettingStarts}). A process that does not keep the transcript's prompt, which holds a
+	 * change whose time has not come, sends that change from its first request ({@link RestoredTranscript.unkeptHold}):
+	 * its first notice says so whether or not anything else is contradicted, names each tool they gave as available
+	 * after the rebuild that is enabled as available now, and each they gave as disabled, listed until the rebuild,
+	 * that is not enabled as gone now: this process's own build does not list it, and its requests do not declare it.
 	 */
 	#releasedSettingsNotice(earlier: EarlierNoticesTold): CustomMessage<SettingsNoticeDetails> | undefined {
 		const { newest } = earlier;
 		if (!newest) return undefined;
 		const { changes, given } = this.#settingChanges(noticedSettingStarts(NO_SETTINGS, earlier), new Map());
 		const enabled = new Set(this.getEnabledToolNames());
+		const restored = this.#restoredTranscript;
+		const unkept = restored?.unkeptHold === true;
 		const tools = {
-			disabledTools: [],
+			disabledTools: unkept ? earlier.disabledTools.filter(name => !enabled.has(name)) : [],
 			reenabledTools: earlier.disabledTools.filter(name => enabled.has(name)),
-			enabledTools: [],
+			enabledTools: unkept ? earlier.enabledTools.filter(name => enabled.has(name)) : [],
 			noLongerEnabledTools: earlier.enabledTools.filter(name => !enabled.has(name)),
 		};
-		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
+		if (!unkept && changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
+		if (restored && unkept) this.#restoredTranscript = { reply: restored.reply, promptDigest: restored.promptDigest };
 		return settingsNoticeMessage(changes, given, tools, newest.hold, newest.notices, undefined);
 	}
 
@@ -5615,23 +5707,22 @@ export class SessionTools {
 	}
 
 	/**
-	 * Renders the base prompt for `toolNames` under `candidate`, the prompt surface its tool getters read. The render
-	 * reads the session's settings, whatever tool call's settings frame the rebuild was started in. With `setBack`,
-	 * each setting there reads its value there where the render reads it through the frame (a setting the prompt
-	 * renders from its value alone, a tool description's among them): a build with a change's settings set back,
-	 * which shows what the prompt moves with ({@link #buildMovers}). Such a build still reads from the session's own
-	 * settings each setting that reaches the prompt through state the session keeps in step with it, and its
-	 * `settingsRead` holds those reads alone.
+	 * Renders the base prompt for `roster`, its tools and the skills it lists, under `candidate`, the prompt surface
+	 * its tool getters read. The render reads the session's settings, whatever tool call's settings frame the rebuild
+	 * was started in. With `setBack`, each setting there reads its value there where the render reads it through the
+	 * frame (a setting the prompt renders from its value alone, a tool description's among them): a build with a
+	 * change's settings set back, which shows what the prompt moves with ({@link #buildMovers}). Such a build still
+	 * reads from the session's own settings each setting that reaches the prompt through state the session keeps in
+	 * step with it, and its `settingsRead` holds those reads alone.
 	 */
 	#renderBasePrompt(
 		rebuildSystemPrompt: SystemPromptRebuilder,
-		toolNames: string[],
-		tools: Map<string, AgentTool>,
-		xdev: XdevState | undefined,
+		{ toolNames, tools, xdev, skills }: PromptRoster & { readonly skills?: readonly Skill[] },
 		candidate: PromptSurface,
 		setBack?: ReadonlyMap<AnySetting, unknown>,
 	) {
-		const render = () => this.#promptSurfaceScope.run(candidate, () => rebuildSystemPrompt(toolNames, tools, xdev));
+		const render = () =>
+			this.#promptSurfaceScope.run(candidate, () => rebuildSystemPrompt(toolNames, tools, xdev, skills));
 		return setBack
 			? this.#toolCallSettingsScope.run(
 					this.#settingsWith(setBack, () => true),
@@ -5641,20 +5732,40 @@ export class SessionTools {
 	}
 
 	/**
-	 * A build of the base prompt for the active tools with each setting of `setBack` at its value there
-	 * ({@link #renderBasePrompt}); undefined when the session builds no prompt.
+	 * What a build of the base prompt lists: the active tools, the `xd://` state and the session's prompt skills, or
+	 * under a held settings rebuild what that rebuild lists ({@link #absorbHeldSettingsRebuild}): the registry's skills
+	 * where it holds a rediscovery, and where it reapplies the enabled set, the tools enabled after it
+	 * ({@link #enabledAfterHold}) that the registry has, each at the top level or under `xd://` as that apply places
+	 * it ({@link #xdevMountNames}). A build under the hold is so the build the rebuild commits, the prompt that goes out
+	 * with the change, which a copy of the session sends ({@link withheldPromptBuild}).
+	 */
+	#basePromptListed(): PromptRoster & { readonly skills?: readonly Skill[] } {
+		const held = this.#heldSettingsRebuild;
+		const skills = held?.skills ? this.#skills : undefined;
+		const xdev = this.#xdev;
+		if (!held?.reconcile) return { toolNames: this.getActiveToolNames(), tools: this.#toolRegistry, xdev, skills };
+		const selected = normalizeToolNames(this.#enabledAfterHold(held)).flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [{ name, tool }] : [];
+		});
+		const mounted = this.#xdevMountNames(selected, this.#builtInToolNames.has("write"));
+		return {
+			toolNames: selected.flatMap(({ name }) => (mounted.has(name) ? [] : [name])),
+			tools: this.#toolRegistry,
+			xdev: xdev && !sameItems([...xdev.mountedNames], [...mounted]) ? { ...xdev, mountedNames: mounted } : xdev,
+			skills,
+		};
+	}
+
+	/**
+	 * A build of the base prompt for what it lists ({@link #basePromptListed}) with each setting of `setBack` at its
+	 * value there ({@link #renderBasePrompt}); undefined when the session builds no prompt.
 	 */
 	async #renderSetBack(setBack: ReadonlyMap<AnySetting, unknown>) {
 		const rebuildSystemPrompt = this.#rebuildSystemPrompt;
 		if (this.#host.isDisposed() || !rebuildSystemPrompt) return undefined;
-		return this.#renderBasePrompt(
-			rebuildSystemPrompt,
-			this.getActiveToolNames(),
-			this.#toolRegistry,
-			this.#xdev,
-			this.#derivePromptSurface(),
-			setBack,
-		);
+		const listed = this.#basePromptListed();
+		return this.#renderBasePrompt(rebuildSystemPrompt, listed, this.#derivePromptSurface(listed.skills), setBack);
 	}
 
 	async #prepareBaseSystemPrompt(isCurrent?: () => boolean): Promise<SystemPromptPreparation | undefined> {
@@ -5676,15 +5787,11 @@ export class SessionTools {
 		// published to {@link #promptSurface} here — an abandoned, stale or
 		// throwing preparation leaves the committed snapshot untouched, and the
 		// scope frame (not a rollback write) guarantees no clobbering of a newer
-		// winner.
-		const candidate = this.#derivePromptSurface();
-		const built = await this.#renderBasePrompt(
-			rebuildSystemPrompt,
-			activeToolNames,
-			this.#toolRegistry,
-			this.#xdev,
-			candidate,
-		);
+		// winner. Under a held settings rebuild the render lists what that rebuild
+		// lists, so it is the build that rebuild commits ({@link #basePromptListed}).
+		const listed = this.#basePromptListed();
+		const candidate = this.#derivePromptSurface(listed.skills);
+		const built = await this.#renderBasePrompt(rebuildSystemPrompt, listed, candidate);
 		// A rebuild that renders the build the base stands in for again changes nothing of its own: the base keeps
 		// its bytes. Under a held settings rebuild the tool definitions keep theirs too; otherwise they follow this
 		// process's state, as its own build's would.
@@ -5760,13 +5867,7 @@ export class SessionTools {
 			...this.#derivePromptSurface(),
 			evalToolNames: this.#promptSurface.evalToolNames,
 		};
-		const built = await this.#renderBasePrompt(
-			rebuildSystemPrompt,
-			roster.toolNames,
-			roster.tools,
-			roster.xdev,
-			candidate,
-		);
+		const built = await this.#renderBasePrompt(rebuildSystemPrompt, roster, candidate);
 		if (!sameItems(built.systemPrompt, previousBaseSystemPrompt)) return undefined;
 		return this.#keptBasePreparation(previousBaseSystemPrompt, candidate, isCurrent);
 	}

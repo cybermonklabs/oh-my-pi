@@ -7695,6 +7695,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * The tools the session has once the change its base withholds goes out, at the top level (`active`) or under
+	 * `xd://` (`mounted`); its own while it withholds none ({@link SessionTools.toolSetAfterHold}). A `/tan` clone starts
+	 * with them, the tools the build it sends lists.
+	 */
+	toolSetAfterHold(): { enabled: string[]; active: string[]; mounted: string[] } {
+		return this.#tools.toolSetAfterHold();
+	}
+
+	/**
 	 * Keeps a subagent transcript's latest `session_init` on the base prompt and work-pool yield items
 	 * its model calls are built from, appending a newer one when either changes: signed thinking is
 	 * bound to the system prompt and tools, so cold revival must replay them. A per-turn override is

@@ -928,9 +928,10 @@ export interface CreateAgentSessionOptions {
 	parentMnemopiSessionState?: MnemopiSessionStateApi;
 	/**
 	 * The session a `/tan` clone forks while that session withholds a change (a held settings change, a kept restored
-	 * prompt): the clone's fixed `systemPrompt` is that session's build ({@link AgentSession.withheldPromptBuild}), so
-	 * the clone restores the prompt its copied transcript stores, which that session's operator inputs built, and sends
-	 * its fixed prompt once the change goes out. The digest it compares is read from the session itself.
+	 * prompt), given while the clone declares the tools that session's requests declare: the clone's fixed
+	 * `systemPrompt` is that session's build ({@link AgentSession.withheldPromptBuild}), so the clone restores the
+	 * prompt its copied transcript stores, which that session's operator inputs built, and sends its fixed prompt once
+	 * the change goes out. The digest it compares is read from the session itself.
 	 */
 	tanParent?: AgentSession;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
@@ -4313,6 +4314,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolNames,
 			tools,
 			xdev,
+			listedSkills,
 		): Promise<BuildSystemPromptResult> => {
 			const promptCwd = sessionManager.getCwd();
 			// The settings this build renders from: the session's, or inside a settings frame (`ToolSession.settings`:
@@ -4540,7 +4542,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				xdevDocs: xdevPromptDocs ? renderXdevPromptDocs(xdevPromptDocs, routedCatalogNames) : "",
 				resolvedCustomPrompt: options.customSystemPrompt,
 				systemPromptTemplate: options.systemPromptTemplate,
-				skills: cfgSkillful.get(settings) ? (session?.promptSkills ?? skills) : [],
+				skills: cfgSkillful.get(settings) ? (listedSkills ?? session?.promptSkills ?? skills) : [],
 				skillDescriptions,
 				contextFiles,
 				tools: promptTools,
@@ -4606,8 +4608,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		};
 		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
 		// them, whether or not a listener rebuilds the prompt for it (`SessionTools.holdToolDeclarationChange`).
-		const rebuildSystemPrompt: SystemPromptRebuilder = async (toolNames, tools, xdev) => {
-			const { value, read } = await trackSettingsReads(settings, () => renderSystemPrompt(toolNames, tools, xdev));
+		const rebuildSystemPrompt: SystemPromptRebuilder = async (toolNames, tools, xdev, listedSkills) => {
+			const { value, read } = await trackSettingsReads(settings, () =>
+				renderSystemPrompt(toolNames, tools, xdev, listedSkills),
+			);
 			return { ...value, settingsRead: read };
 		};
 
