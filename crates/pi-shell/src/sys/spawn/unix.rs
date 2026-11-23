@@ -15,6 +15,11 @@
 //! and an open in the child may wait for a FIFO's other end, which only the
 //! child may do (`fork_redirs`).
 //!
+//! **glibc's own signals**, 32 and 33, reach every external as bash's fork
+//! and exec leaves them: ignored when the process ignores them, else at
+//! their default (`internal`). An ignore the process inherited is passed
+//! on only on glibc 2.34 or later (see `internal`).
+//!
 //! **Placement** follows [`Sessions`]: `Detach` makes every external a
 //! session leader; `Share` uses the `setpgid` leader idiom (`New` leads a
 //! group, `Join` joins one) but never joins a group whose leader is in
@@ -431,12 +436,21 @@ impl State {
 
 	/// Whether `posix_spawn` can express a spec with this umask and these
 	/// ignored signals (it can neither set a umask nor ignore a signal; the
-	/// child inherits both from the host).
+	/// child inherits both from the host), glibc's own included
+	/// (`internal::spawnable`).
 	#[cfg_attr(
 		not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))),
 		allow(dead_code, reason = "no posix_spawn path on this target")
 	)]
 	fn posix_eligible(&self, umask: u32, ign: SigSet) -> bool {
+		#[cfg(all(
+			target_os = "linux",
+			target_env = "gnu",
+			any(target_arch = "x86_64", target_arch = "aarch64")
+		))]
+		if !internal::spawnable() {
+			return false;
+		}
 		self.umask == Some(umask) && ign.iter().all(host_ignores)
 	}
 
@@ -683,6 +697,203 @@ fn host_ignored() -> [bool; NSIG] {
 fn host_ignores(sig: Signal) -> bool {
 	let n = usize::from(sig.number(Platform::current()));
 	host_ignored().get(n).copied().unwrap_or(false)
+}
+
+/// glibc's own signals, 32 (`SIGCANCEL`) and 33 (`SIGSETXID`), which its
+/// `sigaction`, `signal` and `sigaddset` refuse: read and set with the
+/// system call, and put in a `sigset_t` by bit. An external starts with
+/// each ignored when the process ignores it ([`internal::ignored`]), else
+/// at its default, on every path. An ignore the process inherited and
+/// glibc then replaced with its own handler is passed on only on glibc 2.34
+/// or later ([`internal::IGNORED_AT_LOAD`]). Only on `x86_64` and aarch64,
+/// whose layouts below are checked: elsewhere glibc's `posix_spawn` decides.
+#[cfg(all(
+	target_os = "linux",
+	target_env = "gnu",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod internal {
+	use std::{
+		ffi::CStr,
+		io, ptr,
+		sync::{
+			LazyLock,
+			atomic::{AtomicU8, Ordering},
+		},
+	};
+
+	/// The signals, in the order of [`ignored`]'s answer.
+	pub(super) const SIGNALS: [i32; 2] = [32, 33];
+
+	/// The kernel's `struct sigaction` on `x86_64` and aarch64, as words:
+	/// handler, flags, restorer, mask.
+	pub(super) type Action = [usize; 4];
+
+	/// The handler's word of an [`Action`].
+	pub(super) const HANDLER: usize = 0;
+
+	/// An action with `handler`, no flags and an empty mask.
+	pub(super) const fn with_handler(handler: libc::sighandler_t) -> Action {
+		[handler, 0, 0, 0]
+	}
+
+	/// `sig`'s action, replaced by `new` when given. Async-signal-safe.
+	pub(super) fn action(sig: i32, new: Option<&Action>) -> io::Result<Action> {
+		let mut old: Action = [0; 4];
+		// SAFETY: `new` is null or a valid action, `old` is writable and as
+		// large as the kernel's struct, and the kernel's sigset is 8 bytes.
+		let rc = unsafe {
+			libc::syscall(
+				libc::SYS_rt_sigaction,
+				sig,
+				new.map_or(ptr::null(), ptr::from_ref),
+				&raw mut old,
+				size_of::<u64>(),
+			)
+		};
+		if rc == 0 {
+			Ok(old)
+		} else {
+			Err(io::Error::last_os_error())
+		}
+	}
+
+	/// Set once read: [`IGNORED_AT_LOAD`] holds the reading at load.
+	pub(super) const READ: u8 = 0x80;
+
+	/// Bit `i` set: the process ignored `SIGNALS[i]` when it was loaded
+	/// ([`READ`] marks the reading done).
+	pub(super) static IGNORED_AT_LOAD: AtomicU8 = AtomicU8::new(0);
+
+	/// Fills [`IGNORED_AT_LOAD`] when the program or library is loaded. On
+	/// glibc 2.34 or later, glibc gives `SIGSETXID` a handler of its own at
+	/// the process's first thread (and `SIGCANCEL` at its first
+	/// `pthread_cancel`), so a later reading cannot see it was ignored; a
+	/// program reads before any thread. A library loaded into a process
+	/// that already runs threads reads that process's handler, and its
+	/// children get the default. On glibc 2.33 and older, libpthread
+	/// installs both handlers in its preinit function, which runs before
+	/// every other initializer (`-z initfirst`), so this reading never sees
+	/// an inherited ignore and children get both at the default. obash's
+	/// `--fault-mode=exec` re-exec loses the reading too: the exec resets
+	/// glibc's handlers to the default before the new image reads.
+	#[used]
+	#[unsafe(link_section = ".init_array")]
+	static READ_AT_LOAD: extern "C" fn() = read_at_load;
+
+	extern "C" fn read_at_load() {
+		let mut bits = READ;
+		for (i, sig) in SIGNALS.into_iter().enumerate() {
+			if action(sig, None).is_ok_and(|a| a[HANDLER] == libc::SIG_IGN) {
+				bits |= 1 << i;
+			}
+		}
+		IGNORED_AT_LOAD.store(bits, Ordering::Relaxed);
+	}
+
+	/// Whether an external starts with each of [`SIGNALS`] ignored: when
+	/// the process ignores it, or ignored it at load and glibc has given it
+	/// a handler since (bash starts no thread, so its children keep it
+	/// ignored).
+	pub(super) fn ignored() -> [bool; 2] {
+		// The address keeps the object holding the load-time reading in
+		// every program that spawns.
+		let _ = std::hint::black_box(&raw const READ_AT_LOAD);
+		let at_load = IGNORED_AT_LOAD.load(Ordering::Relaxed);
+		std::array::from_fn(|i| {
+			action(SIGNALS[i], None).is_ok_and(|a| {
+				let handler = a[HANDLER];
+				handler == libc::SIG_IGN || (handler != libc::SIG_DFL && at_load & (1 << i) != 0)
+			})
+		})
+	}
+
+	/// Add the signals an external is not to ignore to `set`, a
+	/// `posix_spawn` default set. A glibc child that does not use `clone3`
+	/// (glibc before 2.38, or a seccomp filter answering `ENOSYS`) sets
+	/// both to `SIG_IGN` before the exec unless they are in that set;
+	/// `posix_spawnattr_setsigdefault` copies the set as it is.
+	pub(super) fn add_defaults(set: &mut libc::sigset_t) {
+		// glibc's `sigset_t` is `unsigned long[1024 / 64]`: signal n is bit
+		// (n - 1) % 64 of word (n - 1) / 64.
+		const _: () = assert!(
+			size_of::<libc::sigset_t>() == 16 * size_of::<u64>()
+				&& align_of::<libc::sigset_t>() == align_of::<u64>()
+		);
+		let word = ptr::from_mut(set).cast::<u64>();
+		for (sig, ignored) in SIGNALS.into_iter().zip(ignored()) {
+			if !ignored {
+				// SAFETY: the set's first word (layout asserted above).
+				unsafe { *word |= 1 << (sig - 1) };
+			}
+		}
+	}
+
+	/// Whether `posix_spawn` can give an external these signals as
+	/// [`ignored`] says. It cannot ignore one the process no longer ignores
+	/// (ignored at load, glibc's handler now) unless glibc's child ignores
+	/// it itself ([`spawn_ignores`]), as where the process got it ignored.
+	/// The reading costs system calls only when the process ignored one at
+	/// load.
+	pub(super) fn spawnable() -> bool {
+		let at_load = IGNORED_AT_LOAD.load(Ordering::Relaxed);
+		at_load & 0b11 == 0
+			|| spawn_ignores()
+			|| SIGNALS.into_iter().enumerate().all(|(i, sig)| {
+				at_load & (1 << i) == 0
+					|| action(sig, None)
+						.is_ok_and(|a| a[HANDLER] == libc::SIG_IGN || a[HANDLER] == libc::SIG_DFL)
+			})
+	}
+
+	/// Whether glibc's `posix_spawn` child sets these signals itself, to
+	/// `SIG_IGN` unless the default set names them: where it does not use
+	/// `clone3` (glibc before 2.38, or `clone3` refused). Read once. The
+	/// probe counts only ENOSYS (a seccomp filter or a kernel without the
+	/// call); glibc also takes its old child on EINVAL (kernels 5.3 and 5.4,
+	/// which have `clone3` but not `CLONE_CLEAR_SIGHAND`). That miss is
+	/// safe: `spawnable()` then sends only the specs ignored at load and
+	/// under glibc's handler now to the fork path, which sets them right.
+	pub(super) fn spawn_ignores() -> bool {
+		*OLD_SPAWN_PATH
+	}
+
+	/// Whether the running glibc is at least `major.minor` (`false` when its
+	/// version string does not parse).
+	pub(super) fn glibc_at_least(major: u32, minor: u32) -> bool {
+		// SAFETY: glibc returns a static NUL-terminated string.
+		let version = unsafe { CStr::from_ptr(libc::gnu_get_libc_version()) };
+		let mut parts = version.to_bytes().split(|&b| b == b'.').map(|p| {
+			std::str::from_utf8(p)
+				.ok()
+				.and_then(|p| p.parse::<u32>().ok())
+		});
+		match (parts.next().flatten(), parts.next().flatten()) {
+			(Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
+			_ => false,
+		}
+	}
+
+	static OLD_SPAWN_PATH: LazyLock<bool> = LazyLock::new(|| {
+		let before_2_38 = !glibc_at_least(2, 38);
+		// SAFETY: with no arguments and size 0 the kernel refuses the call
+		// (EINVAL) before it creates anything; a seccomp filter or a kernel
+		// without the call answers ENOSYS.
+		let refused = unsafe {
+			libc::syscall(libc::SYS_clone3, ptr::null::<libc::c_void>(), 0usize) == -1
+				&& io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+		};
+		before_2_38 || refused
+	});
+
+	/// In a forked child: give the signals the dispositions [`ignored`]
+	/// read before the fork. Async-signal-safe.
+	pub(super) fn apply(ignored: [bool; 2]) {
+		for (sig, ign) in SIGNALS.into_iter().zip(ignored) {
+			let handler = if ign { libc::SIG_IGN } else { libc::SIG_DFL };
+			let _ = action(sig, Some(&with_handler(handler)));
+		}
+	}
 }
 
 /// Everything `launch` needs besides the fds.
@@ -1159,6 +1370,12 @@ fn fork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Res
 		.collect();
 	let closed = prog.closed.to_vec();
 	let ignore = ignored(prog.ign);
+	#[cfg(all(
+		target_os = "linux",
+		target_env = "gnu",
+		any(target_arch = "x86_64", target_arch = "aarch64")
+	))]
+	let glibc_ignored = internal::ignored();
 	let mask = prog.umask as libc::mode_t;
 	let limits = limits(prog);
 	let session = place == Place::Session;
@@ -1167,8 +1384,8 @@ fn fork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Res
 		cmd.process_group(pgid);
 	}
 	// SAFETY: the hook runs in the forked child before exec and calls only
-	// async-signal-safe functions (umask, dup2, close, signal, setsid,
-	// execve) on data prepared before the fork, without allocating.
+	// async-signal-safe functions (umask, dup2, close, signal, sigaction,
+	// setsid, execve) on data prepared before the fork, without allocating.
 	unsafe {
 		cmd.pre_exec(move || {
 			// Use the whole value: a closure naming only `exec.argv` would
@@ -1196,6 +1413,12 @@ fn fork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Res
 				}
 				libc::signal(n, if ign { libc::SIG_IGN } else { libc::SIG_DFL });
 			}
+			#[cfg(all(
+				target_os = "linux",
+				target_env = "gnu",
+				any(target_arch = "x86_64", target_arch = "aarch64")
+			))]
+			internal::apply(glibc_ignored);
 			if session && libc::setsid() < 0 {
 				return Err(io::Error::last_os_error());
 			}
@@ -1578,6 +1801,12 @@ fn fork_redirs(
 		.filter(|&n| n > 0)
 		.unwrap_or(1 << 16);
 	let ignore = ignored(prog.ign);
+	#[cfg(all(
+		target_os = "linux",
+		target_env = "gnu",
+		any(target_arch = "x86_64", target_arch = "aarch64")
+	))]
+	let glibc_ignored = internal::ignored();
 	let mask = prog.umask as libc::mode_t;
 	let limits = limits(prog);
 	let raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
@@ -1668,6 +1897,12 @@ fn fork_redirs(
 				}
 				libc::signal(n, if ign { libc::SIG_IGN } else { libc::SIG_DFL });
 			}
+			#[cfg(all(
+				target_os = "linux",
+				target_env = "gnu",
+				any(target_arch = "x86_64", target_arch = "aarch64")
+			))]
+			internal::apply(glibc_ignored);
 			// Only now may pending signals arrive: they act as on the program.
 			let empty = std::mem::zeroed::<libc::sigset_t>();
 			libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut());
@@ -2179,7 +2414,8 @@ mod posix {
 	/// `posix_spawn` `exec` with `fds` installed and the targets `closed`
 	/// closed after, at `place`, with every signal not in `ign` at its
 	/// default: the ones the host ignores are reset (`exec` resets caught
-	/// ones; glibc's child spends a `sigaction` on each signal of the set).
+	/// ones; glibc's child spends a `sigaction` on each signal of the set),
+	/// and glibc's own unless the host ignores them (`internal`).
 	/// `add_chdir` is the resolved libc entry point, one value for the
 	/// process, so the cached action list does not key on it.
 	pub fn spawn(
@@ -2293,6 +2529,12 @@ mod posix {
 						libc::sigaddset(&raw mut defaults, n as i32);
 					}
 				}
+				#[cfg(all(
+					target_os = "linux",
+					target_env = "gnu",
+					any(target_arch = "x86_64", target_arch = "aarch64")
+				))]
+				super::internal::add_defaults(&mut defaults);
 				check(libc::posix_spawnattr_setflags(attr.ptr(), flags as libc::c_short))?;
 				check(libc::posix_spawnattr_setsigmask(attr.ptr(), &raw const empty))?;
 				check(libc::posix_spawnattr_setsigdefault(attr.ptr(), &raw const defaults))?;
