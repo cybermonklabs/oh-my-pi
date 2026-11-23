@@ -254,6 +254,9 @@ fn launch(
 			notes.push(b'\n');
 		},
 	}
+	if let Some(flow) = exec::fork_failed(k, vp, cx, 1, exec::line_of(vp, 0)) {
+		return Some(flow);
+	}
 	let mut child = match fresh_shell(k, cx, vp, args, pairs, dollar0, origin) {
 		Ok(child) => child,
 		Err(err) => {

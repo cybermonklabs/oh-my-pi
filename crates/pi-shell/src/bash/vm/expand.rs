@@ -27,7 +27,8 @@ use crate::bash::{
 	diag::Diag,
 	event::WaitKey,
 	ir::{
-		CaseIr, ComsubForm, OpIr, ParamIr, ParamRef, Part, ReplaceIr, SubIr, Unit, Word, WordKind,
+		CaseIr, ComsubForm, OpIr, Opcode, ParamIr, ParamRef, Part, ReplaceIr, SubIr, Unit, Word,
+		WordKind,
 	},
 	pattern::{PatOpts, Pattern},
 	store::{Attrs, Elem, OptId, StoreError, VarValue},
@@ -101,6 +102,9 @@ pub enum Stop {
 	/// A fatal expansion error (`${x?}`, `set -u`): a non-interactive shell
 	/// exits.
 	Fatal(Diag),
+	/// A process substitution needed a vpid and none is left: the command
+	/// fails as when the shell cannot fork ([`super::exec::fork_failure`]).
+	ForkFailed,
 	/// The state store failed.
 	Store(StoreError),
 }
@@ -980,7 +984,11 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
-					let p = super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output);
+					let Some(p) =
+						super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output)
+					else {
+						return Err(Stop::ForkFailed);
+					};
 					self.note(|| Atom::Str(Some(p.clone())));
 					p
 				};
@@ -1020,6 +1028,21 @@ impl<'e, 'c> Expander<'e, 'c> {
 		form: ComsubForm,
 		text: Option<u32>,
 	) -> X<BString> {
+		// A `$( )` with no command (`$()`, `$( )`, only comments or blank
+		// lines, empty backquotes) runs nothing: bash's `command_substitute`
+		// returns at once, without a fork, and leaves `$?` alone (`false;
+		// echo "$( )" $?` prints 1). So no vproc is made and nothing is
+		// logged; none is needed with no vpid left either. Only bash words
+		// come here: a zsh unit's words are `Part::Zsh`, whose `$( )` zsh
+		// forks for (zsh 5.9 under `ulimit -u 1`).
+		if form == ComsubForm::Fork
+			&& unit
+				.ops
+				.get(entry as usize)
+				.is_some_and(|op| op.code == Opcode::SubExit)
+		{
+			return Ok(BString::default());
+		}
 		// A word compiled as unable to park (no replay log) can still meet
 		// a command substitution in run-time text (a nameref's subscript,
 		// `declare -n r='a[$(cmd)]'`). The executor logs every finished
@@ -2888,7 +2911,20 @@ fn dynamic_value(
 		b"BASH_CMDS" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::CmdHash)?),
 		b"BASH_ALIASES" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::Alias)?),
 		b"DIRSTACK" => DynVal::List(super::builtins::dirstack::dirstack_value(cx.store, vp)?),
-		b"BASHPID" => DynVal::Str(BString::from(vp.vpid.0.format_into(&mut NumBuffer::new()))),
+		// bash: the shell's own process outside a subshell, `$$`; a
+		// subshell's own (here its vpid). A nested in-engine shell's `$$` is
+		// its vpid already.
+		b"BASHPID" => DynVal::Str(match vp.parent {
+			None => match state::record(
+				cx.store,
+				vp,
+				crate::bash::store::Key::Misc(crate::bash::store::MiscKey::ShellPid),
+			)? {
+				Some(crate::bash::store::Record::Misc(v)) => v.clone(),
+				_ => BString::from(k.shell_pid.format_into(&mut NumBuffer::new())),
+			},
+			Some(_) => BString::from(vp.vpid.0.format_into(&mut NumBuffer::new())),
+		}),
 		b"BASH_SUBSHELL" => {
 			DynVal::Str(BString::from(super::subshell_depth(vp).format_into(&mut NumBuffer::new())))
 		},
@@ -3936,6 +3972,7 @@ impl arith::Env for Vars<'_, '_> {
 			},
 			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
+			Err(Stop::ForkFailed) => Diag::ForkFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. } | Stop::MathCall(_)) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),
 			},
@@ -3967,6 +4004,7 @@ impl arith::Env for Vars<'_, '_> {
 			},
 			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
+			Err(Stop::ForkFailed) => Diag::ForkFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. } | Stop::MathCall(_)) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),
 			},

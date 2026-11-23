@@ -1013,7 +1013,10 @@ fn procsubst(ex: &mut Expander<'_, '_>, c: u8, body: &[u8]) -> X<Vec<u8>> {
 	if let Some(Atom::Str(Some(p))) = replay(ex) {
 		return Ok(metafy(&p));
 	}
-	let p = crate::bash::vm::exec::start_zsh_procsub(ex.k, ex.vp, ex.cx, &unmetafy(&b), kind);
+	let Some(p) = crate::bash::vm::exec::start_zsh_procsub(ex.k, ex.vp, ex.cx, &unmetafy(&b), kind)
+	else {
+		return Err(Stop::ForkFailed);
+	};
 	note(ex, || Atom::Str(Some(p.clone())));
 	Ok(metafy(&p))
 }

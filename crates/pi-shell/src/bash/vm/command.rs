@@ -2276,6 +2276,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		},
 		Target::Refused { path, code } => refused(k, vp, cx, line, &path, code),
 		Target::Tool(tool) => {
+			// bash forks for the external program a host tool stands for, and
+			// the tool's subshell needs a vpid: with none left it fails as
+			// that fork does.
+			if let Some(flow) = super::exec::fork_failed(k, vp, cx, 1, line) {
+				return Some(flow);
+			}
 			let (env, umask) =
 				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
 					Ok(v) => v,
@@ -5191,6 +5197,9 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 		text.push(b'\'');
 	}
 	text.push(b'\n');
+	if let Some(flow) = super::exec::fork_failed(k, vp, cx, 1, line) {
+		return Some(flow);
+	}
 	let child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });

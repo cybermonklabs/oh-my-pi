@@ -692,6 +692,80 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	}
 }
 
+/// No vpid is left for a command that needs `needed` ([`Kernel::vpids_left`];
+/// none is given past [`Vpid::CEILING`] and none twice): the command fails
+/// before it builds anything ([`fork_failure`]). `None`: there is room.
+pub(super) fn fork_failed(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	needed: u32,
+	line: u32,
+) -> Option<Flow> {
+	(k.vpids_left() < needed).then(|| fork_failure(k, vp, cx, line))
+}
+
+/// A command needed a vpid and none is left: what follows when bash cannot
+/// fork. bash prints `fork: Resource temporarily unavailable` and leaves
+/// as `exit 254` does (the EXIT trap runs; in a subshell only the subshell
+/// ends); an interactive shell drops the command instead (bash
+/// `throw_to_top_level`). zsh prints `fork failed: …` with its line and
+/// abandons the script or subshell with 1 ([`zsh_discard`]), and its EXIT
+/// trap does not run, unlike after other errors (zsh 5.9 under `ulimit -u
+/// 1`; a `${x:?}` error does run it).
+pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Flow {
+	fork_message(k, vp, cx, line);
+	if vp.mode.dialect() == Dialect::Zsh {
+		if let Some(run) = vp.runs.front_mut() {
+			run.exit_trap_started = true;
+		}
+		if vp.transient {
+			vp.exit_trap_run = true;
+		}
+		return Flow::Discard(1);
+	}
+	let interactive = vp.parent.is_none()
+		&& matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
+			Ok(Some(Record::Misc(v))) if v.as_slice() == b"1"
+		);
+	if interactive {
+		Flow::Discard(254)
+	} else {
+		Flow::Exit(254)
+	}
+}
+
+/// The message of [`fork_failure`] alone, in the vproc's dialect: bash's
+/// `fork: Resource temporarily unavailable` (no line), zsh's `fork failed:
+/// resource temporarily unavailable` (with its line where zsh prints one).
+pub(crate) fn fork_message(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) {
+	let diag = if vp.mode.dialect() == Dialect::Zsh {
+		Diag::ZshForkFailed
+	} else {
+		Diag::ForkFailed
+	};
+	k.diag(cx, vp, line, diag);
+}
+
+/// Whether the expansion stopped at `stop` for a substitution that needs a
+/// vproc, and no vpid is left for one ([`Kernel::vpids_left`]): a `$( )`
+/// that forks (not a `$(< file)`, which [`start_sub`] reads in the shell), a
+/// zsh `$(…)` that is not a hook call run in the shell, or a process
+/// substitution that already found none ([`Stop::ForkFailed`]). The
+/// interactive reader fails such a prompt expansion instead of starting it
+/// ([`super::zle::reader`]).
+pub(crate) fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
+	match stop {
+		Stop::ForkFailed => true,
+		Stop::Sub { form: ComsubForm::Fork, unit, entry, .. } => {
+			unit.cat_exec(*entry).is_none() && k.vpids_left() == 0
+		},
+		Stop::ZshSub { here: false, .. } => k.vpids_left() == 0,
+		_ => false,
+	}
+}
+
 /// Start this vproc's EXIT trap, at most once for a forked subshell: it has
 /// no [`Run`](super::proc::Run) to keep `exit_trap_started` on, and
 /// `own_traps`, `trap_frames` and the frame scans all return to their
@@ -2336,6 +2410,8 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 		// `$!` of a job still deciding on its pid: the op runs again (and
 		// replays) once it has.
 		Stop::Wait(key) => Flow::Block(key),
+		// A process substitution found no vpid left.
+		Stop::ForkFailed => fork_failure(k, vp, cx, line),
 		// An expansion that cannot park (a glob qualifier's) met `=cmd`.
 		Stop::Probe(_) => {
 			k.diag(cx, vp, line, Diag::Unsupported { what: "`=cmd` in this expansion".into() });
@@ -2488,6 +2564,9 @@ pub fn start_sub(
 			Flow::Call
 		},
 		ComsubForm::Fork => {
+			if let Some(flow) = fork_failed(k, vp, cx, 1, line) {
+				return flow;
+			}
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
 			// Outside posix mode bash parses `$( )` without aliases and
@@ -2606,6 +2685,9 @@ pub fn start_zsh_sub(
 		push_script(vp, text, line, ScriptKind::Hook);
 		return Flow::Call;
 	}
+	if let Some(flow) = fork_failed(k, vp, cx, 1, line) {
+		return flow;
+	}
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
@@ -2639,7 +2721,11 @@ pub fn start_zsh_procsub(
 	cx: &mut Cx<'_>,
 	text: &[u8],
 	kind: ZshProcSub,
-) -> BString {
+) -> Option<BString> {
+	// `None`: no vpid is left ([`Stop::ForkFailed`]); nothing is built.
+	if k.vpids_left() == 0 {
+		return None;
+	}
 	let output = kind == ZshProcSub::Output;
 	let (r, w) = mem::pipe();
 	let (r, w) = (FdRef::mem(r), FdRef::mem(w));
@@ -2675,7 +2761,7 @@ pub fn start_zsh_procsub(
 		KeyBuf::Misc(MiscKey::ZshProcsubstPid),
 		Some(rec),
 	);
-	BString::from(format!("/dev/fd/{fd}"))
+	Some(BString::from(format!("/dev/fd/{fd}")))
 }
 
 /// `${ ;}` bodies re-parsed while no alias is defined, by the unit and
@@ -2785,7 +2871,11 @@ pub fn start_procsub(
 	unit: &Arc<Unit>,
 	entry: u32,
 	output: bool,
-) -> BString {
+) -> Option<BString> {
+	// `None`: no vpid is left ([`Stop::ForkFailed`]); nothing is built.
+	if k.vpids_left() == 0 {
+		return None;
+	}
 	let (r, w) = mem::pipe();
 	let r = FdRef::mem(r);
 	let w = FdRef::mem(w);
@@ -2817,7 +2907,7 @@ pub fn start_procsub(
 	vp.procsubs.push((vp.frames.len() as u32, fd));
 	// bash: a process substitution sets `$!` (`wait $!` waits for it).
 	vp.last_bg = LastBg::new(vpid);
-	BString::from(format!("/dev/fd/{fd}"))
+	Some(BString::from(format!("/dev/fd/{fd}")))
 }
 
 /// The op of frame `fi` is over: drop its scratch, close its process
@@ -4255,6 +4345,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.as_ref()
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
+		// Every child it starts needs a vpid: none is built unless all fit
+		// (a pipeline counts each stage but one run in the shell itself).
+		let here = info.kind == SpawnKind::Pipeline && last_stage_here(k, cx, vp, unit);
+		let needed = u32::try_from(info.stages.len() - usize::from(here)).unwrap_or(u32::MAX);
+		if let Some(flow) = fork_failed(k, vp, cx, needed, line_of(vp, op.node)) {
+			return flow;
+		}
 		// A job that forks (a subshell, pipeline, job or coprocess of its
 		// own) is not just one program: it keeps its virtual pid. The
 		// pipeline a job's body is passes the decision to its last stage
@@ -4338,16 +4435,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			SpawnKind::Pipeline => {
 				let n = info.stages.len();
 				let tap = cx.host.pipe_tap();
-				// `lastpipe` without job control: the last stage runs here. zsh
-				// runs it in the current shell but under sh emulation
-				// (`execcmd_exec`'s `last1 == 2 && input &&
-				// EMULATION(EMULATE_SH)`).
-				let lastpipe = if unit.mode.dialect() == Dialect::Zsh {
-					vp.mode != ModeId::ZshSh
-				} else {
-					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
-						&& !job_control(k, cx, vp)
-				};
+				let lastpipe = last_stage_here(k, cx, vp, unit);
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
@@ -4490,6 +4578,18 @@ pub(super) fn job_text(
 			BString::from(crate::bash::syntax::command_string(p.commands[0].list()))
 		},
 		_ => src,
+	}
+}
+
+/// Whether a pipeline's last stage runs in the shell itself: bash
+/// `lastpipe` without job control; zsh's always, but under sh emulation
+/// (`execcmd_exec`'s `last1 == 2 && input && EMULATION(EMULATE_SH)`).
+fn last_stage_here(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, unit: &Unit) -> bool {
+	if unit.mode.dialect() == Dialect::Zsh {
+		vp.mode != ModeId::ZshSh
+	} else {
+		state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+			&& !job_control(k, cx, vp)
 	}
 }
 
