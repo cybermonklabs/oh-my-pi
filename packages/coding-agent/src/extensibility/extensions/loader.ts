@@ -47,7 +47,9 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
+	ExtensionPathEntry,
 	ExtensionRuntime as IExtensionRuntime,
+	ExtensionScope,
 	LoadExtensionsResult,
 	MessageRenderer,
 	PreparedExtension,
@@ -541,8 +543,12 @@ async function runExtensionFactory(
 	}
 }
 
-/** Import one extension module and resolve its factory without binding it to a session. */
-export async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
+/**
+ * Import one extension module and resolve its factory without binding it to a session. The prepared extension keeps
+ * `entry`'s path and scope.
+ */
+export async function importExtensionModule(entry: ExtensionPathEntry, cwd: string): Promise<PreparedExtension> {
+	const { path: extensionPath, scope } = entry;
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
@@ -551,16 +557,23 @@ export async function importExtensionModule(extensionPath: string, cwd: string):
 		if (typeof factory !== "function") {
 			return {
 				path: extensionPath,
+				scope,
 				factory: null,
 				resolvedPath,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
 			};
 		}
 
-		return { path: extensionPath, factory, resolvedPath, error: null };
+		return { path: extensionPath, scope, factory, resolvedPath, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
+		return {
+			path: extensionPath,
+			scope,
+			factory: null,
+			resolvedPath,
+			error: `Failed to load extension: ${message}`,
+		};
 	}
 }
 
@@ -604,7 +617,7 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from paths.
+ * Load extensions from path entries; each prepared extension keeps its entry's scope.
  *
  * Module import (the dominant cold-start cost — file I/O plus module
  * evaluation) runs concurrently across extensions; factory binding then runs
@@ -612,12 +625,12 @@ export async function loadExtensionFromFactory(
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
 export async function loadExtensions(
-	paths: string[],
+	entries: readonly ExtensionPathEntry[],
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
 ): Promise<LoadExtensionsResult> {
-	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+	const preparedExtensions = await Promise.all(entries.map(entry => importExtensionModule(entry, cwd)));
 	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime);
 }
 
@@ -754,10 +767,10 @@ export async function listPackageExtensionModules(
 }
 
 /**
- * Discover absolute paths of extensions to load, without importing or
- * binding factories. Hot path on session startup — the scan walks native
- * `.omp`/`.pi` extension capabilities, JS/TS hook factories, the
- * installed-plugin tree, and any configured paths.
+ * Discover the extensions to load, each as its path and the scope it was found
+ * at, without importing or binding factories. Hot path on session startup — the
+ * scan walks native `.omp`/`.pi` extension capabilities, JS/TS hook factories,
+ * the installed-plugin tree, and any configured paths.
  *
  * The root session imports these paths once and forwards prepared factories to
  * subagents. Each child rebinds fresh Extension instances to its OWN
@@ -770,35 +783,40 @@ export interface DiscoverExtensionPathOptions {
 	includeAmbientHooks?: boolean;
 }
 
+/**
+ * The key discovery counts an extension path once by: its real file, so a symlink and its target load once (an
+ * extensions/ symlink plus the same file passed with --extension); a missing path keeps its lexical key so the
+ * loader still reports it.
+ */
+export async function extensionPathKey(extPath: string): Promise<string> {
+	const resolved = path.resolve(extPath);
+	return fs.realpath(resolved).catch(() => resolved);
+}
+
 export async function discoverExtensionPaths(
 	configuredPaths: string[],
 	cwd: string,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
-): Promise<string[]> {
-	const allPaths: string[] = [];
-	const seen = new Set<string>();
+): Promise<ExtensionPathEntry[]> {
+	const entries: ExtensionPathEntry[] = [];
+	/** Each entry by its key, so a file found again keeps the one entry. */
+	const byKey = new Map<string, ExtensionPathEntry>();
 	const disabled = new Set(disabledExtensionIds ?? []);
 	const loadOptions = disabledExtensionIds ? { cwd, disabledExtensions: disabledExtensionIds } : { cwd };
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
-	// Key on the real file so a symlink and its target load once, e.g. an
-	// extensions/ symlink plus the same file passed with --extension. Missing
-	// paths keep their lexical key so the loader still reports them.
-	const addPath = async (extPath: string): Promise<void> => {
-		const resolved = path.resolve(extPath);
-		const key = await fs.realpath(resolved).catch(() => resolved);
-		if (!seen.has(key)) {
-			seen.add(key);
-			allPaths.push(extPath);
-		}
-	};
-
-	const addPaths = async (paths: string[]): Promise<void> => {
-		for (const extPath of paths) {
-			if (isDisabledName(getExtensionNameFromPath(extPath))) continue;
-			await addPath(extPath);
+	const addPath = async (extPath: string, scope: ExtensionScope): Promise<void> => {
+		const key = await extensionPathKey(extPath);
+		const found = byKey.get(key);
+		if (!found) {
+			const entry = { path: extPath, scope };
+			byKey.set(key, entry);
+			entries.push(entry);
+		} else if (found.scope === "project") {
+			// A file found at project level and at another level is not a project's own.
+			found.scope = scope;
 		}
 	};
 
@@ -815,7 +833,7 @@ export async function discoverExtensionPaths(
 			providers: ["native"],
 		});
 		for (const ext of discovered.items) {
-			await addPath(ext.path);
+			await addPath(ext.path, ext.level);
 		}
 	}
 
@@ -826,26 +844,32 @@ export async function discoverExtensionPaths(
 	if (ambient) {
 		if (options.includeAmbientHooks !== false) {
 			const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
-			for (const hookPath of hooks.items
-				.map(hook => hook.path)
-				.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
-				await addPath(hookPath);
+			for (const hook of hooks.items.filter(item => isExtensionFile(path.basename(item.path)))) {
+				await addPath(hook.path, hook.level);
 			}
 		}
 	} else {
 		for (const configuredPath of configuredPaths) {
-			await addPaths(await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd)));
+			for (const hookPath of await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd))) {
+				if (isDisabledName(getExtensionNameFromPath(hookPath))) continue;
+				await addPath(hookPath, "explicit");
+			}
 		}
 	}
 
-	// 3–4. Installed-plugin entries (ambient only), then explicitly configured
-	// paths. Configured file paths bypass the disabled-name filter.
-	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: ambient })) {
+	// 3. Installed-plugin entries (ambient only), at their plugin's scope.
+	for (const module of await listPackageExtensionModules([], cwd, { plugins: ambient })) {
 		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
-		await addPath(module.path);
+		await addPath(module.path, module.level);
+	}
+	// 4. Explicitly configured paths, never a project's own whatever level their setting came from. Configured file
+	// paths bypass the disabled-name filter.
+	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: false })) {
+		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
+		await addPath(module.path, "explicit");
 	}
 
-	return allPaths;
+	return entries;
 }
 
 /**

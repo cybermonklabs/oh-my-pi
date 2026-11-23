@@ -222,7 +222,10 @@ describe("integrations thread service", () => {
 	}, 20_000);
 
 	it("re-binds a parent-prepared extension against the worker's own ExtensionAPI", async () => {
-		const prepared = await importExtensionModule(path.join(FIXTURES, "integrations-extension.ts"), dir);
+		const prepared = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
 		expect(prepared.error).toBeNull();
 		const local = await bindPreparedExtensions([prepared], dir);
 		expect(local.extensions.flatMap(extension => [...extension.commands.keys()])).toEqual(["thread-main"]);

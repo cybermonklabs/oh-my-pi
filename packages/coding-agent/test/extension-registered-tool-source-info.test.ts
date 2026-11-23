@@ -87,7 +87,7 @@ describe("RegisteredTool sourceInfo (upstream pi compat)", () => {
 		);
 
 		try {
-			const loaded = await loadExtensions([relativePath], projectDir.path());
+			const loaded = await loadExtensions([{ path: relativePath, scope: "explicit" }], projectDir.path());
 			expect(loaded.errors).toEqual([]);
 			expect(loaded.extensions).toHaveLength(1);
 
@@ -121,7 +121,7 @@ describe("RegisteredTool sourceInfo (upstream pi compat)", () => {
 		);
 
 		try {
-			const loaded = await loadExtensions([relativePath], projectDir.path());
+			const loaded = await loadExtensions([{ path: relativePath, scope: "explicit" }], projectDir.path());
 			expect(loaded.errors).toEqual([]);
 
 			// A non-absolute sourcePath must not degrade to `<extension:name>` when the

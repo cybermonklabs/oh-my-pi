@@ -4,7 +4,7 @@
  * and a scripted OpenAI-compatible server the worker's model registry finds through
  * `models.yml` (the worker mirror re-reads it, so no spies reach into the worker).
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { __resetDirsFromEnvForTests, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobManager } from "../../src/async/job-manager";
+import type { EvalToolDescriptor } from "../../src/eval/types";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
@@ -27,12 +28,15 @@ import { hasRestorableTurn, INTERRUPTED_TURN_ERROR } from "../../src/session/exi
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
 import { MemorySessionStorage } from "../../src/session/session-storage";
+import { createEvalCustomTools } from "../../src/task/eval-tools";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../../src/task/executor";
 import { createPersistedSubagentReviverFactory } from "../../src/task/persisted-revive";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
 import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
+import * as sessionMirror from "../../src/thread/session-mirror";
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
+import type { ToolSession } from "../../src/tools";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
@@ -49,6 +53,28 @@ const HANG_TASK = `omp-test-scripted-hang-${SCRIPT_ID}`;
 const BG_JOB_TASK = `omp-test-scripted-bg-job-${SCRIPT_ID}`;
 /** In the routed agent's system prompt only, so a request without it is never the run's own turn. */
 const AGENT_MARKER = `omp-test-agent-${SCRIPT_ID}`;
+/** The one eval custom tool of the runs that carry one. */
+const LOOKUP_ROWS: EvalToolDescriptor = {
+	name: "lookup_rows",
+	description: "Looks up rows by key.",
+	parameters: { type: "object", properties: { key: { type: "string" } } },
+	language: "python",
+};
+/** A task whose run defines {@link PARENT_LOOKUP} in its session's JavaScript kernel through an `eval` call. */
+const DEFINE_TOOL_TASK = `omp-test-scripted-define-tool-${SCRIPT_ID}`;
+/** A message whose turn calls {@link PARENT_LOOKUP} with key `a`. */
+const CALL_TOOL_TASK = `omp-test-scripted-call-tool-${SCRIPT_ID}`;
+/** What the kernel-defined {@link PARENT_LOOKUP} answers, before `:<key>`. */
+const KERNEL_ANSWER = `omp-test-kernel-answer-${SCRIPT_ID}`;
+/** A tool a parent's JavaScript kernel defines ({@link DEFINE_TOOL_CODE}). */
+const PARENT_LOOKUP: EvalToolDescriptor = {
+	name: "parent_lookup",
+	description: "Looks up rows by key in the parent's kernel.",
+	parameters: { type: "object", properties: { key: { type: "string" } } },
+	language: "js",
+};
+/** The JavaScript cell that defines {@link PARENT_LOOKUP}; `tool()` reads the name, description and parameters. */
+const DEFINE_TOOL_CODE = `tool(({ key }) => ${JSON.stringify(`${KERNEL_ANSWER}:`)} + key, ${JSON.stringify(PARENT_LOOKUP)});`;
 
 interface ChatMessage {
 	role: string;
@@ -96,14 +122,20 @@ function chunks(reply: Reply): string {
 /**
  * Scripted model. Only the routed agent's own turns (their system prompt carries
  * {@link AGENT_MARKER}) are scripted, by their last user message: containing
- * {@link BG_JOB_TASK} → an async `bash` call; containing {@link HANG_TASK} → no answer until
- * the request is aborted. A tool result is answered with `tool said: …`; everything else
- * (the job's completion notice, side requests) → `pong`.
+ * {@link BG_JOB_TASK} → an async `bash` call; containing {@link DEFINE_TOOL_TASK} → an `eval`
+ * call running {@link DEFINE_TOOL_CODE}; containing {@link CALL_TOOL_TASK} → a
+ * {@link PARENT_LOOKUP} call; containing {@link HANG_TASK} → no answer until the request is
+ * aborted. A tool result is answered with `tool said: …`; everything else (the job's
+ * completion notice, side requests) → `pong`.
  */
 class FakeModelServer {
 	readonly #server: Bun.Server<undefined>;
 	readonly #hangs: Array<() => void> = [];
 	#hungRequest = Promise.withResolvers<void>();
+	/** The model and tool names of each of the routed agent's own requests, in order. */
+	readonly runRequests: Array<{ model: string; toolNames: string[] }> = [];
+	/** The text of each tool result the routed agent's own requests end on, in order. */
+	readonly toolResults: string[] = [];
 
 	constructor() {
 		this.#server = Bun.serve({
@@ -137,6 +169,10 @@ class FakeModelServer {
 				"        name: Fake Model",
 				"        reasoning: false",
 				"        cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 }",
+				"      - id: fake-model-2",
+				"        name: Fake Model 2",
+				"        reasoning: false",
+				"        cost: { input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0 }",
 				"",
 			].join("\n"),
 		);
@@ -166,11 +202,25 @@ class FakeModelServer {
 			.map(message => messageText(message.content))
 			.join("\n");
 		const runTurn = systemText.includes(AGENT_MARKER);
+		if (runTurn && typeof body === "object" && body !== null) {
+			const rawTools: unknown = Reflect.get(body, "tools");
+			const toolNames = (Array.isArray(rawTools) ? rawTools : []).map(tool => {
+				const fn: unknown = typeof tool === "object" && tool !== null ? Reflect.get(tool, "function") : undefined;
+				return typeof fn === "object" && fn !== null ? String(Reflect.get(fn, "name")) : "";
+			});
+			this.runRequests.push({ model: String(Reflect.get(body, "model")), toolNames });
+		}
 		let reply: Reply = { text: "pong" };
 		if (runTurn && last?.role === "tool") {
-			reply = { text: `tool said: ${messageText(last.content)}` };
+			const result = messageText(last.content);
+			this.toolResults.push(result);
+			reply = { text: `tool said: ${result}` };
 		} else if (runTurn && userText.includes(BG_JOB_TASK)) {
 			reply = { tool: "bash", args: { command: "echo bg-done", async: true } };
+		} else if (runTurn && userText.includes(DEFINE_TOOL_TASK)) {
+			reply = { tool: "eval", args: { language: "js", code: DEFINE_TOOL_CODE } };
+		} else if (runTurn && userText.includes(CALL_TOOL_TASK)) {
+			reply = { tool: PARENT_LOOKUP.name, args: { key: "a" } };
 		} else if (runTurn && userText.includes(HANG_TASK)) {
 			const held = Promise.withResolvers<void>();
 			this.#hangs.push(held.resolve);
@@ -474,6 +524,25 @@ describe("subagent runs routed into pooled workers", () => {
 	);
 
 	it(
+		"stores each eval tool's descriptor in the spawn spec of a run placed in a worker",
+		async () => {
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [LOOKUP_ROWS]);
+			const result = await runSubprocess(runOptions("EvalTools", "ping", { customTools }));
+			expect(result.output).toBe("pong");
+			// The tools crossed into the worker as views; the spawn there read the descriptors they carried.
+			const mirror = mirrorOf(AgentRegistry.global().get("EvalTools")?.session);
+			await waitFor(() => !mirror.ircWakesPending);
+			await AgentLifecycleManager.global().park("EvalTools");
+			const peek = await SessionManager.peekSessionInit(path.join(root, "artifacts", "EvalTools.jsonl"));
+			if (!peek?.init) throw new Error("the worker run stored no session_init");
+			// Read as stored JSON, so the file also loads where the spawn spec's reader does not exist.
+			const stored = peek.init as unknown as { spawnSpec?: { tools?: { customTools?: unknown } } };
+			expect(stored.spawnSpec?.tools?.customTools).toEqual([LOOKUP_ROWS]);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
 		"aborts the worker run when main's signal aborts",
 		async () => {
 			const controller = new AbortController();
@@ -651,6 +720,237 @@ describe("subagent runs routed into pooled workers", () => {
 			expect(await fs.exists(ref.sessionFile)).toBe(true);
 			expect(await fs.exists(`${ref.sessionFile}.tombstone`)).toBe(true);
 			expect(AgentRegistry.global().get("WorkerGone")?.status).toBe("aborted");
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive in a subagent worker starts on the spawn's model, flags and custom tools",
+		async () => {
+			settings.setModelRole("task", MODEL);
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [LOOKUP_ROWS]);
+			// The agent lists `lsp`, which the spawn's LSP setting (off) keeps out of its tools.
+			const agent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "lsp"] };
+			const first = await runSubprocess(
+				runOptions("ColdInWorker", "ping", { agent, modelOverride: "@task", customTools, enableLsp: false }),
+			);
+			expect(first.output).toBe("pong");
+			expect(server.runRequests.at(-1)?.toolNames).toContain(LOOKUP_ROWS.name);
+			const mirror = mirrorOf(AgentRegistry.global().get("ColdInWorker")?.session);
+			const home = mirror.home;
+			await waitFor(() => !mirror.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			await lifecycle.park("ColdInWorker");
+			// The subagent's worker exits after the park, and its warm reviver with it.
+			const worker = pool.forThread(home);
+			if (!worker) throw new Error("home worker missing");
+			worker.terminate("worker exited after the park");
+			await waitFor(() => pool.forThread(home)?.alive !== true);
+			// Between the park and the revive the role moves, and the root's LSP policy is on.
+			settings.setModelRole("task", "fake/fake-model-2");
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: true,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const sentAt = server.runRequests.length;
+			const receipt = await IrcBus.global().send({
+				from: MAIN_AGENT_ID,
+				to: "ColdInWorker",
+				body: "hello from main",
+			});
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("ColdInWorker")?.session);
+			expect(woken.home).not.toBe(home);
+			await waitFor(() => server.runRequests.length > sentAt);
+			const [wake] = server.runRequests.slice(sentAt);
+			expect(wake?.model).toBe("fake-model");
+			expect(wake?.toolNames).toContain(LOOKUP_ROWS.name);
+			expect(wake?.toolNames).not.toContain("lsp");
+			// Let the wake turn settle before teardown.
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive of a subagent whose live parent is homed in a worker serves the tools the parent's kernel defines",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			// The parent runs in a worker and defines `parent_lookup` in its JavaScript kernel; it stays live there.
+			const parentAgent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "eval"] };
+			const parentRun = await runSubprocess(runOptions("KernelParent", DEFINE_TOOL_TASK, { agent: parentAgent }));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("KernelParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			// Its child carries the tool's descriptor in its spawn spec.
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [PARENT_LOOKUP]);
+			const childRun = await runSubprocess(
+				runOptions("KernelChild", "ping", { customTools, parentAgentId: "KernelParent" }),
+			);
+			expect(childRun.output).toBe("pong");
+			expect(server.runRequests.at(-1)?.toolNames).toContain(PARENT_LOOKUP.name);
+			const child = mirrorOf(AgentRegistry.global().get("KernelChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			// Killed, the child has no warm reviver; its parent lives on in its worker.
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("KernelChild", undefined, { tombstone: true })).toBe(true);
+			expect(AgentRegistry.global().get("KernelChild")?.status).toBe("aborted");
+			expect(AgentRegistry.global().get("KernelParent")?.session).toBe(parent);
+			expect(pool.forThread(parent.home)?.alive).toBe(true);
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const resultsBefore = server.toolResults.length;
+			const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "KernelChild", body: CALL_TOOL_TASK });
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("KernelChild")?.session);
+			await waitFor(() => server.toolResults.length > resultsBefore);
+			// The revived child's call reached the parent's kernel, which answered it.
+			expect(server.toolResults.slice(resultsBefore).join("\n")).toContain(`${KERNEL_ANSWER}:a`);
+			expect(warnings.filter(message => message.includes("no live kernel defines"))).toEqual([]);
+			// Let the wake turn settle before teardown.
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive of a subagent whose worker-homed parent serves settings the check rejects takes the root's inputs, with the warning",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			const parentAgent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "eval"] };
+			const parentRun = await runSubprocess(runOptions("CheckedParent", DEFINE_TOOL_TASK, { agent: parentAgent }));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("CheckedParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [PARENT_LOOKUP]);
+			const childRun = await runSubprocess(
+				runOptions("CheckedChild", "ping", { customTools, parentAgentId: "CheckedParent" }),
+			);
+			expect(childRun.output).toBe("pong");
+			const child = mirrorOf(AgentRegistry.global().get("CheckedChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("CheckedChild", undefined, { tombstone: true })).toBe(true);
+			// The parent's home answers with a settings layer that names no setting of this build.
+			const serve = parent.subagentParentInputs.bind(parent);
+			const served = vi.spyOn(parent, "subagentParentInputs").mockImplementation(async (id, descriptors) => {
+				const inputs = await serve(id, descriptors);
+				if (!inputs) return inputs;
+				const unknownLayer = { global: { noSuchSetting: true }, overrides: {}, derived: true };
+				return { ...inputs, settings: { ...inputs.settings, layers: [...inputs.settings.layers, unknownLayer] } };
+			});
+			cleanups.push(() => served.mockRestore());
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const resultsBefore = server.toolResults.length;
+			const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "CheckedChild", body: CALL_TOOL_TASK });
+			expect(receipt.outcome).toBe("revived");
+			expect(served).toHaveBeenCalled();
+			const unreadable = warnings.filter(message => message.includes("could not read its live parent's inputs"));
+			expect(unreadable.length).toBeGreaterThan(0);
+			const woken = mirrorOf(AgentRegistry.global().get("CheckedChild")?.session);
+			await waitFor(() => server.toolResults.length > resultsBefore);
+			// On the root's inputs no kernel is asked, so the child's call to the parent's tool answers unavailable.
+			const results = server.toolResults.slice(resultsBefore).join("\n");
+			expect(results).not.toContain(KERNEL_ANSWER);
+			expect(results).toMatch(/unavailable/i);
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive whose worker-homed live parent's mirrored settings fail the main-side check takes the root's inputs, with a warning, and that parent's settings read as the main settings below them, with a warning",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			const parentRun = await runSubprocess(runOptions("MirrorParent", "ping"));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("MirrorParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			const childRun = await runSubprocess(runOptions("MirrorChild", "ping", { parentAgentId: "MirrorParent" }));
+			expect(childRun.output).toBe("pong");
+			const child = mirrorOf(AgentRegistry.global().get("MirrorChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("MirrorChild", undefined, { tombstone: true })).toBe(true);
+			// From here on, main rejects the parent's worker-local settings layers, as it rejects a layer the check fails.
+			const rejected = vi.spyOn(sessionMirror, "settingsFromSource").mockImplementation(() => {
+				throw new Error("The layer names no setting of this build");
+			});
+			cleanups.push(() => rejected.mockRestore());
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const receipt = await IrcBus.global().send({
+				from: MAIN_AGENT_ID,
+				to: "MirrorChild",
+				body: "hello from main",
+			});
+			expect(receipt.outcome).toBe("revived");
+			const woken = mirrorOf(AgentRegistry.global().get("MirrorChild")?.session);
+			// The revived child's live parent, read on main: the main settings below its worker-local layers.
+			let parentSettings: Settings | undefined;
+			expect(() => {
+				parentSettings = parent.settings;
+			}).not.toThrow();
+			expect(parentSettings).toBeInstanceOf(Settings);
+			expect(rejected).toHaveBeenCalled();
+			const tookRoot = warnings.filter(message =>
+				message.startsWith("Revived subagent could not read its live parent's inputs; it takes the root's"),
+			);
+			const fellBack = warnings.filter(message =>
+				message.startsWith("Worker-homed session's settings do not restore"),
+			);
+			expect({ tookRoot: tookRoot.length, fellBack: fellBack.length }).toEqual({ tookRoot: 1, fellBack: 1 });
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},
 		TEST_TIMEOUT_MS,
 	);

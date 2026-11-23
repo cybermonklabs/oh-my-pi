@@ -123,7 +123,10 @@ it("revives a parked subagent on its prewalk handoff target, keeping its todo li
 		{ thinking },
 	);
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
+	const catalogAll = modelRegistry.getAll.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [planner, target, ...catalogAvailable(kind)]);
+	// A registry lists every model it can serve among all its models too; a revive resolves the handoff target there.
+	vi.spyOn(modelRegistry, "getAll").mockImplementation(() => [planner, target, ...catalogAll()]);
 
 	try {
 		const result = await runSubprocess({
