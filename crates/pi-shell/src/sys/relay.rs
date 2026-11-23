@@ -43,9 +43,12 @@ use std::{
 
 use crate::{
 	bash::{ExitStatus, ExtProc, OsHandle, ProcEvent, Signal},
-	sys::pump::{
-		BUF, BURST, End, PollIo, orphan,
-		os::{self, OsPipe, Timer},
+	sys::{
+		WaitKey,
+		pump::{
+			BUF, BURST, End, PollIo, orphan,
+			os::{self, OsPipe, Timer},
+		},
 	},
 };
 
@@ -306,7 +309,7 @@ impl<'a> Relays<'a> {
 		if self.set.is_empty() {
 			return child;
 		}
-		Box::new(Relayed { child, relays: self.set, status: None })
+		Box::new(Relayed { child, relays: self.set, status: None, orphan_key: WaitKey::default() })
 	}
 }
 
@@ -314,9 +317,11 @@ impl<'a> Relays<'a> {
 /// drives: its exit is reported once they have forwarded everything it
 /// wrote.
 struct Relayed {
-	child:  Box<dyn ExtProc>,
-	relays: Vec<Relay>,
-	status: Option<ExitStatus>,
+	child:      Box<dyn ExtProc>,
+	relays:     Vec<Relay>,
+	status:     Option<ExitStatus>,
+	/// This poller's wait on the retained [`orphan`] work.
+	orphan_key: WaitKey,
 }
 
 impl ExtProc for Relayed {
@@ -352,7 +357,7 @@ impl ExtProc for Relayed {
 		for relay in &mut self.relays {
 			drained &= relay.drained(cx);
 		}
-		orphan::poll(cx);
+		orphan::poll(cx, &mut self.orphan_key);
 		if drained {
 			Poll::Ready(ProcEvent::Exited(status))
 		} else {

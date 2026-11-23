@@ -105,8 +105,9 @@ impl Wake for Unpark {
 pub fn wait_runnable(ctl: &ControlHandle) {
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let mut cx = Context::from_waker(&waker);
+	let mut key = crate::sys::WaitKey::default();
 	loop {
-		NativeSpawner::poll_orphans(&cx);
+		NativeSpawner::poll_orphans(&cx, &mut key);
 		if ctl.poll_runnable(&mut cx).is_ready() {
 			break;
 		}

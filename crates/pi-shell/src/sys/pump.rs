@@ -43,7 +43,7 @@ use std::{
 	io,
 	pin::Pin,
 	sync::Arc,
-	task::{Context, Poll, Wake, Waker},
+	task::{Context, Poll, Waker},
 };
 
 use parking_lot::Mutex;
@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 use self::os::OsPipe;
 use crate::{
 	bash::{FdRef, File},
-	sys::lifecycle::Tracker,
+	sys::{WaitKey, Wakers, lifecycle::Tracker},
 };
 
 /// Engine side of a pump.
@@ -346,10 +346,12 @@ impl Duplex {
 /// The pumps of one external and the feeds it holds, polled by its
 /// `ExtProc`.
 pub struct Pumps {
-	tasks: Vec<Task>,
+	tasks:      Vec<Task>,
 	/// Shared input feeds the child holds: kept open while this lives and
-	/// advanced by every poll.
-	feeds: Vec<Arc<Feed>>,
+	/// advanced by every poll, each with this holder's wait on it.
+	feeds:      Vec<(Arc<Feed>, WaitKey)>,
+	/// This holder's wait on the retained [`orphan`] work.
+	orphan_key: WaitKey,
 }
 
 impl Pumps {
@@ -372,7 +374,8 @@ impl Pumps {
 				})),
 			})
 			.collect();
-		Self { tasks, feeds }
+		let feeds = feeds.into_iter().map(|f| (f, WaitKey::default())).collect();
+		Self { tasks, feeds, orphan_key: WaitKey::default() }
 	}
 
 	/// Move what can move now; every side that cannot go on has registered
@@ -386,10 +389,10 @@ impl Pumps {
 				.tasks
 				.retain_mut(|t| t.poll(cx, cancelled).is_pending());
 		}
-		for feed in &self.feeds {
-			feed.poll(cx);
+		for (feed, key) in &mut self.feeds {
+			feed.poll(cx, key);
 		}
-		orphan::poll(cx);
+		orphan::poll(cx, &mut self.orphan_key);
 	}
 }
 
@@ -437,8 +440,8 @@ pub struct Feed {
 	/// The pump. Holders poll it under the lock, which is never held across
 	/// a `Pending`.
 	state:  Mutex<FeedState>,
-	/// The holders' wakers, woken through `waker` (the one the engine object
-	/// and the OS side keep).
+	/// The holders' waits, one per holder's key, woken through `waker` (the
+	/// one the engine object and the OS side keep).
 	wakers: Arc<Wakers>,
 	waker:  Waker,
 }
@@ -453,40 +456,11 @@ struct FeedState {
 	chunk: Chunk,
 }
 
-/// Wakers of the holders of a feed: waking it wakes them all once.
-#[derive(Default)]
-struct Wakers(Mutex<Vec<Waker>>);
-
-impl Wakers {
-	fn add(&self, waker: &Waker) {
-		let mut wakers = self.0.lock();
-		if !wakers.iter().any(|w| w.will_wake(waker)) {
-			wakers.push(waker.clone());
-		}
-	}
-
-	/// Take them all (to wake or drop outside the lock).
-	fn take(&self) -> Vec<Waker> {
-		std::mem::take(&mut *self.0.lock())
-	}
-}
-
-impl Wake for Wakers {
-	fn wake(self: Arc<Self>) {
-		self.wake_by_ref();
-	}
-
-	fn wake_by_ref(self: &Arc<Self>) {
-		for w in self.take() {
-			w.wake();
-		}
-	}
-}
-
 impl Feed {
 	/// A feed of a new OS pipe, filled from `fd`.
 	pub fn new(fd: FdRef) -> io::Result<Self> {
-		let (pipe, read) = os::pipe(true)?;
+		let (mut pipe, read) = os::pipe(true)?;
+		pipe.for_reclaim(&read);
 		let wakers = Arc::new(Wakers::default());
 		let waker = Waker::from(Arc::clone(&wakers));
 		Ok(Self {
@@ -512,9 +486,11 @@ impl Feed {
 		self.read.try_clone()
 	}
 
-	/// Advance the pump; `cx`'s task is woken when it can go on.
-	fn poll(&self, cx: &Context<'_>) {
-		self.wakers.add(cx.waker());
+	/// Advance the pump; `cx`'s task, waiting by its holder's `key`, is woken
+	/// when it can go on.
+	fn poll(&self, cx: &Context<'_>, key: &mut WaitKey) {
+		// Whether no holder waited does not matter: the pump is polled below.
+		let _ = self.wakers.wait(key, cx.waker());
 		let mut fcx = Context::from_waker(&self.waker);
 		let mut st = self.state.lock();
 		let FeedState { pipe, src, chunk } = &mut *st;
@@ -532,11 +508,10 @@ impl Feed {
 impl Drop for Feed {
 	fn drop(&mut self) {
 		let st = self.state.get_mut();
-		// What the pipe holds, read without waiting ([`os::reclaim`]: Unix
-		// closes our write end first, so the read ends at end of file), then
-		// what the pump took but had not written.
-		let mut back = os::reclaim(st.pipe.take(), &self.read);
-		back.extend_from_slice(st.chunk.pending());
+		// What the pipe holds, read without waiting, then what the pump took
+		// but the pipe never did ([`os::reclaim`]: Unix closes our write end
+		// first, so the read ends at end of file).
+		let back = os::reclaim(st.pipe.take(), &self.read, st.chunk.pending());
 		if !back.is_empty() {
 			// An object that cannot take them back loses them.
 			let _ = self.fd.unread(&back);
@@ -546,7 +521,7 @@ impl Drop for Feed {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::io::Read;
+	use std::{io::Read, task::Wake};
 
 	use super::*;
 
@@ -611,14 +586,15 @@ mod tests {
 		pumps.poll(&mut cx, &tracker);
 		assert_eq!(tracker.lock().draining(), 3, "end of file drained one half, once");
 		drop(pumps);
-		orphan::poll(&cx);
+		let mut key = WaitKey::default();
+		orphan::poll(&cx, &mut key);
 		assert_eq!(tracker.lock().draining(), 3, "adopted halves run on");
 		drop((child_open, child_duplex));
 		// Another test of this process may be polling the retained work.
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 		while tracker.lock().draining() > 1 {
 			assert!(std::time::Instant::now() < deadline, "the adopted halves never drained");
-			orphan::poll(&cx);
+			orphan::poll(&cx, &mut key);
 			std::thread::yield_now();
 		}
 		assert_eq!(tracker.lock().draining(), 1, "each drained once at its end of file");
