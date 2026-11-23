@@ -603,6 +603,25 @@ pub struct Job {
 	/// none. A fact ([`Job::facts`]), as [`Self::signal`] is.
 	#[serde(skip)]
 	pub procs:     Option<Box<JobProcs>>,
+	/// This shell's `kill` ended the job with no OS status for obash to reap,
+	/// and nothing showed its end since: bash's process of it is still
+	/// unreaped, so bash's next plain `wait` waits for it, reaps it and
+	/// reports it (`wait_for_background_pids`, `jobs.c:2809-2836`). obash
+	/// takes a job's end in when the host reaps its program's OS status: the
+	/// job runs until then, as bash's does until `waitchld` reaps it. But
+	/// `kill` ends a job, or a process of it, that is no program obash
+	/// spawned ([`Self::os_pid`], [`JobProc::os_pid`] unset: `kill %1` right
+	/// after `&`, or a subshell or group, which is no OS process here) at
+	/// once, in obash's kernel. Set by that `kill`; cleared where bash would
+	/// have reaped it: as the shell waits for a foreground program or child
+	/// (bash's `waitchld` takes in every child that ended), once a `kill`
+	/// finds the job gone (bash's `kill -0` answers for a zombie until bash
+	/// reaps it) or `jobs` finds it done (bash shows a job done only once it
+	/// reaped it). Read by `wait` (`builtins::flow`'s `wait_all`).
+	/// Kept in memory only: a job restored from the store or the frames image
+	/// counts as reaped.
+	#[serde(skip)]
+	pub unreaped:  bool,
 }
 
 impl Job {
@@ -681,6 +700,7 @@ impl Job {
 			os_pid:    self.os_pid,
 			signal:    None,
 			procs:     None,
+			unreaped:  false,
 		}
 	}
 
@@ -701,6 +721,7 @@ impl Job {
 			os_pid,
 			signal: _,
 			procs: _,
+			unreaped: _,
 		} = self;
 		have.signal.is_none()
 			&& have.procs.is_none()

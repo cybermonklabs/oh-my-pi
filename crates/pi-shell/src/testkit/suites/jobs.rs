@@ -47,6 +47,7 @@ fn stops_and_continues_move_the_current_and_previous_jobs() {
 		 %-; jobs -n; echo n; exec 2>/dev/null; kill -9 %1 %2 %3; wait; echo $?; jobs; echo end",
 	);
 	let running = |n: u32, mark: char| format!("[{n}]{mark}  Running                    {LOOP} &\n");
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let want = [
 		running(1, ' '),
 		format!("[2]+  Stopped                    {LOOP}\n"),
@@ -63,9 +64,12 @@ fn stops_and_continues_move_the_current_and_previous_jobs() {
 		format!("[3]+ {LOOP} &\n"),
 		running(3, '+'),
 		running(2, '-'),
-		// `wait` collects the jobs just killed (bash's `wait` finds them still
-		// being reaped: jobs.right, Linux).
-		"n\n0\nend\n".into(),
+		// bash's `wait` finds the jobs just killed still running: it waits
+		// for the first, reaps all three meanwhile, and keeps the one `$!`
+		// names, which `jobs` lists (bash 5.3.20).
+		"n\n0\n".into(),
+		format!("[3]   {killed:<27}{LOOP}\n"),
+		"end\n".into(),
 	]
 	.concat();
 	assert_eq!(out, want);
@@ -146,11 +150,17 @@ fn command_substitutions_list_the_parents_jobs_but_cannot_move_them() {
 		"same\n1\n[1]+ Running while :; do :; done &\n1 [1]+ Running while :; do :; done &\n<[1]+  \
 		 Running                    while :; do>\n<    :;>\n<done &>\n1\nend\n"
 	);
-	assert_eq!(
-		err,
-		"bash: line 1: jobs: no other options allowed with `-x'\nbash: line 1: fg: no current \
-		 jobs\nbash: line 1: fg: no job control\n"
-	);
+	// bash's `wait` reaps the job `kill` just ended and reports it, naming
+	// the job's pid.
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let tail = format!(" {killed:<27}{LOOP}\n");
+	let pid = err
+		.strip_prefix(
+			"bash: line 1: jobs: no other options allowed with `-x'\nbash: line 1: fg: no current \
+			 jobs\nbash: line 1: fg: no job control\nbash: line 1: ",
+		)
+		.and_then(|e| e.strip_suffix(tail.as_str()));
+	assert!(pid.is_some_and(|p| p.trim().parse::<u32>().is_ok()), "{err:?}");
 }
 
 #[test]
