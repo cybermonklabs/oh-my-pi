@@ -1,13 +1,14 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { getDbBusyTimeoutMs, setInteractiveHost } from "../src/env";
 import { initializeSqliteSchema, isSqliteBusyError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
 import { TempDir } from "../src/temp";
 
 const SCHEMA = "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY, value TEXT)";
 
-function createStore(dbPath: string): void {
+function createStore(dbPath: string, journalMode = "WAL"): void {
 	const db = new Database(dbPath);
-	db.run("PRAGMA journal_mode=WAL");
+	db.run(`PRAGMA journal_mode=${journalMode}`);
 	db.run(SCHEMA);
 	db.close();
 }
@@ -24,13 +25,17 @@ function holdWriteLock(dbPath: string): Database {
  * the lock kind every omp process takes (the SQLite lock shim, #15586): with POSIX locks in the holder,
  * an open under gVisor waits out the whole hold and then succeeds instead of reporting the lock.
  */
-async function holdWriteLockInChild(dbPath: string, ms: number): Promise<Bun.Subprocess<"ignore", "pipe", "inherit">> {
+async function holdWriteLockInChild(
+	dbPath: string,
+	ms: number,
+	begin = "BEGIN IMMEDIATE",
+): Promise<Bun.Subprocess<"ignore", "pipe", "inherit">> {
 	const script = `
 		const { Database } = require("bun:sqlite");
 		import(${JSON.stringify(`${import.meta.dir}/../src/sqlite.ts`)}).then(({ ensureSqliteLockShim }) => {
 			ensureSqliteLockShim();
 			const db = new Database(${JSON.stringify(dbPath)});
-			db.run("BEGIN IMMEDIATE");
+			db.run(${JSON.stringify(begin)});
 			db.run("INSERT INTO entries (value) VALUES ('peer')");
 			console.log("held");
 			setTimeout(() => { db.run("COMMIT"); db.close(); }, ${ms});
@@ -150,6 +155,63 @@ describe("open BUSY budget", () => {
 		expect(rows).toEqual([{ value: "peer" }, { value: "mine" }]);
 		await peer.exited;
 	}, 30_000);
+
+	// SQLite's busy handler sleeps the calling thread. On an interactive host each attempt's handler
+	// used the 5 s store timeout, so waiting out a peer froze the event loop in 5 s stretches. The peer
+	// holds an exclusive lock on a rollback-journal store, so the opener's read waits in the busy handler.
+	test("openSqliteDatabase keeps its event loop running while it waits out a peer", async () => {
+		await using dir = await TempDir.create("@omp-sqlite-busy-loop-");
+		const dbPath = dir.join("store.db");
+		createStore(dbPath, "DELETE");
+		const wasInteractive = setInteractiveHost(true);
+		try {
+			const peer = await holdWriteLockInChild(dbPath, 3_000, "BEGIN EXCLUSIVE");
+			let last = performance.now();
+			let longestStall = 0;
+			const beat = setInterval(() => {
+				const now = performance.now();
+				longestStall = Math.max(longestStall, now - last);
+				last = now;
+			}, 5);
+			try {
+				const rows = await openSqliteDatabase(dbPath, db => {
+					try {
+						return db.query<{ value: string }, []>("SELECT value FROM entries ORDER BY id").all();
+					} finally {
+						db.close();
+					}
+				});
+				// An open that blocked until it succeeded resolves before the next tick: measure that stretch too.
+				longestStall = Math.max(longestStall, performance.now() - last);
+				expect(rows).toEqual([{ value: "peer" }]);
+			} finally {
+				clearInterval(beat);
+			}
+			expect(longestStall).toBeLessThan(1_000);
+			await peer.exited;
+		} finally {
+			setInteractiveHost(wasInteractive);
+		}
+	}, 30_000);
+
+	test("a successful openSqliteDatabase gives the connection the store's busy timeout", async () => {
+		await using dir = await TempDir.create("@omp-sqlite-busy-restore-");
+		const dbPath = dir.join("store.db");
+		createStore(dbPath);
+		const timeoutOf = (db: Database) => db.query("PRAGMA busy_timeout").values()[0]?.[0];
+		const plain = await openSqliteDatabase(dbPath, db => db);
+		try {
+			expect(timeoutOf(plain)).toBe(getDbBusyTimeoutMs());
+		} finally {
+			plain.close();
+		}
+		const chosen = await openSqliteDatabase(dbPath, db => db, { busyTimeoutMs: 4_321 });
+		try {
+			expect(timeoutOf(chosen)).toBe(4_321);
+		} finally {
+			chosen.close();
+		}
+	});
 
 	// The synchronous opener runs on its caller's thread (the TUI's event loop for the caches that use
 	// it), so it does not sleep out a peer's lock: it fails after the connection's busy timeout and its

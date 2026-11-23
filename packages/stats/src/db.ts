@@ -177,23 +177,26 @@ async function openStatsDb(): Promise<Database> {
 	// Ensure directory exists
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
-	// The shared opener retries SQLITE_BUSY (a peer's migration or WAL recovery) within its budget.
-	return openSqliteDatabase(getStatsDbPath(), database => {
-		db = database;
-		try {
-			initializeStatsDb(database);
-			return database;
-		} catch (error) {
-			db = null;
-			throw error;
-		}
-	});
+	// The shared opener retries SQLITE_BUSY (a peer's migration or WAL recovery) within its budget. It
+	// installs the busy handler before the initializer's first lock-taking statement (#2421), short
+	// while it opens and 5 s once open.
+	return openSqliteDatabase(
+		getStatsDbPath(),
+		database => {
+			db = database;
+			try {
+				initializeStatsDb(database);
+				return database;
+			} catch (error) {
+				db = null;
+				throw error;
+			}
+		},
+		{ busyTimeoutMs: 5000 },
+	);
 }
 
 function initializeStatsDb(db: Database): void {
-	// Install the busy handler BEFORE any lock-taking statement. See
-	// https://github.com/can1357/oh-my-pi/issues/2421.
-	db.run("PRAGMA busy_timeout = 5000");
 	db.run("PRAGMA journal_mode = WAL");
 	// The database is a derived cache of the transcripts, so WAL's NORMAL sync
 	// (fsync only at checkpoints) is safe: a crash can drop the newest batches,

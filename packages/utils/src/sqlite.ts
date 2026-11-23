@@ -19,6 +19,15 @@ import * as logger from "./logger";
 const BUSY_RETRY_BUDGET_MS = 60_000;
 const BUSY_BASE_DELAY_MS = 100;
 const BUSY_MAX_DELAY_MS = 2_000;
+
+/**
+ * The busy timeout each attempt of {@link openSqliteDatabase} runs with. SQLite's busy handler sleeps
+ * the calling thread, so a long timeout freezes the event loop for as long as a peer holds the lock;
+ * a short one hands the wait to the retry loop, which sleeps without blocking. One attempt can block
+ * for several times this (on runc, a few stretches of 2-4x), so it stays well under the longest
+ * freeze a UI tolerates. A successful open restores the store's own timeout.
+ */
+const BUSY_ATTEMPT_TIMEOUT_MS = 25;
 const SQLITE_STORE_SUFFIXES = ["-wal", "-shm", "-journal", ""];
 
 let sqliteLockShimInstalled: boolean | undefined;
@@ -143,7 +152,7 @@ function closeFailedDatabase(db: Database | undefined, error: unknown, identity:
 	}
 }
 
-/** Controls opt-in replacement of an unrecoverably corrupt SQLite store. */
+/** Controls opt-in replacement of an unrecoverably corrupt SQLite store, and the busy timeout. */
 export interface SqliteOpenOptions {
 	/**
 	 * Preserve a corrupt store and its sidecars, recreate it, and run the
@@ -152,6 +161,12 @@ export interface SqliteOpenOptions {
 	recoverCorruption?: boolean;
 	/** Runs after preservation and before the replacement is initialized. */
 	onCorruptionPreserved?: (backupPath: string, error: unknown) => void;
+	/**
+	 * The busy timeout the connection keeps once opened; defaults to {@link getDbBusyTimeoutMs}. Set it
+	 * here, not in the initializer: an initializer that sets its own makes each attempt of
+	 * {@link openSqliteDatabase} block the thread that long while a peer holds the lock.
+	 */
+	busyTimeoutMs?: number;
 }
 
 /**
@@ -222,12 +237,32 @@ function failedAttempt(
 	return new SqliteAttemptFailure(error, identity);
 }
 
-function openConnection(dbPath: string): Database {
+function openConnection(dbPath: string, busyTimeoutMs: number): Database {
 	ensureSqliteLockShim();
 	const db = new Database(dbPath);
 	// WAL recovery can bypass the busy handler; both it and retries are needed (#2421).
-	db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+	db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
 	return db;
+}
+
+/**
+ * Bun's refusal of a statement on a connection after its `close()`: "Database has closed" from a
+ * statement, "Cannot use a closed database" or "Can't do this on a closed database" elsewhere.
+ */
+function isClosedDatabaseError(error: unknown): boolean {
+	return error instanceof Error && /Database has closed|closed database/.test(error.message);
+}
+
+/**
+ * Gives a successful open's connection the busy timeout its store runs with. The initializer owns the
+ * handle once it returns, and may already have closed it.
+ */
+function restoreBusyTimeout(db: Database, busyTimeoutMs: number): void {
+	try {
+		db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+	} catch (error) {
+		if (!isClosedDatabaseError(error)) throw error;
+	}
 }
 
 async function openWithBusyRetries<T>(
@@ -238,17 +273,22 @@ async function openWithBusyRetries<T>(
 	const retries = new BusyRetries();
 	for (;;) {
 		let db: Database | undefined;
+		let opened: T;
 		const identity = sqliteFileIdentity(dbPath);
 		try {
-			db = openConnection(dbPath);
-			return await initialize(db);
+			db = openConnection(dbPath, BUSY_ATTEMPT_TIMEOUT_MS);
+			opened = await initialize(db);
 		} catch (caught) {
+			// The attempt's connection is closed here, or handed to corruption recovery, which closes it.
 			const failure = failedAttempt(dbPath, db, caught, identity, options);
 			if (!isSqliteBusyError(failure.original) || failure.db) throw failure;
 			const delay = retries.nextDelay();
 			if (delay === undefined) throw new SqliteAttemptFailure(retries.exhausted(failure.original), identity);
 			await Bun.sleep(delay);
+			continue;
 		}
+		restoreBusyTimeout(db, options.busyTimeoutMs ?? getDbBusyTimeoutMs());
+		return opened;
 	}
 }
 
@@ -261,7 +301,7 @@ function openOnceSync<T>(dbPath: string, initialize: (db: Database) => T, option
 	let db: Database | undefined;
 	const identity = sqliteFileIdentity(dbPath);
 	try {
-		db = openConnection(dbPath);
+		db = openConnection(dbPath, options.busyTimeoutMs ?? getDbBusyTimeoutMs());
 		return initialize(db);
 	} catch (caught) {
 		throw failedAttempt(dbPath, db, caught, identity, options);
@@ -362,8 +402,10 @@ function recoverCorruptDatabase(dbPath: string, error: unknown, options: SqliteO
 
 /**
  * Opens and initializes a store, retrying BUSY failures with jittered exponential backoff for up to
- * {@link BUSY_RETRY_BUDGET_MS}; the final error says how long it waited. Installs the busy handler
- * before initialization and closes failed connections.
+ * {@link BUSY_RETRY_BUDGET_MS}; the final error says how long it waited. Each attempt runs with a
+ * {@link BUSY_ATTEMPT_TIMEOUT_MS} busy timeout, so a held lock blocks the thread only that long at a
+ * time and the wait between attempts sleeps; a successful open gives the connection the store's busy
+ * timeout ({@link SqliteOpenOptions.busyTimeoutMs}). Failed connections are closed.
  * The initializer may run again on a fresh connection; on success it owns the handle.
  *
  * With corruption recovery enabled, recovery is serialized across processes.
@@ -383,7 +425,7 @@ export async function openSqliteDatabase<T>(
 	}
 
 	try {
-		return await openWithBusyRetries(dbPath, initialize, {});
+		return await openWithBusyRetries(dbPath, initialize, { busyTimeoutMs: options.busyTimeoutMs });
 	} catch (error) {
 		throw annotateSqliteError(error instanceof SqliteAttemptFailure ? error.original : error, dbPath);
 	}
@@ -408,7 +450,7 @@ export function openSqliteDatabaseSync<T>(
 	}
 
 	try {
-		return openOnceSync(dbPath, initialize, {});
+		return openOnceSync(dbPath, initialize, { busyTimeoutMs: options.busyTimeoutMs });
 	} catch (error) {
 		throw annotateSqliteError(error instanceof SqliteAttemptFailure ? error.original : error, dbPath);
 	}
