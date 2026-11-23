@@ -67,6 +67,13 @@ jobs:
   release_binary:
     needs: version
     cache-mode: write
+    # rust_test checks the addon it downloads against this sha256. Only the
+    # linux-x64 leg sets it: the macOS leg skips the step, so the output is
+    # empty there, and an empty output is not set and does not clear the
+    # linux-x64 leg's value (GitHub's workflow syntax, "Using Job Outputs in
+    # a Matrix Job").
+    outputs:
+      addon-linux-x64-modern-sha256: ${{ steps.addon.outputs.sha256 }}
     env:
       # The release build cache. The restore and save steps must name the
       # same paths. The bounds keep one entry per target small next to
@@ -168,6 +175,35 @@ jobs:
         run: |
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           bun scripts/bazel-natives.ts ${{ matrix.native_targets }} --dest packages/natives/native
+      # rust_test's omp-rpc smoke tests load this linux-x64-modern addon
+      # instead of one rust_test builds: its build was the same Bazel target
+      # with the same flags and took 23 min 39 s of its runner (job
+      # 137144188310). rust_test fails unless the bytes it downloads name this
+      # commit and have this sha256. The artifact is kept 30 days, as long as
+      # GitHub lets a job be re-run, so rust_test can be re-run alone.
+      - name: Hash the addon rust_test loads
+        id: addon
+        if: ${{ matrix.target == 'linux-x64' }}
+        shell: bash
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          file=pi_natives.linux-x64-modern.node
+          dir="$RUNNER_TEMP/natives-linux-x64-modern"
+          sha256="$(sha256sum "packages/natives/native/$file" | cut -d ' ' -f 1)"
+          mkdir -p "$dir"
+          cp "packages/natives/native/$file" "$dir/$file"
+          printf 'commit %s\nfile %s\nsha256 %s\n' "$COMMIT" "$file" "$sha256" >"$dir/manifest.txt"
+          cat "$dir/manifest.txt"
+          echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
+      - name: Upload the addon rust_test loads
+        if: ${{ matrix.target == 'linux-x64' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: natives-linux-x64-modern
+          path: ${{ runner.temp }}/natives-linux-x64-modern
+          retention-days: 30
+          if-no-files-found: error
       - name: Build binary
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
@@ -331,8 +367,12 @@ jobs:
     # self-hosted vmon runners, which the fork has no access to; so every fork
     # run of it is cancelled and no sami release ran a Rust test. This job runs
     # the same `bazel test //crates/...` on a GitHub-hosted runner, uncached,
-    # and release_github waits for it. It needs no
-    # earlier job, so it starts beside carry rather than after the version.
+    # and release_github waits for it. The omp-rpc smoke tests' server loads
+    # the linux-x64-modern native addon release_binary's linux-x64 leg
+    # installed (its step "Hash the addon rust_test loads"), so this job
+    # starts when release_binary's legs end, and it needs that leg: a trial
+    # run that skips release_binary fails here. Re-running a failed
+    # release_binary leg re-runs this job and rust_test_macos too.
     # The parity step fails while a test target of the repository's own Rust
     # suite has no Bazel test target. The test step, .github/sami/rust-test.sh,
     # fails when a test fails that .github/sami/rust-test-known-failures.txt
@@ -350,12 +390,16 @@ jobs:
     # runner's user given the FIFO the precondition step makes, and as root.
     # A test that returns early and prints nothing passes: no log shows it,
     # so each test that can skip prints the marker before it returns.
+    needs: release_binary
+    # It runs whatever release_binary's verdict, so a run without the addon
+    # fails here instead of skipping the tests.
+    if: ${{ !cancelled() }}
     name: Rust tests (bazel)
     runs-on: ubuntu-22.04
     # Uncached, the build and the tests took 17 to 25 minutes (runs
     # 44696018007, 44841451861), and run 44879022489's 35 with the #[ignore]d
-    # tests that run alone (each bounded at 1200 s); the native addon, the
-    # cargo doctests and the omp-rpc smoke tests come on top.
+    # tests that run alone (each bounded at 1200 s); the cargo doctests and
+    # the omp-rpc smoke tests come on top.
     timeout-minutes: 150
     # Test code and dev-dependency build scripts run here, so the job gets a
     # read-only token, and checkout keeps no credential in .git/config.
@@ -365,6 +409,48 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # The omp-rpc smoke tests' server loads packages/natives/native's
+      # pi_natives.linux-x64-modern.node: the one release_binary's linux-x64
+      # leg installed in this run. It has the flags this job's own build had:
+      # the //:natives-linux-x64-modern target through the transition in
+      # bazel/defs.bzl, and the same --config=ci; release_binary's rc adds
+      # only cache locations and cache collection bounds. Nothing here builds
+      # it again: a missing artifact fails the download, and the next step
+      # fails when the artifact names another commit, or its bytes' sha256
+      # differs from release_binary's output or from the artifact's manifest.
+      # They run first, so a run without the addon fails in a minute.
+      - name: Download the addon release_binary built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: natives-linux-x64-modern
+          path: ${{ runner.temp }}/release-natives/natives-linux-x64-modern
+      - name: Check the addon release_binary built
+        shell: bash
+        env:
+          COMMIT: ${{ github.sha }}
+          WANT_SHA256: ${{ needs.release_binary.outputs.addon-linux-x64-modern-sha256 }}
+        run: |
+          fail() { echo "::error title=Native addon::$1"; exit 1; }
+          # The loader takes the modern addon only where /proc/cpuinfo names
+          # avx2 (detectAvx2Support, packages/natives/native/loader-state.js);
+          # elsewhere it looks for a baseline addon, which this job has not.
+          grep -qiw avx2 /proc/cpuinfo ||
+            fail "this runner's CPU has no AVX2, so the loader would not load the linux-x64-modern addon, and the job has no baseline addon"
+          file=pi_natives.linux-x64-modern.node
+          dir="$RUNNER_TEMP/release-natives/natives-linux-x64-modern"
+          [ -f "$dir/$file" ] && [ -f "$dir/manifest.txt" ] ||
+            fail "the natives-linux-x64-modern artifact holds no $file or no manifest.txt"
+          cat "$dir/manifest.txt"
+          [ -n "$WANT_SHA256" ] || fail "release_binary gave no addon-linux-x64-modern-sha256 output"
+          got="$(sha256sum "$dir/$file" | cut -d ' ' -f 1)"
+          [ "$(sed -n 's/^commit //p' "$dir/manifest.txt")" = "$COMMIT" ] ||
+            fail "the artifact's manifest names another commit than this run's $COMMIT"
+          [ "$(sed -n 's/^file //p' "$dir/manifest.txt")" = "$file" ] ||
+            fail "the artifact's manifest names another file than $file"
+          [ "$got" = "$WANT_SHA256" ] ||
+            fail "$file has sha256 $got; release_binary's output gives $WANT_SHA256"
+          [ "$(sed -n 's/^sha256 //p' "$dir/manifest.txt")" = "$got" ] ||
+            fail "$file has sha256 $got; the artifact's manifest gives another"
       # The test step's decisions, the download helper and the parity
       # script's argument checks, against stubs; a minute, before the build.
       - name: The gate's own regression tests
@@ -637,17 +723,25 @@ jobs:
       - uses: ./.github/actions/bun-install
         with:
           cache: "false"
+      # The addon checked above. bazel-natives.ts installs it as it installs a
+      # build: it writes this tree's version into the addon's version slot,
+      # which release_binary wrote with the same version, and loads the addon
+      # in a child process. The installed bytes must stay release_binary's.
       - name: The native addon the smoke tests' server loads
         shell: bash
         env:
-          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+          WANT_SHA256: ${{ needs.release_binary.outputs.addon-linux-x64-modern-sha256 }}
         run: |
           if [ "$(bun --version)" != 1.4.5 ]; then
             echo "::error title=bun::$(command -v bun) is bun $(bun --version), not the pinned 1.4.5"
             exit 1
           fi
-          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
-          OMP_NATIVE_BUILD_BACKEND=bazel bun scripts/bazel-natives.ts host --dest packages/natives/native
+          bun scripts/bazel-natives.ts linux-x64-modern --source "$RUNNER_TEMP/release-natives" --dest packages/natives/native
+          installed="$(sha256sum packages/natives/native/pi_natives.linux-x64-modern.node | cut -d ' ' -f 1)"
+          if [ "$installed" != "$WANT_SHA256" ]; then
+            echo "::error title=Native addon::the installed pi_natives.linux-x64-modern.node has sha256 $installed, not release_binary's $WANT_SHA256"
+            exit 1
+          fi
           ls -l packages/natives/native
       - name: Rust tests against the known-failure list
         shell: bash
