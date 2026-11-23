@@ -2873,12 +2873,16 @@ fn dynamic_value(
 			((cx.host.random() & 0xffff_ffff) as u32).format_into(&mut NumBuffer::new()),
 		)),
 		b"SECONDS" => {
-			seconds_read(k, cx, vp)?;
-			// Wrapping: `SECONDS=` with a negative value puts the start
-			// after the host clock's reading.
-			let ns = cx.host.now_ns().wrapping_sub(k.seconds_origin(vp)) as i64;
-			let s = ns.div_euclid(1_000_000_000);
-			DynVal::Str(BString::from(s.format_into(&mut NumBuffer::new())))
+			// After `unset SECONDS`, or with a local or temporary `SECONDS`
+			// in scope, bash code's `SECONDS` is a plain variable.
+			if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& !seconds_visible(k, cx.store, vp)?
+			{
+				return Ok(None);
+			}
+			let secs = k.seconds_now(vp, cx.host.now_ns());
+			seconds_read(k, cx, vp, secs)?;
+			DynVal::Str(BString::from(secs.format_into(&mut NumBuffer::new())))
 		},
 		b"EPOCHSECONDS" => {
 			DynVal::Str(BString::from(cx.host.wall().secs.format_into(&mut NumBuffer::new())))
@@ -2913,26 +2917,67 @@ fn dynamic_value(
 	}))
 }
 
-/// bash's `get_seconds` gives `SECONDS` the integer attribute
-/// (`set_int_value` with flag 1), so a `SECONDS=` after any read of
-/// `$SECONDS` is arithmetic; the value stays computed on every read. A
-/// variable not yet declared is declared unset (invisible) with it.
-fn seconds_read(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Result<(), StoreError> {
+/// Whether bash code's `SECONDS` as `vp` sees it is the shell's clock: not
+/// after `unset SECONDS`, and not while a local or temporary `SECONDS` is in
+/// scope (bash makes those plain variables; `make_local_variable` copies no
+/// dynamic value).
+pub(crate) fn seconds_visible(
+	k: &Kernel,
+	store: &mut dyn crate::bash::store::StateStore,
+	vp: &Vproc,
+) -> Result<bool, StoreError> {
+	Ok(!k.seconds_plain(vp)
+		&& state::lookup_declared_scoped(&k.root, store, vp, b"SECONDS")?
+			.1
+			.is_none())
+}
+
+/// bash's `get_seconds`, run by every lookup of the shell's `SECONDS` (a
+/// read of `$SECONDS`, and `declare`, `local` and `export` of the name,
+/// which call `find_variable`): the variable gets the integer attribute
+/// (`set_int_value` with flag 1), so a `SECONDS=` after it is arithmetic,
+/// and its value (the text a `SECONDS+=` appends to) becomes `secs`, the
+/// count now.
+fn seconds_read(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	secs: i64,
+) -> Result<(), StoreError> {
 	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
 		return Ok(());
 	}
-	let var = state::lookup_declared(&k.root, cx.store, vp, b"SECONDS")?.cloned();
-	if var
-		.as_ref()
-		.is_some_and(|v| v.attrs.contains(Attrs::INTEGER))
-	{
+	let text = BString::from(secs.format_into(&mut NumBuffer::new()));
+	let var = state::global_in(cx.store, vp, b"SECONDS")?;
+	if var.is_some_and(|v| {
+		v.attrs.contains(Attrs::INTEGER)
+			&& !v.attrs.contains(Attrs::INVISIBLE)
+			&& matches!(&v.value, VarValue::Str(s) if *s == text)
+	}) {
 		return Ok(());
 	}
-	let mut var =
-		var.unwrap_or(Var { attrs: Attrs::INVISIBLE, value: VarValue::Str(BString::default()) });
-	var.attrs = var.attrs.with(Attrs::INTEGER);
-	state::store_var(&mut k.root, cx.store, vp, b"SECONDS", Some(var), Level::Dynamic);
+	let attrs = var
+		.map_or(Attrs::NONE, |v| v.attrs)
+		.without(Attrs::INVISIBLE)
+		.with(Attrs::INTEGER);
+	let var = Var { attrs, value: VarValue::Str(text) };
+	state::store_var(&mut k.root, cx.store, vp, b"SECONDS", Some(var), Level::Global);
 	Ok(())
+}
+
+/// A lookup of the shell's `SECONDS` outside an expansion (`declare`,
+/// `local`, `export`): [`seconds_read`] when bash code's `SECONDS` is the
+/// shell's clock.
+pub(crate) fn seconds_lookup(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+) -> Result<(), StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !seconds_visible(k, cx.store, vp)? {
+		return Ok(());
+	}
+	let secs = k.seconds_now(vp, cx.host.now_ns());
+	seconds_read(k, cx, vp, secs)
 }
 
 /// Whether [`Expander::dynamic`] computes `name` (keep in sync).

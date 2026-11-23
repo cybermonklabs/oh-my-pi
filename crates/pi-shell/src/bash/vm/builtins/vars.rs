@@ -18,7 +18,7 @@ use crate::bash::{
 	vm::{
 		Cx, Kernel,
 		exec::{self, Flow},
-		expand::{self, arith_value, attr_letters},
+		expand::{self, arith_value, attr_letters, seconds_lookup, seconds_visible},
 		is_ident,
 		proc::{AssignValue, Vproc},
 		quote,
@@ -566,35 +566,77 @@ fn set_value_plain(
 		k.seed_random(cx.store, vp, seed);
 		return Ok(());
 	}
-	// bash's `SECONDS=` (`assign_seconds`): the value is a decimal number
-	// (`valid_number`, else 0) until the variable has the integer attribute
-	// (`declare -i SECONDS`, or any read of `$SECONDS`, which sets it); then
-	// it is arithmetic, whose error `evalexp` reports and counts as 0, the
-	// assignment going on. The value is kept as the count's base and the
-	// start moves to now, so `$SECONDS` is the value plus the seconds since
-	// and `printf '%(…)T' -2` and the shell's `time` count from the
-	// assignment. A forked vproc's are its own.
+	// bash's `SECONDS=` (`assign_seconds`) on the shell's clock: not after
+	// `unset SECONDS`, and not on a local or temporary `SECONDS` (plain
+	// variables in bash, as is a readonly one's, which the general path
+	// refuses). `+=` makes the value first as for any variable
+	// (`make_variable_value`: the sum once `SECONDS` is integer, else the
+	// old text with the new after it). The value is then a decimal number
+	// (`valid_number`: else, or out of range, 0) until `SECONDS` has the
+	// integer attribute (`declare -i SECONDS`, or any lookup, which sets
+	// it); then it is arithmetic, whose error `evalexp` reports and counts
+	// as 0, the assignment going on. The value is kept as the count's base
+	// and the start moves to now, so `$SECONDS` is the value plus the
+	// seconds since and `printf '%(…)T' -2` and the shell's `time` count
+	// from the assignment. A forked vproc's are its own.
 	if name == b"SECONDS"
 		&& lhs.index.is_none()
 		&& let AssignValue::Scalar(v) = &value
+		&& !k.seconds_plain(vp)
 	{
-		let integer =
-			current(k, cx, vp, name, level)?.is_some_and(|v| v.attrs.contains(Attrs::INTEGER));
-		let secs = if !integer {
-			super::number(v).unwrap_or(0)
-		} else {
-			match arith_value(k, cx, vp, v) {
-				Ok(n) => n,
-				Err(Diag::StoreFailed) => return Err(Diag::StoreFailed),
-				Err(d) => {
-					k.diag(cx, vp, exec::current_line(vp), d);
-					0
-				},
-			}
+		let cur = match state::assigns_global(&k.root, cx.store, vp, name, level).and_then(|global| {
+			Ok(if global {
+				Some(state::global_in(cx.store, vp, name)?.cloned())
+			} else {
+				None
+			})
+		}) {
+			Ok(cur) => cur,
+			Err(e) => {
+				k.fail(e);
+				return Err(Diag::StoreFailed);
+			},
 		};
-		let now = cx.host.now_ns();
-		k.set_seconds(cx.store, vp, now, secs);
-		return Ok(());
+		if let Some(cur) = cur
+			&& !cur
+				.as_ref()
+				.is_some_and(|c| c.attrs.contains(Attrs::READONLY))
+		{
+			let attrs = cur
+				.as_ref()
+				.map_or(Attrs::NONE, |c| c.attrs.without(Attrs::INVISIBLE));
+			let integer = attrs.contains(Attrs::INTEGER);
+			let text = if lhs.append {
+				let old = cur
+					.as_ref()
+					.filter(|c| !c.attrs.contains(Attrs::INVISIBLE))
+					.and_then(Var::as_scalar)
+					.unwrap_or_default();
+				convert(k, cx, vp, attrs, v, Some(old))?
+			} else {
+				v.clone()
+			};
+			let secs = if !integer {
+				super::valid_number(&text).unwrap_or(0)
+			} else {
+				match arith_value(k, cx, vp, &text) {
+					Ok(n) => n,
+					Err(Diag::StoreFailed) => return Err(Diag::StoreFailed),
+					Err(d) => {
+						k.diag(cx, vp, exec::current_line(vp), d);
+						0
+					},
+				}
+			};
+			let now = cx.host.now_ns();
+			k.set_seconds(cx.store, vp, now, secs);
+			// The variable's value is the number (`set_int_value`), the
+			// text a later `SECONDS+=` adds to.
+			let value = VarValue::Str(BString::from(secs.format_into(&mut NumBuffer::new())));
+			let var = Some(Var { attrs, value });
+			state::store_var(&mut k.root, cx.store, vp, name, var, Level::Global);
+			return Ok(());
+		}
 	}
 	let Some(value) = assign_in_place(k, cx, vp, lhs, value, level)? else {
 		return Ok(());
@@ -1714,6 +1756,11 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let var = if kind == DeclareKind::Local {
 				func_local(ctx, name)?
 			} else {
+				// bash's `declare -p` looks the name up (`find_variable`),
+				// which reads the shell's `SECONDS`.
+				if name == b"SECONDS" {
+					seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
+				}
 				declared(ctx, name)?
 			};
 			if let Some(var) = var {
@@ -1729,6 +1776,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		return done(status);
 	}
 	let first = args.len() - o.rest.len();
+	// `export SECONDS=…` and `readonly SECONDS=…` look `SECONDS` up after
+	// assigning it (`set_or_show_attributes`): see the loop's end.
+	let mut seconds_after = false;
 	for (j, arg) in o.rest.iter().enumerate() {
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
@@ -1749,6 +1799,18 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			_ => false,
 		};
 		let (name, index, append, value) = split_assignment(arg, flat);
+		// bash looks the name up first (`find_variable` in `declare` and
+		// `local`, and in `export` or `readonly` with no value), and a
+		// lookup of the shell's `SECONDS` reads it (`get_seconds`), giving
+		// it the integer attribute: `declare SECONDS=1+1` is 2 and, after
+		// `local SECONDS`, the shell's `SECONDS` is integer.
+		if name == b"SECONDS" && index.is_none() {
+			if matches!(kind, DeclareKind::Export | DeclareKind::Readonly) && value.is_some() {
+				seconds_after = true;
+			} else {
+				seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
+			}
+		}
 		if on.contains(Attrs::NAMEREF)
 			&& (index.is_some() || (value.is_none() && arg.contains(&b'[')))
 		{
@@ -2411,6 +2473,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			},
 		}
 	}
+	if seconds_after {
+		seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
+	}
 	done(status)
 }
 
@@ -2905,6 +2970,23 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				v.next_index(),
 			)
 		});
+		// bash's `unset SECONDS` removes the shell's dynamic variable:
+		// `SECONDS` is a plain variable from then on (a local `SECONDS` is
+		// only that local's, and a readonly one stays, refused below).
+		if name == b"SECONDS"
+			&& index.is_none()
+			&& !o.has(b'n')
+			&& !var
+				.as_ref()
+				.is_some_and(|(attrs, ..)| attrs.contains(Attrs::READONLY))
+			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& seconds_visible(ctx.k, ctx.cx.store, ctx.vp)?
+		{
+			let keep = ctx.option(OptId::LocalvarUnset)?;
+			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+			ctx.k.set_seconds_plain(ctx.cx.store, ctx.vp);
+			continue;
+		}
 		if var.is_none() && !o.has(b'v') && !o.has(b'n') && index.is_none() {
 			status |= unset_function(ctx, name)?;
 			continue;

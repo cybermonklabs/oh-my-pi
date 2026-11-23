@@ -400,20 +400,23 @@ pub struct Shell {
 }
 
 /// The shell's `$SECONDS` clock as `MiscKey::StartNs` keeps it: the start
-/// in host clock ns, then `:` and bash's assigned value when it is not 0
-/// (`123`, `123:5`), so a record no `SECONDS=` in bash code changed is the
-/// plain number it was.
+/// in host clock ns, then `:` and bash's assigned value when it is not 0,
+/// then `:plain` once `unset SECONDS` removed its special meaning (`123`,
+/// `123:5`, `123:0:plain`), so a record no `SECONDS=` in bash code changed
+/// is the plain number it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartRecord {
 	pub start:   u64,
 	pub seconds: i64,
+	pub plain:   bool,
 }
 
 impl std::fmt::Display for StartRecord {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self.seconds {
-			0 => write!(f, "{}", self.start),
-			s => write!(f, "{}:{s}", self.start),
+		match (self.seconds, self.plain) {
+			(0, false) => write!(f, "{}", self.start),
+			(s, false) => write!(f, "{}:{s}", self.start),
+			(s, true) => write!(f, "{}:{s}:plain", self.start),
 		}
 	}
 }
@@ -422,8 +425,10 @@ impl std::str::FromStr for StartRecord {
 	type Err = std::num::ParseIntError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let (start, seconds) = s.split_once(':').unwrap_or((s, "0"));
-		Ok(Self { start: start.parse()?, seconds: seconds.parse()? })
+		let mut parts = s.splitn(3, ':');
+		let start = parts.next().unwrap_or_default().parse()?;
+		let seconds = parts.next().map_or(Ok(0), str::parse)?;
+		Ok(Self { start, seconds, plain: parts.next() == Some("plain") })
 	}
 }
 
@@ -502,6 +507,11 @@ pub struct Kernel {
 	/// `seconds_value_assigned`), which `$SECONDS` adds to the seconds since
 	/// `start_ns` (kept in `MiscKey::StartNs` with it, [`StartRecord`]).
 	pub seconds:            i64,
+	/// `unset SECONDS` in bash code removed the special meaning of the
+	/// shell's `SECONDS`: it is a plain variable from then on (kept in
+	/// `MiscKey::StartNs`, [`StartRecord`]); a forked vproc has its own
+	/// ([`proc::Clock`]).
+	pub seconds_plain:      bool,
 	/// Startup files (`path`, contents) the root vproc sources when its
 	/// first run starts ([`ShellInit::startup`]); not imaged (the first run
 	/// starts at the first step).
@@ -666,6 +676,7 @@ impl Kernel {
 			rand: state::Random::new(1),
 			start_ns: 0,
 			seconds: 0,
+			seconds_plain: false,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
 			nofork_units: HashMap::new(),
@@ -767,13 +778,31 @@ impl Kernel {
 	}
 
 	/// The host clock reading `vp`'s `$SECONDS` counts from: its start, moved
-	/// back by the value of its last `SECONDS=` in bash code.
+	/// back by the value of its last `SECONDS=` in bash code (zsh code's
+	/// `$SECONDS`).
 	pub fn seconds_origin(&self, vp: &Vproc) -> u64 {
 		let (start, seconds) = vp
 			.clock
 			.as_ref()
 			.map_or((self.start_ns, self.seconds), |c| (c.start_ns, c.seconds));
 		start.wrapping_sub((seconds as u64).wrapping_mul(1_000_000_000))
+	}
+
+	/// `$SECONDS` in bash code at host clock reading `now`: the value of
+	/// `vp`'s last `SECONDS=` plus the whole seconds since its start (bash's
+	/// `get_seconds`, `seconds_value_assigned + time_since_start`).
+	pub fn seconds_now(&self, vp: &Vproc, now: u64) -> i64 {
+		let (start, seconds) = vp
+			.clock
+			.as_ref()
+			.map_or((self.start_ns, self.seconds), |c| (c.start_ns, c.seconds));
+		let since = (now.wrapping_sub(start) as i64).div_euclid(1_000_000_000);
+		seconds.wrapping_add(since)
+	}
+
+	/// Whether `unset SECONDS` removed the special meaning of `vp`'s `SECONDS`.
+	pub fn seconds_plain(&self, vp: &Vproc) -> bool {
+		vp.clock.as_ref().map_or(self.seconds_plain, |c| c.plain)
 	}
 
 	/// `SECONDS=…` in `vp`: its start is `start` and `$SECONDS` adds
@@ -793,8 +822,27 @@ impl Kernel {
 		}
 		self.start_ns = start;
 		self.seconds = seconds;
-		let record = StartRecord { start, seconds }.to_string();
-		self.root.set_misc(store, MiscKey::StartNs, record);
+		self.write_start(store);
+	}
+
+	/// `unset SECONDS` in bash code: `vp`'s `SECONDS` is a plain variable
+	/// from now on. The shell's is written through.
+	pub fn set_seconds_plain(&mut self, store: &mut dyn StateStore, vp: &mut Vproc) {
+		if let Some(clock) = vp.clock.as_mut() {
+			clock.plain = true;
+			return;
+		}
+		self.seconds_plain = true;
+		self.write_start(store);
+	}
+
+	/// The shell's clock record ([`StartRecord`]).
+	fn write_start(&mut self, store: &mut dyn StateStore) {
+		let record =
+			StartRecord { start: self.start_ns, seconds: self.seconds, plain: self.seconds_plain };
+		self
+			.root
+			.set_misc(store, MiscKey::StartNs, record.to_string());
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
@@ -1698,6 +1746,16 @@ impl Shell {
 			.map_or(0, |v| imported_shlvl(v, zsh));
 		k.root
 			.set_var(cx.store, b"SHLVL", Some(Var::scalar((shlvl + 1).to_string(), Attrs::EXPORT)));
+		// bash's `init_seconds_var`: `SECONDS` from the environment, a
+		// decimal number, is the count's starting value (else 0).
+		if !zsh
+			&& let Some(secs) = state::global(cx.store, b"SECONDS")?
+				.and_then(|v| v.as_scalar())
+				.and_then(builtins::valid_number)
+		{
+			k.seconds = secs;
+			k.write_start(cx.store);
+		}
 		startup_vars(&mut k, cx, &init)?;
 		// bash's `sv_strict_posix` at import: `POSIXLY_CORRECT` (or
 		// `POSIX_PEDANTIC`) in the environment turns POSIX mode on; explicit
@@ -1915,6 +1973,7 @@ impl Shell {
 			reseed:   true,
 			start_ns: self.k.start_of(p),
 			seconds:  p.clock.map_or(self.k.seconds, |c| c.seconds),
+			plain:    self.k.seconds_plain(p),
 		};
 		// The parent's global state now; a host's submission (no store) to
 		// the root takes it when the scheduler adopts the subshell, before
@@ -3089,6 +3148,7 @@ impl Vproc {
 			reseed:   true,
 			start_ns: k.start_of(self),
 			seconds:  self.clock.map_or(k.seconds, |c| c.seconds),
+			plain:    k.seconds_plain(self),
 		});
 		vp.set_sticky(self.sticky().cloned());
 		// zsh forks keep `scriptname`: diagnostics of the child name the

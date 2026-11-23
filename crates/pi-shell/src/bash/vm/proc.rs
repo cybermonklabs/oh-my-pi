@@ -155,6 +155,9 @@ pub struct Clock {
 	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
 	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
 	pub seconds:  i64,
+	/// `unset SECONDS` in bash code removed the special meaning of `SECONDS`: a
+	/// plain variable from then on (bash removes the dynamic variable).
+	pub plain:    bool,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

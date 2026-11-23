@@ -5,7 +5,12 @@
 //! filled by `mapfile` and its callbacks.
 //! Goldens: bash 5.3.20 (`bash -c`).
 
-use crate::testkit::{FakeHost, Fault, MemFs, run_script};
+use bstr::BString;
+
+use crate::{
+	bash::{Script, ShellInit},
+	testkit::{FakeHost, Fault, MemFs, Rig, fault::skeleton_init, run_script},
+};
 
 fn run(src: &str) -> (String, String) {
 	let out = run_script(FakeHost::new(), src.as_bytes(), &[], Fault::None);
@@ -167,28 +172,104 @@ fn seconds_assignment_counts_from_the_value_in_each_process() {
 	assert_eq!((out.as_str(), err.as_str()), ("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", ""));
 }
 
-/// bash's `SECONDS=` takes a decimal number (`valid_number`, else 0) until
-/// the variable is an integer: after `declare -i SECONDS`, or once
-/// `$SECONDS` was read (`get_seconds` sets the attribute), the value is
-/// arithmetic, and an arithmetic error is reported, counts as 0 and the
-/// script goes on with status 0. Each `$(…)` below is a shell that has not
-/// read `$SECONDS` before its assignment. Goldens from bash 5.2.21 and
-/// 5.3.20.
+/// bash's `SECONDS=` takes a decimal number (`valid_number`, else 0; out of
+/// `i64`'s range too) until the variable is an integer: after `declare -i
+/// SECONDS`, or once `$SECONDS` was read (`get_seconds` sets the
+/// attribute), the value is arithmetic, and an arithmetic error is
+/// reported, counts as 0 and the script goes on with status 0. Each `$(…)`
+/// below is a shell that has not read `$SECONDS` before its assignment.
+/// Goldens from bash 5.2.21 and 5.3.20.
 #[test]
 fn seconds_assignment_takes_a_decimal_number_until_seconds_is_an_integer() {
 	let (out, err) = run(
-		"x=7; for v in 1+1 x 0x10 ' 7 ' abc 5.5 -3; do r=$(SECONDS=$v; echo \"$SECONDS st=$?\"); \
-		 echo \"[$v] $r\"; done; r=$(: $SECONDS; SECONDS=1+1; a=$SECONDS; SECONDS=x; b=$SECONDS; \
-		 SECONDS=0x10; echo $a $b $SECONDS); echo \"after a read: $r\"; r=$(: $SECONDS; \
-		 SECONDS=5.5; echo \"st=$? $SECONDS\"; f() { SECONDS=5.5; echo \"f st=$?\"; }; f; echo \
-		 \"after f st=$?\"); echo $r; declare -i SECONDS; SECONDS=1+1; echo $SECONDS",
+		"x=7; for v in 1+1 x 0x10 ' 7 ' abc 5.5 -3 99999999999999999999 -9223372036854775808 \
+		 -9223372036854775809; do r=$(SECONDS=$v; echo \"$SECONDS st=$?\"); echo \"[$v] $r\"; done; \
+		 r=$(: $SECONDS; SECONDS=1+1; a=$SECONDS; SECONDS=x; b=$SECONDS; SECONDS=0x10; echo $a $b \
+		 $SECONDS); echo \"after a read: $r\"; r=$(: $SECONDS; SECONDS=5.5; echo \"st=$? \
+		 $SECONDS\"; f() { SECONDS=5.5; echo \"f st=$?\"; }; f; echo \"after f st=$?\"); echo $r; \
+		 declare -i SECONDS; SECONDS=1+1; echo $SECONDS",
 	);
 	assert_eq!(
 		out,
 		"[1+1] 0 st=0\n[x] 0 st=0\n[0x10] 0 st=0\n[ 7 ] 7 st=0\n[abc] 0 st=0\n[5.5] 0 st=0\n[-3] -3 \
-		 st=0\nafter a read: 2 7 16\nst=0 0 f st=0 after f st=0\n2\n"
+		 st=0\n[99999999999999999999] 0 st=0\n[-9223372036854775808] -9223372036854775808 \
+		 st=0\n[-9223372036854775809] 0 st=0\nafter a read: 2 7 16\nst=0 0 f st=0 after f st=0\n2\n"
 	);
 	assert_eq!(err.matches("5.5: arithmetic syntax error").count(), 2, "{err}");
+}
+
+/// bash's `SECONDS+=` makes the value first (`make_variable_value`): the old
+/// value's text with the new one after it, or their sum once `SECONDS` is
+/// integer; the old value is the last assignment's or read's.
+#[test]
+fn seconds_append_adds_to_the_last_value() {
+	for (src, want) in [
+		("SECONDS=5; SECONDS+=5; echo $SECONDS", "55\n"),
+		(": $SECONDS; SECONDS=5; SECONDS+=5; echo $SECONDS", "10\n"),
+		("SECONDS+=5; echo $SECONDS", "5\n"),
+		("SECONDS=7; : $SECONDS; SECONDS+=1+1; echo $SECONDS", "9\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// A local or temporary `SECONDS` is a plain variable (bash's
+/// `make_local_variable` copies no dynamic value), and the shell's clock
+/// goes on unmoved; `local`, `declare` and `export` with no value look the
+/// name up first (`find_variable`), which reads the shell's `SECONDS` and
+/// so makes it integer. `unset SECONDS` removes the special meaning for
+/// good unless a local is what it unsets. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_locals_lookups_and_unset() {
+	for (src, want) in [
+		("f() { local SECONDS=3; echo $SECONDS; }; f; echo $SECONDS", "3\n0\n"),
+		(
+			"f() { local SECONDS; echo \"[$SECONDS]\"; SECONDS=7; echo $SECONDS; }; SECONDS=50; f; \
+			 echo $SECONDS",
+			"[]\n7\n50\n",
+		),
+		("f() { local SECONDS=1+1; echo $SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n2\n"),
+		("f() { local SECONDS=4; unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare SECONDS=1+1; echo $SECONDS", "2\n"),
+		("export SECONDS=1+1; echo $SECONDS; SECONDS=1+1; echo $SECONDS", "0\n2\n"),
+		("export SECONDS; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -p SECONDS", "declare -i SECONDS=\"0\"\n"),
+		("SECONDS=5; declare -p SECONDS", "declare -i SECONDS=\"5\"\n"),
+		(
+			"unset SECONDS; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS; declare -p SECONDS",
+			"[]\n1+1\ndeclare -- SECONDS=\"1+1\"\n",
+		),
+		("f() { unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n"),
+		("( unset SECONDS; SECONDS=1+1; echo $SECONDS ); SECONDS=1+1; echo $SECONDS", "1+1\n0\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `SECONDS` in the environment is the count's starting value, a decimal
+/// number (bash's `init_seconds_var`), for the shell and for a nested
+/// `bash`. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_from_the_environment() {
+	for (value, want) in [("100", "100\n"), ("abc", "0\n"), (" 7 ", "7\n")] {
+		let init = ShellInit {
+			env: vec![
+				(BString::from("PATH"), BString::from("/usr/bin:/bin")),
+				(BString::from("SECONDS"), BString::from(value)),
+			],
+			..skeleton_init(&[])
+		};
+		let mut rig = Rig::new(FakeHost::new(), init);
+		rig.run(Script::command(b"echo $SECONDS".to_vec()), Fault::None);
+		assert_eq!(String::from_utf8_lossy(&rig.host.stdout.bytes()), want, "{value}");
+	}
+	for (src, want) in [
+		("SECONDS=100 bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=100; export SECONDS; bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=abc bash -c 'echo $SECONDS'", "0\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
 }
 
 /// bash's `SECONDS=` keeps the value apart and moves the start to now
