@@ -116,6 +116,12 @@ fn a_timed_jobs_pid_is_a_real_process() {
 			"alive=yes\nps=yes\njp=same\nw=143\n",
 		),
 		(
+			"negated prog",
+			format!("TIMEFORMAT=; time ! {RUNS} & {probe}; kill $!; wait $!; echo w=$?; : > G"),
+			false,
+			"alive=yes\nps=yes\njp=same\nw=143\n",
+		),
+		(
 			"pipe",
 			format!("TIMEFORMAT=; time {RUNS} | {RUNS} & {probe}; : > G; wait $!; echo w=$?"),
 			false,
@@ -151,6 +157,13 @@ fn a_timed_body_is_known_by_its_program_only_when_that_program_is_its_whole_life
 		row("two-command subshell", format!("time ( {RUNS}; /bin/echo rest )"), not),
 		row("two-command function", format!("f() {{ {RUNS}; /bin/echo rest; }}; time f"), not),
 		row("builtin first in a function", format!("f() {{ :; {RUNS}; }}; time f"), not),
+		row("negated group", format!("time {{ ! {RUNS}; }}"), real),
+		row(
+			"a group, then a command, in a subshell",
+			format!("time ( {{ {RUNS}; }}; /bin/echo rest )"),
+			not,
+		),
+		row("a timed first pipeline of a list", format!("time {RUNS} && /bin/echo rest"), not),
 		(
 			"loop",
 			String::from(

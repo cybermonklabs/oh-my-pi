@@ -4005,11 +4005,13 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 
 /// Whether the code at `at` is one simple command whose literal name is no
 /// shell builtin (it may run a program), alone or as the only command of a
-/// group (`{ cmd; }`), and nothing after it: that program is the body's
-/// whole life, so the body decides its job's pid at its dispatch
+/// group (`{ cmd; }`), with or without a `!` (`time ! cmd &`, lowered
+/// `Exec, Not`), and nothing after it: that program is the body's whole
+/// life, so the body decides its job's pid at its dispatch
 /// ([`BangStage::First`]). The body ends at a `SubExit` (a job's or a
-/// subshell's), at `TimeEnd` then `SubExit` (a timed job), or at `End` (a
-/// function body).
+/// subshell's), at `TimeEnd` then `SubExit` (a timed job; `TimeEnd`
+/// followed by more code is the end of a timed first pipeline of a list,
+/// `time cmd && more &`, not of the body), or at `End` (a function body).
 pub(super) fn program_only(unit: &Unit, at: u32) -> bool {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	let program = |at: u32| {
@@ -4026,16 +4028,24 @@ pub(super) fn program_only(unit: &Unit, at: u32) -> bool {
 						if crate::bash::ids::IntrinsicId::from_name(name).is_none())
 				})
 	};
+	// The code after the command at `at`: past its `!`, if it has one.
+	let after = |at: u32| {
+		if code(at + 1) == Some(Opcode::Not) {
+			at + 2
+		} else {
+			at + 1
+		}
+	};
 	let ends = |at: u32| match code(at) {
 		Some(Opcode::SubExit | Opcode::End) => true,
 		Some(Opcode::TimeEnd) => code(at + 1) == Some(Opcode::SubExit),
 		_ => false,
 	};
-	(program(at) && ends(at + 1))
+	(program(at) && ends(after(at)))
 		|| (code(at) == Some(Opcode::Enter)
 			&& program(at + 1)
-			&& code(at + 2) == Some(Opcode::Leave)
-			&& ends(at + 3))
+			&& code(after(at + 1)) == Some(Opcode::Leave)
+			&& ends(after(at + 1) + 1))
 }
 
 /// Whether the background job whose body starts at `entry` is timed
@@ -4120,11 +4130,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				.bangs
 				.iter()
 				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-		// A timed job whose body is a subshell that starts with a program
-		// (`time ( cmd; … ) &`): the subshell's first command decides
-		// ([`BangStage::First`]).
+		// A timed job whose body is a subshell of one program (`time ( cmd
+		// ) &`): the subshell's command decides ([`BangStage::First`]). The
+		// job's vproc holds a pending First only for a body `bang_stage`
+		// (or a function call, whose body is one program and forks nothing)
+		// found to be that subshell, and forks nothing before it: this spawn
+		// is the body's own subshell.
 		let own_subshell = info.kind == SpawnKind::Subshell
-			&& program_only(unit, info.stages[0].entry)
 			&& k
 				.bangs
 				.iter()
