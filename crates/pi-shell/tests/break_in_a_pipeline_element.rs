@@ -9,7 +9,9 @@
 //! element). The forks: the other children that carry the loop level or
 //! not (jobs, process substitutions, backticks, coprocesses, the
 //! not-found hook), a child's own loops beside its parent's, counts
-//! through `eval`, and the message's redirections and order. Each row
+//! through `eval`, and the message's redirections and order. The fatal
+//! rows (bash): where a fatal error in a forked simple command ends, run
+//! with `-c` and from a script file. Each row
 //! prints where it is (`a<n>` per iteration, `b<n>:$?` after the element,
 //! `e:$?` after the loop), so its output says whether the body and the
 //! loop went on. A few rows also run under obash's fault injector, which
@@ -42,7 +44,7 @@ use std::{
 	fmt::Write as _,
 	fs,
 	os::unix::process::CommandExt,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::atomic::{AtomicUsize, Ordering},
 	thread,
 };
@@ -255,6 +257,12 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("posix-alone", "set -o posix; break"),
 	("element-procsub-word", ": | x=<(:) break"),
 	("bg-procsub-word", "x=<(:) break & wait"),
+	// A lone `break` as a forked element with an external reader, as a
+	// `( … )` and as a substitution: bash prints the message only for the
+	// `( … )`.
+	("element-break-cat", "break | cat"),
+	("subshell-break-alone", "( break )"),
+	("cmdsub-break-alone", "x=$( break )"),
 	// `$BASH_SUBSHELL`: a builtin or external element's words expand at its
 	// parent's level; a builtin or function element then runs one level
 	// down (a function, `eval`, `.`, a builtin's callback), however its
@@ -340,6 +348,15 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("bg-group-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; { f | cat; } & wait"),
 	("bg-and-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; true && f | cat & wait"),
 	("group-element-function-level", "f() { echo $BASH_SUBSHELL; }; { f; } | cat"),
+	// A `( … )` job counts once (a `time` or `!` around it too); an and-or
+	// job that starts with one is forked whole, and the `( … )` again.
+	("bg-subshell-level", "( echo $BASH_SUBSHELL ) & wait"),
+	("bg-negated-subshell-level", "! ( echo $BASH_SUBSHELL ) & wait"),
+	("bg-timed-subshell-level", "TIMEFORMAT=; time ( echo $BASH_SUBSHELL ) & wait"),
+	("bg-subshell-and-list-level", "( echo $BASH_SUBSHELL ) && : & wait"),
+	("bg-subshell-or-list-level", "( echo $BASH_SUBSHELL; false ) || : & wait"),
+	("bg-subshell-redir-and-list-level", "( echo $BASH_SUBSHELL ) 2>/dev/null && : & wait"),
+	("bg-timed-subshell-and-list-level", "TIMEFORMAT=; time ( echo $BASH_SUBSHELL ) && : & wait"),
 	// A fatal error (`${x?}`, `set -u`) in a forked element or async command
 	// of a `-c` string: its own words and a function it runs reach the
 	// shell's command loop (127); a builtin it runs (`eval`), a subshell, a
@@ -385,6 +402,282 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	),
 ];
 
+/// The fatal-error shapes (bash only), each run with `-c` (`fatal/c/<name>`)
+/// and from a script file (`fatal/s/<name>`). A fatal error (`${x?}`,
+/// `set -u`) in a forked simple element or async command ends where its
+/// forking shell's would (bash's fork copies `top_level`): at the `-c`
+/// command loop (127) only when that shell's error reaches it, so not in
+/// an element forked inside `( … )`, `$( )` or `<( )`, nor inside a builtin
+/// element (each has its own `top_level`: 1). From a script it is 1.
+const FATALS: &[(&str, &str)] = &[
+	(
+		"cmdsub-element",
+		"f() { echo ${x?boom}; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"",
+	),
+	(
+		"subshell-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+	(
+		"procsub-element",
+		"f() { echo ${x?boom}; }; cat <(f | cat; echo in:${PIPESTATUS[*]}); echo st=$?",
+	),
+	("subshell-async", "f() { echo ${x?boom}; }; ( f & wait $!; echo in:$? ); echo st=$?"),
+	(
+		"bg-subshell-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) & wait $!; echo st=$?",
+	),
+	(
+		"function-cmdsub-element",
+		"f() { echo ${x?boom}; }; g() { x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x\"; }; \
+		 g; echo st=$?",
+	),
+	(
+		"cmdsub-group-element",
+		"f() { echo ${x?boom}; }; x=$({ f | cat; echo in:${PIPESTATUS[*]}; }); echo \"x=$x st=$?\"",
+	),
+	("cmdsub-async", "f() { echo ${x?boom}; }; x=$(f & wait $!; echo in:$?); echo \"x=$x st=$?\""),
+	// The control: at top level the error reaches the `-c` command loop.
+	("top-element", "f() { echo ${x?boom}; }; f | cat; echo ps=${PIPESTATUS[*]}"),
+	(
+		"subshell-in-element",
+		"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	("cmdsub-last-element", "f() { echo ${x?boom}; }; x=$(: | f; echo in:$?); echo \"x=$x st=$?\""),
+	(
+		"cmdsub-element-cmdsub-word",
+		"f() { echo ${x?boom}; }; x=$(f $(:) | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"",
+	),
+	("subshell-last-element", "f() { echo ${x?boom}; }; ( : | f; echo in:$? ); echo st=$?"),
+	(
+		"group-in-element",
+		"f() { echo ${x?boom}; }; { f | cat; echo in:${PIPESTATUS[*]}; } | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"cmdsub-in-cmdsub-element",
+		"f() { echo ${x?boom}; }; x=$(y=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"y=$y\"); echo \
+		 \"x=$x st=$?\"",
+	),
+	(
+		"cmdsub-element-set-u",
+		"set -u; f() { echo $nosuch_q; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x \
+		 st=$?\"",
+	),
+	(
+		"cmdsub-element-pipefail",
+		"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat; echo in:$?); echo \"x=$x st=$?\"",
+	),
+	(
+		"subshell-element-set-u",
+		"set -u; f() { echo $nosuch_q; }; ( f | cat; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+	// A builtin element has its own `top_level`; a function element (also
+	// one running `eval`) has its forking shell's, and passes it on.
+	(
+		"eval-element-inner",
+		"f() { echo ${x?boom}; }; : | eval 'f | cat; echo in:${PIPESTATUS[*]}'; echo st=$?",
+	),
+	(
+		"eval-in-function-element-inner",
+		"f() { echo ${x?boom}; }; g() { eval 'f | cat; echo in:${PIPESTATUS[*]}'; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-inner",
+		"f() { echo ${x?boom}; }; g() { f | cat; echo in:${PIPESTATUS[*]}; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	(
+		"async-in-async",
+		"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g & wait $!; echo st=$?",
+	),
+	(
+		"async-in-element",
+		"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	// An async pipeline's elements are forked from the shell that runs it
+	// (obash's job vproc for the pipeline passes that shell's answer on).
+	("top-bg-pipeline", "set -o pipefail; f() { echo ${x?boom}; }; f | cat & wait $!; echo st=$?"),
+	(
+		"cmdsub-bg-pipeline",
+		"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat & wait $!; echo in:$?); echo \"x=$x \
+		 st=$?\"",
+	),
+	(
+		"subshell-bg-pipeline",
+		"set -o pipefail; f() { echo ${x?boom}; }; ( f | cat & wait $!; echo in:$? ); echo st=$?",
+	),
+	// A compound element's or job's own redirection, a negated simple job,
+	// and the forms bash ends with 1 (a list inside the compound, a
+	// subshell, a substitution).
+	("bg-group-redir-word", "{ :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-pipeline-group-redir-word", "true | { :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-simple-word", ": \"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-group-inner-word", "{ : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	("bg-subshell-inner-word", "( : \"${zz?u}\" ) & wait $!; echo st=$?"),
+	("bg-pipeline-group-inner-word", "true | { : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	("subshell-group-redir-word", "( { :; } 2>\"${zz?u}\" ); echo st=$?"),
+	("cmdsub-group-redir-word", "x=$( { :; } 2>\"${zz?u}\" ); echo st=$?"),
+	("bg-negated-function", "f() { echo ${x?boom}; }; ! f & wait $!; echo st=$?"),
+	("bg-negated-simple-word", "! : \"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-subshell-redir-word", "( : ) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("element-group-redir-word", "{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}"),
+	// A job running a function reaches the command loop. A timed job is
+	// forked through `execute_in_subshell`, its own `top_level`, so what it
+	// runs ends there (1); but the own redirection of a timed compound that
+	// is the whole job is expanded before that, at the fork's (127 with
+	// `-c`).
+	("bg-function-colon", "f() { echo ${x:?u}; }; f & wait $!; echo st=$?"),
+	("bg-timed-function", "TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?"),
+	("bg-timed-simple-word", "TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-negated-function",
+		"TIMEFORMAT=; f() { echo ${x:?u}; }; time ! f & wait $!; echo st=$?",
+	),
+	(
+		"element-timed-function",
+		"TIMEFORMAT=; f() { echo ${x:?u}; }; time f | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	// `time` inside the function the job runs: the status only (stderr
+	// closed), the timing report being another member's.
+	(
+		"bg-function-timed-inside",
+		"exec 2>/dev/null; f() { time echo ${x:?u}; }; f & wait $!; echo st=$?",
+	),
+	("bg-timed-group-redir-word", "TIMEFORMAT=; time { :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-timed-subshell-redir-word", "TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-if-redir-word",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-while-redir-word",
+		"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-for-redir-word",
+		"TIMEFORMAT=; time for x in 1; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-case-redir-word",
+		"TIMEFORMAT=; time case a in a) :;; esac 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	("bg-timed-cond-redir-word", "TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-timed-arith-redir-word", "TIMEFORMAT=; time (( 1 )) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-negated-group-redir-word",
+		"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	// Controls: piped (the job is a pipeline: `cat`'s status), and a word
+	// inside the timed compound (1).
+	(
+		"bg-timed-group-redir-word-piped",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat & wait $!; echo st=$?",
+	),
+	("bg-timed-group-inner-word", "TIMEFORMAT=; time { : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	(
+		"element-timed-group-redir-word",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	// A compound with its own redirection that is only the first command
+	// of a job's and-or list, timed or not: bash forks the whole list
+	// (`execute_connection`), whose child sets its own `top_level` before
+	// the list runs the compound, so the redirection's error ends there
+	// (1); so too a group or subshell job holding the timed compound. The
+	// controls: a lone compound job, negated or timed, ends at the fork's
+	// (127 with `-c`).
+	("bg-group-redir-and-list", "{ :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-timed-group-redir-and-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-subshell-redir-and-list", "( : ) 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-timed-subshell-redir-and-list",
+		"TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-group-redir-or-list", "{ :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?"),
+	(
+		"bg-timed-group-redir-or-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-and-then-timed-group-redir",
+		"TIMEFORMAT=; true && time { :; } 2>\"${zz?u}\" & wait $!; echo w=$?",
+	),
+	("bg-and-then-group-redir", "true && { :; } 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	(
+		"bg-timed-pipe-and-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat && echo and & wait $!; echo w=$?",
+	),
+	("bg-group-holding-timed", "TIMEFORMAT=; { time { :; } 2>\"${zz?u}\"; } & wait $!; echo w=$?"),
+	(
+		"bg-negated-timed-and-list",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-if-redir-and-list",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-if-redir-or-list",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-negated-timed-or-list",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-negated-group-redir-and-list",
+		"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-while-redir-and-list",
+		"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-cond-redir-and-list",
+		"TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-if-redir-and-list", "if :; then :; fi 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-group-list-holding-timed",
+		"TIMEFORMAT=; { time { :; } 2>\"${zz?u}\"; echo after; } & wait $!; echo w=$?",
+	),
+	(
+		"bg-subshell-holding-timed",
+		"TIMEFORMAT=; ( time { :; } 2>\"${zz?u}\"; echo after ) & wait $!; echo w=$?",
+	),
+	(
+		"bg-negated-timed-group-redir-word",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" & wait $!; echo w=$?",
+	),
+	("bg-negated-group-redir-word", "! { :; } 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	("bg-if-redir-word", "if :; then :; fi 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	// A lone simple job's fatal word (127 with `-c`).
+	("bg-echo-word", "echo ${u?m} & wait $!; echo $?"),
+	// No program runs (an external in flight skips a snapshot): these two
+	// also run under snapshots.
+	("top-element-builtin-reader", "f() { echo ${x?boom}; }; f | :; echo ps=${PIPESTATUS[*]}"),
+	(
+		"subshell-element-builtin-reader",
+		"f() { echo ${x?boom}; }; ( f | :; echo in:${PIPESTATUS[*]} ); echo st=$?",
+	),
+];
+
+/// The fatal rows: each [`FATALS`] shape with `-c` and from a script.
+fn fatals() -> Vec<Row> {
+	FATALS
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("fatal/c/{name}"), x.to_owned()), (format!("fatal/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
 /// The fork shapes only zsh runs.
 const ZSH_FORKS: &[(&str, &str)] = &[
 	("procsub-file", "cat =(break; echo s)"),
@@ -424,6 +717,13 @@ const ZSH_FORKS: &[(&str, &str)] = &[
 	("bg-pipeline-subshell-element-level", "( echo $ZSH_SUBSHELL ) | cat & wait"),
 	("bg-pipeline-last-subshell-level", ": | ( echo $ZSH_SUBSHELL ) & wait"),
 	("bg-pipeline-not-group-element-level", "! { echo $ZSH_SUBSHELL; } | cat & wait"),
+	// Not bash's rule: a `( … )` that starts a job counts once however the
+	// job goes on (`!`, `&& :`), and a timed `( … )` job counts twice.
+	("bg-subshell-level", "( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-negated-subshell-level", "! ( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-timed-subshell-level", "exec 2>/dev/null; time ( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-subshell-and-list-level", "( echo $ZSH_SUBSHELL ) && : & wait"),
+	("bg-subshell-redir-and-list-level", "( echo $ZSH_SUBSHELL ) 2>/dev/null && : & wait"),
 ];
 
 /// The fork rows, `fork/x<loops>/<name>`: each shape at top level, in a
@@ -1289,8 +1589,9 @@ enum Runner<'a> {
 	Oracle(&'a str),
 }
 
-/// Run `script` as `dialect` with `runner`.
-fn run_row(dialect: Dialect, runner: Runner<'_>, script: &str) -> Outcome {
+/// Run row `id`'s `script` as `dialect` with `runner`: with `-c`, or for a
+/// `fatal/s/` row from the script file `s.sh` in a directory of its own.
+fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outcome {
 	let mut cmd = match runner {
 		Runner::Oracle(program) => command(program),
 		Runner::Obash | Runner::ObashSnapshots => obash(),
@@ -1304,12 +1605,31 @@ fn run_row(dialect: Dialect, runner: Runner<'_>, script: &str) -> Outcome {
 		}
 		cmd.arg("-f");
 	}
-	let out = output(cmd.args(["-c", script]));
+	let out = if id.starts_with("fatal/s/") {
+		static NEXT: AtomicUsize = AtomicUsize::new(0);
+		let dir = env::temp_dir().join(format!(
+			"pi-loop-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::Relaxed)
+		));
+		fs::create_dir(&dir).unwrap();
+		fs::write(dir.join("s.sh"), format!("{script}\n")).unwrap();
+		let out = output(cmd.current_dir(&dir).arg("s.sh"));
+		remove_dir(&dir);
+		out
+	} else {
+		output(cmd.args(["-c", script]))
+	};
 	(
 		String::from_utf8_lossy(&out.stdout).into_owned(),
 		normalized_stderr(&out.stderr),
 		out.status.code().unwrap_or(-1),
 	)
+}
+
+/// Remove a row's directory, which only it used.
+fn remove_dir(dir: &Path) {
+	fs::remove_dir_all(dir).unwrap();
 }
 
 fn fixture(dialect: Dialect) -> PathBuf {
@@ -1343,10 +1663,10 @@ fn run_all(dialect: Dialect, runner: Runner<'_>, rows: &[Row]) -> Vec<Outcome> {
 					let mut mine = Vec::new();
 					loop {
 						let i = next.fetch_add(1, Ordering::Relaxed);
-						let Some((_, script)) = rows.get(i) else {
+						let Some((id, script)) = rows.get(i) else {
 							break;
 						};
-						mine.push((i, run_row(dialect, runner, script)));
+						mine.push((i, run_row(dialect, runner, id, script)));
 					}
 					mine
 				})
@@ -1431,8 +1751,9 @@ const BASH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/cmdsub/continue/2/last/lastpipe",
 	"fork/x1/cmdsub-own-loop-break2",
 	"fork/x1/bg-simple",
-	"fork/x2/cmdsub-nested",
 	"fork/lines/cmdsub",
+	"fatal/c/top-element-builtin-reader",
+	"fatal/c/subshell-element-builtin-reader",
 ];
 
 /// [`BASH_SNAPSHOT_ROWS`] for zsh.
@@ -1527,14 +1848,27 @@ fn zsh_source_matches_zsh() {
 	assert_rows(Dialect::Zsh, "source/", &sources(Dialect::Zsh));
 }
 
+/// The fatal errors of forked simple commands in bash ([`FATALS`]).
+#[test]
+fn bash_fatal_errors_match_bash() {
+	assert_rows(Dialect::Bash, "fatal/", &fatals());
+}
+
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
 /// the recorded outcome of each: a forked child's loops
-/// (`Vproc::outer_loops`) and zsh's `intrap` survive the frames image.
+/// (`Vproc::outer_loops`), zsh's `intrap` and where a fatal error ends
+/// (`Frame::command_loop`) survive the frames image.
 fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
+	let fatal = if dialect == Dialect::Bash {
+		fatals()
+	} else {
+		Vec::new()
+	};
 	let rows: Vec<Row> = grid(dialect)
 		.into_iter()
 		.chain(forks(dialect))
 		.chain(trap_shapes(dialect))
+		.chain(fatal)
 		.filter(|(id, _)| ids.contains(&id.as_str()))
 		.collect();
 	assert_eq!(rows.len(), ids.len(), "a snapshot row id names no row");
