@@ -142,6 +142,33 @@ export interface SlashCommandRuntime {
 	 * (RPC) ignore the flag and always push.
 	 */
 	notifyConfigChanged?: (options?: { handledBySessionEvent?: boolean }) => Promise<void> | void;
+	/**
+	 * The host's live voice call, which `/live on|off|status` drives. RPC mode provides it (its
+	 * `RpcLiveBridge`); hosts without one (ACP, print mode, subagents) answer `/live` as not available.
+	 */
+	live?: SlashCommandLiveHost;
+}
+
+/** State of a host's live voice call, as `/live status` reports it. */
+export type LiveCallStatus =
+	| { state: "off" }
+	| {
+			state: "starting" | "open";
+			provider: string;
+			/** The voice in use; none on GPT-Live's API (`live.provider: openai`), which gets none from omp. */
+			voice?: string;
+			/** When the call was asked for. */
+			since: Date;
+			muted: boolean;
+	  };
+
+/** One live voice call at a time on the host's audio (microphone and speaker). */
+export interface SlashCommandLiveHost {
+	/** Starts a call; resolves once it records, rejects with the reason it cannot start. */
+	start(): Promise<{ voice?: string }>;
+	/** Ends the call, if one is open; resolves once it has ended. */
+	stop(): Promise<void>;
+	status(): LiveCallStatus;
 }
 
 /**
