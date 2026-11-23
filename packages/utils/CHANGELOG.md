@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `initializeSqliteSchema(db, apply)`, which runs an idempotent schema initializer read-only first and writes, under `BEGIN IMMEDIATE`, only when the schema needs a change ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+- Added `SqliteOpenOptions.busyTimeoutMs`, the busy timeout a connection keeps once `openSqliteDatabase` or `openSqliteDatabaseSync` has opened it ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+
+### Changed
+
+- `openSqliteDatabase` keeps retrying a store another process holds locked for up to 60 s, an attempt every 50-100 ms (was four attempts, about 5 s in headless hosts and about 21 s in interactive ones), and the final error says how long it waited. Each attempt waits 25 ms on the lock and the wait between attempts sleeps, so the event loop keeps running (each attempt blocked it for the full busy timeout, 1 s or 5 s), and an open still gets in when a peer frees the lock only briefly between its own transactions. `openSqliteDatabaseSync` still makes one attempt, because its callers open on the UI thread and fall back when the open fails ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

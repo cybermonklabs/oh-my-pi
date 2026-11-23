@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed opening the auth credential store taking `agent.db`'s write lock on every start, which failed concurrent starts with `database is locked` ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

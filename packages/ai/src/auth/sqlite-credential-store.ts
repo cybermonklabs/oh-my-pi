@@ -13,6 +13,7 @@ import { parseCloudflareCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare"
 import {
 	getAgentDbPath,
 	getDbBusyTimeoutMs,
+	initializeSqliteSchema,
 	isSqliteBusyError,
 	isSqliteCorruptionError,
 	logger,
@@ -629,21 +630,30 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	 * the connection: concurrent omp startups race WAL recovery and the leases
 	 * DDL. Uses the centralized timeout so headless hosts keep their bounded
 	 * busy wait instead of the interactive 5s value. See issues #2421, #7298.
+	 * A connection that already has a handler keeps it: `openSqliteDatabase`
+	 * opens with a short one and installs the store's timeout once the open
+	 * succeeds, so a held lock does not block the thread for 5 s per attempt.
 	 */
 	static #installBusyTimeout(db: Database): void {
-		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+		const current = db.query("PRAGMA busy_timeout").values()[0]?.[0];
+		if (current === 0) db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 	}
 
 	#initializeSchema(): void {
 		// Install the busy handler BEFORE any lock-taking statement (incl.
 		// `PRAGMA journal_mode=WAL`, which acquires an exclusive lock during WAL
 		// recovery). Without this, concurrent omp startups can crash here with
-		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. Re-setting when opened via
-		// `open()` (which already installed it) is idempotent. See issue #2421.
+		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. A connection opened through
+		// `openSqliteDatabase` already has one. See issue #2421.
 		SqliteAuthCredentialStore.#installBusyTimeout(this.#db);
+		this.#db.run("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+		// A current schema is only read, so a peer's open write transaction cannot fail this start.
+		initializeSqliteSchema(this.#db, () => this.#applySchema());
+		this.#createLocalChangeTrackingObjects();
+	}
+
+	#applySchema(): void {
 		this.#db.run(`
-			PRAGMA journal_mode=WAL;
-			PRAGMA synchronous=NORMAL;
 			CREATE TABLE IF NOT EXISTS auth_schema_version (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
@@ -826,13 +836,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				revision INTEGER NOT NULL
 			);
-			INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0);
-			CREATE TEMP TABLE IF NOT EXISTS auth_local_change_revision (
-				id INTEGER PRIMARY KEY CHECK (id = 1),
-				revision INTEGER NOT NULL
-			);
-			INSERT OR IGNORE INTO auth_local_change_revision (id, revision) VALUES (1, 0);
 		`);
+		// `INSERT OR IGNORE` takes the write lock even when the row exists; read first.
+		if (this.#db.query("SELECT 1 FROM auth_change_revision WHERE id = 1").get() === null) {
+			this.#db.run("INSERT INTO auth_change_revision (id, revision) VALUES (1, 0)");
+		}
 		for (const table of ["auth_credentials", "auth_credential_blocks"] as const) {
 			for (const event of ["INSERT", "UPDATE", "DELETE"] as const) {
 				this.#db.run(`
@@ -842,6 +850,21 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 						UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1;
 					END;
 				`);
+			}
+		}
+	}
+
+	/** This connection's own change counter: TEMP objects, which never lock the shared database. */
+	#createLocalChangeTrackingObjects(): void {
+		this.#db.run(`
+			CREATE TEMP TABLE IF NOT EXISTS auth_local_change_revision (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				revision INTEGER NOT NULL
+			);
+			INSERT OR IGNORE INTO auth_local_change_revision (id, revision) VALUES (1, 0);
+		`);
+		for (const table of ["auth_credentials", "auth_credential_blocks"] as const) {
+			for (const event of ["INSERT", "UPDATE", "DELETE"] as const) {
 				this.#db.run(`
 					CREATE TEMP TRIGGER IF NOT EXISTS auth_local_change_revision_${table}_${event.toLowerCase()}
 					AFTER ${event} ON main.${table}
