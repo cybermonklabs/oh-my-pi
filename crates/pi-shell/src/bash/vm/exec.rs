@@ -4145,9 +4145,11 @@ fn shell_debug_stages(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> V
 
 /// The shell ran the DEBUG trap of the simple command a child starts with
 /// at `entry` ([`shell_debug_stages`]): the child does not run it again.
+/// In zsh mode the mark is never read: only bash's trap points (a command,
+/// a `Spawn`) compare `debug_pc` with an `Exec`'s pc, and zsh's trap runs
+/// at its list markers (`Nop`), which `lone_simple`'s `entry` never is.
 fn mark_debug_done(unit: &Unit, frames: &mut [Frame], entry: u32) {
-	if unit.mode.dialect() == Dialect::Bash
-		&& lone_simple(unit, entry)
+	if lone_simple(unit, entry)
 		&& let Some(frame) = frames.last_mut()
 	{
 		frame.debug_pc = Some(entry);

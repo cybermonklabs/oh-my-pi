@@ -77,36 +77,36 @@ wait; trap - DEBUG; echo "v=${{v-unset}}""#
 		)
 	};
 	let rows = [
-		(trap("", "/bin/true mark &"), "0:/bin/true mark\nv=set0\n"),
+		(trap("", "/usr/bin/true mark &"), "0:/usr/bin/true mark\nv=set0\n"),
 		(trap("", ": mark &"), "0:: mark\nv=set0\n"),
 		(trap("", "x=mark &"), "0:x=mark\nv=set0\n"),
-		(trap("", "x=mark /bin/true &"), "0:x=mark /bin/true\nv=set0\n"),
+		(trap("", "x=mark /usr/bin/true &"), "0:x=mark /usr/bin/true\nv=set0\n"),
 		(trap("", "f &"), "0:f\nv=set0\n"),
 		(trap("", "eval ': mark' &"), "0:eval ': mark'\nv=set0\n"),
 		(
-			trap("", "/bin/true mark | /bin/true mark2 &"),
-			"0:/bin/true mark\n0:/bin/true mark2\nv=set0\n",
+			trap("", "/usr/bin/true mark | /usr/bin/true mark2 &"),
+			"0:/usr/bin/true mark\n0:/usr/bin/true mark2\nv=set0\n",
 		),
 		(
-			trap("", "/bin/true mark | /bin/true mark2"),
-			"0:/bin/true mark\n0:/bin/true mark2\nv=set0\n",
+			trap("", "/usr/bin/true mark | /usr/bin/true mark2"),
+			"0:/usr/bin/true mark\n0:/usr/bin/true mark2\nv=set0\n",
 		),
 		(trap("", "{ : mark; } &"), "v=unset\n"),
-		(trap("set -T;", "/bin/true mark &"), "0:/bin/true mark\nv=set0\n"),
+		(trap("set -T;", "/usr/bin/true mark &"), "0:/usr/bin/true mark\nv=set0\n"),
 		(trap("set -T;", "f &"), "0:f\n1:f\n1:: body\nv=set0\n"),
 		(trap("set -T;", "eval ': mark' &"), "0:eval ': mark'\n1:: mark\nv=set0\n"),
 		(trap("set -T;", "{ : mark; } &"), "1:: mark\nv=unset\n"),
 		(
-			trap("set -T;", "/bin/true mark | /bin/true mark2 &"),
-			"0:/bin/true mark\n0:/bin/true mark2\nv=set0\n",
+			trap("set -T;", "/usr/bin/true mark | /usr/bin/true mark2 &"),
+			"0:/usr/bin/true mark\n0:/usr/bin/true mark2\nv=set0\n",
 		),
 		(
-			trap("shopt -s lastpipe; set +m;", "/bin/true mark | : mark2"),
-			"0:/bin/true mark\n0:: mark2\nv=set0\n",
+			trap("shopt -s lastpipe; set +m;", "/usr/bin/true mark | : mark2"),
+			"0:/usr/bin/true mark\n0:: mark2\nv=set0\n",
 		),
 		(
-			trap("set -T; shopt -s lastpipe; set +m;", "/bin/true mark | : mark2"),
-			"0:/bin/true mark\n0:: mark2\nv=set0\n",
+			trap("set -T; shopt -s lastpipe; set +m;", "/usr/bin/true mark | : mark2"),
+			"0:/usr/bin/true mark\n0:: mark2\nv=set0\n",
 		),
 		(trap("", "! : mark &"), "0:: mark\nv=set0\n"),
 		(trap("set -T;", "! : mark &"), "0:: mark\nv=set0\n"),
@@ -133,7 +133,7 @@ async fn a_background_jobs_debug_trap_sees_the_shell() {
 	let seen = |functrace: &str| {
 		format!(
 			"top=$BASHPID; {functrace} trap '[[ $BASH_COMMAND == *mark* ]] && echo \"same=$(( \
-			 BASHPID == top )) sub=$BASH_SUBSHELL line=$LINENO\"' DEBUG\n/bin/true mark & wait"
+			 BASHPID == top )) sub=$BASH_SUBSHELL line=$LINENO\"' DEBUG\n/usr/bin/true mark & wait"
 		)
 	};
 	let rows = [
@@ -158,7 +158,7 @@ async fn bang_does_not_wait_for_a_lone_jobs_debug_trap() {
 	let rows = [
 		(
 			format!(
-				r#"{FIFO} set -T; trap '(( BASH_SUBSHELL )) && x=$(read -r l <&3; echo "$l")' DEBUG; /bin/true & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
+				r#"{FIFO} set -T; trap '(( BASH_SUBSHELL )) && x=$(read -r l <&3; echo "$l")' DEBUG; /usr/bin/true & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
 			),
 			"st=0\n",
 		),
@@ -200,13 +200,13 @@ fn bounded(action: &str, body: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_debug_trap_does_not_run_itself_again() {
 	let rows = [
-		(bounded("x=$(echo y)", "/bin/true"), "done\n"),
-		(bounded("x=`echo y`", "/bin/true"), "done\n"),
-		(bounded("true | true", "/bin/true"), "done\n"),
-		(bounded("x=$(f() { :; }; f)", "/bin/true"), "done\n"),
-		(bounded("cat <(echo y) >/dev/null", "/bin/true"), "done\n"),
-		(bounded("echo y > >(cat >/dev/null)", "/bin/true"), "done\n"),
-		(bounded("x=$(y=$(: a; : b); : c)", "/bin/true"), "done\n"),
+		(bounded("x=$(echo y)", "/usr/bin/true"), "done\n"),
+		(bounded("x=`echo y`", "/usr/bin/true"), "done\n"),
+		(bounded("true | true", "/usr/bin/true"), "done\n"),
+		(bounded("x=$(f() { :; }; f)", "/usr/bin/true"), "done\n"),
+		(bounded("cat <(echo y) >/dev/null", "/usr/bin/true"), "done\n"),
+		(bounded("echo y > >(cat >/dev/null)", "/usr/bin/true"), "done\n"),
+		(bounded("x=$(y=$(: a; : b); : c)", "/usr/bin/true"), "done\n"),
 		(
 			r#"set -T; trap '[[ $BASH_COMMAND == ": mark" ]] && x=$(echo "$BASH_SUBSHELL:$BASH_COMMAND"; : inner)' DEBUG; : mark; echo "x=$x""#
 				.to_owned(),
@@ -289,13 +289,16 @@ fn a_timed_pipelines_bang_is_its_last_program() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tools_command_runs_no_debug_trap() {
 	let rows = [
-		("set -T; trap 'echo dbg' DEBUG; nohup /bin/true; echo done".to_owned(), "dbg\ndbg\ndone\n"),
 		(
-			"set -T; trap 'echo dbg' DEBUG; timeout 5 /bin/true; echo done".to_owned(),
+			"set -T; trap 'echo dbg' DEBUG; nohup /usr/bin/true; echo done".to_owned(),
 			"dbg\ndbg\ndone\n",
 		),
-		(bounded("nohup /bin/true >/dev/null 2>&1", "/bin/true"), "done\n"),
-		(bounded("timeout 5 /bin/true", "/bin/true & wait"), "done\n"),
+		(
+			"set -T; trap 'echo dbg' DEBUG; timeout 5 /usr/bin/true; echo done".to_owned(),
+			"dbg\ndbg\ndone\n",
+		),
+		(bounded("nohup /usr/bin/true >/dev/null 2>&1", "/usr/bin/true"), "done\n"),
+		(bounded("timeout 5 /usr/bin/true", "/usr/bin/true & wait"), "done\n"),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_bash_outputs(&rows).await;
@@ -356,7 +359,7 @@ async fn extdebug_skips_a_job_or_a_stage_before_it_forks() {
 		(skip(r#"(exit 3); ! : mark & echo "st=$? bang=${!:+set} ps=${PIPESTATUS[*]}""#), "st=1 bang= ps=3\n"),
 		(skip(r#"(exit 3); : mark & echo "st=$? bang=${!:+set} ps=${PIPESTATUS[*]}""#), "st=0 bang= ps=3\n"),
 		(lifetime(": | :"), "second\n"),
-		(lifetime("/bin/true & wait"), "second\n"),
+		(lifetime("/usr/bin/true & wait"), "second\n"),
 		(lifetime("( : )"), "second\n"),
 		(
 			r#"D=$(mktemp -d); shopt -s extdebug; n=0; g() { : mark > "$D/ran" | echo second; }; trap 'case $BASH_COMMAND in *mark*) if (( n++ == 0 )); then false; fi;; "echo second") if (( n == 1 )); then n=2; return; fi;; esac' DEBUG; g; echo "call1 $([ -e "$D/ran" ] && echo ran)"; g; trap - DEBUG; echo "call2 $([ -e "$D/ran" ] && echo ran)"; rm -r "$D""#
@@ -381,7 +384,7 @@ async fn extdebug_skips_a_job_or_a_stage_before_it_forks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lone_jobs_debug_trap_does_not_change_its_bang() {
 	let rows = [
-		(pid_row("set -T; trap '/bin/true' DEBUG; PROG"), "program\nst=143\n"),
+		(pid_row("set -T; trap '/usr/bin/true' DEBUG; PROG"), "program\nst=143\n"),
 		(pid_row("g() { :; }; set -T; trap g DEBUG; PROG"), "program\nst=143\n"),
 		(
 			pid_row(r#"set -T; trap 'echo "+ $BASH_COMMAND" >/dev/null' DEBUG; PROG"#),
@@ -392,8 +395,8 @@ async fn a_lone_jobs_debug_trap_does_not_change_its_bang() {
 		// action ran itself again in `nohup`'s subshell without end.
 		(
 			pid_row(
-				"set -T; trap '(( ++d > 4 )) && exit 9; nohup /bin/true >/dev/null 2>&1; : $(( d-- \
-				 ))' DEBUG; PROG",
+				"set -T; trap '(( ++d > 4 )) && exit 9; nohup /usr/bin/true >/dev/null 2>&1; : $(( \
+				 d-- ))' DEBUG; PROG",
 			),
 			"program\nst=143\n",
 		),
@@ -460,8 +463,8 @@ fn a_zsh_trap_function_ends_the_code_only_on_return() {
 fn a_zsh_trap_substitution_does_not_run_the_trap_again() {
 	let row = |set: &str| {
 		format!(
-			"D=$(mktemp -d); {set}; /bin/true; trap - DEBUG; unfunction TRAPDEBUG 2>/dev/null; [[ -e \
-			 $D/deep ]] && print deep; rm -r $D; print done"
+			"D=$(mktemp -d); {set}; /usr/bin/true; trap - DEBUG; unfunction TRAPDEBUG 2>/dev/null; \
+			 [[ -e $D/deep ]] && print deep; rm -r $D; print done"
 		)
 	};
 	let guard = "(( ++d > 4 )) && { : > $D/deep; exit 9 }";
@@ -544,7 +547,7 @@ fn a_zsh_debug_trap_runs_once_for_a_job_or_a_pipeline() {
 #[test]
 fn debug_trap_state_survives_a_restored_snapshot() {
 	let rows = [
-		(bounded("x=$(echo y)", "/bin/true; : two"), "done\n"),
+		(bounded("x=$(echo y)", "/usr/bin/true; : two"), "done\n"),
 		(
 			r#"D=$(mktemp -d); shopt -s extdebug; trap 'case $BASH_COMMAND in *mark*) false;; esac' DEBUG; : mark > "$D/ran" | echo second; trap - DEBUG; [ -e "$D/ran" ] && echo ran; rm -r "$D"; echo done"#
 				.to_owned(),
@@ -601,7 +604,7 @@ fn a_skipped_stage_does_not_change_which_stage_names_the_job() {
 			r#"D=$(mktemp -d); T=$D/pid; {start} & p=$!; trap - DEBUG; until [ -s "$T" ]; do :; done; [ "$p" = "$(cat "$T")" ] && echo program || {{ [ "$p" -ge 1073741824 ] && echo virtual || echo os-other; }}; kill "$p"; wait "$p"; echo "st=$?"; kill "$(cat "$T")" 2>/dev/null; rm -r "$D""#
 		)
 	};
-	let last = r#"{ /bin/true; exec /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 30' sh "$T"; }"#;
+	let last = r#"{ /usr/bin/true; exec /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 30' sh "$T"; }"#;
 	let rows = [
 		kind(&format!(": | {last}")),
 		kind(&format!(
