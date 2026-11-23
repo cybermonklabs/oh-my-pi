@@ -1335,11 +1335,13 @@ fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
 	// The shell has gone, or is a zombie its runner has not reaped yet.
 	const GONE: &str =
 		"case $(ps -o stat= -p $PPID 2>/dev/null | tr -d \" \") in Z*|\"\") true;; *) false;; esac";
-	// Until the shell `pid` names sleeps, is a zombie or is gone.
+	// Until the shell `pid` names sleeps, is a zombie or is gone; at most
+	// 6000 polls, 10 ms apart (then the process exits 97), so that none
+	// outlives a test that was killed.
 	let sleeps = |pid: &str| {
 		format!(
-			"until case $(ps -o stat= -p {pid} 2>/dev/null | tr -d \" \") in S*|Z*|\"\") true;; *) \
-			 false;; esac; do sleep 0.01; done"
+			"n=0; until case $(ps -o stat= -p {pid} 2>/dev/null | tr -d \" \") in S*|Z*|\"\") true;; \
+			 *) false;; esac; do n=$((n+1)); [ $n -le 6000 ] || exit 97; sleep 0.01; done"
 		)
 	};
 	// A first stage: a program that ends so once the shell sleeps, and a
@@ -1350,13 +1352,18 @@ fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
 	let k = first("kill -KILL $$");
 	let echo = group("echo x");
 	let ext = group(E0);
-	let w1 = format!("/bin/sh -c 'until [ -s \"$F\" ] || {GONE}; do sleep 0.01; done'");
+	// Each stage after the first polls at most 6000 times too.
+	const BOUND: &str = "n=$((n+1)); [ $n -le 6000 ] || exit 97";
+	let w1 =
+		format!("/bin/sh -c 'n=0; until [ -s \"$F\" ] || {GONE}; do {BOUND}; sleep 0.01; done'");
 	let w2 = format!(
-		"/bin/sh -c 'until [ -s \"$F\" ] && [ \"$(wc -l <\"$F\")\" -ge 2 ] || {GONE}; do sleep \
-		 0.01; done'"
+		"/bin/sh -c 'n=0; until [ -s \"$F\" ] && [ \"$(wc -l <\"$F\")\" -ge 2 ] || {GONE}; do \
+		 {BOUND}; sleep 0.01; done'"
 	);
-	let w1k =
-		format!("/bin/sh -c 'until [ -s \"$F\" ] || {GONE}; do sleep 0.01; done; kill -KILL $$'");
+	let w1k = format!(
+		"/bin/sh -c 'n=0; until [ -s \"$F\" ] || {GONE}; do {BOUND}; sleep 0.01; done; kill -KILL \
+		 $$'"
+	);
 	let killed = desc(libc::SIGKILL);
 	let killed = killed.as_str();
 	let at = |procs: &[(&str, &str)]| job_notice("bash", 1, procs, "");
@@ -3517,124 +3524,126 @@ fn a_background_pipeline_is_done_once_its_last_process_is_reaped() {
 /// command does not keep: a `for`, `select`, `case` or arithmetic `for`
 /// header around it inside the fork's command, else the line bash had as
 /// it forked the process (a `( … )`'s last line; the parent's line). A
-/// loop's own redirections are applied before it runs. Checked-in goldens
-/// measured with bash 5.3.20 ([`bounded_bash_ends`]).
+/// loop's own redirections are applied before it runs. The redirection
+/// names a file in a directory that does not exist, so that it fails for
+/// root too. Checked-in goldens measured with bash 5.3.20
+/// ([`bounded_bash_ends`]).
 #[test]
 fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 	let rows = vec![
 		(
-			"{ { :; } >/x\n:\n} & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ { :; } >/nonexistent-dir/x\n:\n} & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ { :; } >/x\n:\n} | cat".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ { :; } >/nonexistent-dir/x\n:\n} | cat".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"f() {\n{ { :; } >/x; } &\nwait\n}\nf".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"f() {\n{ { :; } >/nonexistent-dir/x; } &\nwait\n}\nf".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"for i in 1\ndo { { :; } >/x; } & wait; done".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"for i in 1\ndo { { :; } >/nonexistent-dir/x; } & wait; done".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ :\n{ :; } >/x\n:\n} & wait".to_owned(),
-			"bash: line 4: /x: Permission denied\n".to_owned(),
+			"{ :\n{ :; } >/nonexistent-dir/x\n:\n} & wait".to_owned(),
+			"bash: line 4: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ { :; } >/x; } & wait".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"{ { :; } >/nonexistent-dir/x; } & wait".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"x=1\n{ { :; } >/x\n} & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"x=1\n{ { :; } >/nonexistent-dir/x\n} & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ while false; do :; done >/x\n} & wait".to_owned(),
-			"bash: line 2: /x: Permission denied\n".to_owned(),
+			"{ while false; do :; done >/nonexistent-dir/x\n} & wait".to_owned(),
+			"bash: line 2: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"( { :; } >/x\n:\n) & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"( { :; } >/nonexistent-dir/x\n:\n) & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ { :; } >/x\n} | { cat\n}".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ { :; } >/nonexistent-dir/x\n} | { cat\n}".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"echo | { { :; } >/x\n:\n}".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"echo | { { :; } >/nonexistent-dir/x\n:\n}".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ ( { :; } >/x\n:\n) ; } & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ ( { :; } >/nonexistent-dir/x\n:\n) ; } & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ for i in 1\ndo { :; } >/x; done\n} & wait".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"{ for i in 1\ndo { :; } >/nonexistent-dir/x; done\n} & wait".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"( for i in 1\ndo { :; } >/x; done\n) & wait".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"( for i in 1\ndo { :; } >/nonexistent-dir/x; done\n) & wait".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ if :\nthen { :; } >/x; fi\n} & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ if :\nthen { :; } >/nonexistent-dir/x; fi\n} & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ case a in\na) { :; } >/x;; esac\n} & wait".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"{ case a in\na) { :; } >/nonexistent-dir/x;; esac\n} & wait".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ :\ng() { { :; } >/x; }\ng\n} & wait".to_owned(),
-			"bash: line 2: /x: Permission denied\n".to_owned(),
+			"{ :\ng() { { :; } >/nonexistent-dir/x; }\ng\n} & wait".to_owned(),
+			"bash: line 2: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ while :\ndo { :; } >/x; break; done\n} & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ while :\ndo { :; } >/nonexistent-dir/x; break; done\n} & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"for i in 1\ndo\n{ { :; } >/x\n} & wait; done".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"for i in 1\ndo\n{ { :; } >/nonexistent-dir/x\n} & wait; done".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"{ for i in 1\ndo :; done >/x\n} & wait".to_owned(),
-			"bash: line 3: /x: Permission denied\n".to_owned(),
+			"{ for i in 1\ndo :; done >/nonexistent-dir/x\n} & wait".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"( for i in 1\ndo\nfor j in 2\ndo :; done >/x\ndone\n)".to_owned(),
-			"bash: line 1: /x: Permission denied\n".to_owned(),
+			"( for i in 1\ndo\nfor j in 2\ndo :; done >/nonexistent-dir/x\ndone\n)".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(1),
 		),
 		(
-			"{ { :; } >/x\n} 2>&1 | cat".to_owned(),
-			"bash: line 2: /x: Permission denied\n".to_owned(),
+			"{ { :; } >/nonexistent-dir/x\n} 2>&1 | cat".to_owned(),
+			"bash: line 2: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 		(
-			"( :\n{ :; } >/x\n:\n)".to_owned(),
-			"bash: line 4: /x: Permission denied\n".to_owned(),
+			"( :\n{ :; } >/nonexistent-dir/x\n:\n)".to_owned(),
+			"bash: line 4: /nonexistent-dir/x: No such file or directory\n".to_owned(),
 			Exit(0),
 		),
 	];
@@ -4766,7 +4775,7 @@ fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
 /// has sent its signal ([`Run::go_signalled`] makes `$F.sent` then), so the
 /// signal comes while the command runs, however late the run sends it, and
 /// not in a time the command allows.
-const SENT: &str = "until [ -e \"$F.sent\" ]; do /bin/sleep 0.01; done";
+const SENT: &str = "read -r x <&9 || :";
 
 /// A signal case: `shell` runs `script` with `-c` and gets `sig` from
 /// outside (`group`: sent to its process group, else to the shell alone)
@@ -5064,11 +5073,11 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	let died = Signal(libc::SIGINT);
 	// A pipeline's last stage: it makes `$F` once the first has made `$F.a`,
 	// which it removes for the next run.
-	let last = "/bin/sh -c 'until [ -e \"$F.a\" ]; do /bin/sleep 0.01; done; rm -f \"$F.a\"; : > \
-	            \"$F\"; exec /bin/cat'";
+	let last = "/bin/sh -c 'n=0; until [ -e \"$F.a\" ]; do n=$((n+1)); [ $n -le 6000 ] || exit 97; \
+	            /bin/sleep 0.01; done; rm -f \"$F.a\"; : > \"$F\"; exec /bin/cat'";
 	// Shell code that makes `$F`, then runs on, never blocking, until the run
 	// has sent the signal.
-	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do :; done";
+	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do [ \"$SECONDS\" -lt 120 ] || exit 97; done";
 	run_sent(vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
@@ -5100,7 +5109,9 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		SentCase {
 			waits: false,
 			..case(
-				"trap 'echo x' EXIT; ( : > \"$F\"; while :; do :; done ); echo after".into(),
+				"trap 'echo x' EXIT; ( : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; done ); echo \
+				 after"
+					.into(),
 				true,
 				b"x\n",
 				died,
@@ -5148,9 +5159,10 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			waits: false,
 			..case(
 				format!(
-					"trap 'echo x' EXIT; {{ : > \"$F.b\"; while :; do :; done; }} | /bin/sh -c 'trap \
-					 \"echo child-int\" INT; until [ -e \"$F.b\" ]; do /bin/sleep 0.01; done; rm -f \
-					 \"$F.b\"; : > \"$F\"; {SENT}; /bin/sleep 1; echo child-done'; echo after"
+					"trap 'echo x' EXIT; {{ : > \"$F.b\"; while [ \"$SECONDS\" -lt 120 ]; do :; done; \
+					 }} | /bin/sh -c 'trap \"echo child-int\" INT; n=0; until [ -e \"$F.b\" ]; do \
+					 n=$((n+1)); [ $n -le 6000 ] || exit 97; /bin/sleep 0.01; done; rm -f \"$F.b\"; : \
+					 > \"$F\"; {SENT}; /bin/sleep 1; echo child-done'; echo after"
 				),
 				true,
 				b"child-int\nchild-done\nafter\nx\n",
@@ -5248,7 +5260,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		SentCase {
 			waits: false,
 			..case(
-				"( trap '/bin/rm -f \"$F.nx\"' EXIT; : > \"$F\"; while :; do :; done ); echo after"
+				"( trap '/bin/rm -f \"$F.nx\"' EXIT; : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do \
+				 :; done ); echo after"
 					.into(),
 				true,
 				b"",
@@ -5258,7 +5271,9 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		SentCase {
 			waits: false,
 			..case(
-				"( trap 'echo sub' EXIT; : > \"$F\"; while :; do :; done ); echo after".into(),
+				"( trap 'echo sub' EXIT; : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; done ); \
+				 echo after"
+					.into(),
 				true,
 				b"sub\n",
 				died,
@@ -5297,7 +5312,13 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		// it dies of the group's `INT`.
 		SentCase {
 			waits: false,
-			..case("set -m; v=$(: > \"$F\"; while :; do :; done); echo after".into(), true, b"", died)
+			..case(
+				"set -m; v=$(: > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; done); echo after"
+					.into(),
+				true,
+				b"",
+				died,
+			)
 		},
 		// Under `set -m` the job's shell code is in a group of its own: a
 		// `kill` of the shell's pid or group reaches only the shell, whose
@@ -5339,8 +5360,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			waits: false,
 			..case(
 				format!(
-					"set -m; trap 'until [ -e \"$F.done\" ]; do :; done; echo root-exit' EXIT; ( \
-					 {busy}; : > \"$F.done\" ); echo after"
+					"set -m; trap 'until [ -e \"$F.done\" ]; do [ \"$SECONDS\" -lt 120 ] || exit 97; \
+					 done; echo root-exit' EXIT; ( {busy}; : > \"$F.done\" ); echo after"
 				),
 				true,
 				b"root-exit\n",
@@ -5366,7 +5387,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		SentCase {
 			waits: false,
 			..case(
-				"( trap 'kill -KILL $BASHPID' EXIT; : > \"$F\"; while :; do :; done ); echo after"
+				"( trap 'kill -KILL $BASHPID' EXIT; : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; \
+				 done ); echo after"
 					.into(),
 				true,
 				b"after\n",
@@ -5428,8 +5450,9 @@ fn bash_acts_on_a_held_int_once_the_substitutions_output_ends() {
 	let rows = [
 		(
 			format!(
-				"v=$(trap '' INT; : > \"$F\"; {SENT}; exec >/dev/null 2>&1; until [ -e \"$F.checked\" \
-				 ]; do /bin/sleep 0.01; done); echo after"
+				"v=$(trap '' INT; : > \"$F\"; {SENT}; exec >/dev/null 2>&1; n=0; until [ -e \
+				 \"$F.checked\" ]; do n=$((n+1)); [ $n -le 6000 ] || exit 97; /bin/sleep 0.01; done); \
+				 echo after"
 			),
 			(String::new(), Some(Signal(libc::SIGINT))),
 		),
@@ -5462,7 +5485,7 @@ fn bash_acts_on_a_held_int_once_the_substitutions_output_ends() {
 /// loop makes `$F`, then runs until the run has sent the signal.
 #[test]
 fn a_trapped_signal_runs_its_trap_while_the_shell_runs_builtins() {
-	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do :; done";
+	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do [ \"$SECONDS\" -lt 120 ] || exit 97; done";
 	let case = |name: &str, sig, then: &str, stdout: &'static [u8]| SentCase {
 		shell: "bash",
 		script: format!("trap 'echo {name}' {name}; {busy}{then}"),
@@ -5522,8 +5545,12 @@ fn an_embedded_bash_dies_of_the_int_it_acts_on() {
 	}
 	let this = std::env::current_exe().expect("this test binary");
 	for (script, out) in [
-		("exec >\"$F.out\"; : > \"$F\"; while :; do :; done", ""),
-		("exec >\"$F.out\"; trap 'echo x' EXIT; : > \"$F\"; while :; do :; done", "x\n"),
+		("exec >\"$F.out\"; : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; done", ""),
+		(
+			"exec >\"$F.out\"; trap 'echo x' EXIT; : > \"$F\"; while [ \"$SECONDS\" -lt 120 ]; do :; \
+			 done",
+			"x\n",
+		),
 	] {
 		let waits = false;
 		let embedded = Run::new(&this, "process_signals", &["--exact", NAME, "--nocapture"])

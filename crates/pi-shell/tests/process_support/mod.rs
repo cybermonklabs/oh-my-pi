@@ -3,15 +3,25 @@
 //! comparisons need ([`real_bash`], [`real_bash_golden`]), and a signal sent
 //! from outside once the command a shell waits for has started
 //! ([`Run::go_signalled`]).
+//!
+//! A run's processes end with the test, however it ends: on Linux each
+//! shell dies with the thread that started it (`PR_SET_PDEATHSIG`); a
+//! signalled run's shell is killed (its process group, in a group of its
+//! own) if the test panics before it ended ([`Reaper`]); and what it runs
+//! waits for the signal on a pipe only the test writes ([`GATE_FD`]), which
+//! the kernel closes when the test ends.
 
 #![allow(dead_code, reason = "each test crate uses a subset")]
 
 use std::{
 	ffi::{OsStr, OsString},
 	fmt,
-	os::unix::process::{CommandExt, ExitStatusExt},
+	os::{
+		fd::{AsRawFd, RawFd},
+		unix::process::{CommandExt, ExitStatusExt},
+	},
 	path::{Path, PathBuf},
-	process::{Command, Stdio},
+	process::{Child, Command, ExitStatus, Stdio},
 	time::{Duration, Instant},
 };
 
@@ -65,6 +75,17 @@ pub enum End {
 	/// Death by this signal.
 	Signal(i32),
 }
+
+/// The fd on which a signalled run's shell, and all it starts, reads the
+/// gate ([`Run::go_signalled`]): a pipe whose only write end the test holds
+/// (close-on-exec), closed once the signal is sent, or by the kernel when
+/// the test ends. `read -r x <&9` waits for it. Not 3, which rows use
+/// (`exec 3>&1`).
+pub const GATE_FD: RawFd = 9;
+
+/// How long [`Run::go_signalled`] waits for the command to make its start
+/// file before it kills the shell and fails.
+const START_LIMIT: Duration = Duration::from_secs(60);
 
 /// One run of a shell: `program` named `name` (`argv[0]`; through a link
 /// named so under a wrapper, which runs it by its path), with `ZDOTDIR`
@@ -193,6 +214,13 @@ impl Run {
 
 	/// The command, and the directory of the shell's link it needs alive.
 	fn command(&self) -> (Command, tempfile::TempDir) {
+		self.command_with(None)
+	}
+
+	/// [`Self::command`], with `gate`, a pipe's read end, as the shell's fd
+	/// [`GATE_FD`]. On Linux the shell dies with the thread that starts it
+	/// (`PR_SET_PDEATHSIG`), so a killed test leaves no shell behind.
+	fn command_with(&self, gate: Option<RawFd>) -> (Command, tempfile::TempDir) {
 		let link_dir = tempfile::tempdir().expect("a directory for the shell's link");
 		let mut cmd = if let Some((first, rest)) = self.wrap.split_first() {
 			let link = link_dir.path().join(self.name);
@@ -219,10 +247,33 @@ impl Run {
 			cmd.current_dir(dir);
 		}
 		let (ignored, cores, group) = (self.ignored.clone(), self.cores, self.group);
-		// SAFETY: signal, setpgid, getrlimit and setrlimit are
-		// async-signal-safe and change only the child; nothing here allocates.
+		#[cfg(target_os = "linux")]
+		let test = libc::pid_t::try_from(std::process::id()).expect("a pid");
+		// SAFETY: prctl, getppid, dup2, fcntl, signal, setpgid, getrlimit and
+		// setrlimit are async-signal-safe and change only the child; nothing
+		// here allocates.
 		unsafe {
 			cmd.pre_exec(move || {
+				#[cfg(target_os = "linux")]
+				{
+					if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+						return Err(std::io::Error::last_os_error());
+					}
+					// The test ended between the fork and the prctl: no signal
+					// comes.
+					if libc::getppid() != test {
+						return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+					}
+				}
+				if let Some(fd) = gate {
+					if libc::dup2(fd, GATE_FD) == -1 {
+						return Err(std::io::Error::last_os_error());
+					}
+					// A `dup2` onto itself keeps the close-on-exec flag.
+					if fd == GATE_FD && libc::fcntl(GATE_FD, libc::F_SETFD, 0) == -1 {
+						return Err(std::io::Error::last_os_error());
+					}
+				}
 				every_signal_at_its_default();
 				for &sig in &ignored {
 					libc::signal(sig, libc::SIG_IGN);
@@ -253,26 +304,37 @@ impl Run {
 	/// Run it and send it `sig` once `started` exists (the file the command
 	/// it waits for makes when it has started): to its process group when
 	/// `group` ([`Self::own_group`]), else to the shell alone. Then make
-	/// `started` with the extension `sent` (`$F.sent`), which a command waits
-	/// for to go on, so the signal comes while it runs however late it is
-	/// sent; and wait for the shell to end. A shell that ends before the
-	/// file exists fails the test; nextest's own timeout bounds one that
-	/// never makes it.
+	/// `started` with the extension `sent` (`$F.sent`, for shell code that
+	/// must not block) and close the gate ([`GATE_FD`]), which a command
+	/// waits on to go on, so the signal comes while it runs however late it
+	/// is sent; and wait for the shell to end. A shell that ends before the
+	/// file exists, or does not make it within [`START_LIMIT`], fails the
+	/// test; a test that fails or is killed leaves no process of the run
+	/// behind ([`Reaper`], the gate).
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
-		let (mut cmd, _link_dir) = self.command();
-		let mut child = cmd
+		let (gate, gate_writer) = std::io::pipe().expect("a pipe for the gate");
+		let (mut cmd, _link_dir) = self.command_with(Some(gate.as_raw_fd()));
+		let child = cmd
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
 			.spawn()
 			.expect("start the shell");
+		drop(gate);
+		let mut child = Reaper { child: Some(child), group };
+		let deadline = Instant::now() + START_LIMIT;
 		while !started.exists() {
-			if let Some(status) = child.try_wait().expect("look at the shell") {
-				let out = child.wait_with_output().expect("read the shell's output");
+			if let Some(status) = child.try_wait() {
+				let out = child.wait_with_output();
 				panic!("the shell ended ({status}) before {} existed: {out:?}", started.display());
 			}
+			assert!(
+				Instant::now() < deadline,
+				"{} did not exist after {START_LIMIT:?}",
+				started.display()
+			);
 			std::thread::sleep(Duration::from_millis(5));
 		}
-		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+		let pid = child.pid();
 		// The shell blocked waiting for the command ([`Self::when_blocked`]).
 		if self.blocked {
 			wait_blocked(pid);
@@ -281,7 +343,8 @@ impl Run {
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
-		outcome(child.wait_with_output().expect("wait for the shell"))
+		drop(gate_writer);
+		child.wait_with_output()
 	}
 
 	/// Start it with its standard output and error piped, for a caller that
@@ -294,6 +357,53 @@ impl Run {
 			.spawn()
 			.expect("start the shell");
 		Started { child, group: self.group, _link_dir: link_dir }
+	}
+}
+
+/// The shell of a signalled run ([`Run::go_signalled`]): dropped before it
+/// was waited for, as when the test panics, it is killed with `SIGKILL`,
+/// its process group too with `group` ([`Run::own_group`]), and reaped.
+struct Reaper {
+	child: Option<Child>,
+	group: bool,
+}
+
+impl Reaper {
+	/// The shell's pid.
+	fn pid(&self) -> libc::pid_t {
+		let child = self.child.as_ref().expect("the shell not waited for yet");
+		libc::pid_t::try_from(child.id()).expect("a pid")
+	}
+
+	/// How the shell ended, once it has.
+	fn try_wait(&mut self) -> Option<ExitStatus> {
+		let child = self.child.as_mut().expect("the shell not waited for yet");
+		child.try_wait().expect("look at the shell")
+	}
+
+	/// Wait for the shell to end and read what it wrote.
+	fn wait_with_output(mut self) -> Outcome {
+		let child = self.child.take().expect("the shell not waited for yet");
+		outcome(child.wait_with_output().expect("wait for the shell"))
+	}
+}
+
+impl Drop for Reaper {
+	fn drop(&mut self) {
+		let Some(child) = self.child.as_mut() else {
+			return;
+		};
+		let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+			return;
+		};
+		// Not reaped yet, so the pid is still this shell's; a group that
+		// outlives its leader is still the run's.
+		let running = matches!(child.try_wait(), Ok(None));
+		if running || self.group {
+			// SAFETY: kill takes integer ids.
+			unsafe { libc::kill(if self.group { -pid } else { pid }, libc::SIGKILL) };
+		}
+		let _ = child.wait();
 	}
 }
 
