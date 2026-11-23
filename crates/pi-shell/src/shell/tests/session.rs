@@ -1261,6 +1261,52 @@ async fn timeout_spares_background_jobs_of_earlier_commands() {
 	assert_eq!(probe.exit_code, Some(0), "the earlier job died with the timed-out command");
 }
 
+/// A run that has to be dropped leaves its session in an unknown state, so
+/// the next run gets a new one. The dropped run's command ignores TERM and
+/// its KILL waits for the shell's long grace, so it cannot wind down within
+/// the run's own grace after the cancel. A variable the old session set is
+/// gone in the new one; before the drop, a later run still sees it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_run_gives_the_next_run_a_new_session() {
+	let _guard = shell_test_lock().lock().await;
+	let root = tempfile::tempdir().expect("scratch directory");
+	let mut gate = crate::testkit::child::Gate::new();
+	gate.link(&root.path().join("gate"));
+	let shell = Arc::new(shell_with_a_long_grace());
+	let run = |command: String, cancel: CancelToken| {
+		let shell = Arc::clone(&shell);
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		tokio::spawn(async move {
+			let (tx, rx) = flume::unbounded::<String>();
+			let opts = ShellRunOptions { command, cwd: Some(cwd), ..Default::default() };
+			let result = shell
+				.run(opts, Some(tx), cancel)
+				.await
+				.expect("shell result");
+			(result, rx.drain().collect::<String>())
+		})
+	};
+	let output = async |command: &str| {
+		let task = run(command.to_owned(), CancelToken::default());
+		task.await.expect("run task").1
+	};
+	let echo = "echo \"${x-new}\"";
+	output("x=kept").await;
+	assert_eq!(output(echo).await, "kept\n", "a run keeps the variables of the runs before it");
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let held =
+		format!("sh -c 'trap \"\" TERM; : > ready; {}' 3< gate", crate::testkit::child::AWAIT_GATE);
+	let dropped = run(held, cancel);
+	exists(&root.path().join("ready")).await;
+	abort.abort(AbortReason::Signal);
+	let (result, _) = dropped.await.expect("run task");
+	assert!(result.cancelled, "{result:?}");
+	gate.open();
+	assert_eq!(output(echo).await, "new\n", "the run after a dropped run reused its session");
+}
+
 /// An exited `&` child must be waited on while the persistent shell is
 /// idle, not only when the host submits another command. Keep its status
 /// for a later explicit `wait` after the OS process has disappeared.
