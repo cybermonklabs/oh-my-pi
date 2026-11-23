@@ -900,16 +900,17 @@ fi
 # `||` and nothing after the expression's `}}`, on its line or on a deeper
 # line that YAML folds into the value (GitHub reads an `if:` with text
 # outside `${{ }}` as a string, and a string that is not empty is true): the
-# line after it is the step's next key or the end of the step. And it has
-# no actions/cache step (which saves in its post step, under no condition
-# of the job's). Its steps use only the actions it uses
+# line after it is the step's next key, or nothing at all (a blank line or a
+# comment after a guard that ends the step fails the lint). And it has no
+# actions/cache step (which saves in its post step, under no condition of
+# the job's). Its steps use only the actions it uses
 # today, and .github/actions/bazel-cache calls no action, so no other caching
 # action can save under release_binary's token. A line under jobs: that is
 # not a plain `  <id>:` stops the lint, because its steps would be read as
 # the job above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others
-	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\$}]*\}\}\\n(        [^ \\]|$)'
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
