@@ -18,7 +18,9 @@ use crate::bash::{
 	vm::{
 		Cx, Kernel,
 		exec::{self, Flow},
-		expand::{self, arith_value, attr_letters, seconds_lookup, seconds_visible},
+		expand::{
+			self, arith_value, attr_letters, seconds_lookup, seconds_to_plain, seconds_visible,
+		},
 		is_ident,
 		proc::{AssignValue, Vproc},
 		quote,
@@ -565,6 +567,23 @@ fn set_value_plain(
 		let seed = arith_value(k, cx, vp, v)?;
 		k.seed_random(cx.store, vp, seed);
 		return Ok(());
+	}
+	// An element or compound assignment to the shell's `SECONDS`
+	// (`SECONDS[i]=`, `SECONDS=(…)`, `read -a`, `mapfile`) makes it a plain
+	// array first, as bash's `convert_var_to_array` does; element 0 is the
+	// count then. A local `SECONDS` is only that local's.
+	if name == b"SECONDS" && (lhs.index.is_some() || matches!(value, AssignValue::Array(_))) {
+		let global = match state::assigns_global(&k.root, cx.store, vp, name, level) {
+			Ok(global) => global,
+			Err(e) => {
+				k.fail(e);
+				return Err(Diag::StoreFailed);
+			},
+		};
+		if global && let Err(e) = seconds_to_plain(k, cx, vp) {
+			k.fail(e);
+			return Err(Diag::StoreFailed);
+		}
 	}
 	// bash's `SECONDS=` (`assign_seconds`) on the shell's clock: not after
 	// `unset SECONDS`, and not on a local or temporary `SECONDS` (plain
@@ -1810,6 +1829,14 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			} else {
 				seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
 			}
+			// `-a` and `-A` make the shell's `SECONDS` a plain array
+			// (`convert_var_to_array`, `convert_var_to_assoc`); a local is
+			// only that local's.
+			if on.bits() & (Attrs::INDEXED.bits() | Attrs::ASSOC.bits()) != 0
+				&& state::assigns_global(&ctx.k.root, ctx.cx.store, ctx.vp, name, level)?
+			{
+				seconds_to_plain(ctx.k, ctx.cx, ctx.vp)?;
+			}
 		}
 		if on.contains(Attrs::NAMEREF)
 			&& (index.is_some() || (value.is_none() && arg.contains(&b'[')))
@@ -1847,11 +1874,16 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			continue;
 		}
 		// `declare -r c[100]` declares an indexed array; `readonly a[5]`
-		// and `export a[5]` are no names.
+		// and `export a[5]` are no names, nor are `readonly a[5]=x` and
+		// `export a[5]=x` (bash's `legal_identifier` of the name before `=`).
 		let subscripted = value.is_none() && name.len() < arg.len();
 		let special = matches!(kind, DeclareKind::Readonly | DeclareKind::Export);
-		if subscripted && special {
-			ctx.err(Diag::InvalidIdent { name: arg.clone() });
+		if special && (subscripted || (index.is_some() && value.is_some())) {
+			let shown = match index {
+				Some(i) if value.is_some() => element_text(name, i),
+				_ => arg.clone(),
+			};
+			ctx.err(Diag::InvalidIdent { name: shown });
 			// A POSIX shell exits on a special builtin's usage error.
 			ctx.usage_error = true;
 			status = 1;
@@ -2962,6 +2994,18 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				state::Deref::Plain | state::Deref::Circular => (name, index),
 			}
 		};
+		// `unset 'SECONDS[i]'` looks the shell's `SECONDS` up first
+		// (`find_variable`, which reads the clock), so it is an integer
+		// scalar here: element 0 unsets it, which removes the special
+		// meaning as `unset SECONDS` does; another is no array element.
+		let seconds_clock = name == b"SECONDS"
+			&& index.is_some()
+			&& !o.has(b'n')
+			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& seconds_visible(ctx.k, ctx.cx.store, ctx.vp)?;
+		if seconds_clock {
+			seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
+		}
 		let var = state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)?.map(|v| {
 			(
 				v.attrs,
@@ -3114,6 +3158,9 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 					}
 					if scalar && i == 0 {
 						ctx.set_var(name, None, Level::Dynamic);
+						if seconds_clock {
+							ctx.k.set_seconds_plain(ctx.cx.store, ctx.vp);
+						}
 						continue;
 					}
 					Elem::Index(i)

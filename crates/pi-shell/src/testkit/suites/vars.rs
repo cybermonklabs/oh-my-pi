@@ -272,6 +272,160 @@ fn seconds_from_the_environment() {
 	}
 }
 
+/// Two seconds pass on the fake host's clock: `read -t 2` from a coproc
+/// that waits for its input blocks until the clock jumps to its deadline,
+/// then the coproc is given its line and reaped.
+const WAIT_2S: &str =
+	"coproc { read x; }; read -t 2 -u ${COPROC[0]} y; echo hi >&${COPROC[1]}; wait $COPROC_PID; ";
+
+/// bash's arithmetic assignment (`bind_int_variable`) runs `SECONDS`'s
+/// assign function as `SECONDS=` does: `((…))`, `let`, `$((…))`, an
+/// integer variable's value and a subscript all set the clock, which then
+/// counts on. A local `SECONDS` is only that local's; after `unset SECONDS`
+/// the name is a plain variable. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_arithmetic_assignment_sets_the_clock() {
+	let counts = format!("((SECONDS=100)); {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		("((SECONDS=100)); echo $SECONDS", "100\n"),
+		("let SECONDS=200; echo $SECONDS", "200\n"),
+		(": $((SECONDS=50)); echo $SECONDS", "50\n"),
+		("((SECONDS+=5)); echo $SECONDS", "5\n"),
+		("((SECONDS++)); echo $SECONDS", "1\n"),
+		("declare -i x; x='SECONDS=100'; echo $x $SECONDS", "100 100\n"),
+		("a[SECONDS=100]=1; echo $SECONDS", "100\n"),
+		("f() { local SECONDS; ((SECONDS=7)); echo $SECONDS; }; f; echo $SECONDS", "7\n0\n"),
+		(
+			"unset SECONDS; ((SECONDS=7)); echo $SECONDS; declare -p SECONDS",
+			"7\ndeclare -- SECONDS=\"7\"\n",
+		),
+		(counts.as_str(), "102\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// An element, compound or array-attribute assignment to the shell's
+/// `SECONDS` makes it a plain array (bash's `convert_var_to_array`): the
+/// lookup before it reads the clock, so element 0 is the count and the
+/// variable is integer, and it counts no more. A local `SECONDS` is only
+/// that local's. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_array_forms_make_it_a_plain_array() {
+	let stopped = format!("SECONDS[0]=60; {WAIT_2S}echo $SECONDS");
+	let counting = format!("SECONDS=60; {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		(
+			"SECONDS[0]=60; echo \"$SECONDS\"; declare -p SECONDS",
+			"60\ndeclare -ai SECONDS=([0]=\"60\")\n",
+		),
+		(
+			"SECONDS[1]=60; echo \"[$SECONDS]\"; declare -p SECONDS",
+			"[0]\ndeclare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n",
+		),
+		("SECONDS=5; SECONDS[0]+=5; echo \"$SECONDS\"", "10\n"),
+		(
+			"SECONDS=(1 2); echo \"$SECONDS\"; declare -p SECONDS",
+			"1\ndeclare -ai SECONDS=([0]=\"1\" [1]=\"2\")\n",
+		),
+		(
+			"SECONDS=5; SECONDS+=(6); declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"5\" [1]=\"6\")\n",
+		),
+		(
+			"read -a SECONDS <<< \"7 8\"; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		(
+			"mapfile -t SECONDS <<< $'7\\n8'; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("declare -a SECONDS; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\")\n"),
+		("declare -A SECONDS; declare -p SECONDS", "declare -Ai SECONDS=([0]=\"0\" )\n"),
+		("((SECONDS[0]=60)); declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("let 'SECONDS[1]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n"),
+		("declare 'SECONDS[0]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("f() { local SECONDS; SECONDS[0]=60; echo \"$SECONDS\"; }; f; echo \"$SECONDS\"", "60\n0\n"),
+		(stopped.as_str(), "60\n"),
+		(counting.as_str(), "62\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `unset 'SECONDS[i]'` looks `SECONDS` up first, so it is an integer
+/// scalar: element 0 unsets it and removes the special meaning, as `unset
+/// SECONDS` does; another index is no element of it. Goldens from bash
+/// 5.2.21 and 5.3.20.
+#[test]
+fn seconds_unset_of_an_element() {
+	for (src, want) in [
+		("unset 'SECONDS[0]'; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS", "[]\n1+1\n"),
+		("unset 'SECONDS[1-1]'; echo \"[$SECONDS]\"", "[]\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+	let (out, err) = run("unset 'SECONDS[1]'; echo \"st=$? [$SECONDS]\"");
+	assert_eq!(out, "st=1 [0]\n");
+	assert!(err.contains("unset: SECONDS: not an array variable"), "{err}");
+}
+
+/// A readonly `SECONDS` refuses `SECONDS=` and an element assignment, which
+/// end the script, and the arithmetic forms, which fail the command with
+/// status 1; the clock is unmoved. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_readonly_is_refused() {
+	for (src, want) in [
+		("readonly SECONDS; SECONDS=5; echo next", ""),
+		("readonly SECONDS; ((SECONDS=5)); echo \"st=$? $SECONDS\"", "st=1 0\n"),
+		("readonly SECONDS; SECONDS[0]=60; echo next", ""),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains("SECONDS: readonly variable"), "{src}: {err}");
+	}
+}
+
+/// `SECONDS+=` adds to the value the last lookup stored, as bash's
+/// `make_variable_value` reads the variable's cell: a lookup two seconds
+/// on stores the count then (7); without one, the 5 stored before is what
+/// it adds to. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_append_adds_to_the_last_lookups_value() {
+	let looked_up = format!("SECONDS=5; : $SECONDS; {WAIT_2S}: $SECONDS; SECONDS+=0; echo $SECONDS");
+	let stale = format!("SECONDS=5; : $SECONDS; {WAIT_2S}SECONDS+=0; echo $SECONDS");
+	assert_eq!(run(&looked_up), ("7\n".to_owned(), String::new()));
+	assert_eq!(run(&stale), ("5\n".to_owned(), String::new()));
+}
+
+/// `export` and `readonly` take no subscript, with a value either (bash's
+/// `legal_identifier` of the name before `=`): nothing is assigned, the
+/// status is 1 and the script goes on. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn export_and_readonly_refuse_a_subscript() {
+	for (src, want, diag) in [
+		(
+			"export 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\n",
+			"export: `x[0]': not a valid identifier",
+		),
+		(
+			"x=1; readonly 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\ndeclare -- x=\"1\"\n",
+			"readonly: `x[0]': not a valid identifier",
+		),
+		(
+			"export 'SECONDS[0]=60'; echo $SECONDS; declare -p SECONDS",
+			"0\ndeclare -i SECONDS=\"0\"\n",
+			"export: `SECONDS[0]': not a valid identifier",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
 /// bash's `SECONDS=` keeps the value apart and moves the start to now
 /// (`assign_seconds`): `printf '%(%s)T' -2` then gives the assignment's
 /// time, and posix `time` with no pipeline counts from it. The host's clock
