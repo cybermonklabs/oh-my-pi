@@ -3,7 +3,7 @@
 //! process, so when `kill -0 $!` says the pipeline's last program is gone,
 //! `jobs`, `fg`, `bg`, `kill %1` and a command substitution's `jobs` see the
 //! job done. In each `first` row the job's last stage exits only once the
-//! shell has reaped the first (it spins while `/proc/<first pid>` exists), so
+//! shell has reaped the first (it polls while `/proc/<first pid>` exists), so
 //! Bash's answer does not depend on timing; in each `last` row the first stage
 //! ends only after the shell's first report. Bash 5.2.21 prints the same but
 //! for its narrower status column (24, not 27) and an empty `$(jobs)` (its
@@ -11,9 +11,23 @@
 //! table keeps its status for `wait PID` (bash's bgp list), a job `disown`
 //! dropped is no child, `kill %1` makes a job's state news for `jobs -n`, and
 //! the shell's own loop runs beside background loops that start subshells.
+//!
+//! A row's processes end with the test, however the test ends: each row runs
+//! in a directory of its own, obash dies with the thread that started it
+//! (`PR_SET_PDEATHSIG`), and each wait of a job's stage polls at most 6000
+//! times, 10 ms apart, and only while its shell (`$PPID`) lives.
 #![cfg(target_os = "linux")]
 
 mod obash_support;
+
+use std::{
+	io,
+	os::unix::process::CommandExt,
+	path::Path,
+	process::{Child, Command, Stdio},
+	thread,
+	time::{Duration, Instant},
+};
 
 /// One script, its standard output, and its standard error with each line's
 /// `NAME: line 1: ` prefix and each `(PID)` taken out.
@@ -46,12 +60,39 @@ fn normalised(text: &str) -> String {
 	out
 }
 
-/// Runs each row through `obash -c` and reports every row whose output,
-/// error text or exit status (0) differs from Bash's.
+/// `obash -c script` in `dir`, as [`obash_support::obash`] starts it, and
+/// killed when the thread that spawns it ends (`PR_SET_PDEATHSIG`), so a
+/// test that is killed takes its row's shell with it. The job's stages end
+/// once that shell is gone: each of their waits checks `$PPID`.
+fn row_command(dir: &Path, script: &str) -> Command {
+	let mut cmd = obash_support::obash();
+	cmd.args(["-c", script]).current_dir(dir);
+	let test = std::process::id();
+	// SAFETY: the hook runs in the forked child before `exec` and only calls
+	// prctl and getppid (plain syscalls, async-signal-safe).
+	unsafe {
+		cmd.pre_exec(move || {
+			if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+				return Err(io::Error::last_os_error());
+			}
+			// The test ended between the fork and the prctl: no signal comes.
+			if u32::try_from(libc::getppid()).ok() != Some(test) {
+				return Err(io::Error::from_raw_os_error(libc::ESRCH));
+			}
+			Ok(())
+		});
+	}
+	cmd
+}
+
+/// Runs each row through `obash -c`, in a directory of its own, and reports
+/// every row whose output, error text or exit status (0) differs from
+/// Bash's.
 fn assert_rows(rows: &[Row]) {
 	let mut mismatches = Vec::new();
 	for row in rows {
-		let result = obash_support::output(obash_support::obash().args(["-c", row.script]));
+		let dir = tempfile::tempdir().unwrap();
+		let result = obash_support::output(&mut row_command(dir.path(), row.script));
 		let out = String::from_utf8_lossy(&result.stdout).into_owned();
 		let err = normalised(&String::from_utf8_lossy(&result.stderr));
 		if (result.status.code(), out.as_str(), err.as_str()) != (Some(0), row.out, row.err) {
@@ -82,52 +123,59 @@ fn a_pipeline_job_whose_processes_are_gone_is_done() {
 	assert_rows(&[
 		Row {
 			name:   "first/jobs",
-			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs; echo end",
+			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs; echo end",
 			out:    "[1]+  Exit 5                     /bin/sh -c 'echo $$; exit 3' | /bin/sh -c \
-			         'read p; while [ -e /proc/$p ]; do :; done; exit 5'\nend\n",
+			         'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 \
+			         $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5'\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "first/jobs-r",
-			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs -r; echo end",
+			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs -r; echo end",
 			out:    "end\n",
 			err:    "",
 		},
 		Row {
 			name:   "first/jobs-n",
-			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs -n; echo end",
+			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs -n; echo end",
 			out:    "[1]+  Exit 5                     /bin/sh -c 'echo $$; exit 3' | /bin/sh -c \
-			         'read p; while [ -e /proc/$p ]; do :; done; exit 5'\nend\n",
+			         'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 \
+			         $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5'\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "first/jobs-%1",
-			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs %1; echo end",
+			script: r"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs %1; echo end",
 			out:    "[1]+  Exit 5                     /bin/sh -c 'echo $$; exit 3' | /bin/sh -c \
-			         'read p; while [ -e /proc/$p ]; do :; done; exit 5'\nend\n",
+			         'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 \
+			         $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5'\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "first/cmdsub",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
 			out:    "[[1]+  Exit 5                     /bin/sh -c 'echo $$; exit 3' | /bin/sh -c \
-			         'read p; while [ -e /proc/$p ]; do :; done; exit 5']\nend\n",
+			         'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 \
+			         $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5']\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "last/jobs",
-			script: r#"T=$(mktemp -d); /bin/sh -c 'echo $$ > "$1/F"; until [ -e "$1/G" ]; do :; done; exit 3' sh "$T" | /bin/sh -c 'exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs; echo --; : > "$T/G"; until [ -s "$T/F" ]; do :; done; read f < "$T/F"; while kill -0 $f 2>/dev/null; do :; done; jobs; rm -r "$T"; echo end"#,
-			out:    "[1]+  Running                    /bin/sh -c 'echo $$ > \"$1/F\"; until [ -e \
-			         \"$1/G\" ]; do :; done; exit 3' sh \"$T\" | /bin/sh -c 'exit 5' &\n--\n[1]+  \
-			         Exit 5                     /bin/sh -c 'echo $$ > \"$1/F\"; until [ -e \"$1/G\" \
-			         ]; do :; done; exit 3' sh \"$T\" | /bin/sh -c 'exit 5'\nend\n",
+			script: r"/bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 3' | /bin/sh -c 'exit 5' & while kill -0 $! 2>/dev/null; do :; done; jobs; echo --; : > G; until [ -s F ]; do :; done; read f < F; while kill -0 $f 2>/dev/null; do :; done; jobs; echo end",
+			out:    "[1]+  Running                    /bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; \
+			         do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep \
+			         0.01; done; exit 3' | /bin/sh -c 'exit 5' &\n--\n[1]+  Exit 5                     \
+			         /bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 6000 ] && \
+			         kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 3' | /bin/sh -c \
+			         'exit 5'\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "last/cmdsub",
-			script: r#"T=$(mktemp -d); /bin/sh -c 'echo $$ > "$1/F"; until [ -e "$1/G" ]; do :; done; exit 3' sh "$T" | /bin/sh -c 'exit 5' & while kill -0 $! 2>/dev/null; do :; done; : > "$T/G"; until [ -s "$T/F" ]; do :; done; read f < "$T/F"; while kill -0 $f 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; rm -r "$T"; echo end"#,
-			out:    "[[1]+  Exit 5                     /bin/sh -c 'echo $$ > \"$1/F\"; until [ -e \
-			         \"$1/G\" ]; do :; done; exit 3' sh \"$T\" | /bin/sh -c 'exit 5']\nend\n",
+			script: r#"/bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 3' | /bin/sh -c 'exit 5' & while kill -0 $! 2>/dev/null; do :; done; : > G; until [ -s F ]; do :; done; read f < F; while kill -0 $f 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[1]+  Exit 5                     /bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; \
+			         do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep \
+			         0.01; done; exit 3' | /bin/sh -c 'exit 5']\nend\n",
 			err:    "",
 		},
 	]);
@@ -140,13 +188,13 @@ fn fg_and_bg_of_a_pipeline_job_whose_processes_are_gone_say_it_terminated() {
 	assert_rows(&[
 		Row {
 			name:   "first/fg",
-			script: r#"set -m; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; fg %1; echo "st=$?"; echo end"#,
+			script: r#"set -m; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; fg %1; echo "st=$?"; echo end"#,
 			out:    "st=1\nend\n",
 			err:    "fg: job has terminated\n",
 		},
 		Row {
 			name:   "first/bg",
-			script: r#"set -m; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; bg %1; echo "st=$?"; echo end"#,
+			script: r#"set -m; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; bg %1; echo "st=$?"; echo end"#,
 			out:    "st=1\nend\n",
 			err:    "bg: job has terminated\n",
 		},
@@ -161,7 +209,7 @@ fn kill_of_a_finished_job_is_as_bash_5_3_kills_it() {
 	assert_rows(&[
 		Row {
 			name:   "first/kill",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; kill %1; echo "st=$?"; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; kill %1; echo "st=$?"; echo end"#,
 			out:    "st=0\nend\n",
 			err:    "",
 		},
@@ -193,14 +241,15 @@ fn a_lone_program_or_subshell_job_and_wait_stay_as_bash_has_them() {
 		},
 		Row {
 			name:   "virtual/jobs",
-			script: r"( /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' ) & while kill -0 $! 2>/dev/null; do :; done; jobs; echo end",
+			script: r"( /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' ) & while kill -0 $! 2>/dev/null; do :; done; jobs; echo end",
 			out:    "[1]+  Exit 5                     ( /bin/sh -c 'echo $$; exit 3' | /bin/sh -c \
-			         'read p; while [ -e /proc/$p ]; do :; done; exit 5' )\nend\n",
+			         'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 \
+			         $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' )\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "first/wait",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; wait %1; echo "st=$?"; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & while kill -0 $! 2>/dev/null; do :; done; wait %1; echo "st=$?"; echo end"#,
 			out:    "st=5\nend\n",
 			err:    "",
 		},
@@ -215,25 +264,25 @@ fn wait_finds_the_status_of_a_job_jobs_forgot() {
 	assert_rows(&[
 		Row {
 			name:   "kept/pipe-not-last",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
 			out:    "st=5\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "kept/pipe-not-last-l",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs -l >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs -l >/dev/null; wait $p; echo "st=$?"; wait; echo end"#,
 			out:    "st=5\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "kept/twice",
-			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p; echo "st=$?"; wait; echo end"#,
+			script: r#"/bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p; echo "st=$?"; wait; echo end"#,
 			out:    "st=5\nst=5\nend\n",
 			err:    "",
 		},
 		Row {
 			name:   "kept/posix",
-			script: r#"set -o posix; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; while [ -e /proc/$p ]; do :; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p 2>/dev/null; echo "st=$?"; wait; echo end"#,
+			script: r#"set -o posix; /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; n=0; while [ -e /proc/$p ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 5' & p=$!; sleep 0.5 & while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; wait $p; echo "st=$?"; wait $p 2>/dev/null; echo "st=$?"; wait; echo end"#,
 			out:    "st=5\nst=127\nend\n",
 			err:    "",
 		},
@@ -258,6 +307,27 @@ fn wait_finds_the_status_of_a_job_jobs_forgot() {
 		Row {
 			name:   "kept/disown-r-keeps",
 			script: r#"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; jobs >/dev/null; sleep 1 >/dev/null 2>&1 & disown -r; wait $p; echo "st=$?""#,
+			out:    "st=3\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `jobs` in a command substitution reports and forgets its copy of the
+/// parent's finished job, but the child is the parent's: the parent's
+/// `wait $p` still finds it and returns its status.
+#[test]
+fn jobs_in_a_command_substitution_leaves_the_parent_s_child_alone() {
+	assert_rows(&[
+		Row {
+			name:   "copy/program",
+			script: r"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; x=$(jobs); wait $p; echo st=$?",
+			out:    "st=3\n",
+			err:    "",
+		},
+		Row {
+			name:   "copy/pipe",
+			script: r"/bin/true | /bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; x=$(jobs); wait $p; echo st=$?",
 			out:    "st=3\n",
 			err:    "",
 		},
@@ -291,7 +361,7 @@ fn wait_for_a_disowned_job_answers_at_once() {
 		},
 		Row {
 			name:   "disowned/ended-pct",
-			script: r#"T=$(mktemp -d); /bin/sh -c 'until [ -e "$1/go" ]; do :; done; exit 3' sh "$T" & p=$!; disown %1; : > "$T/go"; while kill -0 $p 2>/dev/null; do :; done; wait $p; echo "st=$?"; rm -r "$T""#,
+			script: r#"/bin/sh -c 'n=0; until [ -e go ]; do n=$((n+1)); [ $n -le 6000 ] && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 3' & p=$!; disown %1; : > go; while kill -0 $p 2>/dev/null; do :; done; wait $p; echo "st=$?""#,
 			out:    "st=0\n",
 			err:    "",
 		},
@@ -521,4 +591,106 @@ fn kill_of_bang_finds_no_process_once_its_job_left() {
 			err:    "",
 		},
 	]);
+}
+
+/// Set to a directory, this test binary is the stand-in of
+/// [`a_killed_test_leaves_no_row_process_behind`]: a test killed while its
+/// row runs.
+const STAND_IN: &str = "JOB_STATES_STAND_IN";
+
+/// The stand-in's row: the job's stage waits for a file nobody makes, as the
+/// rows' stages wait (writing its pid to `F` first), and so does the shell
+/// (writing its pid to `O`), with no `$PPID` check: only its death signal
+/// ends it before its own bound.
+const HELD: &str = "/bin/sh -c 'echo $$ > F; n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 6000 ] \
+                    && kill -0 $PPID 2>/dev/null || exit 97; sleep 0.01; done; exit 3' | /bin/sh \
+                    -c 'exit 5' & echo $$ > O; n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 6000 \
+                    ] || exit 97; sleep 0.01; done";
+
+/// Whether process `pid` still runs: neither gone nor a zombie.
+fn runs(pid: i32) -> bool {
+	std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+		// The state follows the command name's closing parenthesis.
+		stat
+			.rsplit_once(") ")
+			.is_some_and(|(_, rest)| !rest.starts_with(['Z', 'X']))
+	})
+}
+
+/// The pid the stand-in's row wrote to `name` in `dir`, once it is there.
+fn pid_written(dir: &Path, name: &str, stand_in: &mut Child, deadline: Instant) -> i32 {
+	loop {
+		let text = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+		if let Some(pid) = text.strip_suffix('\n').and_then(|pid| pid.parse().ok()) {
+			return pid;
+		}
+		if let Some(status) = stand_in.try_wait().unwrap() {
+			panic!("the stand-in ended ({status}) before its row wrote {name}");
+		}
+		if Instant::now() >= deadline {
+			stand_in.kill().unwrap();
+			stand_in.wait().unwrap();
+			panic!("the stand-in's row did not write {name} within {:?}", obash_support::LIMIT);
+		}
+		thread::sleep(Duration::from_millis(10));
+	}
+}
+
+/// A test killed while a row runs leaves none of the row's processes:
+/// obash dies with the test, and the job's stage, which waits for a file
+/// nobody makes, ends once its shell is gone. A stand-in (this test binary
+/// run again for this test alone, with [`STAND_IN`] naming a directory of
+/// this test's) starts such a row ([`HELD`]) and waits; this test kills it
+/// with `SIGKILL`, as a runner kills a test past its time, then waits up to
+/// [`obash_support::LIMIT`] for the shell and the stage to be gone. Whatever
+/// is left then is killed by its pid, so a failing run leaves nothing either.
+#[test]
+fn a_killed_test_leaves_no_row_process_behind() {
+	if let Some(dir) = std::env::var_os(STAND_IN) {
+		let mut row = row_command(Path::new(&dir), HELD)
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()
+			.unwrap();
+		// The row's shell dies with this thread, so the thread waits for it:
+		// this test kills the stand-in first, or the shell's own bound ends
+		// it.
+		let _ = row.wait();
+		return;
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let mut stand_in = Command::new(std::env::current_exe().unwrap())
+		.args(["--exact", "a_killed_test_leaves_no_row_process_behind", "--test-threads", "1"])
+		.env(STAND_IN, dir.path())
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()
+		.unwrap();
+	let deadline = Instant::now() + obash_support::LIMIT;
+	let shell = pid_written(dir.path(), "O", &mut stand_in, deadline);
+	let stage = pid_written(dir.path(), "F", &mut stand_in, deadline);
+	stand_in.kill().unwrap();
+	stand_in.wait().unwrap();
+	let deadline = Instant::now() + obash_support::LIMIT;
+	let left = loop {
+		let left: Vec<i32> = [shell, stage]
+			.into_iter()
+			.filter(|&pid| runs(pid))
+			.collect();
+		if left.is_empty() || Instant::now() >= deadline {
+			break left;
+		}
+		thread::sleep(Duration::from_millis(10));
+	};
+	for &pid in &left {
+		// SAFETY: plain syscall; `pid` is a process of this test's row.
+		unsafe { libc::kill(pid, libc::SIGKILL) };
+	}
+	assert!(
+		left.is_empty(),
+		"{left:?} of the row's shell {shell} and stage {stage} still ran {:?} after the test that \
+		 started them was killed",
+		obash_support::LIMIT
+	);
 }
