@@ -101,9 +101,9 @@ export interface AgentRef {
 export type AgentRefExpectation = AgentRef | AgentSessionHandle;
 
 /** The extension of a subagent's transcript, `<artifacts dir>/<id>.jsonl`. */
-const SESSION_FILE_EXTENSION = ".jsonl";
+export const SESSION_FILE_EXTENSION = ".jsonl";
 /** The extension of the output artifact the executor writes beside it, `<artifacts dir>/<id>.md`. */
-const OUTPUT_FILE_EXTENSION = ".md";
+export const OUTPUT_FILE_EXTENSION = ".md";
 
 /**
  * A directory minted refs' session files are in, as the prefix (the directory and its separator) of each such file,
@@ -112,6 +112,11 @@ const OUTPUT_FILE_EXTENSION = ".md";
  */
 class SessionFileDirectory {
 	constructor(readonly prefix: string) {}
+
+	/** The path of the file `<id><extension>` in this directory. */
+	fileOf(id: string, extension: string): string {
+		return `${this.prefix}${id}${extension}`;
+	}
 }
 
 /** The {@link SessionFileDirectory} of each prefix a live ref names; an entry goes once no ref holds it. */
@@ -159,7 +164,7 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 /** `sessionFile` of a minted ref: the path it keeps, or the one in the directory it keeps named by its id. */
 function mintedSessionFile(this: AgentRef): string | null {
 	const kept: unknown = Reflect.get(this, kSessionFile);
-	if (kept instanceof SessionFileDirectory) return `${kept.prefix}${this.id}${SESSION_FILE_EXTENSION}`;
+	if (kept instanceof SessionFileDirectory) return kept.fileOf(this.id, SESSION_FILE_EXTENSION);
 	return typeof kept === "string" ? kept : null;
 }
 
@@ -187,7 +192,7 @@ function derivedOutputPath(this: AgentHistorySummary): string | undefined {
 	const directory: unknown = Reflect.get(this, kOutputPathDirectory);
 	const id: unknown = Reflect.get(this, kOutputPathId);
 	return directory instanceof SessionFileDirectory && typeof id === "string"
-		? `${directory.prefix}${id}${OUTPUT_FILE_EXTENSION}`
+		? directory.fileOf(id, OUTPUT_FILE_EXTENSION)
 		: undefined;
 }
 
@@ -206,7 +211,7 @@ function historyAsKept(history: AgentHistorySummary | undefined, ref: AgentRef):
 		return history;
 	}
 	const outputPath = history.outputPath;
-	if (outputPath === undefined || outputPath !== `${directory.prefix}${ref.id}${OUTPUT_FILE_EXTENSION}`) {
+	if (outputPath === undefined || outputPath !== directory.fileOf(ref.id, OUTPUT_FILE_EXTENSION)) {
 		return history;
 	}
 	const { outputPath: _outputPath, ...kept } = history;

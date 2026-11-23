@@ -81,7 +81,14 @@ import {
 	type AgentReviveState,
 	WarmReviveInputsMissingError,
 } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
+import {
+	type AgentRef,
+	AgentRegistry,
+	type AgentRegistryApi,
+	MAIN_AGENT_ID,
+	OUTPUT_FILE_EXTENSION,
+	SESSION_FILE_EXTENSION,
+} from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
 	type CreateAgentSessionOptions,
@@ -3005,7 +3012,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		!monitor.runtimeLimitExceeded() &&
 		rawOutput.trim().length > 0;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
-		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
+		const candidatePath = path.join(args.artifactsDir, `${id}${OUTPUT_FILE_EXTENSION}`);
 		try {
 			await writeArtifact(candidatePath, rawOutput);
 			outputPath = candidatePath;
@@ -4899,13 +4906,25 @@ interface WarmReviveState extends SharedSpecOptions {
 	generation: number;
 }
 
-/** Whether `value` parsed back from its JSON is strictly equal to it: JSON loses none of its fields. */
-function jsonKeepsWhole(value: unknown): boolean {
+/** `value` as JSON gives it back, a new value; `undefined` when JSON takes none of it. */
+function jsonCopy(value: unknown): unknown {
+	let json: string | undefined;
 	try {
-		const json = JSON.stringify(value);
-		return json !== undefined && Bun.deepEquals(JSON.parse(json), value, true);
+		json = JSON.stringify(value);
 	} catch {
 		// A cycle or a BigInt.
+		return undefined;
+	}
+	return json === undefined ? undefined : JSON.parse(json);
+}
+
+/** Whether `value` parsed back from its JSON is strictly equal to it: JSON loses none of its fields. */
+function jsonKeepsWhole(value: unknown): boolean {
+	const copy = jsonCopy(value);
+	try {
+		return copy !== undefined && Bun.deepEquals(copy, value, true);
+	} catch {
+		// A field that throws when read again after JSON read it.
 		return false;
 	}
 }
@@ -4927,15 +4946,26 @@ function undefinedFieldPaths(value: object, at: readonly string[] = [], within =
 	return paths;
 }
 
-/** Sets each field `paths` names in `value` (as JSON gave it back, so a new object) to `undefined` again. */
+/**
+ * Sets each field `paths` names in `value` (as JSON gave it back, so a new object) to `undefined` again, as an own
+ * field. A path descends through own fields only, so none (one through `__proto__`, say) reaches a prototype.
+ */
 function setUndefinedFields<T>(value: T, paths: readonly (readonly string[])[]): T {
 	for (const fieldPath of paths) {
 		let parent: unknown = value;
 		for (const key of fieldPath.slice(0, -1)) {
-			parent = typeof parent === "object" && parent !== null ? Reflect.get(parent, key) : undefined;
+			parent =
+				typeof parent === "object" && parent !== null && Object.hasOwn(parent, key)
+					? Reflect.get(parent, key)
+					: undefined;
 		}
 		if (typeof parent === "object" && parent !== null) {
-			Reflect.set(parent, fieldPath[fieldPath.length - 1], undefined);
+			Object.defineProperty(parent, fieldPath[fieldPath.length - 1], {
+				value: undefined,
+				writable: true,
+				enumerable: true,
+				configurable: true,
+			});
 		}
 	}
 	return value;
@@ -4947,18 +4977,19 @@ function setUndefinedFields<T>(value: T, paths: readonly (readonly string[])[]):
  * holds `undefined` fields). `undefined` when it does not.
  */
 function modelUndefinedFields(model: Model<Api>): string[][] | undefined {
-	let json: string | undefined;
-	try {
-		json = JSON.stringify(model);
-	} catch {
-		// A cycle or a BigInt.
-		return undefined;
-	}
-	if (json === undefined) return undefined;
+	const copy = jsonCopy(model);
+	if (copy === undefined) return undefined;
 	const undefinedFields = undefinedFieldPaths(model);
-	return Bun.deepEquals(setUndefinedFields(JSON.parse(json), undefinedFields), model, true)
-		? undefinedFields
-		: undefined;
+	return Bun.deepEquals(setUndefinedFields(copy, undefinedFields), model, true) ? undefinedFields : undefined;
+}
+
+/** The model `registry` holds under `model`'s provider and id, when it equals `model` in every field. */
+function equalRegistryModel(
+	registry: ModelRegistry | undefined,
+	model: Model<Api> | undefined,
+): Model<Api> | undefined {
+	const registered = model && registry?.find(model.provider, model.id);
+	return registered && (registered === model || Bun.deepEquals(registered, model, true)) ? registered : undefined;
 }
 
 /** Whether `url` may hold a key: userinfo or a query string, or a text that is no absolute URL. */
@@ -5037,7 +5068,9 @@ function createWarmReviveState(
  * holds an equal one or JSON keeps it whole; otherwise `state` references it, as the registry's object
  * when the two agree in every field. A catalog rebuild replaces the registry's model objects with
  * equal copies, before the park (so the spawn's copy is the one nothing else holds) or after it (so
- * the park's is), and a parked subagent keeps neither.
+ * the park's is). A parked subagent whose model went to the entry keeps neither; one whose model
+ * `state` references keeps that object through a later rebuild: the registry's as of the park, or
+ * its own.
  */
 function trackSubagentReviveRecord(
 	session: AgentSession,
@@ -5048,11 +5081,9 @@ function trackSubagentReviveRecord(
 	session.addDisposer(() => {
 		const { options, prompt } = inputs.spec;
 		const model = options.model;
-		const registered = model && options.modelRegistry?.find(model.provider, model.id);
-		const registryModel =
-			registered && (registered === model || Bun.deepEquals(registered, model, true)) ? registered : undefined;
+		const registryModel = equalRegistryModel(options.modelRegistry, model);
 		const undefinedFields = model && !modelMayCarrySecret(model) ? modelUndefinedFields(model) : undefined;
-		// A model the registry never held stays as before: in the entry only when JSON keeps it whole.
+		// A model the registry holds no equal of goes to the entry only when JSON keeps it whole.
 		const recordedModel = undefinedFields && (registryModel || undefinedFields.length === 0) ? model : undefined;
 		const keptModel = recordedModel ? undefined : (registryModel ?? model);
 		if (state.model !== keptModel) state.model = keptModel;
@@ -5170,13 +5201,12 @@ async function reviveWarmSubagent(expectedAgentRef: AgentRef, state: WarmReviveS
 		record.options.model && record.modelUndefinedFields
 			? setUndefinedFields(structuredClone(record.options.model), record.modelUndefinedFields)
 			: record.options.model;
-	const registered = recordedModel && shared.modelRegistry?.find(recordedModel.provider, recordedModel.id);
+	const registryModel = equalRegistryModel(shared.modelRegistry, recordedModel);
 	// The inputs the parked session was built from: the plain ones its transcript holds, and the live objects.
 	const options: SubagentSpecOptions = withoutUndefinedFields({
 		...record.options,
 		...shared,
-		model:
-			shared.model ?? (registered && Bun.deepEquals(registered, recordedModel, true) ? registered : recordedModel),
+		model: shared.model ?? registryModel ?? recordedModel,
 	});
 	const inputs: SubagentReviveInputs = {
 		spec: {
@@ -5390,7 +5420,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
 	if (options.artifactsDir) {
-		subtaskSessionFile = path.join(options.artifactsDir, `${id}.jsonl`);
+		subtaskSessionFile = path.join(options.artifactsDir, `${id}${SESSION_FILE_EXTENSION}`);
 	}
 
 	const settings = options.settings ?? Settings.isolated();

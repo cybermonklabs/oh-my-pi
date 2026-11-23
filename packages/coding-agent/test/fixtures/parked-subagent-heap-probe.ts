@@ -193,17 +193,15 @@ function perSubagent(after: number | undefined, before: number | undefined): num
 	return after === undefined || before === undefined ? undefined : (after - before) / count;
 }
 
-/** What the process gained, per subagent of the batch, from reading `before` to reading `after`. */
-function growthPerSubagent(after: HeapReading, before: HeapReading) {
-	return {
-		heapSize: perSubagent(after.heapSize, before.heapSize),
-		Map: perSubagent(after.Map, before.Map),
-		Function: perSubagent(after.Function, before.Function),
-		AsyncFunction: perSubagent(after.AsyncFunction, before.AsyncFunction),
-		JSLexicalEnvironment: perSubagent(after.JSLexicalEnvironment, before.JSLexicalEnvironment),
-		ModuleRecord: perSubagent(after.ModuleRecord, before.ModuleRecord),
-		CommonJSModule: perSubagent(after.CommonJSModule, before.CommonJSModule),
-	};
+/**
+ * What the process gained, per subagent of the batch, from reading `before` to reading `after`: each count of the
+ * reading but {@link HeapReading.liveParkedSessions}, in the reading's order.
+ */
+function growthPerSubagent(after: HeapReading, before: HeapReading): Record<string, number | undefined> {
+	const { liveParkedSessions: _liveParkedSessions, ...counts } = after;
+	return Object.fromEntries(
+		Object.entries(counts).map(([key, value]) => [key, perSubagent(value, before[key as keyof typeof counts])]),
+	);
 }
 
 const readings: HeapReading[] = [];
