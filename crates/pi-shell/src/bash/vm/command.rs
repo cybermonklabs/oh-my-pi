@@ -469,7 +469,7 @@ fn assignment_statement(
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
 	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`).
-	bash_last_arg(k, vp, cx, line, BString::default());
+	bash_last_arg(k, vp, cx, line, BString::default(), None);
 	Some(Flow::Next)
 }
 
@@ -607,7 +607,8 @@ fn plain_statement(
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
-		bash_last_arg(k, vp, cx, line, argv.pop().unwrap_or_default());
+		let last = argv.pop().unwrap_or_default();
+		bash_last_arg(k, vp, cx, line, last, argv.first().map(|n| &n[..]));
 		return Some(Flow::Next);
 	}
 	// The stages take over from the expanded words: a builtin that needs
@@ -4718,7 +4719,8 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// command before them.
 	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash
 		&& !matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
-	let last = binds.then(|| st(vp).argv.pop().unwrap_or_default());
+	// The words go with the scratch below: taken, not copied.
+	let argv = binds.then(|| std::mem::take(&mut st(vp).argv));
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4739,9 +4741,10 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}
-	if let Some(last) = last {
+	if let Some(mut argv) = argv {
+		let last = argv.pop().unwrap_or_default();
 		let line = exec::line_of(vp, op.node);
-		bash_last_arg(k, vp, cx, line, last);
+		bash_last_arg(k, vp, cx, line, last, argv.first().map(|n| &n[..]));
 	}
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
@@ -4783,8 +4786,17 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 /// with bash's error. Then `_` is not exported, so an external gets it only
 /// as its own path ([`build_env`]). A plain `_`, the usual case, takes the
 /// bytes in place. Pipelines, `( )` and background jobs bind it in their
-/// own vprocs only.
-fn bash_last_arg(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, last: BString) {
+/// own vprocs only. `name` is the command's name (`None`: `last` is), which
+/// a value error names as bash's `this_command_name` does (`echo: [3]:
+/// arithmetic syntax error …`); a readonly `_`'s error stays bare.
+fn bash_last_arg(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	last: BString,
+	name: Option<&[u8]>,
+) {
 	let cur = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
 		Ok(v) => v.map(|v| (v.attrs, matches!(v.value, crate::bash::store::VarValue::Str(_)))),
 		Err(err) => {
@@ -4807,10 +4819,18 @@ fn bash_last_arg(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, las
 			attrs.contains(Attrs::EXPORT)
 		},
 		Some((attrs, _)) => {
+			// `_` has attributes, so this is the rare path: the name a value
+			// error gives is kept before the word goes into the assignment.
+			let name = BString::from(name.unwrap_or(&last[..]));
 			let lhs = Lhs { name: b"_", index: None, append: false };
 			if let Err(d) =
 				builtins::set_value(k, cx, vp, lhs, AssignValue::Scalar(last), Level::Dynamic)
 			{
+				let d = if matches!(d, Diag::Readonly { .. }) || name.is_empty() {
+					d
+				} else {
+					d.by(String::from_utf8_lossy(&name).into_owned())
+				};
 				k.diag(cx, vp, line, d);
 			}
 			attrs.contains(Attrs::EXPORT)

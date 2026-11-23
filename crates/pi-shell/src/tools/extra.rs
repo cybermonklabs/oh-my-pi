@@ -186,7 +186,9 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	let mut unexport_env = Vec::new();
 	// An explicit `_=VALUE`: given as a prefix of the final command, which
 	// reaches the program (`_=x exec …`). An `export _=…` command would
-	// itself bind `$_` to its last word, unexported, after it.
+	// itself bind `$_` to its last word, unexported, after it. pi's `env`
+	// gives every `Clear` and `Remove` before its `Set`s
+	// (`environment_changes`), so neither comes after a `_=VALUE`.
 	let mut underscore: Option<BString> = None;
 	for change in command.env_changes() {
 		match change {
@@ -194,7 +196,6 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 			// every function, so no `BASH_FUNC_` export is left either.
 			EnvChange::Clear => {
 				foreign_env.push((None, None));
-				underscore = None;
 				// Unsetting a command-prefix or local binding would uncover
 				// an exported outer one, so every name in the call's
 				// environment is masked too ([`Script::unexport_env`]).
@@ -227,9 +228,6 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 				);
 			},
 			EnvChange::Remove(name) if is_name(name) => {
-				if name == "_" {
-					underscore = None;
-				}
 				unexport_env.push(BString::from(name.as_bytes()));
 				source.extend_from_slice(b"unset -v ");
 				source.extend_from_slice(name.as_bytes());

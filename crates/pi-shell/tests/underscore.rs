@@ -52,6 +52,100 @@ fn a_script_without_a_shebang_starts_with_its_name() {
 	assert_eq!((out.as_str(), status), ("in=[./ns.sh]\n/usr/bin/printenv\n", 0));
 }
 
+/// An arithmetic error in the bind of an integer `_` names the command
+/// whose last word it binds, as bash's `this_command_name` does (a program
+/// by the name it was run by; `command` and `builtin` by the command they
+/// run); a readonly `_`'s error is bare. Stdout and stderr only: bash 5.3.20
+/// also abandons the rest of the line after such an error (status 1 in
+/// `-c`), which this shell does not do for any assignment error yet. Each
+/// script ends with the failing command, so that does not show here.
+#[test]
+fn an_integer_underscore_bind_error_names_its_command() {
+	let rows: &[(&str, &str, &str)] = &[
+		(
+			"declare -i _",
+			"",
+			"bash: line 1: declare: /sentinel: arithmetic syntax error: operand expected (error \
+			 token is \"/sentinel\")\n",
+		),
+		(
+			"declare -i _=5; echo a/b >/dev/null",
+			"",
+			"bash: line 1: echo: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; /bin/echo a/b >/dev/null",
+			"",
+			"bash: line 1: /bin/echo: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; printf '%s\\n' a/b >/dev/null",
+			"",
+			"bash: line 1: printf: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; true a/b",
+			"",
+			"bash: line 1: true: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; command echo a/b >/dev/null",
+			"",
+			"bash: line 1: echo: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; builtin echo a/b >/dev/null",
+			"",
+			"bash: line 1: echo: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; nosuch a/b 2>/dev/null",
+			"",
+			"bash: line 1: nosuch: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; x=1 echo a/b >/dev/null",
+			"",
+			"bash: line 1: echo: a/b: division by 0 (error token is \"b\")\n",
+		),
+		(
+			"declare -i _=5; : 1+2; echo \"[$_]\"",
+			"[3]\n",
+			"bash: line 1: echo: [3]: arithmetic syntax error: operand expected (error token is \
+			 \"[3]\")\n",
+		),
+		(
+			"declare -i _=5; x=a/b; echo \"[$_]\"",
+			"[0]\n",
+			"bash: line 1: echo: [0]: arithmetic syntax error: operand expected (error token is \
+			 \"[0]\")\n",
+		),
+		(
+			"declare -r _=ro 2>/dev/null; echo a >/dev/null",
+			"",
+			"bash: line 1: _: readonly variable\nbash: line 1: _: readonly variable\n",
+		),
+	];
+	let mut bad = Vec::new();
+	for &(script, out, err) in rows {
+		let mut cmd = obash();
+		#[cfg(unix)]
+		cmd.arg0("bash");
+		cmd.env("_", "/sentinel")
+			.env("PATH", "/usr/bin:/bin")
+			.args(["-c", script]);
+		let got = output(&mut cmd);
+		let got = (
+			String::from_utf8_lossy(&got.stdout).into_owned(),
+			String::from_utf8_lossy(&got.stderr).into_owned(),
+		);
+		if got != (out.to_owned(), err.to_owned()) {
+			bad.push(format!("{script:?}\n  bash {:?}\n  got  {got:?}", (out, err)));
+		}
+	}
+	assert!(bad.is_empty(), "{} of {} rows differ:\n{}", bad.len(), rows.len(), bad.join("\n"));
+}
+
 #[test]
 fn bash_binds_the_last_word_after_each_command() {
 	let rows: &[Row] = &[
