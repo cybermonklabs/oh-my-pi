@@ -159,6 +159,26 @@ impl FdRef {
 		}
 	}
 
+	/// Before an external inherits this fd: an end of a pipe between
+	/// pipeline stages becomes an end of the OS pipe `os_pipe` makes
+	/// ([`MemFile::share_with_external`]), so [`Self::os_handle`] gives it to
+	/// the external directly. Every other object is left as it is.
+	pub(crate) fn share_with_external(
+		&self,
+		os_pipe: impl FnOnce(&[u8]) -> Option<(Box<dyn File>, Box<dyn File>)>,
+	) {
+		if let FdState::Mem(m) = &*self.0.state.lock() {
+			m.share_with_external(os_pipe);
+		}
+	}
+
+	/// Whether this fd holds an end of a pipe that became an OS pipe
+	/// ([`MemFile::is_os_pipe`]): a snapshot loses it, as it loses a host
+	/// file.
+	pub(crate) fn is_os_pipe(&self) -> bool {
+		self.with_mem(MemFile::is_os_pipe).unwrap_or(false)
+	}
+
 	/// A handle on a host file outside any shell, for tests that hand engine
 	/// objects to a host directly (the sys spawner's pump tests).
 	pub fn from_file(file: Box<dyn File>) -> Self {
@@ -276,6 +296,45 @@ impl FdRef {
 	pub fn poll_write(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_write(cx, buf),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
+	/// [`Self::poll_read`] for a host task that may wait beside the engine
+	/// and other tasks on this object: `key`, which the task's future holds,
+	/// keeps its wait apart ([`File::poll_read_keyed`]).
+	pub fn poll_read_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_read_keyed(cx, buf, key),
+			None => Poll::Ready(Ok(0)),
+		}
+	}
+
+	/// [`Self::poll_write`] for a host task that may wait beside others, as
+	/// [`Self::poll_read_keyed`].
+	pub fn poll_write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.write_keyed(cx, bytes, None, key)
+	}
+
+	fn write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_keyed(cx, bytes, tag, key),
 			None => Poll::Ready(Err(bad_fd())),
 		}
 	}
@@ -429,6 +488,27 @@ impl File for TaggedOutput {
 		self
 			.base
 			.poll_write_tagged(cx, bytes, tag.unwrap_or(self.tag))
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.base.poll_read_keyed(cx, bytes, key)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self
+			.base
+			.write_keyed(cx, bytes, Some(tag.unwrap_or(self.tag)), key)
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

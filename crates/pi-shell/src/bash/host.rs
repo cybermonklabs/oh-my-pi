@@ -240,8 +240,27 @@ pub trait Host {
 	/// every byte written into the pipe. `None` (the default) taps nothing.
 	/// Only the engine's own pipes are offered: an external's output still
 	/// reaches a tapped pipe through the host's pump, but a pipe the host
-	/// itself connects is not seen.
+	/// itself connects is not seen. A tapped pipe stays in memory, pumped
+	/// ([`Host::os_pipe`] is not asked for it), so its mirror sees every byte.
 	fn pipe_tap(&mut self) -> Option<Arc<dyn PipeTap>> {
+		None
+	}
+	/// A new OS pipe, already holding `prefill`, for an untapped pipe between
+	/// pipeline stages that an external is about to take an end of: `(read,
+	/// write)`. Each end's [`File::os_handle`] is the descriptor externals
+	/// inherit, so two external stages share one kernel pipe, as bash's do,
+	/// and go on if the shell dies. The shell reads and writes each end through
+	/// the end itself, and that I/O never waits: it moves what it can and
+	/// returns `Pending`, waking every task waiting on the end once there is
+	/// more, so a stage of shell code never blocks the engine; a zero-length
+	/// read or write answers readiness, a write with no reader left fails with
+	/// `BrokenPipe`, as for the memory pipe. Whatever that needs (a private
+	/// descriptor) is opened here, never later. `None` (the default) keeps the
+	/// engine's memory pipe, which the host pumps: a host without OS pipes, one
+	/// that cannot give the shell such ends (Unix other than Linux, Windows,
+	/// Linux without `/proc`: see [`crate::sys::stage_pipe`]), or a `prefill`
+	/// the new pipe cannot hold.
+	fn os_pipe(&mut self, _prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 		None
 	}
 	/// Observe an event, synchronously at a safepoint.

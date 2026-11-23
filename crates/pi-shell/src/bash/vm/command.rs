@@ -33,8 +33,8 @@ use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	fs::StatKind,
 	host::{
-		ChildRedirs, EnvView, ExitStatus, Invocation, ProcEvent, ResolveCtx, Resolved, SpawnSpec,
-		StdioSpec, Via,
+		ChildRedirs, EnvView, ExitStatus, Host, Invocation, ProcEvent, ResolveCtx, Resolved,
+		SpawnSpec, StdioSpec, Via,
 	},
 	ids::{CallId, CmdTag, IntrinsicId, RunId},
 	ir::{self, AssignVal, Op, Part, Unit},
@@ -669,6 +669,7 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		return Err((0, 0));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
+	let mut key = vp.write_key.lock();
 	for (i, c) in chunks.iter().enumerate() {
 		let Chunk::Out(fd, bytes) = c else {
 			unreachable!("checked above");
@@ -676,7 +677,7 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		let handle = vp.fds.handle(*fd);
 		let mut off = 0;
 		while off < bytes.len() {
-			match handle.poll_write(&mut tcx, &bytes[off..]) {
+			match handle.poll_write_keyed(&mut tcx, &bytes[off..], &mut key) {
 				Poll::Ready(Ok(n)) if n > 0 => off += n,
 				// Blocked, failed or refused: the staged output waits or
 				// reports it.
@@ -2419,13 +2420,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				env: &env,
 				cwd: BStr::new(&vp.cwd),
 				stdio: [
-					stdio_spec(&vp.fds.handle(0), false),
-					stdio_spec(&vp.fds.handle(1), true),
-					stdio_spec(&vp.fds.handle(2), true),
+					stdio_spec(cx.host, &vp.fds.handle(0), false),
+					stdio_spec(cx.host, &vp.fds.handle(1), true),
+					stdio_spec(cx.host, &vp.fds.handle(2), true),
 				],
 				extra_fds: extra_fds(vp)
 					.iter()
-					.map(|(fd, h)| (*fd, stdio_spec(h, false)))
+					.map(|(fd, h)| (*fd, stdio_spec(cx.host, h, false)))
 					.collect(),
 				pgroup,
 				tag,
@@ -4586,6 +4587,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 	st(vp).writes.front()?;
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
+	let key = Arc::clone(&vp.write_key);
 	loop {
 		let state = st(vp);
 		let pending = state.writes.front()?;
@@ -4597,7 +4599,10 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
-		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
+		// The guard goes before the arms, which may write diagnostics.
+		let polled =
+			handle.poll_write_keyed(&mut tcx, &pending.bytes[pending.off..], &mut key.lock());
+		match polled {
 			Poll::Ready(Ok(written)) if written > 0 => {
 				pending.off += written;
 				if pending.off >= pending.bytes.len() {
@@ -5154,8 +5159,11 @@ fn spawn_error(name: BString, err: std::io::Error) -> (Diag, i32) {
 
 /// How an external gets fd object `h`, as its input or its `output`: a
 /// slot the script closed stays closed (bash's child inherits it so); an
-/// object a restore lost reads as the null device.
-fn stdio_spec(h: &FdRef, output: bool) -> StdioSpec {
+/// object a restore lost reads as the null device. An end of a pipe between
+/// pipeline stages first becomes an end of an OS pipe the host makes
+/// ([`FdRef::share_with_external`]), which the external then inherits.
+fn stdio_spec(host: &mut dyn Host, h: &FdRef, output: bool) -> StdioSpec {
+	h.share_with_external(|prefill| host.os_pipe(prefill));
 	let os = if output {
 		h.os_output_handle()
 	} else {
