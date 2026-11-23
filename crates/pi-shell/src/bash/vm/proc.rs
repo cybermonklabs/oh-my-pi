@@ -114,6 +114,10 @@ pub struct Vproc {
 	/// [`super::exec::push_script`], [`super::exec::pop_frame`] and the
 	/// frame restore; never serialized (recounted from the frames).
 	pub trap_frames:   u32,
+	/// A `break` or `continue` run inside `${ }` or `${| }` that no loop
+	/// has taken yet (bash's `breaking` or `continuing`); boxed, as it is
+	/// rare and an idle vproc pays 8 B for it.
+	pub pending_break: Option<Box<PendingBreak>>,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
@@ -127,6 +131,30 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+}
+
+/// A `break` or `continue` that ran inside `${ }` or `${| }`
+/// ([`Vproc::pending_break`]). bash's `break` only sets `breaking`: the
+/// substitution's body ends there, later substitutions of its command run
+/// nothing, the command itself runs, and the next loop out takes the
+/// levels left ([`super::exec`]'s `pending_break`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingBreak {
+	/// Loop levels left.
+	pub levels: u32,
+	/// `continue` instead of `break`.
+	pub cont:   bool,
+	/// The frame count of the command holding the substitution. A deeper
+	/// frame is one that command entered: its `$(< file)` frame runs on;
+	/// a function, `eval` or `.` runs none of its commands.
+	pub depth:  u32,
+	/// The frame count of the command whose redirections were being expanded
+	/// when the `break` ran (0: not in a redirection). bash expands the
+	/// redirections of a program it runs (an external, a command it cannot
+	/// find) in the forked child, so the break is lost with that child: it is
+	/// dropped once that command's name resolves to one ([`super::command`]'s
+	/// `drop_childs_break`).
+	pub redir:  u32,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's
@@ -860,6 +888,16 @@ pub enum FrameKind {
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
 	/// `SubExit` pops, and the `Spawn` op collects its status.
 	Stage,
+	/// The body of a bash `$(< file)` run in the current shell (bash
+	/// `optimize_cat_file`): its `< file` reads the file into `capture`,
+	/// the substitution's own buffer, and leaves the shell's fds alone;
+	/// `SubExit` pops.
+	Cat {
+		/// The substitution's buffer. The frames image keeps it by its memory
+		/// object (`FrameImage::capture`), not here.
+		#[serde(skip)]
+		capture: crate::bash::mem::Capture,
+	},
 	/// The base frame of a job the shell suspended
 	/// ([`super::jobctl::suspend`]): a subshell frame that also ends its
 	/// vproc when its pc reaches `stop_at` (the end of the top-level
@@ -1813,8 +1851,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B, and a `break` waiting in `${ }`
+// (`Vproc::pending_break`, boxed, 8 B) to at most 1,848 B.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
