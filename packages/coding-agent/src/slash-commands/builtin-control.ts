@@ -6,7 +6,63 @@ import { clearApprovalGrants } from "../tools/approval-cache";
 import { clearSubmittedText } from "./helpers/draft";
 import { shutdownHandlerTui } from "./builtin-lifecycle";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
-import type { SlashCommandSpec } from "./types";
+import type { LiveCallStatus, SlashCommandRuntime, SlashCommandSpec } from "./types";
+
+/** A call's provider and, where it has one, its voice (GPT-Live's API gets none from omp). */
+function describeLiveSource(provider: string | undefined, voice: string | undefined): string {
+	const parts = [provider, voice === undefined ? undefined : `voice ${voice}`].filter(part => part !== undefined);
+	return parts.join(", ");
+}
+
+/** `/live status` in one line. */
+function describeLiveCall(status: LiveCallStatus): string {
+	if (status.state === "off") return "No live call is open.";
+	const microphone = status.muted ? "muted" : "on";
+	return `Live call ${status.state} since ${status.since.toISOString()}: ${describeLiveSource(status.provider, status.voice)}, microphone ${microphone}.`;
+}
+
+/**
+ * `/live on|off|status` outside the terminal: drives the host's live call (RPC mode's live bridge) and
+ * answers in one line, which a chat bridge posts back. A bare `/live` reports status.
+ */
+async function handleLiveText(args: string, runtime: SlashCommandRuntime) {
+	const live = runtime.live;
+	if (!live) {
+		return usage("Live voice is not available here: only RPC mode and the interactive terminal run /live.", runtime);
+	}
+	const verb = args.trim().toLowerCase() || "status";
+	const status = live.status();
+	switch (verb) {
+		case "on": {
+			if (status.state !== "off") {
+				await runtime.output(`A live call is already ${status.state} (since ${status.since.toISOString()}).`);
+				return commandConsumed();
+			}
+			try {
+				const { voice } = await live.start();
+				const started = live.status();
+				const source = describeLiveSource(started.state === "off" ? undefined : started.provider, voice);
+				await runtime.output(source ? `Live call open: ${source}.` : "Live call open.");
+				return commandConsumed();
+			} catch (error) {
+				return usage(`Live call did not start: ${errorMessage(error)}`, runtime);
+			}
+		}
+		case "off":
+			if (status.state === "off") {
+				await runtime.output("No live call is open.");
+				return commandConsumed();
+			}
+			await live.stop();
+			await runtime.output("Live call ended.");
+			return commandConsumed();
+		case "status":
+			await runtime.output(describeLiveCall(status));
+			return commandConsumed();
+		default:
+			return usage("Usage: /live [on|off|status]", runtime);
+	}
+}
 
 /** Advisors with review work they can still run (not parked, yielded, or quota-paused). */
 function advisorUnsettledCount(session: AgentSessionHandle): number {
@@ -93,7 +149,9 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "live",
 		icon: "voice",
-		description: "Start Codex-backed realtime voice mode",
+		description: "Realtime voice mode: the terminal's /live opens it; on, off or status where a host runs calls",
+		acpInputHint: "on|off|status",
+		handle: (command, runtime) => handleLiveText(command.args, runtime),
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleLiveCommand();

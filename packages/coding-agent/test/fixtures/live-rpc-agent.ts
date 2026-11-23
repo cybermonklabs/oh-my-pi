@@ -66,7 +66,13 @@ const extension = await loadExtensionFromFactory(
 );
 const extensionRunner = new ExtensionRunner([extension], runtime, cwd, sessionManager, modelRegistry);
 const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-const mock = createMockModel({ provider: model.provider, id: model.id, handler: () => ({ content: ["Done"] }) });
+// `OMP_LIVE_TURN_MS` keeps each model turn running that long, so a test can type into a running turn.
+const turnMs = Number(process.env.OMP_LIVE_TURN_MS ?? 0);
+const mock = createMockModel({
+	provider: model.provider,
+	id: model.id,
+	handler: () => ({ content: ["Done"], delayMs: turnMs }),
+});
 const agent = new Agent({
 	getApiKey: () => "test-key",
 	initialState: { model, systemPrompt: ["Test"], tools: [] },
