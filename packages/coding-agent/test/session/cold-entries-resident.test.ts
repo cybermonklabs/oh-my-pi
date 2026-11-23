@@ -10,7 +10,6 @@
  * holds every body fails the release checks instead of skipping them.
  */
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { selectRpcEntries } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-compat";
 import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -23,19 +22,9 @@ import {
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
-
-/** SQL session storage, which only some builds carry. */
-interface SqlStorageModule {
-	SqlSessionStorage: { create(options: { client: SQL }): Promise<SessionStorage> };
-}
-// Imported only where the module exists: a static import would fail to load
-// this file in a build without SQL storage, whose cases skip instead.
-const SQL_STORAGE_MODULE = path.join(import.meta.dir, "../../src/session/sql-session-storage.ts");
-const sqlStorageModule: SqlStorageModule | undefined = fs.existsSync(SQL_STORAGE_MODULE)
-	? await import(SQL_STORAGE_MODULE)
-	: undefined;
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** A value whose JSON text is longer than this is a body. */
@@ -210,11 +199,10 @@ interface StoredSession {
 	close(): Promise<void>;
 }
 
-/** Where a test writes the transcript: file storage, and SQLite SQL storage where the build has it. */
-const storages: Array<{ name: string; available: boolean; store(dir: string): Promise<StoredSession> }> = [
+/** Where a test writes the transcript: file storage and SQLite SQL storage. */
+const storages: Array<{ name: string; store(dir: string): Promise<StoredSession> }> = [
 	{
 		name: "file storage",
-		available: true,
 		async store(dir) {
 			const file = path.join(dir, "sessions", "session.jsonl");
 			await Bun.write(file, transcript(dir));
@@ -223,11 +211,9 @@ const storages: Array<{ name: string; available: boolean; store(dir: string): Pr
 	},
 	{
 		name: "SQLite SQL storage",
-		available: sqlStorageModule !== undefined,
 		async store(dir) {
-			if (!sqlStorageModule) throw new Error("SQL session storage is not in this build");
 			const client = new SQL(`sqlite://${path.join(dir, "sessions.db")}`);
-			const storage = await sqlStorageModule.SqlSessionStorage.create({ client });
+			const storage = await SqlSessionStorage.create({ client });
 			const file = path.join(dir, "sessions", "session.jsonl");
 			await storage.writeText(file, transcript(dir));
 			await storage.drain();
@@ -468,73 +454,64 @@ function compactAfterTwoTurns(manager: SessionManager): Map<string, string> {
 	return ids;
 }
 
-describe.each(storages)("a resumed session on $name", ({ available, store }) => {
-	it.skipIf(!available)(
-		"keeps in memory only the bodies from the cut on and of the kinds kept whole, reading older ones on access",
-		async () => {
-			using dir = TempDir.createSync("@omp-cold-resident-");
-			const session = await store(dir.path());
-			const manager = await resume(session);
-			try {
-				expect(await expectOnlyResidentBodiesSurvive(manager)).toEqual(RELEASED_AFTER_RESUME);
-			} finally {
-				await manager.close();
-				await session.close();
-			}
-		},
-	);
+describe.each(storages)("a resumed session on $name", ({ store }) => {
+	it("keeps in memory only the bodies from the cut on and of the kinds kept whole, reading older ones on access", async () => {
+		using dir = TempDir.createSync("@omp-cold-resident-");
+		const session = await store(dir.path());
+		const manager = await resume(session);
+		try {
+			expect(await expectOnlyResidentBodiesSurvive(manager)).toEqual(RELEASED_AFTER_RESUME);
+		} finally {
+			await manager.close();
+			await session.close();
+		}
+	});
 
-	it.skipIf(!available)(
-		"releases the bodies between the old cut and the new one once a compaction moves the cut",
-		async () => {
-			using dir = TempDir.createSync("@omp-cold-resident-");
-			const session = await store(dir.path());
-			const manager = await resume(session);
-			try {
-				const entries = manager.getEntries();
-				// What the entries from the old cut on held while the context kept them.
-				const whole = refsToBodies(entries, new Set(entries.map(entry => entry.id))).resident.filter(
-					({ entryId }) => ["u7", "a7", "c3", "u8", "a8"].includes(entryId),
-				);
-				expect(new Set(whole.map(({ entryId }) => entryId)).size).toBe(5);
-				const appended = compactAfterTwoTurns(manager);
+	it("releases the bodies between the old cut and the new one once a compaction moves the cut", async () => {
+		using dir = TempDir.createSync("@omp-cold-resident-");
+		const session = await store(dir.path());
+		const manager = await resume(session);
+		try {
+			const entries = manager.getEntries();
+			// What the entries from the old cut on held while the context kept them.
+			const whole = refsToBodies(entries, new Set(entries.map(entry => entry.id))).resident.filter(({ entryId }) =>
+				["u7", "a7", "c3", "u8", "a8"].includes(entryId),
+			);
+			expect(new Set(whole.map(({ entryId }) => entryId)).size).toBe(5);
+			const appended = compactAfterTwoTurns(manager);
 
-				const released = await expectOnlyResidentBodiesSurvive(manager);
-				expect(released.map(id => appended.get(id) ?? id)).toEqual([
-					...RELEASED_AFTER_RESUME,
-					"u7",
-					"a7",
-					"c3",
-					"u8",
-					"a8",
-					"u9",
-					"a9",
-				]);
-				await collectGarbage(() => alive(whole).length === 0);
-				expect(alive(whole)).toEqual([]);
-			} finally {
-				await manager.close();
-				await session.close();
-			}
-		},
-	);
+			const released = await expectOnlyResidentBodiesSurvive(manager);
+			expect(released.map(id => appended.get(id) ?? id)).toEqual([
+				...RELEASED_AFTER_RESUME,
+				"u7",
+				"a7",
+				"c3",
+				"u8",
+				"a8",
+				"u9",
+				"a9",
+			]);
+			await collectGarbage(() => alive(whole).length === 0);
+			expect(alive(whole)).toEqual([]);
+		} finally {
+			await manager.close();
+			await session.close();
+		}
+	});
 
-	it.skipIf(!available)(
-		"returns the same entries through every accessor and RPC answer as a manager holding every entry",
-		async () => {
-			using dir = TempDir.createSync("@omp-cold-resident-");
-			const session = await store(dir.path());
-			const manager = await resume(session);
-			try {
-				expectSameAnswers(manager, await holdingEveryEntry(session));
+	it("returns the same entries through every accessor and RPC answer as a manager holding every entry", async () => {
+		using dir = TempDir.createSync("@omp-cold-resident-");
+		const session = await store(dir.path());
+		const manager = await resume(session);
+		try {
+			expectSameAnswers(manager, await holdingEveryEntry(session));
 
-				compactAfterTwoTurns(manager);
-				await manager.flush();
-				expectSameAnswers(manager, await holdingEveryEntry(session));
-			} finally {
-				await manager.close();
-				await session.close();
-			}
-		},
-	);
+			compactAfterTwoTurns(manager);
+			await manager.flush();
+			expectSameAnswers(manager, await holdingEveryEntry(session));
+		} finally {
+			await manager.close();
+			await session.close();
+		}
+	});
 });

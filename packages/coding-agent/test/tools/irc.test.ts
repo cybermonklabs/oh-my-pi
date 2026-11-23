@@ -864,41 +864,38 @@ describe("IRC", () => {
 			// and its owner's wait counted the parked agent as owing a reply. The live sender keeps only
 			// what forgetAgent keeps: its sent mark, which its wake-turn relay asks. Only a lifecycle that resolves a name
 			// to another agent (`ensureLiveTarget`) readdresses a message.
-			it.skipIf(!("ensureLiveTarget" in AgentLifecycleManager.prototype))(
-				"records no direct mark for the agent a readdressed message reached and that parked during the delivery",
-				async () => {
-					registerAgents("0-Main", "0-Running");
-					registry.register({
-						id: "0-Transcript",
-						displayName: "0-Transcript",
-						kind: "sub",
-						parentId: "0-Main",
-						session: null,
-						status: "parked",
-					});
-					const running = registry.get("0-Running")?.session;
-					if (!running) throw new Error("0-Running has no session");
-					running.deliverIrcMessage = async () => {
-						registry.detachSession("0-Running");
-						registry.setStatus("0-Running", "parked");
-						return "injected";
-					};
-					const lifecycle = {
-						manages: () => true,
-						isParking: () => false,
-						has: (id: string) => id === "0-Transcript",
-						ensureLive: async () => running,
-						ensureLiveTarget: async () => ({ session: running, agentId: "0-Running", revived: false }),
-					} as unknown as AgentLifecycleApi;
-					const readdressing = new IrcBus(registry, lifecycle);
+			it("records no direct mark for the agent a readdressed message reached and that parked during the delivery", async () => {
+				registerAgents("0-Main", "0-Running");
+				registry.register({
+					id: "0-Transcript",
+					displayName: "0-Transcript",
+					kind: "sub",
+					parentId: "0-Main",
+					session: null,
+					status: "parked",
+				});
+				const running = registry.get("0-Running")?.session;
+				if (!running) throw new Error("0-Running has no session");
+				running.deliverIrcMessage = async () => {
+					registry.detachSession("0-Running");
+					registry.setStatus("0-Running", "parked");
+					return "injected";
+				};
+				const lifecycle = {
+					manages: () => true,
+					isParking: () => false,
+					has: (id: string) => id === "0-Transcript",
+					ensureLive: async () => running,
+					ensureLiveTarget: async () => ({ session: running, agentId: "0-Running", revived: false }),
+				} as unknown as AgentLifecycleApi;
+				const readdressing = new IrcBus(registry, lifecycle);
 
-					const receipt = await readdressing.send({ from: "0-Main", to: "0-Transcript", body: "which codeword?" });
-					expect(receipt).toMatchObject({ to: "0-Running", outcome: "injected" });
+				const receipt = await readdressing.send({ from: "0-Main", to: "0-Transcript", body: "which codeword?" });
+				expect(receipt).toMatchObject({ to: "0-Running", outcome: "injected" });
 
-					expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(true);
-					expect(readdressing.unansweredSends("0-Main", 0)).toEqual([]);
-				},
-			);
+				expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(true);
+				expect(readdressing.unansweredSends("0-Main", 0)).toEqual([]);
+			});
 		});
 	});
 

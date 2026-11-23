@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -116,14 +115,6 @@ function interruptedSession(dir: string): Promise<string> {
 	]);
 }
 
-/**
- * Where prune passes persist as appended `tool_result_prune` records (their
- * module exists), a pass writes no rewrite whose failure it would undo, so the
- * failed-persist case does not apply.
- */
-const prunesPersistAsAppendedRecords = fs.existsSync(
-	path.join(import.meta.dir, "../../src/session/tool-result-prunes.ts"),
-);
 const PRUNABLE_RESULT_TEXT = `match line\n${BODY}`;
 /**
  * The kept entry a compaction names that is not on the branch: the context
@@ -358,41 +349,4 @@ describe("readers of the recent turns read no older body", () => {
 		if (persistedR1?.type !== "message") throw new Error("persisted r1 missing");
 		expect(JSON.parse(JSON.stringify(persistedR1.message))).toEqual(JSON.parse(JSON.stringify(r1.message)));
 	});
-
-	it.skipIf(prunesPersistAsAppendedRecords)(
-		"returns a result before the cut to the store with its previous values when persisting its prune fails",
-		async () => {
-			using dir = TempDir.createSync("@omp-cold-readers-");
-			const now = Date.now();
-			const file = await prunableResultSession(dir.path(), now);
-			const whole = await open(file, false);
-			const wholeR1 = whole.getEntry("r1");
-			await whole.close();
-			if (wholeR1?.type !== "message") throw new Error("whole r1 missing");
-			const previous: unknown = JSON.parse(JSON.stringify(wholeR1.message));
-			const sessionManager = await open(file, true);
-			const r1 = sessionManager.getEntry("r1");
-			if (r1?.type !== "message") throw new Error("r1 missing");
-			expect(isColdEntry(r1)).toBe(true);
-			let atPersist: unknown;
-			const rewriteEntries = vi.spyOn(sessionManager, "rewriteEntries").mockImplementationOnce(async () => {
-				atPersist = JSON.parse(JSON.stringify(r1.message));
-				throw new Error("injected rewrite failure");
-			});
-
-			await finishTurnWithPrunePass(sessionManager, dir.path(), now);
-
-			// The pass blanked the result, then its persist failed.
-			expect(rewriteEntries).toHaveBeenCalledTimes(1);
-			expect(atPersist).toMatchObject({ prunedAt: expect.any(Number) });
-			expect(isColdEntry(r1)).toBe(true);
-			expect(JSON.parse(JSON.stringify(r1.message))).toEqual(previous);
-			await sessionManager.flush();
-			const persisted = await open(file, false);
-			const persistedR1 = persisted.getEntry("r1");
-			await persisted.close();
-			if (persistedR1?.type !== "message") throw new Error("persisted r1 missing");
-			expect(JSON.parse(JSON.stringify(persistedR1.message))).toEqual(previous);
-		},
-	);
 });

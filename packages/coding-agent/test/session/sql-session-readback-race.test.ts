@@ -4,9 +4,7 @@
  * that read-back is between two chunks, and the read then fails as a read race
  * (`SessionReadConflictError`). The read-back must read the session again from
  * its start, so a body that landed still counts as published. Each case runs
- * two SQL stores over one SQLite file, as two processes would, and skips where
- * the SQL store reads no chunks (then the read-back reads one whole text,
- * which no rewrite can split).
+ * two SQL stores over one SQLite file, as two processes would.
  */
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
@@ -19,17 +17,6 @@ import { SQL } from "bun";
 
 /** One custom entry's fill: twelve of them make a transcript of about 3 MiB, several chunks long. */
 const PAD = "x".repeat(256 * 1024);
-
-/** Whether this tree's SQL store reads a session in chunks, so a rewrite can land between two of them. */
-const SQL_STORE_READS_CHUNKS = await (async () => {
-	const client = new SQL("sqlite::memory:");
-	try {
-		const storage: SessionStorage = await SqlSessionStorage.create({ client });
-		return typeof storage.readChunks === "function";
-	} finally {
-		await client.close();
-	}
-})();
 
 /** Two SQL stores over one SQLite file: `ours` runs the session, `theirs` is another process's. */
 async function openStores() {
@@ -92,9 +79,8 @@ async function seededSession(storage: SessionStorage): Promise<{ manager: Sessio
  * the next chunked read of the path it landed at, the read-back, so that read
  * meets a session replaced under it.
  */
-function raceReadBackOfLandedPublish(ours: SessionStorage, theirs: SqlSessionStorage): { raced: boolean } {
-	const readChunks = ours.readChunks?.bind(ours);
-	if (!readChunks) throw new Error("the SQL store reads no chunks");
+function raceReadBackOfLandedPublish(ours: SqlSessionStorage, theirs: SqlSessionStorage): { raced: boolean } {
+	const readChunks = ours.readChunks.bind(ours);
 	const publish = ours.writeTextAtomic.bind(ours);
 	const state = { raced: false };
 	let landed: { file: string; content: string } | undefined;
@@ -127,7 +113,7 @@ async function storedEntryIds(storage: SqlSessionStorage, file: string): Promise
 	return loaded.entries.flatMap(entry => (entry.type === "session" ? [] : [entry.id]));
 }
 
-describe.skipIf(!SQL_STORE_READS_CHUNKS)("the read-back of a landed publish that another store's rewrite races", () => {
+describe("the read-back of a landed publish that another store's rewrite races", () => {
 	it("counts a rewrite whose acknowledgement failed as published", async () => {
 		// If this regresses, a compaction or rewrite whose body landed reports its lost acknowledgement as a
 		// failed write, and the session keeps the size it had before as its durable one.

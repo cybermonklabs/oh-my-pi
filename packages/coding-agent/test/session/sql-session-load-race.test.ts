@@ -5,13 +5,11 @@
  * a read, or between two reads of one load. Each case races a real full write
  * of that other writer against such a read: the header probe and the load of
  * an open, a switch and a fork, and the check of whether a current-version
- * session predates entry ids. The cases run on a SQLite file, and skip where
- * the SQL store reads no chunks.
+ * session predates entry ids. The cases run on a SQLite file.
  */
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
@@ -20,14 +18,6 @@ const MiB = 1024 * 1024;
 const ID = "01a1f000-0000-7000-8000-0000000000e1";
 const TIMESTAMP = "2026-11-18T00:00:00.000Z";
 const HEADER = `${JSON.stringify({ type: "session", version: 3, id: ID, timestamp: TIMESTAMP, cwd: "/tmp" })}\n`;
-/** Whether the SQL store reads a transcript in chunks (`readChunks`), which these races need. */
-const readsChunks = await (async () => {
-	const client = new SQL("sqlite::memory:");
-	const storage: SessionStorage = await SqlSessionStorage.create({ client });
-	const chunked = typeof storage.readChunks === "function";
-	await client.close();
-	return chunked;
-})();
 
 /** Nine 1 MiB custom entries of `fill` after the header, chained `p0` … `p8`; with `ids: false`, none has an id. */
 function padBody(fill: string, ids = true): string {
@@ -119,9 +109,8 @@ async function seeded(db: SqliteDb, content: string) {
  * `reader` that reads past that chunk (a header probe stops in it). Returns
  * whether it ran.
  */
-function raceAfterFirstChunk(reader: SessionStorage, race: () => Promise<void>): () => boolean {
-	const readChunks = reader.readChunks?.bind(reader);
-	if (!readChunks) throw new Error("the SQL store reads no chunks");
+function raceAfterFirstChunk(reader: SqlSessionStorage, race: () => Promise<void>): () => boolean {
+	const readChunks = reader.readChunks.bind(reader);
 	let raced = false;
 	spyOn(reader, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
 		(async function* () {
@@ -144,7 +133,7 @@ function fills(manager: SessionManager): string {
 		.join("");
 }
 
-describe.skipIf(!readsChunks)("streamed loads of a SQL session that another store rewrites", () => {
+describe("streamed loads of a SQL session that another store rewrites", () => {
 	it("opens one whole body when the holder rewrites the transcript between the start of the header probe's read and its first page", async () => {
 		// If this regresses, `omp --resume` of a long SQL session that another
 		// process rewrites just then fails with a read conflict instead of opening.
@@ -230,13 +219,11 @@ describe.skipIf(!readsChunks)("streamed loads of a SQL session that another stor
 		// of the new body, so the tree, the leaf and every reference by id break.
 		await using db = sqliteDb();
 		const { holder, reader } = await seeded(db, padBody("u", false));
-		const chunked: SessionStorage = reader;
-		const readChunks = chunked.readChunks?.bind(chunked);
-		if (!readChunks) throw new Error("the SQL store reads no chunks");
+		const readChunks = reader.readChunks.bind(reader);
 		// The check reads the whole transcript: the first read that ends; the rewrite lands before the next.
 		let wholeReads = 0;
 		let raced = false;
-		spyOn(chunked, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
+		spyOn(reader, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
 			(async function* () {
 				if (wholeReads > 0 && !raced) {
 					raced = true;

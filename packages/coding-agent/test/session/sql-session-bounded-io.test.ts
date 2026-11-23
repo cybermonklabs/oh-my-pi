@@ -8,10 +8,7 @@
  * transcript handed to, or returned by, the SQL client or the storage.
  *
  * Runs on SQLite always, and on PostgreSQL when `OMP_TEST_SQL_POSTGRES_URL`
- * names a throwaway database. Cases that call the streamed storage methods
- * skip where the storage lacks them; the reader and `SessionManager` cases use
- * only APIs that predate them, so on a storage that reads and writes whole
- * they fail by recording a value as long as the transcript.
+ * names a throwaway database.
  */
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -56,19 +53,6 @@ const TIMEOUT = 300_000;
 const TIMESTAMP = "2026-11-01T00:00:00.000Z";
 const STAGING = "#staging-";
 const HOUR_MS = 60 * 60 * 1000;
-
-/** Whether SQL storage reads in chunks: a storage has `readChunks` when its backend reads in pieces. */
-const streamsReads = await (async () => {
-	const client = new SQL("sqlite::memory:");
-	try {
-		return typeof (await SqlSessionStorage.create({ client })).readChunks === "function";
-	} finally {
-		await client.end();
-	}
-})();
-const streamsWrites =
-	typeof SqlSessionStorage.prototype.writeLinesAtomic === "function" &&
-	typeof SqlSessionStorage.prototype.writeLinesSync === "function";
 
 const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string | undefined }> = [
 	{ adapter: "sqlite", url: "sqlite" },
@@ -258,7 +242,7 @@ for (const { adapter, url } of BACKENDS) {
 			cwd?.removeSync();
 		});
 
-		it.skipIf(!streamsReads)(
+		it(
 			"reads a transcript stored as parts not cut at line ends back byte for byte, a part at a time",
 			async () => {
 				const longest = new Longest();
@@ -520,7 +504,7 @@ for (const { adapter, url } of BACKENDS) {
 		);
 
 		for (const variant of ["writeLinesAtomic", "writeLinesSync"] as const) {
-			it.skipIf(!streamsWrites)(
+			it(
 				`${variant} stores the bytes a whole write of the joined lines stores, with no value over 16 MiB`,
 				async () => {
 					const lines = transcriptLines(cwd.path(), WRITE_BYTES);
@@ -552,7 +536,7 @@ for (const { adapter, url } of BACKENDS) {
 			);
 		}
 
-		it.skipIf(!streamsWrites)(
+		it(
 			"refuses a full write whose expected size no longer matches, leaving the bytes and no staging parts",
 			async () => {
 				const path = "/sessions/p/conflict.jsonl";
@@ -576,7 +560,7 @@ for (const { adapter, url } of BACKENDS) {
 			TIMEOUT,
 		);
 
-		it.skipIf(!streamsWrites)(
+		it(
 			"deletes a killed writer's staging set over an hour old at the next full write, and never lists one",
 			async () => {
 				const path = "/sessions/p/staged.jsonl";
@@ -603,7 +587,7 @@ for (const { adapter, url } of BACKENDS) {
 			TIMEOUT,
 		);
 
-		it.skipIf(!streamsWrites)(
+		it(
 			"refuses, as a conflict, a swap whose staging parts were deleted after they were written",
 			async () => {
 				const path = "/sessions/p/swept.jsonl";
@@ -643,7 +627,7 @@ for (const { adapter, url } of BACKENDS) {
 		// sql-session-storage-read-write.test.ts shows for the other writes. Each
 		// connection here sets its read-only default itself, so the URL must be a
 		// direct connection, not one through a transaction-mode pooler.
-		it.skipIf(!streamsWrites || adapter !== "postgres")(
+		it.skipIf(adapter !== "postgres")(
 			"stages a full write where a session SET made the connection read-only, and refuses one where the session keeps a read-only default",
 			async () => {
 				const path = "/sessions/p/read-only.jsonl";

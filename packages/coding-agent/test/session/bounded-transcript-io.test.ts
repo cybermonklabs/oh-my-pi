@@ -5,9 +5,6 @@
  * the longest string or buffer handed to or returned by it, and spies on
  * `JSON.parse` and `Bun.JSONL.parseChunk` that record the longest text parsed,
  * watch; none may exceed 16 MiB. Full writes that remain name why in their case.
- *
- * SQL storage cases run where SQL storage reads in chunks; without that
- * capability its reads are whole by design, and the cases skip.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -21,6 +18,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { ENTRY_PATCH_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/entry-patches";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type CompactionEntry,
@@ -57,18 +55,6 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const PNG_PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const FILLER = "the session keeps working through the module tree ".repeat(640);
 const FENCE = `\`\`\`ts\n${"const value = compute(a, b, c, d, e);\n".repeat(200)}\`\`\``;
-/** The custom entry type of an appended patch record, where the build has them. */
-const ENTRY_PATCH_TYPE = "entry_patch";
-const hasEntryPatchRecords = fs.existsSync(path.join(import.meta.dir, "../../src/session/entry-patches.ts"));
-/** Whether SQL storage reads in chunks: a storage has `readChunks` when its backend reads in pieces. */
-const sqlStorageReadsChunks = await (async () => {
-	const client = new SQL("sqlite::memory:");
-	try {
-		return typeof ((await SqlSessionStorage.create({ client })) as SessionStorage).readChunks === "function";
-	} finally {
-		await client.end();
-	}
-})();
 const POSTGRES_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 
 /** The longest value each watched entry point handled. */
@@ -937,12 +923,13 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 		CASE_TIMEOUT_MS,
 	);
 
-	it.skipIf(!hasEntryPatchRecords)(
+	it(
 		'appends entry_patch records instead of rewriting for a recovered retry, a compaction stamp and shake("elide")',
 		async () => {
 			const patchRecords = (manager: SessionManager) =>
-				manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === ENTRY_PATCH_TYPE)
-					.length;
+				manager
+					.getEntries()
+					.filter(entry => entry.type === "custom" && entry.customType === ENTRY_PATCH_CUSTOM_TYPE).length;
 			// Without images, a dead-end rescue has none to drop: `dropImages`, a full write by design, keeps its own case.
 			const { transcript, storage } = await setUp({ images: false });
 
@@ -1019,7 +1006,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		return manager;
 	}
 
-	it.skipIf(!sqlStorageReadsChunks)(
+	it(
 		"resumes it by path",
 		async () => {
 			const { transcript, storage, client } = await stored();
@@ -1030,7 +1017,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		CASE_TIMEOUT_MS,
 	);
 
-	it.skipIf(!sqlStorageReadsChunks)(
+	it(
 		"resumes it by id",
 		async () => {
 			const { transcript, storage, client } = await stored();
@@ -1056,7 +1043,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		CASE_TIMEOUT_MS,
 	);
 
-	it.skipIf(!sqlStorageReadsChunks)(
+	it(
 		"rewrites it whole, streamed (rewriteEntries)",
 		async () => {
 			const { transcript, storage, client } = await stored();

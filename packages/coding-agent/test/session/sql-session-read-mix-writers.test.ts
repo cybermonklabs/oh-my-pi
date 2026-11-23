@@ -39,7 +39,6 @@ async function racedRead(
 	race: () => Promise<void>,
 	bodies: Record<string, string>,
 ): Promise<string> {
-	if (!reader.readChunks) throw new Error("the SQL store reads no chunks");
 	const chunks: Uint8Array[] = [];
 	try {
 		for await (const chunk of reader.readChunks(file, fromByte)) {
@@ -285,7 +284,6 @@ function raceAroundEndCheck(
 	recreate: (lines: string[]) => Promise<void>,
 	bodies: { back: string[]; next: string[] },
 ): string[] {
-	if (!reader.readChunks) throw new Error("the SQL store reads no chunks");
 	const readChunks = reader.readChunks.bind(reader);
 	const ran: string[] = [];
 	let yielded = 0;

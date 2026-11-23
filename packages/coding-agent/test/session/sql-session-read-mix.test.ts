@@ -59,7 +59,6 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 
 				const reader = await db.open({ lease: STILL });
 				await reader.refresh();
-				if (!reader.readChunks) throw new Error("the SQL store reads no chunks");
 				const chunks: Uint8Array[] = [];
 				let outcome: string;
 				try {
@@ -106,7 +105,6 @@ async function racedRead(
 	race: () => Promise<void>,
 	bodies: Record<string, string>,
 ): Promise<string> {
-	if (!reader.readChunks) throw new Error("the SQL store reads no chunks");
 	const chunks: Uint8Array[] = [];
 	try {
 		for await (const chunk of reader.readChunks(file, fromByte)) {

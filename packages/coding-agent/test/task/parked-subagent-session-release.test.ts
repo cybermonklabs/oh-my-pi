@@ -25,7 +25,6 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -35,6 +34,7 @@ import {
 	cfgMnemopiLlmApiKey,
 	cfgMnemopiLlmBaseUrl,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
+import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -410,9 +410,6 @@ it("keeps a credential setting a run wrote out of the transcript and revives wit
 	}
 }, 30_000);
 
-/** Session store masking of a build that has it (a release build); undefined in a build without it. */
-const maskSessionStore = lookup("secrets.maskSessionStore");
-
 /** Data of the newest custom entry of `customType` in the transcript text `stored`. */
 function storedCustomData(stored: string, customType: string): unknown {
 	const entry = Bun.JSONL.parse(stored).findLast(
@@ -424,57 +421,53 @@ function storedCustomData(stored: string, customType: string): unknown {
 // If this regresses, a value secrets.yml lists that a subagent was given (in its task context, say) is written in plain
 // text to its transcript file each time it parks, although the session store is masked; or a subagent parked under
 // masking can no longer be woken for a follow-up.
-it.skipIf(maskSessionStore === undefined)(
-	"masks the stored revive inputs as other custom data and still revives",
-	async () => {
-		const secret = "Pv8Wq3Lz6Tn1Kd5Rx9Bm";
-		const context = `Deploy with the key ${secret} to staging.`;
-		// The project's secrets.yml, read when the subagent's session first writes in its cwd.
-		await Bun.write(
-			path.join(root, "home", "work", ".omp", "secrets.yml"),
-			`- type: plain\n  content: ${secret}\n  friendlyName: ReviveProbe\n`,
+it("masks the stored revive inputs as other custom data and still revives", async () => {
+	const secret = "Pv8Wq3Lz6Tn1Kd5Rx9Bm";
+	const context = `Deploy with the key ${secret} to staging.`;
+	// The project's secrets.yml, read when the subagent's session first writes in its cwd.
+	await Bun.write(
+		path.join(root, "home", "work", ".omp", "secrets.yml"),
+		`- type: plain\n  content: ${secret}\n  friendlyName: ReviveProbe\n`,
+	);
+	const run = await runKeptAliveSubagent({ context, settings: { [cfgSecretsMaskSessionStore.id]: true } });
+	try {
+		// Other custom data holding the same text, written by the same session.
+		localSession(AgentRegistry.global().get(AGENT_ID)?.session).sessionManager.appendCustomEntry(
+			"revive-mask-probe",
+			{ context },
 		);
-		const run = await runKeptAliveSubagent({ context, settings: { "secrets.maskSessionStore": true } });
-		try {
-			// Other custom data holding the same text, written by the same session.
-			localSession(AgentRegistry.global().get(AGENT_ID)?.session).sessionManager.appendCustomEntry(
-				"revive-mask-probe",
-				{ context },
-			);
-			await AgentLifecycleManager.global().park(AGENT_ID);
-			run.release();
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
 
-			const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
-			if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
-			const stored = await Bun.file(sessionFile).text();
-			for (let start = 0; start + 8 <= secret.length; start++) {
-				expect(stored).not.toContain(secret.slice(start, start + 8));
-			}
-			const probe = storedCustomData(stored, "revive-mask-probe");
-			const revive = storedCustomData(stored, "subagent-revive-state");
-			if (!isRecord(probe) || typeof probe.context !== "string") throw new Error("The probe entry was not stored");
-			if (!isRecord(revive) || !isRecord(revive.prompt)) throw new Error("No revive inputs were stored");
-			expect(probe.context).not.toBe(context);
-			expect(revive.prompt.context).toBe(probe.context);
-
-			// Woken for a follow-up, it revives warm from the stored inputs, which come back from the store masked as
-			// every other entry does: its prompt shows the masked context, never the value.
-			const followUp = await runSubagentFollowUpTurn({
-				id: AGENT_ID,
-				agent: TASK_AGENT,
-				message: "anything else?",
-				storeMaskCwd: path.join(root, "home", "work"),
-			});
-			expect(followUp.exitCode).toBe(0);
-			const revivedPrompt = runPrompts(run.mock)[0]?.join("\n");
-			expect(revivedPrompt).toContain(probe.context);
-			expect(revivedPrompt).not.toContain(secret);
-		} finally {
-			run.close();
+		const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+		if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+		const stored = await Bun.file(sessionFile).text();
+		for (let start = 0; start + 8 <= secret.length; start++) {
+			expect(stored).not.toContain(secret.slice(start, start + 8));
 		}
-	},
-	30_000,
-);
+		const probe = storedCustomData(stored, "revive-mask-probe");
+		const revive = storedCustomData(stored, "subagent-revive-state");
+		if (!isRecord(probe) || typeof probe.context !== "string") throw new Error("The probe entry was not stored");
+		if (!isRecord(revive) || !isRecord(revive.prompt)) throw new Error("No revive inputs were stored");
+		expect(probe.context).not.toBe(context);
+		expect(revive.prompt.context).toBe(probe.context);
+
+		// Woken for a follow-up, it revives warm from the stored inputs, which come back from the store masked as
+		// every other entry does: its prompt shows the masked context, never the value.
+		const followUp = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: TASK_AGENT,
+			message: "anything else?",
+			storeMaskCwd: path.join(root, "home", "work"),
+		});
+		expect(followUp.exitCode).toBe(0);
+		const revivedPrompt = runPrompts(run.mock)[0]?.join("\n");
+		expect(revivedPrompt).toContain(probe.context);
+		expect(revivedPrompt).not.toContain(secret);
+	} finally {
+		run.close();
+	}
+}, 30_000);
 
 const SECRET_MODEL_API = "test-parked-release-secret-model";
 

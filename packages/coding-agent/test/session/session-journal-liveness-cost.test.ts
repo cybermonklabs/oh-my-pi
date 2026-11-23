@@ -1,11 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import * as sessionStorage from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { sessionJournalLiveness } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-
-/** Exported only by a session storage that tells which process runs a journal; the case below skips without it. */
-const sessionJournalLiveness = Reflect.get(sessionStorage, "sessionJournalLiveness") as (sessionPath: string) => string;
 
 const SESSION_STORAGE_MODULE = path.join(import.meta.dir, "../../src/session/session-storage.ts");
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
@@ -76,7 +73,7 @@ async function runOwner(dir: TempDir, journals: Array<{ id: string; file: string
 	};
 }
 
-describe.skipIf(typeof sessionJournalLiveness !== "function")("liveness of journals another process runs", () => {
+describe("liveness of journals another process runs", () => {
 	// The agent-list scan and `omp gc` check every journal they meet. When that
 	// check blocks about 50 ms for each session another omp pane runs, a user
 	// with 20 sibling panes sees the terminal freeze for a second on each scan.

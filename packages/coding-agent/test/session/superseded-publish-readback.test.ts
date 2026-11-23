@@ -14,13 +14,6 @@ import { SQL } from "bun";
 
 const MiB = 1024 * 1024;
 
-// The SQL case needs a SQL store that reads a transcript in chunks: a store that reads it whole in one
-// statement cannot be cut off mid-read by another writer, so where it has no `readChunks` the case skips.
-const probeClient = new SQL("sqlite::memory:");
-const probe: SessionStorage = await SqlSessionStorage.create({ client: probeClient });
-const sqlReadsChunks = typeof probe.readChunks === "function";
-await probeClient.end();
-
 /**
  * An in-memory store that serves a transcript in small chunks and can park one
  * atomic publish, which then lands even though the manager moved on (a store
@@ -108,7 +101,7 @@ describe("a superseded atomic publish", () => {
 	});
 });
 
-describe.skipIf(!sqlReadsChunks)("a superseded atomic publish on SQL storage (SQLite)", () => {
+describe("a superseded atomic publish on SQL storage (SQLite)", () => {
 	// Regressed: another store's full write of the same bytes cuts off the read-back of a publish that landed
 	// while a synchronous rewrite (which the store refused) superseded it, and the manager records nothing:
 	// its next full write expects the size from before the publish, conflicts with its own body, and reads
@@ -128,10 +121,9 @@ describe.skipIf(!sqlReadsChunks)("a superseded atomic publish on SQL storage (SQ
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected a session file");
 
+			const publish = storage.writeLinesAtomic.bind(storage);
+			const readChunks = storage.readChunks.bind(storage);
 			const store: SessionStorage = storage;
-			const publish = store.writeLinesAtomic?.bind(store);
-			const readChunks = store.readChunks?.bind(store);
-			if (!publish || !readChunks) throw new Error("Expected a SQL store that publishes lines and reads chunks");
 			// The store commits the next atomic publish, and the manager moves on before it hears back.
 			const parked = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
