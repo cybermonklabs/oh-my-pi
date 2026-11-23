@@ -19,7 +19,8 @@ use pi_vfs::{FileHandle, FileSystem, FileType, Metadata, OpenOptions, Permission
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	session::{RunStdio, Session, SessionConfig},
+	bash::{Event, EventData, EventKind, EventMask, EventSink, WaitKey},
+	session::{RunOptions, RunStdio, Session, SessionConfig},
 	vfs::VfsFs,
 };
 
@@ -67,7 +68,7 @@ fn read_back(mut file: std::fs::File) -> String {
 	text
 }
 
-async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> Ran {
+async fn run_with(s: &mut Session, options: RunOptions, cancel: CancellationToken) -> Ran {
 	let (out, err) = (tempfile::tempfile().unwrap(), tempfile::tempfile().unwrap());
 	let stdio = RunStdio {
 		stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
@@ -75,7 +76,7 @@ async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> 
 		stderr: Some(err.try_clone().unwrap()),
 	};
 	let started = Instant::now();
-	let outcome = s.run(command, stdio, cancel).await.unwrap();
+	let outcome = s.run_with(options, stdio, cancel).await.unwrap();
 	Ran {
 		status:    outcome.status,
 		cancelled: outcome.cancelled,
@@ -86,7 +87,7 @@ async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> 
 }
 
 async fn run(s: &mut Session, command: &str) -> Ran {
-	run_with(s, command, CancellationToken::new()).await
+	run_with(s, RunOptions::new(command), CancellationToken::new()).await
 }
 
 /// stdout of `command`, which must succeed.
@@ -164,14 +165,36 @@ async fn background_extras_are_jobs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_ends_an_extra_promptly() {
+	/// Rings when a command of the run parks on a native task: an extra
+	/// runs and the shell waits for it.
+	#[derive(Default)]
+	struct ParkedOnExtra(tokio::sync::Notify);
+	impl EventSink for ParkedOnExtra {
+		fn mask(&self) -> EventMask {
+			EventMask::of(EventKind::Blocked)
+		}
+
+		fn event(&self, ev: &Event<'_>) {
+			if let EventData::Blocked { key: WaitKey::Task(_) } = ev.data {
+				self.0.notify_one();
+			}
+		}
+	}
+
 	let mut s = session();
 	let cancel = CancellationToken::new();
+	let parked = Arc::new(ParkedOnExtra::default());
+	let options = RunOptions { events: Some(parked.clone()), ..RunOptions::new("sleep 30") };
 	let trigger = cancel.clone();
-	tokio::spawn(async move {
-		tokio::time::sleep(Duration::from_millis(200)).await;
+	// The cancel reaches `sleep` while it runs, not the command before it
+	// starts.
+	let cancelling = async {
+		tokio::time::timeout(Duration::from_secs(20), parked.0.notified())
+			.await
+			.expect("the shell never parked on `sleep`");
 		trigger.cancel();
-	});
-	let ran = run_with(&mut s, "sleep 30", cancel).await;
+	};
+	let (ran, ()) = tokio::join!(run_with(&mut s, options, cancel), cancelling);
 	assert!(ran.cancelled);
 	assert!(ran.elapsed < Duration::from_secs(5), "took {:?}", ran.elapsed);
 	// The session stays usable.

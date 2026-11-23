@@ -577,6 +577,278 @@ fn host_reads_through_a_cancelled_view_fail_with_the_cancellation_error() {
 	assert_eq!(text.len(), 300_000);
 }
 
+/// A FIFO open about to start on this thread, for another thread to act on
+/// (connect the other end, cancel the open) once the open waits.
+///
+/// On Linux the open runs through [`OpenMark::run`] on one CPU fewer than
+/// this thread has, one such open at a time ([`MARKED_OPENS`]). A new thread
+/// starts on the CPUs of the thread that starts it, and only the helpers of
+/// such opens run on exactly those; the helpers of earlier ones (left in
+/// `open` by a cancel nothing could release) started before [`Self::new`].
+/// So the open's helper is the one thread started since that does, whatever
+/// its name. Without CPUs to mark it by (one CPU, or a CPU change that is
+/// refused or does not hold), the wait is the time it was.
+#[cfg(unix)]
+struct FifoOpenWait {
+	/// The opening thread.
+	#[cfg(target_os = "linux")]
+	opener: libc::pid_t,
+	/// The threads alive before the open: its helper is not among them.
+	#[cfg(target_os = "linux")]
+	before: Vec<libc::pid_t>,
+	/// The CPUs the open runs on; `None` when this thread has one CPU or may
+	/// not change its CPUs.
+	#[cfg(target_os = "linux")]
+	marked: Option<libc::cpu_set_t>,
+}
+
+/// Lets one marked FIFO open run at a time: opens of tests that run at once
+/// would get the same CPUs.
+#[cfg(target_os = "linux")]
+static MARKED_OPENS: Mutex<()> = Mutex::new(());
+
+/// Runs the open of a [`FifoOpenWait`] on the CPUs that mark its helper.
+#[cfg(unix)]
+struct OpenMark {
+	/// The opening thread's CPUs, and the open's.
+	#[cfg(target_os = "linux")]
+	cpus:           Option<(libc::cpu_set_t, libc::cpu_set_t)>,
+	/// Held from [`FifoOpenWait::new`] until the opening thread has its own
+	/// CPUs back.
+	#[cfg(target_os = "linux")]
+	_one_at_a_time: parking_lot::MutexGuard<'static, ()>,
+}
+
+#[cfg(target_os = "linux")]
+impl FifoOpenWait {
+	/// Taken on the thread that is about to open the FIFO.
+	fn new() -> (Self, OpenMark) {
+		let one_at_a_time = MARKED_OPENS.lock();
+		let cpus = cpus_of(0).and_then(|all| {
+			let marked = less_one_cpu(&all)?;
+			// The change must hold: it is undone at once, and made again for
+			// the open.
+			let holds = set_cpus(&marked) && cpus_of(0).is_some_and(|now| same_cpus(&now, &marked));
+			// A thread this one starts next must not inherit the marked CPUs.
+			assert!(set_cpus(&all), "could not give this thread its CPUs back");
+			holds.then_some((all, marked))
+		});
+		let wait = Self {
+			opener: current_thread_id(),
+			before: thread_ids(),
+			marked: cpus.map(|(_, marked)| marked),
+		};
+		(wait, OpenMark { cpus, _one_at_a_time: one_at_a_time })
+	}
+
+	/// Whether thread `tid` may be the open's helper: started since
+	/// [`Self::new`], on the open's CPUs, `marked`.
+	fn is_helper(&self, tid: libc::pid_t, marked: &libc::cpu_set_t) -> bool {
+		!self.before.contains(&tid) && cpus_of(tid).is_some_and(|cpus| same_cpus(&cpus, marked))
+	}
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl FifoOpenWait {
+	/// Taken on the thread that is about to open the FIFO.
+	const fn new() -> (Self, OpenMark) {
+		(Self {}, OpenMark {})
+	}
+}
+
+#[cfg(unix)]
+#[cfg_attr(
+	not(target_os = "linux"),
+	allow(clippy::unused_self, reason = "without /proc the waits are fixed times")
+)]
+impl FifoOpenWait {
+	/// Returns once the open waits for the other end: the opener sleeps, and
+	/// so does the open's helper (in its `open`). Without `/proc`, or without
+	/// CPUs to mark the helper by, after 150 ms instead.
+	fn wait(&self) {
+		#[cfg(target_os = "linux")]
+		if let Some(marked) = &self.marked {
+			wait_for("the FIFO open waiting for the other end", || {
+				asleep(self.opener)
+					&& thread_ids()
+						.into_iter()
+						.any(|tid| self.is_helper(tid, marked) && asleep(tid))
+			});
+			return;
+		}
+		#[cfg(target_os = "linux")]
+		eprintln!("no CPUs to mark the FIFO open's helper by: waiting 150 ms instead");
+		std::thread::sleep(Duration::from_millis(150));
+	}
+
+	/// Returns once the opener has read every byte written to `fifo` (this
+	/// thread's end) and sleeps, waiting for more. Without `/proc`, after
+	/// 200 ms instead.
+	fn wait_until_drained(&self, fifo: &std::fs::File) {
+		#[cfg(target_os = "linux")]
+		wait_for("the reader waiting for more after reading everything", || {
+			unread(fifo) == 0 && asleep(self.opener)
+		});
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = fifo;
+			std::thread::sleep(Duration::from_millis(200));
+		}
+	}
+}
+
+#[cfg(unix)]
+#[cfg_attr(
+	not(target_os = "linux"),
+	allow(clippy::unused_self, reason = "without /proc no CPUs mark the helper")
+)]
+impl OpenMark {
+	/// Runs `open`, the FIFO open, on the CPUs that mark its helper; the
+	/// opening thread gets its own back once `open` returns.
+	fn run<T>(self, open: impl FnOnce() -> T) -> T {
+		#[cfg(target_os = "linux")]
+		if let Some((_, marked)) = &self.cpus {
+			assert!(set_cpus(marked), "sched_setaffinity: {}", io::Error::last_os_error());
+		}
+		open()
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OpenMark {
+	/// Gives the opening thread its own CPUs back, before the next marked
+	/// open may start.
+	fn drop(&mut self) {
+		if let Some((all, _)) = &self.cpus
+			&& !set_cpus(all)
+			&& !std::thread::panicking()
+		{
+			panic!("could not give the opening thread its CPUs back: {}", io::Error::last_os_error());
+		}
+	}
+}
+
+/// Whether a thread named `name` sleeps within three seconds, polled every
+/// millisecond on the runtime's timer. Without `/proc`, `true` after 200 ms
+/// instead.
+#[cfg(unix)]
+async fn named_thread_sleeps(name: &str) -> bool {
+	#[cfg(target_os = "linux")]
+	{
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+		let named_asleep = |tid: libc::pid_t| thread_name(tid) == name && asleep(tid);
+		while !thread_ids().into_iter().any(named_asleep) {
+			if tokio::time::Instant::now() >= deadline {
+				return false;
+			}
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		true
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = name;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		true
+	}
+}
+
+/// The id of the calling thread.
+#[cfg(target_os = "linux")]
+fn current_thread_id() -> libc::pid_t {
+	// SAFETY: `gettid` has no preconditions.
+	unsafe { libc::gettid() }
+}
+
+/// The ids of this process's threads.
+#[cfg(target_os = "linux")]
+fn thread_ids() -> Vec<libc::pid_t> {
+	std::fs::read_dir("/proc/self/task")
+		.unwrap()
+		.filter_map(|entry| entry.unwrap().file_name().to_str()?.parse().ok())
+		.collect()
+}
+
+/// The name of this process's thread `tid`; empty once it has exited.
+#[cfg(target_os = "linux")]
+fn thread_name(tid: libc::pid_t) -> String {
+	let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
+	comm.trim_end().to_owned()
+}
+
+/// Whether this process's thread `tid` sleeps (state `S`), as a thread that
+/// waits in a call or is parked does.
+#[cfg(target_os = "linux")]
+fn asleep(tid: libc::pid_t) -> bool {
+	let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap_or_default();
+	// The name, in parentheses, may hold anything: the state follows the last
+	// `)`.
+	stat
+		.rsplit_once(')')
+		.is_some_and(|(_, rest)| rest.trim_start().starts_with('S'))
+}
+
+/// The CPUs this process's thread `tid` may run on (`0`: the calling
+/// thread); `None` when they cannot be read.
+#[cfg(target_os = "linux")]
+fn cpus_of(tid: libc::pid_t) -> Option<libc::cpu_set_t> {
+	// SAFETY: a `cpu_set_t` is plain bits; all zeros is the empty set.
+	let mut cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+	// SAFETY: `cpus` is valid for writes of one `cpu_set_t` for the call.
+	let read = unsafe { libc::sched_getaffinity(tid, size_of::<libc::cpu_set_t>(), &raw mut cpus) };
+	(read == 0).then_some(cpus)
+}
+
+/// Lets the calling thread run on `cpus` only; `false` when it may not.
+#[cfg(target_os = "linux")]
+fn set_cpus(cpus: &libc::cpu_set_t) -> bool {
+	// SAFETY: `cpus` is valid for reads of one `cpu_set_t` for the call.
+	unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), cpus) == 0 }
+}
+
+/// Whether `a` and `b` hold the same CPUs.
+#[cfg(target_os = "linux")]
+fn same_cpus(a: &libc::cpu_set_t, b: &libc::cpu_set_t) -> bool {
+	// SAFETY: `CPU_EQUAL` only reads both sets.
+	unsafe { libc::CPU_EQUAL(a, b) }
+}
+
+/// `all` without its lowest CPU; `None` when that leaves none.
+#[cfg(target_os = "linux")]
+fn less_one_cpu(all: &libc::cpu_set_t) -> Option<libc::cpu_set_t> {
+	let bits = 8 * size_of::<libc::cpu_set_t>();
+	// SAFETY: `CPU_ISSET` only reads `all`, at a bit within it.
+	let lowest = (0..bits).find(|&cpu| unsafe { libc::CPU_ISSET(cpu, all) })?;
+	let mut less = *all;
+	// SAFETY: `lowest` is a bit within `less`.
+	unsafe { libc::CPU_CLR(lowest, &mut less) };
+	// SAFETY: `CPU_COUNT` only reads `less`.
+	(unsafe { libc::CPU_COUNT(&less) } > 0).then_some(less)
+}
+
+/// Bytes written to the pipe or FIFO of `file` and not read yet.
+#[cfg(target_os = "linux")]
+fn unread(file: &std::fs::File) -> libc::c_int {
+	use std::os::fd::AsRawFd;
+	let mut bytes: libc::c_int = 0;
+	// SAFETY: `FIONREAD` stores one `int` through the pointer, valid for the
+	// call; the descriptor is borrowed from `file` for the call.
+	let done = unsafe { libc::ioctl(file.as_raw_fd(), libc::FIONREAD, &raw mut bytes) };
+	assert_eq!(done, 0, "FIONREAD: {}", io::Error::last_os_error());
+	bytes
+}
+
+/// Polls `ready` every millisecond until it holds; fails after 20 seconds,
+/// naming `what` it never saw.
+#[cfg(target_os = "linux")]
+fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+	let deadline = std::time::Instant::now() + Duration::from_secs(20);
+	while !ready() {
+		assert!(std::time::Instant::now() < deadline, "never saw {what}");
+		std::thread::sleep(Duration::from_millis(1));
+	}
+}
+
 /// Through a cancellable view, opening a FIFO waits for a writer as a
 /// blocking open does, so even a reader of the bare descriptor (an external
 /// child, `$(< f)`) gets a late writer's data. When no writer comes, the open
@@ -594,11 +866,13 @@ fn fifo_opens_through_a_cancellable_view_wait_for_a_writer_and_observe_the_token
 	let scoped = BlockingFs::native().with_cancellation(token.clone());
 
 	let writer_path = fifo.clone();
+	let (open, mark) = FifoOpenWait::new();
 	let writer = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(150));
+		// A late writer: it comes once the open waits for it.
+		open.wait();
 		std::fs::write(writer_path, "hi").unwrap();
 	});
-	let opened = scoped.open(&fifo).unwrap();
+	let opened = mark.run(|| scoped.open(&fifo)).unwrap();
 	let mut descriptor = opened.native().unwrap();
 	let mut text = String::new();
 	descriptor.read_to_string(&mut text).unwrap();
@@ -606,12 +880,14 @@ fn fifo_opens_through_a_cancellable_view_wait_for_a_writer_and_observe_the_token
 	assert_eq!(text, "hi");
 	drop(opened);
 
+	let (open, mark) = FifoOpenWait::new();
 	let canceller = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(150));
+		// The cancel comes once the open waits for a writer.
+		open.wait();
 		token.cancel();
 	});
 	let started = std::time::Instant::now();
-	let err = scoped.open(&fifo).unwrap_err();
+	let err = mark.run(|| scoped.open(&fifo)).unwrap_err();
 	canceller.join().unwrap();
 	assert!(is_cancelled(&err), "{err}");
 	assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -658,13 +934,15 @@ fn fifo_this_process_cannot_write_still_opens_on_connect_and_observes_the_token(
 	let token = CancellationToken::new();
 	let scoped = BlockingFs::native().with_cancellation(token.clone());
 
-	// The writer connects, then writes only once the reader's open has
-	// returned, and pauses between two writes, so a descriptor left
-	// non-blocking fails the second read with `WouldBlock`.
+	// The writer connects once the open waits for it, writes only once the
+	// reader's open has returned, and holds its second write until the reader
+	// has read the first and waits for more, so a descriptor left
+	// non-blocking fails that read with `WouldBlock`.
 	let (opened_tx, opened_rx) = mpsc::channel::<()>();
 	let writer_path = fifo.clone();
+	let (open, mark) = FifoOpenWait::new();
 	let writer = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(150));
+		open.wait();
 		set_mode(&writer_path, 0o600);
 		let mut file = std::fs::OpenOptions::new()
 			.write(true)
@@ -673,11 +951,11 @@ fn fifo_this_process_cannot_write_still_opens_on_connect_and_observes_the_token(
 		set_mode(&writer_path, 0o400);
 		let waited = opened_rx.recv_timeout(Duration::from_secs(2));
 		file.write_all(b"h").unwrap();
-		std::thread::sleep(Duration::from_millis(200));
+		open.wait_until_drained(&file);
 		file.write_all(b"i").unwrap();
 		waited
 	});
-	let opened = scoped.open(&fifo).unwrap();
+	let opened = mark.run(|| scoped.open(&fifo)).unwrap();
 	let _ = opened_tx.send(());
 	let mut descriptor = opened.native().unwrap();
 	let mut text = String::new();
@@ -687,12 +965,14 @@ fn fifo_this_process_cannot_write_still_opens_on_connect_and_observes_the_token(
 	assert_eq!(text, "hi");
 	drop(opened);
 
+	let (open, mark) = FifoOpenWait::new();
 	let canceller = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(150));
+		// The cancel comes once the open waits for a writer.
+		open.wait();
 		token.cancel();
 	});
 	let started = std::time::Instant::now();
-	let err = scoped.open(&fifo).unwrap_err();
+	let err = mark.run(|| scoped.open(&fifo)).unwrap_err();
 	canceller.join().unwrap();
 	assert!(is_cancelled(&err), "{err}");
 	assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -721,25 +1001,36 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 		});
 		let (done_tx, done_rx) = mpsc::channel();
 		let (path, task_token) = (fifo.clone(), token.clone());
+		// The runtime's blocking pool, where the read waits, by a name of its
+		// own.
+		let pool = format!("fifo-read-{}", u8::from(idle_writer));
 		std::thread::spawn(move || {
 			let runtime = tokio::runtime::Builder::new_current_thread()
 				.enable_all()
+				.thread_name(pool.clone())
 				.build()
 				.unwrap();
 			let result = runtime.block_on(async move {
 				let fs = Fs::native().with_cancellation(task_token.clone());
-				tokio::spawn(async move {
-					tokio::time::sleep(Duration::from_millis(200)).await;
+				let canceller = tokio::spawn(async move {
+					// The cancel comes once the read waits on the blocking pool,
+					// for the writer or for its data.
+					let waited = named_thread_sleeps(&pool).await;
 					task_token.cancel();
+					waited
 				});
-				if idle_writer {
-					fs.open(&path)
-						.await?
-						.read_to_end_async(&mut Vec::new())
-						.await
-				} else {
-					fs.read(&path).await.map(|contents| contents.len())
+				let read = async {
+					if idle_writer {
+						fs.open(&path)
+							.await?
+							.read_to_end_async(&mut Vec::new())
+							.await
+					} else {
+						fs.read(&path).await.map(|contents| contents.len())
+					}
 				}
+				.await;
+				(read, canceller.await.unwrap())
 			});
 			let _ = done_tx.send(result);
 		});
@@ -749,9 +1040,10 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 		if let Some(writer) = writer {
 			drop(writer.join().unwrap());
 		}
-		let err = result
-			.unwrap_or_else(|_| panic!("idle_writer={idle_writer}: the read ignored its token"))
-			.unwrap_err();
+		let (read, waited) =
+			result.unwrap_or_else(|_| panic!("idle_writer={idle_writer}: the read ignored its token"));
+		assert!(waited, "idle_writer={idle_writer}: the read was never seen waiting");
+		let err = read.unwrap_err();
 		assert!(is_cancelled(&err), "idle_writer={idle_writer}: {err}");
 	}
 }
@@ -774,13 +1066,17 @@ fn fifo_opened_non_blocking_reads_without_waiting() {
 	options.read(true).custom_flags(libc::O_NONBLOCK);
 	let mut file = scoped.open_with(&fifo, &options).unwrap();
 
+	// Ends a read that waits for readiness, two seconds in; a read that has
+	// returned ends this wait at once.
+	let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
 	let canceller = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_secs(2));
+		let _ = returned_rx.recv_timeout(Duration::from_secs(2));
 		token.cancel();
 	});
 	let started = std::time::Instant::now();
 	let read = file.read(&mut [0; 8]);
 	let elapsed = started.elapsed();
+	drop(returned_tx);
 	assert_eq!(read.ok(), Some(0), "EOF at once");
 	assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 	canceller.join().unwrap();
@@ -821,8 +1117,10 @@ fn fifo_write_opens_through_a_cancellable_view_wait_for_a_reader_and_observe_the
 		redirect.write(true).create(true).truncate(true);
 
 		let reader_path = fifo.clone();
+		let (open, mark) = FifoOpenWait::new();
 		let reader = std::thread::spawn(move || {
-			std::thread::sleep(Duration::from_millis(150));
+			// The reader comes once the write open waits for it.
+			open.wait();
 			let set = |mode| {
 				std::fs::set_permissions(&reader_path, std::fs::Permissions::from_mode(mode)).unwrap();
 			};
@@ -833,17 +1131,19 @@ fn fifo_write_opens_through_a_cancellable_view_wait_for_a_reader_and_observe_the
 			file.read_to_string(&mut text).unwrap();
 			text
 		});
-		let mut writer = scoped.open_with(&fifo, &redirect).unwrap();
+		let mut writer = mark.run(|| scoped.open_with(&fifo, &redirect)).unwrap();
 		writer.write_all(b"hi").unwrap();
 		drop(writer);
 		assert_eq!(reader.join().unwrap(), "hi", "mode {mode:o}");
 
+		let (open, mark) = FifoOpenWait::new();
 		let canceller = std::thread::spawn(move || {
-			std::thread::sleep(Duration::from_millis(150));
+			// The cancel comes once the open waits for a reader.
+			open.wait();
 			token.cancel();
 		});
 		let started = std::time::Instant::now();
-		let err = scoped.open_with(&fifo, &redirect).unwrap_err();
+		let err = mark.run(|| scoped.open_with(&fifo, &redirect)).unwrap_err();
 		canceller.join().unwrap();
 		assert!(is_cancelled(&err), "mode {mode:o}: {err}");
 		assert!(started.elapsed() < Duration::from_secs(2), "mode {mode:o}: {:?}", started.elapsed());

@@ -1037,15 +1037,66 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn embedded_external_command_runs_in_its_own_session() {
+		use std::{
+			collections::HashMap, ffi::CString, fs::File, io::Write as _,
+			os::unix::ffi::OsStrExt as _, path::PathBuf,
+		};
+
+		/// A FIFO the child holds on until the test has read its session, so
+		/// the child is still alive however late that read comes. Dropping it
+		/// releases the child and removes the FIFO, also when an assertion
+		/// fails.
+		struct Hold {
+			path:   PathBuf,
+			writer: Option<File>,
+		}
+
+		impl Hold {
+			fn new() -> Self {
+				let path =
+					std::env::temp_dir().join(format!("pi-natives-session-hold-{}", std::process::id()));
+				let _ = std::fs::remove_file(&path);
+				let c_path = CString::new(path.as_os_str().as_bytes()).expect("temp path has no NUL");
+				// SAFETY: `c_path` is a valid NUL-terminated path.
+				let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+				assert_eq!(made, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+				Self { path, writer: None }
+			}
+
+			/// Writes the line that ends the child's `read`. The descriptor
+			/// stays open until drop, so the line stays in the FIFO even when
+			/// the child opens it later.
+			fn release(&mut self) -> std::io::Result<()> {
+				if self.writer.is_none() {
+					// Read-write opens of a FIFO never wait for the other end.
+					let mut fifo = File::options().read(true).write(true).open(&self.path)?;
+					fifo.write_all(b"\n")?;
+					self.writer = Some(fifo);
+				}
+				Ok(())
+			}
+		}
+
+		impl Drop for Hold {
+			fn drop(&mut self) {
+				let _ = self.release();
+				let _ = std::fs::remove_file(&self.path);
+			}
+		}
+
+		let mut hold = Hold::new();
+		let env = HashMap::from([("HOLD".to_string(), hold.path.to_string_lossy().into_owned())]);
 		let shell = CoreShell::new(None);
 		let (tx, rx) = flume::unbounded::<String>();
 		let handle = tokio::spawn(async move {
 			shell
 				.run(
 					CoreShellRunOptions {
-						command:    "sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'".to_string(),
+						command:    "sh -c 'printf \"%d\\n\" \"$$\"; exec 3<>\"$HOLD\"; read -r line \
+						             <&3'"
+							.to_string(),
 						cwd:        None,
-						env:        None,
+						env:        Some(env),
 						timeout_ms: None,
 						filesystem: None,
 						pipe_taps:  None,
@@ -1075,25 +1126,59 @@ mod tests {
 		// return value is checked below.
 		let child_sid = unsafe { libc::getsid(child_pid) };
 		assert!(child_sid > 0, "getsid({child_pid}) failed: {}", std::io::Error::last_os_error());
-		let result = handle
+		// Release the child: the line ends its `read`, so `sh` exits 0.
+		hold.release().expect("release the child");
+		let result = time::timeout(Duration::from_secs(30), handle)
 			.await
+			.expect("the child did not exit after its release")
 			.expect("shell task panicked")
 			.expect("shell run");
+		drop(hold);
 		assert_eq!(result.exit_code, Some(0));
 		assert_ne!(child_sid, host_sid);
 		assert_eq!(child_sid, child_pid);
 	}
 
+	/// Waits until process `pid` sleeps in a blocking call: state `S` in
+	/// `/proc/<pid>/stat`.
+	#[cfg(target_os = "linux")]
+	async fn wait_until_asleep(pid: i32) {
+		let deadline = time::Instant::now() + Duration::from_secs(30);
+		loop {
+			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+			// `pid (comm) state ...`: comm may hold spaces and parentheses, so
+			// the state is the first field after the last `)`.
+			if stat
+				.rsplit_once(')')
+				.is_some_and(|(_, rest)| rest.trim_start().starts_with('S'))
+			{
+				return;
+			}
+			assert!(time::Instant::now() < deadline, "process {pid} never went to sleep");
+			time::sleep(Duration::from_millis(5)).await;
+		}
+	}
+
+	/// Off Linux there is no `/proc` to see the process blocked, so the old
+	/// setup sleep stays.
+	#[cfg(not(target_os = "linux"))]
+	async fn wait_until_asleep(_pid: i32) {
+		time::sleep(Duration::from_millis(10)).await;
+	}
+
 	#[tokio::test]
 	async fn read_output_stops_when_cancelled_before_pipe_eof() {
 		let shell = CoreShell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
 		let mut cancel = CancelToken::default();
 		let abort = cancel.emplace_abort_token();
 		let handle = tokio::spawn(async move {
 			shell
 				.run(
 					CoreShellRunOptions {
-						command:    "sh -c 'sleep 30 & wait'".to_string(),
+						// `sh` prints its pid once the background job holds the
+						// output pipe, then waits for that job.
+						command:    "sh -c 'sleep 30 & printf \"%d\\n\" \"$$\"; wait'".to_string(),
 						cwd:        None,
 						env:        None,
 						timeout_ms: None,
@@ -1101,13 +1186,22 @@ mod tests {
 						pipe_taps:  None,
 						trace:      None,
 					},
-					None,
+					Some(tx),
 					cancel,
 				)
 				.await
 		});
 
-		time::sleep(Duration::from_millis(10)).await;
+		// Cancel only once the background job holds the pipe open and `sh`
+		// sleeps in `wait`, so the pipe cannot reach EOF on its own.
+		let sh_pid = time::timeout(Duration::from_secs(30), rx.recv_async())
+			.await
+			.expect("sh never printed its pid")
+			.expect("missing sh pid chunk")
+			.trim()
+			.parse::<i32>()
+			.expect("sh pid parses");
+		wait_until_asleep(sh_pid).await;
 		abort.abort(AbortReason::Signal);
 		let result = time::timeout(Duration::from_secs(3), handle)
 			.await

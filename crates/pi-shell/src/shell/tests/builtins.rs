@@ -1589,12 +1589,30 @@ async fn xargs_exit_137_is_not_signal_death() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn xargs_parallel_signal_death_stops_scheduling() {
-	let (result, output) = execute_captured(
-		"printf 'first\\nsecond\\nthird\\n' | xargs -n1 -P2 sh -c 'case \"$1\" in first) sleep 1;; \
-		 second) kill -9 $$;; third) echo unexpected;; esac' _"
-			.into(),
+	// The first command ends once xargs has reaped the second, which kills
+	// itself: xargs sees that death while the first still runs.
+	let dir = tempfile::tempdir().expect("scratch directory");
+	// Each loop gives up after 3000 polls (at least 30 s), longer than the
+	// run's 20 s bound: if xargs held the killed child until the first command
+	// ended, the bound fails the test before a loop could give up and pass it.
+	let script = concat!(
+		"case \"$1\" in ",
+		"first) n=0; until [ -s \"$0\" ] || [ $n -ge 3000 ]; do sleep 0.01; n=$((n+1)); done; ",
+		"n=0; while kill -0 \"$(cat \"$0\")\" 2>/dev/null && [ $n -lt 3000 ]; do sleep 0.01; \
+		 n=$((n+1)); done;; ",
+		"second) echo $$ > \"$0\"; kill -9 $$;; ",
+		"third) echo unexpected;; esac",
+	);
+	let (result, output) = time::timeout(
+		Duration::from_secs(20),
+		execute_captured(format!(
+			"printf 'first\\nsecond\\nthird\\n' | xargs -n1 -P2 sh -c {} {}",
+			quote_arg(script),
+			quote_arg(&dir.path().join("second.pid").to_string_lossy())
+		)),
 	)
-	.await;
+	.await
+	.expect("xargs did not finish within 20 s");
 	assert_eq!(result.exit_code, Some(125), "{output}");
 	assert!(output.contains("xargs: sh: terminated by signal 9"), "{output}");
 	assert!(!output.contains("unexpected"), "{output}");
@@ -1669,6 +1687,8 @@ async fn uutils_jq_filters_json_and_propagates_exit_status() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn uutils_head_stdin_read_is_cancellable() {
+	use std::io::Write as _;
+
 	let config = ShellConfig {
 		session_env:   None,
 		snapshot_path: None,
@@ -1678,15 +1698,28 @@ async fn uutils_head_stdin_read_is_cancellable() {
 	};
 	let mut session = create_session(&config).await.expect("create_session");
 
-	// Hold the pipe's write end open with no data so `head` blocks reading.
-	let (reader, _writer) = pipe_to_files("cancel").expect("pipe");
+	// Hold the pipe's write end open so `head` blocks reading. It reads the
+	// byte written here first; its next read then waits on an empty pipe.
+	let (reader, writer) = pipe_to_files("cancel").expect("pipe");
+	(&writer)
+		.write_all(b"x")
+		.expect("write the byte head reads first");
+	let probe = reader.try_clone().expect("clone the pipe's read end");
+	assert_eq!(queued_in_pipe(&probe), 1, "FIONREAD must count the byte in the pipe");
 	let params = TestStdio::null().stdin(&reader);
 	drop(reader);
 	let token = CancellationToken::new();
 	let cancel = token.clone();
 
 	let canceller = tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
+		// Once `head` has taken the byte, its next read waits.
+		time::timeout(Duration::from_secs(5), async {
+			while queued_in_pipe(&probe) > 0 {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("head never took the byte waiting in its stdin");
 		token.cancel();
 	});
 	let result = time::timeout(
@@ -1694,7 +1727,7 @@ async fn uutils_head_stdin_read_is_cancellable() {
 		session.run_test_with("head -n 1000000", &params, cancel),
 	)
 	.await;
-	let _ = canceller.await;
+	canceller.await.expect("the canceller panicked");
 
 	let exec = result
 		.expect("head must return promptly after cancel, not hang on the open pipe")
@@ -1705,6 +1738,17 @@ async fn uutils_head_stdin_read_is_cancellable() {
 	// started and reports the TERM-cancelled run as 128 + 15.
 	assert!(exec.cancelled, "the run must report that it was cancelled");
 	assert_eq!(exit_code(&exec), 143, "cancelled stdin read should report TERM's status");
+}
+
+/// The bytes waiting in the pipe `end` reads from (`FIONREAD`).
+#[cfg(unix)]
+fn queued_in_pipe(end: &std::fs::File) -> libc::c_int {
+	use std::os::fd::AsRawFd as _;
+	let mut queued: libc::c_int = 0;
+	// SAFETY: FIONREAD writes one `c_int` to `queued`, which outlives the call.
+	let rc = unsafe { libc::ioctl(end.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+	assert_eq!(rc, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+	queued
 }
 
 /// The disable env vars must actually gate registration: the global switch

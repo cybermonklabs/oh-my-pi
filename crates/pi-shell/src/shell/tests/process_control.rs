@@ -1048,6 +1048,23 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 		return;
 	}
 
+	/// Rings once a command of the run parks waiting for a job of the shell:
+	/// `fg` has taken the job and waits for it.
+	#[derive(Default)]
+	struct WaitsForJob(tokio::sync::Notify);
+	impl crate::bash::EventSink for WaitsForJob {
+		fn mask(&self) -> crate::bash::EventMask {
+			crate::bash::EventMask::of(crate::bash::EventKind::Blocked)
+		}
+
+		fn event(&self, ev: &crate::bash::Event<'_>) {
+			use crate::bash::{EventData::Blocked, WaitKey};
+			if let Blocked { key: WaitKey::Proc(_) | WaitKey::Job(_) } = ev.data {
+				self.0.notify_one();
+			}
+		}
+	}
+
 	let script = "echo $$ > \"$1\"; : > \"$2\"; if test \"$3\" -eq 1; then kill -STOP $$; fi; \
 	              while ! test -e \"$4\"; do sleep 0.01; done";
 	let (_pty_master, pty_slave) = pseudo_terminal_session();
@@ -1106,8 +1123,8 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				}
 			}
 			// The stages finish only once released, which happens after
-			// every stage is running again and fg had time to start waiting:
-			// a job that ended before fg would be refused as terminated.
+			// every stage is running again and fg waits for the job: a job
+			// that ended before fg took it would be refused as terminated.
 			let resume = format!(
 				"kill -CONT {} || exit 97; fg %1",
 				pids
@@ -1116,6 +1133,8 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 					.collect::<Vec<_>>()
 					.join(" ")
 			);
+			let waits = Arc::new(WaitsForJob::default());
+			let options = RunOptions { events: Some(waits.clone()), ..RunOptions::new(resume) };
 			let release_stages = async {
 				time::timeout(Duration::from_secs(20), async {
 					while stages.iter().any(is_stopped) {
@@ -1124,13 +1143,28 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				})
 				.await
 				.expect("stopped stages were not continued");
+				time::timeout(Duration::from_secs(20), waits.0.notified())
+					.await
+					.expect("fg never waited for the job");
+				// The park marks the start of the window, not its end: a
+				// selected stage's stop report may still arrive while fg waits,
+				// and nothing reports that every one has been drained. This
+				// time is the claim.
 				time::sleep(Duration::from_millis(200)).await;
 				fs::write(&release, "").expect("release stages");
 			};
-			let (resumed, ()) = tokio::join!(
-				time::timeout(Duration::from_secs(20), session.run_test(resume, &stdio)),
-				release_stages,
+			let run = time::timeout(
+				Duration::from_secs(20),
+				session
+					.session
+					.run_with(options, stdio.run_stdio(), CancellationToken::new()),
 			);
+			tokio::pin!(run);
+			// A fg that ends before it waits (a stale stop) needs no release.
+			let resumed = tokio::select! {
+				resumed = &mut run => resumed,
+				() = release_stages => run.await,
+			};
 			let resumed = resumed
 				.expect("resumed pipeline did not complete")
 				.expect("foreground resumed pipeline");

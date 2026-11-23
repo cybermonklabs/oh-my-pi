@@ -405,15 +405,23 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	use std::os::unix::fs::PermissionsExt;
 
 	use clap::Parser as _;
+
+	use crate::rsync::transport::wait;
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	fs::write(&rsh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+	// The shell takes the client's protocol version, says so, and never answers.
+	fs::write(&rsh, "#!/bin/sh\nhead -c 4 >/dev/null\n: > \"$0.ready\"\nexec sleep 30\n").unwrap();
 	fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+	let ready = dir.path().join("stuckrsh.ready");
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
+	let client = wait::Sleeper::current();
 	let canceller = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(300));
+		// Cancel once the client waits on its peer: the shell has the client's
+		// version, and the client sleeps reading the reply.
+		wait::until("the shell to receive the client's version", || ready.exists());
+		client.wait_asleep("the client to block on the shell's reply", Duration::from_millis(300));
 		cancel.store(true, Ordering::Relaxed);
 	});
 	let rsh_arg = rsh.to_str().unwrap().to_string();

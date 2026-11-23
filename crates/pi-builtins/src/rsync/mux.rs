@@ -1969,6 +1969,7 @@ mod tests {
 
 	use super::*;
 	use crate::rsync::exit::RERR_SIGNAL;
+	use crate::rsync::transport::wait;
 	use crate::rsync::wire::wire_detail;
 
 	const P33: Proto = Proto::new(33, 0);
@@ -2144,10 +2145,13 @@ mod tests {
 
 	#[test]
 	fn blocked_write_serves_peer_messages_and_fails_with_peer_exit() {
-		/// A connection whose peer never reads: writes block until released.
-		struct Stuck(Arc<AtomicBool>);
+		/// A connection whose peer never reads: writes block until released. Each
+		/// write call signals on the channel when it starts; only the first signal
+		/// is kept.
+		struct Stuck(Arc<AtomicBool>, flume::Sender<()>);
 		impl Write for Stuck {
 			fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+				let _ = self.1.try_send(());
 				while !self.0.load(Ordering::Relaxed) {
 					thread::sleep(Duration::from_millis(5));
 				}
@@ -2158,8 +2162,9 @@ mod tests {
 			}
 		}
 		let release = Arc::new(AtomicBool::new(false));
+		let (stuck_tx, stuck) = flume::bounded(1);
 		let mut w = MuxWriter::new(
-			Box::new(Stuck(Arc::clone(&release))),
+			Box::new(Stuck(Arc::clone(&release), stuck_tx)),
 			IoCounters::default(),
 			WriteConfig::default(),
 		);
@@ -2178,17 +2183,33 @@ mod tests {
 		// This thread reads the reader (so it may serve it while writing).
 		tx.send(frame(MSG_DATA, b"a")).unwrap();
 		r.read_exact(&mut [0u8; 1]).unwrap();
+		let (done_tx, done) = flume::bounded::<()>(1);
+		let late_release = Arc::clone(&release);
 		let sender = thread::spawn(move || {
-			thread::sleep(Duration::from_millis(150));
+			// The write is blocked once the output thread is inside a write call: it
+			// writes only while the waiting writer lets it.
+			let stuck = stuck.recv_timeout(Duration::from_secs(30));
+			stuck.expect("the write never reached the connection");
 			tx.send(frame(MSG_ERROR_EXIT, &12i32.to_le_bytes())).unwrap();
-			tx
+			// A write that misses the exit stays blocked: release the connection
+			// after 10 s so the test fails instead of hanging.
+			let missed = done.recv_timeout(Duration::from_secs(10)).is_err();
+			if missed {
+				late_release.store(true, Ordering::Relaxed);
+			}
+			(tx, missed)
 		});
 		let start = Instant::now();
-		let err = w.write_all(&vec![0u8; 200_000]).unwrap_err();
-		assert_eq!(wire_detail(&err).unwrap().code, 12);
-		assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+		let res = w.write_all(&vec![0u8; 200_000]);
+		let elapsed = start.elapsed();
+		let _ = done_tx.send(());
 		release.store(true, Ordering::Relaxed);
-		drop(sender.join().unwrap());
+		let (tx, missed) = sender.join().unwrap();
+		assert!(!missed, "the blocked write did not end on the peer's exit within 10 s");
+		let err = res.unwrap_err();
+		assert_eq!(wire_detail(&err).unwrap().code, 12);
+		assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+		drop(tx);
 	}
 
 	#[test]
@@ -2331,12 +2352,15 @@ mod tests {
 	fn message_after_unconsumed_data_waits_for_the_reader() {
 		let mut stream = frame(MSG_DATA, b"xy");
 		stream.extend(frame(MSG_INFO, b"later\n"));
+		let total = stream.len() as u64;
 		let mut r = reader(stream);
 		let (seen, on_msg) = recorder();
 		r.start_multiplex(on_msg).unwrap();
 		r.read_exact(&mut [0u8; 1]).unwrap();
-		// Give the read-ahead thread time to buffer the message frame too.
-		thread::sleep(Duration::from_millis(50));
+		// The read-ahead has buffered the message frame too once it read the whole
+		// stream.
+		let read_all = || r.shared.counters.total_read() == total;
+		wait::until("the reader to buffer the message frame", read_all);
 		assert!(lock(&seen).is_empty());
 		assert_eq!(r.end_multiplex().unwrap_err().kind(), io::ErrorKind::InvalidData);
 		r.read_exact(&mut [0u8; 1]).unwrap();
@@ -2530,8 +2554,11 @@ mod tests {
 	fn cancellation_interrupts_a_blocked_read() {
 		let (mut r, _tx, cancel) = blocking_reader(None);
 		let flag = Arc::clone(&cancel);
+		let shared = Arc::clone(&r.shared);
 		let t = thread::spawn(move || {
-			thread::sleep(Duration::from_millis(150));
+			// The read is blocked once it has asked the connection thread for input:
+			// it sets the request and starts waiting under one lock.
+			wait::until("the read to block waiting for input", || shared.lock().request.is_some());
 			flag.store(true, Ordering::Relaxed);
 		});
 		let start = Instant::now();
@@ -2726,8 +2753,11 @@ mod tests {
 		r.start_multiplex(on_msg).unwrap();
 		// Output the peer never takes: the read's first pass cannot write it.
 		w.write_all(b"pending").unwrap();
+		let shared = Arc::clone(&r.shared);
 		let feeder = thread::spawn(move || {
-			thread::sleep(Duration::from_millis(300));
+			// Input arrives once the idle work is done and the read waits for input as
+			// usual: it has asked the connection thread for a read.
+			wait::until("the read to wait for input", || shared.lock().request.is_some());
 			tx.send(frame(MSG_DATA, b"z")).unwrap();
 			tx
 		});

@@ -3229,6 +3229,73 @@ mod testing {
 		tree
 	}
 
+	/// A chain of directories named `d` below `top`, as deep as paths may go,
+	/// made for a test; dropping it removes the chain deepest first, by path,
+	/// with the files in its deepest directory. A tempdir dropped with the
+	/// chain still in it removes it with `std::fs::remove_dir_all`, which
+	/// keeps a descriptor open for each level it is inside: about 2,000 for
+	/// this chain. The tests running beside it in this process share the
+	/// descriptor limit (1,024 by default on Linux), and theirs then fail with
+	/// `EMFILE`.
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	pub(crate) struct DeepChain {
+		top:     PathBuf,
+		deepest: PathBuf,
+		depth:   usize,
+	}
+
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	impl DeepChain {
+		/// Makes `top` and the levels below it. The drop removes each level by
+		/// its path, which must stay under `PATH_MAX`: the depth keeps a
+		/// one-byte name in the deepest level 96 bytes under it, and a test's
+		/// names there must fit in that.
+		pub(crate) fn create(top: PathBuf) -> Self {
+			#[cfg(unix)]
+			let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
+			#[cfg(not(unix))]
+			let path_max = 4096;
+			// Every level adds "/d".
+			let depth = (path_max - 96 - top.join("f").as_os_str().len()) / 2;
+			let mut deepest = top.clone();
+			for _ in 0..depth {
+				deepest.push("d");
+			}
+			std::fs::create_dir_all(&deepest).unwrap();
+			Self { top, deepest, depth }
+		}
+
+		/// The levels below `top`.
+		pub(crate) fn depth(&self) -> usize {
+			self.depth
+		}
+
+		#[cfg(feature = "util.find")]
+		pub(crate) fn deepest(&self) -> &std::path::Path {
+			&self.deepest
+		}
+	}
+
+	#[cfg(any(feature = "util.du", feature = "util.find"))]
+	impl Drop for DeepChain {
+		fn drop(&mut self) {
+			for entry in std::fs::read_dir(&self.deepest).into_iter().flatten().flatten() {
+				let _ = std::fs::remove_file(entry.path());
+			}
+			let mut level = self.deepest.clone();
+			while level.starts_with(&self.top) && std::fs::remove_dir(&level).is_ok() {
+				level.pop();
+			}
+			if !std::thread::panicking() {
+				assert!(
+					std::fs::symlink_metadata(&self.top).is_err(),
+					"DeepChain left {} behind",
+					self.top.display()
+				);
+			}
+		}
+	}
+
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
 	/// with `stdin` on fd 0 and the process environment plus `env`, returning
 	/// its status, stdout, and stderr.
@@ -4017,4 +4084,6 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
+#[cfg(all(test, any(feature = "util.du", feature = "util.find")))]
+pub(crate) use testing::DeepChain;
 

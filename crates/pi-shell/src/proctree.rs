@@ -1146,20 +1146,104 @@ mod tests {
 		);
 	}
 
+	/// Returns once child `pid` has acted on every signal sent to it so far:
+	/// it is dead, or it lives and was spared. Stops it and waits (without
+	/// reaping) until it is stopped or dead: a pending `SIGKILL` is taken
+	/// first and makes the kernel drop a later `SIGSTOP`, so a child that
+	/// stops was not killed. The sweep that follows ends it, stopped or not.
+	///
+	/// The stop goes out once the child runs `program` (or is dead): gVisor
+	/// drops a stop signal that lands while the child is still in `execve`.
+	#[cfg(target_os = "linux")]
+	fn signals_taken(pid: i32, program: &str) {
+		let deadline = std::time::Instant::now() + Duration::from_secs(20);
+		loop {
+			let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+			if comm.trim_end() == program || child_event(pid, libc::WEXITED) {
+				break;
+			}
+			assert!(
+				std::time::Instant::now() < deadline,
+				"child {pid} never ran {program} in 20 s (comm {comm:?})",
+			);
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		// SAFETY: plain syscall; `pid` is the test's own unreaped child.
+		let rc = unsafe { libc::kill(pid, libc::SIGSTOP) };
+		assert_eq!(rc, 0, "SIGSTOP to {pid}: {}", std::io::Error::last_os_error());
+		let deadline = std::time::Instant::now() + Duration::from_secs(20);
+		while !child_event(pid, libc::WSTOPPED | libc::WEXITED) {
+			assert!(
+				std::time::Instant::now() < deadline,
+				"child {pid} neither stopped nor died in 20 s after SIGSTOP",
+			);
+			std::thread::sleep(Duration::from_millis(1));
+		}
+	}
+
+	/// Whether child `pid` has an event of `kinds` to report, without
+	/// blocking and without reaping it.
+	#[cfg(target_os = "linux")]
+	fn child_event(pid: i32, kinds: libc::c_int) -> bool {
+		loop {
+			// SAFETY: siginfo_t is plain data, valid zeroed.
+			let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+			// SAFETY: `info` is writable; WNOWAIT leaves the child waitable.
+			let rc = unsafe {
+				libc::waitid(
+					libc::P_PID,
+					pid as libc::id_t,
+					&raw mut info,
+					kinds | libc::WNOHANG | libc::WNOWAIT,
+				)
+			};
+			if rc == 0 {
+				// SAFETY: `info` is a valid siginfo_t; with WNOHANG its pid
+				// stays 0 when the child has nothing to report.
+				return unsafe { info.si_pid() } != 0;
+			}
+			let err = std::io::Error::last_os_error();
+			assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "waitid on {pid}: {err}");
+		}
+	}
+
+	/// Without the Linux stop-and-wait: the old 50 ms, an unchecked margin
+	/// for a sent `SIGKILL` to take effect.
+	#[cfg(all(unix, not(target_os = "linux")))]
+	fn signals_taken(_pid: i32, _program: &str) {
+		std::thread::sleep(Duration::from_millis(50));
+	}
+
 	/// Regression test for #7452: a cancellation sweep must never signal the
-	/// protected host pid, even when it is enumerated as the sweep root. On
-	/// Windows a recycled pid can make the harness surface as
-	/// a false descendant of a just-spawned child; `TerminateProcess`-ing it
-	/// killed the whole session with no `session_exit` record. The observable
-	/// defense — provable cross-platform — is that `signal_tree_excluding`
-	/// leaves a protected pid untouched.
+	/// protected host pid, even when it is enumerated as the sweep root (a
+	/// root that leads no process group: the sweep signals the group a root
+	/// leads whether or not the root is protected). On Windows a recycled pid
+	/// can make the harness surface as a false descendant of a just-spawned
+	/// child; `TerminateProcess`-ing it killed the whole session with no
+	/// `session_exit` record. The observable defense — provable cross-platform
+	/// — is that `signal_tree_excluding` leaves a protected pid untouched.
 	#[cfg(unix)]
 	#[test]
 	fn signal_tree_spares_protected_pids() {
-		use std::{process::Command, thread, time::Duration};
+		use std::{os::unix::process::CommandExt, process::Command};
 
+		// `signals_taken` stops the child, so it must not share this binary's
+		// process group: gVisor before 553528ee (unlike Linux, which hangs up
+		// only a group that an exit orphans) hangs up an orphaned group (a
+		// `setsid` run's is one) that holds a stopped member whenever any
+		// member exits, and that kills this binary. Nor may it lead a group:
+		// the sweep signals the group its root leads, protected or not. So it
+		// joins a group a second `sleep` leads; with their parent outside it,
+		// that group is not orphaned while this binary runs.
+		let mut leader = Command::new("sleep")
+			.arg("30")
+			.process_group(0)
+			.spawn()
+			.expect("spawn group leader");
+		let leader_pid = i32::try_from(leader.id()).expect("leader pid fits in i32");
 		let mut child = Command::new("sleep")
 			.arg("30")
+			.process_group(leader_pid)
 			.spawn()
 			.expect("spawn sleep");
 		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
@@ -1171,8 +1255,9 @@ mod tests {
 		let signaled = root.signal_tree_excluding(KILL_SIGNAL, &protected);
 		assert_eq!(signaled, 0, "a protected root must never be signalled");
 
-		// The protected process is still alive after the sweep.
-		thread::sleep(Duration::from_millis(50));
+		// The protected process is still alive once it has acted on what the
+		// sweep sent it.
+		signals_taken(child_pid, "sleep");
 		assert_eq!(
 			root.status(),
 			ProcessStatus::Running,
@@ -1184,6 +1269,8 @@ mod tests {
 		let reaped = root.signal_tree_excluding(KILL_SIGNAL, &HashSet::new());
 		assert!(reaped >= 1, "an unprotected root must be signalled");
 		let _ = child.wait();
+		let _ = leader.kill();
+		let _ = leader.wait();
 	}
 
 	/// Regression test for the #7453 review: pruning a protected node must drop
@@ -1358,7 +1445,7 @@ mod tests {
 	/// timeout as `false`, and surfaces cancellation as an abort error.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn wait_for_exit_resolves_times_out_and_aborts() {
-		use std::process::Command;
+		use std::{process::Command, task::Poll};
 
 		#[cfg(unix)]
 		let mut child = Command::new("sleep")
@@ -1385,20 +1472,16 @@ mod tests {
 			.expect_err("an expired token aborts the wait");
 		assert_eq!(aborted.to_string(), "Aborted: Timeout");
 
-		let waiter = {
-			let process = process.clone();
-			tokio::spawn(async move {
-				process
-					.wait_for_exit(Some(Duration::from_secs(20)), CancelToken::default())
-					.await
-			})
-		};
-		tokio::time::sleep(Duration::from_millis(50)).await;
+		let waiter = process.wait_for_exit(Some(Duration::from_secs(20)), CancelToken::default());
+		let mut waiter = std::pin::pin!(waiter);
+		// The wait is in flight, on the exit notification, when the child
+		// exits.
+		let first = std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx))).await;
+		assert!(first.is_pending(), "the wait ended before the child exited");
 		child.kill().expect("kill child");
 		let exited = tokio::time::timeout(Duration::from_secs(5), waiter)
 			.await
 			.expect("the wait ends promptly after exit")
-			.expect("waiter task")
 			.expect("wait result");
 		assert!(exited, "exit resolves the wait");
 		let _ = child.wait();

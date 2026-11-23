@@ -60,6 +60,69 @@ fn restore_permissions(path: &Path) {
 	}
 }
 
+/// A chain of directories named `d` from `parent/d` down, as deep as paths
+/// may go, made for a test; dropping it removes the chain deepest first, by
+/// path, with the files in each level. Left to [`TempDir`]'s drop, the chain
+/// would be walked by [`restore_permissions`] and then
+/// `std::fs::remove_dir_all`, which each keep a descriptor open for every
+/// level they are inside: about 2,000 for this chain. Past the descriptor
+/// limit (1,024 by default on Linux) both stop with `EMFILE` and leave the
+/// chain behind, and while they hold their descriptors a test beside it in
+/// this process that opens a file can get `EMFILE` too.
+#[cfg(unix)]
+struct DeepChain {
+	/// The first level.
+	top:     PathBuf,
+	deepest: PathBuf,
+}
+
+#[cfg(unix)]
+impl DeepChain {
+	/// Makes the chain below `parent`, calling `fill` on each level once it is
+	/// made. Each level is removed by its path, which must stay under
+	/// `PATH_MAX`: the depth keeps `leaf` in the deepest level 96 bytes under
+	/// it, and the names `fill` and the test write must fit in that.
+	fn create(parent: &Path, mut fill: impl FnMut(&Path)) -> Self {
+		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
+		// Every level adds "/d".
+		let depth = (path_max - 96 - parent.join("leaf").as_os_str().len()) / 2;
+		let mut deepest = parent.to_path_buf();
+		for _ in 0..depth {
+			deepest.push("d");
+			std::fs::create_dir(&deepest).expect("level");
+			fill(&deepest);
+		}
+		Self { top: parent.join("d"), deepest }
+	}
+
+	fn deepest(&self) -> &Path {
+		&self.deepest
+	}
+}
+
+#[cfg(unix)]
+impl Drop for DeepChain {
+	fn drop(&mut self) {
+		let mut level = self.deepest.clone();
+		while level.starts_with(&self.top) {
+			for entry in std::fs::read_dir(&level).into_iter().flatten().flatten() {
+				let _ = std::fs::remove_file(entry.path());
+			}
+			if std::fs::remove_dir(&level).is_err() {
+				break;
+			}
+			level.pop();
+		}
+		if !std::thread::panicking() {
+			assert!(
+				std::fs::symlink_metadata(&self.top).is_err(),
+				"DeepChain left {} behind",
+				self.top.display()
+			);
+		}
+	}
+}
+
 /// A temporary tree of files (contents after `=`) and directories (trailing
 /// `/`).
 fn make_tree(name: &str, specs: &[&str]) -> TempDir {
@@ -451,11 +514,15 @@ async fn dropping_a_walk_cancels_it() {
 	.expect("walk");
 	assert!(walked.next().await.is_some());
 	drop(walked);
-	tokio::time::sleep(Duration::from_millis(100)).await;
+	// The workers hold the walk's visitor and with it `counted`: once the
+	// aborted workers are gone, nothing can visit any more.
+	let deadline = std::time::Instant::now() + Duration::from_secs(10);
+	while Arc::strong_count(&visits) > 1 {
+		assert!(std::time::Instant::now() < deadline, "the dropped walk kept its workers");
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
 	let settled = visits.load(Ordering::Relaxed);
 	assert!(settled < 300, "walk kept visiting after it was dropped: {settled}");
-	tokio::time::sleep(Duration::from_millis(100)).await;
-	assert_eq!(visits.load(Ordering::Relaxed), settled);
 }
 
 /// Signals when dropped.
@@ -965,15 +1032,12 @@ async fn tree_walks_trees_deeper_than_the_thread_stack() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_at_the_leaf_of_a_deep_ignore_chain_returns() {
 	let tmp = TempDir::new("deep-ignore");
-	let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
-	let depth = (path_max - 96 - tmp.path().join("leaf").as_os_str().len()) / 2;
-	let mut dir = tmp.path().to_path_buf();
-	for _ in 0..depth {
-		dir.push("d");
-		std::fs::create_dir(&dir).expect("level");
-		std::fs::write(dir.join(".ignore"), "*.log\n").expect("ignore file");
-	}
-	std::fs::write(dir.join("leaf"), "x").expect("leaf");
+	// Dropped before `tmp`, so its removal does not hold a descriptor for
+	// each level of the chain (`DeepChain`).
+	let chain = DeepChain::create(tmp.path(), |level| {
+		std::fs::write(level.join(".ignore"), "*.log\n").expect("ignore file");
+	});
+	std::fs::write(chain.deepest().join("leaf"), "x").expect("leaf");
 	let root = tmp.path().to_path_buf();
 	let found = on_small_stack(async move {
 		let opts = TreeOptions { gitignore: true, ..Default::default() };
