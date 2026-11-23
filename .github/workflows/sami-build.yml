@@ -40,7 +40,8 @@ permissions:
 # cache-mode: write, and every other job gets a cache token that can do
 # neither. rust_test and rust_test_macos run test code with root on their
 # runners; that code therefore cannot write an entry that release_binary
-# restores. Harness cases W1 to W27 (.github/sami/tests/run.sh) keep it so.
+# restores. Harness cases W1 to W27 and W34 (.github/sami/tests/run.sh) keep
+# it so.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
 cache-mode: none
 
@@ -192,7 +193,14 @@ jobs:
       # ref the release is built on, restores the newest entry for its ref and
       # target and saves a new one. Whoever can push sami-candidate can seed
       # what this job restores; the same identities can push sami, which
-      # publishes, so the cache gives them nothing they lack.
+      # publishes, so the cache gives them nothing they lack. A candidate's
+      # own code also runs here before the save, red or green, so its
+      # outputs reach the entry the next candidate restores. When a candidate
+      # is dropped because its code is not trusted, delete sami-candidate's
+      # entries before the next candidate push (or bump v1 in all four
+      # places: the key, both restore-keys, and release_cache_prune's prefix):
+      #   gh api --paginate 'repos/cybermonklabs/oh-my-pi/actions/caches?ref=refs/heads/sami-candidate&key=omp-release-bazel-v1-' -q '.actions_caches[].id' |
+      #     xargs -I{} gh api -X DELETE repos/cybermonklabs/oh-my-pi/actions/caches/{}
       - name: Restore the release build cache
         id: release-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -315,8 +323,8 @@ jobs:
           if-no-files-found: error
       # Only a push to sami-candidate saves the cache; a dispatch or any other
       # event only restores. cache-mode takes no expression, so this condition
-      # on the bound and save steps enforces it (harness cases W14 to W19, W26
-      # and W27). A failed build's finished actions are still valid results,
+      # on the bound and save steps enforces it (harness cases W14 to W19, W26,
+      # W27 and W34). A failed build's finished actions are still valid results,
       # so the cache is saved whenever the native build ran. A re-run of the
       # same commit restored its exact key and has nothing to save.
       - name: Bound the release build cache
@@ -401,10 +409,12 @@ jobs:
     needs: release_binary
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
     # The run's conclusion, which publish reads, follows the build and the
-    # tests; a failed prune shows only on this job.
+    # tests; a failed prune shows only on this job. The step, not the job,
+    # has the 10-minute limit: past it the step fails, which continue-on-error
+    # covers, whereas at a job's limit GitHub cancels the job.
     continue-on-error: true
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       actions: write
       contents: read
@@ -413,6 +423,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Delete superseded release build caches of this ref
+        timeout-minutes: 10
         run: |
           prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
           # A line per entry: id, key, creation time, bytes, group. The group

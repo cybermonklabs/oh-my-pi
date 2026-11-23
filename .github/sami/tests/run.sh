@@ -900,14 +900,15 @@ fi
 # starts its `if:` with that condition, has no `||` and nothing after the
 # expression's `}}`, on its line or on a deeper line that YAML folds into the
 # value (GitHub reads an `if:` with text outside `${{ }}` as a string, and a
-# string that is not empty is true): the line after it is the step's next
-# key, or nothing at all (a blank line or a comment after a guard that ends
-# the step fails the lint). And it has no actions/cache step (which saves in
-# its post step, under no condition of the job's). Its steps use only the
-# actions it uses today, and .github/actions/bazel-cache calls no action, so
-# no other caching action can save under release_binary's token. A line
-# under jobs: that is not a plain `  <id>:` stops the lint, because its steps
-# would be read as the job above's.
+# string that is not empty is true): the line after it starts at the step's
+# key indent (its next key, or a comment there), or there is none: a blank
+# line, or a line indented less or more, after the guard fails the lint. And
+# it has no actions/cache step (which saves in its post step, under no
+# condition of the job's). Its steps use only the actions it uses today, and
+# .github/actions/bazel-cache calls no action, so no other caching action can
+# save under release_binary's token. A line under jobs: that is not a plain
+# `  <id>:` stops the lint, because its steps would be read as the job
+# above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
@@ -1045,6 +1046,9 @@ wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other t
 # on a deeper line that YAML folds into the value (W27).
 wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
 wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
+# A push to another ref only restores, sami included: the guard names
+# sami-candidate (W34).
+wlint W34-release-binary-save-on-sami 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.ref == 'refs\/heads\/sami-candidate' \&\& !cancelled() \&\& steps.release-cache-bound/github.ref == 'refs\/heads\/sami' \&\& !cancelled() \&\& steps.release-cache-bound/" ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
