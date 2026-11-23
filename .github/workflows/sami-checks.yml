@@ -1,0 +1,574 @@
+# sami checks: the tests the release owner used to run by hand before a cut, run on every push of
+# a release candidate. Report only: nothing here gates a release. publish reads only
+# sami-build.yml's run of the candidate, never this workflow's, and a red row here is fixed
+# forward.
+#
+# When it runs.
+#   - A push to sami-candidate tests the pushed commit (sami fast-forwards to that same commit
+#     later, so sami itself is not tested again).
+#   - A dispatch tests any pushed commit, given as a full 40-character id:
+#       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
+#         -f commit=<sha> [-f silent=<job name>]
+#     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
+#     and the summary must then read its units and its row UNKNOWN.
+#   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
+#     counters and the summary against hand-made inputs. GitHub dispatches only a workflow it has
+#     seen run, and this file is not on the default branch; that push run registers it.
+#
+# What it runs. One cargo build of every test target of the root workspace, archived by
+# `cargo nextest archive`; the test jobs run that archive and compile nothing:
+#   - the pi-shell set: each pi-shell test binary (the lib's, obash's, every tests/*.rs one) in a
+#     libtest process of its own at --test-threads=4 with a hang bound, as the runner's user and
+#     as root, each over 4 shards balanced by measured time (.github/sami-checks/pi-shell-seconds.txt);
+#   - the pi-shell lib in one libtest process at 4 threads: the runner's run of the lib binary in
+#     the set, read as its own row;
+#   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml;
+#   - the rest of the root workspace under nextest, in 2 partitions;
+#   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
+#     job; coding-agent --isolate over 8 shards by file; check:ts. The host addon they load is
+#     built once, in the natives job.
+# The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
+# in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
+# sdk/rust/omp-rpc is its own cargo workspace and is not built here (sami-build's rust_test runs it).
+#
+# Where the result is. The summary job's step summary: a row per check (PASS, FAIL or UNKNOWN),
+# its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
+# and the units by time. A unit whose runner did not end normally (libtest 0 or 101, nextest 0 or
+# 100, bun 0 or 1 with its summary line and JUnit report) or that no job reported is UNKNOWN, and
+# so is its row. The summary job fails unless every row passed, so the run's colour is the
+# result. Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
+#
+# Caches. Only the build and natives jobs may write GitHub Actions caches (cache-mode: write), and
+# they save their cargo caches only on a push to sami-candidate. They compile the candidate commit,
+# the same commit sami-build's release_binary compiles on the same push with the same cache
+# access, and run no test. Every job that runs test code gets cache-mode none (the TypeScript
+# jobs read, to restore the bun store main saved), so test code, which can reach the job's token
+# with the runner's sudo, cannot write an entry any job restores.
+# Security. permissions: contents: read; no secrets; every checkout drops its credential.
+name: sami checks
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '')
+  || github.ref == 'refs/heads/sami-candidate' && format('sami checks {0} (sami-candidate)', github.sha)
+  || 'sami checks: the tool''s own controls' }}
+
+on:
+  push:
+    branches:
+      - sami-candidate
+      - feat/sami-checks
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit to test: a full 40-character id, pushed to this repository"
+        required: true
+        type: string
+      silent:
+        description: "Control: a job name (for example set-root-2) that uploads nothing"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+cache-mode: none
+
+concurrency:
+  group: sami-checks-${{ github.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  NEXTEST_VERSION: "0.9.151"
+  SC: ${{ github.workspace }}/sc
+  SC_TREE: ${{ github.workspace }}/tree
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  SC_TEST_PATH: /opt/sc-ref/bin:/usr/local/bin:/usr/bin:/bin
+  # The hang bound of one pi-shell test binary, in seconds.
+  SC_BIN_BOUND: "1800"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      silent: ${{ steps.plan.outputs.silent }}
+      set: ${{ steps.plan.outputs.set }}
+      set_shards: ${{ steps.plan.outputs.set_shards }}
+      workspace: ${{ steps.plan.outputs.workspace }}
+      workspace_parts: ${{ steps.plan.outputs.workspace_parts }}
+      ts: ${{ steps.plan.outputs.ts }}
+      ca_shards: ${{ steps.plan.outputs.ca_shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - name: Controls of the counters and the summary (hand-made inputs)
+        run: python3 tool/.github/sami-checks/sc.py selftest
+      - name: Plan
+        id: plan
+        env:
+          SC_INPUT_COMMIT: ${{ inputs.commit }}
+          SC_INPUT_SILENT: ${{ inputs.silent }}
+        run: python3 tool/.github/sami-checks/sc.py plan | tee -a "$GITHUB_OUTPUT"
+
+  tools:
+    # zsh 5.9, rsync 3.5.1 and jj 0.46.0 from pinned sources; no tree code runs here.
+    name: reference tools
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - name: Build
+        run: bash tool/.github/sami-checks/tools.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/up/sc-tools.tgz
+          retention-days: 3
+          if-no-files-found: error
+
+  build:
+    name: build the tests
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    # It compiles the candidate and runs no test; it alone saves the cargo cache of the tests.
+    cache-mode: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Room for the build
+        run: |
+          df -h / | tail -n 1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -n 1
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: Cargo cache
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: sami-checks-tests
+          workspaces: tree -> ../target
+          cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Build and archive
+        env:
+          SC_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: bash tool/.github/sami-checks/build.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-archive
+          path: ${{ github.workspace }}/sc/up/tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sc-build
+          path: ${{ github.workspace }}/sc/build/
+          retention-days: 14
+
+  natives:
+    # The host addon the TypeScript tests load, built as `bun run build:native` builds it.
+    name: build the host addon
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # It compiles the candidate's pi-natives and runs no test; it alone saves the addon's cargo cache.
+    cache-mode: write
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-natives
+      OMP_NATIVE_BUILD_BACKEND: cargo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: sami-checks-natives
+          workspaces: tree -> ../target-natives
+          cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun store (main's)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-Linux-sami-checks
+          restore-keys: bun-Linux-
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - name: Build the addon
+        working-directory: tree
+        run: |
+          s=$(date +%s)
+          bun run build:native
+          echo "ADDON built in $(($(date +%s) - s)) s"
+          ls -l packages/natives/native/*.node
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-natives
+          path: ${{ github.workspace }}/tree/packages/natives/native/*.node
+          retention-days: 1
+          if-no-files-found: error
+
+  set:
+    name: pi-shell set ${{ matrix.who }} ${{ matrix.shard }}
+    needs: [plan, tools, build]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.set) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      SC_SET_SHARDS: ${{ needs.plan.outputs.set_shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-archive
+          path: ${{ github.workspace }}/sc/archive
+      - name: Host
+        run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
+      - name: Unpack the archive where it was built
+        run: tar --zstd -xf "$SC/archive/tests.tar.zst" -C "$GITHUB_WORKSPACE" && du -sh "$CARGO_TARGET_DIR"
+      - name: Tests
+        run: bash tool/.github/sami-checks/set.sh "${{ matrix.who }}" "${{ matrix.shard }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
+        with:
+          name: sc-res-${{ matrix.name }}
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  builtins:
+    name: pi-builtins
+    needs: [plan, tools, build]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-archive
+          path: ${{ github.workspace }}/sc/archive
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Host
+        run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
+      - name: Tests
+        run: bash tool/.github/sami-checks/nextest.sh builtins pi-builtins 'package(pi-builtins)'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'builtins' }}
+        with:
+          name: sc-res-builtins
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  workspace:
+    name: workspace ${{ matrix.part }}
+    needs: [plan, tools, build]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.workspace) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-archive
+          path: ${{ github.workspace }}/sc/archive
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Host
+        run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
+      - name: Tests
+        run: |
+          bash tool/.github/sami-checks/nextest.sh workspace "part ${{ matrix.part }}/${{ needs.plan.outputs.workspace_parts }}" \
+            'not (package(pi-shell) | package(pi-builtins))' "count:${{ matrix.part }}/${{ needs.plan.outputs.workspace_parts }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
+        with:
+          name: sc-res-${{ matrix.name }}
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  ts-small:
+    name: TypeScript suites
+    needs: [plan, natives]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.natives.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Reads the bun store main saved; writes nothing.
+    cache-mode: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun store (main's)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-Linux-sami-checks
+          restore-keys: bun-Linux-
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-natives
+          path: ${{ github.workspace }}/tree/packages/natives/native
+      - name: The only addon a workspace load reads
+        run: bash tool/.github/sami-checks/bun.sh addon
+      - name: Tests
+        run: bash tool/.github/sami-checks/ts.sh small
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'ts-small' }}
+        with:
+          name: sc-res-ts-small
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  ts-ca:
+    name: coding-agent ${{ matrix.shard }}
+    needs: [plan, natives]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.natives.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.ts) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    cache-mode: read
+    env:
+      SC_CA_SHARDS: ${{ needs.plan.outputs.ca_shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun store (main's)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-Linux-sami-checks
+          restore-keys: bun-Linux-
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-natives
+          path: ${{ github.workspace }}/tree/packages/natives/native
+      - name: The only addon a workspace load reads
+        run: bash tool/.github/sami-checks/bun.sh addon
+      - name: Tests
+        run: bash tool/.github/sami-checks/ts.sh ca "${{ matrix.shard }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
+        with:
+          name: sc-res-${{ matrix.name }}
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  checkts:
+    name: check:ts
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    cache-mode: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun store (main's)
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-Linux-sami-checks
+          restore-keys: bun-Linux-
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - name: check:ts
+        run: bash tool/.github/sami-checks/ts.sh checkts
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'checkts' }}
+        with:
+          name: sc-res-checkts
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  summary:
+    name: summary
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts]
+    if: ${{ always() && needs.plan.outputs.commit != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      # Each artifact lands in a folder of its own name (no merge), so no job's files replace another's.
+      - name: Results
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sc-res-*
+          path: ${{ github.workspace }}/sc/results
+      - name: Build record
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-build
+          path: ${{ github.workspace }}/sc/build
+      - name: Summary
+        env:
+          SC_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          mkdir -p "$SC/report" "$SC/results" "$SC/build"
+          rc=0
+          python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" > "$SC/report/summary.md" || rc=$?
+          cat "$SC/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json,os,sys; sys.path.insert(0, "tool/.github/sami-checks"); import sc; json.dump(sc.load_results(sys.argv[1]), open(sys.argv[2], "w"))' "$SC/results" "$SC/report/results.json"
+          exit "$rc"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sc-report
+          path: ${{ github.workspace }}/sc/report/
+          retention-days: 30
