@@ -4491,11 +4491,6 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				} else if waited_status(k, vp, cx, v, false).is_some() {
 					if first {
 						waited_notice(k, vp, cx, v, line);
-						// bash marks the job it waited for reported
-						// (`wait_for_single_pid`, `jobs.c:2773-2778`).
-						if bash && let Some(job) = vp.jobs.by_vpid_mut(v) {
-							job.notified = true;
-						}
 					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if !matches!(vp.jobs.by_vpid(v).map(|j| j.state), Some(JobState::Stopped(_))) {
@@ -4512,10 +4507,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// bash: `wait` forgets every finished job but the one `$!` names
 			// (`mark_dead_jobs_as_notified`, `jobs.c:5196`; POSIX keeps the
 			// last async status until it is waited for or reported), unless
-			// this wait waited for it (marked reported above) or its status
-			// went elsewhere: one that ended before the wait, or while it
-			// waited for another, the next line reports. zsh forgets the `$!`
-			// job a signal ended.
+			// this wait waited for it (its process is reaped by then, which
+			// drops it here, as bash's `wait_for_single_pid` marks it
+			// reported) or its status went elsewhere: one that ended before
+			// the wait, or while it waited for another, the next line
+			// reports. zsh forgets the `$!` job a signal ended.
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
