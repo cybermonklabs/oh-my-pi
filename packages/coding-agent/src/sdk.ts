@@ -87,7 +87,14 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine, everySetting, type SettingChange, trackSettingsReads } from "./config/registry";
+import {
+	type AnySetting,
+	bindEffects,
+	combine,
+	everySetting,
+	type SettingChange,
+	trackSettingsReads,
+} from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -3942,6 +3949,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// reconcile can add and remove exactly the entries it owns and never a
 		// same-named extension tool, which keeps precedence over them.
 		const settingsGatedCustomEntries = new Map<string, Tool>();
+		// The setting that gates each: the live reconcile reports it with the tool it adds or removes.
+		const settingsGatedCustomGates = new Map<string, AnySetting>([
+			[imageGenTool.name, cfgGenerateImageEnabled],
+			[ttsTool.name, cfgSpeechgenEnabled],
+		]);
 		const reconcileSettingsGatedCustomTools = async (): Promise<{ added: Tool[]; removed: string[] }> => {
 			const added: Tool[] = [];
 			const removed: string[] = [];
@@ -4079,6 +4091,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const explicitToolNames = options.toolNames ? new Set(normalizeToolNames(options.toolNames)) : undefined;
 			const added: { name: string; builtIn: boolean; activate: boolean }[] = [];
 			const removed: string[] = [];
+			// Each setting the gate of a tool this reconcile moves reads, with its value: the settings that gate the tool,
+			// whichever setting's listener started the reconcile (`SessionTools` holds and names only those).
+			const gates = new Map<string, ReadonlyMap<AnySetting, unknown>>();
+			const trackGate = async (name: string): Promise<void> => {
+				const gate = await trackSettingsReads(settings, async () => plan.isAllowed(name));
+				gates.set(name, gate.read);
+			};
 			for (const name of SETTINGS_GATED_BUILTIN_TOOL_NAMES) {
 				const registered = toolRegistry.has(name);
 				if (!plan.isAllowed(name)) {
@@ -4087,6 +4106,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					toolRegistry.delete(name);
 					builtInRegistryToolNames.delete(name);
 					removed.push(name);
+					await trackGate(name);
 					continue;
 				}
 				if (!planned.has(name) || (registered && (isBuiltIn(name) || nativeToolsByName.has(name)))) continue;
@@ -4106,14 +4126,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						name === "rewind"
 					: native.hidden !== true;
 				added.push({ name, builtIn: true, activate });
+				await trackGate(name);
 			}
 			const custom = await reconcileSettingsGatedCustomTools();
 			removed.push(...custom.removed);
 			for (const entry of custom.added) {
 				added.push({ name: entry.name, builtIn: false, activate: entry.hidden !== true });
 			}
+			for (const name of [...custom.removed, ...custom.added.map(entry => entry.name)]) {
+				const gate = settingsGatedCustomGates.get(name);
+				if (gate) gates.set(name, new Map([[gate, gate.get(settings)]]));
+			}
 			syncXdevState();
-			return { added, removed, xdev: toolSession.xdev };
+			return { added, removed, xdev: toolSession.xdev, gates };
 		};
 
 		// Existing staged/device paths need write registered before active-set assembly.
@@ -4290,6 +4315,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			xdev,
 		): Promise<BuildSystemPromptResult> => {
 			const promptCwd = sessionManager.getCwd();
+			// The settings this build renders from: the session's, or inside a settings frame (`ToolSession.settings`:
+			// a build `SessionTools` makes with a change's settings set back) the frame's. A setting whose change
+			// reaches the prompt through state the session keeps in step with it (the rules a build registers, the
+			// context files it keeps, the memory backend, the workspace roots, the obfuscator, the skill list), or
+			// through whether it is configured (`out.enabled`, `dev.autoqa`), is read from `settings` itself below:
+			// no frame sets that state back, so a build inside one still reports the read (`settingsRead`).
+			const source = toolSession.settings;
 			let activeRepoContext = initialActiveRepoContext;
 			// Re-discover rules and context files from disk on every session-scoped
 			// rebuild. The rule buckets are otherwise frozen at
@@ -4353,7 +4385,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// tool-availability caveat lives in the wrapper template.
 			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
-			const inlineToolDescriptors = resolveInlineToolDescriptors(settings);
+			const inlineToolDescriptors = resolveInlineToolDescriptors(source);
 			// Unset only during the initial build; the agent is constructed with them. The request switches follow
 			// the settings the requests read, so a switch changes with the prompt that describes it.
 			if (agent) {
@@ -4435,7 +4467,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// would list carries its catalog summary on the route line and gets no
 			// catalog line; a tool the route bound omits keeps its catalog line.
 			const xdevPromptDocs = xdev
-				? planXdevPromptDocs(xdev, cfgToolsXdevDocs.get(settings), cfgToolsXdevInlineDevices.get(settings))
+				? planXdevPromptDocs(xdev, cfgToolsXdevDocs.get(source), cfgToolsXdevInlineDevices.get(source))
 				: undefined;
 			const projection = projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(xdev ? listXdevTools(xdev) : []));
 			const routedCatalogNames = new Set(
@@ -4473,8 +4505,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const appendPrompt = composeAppendPrompt(appendParts, options.appendSystemPrompt);
 			// Owned/in-band tool dialects (non-native) require the full functions-
 			// namespace catalog; native tool calling lets the compact name list suffice.
-			const nativeTools = resolveDialect(cfgToolsFormat.get(settings), agent?.state.model ?? model) === undefined;
-			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(settings);
+			const nativeTools = resolveDialect(cfgToolsFormat.get(source), agent?.state.model ?? model) === undefined;
+			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(source);
 			if (includeWorkspaceTree && !workspaceTreePromise) {
 				const scan = scanWorkspaceTree();
 				workspaceTreePromise = scan;
@@ -4496,7 +4528,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: { mode: "full" },
 			);
 			// The workspace roots the prompt lists follow `workspace.additionalDirectories` (the session keeps the
-			// setting's roots among its own): the build reads the setting, so a change of it is one the prompt moves with.
+			// setting's roots among its own): the build reads the setting from the session's own settings, so a change
+			// of it is one the prompt moves with, and one no build can set back.
 			cfgWorkspaceAdditionalDirectories.get(settings);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
@@ -4515,42 +4548,42 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				rules: rulebookRules,
 				alwaysApplyRules,
 				resolvedAppendSystemPrompt: appendPrompt,
-				skillsSettings: cfgSkills.get(settings),
+				skillsSettings: cfgSkills.get(source),
 				inlineToolDescriptors,
 				nativeTools,
-				intentField: cfgToolsIntentTracing.get(settings) ? INTENT_FIELD : undefined,
+				intentField: cfgToolsIntentTracing.get(source) ? INTENT_FIELD : undefined,
 				// Spotlight ranks output against the call's intent: experiment sessions ask what each call's output is for.
 				intentGuidance: spotlightExperiment ? SPOTLIGHT_INTENT_GUIDANCE : undefined,
 				// task.eager steers the top-level agent only; subagents keep the model's own delegation policy.
-				eagerTasks: agentKind === "main" && cfgTaskEager.get(settings) !== "default",
-				eagerTasksAlways: agentKind === "main" && cfgTaskEager.get(settings) === "always",
-				taskBatch: cfgTaskBatch.get(settings),
-				taskMaxConcurrency: cfgTaskMaxConcurrency.get(settings),
-				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(settings), options.spawns ?? "*"),
+				eagerTasks: agentKind === "main" && cfgTaskEager.get(source) !== "default",
+				eagerTasksAlways: agentKind === "main" && cfgTaskEager.get(source) === "always",
+				taskBatch: cfgTaskBatch.get(source),
+				taskMaxConcurrency: cfgTaskMaxConcurrency.get(source),
+				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(source), options.spawns ?? "*"),
 				delegationBias: sessionDelegationBias(toolSession),
-				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
+				taskIrcEnabled: !restrictToolNames && isIrcEnabled(source, options.taskDepth ?? 0),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
-				ovnfs: ovnfsCommand(settings),
+				ovnfs: ovnfsCommand(source),
 				writeTransportOnly:
 					toolSession.deviceOnlyWrite === true && toolSession.pendingFullWriteDescription !== true,
-				// The obfuscator follows `secrets.enabled`: the build reads the setting, so a change of it is one the
-				// prompt moves with.
+				// The obfuscator follows `secrets.enabled`: the build reads the setting from the session's own
+				// settings, so a change of it is one the prompt moves with, and one no build can set back.
 				secretsEnabled: cfgSecretsEnabled.get(settings) && obfuscator?.obfuscates() === true,
 				workspaceTree: workspaceTreePromise ?? emptyWorkspaceTree,
 				includeWorkspaceTree,
 				memoryBackend: memoryBackend?.id,
-				securityEnabled: cfgSecurityEnabled.get(settings),
+				securityEnabled: cfgSecurityEnabled.get(source),
 				settingsApproval: toolSession.settingsApproval === true,
 				outReplies: outRepliesActive(settings, tuiTranscript),
 				evalPreludes: toolSession.getAdvertisedEvalPreludes?.(),
 				model: getActiveModelString(),
-				includeModelInPrompt: cfgIncludeModelInPrompt.get(settings),
-				personality: agentKind === "sub" ? "none" : cfgPersonality.get(settings),
+				includeModelInPrompt: cfgIncludeModelInPrompt.get(source),
+				personality: agentKind === "sub" ? "none" : cfgPersonality.get(source),
 				subagent: agentKind === "sub",
-				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(settings),
-				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(settings),
-				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(settings) !== "off",
-				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
+				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(source),
+				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(source),
+				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(source) !== "off",
+				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(source),
 				activeRepoContext,
 			});
 

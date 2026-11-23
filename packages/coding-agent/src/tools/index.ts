@@ -694,8 +694,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 	const allowJs = backends.js;
 	const skipEvalPreflight = session.skipPythonPreflight === true;
 	// Eval tool is enabled if ANY backend is reachable. JS needs no preflight, so
-	// we only probe Python when JS is disabled — otherwise allowEval is
-	// already true and per-backend availability is checked at first invocation.
+	// we only probe Python when JS is disabled — otherwise the eval gate is
+	// already open and per-backend availability is checked at first invocation.
 	let pythonAvailable = true;
 	const evalRequested = requestedTools === undefined || requestedTools.includes("eval");
 	if (!skipEvalPreflight && !allowJs && evalRequested) {
@@ -712,11 +712,6 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
-
-	const effectivePythonAllowed = allowPython && pythonAvailable;
-	// Eval is exposed whenever any backend is reachable. A backend may be
-	// unreachable, in which case eval dispatches exclusively to the others.
-	const allowEval = effectivePythonAllowed || allowJs;
 
 	// Checkpoint and rewind are a pair: listing one without the other strands
 	// the agent (it can checkpoint but not rewind, or vice versa). Auto-include
@@ -785,7 +780,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
-	const editDisabled = cfgEditMode.get(session.settings) === "none";
+	// Each gate reads its settings when it is asked, so a caller that tracks the reads (`trackSettingsReads`: the
+	// live reconcile) learns which settings gate a tool.
 	const isToolAllowed = (name: string) => {
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
@@ -799,9 +795,14 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		}
 		if (name === "lsp") return enableLsp && cfgLspEnabled.get(session.settings);
 		// Without an edit tool, bash is the remaining way to modify existing files.
-		if (name === "edit") return !editDisabled;
-		if (name === "bash") return editDisabled || cfgBashEnabled.get(session.settings);
-		if (name === "eval") return allowEval;
+		if (name === "edit") return cfgEditMode.get(session.settings) !== "none";
+		if (name === "bash") return cfgEditMode.get(session.settings) === "none" || cfgBashEnabled.get(session.settings);
+		// Eval is exposed whenever any backend is reachable. A backend may be
+		// unreachable, in which case eval dispatches exclusively to the others.
+		if (name === "eval") {
+			const { python, js } = resolveEvalBackends(session);
+			return (python && pythonAvailable) || js;
+		}
 		if (name === "debug") return cfgDebugEnabled.get(session.settings);
 		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")
