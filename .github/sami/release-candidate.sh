@@ -88,7 +88,7 @@ find_run() {
 # certificate names that run, a push, and sami-build.yml at
 # refs/heads/$CANDIDATE_BRANCH.
 attested() {
-	local out err signer
+	local out err signer n
 	signer="https://github.com/$GITHUB_REPOSITORY/$workflow@refs/heads/$CANDIDATE_BRANCH"
 	err="$(mktemp)"
 	if ! out="$(gh attestation verify "$1" --repo "$GITHUB_REPOSITORY" \
@@ -100,11 +100,18 @@ attested() {
 		return 1
 	fi
 	rm -f -- "$err"
-	# -s: an empty answer is [] and fails here (jq 1.6 -e exits 0 on no input).
+	# gh prints one JSON document. -s reads all of them as one array, so an
+	# empty answer counts 0 (jq 1.6's -e alone exits 0 on no input), and
+	# more than one cannot be told apart: either is refused by its count.
+	n="$(jq -s length <<<"$out" 2>/dev/null)" || n=""
+	if [ "$n" != 1 ]; then
+		why="gh printed ${n:-unreadable} JSON documents, not 1"
+		return 1
+	fi
 	if ! jq -e -s --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/" --arg signer "$signer" '
-		length == 1 and (.[0] | any(.[]; .verificationResult.signature.certificate
+		.[0] | any(.[]; .verificationResult.signature.certificate
 			| ((.runInvocationURI // "") | startswith($run))
-			  and .buildTrigger == "push" and .buildSignerURI == $signer))' <<<"$out" >/dev/null; then
+			  and .buildTrigger == "push" and .buildSignerURI == $signer)' <<<"$out" >/dev/null; then
 		why="it has no attestation that run $RUN_ID made on a push, signed by $signer"
 		return 1
 	fi

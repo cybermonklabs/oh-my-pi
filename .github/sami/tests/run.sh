@@ -989,12 +989,14 @@ fi
 # five release files (two archives, two sidecars, the notes) has an
 # attest-build-provenance step of its own whose one subject-path names it,
 # with no step if: and no continue-on-error, so a missing file fails the
-# job. No other job, and not the workflow, has a line with write-all or with
-# an id-token key that does not read read or none on that line. A line under
-# jobs: that is not a plain `  <id>:` stops the lint, because its steps would
-# be read as the job above's.
+# job; and it has no line that is not a key, which YAML would fold into the
+# value above it, past these line checks. No other job, and not the
+# workflow, has a line with write-all or with an id-token key that does not
+# read read or none on that line. A line under jobs: that is not a plain
+# `  <id>:` stops the lint, because its steps would be read as the job
+# above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds cont
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	# These four read each line with a space added at its end (and the first
 	# two at its start too), so no pattern needs an anchor inside a group.
@@ -1098,6 +1100,15 @@ cache_lint() {
 				byname="$(grep -vE '^ *#' "$scratch/job.yml" | sed -E 's/[[:space:]]+#.*$//' | awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 " " } END { if (s != "") print s }' | grep -F 'actions/download-artifact@' | grep -vE $'(^|[^[:alnum:]_-])["\']?artifact-ids["\']?[[:space:]]*:[[:space:]]*["\']?\\$\\{\\{[[:space:]]*needs\\.' || true)"
 				if [ -n "$byname" ]; then
 					echo "attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: $(printf '%s\n' "$byname" | sed -E 's/ {2,}/ /g' | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				# A deeper line that is not a key continues the scalar above it,
+				# and YAML folds it into that key's value (GitHub reads an if: so
+				# folded as a string, which is true): the checks below read only
+				# the key's own line.
+				cont="$(grep -vE '^ *#' "$scratch/job.yml" | grep -vE '^[[:space:]]*$' | grep -vE $'^ *(- )?["\']?[A-Za-z_][A-Za-z0-9_-]*["\']?[[:space:]]*:([[:space:]]|$)' || true)"
+				if [ -n "$cont" ]; then
+					echo "attest has a line that is not a key, which YAML folds into the value of the key above it: $(printf '%s\n' "$cont" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
 				# The job's if: is exactly the push-to-sami-candidate test, and
@@ -1308,7 +1319,8 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # which are the upload steps' artifact ids (W60), and attests each release
 # file in a step of its own with one path (W58 two paths in one step, W59 the
 # notes' step gone), with no step skipped by an if: (W61) or let fail by
-# continue-on-error (W62).
+# continue-on-error (W62), and no line that YAML would fold into the if:
+# (W63), the artifact-ids (W64) or a subject-path (W65).
 wlint W39-attest-rule 0 "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to sami-candidate; artifact-ids: the upload steps' three ids; one attest step per release file" '' ''
 wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives and the release notes$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
 wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives and the release notes$|      - run: bash .github/sami/carry-check.sh\n&|' ''
@@ -1333,6 +1345,9 @@ wlint W59-attest-notes-step-gone 1 'attest has 0 attest steps of its own for \[\
 wlint W60-carry-notes-output-not-the-upload-id 1 "carry does not give attest its upload step's artifact id: it lacks \\[      notes-artifact-id: " 's/^      notes-artifact-id: \${{ steps\.upload-notes\.outputs\.artifact-id }}$/      notes-artifact-id: "1"/' ''
 wlint W61-attest-step-if 1 "attest has an if: other than its job's, which could skip an attest step: \\[        if: false\\]" 's|^      - name: Attest the release notes$|&\n        if: false|' ''
 wlint W62-attest-continue-on-error 1 'attest has continue-on-error, so a failed attest step would not fail the job: \[        continue-on-error: true\]' 's|^      - name: Attest the release notes$|&\n        continue-on-error: true|' ''
+wlint W63-attest-if-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[      && \$\{\{ true \}\}\]' "/^  attest:\$/,/^  release_cache_prune:\$/s/^    if: \${{ github\\.event_name == 'push' .* }}\$/&\\n      \\&\\& \${{ true }}/" ''
+wlint W64-attest-artifact-ids-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[            ,12345\]' '/^  attest:$/,/^  release_cache_prune:$/s|^          artifact-ids: .*$|&\n            ,12345|' ''
+wlint W65-attest-subject-path-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[            ,\$\{\{ runner\.temp \}\}/attest/mise-\*/\*\.tar\.gz\]' 's|^          subject-path: \${{ runner.temp }}/attest/release-notes/carry-notes.md$|&\n            ,${{ runner.temp }}/attest/mise-*/*.tar.gz|' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
