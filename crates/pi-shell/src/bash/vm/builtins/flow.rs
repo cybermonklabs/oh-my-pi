@@ -396,10 +396,19 @@ fn bash_logout(ctx: &mut Ctx<'_, '_>, status: i32) -> Result<Option<Outcome>, su
 	Ok(Some(Outcome { status, control: Control::Frame }))
 }
 
-/// `break [n]` / `continue [n]`. A count below 1 is reported and leaves
-/// every loop (status 1); a non-numeric one ends the (non-interactive)
-/// shell.
+/// `break [n]` / `continue [n]`. With no loop in reach (bash
+/// `check_loop_level`, before the count is read) it complains outside
+/// posix mode and succeeds. A count below 1 is reported and leaves every
+/// loop (status 1); a non-numeric one ends the (non-interactive) shell.
 pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
+	if crate::bash::vm::exec::bash_loop_count(ctx.vp) == 0 {
+		if !ctx.option(OptId::Posix)? {
+			ctx.err(Diag::Usage {
+				msg: "only meaningful in a `for', `while', or `until' loop".into(),
+			});
+		}
+		return done(0);
+	}
 	let n = match numeric_arg(ctx, args) {
 		Ok(None) => 1,
 		Ok(Some(n)) if n >= 1 => u32::try_from(n).unwrap_or(u32::MAX),
