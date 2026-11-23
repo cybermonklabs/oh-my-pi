@@ -670,6 +670,28 @@ impl Pty {
 			.map(drop)
 	}
 
+	/// Type `text` and wait until the line editor has handled it
+	/// ([`Self::zle_sync`]): the keys up to and including each `\r` in one
+	/// write, then the wait, so the line a `\r` accepts has run before the
+	/// next keys come, as it had for a typist. Keys still unread while the
+	/// shell runs a line can be echoed by the terminal: on macOS obash's
+	/// screen showed the keys after an accepted line echoed in front of its
+	/// output, zsh's did not, and on Linux neither did.
+	///
+	/// # Errors
+	///
+	/// As [`Self::write`] and [`Self::zle_sync`].
+	pub fn type_lines(&mut self, text: &str, timeout: Duration) -> io::Result<()> {
+		if text.is_empty() {
+			return self.zle_sync(timeout);
+		}
+		for line in text.split_inclusive('\r') {
+			self.write(line)?;
+			self.zle_sync(timeout)?;
+		}
+		Ok(())
+	}
+
 	/// The terminal side, opened anew (not as a controlling terminal) to
 	/// query it.
 	fn open_tty(&self) -> io::Result<fs::File> {
@@ -1002,6 +1024,45 @@ pub fn wait_blocked(pid: i32) {
 #[cfg(not(target_os = "linux"))]
 pub const fn wait_blocked(_pid: i32) {}
 
+/// Wait until the shell `pid` blocks, before a key the terminal turns
+/// into a signal (`^C`): a shell still running then (returning from a
+/// `zle -F` handler) can leave the signal unanswered. On Linux this is
+/// [`wait_blocked`]. On macOS, until none of its threads runs
+/// (`pti_numrunning` of `proc_pidinfo`'s `PROC_PIDTASKINFO`). Bounded as
+/// every wait ([`TIMEOUT`]): then it fails. Elsewhere it returns at once.
+#[cfg(target_os = "linux")]
+pub fn wait_shell_blocked(pid: i32) {
+	wait_blocked(pid);
+}
+
+/// [`wait_shell_blocked`] on macOS.
+#[cfg(target_os = "macos")]
+pub fn wait_shell_blocked(pid: i32) {
+	let deadline = Instant::now() + TIMEOUT;
+	loop {
+		let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+		let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+		// SAFETY: `info` has room for one `proc_taskinfo`.
+		let got = unsafe {
+			libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), want)
+		};
+		// SAFETY: proc_pidinfo filled it when it returned its size.
+		let running = (got == want).then(|| unsafe { info.assume_init() }.pti_numrunning);
+		if running == Some(0) {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"after {TIMEOUT:?}, shell {pid} still runs (running threads: {running:?})"
+		);
+		thread::sleep(Duration::from_millis(5));
+	}
+}
+
+/// [`wait_shell_blocked`] elsewhere: no process state to read.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn wait_shell_blocked(_pid: i32) {}
+
 /// Each of `pid` and the processes below it that is running or in an
 /// uninterruptible wait (state `R` or `D`), into `out` with its state and
 /// name ([`wait_blocked`]); one gone is none.
@@ -1139,7 +1200,22 @@ pub fn differential(
 }
 
 /// Bytes typed on terminal `tty` that no reader has taken yet.
+///
+/// On Linux a write to the pty's other side reaches the terminal's input
+/// queue through a kernel worker, later: `FIONREAD` counts only what
+/// reached the queue, so right after a write it can read 0 while keys are
+/// still on their way. A `poll` that finds the queue empty first waits for
+/// the worker's pending run (`n_tty_poll` calls `tty_buffer_flush_work`),
+/// so for the short writes of these tests (far below the queue's 4096
+/// bytes) the count after it includes what was written before. It is not a
+/// fence in general: a worker stopped for a full queue goes on later.
+/// Elsewhere the poll changes nothing.
 fn unread(tty: &fs::File) -> io::Result<usize> {
+	let mut fd = libc::pollfd { fd: tty.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+	// SAFETY: one valid pollfd, no wait.
+	if unsafe { libc::poll(&raw mut fd, 1, 0) } == -1 {
+		return Err(io::Error::last_os_error());
+	}
 	let mut n: libc::c_int = 0;
 	// The ioctl request's integer type differs between platforms.
 	let fionread = libc::FIONREAD as _;
