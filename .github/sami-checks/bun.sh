@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bun.sh          bun 1.4.5, the release zip whose sha256 sami-build's rust_test pins, on PATH:
+# bun.sh          bun 1.4.5, pinned by the release zip's sha256 (also #61's pin), on PATH:
 #                 package.json names only a floor (bun@>=1.4.4), and test code runs in these jobs.
 # bun.sh addon    the natives job's addon is the only addon a workspace load reads
 #                 (packages/natives/native and bun's own directory: loader-state.js), as the

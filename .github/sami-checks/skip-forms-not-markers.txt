@@ -1,0 +1,4 @@
+# Prints of the tree that say skip, not run or nothing checked and are NOT a test skipping itself.
+# sc.py skip-forms fails on any such print SKIP_MARKER does not read unless it is named here.
+# One per line, tab-separated: <path under the tree> <start of the printed text, arguments as x> <reason>.
+crates/pi-builtins/src/file_backup/tests.rs	x: the host half is skipped	a partial check: the test still checks the in-process half and passes on it
