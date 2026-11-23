@@ -1877,6 +1877,96 @@ mod tests {
 		assert_eq!(taps.0.lock().len(), 1);
 	}
 
+	/// `tail -f` into an external stops once that reader is gone: it asks
+	/// with an empty write, which the shared OS pipe must answer as the
+	/// memory pipe does (`BrokenPipe`), or `tail` follows the idle file for
+	/// good. `tail` (a builtin) opens its stdout while the pipe is still in
+	/// memory; `head` (an external) turns it into an OS pipe. The bound only
+	/// turns a hang into a failure.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn tail_f_into_an_external_stops_once_its_reader_is_gone() {
+		let dir = tempfile::tempdir().unwrap();
+		let log = dir.path().join("app.log");
+		std::fs::write(&log, "first\nsecond\n").unwrap();
+		let mut s = session();
+		let cmd = format!("tail -f '{}' | /usr/bin/head -n 1; echo done", log.display());
+		let c = tokio::time::timeout(Duration::from_secs(60), sh(&mut s, &cmd))
+			.await
+			.expect("tail -f did not stop within 60 s after its reader left");
+		assert_eq!(c.stdout, "first\ndone\n");
+	}
+
+	/// Between two external stages a tapped pipe stays in memory, pumped, so
+	/// the tap and the run's trace see every byte in order. On Linux (the
+	/// probe reads `/proc`, and only Linux shares the pipe), the stages of a
+	/// tapped pipe each have a pipe of their own to the shell, and an
+	/// untapped pipe between the same stages is one OS pipe.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_tapped_pipe_between_externals_mirrors_every_byte_and_an_untapped_one_is_shared() {
+		#[derive(Default)]
+		struct Taps(Mutex<Vec<Arc<Mirror>>>);
+		#[derive(Default)]
+		struct Mirror(Mutex<(Vec<u8>, bool)>);
+		impl PipeTap for Taps {
+			fn open(
+				&self,
+				_producer: &bstr::BStr,
+				_consumer: &bstr::BStr,
+			) -> Option<Arc<dyn crate::bash::PipeMirror>> {
+				let mirror = Arc::new(Mirror::default());
+				self.0.lock().push(Arc::clone(&mirror));
+				Some(mirror)
+			}
+		}
+		impl crate::bash::PipeMirror for Mirror {
+			fn write(&self, bytes: &[u8]) {
+				self.0.lock().0.extend_from_slice(bytes);
+			}
+
+			fn close(&self) {
+				self.0.lock().1 = true;
+			}
+		}
+		const ONE_PIPE: &str = "w=$(/bin/mktemp -d); /bin/sh -c 'x=$(readlink /proc/$$/fd/1); \
+		                        printf \"%s\\n\" \"$x\" > \"$1/w\"' sh \"$w\" | /bin/sh -c \
+		                        'x=$(readlink /proc/$$/fd/0); printf \"%s\\n\" \"$x\" > \"$1/r\"' \
+		                        sh \"$w\"; if [ \"$(/bin/cat \"$w/w\")\" = \"$(/bin/cat \"$w/r\")\" \
+		                        ]; then echo one-pipe; else echo two-pipes; fi; /bin/rm -rf \"$w\"";
+		// awk, not wc, whose count BSD pads with spaces.
+		const SEQ: &str = "/usr/bin/seq 1 20000 | /usr/bin/awk 'END { print NR }'";
+		let seq: String = (1..=20000).map(|n| n.to_string() + "\n").collect();
+		let mut s = session();
+		let tapped =
+			|command: &str, taps: &Arc<Taps>, trace: &Arc<crate::bash::trace::RunTrace>| RunOptions {
+				pipe_tap: Some(Arc::clone(taps) as Arc<dyn PipeTap>),
+				events: Some(Arc::clone(trace) as Arc<dyn crate::bash::EventSink>),
+				text_capture: true,
+				..RunOptions::new(command)
+			};
+		let taps = Arc::new(Taps::default());
+		let trace = Arc::new(crate::bash::trace::RunTrace::new(SEQ));
+		let c = capture(&mut s, tapped(SEQ, &taps, &trace)).await;
+		assert_eq!(c.stdout, "20000\n");
+		{
+			let taps = taps.0.lock();
+			let [mirror] = taps.as_slice() else {
+				panic!("one tapped pipe: {}", taps.len());
+			};
+			let (bytes, closed) = &*mirror.0.lock();
+			assert!(bytes.as_slice() == seq.as_bytes() && *closed, "the tap saw every byte in order");
+		}
+		assert_eq!(trace_output(&trace.snapshot()), c.stdout);
+		if cfg!(target_os = "linux") {
+			let trace = Arc::new(crate::bash::trace::RunTrace::new(ONE_PIPE));
+			let c = capture(&mut s, tapped(ONE_PIPE, &Arc::new(Taps::default()), &trace)).await;
+			assert_eq!(c.stdout, "two-pipes\n", "a tapped pipe stays in memory");
+			assert_eq!(sh(&mut s, ONE_PIPE).await.stdout, "one-pipe\n", "an untapped one is shared");
+		}
+		let (c, trace) = trace_capture(&mut s, SEQ).await;
+		assert_eq!(c.stdout, "20000\n");
+		assert_eq!(trace_output(&trace.snapshot()), c.stdout, "the trace sees the last stage");
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn url_paths_are_absolute_working_directories() {
 		let mut s = session();
