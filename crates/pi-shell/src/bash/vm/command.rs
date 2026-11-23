@@ -4719,8 +4719,9 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// command before them.
 	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash
 		&& !matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
-	// The words go with the scratch below: taken, not copied.
-	let argv = binds.then(|| std::mem::take(&mut st(vp).argv));
+	// The last word is the value; the others stay in the command's state,
+	// which the next command reuses (`spare_exec`, `pool_words`).
+	let last = binds.then(|| st(vp).argv.pop().unwrap_or_default());
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4737,15 +4738,24 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.last_mut()
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
-	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	// The bind follows the command's temporary scope and redirections (a
+	// message goes to the shell's stderr), and reads the name from the
+	// words before they are recycled: a borrow, copied only where `_` has
+	// attributes.
+	let sc = exec::release_scratch(&mut k.root, cx.store, vp, sc);
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}
-	if let Some(mut argv) = argv {
-		let last = argv.pop().unwrap_or_default();
+	if let Some(last) = last {
 		let line = exec::line_of(vp, op.node);
-		bash_last_arg(k, vp, cx, line, last, argv.first().map(|n| &n[..]));
+		let name = sc
+			.exec
+			.as_deref()
+			.and_then(|e| e.argv.first())
+			.map(|n| &n[..]);
+		bash_last_arg(k, vp, cx, line, last, name);
 	}
+	exec::keep_scratch(vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
 	}

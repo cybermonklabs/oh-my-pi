@@ -1794,12 +1794,20 @@ fn pass_reply(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 
 /// Abandon an op's scratch: pop the temporary scope of a builtin and
 /// restore the fds its redirections replaced.
-pub fn drop_scratch(
+pub fn drop_scratch(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, sc: Box<Scratch>) {
+	let sc = release_scratch(root, store, vp, sc);
+	keep_scratch(vp, sc);
+}
+
+/// [`drop_scratch`]'s first half: the temporary scope popped and the fds
+/// restored, the scratch handed back (still holding its command's words)
+/// for [`keep_scratch`].
+pub fn release_scratch(
 	root: &mut Root,
 	store: &mut dyn StateStore,
 	vp: &mut Vproc,
 	mut sc: Box<Scratch>,
-) {
+) -> Box<Scratch> {
 	if sc.exec.as_ref().is_some_and(|e| e.scoped) {
 		state::drop_scope(root, store, vp);
 	}
@@ -1808,9 +1816,13 @@ pub fn drop_scratch(
 			vp.fds.set(s.fd, s.prev);
 		}
 	}
-	// Keep it cleared for a next op: a function call's op holds its own
-	// while the body runs, so one spare per level saves a scratch (and
-	// all its buffers) per call.
+	sc
+}
+
+/// [`drop_scratch`]'s second half: keep it cleared for a next op. A
+/// function call's op holds its own while the body runs, so one spare per
+/// level saves a scratch (and all its buffers) per call.
+pub fn keep_scratch(vp: &mut Vproc, mut sc: Box<Scratch>) {
 	if vp.spare.len() < SPARE_SCRATCH {
 		sc.recycle();
 		vp.spare.push(sc);
