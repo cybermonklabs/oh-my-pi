@@ -262,6 +262,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 		),
 		(KeyBuf::ZshAlias { suffix: true, name: bytes(b"G\xff") }, Record::Alias(bytes(b"vi"))),
 		(KeyBuf::Misc(MiscKey::Mode), Record::Misc(bytes(b"zsh-sh"))),
+		(KeyBuf::BgPid(Vpid(Vpid::BASE + 2)), Record::Misc(bytes(b"5:4242:0"))),
 		(KeyBuf::Alias(bytes(b"l\xffl")), Record::Alias(bytes(b"ls -l \xfe"))),
 		(KeyBuf::Opt(OptId::Errexit), Record::Opt(true)),
 		(KeyBuf::Opt(OptId::Nullglob), Record::Opt(false)),
@@ -686,7 +687,7 @@ fn deleting_a_scope_drops_its_locals(store: &mut dyn StateStore) {
 }
 
 /// Every table, `Scope` and `Local` included.
-const TABLES: [Table; 14] = [
+const TABLES: [Table; 15] = [
 	Table::Var,
 	Table::Func,
 	Table::Alias,
@@ -701,6 +702,7 @@ const TABLES: [Table; 14] = [
 	Table::Local,
 	Table::ZshOpt,
 	Table::ZshAlias,
+	Table::BgPid,
 ];
 
 /// A scan of each table visits exactly that table's records, once each.

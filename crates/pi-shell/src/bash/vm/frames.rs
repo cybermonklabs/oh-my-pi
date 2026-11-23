@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -94,6 +94,19 @@ struct Image {
 	bangs:     Vec<super::proc::Bang>,
 	/// Their commands' redirections still deciding ([`Kernel::deferrals`]).
 	deferrals: Vec<super::proc::Deferral>,
+	/// The take-in's state ([`Kernel::exits_asked`], [`Kernel::exits_taken`],
+	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
+	/// parked across a snapshot, so its ask and its answer go with it.
+	take_in:   TakeInImage,
+}
+
+/// The take-in's state, as the image keeps it ([`Image::take_in`]).
+#[derive(Serialize, Deserialize)]
+struct TakeInImage {
+	asked: Vec<Vpid>,
+	taken: Vec<Vpid>,
+	asks:  Vec<super::TakeIn>,
+	fresh: Vec<Vpid>,
 }
 
 /// One fd object.
@@ -648,6 +661,12 @@ impl Shell {
 			mems: fds.mems,
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
+			take_in: TakeInImage {
+				asked: k.exits_asked.clone(),
+				taken: k.exits_taken.clone(),
+				asks:  self.taking_in.clone(),
+				fresh: self.fresh.clone(),
+			},
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -722,6 +741,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;
@@ -1049,6 +1070,18 @@ impl Shell {
 		self.procs = procs;
 		self.rr = (img.rr as usize).min(self.procs.len() - 1);
 		self.slice = img.slice;
+		// The take-in of the vprocs restored: a builtin parked on its ask is
+		// answered as it would have been without the snapshot.
+		let restored = |v: &Vpid| self.procs.iter().any(|p| p.vpid == *v);
+		let ti = img.take_in;
+		let asked = ti.asked.into_iter().filter(|v| restored(v)).collect();
+		let taken = ti.taken.into_iter().filter(|v| restored(v)).collect();
+		let asks = ti.asks.into_iter().filter(|t| restored(&t.asker)).collect();
+		let fresh = ti.fresh.into_iter().filter(|v| restored(v)).collect();
+		self.k.exits_asked = asked;
+		self.k.exits_taken = taken;
+		self.taking_in = asks;
+		self.fresh = fresh;
 		Ok(())
 	}
 
