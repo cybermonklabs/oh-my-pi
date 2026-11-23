@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		AssignValue, Awaited, BangStage, BusySpawn, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
+		JobState, Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
+		Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -33,8 +33,8 @@ use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	fs::StatKind,
 	host::{
-		ChildRedirs, EnvView, ExitStatus, Invocation, ProcEvent, ResolveCtx, Resolved, SpawnSpec,
-		StdioSpec, Via,
+		ChildRedirs, EnvView, ExitStatus, Invocation, OnBusy, ProcEvent, ResolveCtx, Resolved,
+		SpawnSpec, StdioSpec, Via,
 	},
 	ids::{CallId, CmdTag, IntrinsicId, RunId},
 	ir::{self, AssignVal, Op, Part, Unit},
@@ -2052,21 +2052,24 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			}
 		}
 		// A hashed name ran without a search (its target is set).
+		let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 		let found = if sc.io.as_ref().is_some_and(|io| io.search.is_some()) {
 			let mut tcx = Context::from_waker(&k.waker);
-			Some(probe::path_search(&mut tcx, cx, &mut sc))
+			Some(probe::path_search(&mut tcx, cx, &mut sc, zsh))
 		} else {
 			None
 		};
+		let refused = matches!(found, Some(Search::Refused(_)));
 		let flow = match found {
 			None => None,
-			Some(Search::Found(path)) => {
+			Some(Search::Found(path) | Search::Refused(path)) => {
 				sc.io().search = None;
 				// bash hashes every command it finds in PATH (not with a
-				// temporary PATH).
-				// zsh `pathdirs` names (with a slash) are not hashed.
+				// temporary PATH), one it cannot run too. zsh hashes only one
+				// it can run (`hashcmd`'s `iscom`), and no `pathdirs` name
+				// (with a slash).
 				if !temp_path
-					&& (vp.mode.dialect() != crate::bash::ids::Dialect::Zsh || !name.contains(&b'/'))
+					&& (!zsh || (!refused && !name.contains(&b'/')))
 					&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Hashall)
 						.unwrap_or(true)
 				{
@@ -2283,6 +2286,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		},
 		Target::Refused { path, code } => refused(k, vp, cx, line, &path, code),
 		Target::Tool(tool) => {
+			// bash forks for the external program a host tool stands for, and
+			// the tool's subshell needs a vpid: with none left it fails as
+			// that fork does.
+			if let Some(flow) = super::exec::fork_failed(k, vp, cx, 1, line) {
+				return Some(flow);
+			}
 			let (env, umask) =
 				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
 					Ok(v) => v,
@@ -2442,6 +2451,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				ChildRedirs { list, exec_diag: super::redir::diag_prefix(k, cx, vp, line, &name) }
 			});
 			let child_redirs = redirs.is_some();
+			// An extra fd (above 2) the process's own redirections close or
+			// replace before any of them reads it (`4<&-`, `4<file`, `4>&1`) is
+			// not handed over: the process would hold its engine object (a feed
+			// of the shell's pipe, whose bytes the shell then could not read)
+			// and never use it. stdio is handed over as before.
+			let replaced = redirs
+				.as_ref()
+				.map_or_else(Vec::new, |r| replaced_before_read(&r.list));
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2454,6 +2471,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				],
 				extra_fds: extra_fds(vp)
 					.iter()
+					.filter(|(fd, _)| !replaced.contains(fd))
 					.map(|(fd, h)| (*fd, stdio_spec(h, false)))
 					.collect(),
 				pgroup,
@@ -2469,6 +2487,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					.as_deref()
 					.and_then(|z| z.ctty.0.as_ref())
 					.and_then(crate::bash::fd::FdRef::os_handle),
+				on_busy: on_busy(k, vp.vpid, child_redirs),
 			};
 			let mut pending = cx.host.spawn(spec);
 			let mut tcx = Context::from_waker(&k.waker);
@@ -2554,6 +2573,14 @@ fn spawned_external(
 	how: Spawned<'_>,
 ) -> Option<Flow> {
 	let Spawned { path, interp, child_redirs, argv } = how;
+	// The `$!` external found its program busy ([`OnBusy::Fail`]): its
+	// refusal is rendered, not printed, and the spawn asked for again.
+	if let Err(err) = &spawned
+		&& is_busy(err)
+		&& on_busy(k, vp.vpid, child_redirs) == OnBusy::Fail
+	{
+		return busy_bang(k, vp, cx, line, path, interp, err);
+	}
 	// A refused spawn (retried as a script, or reported) never makes the
 	// job a program: its `$!` readers need not wait for the rest.
 	if spawned.is_err() && !k.bangs.is_empty() {
@@ -2620,17 +2647,10 @@ fn spawned_external(
 			st(vp).target = Some(Target::Script(path));
 		},
 		Err(err) if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
-			// zsh `execute`: `%e: NAME` with the name as written;
-			// 126 for `EACCES` and `ENOEXEC`, else 127.
-			let name = st(vp).argv[0].clone();
-			let msg = format!("{}: {name}", super::redir::zsh_errno(&err)).into();
-			k.diag(cx, vp, line, Diag::Usage { msg });
+			let (diag, status) = zsh_exec_failure(vp, &err);
+			k.diag(cx, vp, line, diag);
 			let s = st(vp);
-			s.status = if err.kind() == std::io::ErrorKind::PermissionDenied || is_enoexec(&err) {
-				126
-			} else {
-				127
-			};
+			s.status = status;
 			s.stage = Stage::Output;
 			exec_failed(k, cx, vp);
 		},
@@ -2701,8 +2721,19 @@ fn refusals_to_host(vp: &mut Vproc) -> bool {
 
 /// Whether `err`, the failure to start the program at `path` with the
 /// arguments `argv` in the working directory `cwd`, is the system refusing
-/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` as GKE Sandbox
-/// (gVisor) says it, but that only when nothing else can have caused it:
+/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` or `ENOMEM` as
+/// GKE Sandbox (gVisor) says it, but those only when nothing else can have
+/// caused them.
+///
+/// `ENOMEM` counts only for arguments past [`GVISOR_EXEC_ARGS_MAX`]: gVisor
+/// before google/gvisor@bd278996 refuses such a line with `ENOMEM` when its
+/// strings end exactly on that limit with more to come. Linux's `ENOMEM` (the
+/// kernel out of memory) of so long a line is retried too, which costs only
+/// the halves' starts. A shorter line's `ENOMEM` is not its length: Linux's,
+/// or gVisor's when the environment's strings fill the limit, which fewer
+/// arguments cannot help.
+///
+/// `ENAMETOOLONG` counts only when:
 /// - The arguments take more than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
 ///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG` is a
 ///   path's.
@@ -2720,11 +2751,12 @@ fn refusals_to_host(vp: &mut Vproc) -> bool {
 fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd: &[u8]) -> bool {
 	/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`).
 	const POSIX_ARG_MAX: usize = 4096;
+	let line = || argv.iter().map(|arg| arg.len() + 1).sum::<usize>();
 	match err.raw_os_error() {
 		Some(libc::E2BIG) => true,
+		Some(libc::ENOMEM) => line() > GVISOR_EXEC_ARGS_MAX,
 		Some(libc::ENAMETOOLONG) => {
-			let line: usize = argv.iter().map(|arg| arg.len() + 1).sum();
-			line > POSIX_ARG_MAX
+			line() > POSIX_ARG_MAX
 				&& fits_as_path(path)
 				&& fits_as_path(cwd)
 				&& !interpreter_path_too_long(&super::probe::absolute(cwd, path), cwd)
@@ -2732,6 +2764,16 @@ fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd:
 		_ => false,
 	}
 }
+
+/// The most bytes of argument strings, each with its NUL, that gVisor's
+/// `execve` copies (`ExecMaxTotalSize` in its
+/// `pkg/sentry/syscalls/linux/sys_thread.go`). Releases before
+/// google/gvisor@bd278996 refuse a longer line with `ENAMETOOLONG` when a
+/// string crosses the limit, and with `ENOMEM` when the strings end exactly
+/// on it and more follow (`CopyInVector` finds nothing left for the next
+/// one). The same constant as `pi_builtins`' `GVISOR_EXEC_ARGS_MAX`.
+#[cfg(unix)]
+const GVISOR_EXEC_ARGS_MAX: usize = 2 << 20;
 
 /// Whether the program at `path` (a host path: the one the system refused)
 /// is a `#!` script whose interpreter the system cannot reach by its path:
@@ -5193,6 +5235,9 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 		text.push(b'\'');
 	}
 	text.push(b'\n');
+	if let Some(flow) = super::exec::fork_failed(k, vp, cx, 1, line) {
+		return Some(flow);
+	}
 	let child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
@@ -5228,6 +5273,106 @@ fn interpreter(text: &[u8]) -> BString {
 		interp.extend_from_slice(b"^M");
 	}
 	interp
+}
+
+/// zsh `execute`'s report of a refused exec: `%e: NAME` with the name as
+/// written; 126 for `EACCES` and `ENOEXEC`, else 127.
+fn zsh_exec_failure(vp: &mut Vproc, err: &std::io::Error) -> (Diag, i32) {
+	let name = st(vp).argv[0].clone();
+	let msg = format!("{}: {name}", super::redir::zsh_errno(err)).into();
+	let status = if err.kind() == std::io::ErrorKind::PermissionDenied || is_enoexec(err) {
+		126
+	} else {
+		127
+	};
+	(Diag::Usage { msg }, status)
+}
+
+/// The OS refused to run the program because a process holds it open for
+/// writing (`ETXTBSY`).
+#[cfg(unix)]
+fn is_busy(err: &std::io::Error) -> bool {
+	err.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+/// Elsewhere no kernel refuses a program held open for writing.
+#[cfg(not(unix))]
+const fn is_busy(_err: &std::io::Error) -> bool {
+	false
+}
+
+/// What the spawn of `vproc`'s external does with a busy program
+/// ([`OnBusy`]): the external that gives a background job its `$!`
+/// (`bang_dispatch` let it through) fails at once, then, its refusal
+/// rendered ([`BusySpawn`]), asks for a process that waits itself, as
+/// bash's forked child is `$!` before its exec. One that applies its own
+/// redirections already is such a process.
+fn on_busy(k: &Kernel, vproc: crate::bash::ids::Vpid, child_redirs: bool) -> OnBusy {
+	match k.busy.iter().find(|(v, _)| *v == vproc) {
+		Some((_, BusySpawn::Child(child))) => child.clone(),
+		_ if !child_redirs && k.bangs.iter().any(|b| b.vproc == vproc) => OnBusy::Fail,
+		_ => OnBusy::Retry,
+	}
+}
+
+/// The `$!` external's program was busy ([`OnBusy::Fail`]): render what its
+/// refusal would print (bash: through `Target::Refused`, whose probes may
+/// wait; zsh: here) and dispatch it again, asking for a process that
+/// waits for the program itself and prints that if it stays busy
+/// ([`OnBusy::Child`]).
+#[cold]
+#[inline(never)]
+fn busy_bang(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	path: BString,
+	interp: bool,
+	err: &std::io::Error,
+) -> Option<Flow> {
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		let (diag, status) = zsh_exec_failure(vp, err);
+		k.busy.push((vp.vpid, BusySpawn::Render));
+		busy_rendered(k, vp, cx, line, &diag, status);
+		st(vp).target = Some(if interp {
+			Target::Interp(path)
+		} else {
+			Target::External(path)
+		});
+	} else {
+		k.busy.push((vp.vpid, BusySpawn::Render));
+		let code = err.raw_os_error().unwrap_or_default();
+		st(vp).target = Some(Target::Refused { path, code });
+	}
+	None
+}
+
+/// `diag` and `status` would report the refusal of the `$!` external whose
+/// program was busy ([`BusySpawn::Render`]): kept for the process that
+/// waits for the program, which prints them if it stays busy. `false`
+/// when this refusal is no such one (it is reported here).
+fn busy_rendered(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	diag: &Diag,
+	status: i32,
+) -> bool {
+	let Some(i) = k
+		.busy
+		.iter()
+		.position(|(v, b)| *v == vp.vpid && *b == BusySpawn::Render)
+	else {
+		return false;
+	};
+	let report = BString::from(k.render_quiet(cx, vp, line, diag));
+	let name = st(vp).argv[0].clone();
+	let exec_diag = super::redir::diag_prefix(k, cx, vp, line, &name);
+	let status = u8::try_from(status).unwrap_or(126);
+	k.busy[i].1 = BusySpawn::Child(OnBusy::Child { report, status, exec_diag });
+	true
 }
 
 /// bash's `shell_execve` after the OS refused to run `path` with `code`
@@ -5292,6 +5437,11 @@ fn refused(
 			}
 		}
 	};
+	if busy_rendered(k, vp, cx, line, &diag, status) {
+		// The `$!` external's busy program: asked for again (`busy_bang`).
+		st(vp).target = Some(Target::External(path.clone()));
+		return None;
+	}
 	k.diag(cx, vp, line, diag);
 	let s = st(vp);
 	s.status = status;
@@ -5301,13 +5451,14 @@ fn refused(
 }
 
 /// zsh `zexecve` after `ENOENT` or `ENOEXEC` for `path`. A `#!` line: with
-/// `ENOEXEC` its interpreter runs as written; with `ENOENT` one that is not
-/// absolute is searched in `$PATH`; it runs with the line's argument (if
-/// any), the script and the arguments. A `#!` line without a newline, or an
-/// interpreter not found: `PATH: bad interpreter: INTERP: ERROR` (the
-/// only message: zsh's error flag is set). `ENOEXEC` without `#!`: the
-/// file runs as a script. Otherwise zsh `execute`'s report: `%e: NAME` for
-/// a name with a slash, else `command not found`.
+/// `ENOEXEC` its interpreter runs as written (an empty one names no file:
+/// its `execve` fails, and the report is the `ENOEXEC`'s); with `ENOENT` one
+/// that is not absolute is searched in `$PATH`; it runs with the line's
+/// argument (if any), the script and the arguments. A `#!` line without a
+/// newline, or an interpreter not found: `PATH: bad interpreter: INTERP:
+/// ERROR` (the only message: zsh's error flag is set). `ENOEXEC` without
+/// `#!`: the file runs as a script. Otherwise zsh `execute`'s report: `%e:
+/// NAME` for a name with a slash, else `command not found`.
 #[inline(never)]
 fn zsh_refused(
 	k: &mut Kernel,
@@ -5338,7 +5489,7 @@ fn zsh_refused(
 			let end = first.iter().position(|&c| c == b' ').unwrap_or(first.len());
 			let (prog, arg) = (&first[..end], first.get(end + 1..));
 			let run = if enoexec {
-				Some(absolute(&vp.cwd, prog))
+				(!prog.is_empty()).then(|| absolute(&vp.cwd, prog))
 			} else if prog.starts_with(b"/") {
 				None
 			} else {
@@ -5365,11 +5516,17 @@ fn zsh_refused(
 				s.target = Some(Target::Interp(run));
 				return None;
 			}
-			BString::from(prog)
+			// With `ENOEXEC` the interpreter is empty (else it ran).
+			(!enoexec).then(|| BString::from(prog))
 		} else {
-			BString::from(rest)
+			Some(BString::from(rest))
 		};
-		format!("{pth}: bad interpreter: {interp}: {}", super::redir::zsh_errno(&err))
+		match interp {
+			Some(interp) => {
+				format!("{pth}: bad interpreter: {interp}: {}", super::redir::zsh_errno(&err))
+			},
+			None => format!("{}: {name}", super::redir::zsh_errno(&err)),
+		}
 	} else if enoexec {
 		st(vp).target = Some(Target::Script(path.clone()));
 		return None;
@@ -5427,6 +5584,48 @@ fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 		})
 		.map(|(fd, h)| (fd, h.clone()))
 		.collect()
+}
+
+/// The fds the redirections `list` of a process close or replace (`Open`,
+/// `Dup` onto it, `Close`) before any of them reads the fd itself (as a
+/// `Dup` source, or as the `/dev/fd/N` path an `Open` of two fds names, as
+/// `&>/dev/fd/4` does): the process never uses what the shell has there. A
+/// step that fails ([`ChildRedir::Fail`]) ends the process: none after it
+/// reads or replaces anything.
+fn replaced_before_read(list: &[crate::bash::ChildRedir]) -> Vec<i32> {
+	use crate::bash::ChildRedir;
+	let mut read: Vec<i32> = Vec::new();
+	let mut replaced: Vec<i32> = Vec::new();
+	let write = |fd: i32, read: &[i32], replaced: &mut Vec<i32>| {
+		if !read.contains(&fd) && !replaced.contains(&fd) {
+			replaced.push(fd);
+		}
+	};
+	for redir in list {
+		match redir {
+			ChildRedir::Open { fds, path, .. } => {
+				// A source replaced earlier is the replacement, not the shell's.
+				if let Some(src) = probe::dev_fd(path)
+					&& !replaced.contains(&src)
+				{
+					read.push(src);
+				}
+				for &fd in fds {
+					write(fd, &read, &mut replaced);
+				}
+			},
+			ChildRedir::Dup { fd, src, .. } => {
+				// A source replaced earlier is the replacement, not the shell's.
+				if !replaced.contains(src) {
+					read.push(*src);
+				}
+				write(*fd, &read, &mut replaced);
+			},
+			ChildRedir::Close { fd } => write(*fd, &read, &mut replaced),
+			ChildRedir::Fail { .. } => break,
+		}
+	}
+	replaced
 }
 
 /// The environment of a command: exported variables as the vproc sees them
@@ -5518,7 +5717,8 @@ mod tests {
 	/// `E2BIG` is always a command line too long; `ENAMETOOLONG` only for
 	/// arguments past `_POSIX_ARG_MAX` (4,096 bytes) when neither the
 	/// program's path nor the working directory is past `PATH_MAX` or holds
-	/// a name past `NAME_MAX`; any other error never is. The cases of
+	/// a name past `NAME_MAX`; `ENOMEM` only past gVisor's limit (the test
+	/// below); any other error never is. The cases of
 	/// `pi_builtins`' twin (`command_line_too_long`), for resolved paths.
 	#[cfg(unix)]
 	#[test]
@@ -5551,8 +5751,33 @@ mod tests {
 			!refused_as_too_long(&enametoolong, b"/usr/bin/printf", &short, b"/tmp"),
 			"a line no system refuses: a path's error"
 		);
-		let other = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		let other = std::io::Error::from_raw_os_error(libc::EACCES);
 		assert!(!refused_as_too_long(&other, b"/usr/bin/printf", &long, b"/tmp"));
+	}
+
+	/// `ENOMEM` is a command line too long only for arguments past gVisor's
+	/// 2 MiB of strings, which gVisor before google/gvisor@bd278996 refuses
+	/// with it when they end exactly on the limit; whatever the program's
+	/// path or the directory. Arguments that fit are not refused for their
+	/// length. The cases of `pi_builtins`' twin.
+	#[cfg(unix)]
+	#[test]
+	fn enomem_is_a_line_too_long_only_past_gvisors_limit() {
+		use bstr::BString;
+
+		use super::{GVISOR_EXEC_ARGS_MAX, refused_as_too_long};
+		let enomem = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		// "prog" and its NUL, then one string to the given total.
+		let line = |total: usize| [BString::from("prog"), BString::from("a".repeat(total - 6))];
+		let too_long = |path: &str, total: usize| {
+			refused_as_too_long(&enomem, path.as_bytes(), &line(total), b"/tmp")
+		};
+		assert_eq!(GVISOR_EXEC_ARGS_MAX, 2 * 1024 * 1024);
+		assert!(too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX + 1));
+		let name = "n".repeat(256);
+		assert!(too_long(&format!("/{name}"), GVISOR_EXEC_ARGS_MAX + 1), "a path is no matter");
+		assert!(!too_long("/usr/bin/printf", GVISOR_EXEC_ARGS_MAX), "a line gVisor takes whole");
+		assert!(!too_long("/usr/bin/printf", 4097));
 	}
 
 	/// The `#!` rule of `pi_builtins`' twin: an `ENAMETOOLONG` of a long line

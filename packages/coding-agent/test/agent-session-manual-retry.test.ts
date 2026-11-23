@@ -354,6 +354,84 @@ describe("AgentSession manual retry", () => {
 		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after replay" });
 	});
 
+	it("does not run a batch again whose calls all failed when no turn failed, in the context or the transcript", async () => {
+		// `/retry` replays a batch only behind a failed or aborted turn (its gate, which `omp --restore` reads through
+		// `toolReplayAnchor`). If this regresses, a batch whose calls failed on their own, with no turn cut off, runs
+		// again on a `/retry` and repeats whatever its calls did before they failed.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const probeTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["should not run"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// The batch's only call failed, and nothing after it failed: the context ends in that error result, and the
+		// session's transcript holds no failed turn either.
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [probeTool],
+				messages: [
+					{ role: "user", content: "run the probe", timestamp: Date.now() },
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "probe",
+						content: [{ type: "text", text: "probe failed" }],
+						isError: true,
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		await expect(session.retry()).resolves.toBe(false);
+		await session.waitForIdle();
+
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(0);
+		expect(session.agent.state.messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult"]);
+	});
+
 	it("retries an aborted tool-call turn past a background-job result folded in after the interrupt", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {

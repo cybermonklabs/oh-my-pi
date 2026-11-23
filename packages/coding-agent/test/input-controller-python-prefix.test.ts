@@ -98,6 +98,7 @@ describe("InputController Python prompt prefix", () => {
 				images: undefined,
 				imageLinks: undefined,
 				streamingBehavior: "steer",
+				origin: "outside",
 			},
 			{ clearEditor: false },
 		);
@@ -108,6 +109,7 @@ describe("InputController Python prompt prefix", () => {
 				images: undefined,
 				imageLinks: undefined,
 				streamingBehavior: "steer",
+				origin: "outside",
 			},
 		]);
 	});
@@ -131,6 +133,7 @@ describe("InputController Python prompt prefix", () => {
 				images: undefined,
 				imageLinks: undefined,
 				streamingBehavior: "steer",
+				origin: "outside",
 			},
 			{ clearEditor: false },
 		);
@@ -141,6 +144,7 @@ describe("InputController Python prompt prefix", () => {
 				images: undefined,
 				imageLinks: undefined,
 				streamingBehavior: "steer",
+				origin: "outside",
 			},
 		]);
 	});

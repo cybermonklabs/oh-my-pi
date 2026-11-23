@@ -42,12 +42,16 @@ const MAX_DEPTH = 24;
 // `beforeDispatch`, so the `tts` and `generate_image` tools sent their
 // requests while `/pause` was engaged.
 describe("pauseHeldFetch", () => {
+	// The model each request calls; its guards are read as it goes out, and no guard holds it here.
+	const model = getBundledModel("deepinfra", "hexgrad/Kokoro-82M");
+	if (!model) throw new Error("Missing bundled test model: deepinfra/hexgrad/Kokoro-82M");
+
 	test("holds a request until resume", async () => {
 		const sent: boolean[] = [];
 		const fetch = pauseHeldFetch(async () => {
 			sent.push(agentPauseGate.paused);
 			return new Response("ok");
-		});
+		}, model);
 
 		agentPauseGate.pause();
 		const pending = fetch("https://speech.example.test/v1/audio/speech", { method: "POST" });
@@ -72,7 +76,7 @@ describe("pauseHeldFetch", () => {
 				sent++;
 				if (agentPauseGate.paused) sentWhilePaused.push(depth);
 				return new Response("ok");
-			})("https://images.example.test/v1/images/generations", { method: "POST" });
+			}, model)("https://images.example.test/v1/images/generations", { method: "POST" });
 			agentPauseGate.resume();
 			afterMicrotasks(depth, () => agentPauseGate.pause());
 			await tick();
@@ -88,7 +92,7 @@ describe("pauseHeldFetch", () => {
 		const fetch = pauseHeldFetch(async () => {
 			sent.push(agentPauseGate.paused);
 			return new Response("ok");
-		});
+		}, model);
 		const abort = new AbortController();
 		const reason = new Error("tool cancelled");
 
@@ -117,7 +121,7 @@ describe("pauseHeldFetch", () => {
 				sent = true;
 				if (agentPauseGate.paused) sentWhilePaused.push(depth);
 				return new Response("ok");
-			})("https://speech.example.test/v1/audio/speech", { signal: abort.signal });
+			}, model)("https://speech.example.test/v1/audio/speech", { signal: abort.signal });
 			agentPauseGate.resume();
 			afterMicrotasks(depth, () => agentPauseGate.pause());
 			await tick();

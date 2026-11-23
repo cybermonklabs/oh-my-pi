@@ -155,6 +155,7 @@ import {
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
+import type { InputOrigin } from "../session/agent-session-types";
 import type { AgentViewSession } from "../session/agent-session-handle";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
@@ -1858,7 +1859,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingPlanReview:
 		| {
 				request: PlanReviewRequestedEvent;
-				remote?: { choice: PlanReviewChoice; feedback?: string };
+				/** An extension's pick: its origin is only what the extension passes (`input.origin`). */
+				remote?: { choice: PlanReviewChoice; feedback?: string; origin?: InputOrigin };
 				/** Applies a remote tier pick to the review's slider selection; undefined when the slider is hidden. */
 				selectTier?: (role: string) => boolean;
 		  }
@@ -3594,13 +3596,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// child process that Esc can no longer reach.
 		this.#abortLoopCondition();
 		this.#loopConditionAbort = controller;
+		const sessionId = this.sessionManager.getSessionId();
 		let verdict: LoopConditionVerdict;
 		try {
 			verdict = await evaluateLoopCondition(condition, {
 				cwd: this.sessionManager.getCwd(),
 				timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
 				signal: controller.signal,
-				sessionId: this.sessionManager.getSessionId(),
+				sessionId,
+				isSessionCurrent: () => this.sessionManager.getSessionId() === sessionId,
 			});
 		} finally {
 			if (this.#loopConditionAbort === controller) this.#loopConditionAbort = undefined;
@@ -4084,6 +4088,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			display?: boolean;
 			streamingBehavior?: "steer" | "followUp";
 			followUps?: string[];
+			origin?: InputOrigin;
 		},
 		options?: { preserveDraft?: boolean; clearEditor?: boolean },
 	): SubmittedUserInput {
@@ -4095,6 +4100,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			display: input.display,
 			streamingBehavior: input.streamingBehavior,
 			followUps: input.followUps,
+			origin: input.origin,
 			cancelled: false,
 			started: false,
 		};
@@ -6631,7 +6637,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	resolvePlanReview(
 		reviewId: string,
 		choice: PlanReviewChoice,
-		input?: { feedback?: string; role?: string },
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
 	): boolean {
 		const pending = this.#pendingPlanReview;
 		const pick = this.#planReviewPick;
@@ -6644,7 +6650,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
-		pending.remote = { choice, feedback };
+		pending.remote = { choice, feedback, origin: input?.origin };
 		if (pick(option.label)) return true;
 		pending.remote = undefined;
 		return false;
@@ -6935,6 +6941,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
 			reviewOwner: object;
+			/**
+			 * The pick's origin: `"outside"` for a person's pick in the review, and for an extension's only
+			 * when it passes `origin: "outside"`. It ends the session's cyber-policy hold only then.
+			 */
+			origin: InputOrigin | undefined;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -6998,7 +7009,8 @@ export class InteractiveMode implements InteractiveModeContext {
 					undefined,
 					undefined,
 					outcome => this.#applyDeferredPlanModelTransition(outcome, options.executionModel),
-					{ internalGuidance: compactionPrompt, readerModel },
+					// The pick's origin: a person's plan approval is input from outside the session.
+					{ internalGuidance: compactionPrompt, readerModel, origin: options.origin },
 				);
 			}
 		} finally {
@@ -7110,17 +7122,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution directive behind it as a synthetic follow-up. If `isStreaming`
 		// flips true between the check and dispatch (the same fire-and-forget race
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
+		// The pick's origin: a person's plan approval is input from outside the session.
 		if (this.session.isStreaming) {
 			await this.session.followUp(planModePrompt, undefined, {
 				synthetic: true,
+				origin: options.origin,
 			});
 		} else {
 			try {
-				await this.session.prompt(planModePrompt, { synthetic: true });
+				await this.session.prompt(planModePrompt, { synthetic: true, origin: options.origin });
 			} catch (error) {
 				if (!(error instanceof AgentBusyError)) throw error;
 				await this.session.followUp(planModePrompt, undefined, {
 					synthetic: true,
+					origin: options.origin,
 				});
 			}
 		}
@@ -7192,6 +7207,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 				images: input?.images,
 				propagateErrors: true,
+				origin: "outside",
 			});
 			return true;
 		}
@@ -7203,13 +7219,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(initialPrompt, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: initialPrompt, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: initialPrompt, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -7254,6 +7273,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 						images: input?.images,
 						propagateErrors: true,
+						origin: "outside",
 					});
 				} finally {
 					this.#vibeSkillInFlight--;
@@ -7275,6 +7295,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(initialPrompt, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
@@ -7286,7 +7307,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#vibeSkillInFlight > 0) return false;
 			const onInput = this.onInputCallback;
 			if (!onInput) return false;
-			onInput(this.startPendingSubmission({ text: initialPrompt, ...input }, { preserveDraft: true }));
+			onInput(
+				this.startPendingSubmission({ text: initialPrompt, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		};
 		if (dispatchViaWaiter()) return true;
@@ -7306,6 +7329,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.session.prompt(initialPrompt, {
 					streamingBehavior: "steer",
 					images,
+					origin: "outside",
 				}),
 			{ imageCount: images?.length ?? 0 },
 		);
@@ -7546,14 +7570,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				initial: rest?.trim() || undefined,
 			});
 			const images = input?.images?.length ? input.images : undefined;
+			// A person's `/guided-goal`: input from outside the session.
 			if (this.session.isStreaming) {
-				await this.session.followUp(kickoff, images, { synthetic: true });
+				await this.session.followUp(kickoff, images, { synthetic: true, origin: "outside" });
 			} else {
 				try {
-					await this.session.prompt(kickoff, images ? { synthetic: true, images } : { synthetic: true });
+					await this.session.prompt(
+						kickoff,
+						images ? { synthetic: true, images, origin: "outside" } : { synthetic: true, origin: "outside" },
+					);
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
-					await this.session.followUp(kickoff, images, { synthetic: true });
+					await this.session.followUp(kickoff, images, { synthetic: true, origin: "outside" });
 				}
 			}
 			return true;
@@ -7702,7 +7730,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#enterGoalMode({ objective, silent: true });
 		if (!this.goalModeEnabled) return;
 		this.#resetGoalContinuationSuppression();
-		await this.session.prompt(objective, { streamingBehavior: "steer" });
+		await this.session.prompt(objective, { streamingBehavior: "steer", origin: "outside" });
 	}
 
 	/** End the `working` hold of `init({ startupRun })` once the command-line prompts are dispatched. */
@@ -7724,13 +7752,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(objective, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: objective, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -7755,13 +7786,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(objective, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: objective, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -8034,6 +8068,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const choice = await choicePromise;
 		if (this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
 		const remote = pending.remote;
+		// A person's pick in the review is input from outside the session; an extension's pick is so only when
+		// the extension says it relays a person's (`ctx.resolvePlanReview(..., { origin: "outside" })`).
+		const pickOrigin: InputOrigin | undefined = remote ? remote.origin : "outside";
 		const closePlanReview = (): void => {
 			this.#hidePlanReview(pending);
 			this.ui.requestRender();
@@ -8108,6 +8145,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
 					reviewOwner: pending,
+					origin: pickOrigin,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
@@ -8124,11 +8162,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
-						const input = this.startPendingSubmission({ text: refinement });
+						const input = this.startPendingSubmission({ text: refinement, origin: pickOrigin });
 						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
 						this.onInputCallback(input);
 					} else {
-						await this.session.prompt(refinement);
+						await this.session.prompt(refinement, { origin: pickOrigin });
 						this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
 				} else {
@@ -9647,7 +9685,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		customInstructions?: string,
 		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
-		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
+		options?: Pick<CompactOptions, "internalGuidance" | "readerModel" | "origin">,
 	): Promise<CompactionOutcome> {
 		return this.#commandController.handleCompactCommand(customInstructions, mode, beforeFlush, options);
 	}

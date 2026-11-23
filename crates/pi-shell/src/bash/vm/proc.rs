@@ -700,6 +700,22 @@ pub enum DeferPhase {
 	Resume,
 }
 
+/// The spawn of the external that gives a background job its `$!` ([`Bang`])
+/// met a program the kernel refuses as busy (`ETXTBSY`), kept by the kernel
+/// ([`super::Kernel::busy`]). bash's forked child is `$!` before its exec,
+/// and the script goes on; here a process that waits for the program itself
+/// takes its place ([`crate::bash::OnBusy::Child`]), so the spawn first
+/// fails at once ([`crate::bash::OnBusy::Fail`]) and the engine renders the
+/// report its refusal would print, for that process to print if the program
+/// stays busy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BusySpawn {
+	/// The refusal is being rendered (its probes may wait).
+	Render,
+	/// Rendered: the spawn asks for the process that waits.
+	Child(crate::bash::OnBusy),
+}
+
 impl Vproc {
 	/// The vproc a pid operand (`kill`, `wait`, `disown`) names here: a
 	/// job's or `$!`'s OS pid maps to its vproc; any other number is taken

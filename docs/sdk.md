@@ -266,11 +266,14 @@ Behavior:
 
 Related APIs:
 
-- `sendUserMessage(content, { deliverAs?, attribution? })`
-- `steer(text, images?, { attribution? })`
-- `followUp(text, images?, { synthetic?, attribution? })`
-- `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`
+- `sendUserMessage(content, { deliverAs?, attribution?, origin? })`
+- `steer(text, images?, { attribution?, origin? })`
+- `followUp(text, images?, { synthetic?, attribution?, origin? })`
+- `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn?, origin? })`
+- `prompt(text, { ..., origin? })`, `resume({ origin? })`
 - `abort()`
+
+`origin: "outside"` marks input that crossed the session's outer boundary: a person, or a harness or RPC client on their behalf. After an OpenAI `cyber_policy` refusal, the session holds every route to an OpenAI model (and to models the catalog cannot classify) for the whole session tree, every model call included; only outside input to the root session ends that hold. Another session tree in the same process is not held; a call the host makes outside every session is held while any tree's hold stands. Unset, input counts as made inside the session (loops, job results, extensions, other agents) and keeps it. The TUI, print mode, RPC and ACP set it on what a person or client sends.
 
 `deliverAs: "aside"` (both APIs) delivers at the next agent step boundary without interrupting the current tool batch, instead of steering (which skips remaining tools) or waiting for the run to finish. The one exception is a running interruptible `wait` or `vibe_wait`, which an aside ends so the message is not delayed behind it. When the session is idle both start a turn instead. In plan mode, or while a user interrupt keeps auto-resume suppressed, the custom message is folded into context without a turn, unless it was sent with `triggerTurn` and no user interrupt came after the send.
 

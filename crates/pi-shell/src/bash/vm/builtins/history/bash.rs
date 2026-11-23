@@ -315,6 +315,13 @@ pub(super) fn file_op(
 	file: Option<&BString>,
 ) -> R {
 	let file = match file {
+		// bash 5.3: an empty file operand names no file (bash 5.2 failed
+		// silently).
+		Some(f) if f.is_empty() => {
+			list.save(&mut ctx.k.root, ctx.cx.store, ctx.vp);
+			ctx.usage("empty filename");
+			return done(1);
+		},
 		Some(f) => Some(f.clone()),
 		None => ctx.scalar(b"HISTFILE")?.filter(|f| !f.is_empty()),
 	};

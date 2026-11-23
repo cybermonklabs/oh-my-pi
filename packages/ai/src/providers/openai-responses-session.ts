@@ -1,5 +1,5 @@
 import { cloneJsonTree, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import type { DispatchHold, RawSseEvent } from "../types";
+import type { Api, DispatchHold, Model, RawSseEvent } from "../types";
 import { sanitizeOpenAIResponsesAssistantHistoryItemsForReplay } from "../utils";
 import { toWebSocketUrl } from "../utils/websocket";
 import { hasOpenAIResponsesGenerationEvidence, readOpenAIResponsesRequestRejection } from "./openai-request-error";
@@ -65,6 +65,8 @@ export class StandardResponsesWebSocketSession {
 			signal: AbortSignal;
 			/** The caller's dispatch hold, awaited before every `response.create` frame this exchange sends. */
 			hold?: DispatchHold;
+			/** The model the request calls: its model-call guards are read before each frame (the first and a resend). */
+			model: Model<Api>;
 			chain: boolean;
 			supportsImageDetailOriginal?: boolean;
 			onSseEvent?: (event: RawSseEvent) => void;
@@ -97,7 +99,7 @@ export class StandardResponsesWebSocketSession {
 				const closedError = this.connection.closedError;
 				if (closedError) throw closedError;
 				for await (const raw of this.connection.streamRequest(
-					{ send: wireRequest, hold: options.hold },
+					{ send: wireRequest, model: options.model, hold: options.hold },
 					{},
 					options.signal,
 					options.onSseEvent,

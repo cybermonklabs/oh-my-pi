@@ -52,9 +52,12 @@ use std::{
 
 use crate::{
 	bash::{ExitStatus, ExtProc, Mark, OsHandle, ProcEvent, Signal},
-	sys::pump::{
-		BUF, BURST, End, PollIo, orphan,
-		os::{self, OsPipe, Timer},
+	sys::{
+		WaitKey,
+		pump::{
+			BUF, BURST, End, PollIo, orphan,
+			os::{self, OsPipe, Timer},
+		},
 	},
 };
 
@@ -409,7 +412,15 @@ impl<'a> Relays<'a> {
 		if self.set.is_empty() {
 			return child;
 		}
-		Box::new(Relayed { child, relays: self.set, status: None })
+		Box::new(Relayed { child, relays: self.set, status: None, orphan_key: WaitKey::default() })
+	}
+
+	/// The set once every relay is attached: without the decoding it
+	/// borrowed, so a spawn that waits for a busy program (Unix) keeps it
+	/// until the child exists.
+	#[cfg(unix)]
+	pub(crate) fn attached(self) -> Relays<'static> {
+		Relays { decoding: None, writers: self.writers, set: self.set }
 	}
 }
 
@@ -417,9 +428,11 @@ impl<'a> Relays<'a> {
 /// drives: its exit is reported once they have forwarded everything it
 /// wrote.
 struct Relayed {
-	child:  Box<dyn ExtProc>,
-	relays: Vec<Relay>,
-	status: Option<ExitStatus>,
+	child:      Box<dyn ExtProc>,
+	relays:     Vec<Relay>,
+	status:     Option<ExitStatus>,
+	/// This poller's wait on the retained [`orphan`] work.
+	orphan_key: WaitKey,
 }
 
 impl ExtProc for Relayed {
@@ -455,7 +468,7 @@ impl ExtProc for Relayed {
 		for relay in &mut self.relays {
 			drained &= relay.drained(cx);
 		}
-		orphan::poll(cx);
+		orphan::poll(cx, &mut self.orphan_key);
 		if drained {
 			Poll::Ready(ProcEvent::Exited(status))
 		} else {
@@ -673,7 +686,12 @@ mod tests {
 		let copy = relays.writers[0].try_clone().unwrap();
 		let Relays { set, writers, .. } = relays;
 		drop(writers);
-		(output, copy, Relayed { child: Box::new(Exited), relays: set, status: None })
+		(output, copy, Relayed {
+			child:      Box::new(Exited),
+			relays:     set,
+			status:     None,
+			orphan_key: WaitKey::default(),
+		})
 	}
 
 	/// What is in the temporary file `output`.

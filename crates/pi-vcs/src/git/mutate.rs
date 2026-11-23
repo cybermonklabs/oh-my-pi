@@ -5461,14 +5461,17 @@ mod tests {
 		assert!(!temp.path().join("untracked.txt").exists(), "`.` selects everything like git");
 	}
 
+	/// The index is read before anything changes: when that read fails, the
+	/// linked worktree keeps its `.git` pointer and its `HEAD`. The index is
+	/// made a directory, which no user can read as a file (root reads a mode
+	/// 000 file), and the worktree sits in a directory of its own, so runs at
+	/// the same time do not share it.
 	#[cfg(unix)]
 	#[test]
 	fn detach_git_dir_does_not_mutate_when_index_snapshot_fails() {
-		use std::os::unix::fs::PermissionsExt;
-
 		let (temp, repo) = fixture();
-		let linked = temp.path().join("../linked-unreadable-index");
-		let _ = fs::remove_dir_all(&linked);
+		let linked_dir = tempfile::tempdir().unwrap();
+		let linked = linked_dir.path().join("linked-unreadable-index");
 		repo
 			.worktree_add(&linked, "main", WorktreeAddOptions {
 				detach:       true,
@@ -5480,19 +5483,23 @@ mod tests {
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
 		let linked_repo = GitRepo::require(&linked).unwrap();
 		let index_path = linked_repo.info().git_dir.join("index");
-		let original_mode = fs::metadata(&index_path).unwrap().permissions().mode();
+		let index = fs::read(&index_path).unwrap();
 		let pointer_before = fs::read(linked.join(".git")).unwrap();
-		fs::set_permissions(&index_path, fs::Permissions::from_mode(0o000)).unwrap();
+		fs::remove_file(&index_path).unwrap();
+		fs::create_dir(&index_path).unwrap();
 
 		let result = detach_git_dir(&linked, &common);
-		fs::set_permissions(&index_path, fs::Permissions::from_mode(original_mode)).unwrap();
-		assert!(matches!(
-			&result,
-			Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied
-		));
+		fs::remove_dir(&index_path).unwrap();
+		fs::write(&index_path, index).unwrap();
+		assert!(
+			matches!(
+				&result,
+				Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::IsADirectory
+			),
+			"the detach did not stop at the index read"
+		);
 		assert_eq!(fs::read(linked.join(".git")).unwrap(), pointer_before);
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), git(&linked, &["rev-parse", "HEAD"]));
-		let _ = fs::remove_dir_all(linked);
 	}
 
 	#[test]

@@ -174,6 +174,7 @@ const streamAzureOpenAIResponsesOnce = (
 					}
 					const handle = await postOpenAIStream<ResponseStreamEvent>({
 						url,
+						model,
 						headers: headersWithTimeout,
 						body: params,
 						signal: guardedRequestSignal,

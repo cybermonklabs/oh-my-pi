@@ -244,16 +244,16 @@ pub struct Script {
 	pub unexport_env:     Vec<BString>,
 	/// On Unix, the host hears of an `exec` replacing the run's vproc that
 	/// the system refuses because the command line is too long (`E2BIG`,
-	/// `ENAMETOOLONG`): the shell prints nothing for it, the run ends with
-	/// status 126, and [`Shell::exec_refusal`] has the error. A callout can
-	/// then retry with fewer arguments (`xargs`). A tool the run calls hears
-	/// of it as well ([`ToolCall::too_long_to_caller`]) and hands such a
-	/// refusal of its own command up the same way ([`CallOutcome::TooLong`]).
-	/// Set it only for a script that runs nothing before that `exec` or tool
-	/// (a callout's generated `exec` of a program, or its call of `timeout`,
-	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`];
-	/// the `exec` of the program `timeout` or `nohup` runs): a retry would
-	/// run all of it again.
+	/// `ENAMETOOLONG`, `ENOMEM`): the shell prints nothing for it, the run
+	/// ends with status 126, and [`Shell::exec_refusal`] has the error. A
+	/// callout can then retry with fewer arguments (`xargs`). A tool the run
+	/// calls hears of it as well ([`ToolCall::too_long_to_caller`]) and hands
+	/// such a refusal of its own command up the same way
+	/// ([`CallOutcome::TooLong`]). Set it only for a script that runs nothing
+	/// before that `exec` or tool (a callout's generated `exec` of a program,
+	/// or its call of `timeout`, `nohup`, `env` or `ifne`, in a subshell with
+	/// [`Script::as_program`]; the `exec` of the program `timeout` or `nohup`
+	/// runs): a retry would run all of it again.
 	pub too_long_to_host: bool,
 	/// With [`Script::too_long_to_host`], the host hears of every other
 	/// refusal of that `exec` too (`EACCES`, `ENOENT` of a `#!` interpreter,
@@ -416,9 +416,9 @@ pub enum CallOutcome {
 	Error(BString),
 	/// For a call with [`ToolCall::too_long_to_caller`]: the system refused
 	/// the tool's command as too long with this error (`E2BIG`,
-	/// `ENAMETOOLONG`). The calling run hears of it as of its own refused
-	/// `exec`: status 126, nothing printed, and [`Shell::exec_refusal`] has
-	/// the error.
+	/// `ENAMETOOLONG`, `ENOMEM`). The calling run hears of it as of its own
+	/// refused `exec`: status 126, nothing printed, and
+	/// [`Shell::exec_refusal`] has the error.
 	TooLong(i32),
 }
 
@@ -572,6 +572,10 @@ pub struct Kernel {
 	/// Pruned there once no vproc carries the label; not imaged (callouts
 	/// do not survive a restore).
 	pub callout_labels:     Vec<(u32, Vpid)>,
+	/// The root's background jobs (their vpids) as its current script
+	/// started: an earlier script's work, which a cancel of this one spares
+	/// (`Shell::apply_requests`). Set at every root run start; not imaged.
+	pub prior_jobs:         Vec<Vpid>,
 	/// The last root run that `exit` or `set -e` ended
 	/// ([`Shell::ended_by_exit`]); not imaged.
 	pub exited:             Option<RunId>,
@@ -607,6 +611,10 @@ pub struct Kernel {
 	/// Background jobs' lone commands whose redirections wait for their name
 	/// to resolve ([`proc::Deferral`]): imaged (a restored command goes on).
 	pub deferrals:          Vec<proc::Deferral>,
+	/// The externals that give background jobs their `$!` whose program
+	/// was busy ([`proc::BusySpawn`]), by deciding vproc; not imaged (a
+	/// restored spawn meets the busy program again).
+	pub busy:               Vec<(Vpid, proc::BusySpawn)>,
 	/// Job control of the interactive shell (process groups, the
 	/// terminal, stop events); not imaged.
 	pub jobctl:             jobctl::JobCtl,
@@ -706,6 +714,7 @@ impl Kernel {
 			clock: None,
 			null_input: None,
 			callout_labels: Vec::new(),
+			prior_jobs: Vec::new(),
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
@@ -716,8 +725,16 @@ impl Kernel {
 			pid_owners: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
+			busy: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
 		}
+	}
+
+	/// Record the root's background jobs as earlier scripts' work
+	/// ([`Kernel::prior_jobs`]), as a root script is about to start.
+	pub fn note_prior_jobs(&mut self, root: &Vproc) {
+		self.prior_jobs.clear();
+		self.prior_jobs.extend(root.jobs.iter().map(|job| job.vpid));
 	}
 
 	/// The redirections `vproc`'s command leaves to the process it spawns,
@@ -742,6 +759,9 @@ impl Kernel {
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
 	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
 	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
+		if !self.busy.is_empty() {
+			self.busy.retain(|(v, _)| *v != vproc);
+		}
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
 			return;
 		};
@@ -774,15 +794,25 @@ impl Kernel {
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
-	/// the store alone never reuses one).
+	/// the store alone never reuses one). The caller checked
+	/// [`Self::vpids_left`]: none is given past [`Vpid::CEILING`], and the
+	/// counter never wraps into numbers an OS pid can take.
 	pub fn vpid(&mut self, store: &mut dyn StateStore) -> Vpid {
+		debug_assert!(self.next_vpid <= Vpid::CEILING, "no vpid left: the caller checks vpids_left");
 		let v = Vpid(self.next_vpid);
-		self.next_vpid += 1;
+		self.next_vpid = self.next_vpid.saturating_add(1);
 		self.written_vpid = self.next_vpid;
 		self
 			.root
 			.set_misc(store, MiscKey::NextVpid, self.next_vpid.to_string());
 		v
+	}
+
+	/// Vpids still to give ([`Vpid::CEILING`] is the last): a command that
+	/// needs more fails before it builds anything, as bash's does when it
+	/// cannot fork ([`exec::fork_failed`]).
+	pub const fn vpids_left(&self) -> u32 {
+		(Vpid::CEILING + 1).saturating_sub(self.next_vpid)
 	}
 
 	/// Write `unit`'s blob ([`BlobSlot::Unit`](crate::bash::store::BlobSlot))
@@ -1608,12 +1638,25 @@ impl Shell {
 	/// # Errors
 	///
 	/// [`ShellError::UnknownOption`] for an option name bash does not know;
+	/// [`ShellError::VpidBase`] for a vpid base an OS pid can take;
+	/// [`ShellError::VpidBaseAtCeiling`] for one that leaves no vpid for a
+	/// child;
 	/// [`ShellError::Store`] when the store fails.
 	pub fn create(
 		engine: &Arc<Engine>,
 		cx: &mut Cx<'_>,
 		init: ShellInit,
 	) -> Result<Self, ShellError> {
+		let base = engine.config().vpid_base;
+		if let Some(limit) = crate::bash::os_pid_limit()
+			&& base < limit
+		{
+			return Err(ShellError::VpidBase { base, limit });
+		}
+		// The shell takes the base; a child needs a vpid above it.
+		if base >= Vpid::CEILING {
+			return Err(ShellError::VpidBaseAtCeiling { base });
+		}
 		let shell_pid = if init.shell_pid == 0 {
 			cx.host.shell_pid()
 		} else {
@@ -1866,6 +1909,12 @@ impl Shell {
 			VprocSel::NewSubshell => None,
 			VprocSel::NewSubshellWithStdio(stdio) => Some(stdio),
 		};
+		// No vpid left ([`Vpid::CEILING`]): the run ends at once with bash's
+		// fork-failure status, and nothing is built.
+		if self.k.vpids_left() == 0 {
+			self.k.done.push_back((id, 254));
+			return id;
+		}
 		let mut edits = ForkEdits {
 			env:          script.env,
 			foreign_env:  script.foreign_env,
@@ -1917,9 +1966,13 @@ impl Shell {
 		};
 		let parent_vpid = p.vpid;
 		// Written as `MiscKey::NextVpid` before the next step returns
-		// (`Kernel::sync_root`).
+		// (`Kernel::sync_root`). The caller checked `vpids_left`.
+		debug_assert!(
+			self.k.next_vpid <= Vpid::CEILING,
+			"no vpid left: the caller checks vpids_left"
+		);
 		let vpid = Vpid(self.k.next_vpid);
-		self.k.next_vpid += 1;
+		self.k.next_vpid = self.k.next_vpid.saturating_add(1);
 		let parent_lineage = self.procs[parent].lineage;
 		let mut vp = Vproc::new(vpid, Some(parent_vpid), fds, cwd, Some(Image::default()), true);
 		vp.lineage = lineage.unwrap_or(parent_lineage);
@@ -2244,9 +2297,22 @@ impl Shell {
 		if req & CANCEL != 0 {
 			let sig = self.k.ctl.cancel_signal();
 			let status = sig.exit_status(self.k.engine.config().platform);
+			if self.procs[0].runs.front().is_some_and(|run| !run.started) {
+				// The cancelled script has not started: it started no job.
+				self.k.note_prior_jobs(&self.procs[0]);
+			}
+			// A detached tree (`nohup`) outlives the cancellation, and so does
+			// a background job an earlier script left running: it is no part
+			// of the cancelled command, as bash's interrupt reaches only the
+			// foreground job.
+			let spared: Vec<Vpid> = self
+				.procs
+				.iter()
+				.filter(|p| p.lineage.detached || self.in_prior_job(p.vpid))
+				.map(|p| p.vpid)
+				.collect();
 			for i in (0..self.procs.len()).rev() {
-				// A detached tree (`nohup`) outlives the cancellation.
-				if self.procs[i].lineage.detached {
+				if spared.contains(&self.procs[i].vpid) {
 					continue;
 				}
 				let key = crate::bash::store::TrapKey::Signal(sig);
@@ -2285,13 +2351,7 @@ impl Shell {
 					self.kill(cx, i, sig, status);
 				}
 			}
-			// Calls of the cancelled vprocs are void; a detached tree's go on.
-			let detached: Vec<Vpid> = self
-				.procs
-				.iter()
-				.filter(|p| p.lineage.detached)
-				.map(|p| p.vpid)
-				.collect();
+			// Calls of the cancelled vprocs are void; the spared ones' go on.
 			let kept: Vec<CallId> = self
 				.k
 				.results
@@ -2300,13 +2360,13 @@ impl Shell {
 				.filter(|&id| {
 					self
 						.awaiting(id)
-						.is_some_and(|i| detached.contains(&self.procs[i].vpid))
+						.is_some_and(|i| spared.contains(&self.procs[i].vpid))
 				})
 				.collect();
 			self
 				.k
 				.calls_out
-				.retain(|(_, call)| detached.contains(&call.vpid));
+				.retain(|(_, call)| spared.contains(&call.vpid));
 			self.k.results.retain(|id, _| kept.contains(id));
 			self.k.paused = false;
 		}
@@ -2412,6 +2472,28 @@ impl Shell {
 			}
 		}
 		hits.sort_unstable();
+	}
+
+	/// Whether `vpid` runs in a background job an earlier root script
+	/// started ([`Kernel::prior_jobs`]): it leads one or descends from one.
+	fn in_prior_job(&self, mut vpid: Vpid) -> bool {
+		if self.k.prior_jobs.is_empty() {
+			return false;
+		}
+		loop {
+			if self.k.prior_jobs.contains(&vpid) {
+				return true;
+			}
+			let Some(parent) = self
+				.procs
+				.iter()
+				.find(|p| p.vpid == vpid)
+				.and_then(|p| p.parent)
+			else {
+				return false;
+			};
+			vpid = parent;
+		}
 	}
 
 	/// Whether `vpid` belongs to the job rooted at `root`, excluding nested

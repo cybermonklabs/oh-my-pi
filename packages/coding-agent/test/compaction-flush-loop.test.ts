@@ -122,7 +122,7 @@ describe("flushCompactionQueue loop parking", () => {
 
 		await new UiHelpers(ctx).flushCompactionQueue({ willRetry: false });
 
-		expect(prompt).toHaveBeenCalledWith("/void-cmd");
+		expect(prompt).toHaveBeenCalledWith("/void-cmd", { origin: "outside" });
 		expect(pauseLoop).toHaveBeenCalledTimes(1);
 		expect(getLoopPrompt()).toBeUndefined();
 	});

@@ -4320,10 +4320,7 @@ export class ModelRegistry {
 			}
 			if (ctx.error !== undefined || resolvedApiKeyBearer(resolved) !== undefined) return resolved;
 			if (this.retriesFailedCommandKey(provider)) {
-				throw new ApiKeyCommandError(
-					provider,
-					commandFailureRetryAfterMs(this.#customProviderApiKeys.get(provider)),
-				);
+				throw new ApiKeyCommandError(provider, await this.commandKeyRetryAfterMs(provider));
 			}
 			const outage = await this.#storedCredentialsOutage(provider, sessionId, ctx.signal);
 			if (outage !== undefined) {
@@ -4335,6 +4332,14 @@ export class ModelRegistry {
 			}
 			return resolved;
 		};
+	}
+	/**
+	 * The remaining failure backoff for a configured `!command` API key. Mirrors ask their
+	 * owner because main runs the command and owns its failure map.
+	 */
+	async commandKeyRetryAfterMs(provider: string): Promise<number | undefined> {
+		if (this.#owner) return this.#owner.commandKeyRetryAfterMs(provider);
+		return commandFailureRetryAfterMs(this.#customProviderApiKeys.get(provider));
 	}
 
 	async #peekApiKeyForProvider(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
@@ -4783,6 +4788,8 @@ export class ModelRegistry {
 export interface ModelRegistryOwner {
 	/** Drop the owner's cached `!command` results for `provider` (every provider when omitted). */
 	invalidateCommandConfigs(provider?: string): void;
+	/** {@link ModelRegistry.commandKeyRetryAfterMs} on the owner. */
+	commandKeyRetryAfterMs(provider: string): Promise<number | undefined>;
 	/** {@link ModelRegistry.refresh} on the owner. */
 	refresh(strategy: ModelRefreshStrategy, options?: ModelRegistryRefreshOptions): Promise<void>;
 	/** {@link ModelRegistry.refreshProvider} on the owner. */

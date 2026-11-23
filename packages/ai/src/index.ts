@@ -14,6 +14,7 @@ export * from "./speech";
 export * from "./transcription";
 export * from "./video";
 export * from "./oneshot-retry";
+export { addModelCallGuard, type ModelCallGuard, ModelCallRefusedError, runInModelCallScope } from "./model-call-guard";
 export * from "./provider-details";
 export * from "./provider-session-state";
 // Provider-specific runtime APIs are imported from their providers/* subpaths.

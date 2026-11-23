@@ -7,7 +7,7 @@ import {
 	type RawHttpRequestDump,
 } from "../utils/http-inspector";
 import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
-import { classify, classifyMessage, status } from "./flags";
+import { classify, classifyMessage, isCyberPolicyRefusal, status } from "./flags";
 import { formatDisplayMessage } from "./format";
 
 /** Context a provider catch block hands to {@link finalize}. */
@@ -84,6 +84,11 @@ export async function finalize(error: unknown, opts: FinalizeOptions = {}): Prom
 		}
 	} catch {
 		message = error instanceof Error ? error.message : String(error);
+	}
+	// The stream driver and the session's recovery read the refusal from this text alone, and a
+	// provider's own wording (Codex, Azure) can leave the `cyber_policy` code out of it.
+	if (!isCyberPolicyRefusal(message) && isCyberPolicyRefusal(error)) {
+		message = `${message} (code=cyber_policy)`;
 	}
 
 	// A captured status is transport context for the original error. Put it at

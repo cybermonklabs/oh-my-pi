@@ -33,6 +33,15 @@ pub(crate) type Handle = OwnedFd;
 pub(crate) const WORKERS: usize = sys::WORKERS;
 
 const DIR_FLAGS: c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+/// A directory opened only to reach what is below it: to open its children
+/// relative to it and to identify it, never to list it. On Linux `O_PATH`
+/// needs only search permission on it, as an open through a handle already
+/// held needs; elsewhere the open needs read permission as a listing open
+/// does.
+#[cfg(target_os = "linux")]
+const SEARCH_FLAGS: c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const SEARCH_FLAGS: c_int = DIR_FLAGS;
 /// `O_NONBLOCK`: a FIFO posing as a regular file must not block the open
 /// before `fstat` rejects it.
 const FILE_FLAGS: c_int = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
@@ -148,6 +157,13 @@ pub(crate) fn open_dir(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
 	sys::openat(libc::AT_FDCWD, path, DIR_FLAGS)
 }
 
+/// Opens the directory at `path` to reach what is below it, following
+/// symlinks ([`SEARCH_FLAGS`]).
+pub(crate) fn open_dir_to_search(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
+	let path = s.cstr(path.as_os_str().as_bytes())?;
+	sys::openat(libc::AT_FDCWD, path, SEARCH_FLAGS)
+}
+
 /// Opens the directory at `path` without following a symlink that is its
 /// final component ([`sys::openat_dir`]).
 pub(crate) fn open_dir_unlinked(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
@@ -162,11 +178,12 @@ pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::R
 	sys::openat_dir(parent.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
 }
 
-/// Opens the directory `..` of `child`: its parent while `child` is where
-/// it was listed. The caller checks the result's identity.
+/// Opens the directory `..` of `child` to reach what is below it
+/// ([`SEARCH_FLAGS`]): its parent while `child` is where it was listed. The
+/// caller checks the result's identity.
 pub(crate) fn open_parent(s: &mut Scratch, child: &Handle) -> io::Result<Handle> {
 	let dotdot = s.cstr(b"..")?;
-	sys::openat_dir(child.as_raw_fd(), dotdot, DIR_FLAGS | libc::O_NOFOLLOW)
+	sys::openat_dir(child.as_raw_fd(), dotdot, SEARCH_FLAGS | libc::O_NOFOLLOW)
 }
 
 pub(crate) fn list(
@@ -215,6 +232,16 @@ pub(crate) fn open_file_beneath(
 /// symlink on the way ([`sys::open_beneath`]).
 pub(crate) fn open_dir_beneath(s: &mut Scratch, root: &Handle, rel: &[u8]) -> io::Result<Handle> {
 	sys::open_beneath(s, root.as_raw_fd(), rel, DIR_FLAGS | libc::O_NOFOLLOW)
+}
+
+/// Opens the directory at the walk-relative `rel` below `root` to reach
+/// what is below it ([`SEARCH_FLAGS`]), following no symlink on the way.
+pub(crate) fn open_dir_beneath_to_search(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+) -> io::Result<Handle> {
+	sys::open_beneath(s, root.as_raw_fd(), rel, SEARCH_FLAGS | libc::O_NOFOLLOW)
 }
 
 /// Rewrites the regular file at the walk-relative `rel` below `root` in place
@@ -290,20 +317,27 @@ pub(crate) fn open_beneath_walking(
 /// when `flags` carry `O_DIRECTORY`, with [`sys::openat_dir`] relative to the
 /// one before, which opens no symlink (`ENOTDIR`); a last component that is
 /// not a directory with `flags`, which carry `O_NOFOLLOW` (`ELOOP` for a
-/// symlink). At most two descriptors are open at once, the directory reached
-/// and the next one.
+/// symlink). A directory on the way opens as a search-only last component
+/// does ([`SEARCH_FLAGS`]) when the last one does, else as a listing would.
+/// At most two descriptors are open at once, the directory reached and the
+/// next one.
 pub(super) fn walk_beneath(
 	s: &mut Scratch,
 	dir: RawFd,
 	rel: &[u8],
 	flags: c_int,
 ) -> io::Result<OwnedFd> {
+	let step = if flags & !libc::O_NOFOLLOW == SEARCH_FLAGS {
+		SEARCH_FLAGS
+	} else {
+		DIR_FLAGS
+	};
 	let mut reached: Option<OwnedFd> = None;
 	let mut rest = rel;
 	while let Some(slash) = memchr::memchr(b'/', rest) {
 		let name = s.cstr(&rest[..slash])?;
 		let at = reached.as_ref().map_or(dir, AsRawFd::as_raw_fd);
-		reached = Some(sys::openat_dir(at, name, DIR_FLAGS | libc::O_NOFOLLOW)?);
+		reached = Some(sys::openat_dir(at, name, step | libc::O_NOFOLLOW)?);
 		rest = &rest[slash + 1..];
 	}
 	let name = s.cstr(rest)?;

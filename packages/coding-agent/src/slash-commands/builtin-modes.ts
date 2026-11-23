@@ -710,15 +710,19 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			// Same delivery as /guided-goal: the kickoff is a hidden developer message queued behind
 			// any in-flight run; the agent's batched `ask` is the first thing the user sees.
 			const images = runtime.input?.images?.length ? runtime.input.images : undefined;
+			// A person's `/ratchet`: input from outside the session.
 			if (session.isStreaming) {
-				await session.followUp(armed.kickoff, images, { synthetic: true });
+				await session.followUp(armed.kickoff, images, { synthetic: true, origin: "outside" });
 				return;
 			}
 			try {
-				await session.prompt(armed.kickoff, images ? { synthetic: true, images } : { synthetic: true });
+				await session.prompt(
+					armed.kickoff,
+					images ? { synthetic: true, images, origin: "outside" } : { synthetic: true, origin: "outside" },
+				);
 			} catch (error) {
 				if (!(error instanceof AgentBusyError)) throw error;
-				await session.followUp(armed.kickoff, images, { synthetic: true });
+				await session.followUp(armed.kickoff, images, { synthetic: true, origin: "outside" });
 			}
 		},
 	},

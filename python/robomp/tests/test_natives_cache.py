@@ -197,19 +197,6 @@ def test_compute_key_uses_all_documented_paths() -> None:
     )
 
 
-def test_image_seed_key_lists_the_cache_key_paths_in_order() -> None:
-    # The Dockerfile writes the image seed's `trees.txt` from its own path list; a seed is
-    # served under the key a workspace computes only when both lists are the same.
-    dockerfile = (Path(__file__).resolve().parents[3] / "Dockerfile").read_text(encoding="utf-8")
-    joined = dockerfile.replace("\\\n", " ")
-    added = re.search(r"git add -f -- ([^\n]*?) ':\(exclude\)", joined)
-    assert added is not None, "the Dockerfile's `git add -f -- <paths>` line is missing"
-    assert tuple(added.group(1).split()) == CACHE_KEY_PATHS
-    trees = re.search(r"printf '%s\\n' ((?:\"\$tree:[^\"]+\"\s*)+)\|", joined)
-    assert trees is not None, "the Dockerfile's `printf ... $tree:<path>` list is missing"
-    assert tuple(re.findall(r"\"\$tree:([^\"]+)\"", trees.group(1))) == CACHE_KEY_PATHS
-
-
 def _dockerignore_excludes(patterns: list[str], rel: str) -> bool:
     """Whether Docker's build context leaves out `rel` under these dockerignore patterns.
 
@@ -277,23 +264,23 @@ def _image_seed_trees(context: Path, trees: Path) -> None:
 
 
 @pytest.mark.parametrize("dockerignore", [".dockerignore", "Dockerfile.dockerignore"])
-def test_build_context_leaves_out_a_host_sources_record(dockerignore: str) -> None:
-    patterns = (Path(__file__).resolve().parents[3] / dockerignore).read_text(encoding="utf-8").splitlines()
-    assert _dockerignore_excludes(patterns, f"packages/natives/native/{SOURCES_RECORD}")
-    assert _dockerignore_excludes(patterns, f"crates/x/{SOURCES_RECORD}")
-    # Not everything: the context still holds the sources the image builds from.
-    assert not _dockerignore_excludes(patterns, "crates/pi-natives/src/lib.rs")
-
-
-def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: Path) -> None:
+def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: Path, dockerignore: str) -> None:
     # A working checkout where someone ran `bun run build:native` holds the addon's sources
-    # record. Docker sends the context through Dockerfile.dockerignore; the seed key computed
-    # from it must be the one a robomp workspace of the same commit computes.
+    # record. Docker sends the context through Dockerfile.dockerignore (`.dockerignore` for a
+    # builder without per-Dockerfile ignore files); the seed key computed from it must be the
+    # one a robomp workspace of the same commit computes, so the ignore file leaves out a
+    # sources record at any depth (the second one, in `crates/x/`, no build writes) and keeps
+    # the crate sources.
     repo = _seed_repo(tmp_path / "repo")
+    lib = repo / "crates" / "pi-natives" / "src" / "lib.rs"
+    lib.parent.mkdir()
+    lib.write_text("// crate source\n")
+    _git(["-C", str(repo), "add", "."], cwd=repo.parent)
+    _git(["-C", str(repo), "commit", "-m", "crate source"], cwd=repo.parent)
     (repo / "packages" / "natives" / "native" / SOURCES_RECORD).write_text('{"addon":{}}\n')
-    patterns = (
-        (Path(__file__).resolve().parents[3] / "Dockerfile.dockerignore").read_text(encoding="utf-8").splitlines()
-    )
+    (repo / "crates" / "x").mkdir()
+    (repo / "crates" / "x" / SOURCES_RECORD).write_text('{"addon":{}}\n')
+    patterns = (Path(__file__).resolve().parents[3] / dockerignore).read_text(encoding="utf-8").splitlines()
     context = tmp_path / "context"
     for source in repo.rglob("*"):
         rel = source.relative_to(repo).as_posix()

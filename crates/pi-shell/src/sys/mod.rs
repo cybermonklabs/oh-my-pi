@@ -27,6 +27,8 @@
 pub mod cmdline;
 #[cfg(windows)]
 pub mod console;
+#[cfg(target_os = "macos")]
+pub(crate) mod fifo_pair;
 mod fs;
 mod fs_ops;
 #[cfg(any(windows, test))]
@@ -44,6 +46,8 @@ mod ready;
 pub mod regex;
 mod relay;
 pub mod rlimit;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod room;
 pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
@@ -52,6 +56,7 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
 #[cfg(not(unix))]
 pub(crate) use fs::BLOCKING_WRITE_CHUNK;
@@ -67,8 +72,9 @@ pub use crate::sys::{
 	park::Parker,
 	relay::{ByteDecoder, OutputDecoding},
 	spawn::{Exits, Leftover, NativeSpawner, Sessions, SpawnConfig, dispositions_changed},
+	wakers::{WaitKey, Wakers},
 };
-pub(crate) use crate::sys::{pump::End, relay::Relays};
+pub(crate) use crate::sys::{pump::End, relay::Relays, spawn::Started};
 
 /// The C library's `PATH_MAX`, which zsh sizes path buffers by. Windows has
 /// no such limit for the engine's paths, so it takes Linux's.

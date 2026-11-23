@@ -390,6 +390,49 @@ pub struct SpawnSpec<'a> {
 	/// has no such process). `None` for every other spawn. Hosts that
 	/// cannot do this on their platform fail the spawn with `Unsupported`.
 	pub ctty:        Option<OsHandle>,
+	/// What the host does with a program the kernel refuses as busy
+	/// (`ETXTBSY`: a process holds it open for writing) ([`OnBusy`]).
+	pub on_busy:     OnBusy,
+}
+
+/// What a host does with a program the kernel refuses to run because a
+/// process holds it open for writing (`ETXTBSY`) ([`SpawnSpec::on_busy`]).
+///
+/// Shell sessions that are threads of one process meet this when one
+/// writes a program while another forks: the child holds a copy of the
+/// write descriptor until its own exec. A host tries such a program again
+/// after waits of about 1 s in all, then fails with `ETXTBSY`, as at once
+/// before; a host whose kernel never refuses a busy program ignores this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum OnBusy {
+	/// The spawn completes once the program ran, or its waits ran out.
+	#[default]
+	Retry,
+	/// The spawn fails with `ETXTBSY` at once, without waiting. The engine
+	/// asks this for the external that gives a background job its `$!`:
+	/// it renders the report a refusal would print, then asks again with
+	/// [`OnBusy::Child`].
+	Fail,
+	/// The spawn returns once a process exists that tries the program
+	/// again itself, as bash's forked child is `$!` before its exec: the
+	/// script goes on, and only a use of the job (`wait $!`) waits for the
+	/// tries. The process holds only the descriptors the program gets
+	/// while it waits. When its last try still finds the program busy it
+	/// writes `report` to its fd 2 and exits with `status`; any other exec
+	/// failure is reported as a [`ChildRedirs`] exec failure, with
+	/// `exec_diag`. A host spawns a possible shell text file (no `#!`, no
+	/// NUL in its first line) as for [`OnBusy::Retry`]: its exec may yet
+	/// fail with `ENOEXEC`, which the engine runs as a script, and a process
+	/// already returned could not.
+	Child {
+		/// What the engine prints when the program stays busy, newline
+		/// included.
+		report:    BString,
+		/// The status of the command then.
+		status:    u8,
+		/// What precedes the description of any other exec failure.
+		exec_diag: BString,
+	},
 }
 
 /// The redirections a spawned process applies itself ([`SpawnSpec::redirs`]).
@@ -404,10 +447,11 @@ pub struct SpawnSpec<'a> {
 /// opens (or the exec) to complete. The process applies `list` in order;
 /// when an entry fails it writes that entry's `diag`, the error's
 /// description (`strerror`) and a newline to its fd 2 and exits with
-/// status 1. When the exec fails it writes `exec_diag`, the description and
-/// a newline and exits with 127 (not found) or 126 (any other error), as
-/// bash's child does. The engine's `ENOEXEC` fallback cannot run after this
-/// return; a host may refuse the deferred spawn to let the engine apply the
+/// status 1 ([`ChildRedir::Fail`]: its `text`), and applies none after it.
+/// When the exec fails it writes `exec_diag`, the description and a newline
+/// and exits with 127 (not found) or 126 (any other error), as bash's child
+/// does. The engine's `ENOEXEC` fallback cannot run after this return; a
+/// host may refuse the deferred spawn to let the engine apply the
 /// redirections and retry when the executable may need that fallback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildRedirs {
@@ -447,6 +491,18 @@ pub enum ChildRedir {
 	Close {
 		/// The fd closed.
 		fd: i32,
+	},
+	/// A redirection the engine found bad: a dup of, or `/dev/fd/N` naming,
+	/// no fd of the process (`3<&9` with fd 9 closed; the process must not
+	/// take the host's own fd 9), or a target that is no single word. Write
+	/// `text` (`bash: line 1: 9: Bad file descriptor`, the newline included)
+	/// to fd 2 and exit with status 1. bash's child fails such a
+	/// redirection in its place in the list, after the ones before it, so an
+	/// open of a FIFO before it still opens, and the FIFO's other end sees
+	/// the process come and go.
+	Fail {
+		/// The whole message.
+		text: BString,
 	},
 }
 
@@ -644,6 +700,34 @@ pub trait PipeMirror: Send + Sync {
 	/// Called once.
 	fn close(&self);
 }
+
+/// A host's feed of an engine pipe's read end into an OS pipe that
+/// externals read ([`FdRef::attach_feed`](crate::bash::FdRef::attach_feed)).
+///
+/// bash's shell and its children read one kernel pipe; here the feed's pump
+/// moves the engine pipe's bytes into an OS pipe for the children, and the
+/// shell's own reads of the pipe come through the feed first, so they take
+/// the bytes in the order the pump took them, whoever reads first.
+pub(crate) trait FeedRead: Send + Sync {
+	/// The shell reads the pipe this feed fills: what the feed's OS pipe
+	/// holds, or `Pending` while the pump holds bytes it took from the
+	/// engine pipe and has not written yet (it is advanced, and `cx` woken
+	/// once they can be read). When the feed holds nothing, `next` reads on
+	/// (the pipe's next feed, then the engine pipe itself) under this feed's
+	/// lock, so no holder's poll of the pump, on any thread, moves the
+	/// engine pipe's bytes before `next` has read them. An empty `buf` asks
+	/// readiness: `Ok(0)` while the feed holds bytes, else `next`'s answer.
+	fn poll_read_through(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		next: &mut ReadOn<'_>,
+	) -> Poll<io::Result<usize>>;
+}
+
+/// The rest of a read ([`FeedRead::poll_read_through`]): into the buffer,
+/// `Ok(0)` at end of file.
+pub(crate) type ReadOn<'a> = dyn FnMut(&mut Context<'_>, &mut [u8]) -> Poll<io::Result<usize>> + 'a;
 
 /// How an external process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

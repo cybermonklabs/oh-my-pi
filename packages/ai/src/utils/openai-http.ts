@@ -17,10 +17,11 @@
 import { fetchWithRetry, readSseJsonOrText, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { OpenAIHttpError } from "../error";
+import { guardedRequestUrl } from "../model-call-guard";
 
 export { OpenAIHttpError };
 
-import type { FetchImpl } from "../types";
+import type { Api, FetchImpl, Model } from "../types";
 import type { CapturedHttpErrorResponse } from "./http-inspector";
 import { getShouldRetryFromHeaders } from "./retry-after";
 
@@ -64,6 +65,8 @@ function isConcurrencyAdmissionRejection(response: Response, bodyText: string): 
 
 export interface OpenAIStreamRequestInit {
 	url: string;
+	/** The model the request is for: each resend reads the model-call guards again first. */
+	model: Model<Api>;
 	headers: Record<string, string>;
 	/** JSON request body; serialized once per call (retries resend the same bytes). */
 	body: unknown;
@@ -101,7 +104,10 @@ export interface OpenAIStreamHandle<TEvent> {
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
 	let response: Response;
 	try {
-		response = await fetchWithRetry(init.url, {
+		// Every attempt reads the model-call guards first: the first one (a provider-level retry, a fallback or
+		// a replay-safe stream retry calls this again after its own wait) and each retry after a backoff. The
+		// URL callback runs outside `fetchWithRetry`'s retry, so a held attempt leaves here unretried.
+		response = await fetchWithRetry(guardedRequestUrl(init.model, init.url), {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
 			body: JSON.stringify(init.body),
@@ -112,10 +118,12 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			// under the removed SDK client. A proxy concurrency-admission 429
 			// (`rate_limit_type: max_parallel_requests`) surfaces immediately instead of
 			// being slept-and-retried here; session recovery owns its backoff/fallback
-			// (issue #8854).
+			// (issue #8854). An OpenAI `cyber_policy` refusal, even one a gateway relays
+			// as a 5xx, is never sent again: each copy adds to the organization's record.
 			shouldRetryResponse: async (response, bodyText) =>
 				getShouldRetryFromHeaders(response.headers) !== false &&
 				!isConcurrencyAdmissionRejection(response, bodyText) &&
+				!AIError.isCyberPolicyRefusal(bodyText) &&
 				(init.shouldRetryResponse === undefined || (await init.shouldRetryResponse(response, bodyText))),
 			// Bun's native fetch enforces a hard ~300s pre-response timeout (issue #2422).
 			// Cold large-context streams legitimately exceed it; the caller's

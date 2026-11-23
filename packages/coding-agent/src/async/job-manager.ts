@@ -2,6 +2,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { IrcBus } from "../irc/bus";
 import type { JobWidgetInputs, JobWidgetRegistry } from "../job-widgets/types";
@@ -81,6 +82,12 @@ export interface AsyncJobDetails extends Record<string, unknown> {
 	images?: ImageContent[];
 	/** Tool output metadata needed when a completion is delivered or recovered later. */
 	meta?: OutputMeta;
+	/**
+	 * The subagents whose results the job's own result hands over (a work pool's workers): its
+	 * delivery, a `wait` snapshot and a kill's report name them, so `omp --restore` knows the owner
+	 * holds their results once it took the job's.
+	 */
+	agentResults?: EvalHeldAgentResult[];
 }
 
 /**

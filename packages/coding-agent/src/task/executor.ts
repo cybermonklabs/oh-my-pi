@@ -101,9 +101,11 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import {
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
+	type RestoreSkippedCalls,
 	type TurnAbortKind,
 	turnAbortKind,
 } from "../session/exit-diagnostics";
@@ -460,6 +462,8 @@ export interface ExecutorOptions {
 	cwd: string;
 	/** Cost gate of the parent session tree; the subagent's requests count toward it. */
 	costGate?: CostGateApi;
+	/** Cyber-policy closure of the parent session tree: a refusal anywhere in the tree closes OpenAI's routes to all of it. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
@@ -486,6 +490,13 @@ export interface ExecutorOptions {
 	index: number;
 	id: string;
 	parentToolCallId?: string;
+	/**
+	 * The parent's top-level tool call this spawn was requested under: the `task` call, or the
+	 * `eval` call whose cell made it (a bridged `tool.task`, `agent()`, a work pool's worker).
+	 * Recorded in the child's `session_init` so `omp --restore` can tell which cut-off call
+	 * started a subagent it relaunches.
+	 */
+	spawnCallId?: string;
 	/**
 	 * Spawn runs as a detached background job (parent turn not blocked on it).
 	 * Rides the subagent lifecycle/progress payloads so HUD-style surfaces can
@@ -2666,9 +2677,11 @@ async function driveSessionToResult(
 		onPromptBusy?: () => Promise<void>;
 		/** Go on with the interrupted turn instead of sending `task`, which only labels the run. */
 		restore?: boolean;
+		/** With {@link restore}: the cut-off calls not to run again, each with the subagents it started ({@link RestoreSkippedCalls}). */
+		restoreSkipped?: RestoreSkippedCalls;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore } = options;
+	const { solutionSpace, onPromptBusy, restore, restoreSkipped } = options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2758,7 +2771,7 @@ async function driveSessionToResult(
 			let promptAttempts = 0;
 			for (;;) {
 				try {
-					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
+					if (restore) await awaitAbortable(session.restoreInterruptedTurn(restoreSkipped));
 					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
 				} catch (error) {
@@ -3992,6 +4005,11 @@ export interface FollowUpTurnOptions {
 	 * `message` (`omp --restore`: {@link AgentSession.restoreInterruptedTurn}).
 	 */
 	restore?: boolean;
+	/**
+	 * With {@link restore}: the cut-off calls of the interrupted turn that started subagents, each
+	 * with their ids ({@link RestoreSkippedCalls}); the turn does not run those calls again.
+	 */
+	restoreSkipped?: RestoreSkippedCalls;
 	index?: number;
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
@@ -4201,6 +4219,7 @@ async function driveFollowUpTurn(
 			outcome = await driveSessionToResult(session, monitor, message, {
 				structured,
 				restore: options.restore,
+				restoreSkipped: options.restoreSkipped,
 				onPromptBusy: async () => {
 					attemptUnsubscribe();
 					logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
@@ -5215,6 +5234,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				options: {
 					cwd: effectiveCwd,
 					costGate: options.costGate,
+					cyberPolicyClosure: options.cyberPolicyClosure,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 					authStorage,
 					modelRegistry,
@@ -5513,6 +5533,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					// stamp the contract so cold revival leaves them transcript-only
 					// even when the workspace was retained for recovery.
 					isolated: worktree !== undefined || undefined,
+					spawnCallId: options.spawnCallId,
 				});
 			};
 			persistSessionInit(session);

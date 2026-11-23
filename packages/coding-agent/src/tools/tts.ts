@@ -117,8 +117,9 @@ async function synthesizeCloud(
 		},
 		{
 			apiKey: ctx.modelRegistry.resolver(model, sessionId),
-			// The synthesis request waits out `/pause`, like every other request.
-			fetch: pauseHeldFetch(ctx.fetch ?? fetch),
+			// The synthesis request waits out `/pause`, like every other request, and reads the
+			// model-call guards again as it goes out.
+			fetch: pauseHeldFetch(ctx.fetch ?? fetch, model),
 			signal,
 		},
 	);

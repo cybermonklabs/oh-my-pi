@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionLiveStartOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
@@ -6,8 +7,11 @@ import type { LiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
 import * as liveTransport from "@oh-my-pi/pi-coding-agent/live/transport";
 import type { LiveTransportOptions } from "@oh-my-pi/pi-coding-agent/live/transport";
 import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
+import type { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import * as contextHelpers from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { CyberPolicyClosure } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 
 /** Fake InteractiveModeContext plus typed capture channels for focus/mount traffic. */
 interface ContextHarness {
@@ -22,7 +26,7 @@ interface ContextHarness {
 	editorRefocused: Promise<void>;
 }
 
-function createContext(): ContextHarness {
+function createContext(settings: Record<string, unknown> = { "live.voice": "vale" }): ContextHarness {
 	const editor = {
 		getUseTerminalCursor: vi.fn(() => true),
 		setUseTerminalCursor: vi.fn(),
@@ -31,7 +35,7 @@ function createContext(): ContextHarness {
 	const mounted: unknown[] = [];
 	const refocused = Promise.withResolvers<void>();
 	const ctx = {
-		settings: Settings.isolated({ "live.voice": "vale" }),
+		settings: Settings.isolated(settings),
 		keybindings: { getKeys: vi.fn(() => ["ctrl+l"]) },
 		session: {},
 		extractAssistantText: vi.fn(() => ""),
@@ -78,6 +82,35 @@ describe("LiveCommandController", () => {
 		try {
 			await controller.handleCommand();
 			expect(receivedVoice).toBe("vale");
+		} finally {
+			await controller.stop();
+		}
+	});
+
+	it("labels GPT-Live's spoken lines with the openai provider and its model, not Codex's", async () => {
+		const { ctx } = createContext({ "live.provider": "openai" });
+		const shown: AssistantMessage[] = [];
+		vi.spyOn(contextHelpers, "createAssistantMessageComponent").mockImplementation(
+			() =>
+				({
+					setTextColorTransform: () => {},
+					updateContent: (message: AssistantMessage) => shown.push(message),
+					markTranscriptBlockFinalized: () => {},
+				}) as unknown as AssistantMessageComponent,
+		);
+		const controller = new LiveCommandController(ctx, options => {
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockImplementation(async () => {
+				options.callbacks.onTranscript({ role: "assistant", turn: 1, text: "On it.", final: true });
+			});
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+		try {
+			await controller.handleCommand();
+			expect(shown.map(({ api, provider, model }) => ({ api, provider, model }))).toEqual([
+				{ api: "openai-responses", provider: "openai", model: "gpt-live-1.1" },
+			]);
 		} finally {
 			await controller.stop();
 		}
@@ -159,6 +192,26 @@ describe("LiveCommandController", () => {
 		await controller.handleCommand();
 		await live.stop();
 		expect(ends).toEqual([undefined]);
+	});
+
+	it("gives an extension session on GPT-Live's API (`live.provider: openai`) no voice", async () => {
+		const { ctx } = createContext({ "live.voice": "vale", "live.provider": "openai" });
+		const received: (string | undefined)[] = [];
+		const controller = new LiveCommandController(ctx, options => {
+			received.push(options.voice);
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			Object.defineProperty(session, "sdpAnswer", { value: "v=0 answer" });
+			return session;
+		});
+		const live = await controller.startRemote({ sdpOffer: "v=0 offer", voice: "cove" });
+		try {
+			expect(received).toEqual([undefined]);
+			expect(live).not.toHaveProperty("voice");
+		} finally {
+			await live.stop();
+		}
 	});
 
 	it("lets exactly one of two starts queued behind a closing session win", async () => {
@@ -257,7 +310,11 @@ describe("LiveSessionController with a caller-owned peer", () => {
 		const delegated: string[] = [];
 		const phases: string[] = [];
 		const agentSession = {
+			// The controller reads the session tree's cyber-policy hold before it starts a call; none stands here.
+			cyberPolicyClosure: new CyberPolicyClosure(),
 			modelRegistry: { authStorage: {} },
+			// The controller reads `live.provider` from the session's settings, as every AgentSession has.
+			settings: Settings.isolated(),
 			sessionId: "s1",
 			subscribe: () => () => {},
 			sendCustomMessage: async (message: { content: string }) => {

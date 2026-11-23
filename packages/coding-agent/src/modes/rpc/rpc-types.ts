@@ -245,13 +245,18 @@ export interface RpcPromptError {
 	model?: string;
 	/** HTTP status reported by the provider, when the failure came from a request. */
 	httpStatus?: number;
-	/** The failure is classified transient: resubmitting later may succeed. OMP's own retries are already exhausted. */
+	/**
+	 * The failure is classified transient: resubmitting later may succeed. OMP's own retries are already
+	 * exhausted. Never set for a `cyber_policy` refusal.
+	 */
 	retryable: boolean;
 	/**
 	 * `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
 	 * `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent.
+	 * `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a
+	 * refusal; resubmitting the same content is refused again.
 	 */
-	code?: "cost_cap" | "session_busy";
+	code?: "cost_cap" | "session_busy" | "cyber_policy";
 }
 
 /**
@@ -623,13 +628,13 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 	// Live voice
-	| { id?: string; type: "response"; command: "live_start"; success: true; data: { voice: string } }
+	| { id?: string; type: "response"; command: "live_start"; success: true; data: { voice?: string } }
 	| {
 			id?: string;
 			type: "response";
 			command: "live_connect";
 			success: true;
-			data: { voice: string; sdpAnswer: string };
+			data: { voice?: string; sdpAnswer: string };
 	  }
 	| { id?: string; type: "response"; command: "live_stop"; success: true }
 	| { id?: string; type: "response"; command: "live_mute"; success: true; data: { muted: boolean } }

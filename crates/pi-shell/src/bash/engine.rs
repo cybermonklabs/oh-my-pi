@@ -33,7 +33,10 @@ pub struct EngineConfig {
 	/// Hard limit on shell-level call depth (`FUNCNEST` defaults to unlimited
 	/// below it; default 10 000).
 	pub max_call_depth:   u32,
-	/// First vpid (default 2^30).
+	/// First vpid (default 2^30). [`Shell::create`](crate::bash::Shell::create)
+	/// and [`Shell::restore`](crate::bash::Shell::restore) refuse one below
+	/// [`os_pid_limit`]: a vpid must never be a number the operating system
+	/// gives a process, which `kill`, `wait` and a user's tools would reach.
 	pub vpid_base:        u32,
 	/// Platform semantics (default: the build target).
 	pub platform:         Platform,
@@ -58,6 +61,32 @@ impl Default for EngineConfig {
 			platform:         Platform::current(),
 			end_orphan_jobs:  false,
 		}
+	}
+}
+
+/// The least number this operating system never gives a process.
+///
+/// Linux pids stay below `/proc/sys/kernel/pid_max` (2^22 when it cannot be
+/// read, the most it can be set to); macOS pids stop at `PID_MAX`, 99 999.
+/// `None` where no limit is known (Windows).
+#[must_use]
+pub fn os_pid_limit() -> Option<u32> {
+	#[cfg(target_os = "linux")]
+	{
+		Some(
+			std::fs::read_to_string("/proc/sys/kernel/pid_max")
+				.ok()
+				.and_then(|s| s.trim().parse().ok())
+				.unwrap_or(1 << 22),
+		)
+	}
+	#[cfg(target_os = "macos")]
+	{
+		Some(100_000)
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+	{
+		None
 	}
 }
 

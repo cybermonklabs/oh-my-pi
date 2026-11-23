@@ -10,6 +10,10 @@
 
 - When `OMP_CONFIG_ROOT` is set, mnemopi keeps its data, blobs, plugins and cost log under `<OMP_CONFIG_ROOT>/mnemopi` and never copies in the legacy `~/.hermes` triples database; downloaded models stay in the home directory
 
+### Fixed
+
+- A remote completion (`llm.mode` remote) and an API embedding request (an API embedding model such as `openai/text-embedding-3-small`) read pi-ai's model-call guards before each attempt, so a hold such as coding-agent's `cyber_policy` hold sends neither. Each also reports an error it meets to the guards, so a `cyber_policy` refusal the endpoint relays starts coding-agent's hold, and never retries a `cyber_policy` refusal, even one relayed as a 5xx. The guards see a model built from the configured name: its family comes from the id (`openai/text-embedding-3-small` is OpenAI's, and an id the catalog cannot place is of an unknown family), and the `<provider>/` part names the route. A held or refused request returns no summary or vector, as a failed one does
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed

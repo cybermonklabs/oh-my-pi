@@ -28,6 +28,15 @@
 //! and hands over the terminal again after the spawn, so neither side
 //! races the other.
 //!
+//! **Busy programs.** On the `posix_spawn` and fork paths an exec that fails
+//! with `ETXTBSY` comes back at once as [`super::Started::Busy`], no process
+//! left of it, with the spawn kept for another try after a wait on the
+//! caller's timer ([`super::Started::settle`]); or, as the spec asks
+//! ([`OnBusy`]), as `ETXTBSY` at once, or through `fork_redirs` with no
+//! redirections. The child of `fork_redirs`, whose exec the parent does not
+//! wait for, tries again itself after the same waits, once it closed every
+//! close-on-exec descriptor.
+//!
 //! **Waiting** reports stops and continues besides the exit
 //! ([`ExtProc::poll_event`]).
 
@@ -55,11 +64,11 @@ use bstr::BString;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use pi_builtins::read_process_umask as process_umask;
 
-use super::{Dir, Leftover, Sessions, Shared, child_end};
+use super::{Dir, Leftover, Sessions, Shared, Started, child_end};
 use crate::{
 	bash::{
-		ChildRedir, ChildRedirs, EnvView, ExitStatus, ExtProc, OpenFlags, OsHandle, PgroupSpec,
-		Platform, ProcEvent, Rlimit, SigSet, Signal, SpawnSpec, StdioSpec,
+		ChildRedir, ChildRedirs, EnvView, ExitStatus, ExtProc, OnBusy, OpenFlags, OsHandle,
+		PgroupSpec, Platform, ProcEvent, Rlimit, SigSet, Signal, SpawnSpec, StdioSpec,
 	},
 	sys::{
 		lifecycle::{Abandon, Tracker},
@@ -512,19 +521,42 @@ fn child_fd(
 /// Move every source fd above every target fd, so installing one target
 /// (`dup2`) can never clobber a source still to be installed.
 fn lift(fds: &mut [(i32, Source)]) -> io::Result<()> {
-	let floor = fds.iter().map(|(t, _)| *t).max().unwrap_or(2).max(2) + 1;
+	let floor = floor(fds);
 	for (_, fd) in fds.iter_mut() {
 		if fd.as_raw_fd() < floor {
-			// SAFETY: fcntl on an fd we hold; returns a new descriptor.
-			let lifted = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
-			if lifted < 0 {
-				return Err(io::Error::last_os_error());
-			}
-			// SAFETY: a successful F_DUPFD_CLOEXEC returned a descriptor we own.
-			*fd = Source::Owned(unsafe { OwnedFd::from_raw_fd(lifted) });
+			*fd = Source::Owned(dup_above(fd.as_raw_fd(), floor)?);
 		}
 	}
 	Ok(())
+}
+
+/// Make every source the spawner's own, a copy above every target as
+/// [`lift`] left them: the engine keeps its own handles open only for the
+/// spawn call, and a busy spawn tries again after that ([`Busy`]).
+fn own(fds: &mut [(i32, Source)]) -> io::Result<()> {
+	let floor = floor(fds);
+	for (_, fd) in fds.iter_mut() {
+		if let Source::Host(handle) = *fd {
+			*fd = Source::Owned(dup_above(handle, floor)?);
+		}
+	}
+	Ok(())
+}
+
+/// The lowest number above every target of `fds`.
+fn floor(fds: &[(i32, Source)]) -> RawFd {
+	fds.iter().map(|(t, _)| *t).max().unwrap_or(2).max(2) + 1
+}
+
+/// A close-on-exec copy of `fd`, numbered `floor` or above.
+fn dup_above(fd: RawFd, floor: RawFd) -> io::Result<OwnedFd> {
+	// SAFETY: fcntl on an fd we hold; returns a new descriptor.
+	let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
+	if copy < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: a successful F_DUPFD_CLOEXEC returned a descriptor we own.
+	Ok(unsafe { OwnedFd::from_raw_fd(copy) })
 }
 
 /// Where the child goes.
@@ -706,7 +738,12 @@ fn may_need_script_fallback(path: &[u8], cwd: &[u8]) -> bool {
 			.contains(&0)
 }
 
-pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box<dyn ExtProc>> {
+/// The first try of the spawn of `spec` ([`super::NativeSpawner::start`]).
+pub(super) fn start(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> Started {
+	try_start(shared, spec).unwrap_or_else(|e| Started::Done(Err(e)))
+}
+
+fn try_start(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Started> {
 	let SpawnSpec {
 		path,
 		argv,
@@ -721,6 +758,7 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 		lineage,
 		redirs,
 		ctty,
+		on_busy,
 		..
 	} = spec;
 	if redirs.is_some() && may_need_script_fallback(path, cwd) {
@@ -767,13 +805,53 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 	let program =
 		Program { path, argv, env, cwd, umask, ign: sigmask_ign, rlimits, tty, closed: &closed };
 	let launched = match &redirs {
-		Some(redirs) => fork_redirs(&program, &fds, place, redirs),
+		Some(redirs) => fork_redirs(&program, &fds, place, redirs, None),
 		None => launch(&shared.state, &program, &fds, place),
+	};
+	// A busy program (`ETXTBSY`), as the spec asks ([`OnBusy`]). `Fail`
+	// reports it at once (below); a possible shell text file is waited
+	// for here even for `Child` (its exec may yet fail with `ENOEXEC`).
+	let launched = match on_busy {
+		OnBusy::Child { report, status, exec_diag }
+			if redirs.is_none() && is_busy(&launched) && !may_need_script_fallback(path, cwd) =>
+		{
+			let waits = ChildRedirs { list: Vec::new(), exec_diag };
+			fork_redirs(&program, &fds, place, &waits, Some((&report, status)))
+		},
+		OnBusy::Retry | OnBusy::Child { .. } if redirs.is_none() && is_busy(&launched) => {
+			at_busy_wait();
+			let kept = Kept { pgroup, lineage, tracker, pumps };
+			return Busy::keep(shared, &program, fds, place, kept)
+				.map(|busy| Started::Busy(super::Busy(Box::new(busy))));
+		},
+		_ => launched,
 	};
 	// Our copies of the child's ends: pumps see end of file when the child
 	// (and what it forks) closes its own.
 	drop(fds);
 	let (pid, place) = launched?;
+	Ok(Started::Done(started(shared, pid, place, tty, Kept { pgroup, lineage, tracker, pumps })))
+}
+
+/// What a spawn keeps from its preparation for the process it starts.
+struct Kept {
+	pgroup:  PgroupSpec,
+	lineage: crate::bash::Lineage,
+	tracker: Arc<Tracker>,
+	/// Polled by the `ExtProc`; dropped (stopping every pump) when no
+	/// process starts.
+	pumps:   Pumps,
+}
+
+/// The external `pid`, spawned at `place`: placed, recorded and watched.
+fn started(
+	shared: &Arc<Shared>,
+	pid: i32,
+	place: Place,
+	tty: Option<RawFd>,
+	kept: Kept,
+) -> io::Result<Box<dyn ExtProc>> {
+	let Kept { pgroup, lineage, tracker, pumps } = kept;
 	if let PgroupSpec::Job { .. } = pgroup
 		&& let Place::Group(pgid) = place
 	{
@@ -826,6 +904,94 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 		#[cfg(target_os = "linux")]
 		awaited: false,
 	}))
+}
+
+/// Whether a try failed because the program was busy: a process holds it
+/// open for writing (`ETXTBSY`).
+fn is_busy<T>(tried: &io::Result<T>) -> bool {
+	matches!(tried, Err(e) if e.raw_os_error() == Some(libc::ETXTBSY))
+}
+
+/// A spawn on the `posix_spawn` or fork path whose program was busy
+/// ([`super::Started::Busy`]): no process exists. It owns what the next try
+/// needs, copied from the spec only for such a spawn: the program's names,
+/// the child's descriptors (a copy of each of the engine's own handles,
+/// which the engine keeps open only for the spawn call), the pumps and the
+/// placement.
+pub(super) struct Busy {
+	shared:  Arc<Shared>,
+	path:    BString,
+	argv:    Vec<BString>,
+	env:     EnvView,
+	cwd:     BString,
+	rlimits: Vec<(Rlimit, Option<u64>, Option<u64>)>,
+	umask:   u32,
+	ign:     SigSet,
+	/// A copy of a foreground job's terminal ([`Program::tty`]).
+	tty:     Option<OwnedFd>,
+	closed:  Vec<i32>,
+	fds:     Vec<(i32, Source)>,
+	place:   Place,
+	kept:    Kept,
+}
+
+impl Busy {
+	/// The spawn of `prog` at `place` from `fds`, refused as busy, kept for
+	/// another try.
+	fn keep(
+		shared: &Arc<Shared>,
+		prog: &Program<'_>,
+		mut fds: Vec<(i32, Source)>,
+		place: Place,
+		kept: Kept,
+	) -> io::Result<Self> {
+		own(&mut fds)?;
+		let tty = prog.tty.map(|tty| dup_above(tty, 3)).transpose()?;
+		Ok(Self {
+			shared: Arc::clone(shared),
+			path: BString::from(prog.path),
+			argv: prog.argv.to_vec(),
+			env: prog.env.clone(),
+			cwd: BString::from(prog.cwd),
+			rlimits: prog.rlimits.to_vec(),
+			umask: prog.umask,
+			ign: prog.ign,
+			tty,
+			closed: prog.closed.to_vec(),
+			fds,
+			place,
+			kept,
+		})
+	}
+
+	/// The next try ([`super::Started::settle`]).
+	pub(super) fn retry(self) -> Started {
+		let launched = launch(&self.shared.state, &self.program(), &self.fds, self.place);
+		if is_busy(&launched) {
+			at_busy_wait();
+			return Started::Busy(super::Busy(Box::new(self)));
+		}
+		let Self { shared, tty, fds, kept, .. } = self;
+		// Our copies of the child's ends, as after a first try.
+		drop(fds);
+		Started::Done(launched.and_then(|(pid, place)| {
+			started(&shared, pid, place, tty.as_ref().map(AsRawFd::as_raw_fd), kept)
+		}))
+	}
+
+	fn program(&self) -> Program<'_> {
+		Program {
+			path:    &self.path,
+			argv:    &self.argv,
+			env:     &self.env,
+			cwd:     &self.cwd,
+			umask:   self.umask,
+			ign:     self.ign,
+			rlimits: &self.rlimits,
+			tty:     self.tty.as_ref().map(AsRawFd::as_raw_fd),
+			closed:  &self.closed,
+		}
+	}
 }
 
 /// Spawn by the best path; returns the pid and the placement that took.
@@ -1083,6 +1249,7 @@ enum ChildStep {
 	Open { fds: Vec<i32>, path: CString, flags: libc::c_int, mode: libc::mode_t, diag: Vec<u8> },
 	Dup { fd: i32, src: i32, diag: Vec<u8> },
 	Close { fd: i32 },
+	Fail { text: Vec<u8> },
 }
 
 impl ChildStep {
@@ -1115,6 +1282,7 @@ impl ChildStep {
 				Self::Dup { fd: *fd, src: *src, diag: diag.to_vec() }
 			},
 			ChildRedir::Close { fd } => Self::Close { fd: *fd },
+			ChildRedir::Fail { text } => Self::Fail { text: text.to_vec() },
 		})
 	}
 }
@@ -1127,11 +1295,27 @@ fn child_fail(diag: &[u8], errno: i32, status: i32, texts: &[Vec<u8>]) -> ! {
 		.ok()
 		.and_then(|n| texts.get(n))
 		.map_or(&b"Unknown error"[..], Vec::as_slice);
-	for part in [diag, text, b"\n"] {
+	child_exit(&[diag, text, b"\n"], status)
+}
+
+/// Write `parts` to fd 2 and exit with `status`. Async-signal-safe.
+fn child_exit(parts: &[&[u8]], status: i32) -> ! {
+	for part in parts {
 		// SAFETY: write(2) of a valid buffer; a failure is ignored (nowhere
 		// to report it).
 		unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
 	}
+	// SAFETY: `_exit` ends the forked child without running host code.
+	unsafe { libc::_exit(status) }
+}
+
+/// Write `text` to fd 2 and exit with `status`: the forked child's report
+/// of a program that stayed busy, as the engine renders it
+/// ([`OnBusy::Child`]). Async-signal-safe.
+fn child_report(text: &[u8], status: i32) -> ! {
+	// SAFETY: write(2) of a valid buffer; a failure is ignored (nowhere to
+	// report it).
+	unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
 	// SAFETY: `_exit` ends the forked child without running host code.
 	unsafe { libc::_exit(status) }
 }
@@ -1141,17 +1325,240 @@ fn errno() -> i32 {
 	io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// Runs `attempt` again after each wait of [`super::BUSY_WAITS_MS`]
+/// (through `wait`) while it fails with `ETXTBSY`; the first other result,
+/// or the last `ETXTBSY` once the waits run out. Async-signal-safe when
+/// `attempt` and `wait` are: it allocates nothing, so the child of
+/// [`fork_redirs`] uses it.
+fn retry_busy<T>(
+	mut attempt: impl FnMut() -> io::Result<T>,
+	mut wait: impl FnMut(u64),
+) -> io::Result<T> {
+	let mut waits = super::BUSY_WAITS_MS.iter();
+	loop {
+		match attempt() {
+			Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => match waits.next() {
+				Some(&ms) => wait(ms),
+				None => return Err(e),
+			},
+			done => return done,
+		}
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	/// A process a test kills when a spawn on this thread, or the child of
+	/// [`fork_redirs`] forked from it (which inherits the value), finds its
+	/// program busy ([`at_busy_wait`]): the stand-in for another session's
+	/// child that lets go of a program by its exec, or a sign the test
+	/// waits for.
+	pub(super) static KILL_AT_BUSY_WAIT: std::cell::Cell<libc::pid_t> =
+		const { std::cell::Cell::new(0) };
+	/// Whether the process that waits for a busy program stops itself
+	/// (`SIGSTOP`) at its first wait: the child of [`fork_redirs`] forked
+	/// from this thread inherits it, and a test reads the stopped child.
+	pub(super) static STOP_AT_BUSY_WAIT: std::cell::Cell<bool> =
+		const { std::cell::Cell::new(false) };
+	/// How many exec tries of the child of [`fork_redirs`] forked from this
+	/// thread (which inherits the value) report the program busy without
+	/// trying ([`fake_busy`]): a busy program on any kernel, gVisor's too,
+	/// which runs a program held open for writing.
+	pub(super) static FAKE_BUSY_EXECS: std::cell::Cell<u32> =
+		const { std::cell::Cell::new(0) };
+	/// A pipe a test reads ([`at_busy_wait`]): the process that waits for a
+	/// busy program writes its pid there at each wait, so a test sees which
+	/// process waited. A child forked from this thread inherits it.
+	pub(super) static BUSY_WAIT_REPORT: std::cell::Cell<RawFd> =
+		const { std::cell::Cell::new(-1) };
+}
+
+/// In tests, whether this exec try reports the program busy without trying
+/// ([`FAKE_BUSY_EXECS`]). Async-signal-safe.
+#[cfg(test)]
+fn fake_busy() -> bool {
+	FAKE_BUSY_EXECS.with(|left| {
+		left
+			.get()
+			.checked_sub(1)
+			.inspect(|n| left.set(*n))
+			.is_some()
+	})
+}
+
+/// Outside tests, no exec try is reported busy without trying.
+#[cfg(not(test))]
+const fn fake_busy() -> bool {
+	false
+}
+
+/// A spawn found its program busy and is about to wait: in tests, kill the
+/// process [`KILL_AT_BUSY_WAIT`] names, once, write this process's pid to
+/// [`BUSY_WAIT_REPORT`], and stop this process if [`STOP_AT_BUSY_WAIT`]
+/// says so, once. Async-signal-safe.
+#[cfg(test)]
+fn at_busy_wait() {
+	KILL_AT_BUSY_WAIT.with(|holder| {
+		let pid = holder.replace(0);
+		if pid > 0 {
+			// SAFETY: a plain syscall on the test's own child.
+			unsafe { libc::kill(pid, libc::SIGKILL) };
+		}
+	});
+	let report = BUSY_WAIT_REPORT.get();
+	if report >= 0 {
+		// SAFETY: getpid and a write of a local buffer to the test's pipe.
+		unsafe {
+			let pid = libc::getpid().to_ne_bytes();
+			libc::write(report, pid.as_ptr().cast(), pid.len());
+		}
+	}
+	if STOP_AT_BUSY_WAIT.with(|stop| stop.replace(false)) {
+		// SAFETY: a plain syscall on this process.
+		unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
+	}
+}
+
+/// Outside tests, a spawn about to wait for a busy program does nothing
+/// more.
+#[cfg(not(test))]
+const fn at_busy_wait() {}
+
+/// Sleeps `ms` milliseconds, again for what is left after a signal, in the
+/// child of [`fork_redirs`]. Async-signal-safe (`nanosleep`).
+fn busy_wait(ms: u64) {
+	at_busy_wait();
+	let mut left = libc::timespec {
+		tv_sec:  (ms / 1000) as libc::time_t,
+		tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+	};
+	// SAFETY: nanosleep with valid timespecs; it writes what is left on a
+	// signal, which the next call sleeps.
+	while unsafe { libc::nanosleep(&raw const left, &raw mut left) } != 0 && errno() == libc::EINTR {
+	}
+}
+
+/// Close every descriptor marked close-on-exec: what an exec would close.
+/// The child of [`fork_redirs`] does it before it waits for a busy
+/// program, so that while it waits it holds only the descriptors the
+/// program will (not another job's pipe, nor a program another session is
+/// writing). Async-signal-safe, without allocation: on Linux it reads the
+/// list of `/proc/self/fd`; elsewhere, or without `/proc`, it asks each
+/// number below `fd_bound`.
+///
+/// # Safety
+///
+/// For the forked child only: it closes descriptors other code of this
+/// process may hold.
+unsafe fn close_on_exec(fd_bound: i32) {
+	#[cfg(target_os = "linux")]
+	// SAFETY: as this function's.
+	if unsafe { close_listed_on_exec() } {
+		return;
+	}
+	for fd in 0..fd_bound {
+		// SAFETY: as this function's.
+		unsafe { close_if_on_exec(fd) };
+	}
+}
+
+/// Close `fd` if it is marked close-on-exec.
+///
+/// # Safety
+///
+/// As [`close_on_exec`]'s.
+unsafe fn close_if_on_exec(fd: i32) {
+	// SAFETY: fcntl and close take scalars.
+	unsafe {
+		let flags = libc::fcntl(fd, libc::F_GETFD);
+		if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+			libc::close(fd);
+		}
+	}
+}
+
+/// [`close_on_exec`] over the descriptors `/proc/self/fd` lists; `false`
+/// when it could not read the whole list.
+///
+/// # Safety
+///
+/// As [`close_on_exec`]'s.
+#[cfg(target_os = "linux")]
+unsafe fn close_listed_on_exec() -> bool {
+	// SAFETY: open of a NUL-terminated path; the result is checked.
+	let dir = unsafe {
+		libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+	};
+	if dir < 0 {
+		return false;
+	}
+	// `linux_dirent64` records, 8-byte aligned.
+	let mut buf = [0u64; 512];
+	let listed = loop {
+		// SAFETY: getdents64 writes at most the buffer's size into it.
+		let n = unsafe {
+			libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), std::mem::size_of_val(&buf))
+		};
+		let Ok(n) = usize::try_from(n) else {
+			break false;
+		};
+		if n == 0 {
+			break true;
+		}
+		// SAFETY: the kernel wrote `n` bytes of records into `buf`.
+		let records = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+		let mut at = 0;
+		// Each record: inode (8 bytes), offset (8), length (2), type (1),
+		// then the NUL-terminated name.
+		while let Some(record) = records.get(at..)
+			&& let Some(&[lo, hi]) = record.get(16..18)
+		{
+			let len = usize::from(u16::from_ne_bytes([lo, hi]));
+			let Some(name) = record.get(19..len) else {
+				break;
+			};
+			if let Some(fd) = fd_number(name)
+				&& fd != dir
+			{
+				// SAFETY: as this function's.
+				unsafe { close_if_on_exec(fd) };
+			}
+			at += len;
+		}
+	};
+	// SAFETY: closes the descriptor opened above.
+	unsafe { libc::close(dir) };
+	listed
+}
+
+/// The descriptor a `/proc/self/fd` entry names (its NUL-terminated decimal
+/// name); `None` for `.` and `..`.
+#[cfg(target_os = "linux")]
+fn fd_number(name: &[u8]) -> Option<i32> {
+	let digits = name.split(|&b| b == 0).next()?;
+	if digits.is_empty() {
+		return None;
+	}
+	digits.iter().try_fold(0i32, |fd, &b| {
+		let digit = b.checked_sub(b'0').filter(|d| *d <= 9)?;
+		fd.checked_mul(10)?.checked_add(i32::from(digit))
+	})
+}
+
 /// The spawn of a process that applies redirections itself
 /// ([`ChildRedirs`]): a bare `fork` whose child installs its fds, applies
 /// the redirections in order (an open may wait for a FIFO's other end:
 /// only the child waits, as bash's does) and execs. The parent returns at
 /// once with the pid; a failure in the child is reported on its own fd 2
-/// and its exit status (1 for a redirection, 127 or 126 for the exec).
+/// and its exit status (1 for a redirection, 127 or 126 for the exec). A
+/// `busy` report `(text, status)` replaces the exec failure's when the last
+/// try still finds the program busy ([`OnBusy::Child`]).
 fn fork_redirs(
 	prog: &Program<'_>,
 	fds: &[(i32, Source)],
 	place: Place,
 	redirs: &ChildRedirs,
+	busy: Option<(&[u8], u8)>,
 ) -> io::Result<(i32, Place)> {
 	let exec = Exec::new(prog)?;
 	let steps = redirs
@@ -1160,12 +1567,38 @@ fn fork_redirs(
 		.map(ChildStep::new)
 		.collect::<io::Result<Vec<_>>>()?;
 	let exec_diag = redirs.exec_diag.to_vec();
+	let busy = busy.map(|(text, status)| (text.to_vec(), i32::from(status)));
 	let texts: &[Vec<u8>] = &ERRNO_TEXT;
+	// The bound of the child's close loop where `/proc` cannot list its
+	// descriptors ([`close_on_exec`]), read here: the child must not
+	// allocate.
+	// SAFETY: sysconf takes a constant and reads no memory of ours.
+	let fd_bound = i32::try_from(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) })
+		.ok()
+		.filter(|&n| n > 0)
+		.unwrap_or(1 << 16);
 	let ignore = ignored(prog.ign);
 	let mask = prog.umask as libc::mode_t;
 	let limits = limits(prog);
 	let raw: Vec<(i32, RawFd)> = fds.iter().map(|(t, fd)| (*t, fd.as_raw_fd())).collect();
 	let closed = prog.closed;
+	// What the child keeps of the descriptors it inherits from the host
+	// ([`close_all_but`]), how it closes the rest, and the bound of its
+	// counting loop, decided here: the child must not allocate.
+	let keep = kept_fds(&raw, closed, &open_without_cloexec());
+	// The kept ones that are the host's own, not placed: listed before the
+	// fork, so the child checks each again ([`close_reused`]).
+	let inherited: Vec<i32> = keep
+		.iter()
+		.copied()
+		.filter(|&fd| !raw.iter().any(|&(target, _)| target == fd))
+		.collect();
+	let open_max = open_max();
+	let sweep = sweep();
+	#[cfg(test)]
+	if let Some(f) = BEFORE_FORK.with(|b| b.borrow_mut().take()) {
+		f();
+	}
 	// Every signal stays blocked across the fork: the child runs with the
 	// host's handlers until it resets them, and a signal delivered then (a
 	// `kill $!` right after the spawn) would run host code and be lost
@@ -1219,6 +1652,14 @@ fn fork_redirs(
 			for &target in closed {
 				libc::close(target);
 			}
+			// Before any redirection, close what the exec would close (every
+			// host descriptor with close-on-exec but the placed ones), as bash's
+			// child holds none of them: an open that waits (a FIFO's other end)
+			// would otherwise hold the host's own descriptors until the exec,
+			// other jobs' pipe ends among them, so their readers would wait for
+			// this open (bash's parent keeps no end of another job's pipe).
+			close_all_but(&keep, open_max, sweep);
+			close_reused(&inherited);
 			libc::umask(mask);
 			for (n, &ign) in ignore.iter().enumerate().skip(1) {
 				let n = n as i32;
@@ -1259,10 +1700,39 @@ fn fork_redirs(
 					ChildStep::Close { fd } => {
 						libc::close(*fd);
 					},
+					ChildStep::Fail { text } => child_exit(&[text.as_slice()], 1),
 				}
 			}
-			libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
-			let e = errno();
+			// A busy program is tried again ([`super::BUSY_WAITS_MS`]). The
+			// parent does not wait for this exec (this process is `$!`, its
+			// opens are done), so this child waits, and first closes what
+			// the exec would: while it waits it holds only the descriptors
+			// the program will.
+			let mut closed_on_exec = false;
+			let e = retry_busy::<()>(
+				|| {
+					if fake_busy() {
+						return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
+					}
+					libc::execve(exec.path(), exec.argv.as_ptr().cast(), exec.env.ptrs.as_ptr().cast());
+					Err(io::Error::last_os_error())
+				},
+				|ms| {
+					if !closed_on_exec {
+						close_on_exec(fd_bound);
+						closed_on_exec = true;
+					}
+					busy_wait(ms);
+				},
+			)
+			.err()
+			.and_then(|e| e.raw_os_error())
+			.unwrap_or(0);
+			if e == libc::ETXTBSY
+				&& let Some((text, status)) = &busy
+			{
+				child_report(text, *status);
+			}
 			child_fail(&exec_diag, e, if e == libc::ENOENT { 127 } else { 126 }, texts);
 		}
 	}
@@ -1286,6 +1756,309 @@ fn fork_redirs(
 		other => other,
 	};
 	Ok((pid, place))
+}
+
+/// The descriptors the child of [`fork_redirs`] keeps, as bash's child
+/// does: the placed `targets` (stdio and extra fds) and every host
+/// descriptor without close-on-exec (`inherited`, listed before the fork; a
+/// `posix_spawn` or fork+exec child keeps those too, such as a make
+/// jobserver's pipe), but the `closed` ones. So the child closes early only
+/// what its exec would close. Every source a redirection may read is one of
+/// these or an fd an earlier redirection opened. Sorted, unique.
+fn kept_fds(targets: &[(i32, RawFd)], closed: &[i32], inherited: &[i32]) -> Vec<i32> {
+	let mut keep: Vec<i32> = targets
+		.iter()
+		.map(|&(target, _)| target)
+		.chain(inherited.iter().copied())
+		.filter(|fd| !closed.contains(fd))
+		.collect();
+	keep.sort_unstable();
+	keep.dedup();
+	keep
+}
+
+/// Close each of `inherited` (the host's descriptors the child of
+/// [`fork_redirs`] keeps, listed before the fork) that has close-on-exec
+/// now: another thread closed the one listed, and a new descriptor took the
+/// number before the fork (another job's pipe end, say). The exec would
+/// close it, so the child must not hold it while its open waits.
+/// Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// Only in the forked child of [`fork_redirs`].
+unsafe fn close_reused(inherited: &[i32]) {
+	for &fd in inherited {
+		// SAFETY: F_GETFD only reads the descriptor's flags.
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		if flags != -1 && flags & libc::FD_CLOEXEC != 0 {
+			// SAFETY: closes a descriptor of the child's own table.
+			unsafe { libc::close(fd) };
+		}
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	static BEFORE_FORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the next [`fork_redirs`] on this thread runs `f` after it lists
+/// the host's descriptors and before it forks, the window [`close_reused`]
+/// covers.
+#[cfg(test)]
+fn before_fork(f: impl FnOnce() + 'static) {
+	BEFORE_FORK.with(|b| *b.borrow_mut() = Some(Box::new(f)));
+}
+
+/// The host's open descriptors above 2 without close-on-exec, now (Linux:
+/// `/proc/self/fd`; elsewhere `/dev/fd`). None where neither can be read:
+/// the child then closes those too.
+fn open_without_cloexec() -> Vec<i32> {
+	let mut fds = Vec::new();
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{
+		// SAFETY: the path is terminated; open makes a descriptor of ours.
+		let dir = unsafe {
+			libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+		};
+		if dir >= 0 {
+			let mut buf = [0u8; 1024];
+			// SAFETY: `dir` is an open directory descriptor of ours.
+			while let Some(n) = unsafe { fd_batch(dir, &mut buf, |fd| fds.push(fd)) }
+				&& n > 0
+			{}
+			// SAFETY: closes the descriptor opened above.
+			unsafe { libc::close(dir) };
+			fds.retain(|&fd| fd != dir);
+		}
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	if let Ok(entries) = std::fs::read_dir("/dev/fd") {
+		fds.extend(entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok()));
+	}
+	fds.retain(|&fd| {
+		// SAFETY: F_GETFD only reads the descriptor flags (fails for the
+		// listing's own descriptor, closed by now).
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+		fd > 2 && flags != -1 && flags & libc::FD_CLOEXEC == 0
+	});
+	fds
+}
+
+/// The bound of [`count_close`]'s loop: the process's descriptor limit.
+fn open_max() -> i32 {
+	// SAFETY: sysconf takes a constant and reads no memory of ours.
+	let n = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+	if n <= 0 {
+		1 << 16
+	} else {
+		i32::try_from(n).unwrap_or(i32::MAX)
+	}
+}
+
+/// How the child of [`fork_redirs`] closes the host's descriptors:
+/// `close_range` over the gaps between the kept ones (Linux 5.9 and later);
+/// else each descriptor `/proc/self/fd` lists (a kernel without
+/// `close_range`, or a seccomp profile that refuses it); else every number
+/// below the descriptor limit (no `/proc`, and macOS). Tests force the
+/// slower ways ([`force_sweep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+	CloseRange,
+	#[cfg_attr(not(test), allow(dead_code, reason = "only tests start the sweep past close_range"))]
+	Walk,
+	#[cfg_attr(not(test), allow(dead_code, reason = "only tests start the sweep past close_range"))]
+	Count,
+}
+
+#[cfg(test)]
+thread_local! {
+	static FORCED_SWEEP: std::cell::Cell<Sweep> = const { std::cell::Cell::new(Sweep::CloseRange) };
+}
+
+/// Tests: the children this thread spawns next start their sweep at
+/// `sweep` (each falls back from there as in production).
+#[cfg(test)]
+fn force_sweep(sweep: Sweep) {
+	FORCED_SWEEP.with(|s| s.set(sweep));
+}
+
+/// Where the next child's sweep starts ([`Sweep`]).
+#[cfg_attr(
+	not(test),
+	allow(clippy::missing_const_for_fn, reason = "tests read a thread-local here")
+)]
+fn sweep() -> Sweep {
+	#[cfg(test)]
+	return FORCED_SWEEP.with(std::cell::Cell::get);
+	#[cfg(not(test))]
+	Sweep::CloseRange
+}
+
+/// Close every descriptor above 2 but those in `keep` (sorted), in the
+/// forked child of [`fork_redirs`], starting at `sweep` ([`Sweep`]).
+/// Async-signal-safe, without allocation.
+///
+/// # Safety
+///
+/// For the forked child only: it closes descriptors other code of this
+/// process may hold.
+unsafe fn close_all_but(keep: &[i32], open_max: i32, sweep: Sweep) {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{
+		// SAFETY: as this function's.
+		if sweep == Sweep::CloseRange && unsafe { close_range_all_but(keep) } {
+			return;
+		}
+		// SAFETY: as this function's.
+		if sweep != Sweep::Count && unsafe { walk_close(keep) } {
+			return;
+		}
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	let _ = sweep;
+	// SAFETY: as this function's.
+	unsafe { count_close(keep, open_max) };
+}
+
+/// `close_range` over each gap between the descriptors in `keep` (sorted);
+/// false as soon as the kernel refuses it.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn close_range_all_but(keep: &[i32]) -> bool {
+	let range = |first: i32, last: i32| {
+		first > last
+			// SAFETY: close_range takes scalars; it only closes descriptors.
+			|| unsafe {
+				libc::syscall(libc::SYS_close_range, first as libc::c_uint, last as libc::c_uint, 0 as libc::c_uint)
+			} == 0
+	};
+	let mut first = 3;
+	for &kept in keep {
+		if kept >= first {
+			if !range(first, kept - 1) {
+				return false;
+			}
+			first = kept + 1;
+		}
+	}
+	range(first, i32::MAX)
+}
+
+/// Close each descriptor above 2 that `/proc/self/fd` lists but those in
+/// `keep` (sorted), reading the directory with `getdents64` into a buffer on
+/// the stack (glibc's `closefrom` fallback works this way); false when the
+/// directory cannot be read. A pass that closed something reads the
+/// directory again from the start, so no entry is skipped.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn walk_close(keep: &[i32]) -> bool {
+	// SAFETY: the path is terminated; open makes a descriptor of ours.
+	let dir = unsafe {
+		libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+	};
+	if dir < 0 {
+		return false;
+	}
+	let mut buf = [0u8; 1024];
+	let read = loop {
+		let mut closed = false;
+		let pass = loop {
+			// SAFETY: `dir` is an open directory descriptor; close takes a
+			// scalar.
+			let batch = unsafe {
+				fd_batch(dir, &mut buf, |fd| {
+					if fd > 2 && fd != dir && keep.binary_search(&fd).is_err() {
+						libc::close(fd);
+						closed = true;
+					}
+				})
+			};
+			match batch {
+				Some(0) => break true,
+				Some(_) => {},
+				None => break false,
+			}
+		};
+		if !pass || !closed {
+			break pass;
+		}
+		// SAFETY: rewinds the directory descriptor opened above.
+		unsafe { libc::lseek(dir, 0, libc::SEEK_SET) };
+	};
+	// SAFETY: closes the descriptor opened above.
+	unsafe { libc::close(dir) };
+	read
+}
+
+/// One `getdents64` batch of the descriptor directory `dir` read into
+/// `buf`, calling `each` with every descriptor number it lists: `Some` of
+/// the bytes read (0 at the end), `None` on an error. Allocates nothing: the
+/// forked child walks with it.
+///
+/// # Safety
+///
+/// `dir` must be an open directory descriptor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn fd_batch(dir: RawFd, buf: &mut [u8], mut each: impl FnMut(i32)) -> Option<usize> {
+	let n = loop {
+		// SAFETY: getdents64 writes at most `buf.len()` bytes into `buf`.
+		let n = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+		if n < 0 && errno() == libc::EINTR {
+			continue;
+		}
+		break n;
+	};
+	let n = usize::try_from(n).ok()?;
+	let mut entries = &buf[..n];
+	// linux_dirent64: two u64 fields, a u16 record length, a u8 type, then
+	// the NUL-terminated name, whatever the userspace ABI.
+	while entries.len() >= 20 {
+		let len = usize::from(u16::from_ne_bytes([entries[16], entries[17]]));
+		if len < 20 || len > entries.len() {
+			return None;
+		}
+		let mut fd: i32 = 0;
+		let mut digits = 0;
+		for &b in &entries[19..len] {
+			if !b.is_ascii_digit() {
+				break;
+			}
+			fd = fd.saturating_mul(10).saturating_add(i32::from(b - b'0'));
+			digits += 1;
+		}
+		if digits > 0 && entries[..len].get(19 + digits) == Some(&0) {
+			each(fd);
+		}
+		entries = &entries[len..];
+	}
+	Some(n)
+}
+
+/// Close every number above 2 below `open_max` but those in `keep`
+/// (sorted): the last resort, where no descriptor list can be read.
+///
+/// # Safety
+///
+/// As [`close_all_but`]'s.
+unsafe fn count_close(keep: &[i32], open_max: i32) {
+	let mut kept = keep.iter().peekable();
+	for fd in 3..open_max {
+		while kept.next_if(|&&k| k < fd).is_some() {}
+		if kept.peek() == Some(&&fd) {
+			continue;
+		}
+		// SAFETY: close takes a scalar.
+		unsafe { libc::close(fd) };
+	}
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]

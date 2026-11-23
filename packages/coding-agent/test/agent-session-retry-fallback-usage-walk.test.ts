@@ -34,16 +34,21 @@ import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 const MOCK_API_SOURCE = "agent-session-retry-fallback-usage-walk-test";
 const WAIT_MS = 4_000;
 
+/**
+ * An account-wide policy denial on the primary (Anthropic): the organization's OAuth denial. Not a `cyber_policy`
+ * refusal: that one judges the request's content, so it is never an account policy, and it holds every OpenAI route
+ * (the fallbacks here include one) instead of walking.
+ */
 const ACCOUNT_POLICY_DENIAL: MockResponse = {
 	stopReason: "error",
-	errorMessage:
-		"This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
+	errorMessage: "OAuth authentication is currently not allowed for this organization.",
 };
+/** An account-wide policy denial on Codex: the ChatGPT plan's denial of the requested model, per account. */
 const CODEX_ACCOUNT_POLICY_DENIAL: MockResponse = {
-	content: [{ type: "thinking", thinking: "Checking whether this security request is allowed." }],
+	content: [{ type: "thinking", thinking: "Checking whether this account's plan includes the model." }],
 	stopReason: "error",
 	errorMessage:
-		"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
+		"Codex error event: The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account. (code=model_not_found)",
 };
 const CLASSIFIER_REFUSAL: MockResponse = {
 	content: [{ type: "thinking", thinking: "Classifier evaluation before refusal." }],

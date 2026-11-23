@@ -31,7 +31,7 @@ use crate::bash::{
 	syntax::zsh::tok,
 	vm::{
 		Cx, Kernel,
-		exec::{Flow, Sub, settle_sub, start_sub, start_zsh_sub},
+		exec::{Flow, Sub, fork_message, no_vpid_for, settle_sub, start_sub, start_zsh_sub},
 		expand::{Expander, Stop},
 		jobctl, probe,
 		proc::{FrameKind, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Vproc},
@@ -414,6 +414,16 @@ impl Reader {
 			Ok(v) => {
 				self.sc.recycle();
 				Ok(Some(v))
+			},
+			// A substitution that needs a vproc when no vpid is left fails as
+			// an expansion: its message once, nothing in its place, and the
+			// line is read (zsh 5.9 under `ulimit -u 1`). Starting it would
+			// end in a flow that pushes no frame, and the reader would expand
+			// the prompt again at once, without end.
+			Err(stop) if no_vpid_for(k, &stop) => {
+				self.sc.recycle();
+				fork_message(k, vp, cx, 0);
+				Ok(None)
 			},
 			Err(Stop::ZshSub { text, here }) => {
 				Err(start_zsh_sub(k, vp, cx, &mut self.sc, &text, here, 0).into())
@@ -804,8 +814,24 @@ impl Reader {
 		None
 	}
 
-	/// Expand the prompts of this line.
+	/// Expand the prompts of this line. Their command substitutions leave
+	/// `$?` as it was (bash 5.2.21 and 5.3.20, zsh 5.9): each pass of the
+	/// expansion replays them and sets `$?` to their statuses, so it is put
+	/// back whenever the expansion returns, also while a substitution still
+	/// runs.
 	fn prompts(&mut self, k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Result<(), Pause> {
+		let expanded = self.expand_prompts(k, cx, vp);
+		vp.status = self.status;
+		expanded
+	}
+
+	/// [`Self::prompts`] without putting `$?` back.
+	fn expand_prompts(
+		&mut self,
+		k: &mut Kernel,
+		cx: &mut Cx<'_>,
+		vp: &mut Vproc,
+	) -> Result<(), Pause> {
 		let zsh = vp.mode.dialect() == Dialect::Zsh;
 		let (lname, rname): (&[u8], &[u8]) = if self.cont {
 			(b"PS2", b"RPS2")
@@ -829,6 +855,14 @@ impl Reader {
 					let mut prompt =
 						|raw: &[u8]| match super::display::expand_prompt(ex, raw, status, &stack) {
 							Ok(p) => Ok(p),
+							// A prompt whose substitution finds no vpid is empty
+							// and prints the message; zsh expands `PS1` and
+							// `RPS1` apart, so each that has one does (zsh 5.9
+							// under `ulimit -u 1`).
+							Err(stop) if no_vpid_for(ex.k, &stop) => {
+								fork_message(ex.k, ex.vp, ex.cx, 0);
+								Ok(Default::default())
+							},
 							Err(
 								e @ (Stop::ZshSub { .. }
 								| Stop::MathCall(_)

@@ -1,9 +1,10 @@
 import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { cyberPolicyHoldMessage } from "../session/cyber-policy-closure";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
@@ -15,13 +16,33 @@ import {
 	type LiveClientMessage,
 	type LiveServerEvent,
 } from "./protocol";
+import { OPENAI_LIVE_ROUTE, OpenAILiveTransport } from "./openai-transport";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
-import { CodexLiveTransport } from "./transport";
+import { cfgLiveProvider } from "./settings";
+import { CODEX_LIVE_ROUTE, CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
+
+/**
+ * Why the live call to `route` may send nothing now, or `undefined` when it may. The call runs on OpenAI (Codex
+ * realtime, `CODEX_LIVE_ROUTE`, or GPT-Live with the `openai` provider's key, `OPENAI_LIVE_ROUTE`) and carries the
+ * session's text, so while the session tree's cyber-policy closure is active (OpenAI refused the tree's content) none
+ * of the session's text goes out and no call opens; the hold's message names `route`, the route the call goes to. It
+ * is read where each of those sends happens: the transport reads it (`holdReason` in either transport's options) in
+ * the same synchronous step as the session request that opens the call (it carries the instructions), as GPT-Live's
+ * sideband attach (it carries the key), and as every sideband frame but `session.close`; the controller reads it
+ * before it builds the transport and again once the call has connected, before any audio or text, and closes a held
+ * call. `session.close`, which only ends the call, is not held.
+ */
+export function liveCallHoldReason(
+	session: Pick<AgentSession, "cyberPolicyClosure">,
+	route: Pick<Model, "provider" | "id">,
+): string | undefined {
+	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(route) : undefined;
+}
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -106,7 +127,7 @@ export class LiveSessionController {
 	readonly #instructionsTemplate: string;
 	readonly #sdpOffer: string | undefined;
 
-	#transport: CodexLiveTransport | undefined;
+	#transport: CodexLiveTransport | OpenAILiveTransport | undefined;
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -130,6 +151,12 @@ export class LiveSessionController {
 	#userTranscriptTurn = 0;
 	#assistantTranscriptTurn = 0;
 	#lastTranscript: LiveTranscript | undefined;
+	/**
+	 * Whether the route can repeat a line it has finished (Codex), so the same text right after it is
+	 * dropped. GPT-Live's transport delivers each event once and finishes a line only when the other
+	 * speaker starts, so there the same text again is a new line, such as a second "yes".
+	 */
+	#finishedLinesRepeat = true;
 	readonly #outputActivity = new OutputActivity(() =>
 		this.#guardEvent(() => {
 			if (!this.#activeDelegationId) this.#refreshAudioPhase();
@@ -179,24 +206,48 @@ export class LiveSessionController {
 		}
 
 		try {
+			const openai = cfgLiveProvider.get(this.#session.settings) === "openai";
+			this.#finishedLinesRepeat = !openai;
+			// The call goes to OpenAI on either route: none starts while a refusal holds the session's OpenAI routes.
+			const route = openai ? OPENAI_LIVE_ROUTE : CODEX_LIVE_ROUTE;
+			const held = liveCallHoldReason(this.#session, route);
+			if (held) throw new Error(held);
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
-			const transport = new CodexLiveTransport({
-				authStorage: this.#session.modelRegistry.authStorage,
-				sessionId: this.#session.sessionId,
-				instructions,
-				voice: this.#voice,
-				sdpOffer: this.#sdpOffer,
-				callbacks: {
-					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
-					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
-				},
-			});
+			const callbacks = {
+				onEvent: (event: LiveServerEvent) => this.#guardEvent(() => this.#handleLiveEvent(event)),
+				onOutputLevel: (level: number) => this.#guardEvent(() => this.#handleOutputLevel(level)),
+			};
+			// Read by the transport in the step of each send to OpenAI: the session request, GPT-Live's sideband
+			// attach (it carries the key), and every frame but `session.close`.
+			const holdReason = () => liveCallHoldReason(this.#session, route);
+			const transport = openai
+				? new OpenAILiveTransport({
+						registry: this.#session.modelRegistry,
+						sessionId: this.#session.sessionId,
+						instructions,
+						sdpOffer: this.#sdpOffer,
+						callbacks,
+						holdReason,
+					})
+				: new CodexLiveTransport({
+						authStorage: this.#session.modelRegistry.authStorage,
+						sessionId: this.#session.sessionId,
+						instructions,
+						voice: this.#voice,
+						sdpOffer: this.#sdpOffer,
+						callbacks,
+						holdReason,
+					});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
+			// A refusal recorded while the call connected (after the POST went out) closes it before any audio
+			// or session text: the catch below stops the call and closes the transport.
+			const heldOnConnect = liveCallHoldReason(this.#session, route);
+			if (heldOnConnect) throw new Error(heldOnConnect);
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
@@ -420,7 +471,7 @@ export class LiveSessionController {
 			this.#startTranscriptTurn(role);
 			next = text;
 		} else if (wasFinal) {
-			if (text === current || current.endsWith(text)) return;
+			if (this.#finishedLinesRepeat && (text === current || current.endsWith(text))) return;
 			this.#startTranscriptTurn(role);
 			next = text;
 		} else if (text.startsWith(current)) {
@@ -440,7 +491,7 @@ export class LiveSessionController {
 		if (!current) {
 			this.#startTranscriptTurn(role);
 		} else if (wasFinal) {
-			if (text === current) return;
+			if (this.#finishedLinesRepeat && text === current) return;
 			this.#startTranscriptTurn(role);
 		}
 		const next = !wasFinal && current.startsWith(text) && current.length > text.length ? current : text;
@@ -482,7 +533,10 @@ export class LiveSessionController {
 		if (!transport || this.#stopped) return;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (!this.#stopped) await transport.send(message);
+				if (this.#stopped) return;
+				// The transport reads the hold in the step of the write and rejects a held frame; the catch below
+				// then ends the call, since the session's answer can no longer reach it.
+				await transport.send(message);
 			})
 			.catch(cause => this.#reportFailure(toError(cause)));
 	}

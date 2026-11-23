@@ -28,6 +28,7 @@ import {
 	type SimpleStreamOptions,
 	streamSimple,
 } from "@oh-my-pi/pi-ai";
+import { guardModelCall } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/register-builtins";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -150,8 +151,9 @@ export const getModel = getBundledModel;
 export const getModels = getBundledModels;
 
 const ANTHROPIC_MESSAGES_API = {
-	// Loads the Anthropic transport on first invocation, not extension setup.
-	stream: streamAnthropic,
+	// Loads the Anthropic transport on first invocation, not extension setup; passes the process's
+	// model-call guard as `streamSimple` does.
+	stream: (...args: Parameters<typeof streamAnthropic>) => guardModelCall(args[0], () => streamAnthropic(...args)),
 	streamSimple: (model: Model<"anthropic-messages">, context: Context, options?: SimpleStreamOptions) =>
 		streamSimple(model, context, options),
 };

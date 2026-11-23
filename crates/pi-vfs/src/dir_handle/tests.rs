@@ -1761,33 +1761,6 @@ mod unix {
 		}
 	}
 
-	/// Whether the thread `tid` of this process waits in an `open`: its
-	/// `/proc/self/task/<tid>/syscall` names `openat` (or, on x86_64, `open`,
-	/// which musl's `open()` issues there). Where that file is not there
-	/// (gVisor), its state is sleeping, which a thread waiting on a lock also
-	/// shows, so there this does not prove the thread is in `open`. `None`
-	/// when neither can be read.
-	#[cfg(target_os = "linux")]
-	fn waits_in_open(tid: libc::c_long) -> Option<bool> {
-		if let Ok(syscall) = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
-			let number = syscall.split_whitespace().next()?;
-			return Some(number.parse::<libc::c_long>().is_ok_and(is_open_call));
-		}
-		let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
-		Some(stat.rsplit_once(')')?.1.trim_start().starts_with('S'))
-	}
-
-	/// Whether the system call `number` opens a file by path: `openat`, and
-	/// on x86_64 also `open`.
-	#[cfg(target_os = "linux")]
-	fn is_open_call(number: libc::c_long) -> bool {
-		#[cfg(target_arch = "x86_64")]
-		if number == libc::SYS_open {
-			return true;
-		}
-		number == libc::SYS_openat
-	}
-
 	/// A release reaches the FIFO its open waits on after the FIFO's name was
 	/// given to another FIFO: the helper's open ends, and a writer to the new
 	/// FIFO meets no release's end. The helper runs into its `open` and is
@@ -1847,7 +1820,7 @@ mod unix {
 							.unwrap_or_else(|_| panic!("{case}: the helper never started"));
 						let start = std::time::Instant::now();
 						loop {
-							match waits_in_open(tid) {
+							match crate::tests::waits_in_open(tid) {
 								Some(true) => break,
 								Some(false) => {},
 								None => panic!("{case}: /proc says nothing of the helper's thread"),
@@ -2435,47 +2408,6 @@ mod unix {
 		}
 	}
 
-	/// The FIFO the sticky-directory test opens: a FIFO of another user, which
-	/// any user may read and write, in a world-writable sticky directory that
-	/// user does not own. `PI_TEST_STICKY_FIFO` names one when set (root makes
-	/// it before a run as another user; a wrong one fails the test); else, as
-	/// root, one is made in `tree`. `Err` says why there is none.
-	#[cfg(target_os = "linux")]
-	fn sticky_fifo(tree: &Tree) -> Result<PathBuf, String> {
-		use std::os::unix::fs::FileTypeExt;
-		// SAFETY: `geteuid` has no preconditions.
-		let me = unsafe { libc::geteuid() };
-		if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
-			let fifo = PathBuf::from(given);
-			let meta = std::fs::metadata(&fifo)
-				.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
-			let parent = std::fs::metadata(fifo.parent().unwrap()).unwrap();
-			assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
-			assert_eq!(
-				parent.mode() & 0o1002,
-				0o1002,
-				"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
-			);
-			assert!(
-				meta.uid() != me && meta.uid() != parent.uid(),
-				"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
-			);
-			assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
-			return Ok(fifo);
-		}
-		if me != 0 {
-			return Err("not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned());
-		}
-		let sticky = tree.at("sticky");
-		std::fs::create_dir(&sticky).unwrap();
-		std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
-		let fifo = sticky.join("report.txt");
-		mkfifo(&fifo);
-		std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o666)).unwrap();
-		std::os::unix::fs::chown(&fifo, Some(OTHER), Some(OTHER)).unwrap();
-		Ok(fifo)
-	}
-
 	/// With `fs.protected_fifos` at 1 or more, an open that asks to create of
 	/// a FIFO another user owns in a world-writable sticky directory that
 	/// user does not own is refused (`EACCES`), so a command that means to
@@ -2502,7 +2434,7 @@ mod unix {
 			return;
 		}
 		let tree = Tree::new("fifo-sticky");
-		let fifo = match sticky_fifo(&tree) {
+		let fifo = match crate::tests::sticky_fifo(&tree.at("")) {
 			Ok(fifo) => fifo,
 			Err(why) => {
 				eprintln!("UNKNOWN: {why}; nothing was checked");
@@ -2620,6 +2552,65 @@ mod unix {
 		canceller.join().unwrap();
 		let opened = helper_opened.recv_timeout(HELPER_BOUND);
 		assert!(opened.is_ok(), "the helper's open was not released");
+	}
+
+	/// A directory opened only to reach what is below it needs only its
+	/// search permission on Linux, where it is opened `O_PATH`: by path
+	/// ([`crate::dir_handle::host::open_dir_to_search`]), as `..` of a child
+	/// ([`DirHandle::open_parent`]), and below another
+	/// ([`DirHandle::open_dir_beneath_to_search_async`]). Each opens the
+	/// subdirectory below it and has its identity, where a listing open of
+	/// the directory is refused. Elsewhere each is refused as the listing
+	/// open is. As root, which needs no permission, the test says it
+	/// is skipped.
+	#[test]
+	fn a_directory_opened_to_search_needs_only_its_search_permission() {
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!("skipped: root needs no permission to read a directory");
+			return;
+		}
+		let tree = TempDir::new("search-only");
+		let top = tree.0.join("top");
+		std::fs::create_dir_all(top.join("mid/sub")).unwrap();
+		let top_id = std::fs::metadata(&top).unwrap().ino();
+		let mid_id = std::fs::metadata(top.join("mid")).unwrap().ino();
+		let root = crate::dir_handle::host::open_dir(&tree.0, false).unwrap();
+		let mid = crate::dir_handle::host::open_dir(&top.join("mid"), false).unwrap();
+		// Search, no read.
+		std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o311)).unwrap();
+		std::fs::set_permissions(top.join("mid"), std::fs::Permissions::from_mode(0o311)).unwrap();
+		let restore =
+			|path: &Path| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap();
+		let listing = crate::dir_handle::host::open_dir(&top, true).map(drop);
+		let by_path = crate::dir_handle::host::open_dir_to_search(&top);
+		let parent = mid.open_parent();
+		let beneath = rt.block_on(root.open_dir_beneath_to_search_async(b"top/mid"));
+		restore(&top.join("mid")).unwrap();
+		restore(&top).unwrap();
+		assert_eq!(listing.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "the listing open");
+		if cfg!(target_os = "linux") {
+			for (how, opened, id) in
+				[("by path", by_path, top_id), ("as ..", parent, top_id), ("beneath", beneath, mid_id)]
+			{
+				let opened = opened.unwrap_or_else(|e| panic!("{how}: {e}"));
+				assert_eq!(opened.identity().unwrap().ino(), id, "{how}: the identity");
+				opened
+					.open_dir_at(OsStr::new(if id == top_id { "mid" } else { "sub" }))
+					.unwrap_or_else(|e| panic!("{how}: the child: {e}"));
+			}
+		} else {
+			for (how, opened) in [("by path", by_path), ("as ..", parent), ("beneath", beneath)] {
+				assert_eq!(
+					opened.map(drop).unwrap_err().kind(),
+					io::ErrorKind::PermissionDenied,
+					"{how}"
+				);
+			}
+		}
 	}
 }
 

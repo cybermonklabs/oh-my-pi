@@ -13,10 +13,10 @@ use std::{
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
 
-use super::{Scope, State, process_umask};
+use super::{Scope, State, Sweep, process_umask};
 use crate::{
 	bash::{
-		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId,
+		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId, OnBusy,
 		OpenFlags, OsHandle, PgroupSpec, Rlimit, RunId, SigSet, Signal, SpawnSpec, StdioSpec, Vpid,
 	},
 	sys::{
@@ -99,6 +99,7 @@ fn spec<'a>(argv: &'a [BString], env: &'a EnvView, pgroup: PgroupSpec) -> SpawnS
 		lineage: crate::bash::Lineage::default(),
 		redirs: None,
 		ctty: None,
+		on_busy: OnBusy::Retry,
 	}
 }
 
@@ -401,6 +402,811 @@ const WRITE: OpenFlags = OpenFlags::WRITE
 	.with(OpenFlags::CREATE)
 	.with(OpenFlags::TRUNC);
 
+/// An exec that keeps failing with ETXTBSY is tried once more after each
+/// wait of `BUSY_WAITS_MS`, and the last ETXTBSY is reported (the child of
+/// `fork_redirs` tries this way): the waits are counted here, not timed.
+#[test]
+fn a_busy_exec_is_tried_after_each_wait_then_reported() {
+	let mut tries = 0;
+	let mut waited = Vec::new();
+	let busy: io::Result<()> = super::retry_busy(
+		|| {
+			tries += 1;
+			Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+		},
+		|ms| waited.push(ms),
+	);
+	assert_eq!(busy.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
+	assert_eq!(waited, super::super::BUSY_WAITS_MS);
+	assert_eq!(tries, super::super::BUSY_WAITS_MS.len() + 1);
+	assert_eq!(super::super::BUSY_WAITS_MS.iter().sum::<u64>(), 1023);
+}
+
+/// A busy exec that clears goes on at once, after only the waits so far;
+/// every other error is reported on the first try, without a wait, and so
+/// is the error of a spawn that a caller would try again after waits.
+#[test]
+fn only_a_busy_exec_is_tried_again() {
+	let mut busy_left = 2;
+	let mut waited = Vec::new();
+	let ran = super::retry_busy(
+		|| {
+			if busy_left == 0 {
+				return Ok(7);
+			}
+			busy_left -= 1;
+			Err(io::Error::from_raw_os_error(libc::ETXTBSY))
+		},
+		|ms| waited.push(ms),
+	);
+	assert_eq!(ran.unwrap(), 7);
+	assert_eq!(waited, [1, 2]);
+	for errno in [libc::ENOEXEC, libc::ENOENT, libc::EACCES, libc::E2BIG] {
+		let (mut tries, mut waits) = (0, 0);
+		let failed: io::Result<()> = super::retry_busy(
+			|| {
+				tries += 1;
+				Err(io::Error::from_raw_os_error(errno))
+			},
+			|_| waits += 1,
+		);
+		assert_eq!((failed.unwrap_err().raw_os_error(), tries, waits), (Some(errno), 1, 0));
+	}
+	let env = EnvView::default();
+	let a = argv(&["/nonexistent/prog"]);
+	let mut waits = 0;
+	let failed = settle_now(NativeSpawner::default().start(spec(&a, &env, NEW)), |_| {
+		waits += 1;
+		Box::new(Fired)
+	});
+	assert_eq!((failed.err().map(|e| e.kind()), waits), (Some(io::ErrorKind::NotFound), 0));
+}
+
+/// A timer that has fired: a test's wait, over at once.
+struct Fired;
+
+impl crate::bash::Timer for Fired {
+	fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+		Poll::Ready(())
+	}
+}
+
+/// `started` settled, its waits on `sleep`'s timers: the test's, which have
+/// fired, so one poll settles it.
+fn settle_now(
+	started: super::Started,
+	sleep: impl FnMut(Duration) -> Box<dyn crate::bash::Timer>,
+) -> io::Result<Box<dyn ExtProc>> {
+	let mut settling = std::pin::pin!(started.settle(sleep));
+	match settling
+		.as_mut()
+		.poll(&mut Context::from_waker(Waker::noop()))
+	{
+		Poll::Ready(settled) => settled,
+		Poll::Pending => panic!("a spawn whose waits have fired is settled at once"),
+	}
+}
+
+/// Whether this kernel refuses to run a program held open for writing
+/// (Linux does; gVisor runs it). The probe is a program in `dir`, the
+/// calling test's own directory.
+#[cfg(target_os = "linux")]
+fn busy_exec_refused(dir: &std::path::Path) -> bool {
+	let program = dir.join("busy-probe");
+	write_program(&program, "#!/bin/sh\nexit 0\n");
+	let held = std::fs::OpenOptions::new()
+		.append(true)
+		.open(&program)
+		.expect("open the probe for writing");
+	let ran = std::process::Command::new(&program).status();
+	drop(held);
+	ran.err().and_then(|e| e.raw_os_error()) == Some(libc::ETXTBSY)
+}
+
+/// Says on the test binary's stderr, past libtest's capture, that `test`
+/// did not run: this kernel runs a program held open for writing, so there
+/// is no busy exec to retry. The policy tests cover the retry there.
+#[cfg(target_os = "linux")]
+fn say_not_run(test: &str) {
+	use std::io::Write as _;
+	let _ = writeln!(
+		std::io::stderr(),
+		"NOT-RUN {test}: this kernel runs a program held open for writing"
+	);
+}
+
+/// Writes `text` to `path`, mode 0755.
+#[cfg(target_os = "linux")]
+fn write_program(path: &std::path::Path, text: &str) {
+	use std::os::unix::fs::PermissionsExt as _;
+	std::fs::write(path, text).expect("write the program");
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// A process that holds a program open for writing until it is killed (a
+/// `sleep` with the file on fd 3, opened before it says `held`): another
+/// session's child before its exec.
+#[cfg(target_os = "linux")]
+struct Holder(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Holder {
+	fn new(program: &std::path::Path) -> Self {
+		use std::io::BufRead as _;
+		let mut child = std::process::Command::new("/bin/sh")
+			.args(["-c", "exec 3>>\"$0\" && echo held && exec sleep 600"])
+			.arg(program)
+			.stdout(std::process::Stdio::piped())
+			.spawn()
+			.expect("start the holder");
+		let mut said = String::new();
+		std::io::BufReader::new(child.stdout.as_mut().expect("holder stdout"))
+			.read_line(&mut said)
+			.expect("read the holder");
+		assert_eq!(said, "held\n", "the holder opened the program for writing");
+		Self(child)
+	}
+
+	fn pid(&self) -> libc::pid_t {
+		libc::pid_t::try_from(self.0.id()).unwrap()
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Holder {
+	fn drop(&mut self) {
+		let _ = self.0.kill();
+		let _ = self.0.wait();
+	}
+}
+
+/// The spec of the spawn of `program` by path `kind` (`posix_spawn`, the
+/// fork path, or the deferred fork whose child reports a failed exec on its
+/// fd 2, here the file `err`, and by its status).
+#[cfg(target_os = "linux")]
+fn spec_by<'a>(
+	kind: &str,
+	program: &'a [BString],
+	env: &'a EnvView,
+	err: &std::path::Path,
+) -> SpawnSpec<'a> {
+	let mut sp = spec(program, env, NEW);
+	match kind {
+		"posix_spawn" => {},
+		"fork" => sp.umask = if sp.umask == 0o077 { 0o027 } else { 0o077 },
+		"deferred" => {
+			sp.redirs = Some(ChildRedirs {
+				list:      vec![child_open(&[2], err, WRITE)],
+				exec_diag: BString::from("test: "),
+			});
+		},
+		_ => unreachable!("{kind}"),
+	}
+	sp
+}
+
+/// The spawn of `program` by path `kind` ([`spec_by`]), one try.
+#[cfg(target_os = "linux")]
+fn spawn_by(
+	s: &NativeSpawner,
+	kind: &str,
+	program: &[BString],
+	env: &EnvView,
+	err: &std::path::Path,
+) -> io::Result<Box<dyn ExtProc>> {
+	s.spawn(spec_by(kind, program, env, err))
+}
+
+#[cfg(target_os = "linux")]
+const BUSY_PATHS: [&str; 3] = ["posix_spawn", "fork", "deferred"];
+
+/// On every spawn path, a program another process holds open for writing
+/// runs once that process lets go within the waits. On the `posix_spawn`
+/// and fork paths the first try fails with no process left of it, and the
+/// holder is killed at the first wait, a timer of the test's; the deferred
+/// fork's child waits itself, and kills the holder at its first wait
+/// (`KILL_AT_BUSY_WAIT`). Every file is in this test's own directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_program_runs_once_its_holder_lets_go() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_busy_program_runs_once_its_holder_lets_go");
+		return;
+	}
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	for kind in BUSY_PATHS {
+		let program = dir.path().join(kind);
+		let err = dir.path().join(format!("{kind}.err"));
+		write_program(&program, "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&program);
+		let a = vec![BString::from(program.as_os_str().as_encoded_bytes())];
+		let spawned = if kind == "deferred" {
+			super::KILL_AT_BUSY_WAIT.set(holder.pid());
+			let spawned = spawn_by(&s, kind, &a, &env, &err);
+			super::KILL_AT_BUSY_WAIT.set(0);
+			spawned
+		} else {
+			let mut holder = Some(holder);
+			let mut waited = Vec::new();
+			let spawned = settle_now(s.start(spec_by(kind, &a, &env, &err)), |wait| {
+				waited.push(wait);
+				drop(holder.take());
+				Box::new(Fired)
+			});
+			assert_eq!(waited, [Duration::from_millis(1)], "{kind}: one wait");
+			spawned
+		};
+		let status = spawned.map(|mut p| wait(&mut p));
+		let said = std::fs::read_to_string(&err).unwrap_or_default();
+		assert_eq!(status.map_err(|e| e.to_string()), Ok(ExitStatus::Exited(7)), "{kind}: {said}");
+	}
+}
+
+/// On every spawn path, a program that stays open for writing still fails
+/// with ETXTBSY once the waits run out, as bash fails at once. On the
+/// `posix_spawn` and fork paths the waits are counted: one timer of the
+/// caller's for each of `BUSY_WAITS_MS`, in order (here timers that have
+/// fired). Every file is in this test's own directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_program_that_stays_busy_fails_after_the_waits() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_program_that_stays_busy_fails_after_the_waits");
+		return;
+	}
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let all_waits: Vec<Duration> = super::super::BUSY_WAITS_MS
+		.iter()
+		.map(|&ms| Duration::from_millis(ms))
+		.collect();
+	for kind in BUSY_PATHS {
+		let program = dir.path().join(kind);
+		let err = dir.path().join(format!("{kind}.err"));
+		write_program(&program, "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&program);
+		let a = vec![BString::from(program.as_os_str().as_encoded_bytes())];
+		let failure = if kind == "deferred" {
+			let mut p = spawn_by(&s, kind, &a, &env, &err).expect("the deferred spawn");
+			let status = wait(&mut p);
+			format!("{status:?}: {}", std::fs::read_to_string(&err).unwrap_or_default())
+		} else {
+			let mut waited = Vec::new();
+			let settled = settle_now(s.start(spec_by(kind, &a, &env, &err)), |wait| {
+				waited.push(wait);
+				Box::new(Fired)
+			});
+			assert_eq!(waited, all_waits, "{kind}: every wait, in order");
+			match settled {
+				Err(e) => e.to_string(),
+				Ok(mut p) => format!("ran: {:?}", wait(&mut p)),
+			}
+		};
+		drop(holder);
+		let expected = if kind == "deferred" {
+			"Exited(126): test: Text file busy\n".to_owned()
+		} else {
+			io::Error::from_raw_os_error(libc::ETXTBSY).to_string()
+		};
+		assert_eq!(failure, expected, "{kind}");
+	}
+}
+
+/// A `sleep` a test watches die: the spawn under test kills it when it
+/// finds its program busy (`KILL_AT_BUSY_WAIT`), the sign that it waits.
+#[cfg(target_os = "linux")]
+struct Sentinel(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Sentinel {
+	fn new() -> Self {
+		Self(
+			std::process::Command::new("sleep")
+				.arg("600")
+				.spawn()
+				.expect("start the sentinel"),
+		)
+	}
+
+	fn pid(&self) -> libc::pid_t {
+		libc::pid_t::try_from(self.0.id()).unwrap()
+	}
+
+	/// Whether it died (reaped, then).
+	fn died(&mut self) -> bool {
+		self.0.try_wait().expect("the sentinel's state").is_some()
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Sentinel {
+	fn drop(&mut self) {
+		let _ = self.0.kill();
+		let _ = self.0.wait();
+	}
+}
+
+/// A runtime with one thread, which drives the session and every other
+/// task of a test.
+#[cfg(target_os = "linux")]
+fn one_thread() -> tokio::runtime::Runtime {
+	tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("a runtime")
+}
+
+/// A shell session's spawn paths: `posix_spawn` for a command run with
+/// the process's umask, the fork path for one run with another.
+#[cfg(target_os = "linux")]
+const SESSION_PATHS: [&str; 2] = ["posix_spawn", "fork"];
+
+/// `then` after the program `./name` in the test's directory, run on the
+/// session's spawn path `kind`.
+#[cfg(target_os = "linux")]
+fn run_by(kind: &str, name: &str, then: &str) -> String {
+	match kind {
+		"posix_spawn" => format!("./{name}; {then}"),
+		"fork" => {
+			let other = if process_umask() == Some(0o077) {
+				"027"
+			} else {
+				"077"
+			};
+			format!("umask {other}; ./{name}; {then}")
+		},
+		_ => unreachable!("{kind}"),
+	}
+}
+
+/// A run of `command` in `dir`.
+#[cfg(target_os = "linux")]
+fn run_in(dir: &std::path::Path, command: String) -> crate::shell::ShellRunOptions {
+	crate::shell::ShellRunOptions {
+		command,
+		cwd: Some(dir.to_string_lossy().into_owned()),
+		..Default::default()
+	}
+}
+
+/// Makes reads of `pipe` return `WouldBlock` instead of waiting.
+#[cfg(target_os = "linux")]
+fn nonblocking(pipe: &std::io::PipeReader) {
+	use std::os::fd::AsRawFd as _;
+	// SAFETY: fcntl on a descriptor the caller holds.
+	unsafe {
+		let flags = libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL);
+		assert!(flags >= 0, "F_GETFL");
+		assert!(
+			libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == 0,
+			"F_SETFL"
+		);
+	}
+}
+
+/// Whether `pipe` reaches end of file with nothing read from it. A read
+/// that would wait yields the runtime's thread to its other tasks (the
+/// run) and tries again: a child that holds the write end delays the end
+/// of file without stopping the run.
+#[cfg(target_os = "linux")]
+async fn reaches_end_of_file(pipe: &std::io::PipeReader) -> bool {
+	nonblocking(pipe);
+	loop {
+		match std::io::Read::read(&mut &*pipe, &mut [0u8; 1]) {
+			Ok(read) => return read == 0,
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => tokio::task::yield_now().await,
+			Err(e) => panic!("read the pipe: {e}"),
+		}
+	}
+}
+
+/// What `pipe` holds now, read without waiting for more.
+#[cfg(target_os = "linux")]
+fn drain(pipe: &mut std::io::PipeReader) -> Vec<u8> {
+	nonblocking(pipe);
+	let mut got = Vec::new();
+	let mut buf = [0u8; 256];
+	loop {
+		match std::io::Read::read(pipe, &mut buf) {
+			Ok(0) => return got,
+			Ok(n) => got.extend_from_slice(&buf[..n]),
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => return got,
+			Err(e) => panic!("read the pipe: {e}"),
+		}
+	}
+}
+
+/// While a session's spawn waits for a busy program, the one thread that
+/// drives the session runs other tasks: a timer of another task fires, a
+/// pipe the host closed reaches end of file, and that task then lets the
+/// program go, which the spawn's next try runs. The spawn's first busy try
+/// kills the sentinel (`KILL_AT_BUSY_WAIT`), so the other task starts only
+/// once the spawn waits; one that waited on the session's thread would have
+/// failed with ETXTBSY (126) before the other task ran. Every wait is the
+/// host's own: each one reports its process's pid (`BUSY_WAIT_REPORT`),
+/// and a child that waited for its exec (holding every descriptor of the
+/// host meanwhile) would report its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_spawn_leaves_its_thread_to_other_tasks() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_busy_spawn_leaves_its_thread_to_other_tasks");
+		return;
+	}
+	for kind in SESSION_PATHS {
+		write_program(&dir.path().join(kind), "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&dir.path().join(kind));
+		let mut sentinel = Sentinel::new();
+		let (host_reads, host_writes) = std::io::pipe().expect("a pipe of the host's");
+		let (mut reports, report_to) = std::io::pipe().expect("the wait reports' pipe");
+		super::KILL_AT_BUSY_WAIT.set(sentinel.pid());
+		super::BUSY_WAIT_REPORT.set(std::os::fd::AsRawFd::as_raw_fd(&report_to));
+		let shell = crate::shell::Shell::new(None);
+		let (ran, end_of_file) = one_thread().block_on(async {
+			let run = shell.run(
+				run_in(dir.path(), run_by(kind, kind, "exit $?")),
+				None,
+				crate::cancel::CancelToken::default(),
+			);
+			let other = async move {
+				while !sentinel.died() {
+					tokio::task::yield_now().await;
+				}
+				tokio::time::sleep(Duration::from_millis(1)).await;
+				drop(host_writes);
+				let end_of_file = reaches_end_of_file(&host_reads).await;
+				drop(holder);
+				end_of_file
+			};
+			tokio::join!(run, other)
+		});
+		super::KILL_AT_BUSY_WAIT.set(0);
+		super::BUSY_WAIT_REPORT.set(-1);
+		// Every wait happened before the run ended, so its report is in the
+		// pipe: read what is there, without waiting for an end of file that
+		// another test's child (holding a copy until its exec) could delay.
+		let reported = drain(&mut reports);
+		drop(report_to);
+		let waiters: Vec<u32> = reported
+			.as_chunks::<4>()
+			.0
+			.iter()
+			.map(|pid| u32::from_ne_bytes(*pid))
+			.collect();
+		assert!(!waiters.is_empty(), "{kind}: the spawn waited");
+		assert!(
+			waiters.iter().all(|&pid| pid == std::process::id()),
+			"{kind}: a process other than the host ({}) waited: {waiters:?}",
+			std::process::id()
+		);
+		assert!(end_of_file, "{kind}: nothing wrote to the pipe");
+		let ran = ran.expect("the run");
+		assert_eq!(
+			ran.exit_code,
+			Some(7),
+			"{kind}: the program ran once the other task let go: {ran:?}"
+		);
+	}
+}
+
+/// What a run printed, and whether the command after the program ran.
+#[cfg(target_os = "linux")]
+fn run_record(said: &flume::Receiver<String>, after: &std::path::Path) -> (String, bool) {
+	(said.drain().collect(), after.exists())
+}
+
+/// `Shell::abort` while the session's spawn waits for a busy program ends
+/// the run at once: the pending spawn is dropped, so the program is never
+/// reported busy and the next command never runs. The spawn's first busy
+/// try kills the sentinel, the sign for the other task to abort; a spawn
+/// that waited on the session's thread would have reported the program
+/// busy and run the next command before the abort could be sent.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abort_ends_a_run_whose_program_is_busy() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("an_abort_ends_a_run_whose_program_is_busy");
+		return;
+	}
+	for kind in SESSION_PATHS {
+		write_program(&dir.path().join(kind), "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&dir.path().join(kind));
+		let mut sentinel = Sentinel::new();
+		let after = dir.path().join(format!("{kind}.after"));
+		let (chunks, said) = flume::unbounded();
+		super::KILL_AT_BUSY_WAIT.set(sentinel.pid());
+		let shell = crate::shell::Shell::new(None);
+		let (ran, ()) = one_thread().block_on(async {
+			let then = format!("echo after > {kind}.after");
+			let run = shell.run(
+				run_in(dir.path(), run_by(kind, kind, &then)),
+				Some(chunks),
+				crate::cancel::CancelToken::default(),
+			);
+			let abort = async {
+				while !sentinel.died() {
+					tokio::task::yield_now().await;
+				}
+				shell.abort().await;
+			};
+			tokio::join!(run, abort)
+		});
+		super::KILL_AT_BUSY_WAIT.set(0);
+		drop(holder);
+		let ran = ran.expect("the run");
+		let (said, after_ran) = run_record(&said, &after);
+		assert!(ran.cancelled, "{kind}: the abort ended the run: {ran:?}");
+		assert!(!said.contains("Text file busy"), "{kind}: reported busy: {said:?}");
+		assert!(!after_ran, "{kind}: the next command ran");
+	}
+}
+
+/// A run's timeout that comes while the session's spawn waits for a busy
+/// program ends the run there: the pending spawn is dropped, so the
+/// program is never reported busy and the next command never runs. No
+/// clock is compared: the timeout's timer (400 ms from before the run) is
+/// armed before the spawn's last wait (512 ms, armed only once the waits
+/// before it fired), so it fires first on the same runtime. A spawn that
+/// waited on the session's thread would have reported the program busy
+/// and run the next command before the timeout could act.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_timeout_ends_a_run_whose_program_is_busy() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_timeout_ends_a_run_whose_program_is_busy");
+		return;
+	}
+	for kind in SESSION_PATHS {
+		write_program(&dir.path().join(kind), "#!/bin/sh\nexit 7\n");
+		let holder = Holder::new(&dir.path().join(kind));
+		let after = dir.path().join(format!("{kind}.after"));
+		let (chunks, said) = flume::unbounded();
+		let then = format!("echo after > {kind}.after");
+		// The token carries the run's timeout.
+		let ran = one_thread().block_on(crate::shell::execute_shell(
+			crate::shell::ShellExecuteOptions {
+				command: run_by(kind, kind, &then),
+				cwd: Some(dir.path().to_string_lossy().into_owned()),
+				..Default::default()
+			},
+			Some(chunks),
+			crate::cancel::CancelToken::new(Some(400)),
+		));
+		drop(holder);
+		let ran = ran.expect("the run");
+		let (said, after_ran) = run_record(&said, &after);
+		assert!(ran.timed_out, "{kind}: the timeout ended the run: {ran:?}");
+		assert!(!said.contains("Text file busy"), "{kind}: reported busy: {said:?}");
+		assert!(!after_ran, "{kind}: the next command ran");
+	}
+}
+
+/// The child of a deferred spawn that waits for a busy program holds none
+/// of the host's other descriptors meanwhile: it closed what its exec would
+/// close. Its first exec try reports the program busy (`FAKE_BUSY_EXECS`,
+/// so the test runs on every kernel, gVisor's too), and at its first wait
+/// the child stops itself (`STOP_AT_BUSY_WAIT`), so the test always reads
+/// it while it waits: its descriptor table (each entry printed as an
+/// `FDTABLE` line) must not hold a pipe of the host's, and the pipe reaches
+/// end of file once the host closes its own end. Continued, the child's
+/// next try runs the program.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deferred_child_waiting_for_a_busy_program_holds_no_host_descriptor() {
+	use std::io::Write as _;
+	const TEST: &str = "a_deferred_child_waiting_for_a_busy_program_holds_no_host_descriptor";
+	let dir = tempfile::tempdir().expect("the test's directory");
+	let program = dir.path().join("deferred");
+	let err = dir.path().join("deferred.err");
+	write_program(&program, "#!/bin/sh\nexit 7\n");
+	let (mut host_reads, host_writes) = std::io::pipe().expect("a pipe of the host's");
+	let pipe = {
+		use std::os::fd::AsRawFd as _;
+		std::fs::read_link(format!("/proc/self/fd/{}", host_writes.as_raw_fd())).expect("the pipe")
+	};
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = vec![BString::from(program.as_os_str().as_encoded_bytes())];
+	super::FAKE_BUSY_EXECS.set(1);
+	super::STOP_AT_BUSY_WAIT.set(true);
+	let mut p = spawn_by(&s, "deferred", &a, &env, &err).expect("the deferred spawn");
+	super::STOP_AT_BUSY_WAIT.set(false);
+	super::FAKE_BUSY_EXECS.set(0);
+	let pid = i32::try_from(p.pid()).unwrap();
+	// The child's state letter (`/proc/PID/stat`, after its name in
+	// parentheses): wait until it shows the stop it makes at its first wait.
+	let state = loop {
+		let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+		match stat
+			.rsplit_once(") ")
+			.and_then(|(_, rest)| rest.chars().next())
+		{
+			Some('R' | 'S' | 'D') => thread::yield_now(),
+			other => break other,
+		}
+	};
+	let entries = std::fs::read_dir(format!("/proc/{pid}/fd"))
+		.into_iter()
+		.flatten();
+	let table: Vec<(String, std::path::PathBuf)> = entries
+		.filter_map(|entry| {
+			let entry = entry.ok()?;
+			Some((
+				entry.file_name().to_string_lossy().into_owned(),
+				std::fs::read_link(entry.path()).ok()?,
+			))
+		})
+		.collect();
+	for (fd, target) in &table {
+		let _ = writeln!(std::io::stderr(), "FDTABLE {TEST} {fd} -> {}", target.display());
+	}
+	let _ = p.signal(Signal::Cont);
+	drop(host_writes);
+	assert_eq!(state, Some('T'), "the child stopped at its first wait");
+	assert!(!table.is_empty(), "the stopped child's descriptor table was read");
+	assert!(
+		table.iter().all(|(_, target)| *target != pipe),
+		"the waiting child holds the host's pipe {pipe:?}: {table:?}"
+	);
+	let read = std::io::Read::read(&mut host_reads, &mut [0u8; 1]).expect("read the pipe");
+	assert_eq!(read, 0, "nothing wrote to the pipe");
+	let status = wait(&mut p);
+	assert_eq!(status, ExitStatus::Exited(7), "the program ran at the next try");
+}
+
+/// `./name &`, then `rest`, on the session's spawn path `kind` (the
+/// background job's external spawns as the foreground one would).
+#[cfg(target_os = "linux")]
+fn background_by(kind: &str, name: &str, rest: &str) -> String {
+	match kind {
+		"posix_spawn" => format!("./{name} & {rest}"),
+		"fork" => {
+			let other = if process_umask() == Some(0o077) {
+				"027"
+			} else {
+				"077"
+			};
+			format!("umask {other}; ./{name} & {rest}")
+		},
+		_ => unreachable!("{kind}"),
+	}
+}
+
+/// What a run prints until `want` appears in it, or until it ends.
+#[cfg(target_os = "linux")]
+async fn said_until(said: &flume::Receiver<String>, want: &str) -> String {
+	let mut text = String::new();
+	while !text.contains(want) {
+		match said.recv_async().await {
+			Ok(chunk) => text.push_str(&chunk),
+			Err(_) => break,
+		}
+	}
+	text
+}
+
+/// `prog & pid=$!` with a busy program: `$!` is known, and the script goes
+/// on, before the program's tries end, as bash's forked child is `$!`
+/// before its exec; only `wait $pid` waits for the tries. The test lets the
+/// program go only once the command after `pid=$!` printed: a `$!` that
+/// waited for the tries would have been known only once they ran out, the
+/// program failing (126) while still held. `$!` names the program's own
+/// process (the one that waited for it), as the program prints `$$`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_jobs_pid_is_known_while_its_program_is_busy() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_background_jobs_pid_is_known_while_its_program_is_busy");
+		return;
+	}
+	for kind in SESSION_PATHS {
+		let program = dir.path().join(kind);
+		let own = dir.path().join(format!("{kind}.pid"));
+		write_program(&program, &format!("#!/bin/sh\necho $$ > {}\nexit 7\n", own.display()));
+		let holder = Holder::new(&program);
+		let (chunks, said) = flume::unbounded();
+		let shell = crate::shell::Shell::new(None);
+		let rest = "pid=$!; echo next $pid; wait $pid; echo status $?";
+		let (ran, before) = one_thread().block_on(async {
+			let run = shell.run(
+				run_in(dir.path(), background_by(kind, kind, rest)),
+				Some(chunks),
+				crate::cancel::CancelToken::default(),
+			);
+			let other = async {
+				let before = said_until(&said, "next ").await;
+				drop(holder);
+				before
+			};
+			tokio::join!(run, other)
+		});
+		let ran = ran.expect("the run");
+		let text = before + &said.drain().collect::<String>();
+		let bang = text
+			.lines()
+			.find_map(|line| line.strip_prefix("next "))
+			.unwrap_or_default()
+			.to_owned();
+		assert!(
+			text.contains("status 7"),
+			"{kind}: the program ran once let go, after the next command: {text:?} {ran:?}"
+		);
+		let ran_as = std::fs::read_to_string(&own).unwrap_or_default();
+		assert_eq!(ran_as.trim(), bang, "{kind}: $! is the program's own pid");
+	}
+}
+
+/// A background job's program that stays busy fails as the same command
+/// in the foreground does: the same message (bash's `bad interpreter` for a
+/// `#!` script) and status 126, though the process that waited for it
+/// prints them ([`crate::bash::OnBusy::Child`]).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_program_that_stays_busy_fails_as_in_the_foreground() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_background_program_that_stays_busy_fails_as_in_the_foreground");
+		return;
+	}
+	let program = dir.path().join("held");
+	write_program(&program, "#!/bin/sh\nexit 7\n");
+	let holder = Holder::new(&program);
+	let (chunks, said) = flume::unbounded();
+	let shell = crate::shell::Shell::new(None);
+	let command = "./held 2> bg.err & wait $!; echo bg $?; ./held 2> fg.err; echo fg $?".to_owned();
+	let ran = one_thread().block_on(shell.run(
+		run_in(dir.path(), command),
+		Some(chunks),
+		crate::cancel::CancelToken::default(),
+	));
+	drop(holder);
+	let ran = ran.expect("the run");
+	let text: String = said.drain().collect();
+	let bg = std::fs::read_to_string(dir.path().join("bg.err")).unwrap_or_default();
+	let fg = std::fs::read_to_string(dir.path().join("fg.err")).unwrap_or_default();
+	assert!(text.contains("bg 126") && text.contains("fg 126"), "{text:?} {ran:?}");
+	assert!(fg.contains("bad interpreter: Text file busy"), "foreground: {fg:?}");
+	assert_eq!(bg, fg, "the background job's report");
+}
+
+/// A background job's busy program without `#!` (a possible shell text
+/// file) is waited for before `$!` is known: once free, its exec fails
+/// with `ENOEXEC`, and the engine runs it as a script, which a process
+/// already returned as `$!` could not. The first wait lets the program go
+/// (`KILL_AT_BUSY_WAIT`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_busy_background_script_without_a_shebang_still_runs_as_a_script() {
+	let dir = tempfile::tempdir().expect("the test's directory");
+	if !busy_exec_refused(dir.path()) {
+		say_not_run("a_busy_background_script_without_a_shebang_still_runs_as_a_script");
+		return;
+	}
+	let program = dir.path().join("plain");
+	write_program(&program, "exit 7\n");
+	let holder = Holder::new(&program);
+	let (chunks, said) = flume::unbounded();
+	super::KILL_AT_BUSY_WAIT.set(holder.pid());
+	let shell = crate::shell::Shell::new(None);
+	let ran = one_thread().block_on(shell.run(
+		run_in(dir.path(), "./plain & wait $!; echo status $?".to_owned()),
+		Some(chunks),
+		crate::cancel::CancelToken::default(),
+	));
+	super::KILL_AT_BUSY_WAIT.set(0);
+	drop(holder);
+	let ran = ran.expect("the run");
+	let text: String = said.drain().collect();
+	assert!(text.contains("status 7"), "{text:?} {ran:?}");
+}
+
 /// bash's forked child opens a background command's FIFO redirection: the
 /// spawn returns (with the pid `$!` shows) while the open still waits for
 /// the FIFO's other end, which the shell's next command opens.
@@ -459,6 +1265,251 @@ fn failures_left_to_the_process_are_its_own_message_and_status() {
 		std::fs::read_to_string(&err).unwrap(),
 		"test: /nonexistent/prog: No such file or directory\n"
 	);
+	std::fs::remove_file(&err).unwrap();
+}
+
+/// A process whose redirection open waits (a FIFO with no other end) holds
+/// none of the host's close-on-exec descriptors meanwhile: a pipe's reader
+/// in the host gets end of file once the host closes the write end (here
+/// close-on-exec at fd 100 or above, as a pump's end is), while the open
+/// still waits. bash's child holds none either. `sweep` is where the child's
+/// sweep starts ([`Sweep`]): the counting loop must reach past fd 16, and
+/// the walk must find an fd wherever it is.
+fn waiting_open_holds_no_host_descriptor(sweep: Sweep) {
+	use std::{
+		io::Read,
+		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+	};
+
+	/// A wait that only names a hang: the end of file comes at once, or
+	/// never while the open waits.
+	const HANG: Duration = Duration::from_secs(60);
+	let fifo = temp_path(&format!("held-fifo-{sweep:?}"));
+	let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+	// SAFETY: mkfifo with a valid C path.
+	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+	let (mut reader, writer) = std::io::pipe().unwrap();
+	// SAFETY: F_DUPFD_CLOEXEC on a descriptor this test owns makes a new one.
+	let high = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
+	assert!(high >= 100, "F_DUPFD_CLOEXEC: {}", io::Error::last_os_error());
+	// SAFETY: `high` is a new descriptor nothing else owns.
+	let high = unsafe { OwnedFd::from_raw_fd(high) };
+	drop(writer);
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = argv(&["/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
+		exec_diag: BString::from("test: /bin/true: "),
+	});
+	super::force_sweep(sweep);
+	let spawned = s.spawn(sp);
+	super::force_sweep(Sweep::CloseRange);
+	let mut p = spawned.expect("spawn");
+	drop(high);
+	let (tx, eof) = std::sync::mpsc::channel();
+	thread::spawn(move || {
+		let mut rest = Vec::new();
+		let _ = tx.send(reader.read_to_end(&mut rest).map(|_| rest));
+	});
+	// Another test's child holds a copy of the write end only until its exec.
+	let got = eof.recv_timeout(HANG);
+	// Let the open go in any case.
+	drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	std::fs::remove_file(&fifo).unwrap();
+	assert!(
+		matches!(&got, Ok(Ok(rest)) if rest.is_empty()),
+		"the reader got no end of file while the open waited: the child held its write end \
+		 ({sweep:?})"
+	);
+}
+
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor() {
+	waiting_open_holds_no_host_descriptor(Sweep::CloseRange);
+}
+
+/// Where `close_range` is refused (a kernel before 5.9, a seccomp profile),
+/// the child walks `/proc/self/fd`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor_without_close_range() {
+	waiting_open_holds_no_host_descriptor(Sweep::Walk);
+}
+
+/// Where no descriptor list can be read either (no `/proc`), the child
+/// closes every number below the descriptor limit.
+#[test]
+fn a_waiting_redirection_open_holds_no_host_descriptor_without_a_list() {
+	waiting_open_holds_no_host_descriptor(Sweep::Count);
+}
+
+/// The host's descriptor without close-on-exec is listed before the fork
+/// as one the child keeps. If another thread closes it and a new
+/// close-on-exec descriptor takes its number before the fork (here a
+/// pipe's write end, as another job's), the child must not keep that
+/// number: the pipe's reader gets end of file once the host closes the
+/// write end, while the child's open still waits.
+#[test]
+fn a_number_reused_between_the_list_and_the_fork_is_not_kept() {
+	use std::{
+		io::Read,
+		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+	};
+
+	/// A wait that only names a hang: the end of file comes at once, or
+	/// never while the open waits.
+	const HANG: Duration = Duration::from_secs(60);
+	let fifo = temp_path("reused-fifo");
+	let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+	// SAFETY: mkfifo with a valid C path.
+	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+	let null = std::fs::File::open("/dev/null").unwrap();
+	// SAFETY: F_DUPFD on a descriptor this test owns makes a new one, without
+	// close-on-exec.
+	let n = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 200) };
+	assert!(n >= 200, "F_DUPFD: {}", io::Error::last_os_error());
+	drop(null);
+	let (mut reader, writer) = std::io::pipe().unwrap();
+	let w = writer.as_raw_fd();
+	// After the list, before the fork: number `n` becomes a copy of the
+	// pipe's write end, with close-on-exec.
+	super::before_fork(move || {
+		// SAFETY: dup2 replaces this test's own descriptor `n`; F_SETFD only
+		// sets its flags.
+		unsafe {
+			assert_eq!(libc::dup2(w, n), n, "dup2: {}", io::Error::last_os_error());
+			assert_eq!(libc::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC), 0, "F_SETFD");
+		}
+	});
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = argv(&["/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
+		exec_diag: BString::from("test: /bin/true: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	// SAFETY: `n` is this test's copy of the write end now, owned here.
+	drop(unsafe { OwnedFd::from_raw_fd(n) });
+	drop(writer);
+	let (tx, eof) = std::sync::mpsc::channel();
+	thread::spawn(move || {
+		let mut rest = Vec::new();
+		let _ = tx.send(reader.read_to_end(&mut rest).map(|_| rest));
+	});
+	// Another test's child holds a copy of the write end only until its exec.
+	let got = eof.recv_timeout(HANG);
+	// Let the open go in any case.
+	drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	std::fs::remove_file(&fifo).unwrap();
+	assert!(
+		matches!(&got, Ok(Ok(rest)) if rest.is_empty()),
+		"the reader got no end of file while the open waited: the child kept fd {n}, which a \
+		 close-on-exec descriptor took before the fork"
+	);
+}
+
+/// A step the engine found bad ([`ChildRedir::Fail`]) ends the process in
+/// its place: the steps before it are applied (its message goes to the file
+/// one of them opened as fd 2), none after it is, and the status is 1.
+#[test]
+fn a_failed_step_ends_the_process_after_the_steps_before_it() {
+	let err = temp_path("fail-err");
+	let after = temp_path("fail-after");
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh("echo never");
+	let mut sp = spec(&a, &env, NEW);
+	let text = "test: line 1: 9: Bad file descriptor\n";
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![
+			child_open(&[2], &err, WRITE),
+			ChildRedir::Fail { text: BString::from(text) },
+			child_open(&[1], &after, WRITE),
+		],
+		exec_diag: BString::from("test: /bin/sh: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(1));
+	assert_eq!(std::fs::read_to_string(&err).unwrap(), text);
+	assert!(!after.exists(), "a step after the failed one was applied");
+	std::fs::remove_file(&err).unwrap();
+}
+
+/// A process that applies its own redirections keeps the host's descriptors
+/// without close-on-exec, as bash's children and this spawner's other paths
+/// (`posix_spawn`, fork+exec) do: an embedded host leaves the descriptors it
+/// inherited open so (`process::host::inherited_fds`), a make jobserver's
+/// pipe among them.
+///
+/// Two strays, so a sweep of part of the range shows: `high`, the lowest
+/// free fd from 10 up, where a shell keeps the copies of the fds a
+/// redirection of a compound command replaces (dash copies stdout to fd 10
+/// for `if …; fi > out`); and `low`, the lowest free fd from 3 up, below 10
+/// in a run alone, where dash keeps nothing (its copies go to 10 and up).
+/// The probe redirects with `exec`, which keeps no copy and closes the fd it
+/// opened for the file before the checks, so only a stray can answer to
+/// either number.
+#[test]
+fn a_process_that_applies_its_redirections_keeps_the_hosts_inherited_fds() {
+	use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+	let out = temp_path("stray-out");
+	let err = temp_path("stray-err");
+	let (pipe_read, _writer) = std::io::pipe().unwrap();
+	// A new descriptor of `pipe_read`'s pipe, the lowest free from `from` up,
+	// not close-on-exec.
+	let stray = |from: i32| {
+		// SAFETY: F_DUPFD on a descriptor this test owns makes a new one.
+		let n = unsafe { libc::fcntl(pipe_read.as_raw_fd(), libc::F_DUPFD, from) };
+		assert!(n >= from, "F_DUPFD: {}", io::Error::last_os_error());
+		// SAFETY: `n` is a new descriptor nothing else owns.
+		unsafe { OwnedFd::from_raw_fd(n) }
+	};
+	let high_fd = stray(10);
+	let low_fd = stray(3);
+	drop(pipe_read);
+	let (high, low) = (high_fd.as_raw_fd(), low_fd.as_raw_fd());
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh(&format!(
+		"exec > '{}'; for n in {high} {low}; do if [ -e /dev/fd/$n ]; then echo has; else echo \
+		 none; fi; done",
+		out.display()
+	));
+	for sweep in [Sweep::CloseRange, Sweep::Walk, Sweep::Count] {
+		let mut deferred = spec(&a, &env, NEW);
+		deferred.redirs = Some(ChildRedirs {
+			list:      vec![child_open(&[2], &err, WRITE)],
+			exec_diag: BString::from("test: /bin/sh: "),
+		});
+		super::force_sweep(sweep);
+		let spawned = s.spawn(deferred);
+		super::force_sweep(Sweep::CloseRange);
+		let mut p = spawned.expect("spawn");
+		assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+		assert_eq!(
+			std::fs::read_to_string(&out).unwrap(),
+			"has\nhas\n",
+			"an inherited fd did not reach the process (fds {high} then {low}, {sweep:?})"
+		);
+	}
+	let mut p = s.spawn(spec(&a, &env, NEW)).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	let other = std::fs::read_to_string(&out).unwrap();
+	// macOS's posix_spawn path closes every descriptor it does not place
+	// (POSIX_SPAWN_CLOEXEC_DEFAULT).
+	#[cfg(target_os = "linux")]
+	assert_eq!(other, "has\nhas\n", "the other paths pass the strays on (fds {high} then {low})");
+	#[cfg(not(target_os = "linux"))]
+	let _ = other;
+	drop((high_fd, low_fd));
+	std::fs::remove_file(&out).unwrap();
 	std::fs::remove_file(&err).unwrap();
 }
 
@@ -843,8 +1894,9 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 	drop(s.spawn(sp).unwrap());
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let cx = Context::from_waker(&waker);
+	let mut key = crate::sys::WaitKey::default();
 	while out.captured() != b"late\n" {
-		NativeSpawner::poll_orphans(&cx);
+		NativeSpawner::poll_orphans(&cx, &mut key);
 		thread::park_timeout(Duration::from_millis(50));
 	}
 }

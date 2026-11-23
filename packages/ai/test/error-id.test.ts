@@ -221,18 +221,40 @@ describe("error-id classification", () => {
 		expect(AIError.retriable(id)).toBe(false);
 	});
 
-	it("classifies Codex cyber approval denials as account-scoped policy blocks", () => {
-		const assistant = message({
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			model: "gpt-5.6-sol",
-			errorMessage:
-				"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
+	it("classifies a cyber-policy refusal as blocked content that no credential can cure", () => {
+		const text =
+			"This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)";
+		for (const [api, provider, errorMessage] of [
+			["openai-codex-responses", "openai-codex", `Codex error event: ${text}`],
+			["openai-responses", "openai", `cyber_policy: ${text}`],
+		] as const) {
+			const assistant = message({ api, provider, model: "gpt-5.6-sol", errorMessage });
+			const id = AIError.classifyMessage(assistant);
+			expect(AIError.is(id, AIError.Flag.ContentBlocked)).toBe(true);
+			expect(AIError.is(id, AIError.Flag.AccountPolicy)).toBe(false);
+			expect(AIError.retriable(id)).toBe(false);
+			expect(AIError.isAccountPolicyError(assistant)).toBe(false);
+			expect(AIError.isAuthRetryableError(new Error(errorMessage))).toBe(false);
+		}
+		// The code alone, as an HTTP body carries it, on a 400 and on a 403.
+		for (const status of [400, 403]) {
+			const error = new AIError.ProviderHttpError("This content was flagged.", status, { code: "cyber_policy" });
+			expect(AIError.is(AIError.classify(error, "openai-responses"), AIError.Flag.AccountPolicy)).toBe(false);
+			expect(AIError.isAuthRetryableError(error)).toBe(false);
+		}
+		// A provider retry header cannot make the refusal retryable on the same credential either.
+		const headered = Object.assign(new Error(`cyber_policy: ${text}`), {
+			headers: new Headers({ "x-should-retry": "true" }),
 		});
-		const id = AIError.classifyMessage(assistant);
-		expect(AIError.is(id, AIError.Flag.AccountPolicy)).toBe(true);
-		expect(AIError.is(id, AIError.Flag.ContentBlocked)).toBe(true);
-		expect(AIError.retriable(id)).toBe(false);
+		expect(AIError.isProviderRetryableError(headered)).toBe(false);
+	});
+
+	it("keeps a retry header's verdict for errors other than a cyber-policy refusal", () => {
+		const headered = Object.assign(new Error("503 Service Unavailable"), {
+			headers: new Headers({ "x-should-retry": "true" }),
+		});
+		expect(AIError.isProviderRetryableError(headered)).toBe(true);
+		expect(AIError.isAuthRetryableError(Object.assign(new Error("403 forbidden"), { status: 403 }))).toBe(true);
 	});
 
 	it("classifies only the matching Codex ChatGPT-account model entitlement denial as account policy", () => {

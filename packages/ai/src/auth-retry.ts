@@ -293,6 +293,9 @@ export async function resolveNextAuthRetryKey(
 ): Promise<string | undefined> {
 	if (signal?.aborted) return undefined;
 	if (state.attempts >= AUTH_RETRY_MAX_ATTEMPTS) return undefined;
+	// Whatever classifier let it through: a cyber-policy refusal is never sent again, on this
+	// credential or a sibling.
+	if (AIError.isCyberPolicyRefusal(error)) return undefined;
 	if (error instanceof AIError.OAuthError && error.kind === "token-refresh") {
 		if (state.tokenRefreshReplayUsed) return undefined;
 		state.tokenRefreshReplayUsed = true;
@@ -502,6 +505,8 @@ export async function withOAuthAccess<T>(
 	while (true) {
 		let next: OAuthAccess | undefined;
 		if (signal?.aborted || attemptCount >= AUTH_RETRY_MAX_ATTEMPTS) break;
+		// Never sent again, on this credential or a sibling: see resolveNextAuthRetryKey.
+		if (AIError.isCyberPolicyRefusal(lastError)) break;
 		const tokenRefreshReplay = lastError instanceof AIError.OAuthError && lastError.kind === "token-refresh";
 		if (tokenRefreshReplay) {
 			if (tokenRefreshReplayUsed) break;

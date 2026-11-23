@@ -361,6 +361,8 @@ export class BtwController {
 					expandPromptTemplates: false,
 					streamingBehavior: "steer",
 					throwOnDrop: true,
+					// A person's `/btw` inject: input from outside the session.
+					origin: "outside",
 					onPromptQueued: () => {
 						queued = true;
 					},

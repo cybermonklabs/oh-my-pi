@@ -1108,8 +1108,8 @@ export interface PromptError {
 	provider?: string;
 	model?: string;
 	httpStatus?: number;
-	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent. */
-	code?: "cost_cap" | "session_busy";
+	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again. */
+	code?: "cost_cap" | "session_busy" | "cyber_policy";
 }
 
 /** Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`. */
@@ -1726,7 +1726,7 @@ export interface LiveStartParams {
 }
 
 export interface LiveStartResult {
-	voice: string;
+	voice?: string;
 }
 
 export interface LiveConnectParams {
@@ -1736,8 +1736,8 @@ export interface LiveConnectParams {
 }
 
 export interface LiveConnectResult {
-	voice: string;
 	sdpAnswer: string;
+	voice?: string;
 }
 
 export interface LiveMuteParams {

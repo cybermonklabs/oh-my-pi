@@ -407,6 +407,14 @@ pub(crate) struct Options {
 	// ---- time limits ----
 	/// `--stop-after`/`--stop-at` as a Unix time (0 = none).
 	pub stop_at_utime: i64,
+
+	// ---- tests ----
+	/// Tests only: the receiving side's generator handles nothing its receiver
+	/// forwards until its first wait for that input has written its output, as
+	/// when upstream's receiver process starts after its generator first waits
+	/// for it (see `generator::receiver_starting_late`).
+	#[cfg(test)]
+	pub receiver_starts_late: bool,
 }
 
 impl Default for Options {
@@ -573,6 +581,8 @@ impl Default for Options {
 			bwlimit: 0,
 			bwlimit_arg: None,
 			stop_at_utime: 0,
+			#[cfg(test)]
+			receiver_starts_late: false,
 		}
 	}
 }

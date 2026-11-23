@@ -762,4 +762,38 @@ describe("cache warmer lifecycle", () => {
 		start(h);
 		expect(h.warmer.status).toMatchObject({ state: "inactive", reason: "cache warming disabled" });
 	});
+
+	// A refresh replays the request that was just sent. When OpenAI refused that request for cyber
+	// policy, a replay is the same refused content sent again. Synthetic refusal text only.
+	test("never replays a request OpenAI refused for cyber policy", async () => {
+		const h = harness();
+		start(h);
+		expect(h.warmer.status.state).toBe("scheduled");
+		h.warmer.onResponse({
+			...makeMessage(makeUsage({}), "error"),
+			errorMessage: "cyber_policy: This content was flagged for possible cybersecurity risk.",
+		});
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(0);
+		expect(h.warmer.status.state).toBe("inactive");
+	});
+
+	test("never replays to a route the host reports closed", async () => {
+		let closed = false;
+		const h = harness({ isRouteClosed: () => closed });
+		start(h);
+		closed = true;
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(0);
+		expect(h.warmer.status.state).toBe("inactive");
+	});
+
+	test("still refreshes after an ordinary failed response, as before", async () => {
+		const h = harness();
+		start(h);
+		h.warmer.onResponse({ ...makeMessage(makeUsage({}), "error"), errorMessage: "503 Service Unavailable" });
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+		h.warmer.cancel();
+	});
 });

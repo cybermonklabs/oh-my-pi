@@ -29,6 +29,24 @@
 //!   on and is reaped in the background when it exits, and the leak checks do
 //!   not count it.
 //!
+//! **Busy programs.** Linux refuses to run a program while a process holds
+//! it open for writing (`ETXTBSY`). A host runs its shell sessions as
+//! threads of one process: while one session writes a program (a
+//! redirection to `run.sh` opens it in this process), a child another
+//! session forks holds a copy of the write descriptor until its own exec,
+//! and the first session's `./run.sh` fails with "Text file busy". bash
+//! never meets this race: each of its sessions is a process of its own,
+//! which no other session's fork copies. [`NativeSpawner::start`] reports
+//! such a spawn as [`Started::Busy`], with no process left of it, and
+//! [`Started::settle`] tries it again after each wait of [`BUSY_WAITS_MS`]
+//! on the host's timers, so no thread waits. The child of a spawn that
+//! applies its own redirections ([`SpawnSpec::redirs`]) is already the
+//! program's process (its pid is `$!`, its FIFO opens are done): that child
+//! tries again itself, holding only the descriptors the program will. The
+//! external that gives a background job its `$!` gets such a child too
+//! ([`crate::bash::OnBusy::Child`]): `$!` is known at once, as bash's
+//! forked child is `$!` before its exec.
+//!
 //! **Leak checks.** The spawner remembers every group (session, job) it
 //! created; [`NativeSpawner::leftovers`] lists the processes still in them,
 //! [`NativeSpawner::kill_leftovers`] kills those. The testkit calls them after
@@ -233,8 +251,16 @@ impl Shared {
 		let feed = if let Some(feed) = found {
 			feed
 		} else {
-			let feed = Arc::new(Feed::new(fd)?);
+			let feed = Arc::new(Feed::new(fd.clone())?);
 			feeds.push(Arc::downgrade(&feed));
+			// The shell's own reads of the object come through a feed with a
+			// drain while it lives ([`crate::bash::FeedRead`]). One without is
+			// not read through: a reader would only take its lock, and could
+			// end up dropping it, reading its pipe to end of file there.
+			if feed.reads_through() {
+				let weak: Weak<dyn crate::bash::FeedRead> = Arc::downgrade(&feed) as _;
+				fd.attach_feed(weak);
+			}
 			feed
 		};
 		drop(feeds);
@@ -294,11 +320,13 @@ impl NativeSpawner {
 	/// whoever calls this (every external's `poll_wait` and a
 	/// [`Parker`](crate::sys::Parker) do) and wakes `cx`'s task when it can go
 	/// on.
-	pub fn poll_orphans(cx: &Context<'_>) {
-		crate::sys::pump::orphan::poll(cx);
+	pub fn poll_orphans(cx: &Context<'_>, key: &mut crate::sys::WaitKey) {
+		crate::sys::pump::orphan::poll(cx, key);
 	}
 
-	/// Spawn `spec`; see the module docs for the process lifecycle.
+	/// Spawn `spec`; see the module docs for the process lifecycle. A program
+	/// the kernel refuses as busy fails at once with `ETXTBSY`
+	/// ([`NativeSpawner::start`] can try it again).
 	///
 	/// # Errors
 	///
@@ -307,7 +335,25 @@ impl NativeSpawner {
 	/// non-UTF-8 on Windows). On Windows an extra fd reaches the child only
 	/// as the named pipe its `/dev/fd/N` argument becomes.
 	pub fn spawn(&self, spec: SpawnSpec<'_>) -> io::Result<Box<dyn ExtProc>> {
-		imp::spawn(&self.shared, spec)
+		match self.start(spec) {
+			Started::Done(spawned) => spawned,
+			#[cfg(unix)]
+			Started::Busy(_) => Err(io::Error::from_raw_os_error(libc::ETXTBSY)),
+		}
+	}
+
+	/// The first try of the spawn of `spec`, as [`spawn`](Self::spawn) makes
+	/// it, but a program the kernel refuses as busy comes back as
+	/// [`Started::Busy`], kept for another try ([`Started::settle`]).
+	pub(crate) fn start(&self, spec: SpawnSpec<'_>) -> Started {
+		#[cfg(unix)]
+		{
+			imp::start(&self.shared, spec)
+		}
+		#[cfg(windows)]
+		{
+			Started::Done(imp::spawn(&self.shared, spec))
+		}
 	}
 
 	/// Processes still alive in the groups, sessions (Unix) or jobs
@@ -357,6 +403,62 @@ impl fmt::Debug for NativeSpawner {
 		f.debug_struct("NativeSpawner")
 			.field("config", &self.shared.config)
 			.finish_non_exhaustive()
+	}
+}
+
+/// The waits, in milliseconds, before each new try of a spawn whose program
+/// the kernel refused as busy (`ETXTBSY`): 1023 ms in all.
+///
+/// The copy of a write descriptor that makes a program busy lives only from
+/// another session's fork to that child's exec, so the first short waits
+/// outlast it, and the doubling waits cover a child a loaded host leaves
+/// unscheduled for a while. A program someone really keeps open for writing
+/// still fails after the last wait, with the error bash reports at once.
+#[cfg(unix)]
+const BUSY_WAITS_MS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+
+/// The first try of a spawn ([`NativeSpawner::start`]).
+pub(crate) enum Started {
+	/// The external, or the error of its spawn.
+	Done(io::Result<Box<dyn ExtProc>>),
+	/// The kernel refused to run the program: a process holds it open for
+	/// writing (`ETXTBSY`). No process exists; dropping it spawns nothing.
+	#[cfg(unix)]
+	Busy(Busy),
+}
+
+/// A spawn whose program the kernel refused as busy ([`Started::Busy`]):
+/// its descriptors, pumps and placement, kept for the next try.
+#[cfg(unix)]
+pub(crate) struct Busy(Box<imp::Busy>);
+
+#[cfg(unix)]
+impl Started {
+	/// The external once its program ran, or the error: a busy spawn is
+	/// tried again after each wait of [`BUSY_WAITS_MS`], each a timer `sleep`
+	/// makes for that long (the host's), so no thread waits; once the waits
+	/// ran out the error is `ETXTBSY`, the one the first try met. Dropping
+	/// the future before then spawns nothing. Only the Unix hosts call it:
+	/// only a Unix kernel refuses a busy program.
+	pub(crate) async fn settle<S>(self, mut sleep: S) -> io::Result<Box<dyn ExtProc>>
+	where
+		S: FnMut(Duration) -> Box<dyn crate::bash::Timer>,
+	{
+		let mut started = self;
+		let mut waits = BUSY_WAITS_MS.iter();
+		loop {
+			match started {
+				Self::Done(spawned) => return spawned,
+				Self::Busy(busy) => {
+					let Some(&ms) = waits.next() else {
+						return Err(io::Error::from_raw_os_error(libc::ETXTBSY));
+					};
+					let mut timer = sleep(Duration::from_millis(ms));
+					std::future::poll_fn(|cx| timer.poll(cx)).await;
+					started = busy.0.retry();
+				},
+			}
+		}
 	}
 }
 

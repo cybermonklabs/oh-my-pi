@@ -86,7 +86,7 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, runInModelCallScope, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import { AuthBrokerRemovalNotRecordedError } from "@oh-my-pi/pi-ai/auth-broker/remote-store";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
@@ -149,7 +149,7 @@ import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PythonResult } from "../eval/py/executor";
 import { EVAL_STATE_CONTEXT_TYPE, formatEvalStateContext, isEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
-import { type BashResult, releaseShellSessions } from "../exec/bash-executor";
+import { type BashResult, drainAbortedShells, releaseShellSessions } from "../exec/bash-executor";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -330,6 +330,7 @@ import type {
 	FollowUpOptions,
 	FreshSessionResult,
 	HandoffResult,
+	InputOrigin,
 	ModelCycleResult,
 	OwnedJobsEnd,
 	Prewalk,
@@ -394,6 +395,7 @@ import {
 } from "./codex-auto-reset";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
+import { CyberPolicyClosure, type CyberPolicyClosureApi, installCyberPolicyGuard } from "./cyber-policy-closure";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
@@ -404,6 +406,9 @@ import {
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
+	RESTORE_SKIPPED_CALL_DETAIL,
+	restoreSkippedCallReason,
+	type RestoreSkippedCalls,
 	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
@@ -1086,6 +1091,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** False for a subagent, whose gate belongs to its session tree's root. */
 	readonly #ownsCostGate: boolean;
 	#costCapRefusal: CostCapRefusal | undefined;
+	/** The session tree's cyber-policy closure (`cyber-policy-closure.ts`). */
+	readonly #cyberPolicyClosure: CyberPolicyClosureApi;
+	/** Set when this session owns the closure (no root gave it one): only input from outside it ends it. */
+	readonly #ownsCyberPolicyClosure: CyberPolicyClosure | undefined;
 	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
@@ -1161,6 +1170,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#cancelExitRecorder?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
+	/**
+	 * Cut-off calls `restoreInterruptedTurn` does not run again, each with the subagents it
+	 * started that `omp --restore` relaunched and those it relaunched earlier that are not
+	 * running now ({@link RestoreSkippedCalls}); {@link #beforeToolCall} blocks each once.
+	 * Cleared when the continuation's run ends.
+	 */
+	#restoreSkippedCalls: Map<string, { relaunched: readonly string[]; ran: readonly string[] }> | undefined;
+	/**
+	 * The calls {@link #beforeToolCall} blocked as restore skips, until {@link #afterToolCall} marks
+	 * each one's result with {@link RESTORE_SKIPPED_CALL_DETAIL}.
+	 */
+	readonly #restoreSkippedResults = new Set<string>();
 	/** Last observed `workspace.additionalDirectories`, diffed on change to add/remove only settings-seeded roots. */
 	#settingsWorkspaceDirectories: readonly string[] = [];
 	/** Last observed auto-QA gate; the system prompt advertises `xd://report_issue` only while it holds. */
@@ -2730,6 +2751,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
+		if (config.cyberPolicyClosure) {
+			this.#cyberPolicyClosure = config.cyberPolicyClosure;
+		} else {
+			this.#ownsCyberPolicyClosure = new CyberPolicyClosure();
+			this.#cyberPolicyClosure = this.#ownsCyberPolicyClosure;
+		}
+		// The closure is the scope of this tree's model calls: the agent's runs, its advisors' runs and the
+		// session's own work enter it, so another tree's guard in this process never holds them, and theirs
+		// never records this tree's refusals. Set before anything copies it (the advisors, built below).
+		this.agent.modelCallScope = this.#cyberPolicyClosure;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
@@ -2922,6 +2953,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			setThinkingLevel: level => this.#models.setThinkingLevel(level),
 			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			modelFallbackDisabled: () => this.#disableModelFallback,
+			cyberPolicyClosure: () => this.#cyberPolicyClosure,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
 			isCompacting: () => this.isCompacting,
@@ -3447,6 +3479,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#recovery.isRetryFallbackEntrySuppressed(selector, model),
 			noteRetryFallbackCooldown: (selector, retryAfterMs, errorMessage) =>
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
+			recordCyberPolicyRefusal: failure => this.#recovery.recordCyberPolicyRefusal(failure),
+			cyberPolicyClosure: () => this.#cyberPolicyClosure,
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
 			sessionId: () => this.sessionId,
 			restrictOAuthAccounts: providerSessionId => this.#accountPoolScope?.restrict(providerSessionId),
@@ -3624,6 +3658,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		syncCostCapGate();
 		this.addDisposer(this.#costGate.onCapChange(syncCostCapGate));
 		this.addDisposer(() => removeCostCapGate?.());
+		// The tree's cyber-policy closure is enforced at the process's model-call checkpoint
+		// (`installCyberPolicyGuard`): every model call of every caller, a run in flight included, is
+		// held while the closure closes its route. Before each of this session's own calls the hook
+		// moves it to an open fallback, so another family can take the turn.
+		// The agent's scope is the closure (set above, before the advisors were built).
+		this.addDisposer(installCyberPolicyGuard(this.#cyberPolicyClosure));
+		this.addDisposer(this.agent.addBeforeModelCallHook(signal => this.#leaveClosedRoute(signal)));
+		this.addDisposer(
+			this.#cyberPolicyClosure.onChange(() => {
+				if (!this.#cyberPolicyClosure.active) this.#advisors.resumeAfterClosedRoute();
+			}),
+		);
 
 		const handoffHost: SessionHandoffHost = {
 			agent: this.agent,
@@ -4266,6 +4312,28 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.emitNotice("error", refusal.message, COST_GATE_NOTICE_SOURCE);
 	}
 
+	/** The session tree's cyber-policy closure; its subagents share it. */
+	get cyberPolicyClosure(): CyberPolicyClosureApi {
+		return this.#cyberPolicyClosure;
+	}
+
+	/** Moves the session off a closed route onto an open fallback before the next model call is built. */
+	async #leaveClosedRoute(signal: AbortSignal | undefined): Promise<void> {
+		if (!this.#cyberPolicyClosure.isClosed(this.model)) return;
+		await this.#recovery.applyCyberPolicyFallback(signal ?? new AbortController().signal);
+	}
+
+	/**
+	 * Input that crossed the session's outer boundary (`origin: "outside"`: a person, or the harness or an
+	 * RPC client on their behalf) ends the closure this session owns. A subagent's closure is its root's,
+	 * so input to a subagent ends nothing.
+	 */
+	#endCyberPolicyClosureFrom(origin: InputOrigin | undefined): void {
+		if (origin !== "outside") return;
+		// What the end starts (an advisor's held batch resuming) runs as this tree's own work: in its scope.
+		runInModelCallScope(this.#cyberPolicyClosure, () => this.#ownsCyberPolicyClosure?.end());
+	}
+
 	/** Records and announces a cost-cap refusal of the next model request; `undefined` lets it through. */
 	#refuseOverCostCap(): AgentPreModelCallStop | undefined {
 		const refusal = this.#costGate.check();
@@ -4299,9 +4367,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#admittedSubmissionsSettled.promise;
 	}
 
-	/** Run session work outside an agent run (prompt setup, manual maintenance) under the agent's log context. */
+	/**
+	 * Run session work outside an agent run (prompt setup, manual maintenance) under the agent's log
+	 * context, in this tree's model-call scope.
+	 */
 	#inLogContext<T>(work: () => T): T {
-		return this.agent.logContext ? logger.withContext(this.agent.logContext, work) : work();
+		return runInModelCallScope(this.#cyberPolicyClosure, () =>
+			this.agent.logContext ? logger.withContext(this.agent.logContext, work) : work(),
+		);
 	}
 
 	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
@@ -5636,6 +5709,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			// The calls a restored turn skips are its first batch's; nothing later can repeat their ids.
+			this.#restoreSkippedCalls = undefined;
+			this.#restoreSkippedResults.clear();
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -5815,6 +5891,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// replayed. Visible/side-effecting output then remains terminal while its
 			// credential is still blocked or rotated exactly once.
 			await this.#recovery.recordUsageLimitOutcome(msg);
+			// A cyber-policy refusal closes every OpenAI route to the session tree until a person's next
+			// prompt, before any recovery below can pick one.
+			this.#recovery.recordCyberPolicyRefusal(msg);
 
 			let compactionResult = COMPACTION_CHECK_NONE;
 			let checkedCompaction = false;
@@ -6130,6 +6209,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			for (;;) {
 				try {
 					if (!this.agent.state.isStreaming) onStart?.();
+					// An Esc can abort an automatic retry after it passed scheduling checks but before
+					// `continue()` claims the agent. Recheck that retry's controller at this final boundary.
+					// Only the retry: other sources' predicates read state this run's own in-flight count
+					// changes (a queued-message drain reads `isStreaming`), so rechecking them here skips
+					// them every time, and the drain reschedules itself without end.
+					if (isAutomaticRetry && request.options.shouldContinue && !request.options.shouldContinue()) {
+						return { status: "skipped", reason: "should-continue-false" };
+					}
 					await this.agent.continue(signal);
 					return { status: "completed" };
 				} catch (error) {
@@ -6417,7 +6504,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
-		return this.#ttsr.afterToolCall(ctx);
+		const after = this.#ttsr.afterToolCall(ctx);
+		if (!this.#restoreSkippedResults.delete(ctx.toolCall.id)) return after;
+		// The skip's result is read by its flag, not its text: `omp --restore` keeps a later restore from
+		// running the call again only on it (isRestoreSkippedCallResult).
+		const details = after?.details ?? ctx.result.details;
+		return {
+			...after,
+			details: {
+				...(typeof details === "object" && details !== null ? details : {}),
+				[RESTORE_SKIPPED_CALL_DETAIL]: true,
+			},
+		};
 	}
 	/**
 	 * Emits the extension `tool_call` event for a loop-dispatched call at
@@ -6430,6 +6528,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const skipped = this.#restoreSkippedCalls?.get(ctx.toolCall.id);
+		if (skipped) {
+			this.#restoreSkippedCalls?.delete(ctx.toolCall.id);
+			this.#restoreSkippedResults.add(ctx.toolCall.id);
+			return { block: true, reason: restoreSkippedCallReason(skipped.relaunched, skipped.ran) };
+		}
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -7126,7 +7230,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		done: PromiseWithResolvers<void>,
 		fromOutside: boolean,
 	): Promise<void> {
-		while (turn.nested.size > 0) await Promise.allSettled([...turn.nested]);
+		while (turn.nested.size > 0) await Promise.allSettled(turn.nested);
 		turn.released = true;
 		if (fromOutside) this.#queuedSessionTransitions--;
 		done.resolve();
@@ -7519,16 +7623,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
 		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
-		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}). Any other dispose cuts it off,
-		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt, and a
-		// process exit labels a turn still in flight as interrupted. The reason says the kind to a
-		// sync subagent of the turn or of a continuation already running.
-		const stop = options.ownedJobsEnd === "stop";
+		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}); so does a SIGINT, the user's
+		// Ctrl+C in print and JSON mode (or `kill -INT` there and in interactive mode and ACP), a stop
+		// as Esc is. RPC mode disposes on no signal: a `kill -INT` there only records the process exit,
+		// so `omp --restore` goes on with that turn. Any other dispose cuts it off, so `omp --restore`
+		// goes on with it: a turn waiting to retry keeps its failed attempt.
+		// When the process is going away for any other postmortem reason but a manual cleanup (its
+		// exit, a SIGTERM such as a pod release, a fatal error), a turn still in flight is labeled as
+		// interrupted, which `omp --restore` continues: nobody chose that end. A dispose the process
+		// lives on after (no reason, or a manual one) gives the platform's own reason, marked as a
+		// cut-off. The reason says the kind to a sync subagent of the turn or of a continuation
+		// already running.
+		const stop = options.ownedJobsEnd === "stop" || options.reason === postmortem.Reason.SIGINT;
 		this.#recovery.abortRetry({ cutOff: !stop });
 		this.abortCompaction();
+		const processEnds = options.reason !== undefined && options.reason !== postmortem.Reason.MANUAL;
 		const abortReason = stop
 			? plainTurnAbortReason("stop")
-			: options.reason === postmortem.Reason.EXIT
+			: processEnds
 				? INTERRUPTED_TURN_ERROR
 				: plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
@@ -7609,6 +7721,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		} catch (error) {
 			logger.warn("Active agent run still settling at dispose deadline", { error: String(error) });
 		}
+		// The agent turn can finish before the native shell's delayed KILL wave.
+		// Keep that wave alive through this session's process teardown, including
+		// commands that started under a session id this one has since replaced.
+		await Promise.all([drainAbortedShells(this.sessionManager.getSessionId()), this.#bash.drainCancelled()]);
 		// Forwarding stays connected through the drain above so a tool that
 		// settles inside it still reaches subscribers (issue #18450); detach now
 		// so events past the deadline are neither forwarded nor persisted.
@@ -8551,6 +8667,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		// A person's `/compact` or an RPC client's compact request is input from outside the session.
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#inLogContext(() => this.#maintenance.compact(customInstructions, options));
 	}
 
@@ -9328,13 +9446,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const controller = new AbortController();
 		this.#imageDescriptionAbortControllers.add(controller);
 		try {
-			return await this.#providerBoundary.buildImageDescriptionNotice(
-				normalizedImages,
-				AbortSignal.any([
-					controller.signal,
-					AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS),
-					...(signal ? [signal] : []),
-				]),
+			// The vision call is this tree's own model call (`steer`/`followUp` reach here from any host):
+			// in its scope.
+			return await runInModelCallScope(this.#cyberPolicyClosure, () =>
+				this.#providerBoundary.buildImageDescriptionNotice(
+					normalizedImages,
+					AbortSignal.any([
+						controller.signal,
+						AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS),
+						...(signal ? [signal] : []),
+					]),
+				),
 			);
 		} finally {
 			this.#imageDescriptionAbortControllers.delete(controller);
@@ -9419,7 +9541,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * @throws {AgentBusyError} when another turn claims the session between the interrupt and the continuation.
 	 * @throws {Error} when there is no conversation to resume.
 	 */
-	async resume(): Promise<void> {
+	async resume(options?: { origin?: InputOrigin }): Promise<void> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (!this.isStreaming) return this.#resumeIdle();
 		// waitForIdle() reads a pending unwind as busy. Hold one from the interrupt
 		// until the continuation is live, so a host driving this session to a result
@@ -9556,6 +9679,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					options?.onPromptAdmitted?.();
 				}
 			: options?.onPromptAdmitted;
+		// Input from outside the session (a person, the harness or an RPC client) may reach OpenAI again
+		// after a cyber-policy refusal; prompts the session, its extensions or its agents make keep the
+		// closure. It ends here, before a command the input names runs, so a person's typed `/mycommand`
+		// ends it for what that command's handler sends.
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
@@ -9822,12 +9950,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution" | "tag">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps"> & {
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps" | "origin"
+		> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
 		},
 	): Promise<boolean> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
 	}
 
@@ -10711,6 +10843,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		await this.#queueUserMessage(expandedText, images, "steer", {
 			timestamp: submittedAt,
 			attribution: options?.attribution,
@@ -10736,6 +10869,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stamp before image preprocessing so a queued image follow-up measures
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp", {
 				timestamp: submittedAt,
@@ -11649,8 +11783,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** Where this message came from; see {@link InputOrigin}. Default: inside. */
+			origin?: InputOrigin;
 		},
 	): Promise<boolean> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		// Taken here, before #admitSubmission, which can await startup-deferred extension loading
 		// first: an interrupt during that load came after this send, so it must fold a `triggerTurn`
 		// aside instead of being read as an interrupt that preceded it.
@@ -12019,6 +12156,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 
 		let deliveredAsAside = false;
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (options?.deliverAs === "aside") {
 			if (this.isStreaming) {
 				if (!(await this.#queueUserMessage(text, images, "aside", { attribution: options.attribution }))) {
@@ -12865,7 +13003,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * `customSystemPrompt` swaps the title prompt for special-purpose titling
 	 * (e.g. plan-save filename topics) without touching the session override.
 	 */
-	async generateTitle(
+	generateTitle(firstMessage: string, customSystemPrompt?: string, signal?: AbortSignal): Promise<string | null> {
+		// Public and called by hosts (the TUI's first-message title): its model call is this tree's, in its scope.
+		return this.#inLogContext(() => this.#generateTitle(firstMessage, customSystemPrompt, signal));
+	}
+
+	async #generateTitle(
 		firstMessage: string,
 		customSystemPrompt?: string,
 		signal?: AbortSignal,
@@ -13919,6 +14062,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#inLogContext(() => this.#maintenance.handoff(customInstructions, options));
 	}
 
@@ -14399,15 +14543,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
 	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
 	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A turn that failed because no request could resolve its
-	 * provider key is retried the same way, even after a normal exit: nothing was
-	 * sent, and a worker that exits on it has nothing else to resume it. A turn
-	 * that finished, failed otherwise, or the user interrupted stays as it is.
+	 * transcript stops. A call in `options.relaunched` or `options.ran` does not run again:
+	 * it started subagents restore relaunched, whose results come as follow-up turns, or that
+	 * an earlier restore relaunched and that ran since, so running it again would start that
+	 * work twice; it gets a result that says so ({@link restoreSkippedCallReason}), and the
+	 * batch's other calls run again. A turn
+	 * that failed because no request could resolve its provider key is retried the same
+	 * way, even after a normal exit: nothing was sent, and a worker that exits on it has
+	 * nothing else to resume it. A turn that finished, failed otherwise, or the user
+	 * interrupted stays as it is.
 	 *
 	 * @returns whether a continuation was scheduled; false while a turn runs, without
 	 * a model, or with nothing left unfinished.
 	 */
-	async restoreInterruptedTurn(): Promise<boolean> {
+	async restoreInterruptedTurn(options: RestoreSkippedCalls = {}): Promise<boolean> {
 		const branch = this.sessionManager.getBranch();
 		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
 		const model = this.model;
@@ -14422,7 +14571,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.sessionManager.appendMessage(abort);
 			this.replaceMessagesFromSessionContext(this.buildDisplaySessionContext().messages);
 		}
-		return this.retry();
+		const skipped = new Map<string, { relaunched: readonly string[]; ran: readonly string[] }>();
+		for (const [callId, ids] of Object.entries(options.relaunched ?? {})) {
+			if (ids.length > 0) skipped.set(callId, { relaunched: ids, ran: [] });
+		}
+		for (const [callId, ids] of Object.entries(options.ran ?? {})) {
+			if (ids.length > 0) skipped.set(callId, { relaunched: skipped.get(callId)?.relaunched ?? [], ran: ids });
+		}
+		this.#restoreSkippedCalls = skipped.size > 0 ? skipped : undefined;
+		const scheduled = await this.retry();
+		if (!scheduled) this.#restoreSkippedCalls = undefined;
+		return scheduled;
 	}
 
 	// =========================================================================
@@ -14654,7 +14813,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * spends, because the preparation between them awaits; the gate is tested
 	 * before awaiting so a running session pays no microtask for it.
 	 */
-	async runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+	runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+		// Public and called directly (`/btw`, `/omfg`, an extension's context): its model calls are this
+		// tree's, in its scope, so another tree's hold does not see them as made outside every session.
+		return this.#inLogContext(() => this.#runEphemeralTurn(args));
+	}
+
+	async #runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
 		// Snapshotted before the entry hold, not after: a `/new` during the hold
 		// replaces the session this turn was asked for, and the readiness check
 		// below is what catches it.
@@ -15573,7 +15738,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.sessionManager.flush();
 		// Last refusal point. Nothing below is rolled back when the transition stops, so an
 		// idle-only snapshot refuses here, after the flush awaits but before any state of the
-		// old session (pending messages, async jobs, auto-learn capture) is discarded.
+		// old session (pending messages, auto-learn capture) is discarded.
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 
 		// Clear pending messages (bound to old session state)
@@ -15583,7 +15748,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -15610,6 +15774,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As on a switch: the outgoing session's background jobs share this agent id, so their
+			// results would otherwise land in the new transcript (their deliveries wait while the
+			// transition runs). They are cancelled once the new session exists, so a work pool this
+			// stops records its discards in the session the user goes on with, which kept the pool's
+			// spawn records, as well as in the one it left. Only a delivery waits: on the empty-session
+			// path (a branch from a user message that is the session's first entry) the manager's
+			// `newSession` and `setSessionName` await after the swap, so a record a running job or cell
+			// appends in that window, such as a pool's spawn record or an eval cell's handover record,
+			// goes into the new session.
+			this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 			this.#clearSessionScopedToolState();
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
@@ -15712,7 +15886,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -15735,6 +15908,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As in {@link #branchIntoNewSession}: cancelled once the new session exists. Before the
+			// branch, a work pool this stops would append its discards to the leaf this branch is
+			// pinned to, and the branch would refuse the changed session.
+			this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 			this.#clearSessionScopedToolState();
 
@@ -15822,8 +15999,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 * or the branch summary were awaited, before any tree change is made.
 			 */
 			requireIdle?: boolean;
+			/** `"outside"` when a person (`/tree`) or an RPC client asked for this move; see {@link InputOrigin}. */
+			origin?: InputOrigin;
 		} = {},
 	): Promise<NavigateTreeResult> {
+		// Public and called by hosts directly (ACP, RPC, an extension's context): its branch summary is this
+		// tree's model call, in its scope, so another tree's hold does not take it for a call made outside every
+		// session.
+		return this.#inLogContext(() => this.#navigateTreeInScope(targetId, options));
+	}
+
+	async #navigateTreeInScope(
+		targetId: string,
+		options: NonNullable<Parameters<AgentSession["navigateTree"]>[1]>,
+	): Promise<NavigateTreeResult> {
+		this.#endCyberPolicyClosureFrom(options.origin);
 		const queued = this.#enterSessionTransition(() => this.navigateTree(targetId, options));
 		if (queued) return queued;
 		using _transition = this.#beginSessionTransition();

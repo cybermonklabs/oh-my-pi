@@ -983,11 +983,25 @@ fn fifo_write_opens_through_a_cancellable_view_wait_for_a_reader_and_observe_the
 	}
 }
 
+/// Held for writing while a test of this binary spawns a process
+/// (`dir_handle::alone`), and for reading while a test looks for ends of its
+/// FIFOs: the spawned process holds a copy of every descriptor of this one
+/// from its fork until its `exec` has closed them (every descriptor here is
+/// close-on-exec), ends this process has closed since included, so a look
+/// meanwhile could see an end this process no longer holds. `Command::spawn`
+/// can return before that close (a vfork-ed parent goes on once the child's
+/// `exec` has replaced its memory), so the spawner holds this until the
+/// child's first output, which the new program writes.
+#[cfg(unix)]
+pub(crate) static SPAWNS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
 /// Whether the FIFO at `path` has a reader: a write-only open that does not
-/// wait fails with ENXIO when it has none.
+/// wait fails with ENXIO when it has none. No process spawn is under way
+/// meanwhile ([`SPAWNS`]).
 #[cfg(unix)]
 fn fifo_has_reader(path: &Path) -> bool {
 	use std::os::unix::fs::OpenOptionsExt;
+	let _no_spawn = SPAWNS.read();
 	match std::fs::OpenOptions::new()
 		.write(true)
 		.custom_flags(libc::O_NONBLOCK)
@@ -1000,10 +1014,12 @@ fn fifo_has_reader(path: &Path) -> bool {
 }
 
 /// Whether the FIFO at `path` has a writer: a reader that does not wait reads
-/// end of file when it has none, and would block when it has one.
+/// end of file when it has none, and would block when it has one. No process
+/// spawn is under way meanwhile, as for [`fifo_has_reader`].
 #[cfg(unix)]
 fn fifo_has_writer(path: &Path) -> bool {
 	use std::os::unix::fs::OpenOptionsExt;
+	let _no_spawn = SPAWNS.read();
 	let mut reader = std::fs::OpenOptions::new()
 		.read(true)
 		.custom_flags(libc::O_NONBLOCK)
@@ -1175,13 +1191,48 @@ fn fifo_opens_through_a_cancellable_view_that_create_open_the_path() {
 	assert!(wrong.is_empty(), "FIFO opens under a token: {wrong:#?}");
 }
 
-/// The FIFO the sticky-directory test opens: a FIFO of another user, which
-/// any user may read and write, in a world-writable sticky directory that
-/// user does not own. `PI_TEST_STICKY_FIFO` names one when set (root makes it
-/// before a run as another user; a wrong one fails the test); else, as root,
-/// one is made in `dir`. `Err` says why there is none.
+/// This thread's id, for [`waits_in_open`].
 #[cfg(target_os = "linux")]
-fn sticky_fifo(dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn thread_id() -> libc::c_long {
+	// SAFETY: `gettid` has no preconditions.
+	unsafe { libc::syscall(libc::SYS_gettid) }
+}
+
+/// Whether the thread `tid` of this process waits in an `open`: its
+/// `/proc/self/task/<tid>/syscall` names `openat` (or, on x86_64, `open`,
+/// which musl's `open()` issues there). Where that file is not there
+/// (gVisor), its state is sleeping, which a thread waiting on a lock also
+/// shows, so there this does not prove the thread is in `open`. `None`
+/// when neither can be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn waits_in_open(tid: libc::c_long) -> Option<bool> {
+	if let Ok(syscall) = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
+		let number = syscall.split_whitespace().next()?;
+		return Some(number.parse::<libc::c_long>().is_ok_and(is_open_call));
+	}
+	let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+	Some(stat.rsplit_once(')')?.1.trim_start().starts_with('S'))
+}
+
+/// Whether the system call `number` opens a file by path: `openat`, and
+/// on x86_64 also `open`.
+#[cfg(target_os = "linux")]
+fn is_open_call(number: libc::c_long) -> bool {
+	#[cfg(target_arch = "x86_64")]
+	if number == libc::SYS_open {
+		return true;
+	}
+	number == libc::SYS_openat
+}
+
+/// The FIFO the sticky-directory tests open (this file's and
+/// `dir_handle/tests.rs`'s): a FIFO of another user, which any user may read
+/// and write, in a world-writable sticky directory that user does not own.
+/// `PI_TEST_STICKY_FIFO` names one when set (root makes it before a run as
+/// another user; a wrong one fails the test); else, as root, one is made in
+/// `dir`. `Err` says why there is none.
+#[cfg(target_os = "linux")]
+pub(crate) fn sticky_fifo(dir: &Path) -> Result<PathBuf, String> {
 	use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 	// SAFETY: `geteuid` has no preconditions.
 	let me = unsafe { libc::geteuid() };

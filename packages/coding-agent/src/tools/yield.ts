@@ -792,6 +792,22 @@ export function resetYieldTurnState(tool: AgentTool | undefined): void {
 	if (tool && canResetTurnState(tool)) tool.resetTurnState();
 }
 
+/**
+ * Whether a `yield` tool result whose call succeeded ends its run: every yield but an incremental
+ * section (`type` a non-empty string array) that does not complete its workpool batch.
+ */
+export function yieldEndsRun(details: unknown): boolean {
+	if (!details || typeof details !== "object") return true;
+	const record = details as Record<string, unknown>;
+	if (record.complete === true) return true;
+	return !(
+		record.status === "success" &&
+		Array.isArray(record.type) &&
+		record.type.length > 0 &&
+		record.type.every(item => typeof item === "string")
+	);
+}
+
 // Register subprocess tool handler for extraction + termination.
 subprocessToolRegistry.register<YieldDetails>("yield", {
 	extractData: event => {
@@ -810,17 +826,5 @@ subprocessToolRegistry.register<YieldDetails>("yield", {
 			schemaOverridden: record.schemaOverridden === true ? true : undefined,
 		};
 	},
-	shouldTerminate: event => {
-		if (event.isError) return false;
-		const details = event.result?.details;
-		if (!details || typeof details !== "object") return true;
-		const record = details as Record<string, unknown>;
-		if (record.complete === true) return true;
-		return !(
-			record.status === "success" &&
-			Array.isArray(record.type) &&
-			record.type.length > 0 &&
-			record.type.every(item => typeof item === "string")
-		);
-	},
+	shouldTerminate: event => !event.isError && yieldEndsRun(event.result?.details),
 });

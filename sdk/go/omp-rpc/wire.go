@@ -4886,7 +4886,7 @@ type PromptError struct {
 	Provider   *string `json:"provider,omitempty"`
 	Model      *string `json:"model,omitempty"`
 	HTTPStatus *int64  `json:"httpStatus,omitempty"`
-	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent.
+	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again.
 	Code *PromptErrorCode `json:"code,omitempty"`
 }
 
@@ -4915,6 +4915,7 @@ type PromptErrorCode string
 const (
 	PromptErrorCodeCostCap     PromptErrorCode = "cost_cap"
 	PromptErrorCodeSessionBusy PromptErrorCode = "session_busy"
+	PromptErrorCodeCyberPolicy PromptErrorCode = "cyber_policy"
 )
 
 func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
@@ -4923,7 +4924,7 @@ func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := PromptErrorCode(s); value {
-	case PromptErrorCodeCostCap, PromptErrorCodeSessionBusy:
+	case PromptErrorCodeCostCap, PromptErrorCodeSessionBusy, PromptErrorCodeCyberPolicy:
 		*v = value
 		return nil
 	}
@@ -7478,7 +7479,7 @@ func (v *CancelSubagentResult) decodeFrom(raw map[string]json.RawMessage) error 
 }
 
 type LiveStartResult struct {
-	Voice string `json:"voice"`
+	Voice *string `json:"voice,omitempty"`
 }
 
 func (v *LiveStartResult) UnmarshalJSON(data []byte) error {
@@ -7488,7 +7489,7 @@ func (v *LiveStartResult) UnmarshalJSON(data []byte) error {
 func (v *LiveStartResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out LiveStartResult
 	d := fieldDecoder{raw: raw, owner: "LiveStartResult"}
-	d.required("voice", &out.Voice)
+	d.optional("voice", &out.Voice)
 	if d.err != nil {
 		return d.err
 	}
@@ -7497,8 +7498,8 @@ func (v *LiveStartResult) decodeFrom(raw map[string]json.RawMessage) error {
 }
 
 type LiveConnectResult struct {
-	Voice     string `json:"voice"`
-	SdpAnswer string `json:"sdpAnswer"`
+	SdpAnswer string  `json:"sdpAnswer"`
+	Voice     *string `json:"voice,omitempty"`
 }
 
 func (v *LiveConnectResult) UnmarshalJSON(data []byte) error {
@@ -7508,8 +7509,8 @@ func (v *LiveConnectResult) UnmarshalJSON(data []byte) error {
 func (v *LiveConnectResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out LiveConnectResult
 	d := fieldDecoder{raw: raw, owner: "LiveConnectResult"}
-	d.required("voice", &out.Voice)
 	d.required("sdpAnswer", &out.SdpAnswer)
+	d.optional("voice", &out.Voice)
 	if d.err != nil {
 		return d.err
 	}
@@ -8182,8 +8183,8 @@ type LiveStartCommand struct {
 	Instructions *string `json:"instructions,omitempty"`
 }
 
-// LiveStart sends "live_start": Start a live voice session bound to this session; returns the voice in use.
-func (c Commands) LiveStart(ctx context.Context, p LiveStartCommand) (string, error) {
+// LiveStart sends "live_start": Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`.
+func (c Commands) LiveStart(ctx context.Context, p LiveStartCommand) (*string, error) {
 	var out LiveStartResult
 	err := c.call(ctx, "live_start", p, 0, &out)
 	return out.Voice, err

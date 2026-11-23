@@ -61,6 +61,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import { type CyberPolicyClosureApi, isRecordableCyberPolicyRefusal } from "./cyber-policy-closure";
 import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
@@ -298,6 +299,38 @@ export class PromptIdleWaitTimeoutError extends Error {
 	}
 }
 
+/**
+ * What {@link TurnRecovery.retry} does on `messages` (the active context): undefined when it finds no failed
+ * or aborted turn to retry, neither at the end of `messages` nor at the end of the persisted display transcript
+ * (`transcript`, read only when `messages` has none: a restored session already dropped the failed turn from
+ * its context). Otherwise `turnEnd` is that turn's end in `messages` (undefined when only the transcript holds
+ * it), and `replayStart` is the first failed result `retry()` strips to run the batch again
+ * ({@link toolReplayStart}), or undefined when it asks the model again instead.
+ */
+function retryDecision(
+	messages: readonly AgentMessage[],
+	transcript: () => readonly AgentMessage[],
+): { turnEnd: number | undefined; replayStart: number | undefined } | undefined {
+	const turnEnd = retryableAssistantTurnEnd(messages);
+	if (turnEnd === undefined && retryableAssistantTurnEnd(transcript()) === undefined) return undefined;
+	return { turnEnd, replayStart: toolReplayStart(messages) };
+}
+
+/**
+ * The reply whose batch {@link TurnRecovery.retry} runs again from `messages` (the active context),
+ * or undefined when it runs none (it asks the model again, or finds nothing to retry): the anchor of
+ * `retry()`'s own decision ({@link retryDecision}). `omp --restore` reads a batch's first run only when
+ * this names the batch's reply on the context restore builds (`task/restore.ts`, `restoreRunsBatchAgain`).
+ */
+export function toolReplayAnchor(
+	messages: readonly AgentMessage[],
+	transcript: () => readonly AgentMessage[],
+): AssistantMessage | undefined {
+	const start = retryDecision(messages, transcript)?.replayStart;
+	const anchor = start === undefined ? undefined : messages[start - 1];
+	return anchor?.role === "assistant" ? anchor : undefined;
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -331,6 +364,8 @@ export interface TurnRecoveryHost {
 	thinkingLevelCeiling(): Effort | undefined;
 	/** The session never switches to a retry fallback model (a per-call `model` subagent). */
 	modelFallbackDisabled?(): boolean;
+	/** The session tree's cyber-policy closure: fallback searches pass over the routes it closes. */
+	cyberPolicyClosure?(): CyberPolicyClosureApi;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
 	isCompacting(): boolean;
@@ -353,6 +388,7 @@ export interface TurnRecoveryHost {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
+		onSkip?: () => void;
 		onError?: (error: unknown) => void;
 	}): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
@@ -2185,17 +2221,53 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Whether a fallback entry is in cooldown: by its own string, or by the key of
-	 * `model`, the model it resolves to. A cooldown is keyed by the model that
-	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so any
-	 * other spelling that resolves to it (an alias such as `pi/<role>`, an id
-	 * without the catalog revision suffix) is in cooldown while that model is.
+	 * Whether a fallback entry is passed over: in cooldown, by its own string or by the key of
+	 * `model`, the model it resolves to, or a route a `cyber_policy` refusal closed until the next
+	 * prompt from a person (`cyber-policy-closure.ts`). A cooldown is keyed by the model that
+	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so any other spelling that
+	 * resolves to it (an alias such as `pi/<role>`, an id without the catalog revision suffix) is in
+	 * cooldown while that model is.
 	 */
 	isRetryFallbackEntrySuppressed(selector: RetryFallbackSelector, model: Model): boolean {
-		return (
+		if (
 			this.#host.modelRegistry.isSelectorSuppressed(selector.raw) ||
 			this.#host.modelRegistry.isSelectorSuppressed(formatModelStringWithRouting(model))
-		);
+		) {
+			return true;
+		}
+		const closure = this.#host.cyberPolicyClosure?.();
+		return closure?.active === true && closure.isClosed(model);
+	}
+
+	/**
+	 * Records an OpenAI `cyber_policy` refusal (a failed assistant message or a thrown error). The
+	 * refusal judges the request's content, and every copy sent again to OpenAI adds a refusal to the
+	 * organization's record, so the call is not retried (the error is not retryable) and the session
+	 * tree's closure keeps every OpenAI route, and every route whose family the catalog cannot tell,
+	 * from every fallback search until the next prompt from a person. A model of a known other family
+	 * may still take the turn.
+	 */
+	recordCyberPolicyRefusal(failure: unknown): void {
+		// A call the hold itself held names the code too; only OpenAI's own refusal is recorded.
+		if (isRecordableCyberPolicyRefusal(failure)) this.#host.cyberPolicyClosure?.().record();
+	}
+
+	/**
+	 * Switches off a route the cyber-policy closure holds closed onto the first open, keyed fallback
+	 * candidate. Unpinned: the primary comes back once a person's prompt ends the closure.
+	 */
+	async applyCyberPolicyFallback(signal: AbortSignal): Promise<boolean> {
+		if (!cfgRetryModelFallback.get(this.#host.settings) || this.#host.modelFallbackDisabled?.()) return false;
+		const currentModel = this.#host.model();
+		if (!currentModel || !this.#host.cyberPolicyClosure?.().isClosed(currentModel)) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal, undefined);
+		if (!fallback) return false;
+		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+			apiKey: fallback.apiKey,
+			signal,
+			reason: "OpenAI refused this turn's content (cyber_policy)",
+		});
 	}
 
 	/** Records the cooldown that should suppress a failing selector. */
@@ -3902,6 +3974,11 @@ export class TurnRecovery {
 		// Quota resets elapse while the machine sleeps; capture the deadline before event delivery.
 		const usageResetDeadline = AIError.is(id, AIError.Flag.UsageLimit) ? Date.now() + delayMs : undefined;
 
+		// Registered before the retry is announced: an `abortRetry()` from an `auto_retry_start` listener
+		// (the user's Esc as the retry notice appears) cancels this retry instead of finding none.
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
@@ -3913,6 +3990,10 @@ export class TurnRecovery {
 		if (this.#host.abortInProgress() || this.#host.promptGeneration() !== generation) {
 			// A newer prompt alone supersedes the retry: the turn goes on in that prompt.
 			return this.#endCancelledRetry(message, this.#host.abortInProgress() && this.#retryCancelStopsTurn);
+		}
+		if (retryAbortController.signal.aborted) {
+			if (this.#retryAbortController !== retryAbortController) return false;
+			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 		}
 
 		// Resolved stream-stall tools and proven-unexecuted malformed/refused
@@ -3929,9 +4010,6 @@ export class TurnRecovery {
 		this.#maybeInjectMalformedFunctionCallRedirect(id, maxRetries, preserveFailedTurn, switchedModel);
 
 		// Quota waits follow the wall clock; ordinary backoff stays monotonic.
-		const retryAbortController = new AbortController();
-		this.#retryAbortController?.abort();
-		this.#retryAbortController = retryAbortController;
 		try {
 			if (usageResetDeadline !== undefined) {
 				await sleepUntil(usageResetDeadline, retryAbortController.signal);
@@ -3944,9 +4022,6 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
-		}
-		if (this.#retryAbortController === retryAbortController) {
-			this.#retryAbortController = undefined;
 		}
 
 		// The identity-keyed removal above can miss when a context rebuild
@@ -3970,7 +4045,15 @@ export class TurnRecovery {
 			source: "automatic-retry",
 			delayMs: 1,
 			generation,
-			shouldContinue: () => this.#retryAttempt > 0,
+			shouldContinue: () => this.#retryAttempt > 0 && !retryAbortController.signal.aborted,
+			onSkip: () => {
+				if (!retryAbortController.signal.aborted || this.#retryAbortController !== retryAbortController) return;
+				void this.#endCancelledRetry(message, this.#retryCancelStopsTurn).catch(error =>
+					logger.error("Closing a retry saga after its continuation was skipped threw", {
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			},
 			onError: error =>
 				void this.#failRetryAfterLocalContinueError(message, error).catch(failure =>
 					logger.error("Closing a retry saga after a failed local continuation threw", {
@@ -4232,30 +4315,26 @@ export class TurnRecovery {
 		if (this.#host.isStreaming() || this.#host.isCompacting() || this.isRetrying) return false;
 
 		const messages = this.#host.agent.state.messages;
-		const activeTurnEnd = retryableAssistantTurnEnd(messages);
-		if (activeTurnEnd !== undefined) {
-			const replayStart = toolReplayStart(messages);
-			if (replayStart !== undefined) {
-				await this.#stripForToolReplay(messages, replayStart);
-			} else {
-				// Remove the failed/aborted assistant message plus its synthetic tool
-				// results (same as auto-retry does before re-attempting), keeping the
-				// trailing context deliveries the continuation is sent with.
-				this.#host.agent.replaceMessages([
-					...messages.slice(0, activeTurnEnd - 1),
-					...messages.slice(conversationEnd(messages)),
-				]);
-			}
-		} else {
-			// A restored session already dropped the failed assistant turn (and its
-			// paired synthetic tool results) from provider context, so the persisted
-			// display transcript is the source of truth for a retryable failed tail.
-			const transcriptMessages = this.#host.sessionManager.buildSessionContext({ transcript: true }).messages;
-			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
-			// The boundary is already gone from active context; when the intact
-			// failed batch is still the tail, replay the tools directly.
-			const replayStart = toolReplayStart(messages);
-			if (replayStart !== undefined) await this.#stripForToolReplay(messages, replayStart);
+		// A restored session already dropped the failed assistant turn (and its paired synthetic tool results) from
+		// provider context, so the persisted display transcript is the source of truth for a retryable failed tail;
+		// the decision reads it only then. `toolReplayAnchor` (what `omp --restore` predicts) takes the same decision.
+		const decision = retryDecision(
+			messages,
+			() => this.#host.sessionManager.buildSessionContext({ transcript: true }).messages,
+		);
+		if (decision === undefined) return false;
+		if (decision.replayStart !== undefined) {
+			// The intact failed batch is the tail (in a restored session too, whose boundary is already gone from
+			// active context): replay the tools directly.
+			await this.#stripForToolReplay(messages, decision.replayStart);
+		} else if (decision.turnEnd !== undefined) {
+			// Remove the failed/aborted assistant message plus its synthetic tool
+			// results (same as auto-retry does before re-attempting), keeping the
+			// trailing context deliveries the continuation is sent with.
+			this.#host.agent.replaceMessages([
+				...messages.slice(0, decision.turnEnd - 1),
+				...messages.slice(conversationEnd(messages)),
+			]);
 		}
 
 		// Reset retry budget for a fresh attempt

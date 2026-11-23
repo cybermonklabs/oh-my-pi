@@ -18,6 +18,7 @@ import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, logger, parseStreamingJsonThrottled, USER_AGENT } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
+import { guardedRequestUrl } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { resolveAwsBearerToken } from "../registry/aws";
 import type {
@@ -334,7 +335,8 @@ async function sendBedrockRequest(
 	let response: Response;
 	let responseBody: string | undefined;
 	try {
-		response = await fetchWithRetry(url, {
+		// Each attempt (the first and every 408/429/5xx retry after its backoff) reads the model-call guards first.
+		response = await fetchWithRetry(guardedRequestUrl(model, url), {
 			method: "POST",
 			headers: requestHeaders,
 			body,

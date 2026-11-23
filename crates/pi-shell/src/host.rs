@@ -417,32 +417,67 @@ impl Launcher {
 		Ok(())
 	}
 
-	/// Start the external `spec` names, now. Text routing and the observer
-	/// see a spawn only once it succeeded.
-	fn launch(&self, mut spec: SpawnSpec<'_>) -> io::Result<Box<dyn ExtProc>> {
+	/// Start the external `spec` names. A program the kernel refuses as busy
+	/// (`ETXTBSY`) is tried again after waits on `runtime`'s timers
+	/// ([`crate::sys::Started::settle`]): the future resolves once it ran or
+	/// the waits ran out, and no thread of the runtime waits for it. Text
+	/// routing and the observer see a spawn only once it succeeded.
+	fn launch(&self, mut spec: SpawnSpec<'_>, runtime: &tokio::runtime::Handle) -> SpawnFuture {
 		let observed = spec.stdio[1..]
 			.iter()
 			.chain(spec.extra_fds.iter().map(|(_, stdio)| stdio))
 			.any(|stdio| matches!(stdio, StdioSpec::Pipe(fd) if fd.observes_output()));
 		let mut relays =
 			(self.decoding.is_some() || observed).then(|| Relays::new(self.decoding.as_deref()));
-		if let Some(relays) = &mut relays {
-			self.route_text(&mut spec, relays, self.decoding.is_none())?;
+		if let Some(relays) = &mut relays
+			&& let Err(e) = self.route_text(&mut spec, relays, self.decoding.is_none())
+		{
+			return Box::pin(std::future::ready(Err(e)));
 		}
 		let lineage = spec.lineage;
-		let mut child = self.spawner.spawn(spec)?;
+		// Only Unix kernels refuse a busy program.
+		#[cfg(not(unix))]
+		let _ = runtime;
+		match self.spawner.start(spec) {
+			crate::sys::Started::Done(spawned) => {
+				Box::pin(std::future::ready(spawned.map(|child| self.started(child, relays, lineage))))
+			},
+			#[cfg(unix)]
+			busy @ crate::sys::Started::Busy(_) => {
+				// Only a busy spawn takes along what its success needs.
+				let launcher = self.clone();
+				let relays = relays.map(Relays::attached);
+				let runtime = runtime.clone();
+				Box::pin(async move {
+					let child = busy
+						.settle(|wait| runtime_timer(&runtime, tokio::time::Instant::now() + wait))
+						.await?;
+					Ok(launcher.started(child, relays, lineage))
+				})
+			},
+		}
+	}
+
+	/// The external `child` once its spawn succeeded: its text routed through
+	/// `relays`, recorded and observed.
+	fn started(
+		&self,
+		mut child: Box<dyn ExtProc>,
+		relays: Option<Relays<'_>>,
+		lineage: crate::bash::Lineage,
+	) -> Box<dyn ExtProc> {
 		if let Some(relays) = relays {
 			child = relays.wrap(child);
 		}
 		self.spawns.record(lineage, child.pid());
-		Ok(match &self.observer {
+		match &self.observer {
 			Some(observer) => {
 				let pid = child.pid();
 				observer.spawned(pid);
 				Box::new(Observed { child, observer: Arc::clone(observer), released: false })
 			},
 			None => child,
-		})
+		}
 	}
 }
 
@@ -620,13 +655,16 @@ impl crate::bash::Host for PiHost {
 			.filter(|_| urls::names_url(&spec))
 			.map(crate::vfs::VfsFs::filesystem)
 		else {
-			return Box::pin(std::future::ready(self.launcher.launch(spec)));
+			return self.launcher.launch(spec, &self.runtime);
 		};
 		let launcher = self.launcher.clone();
+		let runtime = self.runtime.clone();
 		let (names, rest) = urls::split(spec);
 		Box::pin(async move {
 			let hosted = urls::resolve(&fs, &names).await?;
-			rest.launch(&hosted, |spec| launcher.launch(spec))
+			rest
+				.launch(&hosted, |spec| launcher.launch(spec, &runtime))
+				.await
 		})
 	}
 
@@ -687,17 +725,7 @@ impl crate::bash::Host for PiHost {
 
 	fn timer(&mut self, at: Deadline) -> Box<dyn Timer> {
 		let deadline = tokio::time::Instant::from_std(self.start + Duration::from_nanos(at.0));
-		let shared = Arc::new(TimerShared::default());
-		let fire = Arc::clone(&shared);
-		let task = self.runtime.spawn(async move {
-			tokio::time::sleep_until(deadline).await;
-			fire.fired.store(true, Ordering::Release);
-			let waker = fire.waker.lock().take();
-			if let Some(waker) = waker {
-				waker.wake();
-			}
-		});
-		Box::new(RuntimeTimer { shared, task })
+		runtime_timer(&self.runtime, deadline)
 	}
 
 	fn wall(&self) -> SystemTimeLike {
@@ -958,6 +986,24 @@ impl Drop for Observed {
 	fn drop(&mut self) {
 		self.release();
 	}
+}
+
+/// A [`Timer`] that fires at `deadline`, sleeping on `runtime`.
+fn runtime_timer(
+	runtime: &tokio::runtime::Handle,
+	deadline: tokio::time::Instant,
+) -> Box<dyn Timer> {
+	let shared = Arc::new(TimerShared::default());
+	let fire = Arc::clone(&shared);
+	let task = runtime.spawn(async move {
+		tokio::time::sleep_until(deadline).await;
+		fire.fired.store(true, Ordering::Release);
+		let waker = fire.waker.lock().take();
+		if let Some(waker) = waker {
+			waker.wake();
+		}
+	});
+	Box::new(RuntimeTimer { shared, task })
 }
 
 /// State a [`RuntimeTimer`] shares with its sleeping task.

@@ -30,7 +30,8 @@
 //!
 //! An external the system refuses to `exec` because its command line is too
 //! long (`E2BIG`, or `ENAMETOOLONG` for a line past `_POSIX_ARG_MAX` whose
-//! paths fit) is the shell's diagnostic and status 126, unless the command
+//! paths fit, or `ENOMEM` for one past gVisor's 2 MiB of argument strings)
+//! is the shell's diagnostic and status 126, unless the command
 //! asked to hear of it ([`ShellCommand::too_long_as_error`]) and is a program
 //! this callout `exec`s itself: then, on Unix, the shell prints nothing and
 //! the utility gets the error, so `xargs` can retry with fewer arguments.
@@ -195,8 +196,16 @@ impl Extra {
 		let running = self.running.as_ref()?;
 		while let Ok(Request { command, program, reply }) = running.requests.try_recv() {
 			let lineage = Lineage { label: self.child.label, detached: false };
-			let run = api.run_subshell_in(script(command, &program, &running.env_names), lineage);
-			self.runs.push((run, reply));
+			match api.run_subshell_in(script(command, &program, &running.env_names), lineage) {
+				Some(run) => self.runs.push((run, reply)),
+				// No vpid left: the utility sees its fork fail (EAGAIN).
+				None => {
+					let _ = reply.send(Err(io::Error::new(
+						io::ErrorKind::WouldBlock,
+						"Resource temporarily unavailable",
+					)));
+				},
+			}
 		}
 		match running.done.poll(&Context::from_waker(turn.waker)) {
 			// The utility waits for every command it started; one whose

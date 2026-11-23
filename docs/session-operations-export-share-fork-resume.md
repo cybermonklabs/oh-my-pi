@@ -568,8 +568,19 @@ normally on such a turn. Such a subagent's parent got the failed result at once,
 so the subagent is relaunched only while its parent still waits on it, judged
 by its own parent's current conversation (after that parent's last `/clear`, on
 its active branch): a sync subagent while no `task` result there settles it, a
-background one while no delivery of its job's result (an `async-result` message,
-or a `wait` that returned the settled job) is there. When the parent's process
+background one while no handover of its result is there. A handover is a
+delivery of its job's result (an `async-result` message), a `wait` that
+returned the settled job, or a kill (`write` to `proc://<id>/kill`) of the
+settled job; for a subagent an eval cell started (`tool.task`, `agent()`, a
+work pool's worker) also the cell's own: a bridged `tool.task` or `tool.wait`
+that returned the result, `agent()` with `wait()` (the `delivered` record it
+writes first), a `peek` that shows a pool worker's settled latest batch, and
+the pool's result, whose report names its workers, wherever its delivery, a
+`wait` or a kill returns it. A handover counts at the time it happened (when
+the cell got the result, or when the pool drained), not when the entry that
+holds it was written. A stopped work pool records each worker's spawn
+discarded, and a discard written after the worker's transcript began leaves the
+worker, whatever was handed over before it. When the parent's process
 ended inside a sync call, the call recorded no result, or one that settles
 nothing: the result of a run that exit cut off (`aborted`) or that was lost with
 its worker thread (`workerLost`), followed at most by the record that ends the
@@ -583,7 +594,39 @@ The `task` result that only started a background job settles nothing, nor does
 a result written before the subagent's last turn began (its task prompt, or the
 message that woke it again): that result answered an earlier turn, and the
 parent waits on this one. A parent that holds the failed result acts on it
-itself.
+itself. A restored turn, or `/retry`, that runs a batch again whose every result
+is an error leaves the batch's first run on a branch of its own, below the
+batch's reply; for a subagent spawned in the current conversation (its spawn
+record names a call there), a handover on such a branch counts too, also when
+the replay itself was cut off before its first result. Such a branch is known
+from both sides. Its own entries are only: error results of that reply's calls,
+or of the calls of a reply dropped there; replies dropped there, with or without
+calls (one a cut-off ended, an abort or a failed attempt, or any `length` stop:
+one still in the context blocks every replay, so one on that branch was
+dropped); the empty-stop retry's marker; compactions; and records that are no
+turn (start, job, exit and discard records, model and thinking changes, usage,
+labels, eval snapshots, also the one a compaction stores as a message). The
+branch the conversation went on with starts one of that reply's calls again
+before any new input, or `--restore` itself is about to run that batch again: it
+resumes the branch's turn, closes it (results for the calls left unfinished,
+then the interrupted-turn abort), and the batch's error results then follow the
+reply in the context, which is when `/retry` replays a batch. Records between
+them, such as a fallback revert's model change or an exit record, keep that; a
+context message between them (the eval snapshot a `/tree` move, a start or a
+compaction writes, a branch summary), a later reply, or a closing that gives the
+reply's calls no results (a session switch, a turn that ended on its key) makes
+restore ask the model again, and the first run is not read. A replay that wrote
+nothing before it was cut off leaves no fork at all: its move to the reply is in
+memory only, and the first run stays the selected branch. A branch the parent's
+user left fails one side when its calls neither ran again nor will: it holds a
+turn (their prompt, a reply, a call that ran to its end), or on the branch they
+went on with their new input comes before any start record (a `/tree` move to
+the reply after an Esc, then a prompt), the reply's result has no start record
+(a `/tree` re-answer of an `ask`), restore resumes no turn (a `/tree` move, then
+a quit, `omp -c` and a `/restart` before any input), or the move's eval snapshot
+sits between the reply and its results (a `/tree` move, then a kill or a
+`/restart`). It does not count: the conversation they went on with never got
+those results.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:

@@ -1478,14 +1478,15 @@ fn is_writable_metadata(_metadata: &Metadata) -> bool {
 }
 
 /// Removes `path`, and when it is a directory (not a symlink to one)
-/// everything in it, as `rm -r` does with no prompt and no output but the
-/// errors it reports; returns whether it reported one. A native tree goes
-/// through the descriptor walk of [`safe_remove_dir_recursive`]. mv removes
-/// what a move across filesystems copied with this, as GNU mv removes with
-/// rm's code.
+/// everything in it, as `rm -r` does with no prompt, and no output but the
+/// errors it reports and, under `verbose`, `rm -v`'s `removed` lines; returns
+/// whether it reported an error. A native tree goes through the descriptor
+/// walk of [`safe_remove_dir_recursive`]. mv removes what a move across
+/// filesystems copied with this, as GNU mv removes with rm's code.
 #[cfg(all(feature = "util.mv", unix, not(target_os = "redox")))]
-pub(crate) fn remove_quietly(host: &mut Host, path: &Path) -> bool {
-	let options = Options { recursive: true, interactive: InteractiveMode::Never, ..Options::default() };
+pub(crate) fn remove_moved(host: &mut Host, path: &Path, verbose: bool) -> bool {
+	let options =
+		Options { recursive: true, interactive: InteractiveMode::Never, verbose, ..Options::default() };
 	remove_dir_recursive(host, path, &options, None)
 }
 

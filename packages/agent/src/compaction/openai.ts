@@ -16,6 +16,7 @@
  */
 
 import { attach, create, Flag, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { assertModelCallAllowed, guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { getCodexAttestationHeader } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
@@ -861,31 +862,56 @@ export function buildOpenAiNativeHistory(
 // ============================================================================
 // Endpoint requests
 // ============================================================================
-export async function requestOpenAiRemoteCompaction(
+/**
+ * POSTs the history to OpenAI's `/responses/compact` (V1 remote compaction). It passes pi-ai's model-call
+ * checkpoint: a model a guard holds sends nothing (the call rejects with `ModelCallRefusedError`), and an
+ * error the request meets (a `cyber_policy` refusal included) reaches the guards before the caller sees it.
+ * The guards are read again right before the POST, after its waits: `prepareBedrockCompactionRequest`'s
+ * header wait and a Codex model's attestation. A Bedrock Mantle route resolves its credentials and signs
+ * inside the prepared fetch, after that read.
+ */
+export function requestOpenAiRemoteCompaction(
 	model: Model,
 	apiKey: string,
 	compactInput: Array<Record<string, unknown>>,
 	instructions: string,
 	signal?: AbortSignal,
-	opts?: {
-		fetch?: FetchImpl;
-		timeoutMs?: number;
-		sessionId?: string;
-		/**
-		 * Explicit prompt-cache identity. Feeds the Go family affinity header
-		 * (`x-opencode-session`) and the Responses body `prompt_cache_key`
-		 * under the same KDL gate as the V2 request; an absent/empty key keeps
-		 * the child conversation id.
-		 */
-		promptCacheKey?: string;
-		providerSessionState?: Map<string, ProviderSessionState>;
-		codexCompaction?: CodexCompactionContext;
-		/** Forwarded to {@link trimRemoteCompactionInputToContextWindow}. */
-		rewriteOutputs?: boolean;
-		/** Awaited immediately before the request goes out; see `SummaryOptions.beforeDispatch`. */
-		beforeDispatch?: DispatchHold;
-	},
+	opts?: OpenAiRemoteCompactionOptions,
 ): Promise<OpenAiRemoteCompactionResponse> {
+	return guardModelRequest(model, () =>
+		sendOpenAiRemoteCompaction(model, apiKey, compactInput, instructions, signal, opts),
+	);
+}
+
+export interface OpenAiRemoteCompactionOptions {
+	fetch?: FetchImpl;
+	timeoutMs?: number;
+	sessionId?: string;
+	/**
+	 * Explicit prompt-cache identity. Feeds the Go family affinity header
+	 * (`x-opencode-session`) and the Responses body `prompt_cache_key`
+	 * under the same KDL gate as the V2 request; an absent/empty key keeps
+	 * the child conversation id.
+	 */
+	promptCacheKey?: string;
+	providerSessionState?: Map<string, ProviderSessionState>;
+	codexCompaction?: CodexCompactionContext;
+	/** Forwarded to {@link trimRemoteCompactionInputToContextWindow}. */
+	rewriteOutputs?: boolean;
+	/** Awaited immediately before the request goes out; see `SummaryOptions.beforeDispatch`. */
+	beforeDispatch?: DispatchHold;
+}
+
+async function sendOpenAiRemoteCompaction(
+	model: Model,
+	apiKey: string,
+	compactInput: Array<Record<string, unknown>>,
+	instructions: string,
+	signal?: AbortSignal,
+	opts?: OpenAiRemoteCompactionOptions,
+): Promise<OpenAiRemoteCompactionResponse> {
+	// The model the guards judge: the caller's, before a Bedrock route swaps in its own.
+	const guardedModel = model;
 	let fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	if (isBedrockOpenAIUrl(model.baseUrl)) {
 		// Bedrock's fetch signs the request on its way to the wire, so the send
@@ -1006,7 +1032,9 @@ export async function requestOpenAiRemoteCompaction(
 	// The hold is the last step before the wire — the metadata and Bedrock
 	// signing above both await — and it ends on the caller's signal. The fetch
 	// starts in the same synchronous step as the last read of the hold's probe,
-	// so a gate that closed after the hold answered still holds it.
+	// so a gate that closed after the hold answered still holds it. The
+	// model-call guards are read in that step too, so a refusal recorded while
+	// the request waited (a `/pause`, the attestation) holds it.
 	//
 	// The timeout bounds the provider, not a `/pause`: armed before the hold, a
 	// pause would fail a held compaction instead of sending it on resume. It is
@@ -1022,13 +1050,15 @@ export async function requestOpenAiRemoteCompaction(
 	const response = await dispatchWhenOpen(
 		opts?.beforeDispatch,
 		signal,
-		() =>
-			fetchImpl(endpoint, {
+		() => {
+			assertModelCallAllowed(guardedModel);
+			return fetchImpl(endpoint, {
 				method: "POST",
 				headers: wireHeaders,
 				body: stringifyJson(request),
 				signal: armPreResponseTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS).signal,
-			}),
+			});
+		},
 		isCodexResponses
 			? async () => {
 					const attestation = await getCodexAttestationHeader(codexAccountId);
@@ -1113,6 +1143,21 @@ export async function requestRemoteCompaction(
 		onPayload?: SimpleStreamOptions["onPayload"];
 	},
 ): Promise<RemoteCompactionResponse> {
+	// The endpoint summarizes the session's history: with the session's model given, the request passes
+	// pi-ai's model-call checkpoint as that model's call.
+	const model = opts?.model;
+	return model
+		? guardModelRequest(model, () => postRemoteCompaction(endpoint, request, signal, opts, model))
+		: postRemoteCompaction(endpoint, request, signal, opts, undefined);
+}
+
+async function postRemoteCompaction(
+	endpoint: string,
+	request: RemoteCompactionRequest,
+	signal: AbortSignal | undefined,
+	opts: Parameters<typeof requestRemoteCompaction>[3],
+	guardedModel: Model | undefined,
+): Promise<RemoteCompactionResponse> {
 	let endpointPath = endpoint;
 	try {
 		endpointPath = new URL(endpoint).pathname;
@@ -1151,29 +1196,34 @@ export async function requestRemoteCompaction(
 
 	// Held before the timeout is armed, sent in the same synchronous step as the
 	// last read of the hold's probe, and timed by a pre-response guard a
-	// holding transport stops, like the Responses request above.
-	const response = await dispatchWhenOpen(opts?.beforeDispatch, signal, () =>
-		(opts?.fetch ?? fetch)(endpoint, {
+	// holding transport stops, like the Responses request above. The model-call
+	// guards are read in that step too.
+	const response = await dispatchWhenOpen(opts?.beforeDispatch, signal, () => {
+		if (guardedModel) assertModelCallAllowed(guardedModel);
+		return (opts?.fetch ?? fetch)(endpoint, {
 			method: "POST",
 			headers,
 			body: stringifyJson(body),
 			signal: armPreResponseTimeout(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS).signal,
-		}),
-	);
+		});
+	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
+		// The decoded body is the cause, so a `cyber_policy` refusal the endpoint relays reaches the guards
+		// with its code.
+		const cause = await captureOpenAIHttpError(response);
 		logger.warn("Remote compaction failed", {
 			endpoint,
 			status: response.status,
 			statusText: response.statusText,
-			errorText,
+			errorText: cause.captured.bodyText ?? "",
 		});
 		throw new ProviderHttpError(
 			`Remote compaction failed (${response.status} ${response.statusText})`,
 			response.status,
 			{
 				headers: response.headers,
+				cause,
 			},
 		);
 	}

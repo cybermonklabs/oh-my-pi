@@ -195,8 +195,10 @@ impl ShellApi<'_, '_> {
 	/// Run `script` in a new subshell of the calling vproc (for callouts
 	/// such as `xargs` or `find -exec`); `script.vproc` only selects the
 	/// stdio. The run reports `Done` like any other. A `Subshell` event on
-	/// the calling command links the child before its `RunStart`.
-	pub fn run_subshell(&mut self, script: Script) -> RunId {
+	/// the calling command links the child before its `RunStart`. `None`: no
+	/// vpid is left ([`Vpid::CEILING`](crate::bash::ids::Vpid::CEILING)),
+	/// nothing started; the tool fails as its fork would.
+	pub fn run_subshell(&mut self, script: Script) -> Option<RunId> {
 		self.submit_subshell(script, None)
 	}
 
@@ -208,7 +210,10 @@ impl ShellApi<'_, '_> {
 	/// of a tree it runs in) reaches the tree too, as a signal to a process
 	/// reaches what it `exec`s or forwards to. A detached lineage stays
 	/// detached in every descendant, whatever `lineage` says.
-	pub fn run_subshell_in(&mut self, script: Script, mut lineage: Lineage) -> RunId {
+	pub fn run_subshell_in(&mut self, script: Script, mut lineage: Lineage) -> Option<RunId> {
+		if self.shell.k.vpids_left() == 0 {
+			return None;
+		}
 		let caller = self.vproc();
 		lineage.detached |= caller.lineage.detached;
 		if lineage.label != 0 {
@@ -220,7 +225,10 @@ impl ShellApi<'_, '_> {
 		self.submit_subshell(script, Some(lineage))
 	}
 
-	fn submit_subshell(&mut self, mut script: Script, lineage: Option<Lineage>) -> RunId {
+	fn submit_subshell(&mut self, mut script: Script, lineage: Option<Lineage>) -> Option<RunId> {
+		if self.shell.k.vpids_left() == 0 {
+			return None;
+		}
 		if matches!(script.vproc, VprocSel::Root) {
 			script.vproc = VprocSel::NewSubshell;
 		}
@@ -245,7 +253,7 @@ impl ShellApi<'_, '_> {
 			.shell
 			.k
 			.emit_op(self.cx, vp, node, EventData::Subshell { child });
-		run
+		Some(run)
 	}
 
 	/// [`Self::run_subshell_in`] for a callout that stands for the command
@@ -256,8 +264,8 @@ impl ShellApi<'_, '_> {
 	/// program's OS pid, as for `cmd &`. Called while the host handles the
 	/// [`Step::Call`](super::Step::Call), before it steps the shell again
 	/// (later, the job already settled on its virtual pid).
-	pub fn exec_subshell_in(&mut self, script: Script, lineage: Lineage) -> RunId {
-		let run = self.run_subshell_in(script, lineage);
+	pub fn exec_subshell_in(&mut self, script: Script, lineage: Lineage) -> Option<RunId> {
+		let run = self.run_subshell_in(script, lineage)?;
 		let caller = self.vproc().vpid;
 		let child = self.shell.k.spawned.last().map(|p| p.vpid);
 		if let (Some(child), Some(bang)) = (
@@ -272,7 +280,7 @@ impl ShellApi<'_, '_> {
 			bang.vproc = child;
 			bang.stage = BangStage::Lone;
 		}
-		run
+		Some(run)
 	}
 
 	/// Lineage of the calling vproc.

@@ -495,6 +495,12 @@ pub(crate) fn open_dir_beneath(s: &mut Scratch, root: &Handle, rel: &[u8]) -> io
 	nt_open_unlinked(s, at, name, DIR_ACCESS, FILE_DIRECTORY_FILE).map(|(h, _)| h)
 }
 
+// A directory opened only to reach what is below it opens here as a listing
+// open does: the Unix search-only open has no counterpart in this port.
+pub(crate) use self::{
+	open_dir as open_dir_to_search, open_dir_beneath as open_dir_beneath_to_search,
+};
+
 /// Rewrites the regular file at the walk-relative `rel` below `root` in place
 /// with `contents`, creating it when missing: every directory on the way and
 /// the file open without following a reparse point ([`parent_beneath`],

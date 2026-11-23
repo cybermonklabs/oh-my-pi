@@ -431,6 +431,14 @@ mod proc_snapshot {
 			self.stat.comm.clone()
 		}
 
+		/// Whether the process still runs.
+		///
+		/// A leader that reads `Z` while the thread count (`num_threads`) is
+		/// above one exited before another thread of its process (a
+		/// `pthread_exit` from `main`): the count includes the exited leader
+		/// and every thread not yet released, on Linux and under gVisor alike,
+		/// so the process still runs, is exiting, or has a thread a tracer
+		/// holds.
 		pub fn status(&self) -> ProcessStatus {
 			match read_stat(self.pid) {
 				Some(stat) if still_runs(&stat, self.stat.start_time) => ProcessStatus::Running,
@@ -566,9 +574,16 @@ mod proc_snapshot {
 	/// zombie, or nobody waits for it, and it is being released
 	/// (`task_state_array` in fs/proc/array.c; `wait_task_zombie` and
 	/// `exit_notify` in kernel/exit.c). gVisor writes `X (dead)` for its dead
-	/// tasks too (pkg/sentry/kernel/task_sched.go).
+	/// tasks too (pkg/sentry/kernel/task_sched.go). A leader that reads `Z`
+	/// while the thread count is above one has not exited: another thread of
+	/// its process still runs (see `status`).
 	fn still_runs(stat: &Stat, start_time: u64) -> bool {
-		stat.start_time == start_time && !matches!(stat.state, 'Z' | 'X')
+		stat.start_time == start_time
+			&& match stat.state {
+				'X' => false,
+				'Z' => stat.threads > 1,
+				_ => true,
+			}
 	}
 
 	fn status_ids(pid: i32, prefix: &str) -> Option<(u32, u32)> {
@@ -624,6 +639,21 @@ mod proc_snapshot {
 			let running = parse_stat(&stat_line("R")).expect("parses");
 			assert!(still_runs(&running, 987_654), "the control: a running process");
 			assert!(!still_runs(&running, 987_655), "the control: another process at the pid");
+		}
+
+		/// A leader that reads `Z` with another thread of its process left
+		/// still runs; `X` (dead) has exited whatever the thread count.
+		#[test]
+		fn a_zombie_leader_with_another_thread_still_runs() {
+			let runs = |state: &str, threads: u32| {
+				let line = format!(
+					"4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 987654 0 0\n"
+				);
+				still_runs(&parse_stat(&line).expect("parses"), 987_654)
+			};
+			assert!(runs("Z", 2), "the leader exited, a thread runs");
+			assert!(!runs("Z", 1), "only the exited leader is left");
+			assert!(!runs("X", 2), "X (dead) has exited");
 		}
 	}
 }

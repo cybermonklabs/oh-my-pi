@@ -468,6 +468,14 @@ impl DirHandle {
 		Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
 	}
 
+	/// Opens the host directory at `path`, following symlinks, only to reach
+	/// what is below it, for a facade with `scope`
+	/// ([`host::open_dir_to_search`]).
+	pub(crate) fn open_host_to_search(path: &Path, scope: &Scope) -> io::Result<Self> {
+		let handle = with_scratch(|s| native::open_dir_to_search(s, path))?;
+		Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
+	}
+
 	/// Opens the provider directory at `path` on `fs`, checking that it is
 	/// one (without following a final symlink unless `follow`).
 	pub(crate) async fn open_provider(
@@ -747,7 +755,10 @@ impl DirHandle {
 
 	/// Opens the directory `..` of this one, which is its parent only while
 	/// this directory has not moved: callers check the identity of what they
-	/// get ([`Self::identity`]).
+	/// get ([`Self::identity`]). The handle only reaches what is below the
+	/// parent: it opens children and identifies the parent, and on Linux,
+	/// where it is opened `O_PATH` and so needs only the parent's search
+	/// permission, it cannot be listed.
 	///
 	/// # Errors
 	///
@@ -1381,6 +1392,32 @@ impl DirHandle {
 		}
 	}
 
+	/// Opens the directory at the walk-relative `rel` below this one as
+	/// [`Self::open_dir_beneath_async`] does, only to reach what is below it:
+	/// the handle opens children and identifies the directory, and on Linux,
+	/// where it is opened `O_PATH` and so needs only the directory's search
+	/// permission (also each directory on the way, where the kernel has no
+	/// `openat2`), it cannot be listed. A provider's directory opens as
+	/// [`Self::open_dir_beneath_async`] opens it.
+	///
+	/// # Errors
+	///
+	/// As for [`Self::open_dir_beneath_async`].
+	pub async fn open_dir_beneath_to_search_async(&self, rel: &[u8]) -> io::Result<Self> {
+		check_relative(rel)?;
+		match &self.repr {
+			DirRepr::Host { handle, scope } => {
+				let handle = with_scratch(|s| native::open_dir_beneath_to_search(s, handle, rel))?;
+				Ok(Self { repr: DirRepr::Host { handle, scope: scope.clone() } })
+			},
+			DirRepr::Provider(provided) => {
+				let path = provider::beneath(&provided.path, rel);
+				provider::open_dir(&provided.fs, &path, false).await?;
+				Ok(provided.dir(path))
+			},
+		}
+	}
+
 	/// Replaces the contents of the regular file at the walk-relative `rel`
 	/// below this directory with `contents`, creating the file when it is
 	/// missing, and follows no symlink on the way or at the file: the write
@@ -1520,13 +1557,35 @@ pub(crate) fn alone(name: &str) -> bool {
 		.ok()
 		.or_else(|| std::env::args_os().next().map(PathBuf::from))
 		.expect("the test binary");
-	let output = std::process::Command::new(exe)
-		.args(["--exact", name, "--nocapture", "--test-threads=1"])
-		.env(ALONE, name)
-		.output()
+	// Spawned holding `crate::tests::SPAWNS` for writing, until the child has
+	// written its first output: until its `exec` has closed them, it holds a
+	// copy of every descriptor of this process, ends of other tests' FIFOs
+	// included, and `spawn` can return before that (see `SPAWNS`).
+	let (child, first) = {
+		use std::io::Read as _;
+		let _spawning = crate::tests::SPAWNS.write();
+		let mut child = std::process::Command::new(exe)
+			.args(["--exact", name, "--nocapture", "--test-threads=1"])
+			.env(ALONE, name)
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.spawn()
+			.expect("run the test in a process of its own");
+		let mut first = [0; 1];
+		let stdout = child.stdout.as_mut().expect("the child's output");
+		let read = loop {
+			match stdout.read(&mut first) {
+				Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {},
+				read => break read.expect("the child's first output"),
+			}
+		};
+		(child, first[..read].to_vec())
+	};
+	let output = child
+		.wait_with_output()
 		.expect("run the test in a process of its own");
-	let (out, err) =
-		(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+	let out = String::from_utf8_lossy(&[first, output.stdout].concat()).into_owned();
+	let err = String::from_utf8_lossy(&output.stderr);
 	assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
 	assert!(out.contains("1 passed"), "{name} ran no test in a process of its own:\n{out}\n{err}");
 	// What the test reported of itself (counts, notes), for the run's log.

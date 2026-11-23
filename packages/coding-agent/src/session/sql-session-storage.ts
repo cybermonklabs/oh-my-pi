@@ -1808,23 +1808,23 @@ export class SqlSessionStorage extends IndexedSessionStorage {
  * fails with that error as its cause and stays queued.
  *
  * So on PostgreSQL connections no transaction can repair, each land makes at
- * most {@link PG_REPAIR_RETRIES} + 1 attempts (4) and closes as many
+ * most r = {@link PG_REPAIR_RETRIES} + 1 attempts and closes as many
  * connections. A transcript write that names n newly stored images meets at
  * most n + 1 lands (each image's own, which {@link store} starts, and the
- * write's), so it closes at most 4(n + 1); one whose transaction then finds
+ * write's), so it closes at most r(n + 1); one whose transaction then finds
  * k of the blobs it names gone meets at most k + 1 more, which land them
  * again ({@link reland}). A session open that writes m images back to the
  * table (`restoreTierBlobs` in session-loader.ts) meets at most m + 1 lands
  * (one per image it queues, and its reference's), so it closes at most
- * 4(m + 1) from lands; its reference transaction, like a transcript
+ * r(m + 1) from lands; its reference transaction, like a transcript
  * write's, meets k + 1 more when it finds k of the blobs gone. Its other
- * calls are operations of their own, at most 4 closes each: each batch it
+ * calls are operations of their own, at most r closes each: each batch it
  * reads (blob sizes, rows whose bytes do not hash to their key, blob bytes),
  * each row it rewrites, and the reference transaction. On connections that
  * are all repairless its first read, of blob sizes, fails, so it queues no
- * image and writes no reference: it closes 4. A drain
+ * image and writes no reference: it closes r. A drain
  * ({@link SqlSessionStorage.drain}, which lands every queued blob) is a call
- * of its own and one land, so it closes at most 4 more, however many blobs
+ * of its own and one land, so it closes at most r more, however many blobs
  * stay queued.
  *
  * Bytes that do not hash to their reference are never stored. A blob larger

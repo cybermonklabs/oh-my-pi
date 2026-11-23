@@ -15,6 +15,8 @@ import {
 	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
 	hasRestorableTurn,
+	isRestoreSkippedCallResult,
+	restoreSkippedCallReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
@@ -594,5 +596,30 @@ describe("session exit diagnostics", () => {
 		expect(createInterruptedTurnAbortMessage(normalExit.getBranch())).toBeUndefined();
 		expect(createInterruptedTurnAbortMessage(completedTurn.getBranch())).toBeUndefined();
 		expect(createInterruptedTurnAbortMessage(supersededExit.getBranch())).toBeUndefined();
+	});
+});
+
+describe("isRestoreSkippedCallResult", () => {
+	/** The key a skip result's details carry on disk (`RESTORE_SKIPPED_CALL_DETAIL`), as a transcript holds it. */
+	const SKIP_FLAG = "restoreSkippedCall";
+	const skipResult = (details: unknown, isError = true) => ({
+		role: "toolResult" as const,
+		toolCallId: "call_eval",
+		toolName: "eval",
+		content: [{ type: "text" as const, text: restoreSkippedCallReason(["Worker"]) }],
+		details,
+		isError,
+		timestamp: Date.now(),
+	});
+
+	it("reads a skip by the details flag the session sets, not by the result's text", () => {
+		// If this regresses, a result whose text only begins as a skip's (a tool or the model can write any text) is
+		// read as an earlier restore's skip, and a later `--restore` does not run that call again.
+		expect(isRestoreSkippedCallResult(skipResult({ [SKIP_FLAG]: true }))).toBe(true);
+		expect(isRestoreSkippedCallResult(skipResult({}))).toBe(false);
+		expect(isRestoreSkippedCallResult(skipResult(undefined))).toBe(false);
+		expect(isRestoreSkippedCallResult(skipResult({ [SKIP_FLAG]: "true" }))).toBe(false);
+		// A skip is an error result.
+		expect(isRestoreSkippedCallResult(skipResult({ [SKIP_FLAG]: true }, false))).toBe(false);
 	});
 });

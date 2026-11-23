@@ -24,6 +24,7 @@ import {
 	type ConfiguredThinkingLevel,
 } from "../render/render-utils";
 import type { StructuredSubagentOutput } from "./task";
+import type { EvalHeldAgentResult } from "./eval";
 import { describeJobTiles, type JobTile, type JobWidgetView, renderJobTileLines } from "./job-widget";
 import type { RenderResultOptions, ToolRenderer, ToolActivitySummary } from "./renderer";
 import type { IrcDeliveryReceipt, IrcMessage } from "./irc";
@@ -103,6 +104,11 @@ export interface JobSnapshot {
 	 * turn's output; undefined where the body does not report it.
 	 */
 	agentOutputPublished?: boolean;
+	/**
+	 * The subagents whose results a settled job's result hands over (a work pool's workers): a
+	 * snapshot that lists the job hands them over with it.
+	 */
+	agentResults?: EvalHeldAgentResult[];
 }
 
 /** Outcome of cancelling one background job. */

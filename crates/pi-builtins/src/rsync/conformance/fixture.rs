@@ -137,11 +137,25 @@ fn write_file(path: &Path, content: &[u8], mode: u32, secs: i64, nanos: u32) {
 /// the times of every directory the tweaks created.
 pub(super) fn build(w: &Path, tweaks: &str) {
 	let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+	clear_inherited_setgid(w);
 	build_base(w);
 	for tweak in tweaks.split(',').filter(|t| !t.is_empty()) {
 		apply(w, tweak);
 	}
 	pin_fresh_dirs(w, start - 5);
+}
+
+/// Clears the set-group-ID bit `w` took from where it was made. A volume mounted
+/// with a group owner (a Kubernetes pod's `fsGroup` gives `/tmp` mode 2777) passes
+/// the bit to every directory made below it, so the directories the tweaks make
+/// (the stale `dst/`) would have it while the source's, chmodded, do not, and an
+/// itemized run would report a permission change (`.d..tp..... ./`) that depends
+/// on where the test runs. Without it on `w`, only the fixture's own modes count.
+fn clear_inherited_setgid(w: &Path) {
+	let mode = fs::metadata(w).unwrap().permissions().mode() & 0o7777;
+	if mode & 0o2000 != 0 {
+		chmod(w, mode & !0o2000);
+	}
 }
 
 fn build_base(w: &Path) {

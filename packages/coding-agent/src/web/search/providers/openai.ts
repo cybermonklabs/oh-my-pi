@@ -1,4 +1,5 @@
 import { type Api, type AuthStorage, type Model, withAuth } from "@oh-my-pi/pi-ai";
+import { guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { applySessionHeader } from "@oh-my-pi/pi-ai/providers/inference-headers";
 import { asRecord } from "@oh-my-pi/pi-utils";
 import {
@@ -228,27 +229,30 @@ export async function searchOpenAIResponses(params: SearchParams): Promise<Searc
 	const keyOrResolver = params.modelRegistry.resolver(params.model, params.sessionId);
 	return withAuth(
 		keyOrResolver,
-		async apiKey => {
-			const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
-			const headers = new Headers(configuredHeaders);
-			headers.set("Authorization", `Bearer ${apiKey}`);
-			headers.set("Content-Type", "application/json");
-			applySessionHeader(headers, params.model.compat, params.sessionId);
-			const response = await (params.fetch ?? fetch)(responsesEndpoint(params.model.baseUrl), {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: withHardTimeout(params.signal, params.timeoutMs),
-			});
-			if (!response.ok) throw httpError(response.status, await response.text().catch(() => ""));
-			let payload: unknown;
-			try {
-				payload = await response.json();
-			} catch {
-				throw new SearchProviderError("openai", "OpenAI Responses API returned invalid JSON", 502);
-			}
-			return readResponse(payload, params.model.id, resultLimit);
-		},
+		// A model call like any other: each attempt passes the model-call checkpoint, which holds it while a
+		// hold stands on this model and records a refusal it meets (the query is drawn from the conversation).
+		apiKey =>
+			guardModelRequest(params.model, async () => {
+				const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
+				const headers = new Headers(configuredHeaders);
+				headers.set("Authorization", `Bearer ${apiKey}`);
+				headers.set("Content-Type", "application/json");
+				applySessionHeader(headers, params.model.compat, params.sessionId);
+				const response = await (params.fetch ?? fetch)(responsesEndpoint(params.model.baseUrl), {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+					signal: withHardTimeout(params.signal, params.timeoutMs),
+				});
+				if (!response.ok) throw httpError(response.status, await response.text().catch(() => ""));
+				let payload: unknown;
+				try {
+					payload = await response.json();
+				} catch {
+					throw new SearchProviderError("openai", "OpenAI Responses API returned invalid JSON", 502);
+				}
+				return readResponse(payload, params.model.id, resultLimit);
+			}),
 		{
 			signal: params.signal,
 			missingKeyMessage: `OpenAI API credentials not found for selected provider "${params.model.provider}".`,

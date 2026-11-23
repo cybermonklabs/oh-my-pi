@@ -364,7 +364,7 @@ A `prompt` with no `streamingBehavior` whose text goes to the agent as a new tur
 - `agentInvoked: false`: the prompt finished locally (an extension or custom command that started no turn) or failed before reaching the agent.
 - `agentInvoked: true`: the prompt was dispatched or queued for agent work; normal completion reports when the agent **yielded** — see [Yield vs settled](#yield-vs-settled). An abort that wins before dispatch can still report `true` with `status: "aborted"`. A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
-- `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable, code? }`. `message` is the failed turn's `errorMessage`: the provider's error text, which never carries OMP-local diagnostics such as saved request-dump paths. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. `code: "cost_cap"` means the session reached `session.maxCost` and OMP did not send the next request; the server keeps running, and later prompts end the same way until the cap is raised. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
+- `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable, code? }`. `message` is the failed turn's `errorMessage`: the provider's error text, which never carries OMP-local diagnostics such as saved request-dump paths. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. `code: "cost_cap"` means the session reached `session.maxCost` and OMP did not send the next request; the server keeps running, and later prompts end the same way until the cap is raised. `code: "cyber_policy"` (with `retryable: false`) means OpenAI refused the content for cybersecurity risk, or OMP held the request because such a refusal earlier in the session still holds OpenAI's routes; resubmitting the same content is refused again. The next `prompt`, `steer`, `follow_up` or skill command ends that hold. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 - `error.code: "session_busy"` means that the agent was busy: the prompt was refused as described above, or it waited at least 30 seconds for the agent to become idle and another run still held the agent. With this code `retryable` stays `false`: read `code`, not `retryable`, to tell a busy agent from a failed prompt. A client built from an older generated Go, Rust or Python SDK reports a parse failure for a `prompt_result` with this code, and Rust code that names the type of this field must use the `PromptErrorCode` enum.
 
@@ -1505,18 +1505,20 @@ session runs per RPC server.
 
 ### Commands
 
-- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice: string }`
-- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice: string, sdpAnswer: string }`
+- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice?: string }`
+- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice?: string, sdpAnswer: string }`
 - `{ id?, type: "live_stop" }`
 - `{ id?, type: "live_mute", muted?: boolean }` → `data: { muted: boolean }`
 
 `live_start` responds once the session is connected and recording, so it is
 dispatched concurrently like `bash`; `live_stop` sent meanwhile cancels the
 connection and the pending `live_start` then fails. `voice` defaults to the
-`live.voice` setting and the response reports the voice used. `instructions`
-replaces the bundled live prompt; it is rendered as a Handlebars template with
-`{{username}}` and `{{firstName}}` of the local OS account. Starting while a
-session is connecting, active, or closing, or while dictation is active, fails.
+`live.voice` setting and the response reports the voice used; with
+`live.provider: openai`, which sends GPT-Live no voice, the response has none and
+`voice` is ignored. `instructions` replaces the bundled live prompt; it is
+rendered as a Handlebars template with `{{username}}` and `{{firstName}}` of the
+local OS account. Starting while a session is connecting, active, or closing, or
+while dictation is active, fails.
 
 `live_connect` starts the same session with the audio on the client's own
 WebRTC peer instead of the host's microphone and speakers. `sdpOffer` is that
@@ -1551,6 +1553,62 @@ Live frames are not session events: `set_event_filter` never drops them.
 
 Closing stdin, or `pi.shutdown()`, stops an active live session before the
 process exits.
+
+### API billing (`live.provider: openai`)
+
+Live sessions run on Codex with the session's ChatGPT (Codex) sign-in. With
+`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`, which takes precedence
+over `live.provider` in the settings files) every live session
+(`/live`, `live_start`, `live_connect`, extension `startLive`) runs GPT-Live
+(`gpt-live-1.1`) on OpenAI's API instead, billed to the key of the `openai`
+provider: the key omp uses for any OpenAI model (a stored key, `apiKey` in
+`models.yml`, else `OPENAI_API_KEY`), sent to the provider's `baseUrl` from
+`models.yml`, else `https://api.openai.com/v1`. A model gateway that serves
+GPT-Live there works the same way.
+
+1. `POST {base}/live/sessions` with `Authorization: Bearer <key>` and
+   `{ "session": { "model": "gpt-live-1.1", "instructions", "delegation": { "type": "client" } }, "transport": { "type": "webrtc", "sdp": <offer> } }`,
+   answered by `201 { "session": { "id" }, "transport": { "sdp" } }`. No Codex
+   header is sent and no redirect is followed.
+2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
+   bearer carries the call's events and omp's messages.
+
+The key goes nowhere else. Where the server's text could repeat it (a redirect's
+`Location`, an error body or `error` event, the sideband's close reason, a
+session id in the attach URL), every error and log line has `[key]` instead.
+
+The rest of the call is the same as on Codex. GPT-Live's delegation event names
+no task text, only its `offset_ms` on the session timeline, so its turn is the
+user's transcribed words before that offset (at most the minute before it), under
+a line saying they are speech-to-text that can hold recognition errors and speech
+that was not a request. GPT-Live can send a delegation before the transcript of
+the words that led to it, so a delegation goes once the user's transcript has
+reached its offset, or after 1 s with the words that have arrived; the voice's
+transcript does not release it. A user's word that arrives for a delegation
+already handed over is logged, not given to the next one. A delegation is never
+dropped: with no words, its turn says none were transcribed. A turn's progress
+goes to the call as `session.thinking.append` (not spoken) and its final reply
+as `session.commentary.append` (spoken), both with the delegation's
+`delegation_id`. omp sends no context outside a delegation
+(`session.context.append` on Codex). Each message carries an `event_id`; a
+GPT-Live `error` that names the spoken reply ends the call with that error, as a
+failed send does on Codex. One that names a progress note is logged and the call
+stays open, since the user never hears a progress note; any other `error` is
+logged too. The session id is opaque: any id but `.` and `..` is accepted and
+percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
+default; `live.voice` names Codex voices only.
+
+A user's transcript delta without `start_ms` and `end_ms` has no place on the
+timeline. It joins the turn of the next delegation handed over, after the words
+that have one, if it came within the minute before. It cannot show that the
+user's transcript has reached an offset, so a delegation waiting on such words
+alone goes after 1 s.
+
+What the server sends is bounded: omp reads at most 256 KiB of the session
+response, ends a transcript line that would pass 8,192 characters and begins a
+new one (a longer delta is split, its latest characters filling the last
+piece), and keeps for a turn at most the latest 8,192 characters of the user's
+words with timing, and as many of those without. It logs the words it drops.
 
 ## Dictation Sub-Protocol
 

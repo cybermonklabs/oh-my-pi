@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
@@ -417,30 +418,39 @@ describe("prefix-bound tool roster changes", () => {
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
 		});
 
-		/** Kept out of the test body so no strong local binding outlives the capture. */
-		function weakRefToRestoredReply(session: AgentSession): WeakRef<object> {
-			const reply = session.agent.state.messages.findLast(message => message.role === "assistant");
-			if (!reply) throw new Error("resumed session restored no reply");
-			return new WeakRef(reply);
+		/**
+		 * The release check runs in a process of its own with concurrent JIT compilation off: in a process
+		 * that has warmed the session code, an optimizing-JIT plan on a background thread can keep the reply
+		 * reachable, so a collection there says little about what the disposed session holds.
+		 */
+		async function probeRestoredReply(reference: "dropped" | "held"): Promise<boolean> {
+			const child = Bun.spawn(
+				[process.execPath, path.join(import.meta.dir, "fixtures/restored-reply-release-probe.ts"), reference],
+				{
+					cwd: path.join(import.meta.dir, "../../.."),
+					env: { ...process.env, BUN_JSC_useConcurrentJIT: "0" },
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			const result = JSON.parse(stdout) as { collected: boolean; transcriptEntries: number };
+			expect(result.transcriptEntries).toBeGreaterThan(0);
+			return result.collected;
 		}
 
 		it("releases the restored reply when disposed before its first request", async () => {
-			const transcript = await liveTranscript();
-			const resumed = newSession(createPrefixBindingModel(), { sessionManager: transcript.sessionManager });
-			const reply = weakRefToRestoredReply(resumed.session);
-			for (const session of sessions.splice(0)) await session.dispose();
+			expect(await probeRestoredReply("dropped")).toBe(true);
+		}, 30_000);
 
-			await resumed.session.dispose();
-
-			// A WeakRef target stays alive until the current task ends; yield a task between collections.
-			for (let attempt = 0; attempt < 5 && reply.deref() !== undefined; attempt++) {
-				const nextTask = Promise.withResolvers<void>();
-				setImmediate(nextTask.resolve);
-				await nextTask.promise;
-				Bun.gc(true);
-			}
-			expect(reply.deref()).toBeUndefined();
-		});
+		it("keeps a restored reply something else still holds (control)", async () => {
+			expect(await probeRestoredReply("held")).toBe(false);
+		}, 30_000);
 	});
 
 	it("keeps rebuilding roster changes for models without prefix binding", async () => {

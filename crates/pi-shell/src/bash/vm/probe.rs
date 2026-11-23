@@ -211,15 +211,17 @@ pub fn perform(
 					nonexec:       None,
 				});
 			}
-			match path_search(&mut tcx, cx, sc) {
+			match path_search(&mut tcx, cx, sc, false) {
 				// Windows reports the probed path: `shown_candidate` splits PATH
 				// on `:` and its `idx` stops addressing one entry once every
 				// entry expands to a name plus its PATHEXT candidates.
-				Search::Found(found) if k.engine.config().platform == Platform::Windows => {
+				Search::Found(found) | Search::Refused(found)
+					if k.engine.config().platform == Platform::Windows =>
+				{
 					ProbeResult::Path(Some(found))
 				},
 				// bash shows `dir/name` as built (`./e` for an empty entry).
-				Search::Found(_) => {
+				Search::Found(_) | Search::Refused(_) => {
 					let idx = sc
 						.io
 						.as_ref()
@@ -573,7 +575,10 @@ pub const fn path_separator(platform: Platform) -> u8 {
 }
 
 /// `dir/name` for every `$PATH` entry; on Windows each is followed by the
-/// `extensions` (`PATHEXT`) spellings unless `name` already ends in one.
+/// `extensions` (`PATHEXT`) spellings unless `name` already ends in one. An
+/// empty or `.` entry is the current directory, where an empty name names
+/// no file (zsh runs `execve("")` there, bash skips the directory `./`):
+/// its candidate is empty.
 pub fn candidates(
 	path: &[u8],
 	name: &[u8],
@@ -588,6 +593,10 @@ pub fn candidates(
 	let windows = platform == Platform::Windows;
 	let mut out = Vec::new();
 	for dir in path.split(|&c| c == path_separator(platform)) {
+		if name.is_empty() && (dir.is_empty() || dir == b".") {
+			out.push(BString::default());
+			continue;
+		}
 		let mut base = if dir.is_empty() {
 			BString::from(cwd)
 		} else {
@@ -642,7 +651,8 @@ pub fn shown_candidate(path: &[u8], name: &[u8], idx: usize) -> Option<BString> 
 pub use crate::bash::fs::url_root_len;
 
 /// `name` made absolute against `cwd`: a name starting with `/` or a URL
-/// path ([`url_root_len`]) is already absolute.
+/// path ([`url_root_len`]) is already absolute. An empty name stays empty:
+/// it names no file (the kernel's `ENOENT`), not the working directory.
 pub fn absolute(cwd: &[u8], name: &[u8]) -> BString {
 	absolute_on(
 		cwd,
@@ -658,7 +668,7 @@ pub fn absolute(cwd: &[u8], name: &[u8]) -> BString {
 /// [`absolute`] for the configured shell platform: the Windows drive and UNC
 /// rule stays testable on any host instead of compiling only on Windows.
 pub fn absolute_on(cwd: &[u8], name: &[u8], platform: Platform) -> BString {
-	if name.first() == Some(&b'/') || url_root_len(name).is_some() {
+	if name.is_empty() || name.first() == Some(&b'/') || url_root_len(name).is_some() {
 		return name.into();
 	}
 	if platform == Platform::Windows && is_windows_absolute(name) {
@@ -680,15 +690,19 @@ pub const fn is_windows_absolute(name: &[u8]) -> bool {
 
 pub enum Search {
 	Found(BString),
+	/// No candidate can be run: the one the OS refuses (`EACCES`).
+	Refused(BString),
 	NotFound,
 	Pending(WaitKey),
 }
 
 /// Probe PATH candidates through the pollable `Fs`: `stat` (regular file),
 /// then `access(X)`. Without an executable candidate, the first regular
-/// file is found (bash's `FS_EXEC_PREFERRED`; running it fails with
-/// `Permission denied`).
-pub fn path_search(tcx: &mut Context<'_>, cx: &mut Cx<'_>, sc: &mut Scratch) -> Search {
+/// file is refused (bash's `FS_EXEC_PREFERRED`; running it fails with
+/// `Permission denied`); for `zsh`, the first that exists but is not a
+/// regular file (a directory) too: zsh's `execute` tries it, and reports
+/// the `EACCES` `execve` gives.
+pub fn path_search(tcx: &mut Context<'_>, cx: &mut Cx<'_>, sc: &mut Scratch, zsh: bool) -> Search {
 	// The search, beside `sc.live` (its fs operation).
 	let Some(search) = sc.io.as_mut().and_then(|io| io.search.as_mut()) else {
 		return Search::NotFound;
@@ -697,7 +711,7 @@ pub fn path_search(tcx: &mut Context<'_>, cx: &mut Cx<'_>, sc: &mut Scratch) -> 
 		let Some(path) = search.cands.get(search.idx) else {
 			if let Some(i) = search.nonexec.take() {
 				search.idx = i;
-				return Search::Found(search.cands[i].clone());
+				return Search::Refused(search.cands[i].clone());
 			}
 			return Search::NotFound;
 		};
@@ -750,10 +764,13 @@ pub fn path_search(tcx: &mut Context<'_>, cx: &mut Cx<'_>, sc: &mut Scratch) -> 
 				},
 				Poll::Ready(r) => {
 					sc.live = Live::None;
-					if r.is_ok_and(|st| st.kind == StatKind::File) {
-						search.checking_exec = true;
-					} else {
-						search.idx += 1;
+					match r {
+						Ok(st) if st.kind == StatKind::File => search.checking_exec = true,
+						Ok(_) if zsh => {
+							search.nonexec.get_or_insert(search.idx);
+							search.idx += 1;
+						},
+						_ => search.idx += 1,
 					}
 				},
 			}
@@ -830,6 +847,15 @@ mod tests {
 	fn absolute_keeps_absolute_names() {
 		assert_eq!(absolute(b"/x", b"/bin/sh"), "/bin/sh");
 		assert_eq!(absolute(b"/x/", b"./a"), "/x/./a");
+	}
+
+	/// An empty name names no file (`open("")` is `ENOENT`): under a URL
+	/// working directory or on Windows too, it does not become the working
+	/// directory (the provider's or the drive's).
+	#[test]
+	fn an_empty_name_stays_empty_under_any_working_directory() {
+		assert_eq!(absolute(b"virtual://d", b""), "");
+		assert_eq!(absolute_on(br"C:\project", b"", Platform::Windows), "");
 	}
 
 	#[test]

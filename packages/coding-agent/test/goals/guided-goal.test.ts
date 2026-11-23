@@ -160,7 +160,7 @@ describe("guided goal setup", () => {
 
 			expect(promptSpy).toHaveBeenCalledTimes(1);
 			const [text, promptOptions] = promptSpy.mock.calls[0]!;
-			expect(promptOptions).toEqual({ synthetic: true, images });
+			expect(promptOptions).toEqual({ synthetic: true, images, origin: "outside" });
 			// The rough objective rides inside the kickoff, and the kickoff tells the
 			// agent how to finish: `goal` tool, op create.
 			expect(text).toContain("automate flaky test triage");
@@ -199,7 +199,8 @@ describe("guided goal setup", () => {
 
 			expect(promptSpy).not.toHaveBeenCalled();
 			expect(followUp).toHaveBeenCalledTimes(1);
-			expect(followUp.mock.calls[0]?.[2]).toEqual({ synthetic: true });
+			// A person's `/guided-goal`: input from outside the session.
+			expect(followUp.mock.calls[0]?.[2]).toEqual({ synthetic: true, origin: "outside" });
 		} finally {
 			await harness.cleanup();
 		}
@@ -214,7 +215,7 @@ describe("guided goal setup", () => {
 			await harness.mode.handleGuidedGoalCommand("ship it");
 
 			expect(followUp).toHaveBeenCalledTimes(1);
-			expect(followUp.mock.calls[0]?.[2]).toEqual({ synthetic: true });
+			expect(followUp.mock.calls[0]?.[2]).toEqual({ synthetic: true, origin: "outside" });
 		} finally {
 			await harness.cleanup();
 		}

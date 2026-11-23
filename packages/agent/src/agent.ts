@@ -24,6 +24,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { runInModelCallScope } from "@oh-my-pi/pi-ai/model-call-guard";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -674,6 +675,12 @@ export class Agent {
 	 * owning session's `sessionId`), so in-process agents' records stay apart.
 	 */
 	logContext: Readonly<Record<string, unknown>> | undefined;
+
+	/**
+	 * The scope of every model call this agent's runs make (`runInModelCallScope` in pi-ai): the
+	 * process's model-call guards registered for it see those calls. The owning session sets it.
+	 */
+	modelCallScope: object | undefined;
 
 	/**
 	 * Static metadata forwarded to every API request when no resolver is installed
@@ -1889,9 +1896,11 @@ export class Agent {
 		}
 	}
 
-	/** Run `fn` with {@link logContext} on every record it logs. */
+	/** Run `fn` with {@link logContext} on every record it logs, in this agent's {@link modelCallScope}. */
 	#inLogContext<T>(fn: () => T): T {
-		return this.logContext ? logger.withContext(this.logContext, fn) : fn();
+		return runInModelCallScope(this.modelCallScope, () =>
+			this.logContext ? logger.withContext(this.logContext, fn) : fn(),
+		);
 	}
 
 	/**

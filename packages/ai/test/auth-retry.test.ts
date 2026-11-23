@@ -588,6 +588,24 @@ describe("withAuth", () => {
 		expect(result).toBe("ok");
 		expect(keys).toEqual(["k0", "k1"]);
 	});
+
+	it("never sends a cyber-policy refusal again, even when a custom classifier calls it retryable", async () => {
+		const keys: string[] = [];
+		const refusal = new ProviderHttpError("This content was flagged for possible cybersecurity risk.", 403, {
+			code: "cyber_policy",
+		});
+		await expect(
+			withAuth(
+				ctx => (ctx.error === undefined ? "k0" : "k1"),
+				async key => {
+					keys.push(key);
+					throw refusal;
+				},
+				{ isAuthError: () => true },
+			),
+		).rejects.toBe(refusal);
+		expect(keys).toEqual(["k0"]);
+	});
 });
 
 describe("withOAuthAccess", () => {
@@ -913,5 +931,24 @@ describe("withOAuthAccess", () => {
 				missingAccessMessage: "no codex account",
 			}),
 		).rejects.toThrow("no codex account");
+	});
+
+	it("never sends a cyber-policy refusal again: no refresh of the same account, no sibling", async () => {
+		const storage = fakeStorage({ initial: access("t1"), forced: access("t1-fresh"), rotated: access("t2") });
+		const refusal = new Error("cyber_policy: This content was flagged for possible cybersecurity risk.");
+		const attempts: string[] = [];
+		await expect(
+			withOAuthAccess(
+				storage,
+				"prov",
+				async a => {
+					attempts.push(a.accessToken);
+					throw refusal;
+				},
+				{ isAuthError: () => true },
+			),
+		).rejects.toBe(refusal);
+		expect(attempts).toEqual(["t1"]);
+		expect(storage.calls).toEqual([{ forceRefresh: undefined }]);
 	});
 });

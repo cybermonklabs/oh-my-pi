@@ -184,7 +184,9 @@ class FakeAgentSession {
 		return true;
 	}
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
-	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
+	customMessageOptions: Array<
+		{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string; origin?: "outside" | "inside" } | undefined
+	> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
 	buildUserSkillPrompt = buildSkillPromptMessage;
@@ -329,7 +331,7 @@ class FakeAgentSession {
 
 	async promptCustomMessage(
 		message: { customType: string; content: string; details?: unknown },
-		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string },
+		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string; origin?: "outside" | "inside" },
 	): Promise<void> {
 		this.customMessages.push(message);
 		this.customMessageOptions.push(options);
@@ -470,7 +472,12 @@ class FakeAgentSession {
 
 	async sendUserMessage(_content: string, _options?: unknown): Promise<void> {}
 
-	async compact(_instructions?: string, _options?: unknown): Promise<void> {}
+	/** Each compaction the session was asked for: its instructions and options. */
+	compactCalls: Array<[string | undefined, unknown]> = [];
+
+	async compact(instructions?: string, options?: unknown): Promise<void> {
+		this.compactCalls.push([instructions, options]);
+	}
 
 	async fork(): Promise<boolean> {
 		await this.sessionManager.flush();
@@ -2702,7 +2709,7 @@ describe("ACP agent", () => {
 		expect(customMessage.content).toContain("# Sample\nDo work.");
 		expect(customMessage.content).toContain(`[Skill directory: ${skillDir}]`);
 		expect(customMessage.content).toContain("User: extra context");
-		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer" });
+		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer", origin: "outside" });
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -3792,6 +3799,25 @@ describe("ACP agent", () => {
 
 		expect(session.forcedToolChoice).toBe("read");
 		expect(session.promptCalls).toEqual(["inspect package.json"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	// An ACP client's built-in command is input from outside the session: the runtime the ACP agent builds for
+	// it carries `origin: "outside"`, so the client's `/compact` ends a cyber-policy hold as a person's does.
+	it("runs an ACP client's /compact with the origin of input from outside", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-00000000000a",
+			prompt: [{ type: "text", text: "/compact" }],
+		} as PromptRequest);
+
+		expect(session.compactCalls).toEqual([[undefined, { origin: "outside" }]]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

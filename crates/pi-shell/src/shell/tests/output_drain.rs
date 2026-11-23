@@ -1,4 +1,5 @@
-//! Unix only (`next_read`): the Windows readers stop at a cancel.
+//! A cancelled reader keeps what the pipe holds (`next_read`; on Windows,
+//! `PipeReader`).
 
 use std::io::Write as _;
 

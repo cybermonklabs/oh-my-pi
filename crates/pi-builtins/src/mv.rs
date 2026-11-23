@@ -20,7 +20,7 @@ use thiserror::Error;
 #[cfg(unix)]
 use uucore::fs::display_permissions_unix;
 use uucore::{
-	backup_control::{self, BackupMode, source_is_target_backup},
+	backup_control::{self, BackupMode},
 	display::Quotable,
 	fs::path_ends_with_terminator,
 	update_control::{self, UpdateMode},
@@ -28,7 +28,10 @@ use uucore::{
 
 use crate::{
 	cp::{CpError, MoveCopier},
-	file_backup::{backup_display, backup_path, determine_backup_mode, determine_backup_suffix},
+	file_backup::{
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
+		source_is_destination_backup,
+	},
 	host::{Host, Utility, format_usage, matches_parser},
 	progress::stderr_draw_target,
 };
@@ -43,10 +46,14 @@ enum MvError {
 	SameFile(String, String),
 	#[error("cannot move {0} to a subdirectory of itself, {1}")]
 	SelfTargetSubdirectory(String, String),
-	#[error("cannot overwrite directory {0} with non-directory")]
-	DirectoryToNonDirectory(String),
+	#[error("cannot overwrite directory {0} with non-directory {1}")]
+	DirectoryToNonDirectory(String, String),
 	#[error("cannot overwrite non-directory {1} with directory {0}")]
 	NonDirectoryToDirectory(String, String),
+	#[error("backing up {0} might destroy source;  {1} not moved")]
+	BackupWouldDestroySource(String, String),
+	#[error("cannot backup {0}: File exists")]
+	CannotBackup(String),
 	#[error("target {0}: Not a directory")]
 	NotADirectory(String),
 	#[error("target directory {0}: Not a directory")]
@@ -425,20 +432,6 @@ fn parse_paths(files: &[OsString], opts: &Options) -> Vec<PathBuf> {
 }
 
 fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Options) -> MvResult<()> {
-	if opts.backup == BackupMode::Simple && source_is_target_backup(source, target, &opts.suffix) {
-		return Err(
-			io::Error::new(
-				io::ErrorKind::NotFound,
-				format!(
-					"backing up {} might destroy source;  {} not moved",
-					target.quote(),
-					source.quote()
-				),
-			)
-			.into(),
-		);
-	}
-
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
 	let target_fs = host.resolve(target);
@@ -475,24 +468,8 @@ fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Option
 			return move_files_into_dir(host, &[source.to_path_buf()], target, opts);
 		}
 		if !filesystem.is_dir(&source_fs) {
-			return Err(MvError::DirectoryToNonDirectory(target.quote().to_string()).into());
+			return Err(MvError::DirectoryToNonDirectory(target.quote().to_string(), source.quote().to_string()).into());
 		}
-	} else if filesystem.exists(&target_fs) && source_is_dir {
-		match opts.overwrite {
-			OverwriteMode::NoClobber => return Ok(()),
-			OverwriteMode::Interactive => prompt_overwrite(host, target, None)?,
-			OverwriteMode::Force => {},
-			OverwriteMode::Default => {
-				let (writable, mode) = is_writable(host, target);
-				if !writable && stdin_is_terminal(host) {
-					prompt_overwrite(host, target, mode)?;
-				}
-			},
-		}
-		return Err(
-			MvError::NonDirectoryToDirectory(source.quote().to_string(), target.quote().to_string())
-				.into(),
-		);
 	}
 
 	match rename(host, source, target, opts, None, &mut MoveCopier::new(opts.verbose)) {
@@ -761,7 +738,10 @@ fn rename(
 	let from_fs = host.resolve(from);
 	let to_fs = host.resolve(to);
 
-	if filesystem.exists(&to_fs) {
+	// The destination as `lstat` sees it, as GNU mv sees it: a symlink there
+	// is a destination to skip, ask about, compare and back up, even one that
+	// points nowhere.
+	if let Ok(to_meta) = filesystem.symlink_metadata(&to_fs) {
 		if opts.update == UpdateMode::None {
 			if opts.debug {
 				let _ = writeln!(host.stdout, "skipped {}", to.quote());
@@ -769,10 +749,13 @@ fn rename(
 			return Ok(());
 		}
 
-		if (opts.update == UpdateMode::IfOlder)
-			&& filesystem.metadata(&from_fs)?.modified()? <= filesystem.metadata(&to_fs)?.modified()?
-		{
-			return Ok(());
+		// GNU compares the times only for a source that is not a directory,
+		// each as `lstat` reports it; a directory goes on to the checks below.
+		if opts.update == UpdateMode::IfOlder {
+			let from_meta = filesystem.symlink_metadata(&from_fs)?;
+			if !from_meta.file_type().is_dir() && from_meta.modified()? <= to_meta.modified()? {
+				return Ok(());
+			}
 		}
 
 		if opts.update == UpdateMode::NoneFail {
@@ -797,8 +780,37 @@ fn rename(
 			},
 		}
 
-		// numbered-backup probing goes through the injected filesystem.
-		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix);
+		// The backup would be renamed over a source that is the destination's
+		// simple backup, so GNU refuses one in every mode but numbered, where
+		// the backup takes a fresh `.~N~` name (`copy.c`, `source_is_dst_backup`).
+		// mv reads its source without following it.
+		if !matches!(opts.backup, BackupMode::None | BackupMode::Numbered)
+			&& source_is_destination_backup(&filesystem, &from_fs, false, &to_fs, &opts.suffix)
+		{
+			return Err(io::Error::other(MvError::BackupWouldDestroySource(
+				to.quote().to_string(),
+				from.quote().to_string(),
+			)));
+		}
+
+		// numbered-backup probing goes through the injected filesystem. GNU mv
+		// renames a numbered backup without replacing and fails when an entry
+		// holds a long name's `~` fallback; here `backup_path` refuses that
+		// name after an lstat (`exclusive`), and the rename below then
+		// replaces whatever is there, as a simple backup's does. A backup
+		// whose entry is the source's own is refused: the rename would
+		// replace the source. Another hard link of the source is another
+		// entry and is replaced, as GNU mv replaces it.
+		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix, true)
+			.map_err(|_| io::Error::other(MvError::CannotBackup(to.quote().to_string())))?;
+		if let Some(backup) = &backup
+			&& backup_is_source(&filesystem, &from_fs, false, backup)
+		{
+			return Err(io::Error::other(MvError::BackupWouldDestroySource(
+				to.quote().to_string(),
+				from.quote().to_string(),
+			)));
+		}
 		if let Some(backup) = &backup {
 			// The existing file is only moved aside: its copy, if any, is
 			// neither reported nor linked to the moved files.
@@ -836,9 +848,46 @@ fn rename(
 		}
 	}
 
-	rename_with_fallback(host, from, to, display_manager, copier)?;
+	let report = opts.verbose.then_some(backup.as_deref());
+	let copied = match move_entry(host, from, to, display_manager, copier, report) {
+		Ok(copied) => copied,
+		Err(error) => {
+		// The move failed after the destination was backed up: GNU puts the
+		// backup back (`un_backup` in copy.c), so the destination keeps its
+		// name and data. Where that rename fails too, the move's error comes
+		// first and then `cannot un-backup`, as GNU reports them.
+		if let Some(backup) = &backup {
+			match filesystem.rename(backup, &to_fs) {
+				Ok(_) => {
+					if opts.verbose {
+						let _ = writeln!(
+							host.stdout,
+							"{} -> {} (unbackup)",
+							backup_display(to, backup).quote(),
+							to.quote()
+						);
+					}
+				},
+				Err(rename_error) => {
+					return Err(io::Error::new(
+						error.kind(),
+						format!(
+							"{error}\n{}: cannot un-backup {}: {}",
+							Mv::NAME,
+							to.quote(),
+							crate::host::strip_errno(&rename_error)
+						),
+					));
+				},
+			}
+		}
+			return Err(error);
+		},
+	};
 
-	if opts.verbose {
+	// A move between filesystems reported itself as GNU's does: `copied`, then
+	// rm's `removed` lines.
+	if opts.verbose && !copied {
 		let message = if let Some(path) = &backup {
 			// rebuild a display path from the operand for the verbose message.
 			let backup_display = backup_display(to, path);
@@ -872,20 +921,36 @@ fn is_refusal(error: &io::Error) -> bool {
 }
 
 /// A wrapper around `rename`, so that if it fails, we try falling back on
-/// copying and removing.
+/// copying and removing, with nothing reported. Returns whether the move
+/// copied. mv moves an existing file aside to its backup name with it.
 fn rename_with_fallback(
 	host: &mut Host,
 	from: &Path,
 	to: &Path,
 	display_manager: Option<&MultiProgress>,
 	copier: &mut MoveCopier,
-) -> io::Result<()> {
+) -> io::Result<bool> {
+	move_entry(host, from, to, display_manager, copier, None)
+}
+
+/// [`rename_with_fallback`], reporting a copy under `report` (`-v`, with the
+/// backup the move made, if any) as GNU mv reports it: `copied 'from' ->
+/// 'to'` before a file's copy, `created directory` and `copied` lines for a
+/// directory's, then rm's `removed` lines.
+fn move_entry(
+	host: &mut Host,
+	from: &Path,
+	to: &Path,
+	display_manager: Option<&MultiProgress>,
+	copier: &mut MoveCopier,
+	report: Option<Option<&Path>>,
+) -> io::Result<bool> {
 	let filesystem = host.fs().clone();
 	let from_fs = host.resolve(from);
 	let to_fs = host.resolve(to);
 
 	let Err(err) = filesystem.rename(&from_fs, &to_fs) else {
-		return Ok(());
+		return Ok(false);
 	};
 	// We will only copy if:
 	// 1. Files are on different devices or filesystem providers (EXDEV error)
@@ -938,6 +1003,27 @@ fn rename_with_fallback(
 		filesystem.remove_file(&to_fs)?;
 	}
 
+	if let Some(backup) = report
+		&& !file_type.is_dir()
+	{
+		let message = match backup {
+			Some(backup) => format!(
+				"copied {} -> {} (backup: {})",
+				from.quote(),
+				to.quote(),
+				backup_display(to, backup).quote()
+			),
+			None => format!("copied {} -> {}", from.quote(), to.quote()),
+		};
+		match display_manager {
+			Some(pb) => pb.suspend(|| {
+				let _ = writeln!(host.stdout, "{message}");
+			}),
+			None => {
+				let _ = writeln!(host.stdout, "{message}");
+			},
+		}
+	}
 	match copier.copy(host, from, to, metadata, display_manager) {
 		Ok(()) => {},
 		Err(CpError::IoErr(error) | CpError::IoErrContext(error, _)) => return Err(describe(error)),
@@ -949,27 +1035,38 @@ fn rename_with_fallback(
 	}
 
 	if file_type.is_dir() {
-		remove_moved_tree(host, from, &from_fs)
+		remove_tree(host, from, &from_fs, report.is_some())?;
 	} else {
-		filesystem.remove_file(&from_fs).map_err(describe)
+		filesystem.remove_file(&from_fs).map_err(describe)?;
+		if report.is_some() {
+			let _ = writeln!(host.stdout, "removed {}", from.quote());
+		}
 	}
+	Ok(true)
 }
 
 /// Removes the tree at `path` (resolved: `fs_path`) that a move across
 /// filesystems replaces or copied: a symlink is removed itself, and a
 /// directory with everything in it. A native Unix tree goes through rm's own
-/// descriptor walk ([`crate::rm::remove_quietly`]), as GNU mv removes with
+/// descriptor walk ([`crate::rm::remove_moved`]), as GNU mv removes with
 /// rm's code: it opens each directory as the one `lstat` found, following no
 /// symlink, on every kernel. `std::fs::remove_dir_all` trusts `O_DIRECTORY |
 /// O_NOFOLLOW`, which gVisor before release-20261109.0 follows. rm reports
-/// its own errors, so a failure here is [`Reported`].
+/// its own errors, so a failure here is [`Reported`]. Nothing else is
+/// reported: mv removes a replaced destination with it.
 fn remove_moved_tree(host: &mut Host, path: &Path, fs_path: &Path) -> io::Result<()> {
+	remove_tree(host, path, fs_path, false)
+}
+
+/// [`remove_moved_tree`], saying `removed` for each entry of a native tree
+/// under `verbose`, as GNU's mv does through rm's code.
+fn remove_tree(host: &mut Host, path: &Path, fs_path: &Path, verbose: bool) -> io::Result<()> {
 	#[cfg(all(unix, not(target_os = "redox")))]
 	if host.fs().is_native_local(fs_path) {
-		return if crate::rm::remove_quietly(host, path) { Err(io::Error::other(Reported)) } else { Ok(()) };
+		return if crate::rm::remove_moved(host, path, verbose) { Err(io::Error::other(Reported)) } else { Ok(()) };
 	}
 	#[cfg(not(all(unix, not(target_os = "redox"))))]
-	let _ = path;
+	let _ = (path, verbose);
 	host.fs().remove_dir_all(fs_path)
 }
 
@@ -982,7 +1079,13 @@ fn is_empty_dir(host: &Host, path: &Path) -> bool {
 /// Check if file is writable, returning the mode for potential reuse.
 #[cfg(unix)]
 fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
-	if let Ok(metadata) = host.fs().metadata(host.resolve(path)) {
+	let path = host.resolve(path);
+	// A symlink is writable whatever it points to, as GNU mv's
+	// `writable_destination` decides: the move replaces the link itself.
+	if host.fs().is_symlink(&path) {
+		return (true, None);
+	}
+	if let Ok(metadata) = host.fs().metadata(path) {
 		let mode = metadata.permissions().mode();
 		// Check if user write bit is set
 		((mode & 0o200) != 0, Some(mode))
@@ -994,7 +1097,12 @@ fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
 /// Check if file is writable.
 #[cfg(not(unix))]
 fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
-	if let Ok(metadata) = host.fs().metadata(host.resolve(path)) {
+	let path = host.resolve(path);
+	// A symlink is writable whatever it points to, as on Unix.
+	if host.fs().is_symlink(&path) {
+		return (true, None);
+	}
+	if let Ok(metadata) = host.fs().metadata(path) {
 		(!metadata.permissions().readonly(), None)
 	} else {
 		(false, None) // If we can't get metadata, prompt user to be safe
@@ -1068,7 +1176,7 @@ fn prompt_overwrite(host: &mut Host, to: &Path, cached_mode: Option<u32>) -> io:
 		let _ = err.flush();
 	}
 	if !read_yes(host) {
-		return Err(io::Error::other(""));
+		return Err(io::Error::other(Reported));
 	}
 	Ok(())
 }
@@ -1140,6 +1248,8 @@ mod tests {
 	use tempfile::tempdir;
 
 	use super::Mv;
+	#[cfg(unix)]
+	use crate::host::run_util_on;
 	use crate::host::{Host, Utility, run_util};
 
 	#[test]
@@ -1166,7 +1276,8 @@ mod tests {
 		assert_eq!(code, 1);
 		assert_eq!(fs::read(fixture.path().join("source")).unwrap(), b"new");
 		assert_eq!(fs::read(fixture.path().join("target")).unwrap(), b"old");
-		assert_eq!(capture.err(), "mv: overwrite 'target'? mv: \n");
+		// GNU's prompt, and nothing after it: the answer is the user's.
+		assert_eq!(capture.err(), "mv: overwrite 'target'? ");
 	}
 
 	#[test]
@@ -1379,6 +1490,201 @@ mod tests {
 		assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "the source changed");
 	}
 
+	/// `mv -b` across file systems from a source it cannot read, as GNU mv
+	/// 9.4 does as uid 1000: the copy fails ("cannot open ... for reading"),
+	/// and the backup is put back (`un_backup`), so `b` keeps its name and data
+	/// and no backup is left; `-v` says `'b~' -> 'b' (unbackup)`. Root reads
+	/// a file of mode 000, so the test runs only as another user.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_failed_move_across_file_systems_puts_the_backup_back() {
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!("skipped: root reads a file of mode 000");
+			return;
+		}
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		for (flags, backup, verbose) in [
+			(&["-b"][..], "b~", ""),
+			(&["--backup=numbered"][..], "b.~1~", ""),
+			(&["-v", "-b"][..], "b~", "'b~' -> 'b' (unbackup)\n"),
+		] {
+			let from = tempfile::tempdir_in("/dev/shm").unwrap();
+			let to = tempdir().unwrap();
+			let source = from.path().join("a");
+			fs::write(&source, b"A").unwrap();
+			fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+			fs::write(to.path().join("b"), b"old").unwrap();
+			let mut argv = flags.to_vec();
+			argv.extend([source.to_str().unwrap(), "b"]);
+			let (code, capture) = run_util::<Mv>(&argv, "", to.path());
+			let case = flags.join(" ");
+			assert_eq!(code, 1, "{case}: {:?}", capture.err());
+			assert!(capture.err().contains("Permission denied"), "{case}: {:?}", capture.err());
+			assert!(capture.out().ends_with(verbose), "{case}: {:?}", capture.out());
+			assert_eq!(fs::read(to.path().join("b")).ok().as_deref(), Some(&b"old"[..]), "{case}: b lost its data");
+			assert!(!to.path().join(backup).exists(), "{case}: b is left under its backup name");
+			assert!(source.exists(), "{case}: the source is gone");
+			fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+		}
+	}
+
+	/// A link that leads nowhere at the destination, as GNU 9.7 treats it as
+	/// uid 1000 and as root: `mv -b l b` keeps it as `b~`, `-n` keeps it and
+	/// exits 0, and `-i` answered no keeps it and exits 1, with nothing after
+	/// the prompt.
+	#[cfg(unix)]
+	#[test]
+	fn a_link_to_nothing_at_the_destination_is_kept_as_gnu_does() {
+		type Row = (&'static [&'static str], &'static str, i32, &'static str, &'static str, Option<&'static str>);
+		let rows: [Row; 3] = [
+			(&["-b"], "", 0, "", "a", Some("missing")),
+			(&["-n"], "", 0, "", "missing", None),
+			(&["-i"], "n\n", 1, "mv: overwrite 'b'? ", "missing", None),
+		];
+		for (flags, stdin, code, err, b, backup) in rows {
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), b"A").unwrap();
+			std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+			std::os::unix::fs::symlink("missing", dir.path().join("b")).unwrap();
+			let mut args = flags.to_vec();
+			args.extend(["l", "b"]);
+			let (got, capture) = run_util::<Mv>(&args, stdin, dir.path());
+			let case = format!("mv {}, b a link to nothing", args.join(" "));
+			assert_eq!((got, capture.err()), (code, err.to_owned()), "{case}");
+			assert_eq!(fs::read_link(dir.path().join("b")).unwrap(), std::path::Path::new(b), "{case}: b");
+			assert_eq!(
+				fs::read_link(dir.path().join("b~")).ok(),
+				backup.map(std::path::PathBuf::from),
+				"{case}: the backup"
+			);
+		}
+	}
+
+	/// `mv -T` of a non-directory onto a directory is refused with GNU 9.7's
+	/// message, which names the source too (9.4's did not), and both stay.
+	#[cfg(unix)]
+	#[test]
+	fn a_non_directory_moved_onto_a_directory_under_t_is_refused_as_gnu_does() {
+		let dir = tempdir().unwrap();
+		fs::write(dir.path().join("a"), b"A").unwrap();
+		std::os::unix::fs::symlink("a", dir.path().join("l")).unwrap();
+		fs::create_dir(dir.path().join("b")).unwrap();
+		fs::write(dir.path().join("b/x"), b"X").unwrap();
+		for source in ["l", "a"] {
+			let (code, capture) = run_util::<Mv>(&["-T", source, "b"], "", dir.path());
+			assert_eq!(
+				(code, capture.err()),
+				(1, format!("mv: cannot overwrite directory 'b' with non-directory '{source}'\n")),
+				"mv -T {source} b"
+			);
+			assert!(fs::symlink_metadata(dir.path().join(source)).is_ok(), "mv -T {source} b: the source is gone");
+			assert_eq!(fs::read(dir.path().join("b/x")).unwrap(), b"X", "mv -T {source} b: b changed");
+		}
+	}
+
+	/// `mv -v` between file systems says what GNU 9.4 and 9.7 say, as uid
+	/// 1000 and as root: `copied 'a' -> 'b'` (with the backup, if any), then
+	/// `removed 'a'`, for a file; for a directory, `created directory` for
+	/// it and each directory in it, `copied` for every other entry, in the
+	/// order GNU copies them (by inode number), then rm's `removed` lines.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_move_across_file_systems_is_reported_as_gnu_does() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		for backup in [false, true] {
+			let from = tempfile::tempdir_in("/dev/shm").unwrap();
+			let to = tempdir().unwrap();
+			let source = from.path().join("a");
+			fs::write(&source, b"A").unwrap();
+			if backup {
+				fs::write(to.path().join("b"), b"old").unwrap();
+			}
+			let shown = source.display().to_string();
+			let mut args = vec!["-v"];
+			args.extend(backup.then_some("-b"));
+			args.extend([shown.as_str(), "b"]);
+			let (code, capture) = run_util::<Mv>(&args, "", to.path());
+			let note = if backup { " (backup: 'b~')" } else { "" };
+			assert_eq!(
+				(code, capture.err(), capture.out()),
+				(0, String::new(), format!("copied '{shown}' -> 'b'{note}\nremoved '{shown}'\n")),
+				"mv {}",
+				args.join(" ")
+			);
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let to = tempdir().unwrap();
+		let d = from.path().join("d");
+		fs::create_dir(&d).unwrap();
+		fs::write(d.join("x"), b"X").unwrap();
+		fs::create_dir(d.join("e")).unwrap();
+		fs::write(d.join("e/y"), b"Y").unwrap();
+		std::os::unix::fs::symlink("x", d.join("l")).unwrap();
+		let shown = d.display().to_string();
+		// GNU copies a directory's entries by inode number (`savedir` sorts
+		// them), and reports each directory as created before what is in it.
+		let mut entries: Vec<_> = ["x", "e", "l"]
+			.into_iter()
+			.map(|name| (fs::symlink_metadata(d.join(name)).unwrap().ino(), name))
+			.collect();
+		entries.sort_unstable();
+		let mut expected = vec!["created directory 'd'".to_owned()];
+		for (_, name) in entries {
+			if name == "e" {
+				expected.push("created directory 'd/e'".to_owned());
+				expected.push(format!("copied '{shown}/e/y' -> 'd/e/y'"));
+			} else {
+				expected.push(format!("copied '{shown}/{name}' -> 'd/{name}'"));
+			}
+		}
+		let (code, capture) = run_util::<Mv>(&["-v", shown.as_str(), "d"], "", to.path());
+		assert_eq!((code, capture.err()), (0, String::new()), "mv -v {shown} d");
+		let out = capture.out();
+		let lines: Vec<_> = out.lines().collect();
+		let copied: Vec<_> = lines
+			.iter()
+			.filter(|line| line.starts_with("copied ") || line.starts_with("created directory "))
+			.map(|line| (*line).to_owned())
+			.collect();
+		let removed: Vec<_> = lines.iter().filter(|line| line.starts_with("removed ")).copied().collect();
+		assert_eq!(copied.len() + removed.len(), lines.len(), "{out}");
+		assert_eq!(copied, expected, "{out}");
+		let mut sorted_removed = removed.clone();
+		sorted_removed.sort_unstable();
+		assert_eq!(
+			sorted_removed,
+			[
+				"removed '<D>/e/y'".replace("<D>", &shown),
+				"removed '<D>/l'".replace("<D>", &shown),
+				"removed '<D>/x'".replace("<D>", &shown),
+				"removed directory '<D>'".replace("<D>", &shown),
+				"removed directory '<D>/e'".replace("<D>", &shown),
+			],
+			"{out}"
+		);
+		assert_eq!(removed.last(), Some(&format!("removed directory '{shown}'").as_str()), "{out}");
+		assert!(lines.iter().position(|line| line.starts_with("removed ")) > Some(copied.len() - 1), "{out}");
+	}
+
 	/// Moves `from/src`, a directory, into `to/file-dest`, which holds a
 	/// regular file `src`, and into `to/link-dest`, which holds a symlink `src`
 	/// to a directory: each move must fail with GNU's message and leave both
@@ -1418,5 +1724,421 @@ mod tests {
 			"the link was replaced"
 		);
 		assert!(!to.join("elsewhere/moved").exists(), "the move went through the link");
+	}
+
+	/// Runs `mv` with `args` and `stdin` in `dir`, returning the exit status
+	/// and standard error.
+	#[cfg(unix)]
+	fn mv_in(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String) {
+		let (code, capture) = run_util::<Mv>(args, stdin, dir);
+		(code, capture.err())
+	}
+
+	/// Where a symlink to nothing is the destination's name.
+	#[cfg(unix)]
+	fn dangling(path: &std::path::Path) {
+		std::os::unix::fs::symlink("missing", path).unwrap();
+	}
+
+	/// The link at `path`, if it is one.
+	#[cfg(unix)]
+	fn link_at(path: &std::path::Path) -> Option<std::path::PathBuf> {
+		fs::read_link(path).ok()
+	}
+
+	/// A symlink at the destination's name is a destination, even one that
+	/// points nowhere: GNU mv looks at the destination without following a
+	/// symlink there. Each expectation is GNU coreutils 9.7's, checked against
+	/// it and 9.4 in the same runs; `-n` is 9.5's and later (a silent skip
+	/// with status 0), as this port's `-n` is for any destination.
+	#[cfg(unix)]
+	#[test]
+	fn a_dangling_link_at_the_destination_is_a_destination() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("src")).unwrap();
+			fs::write(dir.join("src/moved"), b"moved").unwrap();
+			fs::create_dir(dir.join("dd")).unwrap();
+			dangling(&dir.join("dd/src"));
+			dir
+		};
+
+		// --backup: the link is moved aside, as any destination is, and the
+		// directory takes its name.
+		let dir = case("backup");
+		assert_eq!(mv_in(&dir, &["--backup=simple", "src", "dd"], ""), (0, String::new()), "backup");
+		assert_eq!(link_at(&dir.join("dd/src~")), Some("missing".into()), "backup: the link was not backed up");
+		assert_eq!(fs::read(dir.join("dd/src/moved")).unwrap(), b"moved", "backup: the directory did not move");
+
+		// -n: the destination exists, so nothing is moved.
+		let dir = case("no-clobber");
+		assert_eq!(mv_in(&dir, &["-n", "src", "dd"], ""), (0, String::new()), "-n");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-n: the link was replaced");
+		assert!(dir.join("src/moved").exists(), "-n: the source moved");
+
+		// --update=none: the same.
+		let dir = case("update-none");
+		assert_eq!(mv_in(&dir, &["--update=none", "src", "dd"], ""), (0, String::new()), "--update=none");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "--update=none: the link was replaced");
+
+		// -i: the link is a destination to ask about; declining keeps it.
+		let dir = cwd.path().join("interactive");
+		fs::create_dir_all(dir.join("dd")).unwrap();
+		fs::write(dir.join("src"), b"src").unwrap();
+		dangling(&dir.join("dd/src"));
+		assert_eq!(
+			mv_in(&dir, &["-i", "src", "dd"], "n\n"),
+			(1, "mv: overwrite 'dd/src'? ".to_owned()),
+			"-i: no prompt for the link"
+		);
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-i: the link was replaced");
+		assert_eq!(fs::read(dir.join("src")).unwrap(), b"src", "-i: the source moved");
+
+		// -u: the link's own time is the destination's; it is newer than
+		// the source, so nothing is moved.
+		let dir = cwd.path().join("update-older");
+		fs::create_dir_all(dir.join("dd")).unwrap();
+		fs::write(dir.join("src"), b"src").unwrap();
+		fs::File::options()
+			.write(true)
+			.open(dir.join("src"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+			.unwrap();
+		dangling(&dir.join("dd/src"));
+		assert_eq!(mv_in(&dir, &["-u", "src", "dd"], ""), (0, String::new()), "-u");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-u: the link was replaced");
+		assert_eq!(fs::read(dir.join("src")).unwrap(), b"src", "-u: the source moved");
+
+		// With neither, a directory does not replace the link (the control:
+		// this held before).
+		let dir = case("plain");
+		assert_eq!(
+			mv_in(&dir, &["src", "dd"], ""),
+			(1, "mv: cannot overwrite non-directory 'dd/src' with directory 'src'\n".to_owned()),
+			"plain"
+		);
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "plain: the link was replaced");
+
+		// Without -i, a destination the user cannot write to is asked about
+		// when stdin is a terminal, but a link is writable whatever it points
+		// to, as GNU's `writable_destination` decides: a dangling link here
+		// would otherwise be asked about, which GNU never does.
+		let (host, _capture) = Host::for_test(Mv::NAME, "", &dir);
+		assert_eq!(
+			super::is_writable(&host, std::path::Path::new("dd/src")),
+			(true, None),
+			"the link is not writable"
+		);
+	}
+
+	/// `-u` does not skip a directory, whatever the destination's time: GNU
+	/// compares times only for a source that is not a directory, so a
+	/// directory moved onto a newer regular file is refused, not skipped.
+	#[cfg(unix)]
+	#[test]
+	fn update_older_does_not_skip_a_directory() {
+		let cwd = tempdir().unwrap();
+		fs::create_dir_all(cwd.path().join("src")).unwrap();
+		fs::create_dir(cwd.path().join("dd")).unwrap();
+		fs::write(cwd.path().join("dd/src"), b"kept").unwrap();
+		std::fs::File::open(cwd.path().join("src"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+			.unwrap();
+		assert_eq!(
+			mv_in(cwd.path(), &["-u", "src", "dd"], ""),
+			(1, "mv: cannot overwrite non-directory 'dd/src' with directory 'src'\n".to_owned())
+		);
+		assert_eq!(fs::read(cwd.path().join("dd/src")).unwrap(), b"kept");
+		assert!(cwd.path().join("src").is_dir());
+	}
+
+	/// With two operands, a directory moved onto a regular file or a symlink
+	/// is refused unless the destination is backed up (`-b`), as GNU mv
+	/// allows: then the destination is moved aside and the directory takes
+	/// its name. `--update=none` skips it with status 0.
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_replaces_a_non_directory_operand_only_with_a_backup() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str, link: bool| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("src")).unwrap();
+			fs::write(dir.join("src/moved"), b"moved").unwrap();
+			if link {
+				dangling(&dir.join("dest"));
+			} else {
+				fs::write(dir.join("dest"), b"kept").unwrap();
+			}
+			dir
+		};
+
+		let dir = case("file-backup", false);
+		assert_eq!(mv_in(&dir, &["-b", "src", "dest"], ""), (0, String::new()), "-b onto a file");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"kept", "-b onto a file: no backup");
+		assert_eq!(fs::read(dir.join("dest/moved")).unwrap(), b"moved", "-b onto a file: not moved");
+
+		let dir = case("link-backup", true);
+		assert_eq!(mv_in(&dir, &["-b", "src", "dest"], ""), (0, String::new()), "-b onto a link");
+		assert_eq!(link_at(&dir.join("dest~")), Some("missing".into()), "-b onto a link: no backup");
+		assert_eq!(fs::read(dir.join("dest/moved")).unwrap(), b"moved", "-b onto a link: not moved");
+
+		let dir = case("file-update-none", false);
+		assert_eq!(mv_in(&dir, &["--update=none", "src", "dest"], ""), (0, String::new()), "--update=none");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"kept", "--update=none: replaced");
+
+		// The controls: without a backup each is refused, as before.
+		for (name, link) in [("file", false), ("link", true)] {
+			let dir = case(name, link);
+			assert_eq!(
+				mv_in(&dir, &["src", "dest"], ""),
+				(1, "mv: cannot overwrite non-directory 'dest' with directory 'src'\n".to_owned()),
+				"{name}"
+			);
+			assert!(dir.join("src/moved").exists(), "{name}: the source moved");
+		}
+	}
+
+	/// `mv --backup` never makes its numbered backup over an entry already
+	/// at a backup name, a symlink that points nowhere included, and numbers
+	/// after the highest one, as GNU mv does
+	/// ([`crate::file_backup::tests::check_numbered_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn numbered_backups_count_every_entry_at_a_backup_name() {
+		crate::file_backup::tests::check_numbered_backups(|dir, control| {
+			let (code, capture) = run_util::<Mv>(&[&format!("--backup={control}"), "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// A source that is the destination's simple backup (`dest~` for `dest`,
+	/// by name and as the same file) is not moved over the destination when
+	/// a backup is to be made in any mode but `numbered`: the backup would be
+	/// renamed over the source first. GNU mv refuses with "backing up 'dest'
+	/// might destroy source;  'dest~' not moved", status 1, also when `dest`
+	/// is a symlink that points nowhere, and also for `./dest~`; `numbered`
+	/// backs `dest` up as `dest.~1~` and moves. A `dest~` elsewhere is
+	/// another file, and moves. Each answer is GNU coreutils 9.4's and 9.7's.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_that_is_the_destinations_simple_backup_is_not_moved_over_it() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str, dest: Option<bool>| {
+			let dir = cwd.path().join(name);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("dest~"), b"payload").unwrap();
+			match dest {
+				Some(true) => dangling(&dir.join("dest")),
+				Some(false) => fs::write(dir.join("dest"), b"old").unwrap(),
+				None => {},
+			}
+			dir
+		};
+		let refused = |source: &str| {
+			(1, format!("mv: backing up 'dest' might destroy source;  '{source}' not moved\n"))
+		};
+		for control in ["--backup=simple", "--backup=existing", "-b"] {
+			for link in [true, false] {
+				let what = format!("{control} onto a {}", if link { "dangling link" } else { "file" });
+				let dir = case(&format!("{}-{link}", control.trim_start_matches('-')), Some(link));
+				assert_eq!(mv_in(&dir, &[control, "dest~", "dest"], ""), refused("dest~"), "{what}");
+				assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "{what}: the source was lost");
+				if link {
+					assert_eq!(link_at(&dir.join("dest")), Some("missing".into()), "{what}: dest replaced");
+				} else {
+					assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "{what}: dest replaced");
+				}
+			}
+		}
+		let dir = case("dot-slash", Some(false));
+		assert_eq!(mv_in(&dir, &["-b", "./dest~", "dest"], ""), refused("./dest~"), "./dest~");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "./dest~: the source was lost");
+
+		// The controls: numbered backups, no destination, a `dest~` elsewhere.
+		for link in [true, false] {
+			let dir = case(&format!("numbered-{link}"), Some(link));
+			assert_eq!(mv_in(&dir, &["--backup=numbered", "dest~", "dest"], ""), (0, String::new()));
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "numbered: not moved");
+			if link {
+				assert_eq!(link_at(&dir.join("dest.~1~")), Some("missing".into()), "numbered: no backup");
+			} else {
+				assert_eq!(fs::read(dir.join("dest.~1~")).unwrap(), b"old", "numbered: no backup");
+			}
+		}
+		let dir = case("no-dest", None);
+		assert_eq!(mv_in(&dir, &["-b", "dest~", "dest"], ""), (0, String::new()), "no dest");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "no dest: not moved");
+		let dir = cwd.path().join("elsewhere");
+		fs::create_dir_all(dir.join("s")).unwrap();
+		fs::write(dir.join("s/dest~"), b"payload").unwrap();
+		fs::write(dir.join("dest"), b"old").unwrap();
+		assert_eq!(mv_in(&dir, &["-b", "s/dest~", "dest"], ""), (0, String::new()), "elsewhere");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "elsewhere: not moved");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"old", "elsewhere: no backup");
+	}
+
+	/// `-u` compares the source's own time, as `lstat` reports it: a source
+	/// symlink older than the destination is not moved, though the file it
+	/// points to is newer, as GNU mv decides.
+	#[cfg(unix)]
+	#[test]
+	fn update_older_compares_a_source_links_own_time() {
+		let cwd = tempdir().unwrap();
+		let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+		let target = cwd.path().join("target");
+		fs::write(&target, b"target").unwrap();
+		std::os::unix::fs::symlink("target", cwd.path().join("src")).unwrap();
+		fs::write(cwd.path().join("dest"), b"old").unwrap();
+		// The link keeps the time it was made at, now; the destination is
+		// newer than it, and the link's target newer still.
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		fs::File::options().write(true).open(&target).unwrap().set_modified(at(now + 2_000)).unwrap();
+		fs::File::options()
+			.write(true)
+			.open(cwd.path().join("dest"))
+			.unwrap()
+			.set_modified(at(now + 1_000))
+			.unwrap();
+		assert_eq!(mv_in(cwd.path(), &["-u", "src", "dest"], ""), (0, String::new()));
+		assert_eq!(fs::read(cwd.path().join("dest")).unwrap(), b"old", "the link was moved");
+		assert_eq!(link_at(&cwd.path().join("src")), Some("target".into()), "the link was moved");
+	}
+
+	/// A directory moved with `--backup=numbered` onto a symlink that points
+	/// nowhere, beside an earlier backup that is also such a link, backs the
+	/// link up one past it and keeps both, as GNU mv does: `dd/src.~1~` was
+	/// taken as free and replaced.
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_keeps_an_earlier_dangling_backup() {
+		let cwd = tempdir().unwrap();
+		fs::create_dir_all(cwd.path().join("src")).unwrap();
+		fs::create_dir(cwd.path().join("dd")).unwrap();
+		dangling(&cwd.path().join("dd/src"));
+		std::os::unix::fs::symlink("gone", cwd.path().join("dd/src.~1~")).unwrap();
+		assert_eq!(mv_in(cwd.path(), &["--backup=numbered", "src", "dd"], ""), (0, String::new()));
+		assert!(cwd.path().join("dd/src").is_dir(), "the directory was not moved");
+		assert_eq!(link_at(&cwd.path().join("dd/src.~1~")), Some("gone".into()), "the earlier backup was lost");
+		assert_eq!(link_at(&cwd.path().join("dd/src.~2~")), Some("missing".into()), "the link was not backed up");
+	}
+
+	/// On a provider whose metadata has no file identities, a source that is
+	/// the destination's simple backup is still refused: without both
+	/// identities the two names are compared by location, as cp compares
+	/// files. A `dest~` in another directory, with another `dest~` beside
+	/// `dest`, still moves, and the backup replaces that `dest~`: the names
+	/// match there, so only the location comparison lets the move go on.
+	#[cfg(unix)]
+	#[test]
+	fn a_provider_without_file_ids_still_refuses_the_backup_as_source() {
+		let provider = crate::file_backup::tests::HostWithoutIds::fs(false);
+		let cwd = tempdir().unwrap();
+		for control in ["--backup=simple", "--backup=existing", "-b"] {
+			let dir = cwd.path().join(control.trim_start_matches('-'));
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("dest~"), b"payload").unwrap();
+			fs::write(dir.join("dest"), b"old").unwrap();
+			let (code, capture) = run_util_on::<Mv>(&provider, &[control, "dest~", "dest"], "", &dir);
+			assert_eq!(
+				(code, capture.err()),
+				(1, "mv: backing up 'dest' might destroy source;  'dest~' not moved\n".to_owned()),
+				"{control}"
+			);
+			assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "{control}: the source was lost");
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "{control}: dest replaced");
+		}
+		let dir = cwd.path().join("elsewhere");
+		fs::create_dir_all(dir.join("s")).unwrap();
+		fs::write(dir.join("s/dest~"), b"payload").unwrap();
+		fs::write(dir.join("dest~"), b"other").unwrap();
+		fs::write(dir.join("dest"), b"old").unwrap();
+		let (code, capture) = run_util_on::<Mv>(&provider, &["-b", "s/dest~", "dest"], "", &dir);
+		assert_eq!((code, capture.err()), (0, String::new()), "elsewhere");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "elsewhere: not moved");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"old", "elsewhere: no backup");
+		assert!(!dir.join("s/dest~").exists(), "elsewhere: the source is still there");
+	}
+
+	/// `mv --backup=numbered` past the name limit backs up as GNU mv does
+	/// ([`crate::file_backup::tests::check_name_limit`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_past_the_name_limit_ends_in_a_tilde() {
+		crate::file_backup::tests::check_name_limit(|dir, name| mv_in(dir, &["--backup=numbered", "src", name], ""));
+	}
+
+	/// `mv -b -S ''` backs up to `dest~`, as GNU mv does
+	/// ([`crate::file_backup::tests::check_empty_suffix`]).
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_suffix_backs_up_with_a_tilde() {
+		crate::file_backup::tests::check_empty_suffix(|dir| mv_in(dir, &["-b", "-S", "", "src", "dest"], ""));
+	}
+
+	/// `mv` with long names refuses each backup that would replace its source
+	/// or the destination itself, or that GNU mv refuses
+	/// ([`crate::file_backup::tests::check_long_name_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
+		crate::file_backup::tests::check_long_name_backups("mv", |dir, args| mv_in(dir, args, ""));
+	}
+
+	/// `mv CONTROL a dest`, where `dest~` is another hard link of `a`, backs
+	/// `dest` up over that link and moves, as GNU mv does
+	/// ([`crate::file_backup::tests::check_hard_link_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_over_another_hard_link_of_the_source_is_made() {
+		crate::file_backup::tests::check_hard_link_backups("mv", false, |dir, control| {
+			mv_in(dir, &[control, "a", "dest"], "")
+		});
+	}
+
+	/// `mv -b dest~ dest`, where `dest~` is a symbolic link (to a file, or
+	/// to nothing), is refused: the backup of `dest` would replace the link,
+	/// the source's own entry, and the move would then put `dest` back,
+	/// losing the link. This differs from GNU mv 9.4 and 9.7, which exit 0
+	/// there and lose the link: GNU's `source_is_dst_backup` compares the link
+	/// with the file it points to, which is never the link itself.
+	/// `--backup=numbered` backs `dest` up as `dest.~1~` and moves the link,
+	/// as GNU does.
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_named_as_the_backup_is_not_moved_over_the_destination() {
+		let cwd = tempdir().unwrap();
+		for target in ["t", "missing"] {
+			let dir = cwd.path().join(target);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("t"), b"T").unwrap();
+			fs::write(dir.join("dest"), b"old").unwrap();
+			std::os::unix::fs::symlink(target, dir.join("dest~")).unwrap();
+			assert_eq!(
+				mv_in(&dir, &["-b", "dest~", "dest"], ""),
+				(1, "mv: backing up 'dest' might destroy source;  'dest~' not moved\n".to_owned()),
+				"to {target}"
+			);
+			assert_eq!(link_at(&dir.join("dest~")), Some(target.into()), "to {target}: the link was lost");
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "to {target}: dest replaced");
+			assert_eq!(fs::read(dir.join("t")).unwrap(), b"T", "to {target}: t changed");
+			// The control: a numbered backup leaves the link's entry alone.
+			assert_eq!(mv_in(&dir, &["--backup=numbered", "dest~", "dest"], ""), (0, String::new()), "to {target}");
+			assert_eq!(link_at(&dir.join("dest")), Some(target.into()), "to {target}: the link was not moved");
+			assert_eq!(fs::read(dir.join("dest.~1~")).unwrap(), b"old", "to {target}: no numbered backup");
+		}
+	}
+
+	/// `mv -b DEST~ dest` where names fold
+	/// ([`crate::file_backup::tests::check_folded_sources`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_source_whose_name_folds_to_the_backup_is_not_moved_over_it() {
+		crate::file_backup::tests::check_folded_sources("mv", |fs, dir, args| {
+			let (code, capture) = run_util_on::<Mv>(fs, args, "", dir);
+			(code, capture.err())
+		});
 	}
 }
