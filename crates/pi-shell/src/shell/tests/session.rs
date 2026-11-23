@@ -2112,9 +2112,9 @@ async fn wait_n_p_records_completed_process_id() {
 	});
 	let options = ShellExecuteOptions {
 		command: "sh -c 'until [ -e released ]; do kill -0 \"$PPID\" 2>/dev/null || exit 97; sleep \
-		          0.01; done; exit 42' & slow=$!; sh -c \
-		          'exit 13' & fast=$!; wait -n -p hit \"$slow\" \"$fast\"; status=$?; : > released; \
-		          wait \"$slow\"; [ \"$status\" -eq 13 ] && [ \"$hit\" = \"$fast\" ]"
+		          0.01; done; exit 42' & slow=$!; sh -c 'exit 13' & fast=$!; wait -n -p hit \
+		          \"$slow\" \"$fast\"; status=$?; : > released; wait \"$slow\"; [ \"$status\" -eq \
+		          13 ] && [ \"$hit\" = \"$fast\" ]"
 			.to_string(),
 		cwd: Some(dir.path().to_string_lossy().into_owned()),
 		..Default::default()
