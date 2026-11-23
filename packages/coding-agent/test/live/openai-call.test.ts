@@ -1,8 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LiveSessionController, type LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { logger } from "@oh-my-pi/pi-utils";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 /**
  * A whole call on `live.provider: openai`: the controller with the real GPT-Live transport, against a
@@ -109,6 +114,12 @@ function liveCall(base: string, apiKey: () => Promise<string> = async () => KEY)
 				type: "agent_end",
 				isTerminal: true,
 				messages: [{ role: "assistant" }],
+			} as unknown as AgentSessionEvent),
+		/** The agent calls a tool: the controller sends its words so far as a progress note. */
+		progress: () =>
+			listener?.({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "toolUse" },
 			} as unknown as AgentSessionEvent),
 	};
 }
@@ -258,6 +269,53 @@ describe("GPT-Live call lifecycle", () => {
 			await until(() => call.turns.length >= 1);
 			call.answer();
 			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(String(ended)).toMatch(/GPT-Live refused omp's session\.commentary\.append: Unknown delegation/);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("GPT-Live refusing a progress note leaves the call open; refusing the answer then ends it", async () => {
+		const refused: string[] = [];
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "is CI green", 100, 900),
+				delegated("d1", "item_1", 1_000),
+				voiceSaid("t2", "Checking.", 1_100, 1_400),
+			],
+			onMessage: (message, socket) => {
+				if (message.type !== "session.thinking.append" && message.type !== "session.commentary.append") return;
+				refused.push(String(message.type));
+				const error = {
+					type: "invalid_request_error",
+					message: "Unknown delegation",
+					client_event_id: message.event_id,
+				};
+				socket.send(JSON.stringify({ type: "error", event_id: `e${refused.length}`, error }));
+			},
+		});
+		const warn = vi.spyOn(logger, "warn");
+		const call = liveCall(stub.base);
+		let endedWith: string | undefined;
+		void call.ended.then(error => {
+			endedWith = String(error);
+		});
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			call.progress();
+			const noteRefused = () =>
+				warn.mock.calls.some(
+					([message]) => message === "GPT-Live refused omp's progress note; the call stays open",
+				);
+			// The transport has handled the refusal once it logs it, or once the call ends on it.
+			await until(() => noteRefused() || endedWith !== undefined);
+			expect(endedWith).toBeUndefined();
+			expect(noteRefused()).toBe(true);
+			call.answer();
+			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(refused).toEqual(["session.thinking.append", "session.commentary.append"]);
 			expect(String(ended)).toMatch(/GPT-Live refused omp's session\.commentary\.append: Unknown delegation/);
 		} finally {
 			await call.controller.stop();

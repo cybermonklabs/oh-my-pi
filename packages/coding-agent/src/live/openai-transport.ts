@@ -457,8 +457,10 @@ export class OpenAILiveTransport implements Pick<
 	 *   words before that offset; see {@link #releaseDelegations}.
 	 * - Its `error` reports a problem in the session "such as an invalid client command", and names that
 	 *   command by its `client_event_id` (OpenAI's Live reference); the session stays open (the delegation
-	 *   guide, on `responses_validation_failed`). An error that names one of omp's messages fails the call,
-	 *   as a failed send does on Codex, so a refused answer is not lost unseen. Any other is logged.
+	 *   guide, on `responses_validation_failed`). An error that names omp's spoken answer
+	 *   (`session.commentary.append`) or `session.close` fails the call, as a failed send does on Codex, so
+	 *   a refused answer is not lost unseen. One that names a progress note (`session.thinking.append`),
+	 *   which the user never hears, is logged and the call goes on; so is any other.
 	 */
 	#mapEvent(record: Record<string, unknown>): LiveServerEvent[] {
 		switch (record.type) {
@@ -509,10 +511,12 @@ export class OpenAILiveTransport implements Pick<
 				const error: Record<string, unknown> = isRecord(record.error) ? record.error : {};
 				const clientEventId = error.client_event_id ?? record.client_event_id;
 				const refused = typeof clientEventId === "string" ? this.#sentEventIds.get(clientEventId) : undefined;
+				const reason = typeof error.message === "string" ? error.message : "no reason given";
 				if (refused === undefined) {
 					logger.warn("GPT-Live reported an error; the call stays open", { error: record.error });
+				} else if (refused === "session.thinking.append") {
+					logger.warn("GPT-Live refused omp's progress note; the call stays open", { reason });
 				} else {
-					const reason = typeof error.message === "string" ? error.message : "no reason given";
 					this.#reportFailure(`GPT-Live refused omp's ${refused}: ${reason}`);
 				}
 				return [];

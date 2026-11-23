@@ -1561,11 +1561,12 @@ have arrived. A delegation is never dropped: with no words, its turn says none
 were transcribed. A turn's progress goes to the call as `session.thinking.append`
 (not spoken) and its final reply as `session.commentary.append` (spoken); context
 outside a delegation goes the same way with `delegation_id: null`. Each message
-carries an `event_id`; a GPT-Live `error` that names one ends the call with that
-error, as a failed send does on Codex, and any other `error` is logged while the
-call stays open. The session id is opaque: any id but `.` and `..` is accepted
-and percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
-default; `live.voice` names Codex voices only.
+carries an `event_id`; a GPT-Live `error` that names the spoken reply ends the
+call with that error, as a failed send does on Codex. One that names a progress
+note is logged and the call stays open, since the user never hears a progress
+note; any other `error` is logged too. The session id is opaque: any id but `.`
+and `..` is accepted and percent-encoded into the attach path. No voice is sent,
+so GPT-Live uses its default; `live.voice` names Codex voices only.
 
 ## Dictation Sub-Protocol
 
