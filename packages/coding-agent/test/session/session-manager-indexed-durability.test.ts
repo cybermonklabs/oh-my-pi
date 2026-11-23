@@ -458,17 +458,20 @@ describe("SessionManager + indexed backend durability", () => {
 	// that rewrite fails, its successor (parented to it) must not reach the
 	// backend as a bare append: a reload would find a record whose parent is gone.
 	it.each([
-		{ failure: "the backend rejects its deferred publish", rewritesContent: false, failWrites: 1 },
+		{ failure: "the backend rejects its deferred publish", rewritesContent: false, failWrites: 1, recovered: false },
 		{
 			// Tool-output pruning changes a durable turn's length in place, so the held
-			// publish moves the optimistic index past the last confirmed size.
+			// publish moves the optimistic index past the last confirmed size. The size
+			// check's refusal is a queued write's conflict, which a store that defers
+			// publishes recovers: it reads the journal back and appends what it lacks.
 			failure: "its size check meets the held rewrite's optimistic index",
 			rewritesContent: true,
 			failWrites: 0,
+			recovered: true,
 		},
 	])(
 		"never lands a successor of a fenced append whose rewrite failed when $failure",
-		async ({ rewritesContent, failWrites }) => {
+		async ({ rewritesContent, failWrites, recovered }) => {
 			const { backend, storage, manager } = await makeManager();
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("expected a session file");
@@ -505,7 +508,13 @@ describe("SessionManager + indexed backend durability", () => {
 			await manager.close().catch(() => {});
 
 			expect(orphanedRecords(backend.files.get(sessionFile) ?? "")).toEqual([]);
-			expect(errors.length).toBeGreaterThan(0);
+			if (recovered) {
+				const body = backend.files.get(sessionFile) ?? "";
+				for (const turn of ["fenced append", "after fenced append", "next turn"]) expect(body).toContain(turn);
+				expect(errors).toEqual([]);
+			} else {
+				expect(errors.length).toBeGreaterThan(0);
+			}
 		},
 	);
 
