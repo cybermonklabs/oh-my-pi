@@ -196,8 +196,10 @@ afterEach(() => {
 });
 
 describe("the chokepoint re-resolves a caller's key that a pause may have outlived", () => {
-	it("trusts a resolved key for half the refresher's skew, leaving the other half for the trip", () => {
-		expect(RESOLVED_CREDENTIAL_REUSE_MS).toBe(OAUTH_REFRESH_SKEW_MS / 2);
+	it("trusts a resolved key for less than the refresher's skew, leaving part of it for the trip", () => {
+		// The refresher hands out a token only while it has OAUTH_REFRESH_SKEW_MS of life left;
+		// a key sent as resolved for that long or longer can expire before it reaches the provider.
+		expect(RESOLVED_CREDENTIAL_REUSE_MS).toBeLessThan(OAUTH_REFRESH_SKEW_MS);
 	});
 
 	it("a custom API: dispatches with a key resolved after a pause longer than the reuse window", async () => {
