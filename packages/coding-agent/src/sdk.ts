@@ -4323,7 +4323,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// context files it keeps, the memory backend, the workspace roots, the obfuscator, the skill list), or
 			// through whether it is configured (`out.enabled`, `dev.autoqa`), is read from `settings` itself below:
 			// no frame sets that state back, so a build inside one still reports the read (`settingsRead`).
-			const source = toolSession.settings;
+			const renderSettings = toolSession.settings;
 			let activeRepoContext = initialActiveRepoContext;
 			// Re-discover rules and context files from disk on every session-scoped
 			// rebuild. The rule buckets are otherwise frozen at
@@ -4387,7 +4387,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// tool-availability caveat lives in the wrapper template.
 			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
-			const inlineToolDescriptors = resolveInlineToolDescriptors(source);
+			const inlineToolDescriptors = resolveInlineToolDescriptors(renderSettings);
 			// Unset only during the initial build; the agent is constructed with them. The request switches follow
 			// the settings the requests read, so a switch changes with the prompt that describes it.
 			if (agent) {
@@ -4469,7 +4469,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// would list carries its catalog summary on the route line and gets no
 			// catalog line; a tool the route bound omits keeps its catalog line.
 			const xdevPromptDocs = xdev
-				? planXdevPromptDocs(xdev, cfgToolsXdevDocs.get(source), cfgToolsXdevInlineDevices.get(source))
+				? planXdevPromptDocs(
+						xdev,
+						cfgToolsXdevDocs.get(renderSettings),
+						cfgToolsXdevInlineDevices.get(renderSettings),
+					)
 				: undefined;
 			const projection = projectMountedMCPXdevGuidance(collectMountedMCPToolRoutes(xdev ? listXdevTools(xdev) : []));
 			const routedCatalogNames = new Set(
@@ -4507,8 +4511,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const appendPrompt = composeAppendPrompt(appendParts, options.appendSystemPrompt);
 			// Owned/in-band tool dialects (non-native) require the full functions-
 			// namespace catalog; native tool calling lets the compact name list suffice.
-			const nativeTools = resolveDialect(cfgToolsFormat.get(source), agent?.state.model ?? model) === undefined;
-			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(source);
+			const nativeTools =
+				resolveDialect(cfgToolsFormat.get(renderSettings), agent?.state.model ?? model) === undefined;
+			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(renderSettings);
 			if (includeWorkspaceTree && !workspaceTreePromise) {
 				const scan = scanWorkspaceTree();
 				workspaceTreePromise = scan;
@@ -4550,22 +4555,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				rules: rulebookRules,
 				alwaysApplyRules,
 				resolvedAppendSystemPrompt: appendPrompt,
-				skillsSettings: cfgSkills.get(source),
+				skillsSettings: cfgSkills.get(renderSettings),
 				inlineToolDescriptors,
 				nativeTools,
-				intentField: cfgToolsIntentTracing.get(source) ? INTENT_FIELD : undefined,
+				intentField: cfgToolsIntentTracing.get(renderSettings) ? INTENT_FIELD : undefined,
 				// Spotlight ranks output against the call's intent: experiment sessions ask what each call's output is for.
 				intentGuidance: spotlightExperiment ? SPOTLIGHT_INTENT_GUIDANCE : undefined,
 				// task.eager steers the top-level agent only; subagents keep the model's own delegation policy.
-				eagerTasks: agentKind === "main" && cfgTaskEager.get(source) !== "default",
-				eagerTasksAlways: agentKind === "main" && cfgTaskEager.get(source) === "always",
-				taskBatch: cfgTaskBatch.get(source),
-				taskMaxConcurrency: cfgTaskMaxConcurrency.get(source),
-				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(source), options.spawns ?? "*"),
+				eagerTasks: agentKind === "main" && cfgTaskEager.get(renderSettings) !== "default",
+				eagerTasksAlways: agentKind === "main" && cfgTaskEager.get(renderSettings) === "always",
+				taskBatch: cfgTaskBatch.get(renderSettings),
+				taskMaxConcurrency: cfgTaskMaxConcurrency.get(renderSettings),
+				scoutAvailable: isScoutSpawnable(cfgTaskDisabledAgents.get(renderSettings), options.spawns ?? "*"),
 				delegationBias: sessionDelegationBias(toolSession),
-				taskIrcEnabled: !restrictToolNames && isIrcEnabled(source, options.taskDepth ?? 0),
+				taskIrcEnabled: !restrictToolNames && isIrcEnabled(renderSettings, options.taskDepth ?? 0),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
-				ovnfs: ovnfsCommand(source),
+				ovnfs: ovnfsCommand(renderSettings),
 				writeTransportOnly:
 					toolSession.deviceOnlyWrite === true && toolSession.pendingFullWriteDescription !== true,
 				// The obfuscator follows `secrets.enabled`: the build reads the setting from the session's own
@@ -4574,18 +4579,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				workspaceTree: workspaceTreePromise ?? emptyWorkspaceTree,
 				includeWorkspaceTree,
 				memoryBackend: memoryBackend?.id,
-				securityEnabled: cfgSecurityEnabled.get(source),
+				securityEnabled: cfgSecurityEnabled.get(renderSettings),
 				settingsApproval: toolSession.settingsApproval === true,
 				outReplies: outRepliesActive(settings, tuiTranscript),
 				evalPreludes: toolSession.getAdvertisedEvalPreludes?.(),
 				model: getActiveModelString(),
-				includeModelInPrompt: cfgIncludeModelInPrompt.get(source),
-				personality: agentKind === "sub" ? "none" : cfgPersonality.get(source),
+				includeModelInPrompt: cfgIncludeModelInPrompt.get(renderSettings),
+				personality: agentKind === "sub" ? "none" : cfgPersonality.get(renderSettings),
 				subagent: agentKind === "sub",
-				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(source),
-				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(source),
-				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(source) !== "off",
-				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(source),
+				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(renderSettings),
+				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(renderSettings),
+				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(renderSettings) !== "off",
+				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(renderSettings),
 				activeRepoContext,
 			});
 

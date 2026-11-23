@@ -5,7 +5,8 @@ import { dataDir as configuredDataDir } from "../config";
 import { closeQuietly, openDatabase } from "../db";
 
 export const DEFAULT_DATA_DIR = join(homedir(), ".hermes", "mnemopi", "data");
-export const BANKS_DIR = join(DEFAULT_DATA_DIR, "banks");
+const BANKS_DIRNAME = "banks";
+export const BANKS_DIR = join(DEFAULT_DATA_DIR, BANKS_DIRNAME);
 const DB_FILENAME = "mnemopi.db";
 
 export class ValueError extends Error {
@@ -26,7 +27,7 @@ export class BankManager {
 
 	constructor(dataDir?: string) {
 		this.dataDir = dataDir ?? configuredDataDir();
-		this.banksDir = join(this.dataDir, "banks");
+		this.banksDir = join(this.dataDir, BANKS_DIRNAME);
 		mkdirSync(this.banksDir, { recursive: true });
 	}
 
@@ -106,7 +107,7 @@ function validateBankName(name: string): void {
 export function bankDbPathIn(dataDir: string, name: string): string {
 	if (name.length === 0 || name === "default") return join(dataDir, DB_FILENAME);
 	validateBankName(name);
-	return join(dataDir, "banks", name, DB_FILENAME);
+	return join(dataDir, BANKS_DIRNAME, name, DB_FILENAME);
 }
 
 let defaultBank = "default";

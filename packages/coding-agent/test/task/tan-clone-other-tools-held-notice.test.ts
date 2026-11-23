@@ -18,7 +18,13 @@ import * as sdk from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, SETTINGS_NOTICE } from "../helpers/agent-session-setup";
+import {
+	createInMemoryAuthStorage,
+	RELOAD_CALLS,
+	reloadOverlay,
+	SETTINGS_NOTICE,
+	setClock,
+} from "../helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -40,29 +46,6 @@ const GREP_OFF = `${OVERLAY}grep:\n  enabled: false\n`;
 const RELEASED = "the change it described is no longer held";
 
 const MINUTE_MS = 60_000;
-
-/** The real clock, read before the test moves it. */
-const realNow = Date.now.bind(Date);
-
-function setClock(offsetMs: number): void {
-	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-}
-
-/**
- * Rewrites the overlay with `content` and reloads it as the config watcher does, then waits for the prompt rebuild,
- * the tool reconcile and the hold the change starts.
- */
-async function reloadOverlay(session: AgentSession, settings: Settings, overlay: string, content: string) {
-	const calls = ["refreshBaseSystemPrompt", "reconcileBuiltinTools", "holdToolDeclarationChange"] as const;
-	const spies = calls
-		.filter(call => typeof (session as unknown as Record<string, unknown>)[call] === "function")
-		.map(call => vi.spyOn(session as unknown as Record<string, () => Promise<void>>, call));
-	await Bun.write(overlay, content);
-	await settings.reloadFromDisk();
-	await Promise.resolve();
-	await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
-	for (const spy of spies) spy.mockRestore();
-}
 
 function declared(request: MessagesRequest): string[] {
 	return (request.tools ?? []).map(tool => tool.name);
@@ -120,7 +103,7 @@ async function cloneOfHeldSession(initial: string, synced: string): Promise<Clon
 		sessions.push(parent);
 		setClock(0);
 		await parent.prompt("first");
-		await reloadOverlay(parent, settings, overlay, synced);
+		await reloadOverlay({ session: parent, settings, overlay }, synced, RELOAD_CALLS);
 		setClock(MINUTE_MS);
 		await parent.prompt("second");
 

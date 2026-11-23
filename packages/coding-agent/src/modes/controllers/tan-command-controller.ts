@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
@@ -97,10 +98,7 @@ export class TanCommandController {
 		// decide the restore (`tanParent`). One that declares other tools cannot read the parent's cached prompt (the
 		// tools come first in the cache order), so it holds nothing: it sends the build from its first request, and its
 		// first settings notice tells its model the change is no longer held.
-		const restoresParentPrompt =
-			afterHold !== undefined &&
-			afterHold.active.length === parentActiveToolNames.length &&
-			afterHold.active.every((name, index) => name === parentActiveToolNames[index]);
+		const restoresParentPrompt = sameItems(afterHold?.active, parentActiveToolNames);
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
 		// The child rebinds these (skipping discovery) so it re-registers the

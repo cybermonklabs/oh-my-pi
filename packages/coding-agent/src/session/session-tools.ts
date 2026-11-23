@@ -1240,6 +1240,11 @@ interface PromptRoster {
 	readonly xdev: XdevState | undefined;
 }
 
+/** A {@link PromptRoster} with the skills a build lists; undefined lists the session's prompt skills. */
+interface ListedPromptRoster extends PromptRoster {
+	readonly skills?: readonly Skill[];
+}
+
 /** A mount notice previewed for pre-prompt context maintenance ({@link SessionTools.peekXdevMountNotice}). */
 interface XdevMountNoticePreview {
 	notice: CustomMessage<XdevMountNoticeDetails> | undefined;
@@ -1280,6 +1285,11 @@ function storedPromptListing(stored: StoredSystemPrompt): PromptListing {
 /** The skills of `skills` a system prompt lists: the ones not hidden. */
 function listedSkills(skills: readonly Skill[]): Skill[] {
 	return skills.filter(skill => skill.hide !== true);
+}
+
+/** The skills of `skills` a system prompt lists ({@link listedSkills}), by name, with the description it gives each. */
+function listedSkillDescriptions(skills: readonly Skill[]): Map<string, string> {
+	return new Map<string, string>(listedSkills(skills).map(skill => [skill.name, skill.description]));
 }
 
 /** A withheld change with the members a move to another transcript or a rebuild changes in place. */
@@ -2772,10 +2782,14 @@ export class SessionTools {
 		const enabled = normalizeToolNames(this.getEnabledToolNames());
 		if (names.length !== enabled.length || names.some((name, index) => name !== enabled[index])) return false;
 		const declared = this.#host.agent.state.tools.map(tool => this.#declaredOwners.get(tool) ?? tool);
-		const pinned = (name: string): boolean =>
-			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true;
-		const mayMove = (tool: AgentTool): boolean => !pinned(tool.name) && isMountableUnderXdev(tool);
-		if (this.#xdev && ([...this.#xdev.mountedNames].some(pinned) || declared.some(mayMove))) return false;
+		const mayMove = (tool: AgentTool): boolean =>
+			!this.#isPresentationPinned(tool.name) && isMountableUnderXdev(tool);
+		if (
+			this.#xdev &&
+			([...this.#xdev.mountedNames].some(name => this.#isPresentationPinned(name)) || declared.some(mayMove))
+		) {
+			return false;
+		}
 		const current = declared.map(tool => this.#toolRegistry.get(tool.name) ?? tool);
 		if (current.some((tool, index) => toolDeclaration(tool) !== toolDeclaration(declared[index]))) return false;
 		const base = this.#baseSystemPrompt;
@@ -2798,6 +2812,21 @@ export class SessionTools {
 		);
 	}
 
+	/** Whether a presentation pins the tool `name` to the top level: the host's pinned tools or the runtime selection. */
+	#isPresentationPinned(name: string): boolean {
+		return (
+			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true
+		);
+	}
+
+	/** The tools of `names` the registry has, each with its name, in the order of `names`. */
+	#registeredTools(names: readonly string[]): { name: string; tool: AgentTool }[] {
+		return names.flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [{ name, tool }] : [];
+		});
+	}
+
 	/**
 	 * The tools of `selected`, an apply's tool set as the registry gives it, that the apply mounts under `xd://`: with
 	 * the `xd://` state on, a built-in `read` among them and a `write` transport (`builtInWriteAvailable`, with `write`
@@ -2815,11 +2844,7 @@ export class SessionTools {
 		if (this.#xdev === undefined || !xdevReadAvailable || !xdevWriteAvailable) return new Set();
 		return new Set(
 			selected.flatMap(({ name, tool }) =>
-				this.#presentationPinnedToolNames?.has(name) !== true &&
-				this.#runtimeSelectedToolNames?.has(name) !== true &&
-				isMountableUnderXdev(tool)
-					? [name]
-					: [],
+				!this.#isPresentationPinned(name) && isMountableUnderXdev(tool) ? [name] : [],
 			),
 		);
 	}
@@ -2828,10 +2853,7 @@ export class SessionTools {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
-		const fullWriteSelected =
-			toolNames.includes("write") &&
-			(this.#presentationPinnedToolNames?.has("write") === true ||
-				this.#runtimeSelectedToolNames?.has("write") === true);
+		const fullWriteSelected = toolNames.includes("write") && this.#isPresentationPinned("write");
 		if (fullWriteSelected) {
 			const writeRegistration = this.#ensureWriteRegistered?.();
 			if (writeRegistration) {
@@ -2853,12 +2875,7 @@ export class SessionTools {
 			const goalRegistration = this.#ensureGoalRegistered?.();
 			if (goalRegistration) await untilAborted(signal, goalRegistration);
 		}
-		const selectedTools = toolNames.flatMap(name => {
-			const tool = this.#toolRegistry.get(name);
-			return tool ? [{ name, tool }] : [];
-		});
-		const isPresentationPinned = (name: string): boolean =>
-			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true;
+		const selectedTools = this.#registeredTools(toolNames);
 		const mountNames = this.#xdevMountNames(selectedTools, builtInWriteAvailable);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
@@ -2868,7 +2885,7 @@ export class SessionTools {
 			validToolNames.push(name);
 		}
 
-		const pinnedWrite = isPresentationPinned("write");
+		const pinnedWrite = this.#isPresentationPinned("write");
 		const activeDeferrableTool = tools.some(tool => tool.deferrable === true);
 		const transportNeeded = mountNames.size > 0 || activeDeferrableTool || this.#host.planModeEnabled();
 		if (transportNeeded && !builtInWriteAvailable) {
@@ -3310,10 +3327,7 @@ export class SessionTools {
 	 * renders.
 	 */
 	#basePromptSkills(): ReadonlyMap<string, string> {
-		return (
-			this.#basePromptListing.skills ??
-			new Map<string, string>(listedSkills(this.#promptSkills).map(skill => [skill.name, skill.description]))
-		);
+		return this.#basePromptListing.skills ?? listedSkillDescriptions(this.#promptSkills);
 	}
 
 	/**
@@ -3733,10 +3747,7 @@ export class SessionTools {
 	 */
 	#restoredSettingsSetBack(restored: RestoredPrompt): boolean {
 		if (this.#heldSettingsRebuild || restored.before.size === 0) return false;
-		const settings = this.#host.settings;
-		for (const [setting, value] of restored.before) {
-			if (!settingValuesEqual(value, setting.get(settings))) return false;
-		}
+		for (const setting of restored.before.keys()) if (this.#readAtOtherValue(restored.before, setting)) return false;
 		return true;
 	}
 
@@ -4389,7 +4400,7 @@ export class SessionTools {
 	 */
 	refreshSkills(options?: SettingsChangeOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
-			const listedBefore = new Map(listedSkills(this.#skills).map(skill => [skill.name, skill.description]));
+			const listedBefore = listedSkillDescriptions(this.#skills);
 			await this.#rediscoverSkills();
 			const settingsChange = options?.settingsChange;
 			if (settingsChange && this.#promptBound) {
@@ -4426,11 +4437,10 @@ export class SessionTools {
 	}
 
 	/**
-	 * Whether a prompt built for `enabledToolNames` (the session's enabled tools unless given) lists skills, and the
-	 * skill notice reconciles the list: `skillful` on and one of those tools, top-level or `xd://`-mounted, that
-	 * reads `skill://`.
+	 * Whether a prompt built for `enabledToolNames` lists skills, and the skill notice reconciles the list: `skillful`
+	 * on and one of those tools, top-level or `xd://`-mounted, that reads `skill://`.
 	 */
-	#listsSkills(enabledToolNames: Iterable<string> = this.getEnabledToolNames()): boolean {
+	#listsSkills(enabledToolNames: Iterable<string>): boolean {
 		if (cfgSkillful.get(this.#host.settings) !== true) return false;
 		for (const name of enabledToolNames) if (toolReadsSkillUris(this.getToolByName(name))) return true;
 		return false;
@@ -4559,8 +4569,7 @@ export class SessionTools {
 		const transportWriteActive =
 			normalized.includes("write") &&
 			this.#builtInToolNames.has("write") &&
-			this.#presentationPinnedToolNames?.has("write") !== true &&
-			this.#runtimeSelectedToolNames?.has("write") !== true &&
+			!this.#isPresentationPinned("write") &&
 			((this.#host.planModeEnabled() && (!writeSelected || deviceOnlyWriteActive)) ||
 				(writeSelected && deviceOnlyWriteActive && (retainedMountedDevice || retainedDeferrableTool)));
 		const previousRuntimeSelectedToolNames = this.#runtimeSelectedToolNames;
@@ -5198,9 +5207,9 @@ export class SessionTools {
 	 * per-call models, `skillful`) is left out: its change rides the surface's own notices and goes into the prompt
 	 * with the next rebuild ({@link #promptSurface}). With `rebuilds` (a listener rebuilds for the change), a render
 	 * that moved while no setting a build reads moved it moved through state that listener set before it asked for
-	 * the rebuild (a memory recall a Hindsight edit withdrew): each changed setting no build reads moved it, but a
-	 * setting the system prompt renders from ({@link cfgSystemPromptInputs}), whose listener sets no state a build
-	 * does not read the setting for, so one no build reads moved nothing. Without `rebuilds`, nothing is rendered
+	 * the rebuild (a memory recall a Hindsight edit withdrew): each changed setting no build reads moved it, except a
+	 * setting the system prompt renders from ({@link cfgSystemPromptInputs}): its listener sets no state that a build
+	 * does not read the setting for, so if no build reads it, it moved nothing. Without `rebuilds`, nothing is rendered
 	 * unless a setting the base's build read, or the build the base stands in for read ({@link #baseStandIn}),
 	 * changed. Gives the render too, undefined when nothing was rendered, and the settings the prompt surface reads,
 	 * undefined when they were not derived.
@@ -5236,7 +5245,7 @@ export class SessionTools {
 			if (read.has(setting)) return { setting, previous: read.get(setting) };
 			return { setting, previous: unread.has(setting) ? unread.get(setting) : previous };
 		});
-		const movers = await this.#buildMovers(built, render.systemPrompt);
+		const movers = await this.#buildMovers(built, render.systemPrompt, render.settingsRead);
 		if (movers.length > 0 || !rebuilds) return { movers, render, surfaceRead };
 		const liveRead = render.settingsRead ?? NO_SETTINGS;
 		const inputs = cfgSystemPromptInputs.sources;
@@ -5249,8 +5258,9 @@ export class SessionTools {
 
 	/**
 	 * The changes of `changes`, each with its setting's value when the base was built, that the prompt moves with,
-	 * given `live`, the prompt a build under the settings now gives. A build with the changes set back to those
-	 * values ({@link #renderBasePrompt}) tells two kinds of setting apart:
+	 * given `live`, the prompt a build under the settings now gives, and `liveRead`, the settings that build read
+	 * (undefined when its reads were not tracked). A build with the changes set back to those values
+	 * ({@link #renderBasePrompt}) tells two kinds of setting apart:
 	 * - one the build still reads from the session's own settings, at another value than the base was built with,
 	 *   reaches the prompt through state the session keeps in step with it (the workspace roots, the memory backend
 	 *   and its recall, the obfuscator, the rules a build registers), which no build sets back: it moves the prompt
@@ -5259,9 +5269,14 @@ export class SessionTools {
 	 *   a setting the prompt renders only beside another changed one, when it alone keeps its value now while the
 	 *   others are set back, as {@link #declarationMovers} tells the declarations' movers. A setting the build does
 	 *   not read, or reads and renders nothing of (`task.maxConcurrency` without the `task` tool), moves nothing,
-	 *   whatever else makes `live` differ from the base.
+	 *   whatever else makes `live` differ from the base. A setting `liveRead` lacks is not set back alone: that build
+	 *   reads every other setting at its value now, so it takes the live build's path, never reads it, and gives `live`.
 	 */
-	async #buildMovers(changes: readonly SettingChange[], live: readonly string[]): Promise<SettingChange[]> {
+	async #buildMovers(
+		changes: readonly SettingChange[],
+		live: readonly string[],
+		liveRead: ReadonlyMap<AnySetting, unknown> | undefined,
+	): Promise<SettingChange[]> {
 		const moving = changes.filter(
 			({ setting, previous }) => !settingValuesEqual(previous, setting.get(this.#host.settings)),
 		);
@@ -5277,11 +5292,13 @@ export class SessionTools {
 			if (!sameItems(setBack.systemPrompt, live)) movers.add(rendered[0]);
 		} else if (!sameItems(setBack.systemPrompt, live)) {
 			for (const change of rendered) {
-				const alone = await this.#renderSetBack(new Map([[change.setting, change.previous]]));
-				if (!alone) return [];
-				if (!sameItems(alone.systemPrompt, live)) {
-					movers.add(change);
-					continue;
+				if (liveRead === undefined || liveRead.has(change.setting)) {
+					const alone = await this.#renderSetBack(new Map([[change.setting, change.previous]]));
+					if (!alone) return [];
+					if (!sameItems(alone.systemPrompt, live)) {
+						movers.add(change);
+						continue;
+					}
 				}
 				const others = new Map(before);
 				others.delete(change.setting);
@@ -5301,12 +5318,13 @@ export class SessionTools {
 
 	/**
 	 * Renders the base prompt a rebuild would give now under a held settings rebuild (the live settings, with the
-	 * tool set and skill list the prompt keeps), or takes `render`, one made for the change just now or one that joins
-	 * the change the base withholds ({@link refreshBaseSystemPrompt}), and records it as the build the bound base, or
-	 * the kept restored transcript prompt, stands in for ({@link #baseStandIn}). A later rebuild that only renders it
-	 * again, such as a skill rediscovery that leaves the prompt's list as it is, then leaves the base and the hold in
-	 * place. A build that changes the prompt holds the earlier changes it renders too ({@link #holdEarlierChanges}),
-	 * told the prompt surface's reads by `surfaceRead` where the change just now derived them.
+	 * tools and skill list the held rebuild lists, the prompt's own where the hold moves neither), or takes `render`,
+	 * one made for the change just now or one that joins the change the base withholds
+	 * ({@link refreshBaseSystemPrompt}), and records it as the build the bound base, or the kept restored transcript
+	 * prompt, stands in for ({@link #baseStandIn}). A later rebuild that only renders it again, such as a skill
+	 * rediscovery that leaves the prompt's list as it is, then leaves the base and the hold in place. A build that
+	 * changes the prompt holds the earlier changes it renders too ({@link #holdEarlierChanges}), told the prompt
+	 * surface's reads by `surfaceRead` where the change just now derived them.
 	 */
 	async #recordHeldSettingsBuild(
 		render?: SystemPromptPreparation,
@@ -5367,6 +5385,7 @@ export class SessionTools {
 		const movers = await this.#buildMovers(
 			earlier.filter(({ setting }) => !surface.has(setting)),
 			build,
+			read,
 		);
 		if (this.#heldSettingsRebuild === held) this.#holdMoreSettings(held, movers);
 	}
@@ -5625,7 +5644,7 @@ export class SessionTools {
 			noLongerEnabledTools: earlier.enabledTools.filter(name => !enabled.has(name)),
 		};
 		if (!unkept && changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
-		if (restored && unkept) this.#restoredTranscript = { reply: restored.reply, promptDigest: restored.promptDigest };
+		if (restored && unkept) this.#restoredTranscript = { ...restored, unkeptHold: undefined };
 		return settingsNoticeMessage(changes, given, tools, newest.hold, newest.notices, undefined);
 	}
 
@@ -5717,7 +5736,7 @@ export class SessionTools {
 	 */
 	#renderBasePrompt(
 		rebuildSystemPrompt: SystemPromptRebuilder,
-		{ toolNames, tools, xdev, skills }: PromptRoster & { readonly skills?: readonly Skill[] },
+		{ toolNames, tools, xdev, skills }: ListedPromptRoster,
 		candidate: PromptSurface,
 		setBack?: ReadonlyMap<AnySetting, unknown>,
 	) {
@@ -5739,15 +5758,12 @@ export class SessionTools {
 	 * it ({@link #xdevMountNames}). A build under the hold is so the build the rebuild commits, the prompt that goes out
 	 * with the change, which a copy of the session sends ({@link withheldPromptBuild}).
 	 */
-	#basePromptListed(): PromptRoster & { readonly skills?: readonly Skill[] } {
+	#basePromptListed(): ListedPromptRoster {
 		const held = this.#heldSettingsRebuild;
 		const skills = held?.skills ? this.#skills : undefined;
 		const xdev = this.#xdev;
 		if (!held?.reconcile) return { toolNames: this.getActiveToolNames(), tools: this.#toolRegistry, xdev, skills };
-		const selected = normalizeToolNames(this.#enabledAfterHold(held)).flatMap(name => {
-			const tool = this.#toolRegistry.get(name);
-			return tool ? [{ name, tool }] : [];
-		});
+		const selected = this.#registeredTools(normalizeToolNames(this.#enabledAfterHold(held)));
 		const mounted = this.#xdevMountNames(selected, this.#builtInToolNames.has("write"));
 		return {
 			toolNames: selected.flatMap(({ name }) => (mounted.has(name) ? [] : [name])),
