@@ -1520,13 +1520,35 @@ pub(crate) fn alone(name: &str) -> bool {
 		.ok()
 		.or_else(|| std::env::args_os().next().map(PathBuf::from))
 		.expect("the test binary");
-	let output = std::process::Command::new(exe)
-		.args(["--exact", name, "--nocapture", "--test-threads=1"])
-		.env(ALONE, name)
-		.output()
+	// Spawned holding `crate::tests::SPAWNS` for writing, until the child has
+	// written its first output: until its `exec` has closed them, it holds a
+	// copy of every descriptor of this process, ends of other tests' FIFOs
+	// included, and `spawn` can return before that (see `SPAWNS`).
+	let (child, first) = {
+		use std::io::Read as _;
+		let _spawning = crate::tests::SPAWNS.write();
+		let mut child = std::process::Command::new(exe)
+			.args(["--exact", name, "--nocapture", "--test-threads=1"])
+			.env(ALONE, name)
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.spawn()
+			.expect("run the test in a process of its own");
+		let mut first = [0; 1];
+		let stdout = child.stdout.as_mut().expect("the child's output");
+		let read = loop {
+			match stdout.read(&mut first) {
+				Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {},
+				read => break read.expect("the child's first output"),
+			}
+		};
+		(child, first[..read].to_vec())
+	};
+	let output = child
+		.wait_with_output()
 		.expect("run the test in a process of its own");
-	let (out, err) =
-		(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+	let out = String::from_utf8_lossy(&[first, output.stdout].concat()).into_owned();
+	let err = String::from_utf8_lossy(&output.stderr);
 	assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
 	assert!(out.contains("1 passed"), "{name} ran no test in a process of its own:\n{out}\n{err}");
 	// What the test reported of itself (counts, notes), for the run's log.
