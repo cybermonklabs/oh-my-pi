@@ -468,6 +468,8 @@ fn assignment_statement(
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
+	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`).
+	bash_last_arg(k, vp, cx, BString::default());
 	Some(Flow::Next)
 }
 
@@ -605,6 +607,7 @@ fn plain_statement(
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
+		bash_last_arg(k, vp, cx, argv.last().cloned().unwrap_or_default());
 		return Some(Flow::Next);
 	}
 	// The stages take over from the expanded words: a builtin that needs
@@ -2247,7 +2250,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			s.stage = Stage::Output;
 			None
 		},
-		Target::SelfShell => match build_env(k, cx, vp) {
+		Target::SelfShell => match build_env(k, cx, vp, None) {
 			Ok(env) => super::nested::start(k, vp, cx, line, &env),
 			Err(err) => {
 				k.fail(err);
@@ -2256,14 +2259,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		},
 		Target::Refused { path, code } => refused(k, vp, cx, line, &path, code),
 		Target::Tool(tool) => {
-			let (env, umask) =
-				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
-					Ok(v) => v,
-					Err(err) => {
-						k.fail(err);
-						return Some(Flow::Discard(1));
-					},
-				};
+			let (env, umask) = match build_env(k, cx, vp, None)
+				.and_then(|env| Ok((env, state::umask(cx.store, vp)?)))
+			{
+				Ok(v) => v,
+				Err(err) => {
+					k.fail(err);
+					return Some(Flow::Discard(1));
+				},
+			};
 			let id = CallId(k.next_call);
 			k.next_call += 1;
 			let (argv, tag) = {
@@ -2289,14 +2293,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			Some(Flow::Block(WaitKey::Call(id)))
 		},
 		Target::Native(native) | Target::Device(native) => {
-			let (env, umask) =
-				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
-					Ok(v) => v,
-					Err(err) => {
-						k.fail(err);
-						return Some(Flow::Discard(1));
-					},
-				};
+			let (env, umask) = match build_env(k, cx, vp, None)
+				.and_then(|env| Ok((env, state::umask(cx.store, vp)?)))
+			{
+				Ok(v) => v,
+				Err(err) => {
+					k.fail(err);
+					return Some(Flow::Discard(1));
+				},
+			};
 			let extra = extra_fds(vp);
 			let argv = st(vp).argv.clone();
 			let tag = st(vp).tag;
@@ -2359,7 +2364,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
 			} else {
-				match build_env(k, cx, vp) {
+				// bash gives `_` the program's path for a command it runs, not
+				// for `exec` (which passes the exported `_`, if any: the one the
+				// shell imported, until a command binds it unexported). A
+				// utility's command (`env`, `xargs`) runs through `exec`, so it
+				// gets none either, as the program GNU's `env -i` starts.
+				let path = exec_as.is_none().then_some(&path[..]);
+				match build_env(k, cx, vp, path) {
 					Ok(env) => env,
 					Err(err) => {
 						k.fail(err);
@@ -4700,6 +4711,10 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	// bash `bind_lastarg`: the command's last word (its name when it has
+	// no argument, empty after an assignment-only command).
+	let last = (vp.mode.dialect() == crate::bash::ids::Dialect::Bash)
+		.then(|| st(vp).argv.last().cloned().unwrap_or_default());
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4719,6 +4734,9 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
+	}
+	if let Some(last) = last {
+		bash_last_arg(k, vp, cx, last);
 	}
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
@@ -4749,6 +4767,27 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			}
 		},
 		Some(Transfer::Exec) => Flow::Exit(status),
+	}
+}
+
+/// bash `bind_lastarg`: after a simple command `$_` is its last word (its
+/// name when it has no argument, empty after an assignment-only command).
+/// It is the shell variable `_`, bound at the innermost scope that declares
+/// it (`local _`) and without its export attribute, so an external gets
+/// `_` only as its own path ([`build_env`]). A readonly `_` keeps its
+/// value (bash also prints `_: readonly variable` there; this does not).
+/// Pipelines, `( )` and background jobs bind it in their own vprocs only.
+fn bash_last_arg(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, last: BString) {
+	let readonly = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
+		Ok(v) => v.is_some_and(|v| v.attrs.contains(Attrs::READONLY)),
+		Err(err) => {
+			k.fail(err);
+			return;
+		},
+	};
+	if !readonly {
+		let var = Var::scalar(last, Attrs::default());
+		state::store_var(&mut k.root, cx.store, vp, b"_", Some(var), Level::Dynamic);
 	}
 }
 
@@ -4839,7 +4878,7 @@ fn run_script_file(
 	let env = if st(vp).exec_as.as_ref().is_some_and(|e| e.clear_env) {
 		EnvView::new(Vec::new())
 	} else {
-		match build_env(k, cx, vp) {
+		match build_env(k, cx, vp, None) {
 			Ok(env) => env,
 			Err(err) => {
 				k.fail(err);
@@ -5189,8 +5228,15 @@ fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 /// The environment of a command: exported variables as the vproc sees them
 /// (prefix assignments are in its innermost scope), plus exported
 /// functions as `BASH_FUNC_name%%`. Built per external (and nested shell
-/// or tool call): only the exported entries are read and copied.
-fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreError> {
+/// or tool call): only the exported entries are read and copied. `path`:
+/// a bash external's full path, which bash gives it as `_` (bash
+/// `put_command_name_into_env`).
+fn build_env(
+	k: &Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	path: Option<&[u8]>,
+) -> Result<EnvView, StoreError> {
 	let mut pairs: Vec<(BString, BString)> = Vec::new();
 	state::exported(&k.root, cx.store, vp, &mut pairs)?;
 	// Imported strings with non-identifier names pass through unchanged.
@@ -5233,6 +5279,10 @@ fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreEr
 				pairs.push((name.clone(), v.clone()));
 			}
 		}
+	}
+	if let Some(path) = path.filter(|_| vp.mode.dialect() == crate::bash::ids::Dialect::Bash) {
+		pairs.retain(|(n, _)| n.as_slice() != b"_");
+		pairs.push((BString::from("_"), BString::from(path)));
 	}
 	Ok(EnvView::new(pairs))
 }
