@@ -63,7 +63,11 @@ fn drive(
 				let mut api = shell.api(&mut cx, id).expect("call is outstanding");
 				let mut script = Script::command(&b"\"$@\""[..]);
 				script.args = Some(call.argv[1..].to_vec());
-				pending.push((id, api.run_subshell_in(script, lineage)));
+				pending.push((
+					id,
+					api.run_subshell_in(script, lineage)
+						.expect("a vpid is left"),
+				));
 			},
 			Step::Yield => {
 				yields += 1;

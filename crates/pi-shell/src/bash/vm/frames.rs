@@ -685,12 +685,24 @@ impl Shell {
 	/// [`RestoreError::Incompatible`] for frames of another IR version or
 	/// engine build (retry with `drop_frames`), [`RestoreError::Corrupt`] /
 	/// [`RestoreError::InvalidUnit`] for undecodable or inconsistent blobs,
-	/// [`RestoreError::MissingUnit`], [`RestoreError::Store`].
+	/// [`RestoreError::MissingUnit`], [`RestoreError::VpidBase`] for a vpid
+	/// base an OS pid can take, [`RestoreError::VpidBaseAtCeiling`] for one
+	/// that leaves no vpid for a child, [`RestoreError::Store`].
 	pub fn restore(
 		engine: &Arc<Engine>,
 		cx: &mut Cx<'_>,
 		opts: RestoreOpts,
 	) -> Result<(Self, RestoreReport), RestoreError> {
+		let base = engine.config().vpid_base;
+		if let Some(limit) = crate::bash::os_pid_limit()
+			&& base < limit
+		{
+			return Err(RestoreError::VpidBase { base, limit });
+		}
+		// The shell takes the base; a child needs a vpid above it.
+		if base >= crate::bash::Vpid::CEILING {
+			return Err(RestoreError::VpidBaseAtCeiling { base });
+		}
 		let root = Root::load(cx.store)?;
 		let argv0 = state::root_misc(cx.store, MiscKey::Argv0)?
 			.map_or_else(|| BString::from("bash"), BString::from);
@@ -704,8 +716,12 @@ impl Shell {
 		let mut k = Kernel::new(engine, root, argv0, shell_pid);
 		// The counters a shell restored from the store alone continues
 		// (`Shell::create` wrote them; the root vproc took the first vpid).
-		let base = engine.config().vpid_base;
-		k.next_vpid = parse_misc(cx.store, MiscKey::NextVpid)?.unwrap_or(base + 1);
+		// `base` was checked above, so `base + 1` is a vpid. A stored next
+		// vpid at or below the base cannot come from this engine (`create`
+		// stores base + 1 and the counter only grows): it starts above the
+		// base, where no vpid is a number an OS pid can take.
+		k.next_vpid =
+			parse_misc(cx.store, MiscKey::NextVpid)?.map_or(base + 1, |n: u32| n.max(base + 1));
 		k.written_vpid = k.next_vpid;
 		k.next_job = parse_misc(cx.store, MiscKey::NextJob)?.unwrap_or(1);
 		k.rand = if opts.reseed_random {
@@ -796,6 +812,12 @@ impl Shell {
 		k.ctl.restore_wakes(img.wakes);
 		k.done = img.done.into();
 		k.results = img.results.into_iter().collect();
+		// No vpid twice: the counter starts above every vproc the image brings
+		// back (`restore` raised a stored counter below the base to base + 1;
+		// a live vproc can already hold that or a higher one).
+		if let Some(top) = img.procs.iter().map(|p| p.vpid.0).max() {
+			k.next_vpid = k.next_vpid.max(top.saturating_add(1));
+		}
 		// Only a restored vproc still decides (a job that never settles
 		// would hold its `$!` readers forever).
 		k.bangs = img

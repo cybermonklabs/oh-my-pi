@@ -59,6 +59,10 @@
 
 - A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
 - Fixed the bash tool's built-in `rsync -K` (`--keep-dirlinks`) reporting `Operation not supported (95)` where rsync 3.5.1 reports `Too many levels of symbolic links (40)`: when the destination name of a directory is a symlink to a directory and the modes differ, rsync refuses to set the mode through the symlink with `ELOOP` (exit 23), and the built-in now refuses it the same way. A symlink's own mode is still set with lchmod where the platform can
+- `$BASHPID` is `$$` in the shell itself (at the top level, in a function, `eval`, a group and a `lastpipe` stage), as in bash; it was a virtual pid no process has
+- A shell refuses an engine whose first virtual pid is below the system's pid limit (Linux `pid_max`, macOS 100 000): a virtual pid there would name a real process to `kill`, `wait` and the user's tools
+- A shell that has handed out its last virtual pid (2 147 483 647) no longer hands out numbers past it or wraps around to numbers an OS process can have: a command that needs one fails as when bash cannot fork (`fork: Resource temporarily unavailable`, status 254; zsh: `fork failed: …`, status 1; `zpty`: `can't create pty command`, status 1). A script then ends as it does after `exit 254` (zsh: with status 1), a failure inside a subshell ends only that subshell, and an interactive shell drops the command and reads the next one. A prompt whose command substitution needs a virtual pid then fails as an expansion: the message once, the prompt empty, and the line is read, as zsh does (bash retries the prompt every 15 s and reads nothing). An engine whose first virtual pid is the last one or above it, which leaves none for a child, is refused
+- A bash command substitution that has no command (`$()`, `$( )`, only comments) runs nothing and leaves `$?` as it was, as in bash: `false; echo "$( )" $?` printed `0`
 
 ## [18.18.6] - 2026-11-09
 

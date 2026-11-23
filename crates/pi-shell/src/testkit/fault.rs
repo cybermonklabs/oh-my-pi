@@ -220,6 +220,42 @@ impl Rig {
 		self.shell = Some(shell);
 		self.snapshots += 1;
 	}
+
+	/// Test hook: the shell's next vpid becomes `next` (a counter near
+	/// [`crate::bash::ids::Vpid::CEILING`]): snapshot, rewrite the stored
+	/// `MiscKey::NextVpid`, restore.
+	pub fn set_next_vpid(&mut self, next: u32) {
+		self.set_next_vpid_with(next, RestoreOpts::default());
+	}
+
+	/// [`Self::set_next_vpid`], restoring with `opts` (`drop_frames` restores
+	/// from the store's records alone, as a host that drops the frames does).
+	pub fn set_next_vpid_with(&mut self, next: u32, opts: RestoreOpts) {
+		let mut shell = self.shell.take().expect("rig holds a shell between steps");
+		shell.control().request_suspend();
+		{
+			let mut cx = Cx { host: &mut self.host, store: &mut self.store };
+			let step = shell.step(&mut cx, Budget::default());
+			assert!(matches!(step, Step::SuspendReady), "suspend drains to a safepoint, got {step:?}");
+			shell.externalize(&mut cx).expect("externalize");
+		}
+		drop(shell);
+		crate::bash::store::StateStore::apply(
+			&mut self.store,
+			crate::bash::store::Change::Put(
+				crate::bash::store::Key::Misc(crate::bash::store::MiscKey::NextVpid),
+				crate::bash::store::Record::Misc(next.to_string().into()),
+			),
+		)
+		.expect("write the next vpid");
+		let (shell, _) = Shell::restore(
+			&self.engine,
+			&mut Cx { host: &mut self.host, store: &mut self.store },
+			opts,
+		)
+		.expect("restore");
+		self.shell = Some(shell);
+	}
 }
 
 impl Drop for Rig {
