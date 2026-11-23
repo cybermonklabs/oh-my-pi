@@ -396,12 +396,13 @@ pub struct Shell {
 	/// `orphans` module); empty unless [`Self::gone`] ever had entries.
 	orphans:   Vec<Vpid>,
 	/// Builtins' asks to take in the exits already available, not answered
-	/// yet ([`Kernel::ask_exits`], [`Self::take_in_exits`]). Not imaged, as
-	/// [`Self::slice`]: a restored builtin runs again and asks again.
+	/// yet ([`Kernel::ask_exits`], [`Self::take_in_exits`]). Imaged, as
+	/// [`Self::slice`] is: the asker stays parked across a snapshot, and
+	/// only the answer wakes it.
 	taking_in: Vec<TakeIn>,
 	/// Vprocs adopted that have not had a turn yet: a take-in owes none of
-	/// the asker's own such jobs a turn ([`Self::take_in_exits`]). Not
-	/// imaged: a restored vproc counts as one that had its turn.
+	/// the asker's own such jobs a turn ([`Self::take_in_exits`]). Imaged
+	/// with [`Self::taking_in`].
 	fresh:     Vec<Vpid>,
 }
 
@@ -409,7 +410,8 @@ pub struct Shell {
 /// ([`Kernel::ask_exits`]), until the scheduler answers it
 /// ([`Shell::take_in_exits`]). Every vproc keeps its place in the
 /// round-robin; nothing runs out of turn.
-struct TakeIn {
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct TakeIn {
 	/// The vproc whose builtin asked.
 	asker: Vpid,
 	/// The vprocs that had work when it asked, but for the asker's own jobs
@@ -547,11 +549,11 @@ pub struct Kernel {
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
 	/// Vprocs whose builtin is about to report job state and asked first to
 	/// take in the exits already available ([`Kernel::ask_exits`]); the
-	/// scheduler answers after the turn (`Shell::take_in_exits`). Not
-	/// imaged: a restored builtin runs again and asks again.
+	/// scheduler answers after the turn (`Shell::take_in_exits`). Imaged:
+	/// the asker stays parked across a snapshot.
 	pub exits_asked:        Vec<Vpid>,
 	/// Vprocs whose ask the scheduler answered: their builtin, run again,
-	/// reports now ([`Kernel::exits_taken`]). Not imaged.
+	/// reports now ([`Kernel::exits_taken`]). Imaged.
 	pub exits_taken:        Vec<Vpid>,
 	/// Jobs `disown` dropped before the scheduler adopted them: their
 	/// record names no parent (`Shell::adopt`, [`Kernel::disown`]). Empty

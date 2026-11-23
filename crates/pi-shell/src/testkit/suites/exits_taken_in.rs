@@ -162,8 +162,13 @@ fn init(zsh: bool) -> ShellInit {
 /// Run `src` as `bash -c src` (`zsh`: `zsh -c src`) over `world`'s host:
 /// stdout, stderr, status.
 fn run(world: &World, src: &str, zsh: bool) -> (String, String, i32) {
+	run_with(world, src, zsh, Fault::None)
+}
+
+/// [`run`] under `fault`.
+fn run_with(world: &World, src: &str, zsh: bool, fault: Fault) -> (String, String, i32) {
 	let mut rig = Rig::new(world.host(), init(zsh));
-	let status = rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+	let status = rig.run(Script::command(src.as_bytes().to_vec()), fault);
 	let (shell, host, store) = rig.parts();
 	let out = (
 		String::from_utf8_lossy(&host.stdout.bytes()).into_owned(),
@@ -565,5 +570,76 @@ fn kill_of_a_job_pid_takes_in_the_exits_first() {
 		);
 		assert_eq!(out, "alive=0\n", "control zsh={zsh}");
 		assert_eq!(err, "", "control zsh={zsh}");
+	}
+}
+
+/// [`run_with`] on a world of its own, in a thread of its own: a run that
+/// has not finished after 30 s fails the test (`what` names the fault). The
+/// thread of a run that never ends spins on until the test process exits.
+fn run_bounded(src: &'static str, zsh: bool, fault: Fault, what: &str) -> (String, String, i32) {
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = tx.send(run_with(&World::new(), src, zsh, fault));
+	});
+	rx.recv_timeout(std::time::Duration::from_secs(30))
+		.unwrap_or_else(|_| panic!("`{src}` (zsh={zsh}) did not finish within 30 s with {what}"))
+}
+
+// Failure mode: a snapshot taken while a builtin waited for the answer to
+// its ask (`Kernel::ask_exits`) lost the ask: the restored builtin stayed
+// parked on its job for ever, so `kill` of a running in-engine job never
+// sent, in the root and in a subshell. Each script runs with a snapshot
+// every 1, 2, 3, 5 and 8 ops (`Fault::Snapshot`) and with a pause in the
+// same places (`Fault::PauseResume`: the same steps, no image), and the two
+// runs agree. The long jobs make the answer's turns matter: a restored
+// shell must answer an ask as the shell without the snapshot does, after
+// the same turns, and no other.
+#[test]
+fn an_ask_outlives_a_snapshot() {
+	let rows: [(&'static str, bool); 13] = [
+		("{ while :; do :; done; } & kill -KILL $!; wait $!; echo st=$?", false),
+		("( { while :; do :; done; } & kill -KILL $!; wait $!; echo st=$? )", false),
+		("{ while :; do :; done; } & jobs; kill %1; wait; echo end", false),
+		("{ exit 3; } & { exit 4; } & :; jobs; wait; echo end", false),
+		("{ { exit 5; } & wait $!; exit $?; } & :; :; jobs; wait $!; echo st=$?", false),
+		("( { exit 3; } & :; jobs )", false),
+		("{ exit 3; } & p=$!; :; kill -0 $p; echo alive=$?; wait", false),
+		("{ while :; do :; done; } & kill -KILL $!; wait $!; echo st=$?", true),
+		("{ exit 3; } & { exit 4; } & :; jobs; wait; echo end", true),
+		(
+			concat!(
+				"{ :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; exit 3; }",
+				" & :; :; :; jobs; wait; echo end"
+			),
+			false,
+		),
+		(
+			concat!(
+				"{ :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; exit 3; }",
+				" & p=$!; :; :; kill -0 $p; echo alive=$?; wait"
+			),
+			false,
+		),
+		(
+			concat!(
+				"{ :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; exit 3; }",
+				" & :; :; :; :; :; :; jobs; jobs; wait; echo end"
+			),
+			false,
+		),
+		(
+			concat!(
+				"{ :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; :; exit 3; }",
+				" & :; :; :; jobs; wait; echo end"
+			),
+			true,
+		),
+	];
+	for (src, zsh) in rows {
+		for every in [1, 2, 3, 5, 8] {
+			let paused = run_bounded(src, zsh, Fault::PauseResume { every }, "a pause every few ops");
+			let snap = run_bounded(src, zsh, Fault::Snapshot { every }, "a snapshot every few ops");
+			assert_eq!(snap, paused, "`{src}` (zsh={zsh}), every {every} ops");
+		}
 	}
 }
