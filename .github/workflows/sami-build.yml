@@ -1,19 +1,43 @@
 name: Build sami branch
 
+# How the release owner cuts a release:
+#   1. Push the composed candidate to sami-candidate. That push runs every
+#      job here but publish: carry, version, release_binary (it builds,
+#      smoke-tests, uploads and attests the archives), rust_test and
+#      rust_test_macos.
+#   2. Wait for that run to go green.
+#   3. Fast-forward sami to exactly that commit.
+#   4. The push to sami runs only publish, which publishes that run's
+#      attested archives. It never rebuilds.
+# A sami head with no green sami-candidate run publishes nothing, and publish
+# fails. An archive whose sha256 is not the one the candidate run attested is
+# refused and named with both digests, and nothing is published. A candidate
+# whose carry check named a release older than the newest one is refused too:
+# a release published after that check was not compared with it
+# (.github/sami/release-candidate.sh). A run on sami other than that push (a
+# dispatch) runs no job; a dispatch on another ref builds and tests, and
+# attests nothing.
+# Known limit: any identity of the agent App sjawhar-agent[bot] can move sami
+# and sami-candidate. No ruleset guards either ref, by the decision of
+# 2026-11-23: a push to sami that no green candidate run built publishes
+# nothing, so a ruleset would guard against a harm publish already stops.
+
 on:
   push:
     branches:
       - sami
+      - sami-candidate
   workflow_dispatch:
 
+# Each job that needs more than reading the repository says so itself.
 permissions:
-  contents: write
+  contents: read
 
 # Only release_binary may restore or save GitHub Actions caches: it sets
 # cache-mode: write, and every other job gets a cache token that can do
 # neither. rust_test and rust_test_macos run test code with root on their
 # runners; that code therefore cannot write an entry that release_binary
-# restores. Harness cases W1 to W18 (.github/sami/tests/run.sh) keep it so.
+# restores. Harness cases W1 to W22 (.github/sami/tests/run.sh) keep it so.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
 cache-mode: none
 
@@ -24,8 +48,16 @@ jobs:
     # drops or reverts what the previous release carried (v18.16.0 lost two
     # commits of v18.13.3 that way). Fails unless every previous-release commit
     # is carried or named in .github/sami/carried-drops.txt.
+    # A run on sami (a push or a dispatch) builds nothing: publish takes the
+    # candidate run's archives and notes.
+    if: ${{ github.ref != 'refs/heads/sami' }}
     name: Carries the previous release
     runs-on: ubuntu-22.04
+    # id-token and attestations: write, for the notes' attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       notes: ${{ steps.check.outputs.notes }}
     steps:
@@ -47,9 +79,25 @@ jobs:
             echo "CARRY_NOTES_EOF"
           } >>"$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/carry-notes.md" >>"$GITHUB_STEP_SUMMARY"
+      # publish takes the release notes from this artifact, and publishes
+      # them only if this run attested them. Only a push to sami-candidate
+      # attests: a dispatch run makes nothing publishable, and the public
+      # transparency log gets no trial entries.
+      - name: Attest the release notes
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/carry-notes.md
+      - name: Upload the release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/carry-notes.md
+          if-no-files-found: error
 
   version:
     needs: carry
+    if: ${{ github.ref != 'refs/heads/sami' }}
     name: Compute version
     runs-on: ubuntu-22.04
     outputs:
@@ -66,7 +114,13 @@ jobs:
 
   release_binary:
     needs: version
+    if: ${{ github.ref != 'refs/heads/sami' }}
     cache-mode: write
+    # id-token and attestations: write, for the archives' attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # rust_test checks the addon it downloads against this sha256. Only the
     # linux-x64 leg sets it: the macOS leg skips the step, so the output is
     # empty there, and an empty output is not set and does not clear the
@@ -122,8 +176,11 @@ jobs:
       # and 27 min on macos-15 over the 19 pushes of 2026-11-19 to 11-22. The
       # steps below keep Bazel's disk cache and repository cache, and the
       # cargo registry that crate_universe reads (CARGO_BAZEL_ISOLATED=0 in
-      # .bazelrc), in GitHub's Actions cache: each push to sami restores the
-      # newest entry for its target and saves a new one.
+      # .bazelrc), in GitHub's Actions cache: each push to sami-candidate, the
+      # ref the release is built on, restores the newest entry for its ref and
+      # target and saves a new one. Whoever can push sami-candidate can seed
+      # what this job restores; the same identities can push sami, which
+      # publishes, so the cache gives them nothing they lack.
       - name: Restore the release build cache
         id: release-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -220,20 +277,39 @@ jobs:
           mkdir -p "release/${asset}/bin"
           cp "packages/coding-agent/binaries/omp-${TARGET}" "release/${asset}/bin/omp"
           tar -C release -czf "release/${asset}.tar.gz" "$asset"
+          # The sidecar, one sha256sum line, is attested with the archive. It
+          # lets publish name the digest this run attested when an archive it
+          # downloads differs: GitHub has no API that lists attestations by
+          # run or by name. macos-15 has shasum, which writes the same line.
+          if command -v sha256sum >/dev/null; then sum=(sha256sum); else sum=(shasum -a 256); fi
+          (cd release && "${sum[@]}" "${asset}.tar.gz" >"${asset}.tar.gz.sha256")
+          cat "release/${asset}.tar.gz.sha256"
+      # Only a push to sami-candidate makes publishable, attested archives: a
+      # dispatch run attests nothing, and the public transparency log gets no
+      # trial entries.
+      - name: Attest the archive and its sidecar
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: mise-${{ matrix.target }}
-          path: release/*.tar.gz
+          path: |
+            release/*.tar.gz
+            release/*.tar.gz.sha256
           if-no-files-found: error
-      # Only a push to sami saves the cache; a dispatch or any other event
-      # only restores. cache-mode takes no expression, so this condition on
-      # the bound and save steps enforces it (harness cases W14 to W18). A
+      # Only a push to sami-candidate saves the cache; a dispatch or any other
+      # event only restores. cache-mode takes no expression, so this condition
+      # on the bound and save steps enforces it (harness cases W14 to W19). A
       # failed build's finished actions are still valid results, so the
       # cache is saved whenever the native build ran. A re-run of the same
       # commit restored its exact key and has nothing to save.
       - name: Bound the release build cache
         id: release-cache-bound
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
         shell: python3 {0}
         run: |
           import os, shutil, time
@@ -295,7 +371,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"save={'true' if save else 'false'}\n")
       - name: Save the release build cache
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami' && !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.RELEASE_CACHE_PATHS }}
@@ -305,13 +381,14 @@ jobs:
     # Upstream runs these tests in ci.yml's rust_validate job, on upstream's
     # self-hosted vmon runners, which the fork has no access to; so every fork
     # run of it is cancelled and no sami release ran a Rust test. This job runs
-    # the same `bazel test //crates/...` on a GitHub-hosted runner, uncached,
-    # and release_github waits for it. The omp-rpc smoke tests' server loads
-    # the linux-x64-modern native addon release_binary's linux-x64 leg
-    # installed (its step "Hash the addon rust_test loads"), so this job
-    # starts when release_binary's legs end, and it needs that leg: a trial
-    # run that skips release_binary fails here. Re-running a failed
-    # release_binary leg re-runs this job and rust_test_macos too.
+    # the same `bazel test //crates/...` on a GitHub-hosted runner, uncached;
+    # a candidate run is green, and publish takes it, only when it passes.
+    # The omp-rpc smoke tests' server loads the linux-x64-modern native addon
+    # release_binary's linux-x64 leg installed (its step "Hash the addon
+    # rust_test loads"), so this job starts when release_binary's legs end,
+    # and it needs that leg: a trial run that skips release_binary fails
+    # here. Re-running a failed release_binary leg re-runs this job and
+    # rust_test_macos too.
     # The parity step fails while a test target of the repository's own Rust
     # suite has no Bazel test target. The test step, .github/sami/rust-test.sh,
     # fails when a test fails that .github/sami/rust-test-known-failures.txt
@@ -331,8 +408,9 @@ jobs:
     # so each test that can skip prints the marker before it returns.
     needs: release_binary
     # It runs whatever release_binary's verdict, so a run without the addon
-    # fails here instead of skipping the tests.
-    if: ${{ !cancelled() }}
+    # fails here instead of skipping the tests. The ref test keeps it off
+    # sami, where release_binary is skipped.
+    if: ${{ !cancelled() && github.ref != 'refs/heads/sami' }}
     name: Rust tests (bazel)
     runs-on: ubuntu-22.04
     # Uncached, the build and the tests took 17 to 25 minutes (runs
@@ -736,8 +814,9 @@ jobs:
     # rules; it fails unless each of them ran. A known printing test runs
     # beside them as the skip scan's canary.
     needs: rust_test
-    # It runs whatever rust_test's verdict, once its listings are uploaded.
-    if: ${{ !cancelled() }}
+    # It runs whatever rust_test's verdict, once its listings are uploaded,
+    # but not on sami, where rust_test is skipped.
+    if: ${{ !cancelled() && github.ref != 'refs/heads/sami' }}
     name: Rust tests (bazel, macOS-only tests)
     runs-on: macos-15
     timeout-minutes: 120
@@ -806,24 +885,72 @@ jobs:
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
             bash .github/sami/rust-test.sh
 
-  release_github:
-    # A red Rust test stops the release: rust_test and rust_test_macos are
-    # needs like the builds.
-    needs: [carry, version, release_binary, rust_test, rust_test_macos]
+  publish:
+    # A push to sami runs only this job, and it builds nothing. It takes the
+    # green sami-build run of sami-candidate at the same commit, downloads
+    # that run's archives and release notes, and publishes them only after
+    # .github/sami/release-candidate.sh checks that each one is a file that
+    # run attested and that there is exactly one archive per release target.
+    # A red rust_test or rust_test_macos leaves the candidate run red, so no
+    # run is found and nothing is published. The checkout has the tags: the
+    # check names the newest release, which the candidate's notes must name.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami' }}
     runs-on: ubuntu-22.04
+    # One publish at a time: a second push to sami waits for the first, and
+    # then its notes check sees the release the first one published. GitHub
+    # keeps one waiting run per group; a third push cancels the waiting one,
+    # which then publishes nothing.
+    concurrency:
+      group: sami-publish
+      cancel-in-progress: false
+    # contents: write creates the release; actions: read downloads another
+    # run's artifacts; attestations: read reads the attestations.
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    env:
+      CANDIDATE_BRANCH: sami-candidate
+      # release_binary's matrix targets: one archive of each is published.
+      RELEASE_TARGETS: linux-x64 darwin-arm64
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Find the candidate run
+        id: candidate
+        run: bash .github/sami/release-candidate.sh find
+      # Each artifact goes to a directory of its own (merge-multiple is off),
+      # so the check below sees which artifact gave which file.
+      - name: Download the candidate run's archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          github-token: ${{ github.token }}
           pattern: mise-*
-          path: release
-          merge-multiple: true
+          path: ${{ runner.temp }}/candidate
+      - name: Download the candidate run's release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: release-notes
+          path: ${{ runner.temp }}/candidate/release-notes
+      - name: Check the archives and notes against the candidate run's attestations
+        id: verify
+        env:
+          RUN_ID: ${{ steps.candidate.outputs.run_id }}
+        run: bash .github/sami/release-candidate.sh verify
       - uses: sjawhar/.github/.github/actions/sami-release@v1
         with:
-          tag: ${{ needs.version.outputs.tag }}
-          files: release/*.tar.gz
+          tag: ${{ steps.verify.outputs.tag }}
+          files: ${{ steps.verify.outputs.files }}
           body: |
             Automated build from the sami branch.
 
             Commit: ${{ github.sha }}
 
-            ${{ needs.carry.outputs.notes }}
+            ${{ steps.verify.outputs.notes }}

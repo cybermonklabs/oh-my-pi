@@ -893,17 +893,18 @@ fi
 # bun-install step, which then sets cache=none and runs neither of its cache
 # steps. release_binary passes `cache: "false"` to its bun-install step too,
 # since bun-install's own save runs on main. release_binary may restore, and
-# saves only on a push to sami: cache-mode takes no expression, so each of
-# its actions/cache/save steps starts its `if:` with that condition and has
-# no `||`, and it has no actions/cache step (which saves in its post step,
-# under no condition of the job's). Its steps use only the actions it uses
-# today, and .github/actions/bazel-cache calls no action, so no other caching
-# action can save under release_binary's token. A line under jobs: that is
-# not a plain `  <id>:` stops the lint, because its steps would be read as
-# the job above's.
+# saves only on a push to sami-candidate, the ref the release is built on:
+# cache-mode takes no expression, so each of its actions/cache/save steps
+# starts its `if:` with that condition and has no `||`, and it has no
+# actions/cache step (which saves in its post step, under no condition of the
+# job's). Its steps use only the actions it uses today, and
+# .github/actions/bazel-cache calls no action, so no other caching action can
+# save under release_binary's token. A line under jobs: that is not a plain
+# `  <id>:` stops the lint, because its steps would be read as the job
+# above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok mode saves ns others
-	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\]*\}\}\\n'
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\]*\}\}\\n'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -937,7 +938,9 @@ cache_lint() {
 				echo "release_binary has an actions/cache step that saves in its post step"
 				ok=0
 			fi
-			others="$(printf '%s\n' "$steps" | grep -oE 'uses: *[^ \\]+' | sed 's/^uses: *//' | grep -vE '^(actions/checkout@|actions/upload-artifact@|actions/cache/restore@|actions/cache/save@|\./\.github/actions/(bun-install|bazel-cache)$)' || true)"
+			# actions/attest-build-provenance signs the archives' digests and
+			# caches nothing.
+			others="$(printf '%s\n' "$steps" | grep -oE 'uses: *[^ \\]+' | sed 's/^uses: *//' | grep -vE '^(actions/checkout@|actions/upload-artifact@|actions/cache/restore@|actions/cache/save@|actions/attest-build-provenance@|\./\.github/actions/(bun-install|bazel-cache)$)' || true)"
 			if [ -n "$others" ]; then
 				echo "release_binary uses an action outside its list: $(printf '%s' "$others" | tr '\n' ' ')"
 				ok=0
@@ -945,11 +948,11 @@ cache_lint() {
 			saves="$(printf '%s\n' "$steps" | grep -E 'uses: *actions/cache/save@' || true)"
 			ns="$(printf '%s' "$saves" | grep -c . || true)"
 			if printf '%s\n' "$saves" | grep -vE -- "$push_guard" | grep -q .; then
-				echo "release_binary saves a cache on an event other than a push to sami"
+				echo "release_binary saves a cache on an event other than a push to sami-candidate"
 				ok=0
 			fi
 			if [ "$ok" = 1 ]; then
-				echo "release_binary: save steps: $ns, each only on a push to sami; bun-install steps: $n, each with cache: \"false\""
+				echo "release_binary: save steps: $ns, each only on a push to sami-candidate; bun-install steps: $n, each with cache: \"false\""
 			fi
 		else
 			if [ -n "$mode" ] && [ "$mode" != none ]; then
@@ -995,7 +998,7 @@ wlint() {
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
-wlint W1-release-binary-cache-rule 0 'release_binary: save steps: 1, each only on a push to sami; bun-install steps: 1, each with cache: "false"' '' ''
+wlint W1-release-binary-cache-rule 0 'release_binary: save steps: 1, each only on a push to sami-candidate; bun-install steps: 1, each with cache: "false"' '' ''
 wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-install step without cache: "false"' '/^          cache: "false"$/d' ''
 wlint W3-carry-cache-step 1 'carry has an actions/cache step' 's|^        run: git fetch --no-tags https://github.com/can1357/oh-my-pi.git main:refs/remotes/upstream/main$|&\n      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
@@ -1012,15 +1015,15 @@ wlint W9-rust-test-bun-install-with-cache 1 'rust_test has a bun-install step wi
 wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: read/' ''
 wlint W11-carry-cache-mode-read 1 'carry has cache-mode: read' 's/^  carry:$/&\n    cache-mode: read/' ''
 wlint W12-rust-test-cache-mode-write 1 'rust_test has cache-mode: write' 's/^  rust_test:$/&\n    cache-mode: write/' ''
-wlint W13-release-github-cache-step 1 'release_github has an actions/cache step' 's|^      - uses: actions/download-artifact@v4$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
-# release_binary saves only on a push to sami; a dispatch, a pull request or
-# any other event only restores.
-wlint W14-release-binary-save-unguarded 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push' && github.ref == 'refs\/heads\/sami' && //" ''
-wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push'/github.event_name == 'workflow_dispatch'/" ''
-wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to sami' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
-wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to sami' "s#github.ref == 'refs/heads/sami' &&#github.ref == 'refs/heads/sami' ||#" ''
+wlint W13-publish-cache-step 1 'publish has an actions/cache step' 's|^      - name: Find the candidate run$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
+# release_binary saves only on a push to sami-candidate; a dispatch, a pull
+# request, a push to another ref or any other event only restores.
+wlint W14-release-binary-save-unguarded 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push' && github.ref == 'refs\/heads\/sami-candidate' && //" ''
+wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push'/github.event_name == 'workflow_dispatch'/" ''
+wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
+wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s#github.ref == 'refs/heads/sami-candidate' &&#github.ref == 'refs/heads/sami-candidate' ||#" ''
 wlint W18-release-binary-post-save-step 1 'release_binary has an actions/cache step that saves in its post step' 's|uses: actions/cache/restore@|uses: actions/cache@|' ''
-wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}/steps.release-cache-bound.outputs.save == 'true' || github.event_name == 'workflow_dispatch' }}/" ''
+wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}/steps.release-cache-bound.outputs.save == 'true' || github.event_name == 'workflow_dispatch' }}/" ''
 # No other caching action can save under release_binary's token, and a job
 # line the lint cannot read stops it.
 wlint W20-release-binary-other-cache-action 1 'release_binary uses an action outside its list: Swatinem/rust-cache@v2' 's|^      - name: Point Bazel at the release build cache$|      - uses: Swatinem/rust-cache@v2\n&|' ''
