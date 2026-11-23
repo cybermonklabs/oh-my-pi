@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- External commands a shell starts on Linux with glibc no longer start with signals 32 and 33 ignored when the shell does not ignore them. Where `posix_spawn` does not use `clone3` (glibc before 2.38, or a seccomp profile that answers `clone3` with `ENOSYS`), glibc sets these two, its own signals, to `SIG_IGN` in the child before the exec, so `kill -s 33` could not end such a command; bash leaves them at their default. A shell that was started with them ignored passes that on, as bash does.
+- External commands a shell starts on Linux with glibc no longer start with signals 32 and 33 ignored when the shell does not ignore them. Where `posix_spawn` does not use `clone3` (glibc before 2.38, or a seccomp profile that answers `clone3` with `ENOSYS`), glibc sets these two, its own signals, to `SIG_IGN` in the child before the exec, so `kill -s 33` could not end such a command; bash leaves them at their default. A shell program (`obash`) on glibc 2.34 or later that was started with them ignored passes that on, as bash does. This addon is the exception: it loads into a process that already runs threads, where glibc has replaced an inherited ignore of 33 with its own handler, so its commands get 33 at the default. On glibc 2.33 or older, glibc replaces both before any other code runs, so the commands of `obash` and of this addon get both at the default.
 
 ## [18.18.6] - 2026-11-09
 

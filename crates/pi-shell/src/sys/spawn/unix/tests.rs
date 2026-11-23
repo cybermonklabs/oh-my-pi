@@ -1272,22 +1272,32 @@ mod glibc_signals {
 	}
 
 	/// Entered with both signals ignored, as glibc's `posix_spawn` hands
-	/// them on where it does not use `clone3`: the reading at load sees
-	/// them ignored, and every child still gets them ignored after glibc
-	/// gave `SIGSETXID` a handler of its own at this process's first thread.
-	/// Where glibc's child ignores them itself, the spec as given still
-	/// takes `posix_spawn`.
+	/// them on where it does not use `clone3`. On glibc 2.34 or later the
+	/// reading at load sees them ignored, and every child still gets them
+	/// ignored after glibc gave `SIGSETXID` a handler of its own at this
+	/// process's first thread. On glibc 2.33 and older, libpthread's preinit
+	/// installs both handlers before the reading, so it sees nothing and the
+	/// children get both at the default (the stated limit). Either way,
+	/// where glibc's child ignores them itself, the spec as given takes
+	/// `posix_spawn`.
 	#[test]
 	fn glibc_signals_ignored_when_the_process_started_stay_ignored() {
 		if !isolated("glibc_signals_ignored_when_the_process_started_stay_ignored", libc::SIG_IGN) {
 			return;
 		}
-		assert_eq!(IGNORED_AT_LOAD.load(Ordering::Relaxed), READ | 0b11, "the reading at load");
+		let seen = internal::glibc_at_least(2, 34);
+		let at_load = if seen { READ | 0b11 } else { READ };
+		assert_eq!(IGNORED_AT_LOAD.load(Ordering::Relaxed), at_load, "the reading at load");
 		std::thread::spawn(|| {}).join().unwrap();
 		let s = NativeSpawner::default();
 		assert_eq!(by_posix_spawn(&s), internal::spawn_ignores(), "posix_spawn when it can");
 		let got = rows(|path, sig| kill_self(&s, path, sig));
-		assert_eq!(got, rows(|_, _| ExitStatus::Exited(7)));
+		let want = if seen {
+			rows(|_, _| ExitStatus::Exited(7))
+		} else {
+			rows(|_, sig| ExitStatus::SignaledRaw(sig))
+		};
+		assert_eq!(got, want);
 	}
 
 	/// One with a handler stays ignored in a child when the process ignored

@@ -17,7 +17,8 @@
 //!
 //! **glibc's own signals**, 32 and 33, reach every external as bash's fork
 //! and exec leaves them: ignored when the process ignores them, else at
-//! their default (`internal`).
+//! their default (`internal`). An ignore the process inherited is passed
+//! on only on glibc 2.34 or later (see `internal`).
 //!
 //! **Placement** follows [`Sessions`]: `Detach` makes every external a
 //! session leader; `Share` uses the `setpgid` leader idiom (`New` leads a
@@ -551,8 +552,10 @@ fn host_ignores(sig: Signal) -> bool {
 /// `sigaction`, `signal` and `sigaddset` refuse: read and set with the
 /// system call, and put in a `sigset_t` by bit. An external starts with
 /// each ignored when the process ignores it ([`internal::ignored`]), else
-/// at its default, on every path. Only on `x86_64` and aarch64, whose
-/// layouts below are checked: elsewhere glibc's `posix_spawn` decides.
+/// at its default, on every path. An ignore the process inherited and
+/// glibc then replaced with its own handler is passed on only on glibc 2.34
+/// or later ([`internal::IGNORED_AT_LOAD`]). Only on `x86_64` and aarch64,
+/// whose layouts below are checked: elsewhere glibc's `posix_spawn` decides.
 #[cfg(all(
 	target_os = "linux",
 	target_env = "gnu",
@@ -611,12 +614,18 @@ mod internal {
 	/// ([`READ`] marks the reading done).
 	pub(super) static IGNORED_AT_LOAD: AtomicU8 = AtomicU8::new(0);
 
-	/// Fills [`IGNORED_AT_LOAD`] when the program or library is loaded:
-	/// glibc gives `SIGSETXID` a handler of its own at the process's first
-	/// thread (and `SIGCANCEL` at its first `pthread_cancel`), so a later
-	/// reading cannot see it was ignored. A program reads before any
-	/// thread; a library loaded into a process that already runs threads
-	/// reads that process's handler, and its children get the default.
+	/// Fills [`IGNORED_AT_LOAD`] when the program or library is loaded. On
+	/// glibc 2.34 or later, glibc gives `SIGSETXID` a handler of its own at
+	/// the process's first thread (and `SIGCANCEL` at its first
+	/// `pthread_cancel`), so a later reading cannot see it was ignored; a
+	/// program reads before any thread. A library loaded into a process
+	/// that already runs threads reads that process's handler, and its
+	/// children get the default. On glibc 2.33 and older, libpthread
+	/// installs both handlers in its preinit function, which runs before
+	/// every other initializer (`-z initfirst`), so this reading never sees
+	/// an inherited ignore and children get both at the default. obash's
+	/// `--fault-mode=exec` re-exec loses the reading too: the exec resets
+	/// glibc's handlers to the default before the new image reads.
 	#[used]
 	#[unsafe(link_section = ".init_array")]
 	static READ_AT_LOAD: extern "C" fn() = read_at_load;
@@ -688,13 +697,19 @@ mod internal {
 
 	/// Whether glibc's `posix_spawn` child sets these signals itself, to
 	/// `SIG_IGN` unless the default set names them: where it does not use
-	/// `clone3` (glibc before 2.38, or `clone3` refused by a seccomp filter
-	/// or the kernel). Read once.
+	/// `clone3` (glibc before 2.38, or `clone3` refused). Read once. The
+	/// probe counts only ENOSYS (a seccomp filter or a kernel without the
+	/// call); glibc also takes its old child on EINVAL (kernels 5.3 and 5.4,
+	/// which have `clone3` but not `CLONE_CLEAR_SIGHAND`). That miss is
+	/// safe: `spawnable()` then sends only the specs ignored at load and
+	/// under glibc's handler now to the fork path, which sets them right.
 	pub(super) fn spawn_ignores() -> bool {
 		*OLD_SPAWN_PATH
 	}
 
-	static OLD_SPAWN_PATH: LazyLock<bool> = LazyLock::new(|| {
+	/// Whether the running glibc is at least `major.minor` (`false` when its
+	/// version string does not parse).
+	pub(super) fn glibc_at_least(major: u32, minor: u32) -> bool {
 		// SAFETY: glibc returns a static NUL-terminated string.
 		let version = unsafe { CStr::from_ptr(libc::gnu_get_libc_version()) };
 		let mut parts = version.to_bytes().split(|&b| b == b'.').map(|p| {
@@ -702,10 +717,14 @@ mod internal {
 				.ok()
 				.and_then(|p| p.parse::<u32>().ok())
 		});
-		let before_2_38 = match (parts.next().flatten(), parts.next().flatten()) {
-			(Some(major), Some(minor)) => (major, minor) < (2, 38),
-			_ => true,
-		};
+		match (parts.next().flatten(), parts.next().flatten()) {
+			(Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
+			_ => false,
+		}
+	}
+
+	static OLD_SPAWN_PATH: LazyLock<bool> = LazyLock::new(|| {
+		let before_2_38 = !glibc_at_least(2, 38);
 		// SAFETY: with no arguments and size 0 the kernel refuses the call
 		// (EINVAL) before it creates anything; a seccomp filter or a kernel
 		// without the call answers ENOSYS.
