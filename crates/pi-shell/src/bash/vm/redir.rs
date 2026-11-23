@@ -131,7 +131,21 @@ pub fn apply(
 		};
 		let before = io(vp).saved.len();
 		if zsh {
-			zsh_install(k, vp, cx, r, &target, line, multios)?;
+			match zsh_install(k, vp, cx, r, &target, line, multios) {
+				// The open waits (a FIFO without its other end): the
+				// background job this vproc decides keeps its virtual pid, so
+				// a reader of `$!` never waits on that rendezvous, which may
+				// need the reader. (zsh's `$!` names its forked child, which
+				// opens the FIFO; a bash lone external leaves the open to its
+				// process ([`defer`]), which zsh's redirections do not.)
+				Err(Halt::Flow(Flow::Block(WaitKey::Fs { op: FsOp::Open, path })))
+					if !k.bangs.is_empty() =>
+				{
+					k.settle_bang(vp.vpid, None);
+					return Err(Halt::Flow(Flow::Block(WaitKey::Fs { op: FsOp::Open, path })));
+				},
+				res => res?,
+			}
 		} else if collecting(k, vp) {
 			if !collect(k, vp, cx, r, &target, line) {
 				end_collect(vp, redirs.len());
