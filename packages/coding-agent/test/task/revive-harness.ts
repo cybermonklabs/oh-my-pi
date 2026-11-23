@@ -352,6 +352,41 @@ export async function sessionInitRecords(sessionFile: string): Promise<Array<Rec
 	return records.filter(isRecord).filter(record => record.type === "session_init");
 }
 
+/**
+ * Rewrites each record of `sessionFile` that `edit` changes in place (it returns whether it did), as a writer of the
+ * session store does; a blank line is kept as it is. Returns the number of records rewritten.
+ */
+export async function editSessionRecords(
+	sessionFile: string,
+	edit: (record: Record<string, unknown>) => boolean,
+): Promise<number> {
+	let changed = 0;
+	const lines = (await Bun.file(sessionFile).text()).split("\n").map(line => {
+		if (line.trim() === "") return line;
+		const record: unknown = JSON.parse(line);
+		if (!isRecord(record) || !edit(record)) return line;
+		changed++;
+		return JSON.stringify(record);
+	});
+	await Bun.write(sessionFile, lines.join("\n"));
+	return changed;
+}
+
+/**
+ * Rewrites the spawn spec of each `session_init` of a parked subagent's `sessionFile` through `edit`, which changes
+ * it in place ({@link editSessionRecords}). Returns the number of records rewritten.
+ */
+export function editStoredSpawnSpecs(
+	sessionFile: string,
+	edit: (spec: Record<string, unknown>) => void,
+): Promise<number> {
+	return editSessionRecords(sessionFile, record => {
+		if (record.type !== "session_init" || !isRecord(record.spawnSpec)) return false;
+		edit(record.spawnSpec);
+		return true;
+	});
+}
+
 /** A process MCP manager with no servers, whose tool set a test changes as a server's `tools/list` change would. */
 export class FixtureMcpManager extends MCPManager {
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];

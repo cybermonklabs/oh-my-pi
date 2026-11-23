@@ -42,7 +42,9 @@ import {
 import { type EditMode, getEditInputPaths } from "@oh-my-pi/pi-tui/tools/edit";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelStringWithRouting,
+	modelNotFoundMessage,
 	resolveAgentAdvisorRolePattern,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
@@ -196,8 +198,14 @@ import {
 	cfgRetryFallbackChains,
 	cfgDefaultThinkingLevel,
 } from "../session/settings";
-import { cfgDisabledProviders } from "../config/model-settings";
-import { getRetryFallbackRole, installRetryFallbackRole } from "../session/retry-fallback-chains";
+import { cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
+import {
+	formatRetryFallbackBaseSelector,
+	getRetryFallbackRole,
+	installRetryFallbackRole,
+	parseRetryFallbackChainEntry,
+	type RetryFallbackSelector,
+} from "../session/retry-fallback-chains";
 import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
@@ -1230,7 +1238,7 @@ interface SubagentChainSettings extends Settings {
  */
 export function compactionThresholdSettings(
 	threshold: CompactionThresholdPair | undefined,
-): Readonly<Record<string, unknown>> | undefined {
+): Readonly<SubagentOverlayOverrides> | undefined {
 	return threshold === undefined
 		? undefined
 		: {
@@ -1242,7 +1250,7 @@ export function compactionThresholdSettings(
 
 export function createSubagentSettings(
 	baseSettings: SubagentChainSettings,
-	overrides?: Readonly<Record<string, unknown>>,
+	overrides?: Readonly<SubagentOverlayOverrides>,
 	inheritedServiceTier?: ServiceTierByFamily | null,
 ): Settings {
 	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
@@ -1259,46 +1267,45 @@ export function createSubagentSettings(
 		thresholdTokens: cfgCompactionThresholdTokens.get(baseSettings),
 		modelThresholdsEnabled: cfgCompactionModelThresholdsEnabled.get(baseSettings),
 	};
+	const pinnedThresholds: Readonly<SubagentOverlayOverrides> | undefined = inheritedRootThresholds && {
+		"compaction.thresholdPercent": inheritedRootThresholds.thresholdPercent,
+		"compaction.thresholdTokens": inheritedRootThresholds.thresholdTokens,
+		"compaction.modelThresholdsEnabled": inheritedRootThresholds.modelThresholdsEnabled,
+	};
 	// Every other setting reads through to the parent live; writes on the overlay stay local.
-	const subagentSettings: SubagentChainSettings = baseSettings.overlay(
-		{
-			...(inheritedRootThresholds && {
-				"compaction.thresholdPercent": inheritedRootThresholds.thresholdPercent,
-				"compaction.thresholdTokens": inheritedRootThresholds.thresholdTokens,
-				"compaction.modelThresholdsEnabled": inheritedRootThresholds.modelThresholdsEnabled,
-			}),
-			// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
-			// snapshot of the parent default); a later parent default edit must not re-steer it.
-			defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
-			"tier.openai": subagentTiers.openai ?? "none",
-			"tier.anthropic": subagentTiers.anthropic ?? "none",
-			"tier.google": subagentTiers.google ?? "none",
-			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
-			// background jobs are owner-routed to the subagent's own session, and
-			// the run driver's quiescence barrier + teardown reap guarantee no
-			// owner job outlives the run, so worktree capture/cleanup stays
-			// race-free (previously both were force-disabled here).
+	const writes: Readonly<SubagentOverlayOverrides> = {
+		...pinnedThresholds,
+		// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
+		// snapshot of the parent default); a later parent default edit must not re-steer it.
+		defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
+		"tier.openai": subagentTiers.openai ?? "none",
+		"tier.anthropic": subagentTiers.anthropic ?? "none",
+		"tier.google": subagentTiers.google ?? "none",
+		// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
+		// background jobs are owner-routed to the subagent's own session, and
+		// the run driver's quiescence barrier + teardown reap guarantee no
+		// owner job outlives the run, so worktree capture/cleanup stays
+		// race-free (previously both were force-disabled here).
 
-			// Subagents run headless — there is no UI to confirm prompts against, so
-			// the parent task approval is the authorization boundary. Use yolo mode
-			// to preserve unattended subagent execution. User `tools.approval` policies still apply.
-			"tools.approvalMode": "yolo",
-			// Subagents run unadvised by default; runSubprocess opts a spawn back in
-			// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
-			"advisor.enabled": false,
-			// A subagent assignment is one turn: its tool loop ends only when the run
-			// yields, so post-turn `checkCompaction` (driven from `agent_end`) fires
-			// after the run is over and `maintainContextMidRun` is the only proactive
-			// compaction the child ever reaches. `compaction.midTurnEnabled` encodes an
-			// interactive preference — keep compaction boundaries on real user turns —
-			// that has no counterpart here, so inheriting `false` left hours-long
-			// worker runs sailing past the configured threshold until the provider
-			// rejected the context (#13211). A per-spawn override still wins.
-			"compaction.midTurnEnabled": true,
-			...overrides,
-		},
-		{ derived: true },
-	);
+		// Subagents run headless — there is no UI to confirm prompts against, so
+		// the parent task approval is the authorization boundary. Use yolo mode
+		// to preserve unattended subagent execution. User `tools.approval` policies still apply.
+		"tools.approvalMode": "yolo",
+		// Subagents run unadvised by default; runSubprocess opts a spawn back in
+		// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
+		"advisor.enabled": false,
+		// A subagent assignment is one turn: its tool loop ends only when the run
+		// yields, so post-turn `checkCompaction` (driven from `agent_end`) fires
+		// after the run is over and `maintainContextMidRun` is the only proactive
+		// compaction the child ever reaches. `compaction.midTurnEnabled` encodes an
+		// interactive preference — keep compaction boundaries on real user turns —
+		// that has no counterpart here, so inheriting `false` left hours-long
+		// worker runs sailing past the configured threshold until the provider
+		// rejected the context (#13211). A per-spawn override still wins.
+		"compaction.midTurnEnabled": true,
+		...overrides,
+	};
+	const subagentSettings: SubagentChainSettings = baseSettings.overlay(writes, { derived: true });
 	subagentSettings[kRootCompactionThresholds] = rootThresholds;
 	return subagentSettings;
 }
@@ -1307,9 +1314,10 @@ export function createSubagentSettings(
  * Every setting a spawn writes to a subagent's overlay that a revive restores: {@link createSubagentSettings}' own,
  * the spawn's per-agent overrides and the retry-fallback role it installs. A cold revive restores only these from
  * a stored overlay; any other stored value reads through to the live parent. (`workspace.additionalDirectories`
- * is written only for an isolated run, which is never revived.)
+ * is written only for an isolated run, which is never revived.) Each writer types its writes with
+ * {@link SubagentOverlayOverrides}, so a write of a setting this list leaves out fails the type check.
  */
-export const SUBAGENT_OVERLAY_SETTINGS: readonly string[] = [
+export const SUBAGENT_OVERLAY_SETTINGS = [
 	"compaction.thresholdPercent",
 	"compaction.thresholdTokens",
 	"compaction.modelThresholdsEnabled",
@@ -1321,9 +1329,20 @@ export const SUBAGENT_OVERLAY_SETTINGS: readonly string[] = [
 	"tools.approvalMode",
 	"advisor.enabled",
 	"read.summarize.enabled",
-	"modelRoles",
-	"retry.fallbackChains",
-];
+	// `installRetryFallbackRole` writes the `subagent:<id>` role through setting handles, so these two are its
+	// handles' ids, each typed as its literal id.
+	cfgModelRoles.id,
+	cfgRetryFallbackChains.id,
+] as const;
+
+/** The id of a setting a spawn writes to a subagent's overlay: one of {@link SUBAGENT_OVERLAY_SETTINGS}. */
+export type SubagentOverlaySettingId = (typeof SUBAGENT_OVERLAY_SETTINGS)[number];
+
+/** The ids a spawn writes to a subagent's overlay: the restored ones, and the roots an isolated run clears. */
+type SubagentOverlayWriteId = SubagentOverlaySettingId | "workspace.additionalDirectories";
+
+/** Values a spawn writes to a subagent's overlay, by setting id. */
+export type SubagentOverlayOverrides = Partial<Record<SubagentOverlayWriteId, unknown>>;
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
 
@@ -4938,10 +4957,11 @@ export async function reopenParkedSubagent(id: string, sessionFile: string): Pro
 
 /**
  * The models one revive's stored identities (`formatModelStringWithRouting`) name, among every model the
- * registry holds whose provider the live settings leave enabled. At the revive's first identity the registry
- * does not hold, the registry's discovery runs (`discover()`) and the identity is resolved again; a later
- * miss of the same revive waits on that discovery rather than starting another. An identity the registry
- * holds under a disabled provider resolves to nothing at once: no discovery can make it resolve.
+ * registry holds whose provider the live settings leave enabled: the one place a revive holds a model to
+ * `disabledProviders`. At the revive's first identity the registry does not hold, the registry's discovery
+ * runs and the identity is resolved again; a later miss of the same revive waits on that discovery rather
+ * than starting another. An identity the registry holds under a disabled provider resolves to nothing at
+ * once: no discovery can make it resolve.
  */
 export class RevivedModels {
 	readonly #modelRegistry: ModelRegistry;
@@ -4963,13 +4983,12 @@ export class RevivedModels {
 		return this.#discovery !== undefined;
 	}
 
-	/** The registry's discovery, once per revive: started where this revive started none, else the one it started. */
-	discover(): Promise<void> {
-		if (!this.#discovery) {
-			this.#modelRegistry.refreshInBackground("online-if-uncached");
-			this.#discovery = this.#modelRegistry.awaitBackgroundRefresh();
-		}
-		return this.#discovery;
+	/**
+	 * The model `identity` names among the models the registry holds now, without its discovery; undefined where
+	 * it holds none, or where the model belongs to a disabled provider.
+	 */
+	lookup(identity: string): Model | undefined {
+		return this.#enabled(resolveSpawnModelIdentity(identity, this.#modelRegistry));
 	}
 
 	/**
@@ -4979,10 +4998,63 @@ export class RevivedModels {
 	async resolve(identity: string): Promise<Model | undefined> {
 		let held = resolveSpawnModelIdentity(identity, this.#modelRegistry);
 		if (!held) {
-			await this.discover();
+			await this.#discover();
 			held = resolveSpawnModelIdentity(identity, this.#modelRegistry);
 		}
-		return held && !disabledProviderIds(this.#settings).has(held.provider) ? held : undefined;
+		return this.#enabled(held);
+	}
+
+	/**
+	 * Each model a retry-fallback `chain` names when the stored model `identity` is gone or refused, in the
+	 * chain's order, every entry read as the live retry walk reads it (a provider wildcard keeps the failing
+	 * model's id under another provider, without an aggregator's vendor prefix the target provider does not
+	 * use): the entry's selector, and the model {@link lookup} gives for it, if any. Where `identity` names no
+	 * model, the registry's discovery runs first, so the walk sees what it adds, also where the model is held
+	 * under a disabled provider.
+	 */
+	async *chainModels(
+		chain: readonly string[],
+		identity: string,
+	): AsyncGenerator<{ candidate: RetryFallbackSelector; model: Model | undefined }> {
+		if (!this.lookup(identity)) await this.#discover();
+		// A stored identity is exact: no part of its id is read as a thinking level.
+		const slash = identity.indexOf("/");
+		const current: RetryFallbackSelector = {
+			raw: identity,
+			provider: identity.slice(0, slash),
+			id: identity.slice(slash + 1),
+			thinkingLevel: undefined,
+		};
+		for (const entry of chain) {
+			const candidate = parseRetryFallbackChainEntry({ modelLookup: this.#modelRegistry }, entry, current);
+			if (!candidate) continue;
+			yield { candidate, model: this.lookup(formatRetryFallbackBaseSelector(candidate)) };
+		}
+	}
+
+	/**
+	 * The spawn's own message for a model the registry does not know, its hint drawn, as the spawn draws it,
+	 * from the models of the providers the live settings leave enabled.
+	 */
+	notFoundMessage(identity: string): string {
+		return modelNotFoundMessage(
+			[identity],
+			enabledProviderModels(this.#modelRegistry.getAll(), disabledProviderIds(this.#settings)),
+		);
+	}
+
+	/** The registry's discovery, once per revive: started where this revive started none, else the one it started. */
+	#discover(): Promise<void> {
+		if (!this.#discovery) {
+			this.#modelRegistry.refreshInBackground("online-if-uncached");
+			this.#discovery = this.#modelRegistry.awaitBackgroundRefresh();
+		}
+		return this.#discovery;
+	}
+
+	/** `model`, where the live settings leave its provider enabled. */
+	#enabled(model: Model | undefined): Model | undefined {
+		return model && !disabledProviderIds(this.#settings).has(model.provider) ? model : undefined;
 	}
 }
 
@@ -5151,20 +5223,13 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	const advisorRolePattern = advisorSelection?.model
 		? resolveAgentAdvisorRolePattern(advisorSelection.model, settings)
 		: undefined;
-	const subagentSettings = createSubagentSettings(
-		settings,
-		{
-			...compactionThresholdSettings(options.compactionThresholdOverride),
-			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
-			// Isolated runs must not expose roots outside the worktree.
-			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
-			...(advisorSelection ? { "advisor.enabled": true } : undefined),
-			...(advisorRolePattern
-				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorRolePattern } }
-				: undefined),
-		},
-		options.parentServiceTier,
-	);
+	const overrides: SubagentOverlayOverrides = { ...compactionThresholdSettings(options.compactionThresholdOverride) };
+	if (agent.readSummarize === false) overrides["read.summarize.enabled"] = false;
+	// Isolated runs must not expose roots outside the worktree.
+	if (worktree !== undefined) overrides["workspace.additionalDirectories"] = [];
+	if (advisorSelection) overrides["advisor.enabled"] = true;
+	if (advisorRolePattern) overrides.modelRoles = { ...settings.getModelRoles(), advisor: advisorRolePattern };
+	const subagentSettings = createSubagentSettings(settings, overrides, options.parentServiceTier);
 	const maxRecursionDepth = cfgTaskMaxRecursionDepth.get(settings);
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? cfgTaskMaxRuntimeMs.get(settings)) || 0));
 	// TTL before an adopted idle subagent is parked by the lifecycle manager.

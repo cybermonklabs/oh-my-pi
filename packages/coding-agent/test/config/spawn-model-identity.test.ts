@@ -1,17 +1,20 @@
 /**
  * A revive turns the model identity a subagent's spawn spec stores back into the model the spawn
- * started on, for every kind of model a spawn can start on.
+ * started on, for every kind of model a spawn can start on, and holds it to the providers the live
+ * settings leave enabled.
  */
 import { describe, expect, test } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import {
 	formatModelStringWithRouting,
 	resolveModelOverride,
 	resolveSpawnModelIdentity,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { RevivedModels } from "@oh-my-pi/pi-coding-agent/task/executor";
 
 const models: Model<Api>[] = [
 	buildModel({
@@ -93,7 +96,9 @@ describe("resolveSpawnModelIdentity", () => {
 	])("resolves to nothing when the registry no longer holds %s", (_missing, identity) => {
 		expect(resolveSpawnModelIdentity(identity, { getAll: () => models })).toBeUndefined();
 	});
+});
 
+describe("RevivedModels", () => {
 	// A disabled provider has no models however one is named, as the registry's own `find()` says.
 	test.each([
 		["a catalog model", "anthropic/claude-sonnet-4-5"],
@@ -103,14 +108,14 @@ describe("resolveSpawnModelIdentity", () => {
 			"a Bedrock inference-profile model",
 			"amazon-bedrock/arn:aws:bedrock:us-east-2:1234567890:application-inference-profile/company-opus-48",
 		],
-	])("resolves %s to nothing when the settings disable its provider", (_kind, pattern) => {
+	])("resolves %s to nothing when the live settings disable its provider", (_kind, pattern) => {
 		const model = spawnedModel(pattern);
 		const identity = formatModelStringWithRouting(model);
-		const registry = { getAll: () => models };
+		const registry = { getAll: () => models } as unknown as ModelRegistry;
 		const disabled = Settings.isolated({ disabledProviders: [model.provider] });
 		const otherDisabled = Settings.isolated({ disabledProviders: ["some-other-provider"] });
 
-		expect(resolveSpawnModelIdentity(identity, registry, disabled)).toBeUndefined();
-		expect(resolveSpawnModelIdentity(identity, registry, otherDisabled)).toEqual(model);
+		expect(new RevivedModels(registry, disabled).lookup(identity)).toBeUndefined();
+		expect(new RevivedModels(registry, otherDisabled).lookup(identity)).toEqual(model);
 	});
 });

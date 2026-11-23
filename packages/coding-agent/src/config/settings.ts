@@ -189,7 +189,7 @@ export interface SettingsOptions {
 /**
  * Get a nested value from an object by path segments.
  */
-export function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
+function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 	let current: unknown = obj;
 	for (const segment of segments) {
 		if (current === null || current === undefined || typeof current !== "object") {
@@ -204,7 +204,7 @@ export function getByPath(obj: RawSettings, segments: readonly string[]): unknow
  * Set a nested value in an object by path segments.
  * Creates intermediate objects as needed, replacing whatever non-record (a malformed `[]` included) is in the way.
  */
-export function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
+function setByPath(obj: RawSettings, segments: readonly string[], value: unknown): void {
 	let current = obj;
 	for (let i = 0; i < segments.length - 1; i++) {
 		const segment = segments[i];
@@ -231,7 +231,7 @@ function setOwn(obj: RawSettings, key: string, value: unknown): void {
  * Removes the value at `segments`, pruning the parent objects the removal leaves empty. Every record on the
  * path below `obj` is replaced by a copy rather than edited: a merged view or a cached read may share it.
  */
-export function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
+function deleteByPath(obj: RawSettings, segments: readonly string[]): void {
 	const containers: RawSettings[] = [obj];
 	for (let i = 0; i < segments.length - 1; i++) {
 		const next = containers[i][segments[i]];
@@ -319,6 +319,14 @@ interface OwnLayers {
 
 /** The layers an {@link Settings.overlay} child writes locally; see {@link Settings.overlayLayers}. */
 export type OverlayLayers = Readonly<Pick<OwnLayers, "global" | "overrides"> & { derived: boolean }>;
+
+/** What {@link Settings.keptOverlayLayers} keeps of stored overlay layers. */
+export interface KeptOverlayLayers {
+	/** The layers, checked, holding only the values of the settings asked for. */
+	readonly layers: OverlayLayers;
+	/** A layer held a value of any other setting, which `layers` leaves out. */
+	readonly dropped: boolean;
+}
 
 /**
  * Copy of one instance's own layers and scope, from which a worker-thread {@link Settings.mirror}
@@ -931,15 +939,34 @@ export class Settings {
 	}
 
 	/**
-	 * Checks `layers` as {@link restoreOverlay} checks them, without building the overlay: no child is made
-	 * and nothing of this instance changes.
+	 * Of `layers` (from {@link overlayLayers}, kept by another process), the values of the settings `ids` name, each
+	 * layer checked as {@link restoreOverlay} checks it, and whether a layer held a value of any other setting. No
+	 * child is made and nothing of this instance changes.
 	 *
 	 * @throws Error where {@link restoreOverlay} throws: a layer names an unknown setting or holds a value its
-	 * definition rejects.
+	 * definition rejects, whether or not `ids` name it.
 	 */
-	assertOverlayLayers(layers: OverlayLayers): void {
-		this.#checkedLayer(structuredClone(layers.global), false);
-		this.#checkedLayer(structuredClone(layers.overrides), false);
+	keptOverlayLayers(layers: OverlayLayers, ids: readonly string[]): KeptOverlayLayers {
+		const global = this.#keptLayer(layers.global, ids);
+		const overrides = this.#keptLayer(layers.overrides, ids);
+		return {
+			layers: { global: global.kept, overrides: overrides.kept, derived: layers.derived },
+			dropped: global.dropped || overrides.dropped,
+		};
+	}
+
+	/** Of `layer`, checked, the values of the settings `ids` name, each at its path; `dropped`: it held any other. */
+	#keptLayer(layer: RawSettings, ids: readonly string[]): { kept: RawSettings; dropped: boolean } {
+		const rest = this.#checkedLayer(structuredClone(layer), false);
+		const kept: RawSettings = {};
+		for (const id of ids) {
+			const segments = id.split(".");
+			const value = getByPath(rest, segments);
+			if (value === undefined) continue;
+			setByPath(kept, segments, value);
+			deleteByPath(rest, segments);
+		}
+		return { kept, dropped: Object.keys(rest).length > 0 };
 	}
 
 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */

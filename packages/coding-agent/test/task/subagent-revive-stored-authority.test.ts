@@ -20,6 +20,8 @@ import { cfgTaskMaxRecursionDepth, cfgTaskSoftRequestBudget } from "@oh-my-pi/pi
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { localSession } from "../helpers/local-session";
 import {
+	editSessionRecords,
+	editStoredSpawnSpecs,
 	expectEndedAtLimit,
 	heldTurn,
 	holdWake,
@@ -50,33 +52,9 @@ function part(record: Record<string, unknown>, key: string): Record<string, unkn
 	return value;
 }
 
-/** Edits every line of `file` that `edit` changes, as a writer of the session store does; counts the lines changed. */
-async function editRecords(file: string, edit: (record: Record<string, unknown>) => boolean): Promise<number> {
-	const lines = (await Bun.file(file).text()).split("\n");
-	let changed = 0;
-	const rewritten = lines.map(line => {
-		if (line.trim() === "") return line;
-		const record: unknown = JSON.parse(line);
-		if (!isRecord(record) || !edit(record)) return line;
-		changed++;
-		return JSON.stringify(record);
-	});
-	await Bun.write(file, rewritten.join("\n"));
-	return changed;
-}
-
-/** Edits the spawn spec of every `session_init` of `file` in place. */
-function editStoredSpec(file: string, edit: (spec: Record<string, unknown>) => void): Promise<number> {
-	return editRecords(file, record => {
-		if (record.type !== "session_init" || !isRecord(record.spawnSpec)) return false;
-		edit(record.spawnSpec);
-		return true;
-	});
-}
-
 /** Sets the workspace roots the header of `file` holds. */
 function editHeaderRoots(file: string, roots: string[]): Promise<number> {
-	return editRecords(file, record => {
+	return editSessionRecords(file, record => {
 		if (record.type !== "session") return false;
 		record.additionalDirectories = roots;
 		return true;
@@ -139,7 +117,7 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 		const frames = recordFrames(env.eventBus);
 		const elsewhere = path.join(env.root, "elsewhere");
 		await fs.mkdir(elsewhere, { recursive: true });
-		changed = await editStoredSpec(opened.sessionFile, spec => {
+		changed = await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const policy = part(spec, "policy");
 			policy.taskDepth = 0;
 			policy.cwd = elsewhere;
@@ -227,7 +205,7 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 		});
 		env = opened.env;
 		root = opened.root;
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const names = Array.isArray(spec.liveInputs) ? spec.liveInputs : [];
 			spec.liveInputs = names.filter(name => name !== "costGate" && name !== "preloadedPreparedExtensions");
 		});
@@ -263,7 +241,7 @@ describe("a cold revive of a record whose stored wake.artifactsDir was edited", 
 		const frames = recordFrames(env.eventBus);
 		elsewhere = path.join(env.root, "elsewhere");
 		await fs.mkdir(elsewhere, { recursive: true });
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			part(spec, "wake").artifactsDir = elsewhere;
 		});
 		const cold = await reviveCold(env, id);
@@ -299,7 +277,7 @@ describe("a cold revive of a record whose stored identity.agentId was edited", (
 	beforeAll(async () => {
 		const opened = await spawnAndPark(id);
 		env = opened.env;
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			part(spec, "identity").agentId = IMPOSTOR;
 		});
 		({ revived, failure } = await reviveCold(env, id));
@@ -324,7 +302,7 @@ describe("a cold revive of a record whose stored identity.parentAgentId and iden
 	beforeAll(async () => {
 		const opened = await spawnAndPark(id);
 		env = opened.env;
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const identity = part(spec, "identity");
 			identity.parentAgentId = IMPOSTOR_PARENT;
 			identity.parentTaskPrefix = "";
@@ -357,7 +335,7 @@ describe("a cold revive of a record whose stored wake limit was edited to none, 
 		const opened = await spawnAndPark(id, { "task.maxRuntimeMs": 2_000 });
 		env = opened.env;
 		frames = recordFrames(env.eventBus);
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			part(spec, "wake").maxRuntimeMs = 0;
 		});
 		env.dropWarmReviver(id);
@@ -388,7 +366,7 @@ describe("a cold revive of a record whose stored soft request budget was edited 
 		const opened = await spawnAndPark(id);
 		env = opened.env;
 		frames = recordFrames(env.eventBus);
-		await editStoredSpec(opened.sessionFile, spec => {
+		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			part(spec, "wake").softRequestBudget = 0;
 		});
 		cfgTaskSoftRequestBudget.override(env.settings, 1);
@@ -428,7 +406,7 @@ describe("a cold revive of a record whose stored policy part has a shape no spaw
 		env = opened.env;
 		elsewhere = path.join(env.root, "elsewhere");
 		await fs.mkdir(elsewhere, { recursive: true });
-		changed = await editStoredSpec(opened.sessionFile, spec => {
+		changed = await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			part(spec, "policy").taskDepth = "x";
 		});
 		await editHeaderRoots(opened.sessionFile, [elsewhere]);

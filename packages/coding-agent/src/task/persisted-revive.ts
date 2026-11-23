@@ -8,16 +8,12 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import type { ModelRegistry } from "../config/model-registry";
 import {
-	disabledProviderIds,
-	enabledProviderModels,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
-	modelNotFoundMessage,
 	resolveAgentAdvisorRolePattern,
-	resolveSpawnModelIdentity,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
-import { deleteByPath, getByPath, type RawSettings, type Settings, setByPath } from "../config/settings";
+import type { KeptOverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { MCPManager } from "../mcp/manager";
@@ -31,8 +27,6 @@ import {
 	formatRetryFallbackBaseSelector,
 	getRetryFallbackRole,
 	installRetryFallbackRole,
-	parseRetryFallbackChainEntry,
-	type RetryFallbackSelector,
 	retryFallbackThinkingLevel,
 } from "../session/retry-fallback-chains";
 import { extractSessionInit, type PersistedSessionInit, SessionManager } from "../session/session-manager";
@@ -64,6 +58,7 @@ import {
 	type SubagentLegacyRevive,
 	type SubagentLiveInputs,
 	type SubagentLivePolicy,
+	type SubagentOverlayOverrides,
 	type SubagentSpawnerLiveInputs,
 	softRequestBudgetFor,
 	spawnerLiveInputs,
@@ -80,7 +75,6 @@ import {
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { cfgTaskMaxEffort, cfgTaskMaxRuntimeMs } from "./settings";
 import {
-	type JsonRecord,
 	jsonValue,
 	readSpawnSpec,
 	SPAWN_LIVE_INPUT_NAMES,
@@ -194,6 +188,12 @@ export interface PreparedColdRevive {
 	readonly prewalkTarget: Model | undefined;
 	/** The registry's discovery ran while this step resolved a model; the build does not run it again. */
 	readonly discoveryRan: boolean;
+	/**
+	 * The spec's settings overlay as it restores, checked once per revive here: only the settings a spawn writes
+	 * ({@link SUBAGENT_OVERLAY_SETTINGS}). Undefined where the record holds none, or where it does not restore (the
+	 * build then takes the settings of an older record).
+	 */
+	readonly settings: SpawnSpecSettings | undefined;
 	/** A per-call worker's grants, which each of its requests is held to. */
 	readonly grants: PerCallGrantInputs | undefined;
 	/** Each custom tool the spec names, built over the live parent's kernel or kept as unavailable. */
@@ -357,10 +357,10 @@ export function createPersistedSubagentReviverFactory(
 
 /**
  * The main thread's part of one cold revive, at the start of each reviver call and before anything is
- * reopened: the live parent session's inputs (from its home where it is homed in a worker), the model the
- * record's spawn spec starts on as the registry holds it now (a per-call worker: its saved model, held to
- * the grants as they are now), and the spec's custom tools over the live parent's eval kernels. `init` is
- * the `session_init` the factory read.
+ * reopened: the spec's settings overlay as it restores (checked here, once per revive), the live parent
+ * session's inputs (from its home where it is homed in a worker), the model the record's spawn spec starts on
+ * as the registry holds it now (a per-call worker: its saved model, held to the grants as they are now), and
+ * the spec's custom tools over the live parent's eval kernels. `init` is the `session_init` the factory read.
  */
 export async function prepareColdRevive(
 	ctx: PersistedSubagentReviveContext,
@@ -368,18 +368,9 @@ export async function prepareColdRevive(
 	init: PersistedSessionInit,
 ): Promise<PreparedColdRevive> {
 	const root = ctx.session;
-	const { parts, rejected, unwritten } = coldReviveSpecParts(target, init);
-	if (rejected !== undefined) {
-		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
-			subagent: target.id,
-			error: rejected,
-		});
-	}
-	if (unwritten) {
-		logger.warn("Revived subagent's stored settings hold values no spawn writes; they read through to the parent", {
-			subagent: target.id,
-		});
-	}
+	const stored = coldReviveSpecParts(target, init);
+	const settings = stored.settings && coldReviveSettings(target, stored.settings);
+	const parts: SpawnSpecParts = { ...stored, settings };
 	const parentSession = liveParentSession(target);
 	const descriptors = parts.tools?.customTools ?? [];
 	const parent = await liveParent(target.id, parentSession, descriptors);
@@ -422,7 +413,6 @@ export async function prepareColdRevive(
 			chain,
 			models,
 			modelRegistry,
-			settings: settingsParent,
 			ceiling,
 			approve: perCallModelAssertion(approve, () => ceiling),
 		});
@@ -434,7 +424,6 @@ export async function prepareColdRevive(
 			chain,
 			models,
 			modelRegistry,
-			settings: settingsParent,
 			ceiling: liveEffortCeiling(parts.thinking?.thinkingLevelCeiling, settingsParent),
 			// The model of the parent's live session; the root's where the parent ref holds no session.
 			fallback: parentSession?.model ?? root.model,
@@ -461,6 +450,7 @@ export async function prepareColdRevive(
 		model,
 		prewalkTarget,
 		discoveryRan: models.discoveryRan,
+		settings: parts.settings,
 		grants,
 		customTools: tools.customTools,
 		unavailableTools: tools.unavailable,
@@ -594,55 +584,35 @@ async function parentEvalCustomTools(
 	}
 }
 
-/**
- * The spawn spec of a cold revive's record, part by part; a seance consult's record holds none. The stored
- * settings overlay must restore as `overlay()` checks overrides (each setting known, each value one its
- * definition accepts); an overlay that does not is a malformed part, which takes its legacy variant, and
- * `rejected` holds the check's error. Of an overlay that restores, only the settings a spawn writes
- * ({@link SUBAGENT_OVERLAY_SETTINGS}) are kept, so a stored value never widens what the live parent allows;
- * `unwritten` says whether it held any other.
- */
-function coldReviveSpecParts(
-	target: ColdReviveTarget,
-	init: PersistedSessionInit,
-): { parts: SpawnSpecParts; rejected?: string; unwritten?: boolean } {
-	if (target.restoredSeance) return { parts: { stored: false } };
-	const parts = readSpawnSpec(init);
-	if (!parts.settings) return { parts };
-	try {
-		target.settings.assertOverlayLayers(parts.settings.layers);
-	} catch (error) {
-		return {
-			parts: { ...parts, settings: undefined },
-			rejected: error instanceof Error ? error.message : String(error),
-		};
-	}
-	const { global, overrides, derived } = parts.settings.layers;
-	const keptGlobal = spawnWrittenLayer(global);
-	const keptOverrides = spawnWrittenLayer(overrides);
-	const settings = spawnSpecSettings({
-		layers: { global: keptGlobal.kept, overrides: keptOverrides.kept, derived },
-		rootThresholds: parts.settings.rootThresholds,
-	});
-	return { parts: { ...parts, settings }, unwritten: keptGlobal.unwritten || keptOverrides.unwritten };
+/** The spawn spec of a cold revive's record, part by part, as stored; a seance consult's record holds none. */
+function coldReviveSpecParts(target: ColdReviveTarget, init: PersistedSessionInit): SpawnSpecParts {
+	return target.restoredSeance ? { stored: false } : readSpawnSpec(init);
 }
 
 /**
- * Of `layer`, one layer of a stored overlay: the settings of {@link SUBAGENT_OVERLAY_SETTINGS} it holds, each at its
- * path (a `null` unset kept), and whether it holds any other.
+ * `stored`, a spec's settings overlay, as a cold revive restores it. It must restore as `overlay()` checks
+ * overrides (each setting known, each value one its definition accepts); an overlay that does not is a malformed
+ * part, which takes its legacy variant (undefined), with a warning. Of an overlay that restores, only the settings
+ * a spawn writes ({@link SUBAGENT_OVERLAY_SETTINGS}) are kept, so a stored value never widens what the live parent
+ * allows, with a warning where it held any other.
  */
-function spawnWrittenLayer(layer: JsonRecord): { kept: RawSettings; unwritten: boolean } {
-	const kept: RawSettings = {};
-	// A shallow copy is enough: `deleteByPath` replaces each record on the path it edits rather than editing it.
-	const rest: RawSettings = { ...layer };
-	for (const id of SUBAGENT_OVERLAY_SETTINGS) {
-		const segments = id.split(".");
-		const value = getByPath(rest, segments);
-		if (value === undefined) continue;
-		setByPath(kept, segments, value);
-		deleteByPath(rest, segments);
+function coldReviveSettings(target: ColdReviveTarget, stored: SpawnSpecSettings): SpawnSpecSettings | undefined {
+	let kept: KeptOverlayLayers;
+	try {
+		kept = target.settings.keptOverlayLayers(stored.layers, SUBAGENT_OVERLAY_SETTINGS);
+	} catch (error) {
+		logger.warn("Revived subagent's stored settings do not restore; it takes the settings of an older record", {
+			subagent: target.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
 	}
-	return { kept, unwritten: Object.keys(rest).length > 0 };
+	if (kept.dropped) {
+		logger.warn("Revived subagent's stored settings hold values no spawn writes; they read through to the parent", {
+			subagent: target.id,
+		});
+	}
+	return spawnSpecSettings({ layers: kept.layers, rootThresholds: stored.rootThresholds });
 }
 
 /** What a cold revive restores the subagent's overlay over: the live parent's settings for a spec's, else the root's. */
@@ -772,45 +742,6 @@ function retryFallbackChain(
 }
 
 /**
- * Each model a retry-fallback `chain` names when the stored model `identity` failed, in the chain's order,
- * every entry read as the live retry walk reads it (a provider wildcard keeps the failing model's id under
- * another provider, without an aggregator's vendor prefix the target provider does not use): the entry's
- * selector, and the model the registry holds for it, if any, among the providers `settings` leave enabled.
- */
-function* chainModels(
-	chain: readonly string[],
-	identity: string,
-	modelRegistry: ModelRegistry,
-	settings: Settings,
-): Generator<{ candidate: RetryFallbackSelector; model: Model | undefined }> {
-	// A stored identity is exact: no part of its id is read as a thinking level.
-	const slash = identity.indexOf("/");
-	const current: RetryFallbackSelector = {
-		raw: identity,
-		provider: identity.slice(0, slash),
-		id: identity.slice(slash + 1),
-		thinkingLevel: undefined,
-	};
-	for (const entry of chain) {
-		const candidate = parseRetryFallbackChainEntry({ modelLookup: modelRegistry }, entry, current);
-		if (!candidate) continue;
-		const model = resolveSpawnModelIdentity(formatRetryFallbackBaseSelector(candidate), modelRegistry, settings);
-		yield { candidate, model };
-	}
-}
-
-/**
- * The spawn's own message for a model the registry does not know, its hint drawn, as the spawn draws it,
- * from the models of the providers `settings` leave enabled.
- */
-function notFoundMessage(identity: string, modelRegistry: ModelRegistry, settings: Settings): string {
-	return modelNotFoundMessage(
-		[identity],
-		enabledProviderModels(modelRegistry.getAll(), disabledProviderIds(settings)),
-	);
-}
-
-/**
  * The model a cold revive of a record with a spawn spec starts on: the spec's model as the registry holds
  * it, after its discovery ran; else the first model of the subagent's retry-fallback chain that the live
  * retry walk would switch to (its provider enabled and credentialed, within the effort ceiling); else
@@ -825,8 +756,6 @@ async function chooseColdReviveModel(args: {
 	chain: () => readonly string[];
 	models: RevivedModels;
 	modelRegistry: ModelRegistry;
-	/** The live settings, whose disabled providers have no models. */
-	settings: Settings;
 	ceiling: Effort | undefined;
 	fallback: Model | undefined;
 }): Promise<ExplicitBuildModel> {
@@ -835,15 +764,13 @@ async function chooseColdReviveModel(args: {
 	if (identity === null) return { kind: "model", model: undefined, thinkingLevel: level };
 	const known = await args.models.resolve(identity);
 	if (known) return { kind: "model", model: known, thinkingLevel: level };
-	// The chain walk sees what the discovery adds, also where the stored model is held under a disabled provider.
-	await args.models.discover();
 	const moved = (model: Model | undefined): void => {
-		logger.warn(notFoundMessage(identity, modelRegistry, args.settings), {
+		logger.warn(args.models.notFoundMessage(identity), {
 			subagent: id,
 			model: model ? formatModelStringWithRouting(model) : undefined,
 		});
 	};
-	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry, args.settings)) {
+	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity)) {
 		if (!model || !modelRegistry.hasConfiguredAuth(model)) continue;
 		if (ceiling && !modelSupportsEffortCeiling(model, ceiling)) continue;
 		moved(model);
@@ -868,8 +795,6 @@ async function choosePerCallModel(args: {
 	chain: () => readonly string[];
 	models: RevivedModels;
 	modelRegistry: ModelRegistry;
-	/** The live settings, whose disabled providers have no models. */
-	settings: Settings;
 	ceiling: Effort | undefined;
 	approve: (model: Model) => void;
 }): Promise<ExplicitBuildModel> {
@@ -886,11 +811,8 @@ async function choosePerCallModel(args: {
 		} catch (error) {
 			refusal = error;
 		}
-	} else {
-		// The chain walk sees what the discovery adds, also where the saved model is held under a disabled provider.
-		await args.models.discover();
 	}
-	for (const { candidate, model } of chainModels(args.chain(), identity, modelRegistry, args.settings)) {
+	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity)) {
 		if (!model) {
 			unknown.push(formatRetryFallbackBaseSelector(candidate));
 			continue;
@@ -905,7 +827,7 @@ async function choosePerCallModel(args: {
 			? refusal instanceof Error
 				? refusal.message
 				: String(refusal)
-			: notFoundMessage(identity, modelRegistry, args.settings);
+			: args.models.notFoundMessage(identity);
 		logger.warn(reason, { subagent: id, model: formatModelStringWithRouting(model) });
 		const thinkingLevel = retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, args.ceiling);
 		return { kind: "model", model, thinkingLevel };
@@ -1002,7 +924,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			`Cannot revive subagent "${spec.id}": session file "${spec.sessionFile}" has no persisted session contract. The agent was not revived.`,
 		);
 	}
-	const { parts } = coldReviveSpecParts(spec, init);
+	// The settings overlay as the main thread checked it, once per revive; the other parts as the record holds them.
+	const parts: SpawnSpecParts = { ...coldReviveSpecParts(spec, init), settings: prepared.settings };
 	const settingsParent = coldReviveSettingsParent(spec, parts, prepared.live);
 	const { spawnSpec, legacy } = coldReviveSpawnSpec(spec, parts, init, settingsParent);
 	const approve = prepared.grants
@@ -1247,24 +1170,22 @@ export function tighterLimit(stored: number | undefined, live: number): number {
  * resolved only at spawn).
  */
 function legacySubagentSettings(id: string, init: PersistedSessionInit, parent: Settings): SpawnSpecSettings {
-	// `"on"` = advisor-role model, anything else = the pattern stamped onto this session's
-	// `modelRoles.advisor`, which spawn persists already expanded against the spawning owner's roles;
-	// expanding again is a no-op for those and only resolves aliases in files written before that.
+	const overrides: SubagentOverlayOverrides = {};
+	if (init.readSummarize === false) overrides["read.summarize.enabled"] = false;
+	if (init.advisor) {
+		overrides["advisor.enabled"] = true;
+		// `"on"` = advisor-role model, anything else = the pattern stamped onto this session's
+		// `modelRoles.advisor`, which spawn persists already expanded against the spawning owner's roles;
+		// expanding again is a no-op for those and only resolves aliases in files written before that.
+		if (init.advisor !== "on") {
+			overrides.modelRoles = {
+				...parent.getModelRoles(),
+				advisor: resolveAgentAdvisorRolePattern(init.advisor, parent),
+			};
+		}
+	}
 	const settings = createSubagentSettings(parent, {
-		...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
-		...(init.advisor
-			? {
-					"advisor.enabled": true,
-					...(init.advisor !== "on"
-						? {
-								modelRoles: {
-									...parent.getModelRoles(),
-									advisor: resolveAgentAdvisorRolePattern(init.advisor, parent),
-								},
-							}
-						: undefined),
-				}
-			: undefined),
+		...overrides,
 		...compactionThresholdSettings(init.compactionThreshold),
 	});
 	if (init.retryFallback) installRetryFallbackRole(settings, subagentRetryFallbackRole(id), init.retryFallback);

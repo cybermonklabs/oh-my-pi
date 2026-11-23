@@ -49,6 +49,7 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import {
+	editStoredSpawnSpecs,
 	expectEndedAtLimit,
 	fixtureAgent,
 	HELD,
@@ -1401,20 +1402,15 @@ describe("stored LSP, IRC and MCP values revived in a process with each off", ()
  * Rewrites each `session_init` of `sessionFile`, as a party that can write the stored session but not the
  * operator's config can: `edit` gets the stored spawn spec's settings layers and returns the ones to store.
  */
-async function editStoredSettingsLayers(
+function editStoredSettingsLayers(
 	sessionFile: string,
 	edit: (layers: Record<string, unknown>) => Record<string, unknown>,
-): Promise<void> {
-	const lines = (await Bun.file(sessionFile).text()).split("\n").map(line => {
-		if (line.length === 0) return line;
-		const entry: unknown = JSON.parse(line);
-		if (!isRecord(entry) || entry.type !== "session_init" || !isRecord(entry.spawnSpec)) return line;
-		const spec = entry.spawnSpec;
+): Promise<number> {
+	return editStoredSpawnSpecs(sessionFile, spec => {
 		const settings = isRecord(spec.settings) ? spec.settings : {};
 		const layers = isRecord(settings.layers) ? settings.layers : {};
-		return JSON.stringify({ ...entry, spawnSpec: { ...spec, settings: { ...settings, layers: edit(layers) } } });
+		spec.settings = { ...settings, layers: edit(layers) };
 	});
-	await Bun.write(sessionFile, lines.join("\n"));
 }
 
 /** `layers.overrides`, with `extra` merged into it one level deep. */

@@ -220,16 +220,11 @@ export type SpawnModelRegistry = Pick<ModelRegistry, "getAll">;
  * a catalog model, an `@upstream` pin, an OpenRouter requested-id clone or a Bedrock inference-profile
  * model, each rebuilt by the function that made it at spawn, from the identity alone. Searches every
  * model the registry holds, so a model whose provider has no credentials still resolves; undefined
- * when no model has the identity, or when `settings` disable its provider (`disabledProviders`): a
- * disabled provider has no models, however one is named.
+ * when no model has the identity. It reads no settings: a caller holds the model to the providers
+ * `disabledProviders` turns off.
  */
-export function resolveSpawnModelIdentity(
-	identity: string,
-	registry: SpawnModelRegistry,
-	settings?: Settings,
-): Model<Api> | undefined {
-	const model = resolveSpawnModelIdentityIn(identity, registry.getAll());
-	return model && !disabledProviderIds(settings).has(model.provider) ? model : undefined;
+export function resolveSpawnModelIdentity(identity: string, registry: SpawnModelRegistry): Model<Api> | undefined {
+	return resolveSpawnModelIdentityIn(identity, registry.getAll());
 }
 
 function resolveSpawnModelIdentityIn(identity: string, models: readonly Model<Api>[]): Model<Api> | undefined {
