@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hindsight `last-turn` auto-retain keeps the position of its last retain in the session as a custom entry, so a session resumed in a new process, cleared with `/clear`, forked or switched to no longer sends again what an earlier retain sent, and the reply to a turn that a custom message starts (no user message) goes in the next retain instead of being skipped. Transcript retains are single-flight per session, and `/memory enqueue` sends from the earlier of its own window and the first message no retain sent
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
