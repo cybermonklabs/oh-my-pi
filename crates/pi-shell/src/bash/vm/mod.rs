@@ -989,6 +989,13 @@ impl Kernel {
 
 	/// Queue a diagnostic on the vproc's stderr and emit a `Diag` event.
 	pub fn diag(&mut self, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, diag: Diag) {
+		// bash's arithmetic subscript error runs `top_level_cleanup` before it
+		// jumps (`array_expand_index`), so a `time` around it never reports.
+		if matches!(diag, Diag::ArithSubscript { .. })
+			&& vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
+		{
+			exec::drop_times(vp);
+		}
 		zle::display::trash_for_message(self, cx, vp);
 		let bytes = self.render_diag(cx, vp, line, &diag);
 		vp.out

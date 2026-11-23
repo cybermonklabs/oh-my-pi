@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `time` prints its report when its command leaves it by a jump, as bash does: a fatal expansion error (`( time echo ${x:?u} )`, `time cmd ${x:?u} &`, `set -u`, `$(( 1 / 0 ))`), `exit`, `set -e`, `break` and `continue`. Nested `time`s each report, innermost first, and the report comes before the EXIT trap runs. `return`, `exec` and an arithmetic subscript error (`a[1/0]=v`) still give no report, as in bash.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

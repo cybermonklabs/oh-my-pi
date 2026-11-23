@@ -4742,13 +4742,26 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			// zsh: a builtin's `zerr` (`errflag`) unwinds through `zsh_discard`
 			// (always-lists run, the builtin's status stays); `Abort` is the
 			// parse-error path.
-			if command && in_run && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh {
+			let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+			if !zsh {
+				// A builtin abandoned the line: an arithmetic subscript error
+				// (bash's `top_level_cleanup` restores the outer jump target
+				// first) or `suspend`'s usage error. bash's `time_command`
+				// never sees that jump and prints no report.
+				exec::drop_times(vp);
+			}
+			if command && in_run && !zsh {
 				Flow::Abort(n)
 			} else {
 				Flow::Discard(n)
 			}
 		},
-		Some(Transfer::Exec) => Flow::Exit(status),
+		Some(Transfer::Exec) => {
+			// The program replaced the shell (or `exec` failed and the shell
+			// exits): bash's `time` around it never reports.
+			exec::drop_times(vp);
+			Flow::Exit(status)
+		},
 	}
 }
 

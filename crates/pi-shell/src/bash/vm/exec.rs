@@ -428,7 +428,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			},
 			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
 			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
-			Flow::Exit(status) => exit_shell(k, vp, cx, status),
+			Flow::Exit(status) => {
+				report_left_times(k, vp, cx, 0, 0);
+				exit_shell(k, vp, cx, status);
+			},
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_discard(k, vp, cx, status);
 			},
@@ -442,6 +445,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					.iter()
 					.rposition(|f| matches!(f.kind, FrameKind::Script { .. }));
 				if let Some(i) = script {
+					report_left_times(k, vp, cx, i, 0);
 					unwind(&mut k.root, cx.store, vp, i + 1);
 					clear_scratch(&mut k.root, cx.store, vp);
 					truncate(vp, Depths::default());
@@ -449,6 +453,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					f.unit = None;
 					f.loops.clear();
 				} else {
+					report_left_times(k, vp, cx, 0, 0);
 					unwind(&mut k.root, cx.store, vp, 0);
 				}
 			},
@@ -470,6 +475,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		} else if errexit {
 			let status = vp.status;
+			report_left_times(k, vp, cx, 0, 0);
 			exit_shell(k, vp, cx, status);
 		} else if errreturn_failed && unit.mode.dialect() == Dialect::Zsh && zsh_errreturn(k, cx, vp)
 		{
@@ -1940,15 +1946,18 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
 	let mut remaining = n.max(1);
 	loop {
+		let top = vp.frames.len() - 1;
 		let f = top_frame(vp);
 		if let Some(rec) = f.loops.last().cloned() {
 			// More levels than loops: the outermost loop ends.
 			if remaining > 1 && f.loops.len() > 1 {
 				f.loops.pop();
+				report_left_times(k, vp, cx, top, rec.depth.times as usize);
 				truncate(vp, rec.depth);
 				remaining -= 1;
 				continue;
 			}
+			report_left_times(k, vp, cx, top, rec.depth.times as usize);
 			truncate(vp, rec.depth);
 			// The status is the builtin's: 0, or 1 for `break 0` (which
 			// leaves every loop).
@@ -3316,12 +3325,37 @@ fn time_end(
 	} else {
 		start
 	};
-	let format = if op.b == 1 {
+	bash_time_report(k, vp, cx, op.b == 1, posix, elapsed(start, end), line);
+}
+
+/// The real, user and system times from `start` to `end`.
+const fn elapsed(start: super::proc::TimeMark, end: super::proc::TimeMark) -> [u64; 3] {
+	[
+		end.real.saturating_sub(start.real),
+		end.user.saturating_sub(start.user),
+		end.sys.saturating_sub(start.sys),
+	]
+}
+
+/// bash's report of a `time`d pipeline's `times` on stderr: `time -p`
+/// (`dash_p`) in the POSIX format, else in `TIMEFORMAT` (unset: bash's
+/// default, or in posix mode for `time` without a pipeline (`null_posix`)
+/// the user and system times only; empty: nothing).
+fn bash_time_report(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	dash_p: bool,
+	null_posix: bool,
+	times: [u64; 3],
+	line: u32,
+) {
+	let format = if dash_p {
 		BString::from(POSIX_TIMEFORMAT)
 	} else {
 		match state::lookup(&k.root, cx.store, vp, b"TIMEFORMAT") {
 			Ok(Some(v)) => BString::from(v.as_scalar().unwrap_or_default()),
-			Ok(None) if posix => BString::from("user\t%2lU\nsys\t%2lS"),
+			Ok(None) if null_posix => BString::from("user\t%2lU\nsys\t%2lS"),
 			Ok(None) => BString::from(BASH_TIMEFORMAT),
 			Err(err) => {
 				k.fail(err);
@@ -3332,11 +3366,6 @@ fn time_end(
 	if format.is_empty() {
 		return;
 	}
-	let times = [
-		end.real.saturating_sub(start.real),
-		end.user.saturating_sub(start.user),
-		end.sys.saturating_sub(start.sys),
-	];
 	match time_report(&format, times) {
 		Ok(text) => vp
 			.out
@@ -3345,6 +3374,78 @@ fn time_end(
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
 		},
+	}
+}
+
+/// bash's `time_command` catches a jump out of the timed command (`exit`,
+/// `set -e`, a fatal expansion error, a discarded command, `break`,
+/// `continue`): it reports the times, then jumps on. `return` passes it
+/// (bash's `return_catch`), `exec` replaces the shell, and an arithmetic
+/// subscript error's jump is taken after `top_level_cleanup` restored the
+/// outer jump target: no report then ([`drop_times`]). Report, innermost
+/// first, the `time` marks the jump leaves: those of the frames above
+/// `frame` and those of frame `frame` above `keep`, and drop them. zsh mode
+/// keeps its own rules.
+fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize, keep: usize) {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return;
+	}
+	let mut left = Vec::new();
+	for (i, f) in vp.frames.iter().enumerate().skip(frame).rev() {
+		let from = if i == frame {
+			keep.min(f.times.len())
+		} else {
+			0
+		};
+		let ends = pending_time_ends(f, f.times.len() - from);
+		left.extend(f.times[from..].iter().rev().copied().zip(ends));
+	}
+	if left.is_empty() {
+		return;
+	}
+	let end = time_mark(&*cx.host);
+	let line = vp
+		.frames
+		.last()
+		.and_then(|f| f.unit.as_deref().and_then(|u| u.ops.get(f.pc as usize)))
+		.map_or(0, |op| line_of(vp, op.node));
+	for (start, dash_p) in left {
+		bash_time_report(k, vp, cx, dash_p, false, elapsed(start, end), line);
+	}
+	for (i, f) in vp.frames.iter_mut().enumerate().skip(frame) {
+		f.times.truncate(if i == frame { keep } else { 0 });
+	}
+}
+
+/// The `-p` flags of the `n` innermost `TimeEnd`s frame `f` has still to
+/// reach (its pending `time` marks, innermost first): the first ones after
+/// its pc that close no `time` started after it.
+fn pending_time_ends(f: &super::proc::Frame, n: usize) -> Vec<bool> {
+	let mut ends = Vec::with_capacity(n);
+	if let Some(unit) = f.unit.as_deref() {
+		let mut depth = 0u32;
+		for op in unit.ops.iter().skip(f.pc as usize) {
+			if ends.len() == n {
+				break;
+			}
+			match op.code {
+				Opcode::TimeStart => depth += 1,
+				Opcode::TimeEnd if depth > 0 => depth -= 1,
+				Opcode::TimeEnd => ends.push(op.b == 1),
+				_ => {},
+			}
+		}
+	}
+	ends.resize(n, false);
+	ends
+}
+
+/// Drop every pending `time` mark without a report: `exec` replaced the
+/// shell, or an arithmetic subscript error discards the line past bash's
+/// `time_command` ([`report_left_times`]).
+pub(super) fn drop_times(vp: &mut Vproc) {
+	for f in &mut vp.frames {
+		f.times.clear();
 	}
 }
 
