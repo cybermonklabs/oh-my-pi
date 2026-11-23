@@ -540,6 +540,39 @@ describe("a live root restarted in B and then moved to C, whose project extensio
 	}, 30_000);
 });
 
+describe("a live root restarted in B whose explicit extensions name EA's file beside EX", () => {
+	const id = "ExplicitProjectFile";
+	let process: ToolSourceProcess | undefined;
+	let eaBindings = 0;
+
+	beforeAll(async () => {
+		// EA is A's project extension and, by its file, one of the root's explicit (`--extension`) entries too.
+		process = await openToolSourceProcess(projects => ({
+			explicit: [projects.explicitExtension, path.join(projects.a, ".omp", "extensions", `${EA}.ts`)],
+			mode: "merge",
+			configured: [projects.configuredExtension],
+			configuredLevel: "user",
+		}));
+		const { env, root, projects } = process;
+		await env.spawn(taskSpawn(env, root.toolSession, id));
+		await env.park(id);
+		await process.startRootIn(projects.b);
+		env.dropWarmReviver(id);
+		await fs.rm(projects.hookLog, { force: true });
+		await env.revive(id);
+		const hooks = (await readOptional(projects.hookLog))?.split("\n") ?? [];
+		eaBindings = hooks.filter(name => name === EA).length;
+	}, 90_000);
+
+	afterAll(async () => {
+		await process?.close();
+	}, 30_000);
+
+	it("explicit EA, root in B: the cold revive binds EA, which its discovery in A finds as well, once", () => {
+		expect(eaBindings).toBe(1);
+	}, 30_000);
+});
+
 describe("a spawner that passed no custom-tool paths and no MCP manager, its root restarted in B", () => {
 	const id = "SpawnerPassedNone";
 	let process: ToolSourceProcess | undefined;
