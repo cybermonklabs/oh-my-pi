@@ -58,6 +58,12 @@ ROWS = (
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
 )
+# The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
+# read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
+RUST_JOBS = (
+    ("Rust tests, Bazel and the other cargo workspaces (sami-rust-test.yml rust_test)", "rust_test"),
+    ("Rust tests, macOS only (sami-rust-test.yml rust_test_macos)", "rust_test_macos"),
+)
 
 
 def set_matrix():
@@ -486,6 +492,20 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                + (f"KNOWN ({why})" if why else "**NEW**"))
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
+    # SC_RUST_TESTS is "rust_test=<result> rust_test_macos=<result>". Absent: a caller from before
+    # those jobs, and no Rust rows. success passes and failure fails; a job with no result, or with
+    # any other (cancelled, skipped), is UNKNOWN.
+    rust = os.environ.get("SC_RUST_TESTS")
+    if rust is not None:
+        conclusions = dict(p.split("=", 1) for p in rust.split() if "=" in p)
+        for title, job in RUST_JOBS:
+            conclusion = conclusions.get(job, "")
+            verdict = {"success": "PASS", "failure": "FAIL"}.get(conclusion, "UNKNOWN")
+            lines.append(f"| {title} | **{verdict}** | - | - | - |")
+            if verdict != "PASS":
+                all_ok = False
+                details.append(f"- **{title}**: {verdict}: the job's conclusion is [{conclusion or 'none'}]; "
+                               "its failing tests are in that job's annotations and log")
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -705,6 +725,21 @@ def selftest():
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
+    # The Rust tests' rows, from their two jobs' conclusions: success passes, failure fails, and a
+    # missing, cancelled or skipped result is UNKNOWN. Without SC_RUST_TESTS there is no Rust row.
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("no Rust rows without SC_RUST_TESTS", ("| Rust tests" in out, rc), (False, 0))
+    os.environ["SC_RUST_TESTS"] = "rust_test=success rust_test_macos=success"
+    rc, out = summary()
+    check("both Rust jobs passed", (f"| {RUST_JOBS[0][0]} | **PASS** |" in out, f"| {RUST_JOBS[1][0]} | **PASS** |" in out, rc), (True, True, 0))
+    os.environ["SC_RUST_TESTS"] = "rust_test=failure rust_test_macos=cancelled"
+    rc, out = summary()
+    check("a failed and a cancelled Rust job", (f"| {RUST_JOBS[0][0]} | **FAIL** |" in out, f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, rc), (True, True, 1))
+    os.environ["SC_RUST_TESTS"] = "rust_test= rust_test_macos=skipped"
+    rc, out = summary()
+    check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 1))
+    del os.environ["SC_RUST_TESTS"]
     open(known_file, "w").write("# none\n")
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
@@ -716,7 +751,8 @@ def selftest():
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
-          "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported")
+          "assignment and per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, "
+          "and the Rust tests' rows from their jobs' conclusions")
 
 
 def main(argv):

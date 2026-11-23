@@ -28,9 +28,10 @@ name: Build sami branch
 # release_cache_prune keeps one entry per target; sami, where nothing is
 # built, keeps none.
 # Known limit: a push to sami runs the pushed commit's own sami-build.yml and
-# release-candidate.sh. One from before this workflow (a72018dd, sami's head
-# on 2026-11-23, among them) builds and publishes at once, and one whose
-# copies were changed publishes what its own copies allow. For the same
+# release-candidate.sh. A commit from before this workflow (every sami
+# release before the first that carries it) builds and publishes at once, on
+# a push and on a dispatch alike, and one whose copies were changed
+# publishes what its own copies allow. For the same
 # reason, a push of any branch whose own workflow asks for contents: write
 # can create a release directly, and a ruleset on sami would not stop it.
 # Any identity of the agent App sjawhar-agent[bot] can push sami and

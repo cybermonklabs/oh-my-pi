@@ -4,7 +4,7 @@
 # (.github/sami/rust-test.sh); rust_test_macos runs the tests only macOS can run. These were
 # sami-build.yml's rust_test and rust_test_macos jobs, where a red one held the release. Here a
 # red one holds nothing: publish reads only sami-build.yml's run, and a red test is fixed forward.
-# Their verdict is their own conclusion; sami-checks.yml's summary does not read them.
+# sami-checks.yml's summary has a row for each job, read from the job's result (this workflow's outputs).
 #
 # The tree under test is inputs.commit, checked out at tree/. The gate's scripts and lists
 # (.github/sami) and the actions these jobs use (.github/actions) come from the commit this run
@@ -42,6 +42,14 @@ on:
         required: false
         default: ""
         type: string
+    # Each job's result (success, failure, cancelled or skipped), for sami-checks' summary rows.
+    outputs:
+      rust-test:
+        description: "rust_test's result"
+        value: ${{ jobs.rust_test.result }}
+      rust-test-macos:
+        description: "rust_test_macos's result"
+        value: ${{ jobs.rust_test_macos.result }}
 
 permissions:
   contents: read

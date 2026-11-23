@@ -31,7 +31,7 @@
 #   - the Rust tests under Bazel (`bazel test //crates/...` with the known-failure gate, the other
 #     cargo workspaces, sdk/rust/omp-rpc among them, and the tests only macOS can run): the
 #     rust-test job calls .github/workflows/sami-rust-test.yml, whose jobs build their own tests.
-#     The summary reads no unit of theirs; their verdict is their own jobs' conclusion.
+#     The summary has a row for each of its two jobs, read from that job's result.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
 # sdk/rust/omp-rpc is its own cargo workspace and is not in the archive (sami-rust-test.yml runs it).
@@ -521,9 +521,9 @@ jobs:
 
   rust-test:
     # sami-rust-test.yml: the Rust tests under Bazel and the macOS-only tests, with the addon
-    # the natives job built. The summary reads no unit of theirs: their verdict is the conclusion
-    # of the two jobs that workflow runs. They run whatever the natives job's verdict, and fail
-    # by name without its addon.
+    # the natives job built. The summary reads no unit of theirs: it has a row for each of the two
+    # jobs that workflow runs, from the job's result. They run whatever the natives job's verdict,
+    # and fail by name without its addon.
     name: rust tests
     needs: [plan, natives]
     if: ${{ !cancelled() && needs.plan.outputs.commit != '' }}
@@ -539,7 +539,7 @@ jobs:
 
   summary:
     name: summary
-    # rust-test is here so that the summary runs last; it reads no unit of rust-test's.
+    # rust-test is here so that the summary runs last and reads its two jobs' results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, rust-test]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
@@ -566,6 +566,7 @@ jobs:
       - name: Summary
         env:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
+          SC_RUST_TESTS: "rust_test=${{ needs.rust-test.outputs.rust-test }} rust_test_macos=${{ needs.rust-test.outputs.rust-test-macos }}"
         run: |
           mkdir -p "$SC/report" "$SC/results" "$SC/build"
           rc=0
