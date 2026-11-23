@@ -16,6 +16,7 @@
 ### Changed
 
 - `spawn(cmd, { subreaper: true })` on Linux now starts the subreaper as the leader of its own process group and session, as `detached: true` does, and `subreaper` with `detached: false` is refused on every platform. The new session has no controlling terminal, so such a command cannot open `/dev/tty`, and terminal job control (Ctrl-C, Ctrl-Z) and a terminal hangup (SIGHUP) no longer reach it directly; stop it with `kill()`, `signal` or `timeout`
+- Added `isStringList()`, a type guard for an array whose every item is a string
 
 ### Fixed
 

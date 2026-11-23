@@ -15,6 +15,14 @@
  * A model is warmed only when its catalog entry (or a models.yml `promptCache`
  * override) declares a lifetime for the retention tier the request used, so
  * providers whose replay behavior is unvalidated are never touched.
+ *
+ * A request whose `tool_choice` on the wire is another than the default (a
+ * forced tool its provider sends as given, or `none`) is neither tracked nor
+ * warmed ({@link sendsNonDefaultToolChoice}): Anthropic keys the cached messages
+ * on `tool_choice`, so it writes messages the next request, back on the default
+ * choice, does not read, and refreshes none of the entry the request before it
+ * left, which stays the one tracked and kept warm. The agent loop forces a
+ * tool for one turn when the model skips a soft tool requirement.
  */
 import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import {
@@ -23,11 +31,18 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	type Model,
+	openAICompletionsReasoningOptions,
 	resolveCacheRetention,
 	type SimpleStreamOptions,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { bedrockSendsForcedToolChoice } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import { openAICompletionsSendsNonDefaultToolChoice } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { mapOpenAIResponsesToolChoiceForTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { isOpenAIToolsModel, openAIToolsApi } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
+import { isForcedToolChoice } from "@oh-my-pi/pi-ai/utils/tool-choice";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../extensibility/shared-events";
@@ -173,15 +188,25 @@ export function promptTokensOf(usage: Usage): number {
 }
 
 /**
- * Whether `message` is the response to a request sent to `model`. A
- * server-side fallback retags the response with the served model, so its
- * fallback marker's `from` names the model the request went to.
+ * The id of the model the request `message` answers went to. A server-side
+ * fallback retags the response with the served model, so its fallback
+ * marker's `from` names the model the request went to.
  */
-function answers(message: AssistantMessage, model: Model<Api>): boolean {
-	if (message.provider !== model.provider) return false;
-	if (message.model === model.id) return true;
+export function requestedModelId(message: AssistantMessage): string {
 	const fallback = message.content.find(block => block.type === "fallback");
-	return fallback?.type === "fallback" && fallback.from.model === model.id;
+	return fallback?.type === "fallback" ? fallback.from.model : message.model;
+}
+
+/**
+ * Whether `message` is the response to a request sent to `model`: the model
+ * the request went to ({@link requestedModelId}) is `model`, or the model a
+ * wrapper transport sent it as ({@link wireModel}: GitLab Duo tags its
+ * responses with the upstream id).
+ */
+export function answersRequestTo(message: AssistantMessage, model: Model<Api>): boolean {
+	if (message.provider !== model.provider) return false;
+	const requested = requestedModelId(message);
+	return requested === model.id || requested === wireModel(model).id;
 }
 
 /**
@@ -203,6 +228,56 @@ export function isReplayable(model: Model<Api>, options: SimpleStreamOptions | u
 		return model.thinking?.mode === "anthropic-adaptive";
 	}
 	return true;
+}
+
+/** Whether `model` goes out on `api`, so its compat is that API's. */
+function isApiModel<TApi extends Api>(model: Model<Api>, api: TApi): model is Model<TApi> {
+	return model.api === api;
+}
+
+/**
+ * Whether `request` sends another `tool_choice` than the default (`auto`) on its model: `none`, or a forced choice the
+ * provider sends as given, by the provider's own rule, read on the model the request goes out as ({@link wireModel}: a
+ * wrapper transport's inner model, as Factory Droid's route sends it) and on the API it goes out on (an `openrouter`
+ * model's on Responses, or on chat completions, as {@link openAIToolsApi} routes it). Bedrock sends `auto` for a model
+ * that takes no forced tool use and for a prefix-bound line thinking on the request
+ * ({@link bedrockSendsForcedToolChoice}); chat completions and Responses send no `tool_choice` to a host that takes
+ * none, and `auto` for a forced choice a host does not take, chat completions under the compat it resolves for the
+ * request, the `whenThinking` view with thinking on ({@link openAICompletionsSendsNonDefaultToolChoice},
+ * {@link mapOpenAIResponsesToolChoiceForTools}); elsewhere a forced choice goes out as `auto` where the compat says
+ * `supportsForcedToolChoice` is off. A forced choice Anthropic sends also drops thinking.
+ */
+export function sendsNonDefaultToolChoice(request: Pick<CacheWarmRequest, "model" | "context" | "options">): boolean {
+	const { context, options } = request;
+	const toolChoice = options.toolChoice;
+	if (toolChoice === undefined || toolChoice === "auto") return false;
+	const model = wireModel(request.model, options);
+	// An `openrouter` model goes out on the API it is routed to under its own compat, as `stream` sends it.
+	const api = isOpenAIToolsModel(model) ? openAIToolsApi(model) : model.api;
+	if (api === "openai-completions") {
+		const completions = model as Model<"openai-completions">;
+		return openAICompletionsSendsNonDefaultToolChoice(
+			completions,
+			{ ...openAICompletionsReasoningOptions(completions, options), toolChoice },
+			Boolean(context.tools?.length),
+		);
+	}
+	if (api === "openai-responses") {
+		const sent = mapOpenAIResponsesToolChoiceForTools(
+			toolChoice,
+			context.tools ?? [],
+			model as Model<"openai-responses">,
+		);
+		return sent !== undefined && sent !== "auto";
+	}
+	if (!isForcedToolChoice(toolChoice)) return true;
+	if (isApiModel(model, "bedrock-converse-stream")) {
+		// The reasoning the stream hands the provider: none once the request turns it off.
+		const reasoning = options.disableReasoning || options.forceReasoningOff ? undefined : options.reasoning;
+		return bedrockSendsForcedToolChoice(model, reasoning);
+	}
+	const { compat } = model;
+	return !(compat !== undefined && "supportsForcedToolChoice" in compat && !compat.supportsForcedToolChoice);
 }
 
 /**
@@ -494,9 +569,12 @@ export class CacheWarmer {
 	/**
 	 * Keep the prompt cache entry written by `request` warm until `change` reports a difference in the next request.
 	 * Returns the request's dispatch hook: call it each time the provider sends the request (its `onPayload`),
-	 * so the entry's lifetime counts from when it left rather than from a wait for a provider slot.
+	 * so the entry's lifetime counts from when it left rather than from a wait for a provider slot. Undefined for a
+	 * request with another tool choice than the default ({@link sendsNonDefaultToolChoice}): it is not tracked, and the
+	 * entry and run of the request before it stay.
 	 */
-	start(request: CacheWarmRequest, change: () => PromptCacheChange | undefined): () => void {
+	start(request: CacheWarmRequest, change: () => PromptCacheChange | undefined): (() => void) | undefined {
+		if (sendsNonDefaultToolChoice(request)) return undefined;
 		this.#clearRun();
 		// A string key is classified up front. Resolver keys (rotating
 		// credentials) cannot be inspected without consuming them; they start on
@@ -561,7 +639,7 @@ export class CacheWarmer {
 	onResponse(message: AssistantMessage): void {
 		const observed = observedPromptCacheTier(message.usage);
 		const pending = this.#pendingEntry;
-		if (pending && answers(message, pending.model)) {
+		if (pending && answersRequestTo(message, pending.model)) {
 			this.#pendingEntry = undefined;
 			if (message.stopReason !== "error" && (message.usage.cacheRead > 0 || message.usage.cacheWrite > 0)) {
 				if (observed !== undefined) pending.tier = observed;
@@ -575,13 +653,13 @@ export class CacheWarmer {
 			run &&
 			message.stopReason === "error" &&
 			AIError.isCyberPolicyRefusal(message) &&
-			answers(message, run.model)
+			answersRequestTo(message, run.model)
 		) {
 			this.#stop(CYBER_POLICY_STOP_REASON);
 			return;
 		}
 		if (!run || run.timer === undefined) return;
-		if (!answers(message, run.model)) return;
+		if (!answersRequestTo(message, run.model)) return;
 		if (observed === undefined || observed === run.tier) return;
 		const delayMs = this.#delayFor(run.model, observed);
 		if (delayMs === undefined) {

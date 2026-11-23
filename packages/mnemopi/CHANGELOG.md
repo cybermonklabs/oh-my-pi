@@ -5,6 +5,7 @@
 ### Added
 
 - `MnemopiOptions.beforeDispatch`, awaited before every remote completion and embedding attempt and handed to a custom completion function, and `RecallOptions.signal`, which cancels a recall's query embedding ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- Added `bankDbPathIn()` to `@oh-my-pi/pi-mnemopi/core/banks`: the database file a bank lives in under a data directory, as `BankManager` lays banks out, without creating the `banks` directory a `BankManager` creates
 
 ### Changed
 

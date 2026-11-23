@@ -13,9 +13,11 @@
 import { fitOutputTokensToContextWindow, type StreamFn, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { endpointUrl } from "../utils/endpoint-url";
 import { type AnthropicSlowModeLanes, anthropicSlowModeLanes } from "./anthropic-slow-mode";
 
 import {
@@ -27,6 +29,7 @@ import {
 	cfgProvidersAnthropicSlowMode,
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersCacheRetention,
+	cfgProvidersKimiApiFormat,
 	cfgProvidersMaxInFlightRequests,
 	cfgProvidersMuseCodeStoreResponses,
 	cfgProvidersOpenaiCodexDaybreak,
@@ -88,6 +91,32 @@ function configuredServerSideFallbackModels(configured: readonly unknown[], warn
 		}
 	}
 	return models.slice(0, ANTHROPIC_MAX_FALLBACK_MODELS);
+}
+
+/**
+ * The Kimi Code API format a main request goes out in: the request's own, else `providers.kimiApiFormat`; undefined
+ * under `auto`, which leaves the model's catalog format.
+ */
+export function resolveKimiApiFormat(
+	settings: Settings,
+	requestFormat?: SimpleStreamOptions["kimiApiFormat"],
+): SimpleStreamOptions["kimiApiFormat"] {
+	if (requestFormat !== undefined) return requestFormat;
+	const setting = cfgProvidersKimiApiFormat.get(settings);
+	return setting === "auto" ? undefined : setting;
+}
+
+/**
+ * The model a main request on `model` goes out as in the Kimi Code API format `kimiApiFormat` ({@link wireModel}), as
+ * the prompt cache keys it: the catalog entry with the API and endpoint of that wire model. Each endpoint keeps a cache
+ * of its own, so a request in another API format (Kimi Code's) or on another route of a wrapper transport (Factory
+ * Droid's) changes the key as a switch to another model does. The endpoint is keyed as the request reaches it
+ * ({@link endpointUrl}): a base URL spelled with its host in capitals, a default port or a trailing slash names the
+ * same endpoint, as `fetch` sends to it.
+ */
+export function promptCacheModelKey(model: Model, kimiApiFormat: SimpleStreamOptions["kimiApiFormat"]): string {
+	const wire = wireModel(model, { kimiApiFormat });
+	return JSON.stringify([model.provider, model.id, wire.api, endpointUrl(wire.baseUrl)]);
 }
 
 function timeoutSecondsToMs(value: number): number | undefined {

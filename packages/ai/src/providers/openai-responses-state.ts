@@ -1,10 +1,22 @@
 import { $flag } from "@oh-my-pi/pi-utils";
 import type { Model, ProviderSessionState } from "../types";
+import { releaseOpenAIEffortControlSession } from "./openai-configuration-update";
+import {
+	clearOpenAIReasoningEffortFallbackState,
+	createOpenAIReasoningEffortFallbackState,
+} from "./openai-reasoning-fallback";
 import type {
 	OpenAIResponsesChainState,
 	OpenAIResponsesOptions,
 	OpenAIResponsesProviderSessionState,
 } from "./openai-responses";
+import {
+	clearOpenAIStrictToolsState,
+	createOpenAIStrictToolsState,
+	disableStrictToolsForScope,
+	normalizeOpenAIPromptCacheKey,
+	type OpenAIStrictToolsScope,
+} from "./openai-shared";
 
 /** Prefix shared by Responses request state and credential-reset hooks. */
 export const OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX = "openai-responses:";
@@ -27,6 +39,68 @@ export function openAIResponsesReplaysNativeHistory(
 	if (state) return state.nativeHistoryReplayWarmed;
 	const compat = model.compat;
 	return !(compat && "connectionBoundNativeHistory" in compat && compat.connectionBoundNativeHistory);
+}
+
+function createOpenAIResponsesProviderSessionState(
+	model: Model<"openai-responses">,
+): OpenAIResponsesProviderSessionState {
+	const strictToolsState = createOpenAIStrictToolsState();
+	const reasoningEffortFallbackState = createOpenAIReasoningEffortFallbackState();
+	const state: OpenAIResponsesProviderSessionState = {
+		...strictToolsState,
+		...reasoningEffortFallbackState,
+		nativeHistoryReplayWarmed: !model.compat.connectionBoundNativeHistory,
+		closeCount: 0,
+		chains: new Map(),
+		effortControls: new Map(),
+		releaseSession: sessionId => {
+			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
+			if (!normalizedSessionId) return;
+			for (const [key, chain] of state.chains) {
+				if (chain.sessionId === normalizedSessionId) state.chains.delete(key);
+			}
+			releaseOpenAIEffortControlSession(state.effortControls, normalizedSessionId);
+			state.transports?.releaseSession(normalizedSessionId);
+		},
+		close: () => {
+			state.nativeHistoryReplayWarmed = false;
+			state.closeCount++;
+			state.chains.clear();
+			state.effortControls.clear();
+			state.transports?.close();
+			state.transports = undefined;
+			clearOpenAIStrictToolsState(state);
+			clearOpenAIReasoningEffortFallbackState(state);
+		},
+	};
+	return state;
+}
+
+/** Return or initialize the Responses state for `model`'s provider in a session's provider state. */
+export function getOpenAIResponsesProviderSessionState(
+	model: Model<"openai-responses">,
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+): OpenAIResponsesProviderSessionState | undefined {
+	if (!providerSessionState) return undefined;
+	const key = `${OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX}${model.provider}`;
+	const existing = providerSessionState.get(key) as OpenAIResponsesProviderSessionState | undefined;
+	if (existing) return existing;
+	const created = createOpenAIResponsesProviderSessionState(model);
+	providerSessionState.set(key, created);
+	return created;
+}
+
+/**
+ * Puts back the strict-tools fallback an earlier process of the session kept for `scope` (see
+ * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): requests for `model`'s provider send no tool as strict for that
+ * scope, as the requests after the endpoint rejected strict tools did.
+ */
+export function restoreOpenAIResponsesStrictToolsFallback(
+	providerSessionState: Map<string, ProviderSessionState>,
+	model: Model<"openai-responses">,
+	scope: OpenAIStrictToolsScope,
+): void {
+	disableStrictToolsForScope(getOpenAIResponsesProviderSessionState(model, providerSessionState), scope);
 }
 
 /** Host per-provider storage defaults; see {@link configureProviderStoreResponses}. */

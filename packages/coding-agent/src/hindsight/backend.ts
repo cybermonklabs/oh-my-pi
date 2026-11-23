@@ -15,7 +15,7 @@ import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation 
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, computeBankScope, type HindsightBankSet } from "./bank";
-import { createHindsightClient } from "./client";
+import { createHindsightClient, hindsightAccountToken, hindsightServer } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
 import { type HindsightMessage, hasSubstantiveContent } from "./content";
 import { sessionDisposalSignal } from "./session-lifetime";
@@ -79,7 +79,7 @@ export const hindsightBackend: MemoryBackend = {
 		await installPrimaryState(session, settings, new Set());
 	},
 
-	async buildDeveloperInstructions(_agentDir, _cwd, settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, _cwd, settings, session, options): Promise<string | undefined> {
 		const config = loadHindsightConfig(settings);
 		if (!isHindsightConfigured(config)) return undefined;
 
@@ -93,7 +93,7 @@ export const hindsightBackend: MemoryBackend = {
 		// anchored on curated knowledge.
 		const parts = [prompt.render(hindsightInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) })];
 		if (mentalModelsSnippet) parts.push(mentalModelsSnippet);
-		if (recallSnippet) parts.push(recallSnippet);
+		if (recallSnippet && !options?.recallDelivered) parts.push(recallSnippet);
 		return parts.join("\n\n");
 	},
 
@@ -109,6 +109,7 @@ export const hindsightBackend: MemoryBackend = {
 		if (!preparation) return undefined;
 		return {
 			context: preparation.context,
+			reused: preparation.reused,
 			commit: () => session.getHindsightSessionState() === state && preparation.commit(),
 		};
 	},
@@ -323,7 +324,10 @@ async function installPrimaryState(
 	// Kick off mental-model bootstrap. Resolves asynchronously; the first
 	// turn races and is covered in `beforeAgentStartPrompt` via
 	// `mentalModelsLoadPromise`. Subsequent turns see the populated cache
-	// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`.
+	// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`; while the
+	// switch or edit that installed this state is held on a bound prompt, or a
+	// resumed process still sends the transcript's stored prompt, that rebuild
+	// joins the withheld change and goes out with it.
 	if (config.mentalModelsEnabled) {
 		state.mentalModelsLoadPromise = state.runMentalModelLoad(scope).catch(err => {
 			logger.debug("Hindsight: mental-model bootstrap failed", { bankId: state.bankId, error: String(err) });
@@ -369,13 +373,14 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 	// A confirmed bank includes its mission metadata, not just its server/id.
 	// Reuse confirmations only while the effective PUT payload is unchanged.
 	const sameBankConfig =
-		current.config.hindsightApiUrl === config.hindsightApiUrl &&
+		hindsightServer(current.config) === hindsightServer(config) &&
 		current.config.bankMission.trim() === config.bankMission.trim() &&
 		(current.config.retainMission?.trim() || "") === (config.retainMission?.trim() || "");
 	const state = await installPrimaryState(session, settings, sameBankConfig ? current.banksSet : new Set());
 	if (!state) return false;
-	// A destination with no recall injection must not reuse the source bank's prompt.
-	await session.refreshBaseSystemPrompt();
+	// The fresh state recalls afresh at the next turn: the old state's recall goes out in no later request, and a
+	// destination with no recall injection must not reuse the source bank's prompt.
+	await session.withdrawMemoryRecall();
 	return true;
 }
 
@@ -383,9 +388,14 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
  * Structural compare of two resolved Hindsight configs. Both sides come from
  * `loadHindsightConfig`, so iterating one side's keys covers the whole shape
  * and a newly added config field is picked up without touching this compare.
+ * The server and token compare as the client reaches the server and as the
+ * recall scope names the account ({@link hindsightServer},
+ * {@link hindsightAccountToken}).
  */
 function hindsightConfigsEqual(a: HindsightConfig, b: HindsightConfig): boolean {
+	if (hindsightServer(a) !== hindsightServer(b) || hindsightAccountToken(a) !== hindsightAccountToken(b)) return false;
 	for (const key of Object.keys(a) as (keyof HindsightConfig)[]) {
+		if (key === "hindsightApiUrl" || key === "hindsightApiToken") continue;
 		const left = a[key];
 		const right = b[key];
 		if (Array.isArray(left) || Array.isArray(right)) {

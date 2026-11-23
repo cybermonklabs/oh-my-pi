@@ -16,6 +16,11 @@
 - Provider model resolution reads each cache row and parses it in separate slices, and collapses variants and fills catalog metrics in slices; a corrupt row is deleted only if no write replaced it since it was read
 - Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
 - Concurrent refreshes of one provider read, merge and write its cache row one at a time, in the order their fetches resolved, each from the row the earlier ones left, as they did before the work was sliced; a slow refresh can no longer write an older catalog over a newer one or drop rows another refresh fetched
+- Added `getCacheTokenPrices()`, the per-token cache read and write prices at a five-minute or one-hour lifetime for a request not yet sent, priced the way usage is billed (long-context tiers and time-based prices included); a card that prices cache reads but no cache write gets its writes at the input rate at either lifetime, since its provider bills the tokens a request writes as uncached input, and a card that prices neither a cache read nor a cache write gets both at 0
+
+### Fixed
+
+- Fixed one-hour cache writes on a card without a cache-write price billing at twice the input rate; they bill at the card's write price, as five-minute writes do
 
 ## [18.18.6] - 2026-11-09
 

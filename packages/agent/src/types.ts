@@ -23,6 +23,7 @@ import type {
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import type { RepeatedPerCallMessages } from "./repeated-per-call-messages";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { SentToolDefinitions } from "./sent-tool-definitions";
 import type { AgentTelemetryConfig } from "./telemetry";
@@ -186,6 +187,16 @@ export interface SteeringQueueState {
 	source?: SteeringInterruptSource;
 }
 
+/** What a provider-context transform (`AgentOptions.transformProviderContext`) shapes a context for. */
+export interface ProviderContextRequest {
+	/**
+	 * A side request (`Agent.buildSideRequestContext`): it shares the conversation's prompt prefix but is no part of
+	 * its history, so a transform that keeps state for the conversation's requests reads that state and leaves it as
+	 * it was.
+	 */
+	sideRequest?: boolean;
+}
+
 /**
  * Configuration for the agent loop.
  */
@@ -276,6 +287,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/** Remembers sent tool definitions to fill {@link Context.inactiveTools}. */
 	sentToolDefinitions?: SentToolDefinitions;
+
+	/**
+	 * Sends each per-call message that repeats the previous main request's bytes at its position as history, so
+	 * prompt caching treats it like the rest of the history. Applied to main requests only.
+	 */
+	repeatedPerCallMessages?: RepeatedPerCallMessages;
 
 	/**
 	 * Resolves the API key or resolver for the current model before each LLM call.
@@ -435,6 +452,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * provider-bound context.
 	 */
 	syncContextBeforeModelCall?: (context: AgentContext, signal?: AbortSignal) => void | Promise<void>;
+
+	/**
+	 * Messages the next model call must carry that its context lacks, asked before each model call once
+	 * {@link syncContextBeforeModelCall} has run. They are appended to the context as input messages of the turn
+	 * the call opens, and emitted with its other inputs, so a host records them where the call sent them and later
+	 * calls replay them as history.
+	 */
+	getMissingContextMessages?: (context: AgentContext) => AgentMessage[] | Promise<AgentMessage[]>;
 
 	/**
 	 * Asked after the complete provider context has been built, including

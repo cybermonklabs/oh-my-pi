@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import type { AssistantMessage, AssistantMessageEvent, SimpleStreamOptions, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, SimpleStreamOptions, ToolChoice, Usage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { factoryModel } from "../../ai/test/helpers/factory-droid";
 import {
@@ -796,4 +797,173 @@ describe("cache warmer lifecycle", () => {
 		expect(h.replays).toHaveLength(1);
 		h.warmer.cancel();
 	});
+	// Anthropic keys the cached messages on `tool_choice`: a request with another choice than the default writes
+	// messages the next default request does not read, and refreshes none of the entry the request before it left.
+	test.each([
+		{ choice: "a forced tool", toolChoice: { type: "tool", name: "write" } },
+		{ choice: "no tool", toolChoice: "none" },
+	] satisfies { choice: string; toolChoice: ToolChoice }[])(
+		"keeps warming the request before one whose tool choice is $choice",
+		async ({ toolChoice }) => {
+			const h = harness();
+			const model = makeModel();
+			// Precondition: the model takes a forced tool choice, so the request sends the choice as given.
+			expect(model.compat).toMatchObject({ supportsForcedToolChoice: true });
+			start(h);
+			const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () =>
+				change(h),
+			);
+
+			expect(dispatched).toBeUndefined();
+			await advance(SHORT_DELAY_MS);
+			expect(h.replays).toHaveLength(1);
+			expect(h.replays[0]?.options?.toolChoice).toBeUndefined();
+		},
+	);
+
+	test("arms a forced tool choice the model sends as auto", async () => {
+		const h = harness();
+		const model = buildModel({
+			id: "claude-opus-5-5",
+			name: "Claude Opus 5.5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			promptCache: { short: 300, long: 3600 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		});
+		// Precondition: the model takes no forced tool choice; the provider sends the request with `auto`.
+		expect(model.compat).toMatchObject({ supportsForcedToolChoice: false });
+		const toolChoice: ToolChoice = { type: "tool", name: "write" };
+		h.warmer.start({ model, context: { messages: [] }, options: {} }, () => change(h));
+		h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () => change(h));
+
+		await advance(SHORT_DELAY_MS);
+		expect(h.replays).toHaveLength(1);
+		expect(h.replays[0]?.options?.toolChoice).toEqual(toolChoice);
+	});
+
+	// The provider's own downgrade decides what the wire carries: a forced choice Bedrock sends as `auto` for a
+	// prefix-bound line thinking on the request, or one a chat completions host takes no `tool_choice` for, leaves the
+	// request on the default choice, so its entry is the one the next request reads.
+	test.each([
+		{ thinking: "on", options: { reasoning: Effort.High }, armed: true },
+		{ thinking: "off", options: {}, armed: false },
+	] satisfies { thinking: string; options: SimpleStreamOptions; armed: boolean }[])(
+		"on Bedrock's prefix-bound Haiku 5.5 with thinking $thinking, arms a forced tool choice only when it goes out as auto",
+		({ options, armed }) => {
+			const h = harness();
+			const model = getBundledModel("amazon-bedrock", "anthropic.claude-haiku-5-5") as Model;
+			// Precondition: the model takes a forced tool choice, and binds thinking to its prompt prefix.
+			expect({ compat: model.compat, prefixBinding: model.thinking?.prefixBinding }).toMatchObject({
+				compat: { supportsForcedToolChoice: true, disabledThinking: "disabled" },
+				prefixBinding: true,
+			});
+			const toolChoice: ToolChoice = { type: "tool", name: "write" };
+			const dispatched = h.warmer.start(
+				{ model, context: { messages: [] }, options: { ...options, toolChoice } },
+				() => change(h),
+			);
+			expect(dispatched !== undefined).toBe(armed);
+			h.warmer.cancel();
+		},
+	);
+
+	test("arms a forced tool choice a chat completions host takes no tool_choice for", () => {
+		const h = harness();
+		const model = buildModel({
+			id: "gpt-4.1",
+			name: "GPT-4.1",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 0 },
+			promptCache: { short: 300 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+			compat: { supportsToolChoice: false },
+		});
+		// Precondition: the host takes no `tool_choice`, though a forced one would be taken were it sent.
+		expect(model.compat).toMatchObject({ supportsToolChoice: false, supportsForcedToolChoice: true });
+		const toolChoice: ToolChoice = { type: "tool", name: "write" };
+		const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () => change(h));
+		expect(dispatched).toBeDefined();
+		h.warmer.cancel();
+	});
+
+	// Chat completions decides the request's `tool_choice` under the compat it resolves for the request: the
+	// `whenThinking` view when thinking is on. A forced choice that view takes none of goes out as `auto`.
+	test.each([
+		{ thinking: "on", options: { reasoning: Effort.High }, armed: true },
+		{ thinking: "off", options: {}, armed: false },
+	] satisfies { thinking: string; options: SimpleStreamOptions; armed: boolean }[])(
+		"on a chat completions host that takes no forced tool choice while thinking, with thinking $thinking, arms a forced tool choice only when it goes out as auto",
+		({ options, armed }) => {
+			const h = harness();
+			const model = buildModel({
+				id: "gpt-5",
+				name: "GPT-5",
+				api: "openai-completions",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+				promptCache: { short: 300 },
+				contextWindow: 400_000,
+				maxTokens: 8_192,
+				compat: { whenThinking: { supportsForcedToolChoice: false } },
+			});
+			// Precondition: the host takes a forced tool choice, except on a request with thinking on.
+			expect(model.compat).toMatchObject({
+				supportsForcedToolChoice: true,
+				whenThinking: { supportsForcedToolChoice: false },
+			});
+			const toolChoice: ToolChoice = { type: "tool", name: "write" };
+			const dispatched = h.warmer.start(
+				{ model, context: { messages: [] }, options: { ...options, toolChoice } },
+				() => change(h),
+			);
+			expect(dispatched !== undefined).toBe(armed);
+			h.warmer.cancel();
+		},
+	);
+
+	// A wrapper transport sends the request as a model of its own: Factory Droid's Claude route as an Anthropic model,
+	// whose provider sends a forced choice the model line takes none of as `auto`.
+	test("arms a forced tool choice Factory Droid's Claude Opus 5.5 route sends as auto", () => {
+		const h = harness();
+		const model = { ...factoryModel("claude-opus-5-5"), promptCache: { short: 300, long: 3600 } };
+		// Precondition: the model line takes no forced tool choice on any host.
+		expect(getBundledModel("anthropic", "claude-opus-5-5").compat).toMatchObject({ supportsForcedToolChoice: false });
+		const toolChoice: ToolChoice = { type: "tool", name: "write" };
+		const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () => change(h));
+		expect(dispatched).toBeDefined();
+		h.warmer.cancel();
+	});
+
+	// An `openrouter` model goes out on Responses, which sends no `tool_choice` to a model that takes none.
+	test.each([
+		{ choice: "a forced tool", toolChoice: { type: "tool", name: "write" } },
+		{ choice: "no tool", toolChoice: "none" },
+	] satisfies { choice: string; toolChoice: ToolChoice }[])(
+		"arms a request whose tool choice is $choice on an OpenRouter model that takes no tool_choice",
+		({ toolChoice }) => {
+			const h = harness();
+			const model = { ...getBundledModel("openrouter", "meta/muse-spark-1.3"), promptCache: { short: 300 } };
+			// Precondition: the model takes no `tool_choice`, though a forced one would be taken were it sent.
+			expect(model.compat).toMatchObject({ supportsToolChoice: false, supportsForcedToolChoice: true });
+			const dispatched = h.warmer.start({ model, context: { messages: [] }, options: { toolChoice } }, () =>
+				change(h),
+			);
+			expect(dispatched).toBeDefined();
+			h.warmer.cancel();
+		},
+	);
 });
