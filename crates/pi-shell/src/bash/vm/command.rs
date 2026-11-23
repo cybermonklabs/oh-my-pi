@@ -4478,6 +4478,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// (`jobs.c:5196`). The list holds the jobs running when `wait`
 			// began, `$!` last: it ends in the pass that keeps it.
 			let last = vp.last_bg;
+			let bash = vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
 			let mut kept = None;
 			let mut first = st(vp).writes.is_empty();
 			while let Some(&v) = st(vp).wait_for.first() {
@@ -4503,12 +4504,14 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				first = false;
 				st(vp).wait_for.remove(0);
 			}
-			// bash: `wait` forgets every finished job, except the one `$!`
-			// names when it finished before the wait (POSIX keeps the last
-			// async status until it is waited for or reported) or while it
-			// waited for another. A job this shell just killed is still being
-			// reaped when bash's `wait` looks, so that wait collects it
-			// (jobs.tests).
+			// bash: `wait` forgets every finished job but the one `$!` names
+			// (`mark_dead_jobs_as_notified`, `jobs.c:5196`; POSIX keeps the
+			// last async status until it is waited for or reported), unless
+			// this wait waited for it (its process is reaped by then, which
+			// drops it here, as bash's `wait_for_single_pid` marks it
+			// reported) or its status went elsewhere: one that ended before
+			// the wait, or while it waited for another, the next line
+			// reports. zsh forgets the `$!` job a signal ended.
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
@@ -4516,7 +4519,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					JobState::Done(status) => {
 						!last.is(j.vpid)
 							|| (kept != Some(j.vpid)
-								&& (status > 128
+								&& ((if bash { j.notified } else { status > 128 })
 									|| !matches!(
 										k.proc_state(cx.store, j.vpid),
 										Some(super::ProcState::Exited(_))
@@ -4712,6 +4715,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				st(vp).notice = end.notice.map(Box::new);
 			}
 			super::external_ended(k, vp, killed, replacing);
+			// bash reaped every child that had ended as it waited for the
+			// program.
+			if reaped {
+				vp.jobs.all_reaped();
+			}
 			// The program run in place has ended (or is lost): the process is
 			// the shell's own again, with the shell's signal rules; a session
 			// runs its next command ([`super::untrapped::program_ended`]).

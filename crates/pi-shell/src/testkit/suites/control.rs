@@ -377,10 +377,16 @@ fn a_killed_externals_death_outlives_every_snapshot() {
 /// restore: the next run's first line reports the job as the run without
 /// the image does, a line for each process `kill %1` ended. Those the job's
 /// vproc started (`$!` waits for that) are named by their own vprocs; those
-/// it had not started yet ended with it, and name it.
+/// it had not started yet ended with it, and name it. The first run ends
+/// once `jobs -r` lists no running job (`GONE`: builtins only, which report
+/// nothing; `/tmp` is the test host's in-memory one): `kill -0 %1`
+/// succeeds for a finished job still listed, in bash 5.3.20 and 5.2.21 too,
+/// so a loop on it never ends there. The loop stops after 100,000 passes,
+/// and says so on standard error.
 #[test]
 fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
-	const GONE: &str = "while kill -0 %1 2>/dev/null; do :; done";
+	const GONE: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running ]; do n=$((n+1)); [ $n \
+	                    -le 100000 ] || { echo still running >&2; exit 97; }; done";
 	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let text = "{ while :; do\n    :;\ndone; }";
 	for (start, started) in [(": $!; ", true), ("", false)] {

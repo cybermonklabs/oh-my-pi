@@ -286,6 +286,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				os_pid:    Some(4242),
 				signal:    None,
 				procs:     None,
+				unreaped:  false,
 			}),
 		),
 		(
@@ -304,6 +305,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				os_pid:    None,
 				signal:    None,
 				procs:     None,
+				unreaped:  false,
 			}),
 		),
 		(

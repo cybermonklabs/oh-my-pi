@@ -879,11 +879,33 @@ fn masked_stages(o: &Outcome) -> Outcome {
 /// reads its input to its end before it ends: the stage before it has ended
 /// then. A job is known to have ended once the shell's table lists no
 /// running job (`jobs -r` into `$F`, `DONE`: builtins only, as a
-/// foreground program would end with a report point).
+/// foreground program would end with a report point). A job this shell's
+/// `kill` just ended is still running for bash until bash reaps it: a
+/// plain `wait` with no other job running waits for it and prints its
+/// notice (`wait_for_background_pids`, `jobs.c:2809-2836`), as `wait %1`
+/// and `wait $!` do; with another job running bash waits for that one and
+/// keeps the killed `$!` job for the next line's notice
+/// (`mark_dead_jobs_as_notified`, `jobs.c:5196`; bash 5.2.21 prints that
+/// one at the `wait`). Once bash reaped it before the `wait` (as it waited
+/// for a foreground command, or as a `kill -0` loop ran), the `wait`
+/// reports nothing and keeps the job `$!` names for the next line's notice
+/// and `jobs`. obash takes a job's end in as its host reaps the program's
+/// OS status, as bash does; a job its `kill` ends before each of its
+/// processes is a program obash spawned (`kill %1` right after `&`, a group
+/// job) has no OS status to reap, and counts as unreaped until the shell
+/// waits for a foreground command, a `kill` finds the job gone or `jobs`
+/// finds it done (`store::Job::unreaped`).
 #[test]
 fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 	use stage::{E0, E3, G, K, PF, R0, R5, RH, RK, RT, T};
 	const DONE: &str = "while jobs -r >\"$F\"; [ -s \"$F\" ]; do :; done";
+	// `DONE` with a bound: a shell that never lists the job done exits 97.
+	const BOUNDED_DONE: &str = "n=0; while jobs -r >\"$F\"; [ -s \"$F\" ]; do n=$((n+1)); [ $n -le \
+	                            100000 ] || exit 97; done";
+	// The review's row: two processes this shell's `kill` ended.
+	const PIPE: &str = "/bin/sleep 5 | /bin/sleep 6 & kill -KILL %1";
+	// Until the shell reaped job `$!`, with builtins only.
+	const GONE: &str = "while kill -0 $! 2>/dev/null; do :; done";
 	let killed = desc(libc::SIGKILL);
 	let killed = killed.as_str();
 	let hangup = desc(libc::SIGHUP);
@@ -955,6 +977,88 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 			format!("{E0} | /bin/sleep 30 & kill -KILL $!; wait %1; echo st=$?"),
 			format!("{}st=137\n", at(1, &[("Done", E0), (killed, "/bin/sleep 30")])),
 		),
+		// A job this shell's `kill` ended: a plain `wait` reports it, as
+		// `wait %1` and `wait $!` do; `jobs` lists it once it is done.
+		(
+			format!("{PIPE}; wait; echo st=$?"),
+			format!("{}st=0\n", at(1, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])),
+		),
+		(
+			format!("{PIPE}; wait %1; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])),
+		),
+		(
+			format!("{PIPE}; wait $!; echo st=$?"),
+			format!("{}st=137\n", at(1, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])),
+		),
+		(
+			format!("{PIPE}; {BOUNDED_DONE}; jobs; echo st=$?"),
+			format!("[1]+  {killed:<27}/bin/sleep 5 | /bin/sleep 6\nst=0\n"),
+		),
+		(
+			"/bin/sleep 5 & kill -KILL %1; wait; echo st=$?".into(),
+			format!("{}st=0\n", at(1, &[(killed, "/bin/sleep 5")])),
+		),
+		(
+			"/bin/sleep 2 & /bin/sleep 5 | /bin/sleep 6 & kill -KILL %2; wait; echo st=$?\necho next"
+				.into(),
+			format!("st=0\n{}next\n", at(2, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])),
+		),
+		(
+			"{ /bin/sleep 30; } & kill -KILL %1; wait; echo st=$?".into(),
+			format!("{}st=0\n", at(1, &[(killed, "{ /bin/sleep 30; }")])),
+		),
+		// Once the shell reaped the job before the `wait` (`kill -0` finds it
+		// gone, `jobs -r` lists it no more), `wait` has nothing to report:
+		// [`bash_reports_a_background_job_killed_by_a_signal`]'s row for a
+		// program, here for a job without one and for the review's job.
+		(format!("/bin/sleep 30 & kill -KILL $!; {GONE}; wait; echo st=$?"), "st=0\n".into()),
+		(format!("{{ /bin/sleep 30; }} & kill -KILL %1; {GONE}; wait; echo st=$?"), "st=0\n".into()),
+		(format!("{PIPE}; {BOUNDED_DONE}; wait; echo st=$?"), "st=0\n".into()),
+		// bash reaps the killed job as it waits for a foreground program or
+		// child (`waitchld` takes in every child that ended): `wait` reports
+		// nothing and keeps the job `$!` names for the next line's notice
+		// (bash 5.2.21 reports it at the `wait`).
+		(
+			"{ /bin/sleep 30; } & kill -KILL %1; /bin/sleep 1; wait; echo st=$?".into(),
+			"st=0\n".into(),
+		),
+		(
+			"{ /bin/sleep 30; } & kill -KILL %1; /bin/sleep 1; wait; echo st=$?\necho next".into(),
+			format!("st=0\n{}next\n", at(2, &[(killed, "{ /bin/sleep 30; }")])),
+		),
+		(format!("{PIPE}; /bin/sleep 1; wait; echo st=$?"), "st=0\n".into()),
+		(
+			format!("{PIPE}; /bin/sleep 1; wait; echo st=$?\necho next"),
+			format!("st=0\n{}next\n", at(2, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])),
+		),
+		(
+			"{ /bin/sleep 30; } & kill -KILL %1; ( /bin/sleep 0.3 ); wait; echo st=$?".into(),
+			"st=0\n".into(),
+		),
+		// The job `$!` names that bash reaped before the `wait` stays for the
+		// next line and for `jobs` (`mark_dead_jobs_as_notified`); the one
+		// the `wait` waited for goes (`wait_for_single_pid` marks it
+		// reported), one a `TERM` ended, with no notice, too.
+		(
+			format!("/bin/sleep 30 & kill -KILL $!; {GONE}; wait; echo st=$?\necho next"),
+			format!("st=0\n{}next\n", at(2, &[(killed, "/bin/sleep 30")])),
+		),
+		(
+			format!("/bin/sleep 30 & kill -KILL $!; {GONE}; wait; jobs; echo end"),
+			format!("[1]+  {killed:<27}/bin/sleep 30\nend\n"),
+		),
+		("/bin/sleep 30 & kill -TERM $!; wait; jobs; echo end".into(), "end\n".into()),
+		// The job the `wait` waited for is reported once: not again at the
+		// next line, and `jobs` lists it no more (bash 5.3.20 and 5.2.21).
+		(
+			"/bin/sleep 5 | /bin/sleep 6 & kill -KILL %1; wait; echo st=$?\necho next\njobs; echo end"
+				.into(),
+			format!(
+				"{}st=0\nnext\nend\n",
+				at(1, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])
+			),
+		),
 		// `wait`, `wait $!`, `wait -n`; the next line read; `jobs`. A `wait`
 		// without operands drops a job that ended before it (bash
 		// `wait_for_background_pids`): this one's last process dies once the
@@ -1012,11 +1116,47 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 			format!("{}st=137\n", at(1, &[("Done", E0), (killed, RK)])),
 		),
 	];
+	// The rows whose bash output depends on bash's own timing, each with
+	// bash's other output: bash reaps a job this shell's `kill` ended in its
+	// `SIGCHLD` handler before the `wait` or inside it, as the job's
+	// processes die before bash reaches the `wait` or after. Reaped before,
+	// the `wait` reports nothing, and the job stays for the next line's
+	// notice and for `jobs` (a job `TERM` ended too). bash 5.3.20 and
+	// 5.2.21 print the other output when a loop before the `wait` holds
+	// until bash reaped the job (as the `{GONE}` rows do). obash's output is
+	// the golden; the live bash may give either.
+	let raced = [
+		(format!("{PIPE}; wait; echo st=$?"), "st=0\n".to_owned()),
+		("/bin/sleep 5 & kill -KILL %1; wait; echo st=$?".to_owned(), "st=0\n".to_owned()),
+		("{ /bin/sleep 30; } & kill -KILL %1; wait; echo st=$?".to_owned(), "st=0\n".to_owned()),
+		(
+			"/bin/sleep 30 & kill -TERM $!; wait; jobs; echo end".to_owned(),
+			format!("[1]+  {:<27}/bin/sleep 30\nend\n", desc(libc::SIGTERM)),
+		),
+		(
+			"/bin/sleep 5 | /bin/sleep 6 & kill -KILL %1; wait; echo st=$?\necho next\njobs; echo end"
+				.to_owned(),
+			format!(
+				"st=0\n{}next\nend\n",
+				at(2, &[(killed, "/bin/sleep 5"), (killed, "/bin/sleep 6")])
+			),
+		),
+	];
+	assert!(
+		raced
+			.iter()
+			.all(|(row, _)| cases.iter().any(|(script, _)| script == row)),
+		"each raced row is a row of the table"
+	);
 	let dir = tempfile::tempdir().expect("a directory for `jobs -r`");
 	let file = dir.path().join("running");
 	let masked = masked_stages;
 	let mut wrong = Vec::new();
 	for (script, out) in cases {
+		let other = raced
+			.iter()
+			.find(|(row, _)| *row == script)
+			.map(|(_, other)| other);
 		let script = format!("exec 2>&1; {script}");
 		let run = |shell: &OsStr| Run::script(shell, "bash", &script).env("F", &file).go();
 		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
@@ -1028,7 +1168,11 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
 		}
 		if let Some(bash) = real_bash_golden() {
-			assert_eq!(masked(&ours), masked(&run(bash.as_os_str())), "{script:?}");
+			let (ours, theirs) = (masked(&ours), masked(&run(bash.as_os_str())));
+			let other = other.map(|o| Outcome { stdout: mask_names(o.as_bytes()), ..ours.clone() });
+			if other.as_ref() != Some(&theirs) {
+				assert_eq!(ours, theirs, "{script:?}");
+			}
 		}
 	}
 	// A script file in posix mode: an exit shows as `Done(N)`.
@@ -1053,6 +1197,92 @@ fn bash_reports_a_pipeline_job_killed_by_a_signal() {
 	let pids = "/bin/sh -c 'echo $$ >\"$F.1\"; exit 0' | /bin/sh -c 'echo $$ >\"$F.2\"; read x; \
 	            kill -KILL $$' & wait %1";
 	check_notice_pids(pids, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Pinned difference, not bash's behavior: a job that is no program obash
+/// spawned (a group or subshell job), which this shell's `kill` just ended,
+/// is reported at the next line read. bash 5.3.20 and 5.2.21 have not reaped
+/// it then (it ends only as its `SIGCHLD` comes): for
+/// `{ /bin/sleep 30; } & kill -KILL %1` and then the lines `echo next` and
+/// `echo after`, both print only `next` and `after`. obash ends the job at
+/// once in its kernel and prints a line-2 `Killed` notice first. Left as it
+/// is: holding the notice until a foreground wait, a `kill` or `jobs` shows
+/// the job reaped would delay it in an interactive shell, where bash's
+/// asynchronous `SIGCHLD` has usually reaped the job by the next prompt.
+/// The row asserts obash's current output, so that a change shows up here;
+/// it is no bash golden.
+#[test]
+fn obash_reports_a_job_its_kill_ended_at_the_next_line_where_bash_reaps_later() {
+	let script = "exec 2>&1; { /bin/sleep 30; } & kill -KILL %1\necho next\necho after";
+	let ours = match Run::script(OsStr::new(env!("CARGO_BIN_EXE_obash")), "bash", script)
+		.spawn()
+		.ended_within(EVENT_LIMIT)
+	{
+		Ok(ours) => ours,
+		Err(killed) => panic!("still running after {EVENT_LIMIT:?}: {killed:?}"),
+	};
+	let mut want = long_notice(2, libc::SIGKILL, b"{ /bin/sleep 30; }");
+	want.extend_from_slice(b"next\nafter\n");
+	assert_eq!(
+		(String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end()),
+		(String::from_utf8_lossy(&want).into_owned(), Some(Exit(0))),
+		"{script:?}"
+	);
+}
+
+/// A subshell's notice names it by the pid the shell shows for it
+/// everywhere else: `$BASHPID` inside it, `$!` for its job (bash 5.3.20 and
+/// 5.2.21: its process's pid, compared live only with a bash 5.3 or later,
+/// [`real_bash_golden`]). obash runs a subshell as a virtual process of the
+/// shell's own, with no OS process: that pid is its virtual pid (2^30 and
+/// up, apart from every OS pid), the one `$BASHPID`, `$!`, `jobs -l`, `kill`
+/// and `wait` show and take. No row waits for anything.
+#[test]
+fn a_subshells_notice_names_the_pid_the_shell_shows_for_it() {
+	let dir = tempfile::tempdir().expect("a directory for the pid");
+	let file = dir.path().join("pid");
+	let rows = [
+		"( echo $BASHPID >\"$F\"; kill -QUIT $BASHPID ); read -r p <\"$F\"; echo \"pid=$p\"",
+		"( /bin/sleep 5 ) & p=$!; kill -KILL %1; wait %1; echo \"pid=$p\"",
+		"{ /bin/sleep 5; } & p=$!; kill -KILL $p; wait $p; echo \"pid=$p\"",
+	];
+	let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+	let mut wrong = Vec::new();
+	for row in rows {
+		let script = format!("exec 2>&1; {row}");
+		for shell in std::iter::once(obash.to_owned()).chain(real_bash_golden().map(Into::into)) {
+			let _ = fs::remove_file(&file);
+			let out = match Run::script(&shell, "bash", &script)
+				.env("F", &file)
+				.spawn()
+				.ended_within(EVENT_LIMIT)
+			{
+				Ok(out) => out,
+				Err(killed) => {
+					wrong.push(format!(
+						"{shell:?} {row:?}: still running after {EVENT_LIMIT:?}: {killed:?}"
+					));
+					continue;
+				},
+			};
+			let text = String::from_utf8_lossy(&out.stdout).into_owned();
+			let named = text.lines().find_map(|line| {
+				let (_, rest) = line.split_once(": line ")?;
+				let (_, rest) = rest.split_once(": ")?;
+				rest.split_whitespace().next().map(str::to_owned)
+			});
+			let shown = text
+				.lines()
+				.find_map(|line| line.strip_prefix("pid="))
+				.map(str::to_owned);
+			if named.is_none() || named != shown {
+				wrong.push(format!(
+					"{shell:?} {row:?}: the notice names {named:?}, the shell shows {shown:?}\n{text}"
+				));
+			}
+		}
+	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 

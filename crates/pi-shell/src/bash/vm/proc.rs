@@ -607,6 +607,7 @@ impl JobTable {
 			os_pid: None,
 			signal: None,
 			procs: None,
+			unreaped: false,
 		});
 		self.reset_current();
 		number
@@ -634,6 +635,15 @@ impl JobTable {
 			self.reset_current();
 		}
 		Some(job)
+	}
+
+	/// bash reaped every child that had ended ([`Job::unreaped`]): it does as
+	/// it waits for a foreground command (`wait_for`'s `waitchld` takes in
+	/// each child that ended, not only the one it waits for).
+	pub fn all_reaped(&mut self) {
+		for job in &mut self.list {
+			job.unreaped = false;
+		}
 	}
 
 	/// Remove every job `pick` selects, as [`Self::remove`] does.

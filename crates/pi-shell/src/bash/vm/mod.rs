@@ -2374,6 +2374,11 @@ impl Shell {
 			}
 		}
 		jobctl::job_done(&mut self.k, cx, &mut self.procs[i], vpid);
+		// bash reaped every child that had ended as it waited for this
+		// foreground one ([`proc::Job::unreaped`]).
+		if !background {
+			self.procs[i].jobs.all_reaped();
+		}
 		if self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			owed = 1;
 		}

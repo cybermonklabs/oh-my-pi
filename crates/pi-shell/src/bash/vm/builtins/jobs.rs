@@ -217,6 +217,20 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if execute {
 		return execute_with_pids(ctx, o.rest);
 	}
+	// A job `jobs` finds done is one bash's `jobs` shows done only once it
+	// reaped it ([`crate::bash::store::Job::unreaped`]).
+	let finished: Vec<u32> = ctx
+		.vp
+		.jobs
+		.iter()
+		.filter(|j| j.unreaped && matches!(j.state, JobState::Done(_)))
+		.map(|j| j.number)
+		.collect();
+	for n in finished {
+		if let Some(job) = ctx.vp.jobs.get_mut(n) {
+			job.unreaped = false;
+		}
+	}
 	let home = ctx.scalar(b"HOME")?;
 	let show = Show {
 		posix:    ctx.option(OptId::Posix)?,
