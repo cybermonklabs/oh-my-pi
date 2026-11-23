@@ -514,7 +514,22 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def cmd_summary(results_dir, build_dir):
+def read_known(path):
+    """known-failures.txt: (row, user, unit, test) -> reason."""
+    known = {}
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            if not line.strip() or line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 5:
+                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
+            known[tuple(f[:4])] = f[4]
+    return known
+
+
+def cmd_summary(results_dir, build_dir, known_path=None):
+    known = read_known(known_path)
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -537,12 +552,13 @@ def cmd_summary(results_dir, build_dir):
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
     lines.append("")
-    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed. "
-                 "A unit is UNKNOWN when its runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with "
-                 "its summary line), when a passing test printed a skip marker, or when no job (or more than one) "
+    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed, "
+                 "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
+                 "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line), when a "
+                 "passing test printed a skip marker and passed as no other user, or when no job (or more than one) "
                  "reported it; its row is then UNKNOWN too.")
     lines.append("")
-    lines.append("| Row | Verdict | Units: pass / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
+    lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
     all_ok = True
     details = []
@@ -562,14 +578,16 @@ def cmd_summary(results_dir, build_dir):
                     r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
                 else:
                     r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+            if r["status"] == "FAIL" and r["failures"] and all((key, r["who"], r["unit"], f) in known for f in r["failures"]):
+                r = dict(r, status="KNOWN")
             rs.append(r)
         if key in notes and not units:
             verdict, counts = "UNKNOWN", "-"
             details.append(f"- **{title}**: UNKNOWN: {notes[key]}")
         else:
-            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "FAIL", "UNKNOWN")}
-            verdict = "UNKNOWN" if n["UNKNOWN"] or not rs else ("FAIL" if n["FAIL"] else "PASS")
-            counts = f"{n['PASS']} / {n['FAIL']} / {n['UNKNOWN']}"
+            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "KNOWN", "FAIL", "UNKNOWN")}
+            verdict = ("UNKNOWN" if n["UNKNOWN"] or not rs else "FAIL" if n["FAIL"] else "KNOWN" if n["KNOWN"] else "PASS")
+            counts = f"{n['PASS']} / {n['KNOWN']} / {n['FAIL']} / {n['UNKNOWN']}"
         tp = sum(r["passed"] for r in rs)
         tf = sum(r["failed"] for r in rs)
         ti = sum(r["ignored"] for r in rs)
@@ -577,13 +595,15 @@ def cmd_summary(results_dir, build_dir):
         longest = max(rs, key=lambda r: r["seconds"], default=None)
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
-        if verdict != "PASS":
+        if verdict not in ("PASS", "KNOWN"):
             all_ok = False
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`")
+                why = known.get((key, r["who"], r["unit"], f))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
+                               + (f"KNOWN ({why})" if why else "**NEW**"))
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
     lines.append("")
@@ -593,6 +613,23 @@ def cmd_summary(results_dir, build_dir):
         lines.append("")
         for r, e in sorted(env, key=lambda x: (x[0]["row"], x[1]["test"])):
             lines.append(f"- {r['row']} `{r['unit']}` ({r['who']}): {e['kind']} `{e['test']}`: \"{e['line']}\" ({e['reason']})")
+        lines.append("")
+    # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
+    # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
+    # neither: it stays.
+    stale = []
+    for (row, who, unit, test), why in sorted(known.items()):
+        r = got.get((row, unit, who))
+        if r is None or r["status"] == "UNKNOWN" or test in r["failures"]:
+            continue
+        names = {n for n, _ in r["tests"]}
+        stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else "no longer in its unit")
+                     + f" (listed for: {why})")
+    if stale:
+        all_ok = False
+        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("")
+        lines.extend(stale)
         lines.append("")
     if details:
         lines.append("### Each failing test and each UNKNOWN")
@@ -739,17 +776,20 @@ def selftest():
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
                   open(paths[(row, unit, who)], "w"))
 
+    known_file = os.path.join(d, "known.txt")
+    open(known_file, "w").write("# none\n")
+
     def summary():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = cmd_summary(res, build)
+            rc = cmd_summary(res, build, known_file)
         return rc, buf.getvalue()
 
     rc, out = summary()
     check("summary exit with a silent unit", rc, 1)
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
-    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
-    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 |" in out, True)
+    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
     json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1),
               open(os.path.join(res, "silent.json"), "w"))
@@ -776,6 +816,25 @@ def selftest():
     json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
     rc, out = summary()
     check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # The known-failure list: a failure it names reads KNOWN, one it does not is NEW, and an entry
+    # whose test passed is listed for removal and fails the summary.
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=1,
+                     failures=["k"], tests=[("k", 1.0), ("p", 1.0)]),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"], r["who"]) == ("set-runner", "pi-shell::zle_pty", "runner") and f != "zle-runner.json":
+            os.remove(os.path.join(res, f))
+    rc, out = summary()
+    check("an unlisted failure is NEW", ("FAILED `k`: **NEW**" in out, "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("a listed failure is KNOWN", ("FAILED `k`: KNOWN (the host's zsh)" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, True, 0))
+    open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
+    rc, out = summary()
+    check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
+    open(known_file, "w").write("# none\n")
     # A gVisor job that reports nothing: gv-builtins-root (its one unit), and the uid 1000 set shard
     # that holds the lib binary (its set unit and the lib row both come from that job).
     check("the plan names the gVisor jobs", {"gv-builtins-root", "gv-set-uid1000-1", "gv-set-root-4"} <= set(all_job_names()), True)
@@ -789,12 +848,12 @@ def selftest():
             os.rename(paths[k], paths[k] + ".planted")
     rc, out = summary()
     check("summary exit with a silent gVisor job", rc, 1)
-    check("a silent gVisor builtins job reads UNKNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
+    check("a silent gVisor builtins job reads UNKNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("a silent gVisor builtins job is named", "`pi-builtins` (root): UNKNOWN: no result" in out, True)
-    check("a silent gVisor set shard reads UNKNOWN", "| pi-shell set, gVisor (uid 1000) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
-    check("its lib row reads UNKNOWN", "| pi-shell lib, one process, 4 threads, gVisor (uid 1000) | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
-    check("the other gVisor rows pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** | 1 / 0 / 0 |" in out
-          and "| pi-shell set, gVisor (root) | **PASS** | 2 / 0 / 0 |" in out, True)
+    check("a silent gVisor set shard reads UNKNOWN", "| pi-shell set, gVisor (uid 1000) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("its lib row reads UNKNOWN", "| pi-shell lib, one process, 4 threads, gVisor (uid 1000) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("the other gVisor rows pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** | 1 / 0 / 0 / 0 |" in out
+          and "| pi-shell set, gVisor (root) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     # A gVisor unit that ran and failed reads FAIL with its test named.
     for k in gv_silent:
         if k in paths:
@@ -802,8 +861,13 @@ def selftest():
     json.dump(result("gv-builtins-root", "pi-builtins", "root", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::cp::tests::x"]),
               open(paths.get(("gv-builtins-root", "pi-builtins", "root"), os.path.join(res, "gv-builtins-root.json")), "w"))
     rc, out = summary()
-    check("a failing gVisor unit fails its row", ("| pi-builtins, nextest default profile, gVisor (root) | **FAIL** | 0 / 1 / 0 |" in out, rc), (True, 1))
-    check("a failing gVisor test is named", "`pi-builtins` (root): FAILED `pi-builtins::cp::tests::x`" in out, True)
+    check("a failing gVisor unit fails its row", ("| pi-builtins, nextest default profile, gVisor (root) | **FAIL** | 0 / 0 / 1 / 0 |" in out, rc), (True, 1))
+    check("a failing gVisor test is named", "`pi-builtins` (root): FAILED `pi-builtins::cp::tests::x`: **NEW**" in out, True)
+    # A gVisor row's failure that the list names under its gVisor row key reads KNOWN.
+    open(known_file, "w").write("gv-builtins-root\troot\tpi-builtins\tpi-builtins::cp::tests::x\tthe host's too\n")
+    rc, out = summary()
+    check("a listed gVisor failure is KNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **KNOWN** | 0 / 1 / 0 / 0 |" in out, True)
+    open(known_file, "w").write("# none\n")
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
