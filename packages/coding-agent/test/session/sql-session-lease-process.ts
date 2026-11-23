@@ -12,9 +12,10 @@
  * - `{ op: "open", file, sessionDir }`: open the session file as the held session without claiming it, as
  *   inspection does; its first write claims it.
  * - `{ op: "append", text, contested? }`: write one more turn to the held session; `error` names a
- *   failure. With `contested`, another store that claims nothing (an older build) appends an entry to
- *   the session first, and again right before each full write, so the append and every full write meet
- *   a changed file.
+ *   failure. With `contested`, another store that claims nothing (an older build) appends a record the
+ *   loader skips and an entry to the session first, and an entry again right before each full write, so
+ *   the append and every full write meet a changed file. The skipped record keeps every recovery on full
+ *   writes: a recovery appends what the store lacks only to a journal whose every line it parses.
  * - `{ op: "appendSubagent", text }`: the same for the held subagent transcript.
  * - `{ op: "closeHeld" }`: close the held session's manager, leaving the subagent transcript's open.
  * - `{ op: "openSubagent", file }`: close the held subagent transcript's manager, if any, and open `file` as the
@@ -196,9 +197,10 @@ async function resume(command: Record<string, unknown>): Promise<Record<string, 
 /**
  * Another store that claims nothing (an older build), and a hook on this
  * process's store that has it append an entry to `file` right before each
- * full write of `file`. Returns that append.
+ * full write of `file`. Returns that append; with `skipped`, its first call
+ * appends a record the loader skips before the entry.
  */
-async function contest(file: string): Promise<() => Promise<void>> {
+async function contest(file: string, options: { skipped?: boolean } = {}): Promise<() => Promise<void>> {
 	const other: SessionStorage =
 		config.storage === "file"
 			? new FileSessionStorage()
@@ -211,6 +213,7 @@ async function contest(file: string): Promise<() => Promise<void>> {
 	const foreign = async () => {
 		n++;
 		const writer = other.openWriter(file);
+		if (n === 1 && options.skipped) await writer.append("not json\n");
 		await writer.append(
 			`${JSON.stringify({ type: "message", id: `foreign${n}`, parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: `foreign ${n}`, timestamp: n } })}\n`,
 		);
@@ -230,7 +233,7 @@ async function appendContested(text: string): Promise<Record<string, unknown>> {
 	const file = held?.getSessionFile();
 	if (!held || !file) throw new Error("no session is held");
 	await (
-		await contest(file)
+		await contest(file, { skipped: true })
 	)();
 	return appendTo(held, text);
 }
