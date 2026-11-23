@@ -55,3 +55,14 @@ set-runner	runner	pi-shell::zsh_comp_pty	options_and_values_of_arguments	fails a
 set-runner	runner	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+# Windows: the fork peer's platform-reds report, each red at upstream 9058ab9d (10/10 there); at bfd23484 in run 45278357371.
+windows	runner	pi-shell	pi-shell::shell::tests::builtins::uutils_find_display_and_actions_split_paths	fails at upstream 9058ab9d (platform-reds row 2): Windows command lookup returns a path without .exe (tools/extra.rs:385-389,427-430)
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::inherited_short_temp_matches_pwd_after_cd	fails at upstream 9058ab9d (platform-reds row 3): the fixture's TEMP has an 8.3 part and a trailing backslash (shell/tests/mod.rs:174-183)
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::session_env_short_temp_matches_pwd_after_cd	fails at upstream 9058ab9d (platform-reds row 4): as row 3
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::short_spelled_cwd_matches_stored_long_form	fails at upstream 9058ab9d (platform-reds row 5): the fixture's long path keeps RUNNER~1 (shell/tests/mod.rs:161-166)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_files::zsh_mod_files_mkdir	fails at upstream 9058ab9d (platform-reds row 7): errors carry no C errno on Windows (zsh_mod_files.rs:360-374)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_files::zsh_mod_files_mv_ln_chmod	fails at upstream 9058ab9d (platform-reds row 8): as row 7
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_system_bad_fds_set_errno	fails at upstream 9058ab9d (platform-reds row 9): strerror_of prints the Win32 message table (zsh_mod_system.rs:99-101)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_system_pipes_do_not_seek	fails at upstream 9058ab9d (platform-reds row 10): as row 9
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_terminfo::dumb_terminal	fails at upstream 9058ab9d (platform-reds row 11): Windows has no terminfo database and the test has no gate
+windows	runner	pi-shell	pi-shell::obash::externals_start_where_read_stopped	fails at upstream 9058ab9d (platform-reds row 12): the test runs /usr/bin/true, wc and tr, which Windows lacks (tests/obash.rs:163-166)
