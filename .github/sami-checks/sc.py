@@ -51,6 +51,8 @@ GV_WHO = ("uid1000", "root")
 # Tests a gVisor row cannot pass for a reason in gVisor, not in the tree: test name -> the reason.
 # In a gVisor unit their failures and self-skips do not count in the verdict; the summary lists
 # each one, with the line it printed, apart from the tree's failures. Each entry needs evidence.
+BUSY_EXEC = ("gVisor runs a program held open for writing (no ETXTBSY), so there is no busy exec to retry; the test "
+             "says NOT-RUN (spawn/unix/tests.rs busy_exec_refused); the policy tests cover the retry")
 GV_ENVIRONMENT = {
     "sys::fs::fifo::tests::an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is":
         "gVisor has no /proc/sys/fs/protected_fifos (its procfs fs/ lists only aio-max-nr, aio-nr, file-max, "
@@ -58,6 +60,14 @@ GV_ENVIRONMENT = {
     "pi-builtins::cp::tests::a_read_only_file_cp_wrote_gets_its_attributes":
         "the test skips itself under gVisor, where an attribute set after the mode changed is refused in some runs "
         "(its own skip line)",
+    "sys::spawn::unix::tests::a_background_jobs_pid_is_known_while_its_program_is_busy": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_background_program_that_stays_busy_fails_as_in_the_foreground": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_busy_background_script_without_a_shebang_still_runs_as_a_script": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_busy_program_runs_once_its_holder_lets_go": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_busy_spawn_leaves_its_thread_to_other_tasks": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_program_that_stays_busy_fails_after_the_waits": BUSY_EXEC,
+    "sys::spawn::unix::tests::a_timeout_ends_a_run_whose_program_is_busy": BUSY_EXEC,
+    "sys::spawn::unix::tests::an_abort_ends_a_run_whose_program_is_busy": BUSY_EXEC,
 }
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
@@ -65,7 +75,8 @@ DEFAULT_WEIGHT = 5.0
 # rust_test reads, .github/sami/rust-test.sh): a passing test that prints one did not pass.
 # A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
 # a line that only mentions the word later (`the host half is skipped: ...`) does not.
-SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
+NOT_RUN = re.compile(r"NOT-RUN ([A-Za-z0-9_]+): ")
+SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|NOT-RUN\b|UNKNOWN:)|UNCOMPARED", re.M)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -241,7 +252,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
     Lines that are not events (a child's or a thread's own writes) are ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped = set(), set(), set(), {}, [], []
+    started, ended, slow, times, failures, skipped, oks = set(), set(), set(), {}, [], [], set()
     passed = failed = ignored = 0
     suite_end = None
     try:
@@ -268,6 +279,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
                 ended.add(name)
                 if e == "ok":
                     passed += 1
+                    oks.add(name)
                     if SKIP_MARKER.search(ev.get("stdout") or ""):
                         skipped.append(name)
                 elif e == "ignored":
@@ -283,6 +295,18 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
         code = None
     tests = sorted(times.items())
     unfinished = sorted(started - ended)
+    # A test that writes "NOT-RUN <its name>: <why>" straight to the binary's stderr, past libtest's
+    # capture (pi-shell's spawn tests do), skipped itself: the line names the test, so it is matched
+    # to the one passing test whose name ends in that name. A line that names no passing test, or
+    # more than one, makes the unit UNKNOWN.
+    unmatched = []
+    for nr in sorted(set(NOT_RUN.findall("\n".join(lines)))):
+        hit = [t for t in oks if t == nr or t.endswith("::" + nr)]
+        if len(hit) == 1:
+            if hit[0] not in skipped:
+                skipped.append(hit[0])
+        else:
+            unmatched.append(nr)
 
     def r(status, note=""):
         return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped)
@@ -301,6 +325,8 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
                             f"the events {passed} and {failed}")
     if (code == 0) != (failed == 0):
         return r("UNKNOWN", f"exit {exit_code} with {failed} failed")
+    if unmatched and not failed:
+        return r("UNKNOWN", "NOT-RUN line(s) that name no one passing test: " + ", ".join(unmatched[:10]))
     res = r("FAIL" if failed else "PASS")
     if slow:
         res["note"] = "past 60 s: " + ", ".join(sorted(slow)[:10])
@@ -337,6 +363,11 @@ def test_outputs(path, kind):
                         continue
                     if ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
                         out[ev.get("name", "?")] = ev.get("stdout") or ""
+            text = open(path, encoding="utf-8", errors="replace").read()
+            for m in re.finditer(r"NOT-RUN ([A-Za-z0-9_]+): [^\n]*", text):
+                hit = [t for t in out if t == m.group(1) or t.endswith("::" + m.group(1))]
+                if len(hit) == 1:
+                    out[hit[0]] = m.group(0) + "\n" + out[hit[0]]
         else:
             for name, _, _, text in junit_cases(path):
                 out[name] = text
@@ -705,6 +736,23 @@ def selftest():
     check("libtest no log", parse_libtest(os.path.join(d, "absent"), "0", 1, "r", "u", "w")["status"], "UNKNOWN")
     r = lt([s0, a_s, a_skip, end_ok], 0)
     check("libtest self-skip", (r["status"], r["passed"], r["self_skipped"]), ("UNKNOWN", 0, ["a"]))
+    busy_t = "sys::spawn::unix::tests::a_busy_program_runs_once_its_holder_lets_go"
+    nr_s = {"type": "test", "event": "started", "name": busy_t}
+    nr_ok = {"type": "test", "event": "ok", "name": busy_t, "exec_time": 0.1}
+    nr_end = {"type": "suite", "event": "ok", "passed": 2, "failed": 0}
+    nr_line = "NOT-RUN a_busy_program_runs_once_its_holder_lets_go: this kernel runs a program held open for writing\n"
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, nr_line)
+    check("a NOT-RUN line on stderr is that test's self-skip", (r["status"], r["self_skipped"]), ("UNKNOWN", [busy_t]))
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, "NOT-RUN no_such_test: why\n")
+    check("a NOT-RUN line that names no test is UNKNOWN", (r["status"], "no_such_test" in r["note"]), ("UNKNOWN", True))
+    p = os.path.join(d, "lt.log")
+    with open(p, "w") as f:
+        f.write(nr_line)
+        for e in [s0, a_s, a_ok, nr_s, nr_ok, nr_end]:
+            f.write(json.dumps(e) + "\n")
+    r = gv_environment(parse_libtest(p, "0", 1, "gv-set-root", "pi-shell", "root"), test_outputs(p, "libtest"), libtest_slow(p))
+    check("a GV_ENVIRONMENT NOT-RUN test is set apart with its line", (r["status"], r["environment"][0]["line"][:28]),
+          ("PASS", "NOT-RUN a_busy_program_runs_"))
 
     ju = os.path.join(d, "j.xml")
     with open(ju, "w") as f:

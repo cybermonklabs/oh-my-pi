@@ -3,7 +3,7 @@
 # failures are known reads KNOWN. An entry whose test passed or no longer exists is listed in
 # the summary to be removed, and the summary job fails until it is, so the list only shrinks.
 # One per line, tab-separated: <row> <user> <unit> <test> <reason>.
-# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca (sc.py ROWS).
+# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, gv-set-uid1000, gv-set-root (sc.py ROWS).
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_autolist	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
@@ -53,3 +53,52 @@ set-runner	runner	pi-shell::zsh_comp_pty	options_and_values_of_arguments	fails a
 set-runner	runner	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+# gVisor rows (sami-checks-gvisor.yml): only failures the host rows have too, with the host's reason;
+# run 45258885316 (509a2d77). gVisor's own findings (the lib's SIGSEGV, zsh_jobs_pty) are not listed.
+gv-set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_autolist	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	cd_completes_directories	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	command_ambiguous_lists_then_menu	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	command_unique	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compadd_autoremovable_suffix	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compadd_groups_explanations_and_displays	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compadd_matchers	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compadd_prefixes_and_suffixes	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	complete_in_double_quotes	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	complete_in_open_brace_expansion	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compset_prefix_suffix_words_and_quotes	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compstate_insert_and_list_set_by_a_widget	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	compstate_keys_in_a_widget	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	delete_char_or_list_lists	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	expand_cmd_path	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	expand_or_complete_expands	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	expand_or_complete_falls_back_to_files	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	files_list_then_menu	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	list_colors_style	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	list_expand_and_expand_word	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	listmax_asks_before_listing	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	listprompt_scrolls_a_long_list	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_accept_and_hold	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_incremental_search	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_interactive_via_vi_insert	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_navigation	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_scrolls_with_menuprompt	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_send_break_restores_the_line	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_undo	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menu_select_widget_over_rows	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	menucomplete_cycles_and_reverse_menu_complete	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	options_and_values_of_arguments	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	options_of_print_with_descriptions	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	parameter_after_dollar	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	parameter_in_braces	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	spell_word_corrects_a_command	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	zls_colors_parameter	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_comp_pty	zls_colors_types_patterns_and_selection	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
+gv-set-root	root	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
+gv-set-root	root	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+gv-set-root	root	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+gv-set-uid1000	uid1000	pi-shell::zsh_comp_pty	options_and_values_of_arguments	fails against zsh 5.9 on every tree since Cut7 (no fix yet)
+gv-set-uid1000	uid1000	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
+gv-set-uid1000	uid1000	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+gv-set-uid1000	uid1000	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
