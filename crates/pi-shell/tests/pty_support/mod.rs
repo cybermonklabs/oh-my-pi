@@ -473,6 +473,50 @@ impl Pty {
 		Ok(String::from_utf8_lossy(&state.0[mark..end]).into_owned())
 	}
 
+	/// [`Self::read_until`], failing once `repeated` came more than `bound`
+	/// times since the mark before `pattern` did: a shell that prints it
+	/// without end (a loop) fails by that count, long before the timeout.
+	///
+	/// # Errors
+	///
+	/// `Other` (with the output so far) past the bound; `TimedOut` as
+	/// [`Self::read_until`].
+	pub fn read_until_bounded(
+		&mut self,
+		pattern: impl AsRef<[u8]>,
+		repeated: impl AsRef<[u8]>,
+		bound: usize,
+		timeout: Duration,
+	) -> io::Result<String> {
+		let (pattern, repeated) = (pattern.as_ref(), repeated.as_ref());
+		let mark = self.mark;
+		let mut over = None;
+		self
+			.wait_output(timeout, |out, _, _| {
+				let fresh = &out[mark.min(out.len())..];
+				let seen = fresh
+					.windows(repeated.len().max(1))
+					.filter(|w| *w == repeated)
+					.count();
+				if seen > bound {
+					over = Some(seen);
+					return true;
+				}
+				fresh.windows(pattern.len().max(1)).any(|w| w == pattern)
+			})
+			.map_err(|_| self.timeout(&format!("{:?}", String::from_utf8_lossy(pattern))))?;
+		if let Some(seen) = over {
+			let out = self.shared.state.lock().unwrap().0.clone();
+			let tail = String::from_utf8_lossy(&out[out.len().saturating_sub(2000)..]);
+			return Err(io::Error::other(format!(
+				"{seen} times {:?} before {:?}, more than {bound}\n--- output (tail) ---\n{tail}",
+				String::from_utf8_lossy(repeated),
+				String::from_utf8_lossy(pattern),
+			)));
+		}
+		self.read_until(pattern, timeout)
+	}
+
 	/// Wait until the rendered screen satisfies `cond`.
 	///
 	/// # Errors

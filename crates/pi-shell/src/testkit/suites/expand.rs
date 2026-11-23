@@ -770,3 +770,30 @@ fn pattern_charset_follows_locale_changes() {
 		"u1\nno-c1\nu2\nno-c2\nu3\nno-c3\nu4\nno-c4\nu5\nno-c5\nno-C\nen_US.UTF-8\nno-C\n"
 	);
 }
+
+/// A `$( )` with no command runs nothing and leaves `$?` alone, inside the
+/// command and after it: bash 5.2.21 and 5.3.20 (`command_substitute` returns
+/// before it forks, so it counts as no substitution).
+#[test]
+fn a_substitution_with_no_command_leaves_the_status_alone() {
+	let rows = [
+		("false; echo \"[$( )]\" $?", "[] 1\n"),
+		("false; x=$( ); echo \"st=$?\"", "st=0\n"),
+		("x=$(false)$( ); echo \"st=$?\"", "st=1\n"),
+		("x=$( )$(false); echo \"st=$?\"", "st=1\n"),
+		("false; x=`` ; echo \"st=$? x=[$x]\"", "st=0 x=[]\n"),
+		("false; echo \"[$(\n)]\" $?", "[] 1\n"),
+		("false; echo \"[$( # c\n)]\" $?", "[] 1\n"),
+		("f() { return 3; }; f; echo \"[$( )]\" $?", "[] 3\n"),
+		("false; echo \"$( )$?\"", "1\n"),
+		("false; echo $( ) \"$?\"", "1\n"),
+	];
+	let mut mismatches = Vec::new();
+	for (src, want) in rows {
+		let got = run(src);
+		if got != (want.to_owned(), String::new()) {
+			mismatches.push(format!("`{src}`: bash {want:?}, got {got:?}"));
+		}
+	}
+	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}

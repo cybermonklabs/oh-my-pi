@@ -16,6 +16,25 @@ pub enum ShellError {
 		/// The name.
 		name: BString,
 	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// below the operating system's pid limit
+	/// ([`os_pid_limit`](crate::bash::os_pid_limit)).
+	#[error("vpid base {base} is below the system's pid limit {limit}")]
+	VpidBase {
+		/// The configured base.
+		base:  u32,
+		/// The limit.
+		limit: u32,
+	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// at or above the last vpid
+	/// ([`Vpid::CEILING`](crate::bash::Vpid::CEILING)): the shell would take it,
+	/// and no child could have one.
+	#[error("vpid base {base} leaves no vpid below the last one")]
+	VpidBaseAtCeiling {
+		/// The configured base.
+		base: u32,
+	},
 }
 
 /// Failure of [`Shell::restore`](crate::bash::Shell::restore).
@@ -64,6 +83,25 @@ pub enum RestoreError {
 		/// The host's error.
 		#[source]
 		source: std::io::Error,
+	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// below the operating system's pid limit
+	/// ([`os_pid_limit`](crate::bash::os_pid_limit)).
+	#[error("vpid base {base} is below the system's pid limit {limit}")]
+	VpidBase {
+		/// The configured base.
+		base:  u32,
+		/// The limit.
+		limit: u32,
+	},
+	/// [`EngineConfig::vpid_base`](crate::bash::EngineConfig::vpid_base) is
+	/// at or above the last vpid
+	/// ([`Vpid::CEILING`](crate::bash::Vpid::CEILING)): the shell would take it,
+	/// and no child could have one.
+	#[error("vpid base {base} leaves no vpid below the last one")]
+	VpidBaseAtCeiling {
+		/// The configured base.
+		base: u32,
 	},
 }
 

@@ -476,6 +476,19 @@ pub enum Diag {
 		/// Command.
 		name: BString,
 	},
+	/// No vpid is left for a command that needs one ([`Vpid::CEILING`]):
+	/// bash's `fork: Resource temporarily unavailable` (`sys_error`, no
+	/// line), after which the shell leaves as `exit 254` does. bash first
+	/// retries its fork four times (`fork: retry: …`, about 15 s); no vpid
+	/// frees itself while a command waits, so this engine does not retry.
+	///
+	/// [`Vpid::CEILING`]: crate::bash::ids::Vpid::CEILING
+	#[error("fork: Resource temporarily unavailable")]
+	ForkFailed,
+	/// zsh's form of [`Diag::ForkFailed`] (`zerr("fork failed: %e")`):
+	/// printed with its line, after which the shell leaves with 1.
+	#[error("fork failed: resource temporarily unavailable")]
+	ZshForkFailed,
 }
 
 impl Diag {
@@ -590,7 +603,7 @@ pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 		out.push(b'\n');
 		return out;
 	}
-	if let Diag::BadInterpreter { .. } = diag {
+	if let Diag::BadInterpreter { .. } | Diag::ForkFailed = diag {
 		// bash's `sys_error`: no line number.
 		out.extend_from_slice(b": ");
 		write!(out, "{diag}").expect("writing to a Vec cannot fail");

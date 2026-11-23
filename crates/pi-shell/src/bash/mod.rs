@@ -69,7 +69,7 @@ pub mod syntax;
 pub use crate::bash::vm::newuser_startup_scripts;
 pub use crate::bash::{
 	diag::Diag,
-	engine::{Engine, EngineConfig},
+	engine::{Engine, EngineConfig, os_pid_limit},
 	error::{ExtError, Incompatibility, RestoreError, ShellError},
 	event::{
 		CompiledUnit, CustomEvent, Event, EventData, EventKind, EventMask, EventSink, NodeRef,

@@ -537,6 +537,27 @@ fn newptycmd(
 	} else {
 		None
 	};
+	// zsh forks the command's subshell once the pty is open; with no vpid
+	// left that fork fails (`exec::fork_failed`'s rule): `can't create pty
+	// command NAME: …`, status 1, and the shell goes on (zsh 5.9 under
+	// `ulimit -u 1`). While `evallineno` is on zsh's message names
+	// `(zpty)`, under which it parsed the text. Checked before the pty
+	// opens, so a host without one reports the same.
+	if ctx.k.vpids_left() == 0 {
+		let msg = format!("can't create pty command {name}: resource temporarily unavailable");
+		if evallineno && !ctx.k.zsh_shinstdin(ctx.cx, ctx.vp) {
+			let (_, line) = ctx.k.zsh_site(ctx.cx, ctx.vp, ctx.line);
+			let utf8 =
+				crate::bash::vm::zsh::params::mb_in(ctx.k, ctx.cx.store, ctx.vp).unwrap_or(false);
+			let diag = Diag::Usage { msg: msg.into() }.by(ctx.name);
+			let site = crate::bash::diag::ZshSite { prefix: b"(zpty)", line, utf8 };
+			let bytes = crate::bash::diag::render_zsh(&diag, site);
+			ctx.out_fd(2, &bytes);
+		} else {
+			ctx.usage(msg);
+		}
+		return done(1);
+	}
 	let opened = match ctx.cx.host.terminal() {
 		Some(term) => term.open_pty(size),
 		None => Err(io::Error::from(io::ErrorKind::Unsupported)),

@@ -828,15 +828,25 @@ impl Kernel {
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
-	/// the store alone never reuses one).
+	/// the store alone never reuses one). The caller checked
+	/// [`Self::vpids_left`]: none is given past [`Vpid::CEILING`], and the
+	/// counter never wraps into numbers an OS pid can take.
 	pub fn vpid(&mut self, store: &mut dyn StateStore) -> Vpid {
+		debug_assert!(self.next_vpid <= Vpid::CEILING, "no vpid left: the caller checks vpids_left");
 		let v = Vpid(self.next_vpid);
-		self.next_vpid += 1;
+		self.next_vpid = self.next_vpid.saturating_add(1);
 		self.written_vpid = self.next_vpid;
 		self
 			.root
 			.set_misc(store, MiscKey::NextVpid, self.next_vpid.to_string());
 		v
+	}
+
+	/// Vpids still to give ([`Vpid::CEILING`] is the last): a command that
+	/// needs more fails before it builds anything, as bash's does when it
+	/// cannot fork ([`exec::fork_failed`]).
+	pub const fn vpids_left(&self) -> u32 {
+		(Vpid::CEILING + 1).saturating_sub(self.next_vpid)
 	}
 
 	/// Write `unit`'s blob ([`BlobSlot::Unit`](crate::bash::store::BlobSlot))
@@ -1662,12 +1672,25 @@ impl Shell {
 	/// # Errors
 	///
 	/// [`ShellError::UnknownOption`] for an option name bash does not know;
+	/// [`ShellError::VpidBase`] for a vpid base an OS pid can take;
+	/// [`ShellError::VpidBaseAtCeiling`] for one that leaves no vpid for a
+	/// child;
 	/// [`ShellError::Store`] when the store fails.
 	pub fn create(
 		engine: &Arc<Engine>,
 		cx: &mut Cx<'_>,
 		init: ShellInit,
 	) -> Result<Self, ShellError> {
+		let base = engine.config().vpid_base;
+		if let Some(limit) = crate::bash::os_pid_limit()
+			&& base < limit
+		{
+			return Err(ShellError::VpidBase { base, limit });
+		}
+		// The shell takes the base; a child needs a vpid above it.
+		if base >= Vpid::CEILING {
+			return Err(ShellError::VpidBaseAtCeiling { base });
+		}
 		let shell_pid = if init.shell_pid == 0 {
 			cx.host.shell_pid()
 		} else {
@@ -1921,6 +1944,12 @@ impl Shell {
 			VprocSel::NewSubshell => None,
 			VprocSel::NewSubshellWithStdio(stdio) => Some(stdio),
 		};
+		// No vpid left ([`Vpid::CEILING`]): the run ends at once with bash's
+		// fork-failure status, and nothing is built.
+		if self.k.vpids_left() == 0 {
+			self.k.done.push_back((id, 254));
+			return id;
+		}
 		let mut edits = ForkEdits {
 			env:          script.env,
 			foreign_env:  script.foreign_env,
@@ -1972,9 +2001,13 @@ impl Shell {
 		};
 		let parent_vpid = p.vpid;
 		// Written as `MiscKey::NextVpid` before the next step returns
-		// (`Kernel::sync_root`).
+		// (`Kernel::sync_root`). The caller checked `vpids_left`.
+		debug_assert!(
+			self.k.next_vpid <= Vpid::CEILING,
+			"no vpid left: the caller checks vpids_left"
+		);
 		let vpid = Vpid(self.k.next_vpid);
-		self.k.next_vpid += 1;
+		self.k.next_vpid = self.k.next_vpid.saturating_add(1);
 		let parent_lineage = self.procs[parent].lineage;
 		let mut vp = Vproc::new(vpid, Some(parent_vpid), fds, cwd, Some(Image::default()), true);
 		vp.lineage = lineage.unwrap_or(parent_lineage);

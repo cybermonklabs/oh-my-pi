@@ -738,6 +738,7 @@ pub fn assign_zsh_loop_var(
 	match params::assignsparam(&mut ex, name, value, 0) {
 		Ok(()) => Ok(()),
 		Err(Stop::Fail(d) | Stop::Fatal(d)) => Err(d),
+		Err(Stop::ForkFailed) => Err(Diag::ZshForkFailed),
 		Err(Stop::Store(e)) => {
 			k.fail(e);
 			Err(Diag::StoreFailed)

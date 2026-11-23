@@ -352,7 +352,7 @@ fn drive(world: &World, tool: &str, exec: bool, src: &str) -> String {
 				} else {
 					api.run_subshell_in(script, lineage)
 				};
-				pending.push((id, run));
+				pending.push((id, run.expect("a vpid is left")));
 			},
 			Step::Yield => {},
 			Step::Blocked => {
