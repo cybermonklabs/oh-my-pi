@@ -8,7 +8,7 @@
 
 ### Changed
 
-- The `voice` that RPC `live_start`/`live_connect` (and `RpcClient.liveStart()`/`liveConnect()`) and extension `startLive` return is optional: with `live.provider: openai` it is absent, since GPT-Live gets no voice from omp, and a `voice` passed in is ignored
+- The `voice` that RPC `live_start`/`live_connect` (and `RpcClient.liveStart()`/`liveConnect()`, and the Python SDK's `live_start()`, which returns `None`) and extension `startLive` return is optional: with `live.provider: openai` it is absent, since GPT-Live gets no voice from omp, and a `voice` passed in is ignored
 
 ## [18.18.6] - 2026-11-09
 
