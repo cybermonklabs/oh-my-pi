@@ -268,10 +268,7 @@ impl MemFs {
 			},
 			Some(Node::File { data, .. }) => Arc::clone(data),
 			None if flags.contains(OpenFlags::CREATE) => {
-				let parent = path
-					.rfind_byte(b'/')
-					.map_or(&b"/"[..], |i| if i == 0 { &b"/"[..] } else { &path[..i] });
-				if !matches!(nodes.get(parent), Some(Node::Dir { .. })) {
+				if !matches!(nodes.get(parent(path)), Some(Node::Dir { .. })) {
 					return Err(io::ErrorKind::NotFound.into());
 				}
 				let data = Arc::new(Mutex::new(Vec::new()));
@@ -336,12 +333,14 @@ fn has_children(nodes: &BTreeMap<BString, Node>, dir: &[u8]) -> bool {
 		.is_some_and(|(k, _)| k.starts_with(prefix.as_slice()))
 }
 
-/// The directory holding `path` (`/` for a top-level name).
+/// The directory holding `path` (`/` for a top-level name); empty, naming
+/// nothing, for a path that is not absolute (the empty path).
 fn parent(path: &[u8]) -> &[u8] {
 	let path = trim(path);
 	match path.rfind_byte(b'/') {
-		Some(0) | None => b"/",
+		Some(0) => b"/",
 		Some(i) => &path[..i],
+		None => b"",
 	}
 }
 
@@ -730,6 +729,8 @@ impl Fs for MemFs {
 				let mut nodes = self.nodes.lock();
 				if nodes.contains_key(trim(to)) {
 					Err(io::ErrorKind::AlreadyExists.into())
+				} else if !matches!(nodes.get(parent(to)), Some(Node::Dir { .. })) {
+					Err(io::ErrorKind::NotFound.into())
 				} else {
 					// Files share their data, as hard links do.
 					nodes.insert(BString::from(trim(to)), node);
@@ -1059,5 +1060,23 @@ mod tests {
 		let _ = f.poll_write(&mut cx, b"de");
 		assert_eq!(fs.read("/tmp/x").unwrap(), b"abcde");
 		assert!(resolve(fs.open(b"/missing/x".as_bstr(), w, 0o644)).is_err());
+	}
+
+	/// An empty path names no file ([`Fs`]): nothing creates a node for it.
+	#[test]
+	fn an_empty_path_names_no_file() {
+		let mut fs = MemFs::new();
+		fs.add_file("/a", b"", 0o644);
+		let empty = b"".as_bstr();
+		let notfound = |r: io::Result<()>| r.unwrap_err().kind() == io::ErrorKind::NotFound;
+		let w = OpenFlags::WRITE.with(OpenFlags::CREATE);
+		assert!(notfound(resolve(fs.open(empty, w, 0o644)).map(drop)));
+		assert!(notfound(resolve(fs.mkdir(empty, 0o755))));
+		assert!(notfound(resolve(fs.symlink(b"/a".as_bstr(), empty))));
+		assert!(notfound(resolve(fs.link(b"/a".as_bstr(), empty))));
+		assert!(notfound(resolve(fs.rename(b"/a".as_bstr(), empty))));
+		assert!(notfound(resolve(fs.stat(empty, true)).map(drop)));
+		assert!(!fs.nodes.lock().contains_key(b"".as_slice()));
+		assert!(fs.read("/a").is_some());
 	}
 }

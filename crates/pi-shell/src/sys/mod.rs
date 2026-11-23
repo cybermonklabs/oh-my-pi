@@ -29,6 +29,8 @@
 pub mod cmdline;
 #[cfg(windows)]
 pub mod console;
+#[cfg(target_os = "macos")]
+pub(crate) mod fifo_pair;
 mod fs;
 mod fs_ops;
 #[cfg(any(windows, test))]

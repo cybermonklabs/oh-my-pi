@@ -15,9 +15,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash::{
 	fs::{File, FileKind, Mark},
-	host::{OsHandle, StdFd},
-	mem::MemFile,
+	host::{FeedRead, OsHandle, ReadOn, StdFd},
+	mem::{Feeds, MemFile},
 };
+
+#[cfg(test)]
+thread_local! {
+	/// Tests: run on this thread at the start of each read of an object
+	/// itself in [`FdRef::poll_read`] and [`FdRef::poll_read_keyed`], while
+	/// every feed's lock is held.
+	pub(crate) static BEFORE_DIRECT_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// Read through `feeds` in turn, each one's lock held while the next is asked
+/// ([`FeedRead::poll_read_through`]), then `direct`.
+fn read_through(
+	feeds: &[Arc<dyn FeedRead>],
+	cx: &mut Context<'_>,
+	buf: &mut [u8],
+	direct: &mut ReadOn<'_>,
+) -> Poll<io::Result<usize>> {
+	match feeds.split_first() {
+		None => direct(cx, buf),
+		Some((feed, rest)) => {
+			feed.poll_read_through(cx, buf, &mut |cx, buf| read_through(rest, cx, buf, direct))
+		},
+	}
+}
 
 /// Shared handle to one engine fd object.
 ///
@@ -143,6 +168,14 @@ impl FdRef {
 		}))
 	}
 
+	/// Tests elsewhere in the crate: the read and write ends of a new engine
+	/// pipe, as fds.
+	#[cfg(test)]
+	pub(crate) fn engine_pipe() -> (Self, Self) {
+		let (r, w) = crate::bash::mem::pipe();
+		(Self::mem(r), Self::mem(w))
+	}
+
 	/// Identity of the fd object (shared by every slot holding this handle).
 	pub(crate) fn key(&self) -> usize {
 		if self.is_tagged() {
@@ -264,11 +297,78 @@ impl FdRef {
 	}
 
 	/// Read into `buf`; `Ok(0)` at end of file (also for closed or lost fds).
+	///
+	/// A pipe's read end that the host feeds to externals is read through
+	/// its feeds first (the host's `FeedRead`): what a feed's OS pipe and its
+	/// pump hold comes before the object's next bytes, as readers of bash's one
+	/// kernel pipe take them, and each feed's lock is held until the read is
+	/// done, so no holder's poll of a pump, on any thread, moves bytes past it.
+	/// The order holds for a pipe one feed fills; where two fd objects of the
+	/// pipe each have one (a `/dev/fd/N` duplicate), the first is read first
+	/// even when the second holds older bytes.
 	pub fn poll_read(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		self.read_fed(cx, buf, &mut |cx, buf| self.poll_read_direct(cx, buf))
+	}
+
+	/// Read through the feeds of this pipe read end, if the host feeds it to
+	/// externals, then the object itself with `direct`.
+	fn read_fed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		direct: &mut ReadOn<'_>,
+	) -> Poll<io::Result<usize>> {
+		let feeds = self
+			.with_mem(|m| match m {
+				MemFile::PipeRead(r) => r.feeds(),
+				_ => Feeds::new(),
+			})
+			.unwrap_or_default();
+		read_through(&feeds, cx, buf, &mut |cx, buf| {
+			#[cfg(test)]
+			BEFORE_DIRECT_READ.with_borrow_mut(|hook| {
+				if let Some(hook) = hook.as_mut() {
+					hook();
+				}
+			});
+			direct(cx, buf)
+		})
+	}
+
+	/// Read into `buf` from the object itself, past any feed.
+	pub(crate) fn poll_read_direct(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+	) -> Poll<io::Result<usize>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_read(cx, buf),
 			None => Poll::Ready(Ok(0)),
 		}
+	}
+
+	/// [`Self::poll_read_direct`] as the task `key` names: the host's pump
+	/// filling a feed reads this way, with its copy's key.
+	pub(crate) fn poll_read_direct_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_read_keyed(cx, buf, key),
+			None => Poll::Ready(Ok(0)),
+		}
+	}
+
+	/// The host fills an OS pipe from this pipe read end for externals
+	/// through `feed`, while `feed` lives; any other object is left alone.
+	pub(crate) fn attach_feed(&self, feed: std::sync::Weak<dyn FeedRead>) {
+		let _ = self.with_mem(|m| {
+			if let MemFile::PipeRead(r) = m {
+				r.attach_feed(feed);
+			}
+		});
 	}
 
 	/// Write a prefix of `buf`; closed and lost fds fail with "Bad file
@@ -282,17 +382,15 @@ impl FdRef {
 
 	/// [`Self::poll_read`] for a host task that may wait beside the engine
 	/// and other tasks on this object: `key`, which the task's future holds,
-	/// keeps its wait apart ([`File::poll_read_keyed`]).
+	/// keeps its wait apart ([`File::poll_read_keyed`]). It reads through the
+	/// object's feeds first, as [`Self::poll_read`] does.
 	pub fn poll_read_keyed(
 		&self,
 		cx: &mut Context<'_>,
 		buf: &mut [u8],
 		key: &mut crate::sys::WaitKey,
 	) -> Poll<io::Result<usize>> {
-		match self.0.state.lock().file() {
-			Some(f) => f.poll_read_keyed(cx, buf, key),
-			None => Poll::Ready(Ok(0)),
-		}
+		self.read_fed(cx, buf, &mut |cx, buf| self.poll_read_direct_keyed(cx, buf, key))
 	}
 
 	/// [`Self::poll_write`] for a writer that may wait beside others, as

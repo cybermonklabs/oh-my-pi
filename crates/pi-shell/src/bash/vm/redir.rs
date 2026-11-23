@@ -469,7 +469,9 @@ fn install(
 				Some(d) => (d, true),
 				None => (target.as_slice(), false),
 			};
-			if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+			// An empty word is all digits (bash's `all_digits("")`): a source
+			// that is no fd.
+			if digits.iter().all(u8::is_ascii_digit) {
 				let src: i32 = std::str::from_utf8(digits)
 					.ok()
 					.and_then(|s| s.parse().ok())

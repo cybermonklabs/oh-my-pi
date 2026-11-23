@@ -233,8 +233,16 @@ impl Shared {
 		let feed = if let Some(feed) = found {
 			feed
 		} else {
-			let feed = Arc::new(Feed::new(fd)?);
+			let feed = Arc::new(Feed::new(fd.clone())?);
 			feeds.push(Arc::downgrade(&feed));
+			// The shell's own reads of the object come through a feed with a
+			// drain while it lives ([`crate::bash::FeedRead`]). One without is
+			// not read through: a reader would only take its lock, and could
+			// end up dropping it, reading its pipe to end of file there.
+			if feed.reads_through() {
+				let weak: Weak<dyn crate::bash::FeedRead> = Arc::downgrade(&feed) as _;
+				fd.attach_feed(weak);
+			}
 			feed
 		};
 		drop(feeds);

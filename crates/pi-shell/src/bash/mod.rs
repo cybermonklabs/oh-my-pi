@@ -66,6 +66,9 @@ pub mod zshopt;
 pub mod pattern;
 pub mod syntax;
 
+#[cfg(test)]
+pub(crate) use crate::bash::fd::BEFORE_DIRECT_READ;
+pub(crate) use crate::bash::host::{FeedRead, ReadOn};
 /// zsh/newuser's startup check: the `newuser` scripts an interactive zsh
 /// sources after `/etc/zshenv` when the user has no startup files.
 pub use crate::bash::vm::newuser_startup_scripts;

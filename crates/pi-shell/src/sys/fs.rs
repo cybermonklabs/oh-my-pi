@@ -1247,11 +1247,12 @@ impl File for StdFile {
 
 /// Engine path → host path (UTF-8 required on Windows). A URL path
 /// ([`crate::bash::fs::url_root_len`]) names no host file: `NotFound`, rather
-/// than a lookup relative to the process's working directory. On Windows,
+/// than a lookup relative to the process's working directory; nor does an
+/// empty path, as on every platform `open("")` is `ENOENT`. On Windows,
 /// `/dev/null` is the null device `NUL` (else `\dev\null` on the current
 /// drive, which does not exist).
 pub fn host_path(p: &[u8]) -> io::Result<&Path> {
-	if crate::bash::fs::url_root_len(p).is_some() {
+	if p.is_empty() || crate::bash::fs::url_root_len(p).is_some() {
 		return Err(io::Error::from(io::ErrorKind::NotFound));
 	}
 	if cfg!(windows) && p == b"/dev/null" {
@@ -2789,6 +2790,27 @@ pub(crate) mod tests {
 		let missing = ready(fs.stat(b"/definitely/not/here".as_bstr(), true)).unwrap_err();
 		assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 		assert!(ready(fs.chdir_check(dir_bytes.as_bstr())).is_ok());
+	}
+
+	/// An empty path names no file on every platform: never the process's
+	/// working directory, whatever the OS makes of `""`.
+	#[test]
+	fn an_empty_path_names_no_file() {
+		assert_eq!(host_path(b"").unwrap_err().kind(), io::ErrorKind::NotFound);
+		let mut fs = StdFs::default();
+		let empty = b"".as_bstr();
+		let write = OpenFlags::WRITE.with(OpenFlags::CREATE);
+		assert_eq!(
+			ready(fs.open(empty, write, 0o644)).err().map(|e| e.kind()),
+			Some(io::ErrorKind::NotFound)
+		);
+		assert_eq!(ready(fs.stat(empty, true)).unwrap_err().kind(), io::ErrorKind::NotFound);
+		assert_eq!(
+			ready(fs.access(empty, Access::READ)).unwrap_err().kind(),
+			io::ErrorKind::NotFound
+		);
+		assert_eq!(ready(fs.read_dir(empty)).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+		assert_eq!(ready(fs.chdir_check(empty)).unwrap_err().kind(), io::ErrorKind::NotFound);
 	}
 
 	#[cfg(unix)]

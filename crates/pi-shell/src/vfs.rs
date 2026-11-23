@@ -10,6 +10,8 @@
 //!   operation as a task on the tokio runtime given to [`VfsFs::new`] and
 //!   return `Pending`; the task's completion wakes the waker the engine polled
 //!   with. Dropping the pending operation aborts the task.
+//! - **The empty path** names no file: every operation answers `NotFound` at
+//!   once, before any provider sees a relative path.
 //!
 //! An open provider file is a [`File`] over [`pi_vfs::File`] whose reads,
 //! writes and flushes are owned-buffer tasks on the same runtime. A provider
@@ -495,18 +497,25 @@ struct DescriptorLimit {
 	limit: u64,
 }
 
-/// Engine path → host path, byte for byte on Unix.
+/// Engine path → host path, byte for byte on Unix. An empty path names no
+/// file ([`Fs`]): `NotFound`, before any provider sees a relative path.
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps, reason = "only Windows rejects a path")]
 fn host_path(path: &BStr) -> io::Result<&Path> {
 	use std::os::unix::ffi::OsStrExt;
+	if path.is_empty() {
+		return Err(io::ErrorKind::NotFound.into());
+	}
 	Ok(Path::new(std::ffi::OsStr::from_bytes(path)))
 }
 
-/// Engine path → host path (UTF-8 required).
+/// Engine path → host path (UTF-8 required). An empty path names no file
+/// ([`Fs`]): `NotFound`.
 #[cfg(not(unix))]
 fn host_path(path: &BStr) -> io::Result<&Path> {
 	use bstr::ByteSlice;
+	if path.is_empty() {
+		return Err(io::ErrorKind::NotFound.into());
+	}
 	path
 		.to_path()
 		.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
@@ -1106,5 +1115,68 @@ mod tests {
 		assert_eq!(ids(&kept), [live_id], "the gone task's result was dropped");
 		keep(&mut kept, &tasks, gone_id, Done::Flush(Ok(())));
 		assert_eq!(ids(&kept), [live_id], "nothing is kept for a gone task");
+	}
+
+	/// A provider that claims every path and records each one it is asked.
+	#[derive(Debug, Default)]
+	struct Claims(Mutex<Vec<PathBuf>>);
+
+	impl Claims {
+		fn asked(&self, path: &Path) -> io::Error {
+			self.0.lock().push(path.to_path_buf());
+			io::Error::other("asked")
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for Claims {
+		async fn open(&self, path: &Path, _: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			Err(self.asked(path))
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			Err(self.asked(path))
+		}
+
+		async fn read_dir(&self, path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			Err(self.asked(path))
+		}
+	}
+
+	/// The error of an answer given at once; `None` while it is pending.
+	fn now<T>(r: FsPoll<T>) -> Option<io::ErrorKind> {
+		match r {
+			FsPoll::Ready(r) => r.err().map(|e| e.kind()),
+			FsPoll::Pending(_) => None,
+		}
+	}
+
+	/// An empty path names no file ([`Fs`]): each operation on it is
+	/// `NotFound` at once, and a provider that claims every path never sees
+	/// it.
+	#[test]
+	fn an_empty_path_names_no_file_and_reaches_no_provider() {
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.expect("runtime");
+		let claims = Arc::new(Claims::default());
+		let provider: Arc<dyn pi_vfs::FileSystem> = Arc::clone(&claims) as _;
+		let mut fs = VfsFs::new(pi_vfs::Fs::new(provider), rt.handle().clone());
+		let empty = BStr::new("");
+		let notfound = Some(io::ErrorKind::NotFound);
+		let write = OpenFlags::WRITE.with(OpenFlags::CREATE);
+		assert_eq!(now(fs.open(empty, write, 0o644)), notfound);
+		assert_eq!(now(fs.stat(empty, true)), notfound);
+		assert_eq!(now(fs.access(empty, Access::READ)), notfound);
+		assert_eq!(now(fs.read_dir(empty)), notfound);
+		assert_eq!(now(fs.chdir_check(empty)), notfound);
+		assert_eq!(now(fs.mkdir(empty, 0o755)), notfound);
+		// A URL is still the provider's.
+		let FsPoll::Pending(mut asked) = fs.stat(BStr::new("virtual://x"), true) else {
+			panic!("the provider answers a URL");
+		};
+		let got = rt.block_on(std::future::poll_fn(|cx| asked.poll(cx)));
+		assert_eq!(got.err().map(|e| e.to_string()).as_deref(), Some("asked"));
+		assert_eq!(*claims.0.lock(), [PathBuf::from("virtual://x")]);
 	}
 }

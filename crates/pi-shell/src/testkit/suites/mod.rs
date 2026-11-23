@@ -20,6 +20,7 @@ mod cancel_latency;
 mod cancel_traps;
 mod control;
 mod coproc_jobs;
+mod empty_name;
 mod errexit;
 mod events;
 mod executor;

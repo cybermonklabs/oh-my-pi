@@ -91,6 +91,12 @@ pub fn cd(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			};
 			home
 		},
+		// bash 5.3: an empty operand names no directory (bash 5.2 took it as
+		// the working directory, or failed `ENOENT` under `-P`).
+		Some(d) if d.is_empty() => {
+			ctx.usage("null directory");
+			return done(1);
+		},
 		Some(d) if d.as_slice() == b"-" => {
 			let Some(old) = ctx.scalar(b"OLDPWD")? else {
 				ctx.usage("OLDPWD not set");

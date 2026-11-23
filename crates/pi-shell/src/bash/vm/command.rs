@@ -2053,21 +2053,24 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			}
 		}
 		// A hashed name ran without a search (its target is set).
+		let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 		let found = if sc.io.as_ref().is_some_and(|io| io.search.is_some()) {
 			let mut tcx = Context::from_waker(&k.waker);
-			Some(probe::path_search(&mut tcx, cx, &mut sc))
+			Some(probe::path_search(&mut tcx, cx, &mut sc, zsh))
 		} else {
 			None
 		};
+		let refused = matches!(found, Some(Search::Refused(_)));
 		let flow = match found {
 			None => None,
-			Some(Search::Found(path)) => {
+			Some(Search::Found(path) | Search::Refused(path)) => {
 				sc.io().search = None;
 				// bash hashes every command it finds in PATH (not with a
-				// temporary PATH).
-				// zsh `pathdirs` names (with a slash) are not hashed.
+				// temporary PATH), one it cannot run too. zsh hashes only one
+				// it can run (`hashcmd`'s `iscom`), and no `pathdirs` name
+				// (with a slash).
 				if !temp_path
-					&& (vp.mode.dialect() != crate::bash::ids::Dialect::Zsh || !name.contains(&b'/'))
+					&& (!zsh || (!refused && !name.contains(&b'/')))
 					&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Hashall)
 						.unwrap_or(true)
 				{
@@ -5306,13 +5309,14 @@ fn refused(
 }
 
 /// zsh `zexecve` after `ENOENT` or `ENOEXEC` for `path`. A `#!` line: with
-/// `ENOEXEC` its interpreter runs as written; with `ENOENT` one that is not
-/// absolute is searched in `$PATH`; it runs with the line's argument (if
-/// any), the script and the arguments. A `#!` line without a newline, or an
-/// interpreter not found: `PATH: bad interpreter: INTERP: ERROR` (the
-/// only message: zsh's error flag is set). `ENOEXEC` without `#!`: the
-/// file runs as a script. Otherwise zsh `execute`'s report: `%e: NAME` for
-/// a name with a slash, else `command not found`.
+/// `ENOEXEC` its interpreter runs as written (an empty one names no file:
+/// its `execve` fails, and the report is the `ENOEXEC`'s); with `ENOENT` one
+/// that is not absolute is searched in `$PATH`; it runs with the line's
+/// argument (if any), the script and the arguments. A `#!` line without a
+/// newline, or an interpreter not found: `PATH: bad interpreter: INTERP:
+/// ERROR` (the only message: zsh's error flag is set). `ENOEXEC` without
+/// `#!`: the file runs as a script. Otherwise zsh `execute`'s report: `%e:
+/// NAME` for a name with a slash, else `command not found`.
 #[inline(never)]
 fn zsh_refused(
 	k: &mut Kernel,
@@ -5343,7 +5347,7 @@ fn zsh_refused(
 			let end = first.iter().position(|&c| c == b' ').unwrap_or(first.len());
 			let (prog, arg) = (&first[..end], first.get(end + 1..));
 			let run = if enoexec {
-				Some(absolute(&vp.cwd, prog))
+				(!prog.is_empty()).then(|| absolute(&vp.cwd, prog))
 			} else if prog.starts_with(b"/") {
 				None
 			} else {
@@ -5370,11 +5374,17 @@ fn zsh_refused(
 				s.target = Some(Target::Interp(run));
 				return None;
 			}
-			BString::from(prog)
+			// With `ENOEXEC` the interpreter is empty (else it ran).
+			(!enoexec).then(|| BString::from(prog))
 		} else {
-			BString::from(rest)
+			Some(BString::from(rest))
 		};
-		format!("{pth}: bad interpreter: {interp}: {}", super::redir::zsh_errno(&err))
+		match interp {
+			Some(interp) => {
+				format!("{pth}: bad interpreter: {interp}: {}", super::redir::zsh_errno(&err))
+			},
+			None => format!("{}: {name}", super::redir::zsh_errno(&err)),
+		}
 	} else if enoexec {
 		st(vp).target = Some(Target::Script(path.clone()));
 		return None;
