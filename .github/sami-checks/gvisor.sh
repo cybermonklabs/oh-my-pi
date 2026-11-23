@@ -10,6 +10,9 @@ set -uo pipefail
 who=$1 part=$2 shard=$3
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
 mkdir -p "$SC/res/logs" "$SC/meta" "$SC_TREE/target"
+# The tree belongs to the user the tests run as, as on a host row (set.sh, nextest.sh): tests write
+# their scratch directories into their crate's directory. Given back after the run.
+[ "$who" = uid1000 ] && sudo chown -R 1000:1000 "$SC_TREE"
 for f in binaries-metadata.json cargo-metadata.json; do
 	cp "$CARGO_TARGET_DIR/nextest/$f" "$SC/meta/$f" || { echo "::error::the archive has no target/nextest/$f: it did not unpack"; exit 1; }
 done
@@ -28,6 +31,6 @@ fi
 s=$(date +%s)
 docker run "${args[@]}" sc-gv bash "$tool/gvisor-run.sh" "$who" "$part" "$shard"
 rc=$?
-sudo chown -R "$(id -u):$(id -g)" "$SC/res"
+sudo chown -R "$(id -u):$(id -g)" "$SC/res" "$SC_TREE"
 echo "CONTAINER $who $part $shard: exit $rc in $(($(date +%s) - s)) s; $(find "$SC/res" -maxdepth 1 -name '*.json' | wc -l) results"
 exit "$rc"

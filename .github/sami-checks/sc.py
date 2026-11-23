@@ -55,6 +55,9 @@ GV_ENVIRONMENT = {
     "sys::fs::fifo::tests::an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is":
         "gVisor has no /proc/sys/fs/protected_fifos (its procfs fs/ lists only aio-max-nr, aio-nr, file-max, "
         "file-nr, mount-max, nr_open, pipe-max-size), so the test checks nothing",
+    "pi-builtins::cp::tests::a_read_only_file_cp_wrote_gets_its_attributes":
+        "the test skips itself under gVisor, where an attribute set after the mode changed is refused in some runs "
+        "(its own skip line)",
 }
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
