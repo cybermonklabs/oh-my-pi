@@ -104,8 +104,12 @@ attested() {
 	# empty answer counts 0 (jq 1.6's -e alone exits 0 on no input), and
 	# more than one cannot be told apart: either is refused by its count.
 	n="$(jq -s length <<<"$out" 2>/dev/null)" || n=""
+	if [ -z "$n" ]; then
+		why="gh printed an answer jq cannot read"
+		return 1
+	fi
 	if [ "$n" != 1 ]; then
-		why="gh printed ${n:-unreadable} JSON documents, not 1"
+		why="gh printed $n JSON documents, not 1"
 		return 1
 	fi
 	if ! jq -e -s --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/" --arg signer "$signer" '

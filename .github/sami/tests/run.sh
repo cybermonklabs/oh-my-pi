@@ -990,11 +990,12 @@ fi
 # attest-build-provenance step of its own whose one subject-path names it,
 # with no step if: and no continue-on-error, so a missing file fails the
 # job; and it has no line that is not a key, which YAML would fold into the
-# value above it, past these line checks. No other job, and not the
-# workflow, has a line with write-all or with an id-token key that does not
-# read read or none on that line. A line under jobs: that is not a plain
-# `  <id>:` stops the lint, because its steps would be read as the job
-# above's.
+# value above it, past these line checks; and its artifact-ids line has no
+# quote and no #, since inside quotes " #" is part of the value. No other
+# job, and not the workflow, has a line with write-all or with an id-token
+# key that does not read read or none on that line. A line under jobs: that
+# is not a plain `  <id>:` stops the lint, because its steps would be read as
+# the job above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds cont
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
@@ -1131,13 +1132,18 @@ cache_lint() {
 					ok=0
 				fi
 				# The download's artifact-ids name the three ids the upload steps
-				# gave, each once and by its needs output, in one block-style line.
-				idl="$(grep -vE '^ *#' "$scratch/job.yml" | sed -E 's/[[:space:]]+#.*$//' | grep -E $'^ +["\']?artifact-ids["\']?[[:space:]]*:' || true)"
+				# gave, each once and by its needs output, in one block-style line
+				# with no quote and no #: inside quotes, " #" is part of the value
+				# (download-artifact reads "<id> #" as <id>), not a comment.
+				idl="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'^ +["\']?artifact-ids["\']?[[:space:]]*:' || true)"
 				if [ "$(printf '%s' "$idl" | grep -c .)" != 1 ]; then
 					echo "attest has $(printf '%s' "$idl" | grep -c .) block-style artifact-ids lines, not 1, so this lint cannot read which ids it downloads"
 					ok=0
+				elif printf '%s\n' "$idl" | grep -qE $'["\'#]'; then
+					echo "attest's artifact-ids line has a quote or a #, and inside quotes \" #\" is part of the value, so this lint cannot read which ids it downloads: [$idl]"
+					ok=0
 				else
-					bad="$(printf '%s\n' "$idl" | sed -E $'s/^ +["\']?artifact-ids["\']?[[:space:]]*:[[:space:]]*//; s/^["\']//; s/["\'][[:space:]]*$//' | tr ',' '\n' | awk '
+					bad="$(printf '%s\n' "$idl" | sed -E 's/^ +artifact-ids[[:space:]]*:[[:space:]]*//' | tr ',' '\n' | awk '
 						BEGIN { want["needs.carry.outputs.notes-artifact-id"]; want["needs.release_binary.outputs.mise-linux-x64-artifact-id"]; want["needs.release_binary.outputs.mise-darwin-arm64-artifact-id"] }
 						{ sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
 						/^\$\{\{[ \t]*needs\.[A-Za-z0-9_-]+\.outputs\.[A-Za-z0-9_-]+[ \t]*\}\}$/ { n = $0; sub(/^\$\{\{[ \t]*/, "", n); sub(/[ \t]*\}\}$/, "", n); if (n in want) seen[n]++; else print "OTHER\t" $0; next }
@@ -1319,8 +1325,10 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # which are the upload steps' artifact ids (W60), and attests each release
 # file in a step of its own with one path (W58 two paths in one step, W59 the
 # notes' step gone), with no step skipped by an if: (W61) or let fail by
-# continue-on-error (W62), and no line that YAML would fold into the if:
-# (W63), the artifact-ids (W64) or a subject-path (W65).
+# continue-on-error (W62), no line that YAML would fold into the if: (W63),
+# the artifact-ids (W64) or a subject-path (W65), and no quote or # on the
+# artifact-ids line (W66 " #,<id>" inside quotes, W67 the quoted value
+# continued on a line that starts with #).
 wlint W39-attest-rule 0 "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to sami-candidate; artifact-ids: the upload steps' three ids; one attest step per release file" '' ''
 wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives and the release notes$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
 wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives and the release notes$|      - run: bash .github/sami/carry-check.sh\n&|' ''
@@ -1348,6 +1356,8 @@ wlint W62-attest-continue-on-error 1 'attest has continue-on-error, so a failed 
 wlint W63-attest-if-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[      && \$\{\{ true \}\}\]' "/^  attest:\$/,/^  release_cache_prune:\$/s/^    if: \${{ github\\.event_name == 'push' .* }}\$/&\\n      \\&\\& \${{ true }}/" ''
 wlint W64-attest-artifact-ids-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[            ,12345\]' '/^  attest:$/,/^  release_cache_prune:$/s|^          artifact-ids: .*$|&\n            ,12345|' ''
 wlint W65-attest-subject-path-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[            ,\$\{\{ runner\.temp \}\}/attest/mise-\*/\*\.tar\.gz\]' 's|^          subject-path: \${{ runner.temp }}/attest/release-notes/carry-notes.md$|&\n            ,${{ runner.temp }}/attest/mise-*/*.tar.gz|' ''
+wlint W66-attest-artifact-ids-quoted-hash 1 "attest's artifact-ids line has a quote or a #, and inside quotes \" #\" is part of the value, so this lint cannot read which ids it downloads: \\[          artifact-ids: \"\\\$\\{\\{ needs\\.carry\\.outputs\\.notes-artifact-id \\}\\},.* #,12345\"\\]" '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: \(.*\)$/          artifact-ids: "\1 #,12345"/' ''
+wlint W67-attest-artifact-ids-quoted-hash-folded 1 "attest's artifact-ids line has a quote or a #, and inside quotes \" #\" is part of the value, so this lint cannot read which ids it downloads: \\[          artifact-ids: \"\\\$\\{\\{ needs\\.carry\\.outputs\\.notes-artifact-id \\}\\},.*artifact-id \\}\\}\\]" '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: \(.*\)$/          artifact-ids: "\1\n            #,12345"/' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

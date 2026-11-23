@@ -21,6 +21,7 @@ if [ "$1" = attestation ] && [ "$2" = verify ]; then
   # the three certificate fields split over two attestations of one answer,
   # each of the three ways (run alone, trigger alone, signer alone).
   case " ${STUB_EMPTY:-} " in *" $b "*) exit 0;; esac
+  case " ${STUB_GARBLED:-} " in *" $b "*) printf '[%s]\n[\n' "$(att o/r "$run" push sami-candidate)"; exit 0;; esac
   case " ${STUB_TWO:-} " in *" $b "*) printf '[%s]\n[%s]\n' "$(att o/r 999 push sami-candidate)" "$(att o/r "$run" push sami-candidate)"; exit 0;; esac
   case " ${STUB_SPLIT:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch other)" "$(att o/r 999 push sami-candidate)"; exit 0;; esac
   case " ${STUB_SPLIT2:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch sami-candidate)" "$(att o/r 999 push other)"; exit 0;; esac
@@ -47,7 +48,7 @@ setup() { # fresh candidate dir
   printf 'Previous release: v18.18.6-sami.20261123-024918 (%s).\n\nnotes body\n' "${PREVC:0:12}" > "$RUNNER_TEMP/candidate/release-notes/carry-notes.md"
   export GITHUB_OUTPUT="$W/out"; : > "$GITHUB_OUTPUT"; export GITHUB_STEP_SUMMARY="$W/sum"; : > "$GITHUB_STEP_SUMMARY"
   export GITHUB_REPOSITORY=o/r GITHUB_SHA="$SHA" CANDIDATE_BRANCH=sami-candidate RUN_ID=4242 RELEASE_TARGETS="linux-x64 darwin-arm64"
-  unset STUB_REFUSE STUB_OTHER STUB_PLANT STUB_RUN STUB_FOREIGN STUB_DISPATCH STUB_SIGNER_REF STUB_EMPTY STUB_TWO STUB_SPLIT STUB_SPLIT2 STUB_SPLIT3; : > "$STUB_LOG"
+  unset STUB_REFUSE STUB_OTHER STUB_PLANT STUB_RUN STUB_FOREIGN STUB_DISPATCH STUB_SIGNER_REF STUB_EMPTY STUB_GARBLED STUB_TWO STUB_SPLIT STUB_SPLIT2 STUB_SPLIT3; : > "$STUB_LOG"
 }
 case_() { # name want(0|1) msg-regex  -- runs verify in the repo
   local name="$1" want="$2" msg="$3" out rc ok=1
@@ -91,6 +92,7 @@ setup; export STUB_TWO="omp-$TAG-darwin-arm64.tar.gz"; case_ V19-two-json-docume
 setup; export STUB_SPLIT="carry-notes.md"; case_ V20-fields-split-run-alone 1 'carry-notes.md: it has no attestation that run 4242 made'
 setup; export STUB_SPLIT2="omp-$TAG-linux-x64.tar.gz.sha256"; case_ V20b-fields-split-trigger-alone 1 'linux-x64.tar.gz.sha256: it has no attestation that run 4242 made'
 setup; export STUB_SPLIT3="omp-$TAG-darwin-arm64.tar.gz"; case_ V20c-fields-split-signer-alone 1 'darwin-arm64.tar.gz: it has no attestation that run 4242 made'
+setup; export STUB_GARBLED="carry-notes.md"; case_ V21-answer-jq-cannot-read 1 'carry-notes.md: gh printed an answer jq cannot read'
 # find
 fcase() { # name want msg json
   local name="$1" want="$2" msg="$3" out rc ok=1; printf '%s' "$4" > "$W/runs.json"; export STUB_RUNS="$W/runs.json"

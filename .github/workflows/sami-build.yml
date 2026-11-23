@@ -395,7 +395,7 @@ jobs:
     # and upload another under its name, but not under its id, so what it
     # attests is what carry and release_binary uploaded. Each file has its
     # own attest step, so a missing file fails this job and the candidate
-    # run is red before sami moves. Harness cases W39 to W65
+    # run is red before sami moves. Harness cases W39 to W67
     # (.github/sami/tests/run.sh) keep it so. It runs only on a push to
     # sami-candidate, so the public transparency log gets no trial entries.
     # This if: does not keep a dispatch run's files out of a release: GitHub
