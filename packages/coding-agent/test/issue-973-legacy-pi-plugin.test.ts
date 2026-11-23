@@ -49,7 +49,7 @@ describe("issue #973: legacy Pi plugin imports", () => {
 	});
 
 	it("loads plugin extensions that still import legacy @mariozechner Pi packages", async () => {
-		const result = await loadExtensions([extensionPath], projectDir.path());
+		const result = await loadExtensions([{ path: extensionPath, scope: "explicit" }], projectDir.path());
 		const extension = result.extensions.find(ext => ext.path === extensionPath);
 
 		expect(result.errors).toEqual([]);

@@ -116,7 +116,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 					"}",
 				].join("\n"),
 			);
-			const extensionsResult = await loadExtensions([extensionPath], tempDir.path());
+			const extensionsResult = await loadExtensions([{ path: extensionPath, scope: "explicit" }], tempDir.path());
 			extensionRunner = new ExtensionRunner(
 				extensionsResult.extensions,
 				extensionsResult.runtime,

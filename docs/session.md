@@ -491,7 +491,11 @@ For `perCallModel: true`, cold revival requires both `perCallModelIdentity` (the
 exact `provider/model-id[@upstream]`, without an effort suffix) and
 `perCallThinkingLevel` (the configured effort selector, including `auto`, or
 `null` for unset). Legacy per-call records missing either field refuse revival
-rather than guessing from the historical-display `resolvedModel`. These fields
+rather than guessing from the historical-display `resolvedModel`. A per-call
+worker revives on its saved model; where that model is gone or the operator's
+grants no longer approve it, it revives on the next model of its retry-fallback
+chain that the registry knows and the grants approve, and it is refused only
+when no model of the chain is known and approved. These fields
 are preserved in anonymized exports under the same flag, model-identity and
 effort rules as other session metadata.
 `isolated: true` marks an isolation-worktree child that cannot be cold-revived.
@@ -500,10 +504,94 @@ tools; cold revival mounts them again, so the revived session sends the same too
 inventory. Files without it revive every name in `tools` top-level. Anonymized exports treat it like
 `tools`.
 `systemPrompt` holds the base prompt blocks a model call was built from (never a per-turn
-`before_agent_start` override), and revival replays them unchanged. A session appends a newer
-`session_init` when a model call runs on a different base prompt or work-pool yield items
+`before_agent_start` override). A revived session sends them unchanged until its first model
+call; after that, a session revived from a file with `spawnSpec` renders its prompt again from the
+spawn's prompt inputs, and one revived from an older file keeps sending them. A session appends
+a newer `session_init` when a model call runs on a different base prompt or work-pool yield items
 (`workPoolYieldItems`, restored on revival). Older files store one joined string, which revives
 as a single block.
+`spawnSpec` (absent from older files and a `/tan` clone) records, as plain data with a version
+`v`, the inputs the subagent was spawned with: the exact model it started on, its thinking level
+and effort ceiling, the tool names, mounted tool commands and the descriptor of each eval custom
+tool, the LSP, IRC, MCP, Python-preflight and cache-warming values, the prewalk target, the
+settings overlay the spawn wrote (with its `subagent:<id>` retry-fallback role), the inputs of the
+subagent's prompt block, the wake-turn inputs (agent, description, index, spawning tool call id
+and `maxRuntimeMs`), and the names of the live inputs the spawn passed. Every later
+`session_init` carries it. The in-memory revive and the revive from this file both build the
+subagent from it, so a subagent revived from its file runs on its spawn's settings. A stored
+value never widens what the live process allows, except the values that the revive from the
+file also took from the stored session before spawn specs existed: the working directory in
+which its tools run, the tool names, the mounted tool commands, `restrictToolNames`, the spawn
+allowlist, the agent and display names, the advisor, the service tier, the model roles and the
+retry-fallback chains. The values that it took from the live process stay live: the ids, the
+task depth, the credential source, the workspace roots, the wake limit, the soft request budget
+and the settings that grant authority; a stored LSP, IRC or MCP value never turns on what the
+live process has off; and LSP checks on its writes run only where both the spawn and the live
+`task.enableLsp` allow them. So the revive from the file builds the session in the working
+directory of the file's header, as the reopened session manager reads it: where its tools run,
+and where the spawn and the in-memory revive build it. It takes the subagent's ids from its
+registry entry; a task depth never shallower than its live parent chain; the credential source
+and workspace roots of its live parent where its spawn passed them (the root session's where the
+parent is not live); the tree's cost gate and the prepared extensions of the live parent or the
+root, whatever the stored list of live inputs names; that session's extension roots, and where
+the list leaves them out (as on a route whose spawner passes none, such as a vibe worker's, where
+the in-memory revive passes none) their mode and configured list without their explicit list, so
+what the session and its own subagents discover holds to the owner's extension policy and its
+task tool offers no agent its spawn did not have; the SDK's own discovery in the file's working
+directory (the slash commands and the custom TS commands it finds there), while the context
+files, skills, rules, prompt templates and workspace tree come from the live parent or the root;
+the cache-warming value every spawn writes (`streaming`); its own directory for its artifacts;
+and wake limits (`maxRuntimeMs`, the soft request budget) never looser than the live settings.
+Where the working directory of the session its live inputs come from (the live parent, or the
+root session where the parent is not live) is not the file's, it builds on the main thread, not
+in a worker, and that session's tool sources follow the file's directory: no custom-tool paths
+and no MCP manager are passed, so the SDK discovers the custom tools and the project's MCP
+servers there; of that session's prepared extensions (else its extension paths) only its
+explicit and inline ones stay (those passed with `--extension` or configured in the
+`extensions` setting, and a host's inline extensions), and every project and user extension,
+plugins included, comes from discovery in the file's directory under the root session's policy
+(its explicit-only mode, the live settings' disabled list, and that directory's plugin
+overrides), added first; an extension both hold is bound once. A per-call worker's agent
+definition is still looked up in the live parent's working directory (the root session's where
+the parent is not live). Before it builds the session, a revive of a file with `spawnSpec`, the
+in-memory one too, writes the workspace roots of the file's header once, as the roots the
+session uses: those of the spawn's policy (on the revive from the file, as named above) together
+with those of the live `workspace.additionalDirectories` setting. The file is then rewritten for
+its roots only where these changed, a root that the subagent took from a live edit of that
+setting during its run stays while the setting holds it, and a root that only the header holds
+is not kept. A spec whose policy part is missing or holds a shape that no spawn writes takes the
+policy of a file without `spawnSpec`, with the cache-warming value `streaming`, and its header's
+roots are written as above, from the live setting alone. Where the working directory of the
+session its live inputs come from is not the file's, both builds of the secret mask, when the
+session is created and when `secrets.enabled` turns on later, load the project secrets
+(`.omp/secrets.yml`) of that session's directory beside those of the file's, so a mask entry is
+only added. The stored settings overlay restores over the live parent's
+settings as a derived overlay, whatever flag the file holds, so the file's settings never become
+grant authority, and each stored setting is checked as a settings override is; an overlay that
+fails the check is replaced by the settings a file without `spawnSpec` gets, and of one that
+passes only the settings a spawn writes are restored (any other value reads through to the live
+parent). When the model registry, after its discovery, does not know the stored model, the revive
+starts on the next model of the subagent's retry-fallback chain that it knows, that has a
+credential and that runs within the effort ceiling, else on the parent session's model (the root
+session's when the parent is not live), and logs the move. A model of a provider that
+`disabledProviders` turns off counts as not known: the stored model, each chain entry and the
+prewalk target alike; a prewalk target that is not known or has no credential is not armed. A
+parent session homed in a worker thread counts as live: the revive reads its live inputs, its
+settings and its eval kernel there; where it cannot answer, or its settings fail the check that
+a stored overlay gets, the revive logs it and takes the root session's inputs. A custom tool that
+the parent's eval kernel no longer defines stays in the tool list, answers a call as
+unavailable, and is named in a notice on the next turn; where the parent is not live, no kernel
+is asked, the root session's included, and every custom tool answers so. A file without
+`spawnSpec` takes, field by field, what a revive from such a file took before spawn specs
+existed: among others, the role alias, the root session's LSP value, the cut-back to the stored
+tool list and the workspace roots its header holds. A value that every spawn gives a subagent
+whatever its inputs applies to such a file too: its session gets no `AGENTS.md`
+(`excludeAgentsMd: true`) and its cache warming is held to `streaming`. Its live inputs come, as a
+spawn's do, from the live parent's tool session (the root session's when the parent is not live),
+among them the context files, skills, rules, prompt templates, workspace tree, inherited session
+agents, API key reader, telemetry, protocol options and artifact manager; and IRC and MCP stay
+off where the root session's tool session has them off. Shared exports drop `spawnSpec`;
+anonymized exports keep it opaque.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 
 ### `mode_change`

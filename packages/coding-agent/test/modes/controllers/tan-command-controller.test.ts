@@ -9,7 +9,7 @@ import { AsyncJobManager, type AsyncJobRegisterOptions } from "@oh-my-pi/pi-codi
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ExtensionPathEntry, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { TanCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/tan-command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -498,7 +498,7 @@ describe("TanCommandController", () => {
 		// and the parent loses the registration too. The child MUST rebind the
 		// parent's prepared extensions before that prune runs.
 		const preparedExtensions: PreparedExtension[] = [
-			{ path: "/ext/provider.ts", resolvedPath: "/ext/provider.ts", factory: null, error: null },
+			{ path: "/ext/provider.ts", scope: "explicit", resolvedPath: "/ext/provider.ts", factory: null, error: null },
 		];
 		const effectiveExtensionRoots: EffectiveExtensionRoots = {
 			explicit: ["/ext/provider.ts"],
@@ -506,7 +506,7 @@ describe("TanCommandController", () => {
 			configured: [],
 			configuredLevel: "user",
 		};
-		const extensionPaths = ["/ext/provider.ts"];
+		const extensionPaths: ExtensionPathEntry[] = [{ path: "/ext/provider.ts", scope: "explicit" }];
 		const harness = createContext({ preparedExtensions, effectiveExtensionRoots, extensionPaths });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const { clone } = createCloneStub({ lastAssistantText: "done" });
@@ -539,7 +539,7 @@ describe("TanCommandController", () => {
 			configured: [],
 			configuredLevel: "user",
 		};
-		const extensionPaths = ["/ext/provider.ts"];
+		const extensionPaths: ExtensionPathEntry[] = [{ path: "/ext/provider.ts", scope: "explicit" }];
 		const harness = createContext({ preparedExtensions: [], effectiveExtensionRoots, extensionPaths });
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
 		const { clone } = createCloneStub({ lastAssistantText: "done" });

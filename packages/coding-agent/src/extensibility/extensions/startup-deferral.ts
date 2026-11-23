@@ -19,7 +19,7 @@ import * as fs from "node:fs/promises";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { AgentStorageApi } from "../../session/agent-storage";
 import { resolvePath } from "../utils";
-import type { Extension } from "./types";
+import type { Extension, ExtensionPathEntry } from "./types";
 
 // Bumped whenever canBindAfterStartup counts a new registration, so verdicts recorded without it
 // are not trusted.
@@ -33,10 +33,10 @@ interface StartupVerdict {
 	todoBackends: string[];
 }
 
-/** Discovered extension paths split by whether they must bind before the session is created. */
+/** Discovered extension entries split by whether they must bind before the session is created. */
 export interface StartupExtensionPartition {
-	eager: string[];
-	deferred: string[];
+	eager: ExtensionPathEntry[];
+	deferred: ExtensionPathEntry[];
 }
 
 async function fingerprintSource(resolvedPath: string): Promise<string | undefined> {
@@ -88,28 +88,28 @@ export function canBindAfterStartup(extension: Extension): boolean {
 }
 
 /**
- * Split extension paths into those that must load before session creation and
+ * Split extension entries into those that must load before session creation and
  * those a recorded verdict for their current source proves safe to bind later.
  * A source that registers the `todoBackend` id (the `todo.backend` setting)
- * stays eager. Order within each list follows `paths`.
+ * stays eager. Order within each list follows `entries`.
  */
 export async function partitionStartupExtensions(
 	storage: AgentStorageApi,
-	paths: readonly string[],
+	entries: readonly ExtensionPathEntry[],
 	cwd: string,
 	todoBackend: string,
 ): Promise<StartupExtensionPartition> {
 	const deferrable = await Promise.all(
-		paths.map(async extensionPath => {
-			const resolvedPath = resolvePath(extensionPath, cwd);
+		entries.map(async entry => {
+			const resolvedPath = resolvePath(entry.path, cwd);
 			const verdict = readVerdict(storage, resolvedPath);
 			if (!verdict?.deferrable || verdict.todoBackends.includes(todoBackend)) return false;
 			return verdict.fingerprint === (await fingerprintSource(resolvedPath));
 		}),
 	);
 	const partition: StartupExtensionPartition = { eager: [], deferred: [] };
-	for (let index = 0; index < paths.length; index++) {
-		(deferrable[index] ? partition.deferred : partition.eager).push(paths[index]);
+	for (let index = 0; index < entries.length; index++) {
+		(deferrable[index] ? partition.deferred : partition.eager).push(entries[index]);
 	}
 	return partition;
 }

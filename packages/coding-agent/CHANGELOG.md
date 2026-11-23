@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
+- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids and artifacts directory now come from the live registry entry, its credential source and workspace roots from the live parent (the root session where the parent is not live), its cost gate and prepared extensions from that session whatever the record's list of live inputs names, and its extension roots from that session too, without their explicit list where the record leaves them out; its task depth and wake limits are held to the live parent chain and settings, its cache warming is held to `streaming` as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed a subagent revived from its stored transcript after the root session moved to another directory being built in the root's directory while its tools ran in its own: it now builds in its own directory, where it finds its project's custom tools, MCP servers, extensions, custom commands and memory; where its live parent (or the root) works in another directory, it takes none of that directory's custom-tool paths, MCP manager, or project and user extensions (it discovers those, plugins included, in its own directory under the root session's extension policy, and keeps only that session's explicit and inline extensions), builds on the main thread, and still masks that project's secrets (`.omp/secrets.yml`) beside its own
+- Fixed a session's task tool offering the agents that the first session in the same directory had discovered under other extension roots (such as another session's `--extension` agents under `--no-extensions`); each task tool now lists the agents of its own session's extension roots
+
 ## [19.1.1] - 2026-11-23
 
 ### Breaking Changes

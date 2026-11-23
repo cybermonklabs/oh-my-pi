@@ -222,7 +222,10 @@ describe("integrations thread service", () => {
 	}, 20_000);
 
 	it("re-binds a parent-prepared extension against the worker's own ExtensionAPI", async () => {
-		const prepared = await importExtensionModule(path.join(FIXTURES, "integrations-extension.ts"), dir);
+		const prepared = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
 		expect(prepared.error).toBeNull();
 		const local = await bindPreparedExtensions([prepared], dir);
 		expect(local.extensions.flatMap(extension => [...extension.commands.keys()])).toEqual(["thread-main"]);
@@ -234,13 +237,17 @@ describe("integrations thread service", () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const inline: PreparedExtension = {
 			path: "<inline-0>",
+			scope: "inline",
 			resolvedPath: "<inline-0>",
 			factory: function sdkInlineFactory(pi) {
 				pi.registerCommand("inline-hook", { description: "SDK inline factory", handler: async () => {} });
 			},
 			error: null,
 		};
-		const fileBacked = await importExtensionModule(path.join(FIXTURES, "integrations-extension.ts"), dir);
+		const fileBacked = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
 
 		// Two worker-hosted spawns: neither treats the `<inline-0>` source id as a module to import.
 		for (let spawn = 0; spawn < 2; spawn++) {

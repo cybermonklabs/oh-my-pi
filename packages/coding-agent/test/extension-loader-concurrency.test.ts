@@ -82,7 +82,13 @@ export default function fastExtension() {
 `,
 		);
 
-		const loading = loadExtensions([slowPath, fastPath], project!.path());
+		const loading = loadExtensions(
+			[
+				{ path: slowPath, scope: "explicit" },
+				{ path: fastPath, scope: "explicit" },
+			],
+			project!.path(),
+		);
 		await fastEvaluated;
 		const eventsDuringImport = [...eventsGlobal[EVENTS_KEY]!];
 		releaseSlow();
@@ -117,7 +123,13 @@ export default function okExtension() {
 `,
 		);
 
-		const result = await loadExtensions([brokenPath, okPath], project!.path());
+		const result = await loadExtensions(
+			[
+				{ path: brokenPath, scope: "explicit" },
+				{ path: okPath, scope: "explicit" },
+			],
+			project!.path(),
+		);
 
 		expect(result.errors).toHaveLength(1);
 		expect(result.errors[0]!.path).toBe(brokenPath);
