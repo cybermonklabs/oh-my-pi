@@ -2353,6 +2353,28 @@ impl Shell {
 		}
 	}
 
+	/// The running subshell of the `( … )` that vproc `i` only waits for
+	/// before it exits (the job vproc of `( list ) &`; [`transparent`]'s
+	/// `Some(false)` for a `( … )`), by index.
+	fn paren_child(&self, i: usize) -> Option<usize> {
+		let p = &self.procs[i];
+		if transparent(p, true) != Some(false) {
+			return None;
+		}
+		let [frame] = p.frames.as_slice() else {
+			return None;
+		};
+		let unit = frame.unit.as_ref()?;
+		let op = unit.ops.get(frame.pc as usize)?;
+		if !matches!(unit.spawns.get(op.a as usize)?.kind, ir::SpawnKind::Subshell) {
+			return None;
+		}
+		let [(child, None)] = frame.scratch.as_ref()?.children.as_slice() else {
+			return None;
+		};
+		self.procs.iter().position(|q| q.vpid == *child)
+	}
+
 	/// Deliver a virtual signal to its target or its configured trap.
 	fn deliver(&mut self, cx: &mut Cx<'_>, target: SigTarget, sig: Signal) {
 		let root = (self.procs[0].vpid, self.procs[0].mode);
@@ -2378,6 +2400,25 @@ impl Shell {
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})
 			.collect();
+		// bash forks once for `( list ) &`, and that one process is the
+		// subshell: a signal sent to the pid of a vproc that only waits for
+		// its `( … )` (the job vproc of `( list ) &`, `$!`) reaches that
+		// subshell, as `kill %1` does, transitively through `( ( … ) )`.
+		// Each such waiter is transparent to the signal below, so it ends
+		// with its subshell's status.
+		let mut waiters: Vec<Vpid> = Vec::new();
+		if let SigTarget::Vpid(v) = target {
+			let mut at = hits.iter().copied().find(|&i| self.procs[i].vpid == v);
+			while let Some(child) = at.and_then(|i| self.paren_child(i)) {
+				if let Some(i) = at {
+					waiters.push(self.procs[i].vpid);
+				}
+				if !hits.contains(&child) {
+					hits.push(child);
+				}
+				at = Some(child);
+			}
+		}
 		self.callout_trees(&mut hits);
 		// Vprocs this signal stopped or continued (job states follow).
 		let mut changed: Vec<(Vpid, Option<Signal>)> = Vec::new();
@@ -2418,7 +2459,8 @@ impl Shell {
 			// it, and the vproc ends with the program's real status, once it
 			// has exited (`wait` returns then, not before).
 			if terminating && target != SigTarget::Vpid(root.0) {
-				let reaches_children = !matches!(target, SigTarget::Vpid(_));
+				let reaches_children =
+					!matches!(target, SigTarget::Vpid(_)) || waiters.contains(&self.procs[i].vpid);
 				if let Some(lone) = transparent(&self.procs[i], reaches_children) {
 					let p = &mut self.procs[i];
 					let stopped = p.stopped;

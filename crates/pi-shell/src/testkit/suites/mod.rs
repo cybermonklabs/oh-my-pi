@@ -34,6 +34,7 @@ mod mem_fds;
 mod modes;
 mod nested_shell;
 mod orphan_jobs;
+mod pid_signal_subshell;
 mod procsub;
 mod restore_fidelity;
 mod skeleton;

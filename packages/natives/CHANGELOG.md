@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `kill $!` of a `( list ) &` job reaches the subshell that runs the list, as in bash, which runs such a job as one process. Only the job's own vproc died: `wait $!` answered at once with its status, the subshell's trap of the signal never ran, and without `end_orphan_jobs` (obash, the engine's default) `( while :; do :; done ) & sleep 1; kill $!` left the loop running for the life of the shell. Now the subshell's trap runs and `wait $!` returns the subshell's status; `( ( list ) ) &` is reached the same way. `kill %1` already reached it.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
