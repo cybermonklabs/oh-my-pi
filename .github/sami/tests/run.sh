@@ -8,8 +8,12 @@
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
 #   - rust-test-tmpdir.sh.
+#   - release-candidate.sh, publish's checks, by release-candidate-harness.sh
+#     with a stub in place of gh (cases RC-*).
 #   - sami-build.yml and .github/actions/bun-install: only release_binary
-#     may use the GitHub Actions cache (cache_lint).
+#     may use the GitHub Actions cache, only release_cache_prune may hold
+#     actions: write and only attest id-token: write, and neither runs
+#     member code (cache_lint).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -36,6 +40,7 @@ scratch="$(mktemp -d)"
 trap 'rm -rf -- "$scratch"' EXIT
 pass=0
 fail=0
+skip=0
 
 # --- log writers; FMT is json or text ----------------------------------------
 # lt_pass <names...>: a libtest run whose tests all pass; FILTERED sets its
@@ -880,6 +885,50 @@ if [ -z "$only" ] || [[ T1-each-action-its-own-tmpdir =~ $only ]]; then
 	verdict T1-each-action-its-own-tmpdir 0 "$rc" '' "$a $b"
 fi
 
+# --- release-candidate.sh ------------------------------------------------------
+# release-candidate-harness.sh checks publish's find and verify against a stub
+# gh. Each case it declares (case_, fcase, or a check that prints PASS or FAIL
+# itself) is a case here, named RC-<its name>, and fails unless the harness
+# reports it exactly once, as PASS, and ends with its summary line. verify
+# needs GNU find (-printf) and sha256sum; a runner that lacks either (macOS's
+# find has no -printf) skips the cases, counts them, and names what it lacks.
+rc_harness="$here/release-candidate-harness.sh"
+rc_names="$(grep -oE '^[^#]*(case_|fcase) [A-Za-z0-9-]+|echo "PASS [A-Za-z0-9-]+"' "$rc_harness" | sed -E 's/.*(case_|fcase) //; s/^echo "PASS //; s/"$//' | sort -u)"
+rc_want=()
+for n in $rc_names; do
+	if [ -z "$only" ] || [[ "RC-$n" =~ $only ]]; then rc_want+=("$n"); fi
+done
+if [ "${#rc_want[@]}" -gt 0 ]; then
+	rc_lacks=""
+	find "$scratch" -maxdepth 0 -printf '' >/dev/null 2>&1 || rc_lacks="GNU find (-printf)"
+	command -v sha256sum >/dev/null || rc_lacks="${rc_lacks:+$rc_lacks and }sha256sum"
+	if [ -n "$rc_lacks" ]; then
+		skip=$((skip + ${#rc_want[@]}))
+		echo "SKIP RC-* (${#rc_want[@]} cases): release-candidate.sh needs $rc_lacks, which this runner lacks; publish runs it on ubuntu-22.04"
+	else
+		t="$(mktemp -d "$scratch/release-candidate.XXXXXX")"
+		out="$(cd "$t" && TMPDIR="$t" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 bash "$rc_harness" "$repo/.github/sami/release-candidate.sh" 2>&1)"
+		printf '%s\n' "$out" | grep -E '^INFO ' || true
+		ended=0
+		printf '%s\n' "$out" | grep -qE '^release-candidate\.sh harness: [0-9]+ passed, [0-9]+ failed$' && ended=1
+		for n in "${rc_want[@]}"; do
+			got="$(printf '%s\n' "$out" | awk -v n="$n" '$1 == "PASS" || $1 == "FAIL" { on = ($2 == n); if (on) print; next } /^    \| / { if (on) print; next } { on = 0 }')"
+			rc=1
+			if [ "$ended" = 0 ]; then
+				got="UNKNOWN: the harness did not reach its summary line
+$got"
+			elif [ "$(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ')" != 1 ]; then
+				got="UNKNOWN: the harness reported $n $(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL) ') times, not once
+$got"
+			elif printf '%s\n' "$got" | grep -qE '^PASS '; then
+				rc=0
+			fi
+			verdict "RC-$n" 0 "$rc" '' ''
+			[ "$rc" = 0 ] || printf '%s\n' "$got" | sed 's/^/    | /'
+		done
+	fi
+fi
+
 # --- the jobs' caches -------------------------------------------------------------
 # cache_lint <workflow> <bun-install action>: only release_binary may use the
 # GitHub Actions cache. rust_test and rust_test_macos run test code on
@@ -919,10 +968,17 @@ fi
 # line with write-all or with an actions key that does not read read or
 # none on that line (GitHub also reads a value on the next line); and the
 # workflow has a permissions key, so no job takes the repository's default
-# token permissions. A line under jobs: that is not a plain `  <id>:`
-# stops the lint, because its steps would be read as the job above's.
+# token permissions. attest holds id-token: write, with which it signs the
+# release's attestations, so it must not run member code either: its only
+# actions are actions/download-artifact and actions/attest-build-provenance,
+# it has no run step, and it names no run-id, repository or github-token (so
+# it downloads this run's artifacts only). No other job, and not the
+# workflow, has a line with write-all or with an id-token key that does not
+# read read or none on that line. A line under jobs: that is not a plain
+# `  <id>:` stops the lint, because its steps would be read as the job
+# above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	# These four read each line with a space added at its end (and the first
 	# two at its start too), so no pattern needs an anchor inside a group.
@@ -930,6 +986,8 @@ cache_lint() {
 	local gh_call='[^[:alnum:]_.-]gh[^[:alnum:]_.-]'
 	local actions_key=$'[^[:alnum:]_/-]["\']?actions["\']?[[:space:]]*:'
 	local actions_safe=$'actions["\']?[[:space:]]*:[[:space:]]*["\']?(read|none)["\']?[[:space:]]*[,}#[:space:]]'
+	local idtoken_key=$'[^[:alnum:]_/-]["\']?id-token["\']?[[:space:]]*:'
+	local idtoken_safe=$'id-token["\']?[[:space:]]*:[[:space:]]*["\']?(read|none)["\']?[[:space:]]*[,}#[:space:]]'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -940,7 +998,7 @@ cache_lint() {
 		echo "UNKNOWN: $wf has a job line cache_lint cannot read: $bad"
 		return 1
 	fi
-	for job in release_binary release_cache_prune rust_test rust_test_macos; do
+	for job in release_binary attest release_cache_prune rust_test rust_test_macos; do
 		printf '%s\n' "$jobs" | grep -qxF "$job" || { echo "UNKNOWN: $wf has no $job job"; return 1; }
 	done
 	for job in $jobs; do
@@ -962,9 +1020,7 @@ cache_lint() {
 				echo "release_binary has an actions/cache step that saves in its post step"
 				ok=0
 			fi
-			# actions/attest-build-provenance signs the archives' digests and
-			# caches nothing.
-			others="$(printf '%s\n' "$steps" | grep -oE 'uses: *[^ \\]+' | sed 's/^uses: *//' | grep -vE '^(actions/checkout@|actions/upload-artifact@|actions/cache/restore@|actions/cache/save@|actions/attest-build-provenance@|\./\.github/actions/(bun-install|bazel-cache)$)' || true)"
+			others="$(printf '%s\n' "$steps" | grep -oE 'uses: *[^ \\]+' | sed 's/^uses: *//' | grep -vE '^(actions/checkout@|actions/upload-artifact@|actions/cache/restore@|actions/cache/save@|\./\.github/actions/(bun-install|bazel-cache)$)' || true)"
 			if [ -n "$others" ]; then
 				echo "release_binary uses an action outside its list: $(printf '%s' "$others" | tr '\n' ' ')"
 				ok=0
@@ -1005,11 +1061,31 @@ cache_lint() {
 					ok=0
 				fi
 			fi
+			if [ "$job" = attest ]; then
+				acts="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E 'uses.?[[:space:]]*:' | grep -vE '^ *(- )?uses: *(actions/download-artifact|actions/attest-build-provenance)@[^ ]+( +#.*)?$' || true)"
+				if [ -n "$acts" ]; then
+					echo "attest uses an action other than actions/download-artifact and actions/attest-build-provenance, so it could run member code: $(printf '%s\n' "$acts" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				runs="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'^ *(- )?["\']?(run|shell)["\']?[[:space:]]*:' || true)"
+				if [ -n "$runs" ]; then
+					echo "attest has a run step, so it could run member code: $(printf '%s\n' "$runs" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				foreign="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E $'^ *["\']?(run-id|repository|github-token)["\']?[[:space:]]*:' || true)"
+				if [ -n "$foreign" ]; then
+					echo "attest names another run, repository or token, so it could attest files this run did not build: $(printf '%s\n' "$foreign" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+			fi
 			if [ "$ok" = 1 ]; then
 				echo "$job: cache-mode none; no actions/cache step; bun-install steps: $n, each with cache: \"false\""
 			fi
 			if [ "$ok" = 1 ] && [ "$job" = release_cache_prune ]; then
 				echo "release_cache_prune: no action; no listed interpreter or downloader, git, ./, ../ or .github/ path or GITHUB_WORKSPACE; each gh call names actions/caches or gh cache outside a comment"
+			fi
+			if [ "$ok" = 1 ] && [ "$job" = attest ]; then
+				echo "attest: only actions/download-artifact and actions/attest-build-provenance; no run step; no other run, repository or token"
 			fi
 		fi
 		[ "$ok" = 1 ] || rc=1
@@ -1018,9 +1094,17 @@ cache_lint() {
 		echo "$wf has no workflow-level permissions, so a job without its own takes the repository's default, which can grant actions: write"
 		rc=1
 	fi
-	aw="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { on = 0; job = "" } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { job = substr($0, 3, length($0) - 3); next } !/^ *#/ { print (job == "" ? "the workflow" : job) "\t" $0 " " }' "$wf" | awk -F'\t' -v k="$actions_key" -v s="$actions_safe" '$1 != "release_cache_prune" { t = $0; gsub(s, " ", t); if (t ~ k || t ~ /write-all/) print }' || true)"
+	# Each line outside a comment, after the name of its job (or "the
+	# workflow"), with a space added at its end.
+	perms="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { on = 0; job = "" } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { job = substr($0, 3, length($0) - 3); next } !/^ *#/ { print (job == "" ? "the workflow" : job) "\t" $0 " " }' "$wf")"
+	aw="$(printf '%s\n' "$perms" | awk -F'\t' -v k="$actions_key" -v s="$actions_safe" '$1 != "release_cache_prune" { t = $0; gsub(s, " ", t); if (t ~ k || t ~ /write-all/) print }' || true)"
 	if [ -n "$aw" ]; then
 		printf '%s\n' "$aw" | awk -F'\t' '{ sub(/ $/, "", $2); printf "%s names an actions permission other than read or none, which only release_cache_prune may hold: [%s]\n", $1, $2 }'
+		rc=1
+	fi
+	idt="$(printf '%s\n' "$perms" | awk -F'\t' -v k="$idtoken_key" -v s="$idtoken_safe" '$1 != "attest" { t = $0; gsub(s, " ", t); if (t ~ k || t ~ /write-all/) print }' || true)"
+	if [ -n "$idt" ]; then
+		printf '%s\n' "$idt" | awk -F'\t' '{ sub(/ $/, "", $2); printf "%s names an id-token permission other than read or none, which only attest may hold: [%s]\n", $1, $2 }'
 		rc=1
 	fi
 	if grep -qE '^ *(- )?uses:' "$bazel_action"; then
@@ -1113,6 +1197,20 @@ wlint W37-release-cache-prune-gh-caches-in-a-comment 1 'release_cache_prune call
 # A push to another ref only restores, sami included: the guard names
 # sami-candidate (W38).
 wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.ref == 'refs\/heads\/sami-candidate' \&\& !cancelled() \&\& steps.release-cache-bound/github.ref == 'refs\/heads\/sami' \&\& !cancelled() \&\& steps.release-cache-bound/" ''
+# attest holds id-token: write, so it runs no member code: no action but
+# download-artifact and attest-build-provenance (W40), no run step (W41),
+# and no download of another run's artifacts (W42). No other job (W43, W45
+# by write-all, W46 with the value on the next line, W47) and not the
+# workflow (W44) names an id-token permission other than read or none.
+wlint W39-attest-rule 0 'attest: only actions/download-artifact and actions/attest-build-provenance; no run step; no other run, repository or token' '' ''
+wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
+wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives$|      - run: bash .github/sami/carry-check.sh\n&|' ''
+wlint W42-attest-download-of-another-run 1 'attest names another run, repository or token, so it could attest files this run did not build: \[          run-id: 1\]' '/^  attest:$/,/^  release_cache_prune:$/s/^          pattern: mise-\*$/&\n          run-id: 1/' ''
+wlint W43-carry-id-token-write 1 'carry names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' 's/^  carry:$/&\n    permissions:\n      id-token: write/' ''
+wlint W44-workflow-id-token-write 1 'the workflow names an id-token permission other than read or none, which only attest may hold: \[  id-token: write\]' 's/^  contents: read$/&\n  id-token: write/' ''
+wlint W45-release-binary-write-all 1 'release_binary names an id-token permission other than read or none, which only attest may hold: \[    permissions: write-all\]' 's/^  release_binary:$/&\n    permissions: write-all/' ''
+wlint W46-rust-test-id-token-on-the-next-line 1 'rust_test names an id-token permission other than read or none, which only attest may hold: \[      id-token:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      id-token:\n        write/' ''
+wlint W47-release-cache-prune-id-token-write 1 'release_cache_prune names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' '/^  release_cache_prune:$/,/^  rust_test:$/s/^      contents: read$/&\n      id-token: write/' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in
@@ -1184,5 +1282,5 @@ prun P10-filter-of-another-binary-does-not-cover 1 "//crates/demo:demo_test's ar
 $(rule native_test //crates/demo:slow_test "$(str src //crates/other:other_test)" "$(strs args ::slow::)")"
 prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust_test' "$LIB"
 
-echo "rust_test job scripts: $pass passed, $fail failed"
+echo "rust_test job scripts: $pass passed, $fail failed, $skip skipped"
 [ "$fail" = 0 ] && [ "$pass" -gt 0 ]

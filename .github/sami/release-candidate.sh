@@ -13,14 +13,15 @@
 #           sidecar <archive>.sha256, and nothing else; no other mise-*
 #           artifact exists. The sidecar, the archive and
 #           release-notes/carry-notes.md each have an attestation that run
-#           made (gh attestation verify); each archive's sha256 is the one its
-#           sidecar gives, and a mismatch is named with both digests; every
-#           archive names the same tag. The notes' first line, which
-#           carry-check.sh writes, names the newest v*-sami.* tag not on this
-#           commit: a release published after the candidate's carry check
-#           was not compared with it. Then it copies the archives to
-#           $RUNNER_TEMP/candidate/publish/ and writes tag, files and notes to
-#           $GITHUB_OUTPUT. It reads the tags of the checkout it runs in.
+#           made on a push, signed by sami-build.yml at
+#           refs/heads/$CANDIDATE_BRANCH (attested, below); each archive's
+#           sha256 is the one its sidecar gives, and a mismatch is named with
+#           both digests; every archive names the same tag. The notes' first
+#           line, which carry-check.sh writes, names the newest v*-sami.* tag
+#           not on this commit: a release published after the candidate's
+#           carry check was not compared with it. Then it copies the archives
+#           to $RUNNER_TEMP/candidate/publish/ and writes tag, files and notes
+#           to $GITHUB_OUTPUT. It reads the tags of the checkout it runs in.
 # Each failure writes ::error lines and a step summary and exits 1, so the
 # job publishes nothing.
 set -euo pipefail
@@ -73,15 +74,25 @@ find_run() {
 }
 
 # attested <file>: true when gh attestation verify accepts the file as built
-# by this repository's sami-build.yml from $GITHUB_SHA on
-# refs/heads/$CANDIDATE_BRANCH on a GitHub-hosted runner, and one of the
-# attestations it accepts was made by run $RUN_ID. Otherwise it sets why and
-# returns 1.
+# from $GITHUB_SHA on refs/heads/$CANDIDATE_BRANCH on a GitHub-hosted runner,
+# signed by this repository's sami-build.yml at refs/heads/$CANDIDATE_BRANCH
+# (--cert-identity: the certificate's subject, exactly), and one of the
+# attestations it accepts has a certificate that names run $RUN_ID of this
+# repository (runInvocationURI), a push (buildTrigger) and that signer
+# (buildSignerURI). Otherwise it sets why and returns 1.
+# Any run of any ref can make attestations, a dispatch included: GitHub runs
+# the workflow file of the ref the run is on, whatever sami-build.yml's attest
+# job says. So a dispatch run's files are kept out of a release here: find
+# takes only a push run of $CANDIDATE_BRANCH, the files are that run's
+# artifacts, downloaded by its id, and each one needs an attestation whose
+# certificate names that run, a push, and sami-build.yml at
+# refs/heads/$CANDIDATE_BRANCH.
 attested() {
-	local out err
+	local out err signer
+	signer="https://github.com/$GITHUB_REPOSITORY/$workflow@refs/heads/$CANDIDATE_BRANCH"
 	err="$(mktemp)"
 	if ! out="$(gh attestation verify "$1" --repo "$GITHUB_REPOSITORY" \
-		--signer-workflow "$GITHUB_REPOSITORY/$workflow" \
+		--cert-identity "$signer" \
 		--source-digest "$GITHUB_SHA" --source-ref "refs/heads/$CANDIDATE_BRANCH" \
 		--deny-self-hosted-runners --limit 1000 --format json 2>"$err")"; then
 		why="gh attestation verify refused it: $(tr -s '\n' ' ' <"$err" | cut -c 1-400)"
@@ -89,8 +100,11 @@ attested() {
 		return 1
 	fi
 	rm -f -- "$err"
-	if ! jq -e --arg r "/actions/runs/$RUN_ID/" '[.. | strings | select(contains($r))] | length > 0' <<<"$out" >/dev/null; then
-		why="it has no attestation that run $RUN_ID made"
+	if ! jq -e --arg run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/" --arg signer "$signer" '
+		any(.[]; .verificationResult.signature.certificate
+			| ((.runInvocationURI // "") | startswith($run))
+			  and .buildTrigger == "push" and .buildSignerURI == $signer)' <<<"$out" >/dev/null; then
+		why="it has no attestation that run $RUN_ID made on a push, signed by $signer"
 		return 1
 	fi
 }
@@ -113,7 +127,7 @@ previous_line() {
 verify() {
 	need GITHUB_REPOSITORY GITHUB_SHA CANDIDATE_BRANCH RUN_ID RELEASE_TARGETS RUNNER_TEMP GITHUB_OUTPUT
 	[[ "$RUN_ID" =~ ^[0-9]+$ ]] || fail "RUN_ID is not a run id: $RUN_ID"
-	local dir="$RUNNER_TEMP/candidate" t d e x known base listing archive sidecar want got tag i notes noted prev pub delim
+	local dir="$RUNNER_TEMP/candidate" t d x known base listing archive sidecar want got tag i notes noted prev pub delim
 	local -a errors=() entries=() archives=() sums=() tags=()
 	echo "::group::$(gh --version | sed -n 1p): gh attestation verify --help"
 	gh attestation verify --help
