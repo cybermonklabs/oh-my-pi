@@ -61,6 +61,14 @@ impl OsPipe {
 		self.0.poll_write(cx, buf)
 	}
 
+	/// Tests, Unix: while `hold` is set, a write waits without writing, as
+	/// one the room's thread has in hand while the pipe has room (the thread
+	/// not yet run); letting go wakes the task that asked.
+	#[cfg(all(test, unix))]
+	pub fn hold_writes(&mut self, hold: bool) {
+		self.0.hold_writes(hold);
+	}
+
 	/// Ready once every byte accepted by [`OsPipe::poll_write`] is in the
 	/// pipe (Windows completes writes in the background; Unix writes are
 	/// immediate).
@@ -289,6 +297,14 @@ mod imp {
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		drain:       Option<Arc<Drain>>,
 		file:        fs::File,
+		/// Tests: writes wait as one in hand on the room's thread waits, and
+		/// the task that asked is woken once they are let go
+		/// ([`super::OsPipe::hold_writes`]).
+		#[cfg(test)]
+		held:        bool,
+		/// Tests: the task a held write left waiting, woken when the hold goes.
+		#[cfg(test)]
+		held_waker:  Option<std::task::Waker>,
 	}
 
 	/// A write end's [`Room`], once a write waited.
@@ -382,6 +398,10 @@ mod imp {
 				#[cfg(any(target_os = "linux", target_os = "android"))]
 				drain: None,
 				file: fs::File::from(fd),
+				#[cfg(test)]
+				held: false,
+				#[cfg(test)]
+				held_waker: None,
 			})
 		}
 
@@ -391,7 +411,21 @@ mod imp {
 			poll_io(cx, fd, ready::READ, read_watch, || (&*file).read(buf))
 		}
 
+		/// See [`super::OsPipe::hold_writes`].
+		#[cfg(test)]
+		pub fn hold_writes(&mut self, hold: bool) {
+			self.held = hold;
+			if !hold && let Some(waker) = self.held_waker.take() {
+				waker.wake();
+			}
+		}
+
 		pub fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			#[cfg(test)]
+			if self.held {
+				self.held_waker = Some(cx.waker().clone());
+				return Poll::Pending;
+			}
 			#[cfg(any(target_os = "linux", target_os = "android"))]
 			if let Some(r) = self.poll_write_pipe(cx, buf) {
 				return r;

@@ -933,4 +933,113 @@ mod tests {
 			.find(|(w, i)| *w != i.to_be_bytes());
 		assert!(first_wrong.is_none(), "out of order at word {:?}", first_wrong.map(|(_, i)| i));
 	}
+
+	/// Read `want` bytes through `read`, moving `feeds` on whenever the read
+	/// waits, as their holders' polls do; fails after 30 s.
+	fn read_all(read: &FdRef, feeds: &[&Arc<Feed>], want: usize) -> Vec<u8> {
+		let mut cx = Context::from_waker(Waker::noop());
+		let mut key = WaitKey::default();
+		let mut got = Vec::with_capacity(want);
+		let mut buf = [0u8; 4096];
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		while got.len() < want {
+			match read.poll_read(&mut cx, &mut buf) {
+				Poll::Ready(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+				Poll::Ready(other) => panic!("read: {other:?} at {} of {want} bytes", got.len()),
+				Poll::Pending => {
+					assert!(
+						std::time::Instant::now() < deadline,
+						"no progress at {} of {want} bytes",
+						got.len()
+					);
+					for feed in feeds {
+						feed.poll(&cx, &mut key);
+					}
+					std::thread::sleep(std::time::Duration::from_millis(1));
+				},
+			}
+		}
+		got
+	}
+
+	// Failure mode: while the pump's write is in hand (on Linux the room's
+	// thread has it and has not run yet) and the OS pipe is empty, a read
+	// answers end of file, or a zero-length read takes readiness from the OS
+	// pipe alone; one kernel pipe holding those bytes answers "not yet" to
+	// the read and "ready" to the zero-length one. The pump's write is held
+	// here, so the state stays while the shell reads.
+	#[test]
+	fn a_read_while_the_pumps_write_is_in_hand_waits_for_it_and_is_ready() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let bytes = b"bytes the pump holds\n";
+		assert!(matches!(write.poll_write(&mut cx, bytes), Poll::Ready(Ok(n)) if n == bytes.len()));
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(true);
+		let mut key = WaitKey::default();
+		feed.poll(&cx, &mut key);
+		assert_eq!(feed.state.lock().chunk.pending(), bytes, "the pump holds the bytes");
+		assert_eq!(feed.drain.as_ref().expect("a drain").available(), 0, "the OS pipe is empty");
+		assert!(
+			read.poll_read_direct(&mut cx, &mut []).is_pending(),
+			"the engine pipe is empty, its writer open"
+		);
+		assert!(
+			matches!(read.poll_read(&mut cx, &mut []), Poll::Ready(Ok(0))),
+			"the pump holds bytes: ready"
+		);
+		let mut buf = [0u8; 64];
+		assert!(
+			read.poll_read(&mut cx, &mut buf).is_pending(),
+			"not end of file: the pump's bytes come"
+		);
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(false);
+		assert_eq!(read_all(&read, &[&feed], bytes.len()), bytes, "the pump's bytes, once");
+	}
+
+	// Failure mode: a read asks only the pipe's first feed. When another fd
+	// object of the pipe (a `/dev/fd/N` copy handed to another external) has
+	// a feed of its own holding the next bytes, the read takes the engine
+	// pipe's bytes after them.
+	#[test]
+	fn a_read_asks_every_feed_of_the_pipe() {
+		const WORDS: u32 = 1024;
+		let (read, write) = FdRef::engine_pipe();
+		let first = Arc::new(Feed::new(read.clone()).expect("a feed"));
+		let second = Arc::new(Feed::new(read.clone()).expect("a feed"));
+		assert!(first.reads_through() && second.reads_through(), "both have a drain");
+		for feed in [&first, &second] {
+			let weak: std::sync::Weak<dyn FeedRead> = Arc::downgrade(feed) as _;
+			read.attach_feed(weak);
+		}
+		let mut cx = Context::from_waker(Waker::noop());
+		let bytes: Vec<u8> = (0..WORDS).flat_map(u32::to_be_bytes).collect();
+		let half = bytes.len() / 2;
+		assert!(matches!(write.poll_write(&mut cx, &bytes[..half]), Poll::Ready(Ok(n)) if n == half));
+		// The second feed's pump takes the first half into its OS pipe.
+		second.poll(&cx, &mut WaitKey::default());
+		assert_eq!(
+			second.drain.as_ref().expect("a drain").available(),
+			half,
+			"the second feed holds the first half"
+		);
+		assert!(matches!(write.poll_write(&mut cx, &bytes[half..]), Poll::Ready(Ok(n)) if n == half));
+		let got = read_all(&read, &[&first, &second], bytes.len());
+		let first_wrong = got
+			.chunks(4)
+			.zip(0u32..)
+			.find(|(w, i)| *w != i.to_be_bytes());
+		assert!(first_wrong.is_none(), "out of order at word {:?}", first_wrong.map(|(_, i)| i));
+	}
 }
