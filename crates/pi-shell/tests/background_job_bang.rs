@@ -324,7 +324,7 @@ async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 }
 
 /// A function run as a job's command, under a `set -T` DEBUG trap whose
-/// action, run in the job before the body's `/bin/true`, waits for what
+/// action, run in the job before the body's `/usr/bin/true`, waits for what
 /// the row writes after `$!`: a builtin with a redirection (which the
 /// staged path runs), a program, or a command substitution. Bash's child
 /// runs a function body's traps; here the job keeps its virtual pid once
@@ -341,7 +341,7 @@ async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 	let in_function = |action: &str| {
 		format!(
-			r#"{FIFO} f() {{ /bin/true; }}; set -T; trap '[[ $BASH_COMMAND == /bin/true ]] && {{ {action}; }}' DEBUG; f & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
+			r#"{FIFO} f() {{ /usr/bin/true; }}; set -T; trap '[[ $BASH_COMMAND == /usr/bin/true ]] && {{ {action}; }}' DEBUG; f & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
 		)
 	};
 	let looped = |guard: &str, job: &str| {
@@ -355,7 +355,7 @@ async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 		(in_function(r#"x=$(read -r l <&3; echo "$l")"#), "st=0\n"),
 		(
 			format!(
-				r#"{FIFO} set -T; trap '(( BASH_SUBSHELL )) && /usr/bin/head -n 1 <&3 >/dev/null' DEBUG; /bin/true & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
+				r#"{FIFO} set -T; trap '(( BASH_SUBSHELL )) && /usr/bin/head -n 1 <&3 >/dev/null' DEBUG; /usr/bin/true & p=$!; echo go >&3; wait "$p"; echo "st=$?""#
 			),
 			"st=0\n",
 		),
@@ -559,16 +559,16 @@ async fn a_job_that_runs_something_before_exec_is_known_by_its_program() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_waits_before_exec_keeps_its_own_pid() {
 	let rows = [
-		(pid_kind_row("f() { /bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
-		(late_pid_kind_row("f() { /bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
-		(pid_kind_row("f() { x=$(/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
-		(late_pid_kind_row("f() { x=$(/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
+		(pid_kind_row("f() { /usr/bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
+		(late_pid_kind_row("f() { /usr/bin/true; exec PROG; }; f"), "virtual\nst=143\n"),
+		(pid_kind_row("f() { x=$(/usr/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
+		(late_pid_kind_row("f() { x=$(/usr/bin/true); exec PROG; }; f"), "virtual\nst=143\n"),
 		(pid_kind_row(r#"printf 'exec %s\n' "$c" | . /dev/stdin"#), "virtual\nst=143\n"),
 		(
 			pid_kind_row("f() { for (( i = 0; i < 5000; i++ )); do :; done; exec PROG; }; f"),
 			"virtual\nst=143\n",
 		),
-		(alive_row(r#"eval "/bin/true; $c""#), "not-found\nst=143\n"),
+		(alive_row(r#"eval "/usr/bin/true; $c""#), "not-found\nst=143\n"),
 		(
 			probe_row(
 				"f() { kill -STOP $BASHPID; exec PROG; }; f",
@@ -689,7 +689,7 @@ fn bang_of_a_zsh_source_job_does_not_wait_for_its_file() {
 async fn bang_of_a_job_whose_child_opens_a_fifo_is_there_at_once() {
 	let opened = |body: &str| {
 		format!(
-			r#"d=$(mktemp -d); mkfifo "$d/q"; f() {{ {body}; exec /bin/true; }}; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#
+			r#"d=$(mktemp -d); mkfifo "$d/q"; f() {{ {body}; exec /usr/bin/true; }}; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#
 		)
 	};
 	let rows = [
@@ -712,7 +712,7 @@ async fn bang_of_a_job_whose_child_opens_a_fifo_is_there_at_once() {
 #[test]
 fn bang_of_a_zsh_job_whose_substitution_opens_a_fifo_is_there_at_once() {
 	assert_zsh_outputs(&[(
-		r#"d=$(mktemp -d); mkfifo "$d/q"; f() { x=$(< "$d/q"); exec /bin/true }; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#,
+		r#"d=$(mktemp -d); mkfifo "$d/q"; f() { x=$(< "$d/q"); exec /usr/bin/true }; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#,
 		"st=0\n",
 	)]);
 }
