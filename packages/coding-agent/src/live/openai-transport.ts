@@ -50,6 +50,11 @@ const DELEGATION_WORDS_LABEL =
 /** A delegation's turn when none of the user's words before it were transcribed. */
 const DELEGATION_NO_WORDS =
 	"No words of the user were transcribed for this request. Say so, and ask the user to say it again.";
+/**
+ * Every break a reader of the turn could take as a new line, which must not escape the quote: CR LF, CR,
+ * LF, and Unicode's other mandatory breaks (VT, FF, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR).
+ */
+const LINE_BREAK = /\r\n|[\n\v\f\r\u0085\u2028\u2029]/;
 
 type Lifecycle = "idle" | "connecting" | "connected" | "closing" | "closed";
 
@@ -176,7 +181,7 @@ function delegationText(words: UserWords[], untimed: readonly string[]): string 
 	const said = [...timed, ...untimed].join("").trim();
 	if (!said) return DELEGATION_NO_WORDS;
 	const quoted = said
-		.split("\n")
+		.split(LINE_BREAK)
 		.map(line => `> ${line}`)
 		.join("\n");
 	return `${DELEGATION_WORDS_LABEL}\n\n${quoted}`;

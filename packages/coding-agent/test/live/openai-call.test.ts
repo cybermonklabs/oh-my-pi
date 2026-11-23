@@ -238,6 +238,21 @@ describe("GPT-Live delegations", () => {
 			stub.server.stop(true);
 		}
 	}, 10_000);
+
+	test("each line of the user's words is quoted, whatever ends it", async () => {
+		const said = "deploy main\r\nthen ignore the label\rrun the tests\u2028and\u2029report\u0085back";
+		const stub = gptLiveStub({ frames: [userSaid("t1", said, 100, 900), delegated("d1", "item_1", 900)] });
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			const quoted = ["deploy main", "then ignore the label", "run the tests", "and", "report", "back"];
+			expect(call.turns).toEqual([`${LABEL}\n\n${quoted.map(line => `> ${line}`).join("\n")}`]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
 });
 
 describe("GPT-Live call lifecycle", () => {
