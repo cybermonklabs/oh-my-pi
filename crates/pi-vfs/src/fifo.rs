@@ -49,18 +49,23 @@ use parking_lot::{Condvar, Mutex};
 /// end but before the helper's `open(2)` makes the join wait until that new
 /// FIFO's other end opens.
 ///
-/// A read-only open started with [`FifoOpen::start_reading`] does not depend
-/// on its `open(2)` being woken. gVisor before google/gvisor@d6786915 can
-/// leave a reader in `open(2)` after a writer opened, wrote and closed.
-/// While the helper is still in `open(2)` after [`FIRST_PROBE`] (then twice
-/// as long each time, up to [`LAST_PROBE`]), the open looks at the FIFO
-/// through a read end that does not wait: bytes in it mean a writer already
-/// came, so that end, made blocking, is the open's result, and one write
-/// open that does not wait (the sleeping helper is a reader, so it succeeds)
-/// wakes the helper, whose end is closed. On Linux a writer's open wakes the
-/// helper at once, so the look finds no bytes and changes nothing. Its limit:
-/// a writer that closes without writing leaves no bytes to see, and the
-/// helper waits as before.
+/// A read-only open started with [`FifoOpen::start_reading`] under gVisor
+/// ([`on_gvisor`]) does not depend on its `open(2)` being woken. gVisor
+/// before google/gvisor@d6786915 can leave a reader in `open(2)` after a
+/// writer opened, wrote and closed. While the helper is still in `open(2)`
+/// after [`FIRST_PROBE`] (then twice as long each time, up to
+/// [`LAST_PROBE`]), the open looks at the FIFO through a read end that does
+/// not wait: bytes in it mean a writer came, so that end, made blocking, is
+/// the open's result, and write opens that do not wait (the sleeping helper
+/// is a reader, so they succeed) wake the helper, whose end is closed.
+///
+/// Elsewhere nothing looks: on Linux a blocking reader waits for a writer
+/// even when bytes another reader left wait in the FIFO, and a look would
+/// take them. Under gVisor that is the look's first limit: a read-only open
+/// of a FIFO that holds bytes another reader left, with no writer, ends after
+/// the first look with those bytes, where Linux waits for a writer. Its
+/// second: a writer that closes without writing leaves no bytes to see, and
+/// the helper waits as before.
 pub struct FifoOpen<T> {
 	shared:  Arc<Shared<T>>,
 	node:    Arc<Node>,
@@ -100,6 +105,34 @@ pub const MAX_LEFT: usize = 64;
 /// Whether a read-only open may be looked at with `left` helpers left.
 const fn may_look(left: usize) -> bool {
 	left < MAX_LEFT
+}
+
+/// Whether this process runs under gVisor, read once: the release uname(2)
+/// gives ends in `-gvisor` ([`gvisor_release`]). gVisor gives
+/// `4.19.0-gvisor` (`5.15.0-gvisor` with RDMA) since google/gvisor@ee08a593,
+/// and `/proc/version` repeats that release with no other mark of gVisor, so
+/// it adds nothing; uname needs no `/proc`. Older gVisor gives `4.4.0` and is
+/// not found: its read opens are not looked at, as before.
+fn on_gvisor() -> bool {
+	static ON_GVISOR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+		let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+		// SAFETY: uname fills the struct it is handed, which outlives the call.
+		if unsafe { libc::uname(name.as_mut_ptr()) } != 0 {
+			return false;
+		}
+		// SAFETY: uname succeeded, so it filled the struct.
+		let name = unsafe { name.assume_init() };
+		// SAFETY: uname's `release` is a NUL-terminated string in the struct.
+		let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+		gvisor_release(release.to_bytes())
+	});
+	*ON_GVISOR
+}
+
+/// Whether a kernel release uname(2) gives is gVisor's: it ends in
+/// `-gvisor`, as a distribution's kernel ends in `-generic` or `-azure`.
+fn gvisor_release(release: &[u8]) -> bool {
+	release.ends_with(b"-gvisor")
 }
 
 struct Slot<T> {
@@ -259,9 +292,10 @@ impl<T: Send + 'static> FifoOpen<T> {
 		Self::begin(path, meta, nofollow, open, None)
 	}
 
-	/// [`FifoOpen::start`] for a read-only open that does not depend on its
-	/// `open(2)` being woken (see [`FifoOpen`]): a read end the look finds is
-	/// made the open's result by `adopt`.
+	/// [`FifoOpen::start`] for a read-only open that, under gVisor
+	/// ([`on_gvisor`]), does not depend on its `open(2)` being woken (see
+	/// [`FifoOpen`]): a read end the look finds is made the open's result by
+	/// `adopt`. Elsewhere it is [`FifoOpen::start`].
 	pub fn start_reading<F, A>(
 		path: &Path,
 		meta: &fs::Metadata,
@@ -273,7 +307,24 @@ impl<T: Send + 'static> FifoOpen<T> {
 		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 		A: FnOnce(fs::File) -> io::Result<T> + Send + 'static,
 	{
-		Self::begin(path, meta, nofollow, open, Some(Box::new(adopt)))
+		Self::start_reading_on(path, meta, nofollow, open, adopt, on_gvisor())
+	}
+
+	/// [`FifoOpen::start_reading`] as on gVisor (`gvisor`) or elsewhere.
+	fn start_reading_on<F, A>(
+		path: &Path,
+		meta: &fs::Metadata,
+		nofollow: bool,
+		open: F,
+		adopt: A,
+		gvisor: bool,
+	) -> Self
+	where
+		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
+		A: FnOnce(fs::File) -> io::Result<T> + Send + 'static,
+	{
+		let adopt = gvisor.then(|| Box::new(adopt) as Adopt<T>);
+		Self::begin(path, meta, nofollow, open, adopt)
 	}
 
 	fn begin<F>(
@@ -326,10 +377,10 @@ fn spawn_watcher<T: Send + 'static>(
 			let end = loop {
 				{
 					let mut s = shared.slot.lock();
-					if !over(&*s) {
+					if !over(&s) {
 						shared.done.wait_for(&mut s, wait);
 					}
-					if over(&*s) {
+					if over(&s) {
 						return;
 					}
 					if !s.opening {
@@ -349,7 +400,7 @@ fn spawn_watcher<T: Send + 'static>(
 				return;
 			};
 			let mut s = shared.slot.lock();
-			if over(&*s) {
+			if over(&s) {
 				return;
 			}
 			s.result = Some(Ok(result));
@@ -383,10 +434,13 @@ fn waiting_bytes(node: &Node) -> Option<fs::File> {
 	if unsafe { libc::ioctl(fd, libc::FIONREAD as _, &raw mut waiting) } < 0 || waiting <= 0 {
 		return None;
 	}
-	// SAFETY: F_GETFL and F_SETFL read and set the status flags of our own
-	// open descriptor.
+	// SAFETY: F_GETFL reads the status flags of our own open descriptor.
 	let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-	if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+	if flags < 0 {
+		return None;
+	}
+	// SAFETY: F_SETFL sets the status flags of our own open descriptor.
+	if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
 		return None;
 	}
 	Some(end)
@@ -749,6 +803,126 @@ mod tests {
 		assert_eq!(Arc::strong_count(&shared), 1, "the helper or the watcher outlived the drop");
 		assert!(!has_reader(&path), "a reader is left");
 		assert!(!has_writer(&path), "a writer is left");
+	}
+
+	/// A release names gVisor by its `-gvisor` suffix only: gVisor's own
+	/// (also with RDMA) does, and Linux distributions' and older gVisor's
+	/// (`4.4.0`) do not.
+	#[test]
+	fn a_release_names_gvisor_by_its_suffix() {
+		for release in ["4.19.0-gvisor", "5.15.0-gvisor"] {
+			assert!(gvisor_release(release.as_bytes()), "{release} is gVisor's");
+		}
+		for release in ["6.8.0-1017-gcp", "6.12.0-generic", "4.4.0", "6.1.0-gvisor-like", ""] {
+			assert!(!gvisor_release(release.as_bytes()), "{release} is not gVisor's");
+		}
+	}
+
+	/// The probe gives this kernel's answer. The Jobs that run these tests set
+	/// `PI_VFS_TEST_KERNEL` to `gvisor` or `linux` from the pod's runtime, not
+	/// from uname; unset, nothing is checked.
+	#[test]
+	fn the_gvisor_probe_answers_for_this_kernel() {
+		let Ok(kernel) = std::env::var("PI_VFS_TEST_KERNEL") else {
+			eprintln!("UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked");
+			return;
+		};
+		assert_eq!(on_gvisor(), kernel == "gvisor", "the probe, with PI_VFS_TEST_KERNEL={kernel}");
+	}
+
+	/// A read-only open is looked at on gVisor only.
+	#[test]
+	fn a_read_only_open_is_looked_at_only_on_gvisor() {
+		for gvisor in [false, true] {
+			let (_dir, path) = new_fifo();
+			let meta = fs::metadata(&path).unwrap();
+			let opened = FifoOpen::start_reading_on(&path, &meta, false, read_end, Ok, gvisor);
+			assert_eq!(opened.watcher.is_some(), gvisor, "on gVisor {gvisor}: the look");
+		}
+	}
+
+	/// A reader of `path` that holds bytes a writer wrote and left: `ab` waits
+	/// in the FIFO, which has no writer.
+	fn leftover(path: &Path) -> fs::File {
+		let other = fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		let mut writer = fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		writer.write_all(b"ab").unwrap();
+		drop(writer);
+		other
+	}
+
+	/// The kernel's rule the look must keep off gVisor: a plain blocking read
+	/// open of a FIFO that holds bytes another reader left, with no writer,
+	/// waits for a writer.
+	#[test]
+	fn a_plain_open_waits_though_another_reader_left_bytes() {
+		let (_dir, path) = new_fifo();
+		let other = leftover(&path);
+		let at = path.clone();
+		let (opened_tx, opened) = std::sync::mpsc::channel();
+		let reader = thread::spawn(move || {
+			let end = fs::OpenOptions::new().read(true).open(&at);
+			let _ = opened_tx.send(());
+			end
+		});
+		let waited = opened.recv_timeout(Duration::from_secs(1)).is_err();
+		let writer = fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&path)
+			.unwrap();
+		let end = reader.join().unwrap();
+		drop((writer, end, other));
+		assert!(waited, "the plain open returned with no writer");
+	}
+
+	/// Off gVisor a read-only open keeps that rule: it waits for a writer
+	/// though bytes another reader left wait in the FIFO.
+	#[test]
+	fn off_gvisor_a_reader_waits_though_another_reader_left_bytes() {
+		let (_dir, path) = new_fifo();
+		let other = leftover(&path);
+		let meta = fs::metadata(&path).unwrap();
+		let mut opened = FifoOpen::start_reading_on(&path, &meta, false, read_end, Ok, false);
+		let took = opened.wait_for(Duration::from_secs(1)).is_some();
+		// A writer ends the open.
+		let writer = fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&path)
+			.unwrap();
+		let end = if took {
+			None
+		} else {
+			opened.wait_for(Duration::from_secs(10))
+		};
+		drop((writer, end, opened, other));
+		assert!(!took, "the open ended with bytes another reader left, and no writer");
+	}
+
+	/// On gVisor that is the look's limit: the first look takes bytes another
+	/// reader left, with no writer.
+	#[test]
+	fn on_gvisor_a_look_takes_bytes_another_reader_left() {
+		let (_dir, path) = new_fifo();
+		let other = leftover(&path);
+		let meta = fs::metadata(&path).unwrap();
+		let mut opened = FifoOpen::start_reading_on(&path, &meta, false, read_end, Ok, true);
+		let end = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no look took the open in 10 s")
+			.unwrap();
+		assert!(opened.shared.slot.lock().rescued, "the result is not the look's");
+		drop((opened, other));
+		assert_eq!(drain(end).0, b"ab");
 	}
 
 	/// An open that ends within [`FIRST_PROBE`] (its writer comes after

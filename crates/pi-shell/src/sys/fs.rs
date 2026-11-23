@@ -794,8 +794,8 @@ mod fifo {
 			}
 			opts.open(path)
 		};
-		// A read-only open does not depend on its `open(2)` being woken
-		// (gVisor can leave it asleep after its writer came): see
+		// Under gVisor a read-only open does not depend on its `open(2)` being
+		// woken (gVisor can leave it asleep after its writer came): see
 		// `FifoOpen::start_reading`.
 		let open = if write {
 			FifoOpen::start(host, &meta, nofollow, open)

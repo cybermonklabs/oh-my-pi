@@ -316,8 +316,8 @@ fn start_fifo(
 		through_pin.custom_flags(through_pin.get_custom_flags() & !libc::O_NOFOLLOW);
 		native_open(&scope, path, &through_pin)
 	};
-	// A read-only open does not depend on its `open(2)` being woken (gVisor
-	// can leave it asleep after its writer came): see
+	// Under gVisor a read-only open does not depend on its `open(2)` being
+	// woken (gVisor can leave it asleep after its writer came): see
 	// `FifoOpen::start_reading`.
 	Ok(if read_only {
 		FifoOpen::start_reading(path, meta, nofollow, open, |end| Ok(File::from(end)))
