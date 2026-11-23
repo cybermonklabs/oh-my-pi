@@ -628,13 +628,13 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 	// Live voice
-	| { id?: string; type: "response"; command: "live_start"; success: true; data: { voice: string } }
+	| { id?: string; type: "response"; command: "live_start"; success: true; data: { voice?: string } }
 	| {
 			id?: string;
 			type: "response";
 			command: "live_connect";
 			success: true;
-			data: { voice: string; sdpAnswer: string };
+			data: { voice?: string; sdpAnswer: string };
 	  }
 	| { id?: string; type: "response"; command: "live_stop"; success: true }
 	| { id?: string; type: "response"; command: "live_mute"; success: true; data: { muted: boolean } }

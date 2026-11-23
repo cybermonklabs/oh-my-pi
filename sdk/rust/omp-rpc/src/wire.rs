@@ -5479,7 +5479,8 @@ pub struct LiveStartParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveStartResult {
-	pub voice: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub voice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5494,9 +5495,10 @@ pub struct LiveConnectParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveConnectResult {
-	pub voice: String,
 	#[serde(rename = "sdpAnswer")]
 	pub sdp_answer: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub voice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6709,7 +6711,7 @@ impl Command for SteerSubagentCommand {
 	}
 }
 
-/// Start a live voice session bound to this session; returns the voice in use.
+/// Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct LiveStartCommand {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6721,7 +6723,7 @@ pub struct LiveStartCommand {
 impl Command for LiveStartCommand {
 	const NAME: &'static str = "live_start";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = String;
+	type Output = Option<String>;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<LiveStartResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.voice)

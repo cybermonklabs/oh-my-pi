@@ -1705,8 +1705,8 @@ class NegotiateProtocolResult:
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class LiveConnectResult:
-    voice: str
     sdp_answer: str
+    voice: str | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -3232,8 +3232,8 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
 def parse_live_connect_result(value: object, path: str = "LiveConnectResult") -> LiveConnectResult:
     payload = expect_object(value, path)
     return LiveConnectResult(
-        voice=required(payload, "voice", decode_str, path),
         sdp_answer=required(payload, "sdpAnswer", decode_str, path),
+        voice=optional(payload, "voice", decode_str, path),
     )
 
 
@@ -3533,14 +3533,14 @@ class WireClient:
         params["message"] = message
         self._command("steer_subagent", params)
 
-    def live_start(self, *, voice: str | None = None, instructions: str | None = None) -> str:
-        """Start a live voice session bound to this session; returns the voice in use."""
+    def live_start(self, *, voice: str | None = None, instructions: str | None = None) -> str | None:
+        """Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`."""
         params: dict[str, object] = {}
         if voice is not None:
             params["voice"] = voice
         if instructions is not None:
             params["instructions"] = instructions
-        return required(expect_object(self._command("live_start", params), "live_start"), "voice", decode_str, "live_start")
+        return optional(expect_object(self._command("live_start", params), "live_start"), "voice", decode_str, "live_start")
 
     def live_connect(self, sdp_offer: str, *, voice: str | None = None, instructions: str | None = None) -> LiveConnectResult:
         """Start a live voice session whose audio runs on a caller-owned WebRTC peer: send its SDP offer, apply the returned answer."""

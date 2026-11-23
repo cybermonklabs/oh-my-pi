@@ -11,7 +11,8 @@ import type { InteractiveModeContext } from "../types";
 import { createAssistantMessageComponent } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 
 import type { ExtensionLiveSession, ExtensionLiveStartOptions } from "../../extensibility/extensions/types";
-import { resolveLiveVoice } from "../../live/settings";
+import { OPENAI_LIVE_MODEL } from "../../live/openai-transport";
+import { cfgLiveProvider, resolveLiveVoice } from "../../live/settings";
 
 const ANIMATION_INTERVAL_MS = 80;
 type LiveSessionFactory = (options: LiveSessionControllerOptions) => LiveSessionController;
@@ -26,6 +27,12 @@ const LIVE_MESSAGE_USAGE: AssistantMessage["usage"] = {
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+/** The provider and model a call's spoken lines are labelled with: the route the call runs on. */
+const LIVE_LINE_ORIGIN = {
+	codex: { api: "openai-codex-responses", provider: "openai-codex", model: LIVE_MODEL },
+	openai: { api: "openai-responses", provider: "openai", model: OPENAI_LIVE_MODEL },
+} as const satisfies Record<string, Pick<AssistantMessage, "api" | "provider" | "model">>;
 
 /** Runs an extension's live observer; its failures are logged, never turned into a session failure. */
 function notifyRemote(callback: () => void): void {
@@ -52,6 +59,8 @@ export class LiveCommandController {
 	#assistantTranscriptComponent: AssistantMessageComponent | undefined;
 	#assistantTranscriptTurn = 0;
 	#assistantTranscriptStartedAt = 0;
+	/** The label of the current call's spoken lines; set when the call starts. */
+	#lineOrigin: Pick<AssistantMessage, "api" | "provider" | "model"> = LIVE_LINE_ORIGIN.codex;
 
 	constructor(ctx: InteractiveModeContext, createSession?: LiveSessionFactory) {
 		this.#ctx = ctx;
@@ -99,7 +108,7 @@ export class LiveCommandController {
 			await stop();
 			throw new Error("The live session stopped before its SDP answer was available");
 		}
-		return { sdpAnswer, voice, stop };
+		return voice === undefined ? { sdpAnswer, stop } : { sdpAnswer, voice, stop };
 	}
 
 	/** Stop the active live session and restore the editor. */
@@ -135,10 +144,11 @@ export class LiveCommandController {
 	 * Starts a session. A connect failure is shown, cleaned up and returned; the slot check and
 	 * claim (`#session = session`) run synchronously, so concurrent starts cannot both win.
 	 */
-	async #start(voice: string, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
+	async #start(voice: string | undefined, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
 		if (this.#session) throw new Error("A live session is already active");
 		this.#assistantTranscriptTurn = 0;
 		this.#assistantTranscriptStartedAt = 0;
+		this.#lineOrigin = LIVE_LINE_ORIGIN[cfgLiveProvider.get(this.#ctx.settings)];
 		const visualizer = new LiveVisualizer({
 			onStop: () => {
 				void this.stop().catch(cause => this.#ctx.showError(toError(cause).message));
@@ -231,9 +241,7 @@ export class LiveCommandController {
 		const message: AssistantMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: transcript.text }],
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			model: LIVE_MODEL,
+			...this.#lineOrigin,
 			usage: { ...LIVE_MESSAGE_USAGE },
 			stopReason: "stop",
 			timestamp: this.#assistantTranscriptStartedAt,

@@ -7479,7 +7479,7 @@ func (v *CancelSubagentResult) decodeFrom(raw map[string]json.RawMessage) error 
 }
 
 type LiveStartResult struct {
-	Voice string `json:"voice"`
+	Voice *string `json:"voice,omitempty"`
 }
 
 func (v *LiveStartResult) UnmarshalJSON(data []byte) error {
@@ -7489,7 +7489,7 @@ func (v *LiveStartResult) UnmarshalJSON(data []byte) error {
 func (v *LiveStartResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out LiveStartResult
 	d := fieldDecoder{raw: raw, owner: "LiveStartResult"}
-	d.required("voice", &out.Voice)
+	d.optional("voice", &out.Voice)
 	if d.err != nil {
 		return d.err
 	}
@@ -7498,8 +7498,8 @@ func (v *LiveStartResult) decodeFrom(raw map[string]json.RawMessage) error {
 }
 
 type LiveConnectResult struct {
-	Voice     string `json:"voice"`
-	SdpAnswer string `json:"sdpAnswer"`
+	SdpAnswer string  `json:"sdpAnswer"`
+	Voice     *string `json:"voice,omitempty"`
 }
 
 func (v *LiveConnectResult) UnmarshalJSON(data []byte) error {
@@ -7509,8 +7509,8 @@ func (v *LiveConnectResult) UnmarshalJSON(data []byte) error {
 func (v *LiveConnectResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out LiveConnectResult
 	d := fieldDecoder{raw: raw, owner: "LiveConnectResult"}
-	d.required("voice", &out.Voice)
 	d.required("sdpAnswer", &out.SdpAnswer)
+	d.optional("voice", &out.Voice)
 	if d.err != nil {
 		return d.err
 	}
@@ -8183,8 +8183,8 @@ type LiveStartCommand struct {
 	Instructions *string `json:"instructions,omitempty"`
 }
 
-// LiveStart sends "live_start": Start a live voice session bound to this session; returns the voice in use.
-func (c Commands) LiveStart(ctx context.Context, p LiveStartCommand) (string, error) {
+// LiveStart sends "live_start": Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`.
+func (c Commands) LiveStart(ctx context.Context, p LiveStartCommand) (*string, error) {
 	var out LiveStartResult
 	err := c.call(ctx, "live_start", p, 0, &out)
 	return out.Voice, err

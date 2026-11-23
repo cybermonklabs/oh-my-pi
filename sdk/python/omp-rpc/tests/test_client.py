@@ -542,6 +542,9 @@ FAKE_SERVER = textwrap.dedent(
                 print(json.dumps({"type": "queue_update", "steering": queued_messages["steering"], "followUp": queued_messages["followUp"]}), flush=True)
         elif command_type == "abort":
             respond(request_id, command_type, {})
+        elif command_type == "live_start":
+            # A server on `live.provider: openai` names no voice.
+            respond(request_id, command_type, {"voice": command["voice"]} if "voice" in command else {})
         elif command_type == "debug_last_ui_response":
             respond(request_id, command_type, last_ui_response)
         elif command_type == "goal":
@@ -1213,6 +1216,11 @@ class RpcClientTests(unittest.TestCase):
             client.set_model("anthropic", "solo")
             # Regression: a null cycle_model result used to raise instead of returning None.
             self.assertIsNone(client.cycle_model())
+
+    def test_live_start_returns_the_voice_or_none_when_the_server_names_none(self) -> None:
+        with self.make_client() as client:
+            self.assertEqual(client.live_start(voice="marin"), "marin")
+            self.assertIsNone(client.live_start())
 
     def test_non_session_frames_reach_their_listeners_but_not_the_event_history(
         self,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as liveAttestation from "@oh-my-pi/pi-coding-agent/live/attestation";
 import {
 	type LiveSessionCallbacks,
@@ -108,6 +109,8 @@ function harness(options: { onAccess?: () => void } = {}) {
 			},
 		},
 		sessionId: "live-session",
+		// No `live.provider`: the call goes to Codex realtime.
+		settings: Settings.isolated({}),
 		subscribe(listener: (event: AgentSessionEvent) => void) {
 			listeners.push(listener);
 			return () => {};

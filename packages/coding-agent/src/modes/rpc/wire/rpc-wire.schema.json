@@ -321,7 +321,7 @@
 			},
 			{
 				"name": "live_start",
-				"doc": "Start a live voice session bound to this session; returns the voice in use.",
+				"doc": "Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`.",
 				"params": "LiveStartParams",
 				"result": "LiveStartResult",
 				"nullable": false,
@@ -6670,10 +6670,7 @@
 				"voice": {
 					"type": "string"
 				}
-			},
-			"required": [
-				"voice"
-			]
+			}
 		},
 		"LiveConnectParams": {
 			"type": "object",
@@ -6695,15 +6692,14 @@
 		"LiveConnectResult": {
 			"type": "object",
 			"properties": {
-				"voice": {
+				"sdpAnswer": {
 					"type": "string"
 				},
-				"sdpAnswer": {
+				"voice": {
 					"type": "string"
 				}
 			},
 			"required": [
-				"voice",
 				"sdpAnswer"
 			]
 		},

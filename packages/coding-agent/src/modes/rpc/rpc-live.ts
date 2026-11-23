@@ -27,9 +27,12 @@ export interface RpcLiveStartOptions {
 	sdpOffer?: string;
 }
 
-/** A started live session: the voice in use, plus the SDP answer for an `sdpOffer` session. */
+/**
+ * A started live session: the voice in use, plus the SDP answer for an `sdpOffer` session. No voice on
+ * GPT-Live's API (`live.provider: openai`), which gets none from omp.
+ */
 export interface RpcLiveStartResult {
-	voice: string;
+	voice?: string;
 	sdpAnswer?: string;
 }
 
@@ -115,13 +118,14 @@ export class RpcLiveBridge {
 			await this.#retire(controller);
 			throw toError(cause);
 		}
-		if (options.sdpOffer === undefined) return { voice };
+		const started = voice === undefined ? {} : { voice };
+		if (options.sdpOffer === undefined) return started;
 		const sdpAnswer = controller.sdpAnswer;
 		if (sdpAnswer === undefined) {
 			await this.#retire(controller);
 			throw new Error("The live session stopped before its SDP answer was available");
 		}
-		return { voice, sdpAnswer };
+		return { ...started, sdpAnswer };
 	}
 
 	/** Stops the active session; resolves once it has stopped. No-op without one. */
