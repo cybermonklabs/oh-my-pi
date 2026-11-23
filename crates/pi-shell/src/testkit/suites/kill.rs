@@ -113,3 +113,30 @@ fn kill_signals_root_from_a_background_vproc() {
 	assert_eq!(result.stdout, b"trapped\ndone\n");
 	assert_eq!(result.status, 0);
 }
+
+// Failure mode: once `wait` collected a job, `kill -0` of the pid `$!`
+// names still found a process (bash 5.2.21, 5.3.20 and zsh 5.9: gone,
+// status 1): a pid with no record counted as live while `$!` named it, the
+// rule for a job disowned before the scheduler adopted it. Control: a held
+// program is found until it is killed and collected.
+#[test]
+fn kill_finds_no_process_for_a_collected_job() {
+	for fault in [Fault::None, Fault::Snapshot { every: 17 }] {
+		let mut host = FakeHost::new();
+		host.countdown("hold", 10_000, 0);
+		let result = run_script(
+			host,
+			b"{ :; } & p=$!; wait; kill -0 $p 2>/dev/null; echo a=$?; ( : ) & p=$!; wait $p; kill -0 \
+			  $p 2>/dev/null; echo b=$?; hold & p=$!; kill -0 $p; echo live=$?; kill %1; wait %1; \
+			  kill -0 $p 2>/dev/null; echo killed=$?",
+			&[],
+			fault,
+		);
+		assert_eq!(
+			String::from_utf8_lossy(&result.stdout),
+			"a=1\nb=1\nlive=0\nkilled=1\n",
+			"{fault:?}"
+		);
+		assert_eq!(result.status, 0, "{fault:?}");
+	}
+}
