@@ -40,6 +40,11 @@ TS_SMALL = (
     ("mnemopi", "packages/mnemopi", 1200, ["--isolate", "test"]),
 )
 PI_SHELL = "pi-shell"
+# The gVisor rows (sami-checks-gvisor.yml): the pi-shell set, one libtest process per binary, over
+# GV_SET_SHARDS shards (its run of the lib binary is also the one-process lib row), and pi-builtins
+# under nextest, each in a runsc container, as uid 1000 and as root.
+GV_SET_SHARDS = 4
+GV_WHO = ("uid1000", "root")
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing (the markers sami-build's
@@ -55,6 +60,12 @@ ROWS = (
     ("TypeScript suites", "ts-small"),
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
+    ("pi-shell set, gVisor (uid 1000)", "gv-set-uid1000"),
+    ("pi-shell set, gVisor (root)", "gv-set-root"),
+    ("pi-shell lib, one process, 4 threads, gVisor (uid 1000)", "gv-lib4-uid1000"),
+    ("pi-shell lib, one process, 4 threads, gVisor (root)", "gv-lib4-root"),
+    ("pi-builtins, nextest default profile, gVisor (uid 1000)", "gv-builtins-uid1000"),
+    ("pi-builtins, nextest default profile, gVisor (root)", "gv-builtins-root"),
 )
 
 
@@ -70,9 +81,18 @@ def ts_matrix():
     return [{"shard": s, "name": f"ts-ca-{s}"} for s in range(1, CODING_AGENT_SHARDS + 1)]
 
 
+def gvisor_matrix():
+    m = []
+    for w in GV_WHO:
+        m += [{"who": w, "part": "set", "shard": s, "name": f"gv-set-{w}-{s}"} for s in range(1, GV_SET_SHARDS + 1)]
+        m.append({"who": w, "part": "builtins", "shard": 0, "name": f"gv-builtins-{w}"})
+    return m
+
+
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in ts_matrix()] + ["builtins", "ts-small", "checkts"]
+    names += [m["name"] for m in gvisor_matrix()]
     return names
 
 
@@ -100,6 +120,8 @@ def cmd_plan():
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
+        "gvisor": json.dumps(gvisor_matrix()),
+        "gv_set_shards": GV_SET_SHARDS,
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -359,8 +381,13 @@ def expected_units(build_dir):
                 exp.append((f"set-{who}", ident, who))
         if any(i == PI_SHELL for i, _ in bins):
             exp.append(("lib4", PI_SHELL, "runner"))
+        for who in GV_WHO:
+            exp += [(f"gv-set-{who}", ident, who) for ident, _ in bins]
+            if any(i == PI_SHELL for i, _ in bins):
+                exp.append((f"gv-lib4-{who}", PI_SHELL, who))
     else:
-        notes["set-runner"] = notes["set-root"] = notes["lib4"] = "the build gave no binary list, so the set could not run"
+        for key in ["set-runner", "set-root", "lib4"] + [f"gv-{r}-{w}" for r in ("set", "lib4") for w in GV_WHO]:
+            notes[key] = "the build gave no binary list, so the set could not run"
     exp.append(("builtins", "pi-builtins", "runner"))
     for p in range(1, WORKSPACE_PARTS + 1):
         exp.append(("workspace", f"part {p}/{WORKSPACE_PARTS}", "runner"))
@@ -369,6 +396,8 @@ def expected_units(build_dir):
     for s in range(1, CODING_AGENT_SHARDS + 1):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
+    for who in GV_WHO:
+        exp.append((f"gv-builtins-{who}", "pi-builtins", who))
     return exp, notes
 
 
@@ -553,11 +582,13 @@ def selftest():
     }}
     json.dump(meta, open(os.path.join(build, "binaries-metadata.json"), "w"))
     exp, _ = expected_units(build)
+    paths = {}
     for i, (row, unit, who) in enumerate(exp):
+        paths[(row, unit, who)] = os.path.join(res, f"{i}.json")
         if (row, unit, who) == ("set-root", "pi-shell::zle_pty", "root"):
             continue  # the planted silent unit
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
-                  open(os.path.join(res, f"{i}.json"), "w"))
+                  open(paths[(row, unit, who)], "w"))
 
     def summary():
         buf = io.StringIO()
@@ -580,17 +611,47 @@ def selftest():
     rc, out = summary()
     check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (1, True))
     os.remove(os.path.join(res, "dup.json"))
+    # A gVisor job that reports nothing: gv-builtins-root (its one unit), and the uid 1000 set shard
+    # that holds the lib binary (its set unit and the lib row both come from that job).
+    check("the plan names the gVisor jobs", {"gv-builtins-root", "gv-set-uid1000-1", "gv-set-root-4"} <= set(all_job_names()), True)
+    check("the gVisor set jobs are the shards assign() gives", set(assign([f"b{i}" for i in range(40)], {}, GV_SET_SHARDS).values()),
+          {m["shard"] for m in gvisor_matrix() if m["part"] == "set" and m["who"] == "root"})
+    check("the gVisor rows expect both users", {("gv-builtins-uid1000", "pi-builtins", "uid1000"), ("gv-lib4-root", "pi-shell", "root"),
+                                                ("gv-set-root", "pi-shell::zle_pty", "root")} <= set(exp), True)
+    gv_silent = [("gv-builtins-root", "pi-builtins", "root"), ("gv-set-uid1000", "pi-shell", "uid1000"), ("gv-lib4-uid1000", "pi-shell", "uid1000")]
+    for k in gv_silent:
+        if k in paths:
+            os.rename(paths[k], paths[k] + ".planted")
+    rc, out = summary()
+    check("summary exit with a silent gVisor job", rc, 1)
+    check("a silent gVisor builtins job reads UNKNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
+    check("a silent gVisor builtins job is named", "`pi-builtins` (root): UNKNOWN: no result" in out, True)
+    check("a silent gVisor set shard reads UNKNOWN", "| pi-shell set, gVisor (uid 1000) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
+    check("its lib row reads UNKNOWN", "| pi-shell lib, one process, 4 threads, gVisor (uid 1000) | **UNKNOWN** | 0 / 0 / 1 |" in out, True)
+    check("the other gVisor rows pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** | 1 / 0 / 0 |" in out
+          and "| pi-shell set, gVisor (root) | **PASS** | 2 / 0 / 0 |" in out, True)
+    # A gVisor unit that ran and failed reads FAIL with its test named.
+    for k in gv_silent:
+        if k in paths:
+            os.rename(paths[k] + ".planted", paths[k])
+    json.dump(result("gv-builtins-root", "pi-builtins", "root", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::cp::tests::x"]),
+              open(paths.get(("gv-builtins-root", "pi-builtins", "root"), os.path.join(res, "gv-builtins-root.json")), "w"))
+    rc, out = summary()
+    check("a failing gVisor unit fails its row", ("| pi-builtins, nextest default profile, gVisor (root) | **FAIL** | 0 / 1 / 0 |" in out, rc), (True, 1))
+    check("a failing gVisor test is named", "`pi-builtins` (root): FAILED `pi-builtins::cp::tests::x`" in out, True)
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
+    check("summary without a binary list (gVisor)", "| pi-shell set, gVisor (root) | **UNKNOWN** | - |" in out, True)
 
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
-          "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported")
+          "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported "
+          "(also a gVisor job)")
 
 
 def main(argv):

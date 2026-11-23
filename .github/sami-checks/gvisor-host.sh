@@ -75,7 +75,7 @@ RUN set -eu; [ -z "\$MIRROR" ] || sed -i "s#^URIs: .*#URIs: \$MIRROR#" /etc/apt/
     userdel -r ubuntu 2> /dev/null || true; \\
     useradd -m -u 1000 -U -s /bin/bash runner
 COPY sc-tools.tgz /tmp/sc-tools.tgz
-RUN tar -C / -xzf /tmp/sc-tools.tgz && rm /tmp/sc-tools.tgz
+RUN tar -C / --no-overwrite-dir -xzf /tmp/sc-tools.tgz && rm /tmp/sc-tools.tgz
 EOF
 s=$(date +%s)
 docker build --progress=plain --build-arg MIRROR="$mirror" -t sc-gv "$ctx" > "$ctx/build.log" 2>&1 ||
