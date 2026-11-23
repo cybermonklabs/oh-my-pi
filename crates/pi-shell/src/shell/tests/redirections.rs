@@ -160,3 +160,84 @@ async fn a_closed_descriptor_stays_closed_in_a_script_the_kernel_refused() {
 	}])
 	.await;
 }
+
+/// A command whose redirection open waits (a FIFO: the process applies its
+/// redirections itself) gets the host process's descriptors that have no
+/// close-on-exec, as bash's children and this shell's other spawns do: a
+/// make jobserver's pipe the host inherited reaches `make > out 9> fifo &`
+/// as it reaches `make`. And `/dev/fd/N` naming such a host descriptor, which
+/// is no descriptor of the script, fails as `3<&N` does, in its place after
+/// the FIFO open: the process never takes the host's object through it, and
+/// the FIFO's reader (`cat fifo`) gets end of file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_command_keeps_the_hosts_inherited_fds_but_takes_none_by_dev_fd() {
+	use std::{
+		io::Write as _,
+		os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+	};
+
+	let dir = tempfile::tempdir().expect("temp dir");
+	let fifo = std::ffi::CString::new(
+		dir.path()
+			.join("fifo")
+			.into_os_string()
+			.into_encoded_bytes(),
+	)
+	.expect("path");
+	// SAFETY: `fifo` is a NUL-terminated string that outlives the call.
+	assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+	// The host's descriptor: a pipe's read end without close-on-exec, at 50
+	// or above, holding a line; its write end is closed, so a read ends.
+	let (read, mut write) = std::io::pipe().expect("pipe");
+	write.write_all(b"HOST-ONLY\n").expect("write");
+	drop(write);
+	// SAFETY: F_DUPFD makes a new descriptor of `read`'s pipe without
+	// close-on-exec.
+	let n = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD, 50) };
+	assert!(n >= 50, "F_DUPFD: {}", std::io::Error::last_os_error());
+	// SAFETY: `n` is a new descriptor nothing else owns.
+	let host = unsafe { OwnedFd::from_raw_fd(n) };
+	drop(read);
+	let script = format!(
+		"/bin/sh -c 'if [ -e /dev/fd/{n} ]; then echo has; else echo none; fi > kept' > fifo &
+cat fifo
+wait
+/bin/sh -c 'cat <&3 > took' > fifo 3< /dev/fd/{n} &
+cat fifo
+wait $!
+echo \"status $?\"
+cat kept; if [ -e took ]; then echo took; cat took; else echo refused; fi"
+	);
+	let (tx, rx) = flume::unbounded::<String>();
+	let result = Shell::new(None)
+		.run(
+			ShellRunOptions {
+				command: script,
+				cwd: Some(dir.path().to_string_lossy().into_owned()),
+				..Default::default()
+			},
+			Some(tx),
+			CancelToken::new(Some(10_000)),
+		)
+		.await
+		.expect("run");
+	drop(host);
+	let output = strip_prefixes(&rx.drain().collect::<String>());
+	assert!(!result.timed_out, "{output}");
+	let lines: Vec<&str> = output
+		.lines()
+		.filter(|l| !l.ends_with("Bad file descriptor"))
+		.collect();
+	assert_eq!(
+		lines,
+		["status 1", "has", "refused"],
+		"an inherited fd did not reach the process, or /dev/fd/{n} took the host's object: \
+		 {output:?}"
+	);
+	assert!(
+		output
+			.lines()
+			.any(|l| l.ends_with(&format!("/dev/fd/{n}: Bad file descriptor"))),
+		"/dev/fd/{n} was not refused as a closed fd: {output:?}"
+	);
+}

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it closes the descriptors its exec would close (the shell's own, all close-on-exec) before its redirections, so another job's reader gets end of file when its writer ends, as in bash.
+- A background command whose redirection open waits for a FIFO's other end, and whose later redirection is bad (a dup of a closed fd such as `3<&9` or `3< /dev/fd/9`, or a target that expands to two words), no longer leaves the FIFO's reader waiting for ever: the child opens the FIFO and then fails that redirection, as bash's child does. The shell refused it before the child existed, so the FIFO was never opened.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
