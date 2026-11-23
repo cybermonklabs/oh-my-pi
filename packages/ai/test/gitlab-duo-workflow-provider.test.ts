@@ -15,7 +15,6 @@ import {
 	buildGitLabDuoWorkflowWebSocketUrl,
 	describeGitLabDuoWorkflowSocketEvent,
 	extractGitLabWorkflowToken,
-	GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES,
 	type GitLabDuoWorkflowProviderSessionState,
 	type GitLabDuoWorkflowStreamState,
 	type GitLabDuoWorkflowWebSocketFactory,
@@ -187,18 +186,6 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		expect(serviceUrl).toBe("wss://duo-workflow-svc.runway.gitlab.net/");
 	});
 
-	it("sends exact supported client capabilities", () => {
-		expect(GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES).toEqual([
-			"incremental_streaming",
-			"read_file_chunked",
-			"shell_command",
-			"command_timeout",
-			"tool_call_approval",
-		]);
-		expect(GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES).not.toContain("web_search");
-		expect(GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES).not.toContain("tool_call_pattern_approval");
-	});
-
 	it("advertises OMP tools under their bare names with the official GitLab MCP schema", () => {
 		const mcpTools = buildGitLabDuoWorkflowMcpTools([...nativeTools, editTool]);
 		// Bare names: the server binds the model schema and matches tool calls under the
@@ -228,8 +215,13 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		expect(metadata).toHaveProperty("client_type", "node-websocket");
 		expect(metadata).toHaveProperty("environment", "ide");
 		expect(metadata).toHaveProperty("selectedModelIdentifier", "claude_sonnet_4_6_vertex");
-		expect(payload.clientCapabilities).not.toContain("web_search");
-		expect(payload.clientCapabilities).not.toContain("tool_call_pattern_approval");
+		expect(payload.clientCapabilities).toEqual([
+			"incremental_streaming",
+			"read_file_chunked",
+			"shell_command",
+			"command_timeout",
+			"tool_call_approval",
+		]);
 		expect(payload.mcpTools.map(tool => tool.name)).toEqual([
 			"read",
 			"write",
