@@ -2791,8 +2791,6 @@ mod tests {
 	// Failure mode: two zsh `syswrite`s in two vprocs wrote through one tee
 	// with no key and were one writer to it.
 	#[test]
-	#[ignore = "zsh multios tee: a 1 MiB syswrite through it loses 64 KiB (983,040 of 1,048,576 \
-	            bytes arrive); out of fleet scope"]
 	fn two_syswrites_through_one_tee_write_their_bytes_once() {
 		two_writers_finish(
 			"emulate zsh -c 'zmodload zsh/system; a=$(printf %{EXTRA}s \"\"); b=$(printf \
@@ -2989,7 +2987,6 @@ mod tests {
 	// '0's and no 'T'. bash 5.2/5.3 and zsh 5.9 run a `CHLD` trap after the
 	// command: 131,072 '0's, then the 10 'T's.
 	#[test]
-	#[ignore = "zsh multios tee: a CHLD trap held for the write loses its output; out of fleet scope"]
 	fn a_chld_trap_owed_during_a_write_through_a_tee_runs_after_it() {
 		let run = run_with_steps(
 			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\ntrap 'printf %s TTTTTTTTTT' CHLD\n{ \
@@ -3165,8 +3162,6 @@ mod tests {
 	// 131,072 '0's, then the 'T's. The trap waits; the run does not end
 	// before it runs.
 	#[test]
-	#[ignore = "zsh multios tee: a WINCH trap held for the write loses its output; out of fleet \
-	            scope"]
 	fn a_winch_trap_during_a_write_through_a_tee_runs_after_it() {
 		let run = run_with_steps(
 			&winch_script("emulate zsh -c 'exec >&1 >/dev/null'\n", "printf %s TTTTTTTTTT", TEE_WAITS),
@@ -3263,8 +3258,6 @@ mod tests {
 	// it: stdout holds the '0's written before the trap, its 10 'T's, then
 	// AFTER7.
 	#[test]
-	#[ignore = "zsh multios tee: the write after a trap's return dropped the interrupted one is \
-	            lost (runc); out of fleet scope"]
 	fn a_write_a_trap_return_drops_leaves_the_next_write_whole() {
 		let run = run_with_steps(
 			"emulate zsh -c 'exec >&1 >/dev/null'\nexec 3<&0\nf() { printf %0262144d 0; printf %s \
@@ -3610,6 +3603,20 @@ mod tests {
 		}
 	}
 
+	/// The bytes that fill a tee on a FIFO of `room` bytes but for 4: the
+	/// writes the FIFO takes whole, and one hold more. The tee's queue keeps
+	/// a write (of [`TEE_HOLD`](crate::bash::TEE_HOLD) bytes, the room of
+	/// an empty queue) until every target has all of it, so the part a
+	/// smaller FIFO took still counts in the hold: on an 8 KiB FIFO the tee
+	/// takes 65,536 bytes, not 8,192 more. Measured with a trace of the
+	/// tee: the 73,724 '0's of `fifo_room + TEE_HOLD - 4` waited after
+	/// 65,536, the cancel ended them there, and both targets got those
+	/// 65,536 and `AFTER`, each byte the tee took once.
+	const fn tee_fill(room: usize) -> usize {
+		let hold = crate::bash::TEE_HOLD;
+		room / hold * hold + hold - 4
+	}
+
 	/// Shrink a FIFO's buffer to `bytes` (Linux), as the kernel makes one
 	/// when its user's pipes pass `fs.pipe-user-pages-soft`.
 	#[cfg(target_os = "linux")]
@@ -3734,12 +3741,10 @@ mod tests {
 	// which goes with it. Each case: the FIFO and the file both hold the
 	// '0's, the same part of the tool's message (none: a short write goes
 	// into a tee whole or not at all, `TEE_WHOLE`), then `AFTER`. The '0's
-	// fill the FIFO and the tee's hold but for 4 bytes, whatever the FIFO
-	// holds: a FIFO of 8 KiB took a fixed count part way, and the cancel
-	// came before the tool ran. (#111's tee gave the file the whole message.)
+	// fill the tee but for 4 bytes ([`tee_fill`]), so `printf` has ended and
+	// the tool's message waits when the run ends. (#111's tee gave the file
+	// the whole message.)
 	#[test]
-	#[ignore = "zsh multios tee: with its FIFO at 8 KiB, 65,536 of a write's 73,724 bytes reach the \
-	            targets; out of fleet scope"]
 	fn a_tools_write_dropped_part_way_through_a_tee_leaves_the_next_run_whole() {
 		let mut wrong = Vec::new();
 		// Each case twice: with the FIFO as it is, and shrunk to 8 KiB, as a
@@ -3766,7 +3771,7 @@ mod tests {
 							if let Some(bytes) = shrunk {
 								shrink_fifo(reader, bytes);
 							}
-							let zeros = fifo_room(reader) + crate::bash::TEE_HOLD - 4;
+							let zeros = tee_fill(fifo_room(reader));
 							counted.store(zeros, Ordering::SeqCst);
 							format!("{ends}printf %0{zeros}d 0 >&3; {tool} --version >&3")
 						}
@@ -3785,13 +3790,13 @@ mod tests {
 						.is_some_and(|p| p.is_empty() || p.starts_with(message.as_bytes()));
 				if !same {
 					wrong.push(format!(
-						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO (room \
-						 {}) {} bytes ending {:?}",
+						"{tool} {how} (status {status}): the file {} bytes ending {:?}, the FIFO {} \
+						 bytes ending {:?}, after {} '0's written",
 						written.len(),
 						String::from_utf8_lossy(&written[written.len().saturating_sub(24)..]),
-						zeros + 4,
 						got.len(),
 						String::from_utf8_lossy(&got[got.len().saturating_sub(24)..]),
+						zeros,
 					));
 				}
 			}
