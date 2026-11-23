@@ -47,11 +47,6 @@ TS_SMALL = (
 PI_SHELL = "pi-shell"
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
-# What a test prints when it returns early having checked nothing (the markers sami-build's
-# rust_test reads, .github/sami/rust-test.sh): a passing test that prints one did not pass.
-# A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
-# a line that only mentions the word later (`the host half is skipped: ...`) does not.
-SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
 # The platform rows: platform-checks.yml, called on the candidate, tests these crates on these
 # platforms (the fork's hand-run platform rows: pi-shell, macOS and Windows).
 PLATFORMS = ("macos", "windows")
@@ -62,6 +57,19 @@ PLATFORM_PARTITIONS = 3
 CLIPPY_CRATES = ("pi-shell", "pi-vcs", "pi-vfs", "pi-walker", "pi-builtins", "pi-natives")
 # The name of the unused import clippy.sh plants as the clippy row's control.
 CLIPPY_CONTROL = "ScClippyControl"
+# What a test prints when it returns early having checked nothing: a passing test that prints one
+# did not pass. The forms are the tree's own (sc.py skip-forms lists every print of the tree that
+# says skip, not run or nothing checked, and fails on one this rule does not read): `skipped: ...`,
+# `skipped, ...`, `skipped mode 0200: ...`, `skipping ...`, `SKIP: ...`, `NOT-RUN ...`,
+# `UNKNOWN: ...`, `UNCOMPARED`, each at the start of a line or after a `<case>: ` prefix or one
+# capitalised word (`CHILD skipped: ...`). A line that says the word later (`<util>: the host half
+# is skipped: ...`, a partial check) does not count.
+SKIP_MARKER = re.compile(
+    r"^\s*(?:[^\n:]{1,200}:\s+|[A-Z][A-Z0-9_-]*\s+)?(?:skipped\b|skipping\b|SKIP\b|not run\b|NOT-RUN\b|UNKNOWN:)|UNCOMPARED|nothing was checked|the test saw nothing",
+    re.M,
+)
+# A literal of the tree that says it skips, did not run or checked nothing (sc.py skip-forms).
+SKIP_WORD = re.compile(r"\bskip(?:ped|ping|s)?\b|\bnot[ -]run\b|NOT-RUN|UNCOMPARED|nothing was checked", re.I)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -75,6 +83,7 @@ ROWS = (
     ("macOS: pi-shell, platform checks", "macos"),
     ("Windows: pi-shell, platform checks", "windows"),
     ("clippy --tests -D warnings, per crate (failed: findings)", "clippy"),
+    ("skip prints the summary reads", "skipforms"),
 )
 
 
@@ -97,7 +106,7 @@ def ts_matrix():
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()]
-    names += ["ts-small", "checkts", "platforms", "clippy"]
+    names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy"]
     return names
 
 
@@ -592,6 +601,7 @@ def expected_units(build_dir):
         exp.append((p, PLATFORM_CRATES, "runner"))
     for c in CLIPPY_CRATES:
         exp.append(("clippy", c, "runner"))
+    exp.append(("skipforms", "tree", "runner"))
     return exp, notes
 
 
@@ -612,6 +622,110 @@ def read_known(path):
                 sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
             known[tuple(f[:4])] = f[4]
     return known
+
+
+def rust_literals(text):
+    """The string literals of Rust source (plain, byte and raw), comments and chars left out:
+    [(offset, text)]."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif re.match(r'b?r#*"', text[i:i + 66]) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            m = re.match(r'(b?r)(#*)"', text[i:])
+            close = '"' + m.group(2)
+            start = i + len(m.group(0))
+            j = text.find(close, start)
+            j = n if j < 0 else j
+            out.append((i, text[start:j]))
+            i = j + len(close)
+        elif c == '"' or (c == "b" and text.startswith('b"', i) and (i == 0 or not text[i - 1].isalnum())):
+            start = i + (2 if c == "b" else 1)
+            j = start
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append((i, text[start:j]))
+            i = j + 1
+        elif c == "'":
+            m = re.match(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'", text[i:])
+            i += len(m.group(0)) if m else 1
+        else:
+            i += 1
+    return out
+
+
+def literal_sample(lit):
+    """What a format literal prints, roughly: line continuations joined, `{...}` arguments as `x`."""
+    s = re.sub(r"\\\n\s*", "", lit).replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    s = s.replace("{{", "\0").replace("}}", "\1")
+    s = re.sub(r"\{[^{}]*\}", "x", s)
+    return s.replace("\0", "{").replace("\1", "}")
+
+
+PRINT_CALL = re.compile(r"\b(?:e?print(?:ln)?|writeln|write)!\s*\(")
+
+
+def printed(text, off):
+    """Whether the literal at `off` is an argument of a print macro: eprintln!, println!, eprint!,
+    print!, or write!/writeln! to std::io::stderr() or stdout() (pi-shell's say_not_run)."""
+    window = text[max(0, off - 400):off]
+    for m in reversed(list(PRINT_CALL.finditer(window))):
+        inner = window[m.end():]
+        if inner.count("(") >= inner.count(")"):
+            return not m.group(0).startswith("write") or "stderr()" in inner or "stdout()" in inner
+    return False
+
+
+def skip_forms(tree, exceptions_path):
+    """Every literal under <tree>/crates that says skip, not run or nothing checked must be read by
+    SKIP_MARKER or be named in the exceptions file (`<path>\\t<start of the literal>\\t<reason>`) as
+    not a skip marker. Returns (unread literals, exceptions that match nothing)."""
+    exc = []
+    for line in open(exceptions_path, encoding="utf-8"):
+        if line.strip() and not line.startswith("#"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 3:
+                sys.exit(f"{exceptions_path}: not three tab-separated fields: {line!r}")
+            exc.append([f[0], f[1], False])
+    unread = []
+    for dp, dirs, files in os.walk(os.path.join(tree, "crates")):
+        dirs[:] = sorted(d for d in dirs if d != "target")
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, tree)
+            text = open(p, encoding="utf-8", errors="replace").read()
+            for off, lit in rust_literals(text):
+                s = literal_sample(lit)
+                if not SKIP_WORD.search(s) or SKIP_MARKER.search(s) or not printed(text, off):
+                    continue
+                hit = [e for e in exc if e[0] == rel and s.startswith(e[1])]
+                for e in hit:
+                    e[2] = True
+                if not hit:
+                    unread.append(f"{rel}:{text.count(chr(10), 0, off) + 1}: {s[:160]!r}")
+    stale = [f"{e[0]}: {e[1]!r}" for e in exc if not e[2]]
+    return unread, stale
+
+
+def cmd_skip_forms(tree, exceptions_path):
+    unread, stale = skip_forms(tree, exceptions_path)
+    fails = [f"a skip print the summary does not read: {u}" for u in unread]
+    fails += [f"an exception that names no literal of the tree any more: {s}" for s in stale]
+    return result("skipforms", "tree", "runner", "FAIL" if fails else "PASS", 0, 0, int(not fails), len(fails),
+                  failures=fails, note="" if fails else "every skip print of the tree is read or named as not a marker")
 
 
 def cmd_summary(results_dir, build_dir, known_path=None):
@@ -997,6 +1111,27 @@ def selftest():
     os.remove(os.path.join(res, "macos.json"))
     json.dump(result("macos", PLATFORM_CRATES, "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "macos.json"), "w"))
     open(known_file, "w").write("# none\n")
+    # skip-forms: a literal that says it skips is read by SKIP_MARKER or named as not a marker; a new
+    # form fails the check until one of the two is true.
+    tree = os.path.join(d, "tree")
+    os.makedirs(os.path.join(tree, "crates", "c", "src"))
+    src = os.path.join(tree, "crates", "c", "src", "lib.rs")
+    exf = os.path.join(d, "exc.txt")
+    open(src, "w").write('// skipped: a comment is no print\nfn t(case: &str) {\n'
+                         '    eprintln!("{case}: skipped, it needs root");\n    eprintln!("CHILD skipped: {}", 1);\n'
+                         '    eprintln!("NOT-RUN {case}: this kernel runs a program held open for writing");\n'
+                         '    let c = \'"\';\n    eprintln!(r#"skipped mode 0200: "raw" ok"#);\n'
+                         '    eprintln!("{case}: the host half is skipped: names do not fold");\n}\n')
+    open(exf, "w").write("crates/c/src/lib.rs\tx: the host half is skipped\ta partial check\n")
+    check("skip-forms on known forms", skip_forms(tree, exf), ([], []))
+    open(src, "a").write('fn u() { eprintln!("no check here, skipping quietly"); }\n')
+    unread, _ = skip_forms(tree, exf)
+    check("skip-forms catches a planted new form", unread, ["crates/c/src/lib.rs:10: 'no check here, skipping quietly'"])
+    open(exf, "a").write("crates/c/src/lib.rs\tgone\tstale\n")
+    check("skip-forms names a stale exception", skip_forms(tree, exf)[1], ["crates/c/src/lib.rs: 'gone'"])
+    for line in ("x: skipped, this filesystem does not clone", "CHILD skipped: uid 1000", "skipped mode 0200: root",
+                 "NOT-RUN t: this kernel", "SKIP: running as root", "skipping reftable coverage: x"):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line)), True)
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
@@ -1038,6 +1173,8 @@ def main(argv):
         cmd_platforms(*a)
     elif c == "summary":
         sys.exit(cmd_summary(*a))
+    elif c == "skip-forms":
+        print(json.dumps(cmd_skip_forms(*a)))
     elif c == "selftest":
         selftest()
     else:

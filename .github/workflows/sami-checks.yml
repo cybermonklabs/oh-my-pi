@@ -37,7 +37,7 @@
 #     code only; code built only for macOS or Windows is compiled, not linted, in the platform rows.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
-# sdk/rust/omp-rpc is its own cargo workspace and is not built here (sami-build's rust_test runs it).
+# sdk/rust/omp-rpc is its own cargo workspace and is not built here.
 #
 # Where the result is. The summary job's step summary: a row per check (PASS, FAIL or UNKNOWN),
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
@@ -571,7 +571,7 @@ jobs:
 
   summary:
     name: summary
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, platforms, clippy]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms, platforms, clippy]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -638,3 +638,35 @@ jobs:
           name: sc-report
           path: ${{ github.workspace }}/sc/report/
           retention-days: 30
+
+  skip-forms:
+    # Every print of the tree that says skip, not run or nothing checked is read by sc.py's
+    # SKIP_MARKER or named in skip-forms-not-markers.txt; a new form fails this job and its row.
+    name: skip prints the summary reads
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+          sparse-checkout: crates
+      - name: Scan
+        run: |
+          mkdir -p "$SC/res"
+          python3 tool/.github/sami-checks/sc.py skip-forms tree tool/.github/sami-checks/skip-forms-not-markers.txt > "$SC/res/skip-forms.json"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], r["note"]); [print(f) for f in r["failures"]]; sys.exit(r["status"] != "PASS")' "$SC/res/skip-forms.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'skip-forms' }}
+        with:
+          name: sc-res-skip-forms
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
