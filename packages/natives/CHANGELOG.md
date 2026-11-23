@@ -60,6 +60,7 @@
 - A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
 - Fixed the bash tool's built-in `rsync -K` (`--keep-dirlinks`) reporting `Operation not supported (95)` where rsync 3.5.1 reports `Too many levels of symbolic links (40)`: when the destination name of a directory is a symlink to a directory and the modes differ, rsync refuses to set the mode through the symlink with `ELOOP` (exit 23), and the built-in now refuses it the same way. A symlink's own mode is still set with lchmod where the platform can
 - A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it closes the descriptors its exec would close (the shell's own, all close-on-exec) before its redirections, so another job's reader gets end of file when its writer ends, as in bash.
+- A background command whose redirection open waits for a FIFO's other end, and whose later redirection is bad (a dup of a closed fd such as `3<&9` or `3< /dev/fd/9`, or a target that expands to two words), no longer leaves the FIFO's reader waiting for ever: the child opens the FIFO and then fails that redirection, as bash's child does. The shell refused it before the child existed, so the FIFO was never opened.
 
 ## [18.18.6] - 2026-11-09
 

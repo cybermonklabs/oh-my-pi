@@ -540,6 +540,101 @@ fn a_waiting_redirection_open_holds_no_host_descriptor_without_a_list() {
 	waiting_open_holds_no_host_descriptor(Sweep::Count);
 }
 
+/// The host's descriptor without close-on-exec is listed before the fork
+/// as one the child keeps. If another thread closes it and a new
+/// close-on-exec descriptor takes its number before the fork (here a
+/// pipe's write end, as another job's), the child must not keep that
+/// number: the pipe's reader gets end of file once the host closes the
+/// write end, while the child's open still waits.
+#[test]
+fn a_number_reused_between_the_list_and_the_fork_is_not_kept() {
+	use std::{
+		io::Read,
+		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+	};
+
+	/// A wait that only names a hang: the end of file comes at once, or
+	/// never while the open waits.
+	const HANG: Duration = Duration::from_secs(60);
+	let fifo = temp_path("reused-fifo");
+	let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+	// SAFETY: mkfifo with a valid C path.
+	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+	let null = std::fs::File::open("/dev/null").unwrap();
+	// SAFETY: F_DUPFD on a descriptor this test owns makes a new one, without
+	// close-on-exec.
+	let n = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 200) };
+	assert!(n >= 200, "F_DUPFD: {}", io::Error::last_os_error());
+	drop(null);
+	let (mut reader, writer) = std::io::pipe().unwrap();
+	let w = writer.as_raw_fd();
+	// After the list, before the fork: number `n` becomes a copy of the
+	// pipe's write end, with close-on-exec.
+	super::before_fork(move || {
+		// SAFETY: dup2 replaces this test's own descriptor `n`; F_SETFD only
+		// sets its flags.
+		unsafe {
+			assert_eq!(libc::dup2(w, n), n, "dup2: {}", io::Error::last_os_error());
+			assert_eq!(libc::fcntl(n, libc::F_SETFD, libc::FD_CLOEXEC), 0, "F_SETFD");
+		}
+	});
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = argv(&["/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
+		exec_diag: BString::from("test: /bin/true: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	// SAFETY: `n` is this test's copy of the write end now, owned here.
+	drop(unsafe { OwnedFd::from_raw_fd(n) });
+	drop(writer);
+	let (tx, eof) = std::sync::mpsc::channel();
+	thread::spawn(move || {
+		let mut rest = Vec::new();
+		let _ = tx.send(reader.read_to_end(&mut rest).map(|_| rest));
+	});
+	// Another test's child holds a copy of the write end only until its exec.
+	let got = eof.recv_timeout(HANG);
+	// Let the open go in any case.
+	drop(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	std::fs::remove_file(&fifo).unwrap();
+	assert!(
+		matches!(&got, Ok(Ok(rest)) if rest.is_empty()),
+		"the reader got no end of file while the open waited: the child kept fd {n}, which a \
+		 close-on-exec descriptor took before the fork"
+	);
+}
+
+/// A step the engine found bad ([`ChildRedir::Fail`]) ends the process in
+/// its place: the steps before it are applied (its message goes to the file
+/// one of them opened as fd 2), none after it is, and the status is 1.
+#[test]
+fn a_failed_step_ends_the_process_after_the_steps_before_it() {
+	let err = temp_path("fail-err");
+	let after = temp_path("fail-after");
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh("echo never");
+	let mut sp = spec(&a, &env, NEW);
+	let text = "test: line 1: 9: Bad file descriptor\n";
+	sp.redirs = Some(ChildRedirs {
+		list:      vec![
+			child_open(&[2], &err, WRITE),
+			ChildRedir::Fail { text: BString::from(text) },
+			child_open(&[1], &after, WRITE),
+		],
+		exec_diag: BString::from("test: /bin/sh: "),
+	});
+	let mut p = s.spawn(sp).expect("spawn");
+	assert_eq!(wait(&mut p), ExitStatus::Exited(1));
+	assert_eq!(std::fs::read_to_string(&err).unwrap(), text);
+	assert!(!after.exists(), "a step after the failed one was applied");
+	std::fs::remove_file(&err).unwrap();
+}
+
 /// A process that applies its own redirections keeps the host's descriptors
 /// without close-on-exec, as bash's children and this spawner's other paths
 /// (`posix_spawn`, fork+exec) do: an embedded host leaves the descriptors it
