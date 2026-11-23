@@ -1,5 +1,5 @@
 # Lines test binaries write outside libtest's record, for the rust_test jobs in
-# .github/workflows/sami-build.yml: a child process's or a thread's write to
+# .github/workflows/sami-rust-test.yml: a child process's or a thread's write to
 # the stdout or stderr it inherited, which no test's record holds. A line with
 # a skip word is a skip whatever this list says. Every other line must match an
 # entry for its target, or the job fails, since it can be a skip in other

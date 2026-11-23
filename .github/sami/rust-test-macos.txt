@@ -1,6 +1,6 @@
 # Tests that run only on macOS: they expect macOS's libc, libm or terminfo,
 # and are #[ignore]d on other targets. The rust_test_macos job in
-# .github/workflows/sami-build.yml runs these, with every test compiled only
+# .github/workflows/sami-rust-test.yml runs these, with every test compiled only
 # on macOS (.github/sami/rust-test-macos-inventory.sh finds those), on
 # macos-15, and fails unless each ran there; the rust_test job (Linux)
 # accounts for them as run there, and fails for a line that names no test

@@ -1,4 +1,4 @@
-# Tests the rust_test job in .github/workflows/sami-build.yml runs in a process
+# Tests the rust_test job in .github/workflows/sami-rust-test.yml runs in a process
 # of their own, after the other tests: the main invocation passes each to every
 # test binary as `--skip <name>`, and a later invocation runs the named target
 # with `--exact <name>`. The job fails unless each name matches exactly one

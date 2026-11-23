@@ -1,4 +1,4 @@
-# #[ignore]d tests the rust_test job in .github/workflows/sami-build.yml runs
+# #[ignore]d tests the rust_test job in .github/workflows/sami-rust-test.yml runs
 # anyway: each alone, after the other tests, with `--ignored --exact <name>`
 # and a 1200 s bound for that one run. The job fails unless each runs there
 # (exactly that test, not still ignored), and when it fails, like any test.

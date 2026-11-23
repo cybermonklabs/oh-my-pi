@@ -1,5 +1,5 @@
 # #[ignore]d tests that are a child process's entry point, for the rust_test
-# job in .github/workflows/sami-build.yml: another test of the same binary
+# job in .github/workflows/sami-rust-test.yml: another test of the same binary
 # starts the binary again with `--ignored --exact <name>`, so they run inside
 # that test, and not as tests of their own. The job fails for an #[ignore]d
 # test that no invocation runs and no list names, and for a line here that

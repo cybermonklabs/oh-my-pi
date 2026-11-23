@@ -1,6 +1,6 @@
 # Cargo workspaces outside the root workspace, which Bazel does not build, so
 # `bazel test //crates/...` cannot run their tests. The rust_test job in
-# .github/workflows/sami-build.yml runs every test target of each one under
+# .github/workflows/sami-rust-test.yml runs every test target of each one under
 # cargo, with the root's pinned nightly, and reads libtest's record of each
 # as it does a Bazel rust_test's. .github/sami/rust-test-parity.sh fails while
 # a Cargo.toml outside the root workspace is missing here.

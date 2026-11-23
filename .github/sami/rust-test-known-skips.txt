@@ -1,4 +1,4 @@
-# Known skips for the rust_test job in .github/workflows/sami-build.yml: tests
+# Known skips for the rust_test job in .github/workflows/sami-rust-test.yml: tests
 # that skip themselves on the runner (print `skipped: <reason>`, or a word the
 # skip scan in .github/sami/rust-test.sh knows, and return), though the runner
 # cannot give them their precondition. The job passes only when exactly the

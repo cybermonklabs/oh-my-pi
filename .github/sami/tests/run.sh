@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regression tests for the rust_test job's scripts in .github/sami, with no
-# network, Bazel or cargo: the job runs this before its build.
+# network, Bazel or cargo: the job (.github/workflows/sami-rust-test.yml)
+# runs this before its build.
 #   - rust-test.sh, the test step, against stubs of bazelisk and rustup. The
 #     bazelisk stub checks each invocation's arguments, then writes the build
 #     event log and the test logs a case describes, laid out as Bazel lays
@@ -13,7 +14,8 @@
 #   - sami-build.yml and .github/actions/bun-install: only release_binary
 #     may use the GitHub Actions cache, only release_cache_prune may hold
 #     actions: write and only attest id-token: write, and neither runs
-#     member code (cache_lint).
+#     member code (cache_lint); and sami-rust-test.yml, whose jobs run the
+#     tests: none of them may use the cache or hold either permission.
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -937,11 +939,15 @@ $got"
 fi
 
 # --- the jobs' caches -------------------------------------------------------------
-# cache_lint <workflow> <bun-install action>: only release_binary may use the
-# GitHub Actions cache. rust_test and rust_test_macos run test code on
-# runners whose user has passwordless sudo, on the release's ref; such code
-# could save an entry for that ref (one no run has written yet, or one a
-# ref's own lookup takes before main's) that release_binary would restore.
+# cache_lint <workflow> <bun-install action> <bazel-cache action> <jobs>:
+# only release_binary may use the GitHub Actions cache. <jobs> names the
+# jobs the workflow must have: sami-build.yml's release_binary, attest and
+# release_cache_prune, or sami-rust-test.yml's rust_test and rust_test_macos.
+# Those two run test code on runners whose user has passwordless sudo, on
+# the release's ref (sami-checks.yml calls them on the push of
+# sami-candidate); such code could save an entry for that ref (one no run
+# has written yet, or one a ref's own lookup takes before main's) that
+# release_binary would restore.
 # The workflow sets cache-mode: none, so a job's cache token can neither
 # restore nor save unless the job sets a mode of its own. So: the workflow
 # has cache-mode: none; every job but release_binary has no line that names
@@ -997,7 +1003,7 @@ fi
 # is not a plain `  <id>:` stops the lint, because its steps would be read as
 # the job above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds cont
+	local wf="$1" action="$2" bazel_action="$3" need="$4" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds cont
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	# These four read each line with a space added at its end (and the first
 	# two at its start too), so no pattern needs an anchor inside a group.
@@ -1017,7 +1023,7 @@ cache_lint() {
 		echo "UNKNOWN: $wf has a job line cache_lint cannot read: $bad"
 		return 1
 	fi
-	for job in release_binary attest release_cache_prune rust_test rust_test_macos; do
+	for job in $need; do
 		printf '%s\n' "$jobs" | grep -qxF "$job" || { echo "UNKNOWN: $wf has no $job job"; return 1; }
 	done
 	for job in $jobs; do
@@ -1239,15 +1245,24 @@ cache_lint() {
 # wlint <name> <want> <message regex> <sed for the workflow> <sed for the
 # bun-install action> [<sed for the bazel-cache action>]: cache_lint on the
 # repository's files, each edited by its sed script (an empty one leaves it
-# as it is).
+# as it is). The workflow is sami-build.yml, or the one WF names
+# (sami-rust-test.yml).
 wlint() {
-	local name="$1" want="$2" msg="$3" w out rc
+	local name="$1" want="$2" msg="$3" wf="${WF:-sami-build.yml}" need w out rc
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	case "$wf" in
+	sami-build.yml) need="release_binary attest release_cache_prune" ;;
+	sami-rust-test.yml) need="rust_test rust_test_macos" ;;
+	*)
+		verdict "$name" "$want" 97 "$msg" "wlint knows no workflow $wf"
+		return 0
+		;;
+	esac
 	w="$(mktemp -d "$scratch/wlint.XXXXXX")"
-	sed -e "${4:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/sami-build.yml"
+	sed -e "${4:-p;d}" "$repo/.github/workflows/$wf" >"$w/$wf"
 	sed -e "${5:-p;d}" "$repo/.github/actions/bun-install/action.yml" >"$w/action.yml"
 	sed -e "${6:-p;d}" "$repo/.github/actions/bazel-cache/action.yml" >"$w/bazel-cache.yml"
-	out="$(cache_lint "$w/sami-build.yml" "$w/action.yml" "$w/bazel-cache.yml" 2>&1)"
+	out="$(cache_lint "$w/$wf" "$w/action.yml" "$w/bazel-cache.yml" "$need" 2>&1)"
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
@@ -1256,18 +1271,22 @@ wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-insta
 wlint W3-carry-cache-step 1 'carry has an actions/cache step' 's|^        run: git fetch --no-tags https://github.com/can1357/oh-my-pi.git main:refs/remotes/upstream/main$|&\n      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
 wlint W5-action-cache-step-ungated 1 'has a cache step that does not need cache=gha' '' 's/if: steps.env.outputs.cache == .gha. && github.ref/if: github.ref/'
-# The gate's own jobs: their tools (the reference rsync, zsh and bash, the
-# macOS step bash) and bun's packages come from the build, not a cache, and
-# their tokens can neither restore nor save one.
-wlint W6-gate-jobs-no-cache-access 0 'rust_test_macos: cache-mode none; no actions/cache step; bun-install steps: 0, each with cache: "false"' '' ''
-wlint W7-rust-test-cache-step 1 'rust_test has an actions/cache step' 's|^      - name: Libraries of the reference rsync$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
-wlint W8-rust-test-macos-cache-step 1 'rust_test_macos has an actions/cache step' 's|^      - name: The tests only macOS can run$|      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
-wlint W9-rust-test-bun-install-with-cache 1 'rust_test has a bun-install step without cache: "false"' '/^  rust_test:$/,/^  rust_test_macos:$/{/^          cache: "false"$/d;}' ''
+# The gate's own jobs, in sami-rust-test.yml: their tools (the reference
+# rsync, zsh and bash, the macOS step bash) and bun's packages come from the
+# build, not a cache, and their tokens can neither restore nor save one: the
+# workflow has cache-mode none (W68) and no job sets another (W12, W23 to
+# W25). (W9, a bun-install step without cache: "false", is gone: rust_test
+# runs `bun install` itself, with no store, since bun-install reads
+# package.json at the workspace root, where that job keeps no tree.)
+WF=sami-rust-test.yml wlint W6-gate-jobs-no-cache-access 0 'rust_test_macos: cache-mode none; no actions/cache step; bun-install steps: 0, each with cache: "false"' '' ''
+WF=sami-rust-test.yml wlint W7-rust-test-cache-step 1 'rust_test has an actions/cache step' 's|^      - name: Libraries of the reference rsync$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+WF=sami-rust-test.yml wlint W8-rust-test-macos-cache-step 1 'rust_test_macos has an actions/cache step' 's|^      - name: The tests only macOS can run$|      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
+WF=sami-rust-test.yml wlint W68-rust-test-workflow-cache-mode-not-none 1 'sami-rust-test.yml has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: write/' ''
 # Any cache access outside release_binary: the workflow's default, a job's own
 # mode, a cache step in a job none of the cases above names.
 wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: read/' ''
 wlint W11-carry-cache-mode-read 1 'carry has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: read\]' 's/^  carry:$/&\n    cache-mode: read/' ''
-wlint W12-rust-test-cache-mode-write 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: write\]' 's/^  rust_test:$/&\n    cache-mode: write/' ''
+WF=sami-rust-test.yml wlint W12-rust-test-cache-mode-write 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: write\]' 's/^  rust_test:$/&\n    cache-mode: write/' ''
 wlint W13-publish-cache-step 1 'publish has an actions/cache step' 's|^      - name: Find the candidate run$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
 # release_binary saves only on a push to sami-candidate; a dispatch, a pull
 # request, a push to another ref or any other event only restores.
@@ -1284,9 +1303,9 @@ wlint W21-bazel-cache-action-calls-an-action 1 'bazel-cache.yml calls an action'
 wlint W22-job-line-with-a-comment 1 'job line cache_lint cannot read' 's/^  carry:$/  carry: # the carry check/' ''
 # GitHub reads these spellings of a job's mode too: the value on the next
 # line, a quoted key, and a job whose keys are indented 6 spaces.
-wlint W23-rust-test-cache-mode-on-the-next-line 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode:\]' 's/^  rust_test:$/&\n    cache-mode:\n      write/' ''
-wlint W24-rust-test-cache-mode-quoted-key 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    "cache-mode": write\]' 's/^  rust_test:$/&\n    "cache-mode": write/' ''
-wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[      cache-mode: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^    /      /;s/^  rust_test:$/&\n      cache-mode: write/' ''
+WF=sami-rust-test.yml wlint W23-rust-test-cache-mode-on-the-next-line 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode:\]' 's/^  rust_test:$/&\n    cache-mode:\n      write/' ''
+WF=sami-rust-test.yml wlint W24-rust-test-cache-mode-quoted-key 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    "cache-mode": write\]' 's/^  rust_test:$/&\n    "cache-mode": write/' ''
+WF=sami-rust-test.yml wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[      cache-mode: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^    /      /;s/^  rust_test:$/&\n      cache-mode: write/' ''
 # GitHub reads an if: with text outside ${{ }} as a string, which is true,
 # so nothing may follow the save guard's expression, on its line (W26) or
 # on a deeper line that YAML folds into the value (W27).
@@ -1295,19 +1314,19 @@ wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a ca
 # release_cache_prune holds actions: write, so it runs no member code: no
 # action (W28), no interpreter, git or repository path (W29), and no gh
 # call but on actions/caches (W35, and W37 with actions/caches only in a
-# comment). No other job (W30, W34 with the value on the next line, W36
-# with read only in a comment, W33 by write-all) and not the workflow (W32)
-# names an actions permission other than read or none, and the workflow
-# has a permissions key (W31).
+# comment). No other job (W33 by write-all; in sami-rust-test.yml, W30,
+# W34 with the value on the next line, W36 with read only in a comment)
+# and not the workflow (W32) names an actions permission other than read or
+# none, and the workflow has a permissions key (W31).
 wlint W28-release-cache-prune-checkout 1 'release_cache_prune uses an action, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Delete superseded release build caches of this ref$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
 wlint W29-release-cache-prune-repository-script 1 'release_cache_prune names an interpreter, a downloader, git, a repository path or GITHUB_WORKSPACE, so it could run member code: \[          bash \.github/sami/rust-test\.sh\]' 's|^          list >caches.tsv$|          bash .github/sami/rust-test.sh\n&|' ''
-wlint W30-rust-test-actions-write 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write/' ''
+WF=sami-rust-test.yml wlint W30-rust-test-actions-write 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write/' ''
 wlint W31-no-workflow-permissions 1 'has no workflow-level permissions' '/^permissions:$/,/^  contents: read$/d' ''
 wlint W32-workflow-actions-write 1 'the workflow names an actions permission other than read or none, which only release_cache_prune may hold: \[  actions: write\]' 's/^  contents: read$/&\n  actions: write/' ''
 wlint W33-version-write-all 1 'version names an actions permission other than read or none, which only release_cache_prune may hold: \[    permissions: write-all\]' 's/^  version:$/&\n    permissions: write-all/' ''
-wlint W34-rust-test-actions-write-on-the-next-line 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions:\n        write/' ''
+WF=sami-rust-test.yml wlint W34-rust-test-actions-write-on-the-next-line 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions:\n        write/' ''
 wlint W35-release-cache-prune-gh-repo-clone 1 'release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: \[          gh repo clone "\$GH_REPO" src -- --depth 1\]' 's|^          list >caches.tsv$|          gh repo clone "$GH_REPO" src -- --depth 1\n&|' ''
-wlint W36-rust-test-actions-write-read-in-a-comment 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write # was actions: read\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write # was actions: read/' ''
+WF=sami-rust-test.yml wlint W36-rust-test-actions-write-read-in-a-comment 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write # was actions: read\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write # was actions: read/' ''
 wlint W37-release-cache-prune-gh-caches-in-a-comment 1 'release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: \[          gh api "repos/\$GH_REPO/contents/p\.sh" >p # not actions/caches\]' 's|^          list >caches.tsv$|          gh api "repos/$GH_REPO/contents/p.sh" >p # not actions/caches\n&|' ''
 # A push to another ref only restores, sami included: the guard names
 # sami-candidate (W38).
@@ -1317,10 +1336,11 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # (W51), no run step (W41, W48 in flow style), no download of another run's
 # artifacts (W42, W49 in flow style), and no download by name or pattern
 # (W50; W52 with artifact-ids only in a comment, W53 with an empty one). No
-# other job (W43, W45 by write-all, W46 with the value on the next
-# line, W47) and not the workflow (W44) names an id-token permission other
-# than read or none. attest runs only on a push to sami-candidate (W54
-# without the event test, W55 with ||), downloads exactly the upload steps'
+# other job (W43, W45 by write-all, W47; in sami-rust-test.yml, W46 with
+# the value on the next line) and not the workflow (W44) names an id-token
+# permission other than read or none. attest runs only on a push to
+# sami-candidate (W54 without the event test, W55 with ||), downloads
+# exactly the upload steps'
 # three ids by their needs outputs (W56 another output, W57 a literal id),
 # which are the upload steps' artifact ids (W60), and attests each release
 # file in a step of its own with one path (W58 two paths in one step, W59 the
@@ -1336,8 +1356,8 @@ wlint W42-attest-download-of-another-run 1 'attest names another run, repository
 wlint W43-carry-id-token-write 1 'carry names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' 's/^  carry:$/&\n    permissions:\n      id-token: write/' ''
 wlint W44-workflow-id-token-write 1 'the workflow names an id-token permission other than read or none, which only attest may hold: \[  id-token: write\]' 's/^  contents: read$/&\n  id-token: write/' ''
 wlint W45-release-binary-write-all 1 'release_binary names an id-token permission other than read or none, which only attest may hold: \[    permissions: write-all\]' 's/^  release_binary:$/&\n    permissions: write-all/' ''
-wlint W46-rust-test-id-token-on-the-next-line 1 'rust_test names an id-token permission other than read or none, which only attest may hold: \[      id-token:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      id-token:\n        write/' ''
-wlint W47-release-cache-prune-id-token-write 1 'release_cache_prune names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' '/^  release_cache_prune:$/,/^  rust_test:$/s/^      contents: read$/&\n      id-token: write/' ''
+WF=sami-rust-test.yml wlint W46-rust-test-id-token-on-the-next-line 1 'rust_test names an id-token permission other than read or none, which only attest may hold: \[      id-token:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      id-token:\n        write/' ''
+wlint W47-release-cache-prune-id-token-write 1 'release_cache_prune names an id-token permission other than read or none, which only attest may hold: \[      id-token: write\]' '/^  release_cache_prune:$/,/^  publish:$/s/^      contents: read$/&\n      id-token: write/' ''
 wlint W48-attest-run-step-in-flow-style 1 'attest has a run step, so it could run member code: \[      - \{ name: x, run: bash \.github/sami/carry-check\.sh \}\]' 's|^      - name: Download the archives and the release notes$|      - { name: x, run: bash .github/sami/carry-check.sh }\n&|' ''
 wlint W49-attest-another-run-in-flow-style 1 'attest names another run, repository or token, so it could attest files this run did not build: \[        with: \{ artifact-ids: "1,2,3", path: x, run-id: 1 \}\]' '/^  attest:$/,/^  release_cache_prune:$/{/^        with:$/{N;s/^        with:\n          artifact-ids: .*$/        with: { artifact-ids: "1,2,3", path: x, run-id: 1 }/;};/^          path: \${{ runner.temp }}\/attest$/d;}' ''
 wlint W50-attest-download-by-pattern 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          pattern: mise-*/' ''
@@ -1346,7 +1366,7 @@ wlint W52-attest-artifact-ids-only-in-a-comment 1 'attest downloads an artifact 
 wlint W53-attest-artifact-ids-empty 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          artifact-ids: ""\n          pattern: mise-*/' ''
 wlint W54-attest-if-without-the-event 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.ref == 'refs/heads/sami-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/^    if: \${{ github.event_name == 'push' && /    if: \${{ /" ''
 wlint W55-attest-if-or 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.event_name == 'push' \\|\\| github\\.ref == 'refs/heads/sami-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/ && github.ref == 'refs\\/heads\\/sami-candidate' }}\$/ || github.ref == 'refs\\/heads\\/sami-candidate' }}/" ''
-wlint W56-attest-artifact-ids-another-output 1 "attest downloads by a needs output that is not an upload step's artifact id: \\[.\\{\\{ needs\\.release_binary\\.outputs\\.addon-linux-x64-modern-sha256 \\}\\}\\]" 's/needs\.release_binary\.outputs\.mise-darwin-arm64-artifact-id/needs.release_binary.outputs.addon-linux-x64-modern-sha256/' ''
+wlint W56-attest-artifact-ids-another-output 1 "attest downloads by a needs output that is not an upload step's artifact id: \\[.\\{\\{ needs\\.version\\.outputs\\.tag \\}\\}\\]" 's/needs\.release_binary\.outputs\.mise-darwin-arm64-artifact-id/needs.version.outputs.tag/' ''
 wlint W57-attest-artifact-ids-literal 1 'attest downloads an artifact id that is not a needs output \(a literal or another expression\), so it need not be what this run uploaded: \[12345\]' 's/,\${{ needs\.release_binary\.outputs\.mise-linux-x64-artifact-id }},/,12345,/' ''
 wlint W58-attest-two-paths-in-one-step 1 'attest has an attest-build-provenance step that does not give one subject-path on its line, so a missing file might not fail it: \[- name: Attest the release notes\]' 's|^          subject-path: \${{ runner.temp }}/attest/release-notes/carry-notes.md$|          subject-path: \|\n            ${{ runner.temp }}/attest/release-notes/carry-notes.md\n            ${{ runner.temp }}/attest/mise-*/*.tar.gz|' ''
 wlint W59-attest-notes-step-gone 1 'attest has 0 attest steps of its own for \[\$\{\{ runner\.temp \}\}/attest/release-notes/carry-notes\.md\], not 1, so that file could be missing and the run still green' '/^      - name: Attest the release notes$/,/^          subject-path: .*carry-notes\.md$/d' ''

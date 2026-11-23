@@ -27,9 +27,13 @@
 #   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
 #     job; coding-agent --isolate over 8 shards by file; check:ts. The host addon they load is
 #     built once, in the natives job.
+#   - the Rust tests under Bazel (`bazel test //crates/...` with the known-failure gate, the other
+#     cargo workspaces, sdk/rust/omp-rpc among them, and the tests only macOS can run): the
+#     rust-test job calls .github/workflows/sami-rust-test.yml, whose jobs build their own tests.
+#     The summary reads no unit of theirs; their verdict is their own jobs' conclusion.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
-# sdk/rust/omp-rpc is its own cargo workspace and is not built here (sami-build's rust_test runs it).
+# sdk/rust/omp-rpc is its own cargo workspace and is not in the archive (sami-rust-test.yml runs it).
 #
 # Where the result is. The summary job's step summary: a row per check (PASS, FAIL or UNKNOWN),
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
@@ -43,7 +47,8 @@
 # the same commit sami-build's release_binary compiles on the same push with the same cache
 # access, and run no test. Every job that runs test code gets cache-mode none (the TypeScript
 # jobs read, to restore the bun store main saved), so test code, which can reach the job's token
-# with the runner's sudo, cannot write an entry any job restores.
+# with the runner's sudo, cannot write an entry any job restores. The rust-test job calls its
+# workflow with cache-mode none, and that workflow declares none for its own jobs.
 # Security. permissions: contents: read; no secrets; every checkout drops its credential.
 name: sami checks
 
@@ -213,6 +218,11 @@ jobs:
     timeout-minutes: 90
     # It compiles the candidate's pi-natives and runs no test; it alone saves the addon's cargo cache.
     cache-mode: write
+    # What it built, for sami-rust-test.yml's check of the bytes it downloads.
+    outputs:
+      addon-file: ${{ steps.addon.outputs.file }}
+      addon-sha256: ${{ steps.addon.outputs.sha256 }}
+      addon-commit: ${{ steps.addon.outputs.commit }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-natives
       OMP_NATIVE_BUILD_BACKEND: cargo
@@ -258,6 +268,21 @@ jobs:
           bun run build:native
           echo "ADDON built in $(($(date +%s) - s)) s"
           ls -l packages/natives/native/*.node
+      # The one addon's name, sha256 and commit; no output when there is not exactly one.
+      - name: Hash the addon
+        id: addon
+        working-directory: tree
+        run: |
+          set -- packages/natives/native/*.node
+          if [ "$#" != 1 ] || [ ! -f "$1" ]; then
+            echo "::warning title=Addon::expected one addon, found: $*"
+            exit 0
+          fi
+          {
+            echo "file=$(basename "$1")"
+            echo "sha256=$(sha256sum "$1" | cut -d ' ' -f 1)"
+            echo "commit=$(git rev-parse HEAD)"
+          } | tee -a "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sc-natives
@@ -531,9 +556,27 @@ jobs:
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
 
+  rust-test:
+    # sami-rust-test.yml: the Rust tests under Bazel and the macOS-only tests, with the addon
+    # the natives job built. The summary reads no unit of theirs: their verdict is the conclusion
+    # of the two jobs that workflow runs. They run whatever the natives job's verdict, and fail
+    # by name without its addon.
+    name: rust tests
+    needs: [plan, natives]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' }}
+    permissions:
+      contents: read
+    cache-mode: none
+    uses: ./.github/workflows/sami-rust-test.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      addon-file: ${{ needs.natives.outputs.addon-file }}
+      addon-sha256: ${{ needs.natives.outputs.addon-sha256 }}
+      addon-commit: ${{ needs.natives.outputs.addon-commit }}
+
   summary:
     name: summary
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, rust-test]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fail when a test target of the repository's own Rust suite has no Bazel test
-# target, so `bazel test //crates/...` (the rust_test job in sami-build.yml)
+# target, so `bazel test //crates/...` (the rust_test job in sami-rust-test.yml)
 # never builds or runs it.
 #
 # The suite is what `bun run test:rs` runs (scripts/run-rs-task.ts):

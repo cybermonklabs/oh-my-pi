@@ -1,4 +1,4 @@
-# Sanctioned skips for the rust_test job in .github/workflows/sami-build.yml:
+# Sanctioned skips for the rust_test job in .github/workflows/sami-rust-test.yml:
 # tests the fork's owner ruled out of the gate that stops a release. The job
 # passes each to every test binary as `--skip <name>`, and fails unless each
 # name matches exactly one test, in the named target, which then did not run.

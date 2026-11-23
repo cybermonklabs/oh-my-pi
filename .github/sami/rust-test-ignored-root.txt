@@ -1,5 +1,5 @@
 # #[ignore]d tests that need root, which the rust_test job in
-# .github/workflows/sami-build.yml runs anyway: each alone, last, as root
+# .github/workflows/sami-rust-test.yml runs anyway: each alone, last, as root
 # (`sudo -E`, outside linux-sandbox, which maps one uid), with `--ignored
 # --exact <name>` and a 1200 s bound. The job fails unless each runs there
 # (exactly that test, not still ignored), and when it fails, like any test.

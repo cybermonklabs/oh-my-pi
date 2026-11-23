@@ -6,7 +6,7 @@
 #   - rsync 3.5.1 with every checksum and compressor the builtin offers (/opt/sc-ref/bin/rsync):
 #     pi-builtins' conformance and daemon tests compare with it byte for byte;
 #   - jj 0.46.0, the jj-lib version Cargo.lock pins (/opt/sc-ref/bin/jj): pi-vcs's jj tests.
-# The pins are rust_test's (sami-build.yml) and the gate kit's refenv.sh. No tree code runs here.
+# The pins are rust_test's (sami-rust-test.yml) and the gate kit's refenv.sh. No tree code runs here.
 set -euo pipefail
 st=$SC/stage
 mkdir -p "$st/opt/sc-ref/bin" "$SC/up" "$SC/src"
