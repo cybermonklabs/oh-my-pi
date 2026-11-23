@@ -472,6 +472,9 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(
 		`omp --resume <id> under OMP_SESSION_EXCLUSIVE=1 when an older build writes the file (${adapter})`,
 		() => {
+			// Each stop names its reason on stderr. The process exits once its store gave its claims back, a database
+			// round trip after the stop on PostgreSQL and MySQL, so the append's answer can come before the exit.
+
 			// Through an append: a rewrite a caller asks for rejects a stale view instead (see the manager rows).
 			it("exits non-zero naming contested when an append and every full write meet a file an older build changed", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
@@ -479,16 +482,11 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await using resumed = await LeaseProcess.start(session.config, db.dir.join("resumed"), EXCLUSIVE);
 				expect((await resumed.run(resumeById(session))).sessionId).toBe(ID);
 
-				const failure = await resumed.run({ op: "append", text: "after the older build", contested: true }).then(
-					done => `appended ${done.sessionId} ${done.error ?? ""}`,
-					(err: unknown) => String(err),
-				);
+				await resumed.run({ op: "append", text: "after the older build", contested: true }).catch(() => undefined);
 				const exitCode = await exitOf(resumed, 20_000);
 
-				expect({ exitCode, reason: failure.includes(`Session ${ID} stops (contested)`) }).toEqual({
-					exitCode: 1,
-					reason: true,
-				});
+				expect(exitCode).toBe(1);
+				expect(await resumed.stderr()).toContain(`Session ${ID} stops (contested)`);
 				expect(await db.paths()).toEqual([session.file]);
 			}, 60_000);
 
@@ -502,16 +500,11 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await older.writeText(session.file, replacement);
 				await older.drain();
 
-				const failure = await resumed.run({ op: "append", text: "after the older build" }).then(
-					done => `appended ${done.sessionId} ${done.error ?? ""}`,
-					(err: unknown) => String(err),
-				);
+				await resumed.run({ op: "append", text: "after the older build" }).catch(() => undefined);
 				const exitCode = await exitOf(resumed, 20_000);
 
-				expect({ exitCode, reason: failure.includes(`Session ${ID} stops (replaced)`) }).toEqual({
-					exitCode: 1,
-					reason: true,
-				});
+				expect(exitCode).toBe(1);
+				expect(await resumed.stderr()).toContain(`Session ${ID} stops (replaced)`);
 				expect(await db.paths()).toEqual([session.file]);
 				expect((await db.row(session.file))?.content).toBe(replacement);
 			}, 60_000);
