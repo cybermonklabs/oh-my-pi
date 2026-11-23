@@ -91,7 +91,7 @@ describe("/handoff command", () => {
 
 		expect(statusContainer.children).toHaveLength(0);
 		expect(ctx.editor.onEscape).toBe(originalOnEscape);
-		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
+		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests", { origin: "outside" });
 	});
 
 	it("clears a working loader mounted while the completed handoff rebuilds the transcript", async () => {

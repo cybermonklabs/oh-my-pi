@@ -6,6 +6,10 @@
 
 - `CustomMessage` has an optional `tag`, a caller correlation id that stays with the message ([#14323](https://github.com/can1357/oh-my-pi/pull/14323) by [@sjawhar](https://github.com/sjawhar))
 
+### Fixed
+
+- Remote compaction passes pi-ai's model-call checkpoint (`addModelCallGuard`): OpenAI's `/responses/compact` (V1), V2 streaming compaction (each retry after its backoff included) and a configured `compaction.remoteEndpoint` read the guards before they send, so a model a guard holds (an OpenAI route during a `cyber_policy` hold) sends nothing, and a refusal these requests meet reaches the guards. V2 compaction no longer retries a `cyber_policy` refusal, also when a gateway relays it as a 5xx.
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

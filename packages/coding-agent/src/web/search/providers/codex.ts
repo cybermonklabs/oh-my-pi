@@ -5,6 +5,7 @@
  * the official ChatGPT backend for OAuth logins.
  */
 import { type Api, type AuthStorage, type FetchImpl, type Model, withAuth, withOAuthAccess } from "@oh-my-pi/pi-ai";
+import { guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { resolveCodexResponsesUrl } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import {
 	applyCodexResidencyHeader,
@@ -568,15 +569,19 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		// Re-resolved per attempt so a retried or rotated credential sees the
 		// registry headers current at call time.
 		const requestTransport = await resolveCodexSearchTransport(params);
-		return callCodexSearch(auth, query, {
-			signal: params.signal,
-			timeoutMs: params.timeoutMs,
-			systemPrompt: params.systemPrompt,
-			searchContextSize: "high",
-			modelId: params.model.id,
-			fetch: params.fetch,
-			transport: requestTransport,
-		});
+		// A model call like any other: the model-call checkpoint holds it while a hold stands on this model,
+		// and a refusal it meets is recorded (the query is drawn from the conversation).
+		return guardModelRequest(params.model, () =>
+			callCodexSearch(auth, query, {
+				signal: params.signal,
+				timeoutMs: params.timeoutMs,
+				systemPrompt: params.systemPrompt,
+				searchContextSize: "high",
+				modelId: params.model.id,
+				fetch: params.fetch,
+				transport: requestTransport,
+			}),
+		);
 	};
 
 	let result: CodexSearchResult;

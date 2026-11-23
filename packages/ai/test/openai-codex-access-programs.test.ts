@@ -161,7 +161,14 @@ describe("openai-codex cyber access programs", () => {
 		expect(sent).toEqual([rejectsProgram ? undefined : { cyber: "daybreak_blue" }]);
 	});
 
-	it.each(["SSE", "HTTP"])("surfaces %s cyber policy errors without replaying or disabling Daybreak", async path => {
+	// OpenAI's cyber-policy text names `access_programs.cyber`, so a body that carries no specific code
+	// must not read as the backend refusing the program: a replay would send the flagged request again.
+	it.each([
+		["SSE", true],
+		["HTTP", true],
+		["SSE without a code", false],
+		["HTTP without a code", false],
+	] as const)("surfaces %s cyber policy errors without replaying or disabling Daybreak", async (path, withCode) => {
 		const accountId = `acct-daybreak-cyber-policy-${path}`;
 		const policyModel = createCodexModel(`gpt-6-sol-cyber-policy-${path}`, {
 			preferWebsockets: false,
@@ -169,7 +176,8 @@ describe("openai-codex cyber access programs", () => {
 		});
 		const message =
 			"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. Otherwise, confirm that the access_programs.cyber parameter is set to the appropriate tier, and note that some cybersecurity requests are still limited, even when Daybreak is on.";
-		const errorSse = `data: ${JSON.stringify({ type: "error", code: "cyber_policy", message })}\n\n`;
+		const code = withCode ? { code: "cyber_policy" } : {};
+		const errorSse = `data: ${JSON.stringify({ type: "error", ...code, message })}\n\n`;
 		const sent: unknown[] = [];
 		const fetch = (async (input: string | URL, init?: RequestInit) => {
 			const url = typeof input === "string" ? input : input.toString();
@@ -182,19 +190,18 @@ describe("openai-codex cyber access programs", () => {
 		}) as FetchImpl;
 		const options = {
 			apiKey: createCodexTestToken(accountId),
-			fetch:
-				path === "HTTP"
-					? createFetchMock(
-							[403, 200],
-							sent,
-							JSON.stringify({ error: { type: "invalid_request_error", code: "cyber_policy", message } }),
-						)
-					: fetch,
+			fetch: path.startsWith("HTTP")
+				? createFetchMock(
+						[403, 200],
+						sent,
+						JSON.stringify({ error: { type: "invalid_request_error", ...code, message } }),
+					)
+				: fetch,
 		};
 
 		const failed = await streamOpenAICodexResponses(policyModel, context, options).result();
 		expect(failed.stopReason).toBe("error");
-		expect(failed.errorMessage).toContain(message);
+		expect(failed.errorMessage).toContain("This content was flagged for possible cybersecurity risk.");
 		expect(sent).toEqual([{ cyber: "daybreak_blue" }]);
 
 		expect((await streamOpenAICodexResponses(policyModel, context, options).result()).stopReason).toBe("stop");

@@ -53,6 +53,7 @@ import type {
 	PreparedExtension,
 	ProviderConfig,
 	RegisteredCommand,
+	SendMessageHandler,
 	SendUserInputOptions,
 	SendUserInputResult,
 	ShortcutConflict,
@@ -375,10 +376,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.flagValues.get(name);
 	}
 
-	sendMessage<T = unknown>(
-		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
-	): void {
+	sendMessage<T = unknown>(message: CustomMessagePayload<T>, options?: Parameters<SendMessageHandler>[1]): void {
 		this.runtime.sendMessage(message, options);
 	}
 

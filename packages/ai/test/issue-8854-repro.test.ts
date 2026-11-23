@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { OpenAIHttpError, postOpenAIStream } from "../src/utils/openai-http";
+import { createMockModel } from "../src/providers/mock";
 import { mockFetch } from "./helpers/fetch-mock";
+
+/** The model the request is for: `postOpenAIStream` reads the model-call guards before each resend. */
+const MODEL = createMockModel({ handler: { content: [] } });
 
 // LiteLLM (and compatible proxies) shed over-concurrency requests before the
 // upstream call with an immediate HTTP 429 marked `rate_limit_type:
@@ -34,6 +38,7 @@ describe("OpenAI transport concurrency-admission 429 (#8854)", () => {
 
 		const error = await postOpenAIStream({
 			url: "https://litellm.local/v1/chat/completions",
+			model: MODEL,
 			headers: {},
 			body: { model: "gpt-4o", messages: [] },
 			signal: new AbortController().signal,
@@ -60,6 +65,7 @@ describe("OpenAI transport concurrency-admission 429 (#8854)", () => {
 
 		const error = await postOpenAIStream({
 			url: "https://litellm.local/v1/chat/completions",
+			model: MODEL,
 			headers: {},
 			body: { model: "gpt-4o", messages: [] },
 			signal: new AbortController().signal,
@@ -95,6 +101,7 @@ describe("OpenAI transport concurrency-admission 429 (#8854)", () => {
 
 		const handle = await postOpenAIStream({
 			url: "https://api.openai.com/v1/chat/completions",
+			model: MODEL,
 			headers: {},
 			body: { model: "gpt-4o", messages: [] },
 			signal: new AbortController().signal,

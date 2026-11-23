@@ -1481,6 +1481,8 @@ export class AcpAgent implements Agent {
 			cwd: record.session.sessionManager.getCwd(),
 			signal: promptTurn?.abortController.signal,
 			...this.#slashCommandHost(record),
+			// An ACP client's command: input from outside the session.
+			origin: "outside",
 			keepTurnOpenUntilIdle: async () => {
 				await record.session.waitForIdle();
 				// `AgentSession.#emit()` does not await listeners, so the retried
@@ -1496,7 +1498,10 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images });
+				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, {
+					images,
+					origin: "outside",
+				});
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1521,7 +1526,8 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
-		const agentInvoked = await record.session.prompt(text, { images });
+		// An ACP client's prompt: input from outside the session.
+		const agentInvoked = await record.session.prompt(text, { images, origin: "outside" });
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -1555,7 +1561,7 @@ export class AcpAgent implements Agent {
 				details: built.details,
 				attribution: "user",
 			},
-			{ streamingBehavior: "steer" },
+			{ streamingBehavior: "steer", origin: "outside" },
 		);
 		return true;
 	}

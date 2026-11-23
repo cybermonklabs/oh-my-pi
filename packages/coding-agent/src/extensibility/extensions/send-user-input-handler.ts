@@ -86,6 +86,8 @@ export async function sendSessionUserInput(
 ): Promise<SendUserInputResult> {
 	const streamingBehavior = options?.deliverAs ?? "steer";
 	const tag = options?.tag;
+	// A person's input the extension relays (`origin: "outside"`) ends the cyber-policy hold, as typed input does.
+	const origin = options?.origin;
 	let images: ImageContent[] | undefined;
 
 	// The ingress hook RPC's `prompt` and interactive Enter run before anything else; a handler that
@@ -101,7 +103,7 @@ export async function sendSessionUserInput(
 
 	const skill = resolveRpcSkillInvocation(session, text);
 	if (skill) {
-		await runRpcSkillCommand(session, skill, { streamingBehavior, images, tag });
+		await runRpcSkillCommand(session, skill, { streamingBehavior, images, tag, origin });
 		return { handled: "skill" };
 	}
 
@@ -119,6 +121,9 @@ export async function sendSessionUserInput(
 			settings: session.settings,
 			cwd: session.sessionManager.getCwd(),
 			...commandHost,
+			// After the host: the caller's origin decides, so a host built from a typed-input runtime (one that
+			// carries `origin: "outside"`) cannot mark the extension's own command as a person's.
+			origin,
 			output: line => {
 				printed.push(line);
 				return commandHost.output(line);
@@ -126,7 +131,7 @@ export async function sendSessionUserInput(
 		});
 		const output = printed.length > 0 ? { output: printed.join("\n") } : undefined;
 		if (result && "prompt" in result) {
-			await session.prompt(result.prompt, { streamingBehavior, images, tag });
+			await session.prompt(result.prompt, { streamingBehavior, images, tag, origin });
 			return { handled: "prompt", ...output };
 		}
 		// `/retry` and the like start a turn without submitting a message; hosts must not treat it as local.
@@ -134,7 +139,7 @@ export async function sendSessionUserInput(
 		return { handled: "command", ...agentInvoked, ...output };
 	}
 
-	const submitted = await session.prompt(text, { streamingBehavior, images, tag });
+	const submitted = await session.prompt(text, { streamingBehavior, images, tag, origin });
 	// `prompt()` answers false only when an extension or custom command handled the text locally.
 	return { handled: submitted ? "prompt" : "command" };
 }
