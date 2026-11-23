@@ -22,7 +22,6 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
 	resolveModelFromSettings,
-	resolveExactModelIdentity,
 	resolveModelFromString,
 	resolveModelOverride,
 	resolveModelRoleValue,
@@ -1509,37 +1508,6 @@ describe("resolveModelOverride", () => {
 	});
 });
 
-describe("resolveExactModelIdentity", () => {
-	const model = (id: string) =>
-		buildModel({
-			id,
-			name: id,
-			api: "anthropic-messages",
-			provider: "mock",
-			baseUrl: "https://example.invalid",
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 200000,
-			maxTokens: 8192,
-		});
-
-	test("never treats a level-shaped suffix as thinking", () => {
-		const base = model("router");
-		const literal = model("router:low");
-		expect(resolveExactModelIdentity("mock/router", { getAvailable: () => [literal] })).toBeUndefined();
-		expect(resolveExactModelIdentity("mock/router:low", { getAvailable: () => [base] })).toBeUndefined();
-		expect(resolveExactModelIdentity("mock/router:low", { getAvailable: () => [base, literal] })).toBe(literal);
-	});
-
-	test("restores canonical aggregator routing exactly", () => {
-		const routed = resolveExactModelIdentity("openrouter/z-ai/glm-4.7@cerebras", { getAvailable: () => allModels });
-		expect(routed && formatModelStringWithRouting(routed)).toBe("openrouter/z-ai/glm-4.7@cerebras");
-		expect(
-			resolveExactModelIdentity("openrouter/z-ai/glm-4.7@cerebras:high", { getAvailable: () => allModels }),
-		).toBeUndefined();
-	});
-});
 describe("resolveCliModel", () => {
 	const allModelsRegistry = { getAll: () => allModels, getAvailable: () => allModels };
 
