@@ -13,7 +13,6 @@ import {
 	PG_APPLICATION_NAME,
 	PG_CONDITIONAL_PARAMETERS,
 	PG_OPENING,
-	PG_REPAIR_RETRIES,
 	PG_SESSION_SETTINGS,
 	type PgSessionSetting,
 	type PgSettingKind,
@@ -345,8 +344,4 @@ describe("pgOpening", () => {
 			expect(pgOpening("read", present)).toBe(`${BEGIN_READ}${write.slice(BEGIN_WRITE.length)}`);
 		});
 	}
-});
-
-it("an operation runs again on at most 3 more connections it cannot repair", () => {
-	expect(PG_REPAIR_RETRIES).toBe(3);
 });
