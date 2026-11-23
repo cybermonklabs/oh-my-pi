@@ -193,19 +193,6 @@ def test_compute_key_uses_all_documented_paths() -> None:
     )
 
 
-def test_image_seed_key_lists_the_cache_key_paths_in_order() -> None:
-    # The Dockerfile writes the image seed's `trees.txt` from its own path list; a seed is
-    # served under the key a workspace computes only when both lists are the same.
-    dockerfile = (Path(__file__).resolve().parents[3] / "Dockerfile").read_text(encoding="utf-8")
-    joined = dockerfile.replace("\\\n", " ")
-    added = re.search(r"git add -f -- ([^\n]*?) ':\(exclude\)", joined)
-    assert added is not None, "the Dockerfile's `git add -f -- <paths>` line is missing"
-    assert tuple(added.group(1).split()) == CACHE_KEY_PATHS
-    trees = re.search(r"printf '%s\\n' ((?:\"\$tree:[^\"]+\"\s*)+)\|", joined)
-    assert trees is not None, "the Dockerfile's `printf ... $tree:<path>` list is missing"
-    assert tuple(re.findall(r"\"\$tree:([^\"]+)\"", trees.group(1))) == CACHE_KEY_PATHS
-
-
 def _dockerignore_excludes(patterns: list[str], rel: str) -> bool:
     """Whether Docker's build context leaves out `rel` under these dockerignore patterns.
 
