@@ -70,3 +70,8 @@ windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_syste
 windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_system_pipes_do_not_seek	fails at upstream 9058ab9d (platform-reds row 10): as row 9
 windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_terminfo::dumb_terminal	fails at upstream 9058ab9d (platform-reds row 11): Windows has no terminfo database and the test has no gate
 windows	runner	pi-shell	pi-shell::obash::externals_start_where_read_stopped	fails at upstream 9058ab9d (platform-reds row 12): the test runs /usr/bin/true, wc and tr, which Windows lacks (tests/obash.rs:163-166)
+# macOS: red at upstream 9058ab9d in run 45287904461 (2 repeats), and at 509a2d77 and a72018dd.
+macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_digest_and_listing_match_zsh	fails at upstream 9058ab9d, 0 of 2 (run 45287904461)
+macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_lists_dumps_zsh_wrote	fails at upstream 9058ab9d, 0 of 2 (run 45287904461)
+macos	runner	pi-shell	pi-shell::zle_widgets_pty::transposes	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461)
+macos	runner	pi-shell	pi-shell::zsh_jobs_pty::a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461); a race in the real zsh, not in obash (platform-reds row 18)
