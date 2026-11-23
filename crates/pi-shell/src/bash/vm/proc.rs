@@ -89,6 +89,15 @@ pub struct Vproc {
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:      u32,
+	/// Loops of the shell that forked this vproc that its code runs inside
+	/// (bash's inherited `loop_level`, zsh's `loops`), set by
+	/// [`super::exec::fork_loops`]: a `break` or `continue` that reaches
+	/// past this vproc's own loops ends the vproc, as the end of its code
+	/// would. Zero for the shell itself and for a fork bash runs through
+	/// `execute_in_subshell`, which zeroes the level. A `u16` (saturating
+	/// past 65,535 loops) that shares `trap_frames`'s former 4 bytes, so
+	/// `Vproc` keeps its size.
+	pub outer_loops:   u16,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
@@ -106,8 +115,10 @@ pub struct Vproc {
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
 	/// [`super::exec::push_script`], [`super::exec::pop_frame`] and the
-	/// frame restore; never serialized (recounted from the frames).
-	pub trap_frames:   u32,
+	/// frame restore; never serialized (recounted from the frames). A trap
+	/// never runs inside its own action, so they nest at most once per trap
+	/// kind, far below `u16::MAX`.
+	pub trap_frames:   u16,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
@@ -991,6 +1002,14 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// The base frame of a fork: a fatal error in it, run as a forked
+	/// simple command, reaches bash's command loop when its forking
+	/// shell's would have when it forked (bash's fork copies `top_level`).
+	/// Set from [`super::exec::fatal_reaches_command_loop`] of the forking
+	/// shell and read there. It takes the padding byte after `Frame`'s
+	/// fields smaller than 8 B (two `u32`s, two `Option<u32>`s and seven
+	/// `bool`s: 31 B), so `Frame` keeps its size.
+	pub command_loop:      bool,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1024,6 +1043,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
+			command_loop: false,
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1535,6 +1555,10 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// A forked pipeline element's builtin or function was put one
+	/// subshell level down ([`super::exec::raise_element_level`]), once.
+	#[serde(default)]
+	pub raised:      bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1754,7 +1778,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
+// that to at most 1,840 B. The forking shell's loop count
+// (`Vproc::outer_loops`) is a `u16` beside a `u16` `Vproc::trap_frames`,
+// in the 4 bytes `trap_frames` had: `Vproc` keeps its 672 B.
 const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
