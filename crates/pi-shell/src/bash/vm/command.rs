@@ -664,7 +664,11 @@ fn seeded_exec(
 /// Write a fast-path builtin's output now. `Err((n, off, handed))`: the
 /// first `n` chunks and `off` bytes of the next went out, the rest is for
 /// the staged output, which also takes all of it (`Err((0, 0, _))`) when it
-/// has a diagnostic to render or the shell has output queued before it.
+/// has a diagnostic to render or the shell's own output is still going out
+/// before it ([`exec::output_waits`]: queued diagnostics, job notices, the
+/// editor's display bytes). Written now, on another writer thread, the
+/// builtin's bytes could pass those; the staged output waits for them
+/// ([`exec::flush_out`]).
 /// Only bytes that are out of the shell count: a chunk a writer thread took
 /// ([`crate::bash::File::poll_write_marked`]) is out once it settles, so
 /// the fast path stops there and the staged output settles it (`handed`),
@@ -674,7 +678,7 @@ fn write_now(
 	vp: &Vproc,
 	chunks: &[Chunk],
 ) -> Result<(), (usize, usize, super::proc::HandedOff)> {
-	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
+	if exec::output_waits(k, vp) || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
 		return Err((0, 0, super::proc::HandedOff::default()));
 	}
 	let mut tcx = Context::from_waker(&k.waker);

@@ -157,6 +157,12 @@ impl Tty {
 		Some((usize::from(info.cols), usize::from(info.rows)))
 	}
 
+	/// Display bytes are not out yet: queued, or taken by the terminal's
+	/// writer thread and not settled ([`Self::flush`]).
+	pub const fn pending(&self) -> bool {
+		!self.out.is_empty() || self.unsettled.held()
+	}
+
 	/// Queue display bytes.
 	pub fn put(&mut self, bytes: &[u8]) {
 		self.out.extend_from_slice(bytes);

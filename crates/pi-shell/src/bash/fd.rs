@@ -472,6 +472,11 @@ impl PartialEq for Unsettled {
 impl Eq for Unsettled {}
 
 impl Unsettled {
+	/// Whether a chunk a writer thread took is still to settle.
+	pub const fn held(&self) -> bool {
+		self.0.is_some()
+	}
+
 	/// Give up the chunk a writer thread took, with its length: the thread
 	/// still writes it, in order, before anything else handed to it, but its
 	/// result is no longer this writer's to settle. A writer that hands what
