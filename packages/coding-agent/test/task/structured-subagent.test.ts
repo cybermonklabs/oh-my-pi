@@ -1216,11 +1216,13 @@ describe("structured subagent primitive", () => {
 	it("suppresses plan capability sources while preserving non-plan propagation", async () => {
 		mockDiscovery();
 		const mcpManager = {} as NonNullable<ToolSession["mcpManager"]>;
-		const extensionPaths = ["/plugins/example.ts"];
+		const extensionPaths: NonNullable<ToolSession["extensionPaths"]> = [
+			{ path: "/plugins/example.ts", scope: "user" },
+		];
 		const preparedExtensions = [
 			{
-				path: extensionPaths[0]!,
-				resolvedPath: extensionPaths[0]!,
+				...extensionPaths[0]!,
+				resolvedPath: extensionPaths[0]!.path,
 				factory: () => {},
 				error: null,
 			},

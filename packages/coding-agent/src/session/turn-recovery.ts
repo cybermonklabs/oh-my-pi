@@ -84,6 +84,7 @@ import {
 	type RetryFallbackSelector,
 	resolveRetryFallbackChainKey,
 	retryFallbackAdmits,
+	retryFallbackThinkingLevel,
 	type ServingModel,
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
@@ -2667,10 +2668,11 @@ export class TurnRecovery {
 		// A fallback selector's explicit level (or the carried level after the
 		// replacement model's floor clamp) must never exceed the session's
 		// per-spawn effort ceiling.
-		const nextThinkingLevel =
-			requestedThinkingLevel === AUTO_THINKING
-				? requestedThinkingLevel
-				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
+		const nextThinkingLevel = retryFallbackThinkingLevel(
+			candidate,
+			requestedThinkingLevel,
+			this.#host.thinkingLevelCeiling(),
+		);
 		const candidateSelector = formatModelStringWithRouting(candidate);
 		const previousModel = this.#host.model();
 		// Capture the edit mode under the outgoing model so the base system prompt

@@ -2652,12 +2652,26 @@ export interface Extension {
 }
 
 /**
+ * Where discovery found an extension: a project's own (its native module or hook, a plugin of project scope), the
+ * user's (the agent directory's module or hook, a plugin of user scope), an explicit or configured path
+ * (`--extension`, `additionalExtensionPaths`, the `extensions` setting), or a host's inline factory. A file found at
+ * project level and at another level is not a project's own.
+ */
+export type ExtensionScope = "project" | "user" | "explicit" | "inline";
+
+/** An extension source path with the scope discovery found it at, as sessions forward it to their children. */
+export interface ExtensionPathEntry {
+	path: string;
+	scope: ExtensionScope;
+}
+
+/**
  * Imported extension factory detached from any session runtime. The same
  * prepared module may be rebound to multiple session-scoped ExtensionAPI
- * instances without evaluating its module graph again.
+ * instances without evaluating its module graph again. It keeps the scope of
+ * the entry it was imported from.
  */
-export interface PreparedExtension {
-	path: string;
+export interface PreparedExtension extends ExtensionPathEntry {
 	resolvedPath: string;
 	factory: ExtensionFactory | null;
 	error: string | null;

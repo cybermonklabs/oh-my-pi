@@ -73,7 +73,7 @@ describe("session lifecycle environment reaches bash commands", () => {
 	): Promise<ExtensionRunner> {
 		const extensionPath = tempDir.join("session-env.ts");
 		fs.writeFileSync(extensionPath, SESSION_ENV_EXTENSION);
-		const loaded = await loadExtensions([extensionPath], tempDir.path());
+		const loaded = await loadExtensions([{ path: extensionPath, scope: "explicit" }], tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		return new ExtensionRunner(
 			loaded.extensions,

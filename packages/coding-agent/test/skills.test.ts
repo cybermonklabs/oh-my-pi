@@ -1229,7 +1229,7 @@ export default function (pi) {
 			// `initializeWithSettings` and wires process-global registries
 			// (model lifecycle, settings) that other suites assert against —
 			// unrelated global state this test must not touch.
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1313,7 +1313,7 @@ export default function (pi) {
 }
 `,
 			);
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1390,7 +1390,7 @@ export default function (pi) {
 }
 `,
 			);
-			const loaded = await loadExtensions([extPath], projectA);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], projectA);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1455,7 +1455,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1581,7 +1581,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1720,7 +1720,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1796,7 +1796,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1887,7 +1887,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1967,7 +1967,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2057,7 +2057,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2134,7 +2134,7 @@ export default function (pi) {
 }
 `,
 			);
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2231,7 +2231,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2325,7 +2325,7 @@ export default function (pi) {
 }
 `,
 			);
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2389,7 +2389,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2480,7 +2480,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2573,7 +2573,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2654,7 +2654,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2738,7 +2738,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -2843,7 +2843,7 @@ export default function (pi) {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");

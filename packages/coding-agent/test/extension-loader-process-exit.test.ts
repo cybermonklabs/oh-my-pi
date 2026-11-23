@@ -104,7 +104,10 @@ void withHostGuard(async () => {
 		const originalReallyExit = process.reallyExit;
 
 		const extensionResult = await loadExtensions(
-			[topLevelExtension, factoryExtension, reallyExitExtension, goodExtension],
+			[topLevelExtension, factoryExtension, reallyExitExtension, goodExtension].map(file => ({
+				path: file,
+				scope: "explicit" as const,
+			})),
 			cwd,
 		);
 		const hookResult = await loadHooks([topLevelHook, factoryHook], cwd);

@@ -68,13 +68,14 @@ import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mo
 import { isAuthenticated, kNoAuth, ModelRegistry, probeModelApiKey } from "./config/model-registry";
 import {
 	disabledProviderIds,
+	enabledProviderModels,
 	formatModelString,
 	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	type ModelMatchPreferences,
+	modelNotFoundMessage,
 	parseModelPattern,
 	pickDefaultAvailableModel,
-	providerModelHint,
 	resolveAllowedModels,
 	resolveCliModel,
 	type ResolveCliModelResult,
@@ -117,6 +118,7 @@ import {
 	type ExtensionAgentIdentity,
 	type ExtensionContext,
 	type ExtensionFactory,
+	type ExtensionPathEntry,
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
@@ -591,6 +593,12 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
+	/**
+	 * Project directories whose `.omp/secrets.yml` the secret mask loads besides cwd's (each directory once, cwd
+	 * included; the global secrets load once either way): a subagent revived from its file whose live inputs come
+	 * from a session in another directory passes that directory, so the secrets of both projects stay masked.
+	 */
+	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
@@ -800,16 +808,16 @@ export interface CreateAgentSessionOptions {
 	 *
 	 * @internal
 	 */
-	deferredExtensionPaths?: readonly string[];
+	deferredExtensionPaths?: readonly ExtensionPathEntry[];
 	/**
-	 * Pre-discovered extension source paths. When provided, the filesystem-scan
+	 * Pre-discovered extension source paths, each with its scope. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
 	 * `loadExtensions()` itself so each `Extension` is bound to THIS session's
 	 * `ExtensionAPI` (cwd, eventBus, runtime).
 	 *
 	 * Compatibility pass-through for callers that do not have prepared factories.
 	 */
-	preloadedExtensionPaths?: string[];
+	preloadedExtensionPaths?: ExtensionPathEntry[];
 	/**
 	 * Session-independent imported extension factories. Child sessions, including
 	 * restricted children, rebind these to their own ExtensionAPI without
@@ -837,7 +845,7 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Root-scoped bus carrying `task:subagent:*` observability frames for this
 	 * session and every subagent it spawns. Default: creates a new bus per
-	 * root session; `buildSubagentSessionOptions` inherits the spawner's.
+	 * root session; `buildSubagentSession` inherits the spawner's.
 	 */
 	subagentEventBus?: EventBus;
 
@@ -1223,7 +1231,7 @@ export async function discoverSessionExtensionPaths(
 	options: ExtensionDiscoveryOptions,
 	cwd: string,
 	settings: Settings,
-): Promise<string[]> {
+): Promise<ExtensionPathEntry[]> {
 	const roots = options.extensionRoots?.();
 	const explicit = roots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const explicitOnly = roots ? roots.mode === "explicit-only" : options.disableExtensionDiscovery;
@@ -1235,6 +1243,21 @@ export async function discoverSessionExtensionPaths(
 		ambient: !explicitOnly,
 		includeAmbientHooks: options.includeAmbientHooks,
 	});
+}
+
+/**
+ * The source entries of the file-backed extensions `result` bound: each bound extension's file but the inline
+ * factories (`<inline-N>`, per-session), at the scope of the prepared entry it was imported from; a file no
+ * prepared entry names (a caller-loaded result without them) is the caller's own, `explicit`. What a session
+ * forwards to its children.
+ */
+function boundExtensionPaths(result: LoadExtensionsResult): ExtensionPathEntry[] {
+	const scopes = new Map(
+		(result.preparedExtensions ?? []).map(prepared => [prepared.resolvedPath, prepared.scope] as const),
+	);
+	return result.extensions
+		.filter(extension => !extension.resolvedPath.startsWith("<inline"))
+		.map(({ resolvedPath }) => ({ path: resolvedPath, scope: scopes.get(resolvedPath) ?? "explicit" }));
 }
 
 /**
@@ -1256,7 +1279,7 @@ export async function loadSessionExtensions(
 	settings: Settings,
 	eventBus: EventBus,
 	loadOptions: { deferStartupSafe?: boolean } = {},
-): Promise<LoadExtensionsResult & { deferredPaths: string[] }> {
+): Promise<LoadExtensionsResult & { deferredPaths: ExtensionPathEntry[] }> {
 	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
 	const storage = settings.getStorage();
 	const { eager, deferred } =
@@ -2252,7 +2275,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// reflect actual loaded secrets, not just the setting toggle. Reassigned when
 	// `secrets.enabled` first turns on mid-session (see the watch after session creation).
 	let obfuscator: SecretObfuscator | undefined = cfgSecretsEnabled.get(settings)
-		? await buildSecretObfuscator(cwd, agentDir, options.agentDir)
+		? await buildSecretObfuscator(cwd, agentDir, options.agentDir, options.secretsProjectDirs)
 		: undefined;
 
 	// An abnormal process exit after a non-terminal message tail is durable
@@ -2894,6 +2917,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			storage: sessionManager.getStorage(),
 		});
 
+		// Provider, never a stored value: inherited child policy remains linked to
+		// the owning session, while top-level sessions materialize their own live
+		// settings on every discovery call.
+		const buildSessionExtensionRoots =
+			options.extensionRoots ??
+			((): EffectiveExtensionRoots => ({
+				explicit: options.additionalExtensionPaths ?? [],
+				mode: options.disableExtensionDiscovery ? "explicit-only" : "merge",
+				configured: cfgExtensions.get(settings),
+				configuredLevel: settings.extensionsSourceLevel(),
+			}));
+		// Before the built-in tools: the task tool lists the agents these roots discover when it is created.
+		toolSession.effectiveExtensionRoots = buildSessionExtensionRoots;
+
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 		const initialBrowserPreludeAvailable = shouldFilterBrowserMCPForPrelude({
@@ -2922,17 +2959,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (event.type === "connecting" && event.serverNames.length === 0) return;
 			eventBus.emit(MCP_CONNECTION_STATUS_EVENT_CHANNEL, event);
 		};
-		// Provider, never a stored value: inherited child policy remains linked to
-		// the owning session, while top-level sessions materialize their own live
-		// settings on every discovery call.
-		const buildSessionExtensionRoots =
-			options.extensionRoots ??
-			((): EffectiveExtensionRoots => ({
-				explicit: options.additionalExtensionPaths ?? [],
-				mode: options.disableExtensionDiscovery ? "explicit-only" : "merge",
-				configured: cfgExtensions.get(settings),
-				configuredLevel: settings.extensionsSourceLevel(),
-			}));
 		const mcpDiscoverOptions = {
 			onStatus: onMCPStatus,
 			startupTimeoutMs: cfgMcpStartupTimeoutMs.get(settings),
@@ -3079,7 +3105,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		//   4. No preload: run the full session discovery.
 		// `disableExtensionDiscovery` is honored implicitly: a caller that set
 		// the flag and pre-resolved the result already reflects that choice.
-		let extensionPaths: string[];
+		let extensionPaths: ExtensionPathEntry[];
 		let extensionsResult: LoadExtensionsResult;
 		if (!restrictToolNames && options.preloadedExtensions) {
 			extensionsResult = {
@@ -3087,16 +3113,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				extensions: [...options.preloadedExtensions.extensions],
 				preparedExtensions: options.preloadedExtensions.preparedExtensions?.slice(),
 			};
-			// Capture paths for downstream forwarding; filter inline-factory
-			// entries (`<inline-N>`) — those are per-session, not source paths.
-			extensionPaths = extensionsResult.extensions
-				.map(ext => ext.resolvedPath)
-				.filter(p => !p.startsWith("<inline"));
+			// Capture paths for downstream forwarding; inline-factory entries
+			// (`<inline-N>`) are per-session, not source paths.
+			extensionPaths = boundExtensionPaths(extensionsResult);
 		} else if (restrictToolNames || options.preloadedPreparedExtensions) {
 			// Restricted children retain parent hooks, not ambient discovery, new
 			// extension inputs, or parent-bound instances. Tool admission stays clamped.
 			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
-			extensionPaths = preparedExtensions.map(prepared => prepared.path);
+			extensionPaths = preparedExtensions.map(prepared => ({ path: prepared.path, scope: prepared.scope }));
 			extensionsResult = await logger.time(
 				"bindPreparedExtensions",
 				bindPreparedExtensions,
@@ -3125,7 +3149,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Forward the source-path list (NOT the loaded instances) so subagents
 		// rebuild their own session-scoped extensions.
 		toolSession.extensionPaths = extensionPaths;
-		toolSession.effectiveExtensionRoots = buildSessionExtensionRoots;
 
 		// Inline source ids must remain stable when caller factories are rebound in
 		// child sessions. Start after any prepared inline sources so SDK-provided
@@ -3152,6 +3175,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					extensionsResult.preparedExtensions ??= [];
 					extensionsResult.preparedExtensions.push({
 						path: sourceId,
+						scope: "inline",
 						resolvedPath: sourceId,
 						factory,
 						error: null,
@@ -3310,14 +3334,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allEnabledModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAll()
-					: modelRegistry.getAll().filter(candidate => !disabledProviders.has(candidate.provider));
-			const availableModels =
-				disabledProviders.size === 0
-					? modelRegistry.getAvailable()
-					: modelRegistry.getAvailable().filter(candidate => !disabledProviders.has(candidate.provider));
+			const allEnabledModels = enabledProviderModels(modelRegistry.getAll(), disabledProviders);
+			const availableModels = enabledProviderModels(modelRegistry.getAvailable(), disabledProviders);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -3726,15 +3744,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				});
 			}
 			if (!model) {
-				const requested =
-					deferredModelPatterns.length === 1
-						? `"${deferredModelPatterns[0]}"`
-						: `one of ${deferredModelPatterns.map(pattern => `"${pattern}"`).join(", ")}`;
-				// A single provider-qualified selector names its closest siblings, the same
-				// hint `resolveCliModel` gives before the selector was deferred here.
-				const hint =
-					deferredModelPatterns.length === 1 ? providerModelHint(deferredModelPatterns[0], allEnabledModels) : "";
-				modelFallbackMessage = `Model ${requested} not found${hint ? `.${hint}` : ""}`;
+				modelFallbackMessage = modelNotFoundMessage(deferredModelPatterns, allEnabledModels);
 			}
 		}
 
@@ -5558,7 +5568,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (next.secretsEnabled !== previous.secretsEnabled) {
 				try {
 					if (cfgSecretsEnabled.get(settings) && !obfuscator) {
-						const built = await buildSecretObfuscator(cwd, agentDir, options.agentDir);
+						const built = await buildSecretObfuscator(
+							cwd,
+							agentDir,
+							options.agentDir,
+							options.secretsProjectDirs,
+						);
 						if (!obfuscator && built) {
 							obfuscator = built;
 							session.setObfuscator(built);
@@ -5738,8 +5753,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					discoverExtensionPaths([...roots.explicit, ...seenConfiguredExtensions], cwdNow, []),
 					discoverSessionExtensionPaths({ extensionRoots: () => roots }, cwdNow, settings),
 				]);
-				const governed = new Set(governedPaths.map(extensionPath => resolvePath(extensionPath, cwdNow)));
-				const enabled = new Set(enabledPaths.map(extensionPath => resolvePath(extensionPath, cwdNow)));
+				const governed = new Set(governedPaths.map(entry => resolvePath(entry.path, cwdNow)));
+				const enabled = new Set(enabledPaths.map(entry => resolvePath(entry.path, cwdNow)));
 				const { suspended, resumed } = extensionRunner.setSuspendedExtensions(
 					extension => governed.has(extension.resolvedPath) && !enabled.has(extension.resolvedPath),
 				);
@@ -6294,7 +6309,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.registerProvider(name, config, sourceId);
 				}
 				forwardedPreparedExtensions.push(...(loaded.preparedExtensions ?? []));
-				extensionPaths.push(...loaded.extensions.map(extension => extension.resolvedPath));
+				extensionPaths.push(...boundExtensionPaths(loaded));
 				await extensionRunner.addExtensions(loaded.extensions);
 			});
 		}
