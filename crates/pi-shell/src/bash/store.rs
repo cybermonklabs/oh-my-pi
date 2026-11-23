@@ -562,12 +562,16 @@ pub struct Job {
 	pub inherited: bool,
 	/// Working directory it started in (`(wd: …)` when it differs).
 	pub wd:        BString,
-	/// The OS pid of the program the job runs, once it spawned it: bash's
-	/// subshell for an asynchronous simple command `exec`s the program, so
-	/// a job whose lone command is an external (or whose body `exec`s one)
-	/// is known by that program's pid (`$!`, `jobs -l`/`-p`; `kill`, `wait`
-	/// and `disown` accept it). `None` for a compound job, a builtin, a
-	/// function, a failed spawn, and while the job has not decided yet.
+	/// The pid of the process `$!` names other than the job's own vproc,
+	/// once known: the OS pid of the program the job runs (bash's subshell
+	/// for an asynchronous simple command `exec`s the program, so a job
+	/// whose lone command is an external, or whose body `exec`s one, is
+	/// known by that program's pid), or for a pipeline the pid of its last
+	/// stage (its program's, or the stage vproc's virtual pid when it runs
+	/// no lone program: bash and zsh name the last process). `$!`, `jobs
+	/// -l`/`-p` show it; `kill`, `wait` and `disown` accept it. `None` for
+	/// a compound job, a builtin, a function, a failed spawn, and while the
+	/// job has not decided yet.
 	pub os_pid:    Option<u32>,
 }
 

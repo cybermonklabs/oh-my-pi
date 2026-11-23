@@ -3917,57 +3917,171 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 /// ([`BangStage::Lone`]), a group that `exec`s one (`{ exec cmd; }`,
 /// [`BangStage::Exec`]), or a pipeline, whose last stage decides
 /// ([`BangStage::Pipeline`], [`retarget_bang`]). Any other compound job
-/// keeps its virtual pid at once: its readers never wait.
+/// keeps its virtual pid at once: its readers never wait. A timed body
+/// (`time …`, [`timed_body`]) is judged as the body it times.
 fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-	if code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit) {
-		return Some(BangStage::Lone);
-	}
-	// `time` and `!` wrap the pipeline's spawn: `[TimeStart] Spawn …
-	// [Not] [TimeEnd]`, then the job's `SubExit`.
-	let at = if code(entry) == Some(Opcode::TimeStart) {
-		entry + 1
-	} else {
-		entry
+	// `time` wraps the body: `TimeStart … TimeEnd`, then the job's
+	// `SubExit`.
+	let timed = timed_body(unit, entry);
+	let entry = if timed { entry + 1 } else { entry };
+	let ends = |at: u32| {
+		code(at) == Some(Opcode::SubExit)
+			|| (timed && code(at) == Some(Opcode::TimeEnd) && code(at + 1) == Some(Opcode::SubExit))
 	};
-	if let Some(op) = unit.ops.get(at as usize)
+	// The literal name the simple command at `at` runs, if any.
+	let name_at = |at: u32| {
+		unit
+			.ops
+			.get(at as usize)
+			.and_then(|op| unit.cmds.get(op.a as usize))
+			.and_then(|cmd| unit.lists.get(cmd.words as usize))
+			.and_then(|words| words.first())
+			.and_then(|&w| unit.words.get(w as usize))
+			.and_then(|w| match w.parts.as_slice() {
+				[ir::Part::Lit(name)] => Some(name.as_slice()),
+				_ => None,
+			})
+	};
+	if code(entry) == Some(Opcode::Exec) && ends(entry + 1) {
+		// A timed shell builtin (`time : &`, `time read x &`) runs no
+		// program: the job keeps its virtual pid at once, as it did, so
+		// `$!` does not wait for the job to run it (bash's subshell is still
+		// there for `kill $!` and `jobs`).
+		let builtin = name_at(entry)
+			.and_then(crate::bash::ids::IntrinsicId::from_name)
+			.is_some();
+		return (!(timed && builtin)).then_some(BangStage::Lone);
+	}
+	// `!` wraps the pipeline's spawn: `Spawn … [Not]`.
+	if let Some(op) = unit.ops.get(entry as usize)
 		&& op.code == Opcode::Spawn
 		&& let Some(spawn) = unit.spawns.get(op.a as usize)
 		&& spawn.kind == SpawnKind::Pipeline
 	{
 		let mut end = spawn.end;
-		for wrap in [Opcode::Not, Opcode::TimeEnd] {
-			if code(end) == Some(wrap) {
-				end += 1;
-			}
+		if code(end) == Some(Opcode::Not) {
+			end += 1;
 		}
-		if code(end) == Some(Opcode::SubExit) {
+		if ends(end) {
 			return Some(BangStage::Pipeline);
 		}
 	}
-	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave, Opcode::SubExit]
+	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave]
 		.iter()
 		.zip(entry..)
-		.all(|(&want, at)| code(at) == Some(want));
-	let exec = unit
+		.all(|(&want, at)| code(at) == Some(want))
+		&& ends(entry + 3);
+	let exec = name_at(entry + 1) == Some(b"exec".as_slice());
+	if group && exec {
+		Some(BangStage::Exec)
+	} else {
+		// A timed group whose only command runs a program: that program is
+		// the job's whole life, so it decides at once
+		// ([`BangStage::First`]). Any other timed body keeps the virtual
+		// pid at once. A body with a second command would be known by its
+		// first program, which an outside `kill` ends while the body runs
+		// on, and deciding at a later command could hold `$!` while the
+		// body loops (`time { while :; do :; done; } &`). A timed subshell
+		// body (`time ( cmd ) &`, lowered `Enter, Spawn … SubExit, Leave`)
+		// whose only command runs a program hands the decision to the
+		// subshell (`spawn`).
+		let subshell = code(entry) == Some(Opcode::Enter)
+			&& unit.ops.get(entry as usize + 1).is_some_and(|op| {
+				op.code == Opcode::Spawn
+					&& unit.spawns.get(op.a as usize).is_some_and(|s| {
+						s.kind == SpawnKind::Subshell
+							&& code(s.end) == Some(Opcode::Leave)
+							&& ends(s.end + 1)
+							&& s
+								.stages
+								.first()
+								.is_some_and(|st| program_only(unit, st.entry))
+					})
+			});
+		(timed && (subshell || program_only(unit, entry))).then_some(BangStage::First)
+	}
+}
+
+/// Whether the code at `at` is one simple command whose literal name is no
+/// shell builtin (it may run a program), alone or as the only command of a
+/// group (`{ cmd; }`), with or without a `!` (`time ! cmd &`, lowered
+/// `Exec, Not`), and nothing after it: that program is the body's whole
+/// life, so the body decides its job's pid at its dispatch
+/// ([`BangStage::First`]). The body ends at a `SubExit` (a job's or a
+/// subshell's), at `TimeEnd` then `SubExit` (a timed job; `TimeEnd`
+/// followed by more code is the end of a timed first pipeline of a list,
+/// `time cmd && more &`, not of the body), or at `End` (a function body).
+pub(super) fn program_only(unit: &Unit, at: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let program = |at: u32| {
+		code(at) == Some(Opcode::Exec)
+			&& unit
+				.ops
+				.get(at as usize)
+				.and_then(|op| unit.cmds.get(op.a as usize))
+				.and_then(|cmd| unit.lists.get(cmd.words as usize))
+				.and_then(|words| words.first())
+				.and_then(|&w| unit.words.get(w as usize))
+				.is_some_and(|w| {
+					matches!(w.parts.as_slice(), [ir::Part::Lit(name)]
+						if crate::bash::ids::IntrinsicId::from_name(name).is_none())
+				})
+	};
+	// The code after the command at `at`: past its `!`, if it has one.
+	let after = |at: u32| {
+		if code(at + 1) == Some(Opcode::Not) {
+			at + 2
+		} else {
+			at + 1
+		}
+	};
+	let ends = |at: u32| match code(at) {
+		Some(Opcode::SubExit | Opcode::End) => true,
+		Some(Opcode::TimeEnd) => code(at + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
+	(program(at) && ends(after(at)))
+		|| (code(at) == Some(Opcode::Enter)
+			&& program(at + 1)
+			&& code(after(at + 1)) == Some(Opcode::Leave)
+			&& ends(after(at + 1) + 1))
+}
+
+/// Whether the background job whose body starts at `entry` is timed
+/// (`time … &`): bash runs it as a subshell of its own
+/// (`CMD_FORCE_SUBSHELL`), which `$!` names and which lives as long as the
+/// job, so the program the job is known by stands for the whole job
+/// ([`Bang::timed`]).
+fn timed_body(unit: &Unit, entry: u32) -> bool {
+	unit
 		.ops
-		.get(entry as usize + 1)
-		.and_then(|op| unit.cmds.get(op.a as usize))
-		.and_then(|cmd| unit.lists.get(cmd.words as usize))
-		.and_then(|words| words.first())
-		.and_then(|&w| unit.words.get(w as usize))
-		.is_some_and(
-			|w| matches!(w.parts.as_slice(), [ir::Part::Lit(name)] if name.as_slice() == b"exec"),
-		);
-	(group && exec).then_some(BangStage::Exec)
+		.get(entry as usize)
+		.is_some_and(|op| op.code == Opcode::TimeStart)
+}
+
+/// Whether the `Spawn` at `pc` starts the pipeline a background job's
+/// whole command is ([`BangStage::Pipeline`]): only that job's own vproc
+/// runs the code at its entry. A timed one (`time a | b &`, its `Spawn`
+/// after the `TimeStart`) is not: bash runs `time P &` in a subshell of
+/// its own, where the pipeline is synchronous.
+fn job_pipeline(unit: &Unit, pc: u32) -> bool {
+	unit.spawns.iter().any(|s| {
+		s.kind == SpawnKind::Background
+			&& s.stages.first().is_some_and(|st| {
+				pc == st.entry && bang_stage(unit, st.entry) == Some(BangStage::Pipeline)
+			})
+	})
 }
 
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
-/// started `stages` (`(vproc, entry)`; the last one a child, or the job's
-/// own vproc under `lastpipe`): its last stage decides the job's pid as a
-/// job body of its own would (bash and zsh name the last process in `$!`).
-/// While the job's `[n] pid…` line waits, every earlier stage decides the
-/// pid that line shows for it the same way (zsh names each process).
+/// started `stages` (`(vproc, entry)`; the last one a child, or under
+/// `lastpipe` the job's own vproc when the pipeline is timed): its last
+/// stage decides the job's pid as a job body of its own would (bash and
+/// zsh name the last process in `$!`), and a child one that runs no lone
+/// program is named by its virtual pid (its `$BASHPID`). While the job's
+/// `[n] pid…` line waits, every earlier stage decides the pid that line
+/// shows for it the same way (zsh names each process).
 fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, u32)]) {
 	let Some(i) = k
 		.bangs
@@ -3987,19 +4101,26 @@ fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, 
 			if let Some(kind) = decides
 				&& stage != last
 			{
-				k.bangs.push(Bang { vproc: stage, job: stage, stage: kind });
+				k.bangs.push(Bang {
+					vproc: stage,
+					job:   stage,
+					stage: kind,
+					last:  None,
+					timed: false,
+				});
 			}
 			pids.push((stage, decides.is_some()));
 		}
 		super::jobctl::pipeline_started(k, job_vproc, &pids);
 	}
+	let bang = &mut k.bangs[i];
+	bang.vproc = last;
+	if last != job_vproc {
+		bang.last = Some(last);
+	}
 	match lone(last_entry) {
-		Some(stage) => {
-			let bang = &mut k.bangs[i];
-			bang.vproc = last;
-			bang.stage = stage;
-		},
-		None => k.settle_bang(job_vproc, None),
+		Some(stage) => bang.stage = stage,
+		None => k.settle_bang(last, None),
 	}
 }
 
@@ -4031,7 +4152,18 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				.bangs
 				.iter()
 				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-		if !k.bangs.is_empty() && !own_pipeline {
+		// A timed job whose body is a subshell of one program (`time ( cmd
+		// ) &`): the subshell's command decides ([`BangStage::First`]). The
+		// job's vproc holds a pending First only for a body `bang_stage`
+		// (or a function call, whose body is one program and forks nothing)
+		// found to be that subshell, and forks nothing before it: this spawn
+		// is the body's own subshell.
+		let own_subshell = info.kind == SpawnKind::Subshell
+			&& k
+				.bangs
+				.iter()
+				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::First);
+		if !k.bangs.is_empty() && !own_pipeline && !own_subshell {
 			k.settle_bang(vp.vpid, None);
 		}
 		let mut children = Vec::with_capacity(info.stages.len());
@@ -4072,14 +4204,24 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
+				if own_subshell && let Some(bang) = k.bangs.iter_mut().find(|b| b.vproc == vp.vpid) {
+					bang.vproc = vpid;
+				}
 				k.spawned.push(Box::new(child));
 				if info.kind == SpawnKind::Background {
 					vp.last_bg = LastBg::new(vpid);
 					// Known by its program's OS pid if the first command it runs
 					// spawns it (bash's subshell `exec`s a lone simple command):
 					// readers of the pid wait for that decision.
-					if let Some(stage) = bang_stage(unit, info.stages[0].entry) {
-						k.bangs.push(Bang { vproc: vpid, job: vpid, stage });
+					let entry = info.stages[0].entry;
+					if let Some(stage) = bang_stage(unit, entry) {
+						k.bangs.push(Bang {
+							vproc: vpid,
+							job: vpid,
+							stage,
+							last: None,
+							timed: timed_body(unit, entry),
+						});
 					}
 					let job = k.job_id(cx.store);
 					// zsh `&|` / `&!`: disowned at once (no job entry).
@@ -4108,13 +4250,18 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				// `lastpipe` without job control: the last stage runs here. zsh
 				// runs it in the current shell but under sh emulation
 				// (`execcmd_exec`'s `last1 == 2 && input &&
-				// EMULATION(EMULATE_SH)`).
-				let lastpipe = if unit.mode.dialect() == Dialect::Zsh {
-					vp.mode != ModeId::ZshSh
-				} else {
-					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
-						&& !job_control(k, cx, vp)
-				};
+				// EMULATION(EMULATE_SH)`). Neither for the pipeline a
+				// background job's whole command is ([`job_pipeline`]): bash
+				// and zsh fork every stage of an asynchronous pipeline, the
+				// last one too (bash's `lastpipe` only applies to a
+				// synchronous one, `execute_cmd.c:2735`).
+				let lastpipe = !job_pipeline(unit, top_frame(vp).pc)
+					&& if unit.mode.dialect() == Dialect::Zsh {
+						vp.mode != ModeId::ZshSh
+					} else {
+						state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+							&& !job_control(k, cx, vp)
+					};
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
