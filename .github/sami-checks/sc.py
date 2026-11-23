@@ -299,6 +299,23 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     return skip_verdict(res)
 
 
+def libtest_slow(path):
+    """The tests libtest warned about at 60 s (its `timeout` event), sorted."""
+    slow = set()
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            if line.startswith("{") and '"timeout"' in line:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "test" and ev.get("event") == "timeout":
+                    slow.add(ev.get("name", "?"))
+    except OSError:
+        pass
+    return sorted(slow)
+
+
 def test_outputs(path, kind):
     """{test: what it printed} from a libtest JSON log (kind libtest) or a nextest JUnit report."""
     out = {}
@@ -332,9 +349,10 @@ def why_line(text):
     return lines[0][:300] if lines else "(it printed nothing)"
 
 
-def gv_environment(res, outputs):
+def gv_environment(res, outputs, slow=()):
     """A gVisor unit's GV_ENVIRONMENT tests leave its failures and self-skips for its `environment`
-    list (each with its line and reason); the unit gets the verdict the rest of its tests give."""
+    list (each with its line and reason); the unit gets the verdict the rest of its tests give.
+    `slow`: the tests libtest warned about at 60 s, for the note a re-judged unit gets back."""
     env = []
     for kind, key in (("failed", "failures"), ("skipped itself", "self_skipped")):
         for t in [t for t in res[key] if t in GV_ENVIRONMENT]:
@@ -343,11 +361,11 @@ def gv_environment(res, outputs):
                 res["failed"] -= 1
             env.append({"test": t, "kind": kind, "line": why_line(outputs.get(t, "")), "reason": GV_ENVIRONMENT[t]})
     res["environment"] = env
-    if env and res["status"] == "FAIL" and not res["failures"]:
-        res["status"] = "PASS"
-    elif env and res["status"] == "UNKNOWN" and "printed a skip marker" in res["note"]:
-        # skip_verdict made it UNKNOWN from a PASS: judge the self-skips that are left again.
-        res["status"], res["note"] = "PASS", ""
+    # Re-judge only a unit whose FAIL or skip-marker UNKNOWN came from set-apart tests alone (an
+    # UNKNOWN for its exit or its counts stays). As skip_verdict does: a self-skip left keeps it UNKNOWN.
+    if env and not res["failures"] and (res["status"] == "FAIL" or
+                                        (res["status"] == "UNKNOWN" and "printed a skip marker" in res["note"])):
+        res["status"], res["note"] = "PASS", ("past 60 s: " + ", ".join(list(slow)[:10]) if slow else "")
         res["passed"] += len(res["self_skipped"])
         skip_verdict(res)
     return res
@@ -749,7 +767,7 @@ def selftest():
         with open(p, "w") as f:
             for e in events:
                 f.write(json.dumps(e) + "\n")
-        return gv_environment(parse_libtest(p, str(exit_code), 1, row, "pi-shell", "root"), test_outputs(p, "libtest"))
+        return gv_environment(parse_libtest(p, str(exit_code), 1, row, "pi-shell", "root"), test_outputs(p, "libtest"), libtest_slow(p))
 
     r = gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0)
     check("gVisor env self-skip set apart", (r["status"], r["passed"], r["self_skipped"], [e["kind"] for e in r["environment"]]),
@@ -760,6 +778,12 @@ def selftest():
           ("PASS", 0, [], "assertion failed: refused"))
     r = gvlt([s0, a_s, a_ok, b_s, b_f, e_s, e_fail, end_3f], 101)
     check("a real failure beside it still fails", (r["status"], r["failures"]), ("FAIL", ["b"]))
+    end_1p1f = {"type": "suite", "event": "failed", "passed": 1, "failed": 1}
+    r = gvlt([s0, a_s, a_skip, e_s, e_fail, end_1p1f], 101)
+    check("a self-skip beside a set-apart failure keeps the unit UNKNOWN", (r["status"], r["self_skipped"]), ("UNKNOWN", ["a"]))
+    e_slow = {"type": "test", "event": "timeout", "name": "a"}
+    r = gvlt([s0, a_s, e_slow, a_ok, e_s, e_skip, end_2ok], 0)
+    check("a re-judged unit keeps its 60 s warning note", (r["status"], r["note"]), ("PASS", "past 60 s: a"))
     p = os.path.join(d, "host.log")
     with open(p, "w") as f:
         for e in [s0, a_s, a_ok, e_s, e_skip, end_2ok]:
@@ -794,7 +818,7 @@ def main(argv):
         junit, ex, secs, row, unit, who = a
         print(json.dumps(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,))))
     elif c == "gv-libtest":
-        print(json.dumps(gv_environment(parse_libtest(*a), test_outputs(a[0], "libtest"))))
+        print(json.dumps(gv_environment(parse_libtest(*a), test_outputs(a[0], "libtest"), libtest_slow(a[0]))))
     elif c == "gv-nextest":
         junit, ex, secs, row, unit, who = a
         print(json.dumps(gv_environment(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,)), test_outputs(junit, "junit"))))
