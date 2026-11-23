@@ -173,13 +173,12 @@ import {
 	appendRecallBlock,
 	type ConversationRecall,
 	findConversationRecall,
-	MEMORY_RECALL_ENTRY_TYPE,
 	recallsIntoConversation,
 	withoutDeliveredRecall,
 } from "./memory-backend/recall-entry";
 import { cfgMemoryBackend } from "./memory-backend/settings";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
-import { loadMnemopiCore, type MnemopiSessionStateApi } from "./mnemopi/state";
+import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
@@ -957,6 +956,13 @@ export interface CreateAgentSessionOptions {
 	parentHindsightSessionState?: HindsightSessionStateApi;
 	/** Parent Mnemopi state: subagents alias it; a top-level fork (`/tan`) inherits its delivered recall. */
 	parentMnemopiSessionState?: MnemopiSessionStateApi;
+	/**
+	 * The session a `/tan` clone forks while that session withholds a change (a held settings change, a kept restored
+	 * prompt): the clone's fixed `systemPrompt` is that session's build ({@link AgentSession.withheldPromptBuild}), so
+	 * the clone restores the prompt its copied transcript stores, which that session's operator inputs built, and sends
+	 * its fixed prompt once the change goes out. The digest it compares is read from the session itself.
+	 */
+	tanParent?: AgentSession;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -4622,24 +4628,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			let memoryRecall: ConversationRecall | undefined;
 			if (hasSession) {
 				memoryRecall = session.memoryRecall;
-			} else if (!restrictToolNames) {
-				const backend = cfgMemoryBackend.get(settings);
-				if (recallsIntoConversation(backend)) {
-					// Mnemopi's scope names its banks' databases, which its core module resolves; the backend's start
-					// loads it too, and the session reads the same scope when it adopts the recall. Only a branch that
-					// records a recall has the scope read.
-					if (
-						backend === "mnemopi" &&
-						sessionManager
-							.getBranchView()
-							.some(entry => entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
-					) {
-						await loadMnemopiCore();
-					}
-					memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
-						memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
-					);
-				}
+			} else if (!restrictToolNames && recallsIntoConversation(cfgMemoryBackend.get(settings))) {
+				memoryRecall = findConversationRecall(sessionManager.getBranchView(), () =>
+					memoryRecallScope(settings, sessionManager.getCwd(), agentDir),
+				);
 			}
 			const recallBlock = memoryRecall && !memoryRecall.hidden ? memoryRecall.text : undefined;
 			// A caller's prompt that ends with that block already (a `/tan` clone sends its parent's prompt as sent, a
@@ -4761,6 +4753,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? { mode: "compact", toolNames: [...toolNames, ...mountedPromptToolNames] }
 					: { mode: "full" },
 			);
+			// The workspace roots the prompt lists follow `workspace.additionalDirectories` (the session keeps the
+			// setting's roots among its own): the build reads the setting, so a change of it is one the prompt moves with.
+			cfgWorkspaceAdditionalDirectories.get(settings);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
@@ -4796,7 +4791,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				ovnfs: ovnfsCommand(settings),
 				writeTransportOnly:
 					toolSession.deviceOnlyWrite === true && toolSession.pendingFullWriteDescription !== true,
-				secretsEnabled: obfuscator?.obfuscates() === true,
+				// The obfuscator follows `secrets.enabled`: the build reads the setting, so a change of it is one the
+				// prompt moves with.
+				secretsEnabled: cfgSecretsEnabled.get(settings) && obfuscator?.obfuscates() === true,
 				workspaceTree: workspaceTreePromise ?? emptyWorkspaceTree,
 				includeWorkspaceTree,
 				memoryBackend: memoryBackend?.id,
@@ -5534,7 +5531,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// against the user's standing project rules instead of advising blind.
 		const advisorContextPrompt = formatAdvisorContextPrompt(contextFiles);
 		// The prompt inputs the operator gives explicitly: a resumed transcript's stored prompt is sent again only
-		// while they are unchanged (`SessionTools`). A prompt function cannot be compared, so it never is.
+		// while they are unchanged (`SessionTools`); a `/tan` clone compares its parent's instead (`tanParent`). A
+		// prompt function cannot be compared, so it never is.
 		const operatorPromptDigest =
 			typeof options.systemPrompt === "function"
 				? undefined
@@ -5642,6 +5640,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			rebuildSystemPrompt,
 			baseSettingsRead,
 			operatorPromptDigest,
+			tanParent: options.tanParent,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames,
@@ -5721,7 +5720,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
 		// reports its state. Each settings-started rebuild below passes the change, so a
-		// bound prompt holds it until a cut, a lapsed cache entry or five minutes on (`SessionTools`).
+		// bound prompt holds what of it moves the prompt or a tool definition until a cut, a
+		// lapsed cache entry or five minutes on, and nothing of a change that moves neither
+		// (`SessionTools`): a subagent's prompt never renders `personality`, for one.
 		cfgSystemPromptInputs.listenChanges(session, async settingsChange => {
 			if (settingsChange.some(change => change.setting === cfgSecretsEnabled)) {
 				try {

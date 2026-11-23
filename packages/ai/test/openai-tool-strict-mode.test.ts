@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { restoreOpenAICompletionsStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-completions-state";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { restoreOpenAIResponsesStrictToolsFallback } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { providerFallbacks } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import type {
+	Api,
 	Context,
 	FetchImpl,
 	Model,
@@ -13,6 +17,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 
 const testTool: Tool = {
 	name: "echo",
@@ -788,6 +793,82 @@ describe("OpenAI tool strict mode", () => {
 		expect(nextResult.stopReason).toBe("stop");
 		expect(strictFlags).toEqual([[true], [undefined], [undefined]]);
 	});
+
+	it.each(["openai-completions", "openai-responses"] as const)(
+		"puts a recorded %s strict-tools fallback back when the models config adds a trailing slash to the endpoint",
+		async api => {
+			const bundled = getBundledModel(
+				"openrouter",
+				"deepseek/deepseek-v4-flash-0731",
+			) as Model<"openai-completions">;
+			const spec = { ...toModelSpec(bundled), api } as ModelSpec<typeof api>;
+			const model = buildModel(spec);
+			// A models config edit that only adds a trailing slash: the requests still reach the same endpoint.
+			const slashed = buildModel({ ...spec, baseUrl: `${spec.baseUrl}/` });
+			const strictFlags: boolean[][] = [];
+			const fetchMock: FetchImpl = Object.assign(
+				async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+					const bodyText = typeof init?.body === "string" ? init.body : "";
+					const tools = toRecord(JSON.parse(bodyText)).tools;
+					const flags = Array.isArray(tools)
+						? tools.map(tool => (toRecord(tool).strict ?? toRecord(toRecord(tool).function).strict) === true)
+						: [];
+					strictFlags.push(flags);
+					if (flags.includes(true)) {
+						return new Response(JSON.stringify({ error: { message: "Provider returned error", code: 400 } }), {
+							status: 400,
+							headers: { "content-type": "application/json" },
+						});
+					}
+					return api === "openai-responses"
+						? createResponsesTextSseResponse("Recovered")
+						: createSseResponse([
+								{
+									id: "chatcmpl-slash",
+									object: "chat.completion.chunk",
+									created: 0,
+									model: model.id,
+									choices: [{ index: 0, delta: { content: "Recovered" }, finish_reason: "stop" }],
+								},
+								"[DONE]",
+							]);
+				},
+				{ preconnect: fetch.preconnect },
+			);
+			const send = (sent: Model<Api>, providerSessionState: Map<string, ProviderSessionState>) =>
+				(api === "openai-responses"
+					? streamOpenAIResponses(sent as Model<"openai-responses">, testContext, {
+							apiKey: "not-a-secret",
+							providerSessionState,
+							fetch: fetchMock,
+						})
+					: streamOpenAICompletions(sent as Model<"openai-completions">, testContext, {
+							apiKey: "not-a-secret",
+							providerSessionState,
+							fetch: fetchMock,
+						})
+				).result();
+
+			// The process before met the 400 and kept the fallback, which its session recorded.
+			const before = new Map<string, ProviderSessionState>();
+			expect((await send(model, before)).stopReason).toBe("stop");
+			const recorded = providerFallbacks(before);
+			expect(recorded).toHaveLength(1);
+
+			// The process that resumes the session puts the record back, then sends on the edited endpoint.
+			const resumed = new Map<string, ProviderSessionState>();
+			for (const fallback of recorded) {
+				if (fallback.api === "openai-responses") {
+					restoreOpenAIResponsesStrictToolsFallback(resumed, slashed as Model<"openai-responses">, fallback);
+				} else if (fallback.api === "openai-completions") {
+					restoreOpenAICompletionsStrictToolsFallback(resumed, fallback);
+				}
+			}
+			expect((await send(slashed, resumed)).stopReason).toBe("stop");
+			// Its one request sends no strict tool, as the last request before did: no second 400.
+			expect(strictFlags).toEqual([[true], [false], [false]]);
+		},
+	);
 
 	it("sends strict=true for openai-responses tool schemas on OpenAI", async () => {
 		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;

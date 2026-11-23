@@ -288,6 +288,26 @@ export interface HindsightClientApi {
 	getMentalModelHistory(bankId: string, mentalModelId: string): Promise<MentalModelHistoryEntry[]>;
 }
 
+/**
+ * The base URL the client sends its requests under for `apiUrl` (`hindsight.apiUrl`), as `fetch` reads it: parsed as
+ * a URL (scheme and host lowercased, a default port dropped, dot segments resolved) and without trailing slashes; a
+ * value that does not parse only loses its trailing slashes. Spellings that reach the same server give the same base
+ * URL, which names the server in a recorded recall's scope (`hindsightRecallScope`).
+ */
+export function hindsightBaseUrl(apiUrl: string): string {
+	return (URL.parse(apiUrl)?.href ?? apiUrl).replace(/\/+$/, "");
+}
+
+/** The server `config` names, as the client reaches it ({@link hindsightBaseUrl}); null without `hindsight.apiUrl`. */
+export function hindsightServer(config: HindsightConfig): string | null {
+	return config.hindsightApiUrl === null ? null : hindsightBaseUrl(config.hindsightApiUrl);
+}
+
+/** The API token `config` names, without surrounding whitespace: the account a recall and a running session compare. */
+export function hindsightAccountToken(config: HindsightConfig): string {
+	return (config.hindsightApiToken ?? "").trim();
+}
+
 export class HindsightApi implements HindsightClientApi {
 	#baseUrl: string;
 	#headers: Record<string, string>;
@@ -298,7 +318,7 @@ export class HindsightApi implements HindsightClientApi {
 	#hold: DispatchHold;
 
 	constructor(options: HindsightApiOptions) {
-		this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
+		this.#baseUrl = hindsightBaseUrl(options.baseUrl);
 		this.#headers = {
 			"User-Agent": options.userAgent ?? DEFAULT_USER_AGENT,
 			"Content-Type": "application/json",

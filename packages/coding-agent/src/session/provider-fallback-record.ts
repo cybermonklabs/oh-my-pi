@@ -8,7 +8,9 @@ import {
 	type ProviderFallback,
 	providerFallbacks,
 } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
+import { wireModel } from "@oh-my-pi/pi-ai/providers/wire-model";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import type { ModelRegistry } from "../config/model-registry";
 import type { SessionManager } from "./session-manager";
 
 /**
@@ -27,8 +29,8 @@ export interface ProviderFallbackRecordHost {
 	>;
 	/** The session's provider state, which the providers' requests keep their fallbacks in. */
 	providerSessionState: Map<string, ProviderSessionState>;
-	/** The model a recorded Responses fallback names: its provider state starts from the model's compat. */
-	findModel(provider: string, modelId: string): Model<Api> | undefined;
+	/** Where the model a recorded Responses fallback names is found: its provider state starts from the model's compat. */
+	modelRegistry: Pick<ModelRegistry, "find" | "getProviderModels">;
 }
 
 /** The newest record of one read of the session's entries, kept current by the record's own writes. */
@@ -121,7 +123,7 @@ export class ProviderFallbackRecord {
 					restoreOpenAICompletionsStrictToolsFallback(state, fallback);
 					break;
 				case "openai-responses": {
-					const model = this.#host.findModel(fallback.provider, fallback.modelId);
+					const model = this.#requestModel(fallback.provider, fallback.modelId);
 					// Without the model its state cannot start right; its next rejection turns the fallback on again.
 					if (!model) break;
 					restoreOpenAIResponsesStrictToolsFallback(state, model as Model<"openai-responses">, fallback);
@@ -129,6 +131,22 @@ export class ProviderFallbackRecord {
 				}
 			}
 		}
+	}
+
+	/**
+	 * The model requests went out as under `provider` and `modelId`, the scope a Responses fallback names: the
+	 * registry's model of that id, else the one a wrapper transport sends a model of the provider as ({@link wireModel}:
+	 * GitLab Duo's requests name the upstream id, which no catalog row of the provider carries).
+	 */
+	#requestModel(provider: string, modelId: string): Model<Api> | undefined {
+		const registry = this.#host.modelRegistry;
+		const found = registry.find(provider, modelId);
+		if (found) return found;
+		for (const model of registry.getProviderModels(provider)) {
+			const wire = wireModel(model);
+			if (wire.id === modelId) return wire;
+		}
+		return undefined;
 	}
 }
 

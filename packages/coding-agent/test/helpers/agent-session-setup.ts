@@ -79,6 +79,16 @@ export function setClock(offsetMs: number): void {
 	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
 }
 
+/** The opening of the hidden settings notice. */
+export const SETTINGS_NOTICE = '<system-notice id="settings">';
+
+/** The time a settings notice in `text` gives for its change to go out; throws when `text` gives none. */
+export function noticeDeadline(text: string): number {
+	const deadline = text.match(/at the first request made at (\S+) or later/)?.[1];
+	if (!deadline) throw new Error("Expected the notice's deadline");
+	return Date.parse(deadline);
+}
+
 /** Session storage of a process that may not write the session another omp process owns. */
 export class OwnedElsewhereStorage extends FileSessionStorage {
 	readonly #ownedId: string;

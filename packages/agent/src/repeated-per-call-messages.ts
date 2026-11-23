@@ -12,15 +12,19 @@ import {
  * same position, such as a context hook's fixed note after the compaction summary, is history to the cache:
  * {@link settle} sends it as an ordinary message, so it no longer takes a rolling breakpoint. A message that changes or
  * moves stays per-call. Only the Agent's own loop settles its requests: side requests, live steering and other Agents
- * never read or change this record.
+ * never read or change this record. A request the loop prepares but never sends (a `beforeModelCall` stop, an abort)
+ * leaves the record as the last request sent left it.
  */
 export class RepeatedPerCallMessages {
 	#previous = new Map<number, Message>();
 	/** One history copy per repeated message, so a message the append-only log keeps goes out as the same object. */
 	#asHistory = new WeakMap<Message, Message>();
 
-	/** `messages`, with each per-call message equal to the previous main request's at its position sent as history. */
-	settle(messages: Message[]): Message[] {
+	/**
+	 * `messages`, with each per-call message equal to the previous main request's at its position sent as history,
+	 * and `sent`, which makes them the previous main request's per-call messages once that request goes out.
+	 */
+	settle(messages: Message[]): { messages: Message[]; sent: () => void } {
 		const current = new Map<number, Message>();
 		let settled: Message[] | undefined;
 		for (let index = 0; index < messages.length; index++) {
@@ -38,7 +42,11 @@ export class RepeatedPerCallMessages {
 			settled ??= messages.slice();
 			settled[index] = history;
 		}
-		this.#previous = current;
-		return settled ?? messages;
+		return {
+			messages: settled ?? messages,
+			sent: () => {
+				this.#previous = current;
+			},
+		};
 	}
 }

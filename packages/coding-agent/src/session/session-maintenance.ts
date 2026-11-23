@@ -149,6 +149,7 @@ import {
 } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { cfgProvidersCacheRetention, cfgProvidersOpenaiCodexDaybreak, cfgRetry } from "./settings";
+import { promptCacheModelKey, resolveKimiApiFormat } from "./settings-stream-fn";
 
 export type CompactionCheckResult = Readonly<{
 	continuationScheduled: boolean;
@@ -644,7 +645,7 @@ function isRecordedSnapcompactRefusal(data: unknown): data is RefusedSnapcompact
  * file) sends the same history, and its requests read the same entry.
  */
 interface CompactionWait {
-	/** `provider/id` of the model the compaction was weighed for. */
+	/** The model the compaction was weighed for, as the prompt cache keys it ({@link promptCacheModelKey}). */
 	modelKey: string;
 	entry: NonNullable<ContextCutSession["cacheEntry"]>;
 	/** Id of the branch's newest compaction when the rule answered, null with none: another one ends the wait. */
@@ -1052,7 +1053,7 @@ export class SessionMaintenance {
 			!model || !entry || leafId === undefined
 				? undefined
 				: {
-						modelKey: `${model.provider}/${model.id}`,
+						modelKey: this.#cacheModelKey(model),
 						entry: cacheEntryFigures(entry),
 						compactionId: getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null,
 						leafId,
@@ -1205,13 +1206,18 @@ export class SessionMaintenance {
 		return (
 			model !== undefined &&
 			!entry.refreshMissed &&
-			wait.modelKey === `${model.provider}/${model.id}` &&
+			wait.modelKey === this.#cacheModelKey(model) &&
 			wait.compactionId === (getLatestCompactionEntry(this.#host.sessionManager.getBranchView())?.id ?? null) &&
 			entry.tier === wait.entry.tier &&
 			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
 			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
 			!promptCacheEntryLapsed(entry, Date.now())
 		);
+	}
+
+	/** `model` as the prompt cache keys it, in the session's Kimi Code API format ({@link promptCacheModelKey}). */
+	#cacheModelKey(model: Model): string {
+		return promptCacheModelKey(model, resolveKimiApiFormat(this.#host.settings));
 	}
 
 	/**

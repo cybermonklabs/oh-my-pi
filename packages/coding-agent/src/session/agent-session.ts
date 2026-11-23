@@ -501,6 +501,7 @@ import {
 	type PromptCacheChange,
 	type PromptCacheEntry,
 	promptTokensOf,
+	requestedModelId,
 	resolvePromptCacheTier,
 	sendsNonDefaultToolChoice,
 } from "./cache-warmer";
@@ -549,7 +550,7 @@ import {
 	type SettingsChangeOptions,
 	toolsDigestOfEntry,
 } from "./session-tools";
-import { resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
+import { promptCacheModelKey, resolveKimiApiFormat, resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ProviderFallbackRecord } from "./provider-fallback-record";
 import { carryImageDrops, type RecordedImageDrop, recordedImageDrops } from "./provider-image-budget";
@@ -839,9 +840,11 @@ type PostPromptSkipReason = "aborted" | "stale-generation";
 
 /** Request inputs outside the transcript that are part of the prompt cache key. */
 interface PromptCacheShape {
-	/** `provider/id`. */
+	/** The model the request goes out as ({@link promptCacheModelKey}). */
 	model: string;
 	modelName: string;
+	/** The API the request goes out on. */
+	api: string;
 	thinkingLevel: ThinkingLevel | undefined;
 	/** {@link thinkingLevel} as the cached prefix tells levels apart ({@link promptCacheThinkingKey}). */
 	thinkingKey: string;
@@ -868,6 +871,44 @@ function promptCacheThinkingKey(
 	if (level === undefined || level === "off" || model === undefined) return level ?? "";
 	const wire = wireModel(model, { kimiApiFormat });
 	return sendsConfigurationUpdates(wire) || takesPerMessageEffort(wire) ? "effort" : level;
+}
+
+/** The Kimi Code API formats a request can name ({@link wireModel}); without one it goes out in its catalog's. */
+const KIMI_API_FORMATS = ["openai", "anthropic"] as const satisfies readonly SimpleStreamOptions["kimiApiFormat"][];
+
+/**
+ * Whether a reply on `model` recorded on the API `api` went out as another wire model than a request on `model` goes
+ * out as now, on `wireApi`, the API of its wire model in the Kimi Code API format the request goes out in
+ * ({@link wireModel}): `api` is not `wireApi`, but one a format sends `model` on. A reply on an API no format sends
+ * `model` on (a wrapper transport whose replies name its inner client's API, as Factory Droid's Gemini route) tells
+ * nothing of the wire it went out as.
+ */
+function repliedOnOtherWire(model: Model, api: Model["api"], wireApi: string): boolean {
+	return api !== wireApi && KIMI_API_FORMATS.some(format => wireModel(model, { kimiApiFormat: format }).api === api);
+}
+
+/**
+ * The model a request on `model` goes out as in the Kimi Code API format `kimiApiFormat`, as a prompt cache change
+ * names it: the model's name and the API its wire model goes out on ({@link wireModel}).
+ */
+function promptCacheModelLabel(
+	model: Model | undefined,
+	kimiApiFormat: SimpleStreamOptions["kimiApiFormat"],
+): Pick<PromptCacheShape, "modelName" | "api"> {
+	return { modelName: model?.name ?? "no model", api: model ? wireModel(model, { kimiApiFormat }).api : "" };
+}
+
+/**
+ * The change of the model the requests go out as from `from` to `to`, each named with the API it goes out on when
+ * only that differs (a Kimi Code API format switch keeps the model's name).
+ */
+function modelCacheChange(
+	from: Pick<PromptCacheShape, "modelName" | "api">,
+	to: Pick<PromptCacheShape, "modelName" | "api">,
+): Extract<PromptCacheChange, { kind: "model" }> {
+	return from.modelName === to.modelName && from.api !== to.api
+		? { kind: "model", from: `${from.modelName} (${from.api})`, to: `${to.modelName} (${to.api})` }
+		: { kind: "model", from: from.modelName, to: to.modelName };
 }
 
 /** The newest main-loop request: its transcript, model, active tools, shape and messages. */
@@ -3331,7 +3372,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
-			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
+			toolDefinitionsDigest: (tools, model) => this.agent.declaredToolsFingerprint(model ?? this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (recall, changes) => this.#memory.adoptRecall(recall, changes),
@@ -3365,6 +3406,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			baseSystemPrompt: this.agent.state.systemPrompt,
 			baseSettingsRead: config.baseSettingsRead,
 			operatorPromptDigest: config.operatorPromptDigest,
+			// A `/tan` clone's fixed prompt is its parent's build: a prompt its copied transcript stores is restored
+			// under the parent's operator inputs, read from the parent itself.
+			storedPromptOperatorDigest: config.tanParent ? config.tanParent.#tools.operatorPromptDigest : undefined,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
 			skillsSettings: config.skillsSettings,
@@ -3473,7 +3517,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#providerFallbacks = new ProviderFallbackRecord({
 			sessionManager: this.sessionManager,
 			providerSessionState: this.#providerSessionState,
-			findModel: (provider, modelId) => this.#modelRegistry.find(provider, modelId),
+			modelRegistry: this.#modelRegistry,
 		});
 		onProviderFallback(this.#providerSessionState, () => this.#onProviderFallback());
 		// Records this session's work writes name it; the getter follows every
@@ -6983,7 +7027,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#promptCacheChange(arm: PromptCacheShape, armMessages: readonly AgentMessage[]): PromptCacheChange | undefined {
 		const next = this.#promptCacheShape(this.model);
-		if (next.model !== arm.model) return { kind: "model", from: arm.modelName, to: next.modelName };
+		if (next.model !== arm.model) return modelCacheChange(arm, next);
 		if (next.thinkingKey !== arm.thinkingKey) {
 			return { kind: "thinking", from: arm.thinkingLevel ?? "off", to: next.thinkingLevel ?? "off" };
 		}
@@ -7024,8 +7068,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return memo.shape;
 		}
 		const shape: PromptCacheShape = {
-			model: model ? `${model.provider}/${model.id}` : "",
-			modelName: model?.name ?? "no model",
+			model: model ? promptCacheModelKey(model, kimiApiFormat) : "",
+			...promptCacheModelLabel(model, kimiApiFormat),
 			thinkingLevel,
 			thinkingKey: promptCacheThinkingKey(model, thinkingLevel, kimiApiFormat),
 			tools,
@@ -7118,8 +7162,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
 	 * model declares for the tier the reply wrote. Thinking level and
-	 * credential at the time are unknown; model, compaction and the digests of
-	 * the tool definitions and system prompt recorded for that reply are not,
+	 * credential at the time are unknown; model, the API the reply went out
+	 * on (a Kimi Code API format switch since moves it to another endpoint
+	 * and its cache), compaction and the digests of the tool definitions and
+	 * system prompt recorded for that reply are not,
 	 * and the next request is taken to send the current tool definitions and
 	 * base prompt. `promptDigest` names another base prompt for it, the one a
 	 * resumed process may restore while its tools are not all in yet (tools
@@ -7130,11 +7176,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!observed) return undefined;
 		const { reply } = observed;
 		// A server-side fallback retags the reply with the served model; the cache entry is the requested one's.
-		const fallback = reply.content.find(block => block.type === "fallback");
-		const model = this.#modelRegistry.find(
-			reply.provider,
-			fallback?.type === "fallback" ? fallback.from.model : reply.model,
-		);
+		const model = this.#modelRegistry.find(reply.provider, requestedModelId(reply));
 		if (!model) return undefined;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
 		const isOAuth = model.api === "anthropic-messages" && this.#modelRegistry.isUsingOAuth(model);
@@ -7150,9 +7192,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (tier === undefined) return undefined;
 		const seconds = model.promptCache?.[tier];
 		const current = this.model;
+		// The model the next request goes out as, named as a change names it, with the API its wire model goes out on.
+		const next = promptCacheModelLabel(current, resolveKimiApiFormat(this.settings));
 		let change: ObservedPromptCacheEntry["change"];
-		if (current?.provider !== model.provider || current.id !== model.id) {
-			change = { kind: "model", from: model.name, to: current?.name ?? "no model" };
+		if (
+			current?.provider !== model.provider ||
+			current.id !== model.id ||
+			repliedOnOtherWire(current, reply.api, next.api)
+		) {
+			change = modelCacheChange({ modelName: model.name, api: reply.api }, next);
 		} else if (requestedTier !== tier) {
 			// The next request asks for another tier, or for no caching at all.
 			change = { kind: "retention" };
@@ -7840,6 +7888,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#runStateListeners.clear();
 		this.#ircWakeHoldListeners.clear();
 		this.#sessionChangeCallbacks.clear();
+		// A cold revive sends the newest `session_init` prompt as a fixed prompt and holds nothing, so a session that
+		// parks or ends while its base withholds a change stores the prompt that goes out with it: the revive sends
+		// what the change's notices said the requests would follow, not the held prompt for good.
+		const withheldPromptBuild = this.#tools.withheldPromptBuild;
+		if (withheldPromptBuild) this.#recordModelCallSystemPrompt(withheldPromptBuild);
 
 		// Event handlers can reopen the append writer while they persist their
 		// terminal message; that pipeline has drained (or hit the deadline).
@@ -8353,6 +8406,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Base system prompt blocks the next turn builds on, before any `before_agent_start` override. */
 	get baseSystemPrompt(): string[] {
 		return this.#tools.baseSystemPrompt;
+	}
+
+	/**
+	 * While the base prompt withholds a change (a held settings change, a kept restored transcript prompt), the base
+	 * prompt that goes out with it; undefined otherwise. A copy: nothing a caller does to it reaches the session
+	 * ({@link SessionTools.withheldPromptBuild}). A `/tan` clone sends it once that change goes out.
+	 */
+	get withheldPromptBuild(): string[] | undefined {
+		return this.#tools.withheldPromptBuild;
 	}
 
 	/**

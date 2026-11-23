@@ -2013,6 +2013,8 @@ interface PreparedProviderCall {
 	ownedDialect: Dialect | undefined;
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
+	/** Records this call's per-call messages as the previous main request's; called once the request goes out. */
+	perCallMessagesSent?: () => void;
 }
 
 /**
@@ -2114,9 +2116,11 @@ async function prepareProviderCall(
 	}
 	// After the append-only log, which keeps the object it first synced for each byte-stable position: a repeated
 	// per-call message it holds from an earlier request still goes out as history.
+	let perCallMessagesSent: (() => void) | undefined;
 	if (config.repeatedPerCallMessages) {
-		const messages = config.repeatedPerCallMessages.settle(llmContext.messages);
-		if (messages !== llmContext.messages) llmContext = { ...llmContext, messages };
+		const settled = config.repeatedPerCallMessages.settle(llmContext.messages);
+		if (settled.messages !== llmContext.messages) llmContext = { ...llmContext, messages: settled.messages };
+		perCallMessagesSent = settled.sent;
 	}
 	// Before the transform too, so a request-size clamp in it measures the withdrawn definitions the provider
 	// re-declares; recomputed below against what the transform returns.
@@ -2140,7 +2144,7 @@ async function prepareProviderCall(
 		if (llmContext.tools) config.sentToolDefinitions.record(llmContext.tools);
 		llmContext = config.sentToolDefinitions.withInactiveTools(llmContext);
 	}
-	return { model, context: llmContext, promptToolWireTools, ownedDialect };
+	return { model, context: llmContext, promptToolWireTools, ownedDialect, perCallMessagesSent };
 }
 
 /**
@@ -2338,6 +2342,8 @@ async function streamAssistantResponse(
 		return await runInActiveSpan(chatSpan, async () => {
 			if (agentPauseGate.paused) await waitForProcessPause(config, finalRequestSignal);
 			onProviderStart?.();
+			// Past every gate: the request goes out, so the next one compares its per-call messages with this one's.
+			providerCall.perCallMessagesSent?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey: telemetryApiKey,

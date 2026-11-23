@@ -23,6 +23,7 @@ import { capFrameDataBytes, frameDataBytesBudget, providerImageBudget } from "@o
 import { supportsRemoteImageUrls } from "../blob-broker/context-images";
 import { declaredTools } from "../utils/tool-declarations";
 import { imageDecodeFailureReason } from "@oh-my-pi/pi-tui/chat/image-loading";
+import { answersRequestTo } from "./cache-warmer";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -653,7 +654,8 @@ export class ProviderImageClamp {
 	 * release, which dropped the oldest images past the budget in each request, {@link clampProviderContextImages}), so
 	 * its last request, the history before the newest reply, dropped the oldest of `names` past the budget. Undefined
 	 * where the clamp has no record, that request fit the budget, or another model gave the reply: its drops were for
-	 * another budget, and this model reads none of its cache.
+	 * another budget, and this model reads none of its cache. A reply the provider retagged answers `model` still
+	 * ({@link answersRequestTo}: a server-side fallback's, GitLab Duo's under the upstream id).
 	 */
 	#unrecordedDrops(
 		context: Context,
@@ -665,9 +667,7 @@ export class ProviderImageClamp {
 		if (!this.#record || this.#record.drops().size > 0) return undefined;
 		const reply = context.messages.findLastIndex(message => message.role === "assistant");
 		const answered = context.messages[reply];
-		if (answered?.role !== "assistant" || answered.provider !== model.provider || answered.model !== model.id) {
-			return undefined;
-		}
+		if (answered?.role !== "assistant" || !answersRequestTo(answered, model)) return undefined;
 		let sent = 0;
 		for (let index = 0; index < reply; index++) sent += messageImageCount(context.messages[index], metadataWire);
 		return sent > budget ? new Set(names.slice(0, sent - budget)) : undefined;

@@ -53,19 +53,31 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 /**
  * The scope the first-turn recall of the backend `settings` select reads, as its records name it (`findPersistedRecall`):
  * Hindsight's server, account, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`, read
- * from the settings that name them alone. Undefined under a backend that recalls nothing into the conversation, and
- * under Hindsight with no server. Mnemopi's needs its core module loaded (`loadMnemopiCore`).
+ * from the settings that name them alone. Undefined under a backend that recalls nothing into the conversation, under
+ * Hindsight with no server, and when the scope cannot be read (a Mnemopi bank directory that cannot be created): no
+ * recorded recall is of it, so none is reused.
  */
 export function memoryRecallScope(settings: Settings, cwd: string, agentDir: string): string | undefined {
-	switch (cfgMemoryBackend.get(settings)) {
-		case "hindsight": {
-			const config = loadHindsightConfig(settings);
-			return isHindsightConfigured(config) ? hindsightRecallScope(config, computeBankScope(config, cwd)) : undefined;
+	const backend = cfgMemoryBackend.get(settings);
+	try {
+		switch (backend) {
+			case "hindsight": {
+				const config = loadHindsightConfig(settings);
+				return isHindsightConfigured(config)
+					? hindsightRecallScope(config, computeBankScope(config, cwd))
+					: undefined;
+			}
+			case "mnemopi":
+				return getMnemopiRecallScope(loadMnemopiBankConfig(settings, agentDir));
+			default:
+				return undefined;
 		}
-		case "mnemopi":
-			return getMnemopiRecallScope(loadMnemopiBankConfig(settings, agentDir));
-		default:
-			return undefined;
+	} catch (error) {
+		logger.warn("Memory: the recall scope cannot be read; no recorded recall is reused", {
+			backend,
+			error: String(error),
+		});
+		return undefined;
 	}
 }
 

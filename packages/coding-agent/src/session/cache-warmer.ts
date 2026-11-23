@@ -184,15 +184,25 @@ export function promptTokensOf(usage: Usage): number {
 }
 
 /**
- * Whether `message` is the response to a request sent to `model`. A
- * server-side fallback retags the response with the served model, so its
- * fallback marker's `from` names the model the request went to.
+ * The id of the model the request `message` answers went to. A server-side
+ * fallback retags the response with the served model, so its fallback
+ * marker's `from` names the model the request went to.
  */
-function answers(message: AssistantMessage, model: Model<Api>): boolean {
-	if (message.provider !== model.provider) return false;
-	if (message.model === model.id) return true;
+export function requestedModelId(message: AssistantMessage): string {
 	const fallback = message.content.find(block => block.type === "fallback");
-	return fallback?.type === "fallback" && fallback.from.model === model.id;
+	return fallback?.type === "fallback" ? fallback.from.model : message.model;
+}
+
+/**
+ * Whether `message` is the response to a request sent to `model`: the model
+ * the request went to ({@link requestedModelId}) is `model`, or the model a
+ * wrapper transport sent it as ({@link wireModel}: GitLab Duo tags its
+ * responses with the upstream id).
+ */
+export function answersRequestTo(message: AssistantMessage, model: Model<Api>): boolean {
+	if (message.provider !== model.provider) return false;
+	const requested = requestedModelId(message);
+	return requested === model.id || requested === wireModel(model).id;
 }
 
 /**
@@ -620,7 +630,7 @@ export class CacheWarmer {
 	onResponse(message: AssistantMessage): void {
 		const observed = observedPromptCacheTier(message.usage);
 		const pending = this.#pendingEntry;
-		if (pending && answers(message, pending.model)) {
+		if (pending && answersRequestTo(message, pending.model)) {
 			this.#pendingEntry = undefined;
 			if (message.stopReason !== "error" && (message.usage.cacheRead > 0 || message.usage.cacheWrite > 0)) {
 				if (observed !== undefined) pending.tier = observed;
@@ -630,7 +640,7 @@ export class CacheWarmer {
 		}
 		const run = this.#run;
 		if (!run || run.timer === undefined) return;
-		if (!answers(message, run.model)) return;
+		if (!answersRequestTo(message, run.model)) return;
 		if (observed === undefined || observed === run.tier) return;
 		const delayMs = this.#delayFor(run.model, observed);
 		if (delayMs === undefined) {
