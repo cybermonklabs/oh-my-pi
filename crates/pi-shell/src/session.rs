@@ -2972,7 +2972,39 @@ mod tests {
 	/// FIFO's reader to size its write by ([`fifo_room`]). Returns what the
 	/// FIFO's reader got, ending with `AFTER` unless that was lost, and the
 	/// second run's status.
+	///
+	/// The runs go on a thread of their own, which the test waits for with a
+	/// bound (twice [`STUCK`]): a write through the tee that blocks the
+	/// shell's runtime thread in `write(2)` (gVisor, without the release's
+	/// private pipe writer) stops this runtime's timers too, and the test
+	/// would never end, nor a library run in one process. Past the bound
+	/// the test fails; the stuck thread ends with the process.
 	fn drop_a_write_through_a_fifo_tee(
+		second: impl FnOnce(&std::fs::File) -> String + Send + 'static,
+		file: &std::path::Path,
+		cancel: bool,
+	) -> (Vec<u8>, i32) {
+		let file = file.to_owned();
+		let (done, ended) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let runs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				three_runs_through_a_fifo_tee(second, &file, cancel)
+			}));
+			let _ = done.send(runs);
+		});
+		match ended.recv_timeout(2 * STUCK) {
+			Ok(Ok(got)) => got,
+			Ok(Err(panicked)) => std::panic::resume_unwind(panicked),
+			Err(ended) => panic!(
+				"the runs through the tee did not end within {:?} ({ended}); likely a write blocking \
+				 the shell's thread",
+				2 * STUCK
+			),
+		}
+	}
+
+	/// [`drop_a_write_through_a_fifo_tee`]'s three runs.
+	fn three_runs_through_a_fifo_tee(
 		second: impl FnOnce(&std::fs::File) -> String,
 		file: &std::path::Path,
 		cancel: bool,
@@ -3178,7 +3210,7 @@ mod tests {
 				let dir = tempfile::tempdir().unwrap();
 				let file = dir.path().join("tee-file");
 				let second = format!("{trap}exec 2>&3; {command}");
-				let (got, status) = drop_a_write_through_a_fifo_tee(|_| second, &file, true);
+				let (got, status) = drop_a_write_through_a_fifo_tee(move |_| second, &file, true);
 				let written = std::fs::read(&file).unwrap();
 				let mut once = whole.clone();
 				once.extend_from_slice(b"AFTER");
@@ -3243,18 +3275,23 @@ mod tests {
 			{
 				let dir = tempfile::tempdir().unwrap();
 				let file = dir.path().join("tee-file");
-				let mut zeros = 0;
+				let counted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 				let (got, status) = drop_a_write_through_a_fifo_tee(
-					|reader| {
-						if let Some(bytes) = shrunk {
-							shrink_fifo(reader, bytes);
+					{
+						let counted = Arc::clone(&counted);
+						move |reader| {
+							if let Some(bytes) = shrunk {
+								shrink_fifo(reader, bytes);
+							}
+							let zeros = fifo_room(reader) - 4;
+							counted.store(zeros, Ordering::SeqCst);
+							format!("{ends}printf %0{zeros}d 0 >&3; {tool} --version >&3")
 						}
-						zeros = fifo_room(reader) - 4;
-						format!("{ends}printf %0{zeros}d 0 >&3; {tool} --version >&3")
 					},
 					&file,
 					cancel,
 				);
+				let zeros = counted.load(Ordering::SeqCst);
 				let written = std::fs::read(&file).unwrap();
 				let message = written
 					.get(zeros..written.len().saturating_sub(5))
