@@ -2509,9 +2509,9 @@ export interface Extension {
 
 /**
  * Where discovery found an extension: a project's own (its native module or hook, a plugin of project scope), the
- * user's (the agent directory's module or hook, a plugin of user scope), an explicit or configured path
- * (`--extension`, `additionalExtensionPaths`, the `extensions` setting), or a host's inline factory. A file found at
- * project level and at another level is not a project's own.
+ * user's (the agent directory's module or hook, a plugin of user scope), an explicit or configured path or a hook of
+ * such a package root (`--extension`, `additionalExtensionPaths`, the `extensions` setting), or a host's inline
+ * factory. A file found at project level and at another level is not a project's own.
  */
 export type ExtensionScope = "project" | "user" | "explicit" | "inline";
 
@@ -2531,6 +2531,22 @@ export interface PreparedExtension extends ExtensionPathEntry {
 	resolvedPath: string;
 	factory: ExtensionFactory | null;
 	error: string | null;
+}
+
+/** A prepared extension as a host may build it: one with no `scope` is read as `explicit`. */
+export type PreparedExtensionInput = Omit<PreparedExtension, "scope"> & { scope?: ExtensionScope };
+
+/**
+ * The entry of an extension source a caller passed. A bare path, or a host-built prepared extension with no
+ * `scope`, is the caller's own file: `explicit`. A value with a scope is returned as is.
+ */
+export function toExtensionPathEntry(input: PreparedExtensionInput): PreparedExtension;
+export function toExtensionPathEntry(input: string | ExtensionPathEntry): ExtensionPathEntry;
+export function toExtensionPathEntry(
+	input: string | ExtensionPathEntry | PreparedExtensionInput,
+): ExtensionPathEntry | PreparedExtensionInput {
+	if (typeof input === "string") return { path: input, scope: "explicit" };
+	return input.scope === undefined ? { ...input, scope: "explicit" } : input;
 }
 
 /** Result of loading extensions. */

@@ -125,9 +125,10 @@ import {
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
-	type PreparedExtension,
+	type PreparedExtensionInput,
 	type RegisteredTool,
 	type ToolDefinition,
+	toExtensionPathEntry,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
@@ -782,22 +783,22 @@ export interface CreateAgentSessionOptions {
 	 */
 	deferredExtensionPaths?: readonly ExtensionPathEntry[];
 	/**
-	 * Pre-discovered extension source paths, each with its scope. When provided, the filesystem-scan
-	 * inside `discoverExtensionPaths()` is skipped — the session still calls
+	 * Pre-discovered extension source paths, each with its scope; a bare path is read as `explicit`. When provided,
+	 * the filesystem-scan inside `discoverExtensionPaths()` is skipped — the session still calls
 	 * `loadExtensions()` itself so each `Extension` is bound to THIS session's
 	 * `ExtensionAPI` (cwd, eventBus, runtime).
 	 *
 	 * Compatibility pass-through for callers that do not have prepared factories.
 	 */
-	preloadedExtensionPaths?: ExtensionPathEntry[];
+	preloadedExtensionPaths?: (string | ExtensionPathEntry)[];
 	/**
 	 * Session-independent imported extension factories. Child sessions, including
 	 * restricted children, rebind these to their own ExtensionAPI without
 	 * re-evaluating the module graph. Restricted children retain hooks/providers,
-	 * but never expose extension-contributed tools.
+	 * but never expose extension-contributed tools. One with no `scope` is read as `explicit`.
 	 * @internal
 	 */
-	preloadedPreparedExtensions?: readonly PreparedExtension[];
+	preloadedPreparedExtensions?: readonly PreparedExtensionInput[];
 	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. When provided, the filesystem-scan inside
@@ -3042,20 +3043,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		} else if (restrictToolNames || options.preloadedPreparedExtensions) {
 			// Restricted children retain parent hooks, not ambient discovery, new
 			// extension inputs, or parent-bound instances. Tool admission stays clamped.
-			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
-			extensionPaths = preparedExtensions.map(prepared => ({ path: prepared.path, scope: prepared.scope }));
 			extensionsResult = await logger.time(
 				"bindPreparedExtensions",
 				bindPreparedExtensions,
-				preparedExtensions,
+				options.preloadedPreparedExtensions ?? [],
 				cwd,
 				eventBus,
 			);
+			// The bound entries carry a scope: a host-built prepared extension without one binds as `explicit`.
+			extensionPaths = (extensionsResult.preparedExtensions ?? []).map(({ path, scope }) => ({ path, scope }));
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to bind extension", { path, error });
 			}
 		} else if (options.preloadedExtensionPaths) {
-			extensionPaths = options.preloadedExtensionPaths;
+			extensionPaths = options.preloadedExtensionPaths.map(entry => toExtensionPathEntry(entry));
 			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });

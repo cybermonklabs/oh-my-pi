@@ -53,6 +53,7 @@ import type {
 	LoadExtensionsResult,
 	MessageRenderer,
 	PreparedExtension,
+	PreparedExtensionInput,
 	ProviderConfig,
 	RegisteredCommand,
 	ShortcutConflict,
@@ -61,6 +62,7 @@ import type {
 	ToolInfo,
 	TranscriptPresenter,
 } from "./types";
+import { toExtensionPathEntry } from "./types";
 
 installLegacyPiSpecifierShim();
 
@@ -497,10 +499,13 @@ async function runExtensionFactory(
 
 /**
  * Import one extension module and resolve its factory without binding it to a session. The prepared extension keeps
- * `entry`'s path and scope.
+ * the path and scope of `input`'s entry (a bare path is `explicit`, see {@link toExtensionPathEntry}).
  */
-export async function importExtensionModule(entry: ExtensionPathEntry, cwd: string): Promise<PreparedExtension> {
-	const { path: extensionPath, scope } = entry;
+export async function importExtensionModule(
+	input: string | ExtensionPathEntry,
+	cwd: string,
+): Promise<PreparedExtension> {
+	const { path: extensionPath, scope } = toExtensionPathEntry(input);
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
@@ -569,7 +574,7 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from path entries; each prepared extension keeps its entry's scope.
+ * Load extensions from path entries; each prepared extension keeps its entry's scope, and a bare path is `explicit`.
  *
  * Module import (the dominant cold-start cost — file I/O plus module
  * evaluation) runs concurrently across extensions; factory binding then runs
@@ -577,7 +582,7 @@ export async function loadExtensionFromFactory(
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
 export async function loadExtensions(
-	entries: readonly ExtensionPathEntry[],
+	entries: readonly (string | ExtensionPathEntry)[],
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
@@ -589,10 +594,11 @@ export async function loadExtensions(
 /**
  * Bind previously imported extension factories. A fresh session runtime is
  * created unless `runtime` is given: deferred startup extensions bind into the
- * live session's runtime so they share its flag values and wired actions.
+ * live session's runtime so they share its flag values and wired actions. A
+ * host-built prepared extension with no scope is bound and returned as `explicit`.
  */
 export async function bindPreparedExtensions(
-	preparedExtensions: readonly PreparedExtension[],
+	preparedInputs: readonly PreparedExtensionInput[],
 	cwd: string,
 	eventBus?: EventBus,
 	runtime: IExtensionRuntime = new ExtensionRuntime(),
@@ -600,6 +606,7 @@ export async function bindPreparedExtensions(
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
+	const preparedExtensions = preparedInputs.map(prepared => toExtensionPathEntry(prepared));
 
 	for (const prepared of preparedExtensions) {
 		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
@@ -618,7 +625,7 @@ export async function bindPreparedExtensions(
 		extensions,
 		errors,
 		runtime,
-		preparedExtensions: [...preparedExtensions],
+		preparedExtensions,
 	};
 }
 
@@ -797,7 +804,11 @@ export async function discoverExtensionPaths(
 		if (options.includeAmbientHooks !== false) {
 			const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
 			for (const hook of hooks.items.filter(item => isExtensionFile(path.basename(item.path)))) {
-				await addPath(hook.path, hook.level);
+				// A hook of an explicit or configured package root (its `omp-plugins` origin names the root's lane) is
+				// explicit, as that root's module entries are at step 4; a native or installed-plugin hook keeps its
+				// level.
+				const { origin } = hook._source;
+				await addPath(hook.path, origin === "explicit" || origin === "configured" ? "explicit" : hook.level);
 			}
 		}
 	} else {

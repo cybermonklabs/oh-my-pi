@@ -4181,6 +4181,10 @@ type SubagentLiveOptionKeys =
  * live parent session's at a cold revive. A build never reads one of them from a transcript.
  */
 export interface SubagentLiveInputs extends Pick<CreateAgentSessionOptions, SubagentLiveOptionKeys> {
+	/** The parent's extension entries, each with its scope (the session option also takes bare paths). */
+	preloadedExtensionPaths?: ExtensionPathEntry[];
+	/** The parent's prepared extensions, each with its scope (the session option also takes them without one). */
+	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
 	/** Settings a revive restores the subagent's overlay over, and whose live values a build reads. */

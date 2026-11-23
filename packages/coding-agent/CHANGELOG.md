@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `discoverExtensionPaths()` and `discoverSessionExtensionPaths()` return `{ path, scope }` entries instead of path strings, `AgentSession.extensionPaths` lists such entries, and each `PreparedExtension` carries the `scope` its extension was found at (`project`, `user`, `explicit` or `inline`)
+
+### Changed
+
+- `loadExtensions()` and `CreateAgentSessionOptions.preloadedExtensionPaths` also take `{ path, scope }` entries; a bare path, or a prepared extension given to `bindPreparedExtensions()` without a `scope`, is read as `explicit`
+
 ### Fixed
 
 - Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
