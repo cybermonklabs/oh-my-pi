@@ -41,15 +41,21 @@ fn assert_rows(rows: &[(&str, &str, bool, &str, i32)]) {
 	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-const STATUSES: &str = "! /bin/false & wait $!; echo a=$?; ! /bin/true & wait $!; echo b=$?; ! \
-                        /bin/true | /bin/false & wait $!; echo c=$?; ! /bin/sh -c 'exit 3' & wait \
-                        %1; echo d=$?";
+/// The statuses of four `!` jobs; the last is waited for by `wait`'s
+/// operand `w` (zsh 5.9's `wait %1` may find the job gone already: `%1:
+/// no such job`, 127, in some runs; `wait $!` always finds it).
+fn statuses(w: &str) -> String {
+	format!(
+		"! /bin/false & wait $!; echo a=$?; ! /bin/true & wait $!; echo b=$?; ! /bin/true | \
+		 /bin/false & wait $!; echo c=$?; ! /bin/sh -c 'exit 3' & wait {w}; echo d=$?"
+	)
+}
 
 #[test]
 fn a_background_jobs_negation_does_not_invert_its_status() {
 	assert_rows(&[
-		("bash", STATUSES, false, "a=1\nb=0\nc=1\nd=3\n", 0),
-		("zsh", STATUSES, true, "a=1\nb=0\nc=1\nd=3\n", 0),
+		("bash", &statuses("%1"), false, "a=1\nb=0\nc=1\nd=3\n", 0),
+		("zsh", &statuses("$!"), true, "a=1\nb=0\nc=1\nd=3\n", 0),
 		("bash set -e", "set -e; ! /bin/false & wait $!; echo no", false, "", 1),
 		("zsh set -e", "set -e; ! /bin/false & wait $!; echo no", true, "", 1),
 		(
@@ -104,5 +110,22 @@ fn negation_before_and_after_time() {
 		("zsh &", &format!("exec 2>/dev/null; TIMEFMT=; {bg}"), true, "h=1\ni=0\ng=0\n", 0),
 		("bash", &format!("exec 2>/dev/null; TIMEFORMAT=; {fg}"), false, "a=0\nb=0\nc=1\nd=1\n", 0),
 		("zsh", &format!("exec 2>/dev/null; TIMEFMT=; {fg}"), true, "a=0\nb=0\nc=1\nd=1\n", 0),
+	]);
+}
+
+/// `jobs` shows a job's own `!` pipeline as bash 5.2.21 and 5.3.20 do:
+/// without the `!` for simple commands and a pipeline of several (it is a
+/// flag of the commands there), with it for a lone compound command and in
+/// an and-or list. The job waits on a FIFO written after `jobs`.
+#[test]
+fn jobs_shows_a_jobs_own_bang_as_bash_does() {
+	let row = |job: &str| format!("mkfifo ff; {job} & jobs; echo > ff; wait");
+	let running = |text: &str| format!("[1]+  Running                    {text} &\n");
+	assert_rows(&[
+		("simple", &row("! read x < ff"), false, &running("read x < ff"), 0),
+		("pipeline", &row("! read x < ff | true"), false, &running("read x < ff | true"), 0),
+		("brace", &row("! { read x; } < ff"), false, &running("! { read x; } < ff"), 0),
+		("subshell", &row("! ( read x ) < ff"), false, &running("! ( read x ) < ff"), 0),
+		("and-or", &row("true && ! read x < ff"), false, &running("true && ! read x < ff"), 0),
 	]);
 }

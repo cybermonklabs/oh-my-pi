@@ -4254,7 +4254,29 @@ pub(super) fn job_text(
 	}
 	match crate::bash::syntax::parse_all(&src, feat) {
 		Ok(p) if p.commands.len() == 1 => {
-			BString::from(crate::bash::syntax::command_string(p.commands[0].list()))
+			let list = p.commands[0].list();
+			let text = BString::from(crate::bash::syntax::command_string(list));
+			// bash 5.2.21 and 5.3.20 do not show the `!` of a job that is one
+			// pipeline of simple commands (`! false &` is `false`, `! a | b
+			// &` is `a | b`): it is a flag of those commands, which the
+			// printed text leaves out. A lone compound command keeps it (`!
+			// { false; }`, `! ( false )`, `! [[ … ]]`), and so does a timed
+			// pipeline (`time ! false`).
+			let hidden = list.items().one().is_some_and(|item| {
+				let and_or = item.and_or();
+				let p = and_or.first();
+				and_or.rest().len() == 0
+					&& p.bang()
+					&& p.time().is_none()
+					&& (p.stages().len() > 1
+						|| p.stages().one().is_some_and(|c| {
+							matches!(c.kind(), crate::bash::syntax::tree::CommandKind::Simple(_))
+						}))
+			});
+			match text.strip_prefix(b"! ") {
+				Some(rest) if hidden => BString::from(rest),
+				_ => text,
+			}
 		},
 		_ => src,
 	}
