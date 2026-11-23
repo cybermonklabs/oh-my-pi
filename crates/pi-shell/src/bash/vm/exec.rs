@@ -5268,6 +5268,15 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		}) {
 		return false;
 	}
+	// bash: a fork made while the trap ran is inside it too
+	// (`SIG_INPROGRESS`, which the child keeps; `run_return_trap` also skips
+	// the RETURN trap while the DEBUG trap runs, `trap.c:1333`).
+	if vp.mode.dialect() == Dialect::Bash
+		&& vp.frames.first().is_some_and(|f| {
+			f.traced.running(key) || (key == TrapKey::Return && f.traced.running(TrapKey::Debug))
+		}) {
+		return false;
+	}
 	let (action, trap_mode) = match state::record(cx.store, vp, Key::Trap(key)) {
 		Ok(Some(Record::Trap { action, mode })) if !action.is_empty() => (action.clone(), *mode),
 		// zsh: a `TRAPNAL` function is the trap (zsh `ZSIG_FUNC`).

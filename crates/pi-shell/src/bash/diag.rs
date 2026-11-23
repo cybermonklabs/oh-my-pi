@@ -10,7 +10,7 @@ use std::{borrow::Cow, fmt, io};
 
 use bstr::BString;
 
-use crate::bash::{event::Origin, fd::BadFd};
+use crate::bash::fd::BadFd;
 
 /// A diagnostic, by catalog entry.
 #[derive(Debug, thiserror::Error, strum::EnumDiscriminants)]
@@ -551,10 +551,12 @@ const fn posix_text(kind: io::ErrorKind) -> Option<&'static str> {
 /// Where a diagnostic is printed from, for its prefix.
 #[derive(Clone, Copy, Debug)]
 pub struct DiagSite<'a> {
-	/// `$0` (bash uses it as the message prefix).
+	/// The message prefix: bash's `get_name_for_error`, `BASH_SOURCE[0]` or
+	/// `$0`.
 	pub shell_name: &'a [u8],
-	/// Origin of the running script.
-	pub origin:     &'a Origin,
+	/// The text read is the `-c` string itself, not a file it sources: a
+	/// syntax error there names `-c`.
+	pub command:    bool,
 	/// Current line.
 	pub line:       u32,
 	/// The locale is UTF-8 (which bytes print as they are in names).
@@ -597,7 +599,7 @@ pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 		out.push(b'\n');
 		return out;
 	}
-	if syntax && matches!(site.origin, Origin::Command) {
+	if syntax && site.command {
 		out.extend_from_slice(b": -c");
 	}
 	out.extend_from_slice(b": line ");

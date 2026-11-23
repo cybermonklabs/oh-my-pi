@@ -4815,9 +4815,13 @@ fn forget_job(
 	posix_pid: bool,
 ) {
 	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
-		if !vp.jobs_kept()
-			&& let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number)
-		{
+		// While no job may be deleted (a function substitution) the job
+		// stays, marked reported.
+		if vp.jobs_kept() {
+			if let Some(job) = vp.jobs.by_vpid_mut(v) {
+				job.notified = true;
+			}
+		} else if let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number) {
 			vp.jobs.remove(number);
 		}
 		return;

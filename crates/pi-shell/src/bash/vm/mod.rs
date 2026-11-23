@@ -1203,23 +1203,31 @@ impl Kernel {
 				utf8,
 			});
 		}
-		static COMMAND: Origin = Origin::Command;
-		let origin = vp
+		let command = vp
 			.runs
 			.front()
 			.and_then(|r| r.chain.links.first())
-			.map_or(&COMMAND, |l| &l.origin);
+			.is_none_or(|l| matches!(l.origin, Origin::Command));
 		let utf8 = locale::is_utf8(self, cx.store, vp);
-		// An in-engine nested shell names itself (its `$0`).
-		let shell_name = match vp
+		// bash's `get_name_for_error`: a non-interactive shell names it after
+		// `BASH_SOURCE[0]` (a `.` file, the file a function was defined in),
+		// else `$0`; an in-engine nested shell names itself (its `$0`).
+		let source = callstack::error_source(vp).filter(|_| !killed::interactive(cx, vp));
+		let nested = match vp
 			.overlay
 			.as_ref()
 			.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
 		{
-			Some(Some(Record::Misc(name))) => name.as_slice(),
-			_ => self.argv0.as_slice(),
+			Some(Some(Record::Misc(name))) => Some(name.as_slice()),
+			_ => None,
 		};
-		render(diag, DiagSite { shell_name, origin, line, utf8 })
+		let shell_name = source
+			.map(|s| s.as_slice())
+			.or(nested)
+			.unwrap_or(self.argv0.as_slice());
+		// A `.` file's own syntax error names the file, with no `-c`.
+		let command = command && source.is_none();
+		render(diag, DiagSite { shell_name, command, line, utf8 })
 	}
 
 	/// The `Diag` event of a diagnostic `vp` prints, `tail` after its text
@@ -2528,14 +2536,13 @@ impl Shell {
 		// The runs of the `CHLD` trap this end owes: one for the process it
 		// is, or one for each process of its pipeline job that ended with it
 		// (a job `disown` deleted too: bash reaps its processes all the same).
-		let mut owed: usize = 1;
-		if let Some(procs) = disowned.filter(|_| !background) {
-			owed = procs
+		let mut owed: usize = disowned.filter(|_| !background).map_or(1, |procs| {
+			procs
 				.list
 				.iter()
 				.filter(|p| p.state == proc::ProcState::Running)
-				.count();
-		}
+				.count()
+		});
 		if let Some(job) = job {
 			job.state = proc::JobState::Done(status);
 			job.signal = match job.procs.as_deref_mut() {
@@ -4194,11 +4201,30 @@ impl Vproc {
 		jobctl::inherit(k, vp.vpid, self.vpid);
 		// bash `reset_or_restore_signal_handlers` (`trap.c:1467-1473`): a
 		// child keeps the ERR trap only with `errtrace`, and the DEBUG and
-		// RETURN traps only with `functrace`, as they are when it forks.
-		frame.traced = proc::Traced::forked(
+		// RETURN traps only with `functrace`, as they are when it forks. A
+		// trap running then stays marked running in the child
+		// (`SIG_INPROGRESS`), which so does not run it: `set -T; trap ': $(:)'
+		// DEBUG` runs the substitution without the trap.
+		let mut traced = proc::Traced::forked(
 			state::option(&mut k.root, store, self, OptId::Errtrace).unwrap_or(false),
 			state::option(&mut k.root, store, self, OptId::Functrace).unwrap_or(false),
 		);
+		let inherited = self.frames.first().map_or(proc::Traced::ROOT, |f| f.traced);
+		for key in [
+			crate::bash::store::TrapKey::Debug,
+			crate::bash::store::TrapKey::Err,
+			crate::bash::store::TrapKey::Return,
+		] {
+			let running = inherited.running(key)
+				|| (self.trap_frames != 0
+					&& self.frames.iter().any(|f| {
+						matches!(f.kind,
+							proc::FrameKind::Script { what: proc::ScriptKind::Trap { key: active, .. }, .. }
+								if active == key)
+					}));
+			traced = traced.with_running(key, running);
+		}
+		frame.traced = traced;
 		vp.mode = self.mode;
 		vp.zle.clone_from(&self.zle);
 		vp.set_sticky(self.sticky().cloned());

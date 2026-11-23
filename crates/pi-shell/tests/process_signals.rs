@@ -464,6 +464,21 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 		(format!("{w}; wait %1; echo st=$?"), format!("{}st=137\n", killed(1))),
 		(format!("{w}; wait -n; echo st=$?"), format!("{}st=137\n", killed(1))),
 		(format!("{S}; wait $! 2>/dev/null; echo st=$?"), "st=137\n".into()),
+		// A job that killed itself, reaped before a plain `wait`: the `wait`
+		// keeps the job `$!` names (`mark_dead_jobs_as_notified`), so a later
+		// `wait $!` reports it with 137 and `jobs` lists it.
+		(
+			format!("/bin/sh -c 'kill -KILL $$' & {GONE}; wait; echo w=$?; wait $!; echo w2=$?"),
+			format!("w=0\n{}w2=137\n", notice(1, libc::SIGKILL, "/bin/sh -c 'kill -KILL $$'")),
+		),
+		(
+			format!("{{ kill -9 $BASHPID; }} & {GONE}; wait; jobs; echo end"),
+			format!("[1]+  {:<27}{{ kill -9 $BASHPID; }}\nend\n", desc(libc::SIGKILL)),
+		),
+		(
+			format!("{{ kill -9 $BASHPID; }} & {GONE}; wait; wait $!; echo w=$?"),
+			format!("{}w=137\n", notice(1, libc::SIGKILL, "{ kill -9 $BASHPID; }")),
+		),
 		// Before the next line is read, naming it.
 		(
 			format!("/bin/sleep 30 &\nkill -KILL $!; {GONE}\necho next"),
@@ -3231,6 +3246,126 @@ fn bash_forks_a_subshells_last_command_for_a_trap_set_to_nothing() {
 			]
 			.concat(),
 			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A fork made while the DEBUG, ERR or RETURN trap runs runs that trap no
+/// more: bash keeps the trap's `SIG_INPROGRESS` in the child (no fork
+/// clears it), so a `$( )` in the trap's action, under `functrace` or
+/// `errtrace`, does not run the trap again; `run_return_trap` also skips
+/// the RETURN trap while the DEBUG trap runs (`trap.c:1333`). obash ran it
+/// again in each substitution, without end. Checked-in goldens measured
+/// with bash 5.3.20 and 5.2.21 (the same; [`bounded_bash_ends`]). A `( … )`
+/// or a pipeline in the DEBUG trap's action does not end in either bash;
+/// obash runs it once.
+#[test]
+fn bash_runs_no_trap_in_a_fork_made_while_it_runs() {
+	let rows = vec![
+		("set -T; trap ': $(:)' DEBUG; echo hi".to_owned(), "hi\n".to_owned()),
+		("set -T; trap 'echo dbg; : $(echo in)' DEBUG; echo hi".to_owned(), "dbg\nhi\n".to_owned()),
+		(
+			"set -T; trap 'x=$(echo in); echo \"d:$x\"' DEBUG; echo hi".to_owned(),
+			"d:in\nhi\n".to_owned(),
+		),
+		("set -E; trap 'echo e; : $(false)' ERR; false; echo end".to_owned(), "e\nend\n".to_owned()),
+		(
+			"set -T; f() { :; }; trap 'echo r; : $(f)' RETURN; f; echo end".to_owned(),
+			"r\nend\n".to_owned(),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_rows(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A non-interactive bash names a diagnostic after `BASH_SOURCE[0]`, else
+/// `$0` (`get_name_for_error`): inside a `.` file the file's name as given,
+/// inside a function the file it was defined in, in its subshells and
+/// substitutions too, a killed job's notice, a fatal expansion error and a
+/// syntax error too (with no `-c`, which names the `-c` string itself);
+/// `source /dev/stdin` names `/dev/stdin`, read from a here-string, a
+/// here-document or a pipe. A function defined in the `-c` string is
+/// `$0`'s, and so is the string once the file ended. Checked-in goldens
+/// measured with bash 5.3.20; bash 5.2.21 prints the same but `environment`
+/// for the function defined in the `-c` string.
+#[test]
+fn bash_names_a_diagnostic_after_the_file_it_reads() {
+	let dir = tempfile::tempdir().expect("a directory for the sourced files");
+	let d = dir.path().to_str().expect("a UTF-8 temporary path");
+	for (name, text) in [
+		("c.sh", ":\ncd /nonexistent-dir\n"),
+		("u.sh", ":\necho ${zz?unset here}\n"),
+		("f.sh", "f() {\n  cd /nonexistent-dir\n}\n"),
+		("k.sh", "/bin/sleep 30 & kill -KILL $!; wait $!\n"),
+		("e.sh", "eval 'cd /nonexistent-dir'\n"),
+		("g.sh", "g() { :; }\n"),
+		("s.sh", "echo a\nif then\n"),
+	] {
+		fs::write(dir.path().join(name), text).expect("write a sourced file");
+	}
+	let syntax = |name: &str| {
+		format!(
+			"a\n{name}: line 2: syntax error near unexpected token `then'\n{name}: line 2: `if \
+			 then'\nst=2\n"
+		)
+	};
+	let stdin_name = "/dev/stdin";
+	let cd = "cd: /nonexistent-dir: No such file or directory";
+	let killed = String::from_utf8(long_notice(1, libc::SIGKILL, b"/bin/sleep 30")).expect("ASCII");
+	let rows = vec![
+		(format!(". {d}/c.sh; echo st=$?"), format!("{d}/c.sh: line 2: {cd}\nst=1\n"), Exit(0)),
+		(format!(". {d}/u.sh; echo st=$?"), format!("{d}/u.sh: line 2: zz: unset here\n"), Exit(127)),
+		(format!(". {d}/f.sh; f; echo st=$?"), format!("{d}/f.sh: line 2: {cd}\nst=1\n"), Exit(0)),
+		(
+			format!(". {d}/f.sh; ( f ); echo st=$?"),
+			format!("{d}/f.sh: line 2: {cd}\nst=1\n"),
+			Exit(0),
+		),
+		(
+			format!(". {d}/f.sh; x=$(f); echo st=$?"),
+			format!("{d}/f.sh: line 2: {cd}\nst=1\n"),
+			Exit(0),
+		),
+		(
+			format!(". {d}/k.sh; echo st=$?"),
+			format!("{d}/k.sh{}st=137\n", killed.trim_start_matches("bash")),
+			Exit(0),
+		),
+		(format!(". {d}/e.sh; echo st=$?"), format!("{d}/e.sh: line 1: {cd}\nst=1\n"), Exit(0)),
+		(
+			format!("f() {{ cd /nonexistent-dir; }}; . {d}/g.sh; f; echo st=$?"),
+			format!("bash: line 1: {cd}\nst=1\n"),
+			Exit(0),
+		),
+		(
+			format!(". {d}/g.sh; cd /nonexistent-dir; echo st=$?"),
+			format!("bash: line 1: {cd}\nst=1\n"),
+			Exit(0),
+		),
+		(format!(". {d}/s.sh; echo st=$?"), syntax(&format!("{d}/s.sh")), Exit(0)),
+		(
+			"source /dev/stdin <<< 'nosuchcmd_x'; echo st=$?".to_owned(),
+			format!("{stdin_name}: line 1: nosuchcmd_x: command not found\nst=127\n"),
+			Exit(0),
+		),
+		(
+			"echo nosuchcmd_x | source /dev/stdin; echo st=$?".to_owned(),
+			format!("{stdin_name}: line 1: nosuchcmd_x: command not found\nst=127\n"),
+			Exit(0),
+		),
+		(
+			"source /dev/stdin <<'E'\necho a\nif then\nE\necho st=$?".to_owned(),
+			syntax(stdin_name),
+			Exit(0),
+		),
+		(
+			"source /dev/stdin <<'E'\n:\necho ${zz?unset here}\necho after\nE\necho st=$?".to_owned(),
+			format!("{stdin_name}: line 2: zz: unset here\n"),
+			Exit(127),
 		),
 	];
 	let mut wrong = Vec::new();

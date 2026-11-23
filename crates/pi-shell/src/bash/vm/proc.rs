@@ -132,28 +132,65 @@ pub struct Vproc {
 	pub zle:           Option<Box<super::zle::Zle>>,
 }
 
-/// Whether a vproc's fork passed on the traps bash resets in a child
-/// (`reset_or_restore_signal_handlers`, `trap.c:1467-1473`): the ERR trap
+/// What a vproc's fork passed on of the traps, read on its base frame:
+/// whether it kept the traps bash resets in a child
+/// (`reset_or_restore_signal_handlers`, `trap.c:1467-1473`: the ERR trap
 /// with `errtrace`, the DEBUG and RETURN traps with `functrace`, as those
-/// options were when it forked. The shell itself forked from nothing, and
-/// every trap it sets is its own. One byte: it rides in `Vproc`'s padding
-/// (idle vproc ≤ 2 KiB).
+/// options were when it forked), and which of the DEBUG, ERR and RETURN
+/// traps ran as it forked: bash's `SIG_INPROGRESS`, which no fork clears,
+/// so the child does not run that trap either (no trap runs inside its own
+/// action). The shell itself forked from nothing: every trap it sets is its
+/// own, and none runs. One byte: it rides in `Frame`'s padding (idle vproc
+/// ≤ 2 KiB).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Traced(u8);
 
 impl Traced {
+	/// The DEBUG trap ran as it forked.
+	const DEBUG_RUNS: u8 = 8;
 	/// `errtrace` at the fork.
 	const ERR: u8 = 1;
+	/// The ERR trap ran as it forked.
+	const ERR_RUNS: u8 = 16;
 	/// This vproc was forked at all.
 	const FORKED: u8 = 4;
 	/// `functrace` at the fork.
 	const FUNC: u8 = 2;
+	/// The RETURN trap ran as it forked.
+	const RETURN_RUNS: u8 = 32;
 	/// The shell itself: nothing was reset.
 	pub const ROOT: Self = Self(0);
 
 	/// A fork made with `errtrace` and `functrace` as given.
 	pub const fn forked(err: bool, func: bool) -> Self {
 		Self(Self::FORKED | if err { Self::ERR } else { 0 } | if func { Self::FUNC } else { 0 })
+	}
+
+	/// The bit of a trap that can be running as a fork is made.
+	const fn running_bit(key: crate::bash::store::TrapKey) -> u8 {
+		use crate::bash::store::TrapKey;
+		match key {
+			TrapKey::Debug => Self::DEBUG_RUNS,
+			TrapKey::Err => Self::ERR_RUNS,
+			TrapKey::Return => Self::RETURN_RUNS,
+			_ => 0,
+		}
+	}
+
+	/// `self`, with the `key` trap running at the fork when `on`.
+	#[must_use]
+	pub const fn with_running(self, key: crate::bash::store::TrapKey, on: bool) -> Self {
+		if on {
+			Self(self.0 | Self::running_bit(key))
+		} else {
+			self
+		}
+	}
+
+	/// Whether the `key` trap (DEBUG, ERR or RETURN) ran as this vproc
+	/// forked.
+	pub const fn running(self, key: crate::bash::store::TrapKey) -> bool {
+		self.0 & Self::running_bit(key) != 0
 	}
 
 	/// Whether the `key` trap of a parent is in effect here.
