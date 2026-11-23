@@ -859,9 +859,10 @@ fn zsh_params(args: &ShellArgs) -> Vec<(BString, BString)> {
 	}
 }
 
-/// Run `shell` until script `run` finishes, then until the process
-/// substitutions its exit leaves running end ([`finish_substitutions`]);
-/// the script's status.
+/// Run `shell` until script `run` finishes; the script's status.
+///
+/// It then runs on until the process substitutions its exit leaves
+/// running end ([`finish_substitutions`]).
 ///
 /// Between steps the
 /// OS signals the host caught go to the root vproc `root`; while the shell
@@ -892,7 +893,9 @@ pub fn drive(
 	}
 }
 
-/// The shell's run is over and the process is to exit: bash's process
+/// Wait for the process substitutions a process shell's exit leaves.
+///
+/// The shell's run is over and the process is to exit. bash's process
 /// substitutions are processes that its exit leaves running with the
 /// output they hold (`cmd > >(slow-reader)`, `exec > >(tee log)`), so the
 /// process stays until those of this shell end

@@ -13,8 +13,8 @@
 //! &)`) gets there. A detached tree (`nohup`) is never ended, and a vproc
 //! of a detached lineage never counts. A process substitution is no orphan
 //! ([`Kernel::procsubs`](super::Kernel::procsubs)): what reads or writes
-//! its pipe still reaches it (`$(cmd > >(filter))`, a subshell's `cmd >
-//! >(filter)`), as bash's.
+//! its pipe still reaches it (`$(cmd > >(filter))`, or a subshell's
+//! `cmd > >(filter)`), as bash's.
 //!
 //! The judgement is derived from the vprocs alone, so nothing of it is
 //! externalized: a restored shell finds its orphans again

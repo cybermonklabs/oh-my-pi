@@ -24,9 +24,9 @@
 //! duplicates of standard streams follow the current command's streams.
 //! The root lets go of a command's standard streams when it ends, as a
 //! `bash -c` shell's exit closes its own, but they stay open while a
-//! process substitution the command started still runs (`cmd >
-//! >(slow-reader)`, `exec > >(tee log)`): its output reaches the caller
-//! after the command, as bash's does.
+//! process substitution the command started still runs
+//! (`cmd > >(slow-reader)`, `exec > >(tee log)`): its output reaches the
+//! caller after the command, as bash's does.
 //!
 //! **Forks.** Between engine calls the store holds the whole root state, so
 //! the driver publishes a copy of it at each command boundary
