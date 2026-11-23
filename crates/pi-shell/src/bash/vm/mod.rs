@@ -528,6 +528,10 @@ pub struct Kernel {
 	/// Background jobs' lone commands whose redirections wait for their name
 	/// to resolve ([`proc::Deferral`]): imaged (a restored command goes on).
 	pub deferrals:          Vec<proc::Deferral>,
+	/// The externals that give background jobs their `$!` whose program
+	/// was busy ([`proc::BusySpawn`]), by deciding vproc; not imaged (a
+	/// restored spawn meets the busy program again).
+	pub busy:               Vec<(Vpid, proc::BusySpawn)>,
 	/// Job control of the interactive shell (process groups, the
 	/// terminal, stop events); not imaged.
 	pub jobctl:             jobctl::JobCtl,
@@ -633,6 +637,7 @@ impl Kernel {
 			pid_owners: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
+			busy: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
 		}
 	}
@@ -659,6 +664,9 @@ impl Kernel {
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
 	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
 	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
+		if !self.busy.is_empty() {
+			self.busy.retain(|(v, _)| *v != vproc);
+		}
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
 			return;
 		};

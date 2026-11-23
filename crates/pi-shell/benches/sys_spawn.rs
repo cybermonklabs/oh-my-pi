@@ -111,6 +111,7 @@ mod unix {
 			lineage: pi_shell::bash::Lineage::default(),
 			redirs: None,
 			ctty: None,
+			on_busy: pi_shell::bash::OnBusy::Retry,
 		}
 	}
 

@@ -22,7 +22,7 @@ use std::{
 use bstr::{BStr, BString, ByteSlice};
 
 use crate::bash::{
-	ChildRedirs, CmdTag, EnvView, Lineage, OsHandle, PgroupSpec, Rlimit, SigSet, SpawnSpec,
+	ChildRedirs, CmdTag, EnvView, Lineage, OnBusy, OsHandle, PgroupSpec, Rlimit, SigSet, SpawnSpec,
 	StdioSpec, Vpid,
 };
 
@@ -52,6 +52,7 @@ pub(super) struct Rest {
 	lineage:     Lineage,
 	redirs:      Option<ChildRedirs>,
 	ctty:        Option<OsHandle>,
+	on_busy:     OnBusy,
 }
 
 impl Rest {
@@ -71,6 +72,7 @@ impl Rest {
 			lineage,
 			redirs,
 			ctty,
+			on_busy,
 		} = self;
 		launch(SpawnSpec {
 			path: names.path.as_bstr(),
@@ -88,6 +90,7 @@ impl Rest {
 			lineage,
 			redirs,
 			ctty,
+			on_busy,
 		})
 	}
 }
@@ -119,6 +122,7 @@ pub(super) fn split(spec: SpawnSpec<'_>) -> (Names, Rest) {
 		lineage,
 		redirs,
 		ctty,
+		on_busy,
 	} = spec;
 	let names = Names {
 		path: BString::from(path.as_bytes()),
@@ -138,6 +142,7 @@ pub(super) fn split(spec: SpawnSpec<'_>) -> (Names, Rest) {
 		lineage,
 		redirs,
 		ctty,
+		on_busy,
 	};
 	(names, rest)
 }

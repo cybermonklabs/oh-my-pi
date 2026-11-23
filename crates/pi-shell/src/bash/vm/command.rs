@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		AssignValue, Awaited, BangStage, BusySpawn, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
+		JobState, Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
+		Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -33,8 +33,8 @@ use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	fs::StatKind,
 	host::{
-		ChildRedirs, EnvView, ExitStatus, Invocation, ProcEvent, ResolveCtx, Resolved, SpawnSpec,
-		StdioSpec, Via,
+		ChildRedirs, EnvView, ExitStatus, Invocation, OnBusy, ProcEvent, ResolveCtx, Resolved,
+		SpawnSpec, StdioSpec, Via,
 	},
 	ids::{CallId, CmdTag, IntrinsicId, RunId},
 	ir::{self, AssignVal, Op, Part, Unit},
@@ -2440,6 +2440,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					.as_deref()
 					.and_then(|z| z.ctty.0.as_ref())
 					.and_then(crate::bash::fd::FdRef::os_handle),
+				on_busy: on_busy(k, vp.vpid, child_redirs),
 			};
 			let mut pending = cx.host.spawn(spec);
 			let mut tcx = Context::from_waker(&k.waker);
@@ -2525,6 +2526,14 @@ fn spawned_external(
 	how: Spawned<'_>,
 ) -> Option<Flow> {
 	let Spawned { path, interp, child_redirs, argv } = how;
+	// The `$!` external found its program busy ([`OnBusy::Fail`]): its
+	// refusal is rendered, not printed, and the spawn asked for again.
+	if let Err(err) = &spawned
+		&& is_busy(err)
+		&& on_busy(k, vp.vpid, child_redirs) == OnBusy::Fail
+	{
+		return busy_bang(k, vp, cx, line, path, interp, err);
+	}
 	// A refused spawn (retried as a script, or reported) never makes the
 	// job a program: its `$!` readers need not wait for the rest.
 	if spawned.is_err() && !k.bangs.is_empty() {
@@ -2574,17 +2583,10 @@ fn spawned_external(
 			st(vp).target = Some(Target::Script(path));
 		},
 		Err(err) if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
-			// zsh `execute`: `%e: NAME` with the name as written;
-			// 126 for `EACCES` and `ENOEXEC`, else 127.
-			let name = st(vp).argv[0].clone();
-			let msg = format!("{}: {name}", super::redir::zsh_errno(&err)).into();
-			k.diag(cx, vp, line, Diag::Usage { msg });
+			let (diag, status) = zsh_exec_failure(vp, &err);
+			k.diag(cx, vp, line, diag);
 			let s = st(vp);
-			s.status = if err.kind() == std::io::ErrorKind::PermissionDenied || is_enoexec(&err) {
-				126
-			} else {
-				127
-			};
+			s.status = status;
 			s.stage = Stage::Output;
 			exec_failed(k, cx, vp);
 		},
@@ -4987,6 +4989,106 @@ fn interpreter(text: &[u8]) -> BString {
 	interp
 }
 
+/// zsh `execute`'s report of a refused exec: `%e: NAME` with the name as
+/// written; 126 for `EACCES` and `ENOEXEC`, else 127.
+fn zsh_exec_failure(vp: &mut Vproc, err: &std::io::Error) -> (Diag, i32) {
+	let name = st(vp).argv[0].clone();
+	let msg = format!("{}: {name}", super::redir::zsh_errno(err)).into();
+	let status = if err.kind() == std::io::ErrorKind::PermissionDenied || is_enoexec(err) {
+		126
+	} else {
+		127
+	};
+	(Diag::Usage { msg }, status)
+}
+
+/// The OS refused to run the program because a process holds it open for
+/// writing (`ETXTBSY`).
+#[cfg(unix)]
+fn is_busy(err: &std::io::Error) -> bool {
+	err.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+/// Elsewhere no kernel refuses a program held open for writing.
+#[cfg(not(unix))]
+const fn is_busy(_err: &std::io::Error) -> bool {
+	false
+}
+
+/// What the spawn of `vproc`'s external does with a busy program
+/// ([`OnBusy`]): the external that gives a background job its `$!`
+/// (`bang_dispatch` let it through) fails at once, then, its refusal
+/// rendered ([`BusySpawn`]), asks for a process that waits itself, as
+/// bash's forked child is `$!` before its exec. One that applies its own
+/// redirections already is such a process.
+fn on_busy(k: &Kernel, vproc: crate::bash::ids::Vpid, child_redirs: bool) -> OnBusy {
+	match k.busy.iter().find(|(v, _)| *v == vproc) {
+		Some((_, BusySpawn::Child(child))) => child.clone(),
+		_ if !child_redirs && k.bangs.iter().any(|b| b.vproc == vproc) => OnBusy::Fail,
+		_ => OnBusy::Retry,
+	}
+}
+
+/// The `$!` external's program was busy ([`OnBusy::Fail`]): render what its
+/// refusal would print (bash: through `Target::Refused`, whose probes may
+/// wait; zsh: here) and dispatch it again, asking for a process that
+/// waits for the program itself and prints that if it stays busy
+/// ([`OnBusy::Child`]).
+#[cold]
+#[inline(never)]
+fn busy_bang(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	path: BString,
+	interp: bool,
+	err: &std::io::Error,
+) -> Option<Flow> {
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		let (diag, status) = zsh_exec_failure(vp, err);
+		k.busy.push((vp.vpid, BusySpawn::Render));
+		busy_rendered(k, vp, cx, line, &diag, status);
+		st(vp).target = Some(if interp {
+			Target::Interp(path)
+		} else {
+			Target::External(path)
+		});
+	} else {
+		k.busy.push((vp.vpid, BusySpawn::Render));
+		let code = err.raw_os_error().unwrap_or_default();
+		st(vp).target = Some(Target::Refused { path, code });
+	}
+	None
+}
+
+/// `diag` and `status` would report the refusal of the `$!` external whose
+/// program was busy ([`BusySpawn::Render`]): kept for the process that
+/// waits for the program, which prints them if it stays busy. `false`
+/// when this refusal is no such one (it is reported here).
+fn busy_rendered(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	diag: &Diag,
+	status: i32,
+) -> bool {
+	let Some(i) = k
+		.busy
+		.iter()
+		.position(|(v, b)| *v == vp.vpid && *b == BusySpawn::Render)
+	else {
+		return false;
+	};
+	let report = BString::from(k.render_quiet(cx, vp, line, diag));
+	let name = st(vp).argv[0].clone();
+	let exec_diag = super::redir::diag_prefix(k, cx, vp, line, &name);
+	let status = u8::try_from(status).unwrap_or(126);
+	k.busy[i].1 = BusySpawn::Child(OnBusy::Child { report, status, exec_diag });
+	true
+}
+
 /// bash's `shell_execve` after the OS refused to run `path` with `code`
 /// (not `ENOEXEC`): a directory is `Is a directory`; a missing or
 /// non-executable file, `E2BIG` and `ENOMEM` report the error; an
@@ -5049,6 +5151,11 @@ fn refused(
 			}
 		}
 	};
+	if busy_rendered(k, vp, cx, line, &diag, status) {
+		// The `$!` external's busy program: asked for again (`busy_bang`).
+		st(vp).target = Some(Target::External(path.clone()));
+		return None;
+	}
 	k.diag(cx, vp, line, diag);
 	let s = st(vp);
 	s.status = status;
