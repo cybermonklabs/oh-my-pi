@@ -11,11 +11,15 @@
 //! & …)`) waits on that external and runs on as its own process, as in
 //! bash; one that only runs builtins on the way to it (`(cd d && server
 //! &)`) gets there. A detached tree (`nohup`) is never ended, and a vproc
-//! of a detached lineage never counts.
+//! of a detached lineage never counts. A process substitution is no orphan
+//! ([`Kernel::procsubs`](super::Kernel::procsubs)): what reads or writes
+//! its pipe still reaches it (`$(cmd > >(filter))`, a subshell's `cmd >
+//! >(filter)`), as bash's.
 //!
 //! The judgement is derived from the vprocs alone, so nothing of it is
 //! externalized: a restored shell finds its orphans again
-//! ([`Shell::seed_orphans`]).
+//! ([`Shell::seed_orphans`]); it knows of no process substitution, so one
+//! whose parent is gone is an orphan there.
 //!
 //! [`EngineConfig::end_orphan_jobs`]: crate::bash::EngineConfig::end_orphan_jobs
 
@@ -67,10 +71,14 @@ impl Shell {
 			if self.k.spawned.iter().any(|p| p.parent == Some(parent)) {
 				later.push(parent);
 			}
+			// A process substitution is no job: what reads or writes its pipe
+			// still reaches it (`$(cmd > >(filter))`), as bash's.
 			let found: Vec<Vpid> = self
 				.procs
 				.iter()
-				.filter(|p| p.parent == Some(parent) && !p.lineage.detached)
+				.filter(|p| {
+					p.parent == Some(parent) && !p.lineage.detached && !self.k.procsubs.contains(&p.vpid)
+				})
 				.map(|p| p.vpid)
 				.filter(|v| !self.orphans.contains(v))
 				.collect();

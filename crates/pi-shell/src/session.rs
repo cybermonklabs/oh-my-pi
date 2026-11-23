@@ -22,6 +22,11 @@
 //! Each command starts with its own standard streams, even if an earlier
 //! command redirected them with `exec`. Higher-numbered descriptors persist;
 //! duplicates of standard streams follow the current command's streams.
+//! The root lets go of a command's standard streams when it ends, as a
+//! `bash -c` shell's exit closes its own, but they stay open while a
+//! process substitution the command started still runs (`cmd >
+//! >(slow-reader)`, `exec > >(tee log)`): its output reaches the caller
+//! after the command, as bash's does.
 //!
 //! **Forks.** Between engine calls the store holds the whole root state, so
 //! the driver publishes a copy of it at each command boundary
@@ -75,10 +80,10 @@ use crate::{
 	bash::{
 		Budget, CallId, Cx, Engine, EngineConfig, EventMask, EventSink, Fs, MemStore, PipeTap,
 		Profile, RestoreError, RestoreOpts, RunId, Script, Shell, ShellError, ShellInit, Signal,
-		Step, ToolCall, VprocSel,
+		Step, ToolCall, Vpid, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
-	host::{PiHost, SpawnObserver, TERM_GRACE},
+	host::{HeldRun, PiHost, SpawnObserver, TERM_GRACE},
 	sys::OutputDecoding,
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
@@ -433,6 +438,7 @@ impl Session {
 			children: children.clone(),
 			tools,
 			image: image.clone(),
+			held: Vec::new(),
 		};
 		runtime.spawn(driver.serve());
 		Ok(Self { jobs: Some(jobs), waker, children, image })
@@ -639,6 +645,10 @@ struct Driver {
 	tools:    ToolCalls,
 	/// Updated at the end of each command.
 	image:    LatestImage,
+	/// The streams of ended commands kept open, each with the process
+	/// substitutions it started that still ran when it ended
+	/// ([`Driver::release_ended`]).
+	held:     Vec<(HeldRun, Vec<Vpid>)>,
 }
 
 impl Driver {
@@ -661,7 +671,11 @@ impl Driver {
 	/// when there is none to do (a new job's ring ends it).
 	async fn idle_turn(&mut self) {
 		self.poll_tools();
-		match self.step(Budget::default()) {
+		let step = self.step(Budget::default());
+		// Before any suspension: the step may have ended the last
+		// substitution holding an earlier command's streams.
+		self.release_ended();
+		match step {
 			Step::Done { run, status } => self.on_done(run, status),
 			Step::Call { id, call } => self.on_call(id, call),
 			Step::Yield => tokio::task::yield_now().await,
@@ -705,6 +719,9 @@ impl Driver {
 			.streams()
 			.install([stdio.stdin, stdio.stdout, stdio.stderr], text_capture);
 		self.shell.reset_root_stdio(&mut self.host);
+		// The substitutions an earlier command left running hold its
+		// streams, not this command's.
+		let earlier = self.shell.substitutions().to_vec();
 		self.children.set_active(true);
 		let mut applied = 0;
 		let status = loop {
@@ -719,7 +736,9 @@ impl Driver {
 				self.shell.control().cancel(sig);
 			}
 			self.poll_tools();
-			match self.step(Budget::default()) {
+			let step = self.step(Budget::default());
+			self.release_ended();
+			match step {
 				Step::Done { run: done, status } if done == run => break status,
 				Step::Done { run, status } => self.on_done(run, status),
 				Step::Call { id, call } => self.on_call(id, call),
@@ -744,9 +763,20 @@ impl Driver {
 		let exited = self.shell.ended_by_exit(run);
 		self.settle().await;
 		self.children.set_active(false);
-		self.host.streams().clear();
+		let holders: Vec<Vpid> = self
+			.shell
+			.exit_survivors()
+			.into_iter()
+			.filter(|v| !earlier.contains(v))
+			.collect();
+		if let Some(held) = self.host.streams().end_run(!holders.is_empty()) {
+			self.held.push((held, holders));
+		}
 		self.host.set_pipe_tap(None);
 		self.host.set_event_sink(None);
+		// The root lets go of the command's streams: a `>(…)` reading them
+		// (`exec > >(tee log)`) sees end of file.
+		self.shell.reset_root_stdio(&mut self.host);
 		self.shell.set_event_mask(EventMask::NONE);
 		self.host.set_reported_error(None);
 		self.restore_overlay(saved);
@@ -754,6 +784,22 @@ impl Driver {
 		let cwd = store_cwd(&self.store);
 		// The caller may have stopped waiting (dropped future).
 		let _ = reply.send(RunOutcome { status, cancelled: applied > 0, exited, cwd });
+	}
+
+	/// Close the streams of each ended command whose process
+	/// substitutions, and those they started, have all ended.
+	fn release_ended(&mut self) {
+		if self.held.is_empty() {
+			return;
+		}
+		let shell = &self.shell;
+		let (ended, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+			.into_iter()
+			.partition(|(_, holders)| !holders.iter().any(|&v| shell.substitution_from(v)));
+		self.held = running;
+		for (run, _) in ended {
+			self.host.streams().release(run);
+		}
 	}
 
 	/// Let the background work a command started reach its first wait (an
@@ -1693,6 +1739,104 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(sh(&mut s, "sleep 0.3; wait %1").await.outcome.status, 7);
+	}
+
+	/// [`sh`], but a stream still open `limit` after the command fails the
+	/// test instead of hanging it.
+	async fn sh_within(session: &mut Session, command: &str, limit: Duration) -> Captured {
+		let (out_r, out_w) = io::pipe().unwrap();
+		let (err_r, err_w) = io::pipe().unwrap();
+		let drain = |mut r: io::PipeReader| {
+			let (tx, rx) = std::sync::mpsc::channel();
+			std::thread::spawn(move || {
+				let mut s = String::new();
+				r.read_to_string(&mut s).unwrap();
+				let _ = tx.send(s);
+			});
+			rx
+		};
+		let (out, err) = (drain(out_r), drain(err_r));
+		let stdio = RunStdio {
+			stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(out_w))),
+			stderr: Some(std::fs::File::from(std::os::fd::OwnedFd::from(err_w))),
+		};
+		let outcome = session
+			.run_with(RunOptions::new(command), stdio, CancellationToken::new())
+			.await
+			.unwrap();
+		let end = Instant::now() + limit;
+		let read = |rx: std::sync::mpsc::Receiver<String>| {
+			rx.recv_timeout(end.saturating_duration_since(Instant::now()))
+				.unwrap_or_else(|_| panic!("{command}: output still open {limit:?} after the command"))
+		};
+		Captured { outcome, stdout: read(out), stderr: read(err) }
+	}
+
+	/// A process substitution still running when its command ends keeps
+	/// the command's output open, as bash's keeps the descriptors it
+	/// inherited: what it writes after the command reaches the caller, and
+	/// the output ends when it ends. A command substitution reads until it
+	/// ends too. Each row is what bash 5.3.20 and 5.2.21 print.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn process_substitution_output_outlives_its_command() {
+		for (command, expected) in [
+			("/bin/echo hi > >(sleep 0.2; /bin/cat); echo after", "after\nhi\n"),
+			("echo hi > >(sleep 0.2; /bin/cat); echo after", "after\nhi\n"),
+			(
+				"printf 'a\\nb\\n' > >(sleep 0.2; while read l; do echo \"<$l>\"; done); echo after",
+				"after\n<a>\n<b>\n",
+			),
+			(
+				"/bin/echo hi > >(sleep 0.1; /bin/cat > >(sleep 0.1; /bin/cat)); echo after",
+				"after\nhi\n",
+			),
+			("( /bin/echo hi > >(sleep 0.2; /bin/cat); echo in ); echo after", "in\nafter\nhi\n"),
+			("exec > >(sleep 0.2; /bin/cat); echo hi; echo after", "hi\nafter\n"),
+			("x=$(/bin/echo hi > >(sleep 0.2; /bin/cat)); echo \"[$x]\"", "[hi]\n"),
+			("x=$( ( /bin/echo hi > >(sleep 0.2; /bin/cat) ) ); echo \"[$x]\"", "[hi]\n"),
+		] {
+			let mut s = session();
+			let c = sh_within(&mut s, command, Duration::from_secs(10)).await;
+			assert_eq!(
+				(c.outcome.status, c.stdout.as_str(), c.stderr.as_str()),
+				(0, expected, ""),
+				"{command}"
+			);
+			let next = sh_within(&mut s, "echo next", Duration::from_secs(10)).await;
+			assert_eq!(next.stdout, "next\n", "after {command}");
+		}
+	}
+
+	/// A substitution an earlier command left running (on a descriptor
+	/// that persists) writes to that command's streams, never a later
+	/// command's.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_earlier_process_substitution_stays_out_of_later_commands() {
+		let mut s = session();
+		s.run("exec 3> >(/bin/cat)", RunStdio::default(), CancellationToken::new())
+			.await
+			.unwrap();
+		let c = sh_within(&mut s, "echo to3 >&3; sleep 0.2; echo own", Duration::from_secs(10)).await;
+		assert_eq!((c.stdout.as_str(), c.stderr.as_str()), ("own\n", ""));
+		let c = sh_within(&mut s, "exec 3>&-; sleep 0.2; echo closed", Duration::from_secs(10)).await;
+		assert_eq!((c.stdout.as_str(), c.stderr.as_str()), ("closed\n", ""));
+	}
+
+	/// Without a process substitution still running, a command's streams
+	/// close when it ends: a background job's later output is dropped, not
+	/// delivered to the caller.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn background_output_after_the_command_is_dropped() {
+		for command in [
+			"{ sleep 0.3; echo late; } &",
+			"{ sleep 0.3; echo late >&2; } &",
+			": > >(:); { sleep 0.3; echo late; } &",
+		] {
+			let mut s = session();
+			let c = sh_within(&mut s, command, Duration::from_secs(10)).await;
+			assert_eq!((c.stdout.as_str(), c.stderr.as_str()), ("", ""), "{command}");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
