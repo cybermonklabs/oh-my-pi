@@ -14,6 +14,7 @@ import {
 	type LiveServerEvent,
 } from "@oh-my-pi/pi-coding-agent/live/protocol";
 import * as natives from "@oh-my-pi/pi-natives";
+import { logger } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -387,6 +388,52 @@ describe("GPT-Live transport", () => {
 				{ type: "input_transcript.added", item: { text: c } },
 				heard("item_1", `${b}${c}`),
 			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("one delta over 8,192 characters ends a line where it would pass them, and the turn keeps its end", async () => {
+		const head = "a".repeat(3_808);
+		const tail = `${"b".repeat(8_182)}ENDOFWORDS`;
+		const api = liveApiServer({
+			events: [
+				{
+					type: "session.input_transcript.delta",
+					event_id: "e1",
+					delta: `${head}${tail}`,
+					start_ms: 0,
+					end_ms: 100,
+				},
+				{
+					type: "session.delegation.created",
+					event_id: "e2",
+					offset_ms: 100,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const warn = vi.spyOn(logger, "warn");
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: head } },
+				{ type: "turn.done", turn: { role: "user", transcript: head } },
+				{ type: "input_transcript.added", item: { text: tail } },
+				heard("item_1", tail),
+			]);
+			expect(warn).toHaveBeenCalledWith("Dropped the oldest of the user's words waiting for a GPT-Live delegation", {
+				droppedCharacters: 3_808,
+				limit: 8_192,
+			});
 		} finally {
 			await transport.close();
 			api.server.stop(true);

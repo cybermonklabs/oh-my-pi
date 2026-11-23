@@ -1584,8 +1584,9 @@ alone goes after 1 s.
 
 What the server sends is bounded: omp reads at most 256 KiB of the session
 response, ends a transcript line that would pass 8,192 characters and begins a
-new one, and keeps for a turn at most the latest 8,192 characters of the user's
-words with timing, and as many of those without.
+new one (a longer delta is split, its latest characters filling the last
+piece), and keeps for a turn at most the latest 8,192 characters of the user's
+words with timing, and as many of those without. It logs the words it drops.
 
 ## Dictation Sub-Protocol
 

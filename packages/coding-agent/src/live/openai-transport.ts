@@ -126,14 +126,41 @@ function redactKey(text: string, apiKey: string): string {
 	return apiKey ? text.replaceAll(apiKey, "[key]") : text;
 }
 
-/** `words` without its oldest entries, so that their text is at most {@link MAX_TRANSCRIPT_LENGTH} long. */
+/**
+ * `words` without its oldest entries, so that their text is at most {@link MAX_TRANSCRIPT_LENGTH} long.
+ * The words it drops are logged.
+ */
 function latestWords<T extends { text: string }>(words: T[]): T[] {
 	let length = 0;
 	for (let index = words.length - 1; index >= 0; index--) {
 		length += words[index]!.text.length;
-		if (length > MAX_TRANSCRIPT_LENGTH) return words.slice(index + 1);
+		if (length > MAX_TRANSCRIPT_LENGTH) {
+			const dropped = words.slice(0, index + 1).reduce((sum, part) => sum + part.text.length, 0);
+			logger.warn("Dropped the oldest of the user's words waiting for a GPT-Live delegation", {
+				droppedCharacters: dropped,
+				limit: MAX_TRANSCRIPT_LENGTH,
+			});
+			return words.slice(index + 1);
+		}
 	}
 	return words;
+}
+
+/**
+ * `text` in pieces of at most {@link MAX_TRANSCRIPT_LENGTH} characters, full ones last, so that the latest
+ * words fill a piece. No cut falls inside a surrogate pair.
+ */
+function transcriptPieces(text: string): string[] {
+	const pieces: string[] = [];
+	let end = text.length;
+	while (end > MAX_TRANSCRIPT_LENGTH) {
+		let start = end - MAX_TRANSCRIPT_LENGTH;
+		if ((text.charCodeAt(start) & 0xfc00) === 0xdc00) start++;
+		pieces.push(text.slice(start, end));
+		end = start;
+	}
+	pieces.push(text.slice(0, end));
+	return pieces.reverse();
 }
 
 /** Parses a JSON string from an event channel into a record, or `undefined`. */
@@ -497,7 +524,7 @@ export class OpenAILiveTransport implements Pick<
 	/**
 	 * GPT-Live's public events as the controller's (Codex's) events.
 	 * - Its transcript comes in deltas with no end-of-turn event, so one speaker's line ends when the other
-	 *   speaker starts.
+	 *   speaker starts. A delta longer than a line goes as pieces; see {@link transcriptPieces}.
 	 * - Its delegation carries only an id and its `offset_ms` on the session timeline: OpenAI's client
 	 *   delegation guide says to use the transcript events for what the user wants. Its turn is the user's
 	 *   words before that offset; see {@link #releaseDelegations}. A user's delta with no timing has no
@@ -514,26 +541,29 @@ export class OpenAILiveTransport implements Pick<
 			case "session.input_transcript.delta":
 			case "session.output_transcript.delta": {
 				if (typeof record.delta !== "string" || !record.delta) return [];
-				const delta = record.delta.slice(0, MAX_TRANSCRIPT_LENGTH);
+				const pieces = transcriptPieces(record.delta);
 				const role = record.type === "session.input_transcript.delta" ? "user" : "assistant";
 				const { start_ms: startMs, end_ms: endMs } = record;
 				if (typeof startMs === "number" && typeof endMs === "number" && Number.isFinite(endMs)) {
 					this.#transcriptEndMs[role] = Math.max(this.#transcriptEndMs[role], endMs);
-					if (role === "user") this.#addUserWords(startMs, delta);
+					if (role === "user") for (const piece of pieces) this.#addUserWords(startMs, piece);
 				} else if (role === "user") {
-					this.#addUntimedWords(delta);
+					for (const piece of pieces) this.#addUntimedWords(piece);
 				}
 				const events: LiveServerEvent[] = [];
-				const previous = this.#line;
-				// A line ends when the other speaker starts, or where it would pass the longest line kept.
-				const continues = previous?.role === role && previous.text.length + delta.length <= MAX_TRANSCRIPT_LENGTH;
-				if (previous && !continues) {
-					events.push({ type: "turn.done", turn: { role: previous.role, transcript: previous.text } });
-				}
-				const text = (continues ? previous.text : "") + delta;
-				this.#line = { role, text };
 				const type = role === "user" ? "input_transcript.added" : "output_transcript.added";
-				events.push({ type, item: { text } });
+				for (const piece of pieces) {
+					const previous = this.#line;
+					// A line ends when the other speaker starts, or where it would pass the longest line kept.
+					const continues =
+						previous?.role === role && previous.text.length + piece.length <= MAX_TRANSCRIPT_LENGTH;
+					if (previous && !continues) {
+						events.push({ type: "turn.done", turn: { role: previous.role, transcript: previous.text } });
+					}
+					const text = (continues ? previous.text : "") + piece;
+					this.#line = { role, text };
+					events.push({ type, item: { text } });
+				}
 				events.push(...this.#releaseDelegations());
 				return events;
 			}
