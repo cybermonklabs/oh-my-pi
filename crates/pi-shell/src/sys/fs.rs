@@ -786,14 +786,22 @@ mod fifo {
 		}
 		let mut opts = options(flags, mode);
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
-		let open = FifoOpen::start(host, &meta, nofollow, move |path, pinned| {
+		let open = move |path: &std::path::Path, pinned: bool| {
 			// A pin is checked not to be a symbolic link already, and its
 			// `/proc/self/fd/N` always is one.
 			if pinned {
 				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
 			}
 			opts.open(path)
-		});
+		};
+		// A read-only open does not depend on its `open(2)` being woken
+		// (gVisor can leave it asleep after its writer came): see
+		// `FifoOpen::start_reading`.
+		let open = if write {
+			FifoOpen::start(host, &meta, nofollow, open)
+		} else {
+			FifoOpen::start_reading(host, &meta, nofollow, open, Ok)
+		};
 		Some(Box::new(Pending(open)))
 	}
 

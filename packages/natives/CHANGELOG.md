@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Under gVisor before google/gvisor@d6786915, a shell redirection that opens a FIFO for reading (`mapfile -t l < f`, `cat < f`) no longer waits for ever when its writer opened, wrote and closed while the open waited (`{ echo a; } > f & mapfile -t l < f`): once the open has waited 50 ms (then up to 1 s between looks) it looks for bytes in the FIFO, and takes them. On Linux nothing changes: a writer's open wakes the reader at once. A writer that closes without writing still leaves the reader waiting there. The helper thread of such an open that gVisor keeps asleep is left behind (a 64 KiB stack, no descriptor); once 64 are left, read opens are no longer looked at, so no more are left.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

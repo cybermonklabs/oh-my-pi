@@ -48,17 +48,58 @@ use parking_lot::{Condvar, Mutex};
 /// path that another process points at a new FIFO after the drop opened its
 /// end but before the helper's `open(2)` makes the join wait until that new
 /// FIFO's other end opens.
+///
+/// A read-only open started with [`FifoOpen::start_reading`] does not depend
+/// on its `open(2)` being woken. gVisor before google/gvisor@d6786915 can
+/// leave a reader in `open(2)` after a writer opened, wrote and closed.
+/// While the helper is still in `open(2)` after [`FIRST_PROBE`] (then twice
+/// as long each time, up to [`LAST_PROBE`]), the open looks at the FIFO
+/// through a read end that does not wait: bytes in it mean a writer already
+/// came, so that end, made blocking, is the open's result, and one write
+/// open that does not wait (the sleeping helper is a reader, so it succeeds)
+/// wakes the helper, whose end is closed. On Linux a writer's open wakes the
+/// helper at once, so the look finds no bytes and changes nothing. Its limit:
+/// a writer that closes without writing leaves no bytes to see, and the
+/// helper waits as before.
 pub struct FifoOpen<T> {
-	shared: Arc<Shared<T>>,
-	node:   Arc<Node>,
-	helper: Option<thread::JoinHandle<()>>,
+	shared:  Arc<Shared<T>>,
+	node:    Arc<Node>,
+	helper:  Option<thread::JoinHandle<()>>,
+	/// The thread that looks for a writer the helper missed
+	/// ([`FifoOpen::start_reading`]).
+	watcher: Option<thread::JoinHandle<()>>,
 }
+
+/// How long a read-only open waits in `open(2)` before it first looks for a
+/// writer the helper missed ([`FifoOpen::start_reading`]).
+pub const FIRST_PROBE: Duration = Duration::from_millis(50);
+
+/// The longest wait between two looks.
+pub const LAST_PROBE: Duration = Duration::from_secs(1);
+
+/// How a read end found by the look becomes the open's result.
+type Adopt<T> = Box<dyn FnOnce(fs::File) -> io::Result<T> + Send>;
 
 /// What an open and its helper share.
 struct Shared<T> {
 	slot: Mutex<Slot<T>>,
 	/// Notified once the helper has stored its result.
 	done: Condvar,
+}
+
+/// Helpers a drop left in `open(2)` that have not returned
+/// ([`FifoOpen::release`]): on gVisor each is a thread asleep until a writer
+/// of its FIFO comes, if one ever does.
+static LEFT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most helpers left at once: past it a read-only open is not looked at
+/// ([`FifoOpen::start_reading`] falls back to [`FifoOpen::start`]), so no
+/// more are left. Each holds a 64 KiB stack and no descriptor.
+pub const MAX_LEFT: usize = 64;
+
+/// Whether a read-only open may be looked at with `left` helpers left.
+const fn may_look(left: usize) -> bool {
+	left < MAX_LEFT
 }
 
 struct Slot<T> {
@@ -72,6 +113,16 @@ struct Slot<T> {
 	/// The helper passed its check of `cancelled`: it is in `open(2)`, or
 	/// about to enter it.
 	opening:   bool,
+	/// The helper's `open(2)` returned (or it never entered it).
+	returned:  bool,
+	/// The drop left this helper in `open(2)` ([`FifoOpen::release`]): it
+	/// counts in [`LEFT`] until it returns.
+	left:      bool,
+	/// The open's result is the read end the look found, not the helper's.
+	rescued:   bool,
+	/// Test hook: the read ends the look opened.
+	#[cfg(test)]
+	looks:     usize,
 	/// Test hook: after its check, the helper waits until the drop is about
 	/// to join it.
 	#[cfg(test)]
@@ -88,6 +139,15 @@ struct Slot<T> {
 	/// open would wait for ever, so the helper skips it.
 	#[cfg(test)]
 	peer_held: Option<bool>,
+	/// Test hook: a reader gVisor leaves asleep. The helper opens a read end
+	/// that does not wait (a reader of the FIFO, as one in `open(2)` is) and
+	/// does not return until the open has a result or is cancelled.
+	#[cfg(test)]
+	stuck:     bool,
+	/// Test hook: a `stuck` helper stays asleep, cancelled or not, until this
+	/// is cleared (one gVisor does not wake even for the drop's end).
+	#[cfg(test)]
+	stay:      bool,
 }
 
 impl<T> Default for Slot<T> {
@@ -98,6 +158,11 @@ impl<T> Default for Slot<T> {
 			finished:               false,
 			cancelled:              false,
 			opening:                false,
+			returned:               false,
+			left:                   false,
+			rescued:                false,
+			#[cfg(test)]
+			looks:                  0,
 			#[cfg(test)]
 			hold:                   false,
 			#[cfg(test)]
@@ -106,6 +171,10 @@ impl<T> Default for Slot<T> {
 			probe:                  None,
 			#[cfg(test)]
 			peer_held:              None,
+			#[cfg(test)]
+			stuck:                  false,
+			#[cfg(test)]
+			stay:                   false,
 		}
 	}
 }
@@ -187,6 +256,36 @@ impl<T: Send + 'static> FifoOpen<T> {
 	where
 		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 	{
+		Self::begin(path, meta, nofollow, open, None)
+	}
+
+	/// [`FifoOpen::start`] for a read-only open that does not depend on its
+	/// `open(2)` being woken (see [`FifoOpen`]): a read end the look finds is
+	/// made the open's result by `adopt`.
+	pub fn start_reading<F, A>(
+		path: &Path,
+		meta: &fs::Metadata,
+		nofollow: bool,
+		open: F,
+		adopt: A,
+	) -> Self
+	where
+		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
+		A: FnOnce(fs::File) -> io::Result<T> + Send + 'static,
+	{
+		Self::begin(path, meta, nofollow, open, Some(Box::new(adopt)))
+	}
+
+	fn begin<F>(
+		path: &Path,
+		meta: &fs::Metadata,
+		nofollow: bool,
+		open: F,
+		adopt: Option<Adopt<T>>,
+	) -> Self
+	where
+		F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
+	{
 		let node = Arc::new(Node::new(path, meta, nofollow));
 		let shared = Arc::new(Shared { slot: Mutex::new(Slot::default()), done: Condvar::new() });
 		let helper = match spawn_helper(Arc::clone(&shared), Arc::clone(&node), open) {
@@ -196,7 +295,125 @@ impl<T: Send + 'static> FifoOpen<T> {
 				None
 			},
 		};
-		Self { shared, node, helper }
+		// Without a watcher the open waits on its helper alone, as before:
+		// also once `MAX_LEFT` helpers are left.
+		let watcher = adopt
+			.filter(|_| helper.is_some() && may_look(LEFT.load(std::sync::atomic::Ordering::Relaxed)))
+			.and_then(|adopt| spawn_watcher(Arc::clone(&shared), Arc::clone(&node), adopt).ok());
+		Self { shared, node, helper, watcher }
+	}
+}
+
+/// Starts the thread that looks for a writer the helper of a read-only open
+/// missed ([`FifoOpen::start_reading`]): while the helper is in `open(2)`,
+/// after [`FIRST_PROBE`], then twice as long each time up to [`LAST_PROBE`],
+/// it opens a read end that does not wait and asks how many bytes wait in
+/// the FIFO. None: it changes nothing. Some: a writer came, so that end, made
+/// blocking, becomes the open's result through `adopt`, and the helper is
+/// woken ([`wake_helper`]). It ends with the open's result or its drop.
+fn spawn_watcher<T: Send + 'static>(
+	shared: Arc<Shared<T>>,
+	node: Arc<Node>,
+	adopt: Adopt<T>,
+) -> io::Result<thread::JoinHandle<()>> {
+	thread::Builder::new()
+		.name("fifo-watch".to_owned())
+		.stack_size(64 << 10)
+		.spawn(move || {
+			// The open is over: it has a result, or the helper returned.
+			let over = |s: &Slot<T>| s.result.is_some() || s.finished || s.cancelled || s.returned;
+			let mut wait = FIRST_PROBE;
+			let end = loop {
+				{
+					let mut s = shared.slot.lock();
+					if !over(&*s) {
+						shared.done.wait_for(&mut s, wait);
+					}
+					if over(&*s) {
+						return;
+					}
+					if !s.opening {
+						continue;
+					}
+					#[cfg(test)]
+					{
+						s.looks += 1;
+					}
+				}
+				wait = (wait * 2).min(LAST_PROBE);
+				if let Some(end) = waiting_bytes(&node) {
+					break end;
+				}
+			};
+			let Ok(result) = adopt(end) else {
+				return;
+			};
+			let mut s = shared.slot.lock();
+			if over(&*s) {
+				return;
+			}
+			s.result = Some(Ok(result));
+			s.rescued = true;
+			let waker = s.waker.take();
+			drop(s);
+			shared.done.notify_all();
+			if let Some(w) = waker {
+				w.wake();
+			}
+			wake_helper(&shared, &node);
+		})
+}
+
+/// A read end of `node` that does not wait, when bytes wait in the FIFO:
+/// then made blocking, as the helper's open would leave it.
+fn waiting_bytes(node: &Node) -> Option<fs::File> {
+	use std::os::fd::AsRawFd;
+	let end = fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&node.path)
+		.ok()?;
+	if !node.is(end.metadata()) {
+		return None;
+	}
+	let fd = end.as_raw_fd();
+	let mut waiting: libc::c_int = 0;
+	// SAFETY: FIONREAD writes one int through the pointer, which outlives the
+	// call; `fd` is our open descriptor.
+	if unsafe { libc::ioctl(fd, libc::FIONREAD as _, &raw mut waiting) } < 0 || waiting <= 0 {
+		return None;
+	}
+	// SAFETY: F_GETFL and F_SETFL read and set the status flags of our own
+	// open descriptor.
+	let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+	if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+		return None;
+	}
+	Some(end)
+}
+
+/// Wakes a helper still in `open(2)` once the look took the open: a write
+/// end that does not wait, opened and closed (the helper is a reader, so the
+/// open succeeds), until the helper's `open(2)` has returned, at most 100
+/// times 10 ms apart. A helper gVisor leaves asleep each time stays until a
+/// writer comes, then closes what it gets.
+fn wake_helper<T>(shared: &Shared<T>, node: &Node) {
+	for _ in 0..100 {
+		if let Ok(end) = fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&node.path)
+		{
+			drop(end);
+		}
+		let mut s = shared.slot.lock();
+		if s.returned || s.cancelled {
+			return;
+		}
+		shared.done.wait_for(&mut s, Duration::from_millis(10));
+		if s.returned || s.cancelled {
+			return;
+		}
 	}
 }
 
@@ -224,6 +441,16 @@ impl<T> FifoOpen<T> {
 		let result = s.result.take();
 		s.finished |= result.is_some();
 		result
+	}
+}
+
+/// The helper is out of `open(2)`: a helper the drop left stops counting in
+/// [`LEFT`].
+fn helper_returned<T>(s: &mut Slot<T>) {
+	s.returned = true;
+	if s.left {
+		s.left = false;
+		LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 	}
 }
 
@@ -266,15 +493,37 @@ where
 						return;
 					}
 				}
+				if shared.slot.lock().stuck {
+					// A reader that `open(2)` left asleep: registered, never
+					// woken by the writer.
+					let held = fs::OpenOptions::new()
+						.read(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&node.path);
+					let mut s = shared.slot.lock();
+					while (s.result.is_none() && !s.finished && !s.cancelled) || s.stay {
+						shared.done.wait_for(&mut s, Duration::from_millis(10));
+					}
+					let cancelled = s.cancelled;
+					drop(s);
+					drop(held);
+					if cancelled {
+						helper_returned(&mut shared.slot.lock());
+						return;
+					}
+				}
 			}
 			let opened = catch_unwind(AssertUnwindSafe(|| open(&node.path, node.pinned())))
 				.unwrap_or_else(|_| Err(io::Error::other("the FIFO open panicked")));
 			let mut s = shared.slot.lock();
-			if s.cancelled {
-				return;
+			helper_returned(&mut s);
+			// Cancelled, or the look found the writer first: what the
+			// helper got is closed.
+			let taken = s.cancelled || s.result.is_some() || s.finished;
+			if !taken {
+				s.result = Some(opened);
 			}
-			s.result = Some(opened);
-			let waker = s.waker.take();
+			let waker = if taken { None } else { s.waker.take() };
 			drop(s);
 			shared.done.notify_all();
 			if let Some(w) = waker {
@@ -286,17 +535,41 @@ where
 impl<T> Drop for FifoOpen<T> {
 	/// See [`FifoOpen`]: leaves no end of the FIFO behind once it returns.
 	fn drop(&mut self) {
-		{
+		self.release();
+		if let Some(watcher) = self.watcher.take() {
+			self.shared.done.notify_all();
+			let _ = watcher.join();
+		}
+	}
+}
+
+/// How long a drop waits for a helper the look took the open from to return
+/// from its `open(2)` once the drop's own end is open: gVisor left it asleep
+/// through its writer and the look's wake-ups, and may leave it asleep
+/// through this one too ([`FifoOpen::release`]).
+const RESCUED_JOIN: Duration = Duration::from_millis(100);
+
+impl<T> FifoOpen<T> {
+	/// The drop's release of the helper ([`FifoOpen`]). A helper the look took
+	/// the open from is joined only when it returns within [`RESCUED_JOIN`];
+	/// else it is left: it holds no end of the FIFO until its `open(2)`
+	/// returns, and then closes that end (the open is cancelled). On Linux a
+	/// look never takes an open, so every helper is joined.
+	fn release(&mut self) {
+		let rescued = {
 			let mut s = self.shared.slot.lock();
-			if s.finished {
+			if s.finished && s.returned {
 				return;
 			}
 			s.cancelled = true;
 			let unclaimed = s.result.take();
-			if unclaimed.is_some() || !s.opening {
+			// A helper still in `open(2)` is released even when the look gave
+			// the open its result.
+			if (unclaimed.is_some() && !s.rescued) || !s.opening || s.returned {
 				return;
 			}
-		}
+			s.rescued
+		};
 		let node = &self.node;
 		if !node.is(fs::metadata(&node.path)) {
 			return;
@@ -316,6 +589,16 @@ impl<T> Drop for FifoOpen<T> {
 			{
 				self.shared.slot.lock().joining = true;
 			}
+			if rescued {
+				let deadline = std::time::Instant::now() + RESCUED_JOIN;
+				let mut s = self.shared.slot.lock();
+				while !s.returned && !self.shared.done.wait_until(&mut s, deadline).timed_out() {}
+				if !s.returned {
+					s.left = true;
+					LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+					return;
+				}
+			}
 			let _ = helper.join();
 		}
 	}
@@ -324,7 +607,7 @@ impl<T> Drop for FifoOpen<T> {
 #[cfg(test)]
 mod tests {
 	use std::{
-		io::Read,
+		io::{Read, Write},
 		os::unix::ffi::OsStrExt,
 		sync::atomic::{AtomicUsize, Ordering},
 	};
@@ -411,7 +694,203 @@ mod tests {
 		let node = Arc::new(Node::new(path, &fs::metadata(path).unwrap(), false));
 		let shared = Arc::new(Shared { slot: Mutex::new(slot), done: Condvar::new() });
 		let helper = spawn_helper(Arc::clone(&shared), Arc::clone(&node), open).unwrap();
-		FifoOpen { shared, node, helper: Some(helper) }
+		FifoOpen { shared, node, helper: Some(helper), watcher: None }
+	}
+
+	/// A read-only open of `path` that looks for a writer its helper missed
+	/// ([`FifoOpen::start_reading`]), its slot starting as `slot`.
+	fn reading(path: &Path, slot: Slot<fs::File>) -> FifoOpen<fs::File> {
+		let mut opened = helper(path, slot, read_end);
+		let adopt: Adopt<fs::File> = Box::new(Ok);
+		opened.watcher =
+			Some(spawn_watcher(Arc::clone(&opened.shared), Arc::clone(&opened.node), adopt).unwrap());
+		opened
+	}
+
+	/// Reads `end` to its end of file: what it read, and when the end came.
+	fn drain(mut end: fs::File) -> (Vec<u8>, std::time::Instant) {
+		let mut got = Vec::new();
+		end.read_to_end(&mut got).unwrap();
+		(got, std::time::Instant::now())
+	}
+
+	/// Linux unchanged: a reader whose writer opens 2 s later waits for it,
+	/// as a plain open does. The looks meanwhile find no bytes and change
+	/// nothing: the result is the helper's.
+	#[test]
+	fn a_reader_waits_for_a_writer_two_seconds_late() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot::default());
+		assert!(opened.wait_for(Duration::from_secs(2)).is_none(), "the open ended with no writer");
+		assert!(opened.shared.slot.lock().looks >= 3, "no look in 2 s");
+		let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+		writer.write_all(b"x").unwrap();
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer opened")
+			.unwrap();
+		drop(writer);
+		assert_eq!(drain(reader).0, b"x");
+		assert!(!opened.shared.slot.lock().rescued, "a look took the open");
+	}
+
+	/// Linux unchanged: a reader no writer comes for keeps waiting; the looks
+	/// change nothing, and the drop still ends both threads and leaves no end
+	/// of the FIFO.
+	#[test]
+	fn a_reader_with_no_writer_keeps_waiting() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot::default());
+		assert!(opened.wait_for(Duration::from_secs(3)).is_none(), "the open ended with no writer");
+		assert!(opened.shared.slot.lock().looks >= 4, "no look in 3 s");
+		assert!(!opened.shared.slot.lock().rescued);
+		let shared = Arc::clone(&opened.shared);
+		drop(opened);
+		assert_eq!(Arc::strong_count(&shared), 1, "the helper or the watcher outlived the drop");
+		assert!(!has_reader(&path), "a reader is left");
+		assert!(!has_writer(&path), "a writer is left");
+	}
+
+	/// An open that ends within [`FIRST_PROBE`] (its writer comes after
+	/// 20 ms) is not looked at.
+	#[test]
+	fn an_open_that_ends_within_the_first_wait_is_not_looked_at() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot::default());
+		thread::sleep(Duration::from_millis(20));
+		let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer opened")
+			.unwrap();
+		let watcher = opened.watcher.take().unwrap();
+		watcher.join().unwrap();
+		assert_eq!(opened.shared.slot.lock().looks, 0, "the open was looked at");
+		drop((writer, reader));
+	}
+
+	/// A helper left asleep after its writer wrote (the `stuck` hook, as
+	/// gVisor leaves one) does not keep the open from its bytes: a look takes
+	/// the open, and the helper is woken and closes what it gets.
+	#[test]
+	fn a_look_takes_an_open_whose_helper_was_left_asleep() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot { stuck: true, ..Slot::default() });
+		while !opened.shared.slot.lock().opening {
+			thread::yield_now();
+		}
+		// The stuck helper holds a read end, so this open does not wait.
+		let mut writer = loop {
+			match fs::OpenOptions::new()
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&path)
+			{
+				Ok(writer) => break writer,
+				Err(e) if e.raw_os_error() == Some(libc::ENXIO) => thread::yield_now(),
+				Err(e) => panic!("{e}"),
+			}
+		};
+		writer.write_all(b"ab").unwrap();
+		drop(writer);
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer wrote")
+			.unwrap();
+		assert!(opened.shared.slot.lock().rescued, "the result is not the look's");
+		assert_eq!(drain(reader).0, b"ab");
+		let shared = Arc::clone(&opened.shared);
+		drop(opened);
+		assert!(shared.slot.lock().returned, "the helper is still asleep");
+		assert_eq!(Arc::strong_count(&shared), 1, "the helper or the watcher outlived the drop");
+	}
+
+	/// A drop does not wait for a helper the look took the open from when the
+	/// drop's own end does not wake it either (the `stay` hook: gVisor leaves
+	/// it asleep): the drop returns within a second, and the helper, once it
+	/// returns, closes its end and leaves no reader.
+	#[test]
+	fn a_drop_leaves_a_helper_the_look_could_not_wake() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot { stuck: true, stay: true, ..Slot::default() });
+		while !opened.shared.slot.lock().opening {
+			thread::yield_now();
+		}
+		let mut writer = fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&path)
+			.unwrap();
+		writer.write_all(b"ab").unwrap();
+		drop(writer);
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer wrote")
+			.unwrap();
+		assert!(opened.shared.slot.lock().rescued, "the result is not the look's");
+		let shared = Arc::clone(&opened.shared);
+		// The drop runs on its own thread: one that waits for the helper is
+		// released after 2 s (the helper let go), so the test fails instead of
+		// hanging.
+		let (sent, done) = std::sync::mpsc::channel();
+		let dropper = thread::spawn(move || {
+			drop(opened);
+			let _ = sent.send(());
+		});
+		let waited = done.recv_timeout(Duration::from_secs(2)).is_err();
+		// Read before the helper is let go: once it returns it stops counting.
+		let (returned_meanwhile, left) = {
+			let s = shared.slot.lock();
+			(s.returned, s.left)
+		};
+		shared.slot.lock().stay = false;
+		shared.done.notify_all();
+		dropper.join().unwrap();
+		assert!(!waited, "the drop waited for a helper that does not wake");
+		assert!(!returned_meanwhile, "the helper returned while it was held asleep");
+		assert!(left, "the left helper is not counted");
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		while Arc::strong_count(&shared) > 1 {
+			assert!(std::time::Instant::now() < deadline, "the helper did not end once released");
+			thread::sleep(Duration::from_millis(10));
+		}
+		assert!(shared.slot.lock().returned);
+		assert!(!shared.slot.lock().left, "the helper that returned still counts as left");
+		assert_eq!(drain(reader).0, b"ab");
+		assert!(!has_reader(&path), "a reader is left");
+	}
+
+	/// Past [`MAX_LEFT`] helpers left, a read-only open is not looked at, so
+	/// no more are left.
+	#[test]
+	fn no_look_past_the_left_helper_cap() {
+		assert!(may_look(0));
+		assert!(may_look(MAX_LEFT - 1));
+		assert!(!may_look(MAX_LEFT));
+	}
+
+	/// The look's wake-up of a helper left asleep ends no other reader of
+	/// the FIFO early: a reader waiting in `open(2)` for a writer that comes
+	/// 300 ms later gets all of that writer's bytes, and its end of file only
+	/// once the writer closed.
+	#[test]
+	fn a_look_ends_no_other_reader_before_its_writer() {
+		let (_dir, path) = new_fifo();
+		let other_path = path.clone();
+		let other =
+			thread::spawn(move || drain(fs::OpenOptions::new().read(true).open(&other_path).unwrap()));
+		let opened = reading(&path, Slot { stuck: true, ..Slot::default() });
+		thread::sleep(Duration::from_millis(300));
+		let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+		writer.write_all(b"x").unwrap();
+		thread::sleep(Duration::from_millis(200));
+		writer.write_all(b"y").unwrap();
+		drop(writer);
+		let closed = std::time::Instant::now();
+		let (got, ended) = other.join().unwrap();
+		drop(opened);
+		assert!(ended >= closed, "the other reader read end of file before its writer closed");
+		assert!(!got.is_empty(), "the other reader got none of its writer's bytes");
 	}
 
 	/// A helper that finds the open cancelled opens nothing: it ends

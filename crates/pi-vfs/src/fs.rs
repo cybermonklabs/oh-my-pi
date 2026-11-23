@@ -304,8 +304,9 @@ fn start_fifo(
 		return Err(crate::cancelled());
 	}
 	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
+	let read_only = options.is_read() && !options.is_writable();
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start(path, meta, nofollow, move |path, pinned| {
+	let open = move |path: &Path, pinned: bool| {
 		if !pinned {
 			return native_open(&scope, path, &options);
 		}
@@ -314,7 +315,15 @@ fn start_fifo(
 		let mut through_pin = options;
 		through_pin.custom_flags(through_pin.get_custom_flags() & !libc::O_NOFOLLOW);
 		native_open(&scope, path, &through_pin)
-	}))
+	};
+	// A read-only open does not depend on its `open(2)` being woken (gVisor
+	// can leave it asleep after its writer came): see
+	// `FifoOpen::start_reading`.
+	Ok(if read_only {
+		FifoOpen::start_reading(path, meta, nofollow, open, |end| Ok(File::from(end)))
+	} else {
+		FifoOpen::start(path, meta, nofollow, open)
+	})
 }
 
 /// Waits for a FIFO open on this thread, checking `token` every poll slice.
