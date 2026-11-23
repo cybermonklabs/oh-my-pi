@@ -28,6 +28,25 @@ function makeBusyError(code: string, errno: number): SqliteBusyShape {
 	return err;
 }
 
+/**
+ * Waits until a locker child has written its sentinel file, which it writes once it holds its lock.
+ * Real-time waits are unavoidable here: the lock lives in a separate process, so fake timers cannot
+ * advance the child's sleep or the filesystem sentinel it writes.
+ */
+async function waitForLocker(locker: Bun.Subprocess<"ignore", "ignore", "pipe">, sentinel: string): Promise<void> {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		const locked = await fs.access(sentinel).then(
+			() => true,
+			() => false,
+		);
+		if (locked) return;
+		if (locker.exitCode !== null) break;
+		await Bun.sleep(10);
+	}
+	throw new Error(`locker never signaled readiness: ${await new Response(locker.stderr).text()}`);
+}
+
 describe("isSqliteBusyError", () => {
 	test("recognizes every documented BUSY family code", () => {
 		expect(isSqliteBusyError(makeBusyError("SQLITE_BUSY", 5))).toBe(true);
@@ -89,22 +108,7 @@ db.close();`,
 			],
 			{ env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" }, stdout: "ignore", stderr: "pipe" },
 		);
-		// Real-time waits are unavoidable here: the lock lives in a separate
-		// process, so fake timers cannot advance the child's sleep or the
-		// filesystem sentinel it writes.
-		const deadline = Date.now() + 5000;
-		let locked = false;
-		while (Date.now() < deadline) {
-			locked = await fs.access(sentinel).then(
-				() => true,
-				() => false,
-			);
-			if (locked || locker.exitCode !== null) break;
-			await Bun.sleep(10);
-		}
-		if (!locked) {
-			throw new Error(`locker never signaled readiness: ${await new Response(locker.stderr).text()}`);
-		}
+		await waitForLocker(locker, sentinel);
 
 		const store = await SqliteAuthCredentialStore.open(dbPath);
 		try {
@@ -116,6 +120,72 @@ db.close();`,
 		const [exitCode, stderr] = await Promise.all([locker.exited, new Response(locker.stderr).text()]);
 		expect(exitCode, stderr).toBe(0);
 	});
+
+	// SQLite's busy handler sleeps the calling thread. openSqliteDatabase opens each attempt with a
+	// short busy timeout and sleeps between attempts; a store that sets its own longer timeout inside
+	// the initializer makes every attempt block the event loop for that long again (1 s headless).
+	test("open() keeps its event loop running while a peer holds the store", async () => {
+		const dbPath = path.join(tempDir, "loop.db");
+		const sentinel = path.join(tempDir, "loop.sentinel");
+		// A store with its tables in place but a rollback journal, as an older omp left it: open() gets
+		// past its leases DDL and its own busy-timeout setup, then needs the exclusive lock to switch the
+		// store to WAL.
+		(await SqliteAuthCredentialStore.open(dbPath)).close();
+		const rollback = new Database(dbPath);
+		rollback.run("PRAGMA journal_mode=DELETE");
+		rollback.close();
+		// The child takes the lock shim, as every omp process does, then reads the store in a transaction
+		// for 2.5 s; its shared lock keeps open() from switching the store to WAL until it commits.
+		const locker = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`import { Database } from "bun:sqlite";
+import { writeFileSync } from "node:fs";
+import { ensureSqliteLockShim } from "@oh-my-pi/pi-utils";
+ensureSqliteLockShim();
+const db = new Database(process.argv[1]);
+db.run("BEGIN");
+db.query("SELECT count(*) FROM auth_credential_refresh_leases").get();
+writeFileSync(process.argv[2], "locked");
+await Bun.sleep(2500);
+db.run("COMMIT");
+db.close();`,
+				dbPath,
+				sentinel,
+			],
+			{ env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" }, stdout: "ignore", stderr: "pipe" },
+		);
+		await waitForLocker(locker, sentinel);
+		const start = performance.now();
+
+		let last = performance.now();
+		let longestStall = 0;
+		const beat = setInterval(() => {
+			const now = performance.now();
+			longestStall = Math.max(longestStall, now - last);
+			last = now;
+		}, 5);
+		let store: SqliteAuthCredentialStore;
+		try {
+			store = await SqliteAuthCredentialStore.open(dbPath);
+			// An open that blocked until it succeeded resolves before the next tick: measure that stretch too.
+			longestStall = Math.max(longestStall, performance.now() - last);
+		} finally {
+			clearInterval(beat);
+		}
+		const waited = performance.now() - start;
+		try {
+			expect(store.listAuthCredentials()).toEqual([]);
+		} finally {
+			store.close();
+		}
+		// The peer's read kept open() waiting; meanwhile the event loop never stalled for long.
+		expect(waited).toBeGreaterThan(1_500);
+		expect(longestStall).toBeLessThan(500);
+		const [exitCode, stderr] = await Promise.all([locker.exited, new Response(locker.stderr).text()]);
+		expect(exitCode, stderr).toBe(0);
+	}, 30_000);
 
 	test("retries through a transient SQLITE_BUSY_RECOVERY and eventually succeeds", async () => {
 		const dbPath = path.join(tempDir, "retry.db");
@@ -196,9 +266,11 @@ db.close();`,
 		// SQLITE_BUSY_RECOVERY says what held the database; it is not another process's write lock.
 		expect(String(error)).toContain("a connection was recovering the write-ahead log");
 		expect(error).toMatchObject({ code: "SQLITE_BUSY_RECOVERY" });
-		// Doubling, jittered delays capped at 2 s, stopping within the 60 s budget.
-		expect(delays.length).toBeGreaterThan(4);
-		expect(Math.max(...delays)).toBeLessThanOrEqual(2_000);
+		// An attempt every 50-100 ms until the 60 s budget is spent: a peer that frees the lock only
+		// briefly between transactions is caught only by an attempt that runs then.
+		expect(delays.length).toBeGreaterThan(500);
+		expect(Math.min(...delays)).toBeGreaterThanOrEqual(50);
+		expect(Math.max(...delays)).toBeLessThanOrEqual(100);
 		expect(delays.reduce((sum, delay) => sum + delay, 0)).toBeLessThanOrEqual(60_000);
 	});
 });

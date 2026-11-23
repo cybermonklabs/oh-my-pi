@@ -15,14 +15,22 @@ import * as logger from "./logger";
  * budget is about three times the worst case #17968 measured: 100 `omp -p` starts at once on an empty
  * agent dir, at load average ~410, with another process committing every 2 s; the slowest open waited
  * 22 s before its winning attempt. That run waited up to 1 s in SQLite's busy handler per attempt.
- * Remeasured with {@link BUSY_ATTEMPT_TIMEOUT_MS} attempts, without that load (100 starts on an empty
- * agent.db against a peer holding the write lock 2.0 s of every 2.05 s, runc and gVisor): every start
- * opened, the slowest after 5.9 s (2.6 s with 1 s attempts, which catch the peer's 50 ms gaps sooner).
- * Not remeasured at that load.
+ * Remeasured with {@link BUSY_ATTEMPT_TIMEOUT_MS} attempts every {@link BUSY_RETRY_DELAY_MS}, without that
+ * load (100 starts on an empty agent.db against a peer holding the write lock 2.0 s of every 2.05 s, runc
+ * and gVisor): every start opened, the slowest after 2.2 s (2.6 s with 1 s attempts). Not remeasured at
+ * that load.
  */
 const BUSY_RETRY_BUDGET_MS = 60_000;
-const BUSY_BASE_DELAY_MS = 100;
-const BUSY_MAX_DELAY_MS = 2_000;
+
+/**
+ * The wait between attempts: jittered between half this and this, for the whole budget. A peer may free
+ * the write lock only briefly between its own transactions (5 ms in every 305 ms in the measurement), and
+ * only an attempt that runs then gets it, so attempts must keep coming about as often as SQLite's own busy
+ * handler polls (about every 100 ms). With waits doubling to 2 s, such opens took up to a minute or ran out
+ * of budget, where a 1 s busy handler got in within seconds. Jitter keeps processes that failed together
+ * from retrying in lockstep.
+ */
+const BUSY_RETRY_DELAY_MS = 100;
 
 /**
  * The busy timeout each attempt of {@link openSqliteDatabase} runs with. SQLite's busy handler sleeps
@@ -199,8 +207,8 @@ function revealHiddenCorruption(db: Database | undefined, error: unknown): unkno
 }
 
 /**
- * Backoff for an open that keeps finding the store locked: doubling, jittered delays capped at
- * {@link BUSY_MAX_DELAY_MS}, until {@link BUSY_RETRY_BUDGET_MS} has passed since the first attempt.
+ * Retries for an open that keeps finding the store locked: jittered {@link BUSY_RETRY_DELAY_MS} waits
+ * until {@link BUSY_RETRY_BUDGET_MS} has passed since the first attempt.
  */
 class BusyRetries {
 	readonly #startedAt = performance.now();
@@ -208,10 +216,8 @@ class BusyRetries {
 
 	/** Milliseconds to wait before retrying, or `undefined` once the budget is spent. */
 	nextDelay(): number | undefined {
-		const ceiling = Math.min(BUSY_BASE_DELAY_MS * 2 ** this.#attempts, BUSY_MAX_DELAY_MS);
 		this.#attempts++;
-		// Jitter keeps processes that failed together from retrying in lockstep.
-		const delay = Math.round(ceiling / 2 + (Math.random() * ceiling) / 2);
+		const delay = Math.round(BUSY_RETRY_DELAY_MS / 2 + (Math.random() * BUSY_RETRY_DELAY_MS) / 2);
 		return performance.now() - this.#startedAt + delay > BUSY_RETRY_BUDGET_MS ? undefined : delay;
 	}
 
@@ -411,7 +417,7 @@ function recoverCorruptDatabase(dbPath: string, error: unknown, options: SqliteO
 }
 
 /**
- * Opens and initializes a store, retrying BUSY failures with jittered exponential backoff for up to
+ * Opens and initializes a store, retrying BUSY failures about every {@link BUSY_RETRY_DELAY_MS} for up to
  * {@link BUSY_RETRY_BUDGET_MS}; the final error says how long it waited. Each attempt runs with a
  * {@link BUSY_ATTEMPT_TIMEOUT_MS} busy timeout, so a held lock blocks the thread only that long at a
  * time and the wait between attempts sleeps; a successful open gives the connection the store's busy

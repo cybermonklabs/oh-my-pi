@@ -47,6 +47,43 @@ async function holdWriteLockInChild(
 	return child;
 }
 
+/**
+ * Another process that keeps taking the write lock until `stopFile` exists: a first write transaction
+ * of `firstHoldMs`, then 300 ms ones with 5 ms between them. Resolves once its first transaction holds
+ * the lock. It takes the lock shim.
+ */
+async function starveWriteLockInChild(
+	dbPath: string,
+	stopFile: string,
+	firstHoldMs: number,
+): Promise<Bun.Subprocess<"ignore", "pipe", "inherit">> {
+	const script = `
+		const fs = require("node:fs");
+		const { Database } = require("bun:sqlite");
+		import(${JSON.stringify(`${import.meta.dir}/../src/sqlite.ts`)}).then(({ ensureSqliteLockShim }) => {
+			ensureSqliteLockShim();
+			const db = new Database(${JSON.stringify(dbPath)});
+			db.run("PRAGMA busy_timeout = 5000");
+			let hold = ${firstHoldMs};
+			while (!fs.existsSync(${JSON.stringify(stopFile)})) {
+				db.run("BEGIN IMMEDIATE");
+				db.run("INSERT INTO entries (value) VALUES ('peer')");
+				// Written synchronously: the loop never returns to the event loop.
+				if (hold === ${firstHoldMs}) fs.writeSync(1, "held\\n");
+				Bun.sleepSync(hold);
+				db.run("COMMIT");
+				hold = 300;
+				Bun.sleepSync(5);
+			}
+			db.close();
+		});
+	`;
+	const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "inherit" });
+	const { value } = await child.stdout.getReader().read();
+	expect(new TextDecoder().decode(value)).toContain("held");
+	return child;
+}
+
 describe("initializeSqliteSchema", () => {
 	test("a current schema initializes while another connection holds the write lock", async () => {
 		await using dir = await TempDir.create("@omp-sqlite-schema-current-");
@@ -155,6 +192,56 @@ describe("open BUSY budget", () => {
 		expect(rows).toEqual([{ value: "peer" }, { value: "mine" }]);
 		await peer.exited;
 	}, 30_000);
+
+	// A peer that frees the write lock for only 5 ms between 300 ms write transactions. An open gets the
+	// lock only by trying inside a gap, so it must keep trying about as often as SQLite's own busy
+	// handler polls (about every 100 ms): with waits doubling to 2 s between attempts, opens under this
+	// peer took up to a minute or ran out of budget. The peer's first transaction holds the lock for
+	// 3.5 s, longer than the first five doubling waits take, so every run sees the spacing of attempts
+	// a long wait would give; the open must then still get the lock while the 5 ms gaps go on.
+	test("openSqliteDatabase keeps trying often enough to get a lock a peer frees for 5 ms at a time", async () => {
+		const FIRST_HOLD_MS = 3_500;
+		const DEADLINE_MS = 20_000;
+		await using dir = await TempDir.create("@omp-sqlite-busy-starve-");
+		const dbPath = dir.join("store.db");
+		const stopFile = dir.join("stop");
+		createStore(dbPath);
+		const peer = await starveWriteLockInChild(dbPath, stopFile, FIRST_HOLD_MS);
+		// Each attempt is a new connection that first sets its busy timeout; record when each one starts.
+		const run = Database.prototype.run;
+		const attempts: number[] = [];
+		const runSpy = spyOn(Database.prototype, "run").mockImplementation(function (
+			this: Database,
+			...args: Parameters<typeof run>
+		) {
+			if (this.filename === dbPath && String(args[0]).startsWith("PRAGMA busy_timeout")) {
+				attempts.push(performance.now());
+			}
+			return run.apply(this, args);
+		});
+		// Past the deadline the peer stops, so a slow open finishes and the test reports its time.
+		const deadline = setTimeout(() => Bun.write(stopFile, ""), DEADLINE_MS);
+		const start = performance.now();
+		let waited: number;
+		try {
+			const db = await openSqliteDatabase(dbPath, opened => {
+				initializeSqliteSchema(opened, () => opened.run("CREATE TABLE IF NOT EXISTS mine (id INTEGER)"));
+				return opened;
+			});
+			waited = performance.now() - start;
+			db.close();
+		} finally {
+			clearTimeout(deadline);
+			runSpy.mockRestore();
+			await Bun.write(stopFile, "");
+			await peer.exited;
+		}
+		const spacing = attempts.slice(1).map((at, index) => at - attempts[index]!);
+		// The peer's first transaction kept the open out; the attempts came at most 600 ms apart.
+		expect(waited).toBeGreaterThan(FIRST_HOLD_MS - 500);
+		expect(Math.max(...spacing)).toBeLessThan(600);
+		expect(waited).toBeLessThan(DEADLINE_MS);
+	}, 60_000);
 
 	// SQLite's busy handler sleeps the calling thread. On an interactive host each attempt's handler
 	// used the 5 s store timeout, so waiting out a peer froze the event loop in 5 s stretches. The peer
