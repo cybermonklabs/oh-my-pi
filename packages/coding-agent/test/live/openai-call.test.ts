@@ -197,6 +197,69 @@ describe("GPT-Live delegations", () => {
 		}
 	}, 10_000);
 
+	test("two delegations at one offset both become turns; the words before it go with the first", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "check the build", 100, 900),
+				userSaid("t2", " and test", 900, 1_100),
+				delegated("d1", "item_1", 1_000),
+				delegated("d2", "item_2", 1_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 2);
+			expect(call.turns).toEqual([heard("check the build and test"), NO_WORDS]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("the voice speaking past a delegation before any of the user's words does not send its turn early", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				delegated("d1", "item_1", 5_000),
+				voiceSaid("t1", "On it.", 5_100, 5_400),
+				userSaid("t2", "deploy main", 4_000, 4_800),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("a fragment that comes after its delegation went is carried to no later turn", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "deploy main", 4_000, 4_800),
+				userSaid("t2", " now", 4_800, 5_100),
+				delegated("d1", "item_1", 5_000),
+				// Late: item_1 went when the user's transcript passed 5000.
+				userSaid("t3", " please", 4_900, 4_950),
+				userSaid("t4", "run the tests", 8_000, 8_800),
+				userSaid("t5", " too", 8_800, 9_100),
+				delegated("d2", "item_2", 9_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 2);
+			expect(call.turns).toEqual([heard("deploy main now"), heard("run the tests too")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
 	test("a turn holds the user's words of the minute before its delegation, labelled as speech", async () => {
 		const stub = gptLiveStub({
 			frames: [

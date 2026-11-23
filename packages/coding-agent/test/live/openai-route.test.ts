@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
 import { kNoAuth } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import {
 	OpenAILiveTransport,
+	type OpenAILiveTransportOptions,
 	openAILiveAttachUrl,
 	openAILiveSessionsUrl,
 	resolveOpenAILiveRoute,
@@ -12,6 +13,11 @@ import {
 	buildSessionContextAppend,
 	type LiveServerEvent,
 } from "@oh-my-pi/pi-coding-agent/live/protocol";
+import * as natives from "@oh-my-pi/pi-natives";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; the API route must never send one. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
@@ -66,14 +72,51 @@ function liveApiServer(options: ApiServerOptions = {}) {
 	return { server, posts, upgrades, received, message, base: `http://127.0.0.1:${server.port}/v1` };
 }
 
-function transportFor(base: string, onEvent: (event: LiveServerEvent) => void = () => {}): OpenAILiveTransport {
+function transportFor(
+	base: string,
+	onEvent: (event: LiveServerEvent) => void = () => {},
+	options: Partial<OpenAILiveTransportOptions> = {},
+): OpenAILiveTransport {
 	return new OpenAILiveTransport({
 		registry: { getProviderBaseUrl: () => base, getApiKeyForProvider: async () => "sk-test" },
 		sessionId: "s1",
 		instructions: "Be brief.",
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },
+		...options,
 	});
+}
+
+/** A native media peer the transport made (a stand-in). */
+interface NativePeer {
+	/** Delivers `event` on the peer's data channel. */
+	emit(event: unknown): void;
+}
+
+/**
+ * Replaces the native media peer with a stand-in whose data channel opens at once, after `onOpen`
+ * runs; returns each one made.
+ */
+function nativePeers(onOpen: (peer: NativePeer) => void = () => {}): NativePeer[] {
+	const made: NativePeer[] = [];
+	// bun's spyOn types a class export's implementation as `never`; a plain function (called with `new`) stands in.
+	const spy = vi.spyOn(natives, "LiveWebRtcPeer") as unknown as {
+		mockImplementation(implementation: (onEvent: (error: Error | null, payload: string) => void) => object): void;
+	};
+	spy.mockImplementation(function (onEvent) {
+		const peer = {
+			emit: (event: unknown) => onEvent(null, JSON.stringify(event)),
+			createOffer: async () => "v=0 native offer",
+			acceptAnswer: async () => {},
+			waitForOpen: async () => onOpen(peer),
+			setMuted: () => {},
+			pushAudio: () => {},
+			close: async () => {},
+		};
+		made.push(peer);
+		return peer;
+	});
+	return made;
 }
 
 /** A delegated turn holding `words`, as the transport labels them. */
@@ -303,6 +346,99 @@ describe("GPT-Live transport", () => {
 			await transport.close();
 			redirecting.stop(true);
 			elsewhere.server.stop(true);
+		}
+	});
+
+	test("a close while the key resolves makes no native peer and sends no session request", async () => {
+		const api = liveApiServer();
+		const peers = nativePeers();
+		const key = Promise.withResolvers<string>();
+		const transport = transportFor(api.base, undefined, {
+			registry: { getProviderBaseUrl: () => api.base, getApiKeyForProvider: () => key.promise },
+			sdpOffer: undefined,
+		});
+		try {
+			const connecting = transport.connect().then(
+				() => "connected",
+				(error: unknown) => `refused: ${String(error)}`,
+			);
+			await transport.close();
+			key.resolve("sk-test");
+			expect(await connecting).toStartWith("refused");
+			expect(peers).toEqual([]);
+			expect(api.posts).toEqual([]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("takes the data channel's events until the sideband attaches, then only the sideband's", async () => {
+		const user = (eventId: string, delta: string) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+			start_ms: 0,
+			end_ms: 100,
+		});
+		// The sideband replays what the data channel delivered before it attached.
+		const api = liveApiServer({ events: [user("e1", "deploy"), user("e2", " main")] });
+		const peers = nativePeers(peer => peer.emit(user("e1", "deploy")));
+		const events: LiveServerEvent[] = [];
+		const attached = Promise.withResolvers<void>();
+		const transport = transportFor(
+			api.base,
+			event => {
+				events.push(event);
+				if (event.type === "input_transcript.added" && event.item.text === "deploy main") attached.resolve();
+			},
+			{ sdpOffer: undefined },
+		);
+		try {
+			await transport.connect();
+			await attached.promise;
+			peers[0]!.emit(user("e3", " now"));
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: "deploy" } },
+				{ type: "input_transcript.added", item: { text: "deploy main" } },
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("closing the call stops the timer of a delegation still waiting for the user's words", async () => {
+		const api = liveApiServer({
+			events: [
+				{
+					type: "session.delegation.created",
+					event_id: "e1",
+					offset_ms: 5_000,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+				{ type: "session.input_transcript.delta", event_id: "e2", delta: "deploy", start_ms: 100, end_ms: 400 },
+			],
+		});
+		const setTimer = vi.spyOn(globalThis, "setTimeout");
+		const clearTimer = vi.spyOn(globalThis, "clearTimeout");
+		const heardWords = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			if (event.type === "input_transcript.added") heardWords.resolve();
+		});
+		try {
+			await transport.connect();
+			// The words end before the delegation's offset, so it waits for more, at most its 1 s cap.
+			await heardWords.promise;
+			const cap = setTimer.mock.calls.findIndex(([, ms]) => ms === 1_000);
+			expect(cap).toBeGreaterThanOrEqual(0);
+			const timer = setTimer.mock.results[cap]?.value;
+			await transport.close();
+			// By identity: every Timeout equals every other under `toHaveBeenCalledWith`'s deep equality.
+			expect(clearTimer.mock.calls.some(([cleared]) => cleared === timer)).toBe(true);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
 		}
 	});
 });
