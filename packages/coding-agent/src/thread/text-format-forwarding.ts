@@ -24,15 +24,18 @@
  * then on the thread parses locally ({@link textFormatParsing}).
  *
  * Main side: {@link parseTextFormatForWorker} serves those calls. The main
- * thread never waits on a worker, so the forward cannot deadlock; a busy main
- * thread costs a worker {@link TEXT_FORMAT_FORWARD_TIMEOUT_MS} once.
+ * thread never waits on a worker, so the forward cannot deadlock. A main
+ * thread that answers within {@link TEXT_FORMAT_FORWARD_TIMEOUT_MS} delays
+ * each forwarded parse by its wait, every time; one blocked for the whole
+ * deadline costs the worker that deadline once, as the worker then parses
+ * locally.
  */
 import { isMainThread } from "node:worker_threads";
 import { deserialize, serialize } from "bun:jsc";
 import type { WorkerThreadLink } from "./protocol";
 
 /** Formats whose `Bun.<format>.parse` keeps a heap per thread on Bun 1.4.4 and 1.4.5. */
-export const TEXT_FORMATS = ["YAML", "TOML", "JSONC", "JSON5", "XML"] as const;
+const TEXT_FORMATS = ["YAML", "TOML", "JSONC", "JSON5", "XML"] as const;
 
 /** One of {@link TEXT_FORMATS}. */
 export type TextFormat = (typeof TEXT_FORMATS)[number];
@@ -79,7 +82,7 @@ let link: WorkerThreadLink | undefined;
 /** Set by this thread's first local parse; the main thread always parses locally. */
 let local = isMainThread;
 
-/** Main thread: parse `input` for a worker on main's heap (`options` only for XML). */
+/** Main thread: parse `input` for a worker on main's heap, with the `options` it sent (`undefined` but for XML). */
 export function parseTextFormatForWorker(
 	format: TextFormat,
 	input: TextFormatInput,
@@ -88,7 +91,7 @@ export function parseTextFormatForWorker(
 	const namespace: TextFormatNamespace = Bun[format];
 	let value: unknown;
 	try {
-		value = format === "XML" ? namespace.parse(input, options) : namespace.parse(input);
+		value = namespace.parse(input, options);
 	} catch (error) {
 		return error instanceof Error ? { error: { name: error.name, message: error.message } } : { local: true };
 	}

@@ -12,10 +12,12 @@
  * (`./text-format-forwarding`), also before the rest of the graph, replaces
  * this realm's `Bun.YAML`, `Bun.TOML`, `Bun.JSONC`, `Bun.JSON5` and `Bun.XML`
  * parsers with forwarders that parse on main while this worker lives, so a
- * stopped worker leaks no per-thread parser heap; `start()` gives them the
- * link. Like the CLI's network bootstrap, it then installs PI_PROXY handling on
- * this realm's `globalThis.fetch` (each worker realm has its own), before any
- * service can make a request.
+ * stopped worker leaks no per-thread parser heap unless it had to parse on its
+ * own thread (see that module); `start()` gives them the link through the
+ * first worker hook it runs, the `textFormat` service's
+ * (`./services/text-format`). Like the CLI's network bootstrap, it then
+ * installs PI_PROXY handling on this realm's `globalThis.fetch` (each worker
+ * realm has its own), before any service can make a request.
  *
  * This module only wires the link: thread identity, every service's worker
  * hooks, and the `boot`/`ping` handlers. It deliberately performs no
@@ -23,7 +25,7 @@
  * belongs to the main thread.
  */
 import "./worker-log-install";
-import { attachTextFormatLink } from "./text-format-forwarding";
+import "./text-format-forwarding";
 import { MessagePort, parentPort } from "node:worker_threads";
 import { installGlobalProxyFetch } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -82,7 +84,6 @@ function start(init: SubagentWorkerInit): void {
 		},
 		{ name: `${init.threadId}↔main`, sync: { port: init.replyPort, counter: new Int32Array(init.counter) } },
 	);
-	attachTextFormatLink(link);
 	for (const service of THREAD_SERVICES) service.installWorker?.(link);
 	link.handle("boot", async globals => {
 		for (const service of THREAD_SERVICES) await service.boot?.(globals[service.name], link);
