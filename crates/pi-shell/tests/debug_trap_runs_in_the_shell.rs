@@ -541,13 +541,16 @@ fn a_zsh_debug_trap_runs_once_for_a_job_or_a_pipeline() {
 /// without faults:
 /// - a substitution in a DEBUG trap's action runs no trap
 ///   (`Frame::no_debug_trap`, restored with the frame); [`bounded`], so a
-///   recursion fails in milliseconds;
+///   recursion fails in milliseconds. The substitution runs a loop of 8 passes
+///   so that a fault restores a snapshot while it runs: with `x=$(echo y)` the
+///   plant that loses the flag on a restore failed only 1 or 2 of the 18
+///   faulted runs, and in one runc Job none;
 /// - an `extdebug` stage skip set before the fork (`Kernel::debug_skips`, saved
 ///   in the image): the skipped stage does not run (no `ran`).
 #[test]
 fn debug_trap_state_survives_a_restored_snapshot() {
 	let rows = [
-		(bounded("x=$(echo y)", "/usr/bin/true; : two"), "done\n"),
+		(bounded("x=$(for i in 1 2 3 4 5 6 7 8; do :; done; echo y)", "/usr/bin/true; : two"), "done\n"),
 		(
 			r#"D=$(mktemp -d); shopt -s extdebug; trap 'case $BASH_COMMAND in *mark*) false;; esac' DEBUG; : mark > "$D/ran" | echo second; trap - DEBUG; [ -e "$D/ran" ] && echo ran; rm -r "$D"; echo done"#
 				.to_owned(),
