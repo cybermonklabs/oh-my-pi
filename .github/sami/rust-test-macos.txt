@@ -1,0 +1,20 @@
+# Tests that run only on macOS: they expect macOS's libc, libm or terminfo,
+# and are #[ignore]d on other targets. The rust_test_macos job in
+# .github/workflows/sami-rust-test.yml runs these, with every test compiled only
+# on macOS (.github/sami/rust-test-macos-inventory.sh finds those), on
+# macos-15, and fails unless each ran there; the rust_test job (Linux)
+# accounts for them as run there, and fails for a line that names no test
+# #[ignore]d on Linux.
+# One per line: <bazel test target> <libtest test name>  <what it expects of macOS>.
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_datetime::langinfo_in_the_c_locale  macOS libc's C-locale nl_langinfo values
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_datetime::strftime_options  macOS's %x and an en_US.UTF-8 locale
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_mathfunc::every_function_on_sample_arguments  macOS libm's last digits
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_mathfunc::lgamma_sets_signgam_and_common_values  macOS libm's last digits
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_system::zsh_mod_system_option_and_argument_errors  macOS has no O_NOATIME
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_system::zsh_mod_system_syserror  macOS libc's strerror text
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::another_term_replaces_the_boot_one  macOS's terminfo database
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::held_terminal_from_boot_is_set_up_without_tgetent  macOS's terminfo database
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::scans_list_the_held_terminal  macOS's terminfo database
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::termcap_module_boots_first  macOS's terminfo database
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::tgetent_adjusts_the_held_terminal  macOS's terminfo database
+//crates/pi-shell:pi-shell_test testkit::suites::zsh_mod_terminfo::tgetent_moves_obsolete_defaults  macOS's terminfo database
