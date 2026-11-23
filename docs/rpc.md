@@ -1563,14 +1563,15 @@ its offset: the user's transcript, or the voice's once some of the user's words
 before the offset are in. Failing both, it goes after 1 s with the words that
 have arrived. A delegation is never dropped: with no words, its turn says none
 were transcribed. A turn's progress goes to the call as `session.thinking.append`
-(not spoken) and its final reply as `session.commentary.append` (spoken); context
-outside a delegation goes the same way with `delegation_id: null`. Each message
-carries an `event_id`; a GPT-Live `error` that names the spoken reply ends the
-call with that error, as a failed send does on Codex. One that names a progress
-note is logged and the call stays open, since the user never hears a progress
-note; any other `error` is logged too. The session id is opaque: any id but `.`
-and `..` is accepted and percent-encoded into the attach path. No voice is sent,
-so GPT-Live uses its default; `live.voice` names Codex voices only.
+(not spoken) and its final reply as `session.commentary.append` (spoken), both
+with the delegation's `delegation_id`. omp sends no context outside a delegation
+(`session.context.append` on Codex). Each message carries an `event_id`; a
+GPT-Live `error` that names the spoken reply ends the call with that error, as a
+failed send does on Codex. One that names a progress note is logged and the call
+stays open, since the user never hears a progress note; any other `error` is
+logged too. The session id is opaque: any id but `.` and `..` is accepted and
+percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
+default; `live.voice` names Codex voices only.
 
 A user's transcript delta without `start_ms` and `end_ms` has no place on the
 timeline. It joins the turn of the next delegation handed over, after the words
