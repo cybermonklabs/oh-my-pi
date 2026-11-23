@@ -14,6 +14,7 @@ mkdir -p "$res"
 	echo "leg=$PC_LEG"
 	echo "offset=$PC_OFFSET"
 	echo "count=$PC_COUNT"
+	echo "partition=${PC_PARTITION:-1}/${PC_PARTITIONS:-1}"
 	echo "image=${ImageOS:-?}/${ImageVersion:-?}"
 } > "$meta"
 fail() {
@@ -63,6 +64,11 @@ fi
 common=(--archive-file "$archive" --extract-to "$PC/out" --extract-overwrite
 	--workspace-remap "$PC/tree" --tool-config-file "platform-checks:$cfg" --profile platform-checks
 	-E "$PC_FILTER")
+# A partition leg runs its share of the selected tests (nextest's count partitioner); the report
+# joins the partitions' lists and reports.
+if [ "${PC_PARTITIONS:-1}" -gt 1 ]; then
+	common+=(--partition "count:$PC_PARTITION/$PC_PARTITIONS")
+fi
 as_who "$nx" nextest list "${common[@]}" --run-ignored all --message-format json > "$res/list.json" 2> "$res/list.log"
 rc=$?
 echo "list_exit=$rc" >> "$meta"

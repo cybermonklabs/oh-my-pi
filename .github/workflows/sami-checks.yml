@@ -127,6 +127,7 @@ jobs:
       ca_shards: ${{ steps.plan.outputs.ca_shards }}
       platforms: ${{ steps.plan.outputs.platforms }}
       platform_crates: ${{ steps.plan.outputs.platform_crates }}
+      platform_partitions: ${{ steps.plan.outputs.platform_partitions }}
       clippy_crates: ${{ steps.plan.outputs.clippy_crates }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -529,6 +530,7 @@ jobs:
       head: ${{ needs.plan.outputs.commit }}
       platforms: ${{ needs.plan.outputs.platforms }}
       crates: ${{ needs.plan.outputs.platform_crates }}
+      partitions: ${{ needs.plan.outputs.platform_partitions }}
 
   clippy:
     name: clippy

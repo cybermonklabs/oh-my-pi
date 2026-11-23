@@ -123,6 +123,9 @@ def plan():
             "A-Z a-z 0-9 _ : / ^ $ . * + ? | & ! = ~ ( ) , # { } [ ] \\ - and space")
     repeat = whole("repeat", env.get("PC_REPEAT"), 1, 500)
     legs = whole("legs", env.get("PC_LEGS"), 1, 20)
+    # partitions N splits the selected tests into N parallel legs (nextest --partition count:k/N);
+    # each partition runs every repeat, split over `legs` as before.
+    partitions = whole("partitions", env.get("PC_PARTITIONS") or "1", 1, 20)
     if legs > repeat:
         die(f"legs ({legs}) must not exceed repeat ({repeat})")
     whole("retries", env.get("PC_RETRIES"), 0, 5)
@@ -143,12 +146,16 @@ def plan():
                 builds.append({"platform": p, "runner": RUNNERS[p], "tree": tree})
             for tree in ["head"] + (["plant"] if plant else []) + (["base"] if base else []):
                 for who in ["user"] + (["root"] if as_root and p == "ubuntu" else []):
-                    for k, off, count in shares:
-                        leg_rows.append({
-                            "platform": p, "runner": RUNNERS[p], "tree": tree,
-                            "build": "base" if tree == "base" else "head", "who": who,
-                            "leg": k, "offset": off, "count": count,
-                        })
+                    n = 0
+                    for part in range(1, partitions + 1):
+                        for k, off, count in shares:
+                            n += 1
+                            leg_rows.append({
+                                "platform": p, "runner": RUNNERS[p], "tree": tree,
+                                "build": "base" if tree == "base" else "head", "who": who,
+                                "leg": n, "offset": off, "count": count,
+                                "partition": part, "partitions": partitions,
+                            })
         out[f"builds_{p}"], out[f"legs_{p}"] = builds, leg_rows
         total += len(leg_rows)
     if total > MAX_LEGS:
@@ -343,6 +350,55 @@ def verdict(d):
 # ---------------------------------------------------------------- report
 
 
+def group_results(results_dir, platform, tree, who, members, repeat, images):
+    """(runnable, ignored, reports, listed, cut, notes) of one tree, platform and user over its legs.
+
+    The legs of one partition run the same tests (their lists must agree); the partitions'
+    lists must not share a test, and the group's tests are their union. A repeat has a report
+    only when every partition reported it, and its statuses are the partitions' together.
+    """
+    parts = defaultdict(list)
+    for leg in members:
+        parts[leg.get("partition", 1)].append(leg)
+    runnable, ignored, notes = set(), set(), []
+    reports = {i: {} for i in range(1, repeat + 1)}
+    listed, cut = True, False
+    for part, legs in sorted(parts.items()):
+        pr = pi = None
+        preps = {}
+        for leg in legs:
+            d = Path(results_dir) / f"pc-results-{platform}-{tree}-{who}-{leg['leg']}"
+            meta = read_kv(d / "meta.env")
+            if meta.get("image"):
+                images[platform].add(meta["image"])
+            if d.is_dir() and [meta.get(k) for k in ("platform", "tree", "who", "leg")] != [platform, tree, who, str(leg["leg"])]:
+                listed = False
+                notes.append(f"leg {leg['leg']}: its meta.env names another leg")
+                continue
+            r, ig, reps, leg_cut, note = leg_results(d, leg["offset"], leg["count"])
+            preps.update(reps)
+            cut = cut or leg_cut
+            if note:
+                notes.append(f"leg {leg['leg']}: {note}")
+            if r is None:
+                listed = False
+            elif pr is None:
+                pr, pi = r, ig
+            elif (r, ig) != (pr, pi):
+                listed = False
+                notes.append(f"leg {leg['leg']}: its test list differs from another leg's")
+        if pr is not None:
+            if runnable & pr or ignored & pi:
+                listed = False
+                notes.append(f"partition {part}: its test list shares tests with another partition's")
+            runnable |= pr
+            ignored |= pi
+        for i in range(1, repeat + 1):
+            got = preps.get(i)
+            reports[i] = None if got is None or reports[i] is None else {**reports[i], **got}
+    return runnable, ignored, reports, listed, cut, notes
+
+
 def report(results_dir, builds_dir, out_dir):
     env = os.environ
     repeat = int(env["PC_REPEAT"])
@@ -416,33 +472,8 @@ def report(results_dir, builds_dir, out_dir):
     md.append("| platform | tree | user | verdict |")
     md.append("|---|---|---|---|")
     for (platform, tree, who), members in groups.items():
-        runnable = ignored = None
-        listed, cut = True, False
-        reports, notes = {}, []
-        for leg in members:
-            name = f"pc-results-{platform}-{tree}-{who}-{leg['leg']}"
-            d = Path(results_dir) / name
-            meta = read_kv(d / "meta.env")
-            if meta.get("image"):
-                images[platform].add(meta["image"])
-            if d.is_dir() and [meta.get(k) for k in ("platform", "tree", "who", "leg")] != [platform, tree, who, str(leg["leg"])]:
-                listed = False
-                notes.append(f"leg {leg['leg']}: its meta.env names another leg")
-                continue
-            r, ig, reps, leg_cut, note = leg_results(d, leg["offset"], leg["count"])
-            reports.update(reps)
-            cut = cut or leg_cut
-            if note:
-                notes.append(f"leg {leg['leg']}: {note}")
-            if r is None:
-                listed = False
-            elif runnable is None:
-                runnable, ignored = r, ig
-            elif (r, ig) != (runnable, ignored):
-                listed = False
-                notes.append(f"leg {leg['leg']}: its test list differs from another leg's")
-        line, tests = classify(runnable or set(), ignored or set(), reports, repeat,
-                               listed and runnable is not None, cut)
+        runnable, ignored, reports, listed, cut, notes = group_results(results_dir, platform, tree, who, members, repeat, images)
+        line, tests = classify(runnable, ignored, reports, repeat, listed, cut)
         if notes:
             line += " (" + "; ".join(notes) + ")"
         group_tests[(platform, tree, who)] = tests
@@ -790,6 +821,42 @@ def classifier_selftest():
     return bad
 
 
+def partition_selftest():
+    """Two partitions of one group: disjoint lists read as one; a shared test, or a partition
+    with no report, is UNKNOWN."""
+    rows = []
+    with tempfile.TemporaryDirectory() as d:
+        def leg(n, part, tests, kinds=None):
+            f = Path(d) / f"pc-results-macos-head-user-{n}"
+            f.mkdir(exist_ok=True)
+            (f / "meta.env").write_text(f"platform=macos\ntree=head\nwho=user\nleg={n}\nlist_exit=0\n", encoding="utf-8")
+            (f / "list.json").write_text(json.dumps({"rust-suites": {"pi-shell": {"testcases": {
+                t: {"ignored": False, "filter-match": {"status": "matches"}} for t in tests}}}}), encoding="utf-8")
+            if kinds is not None:
+                (f / "junit.xml").write_bytes(_junit([[("pi-shell", t, k) for t, k in zip(tests, kinds)]]))
+            return {"platform": "macos", "tree": "head", "who": "user", "leg": n, "offset": 0, "count": 1,
+                    "partition": part, "partitions": 2}
+
+        def verdict(members):
+            r, ig, reps, listed, cut, notes = group_results(d, "macos", "head", "user", members, 1, defaultdict(set))
+            return classify(r, ig, reps, 1, listed, cut)[0] + (" (" + "; ".join(notes) + ")" if notes else "")
+
+        a, b = leg(1, 1, ["a::x", "a::y"], ["pass", "pass"]), leg(2, 2, ["b::z"], ["fail"])
+        rows.append(("two partitions, one failure", "FAIL (1 failed: pi-shell b::z) run=3", verdict([a, b])))
+        b = leg(2, 2, ["b::z"], ["pass"])
+        rows.append(("two partitions, all passed", "PASS (3 passed in 1 of 1 repeats) run=3", verdict([a, b])))
+        b = leg(2, 2, ["a::y", "b::z"], ["pass", "pass"])
+        rows.append(("partitions that share a test", "UNKNOWN (no test list", verdict([a, b])))
+        b = leg(2, 2, ["b::z"])
+        (Path(d) / "pc-results-macos-head-user-2" / "junit.xml").unlink()
+        rows.append(("a partition with no report", "UNKNOWN (no JUnit report for repeat 1)", verdict([a, b])))
+    bad = 0
+    for name, want, got in rows:
+        print(f"{'OK      ' if got.startswith(want) else 'MISMATCH'} partitions: {name}: {got}")
+        bad |= not got.startswith(want)
+    return int(bad)
+
+
 def scope_selftest():
     """The plan's scope rows: a dispatch runs only from platform-checks; a call runs anywhere."""
     caller = "cybermonklabs/oh-my-pi/.github/workflows/sami-checks.yml"
@@ -814,7 +881,7 @@ def scope_selftest():
 
 
 def selftest():
-    bad = classifier_selftest() | scope_selftest()
+    bad = classifier_selftest() | scope_selftest() | partition_selftest()
     problems = scan_selftest()
     for p in problems:
         print(f"MISMATCH scan control: {p}")

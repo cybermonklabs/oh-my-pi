@@ -56,6 +56,8 @@ SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP
 # platforms (the fork's hand-run platform rows: pi-shell, macOS and Windows).
 PLATFORMS = ("macos", "windows")
 PLATFORM_CRATES = "pi-shell"
+# Each platform's tests run in this many parallel legs, one nextest partition each (count:k/N).
+PLATFORM_PARTITIONS = 3
 # The clippy row: the crates the fork's hand-run clippy gate linted, one unit each.
 CLIPPY_CRATES = ("pi-shell", "pi-vcs", "pi-vfs", "pi-walker", "pi-builtins", "pi-natives")
 # The name of the unused import clippy.sh plants as the clippy row's control.
@@ -126,6 +128,7 @@ def cmd_plan():
         "ca_shards": CODING_AGENT_SHARDS,
         "platforms": ",".join(PLATFORMS),
         "platform_crates": PLATFORM_CRATES,
+        "platform_partitions": PLATFORM_PARTITIONS,
         "clippy_crates": " ".join(CLIPPY_CRATES),
     }
     for k, v in out.items():
