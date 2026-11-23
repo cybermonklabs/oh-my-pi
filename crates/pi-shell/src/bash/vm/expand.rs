@@ -939,7 +939,16 @@ impl<'e, 'c> Expander<'e, 'c> {
 			.and_then(|v| v.as_scalar().map(BString::from));
 		Ok(match (v, user) {
 			(Some(v), _) => Some(v),
-			(None, b"") => Some(self.cx.host.user().home),
+			// bash `sh_get_home_dir`: the password database entry's home, `/`
+			// for a user without one.
+			(None, b"") => {
+				let home = self.cx.host.user().home;
+				Some(if home.is_empty() {
+					BString::from("/")
+				} else {
+					home
+				})
+			},
 			(None, _) => None,
 		})
 	}
@@ -956,7 +965,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Lit(b) if inq => sink.lit(b, true),
 			Part::Lit(b) => Self::lit_text(sink, b, rhs),
 			Part::Quoted(b) => sink.lit(b, true),
-			Part::Param(p) => self.param(unit, p, sink, inq || p.quoted, rhs)?,
+			Part::Param(p) => {
+				// bash's `extract_dollar_brace_string` re-parses what the
+				// `${ … }` holds even where it does not expand it.
+				if super::killed::reports_due(self.vp) && param_reparsed(unit, p) {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
+				}
+				self.param(unit, p, sink, inq || p.quoted, rhs)?;
+			},
 			Part::Comsub { entry, kind, quoted, text } => {
 				let out = self.comsub(unit, *entry, *kind, *text)?;
 				sink.value(&out, inq || *quoted);
@@ -980,6 +996,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
 					let p = super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output);
 					self.note(|| Atom::Str(Some(p.clone())));
 					p
@@ -1013,6 +1030,11 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(())
 	}
 
+	/// A command substitution: its finished output on a replay, else
+	/// [`Stop::Sub`] to start it. `text` (`None` for a backquote) is what
+	/// bash re-parses in the shell first, through `shell_getc`
+	/// (`xparse_dolparen`): the background jobs a signal killed are reported
+	/// then ([`super::killed::expanded`]).
 	fn comsub(
 		&mut self,
 		unit: &Arc<Unit>,
@@ -1032,13 +1054,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 			self.cursor += usize::from(atom.is_some());
 			atom
 		};
-		match atom {
-			Some(Atom::Sub { out, status }) => {
-				self.sub_status = Some(status);
-				self.vp.status = status;
-				Ok(out)
-			},
-			_ => Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text }),
+		if let Some(Atom::Sub { out, status }) = atom {
+			self.sub_status = Some(status);
+			self.vp.status = status;
+			Ok(out)
+		} else {
+			if text.is_some() {
+				super::killed::expanded(self.k, self.cx, self.vp, self.line);
+			}
+			Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text })
 		}
 	}
 
@@ -1803,6 +1827,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		out: &mut Vec<CompoundElem>,
 		globs: Option<&mut Vec<(u32, BString)>>,
 	) -> X<()> {
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		if elems.first().is_some_and(|e| e.key.is_none()) {
 			let assoc = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
 				state::Deref::Plain => self.is_assoc(name)?,
@@ -1950,6 +1976,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let (Some(Part::Compound(elems)), WordKind::DeclArg) = (w.parts.last(), w.kind) else {
 			return Ok(false);
 		};
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		let mut sink = Sink::Scalar(Vec::new());
 		for part in &w.parts[..w.parts.len() - 1] {
 			self.part(unit, part, &mut sink, false, false)?;
@@ -2089,7 +2117,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 				},
 				b'u' => {
 					let name = self.cx.host.user().name;
-					lit(&mut out, &name);
+					// bash `get_current_user_info`: a uid without a password
+					// database entry is named so.
+					let shown: &[u8] = if name.is_empty() {
+						b"I have no name!"
+					} else {
+						&name
+					};
+					lit(&mut out, shown);
 				},
 				b'h' | b'H' => {
 					let host = self.cx.host.hostname();
@@ -3350,6 +3385,83 @@ pub struct CompoundElem {
 	pub value:  BString,
 }
 
+/// Whether bash re-parses text of `p` through its reader as it expands it,
+/// whether or not it expands that text: `extract_dollar_brace_string` hands
+/// each `$( )`, `${ ;}`, `${| ;}`, `<( )` and `>( )` of the `${ … }` to
+/// `xparse_dolparen`, and each `$( )` of `$(( ))` text through
+/// `extract_delimited_string`, at any depth of nested parameters; a
+/// backquote and `$(( ))` text without one are not ([`Part::Comsub`]'s
+/// `text`). So a job is reported before an operand bash does not expand
+/// (`${x:-$( )}` with `x` set).
+fn param_reparsed(unit: &Unit, p: &ParamIr) -> bool {
+	let index = match p.index {
+		Some(SubIr::Expr(w)) => Some(w),
+		_ => None,
+	};
+	let words: [Option<u32>; 2] = match &p.op {
+		OpIr::Default { word, .. } | OpIr::Assign { word, .. } | OpIr::Alt { word, .. } => {
+			[Some(*word), None]
+		},
+		OpIr::Error { word, .. } => [*word, None],
+		OpIr::Trim { pat, .. } => [Some(*pat), None],
+		OpIr::Replace { pat, rep, .. } => [Some(*pat), *rep],
+		OpIr::Case { pat, .. } => [*pat, None],
+		OpIr::None
+		| OpIr::Length
+		| OpIr::Indirect
+		| OpIr::PrefixNames { .. }
+		| OpIr::Substr { .. }
+		| OpIr::Transform(_) => [None, None],
+	};
+	std::iter::once(index)
+		.chain(words)
+		.flatten()
+		.any(|w| word_reparsed(unit, w))
+}
+
+/// Whether word `w` of `unit` holds text bash re-parses ([`param_reparsed`]).
+fn word_reparsed(unit: &Unit, w: u32) -> bool {
+	unit.words.get(w as usize).is_some_and(|word| {
+		word.parts.iter().any(|part| match part {
+			Part::Comsub { text: Some(_), .. } | Part::ProcSub { .. } => true,
+			Part::Arith { text, .. } => arith_reparsed(text),
+			Part::Param(inner) => param_reparsed(unit, inner),
+			_ => false,
+		})
+	})
+}
+
+/// Whether `$(( ))` text `text` holds a `$( )`, `${ ;}` or `${| ;}`, which
+/// bash re-parses as it extracts the text (`extract_delimited_string`'s
+/// `SX_COMMAND` case); a backslash quotes the next byte, single quotes their
+/// text.
+fn arith_reparsed(text: &[u8]) -> bool {
+	let mut i = 0;
+	while let Some(&c) = text.get(i) {
+		match c {
+			b'\\' => i += 2,
+			b'\'' => {
+				i += 1
+					+ text[i + 1..]
+						.iter()
+						.position(|&b| b == b'\'')
+						.map_or(text.len(), |n| n + 1);
+			},
+			b'$' => {
+				match (text.get(i + 1), text.get(i + 2)) {
+					(Some(b'('), Some(b'(')) => {},
+					(Some(b'('), _) => return true,
+					(Some(b'{'), Some(b' ' | b'\t' | b'\n' | b'|')) => return true,
+					_ => {},
+				}
+				i += 1;
+			},
+			_ => i += 1,
+		}
+	}
+	false
+}
+
 /// The `(…)` text a declaration builtin re-reads: each value (and key)
 /// single-quoted, `[k]=v` / `[k]+=v` for keyed elements.
 pub fn compound_text(elems: &[CompoundElem]) -> BString {
@@ -3848,6 +3960,7 @@ pub fn compound_string(
 	text: &[u8],
 	assoc: bool,
 ) -> Result<Vec<CompoundElem>, Stop> {
+	super::killed::reparsed(k, cx, vp, line);
 	let mode = super::exec::mode_of(vp);
 	let unit = k
 		.engine

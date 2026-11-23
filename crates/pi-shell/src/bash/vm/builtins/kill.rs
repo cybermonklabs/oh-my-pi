@@ -188,6 +188,8 @@ pub(super) fn target(
 				ctx.k.proc_state(ctx.cx.store, job.vpid),
 				Some(crate::bash::vm::ProcState::Exited(_))
 			) {
+			// bash's `kill` finds the job gone once it reaped it.
+			job.unreaped = false;
 			if zsh.is_some() {
 				return Err(TargetError::NoSuchJob);
 			}
@@ -205,6 +207,9 @@ pub(super) fn target(
 		if send == Send::Signal(Signal::Cont) && matches!(job.state, JobState::Stopped(_)) {
 			job.state = JobState::Running;
 			job.notified = true;
+		}
+		if ends(send) && !has_program(job) {
+			job.unreaped = true;
 		}
 		return Ok(Some(SigTarget::Job(job.id)));
 	}
@@ -231,6 +236,16 @@ pub(super) fn target(
 			|| (st.is_none() && ctx.vp.last_bg.is(v) && ctx.k.spawned.iter().any(|p| p.vpid == v)))
 			&& !matches!(st, Some(crate::bash::vm::ProcState::Exited(_)))
 	});
+	// The job `kill` names ([`crate::bash::store::Job::unreaped`]): one
+	// it ends that has no program yet, or one it finds gone, which bash's
+	// `kill` (that still finds a zombie) finds gone only once it reaped it.
+	if let Some(job) = named.and_then(|v| ctx.vp.jobs.by_vpid_mut(v)) {
+		match live {
+			Some(_) if ends(send) && !has_program(job) => job.unreaped = true,
+			Some(_) => {},
+			None => job.unreaped = false,
+		}
+	}
 	match u32::try_from(pid) {
 		Ok(p) if p > 0 && p == ctx.k.shell_pid => Ok(Some(SigTarget::Vpid(Vpid(base)))),
 		Ok(p) if p > 0 && p == ctx.vp.vpid.0 => Ok(Some(SigTarget::Vpid(ctx.vp.vpid))),
@@ -243,6 +258,23 @@ pub(super) fn target(
 			.signal_process(pid, send.signal())
 			.map(|()| None)
 			.map_err(TargetError::Host),
+	}
+}
+
+/// Whether `send` ends a process that neither traps nor ignores it
+/// ([`crate::bash::store::Job::unreaped`]).
+fn ends(send: Send) -> bool {
+	matches!(send, Send::Signal(sig) if sig.default_action() == crate::bash::signal::DefaultAction::Terminate)
+}
+
+/// Whether each process of `job` is a program obash spawned (its OS pid
+/// known): a signal reaches it there and the job ends as the host reaps
+/// it. Else `kill` ends the job's vproc, or a stage's, at once, with no OS
+/// status to reap ([`crate::bash::store::Job::unreaped`]).
+fn has_program(job: &crate::bash::store::Job) -> bool {
+	match job.procs.as_deref() {
+		Some(procs) => procs.list.iter().all(|p| p.os_pid.is_some()),
+		None => job.os_pid.is_some(),
 	}
 }
 

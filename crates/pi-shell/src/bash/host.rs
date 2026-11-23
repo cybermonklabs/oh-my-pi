@@ -123,6 +123,26 @@ pub trait Host {
 	/// `None` restores the default disposition. Its current disposition
 	/// stays as it is. Hosts without OS signals keep the default: nothing.
 	fn forget_ignored(&mut self, _signal: Signal) {}
+	/// Whether the shell may catch `signal` by its own rules, with no trap
+	/// set for it ([`Self::set_signal_trap`] with a catching action: bash's
+	/// EXIT trap catches its fatal signals, zsh `HUP`). A host embedded in a
+	/// runtime keeps the runtime's handlers of the signals it does not hand
+	/// over (its fault handlers). The default: every signal.
+	fn may_catch(&self, _signal: Signal) -> bool {
+		true
+	}
+	/// Forward the OS signals caught since the last call, now, to the
+	/// shell's [`ControlHandle::signal`](crate::bash::ControlHandle::signal).
+	/// A run loop forwards them between steps; the line editor asks before it
+	/// answers a `zle -F` handler's file, as zsh, whose signal handler has run
+	/// (a resize redrawn) by the time `select` reports the file; the engine
+	/// asks at the safepoint a host's signal handler stops the running vproc
+	/// at (it marks the control word, the process host's `WakeOnSignal`),
+	/// before it spawns an external and as a wait for what the shell runs
+	/// begins, so that a signal that came before is taken as come while the
+	/// shell ran shell code. Hosts without OS signals keep the default:
+	/// nothing.
+	fn forward_signals(&mut self) {}
 	/// The filesystem (hookable: VFS, devices, `/dev/fd`, `/dev/tcp`).
 	fn fs(&mut self) -> &mut dyn Fs;
 	/// The shell's own standard stream `fd`; `None` leaves it closed.
@@ -152,6 +172,15 @@ pub trait Host {
 	fn ppid(&self) -> u32;
 	/// Current user (`~`, `$UID`, `$EUID`).
 	fn user(&self) -> UserInfo;
+	/// The login name of the process's session (`getlogin`), which zsh's
+	/// `LOGNAME` starts as when it is not empty (zsh 5.9
+	/// `Src/params.c:841-846`; else the password database's name, as
+	/// [`Host::user`]). It can name another user than the uid's (macOS
+	/// answers the session's login name). `None` (the default): the host
+	/// has no login session of its own.
+	fn login_name(&self) -> Option<BString> {
+		None
+	}
 	/// The current user's login shell from the password database, for
 	/// `SHELL`. [`Shell::create`](crate::bash::Shell::create) and the in-engine
 	/// nested shell call it only when `SHELL` is not imported (as bash
@@ -624,6 +653,15 @@ pub trait ExtProc: Send {
 	fn stop(&mut self) -> io::Result<()>;
 	/// Continue after [`ExtProc::stop`].
 	fn cont(&mut self) -> io::Result<()>;
+	/// Let the process outlive this handle: dropping it then leaves the
+	/// process running, as a [`crate::bash::Lineage::detached`] one is,
+	/// where a drop otherwise ends it (`TERM`, then `KILL`). The shell's own
+	/// end after bash's EXIT trap or zsh's `HUP` handler leaves its
+	/// foreground command running, as bash and zsh do: nothing ends it after
+	/// (a host may still list it among the shell's leftovers, as the test
+	/// kit's sweep does). The default does nothing (a host whose processes
+	/// end with the handle).
+	fn release(&mut self) {}
 }
 
 /// Opens a [`PipeMirror`] per pipeline pipe ([`Host::pipe_tap`]).

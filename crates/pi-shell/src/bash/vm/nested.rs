@@ -147,7 +147,7 @@ pub fn start(
 			}
 		},
 	};
-	let new = New { args: &args, env, pairs: &pairs, dollar0: &dollar0, origin };
+	let new = New { args: &args, env, pairs: &pairs, dollar0: &dollar0, origin, async_int: true };
 	launch(k, vp, cx, &new, &src, stdin)
 }
 
@@ -177,8 +177,79 @@ pub fn start_script(
 	};
 	let pairs = env_pairs(env);
 	let dollar0 = args.dollar0_in(&pairs);
-	let new = New { args: &args, env, pairs: &pairs, dollar0: &dollar0, origin: "" };
+	// The script runs in the process that tried to execute it: `INT` stays
+	// ignored for it as that process holds it ignored itself (bash's
+	// `SIG_IGNORED`), not as the process starts others with it.
+	let candidate = st(vp).exec_as.is_some() || st(vp).in_place || runs_in_the_async_process(vp);
+	let async_int = match candidate
+		.then(|| exec::async_ignored(cx.store, vp, crate::bash::Signal::Int, false))
+		.transpose()
+	{
+		Ok(own) => own.unwrap_or(false),
+		Err(err) => {
+			k.fail(err);
+			return Some(Flow::Discard(1));
+		},
+	};
+	let new = New { args: &args, env, pairs: &pairs, dollar0: &dollar0, origin: "", async_int };
 	launch(k, vp, cx, &new, text, false)
+}
+
+/// Whether the script `vp` runs now (its base frame's `Exec`, which ends
+/// its code, `!` aside) is the whole command of a background job or of a
+/// stage of the job's own pipeline (`./script &`, `./script | cat &`, `!
+/// ./script &`, with substitutions in its words): bash's asynchronous child
+/// starts it in its own process, with `INT` and `QUIT` still ignored as an
+/// asynchronous command's (`setup_async_signals`). Anywhere else in a job
+/// (`( ./script ) &`, `{ ./script; } &`, a list, a function, a pipeline
+/// inside a `( … )`) bash forks it from that process, and the fork puts
+/// `INT` back to its default (`restore_original_signals`, `INT` being a
+/// signal the shell itself handles); `QUIT` stays ignored (bash 5.3.20).
+/// bash only (zsh's ignore is its traps).
+fn runs_in_the_async_process(vp: &Vproc) -> bool {
+	use crate::bash::ir::{Opcode, SpawnKind};
+	let [f] = vp.frames.as_slice() else {
+		return false;
+	};
+	let Some(u) = f.unit.as_deref() else {
+		return false;
+	};
+	let code = |pc: u32| u.ops.get(pc as usize).map(|op| op.code);
+	let next = match code(f.pc + 1) {
+		Some(Opcode::Not) => code(f.pc + 2),
+		next => next,
+	};
+	if vp.parent.is_none() || f.kind != FrameKind::Subshell || next != Some(Opcode::SubExit) {
+		return false;
+	}
+	match super::killed::base_spawn(u, f.pc) {
+		Some((s, i)) if past_jumps(u, s.stages[i].entry) == f.pc => match s.kind {
+			SpawnKind::Background => true,
+			SpawnKind::Pipeline => u.ops.iter().enumerate().any(|(pc, op)| {
+				op.code == Opcode::Spawn
+					&& u
+						.spawns
+						.get(op.a as usize)
+						.is_some_and(|sp| std::ptr::eq(sp, s))
+					&& u32::try_from(pc).is_ok_and(|pc| exec::job_pipeline(u, pc))
+			}),
+			_ => false,
+		},
+		_ => false,
+	}
+}
+
+/// `pc` past the `Jmp`s at it: a command's substitutions (`$( )`,
+/// `` ` ` ``, `<( )`) compile their bodies inline before it, each jumped
+/// over.
+fn past_jumps(u: &crate::bash::ir::Unit, mut pc: u32) -> u32 {
+	for _ in 0..u.ops.len() {
+		match u.ops.get(pc as usize) {
+			Some(op) if op.code == crate::bash::ir::Opcode::Jmp => pc = op.a,
+			_ => break,
+		}
+	}
+	pc
 }
 
 /// The environment as name/value pairs.
@@ -190,13 +261,18 @@ fn env_pairs(env: &EnvView) -> Vec<(BString, BString)> {
 
 /// What a new shell starts from.
 struct New<'a> {
-	args:    &'a ShellArgs,
-	env:     &'a EnvView,
+	args:      &'a ShellArgs,
+	env:       &'a EnvView,
 	/// [`Self::env`] as pairs.
-	pairs:   &'a [(BString, BString)],
-	dollar0: &'a [u8],
+	pairs:     &'a [(BString, BString)],
+	dollar0:   &'a [u8],
 	/// `$-`'s `c` or `s` (`MiscKey::RunOrigin`), empty for a script.
-	origin:  &'static str,
+	origin:    &'static str,
+	/// The asynchronous ignore of `INT` reaches the new shell
+	/// ([`builtins::hard_ignore`]): always for a `bash -c`, a real `exec`; for
+	/// a script the OS would not execute only as [`runs_in_the_async_process`]
+	/// says, or under `exec`.
+	async_int: bool,
 }
 
 /// Start the new shell `new` describes, reading `src` (standard input when
@@ -214,7 +290,7 @@ fn launch(
 	src: &[u8],
 	stdin: bool,
 ) -> Option<Flow> {
-	let New { args, env, pairs, dollar0, origin } = *new;
+	let New { args, env, pairs, .. } = *new;
 	// The startup files (`BASH_ENV` for a non-interactive bash): the first
 	// readable candidate of each.
 	let home = env
@@ -255,7 +331,7 @@ fn launch(
 			notes.push(b'\n');
 		},
 	}
-	let mut child = match fresh_shell(k, cx, vp, args, pairs, dollar0, origin) {
+	let mut child = match fresh_shell(k, cx, vp, new) {
 		Ok(child) => child,
 		Err(err) => {
 			k.fail(err);
@@ -305,11 +381,9 @@ fn fresh_shell(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &Vproc,
-	args: &ShellArgs,
-	env: &[(BString, BString)],
-	dollar0: &[u8],
-	origin: &str,
+	new: &New<'_>,
 ) -> Result<Vproc, StoreError> {
+	let New { args, pairs: env, dollar0, origin, async_int, .. } = *new;
 	let vpid = k.vpid(cx.store);
 	let mut ov = Overlay::default();
 	// Nothing of the parent shell shows through.
@@ -318,7 +392,15 @@ fn fresh_shell(
 			ov.vars.insert(name, None);
 		}
 	}
-	for table in [Table::Func, Table::Alias, Table::CmdHash, Table::DirStack, Table::Job] {
+	for table in [
+		Table::Func,
+		Table::Alias,
+		Table::CmdHash,
+		Table::DirStack,
+		Table::Job,
+		Table::JobFacts,
+		Table::BgPid,
+	] {
 		for (key, _) in state::scan(&k.root, cx.store, vp, table)? {
 			ov.records.insert(key, None);
 		}
@@ -422,6 +504,7 @@ fn fresh_shell(
 		startup_values(cx, &args.shell_name, ppid, k.engine.config().platform, super::StartupVars {
 			lookup_shell: need_shell,
 			interactive:  args.interactive,
+			login_home:   args.login_home(env),
 		})
 	};
 	for (name, var, forced) in values {
@@ -459,6 +542,6 @@ fn fresh_shell(
 		};
 		super::mode::init_zsh_options(&mut k.root, cx.store, &mut child, &start)?;
 	}
-	builtins::hard_ignore(k, cx.store, vp, &mut child)?;
+	builtins::hard_ignore(k, cx.store, vp, &mut child, async_int)?;
 	Ok(child)
 }
