@@ -6,6 +6,7 @@
   sc.py ts-small                   the small TypeScript suites, one "unit<TAB>dir<TAB>bound<TAB>args" a line
   sc.py libtest LOG EXIT SECS ROW UNIT WHO   one libtest binary's result (JSON on stdout)
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
+  sc.py gv-libtest ..., gv-nextest ...       the same for a gVisor row, with GV_ENVIRONMENT's tests set apart
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py summary RESULTS BUILD              the step summary (markdown) on stdout; exit 1 unless every row passed
@@ -16,7 +17,9 @@ binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 no
 with no JUnit report or no summary line, a command the time bound or a signal ended, and a unit
 the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
 they belong to. A test that passed after printing a skip marker compared nothing: it is counted
-apart, named, and its unit is UNKNOWN. A test that started and never ended is named.
+apart, named, and its unit is UNKNOWN. A test that started and never ended is named. In a gVisor
+row only, a test GV_ENVIRONMENT names (one gVisor cannot pass) is listed with its line and reason
+apart from the tree's failures, and does not count in its unit's verdict.
 """
 
 import json
@@ -45,6 +48,14 @@ PI_SHELL = "pi-shell"
 # under nextest, each in a runsc container, as uid 1000 and as root.
 GV_SET_SHARDS = 4
 GV_WHO = ("uid1000", "root")
+# Tests a gVisor row cannot pass for a reason in gVisor, not in the tree: test name -> the reason.
+# In a gVisor unit their failures and self-skips do not count in the verdict; the summary lists
+# each one, with the line it printed, apart from the tree's failures. Each entry needs evidence.
+GV_ENVIRONMENT = {
+    "sys::fs::fifo::tests::an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is":
+        "gVisor has no /proc/sys/fs/protected_fifos (its procfs fs/ lists only aio-max-nr, aio-nr, file-max, "
+        "file-nr, mount-max, nr_open, pipe-max-size), so the test checks nothing",
+}
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing (the markers sami-build's
@@ -285,6 +296,60 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     return skip_verdict(res)
 
 
+def test_outputs(path, kind):
+    """{test: what it printed} from a libtest JSON log (kind libtest) or a nextest JUnit report."""
+    out = {}
+    try:
+        if kind == "libtest":
+            for line in open(path, encoding="utf-8", errors="replace"):
+                if line.startswith("{"):
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
+                        out[ev.get("name", "?")] = ev.get("stdout") or ""
+        else:
+            for name, _, _, text in junit_cases(path):
+                out[name] = text
+    except (OSError, ET.ParseError):
+        pass
+    return out
+
+
+def why_line(text):
+    """The line that says why: a skip marker, else a panic's message, else the first line."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if SKIP_MARKER.search(line):
+            return line[:300]
+    for i, line in enumerate(lines):
+        if "panicked at" in line:
+            return (lines[i + 1] if i + 1 < len(lines) else line)[:300]
+    return lines[0][:300] if lines else "(it printed nothing)"
+
+
+def gv_environment(res, outputs):
+    """A gVisor unit's GV_ENVIRONMENT tests leave its failures and self-skips for its `environment`
+    list (each with its line and reason); the unit gets the verdict the rest of its tests give."""
+    env = []
+    for kind, key in (("failed", "failures"), ("skipped itself", "self_skipped")):
+        for t in [t for t in res[key] if t in GV_ENVIRONMENT]:
+            res[key].remove(t)
+            if key == "failures":
+                res["failed"] -= 1
+            env.append({"test": t, "kind": kind, "line": why_line(outputs.get(t, "")), "reason": GV_ENVIRONMENT[t]})
+    res["environment"] = env
+    if env and res["status"] == "FAIL" and not res["failures"]:
+        res["status"] = "PASS"
+    elif env and res["status"] == "UNKNOWN" and "printed a skip marker" in res["note"]:
+        # skip_verdict made it UNKNOWN from a PASS: judge the self-skips that are left again.
+        res["status"], res["note"] = "PASS", ""
+        res["passed"] += len(res["self_skipped"])
+        skip_verdict(res)
+    return res
+
+
 def junit_cases(path):
     """Each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
     cases would count a nested case once per enclosing suite."""
@@ -466,6 +531,13 @@ def cmd_summary(results_dir, build_dir):
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
     lines.append("")
+    env = [(r, e) for r in results for e in r.get("environment", [])]
+    if env:
+        lines.append("### gVisor: tests gVisor cannot pass (the environment, not the tree; not in the verdicts)")
+        lines.append("")
+        for r, e in sorted(env, key=lambda x: (x[0]["row"], x[1]["test"])):
+            lines.append(f"- {r['row']} `{r['unit']}` ({r['who']}): {e['kind']} `{e['test']}`: \"{e['line']}\" ({e['reason']})")
+        lines.append("")
     if details:
         lines.append("### Each failing test and each UNKNOWN")
         lines.append("")
@@ -656,13 +728,51 @@ def selftest():
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
     check("summary without a binary list (gVisor)", "| pi-shell set, gVisor (root) | **UNKNOWN** | - |" in out, True)
 
+    # GV_ENVIRONMENT: in a gVisor row a listed test's self-skip or failure is set apart with its
+    # line; in a host row the same self-skip still makes the unit UNKNOWN; a real failure beside it
+    # still fails the unit.
+    envt = next(iter(GV_ENVIRONMENT))
+    e_s = {"type": "test", "event": "started", "name": envt}
+    e_skip = {"type": "test", "event": "ok", "name": envt, "exec_time": 0.1,
+              "stdout": "UNKNOWN: fs.protected_fifos is None, not 1 or more; nothing was checked\n"}
+    e_fail = {"type": "test", "event": "failed", "name": envt, "exec_time": 0.1,
+              "stdout": "thread 'x' panicked at src/x.rs:1:2:\nassertion failed: refused\n"}
+    end_2ok = {"type": "suite", "event": "ok", "passed": 2, "failed": 0}
+    end_2f = {"type": "suite", "event": "failed", "passed": 1, "failed": 1}
+    end_3f = {"type": "suite", "event": "failed", "passed": 1, "failed": 2}
+
+    def gvlt(events, exit_code, row="gv-set-root"):
+        p = os.path.join(d, "gv.log")
+        with open(p, "w") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+        return gv_environment(parse_libtest(p, str(exit_code), 1, row, "pi-shell", "root"), test_outputs(p, "libtest"))
+
+    r = gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0)
+    check("gVisor env self-skip set apart", (r["status"], r["passed"], r["self_skipped"], [e["kind"] for e in r["environment"]]),
+          ("PASS", 1, [], ["skipped itself"]))
+    check("gVisor env line", r["environment"][0]["line"], "UNKNOWN: fs.protected_fifos is None, not 1 or more; nothing was checked")
+    r = gvlt([s0, a_s, a_ok, e_s, e_fail, end_2f], 101)
+    check("gVisor env failure set apart", (r["status"], r["failed"], r["failures"], r["environment"][0]["line"]),
+          ("PASS", 0, [], "assertion failed: refused"))
+    r = gvlt([s0, a_s, a_ok, b_s, b_f, e_s, e_fail, end_3f], 101)
+    check("a real failure beside it still fails", (r["status"], r["failures"]), ("FAIL", ["b"]))
+    p = os.path.join(d, "host.log")
+    with open(p, "w") as f:
+        for e in [s0, a_s, a_ok, e_s, e_skip, end_2ok]:
+            f.write(json.dumps(e) + "\n")
+    check("a host row keeps the self-skip UNKNOWN", parse_libtest(p, "0", 1, "set-root", "pi-shell", "root")["status"], "UNKNOWN")
+    json.dump(gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0), open(os.path.join(res, "gv-env.json"), "w"))
+    rc, out = summary()
+    check("the summary lists the gVisor environment test", f"skipped itself `{envt}`: \"UNKNOWN: fs.protected_fifos" in out, True)
+
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
           "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported "
-          "(also a gVisor job)")
+          "(also a gVisor job), and gVisor's environment tests set apart")
 
 
 def main(argv):
@@ -680,6 +790,11 @@ def main(argv):
     elif c == "nextest":
         junit, ex, secs, row, unit, who = a
         print(json.dumps(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,))))
+    elif c == "gv-libtest":
+        print(json.dumps(gv_environment(parse_libtest(*a), test_outputs(a[0], "libtest"))))
+    elif c == "gv-nextest":
+        junit, ex, secs, row, unit, who = a
+        print(json.dumps(gv_environment(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,)), test_outputs(junit, "junit"))))
     elif c == "bun":
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":

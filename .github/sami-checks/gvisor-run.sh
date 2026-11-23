@@ -30,7 +30,8 @@ home=/scratch/home-$who tmp=/scratch/tmp-$who
 mkdir -p "$home" "$tmp"
 [ "$who" = uid1000 ] && chown 1000:1000 "$home" "$tmp"
 # The sticky-directory FIFO (host.sh's): mode 0666, uid 65534, in a 1777 directory of root's. The
-# test that opens it reads fs.protected_fifos first, which gVisor may not have; the log says.
+# test that opens it reads fs.protected_fifos first, which gVisor does not have, so it checks nothing
+# here (sc.py GV_ENVIRONMENT lists it apart).
 fifo=/scratch/sticky/report.txt
 if ! { install -d -o root -g root -m 1777 "$(dirname "$fifo")" && mkfifo -m 0666 "$fifo" && chown 65534:65534 "$fifo"; }; then
 	echo "::error::the sticky FIFO $fifo was not made"
@@ -60,10 +61,10 @@ if [ "$part" = set ]; then
 			timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --show-output --test-threads=4) > "$log" 2>&1 < /dev/null
 		rc=$?
 		secs=$(python3 -c "import time; print(f'{time.time() - $s:.1f}')")
-		python3 "$tool/sc.py" libtest "$log" "$rc" "$secs" "gv-set-$who" "$ident" "$who" > "$res/$safe.json"
-		echo "BIN $ident $who exit=$rc ${secs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], r["note"])' "$res/$safe.json")"
+		python3 "$tool/sc.py" gv-libtest "$log" "$rc" "$secs" "gv-set-$who" "$ident" "$who" > "$res/$safe.json"
+		echo "BIN $ident $who exit=$rc ${secs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], "gVisor-environment", len(r["environment"]), r["note"])' "$res/$safe.json")"
 		if [ "$ident" = pi-shell ]; then
-			python3 "$tool/sc.py" libtest "$log" "$rc" "$secs" "gv-lib4-$who" "$ident" "$who" > "$res/gv-lib4.json"
+			python3 "$tool/sc.py" gv-libtest "$log" "$rc" "$secs" "gv-lib4-$who" "$ident" "$who" > "$res/gv-lib4.json"
 		fi
 	done < /scratch/shard.tsv
 	echo "SHARD $who $shard done: $n binaries"
@@ -92,6 +93,6 @@ s=$(date +%s)
 rc=$?
 secs=$(($(date +%s) - s))
 for j in "${junits[@]}"; do [ -f "$j" ] && cp "$j" "$junit" && break; done
-python3 "$tool/sc.py" nextest "$junit" "$rc" "$secs" "gv-builtins-$who" pi-builtins "$who" > "$res/gv-builtins.json"
+python3 "$tool/sc.py" gv-nextest "$junit" "$rc" "$secs" "gv-builtins-$who" pi-builtins "$who" > "$res/gv-builtins.json"
 echo "ROW gv-builtins-$who: nextest exit $rc in ${secs}s; $(grep -E '^ *Summary ' "$log" | tail -n 1)"
 tail -n 40 "$log"

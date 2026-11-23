@@ -82,15 +82,16 @@ docker build --progress=plain --build-arg MIRROR="$mirror" -t sc-gv "$ctx" > "$c
 	{ grep -v -E '^#[0-9]+ [0-9.]+ (Get|Hit|Selecting|Preparing|Unpacking|Setting up|Processing)' "$ctx/build.log" | tail -n 80; fail "the image sc-gv did not build"; }
 echo "IMAGE sc-gv built in $(($(date +%s) - s)) s from $UBUNTU (apt mirror: ${mirror:-the image default})"
 
-# host.sh's checks of the reference environment, inside a runsc container of the image, as root and
-# as uid 1000; and a pty opens (the kit's first gVisor row could not open one).
-docker run --rm --runtime=runsc -i sc-gv bash -s << 'EOF' || fail "the image sc-gv under runsc misses a part of the reference environment (above)"
+# host.sh's checks of the reference environment, inside a runsc container of the image, once as root
+# and once as uid 1000 (root reads past permissions); and a pty opens (the kit's first gVisor row
+# could not open one).
+read -r -d '' check << 'EOF' || true
 set -euo pipefail
 fail() { echo "::error title=gVisor image::$*"; exit 1; }
 trap 'echo "::error title=gVisor image::line $LINENO exited $?: $BASH_COMMAND"' ERR
 # The evidence is dmesg's first line, not its exit.
 b=$(dmesg 2>&1) || true
-case "${b%%$'\n'*}" in *"Starting gVisor"*) ;; *) fail "not gVisor: ${b%%$'\n'*}" ;; esac
+case "${b%%$'\n'*}" in *"Starting gVisor"*) ;; *) [ "$(id -u)" != 0 ] || fail "not gVisor: ${b%%$'\n'*}" ;; esac
 v=$(/bin/zsh -fc 'print -r -- "$ZSH_VERSION $ZSH_PATCHLEVEL"' 2>&1) || true
 [ "$v" = "5.9 zsh-5.9-0-g73d3173" ] || fail "/bin/zsh is '$v', not 5.9 zsh-5.9-0-g73d3173"
 fp=$(/bin/zsh -fc 'print -r -- "$fpath"')
@@ -116,7 +117,10 @@ j=$(/opt/sc-ref/bin/jj --version)
 case "$j" in "jj 0.46.0"*) ;; *) fail "the reference jj is '$j'" ;; esac
 [ "$(id -u runner)" = 1000 ] || fail "the user runner is not uid 1000"
 for c in setpriv timeout python3 git ping ssh localedef; do command -v "$c" > /dev/null || fail "no $c in the image"; done
-python3 -c 'import os; os.openpty()' || fail "root cannot open a pty"
-setpriv --reuid=1000 --regid=1000 --clear-groups python3 -c 'import os; os.openpty()' || fail "uid 1000 cannot open a pty"
-echo "IMAGE zsh=[$v] rsync=[$r] jj=[$j] bash=[$(bv=$(/bin/bash --version) && echo "${bv%%$'\n'*}")] locales en_US sv_SE de_DE; pty ok as root and uid 1000; kernel=[$(uname -r)] cpus=$(nproc)"
+python3 -c 'import os; os.openpty()' || fail "uid $(id -u) cannot open a pty"
+echo "IMAGE uid=$(id -u) zsh=[$v] rsync=[$r] jj=[$j] bash=[$(bv=$(/bin/bash --version) && echo "${bv%%$'\n'*}")] locales en_US sv_SE de_DE; pty ok; kernel=[$(uname -r)] cpus=$(nproc)"
 EOF
+for u in 0:0 1000:1000; do
+	docker run --rm --runtime=runsc -i --user "$u" sc-gv bash -s <<< "$check" ||
+		fail "the image sc-gv under runsc, as uid ${u%%:*}, misses a part of the reference environment (above)"
+done
