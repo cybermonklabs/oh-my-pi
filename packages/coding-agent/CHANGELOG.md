@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- `discoverExtensionPaths()` and `discoverSessionExtensionPaths()` return `{ path, scope }` entries instead of path strings, `AgentSession.extensionPaths` lists such entries, and each `PreparedExtension` carries the `scope` its extension was found at (`project`, `user`, `explicit` or `inline`)
+- `discoverExtensionPaths()` and `discoverSessionExtensionPaths()` return `{ path, scope }` entries instead of path strings, as do the `deferredPaths` of `loadSessionExtensions()`; `AgentSession.extensionPaths`, `AgentSessionConfig.extensionPaths` and `ToolSession.extensionPaths` list such entries, and each `PreparedExtension` carries the `scope` its extension was found at (`project`, `user`, `explicit` or `inline`)
 
 ### Changed
 

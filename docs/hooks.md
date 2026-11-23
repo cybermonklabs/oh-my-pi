@@ -72,8 +72,15 @@ returns one `{ path, scope }` entry per source, gathered in this order:
 
 A native hook of the project's `.omp/hooks/` has scope `project`, one of the
 agent directory's `hooks/` has scope `user`, a hook of an installed plugin has
-the plugin's install scope, and a hook of a package root named by `--extension`,
+the plugin's install scope, a hook of a plugin loaded with `--plugin-dir` has
+scope `user`, and a hook of a package root named by `--extension`,
 `additionalExtensionPaths` or the `extensions` setting has scope `explicit`.
+A hook of another provider's directory keeps that directory's level: the
+`claude` provider's `.ts`/`.js` files of `.claude/hooks/pre/` and
+`.claude/hooks/post/` are `project`, and those of the same directories under
+Claude's user directory (`~/.claude` by default) are `user`; the
+`codex` provider's `pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}` files of
+`.codex/hooks/` are `project`, and those of `~/.codex/hooks/` are `user`.
 `loadExtensions()` takes these entries; it also takes a bare path string, which
 it reads as an `explicit` entry. See
 [Extension Loading](./extension-loading.md#load-order-and-precedence) for what each scope means.

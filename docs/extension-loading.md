@@ -254,10 +254,14 @@ imported/prepared factories for child sessions, which receive each entry with it
 
 The scope says where discovery found the source:
 
-- `project`: the project's own native module or hook, or a plugin installed at project scope.
-- `user`: a native module or hook of the agent directory, or a plugin installed at user scope.
+- `project`: the project's own native module or hook, a hook of its `.claude/hooks/pre/`, `.claude/hooks/post/` or `.codex/hooks/`, or a plugin installed at project scope.
+- `user`: a native module or hook of the agent directory, a hook of `hooks/pre/` or `hooks/post/` under Claude's user directory (`~/.claude` by default) or of `~/.codex/hooks/`, a plugin installed at user scope, or a hook of a plugin loaded with `--plugin-dir`.
 - `explicit`: a path given with `--extension`, `additionalExtensionPaths` or the `extensions` setting, or a hook of such a package root.
 - `inline`: a factory the host passes in code.
+
+A hook of another provider's directory keeps that directory's level. Of the
+`claude` provider's hook directories, every `.ts`/`.js` file loads; of the
+`codex` provider's, only `pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}` files.
 
 `loadExtensions()`, `importExtensionModule()` and the SDK's `preloadedExtensionPaths`
 also take a bare path string, which they read as an `explicit` entry. A prepared

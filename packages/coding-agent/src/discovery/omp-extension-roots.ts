@@ -32,6 +32,12 @@ import { listClaudePluginRoots } from "./helpers";
  */
 export type OmpExtensionRootOrigin = "explicit" | "configured" | "installed";
 
+/** Lanes of the caller's own package roots, whose hooks load at `explicit` extension scope. */
+export const EXPLICIT_SCOPE_ROOT_ORIGINS: ReadonlySet<string> = new Set<OmpExtensionRootOrigin>([
+	"explicit",
+	"configured",
+]);
+
 /** A resolved extension package directory wired into the discovery surfaces. */
 export interface OmpExtensionRoot {
 	/** Absolute path to the package directory. */
@@ -295,13 +301,12 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
 	const scopedRoots = invocationRootScope.getStore();
 	// Explicit lane, in precedence order: caller-provided reload value, then the
 	// construction-time invocation scope, then process-level CLI injection.
-	const explicitSeed: InjectedRoot[] = ctx.extensionRoots
-		? ctx.extensionRoots.explicit.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user", origin: "explicit" }))
-		: scopedRoots
-			? scopedRoots.paths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user", origin: "explicit" }))
-			: injectedCliRoots.map(root =>
-					root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
-				);
+	const explicitPaths = ctx.extensionRoots ? ctx.extensionRoots.explicit : scopedRoots?.paths;
+	const explicitSeed: InjectedRoot[] = explicitPaths
+		? explicitPaths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user", origin: "explicit" }))
+		: injectedCliRoots.map(root =>
+				root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
+			);
 	const rootMode: OmpExtensionRootMode = ctx.extensionRoots?.mode ?? scopedRoots?.mode ?? injectedCliRootMode;
 	let candidates: InjectedRoot[] = explicitSeed;
 	if (rootMode === "merge") {

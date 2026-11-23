@@ -3050,7 +3050,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				cwd,
 				eventBus,
 			);
-			// The bound entries carry a scope: a host-built prepared extension without one binds as `explicit`.
+			// The entries bindPreparedExtensions returns carry a scope: a host-built prepared extension without one binds
+			// as `explicit`.
 			extensionPaths = (extensionsResult.preparedExtensions ?? []).map(({ path, scope }) => ({ path, scope }));
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to bind extension", { path, error });

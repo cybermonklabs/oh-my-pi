@@ -90,65 +90,12 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 	});
 });
 
-describe("createAgentSession preloadedExtensions forwarding to child sessions", () => {
+describe("createAgentSession forwarding of extensions a caller passes without a scope", () => {
 	let dir: string;
 	let authStorage: AuthStorage;
 
 	beforeAll(() => {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preloaded-ext-forward-"));
-		authStorage = createInMemoryAuthStorage();
-	});
-
-	afterAll(() => {
-		authStorage.close();
-		removeSyncWithRetries(dir);
-	});
-
-	it("forwards a caller-loaded extension that has no prepared entry as the caller's explicit one", async () => {
-		const file = path.join(dir, "caller-extension.ts");
-		fs.writeFileSync(file, "export default function () {}\n");
-		const loaded = await loadExtensions([{ path: file, scope: "explicit" }], dir);
-		expect(loaded.errors).toEqual([]);
-		// An SDK caller that loads extensions itself hands over the bound extensions without prepared entries.
-		const preloaded: LoadExtensionsResult = {
-			extensions: loaded.extensions,
-			errors: loaded.errors,
-			runtime: loaded.runtime,
-		};
-
-		const { session } = await createAgentSession({
-			cwd: dir,
-			agentDir: dir,
-			sessionManager: SessionManager.inMemory(),
-			modelRegistry: new ModelRegistry(authStorage, path.join(dir, "models.yml")),
-			settings: Settings.isolated(),
-			preloadedExtensions: preloaded,
-			enableLsp: false,
-			enableMCP: false,
-			skipPythonPreflight: true,
-			skills: [],
-			rules: [],
-			preloadedCustomToolPaths: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			toolNames: ["read"],
-		});
-
-		try {
-			expect(session.extensionPaths).toEqual([{ path: file, scope: "explicit" }]);
-		} finally {
-			await session.dispose();
-		}
-	});
-});
-
-describe("createAgentSession extension inputs a caller passes without a scope", () => {
-	let dir: string;
-	let authStorage: AuthStorage;
-
-	beforeAll(() => {
-		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preloaded-ext-unscoped-"));
 		authStorage = createInMemoryAuthStorage();
 	});
 
@@ -176,6 +123,27 @@ describe("createAgentSession extension inputs a caller passes without a scope", 
 			toolNames: ["read"],
 			...extensions,
 		});
+
+	it("forwards a caller-loaded extension that has no prepared entry as the caller's explicit one", async () => {
+		const file = path.join(dir, "caller-extension.ts");
+		fs.writeFileSync(file, "export default function () {}\n");
+		const loaded = await loadExtensions([{ path: file, scope: "explicit" }], dir);
+		expect(loaded.errors).toEqual([]);
+		// An SDK caller that loads extensions itself hands over the bound extensions without prepared entries.
+		const preloaded: LoadExtensionsResult = {
+			extensions: loaded.extensions,
+			errors: loaded.errors,
+			runtime: loaded.runtime,
+		};
+
+		const { session } = await createSession({ preloadedExtensions: preloaded });
+
+		try {
+			expect(session.extensionPaths).toEqual([{ path: file, scope: "explicit" }]);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it("binds a bare path of preloadedExtensionPaths and forwards it as the caller's explicit entry", async () => {
 		const file = path.join(dir, "bare-path.ts");

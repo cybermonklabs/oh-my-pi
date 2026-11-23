@@ -556,11 +556,7 @@ async function loadTrustedSessionExtensions(
 			throw new Error(`Trusted extension must be a module file, not a directory: ${trustedPath}`);
 		}
 	}
-	return loadExtensions(
-		paths.map(trustedPath => ({ path: trustedPath, scope: "explicit" })),
-		cwd,
-		eventBus,
-	);
+	return loadExtensions(paths, cwd, eventBus);
 }
 
 /**

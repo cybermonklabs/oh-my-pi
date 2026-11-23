@@ -23,6 +23,7 @@ import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
+import { EXPLICIT_SCOPE_ROOT_ORIGINS } from "../../discovery/omp-extension-roots";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import { getCodingAgentApi } from "../host-api";
@@ -804,11 +805,12 @@ export async function discoverExtensionPaths(
 		if (options.includeAmbientHooks !== false) {
 			const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
 			for (const hook of hooks.items.filter(item => isExtensionFile(path.basename(item.path)))) {
-				// A hook of an explicit or configured package root (its `omp-plugins` origin names the root's lane) is
-				// explicit, as that root's module entries are at step 4; a native or installed-plugin hook keeps its
-				// level.
+				// A hook of an explicit or configured package root (its `omp-plugins` origin names the root's lane, see
+				// EXPLICIT_SCOPE_ROOT_ORIGINS) is explicit, as that root's module entries are at step 4; a native or
+				// installed-plugin hook keeps its level.
 				const { origin } = hook._source;
-				await addPath(hook.path, origin === "explicit" || origin === "configured" ? "explicit" : hook.level);
+				const ownRoot = origin !== undefined && EXPLICIT_SCOPE_ROOT_ORIGINS.has(origin);
+				await addPath(hook.path, ownRoot ? "explicit" : hook.level);
 			}
 		}
 	} else {
