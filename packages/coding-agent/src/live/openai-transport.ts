@@ -22,6 +22,7 @@ import {
 	parseLiveServerEvent,
 } from "./protocol";
 import type { CodexLiveTransport, LiveTransportCallbacks } from "./transport";
+import { readBodyCapped } from "../web/response-body";
 
 /** The provider whose key (and base URL, when models.yml sets one) the route uses; also its proxy scope. */
 const OPENAI_PROVIDER = "openai";
@@ -29,6 +30,13 @@ const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 /** The GPT-Live model a call asks for. */
 export const OPENAI_LIVE_MODEL = "gpt-live-1.1";
 const MAX_ERROR_BODY_LENGTH = 2_048;
+/** The most of the session response read: its SDP answer is a few KB. */
+const MAX_SESSION_RESPONSE_BYTES = 256 * 1024;
+/**
+ * The longest transcript line kept, in characters: a line that would pass it ends and a new one begins.
+ * Also the most of the user's words with timing, and of those without, that wait for a delegation.
+ */
+const MAX_TRANSCRIPT_LENGTH = 8_192;
 /** How much of a redirect's `Location` an error repeats. */
 const MAX_LOCATION_LENGTH = 256;
 const SIDEBAND_CONNECT_ATTEMPTS = 5;
@@ -116,6 +124,16 @@ function bounded(text: string, limit: number): string {
 /** `text` with each copy of `apiKey` replaced: a server can echo the bearer back in any text it sends. */
 function redactKey(text: string, apiKey: string): string {
 	return apiKey ? text.replaceAll(apiKey, "[key]") : text;
+}
+
+/** `words` without its oldest entries, so that their text is at most {@link MAX_TRANSCRIPT_LENGTH} long. */
+function latestWords<T extends { text: string }>(words: T[]): T[] {
+	let length = 0;
+	for (let index = words.length - 1; index >= 0; index--) {
+		length += words[index]!.text.length;
+		if (length > MAX_TRANSCRIPT_LENGTH) return words.slice(index + 1);
+	}
+	return words;
 }
 
 /** Parses a JSON string from an event channel into a record, or `undefined`. */
@@ -342,11 +360,15 @@ export class OpenAILiveTransport implements Pick<
 				`GPT-Live session request was redirected (${response.status}) to ${location}; no redirect is followed`,
 			);
 		}
-		const text = await response.text();
+		const received = await readBodyCapped(response, MAX_SESSION_RESPONSE_BYTES);
+		const text = received ? new TextDecoder().decode(received.bytes) : "";
 		if (!response.ok) {
 			const reply = redactKey(text.trim().replaceAll(/\s+/g, " "), route.apiKey);
 			const detail = bounded(reply || response.statusText, MAX_ERROR_BODY_LENGTH);
 			throw new Error(`GPT-Live session failed (${response.status}): ${detail}`);
+		}
+		if (received?.truncated) {
+			throw new Error(`GPT-Live session response is over ${MAX_SESSION_RESPONSE_BYTES} bytes`);
 		}
 		const answer = parseRecord(text);
 		const id = isRecord(answer?.session) ? answer.session.id : undefined;
@@ -491,8 +513,8 @@ export class OpenAILiveTransport implements Pick<
 		switch (record.type) {
 			case "session.input_transcript.delta":
 			case "session.output_transcript.delta": {
-				const delta = record.delta;
-				if (typeof delta !== "string" || !delta) return [];
+				if (typeof record.delta !== "string" || !record.delta) return [];
+				const delta = record.delta.slice(0, MAX_TRANSCRIPT_LENGTH);
 				const role = record.type === "session.input_transcript.delta" ? "user" : "assistant";
 				const { start_ms: startMs, end_ms: endMs } = record;
 				if (typeof startMs === "number" && typeof endMs === "number" && Number.isFinite(endMs)) {
@@ -503,10 +525,12 @@ export class OpenAILiveTransport implements Pick<
 				}
 				const events: LiveServerEvent[] = [];
 				const previous = this.#line;
-				if (previous && previous.role !== role) {
+				// A line ends when the other speaker starts, or where it would pass the longest line kept.
+				const continues = previous?.role === role && previous.text.length + delta.length <= MAX_TRANSCRIPT_LENGTH;
+				if (previous && !continues) {
 					events.push({ type: "turn.done", turn: { role: previous.role, transcript: previous.text } });
 				}
-				const text = (previous?.role === role ? previous.text : "") + delta;
+				const text = (continues ? previous.text : "") + delta;
 				this.#line = { role, text };
 				const type = role === "user" ? "input_transcript.added" : "output_transcript.added";
 				events.push({ type, item: { text } });
@@ -565,6 +589,7 @@ export class OpenAILiveTransport implements Pick<
 		const oldest = this.#transcriptEndMs.user - DELEGATION_WORDS_WINDOW_MS;
 		this.#userWords = this.#userWords.filter(words => words.startMs >= oldest);
 		this.#userWords.push({ startMs, text });
+		this.#userWords = latestWords(this.#userWords);
 	}
 
 	/**
@@ -577,6 +602,7 @@ export class OpenAILiveTransport implements Pick<
 		const oldest = performance.now() - DELEGATION_WORDS_WINDOW_MS;
 		this.#untimedWords = this.#untimedWords.filter(words => words.arrivedAt >= oldest);
 		this.#untimedWords.push({ arrivedAt: performance.now(), text });
+		this.#untimedWords = latestWords(this.#untimedWords);
 	}
 
 	/** Takes the words without a place on the timeline for one delegation's turn; see {@link #addUntimedWords}. */

@@ -1581,6 +1581,11 @@ that have one, if it came within the minute before. It cannot show that the
 user's transcript has reached an offset, so a delegation waiting on such words
 alone goes after 1 s.
 
+What the server sends is bounded: omp reads at most 256 KiB of the session
+response, ends a transcript line that would pass 8,192 characters and begins a
+new one, and keeps for a turn at most the latest 8,192 characters of the user's
+words with timing, and as many of those without.
+
 ## Dictation Sub-Protocol
 
 Draft-only dictation captures from the machine's microphone using the session's

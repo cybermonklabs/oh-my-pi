@@ -331,6 +331,67 @@ describe("GPT-Live transport", () => {
 		}
 	});
 
+	test("refuses a session response over 256 KiB, and attaches nothing", async () => {
+		const sdp = `v=0 ${"a".repeat(300 * 1024)}`;
+		const api = liveApiServer({
+			answer: () => Response.json({ session: { id: "live_123" }, transport: { sdp } }, { status: 201 }),
+		});
+		const transport = transportFor(api.base);
+		try {
+			await expect(transport.connect()).rejects.toThrow(/GPT-Live session response is over 262144 bytes/);
+			expect(api.upgrades).toEqual([]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
+	test("ends a transcript line before 8,192 characters, and a turn keeps the latest 8,192 of the user's", async () => {
+		const a = "a".repeat(4_000);
+		const b = "b".repeat(4_000);
+		const c = "c".repeat(4_000);
+		const user = (eventId: string, delta: string, startMs: number) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+			start_ms: startMs,
+			end_ms: startMs + 100,
+		});
+		const api = liveApiServer({
+			events: [
+				user("e1", a, 0),
+				user("e2", b, 100),
+				user("e3", c, 200),
+				{
+					type: "session.delegation.created",
+					event_id: "e4",
+					offset_ms: 300,
+					delegation: { id: "item_1", type: "delegation", target: "client" },
+				},
+			],
+		});
+		const events: LiveServerEvent[] = [];
+		const delegated = Promise.withResolvers<void>();
+		const transport = transportFor(api.base, event => {
+			events.push(event);
+			if (event.type === "delegation.created") delegated.resolve();
+		});
+		try {
+			await transport.connect();
+			await delegated.promise;
+			expect(events).toEqual([
+				{ type: "input_transcript.added", item: { text: a } },
+				{ type: "input_transcript.added", item: { text: `${a}${b}` } },
+				{ type: "turn.done", turn: { role: "user", transcript: `${a}${b}` } },
+				{ type: "input_transcript.added", item: { text: c } },
+				heard("item_1", `${b}${c}`),
+			]);
+		} finally {
+			await transport.close();
+			api.server.stop(true);
+		}
+	});
+
 	test("follows no redirect, so the key never leaves the provider's origin", async () => {
 		const elsewhere = liveApiServer();
 		const redirecting = Bun.serve({
