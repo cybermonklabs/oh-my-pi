@@ -11,6 +11,15 @@ import { LIVE_DELEGATION_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/
  */
 
 const KEY = "sk-call-test";
+const LABEL =
+	"The user's words for this request, from speech-to-text. They can hold recognition errors and speech that was not a request:";
+const NO_WORDS = "No words of the user were transcribed for this request. Say so, and ask the user to say it again.";
+
+/** A delegated turn holding `words`, as the transport labels them. */
+function heard(words: string): string {
+	return `${LABEL}\n\n> ${words}`;
+}
+
 interface StubOptions {
 	/** Answer to the session POST; defaults to a 201 for `sessionId`. */
 	answer?: (request: Request) => Response;
@@ -126,6 +135,72 @@ function delegated(eventId: string, id: string, offsetMs: number) {
 		delegation: { id, type: "delegation", target: "client" },
 	};
 }
+
+describe("GPT-Live delegations", () => {
+	test("each turn is the user's words before its delegation, also when they arrive after it", async () => {
+		// The review's probe: each delegation comes before the transcript of the words that led to it.
+		const stub = gptLiveStub({
+			frames: [
+				delegated("d1", "item_1", 1_300),
+				userSaid("t1", "deploy main", 900, 1_200),
+				voiceSaid("t2", "On it.", 1_500, 1_900),
+				delegated("d2", "item_2", 2_600),
+				userSaid("t3", "and run the tests", 2_000, 2_500),
+				delegated("d3", "item_3", 4_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 3);
+			expect(call.turns).toEqual([heard("deploy main"), heard("and run the tests"), NO_WORDS]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("two delegations with no words between them both become turns", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "check the build", 100, 900),
+				delegated("d1", "item_1", 1_000),
+				voiceSaid("t2", "Checking.", 1_100, 1_400),
+				delegated("d2", "item_2", 5_000),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 2);
+			expect(call.turns).toEqual([heard("check the build"), NO_WORDS]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("a turn holds the user's words of the minute before its delegation, labelled as speech", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "tell me a joke", 0, 900),
+				voiceSaid("t2", "Why did the build fail?", 1_000, 2_500),
+				userSaid("t3", "deploy main", 70_000, 70_600),
+				delegated("d1", "item_1", 71_000),
+				voiceSaid("t4", "On it.", 71_100, 71_500),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+});
 
 describe("GPT-Live call lifecycle", () => {
 	test("a stop while the key resolves sends no session request and leaves no call open", async () => {

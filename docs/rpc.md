@@ -1533,7 +1533,8 @@ process exits.
 ### API billing (`live.provider: openai`)
 
 Live sessions run on Codex with the session's ChatGPT (Codex) sign-in. With
-`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`) every live session
+`live.provider: openai` (or `OMP_LIVE_PROVIDER=openai`, which takes precedence
+over `live.provider` in the settings files) every live session
 (`/live`, `live_start`, `live_connect`, extension `startLive`) runs GPT-Live
 (`gpt-live-1.1`) on OpenAI's API instead, billed to the key of the `openai`
 provider: the key omp uses for any OpenAI model (a stored key, `apiKey` in
@@ -1549,11 +1550,22 @@ GPT-Live there works the same way.
    bearer carries the call's events and omp's messages.
 
 The rest of the call is the same as on Codex. GPT-Live's delegation event names
-no task text, so its text is the user's words since the previous delegation, as
-they have arrived when the delegation comes; words that arrive after it go with
-the next one. A turn's progress goes to the call as `session.thinking.append`
-(not spoken) and its final reply as `session.commentary.append` (spoken).
-No voice is sent, so GPT-Live uses its default; `live.voice` names Codex voices only.
+no task text, only its `offset_ms` on the session timeline, so its turn is the
+user's transcribed words before that offset (at most the minute before it), under
+a line saying they are speech-to-text that can hold recognition errors and speech
+that was not a request. GPT-Live can send a delegation before the transcript of
+the words that led to it, so a delegation goes once the transcript has reached
+its offset: the user's transcript, or the voice's once some of the user's words
+before the offset are in. Failing both, it goes after 1 s with the words that
+have arrived. A delegation is never dropped: with no words, its turn says none
+were transcribed. A turn's progress goes to the call as `session.thinking.append`
+(not spoken) and its final reply as `session.commentary.append` (spoken); context
+outside a delegation goes the same way with `delegation_id: null`. Each message
+carries an `event_id`; a GPT-Live `error` that names one ends the call with that
+error, as a failed send does on Codex, and any other `error` is logged while the
+call stays open. The session id is opaque: any id but `.` and `..` is accepted
+and percent-encoded into the attach path. No voice is sent, so GPT-Live uses its
+default; `live.voice` names Codex voices only.
 
 ## Dictation Sub-Protocol
 

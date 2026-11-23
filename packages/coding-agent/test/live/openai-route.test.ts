@@ -76,6 +76,15 @@ function transportFor(base: string, onEvent: (event: LiveServerEvent) => void = 
 	});
 }
 
+/** A delegated turn holding `words`, as the transport labels them. */
+function heard(id: string, words: string): LiveServerEvent {
+	const text = `The user's words for this request, from speech-to-text. They can hold recognition errors and speech that was not a request:\n\n> ${words}`;
+	return {
+		type: "delegation.created",
+		item: { type: "delegation", target: "client", id, content: [{ type: "input_text", text }] },
+	};
+}
+
 function expectNoCodexHeaders(request: Request): void {
 	for (const name of CODEX_ONLY_HEADERS) expect(request.headers.has(name)).toBe(false);
 	for (const name of Object.values(OPENAI_HEADERS)) expect(request.headers.has(name)).toBe(false);
@@ -177,47 +186,50 @@ describe("GPT-Live transport", () => {
 		}
 	});
 
-	test("maps the sideband's events onto the controller's, once each; a delegation gets the user's words since the previous one", async () => {
-		const delegation = (id: string, eventId: string) => ({
+	test("maps the sideband's events onto the controller's, once each", async () => {
+		const delegation = (id: string, eventId: string, offsetMs: number, target = "client") => ({
 			type: "session.delegation.created",
 			event_id: eventId,
-			offset_ms: 1300,
-			delegation: { id, type: "delegation", target: "client" },
+			offset_ms: offsetMs,
+			delegation: { id, type: "delegation", target },
 		});
-		const first = delegation("item_9", "e4");
+		const user = (eventId: string, delta: unknown, startMs: number, endMs: number) => ({
+			type: "session.input_transcript.delta",
+			event_id: eventId,
+			delta,
+			start_ms: startMs,
+			end_ms: endMs,
+		});
+		const first = delegation("item_9", "e4", 1_300);
 		const api = liveApiServer({
 			events: [
-				{ type: "session.input_transcript.delta", event_id: "e1", delta: "deploy ", start_ms: 900, end_ms: 1000 },
-				{ type: "session.input_transcript.delta", event_id: "e2", delta: "main", start_ms: 1000, end_ms: 1200 },
-				{ type: "session.output_transcript.delta", event_id: "e3", delta: "On it.", start_ms: 1500, end_ms: 1900 },
+				user("e1", "deploy ", 900, 1_000),
+				user("e2", "main", 1_000, 1_200),
+				{
+					type: "session.output_transcript.delta",
+					event_id: "e3",
+					delta: "On it.",
+					start_ms: 1_500,
+					end_ms: 1_900,
+				},
 				first,
 				// The attach replays what the call already delivered.
 				first,
 				{ type: "session.usage.updated", event_id: "e5", usage: { seconds: 12 } },
-				// An error such as an invalid client command leaves the session open: logged, not a failure.
+				// An error that names nothing omp sent leaves the session open: logged, not a failure.
 				{ type: "error", event_id: "e6", error: { message: "content too long", code: "invalid_value" } },
-				{ type: "session.input_transcript.delta", event_id: "e7", delta: 3 },
-				{ ...delegation("item_x", "e8"), delegation: { id: "item_x", type: "delegation", target: "responses" } },
-				{
-					type: "session.input_transcript.delta",
-					event_id: "e9",
-					delta: " and test",
-					start_ms: 2000,
-					end_ms: 2400,
-				},
-				delegation("item_10", "e10"),
-				delegation("item_11", "e11"),
+				user("e7", 3, 1_950, 2_000),
+				delegation("item_x", "e8", 2_000, "responses"),
+				user("e9", " and test", 2_000, 2_400),
+				delegation("item_10", "e10", 2_500),
+				user("e11", " thanks", 2_600, 2_900),
 			],
 		});
 		const events: LiveServerEvent[] = [];
 		const done = Promise.withResolvers<void>();
 		const transport = transportFor(api.base, event => {
 			events.push(event);
-			if (event.type === "delegation.created" && event.item.id === "item_11") done.resolve();
-		});
-		const delegated = (id: string, text?: string): LiveServerEvent => ({
-			type: "delegation.created",
-			item: { type: "delegation", target: "client", id, content: text ? [{ type: "input_text", text }] : [] },
+			if (event.type === "delegation.created" && event.item.id === "item_10") done.resolve();
 		});
 		try {
 			await transport.connect();
@@ -227,13 +239,14 @@ describe("GPT-Live transport", () => {
 				{ type: "input_transcript.added", item: { text: "deploy main" } },
 				{ type: "turn.done", turn: { role: "user", transcript: "deploy main" } },
 				{ type: "output_transcript.added", item: { text: "On it." } },
-				delegated("item_9", "deploy main"),
+				// The voice's transcript has passed the offset, and the user's words before it are in.
+				heard("item_9", "deploy main"),
 				{ type: "unknown", wireType: "session.usage.updated" },
 				{ type: "turn.done", turn: { role: "assistant", transcript: "On it." } },
 				{ type: "input_transcript.added", item: { text: " and test" } },
-				// Sent at once with the words that have arrived; with none, the controller makes no turn.
-				delegated("item_10", "and test"),
-				delegated("item_11"),
+				{ type: "input_transcript.added", item: { text: " and test thanks" } },
+				// The user's transcript has passed the offset: the words after it wait for the next delegation.
+				heard("item_10", "and test"),
 			]);
 		} finally {
 			await transport.close();
