@@ -7,17 +7,14 @@ set -uo pipefail
 mkdir -p "$SC/up" "$SC/build"
 rec=$SC/build/build.env
 cd "$SC_TREE" || exit 1
-restored=$(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f 2> /dev/null | wc -l | tr -d ' ')
 {
 	echo "sha=$(git rev-parse HEAD)"
 	echo "image=${ImageOS:-?}/${ImageVersion:-?}"
 	echo "rustc=$(rustc -V)"
 	echo "nextest=$(cargo nextest --version | head -n 1)"
-	echo "cache_hit=${SC_CACHE_HIT:-}"
-	echo "restored_deps=$restored"
 } > "$rec"
 s=$(date +%s)
-cargo nextest archive --workspace --archive-file "$SC/up/tests.tar.zst" > "$SC/build/build.log" 2>&1
+cargo nextest archive --workspace --locked --archive-file "$SC/up/tests.tar.zst" > "$SC/build/build.log" 2>&1
 rc=$?
 secs=$(($(date +%s) - s))
 {

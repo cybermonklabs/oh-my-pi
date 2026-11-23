@@ -3,9 +3,10 @@
 # packages/natives/native (the only addon a workspace load reads). Each `bun test` runs as the gate
 # kit ran it (kit-tsx driver.sh): env -i with bun on PATH and a fresh HOME, stdin /dev/null, a JUnit
 # report; sc.py bun reads it with bun's own summary line.
-#   ts.sh small           natives, utils, scripts/ci-release-publish.test.ts, mnemopi --isolate
-#   ts.sh ca SHARD        coding-agent --isolate, the files whose index (sorted) is SHARD mod N
+#   ts.sh small           the suites sc.py's TS_SMALL lists, one after another
+#   ts.sh ca SHARD        coding-agent --isolate, the files whose index (sorted) mod N is SHARD - 1
 #   ts.sh checkts         bun run check:ts
+# The verdicts are the summary's: this script ends 0 once every unit wrote its result.
 set -uo pipefail
 mode=$1
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
@@ -27,26 +28,25 @@ one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 	rm -rf "${home:?}"
 	python3 "$tool/sc.py" bun "$junit" "$log" "$rc" "$secs" "$row" "$unit" > "$SC/res/$safe.json"
 	echo "BUN $row $unit exit=$rc ${secs}s $(grep -E '^Ran [0-9]+ tests? across' "$log" | tail -n 1)"
-	grep -E '^\(fail\)' "$log" | head -n 40
+	grep -E '^\(fail\)' "$log" | head -n 40 || true
 }
 
 case $mode in
 small)
-	one ts-small natives packages/natives 1800 test
-	one ts-small utils packages/utils 1800 test
-	one ts-small ci-release-publish . 900 ./scripts/ci-release-publish.test.ts
-	one ts-small mnemopi packages/mnemopi 2700 --isolate test
+	while IFS=$'\t' read -r -a f; do
+		one ts-small "${f[0]}" "${f[1]}" "${f[2]}" "${f[@]:3}"
+	done < <(python3 "$tool/sc.py" ts-small)
 	;;
 ca)
 	shard=$2
 	mapfile -t files < <(cd "$SC_TREE/packages/coding-agent" && find test -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) | LC_ALL=C sort)
 	mine=()
 	for i in "${!files[@]}"; do
-		[ $((i % SC_CA_SHARDS)) = "$shard" ] && mine+=("./${files[$i]}")
+		[ $((i % SC_CA_SHARDS + 1)) = "$shard" ] && mine+=("./${files[$i]}")
 	done
-	echo "SHARD coding-agent $((shard + 1))/$SC_CA_SHARDS: ${#mine[@]} of ${#files[@]} files"
+	echo "SHARD coding-agent $shard/$SC_CA_SHARDS: ${#mine[@]} of ${#files[@]} files"
 	[ "${#mine[@]}" -gt 0 ] || { echo "::error::no coding-agent test file in this shard"; exit 1; }
-	one ts-ca "shard $((shard + 1))/$SC_CA_SHARDS" packages/coding-agent 3600 --isolate "${mine[@]}"
+	one ts-ca "shard $shard/$SC_CA_SHARDS" packages/coding-agent 3000 --isolate "${mine[@]}"
 	;;
 checkts)
 	s=$(date +%s)
@@ -61,3 +61,4 @@ checkts)
 	exit 2
 	;;
 esac
+exit 0

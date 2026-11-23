@@ -61,5 +61,7 @@ rsync_pid=$!
 tar -xzf "$SC/src/jj.tar.gz" -C "$st/opt/sc-ref/bin" ./jj
 wait "$zsh_pid" || { tail -n 30 "$SC"/zsh-*.log; echo "::error title=Reference tools::the zsh 5.9 build failed"; exit 1; }
 wait "$rsync_pid" || { tail -n 30 "$SC"/rsync-*.log; echo "::error title=Reference tools::the rsync 3.5.1 build failed"; exit 1; }
-tar -C "$st" -czf "$SC/up/sc-tools.tgz" .
+# Owned by root, and only usr/ and opt/ (no ./ entry): host.sh unpacks it at / and keeps the
+# host's directories as they are.
+tar -C "$st" --owner=0 --group=0 --numeric-owner -czf "$SC/up/sc-tools.tgz" usr opt
 echo "TOOLS $(du -k "$SC/up/sc-tools.tgz" | cut -f1) KiB: $(cd "$st" && find . -maxdepth 3 -type d | sort | tr '\n' ' ')"

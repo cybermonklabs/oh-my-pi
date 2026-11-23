@@ -25,7 +25,7 @@
 #   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml;
 #   - the rest of the root workspace under nextest, in 2 partitions;
 #   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
-#     job; coding-agent --isolate over 8 shards by file; check:ts. The host addon they load is
+#     job; coding-agent --isolate over 10 shards by file; check:ts. The host addon they load is
 #     built once, in the natives job.
 #   - the Rust tests under Bazel (`bazel test //crates/...` with the known-failure gate, the other
 #     cargo workspaces, sdk/rust/omp-rpc among them, and the tests only macOS can run): the
@@ -42,13 +42,12 @@
 # so is its row. The summary job fails unless every row passed, so the run's colour is the
 # result. Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
 #
-# Caches. Only the build and natives jobs may write GitHub Actions caches (cache-mode: write), and
-# they save their cargo caches only on a push to sami-candidate. They compile the candidate commit,
-# the same commit sami-build's release_binary compiles on the same push with the same cache
-# access, and run no test. Every job that runs test code gets cache-mode none (the TypeScript
-# jobs read, to restore the bun store main saved), so test code, which can reach the job's token
-# with the runner's sudo, cannot write an entry any job restores. The rust-test job calls its
-# workflow with cache-mode none, and that workflow declares none for its own jobs.
+# Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
+# The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
+# runs, and a dispatch can name any pushed commit; with cache access on sami-candidate either
+# could plant an entry release_binary restores. So every run builds cold: about 15 min for the
+# tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s.
+# The rust-test job calls its workflow with cache-mode none, and that workflow declares none too.
 # Security. permissions: contents: read; no secrets; every checkout drops its credential.
 name: sami checks
 
@@ -79,10 +78,6 @@ permissions:
 
 cache-mode: none
 
-concurrency:
-  group: sami-checks-${{ github.run_id }}
-  cancel-in-progress: false
-
 defaults:
   run:
     shell: bash
@@ -97,6 +92,8 @@ env:
   SC_TEST_PATH: /opt/sc-ref/bin:/usr/local/bin:/usr/bin:/bin
   # The hang bound of one pi-shell test binary, in seconds.
   SC_BIN_BOUND: "1800"
+  # The FIFO the sticky-directory FIFO tests open as the runner's user (host.sh makes it).
+  SC_STICKY_FIFO: /mnt/sc/sticky/report.txt
 
 jobs:
   plan:
@@ -155,8 +152,6 @@ jobs:
     if: needs.plan.outputs.commit != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 150
-    # It compiles the candidate and runs no test; it alone saves the cargo cache of the tests.
-    cache-mode: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -168,32 +163,16 @@ jobs:
           path: tree
           ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
-      - name: Room for the build
-        run: |
-          df -h / | tail -n 1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h / | tail -n 1
       - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
         run: |
           ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
           [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
-      - name: Cargo cache
-        id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: sami-checks-tests
-          workspaces: tree -> ../target
-          cache-on-failure: true
-          cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Build and archive
-        env:
-          SC_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
         run: bash tool/.github/sami-checks/build.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -216,8 +195,6 @@ jobs:
     if: needs.plan.outputs.commit != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # It compiles the candidate's pi-natives and runs no test; it alone saves the addon's cargo cache.
-    cache-mode: write
     # What it built, for sami-rust-test.yml's check of the bytes it downloads.
     outputs:
       addon-file: ${{ steps.addon.outputs.file }}
@@ -240,24 +217,11 @@ jobs:
       - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
         run: |
           ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
           rustup toolchain install "$ch" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: sami-checks-natives
-          workspaces: tree -> ../target-natives
-          cache-on-failure: true
-          cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
       - name: bun 1.4.5
         run: bash tool/.github/sami-checks/bun.sh
-      - name: bun store (main's)
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.bun/install/cache
-          key: bun-Linux-sami-checks
-          restore-keys: bun-Linux-
       - name: bun install
         working-directory: tree
         run: bun install --frozen-lockfile
@@ -429,8 +393,6 @@ jobs:
     if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.natives.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # Reads the bun store main saved; writes nothing.
-    cache-mode: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -444,12 +406,6 @@ jobs:
           persist-credentials: false
       - name: bun 1.4.5
         run: bash tool/.github/sami-checks/bun.sh
-      - name: bun store (main's)
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.bun/install/cache
-          key: bun-Linux-sami-checks
-          restore-keys: bun-Linux-
       - name: bun install
         working-directory: tree
         run: bun install --frozen-lockfile
@@ -478,7 +434,6 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.ts) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    cache-mode: read
     env:
       SC_CA_SHARDS: ${{ needs.plan.outputs.ca_shards }}
     steps:
@@ -524,7 +479,6 @@ jobs:
     if: needs.plan.outputs.commit != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    cache-mode: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -538,12 +492,6 @@ jobs:
           persist-credentials: false
       - name: bun 1.4.5
         run: bash tool/.github/sami-checks/bun.sh
-      - name: bun store (main's)
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.bun/install/cache
-          key: bun-Linux-sami-checks
-          restore-keys: bun-Linux-
       - name: bun install
         working-directory: tree
         run: bun install --frozen-lockfile
