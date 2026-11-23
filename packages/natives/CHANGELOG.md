@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- External commands a shell starts on Linux with glibc no longer start with signals 32 and 33 ignored when the shell does not ignore them. Where `posix_spawn` does not use `clone3` (glibc before 2.38, or a seccomp profile that answers `clone3` with `ENOSYS`), glibc sets these two, its own signals, to `SIG_IGN` in the child before the exec, so `kill -s 33` could not end such a command; bash leaves them at their default. A shell that was started with them ignored passes that on, as bash does.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
