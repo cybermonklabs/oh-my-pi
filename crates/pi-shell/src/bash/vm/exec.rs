@@ -4828,33 +4828,28 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// `notify_and_cleanup` (parse.y) deletes each finished job that
 /// `notify_of_job_status` marks notified there (`startup_state` 2 with
 /// `SUBSHELL_COMSUB`): every one but the job `$!` names, and not one a
-/// SIGINT, SIGTERM or SIGPIPE killed, whose end such a shell never reports.
-/// Each one deleted keeps its status for `wait PID` (`delete_job`'s
-/// `bgp_add`), and the current and previous jobs are chosen again as
-/// `delete_job` does. An interactive shell's command substitution reads no
-/// line through that path, and keeps every job.
+/// SIGINT, SIGTERM or SIGPIPE killed. bash judges that by how the job ended
+/// (its wait status, [`crate::bash::store::Job::signal`]), not by its
+/// status: a job that exited 130, 141 or 143 goes. Without job control a
+/// background job starts with SIGINT ignored, so only one of a shell with
+/// job control (`set -m`) dies of it. Each one deleted keeps its status for
+/// `wait PID` (`delete_job`'s `bgp_add`),
+/// and the current and previous jobs are chosen again as `delete_job` does.
+/// An interactive shell's command substitution reads no line through that
+/// path, and keeps every job.
 fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 	if super::jobctl::interactive(k) {
 		return;
 	}
-	let platform = k.engine.config().platform;
-	let unreported = |status: i32| {
+	let kept = |j: &super::proc::Job| {
 		use crate::bash::Signal;
-		// A status above 128 is the signal that killed the job
-		// (`builtins::jobs::signaled`).
-		let signal = status
-			.checked_sub(128)
-			.and_then(|n| u8::try_from(n).ok())
-			.and_then(|n| Signal::from_number(n, platform));
-		matches!(signal, Some(Signal::Int | Signal::Term | Signal::Pipe))
+		matches!(j.signal, Some(Signal::Int | Signal::Term | Signal::Pipe))
 	};
 	let dropped: Vec<(u32, Vpid, u32, i32)> = child
 		.jobs
 		.iter()
 		.filter_map(|j| match j.state {
-			super::proc::JobState::Done(status)
-				if !unreported(status) && !child.last_bg.is(j.vpid) =>
-			{
+			super::proc::JobState::Done(status) if !kept(j) && !child.last_bg.is(j.vpid) => {
 				Some((j.number, j.vpid, j.pid(), status))
 			},
 			_ => None,

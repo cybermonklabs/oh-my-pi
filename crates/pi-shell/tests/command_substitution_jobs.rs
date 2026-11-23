@@ -1,12 +1,13 @@
 //! A command substitution of a shell that is not interactive drops the
 //! finished jobs bash 5.3 drops before it runs its first command: every one
-//! but the job `$!` names, and not one a SIGINT, SIGTERM or SIGPIPE killed.
-//! Each one keeps its status for `wait PID`. So `$(jobs)` lists what bash
-//! lists, and a loop that waits for `$(jobs -p | wc -l)` to fall ends. Each
-//! row's output is bash 5.3.20's for `bash -c`; a finished job's end is
-//! waited for with `kill -0`, so the rows need no timing. bash 5.2.21 prints
-//! a narrower status column, and under `-c` its command substitution keeps
-//! no finished job at all (from a script file it keeps `$!`'s, as 5.3 does).
+//! but the job `$!` names, and not one a SIGINT, SIGTERM or SIGPIPE killed
+//! (how the job ended, not its status: one that exited 130, 141 or 143
+//! goes). Each one keeps its status for `wait PID`. So `$(jobs)` lists what
+//! bash lists, and a loop that waits for `$(jobs -p | wc -l)` to fall ends.
+//! Each row's output is bash 5.3.20's for `bash -c`; a finished job's end is
+//! waited for with `kill -0`, so the rows need no timing. bash 5.2.21 prints a
+//! narrower status column, and under `-c` its command substitution keeps no
+//! finished job at all (from a script file it keeps `$!`'s, as 5.3 does).
 #![cfg(target_os = "linux")]
 
 mod obash_support;
@@ -48,11 +49,12 @@ fn assert_rows(rows: &[Row]) {
 }
 
 /// `$(jobs)` lists a finished job only when `$!` names it, or when a SIGINT,
-/// SIGTERM or SIGPIPE ended it (here SIGTERM and SIGPIPE: a background job
-/// of a shell without job control ignores SIGINT); every running job is
-/// listed, and the shell's own `jobs` still lists them all. A dropped
-/// current or previous job makes the marks be chosen again: the one finished
-/// job left has none.
+/// SIGTERM or SIGPIPE killed it; every running job is listed, and the
+/// shell's own `jobs` still lists them all. A job that exited 130, 141 or
+/// 143 goes. Without job control a background job starts with SIGINT
+/// ignored, so its `kill -INT $$` exits 0 and the job goes; with `set -m` it
+/// dies of SIGINT and stays. A dropped current or previous job makes the
+/// marks be chosen again: the one finished job left has none.
 #[test]
 fn a_command_substitution_lists_the_jobs_bash_lists() {
 	assert_rows(&[
@@ -102,6 +104,37 @@ fn a_command_substitution_lists_the_jobs_bash_lists() {
 			err:    "",
 		},
 		Row {
+			name:   "sigint-ignored-dropped",
+			script: r#"/bin/sh -c 'kill -INT $$' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[2]   Done                       /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "interrupt-kept-with-job-control",
+			script: r#"set -m; /bin/sh -c 'kill -INT $$' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[1]-  Interrupt                  /bin/sh -c 'kill -INT $$'\n[2]+  Done                       \
+			         /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "exit-130-dropped",
+			script: r#"/bin/sh -c 'exit 130' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[2]   Done                       /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "exit-141-dropped",
+			script: r#"/bin/sh -c 'exit 141' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[2]   Done                       /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
+			name:   "exit-143-dropped",
+			script: r#"/bin/sh -c 'exit 143' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[2]   Done                       /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
 			name:   "the-shell-keeps-them",
 			script: r"/bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); jobs; echo end",
 			out:    "[1]-  Done                       /bin/true\n[2]+  Done                       \
@@ -113,7 +146,8 @@ fn a_command_substitution_lists_the_jobs_bash_lists() {
 
 /// A loop that waits until fewer than N jobs are listed ends: each finished
 /// job but `$!`'s leaves the command substitution's list (it hung, counting
-/// every job that ever ended; the inner loop's own bound prints `stuck`).
+/// every job that ever ended; the inner loop's own bound prints `stuck`),
+/// also when its jobs exited 130 or 143, or ignored a SIGINT.
 #[test]
 fn a_count_of_listed_jobs_falls_when_they_end() {
 	assert_rows(&[
@@ -126,6 +160,24 @@ fn a_count_of_listed_jobs_falls_when_they_end() {
 		Row {
 			name:   "throttle",
 			script: r#"n=0; for i in 1 2 3 4 5 6; do while [ "$(jobs -p | wc -l)" -ge 3 ]; do n=$((n + 1)); [ $n -lt 50 ] || { echo stuck; break 2; }; done; /bin/true & p=$!; while kill -0 $p 2>/dev/null; do :; done; done; echo end"#,
+			out:    "end\n",
+			err:    "",
+		},
+		Row {
+			name:   "throttle-interrupt",
+			script: r#"n=0; for i in 1 2 3 4 5 6; do while [ "$(jobs -p | wc -l)" -ge 3 ]; do n=$((n + 1)); [ $n -lt 50 ] || { echo stuck; break 2; }; done; /bin/sh -c 'kill -INT $$' & p=$!; while kill -0 $p 2>/dev/null; do :; done; done; echo end"#,
+			out:    "end\n",
+			err:    "",
+		},
+		Row {
+			name:   "throttle-exit-130",
+			script: r#"n=0; for i in 1 2 3 4 5 6; do while [ "$(jobs -p | wc -l)" -ge 3 ]; do n=$((n + 1)); [ $n -lt 50 ] || { echo stuck; break 2; }; done; /bin/sh -c 'exit 130' & p=$!; while kill -0 $p 2>/dev/null; do :; done; done; echo end"#,
+			out:    "end\n",
+			err:    "",
+		},
+		Row {
+			name:   "throttle-exit-143",
+			script: r#"n=0; for i in 1 2 3 4 5 6; do while [ "$(jobs -p | wc -l)" -ge 3 ]; do n=$((n + 1)); [ $n -lt 50 ] || { echo stuck; break 2; }; done; /bin/sh -c 'exit 143' & p=$!; while kill -0 $p 2>/dev/null; do :; done; done; echo end"#,
 			out:    "end\n",
 			err:    "",
 		},
