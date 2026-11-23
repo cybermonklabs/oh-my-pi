@@ -632,10 +632,16 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
-/// finished child whose status is kept (bash's `bgpids`), or the running
-/// process substitution or coprocess `$!` names.
+/// child whose job left the table with its status kept (bash's bgp list,
+/// [`crate::bash::vm::proc::JobTable::bgp`]), a finished child whose
+/// record is not collected yet, or the running process substitution or
+/// coprocess `$!` names. A job `disown` dropped is none of these (its
+/// record names no parent).
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
+		return true;
+	}
+	if ctx.vp.jobs.bgp_search(pid).is_some() {
 		return true;
 	}
 	// A subshell copies `$!`, not its parent's children.
@@ -704,13 +710,12 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
 			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
-			(ctx.vp.jobs.by_vpid(pid).is_none()
-				&& matches!(
+			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
+				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
 					Some(crate::bash::vm::ProcState::Exited(_))
-				)
-				&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid))
-			.then_some(pid)
+				) && ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid));
+			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
 			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };
