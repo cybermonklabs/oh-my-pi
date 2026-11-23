@@ -222,3 +222,58 @@ fn a_timed_builtin_keeps_the_virtual_pid() {
 		"k=0\nw=143\n",
 	)]);
 }
+
+/// When the program a timed job's `$!` names dies by a signal, the job's
+/// status is that signal's, whatever a `!` in the body does with the
+/// program's status: `/bin/kill $!` and the builtin `kill $!` both give
+/// 143, as bash 5.2.21 and 5.3.20 do (their `$!` is the job's forced
+/// subshell, which the signal kills). It gave 0 for `/bin/kill`.
+#[test]
+fn a_signal_death_of_the_named_program_is_the_jobs_status() {
+	let row = |name: &'static str, body: String, kill: &str| {
+		(
+			name,
+			format!(
+				"exec 2>/dev/null; TIMEFORMAT=; {body} & p=$!; {kill} \"$p\"; wait $p; echo w=$?; : > \
+				 G"
+			),
+			false,
+			"w=143\n",
+		)
+	};
+	assert_rows(&[
+		row("negated prog, /bin/kill", format!("time ! {RUNS}"), "/bin/kill"),
+		row("negated prog, kill", format!("time ! {RUNS}"), "kill"),
+		row("negated group, /bin/kill", format!("time {{ ! {RUNS}; }}"), "/bin/kill"),
+		row("negated group, kill", format!("time {{ ! {RUNS}; }}"), "kill"),
+		row("negated subshell, /bin/kill", format!("time ( ! {RUNS} )"), "/bin/kill"),
+		row("negated function, /bin/kill", format!("f() {{ ! {RUNS}; }}; time f"), "/bin/kill"),
+	]);
+}
+
+/// The limit: obash cannot tell an outside kill of the named program from
+/// its own death by a signal, so a `!` inside a group does not invert that
+/// death either (`w=143`); bash 5.2.21 and 5.3.20 give 0 here, their
+/// subshell being alive. An exit status is still inverted, as in bash.
+#[test]
+fn a_programs_own_signal_death_under_a_bang_in_a_group_is_the_jobs_status() {
+	assert_rows(&[
+		(
+			"signal",
+			String::from(
+				"exec 2>/dev/null; TIMEFORMAT=; time { ! /bin/sh -c 'kill -TERM $$'; } & wait $!; \
+				 echo w=$?",
+			),
+			false,
+			"w=143\n",
+		),
+		(
+			"exit",
+			String::from(
+				"exec 2>/dev/null; TIMEFORMAT=; time { ! /bin/sh -c 'exit 3'; } & wait $!; echo w=$?",
+			),
+			false,
+			"w=0\n",
+		),
+	]);
+}

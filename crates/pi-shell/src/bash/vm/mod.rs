@@ -545,6 +545,14 @@ pub struct Kernel {
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// `(OS pid, job, status)`: the program a timed job's `$!` names
+	/// ([`proc::Bang::timed`]), and the status of its death by a signal once
+	/// it died so. bash's `$!` of a timed job names its forced subshell, so
+	/// a signal that kills it is the job's status whatever the body would do
+	/// with the program's status (`time ! cmd &`): here the job ends with
+	/// that status too ([`Self::timed_death`]). Dropped when the job ends;
+	/// not imaged, as [`Self::pid_owners`].
+	pub timed_pids:         Vec<(u32, Vpid, Option<i32>)>,
 	/// Vprocs whose builtin is about to report job state and asked first to
 	/// take in the exits already available ([`Kernel::ask_exits`]); the
 	/// scheduler answers after the turn (`Shell::take_in_exits`). Not
@@ -667,6 +675,7 @@ impl Kernel {
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
+			timed_pids: Vec::new(),
 			exits_asked: Vec::new(),
 			exits_taken: Vec::new(),
 			disowned: Vec::new(),
@@ -744,8 +753,11 @@ impl Kernel {
 			self.settled.push((bang.job, pid));
 			// A pipeline stage's program is that stage's own, but for a timed
 			// job, whose pid stands for the whole job ([`proc::Bang::timed`]):
-			// `kill` and `wait` find the job by its pid.
-			if bang.vproc != bang.job && !bang.timed {
+			// `kill` and `wait` find the job by its pid, and a death of the
+			// program by a signal is the job's status ([`Self::timed_pids`]).
+			if bang.timed {
+				self.timed_pids.push((pid, bang.job, None));
+			} else if bang.vproc != bang.job {
 				self.pid_owners.push((pid, bang.vproc, bang.job));
 			}
 		}
@@ -859,6 +871,25 @@ impl Kernel {
 			.map(|&(_, owner, _)| owner)
 	}
 
+	/// The program OS pid `pid` died by a signal, with `status`: when a
+	/// timed job's `$!` names it, that is the job's status
+	/// ([`Self::timed_pids`]).
+	pub fn program_signaled(&mut self, pid: u32, status: i32) {
+		for e in self.timed_pids.iter_mut().filter(|e| e.0 == pid) {
+			e.2 = Some(status);
+		}
+	}
+
+	/// The status timed job `job` ends with because the program its `$!`
+	/// names died by a signal ([`Self::timed_pids`]), if it did.
+	pub fn timed_death(&self, job: Vpid) -> Option<i32> {
+		self
+			.timed_pids
+			.iter()
+			.find(|e| e.1 == job)
+			.and_then(|e| e.2)
+	}
+
 	/// Child vproc `vpid` of `parent` ended with `status`; the record stays
 	/// until the status is collected ([`Self::proc_collect`]). A record
 	/// `disown` left with no parent ([`Self::disown`]) keeps naming none:
@@ -871,6 +902,7 @@ impl Kernel {
 		status: i32,
 	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
+		self.timed_pids.retain(|&(_, job, _)| job != vpid);
 		let parent = match store.get(Key::Proc(vpid)) {
 			Ok(Some(Record::Proc { parent: None, .. })) => None,
 			_ => parent,
@@ -2100,11 +2132,14 @@ impl Shell {
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
-				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
+				// A timed job whose named program died by a signal ends with
+				// that signal's status, as bash's killed subshell does.
+				let status = self.k.timed_death(p.vpid).unwrap_or(p.status);
+				self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 				self.k.ctl.notify();
 				self.rr = 0;
 				self.ended(p.vpid, p.parent);
-				self.reaped(cx, p.parent, p.vpid, p.status);
+				self.reaped(cx, p.parent, p.vpid, status);
 			} else {
 				i += 1;
 			}

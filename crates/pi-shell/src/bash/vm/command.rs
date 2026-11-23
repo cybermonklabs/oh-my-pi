@@ -4577,6 +4577,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// A timed job's `$!` names this program: its death by a signal is
+			// the job's status ([`Kernel::timed_pids`]).
+			if matches!(exit, Some(ExitStatus::Signaled(_) | ExitStatus::SignaledRaw(_))) {
+				k.program_signaled(pid, status);
+			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
 				let text = vp
 					.frames

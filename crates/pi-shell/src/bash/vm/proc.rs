@@ -847,11 +847,15 @@ pub enum BangStage {
 	/// virtual pid at once, as before: `/bin/kill -0 "$!"` and `ps -p "$!"`
 	/// do not find it, where bash finds its subshell; builtin `kill` and
 	/// `wait` act on the job. A first program as `$!` would let an outside
-	/// `kill` end that program while the body runs on. And when an outside
-	/// `kill` ends the program `$!` names, the job still prints its
-	/// `TIMEFORMAT` report (bash's killed subshell prints none): obash
-	/// cannot tell that kill from the program's own death by a signal, for
-	/// which bash prints the report too.
+	/// `kill` end that program while the body runs on. When the program
+	/// `$!` names dies by a signal, the job ends with that signal's status
+	/// (`time ! cmd &` and `time { ! cmd; } &` killed by `/bin/kill $!` give
+	/// 143, as bash's killed subshell does; [`super::Kernel::timed_pids`]),
+	/// and it still prints its `TIMEFORMAT` report (bash's killed subshell
+	/// prints none). obash cannot tell that kill from the program's own
+	/// death by a signal, after which bash prints the report, and inverts
+	/// the status under a `!` inside a group, subshell or function (`time {
+	/// ! sh -c 'kill -TERM $$'; } &` gives 0 in bash, 143 here).
 	First,
 }
 
