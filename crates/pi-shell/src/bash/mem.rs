@@ -184,16 +184,25 @@ fn unsupported<T>() -> Poll<io::Result<T>> {
 	Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
 }
 
-impl File for PipeReader {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+impl PipeReader {
+	/// A read by `key`'s task (the engine's for `None`): the key reaches the
+	/// OS pipe's end, which keeps one wait per key; the memory pipe keeps
+	/// every waiter's waker itself.
+	fn read_as(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<io::Result<usize>> {
 		let mut s = self.0.lock();
 		if s.buf.is_empty() {
 			if let Some(os) = &mut s.os {
 				// An OS pipe: what it holds, through the shell's end of it,
 				// which stays while this handle holds the read end.
-				return match &mut os.read {
-					Some(end) => end.poll_read(cx, buf),
-					None => Poll::Ready(Ok(0)),
+				return match (&mut os.read, key) {
+					(Some(end), Some(key)) => end.poll_read_keyed(cx, buf, key),
+					(Some(end), None) => end.poll_read(cx, buf),
+					(None, _) => Poll::Ready(Ok(0)),
 				};
 			}
 			if s.writers == 0 {
@@ -213,6 +222,21 @@ impl File for PipeReader {
 		s.buf.drain(..n);
 		s.wake_all();
 		Poll::Ready(Ok(n))
+	}
+}
+
+impl File for PipeReader {
+	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		self.read_as(cx, buf, None)
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.read_as(cx, buf, Some(key))
 	}
 
 	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -248,19 +272,23 @@ impl File for PipeReader {
 	}
 }
 
-impl File for PipeWriter {
-	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
-		unsupported()
-	}
-
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+impl PipeWriter {
+	/// A write by `key`'s task (the engine's for `None`), as
+	/// [`PipeReader::read_as`].
+	fn write_as(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<io::Result<usize>> {
 		let mut s = self.0.lock();
 		if let Some(os) = &mut s.os {
 			// An OS pipe: the kernel decides room and `EPIPE`, as other
 			// processes may hold its read end.
-			return match &mut os.write {
-				Some(end) => end.poll_write(cx, buf),
-				None => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+			return match (&mut os.write, key) {
+				(Some(end), Some(key)) => end.poll_write_keyed(cx, buf, None, key),
+				(Some(end), None) => end.poll_write(cx, buf),
+				(None, _) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
 			};
 		}
 		if s.readers == 0 {
@@ -278,6 +306,26 @@ impl File for PipeWriter {
 		}
 		s.wake_all();
 		Poll::Ready(Ok(n))
+	}
+}
+
+impl File for PipeWriter {
+	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		unsupported()
+	}
+
+	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		self.write_as(cx, buf, None)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		_tag: Option<crate::bash::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.write_as(cx, bytes, Some(key))
 	}
 
 	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -865,6 +913,9 @@ mod tests {
 		// Failure mode: end of file comes while an external still holds the
 		// write end (the shell closed the pipe under it), or never comes
 		// (the shell keeps its own descriptor after its last writer is gone).
+		// Another test of this process may be spawning a child right now,
+		// which holds a copy of every descriptor until its `exec`: end of file
+		// may come only once that copy goes.
 		#[test]
 		fn end_of_file_comes_once_every_writer_is_gone() {
 			let (r, w) = stage_pipe();
@@ -874,11 +925,22 @@ mod tests {
 			drop(w);
 			assert_eq!(drain(&mut r), (Vec::new(), false), "an external still holds the write end");
 			drop(outside);
-			assert_eq!(drain(&mut r), (Vec::new(), true));
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			loop {
+				let (bytes, eof) = drain(&mut r);
+				assert!(bytes.is_empty(), "no bytes were written: {bytes:?}");
+				if eof {
+					break;
+				}
+				assert!(std::time::Instant::now() < deadline, "no end of file within 30 s");
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
 		}
 
 		// Failure mode: a write after every reader left waits or succeeds (the
-		// shell kept its read end), instead of failing as `EPIPE`.
+		// shell kept its read end), instead of failing as `EPIPE`. A child
+		// another test is spawning may hold a copy of the read end until its
+		// `exec`, as above.
 		#[test]
 		fn a_write_fails_once_every_reader_is_gone() {
 			let (r, w) = stage_pipe();
@@ -888,8 +950,18 @@ mod tests {
 			drop(r);
 			assert!(matches!(w.poll_write(&mut cx(), b"x"), Poll::Ready(Ok(1))), "an external reads");
 			drop(outside);
-			let Poll::Ready(Err(e)) = w.poll_write(&mut cx(), b"x") else {
-				panic!("a write with no reader fails");
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let e = loop {
+				match w.poll_write(&mut cx(), b"x") {
+					Poll::Ready(Err(e)) => break e,
+					other => {
+						assert!(
+							std::time::Instant::now() < deadline,
+							"a write still went in 30 s after the last reader went: {other:?}"
+						);
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+				}
 			};
 			assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
 		}
@@ -937,7 +1009,8 @@ mod tests {
 		// whether its reader is gone (`tail -f`, `reader_gone`) or the pipe has
 		// room (`zselect -w`); on an OS pipe it answered `Ok(0)` always, where
 		// the memory pipe says `Pending` when full and `BrokenPipe` when no
-		// reader is left.
+		// reader is left. A child another test is spawning may hold a copy of
+		// the read end until its `exec`: the pipe stays full until then.
 		#[test]
 		fn an_empty_write_sees_a_full_pipe_and_a_gone_reader() {
 			let (r, w) = stage_pipe();
@@ -947,16 +1020,29 @@ mod tests {
 			fill(&mut w, &mut cx());
 			assert!(w.poll_write(&mut cx(), b"").is_pending(), "a full pipe has no room");
 			drop(r);
-			let Poll::Ready(Err(e)) = w.poll_write(&mut cx(), b"") else {
-				panic!("an empty write with no reader left is a broken pipe");
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let e = loop {
+				match w.poll_write(&mut cx(), b"") {
+					Poll::Ready(Err(e)) => break e,
+					Poll::Pending => {
+						assert!(
+							std::time::Instant::now() < deadline,
+							"still full 30 s after the reader went"
+						);
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+					other => panic!("an empty write with no reader left is a broken pipe: {other:?}"),
+				}
 			};
 			assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
 		}
 
-		// Failure mode (review finding 2): two tasks poll one handle (two
-		// extras holding clones of one fd, a host feed), each with its own
-		// waker; the second wait replaced the first, so the first task was
-		// never woken and kept the end open.
+		// Failure mode (review finding 2): two tasks poll one handle (the
+		// engine, and an extra or a host feed holding a clone of the fd), each
+		// with its own waker; the second wait replaced the first, so the first
+		// task was never woken and kept the end open. A host task polls with a
+		// key of its own (`File::poll_write_keyed`), as `FdHandle` and the
+		// pump's chunks do; the engine's poll is keyless.
 		#[test]
 		fn every_task_waiting_on_one_handle_is_woken() {
 			let (r, w) = stage_pipe();
@@ -965,8 +1051,9 @@ mod tests {
 			let (a, b) = (Arc::new(Count::default()), Arc::new(Count::default()));
 			let (wa, wb) = (Waker::from(Arc::clone(&a)), Waker::from(Arc::clone(&b)));
 			fill(&mut w, &mut Context::from_waker(&wa));
+			let mut key = crate::sys::WaitKey::default();
 			assert!(
-				w.poll_write(&mut Context::from_waker(&wb), b"x")
+				w.poll_write_keyed(&mut Context::from_waker(&wb), b"x", None, &mut key)
 					.is_pending()
 			);
 			drain(&mut r);

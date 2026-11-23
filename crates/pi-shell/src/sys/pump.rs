@@ -43,7 +43,7 @@ use std::{
 	io,
 	pin::Pin,
 	sync::Arc,
-	task::{Context, Poll, Waker},
+	task::{Context, Poll, Wake, Waker},
 };
 
 use parking_lot::Mutex;
@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 use self::os::OsPipe;
 use crate::{
 	bash::{FdRef, File},
-	sys::{WaitKey, Wakers, lifecycle::Tracker},
+	sys::{WaitKey, lifecycle::Tracker},
 };
 
 /// Engine side of a pump.
@@ -496,6 +496,36 @@ struct FeedState {
 	chunk: Chunk,
 }
 
+/// Wakers of the holders of a feed: waking it wakes them all once.
+#[derive(Default)]
+struct Wakers(Mutex<Vec<Waker>>);
+
+impl Wakers {
+	fn add(&self, waker: &Waker) {
+		let mut wakers = self.0.lock();
+		if !wakers.iter().any(|w| w.will_wake(waker)) {
+			wakers.push(waker.clone());
+		}
+	}
+
+	/// Take them all (to wake or drop outside the lock).
+	fn take(&self) -> Vec<Waker> {
+		std::mem::take(&mut *self.0.lock())
+	}
+}
+
+impl Wake for Wakers {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		for w in self.take() {
+			w.wake();
+		}
+	}
+}
+
 impl Feed {
 	/// A feed of a new OS pipe, filled from `fd`.
 	pub fn new(fd: FdRef) -> io::Result<Self> {
@@ -527,8 +557,7 @@ impl Feed {
 
 	/// Advance the pump; `cx`'s task is woken when it can go on.
 	fn poll(&self, cx: &Context<'_>) {
-		// Whether the set was empty does not matter: the pump is polled below.
-		let _ = self.wakers.add(cx.waker());
+		self.wakers.add(cx.waker());
 		let mut fcx = Context::from_waker(&self.waker);
 		let mut st = self.state.lock();
 		let FeedState { pipe, src, chunk } = &mut *st;
@@ -560,7 +589,7 @@ impl Drop for Feed {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::{io::Read, task::Wake};
+	use std::io::Read;
 
 	use super::*;
 

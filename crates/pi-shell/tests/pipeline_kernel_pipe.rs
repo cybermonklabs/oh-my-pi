@@ -35,10 +35,11 @@ use std::{
 };
 
 /// How long one run may take before it fails as a hang. The longest correct
-/// run measured is under 6 s (gVisor,
-/// `a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu`); nextest's `ci`
-/// profile ends a whole test at 240 s, and this ends one run first, naming what
-/// is stuck.
+/// run measured took 6.33 s: the byte-at-a-time reader of
+/// `a_shell_code_writer_into_a_byte_at_a_time_reader_uses_no_more_cpu_than_into_cat`,
+/// under gVisor in a pod limited to 1952m CPU (`nproc` 2); the bound is more
+/// than twice that. nextest's `ci` profile ends a whole test at 240 s, and
+/// this ends one run first, naming what is stuck.
 const RUN_BOUND: Duration = Duration::from_secs(60);
 
 /// How a run ended.
@@ -496,11 +497,12 @@ fn two_shell_code_writers_share_one_end() {
 	)]);
 }
 
-/// obash running `script` as bash: its output, and its own CPU time (user and
+/// obash running `script` as bash: its output, its own CPU time (user and
 /// system, all its threads, from `/proc/PID/stat`, read until it ends) and
-/// the run's wall time, in seconds.
+/// the run's wall time, in seconds, and the most write threads of shared pipe
+/// ends (`obash-room`) it had at once.
 #[cfg(target_os = "linux")]
-fn cpu_of(script: &str) -> (Output, f64, f64) {
+fn cpu_of(script: &str) -> (Output, f64, f64, usize) {
 	// SAFETY: sysconf only reads.
 	let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
 	let started = Instant::now();
@@ -514,7 +516,9 @@ fn cpu_of(script: &str) -> (Output, f64, f64) {
 	let child = cmd.spawn().expect("start obash");
 	// obash's own user and system time so far, in ticks (fields 14 and 15).
 	let mut used = 0u64;
+	let mut rooms = 0;
 	let out = finish(child, script, |pid| {
+		rooms = rooms.max(room_threads(u32::try_from(pid).expect("a pid")));
 		if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
 			let fields: Vec<&str> = stat
 				.rsplit_once(')')
@@ -524,7 +528,7 @@ fn cpu_of(script: &str) -> (Output, f64, f64) {
 			}
 		}
 	});
-	(out, used as f64 / tick, started.elapsed().as_secs_f64())
+	(out, used as f64 / tick, started.elapsed().as_secs_f64(), rooms)
 }
 
 /// A shell-code writer that waits on a full shared pipe uses no CPU while it
@@ -540,7 +544,7 @@ fn a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu() {
 	let script = "l=$(printf '%03000d' 0); i=0; while [ $i -lt 100 ]; do echo \"$l\"; i=$((i + \
 	              1)); done | /bin/sh -c 'i=0; while [ $i -lt 100 ]; do /usr/bin/head -c 3001 > \
 	              /dev/null; /bin/sleep 0.01; i=$((i + 1)); done; echo read'";
-	let (out, cpu, wall) = cpu_of(script);
+	let (out, cpu, wall, _) = cpu_of(script);
 	assert_eq!(
 		(out.status.code(), String::from_utf8_lossy(&out.stdout)),
 		(Some(0), "read\n".into()),
@@ -549,6 +553,33 @@ fn a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu() {
 	println!("obash CPU {cpu:.2} s over {wall:.2} s");
 	assert!(wall >= 1.0, "the reader sleeps 100 x 10 ms, so the run takes 1 s: {wall:.2} s");
 	assert!(cpu <= wall / 4.0, "obash used {cpu:.2} s of CPU over {wall:.2} s while it waited");
+}
+
+/// A write end whose write waited uses no CPU while it then stays open and
+/// idle: one `printf` of 100 KB, made once the reader runs (so the pipe is
+/// already shared), waits on a reader that starts reading after 0.5 s, is
+/// made by the end's thread, and the end then idles for 2 s while `sleep`
+/// runs. The thread waits for its next write without polling for it: one that
+/// polled cost a CPU for those 2 s (the review measured 1.97 to 2.00 s). The
+/// run must have made the thread, or it shows nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_end_whose_write_waited_uses_no_cpu_while_it_idles() {
+	let script = "{ /bin/sleep 0.2; printf '%0100000d\\n' 0; /bin/sleep 2; } | /bin/sh -c \
+	              '/bin/sleep 0.5; cat > /dev/null; echo idle'";
+	let (out, cpu, wall, rooms) = cpu_of(script);
+	assert_eq!(
+		(out.status.code(), String::from_utf8_lossy(&out.stdout)),
+		(Some(0), "idle\n".into()),
+		"{script}: {out:?}"
+	);
+	println!("obash CPU {cpu:.2} s over {wall:.2} s, {rooms} write thread(s)");
+	assert!(rooms >= 1, "the write did not wait, so no write thread was made: {script}");
+	assert!(wall >= 2.2, "the end idles for 2 s: {wall:.2} s");
+	assert!(
+		cpu <= (wall / 10.0).max(0.25),
+		"obash used {cpu:.2} s of CPU over {wall:.2} s, 2 s of it with its end idle"
+	);
 }
 
 /// A shell-code writer into a reader that takes the pipe a byte at a time
@@ -582,7 +613,7 @@ fn a_shell_code_writer_into_a_byte_at_a_time_reader_uses_no_more_cpu_than_into_c
 		let mut cpu = [0.0; 2];
 		let mut wall = 0.0;
 		for (i, script) in [&bytes, &cat].into_iter().enumerate() {
-			let (out, used, took) = cpu_of(script);
+			let (out, used, took, _) = cpu_of(script);
 			assert_eq!(
 				(out.status.code(), String::from_utf8_lossy(&out.stdout)),
 				(Some(0), format!("{lines}\n").into()),
@@ -630,6 +661,84 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 		assert!(Instant::now() < deadline, "{what}: not within {RUN_BOUND:?}");
 		std::thread::sleep(Duration::from_millis(10));
 	}
+}
+
+/// A `CHLD` trap owed while a stage of shell code's write waits on a full
+/// shared pipe runs after the write, as bash 5.2/5.3 and zsh 5.9 run it: the
+/// reader gets the 262,144 '0's, then the trap's 10 'T's. The write is four
+/// times what the end's thread takes at once (64 KiB), so a trap that ran
+/// before the write ended would put its bytes between two of the write's.
+/// Failure modes (the review of #111 at 483c9ea5, through this PR's room): the
+/// trap started while the write waited and wrote under the same key, so its
+/// write took the waiting write's result and the room made that write again
+/// (more '0's and no 'T'); or, under a key of its own, its 'T's came in the
+/// middle of the '0's. The test checks the write waits on the end's thread
+/// when the trap is owed (else it shows nothing).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_chld_trap_owed_during_a_write_through_a_pipe_runs_after_it() {
+	let dir = tempfile::tempdir().expect("a directory for the markers");
+	let f = dir.path().join("F");
+	let mark = |ext: &str| f.with_extension(ext);
+	let script = "{ trap 'printf %s TTTTTTTTTT' CHLD
+	                { while [ ! -e \"$F.go\" ]; do :; done; : > \"$F.done\"; } &
+	                printf %0262144d 0
+	                s=$?; wait; exit $s; } | /bin/sh -c 'while [ ! -e \"$F.read\" ]; do sleep 0.01; \
+	              done; exec cat'";
+	let mut child = Command::new(env!("CARGO_BIN_EXE_obash"))
+		.arg0("bash")
+		.args(["-c", script])
+		.env("F", &f)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0)
+		.spawn()
+		.expect("start obash");
+	let pid = child.id();
+	// Kill the run's group on any failure below, so no stage outlives the test.
+	struct Group(i32);
+	impl Drop for Group {
+		fn drop(&mut self) {
+			// SAFETY: kill takes integer ids; the group is the run's own.
+			unsafe { libc::kill(-self.0, libc::SIGKILL) };
+		}
+	}
+	let _group = Group(i32::try_from(pid).expect("a pid"));
+	let mut out = child.stdout.take().expect("stdout");
+	let reader = std::thread::spawn(move || {
+		let mut got = Vec::new();
+		let _ = out.read_to_end(&mut got);
+		got
+	});
+	until("printf's write waits on the end's thread", || room_threads(pid) == 1);
+	std::fs::write(mark("go"), "").unwrap();
+	until("the background job ended", || mark("done").exists());
+	// The job's end owes the trap at once (both are the one shell's).
+	std::thread::sleep(Duration::from_millis(300));
+	assert_eq!(room_threads(pid), 1, "printf's write still waits when the trap is owed");
+	std::fs::write(mark("read"), "").unwrap();
+	until("obash ended", || child.try_wait().is_ok_and(|s| s.is_some()));
+	let mut err = String::new();
+	if let Some(mut e) = child.stderr.take() {
+		let _ = e.read_to_string(&mut err);
+	}
+	assert_eq!(child.wait().expect("reap obash").code(), Some(0), "{err}");
+	let got = reader.join().expect("the reader");
+	let mut counts = [0usize; 256];
+	for &b in &got {
+		counts[usize::from(b)] += 1;
+	}
+	assert_eq!(
+		(
+			counts[usize::from(b'0')],
+			counts[usize::from(b'T')],
+			got.len(),
+			got.iter().position(|&b| b == b'T')
+		),
+		(262_144, 10, 262_154, Some(262_144)),
+		"('0's, 'T's, bytes, first 'T' at)"
+	);
 }
 
 /// A writer of shell code killed while its write waits on a full pipe that

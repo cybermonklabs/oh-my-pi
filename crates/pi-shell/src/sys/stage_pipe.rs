@@ -62,7 +62,7 @@ mod imp {
 
 	use crate::{
 		bash::{File, FileKind, OsHandle, Stat},
-		sys::{ready, room::Room, wakers::Wakers},
+		sys::{WaitKey, Wakers, ready, room::Room},
 	};
 
 	pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
@@ -187,6 +187,25 @@ mod imp {
 			self.own.poll_write(cx, buf)
 		}
 
+		fn poll_read_keyed(
+			&mut self,
+			cx: &mut Context<'_>,
+			buf: &mut [u8],
+			key: &mut WaitKey,
+		) -> Poll<io::Result<usize>> {
+			self.own.poll_read_keyed(cx, buf, key)
+		}
+
+		fn poll_write_keyed(
+			&mut self,
+			cx: &mut Context<'_>,
+			bytes: &[u8],
+			tag: Option<crate::bash::CmdTag>,
+			key: &mut WaitKey,
+		) -> Poll<io::Result<usize>> {
+			self.own.poll_write_keyed(cx, bytes, tag, key)
+		}
+
 		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 			Poll::Ready(Ok(()))
 		}
@@ -232,14 +251,18 @@ mod imp {
 	}
 
 	/// The tasks waiting for a private end to poll ready, all woken together,
-	/// as the memory pipe wakes all its waiters ([`Wakers`]: a task is only
-	/// ever forgotten by being woken, so the engine's one waker, which stands
-	/// for every engine vproc, never loses one of their waits). One readiness
-	/// watch, registered when the first task is stored, wakes them.
+	/// as the memory pipe wakes all its waiters ([`Wakers`]: one wait per
+	/// task's key, so no task's wait replaces another's). One readiness watch,
+	/// registered when the first task waits, wakes them.
 	#[derive(Default)]
 	struct Ready {
 		tasks: Arc<Wakers>,
 		watch: Option<ready::Watch>,
+		/// The wait of keyless polls ([`File::poll_read`], [`File::poll_write`]):
+		/// the end's owner's, the engine's, whose vprocs share one waker. A task
+		/// that waits beside it (an extra's fd, a pump) polls with a key of its
+		/// own ([`File::poll_read_keyed`]).
+		own:   WaitKey,
 	}
 
 	impl Private {
@@ -252,11 +275,16 @@ mod imp {
 			Self { ready: Ready::default(), room, file, write }
 		}
 
-		/// Store `waker` among the tasks waiting for this end to poll ready:
-		/// readable, or writable (or no reader left) on the write end.
-		fn wait(&mut self, waker: &Waker) -> io::Result<()> {
-			let Ready { tasks, watch } = &mut self.ready;
-			if tasks.add(waker) {
+		/// `key`'s task (the owner's for `None`) waits with `waker` for this
+		/// end to poll ready: readable, or writable (or no reader left) on the
+		/// write end.
+		fn wait(&mut self, key: Option<&mut WaitKey>, waker: &Waker) -> io::Result<()> {
+			let Ready { tasks, watch, own } = &mut self.ready;
+			let key = match key {
+				Some(key) => key,
+				None => own,
+			};
+			if tasks.wait(key, waker) {
 				// Nothing watches the end: the last watch fired, or there was
 				// none.
 				*watch = None;
@@ -280,13 +308,15 @@ mod imp {
 			Ok(())
 		}
 
-		/// `op` on the non-blocking descriptor; on `WouldBlock` the task's
-		/// waker is stored and `op` tried once more, as the end may have become
-		/// ready before the wait was registered. Success removes no waiter: a
-		/// task that waited and then went on gets one spurious wake.
+		/// `op` on the non-blocking descriptor; on `WouldBlock` the task waits
+		/// by `key` (the owner's for `None`) and `op` is tried once more, as the
+		/// end may have become ready before the wait was registered. Success
+		/// ends no wait: a task that waited and then went on gets one spurious
+		/// wake, until its key is dropped.
 		fn poll_io(
 			&mut self,
 			cx: &Context<'_>,
+			mut key: Option<&mut WaitKey>,
 			mut op: impl FnMut(&fs::File) -> io::Result<usize>,
 		) -> Poll<io::Result<usize>> {
 			let mut registered = false;
@@ -299,7 +329,7 @@ mod imp {
 				if registered {
 					return Poll::Pending;
 				}
-				if let Err(e) = self.wait(cx.waker()) {
+				if let Err(e) = self.wait(key.as_deref_mut(), cx.waker()) {
 					return Poll::Ready(Err(e));
 				}
 				registered = true;
@@ -313,7 +343,11 @@ mod imp {
 		/// as the memory pipe does: `Ok(0)` when ready, `Pending` (the task's
 		/// waker stored) when not, and on the write end `BrokenPipe` once no
 		/// reader is left (`POLLERR`).
-		fn poll_ready(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
+		fn poll_ready(
+			&mut self,
+			cx: &Context<'_>,
+			mut key: Option<&mut WaitKey>,
+		) -> Poll<io::Result<usize>> {
 			let events = if self.write {
 				ready::WRITE
 			} else {
@@ -334,39 +368,85 @@ mod imp {
 				if registered {
 					return Poll::Pending;
 				}
-				if let Err(e) = self.wait(cx.waker()) {
+				if let Err(e) = self.wait(key.as_deref_mut(), cx.waker()) {
 					return Poll::Ready(Err(e));
 				}
 				registered = true;
 			}
 		}
-	}
 
-	impl File for Private {
-		fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		/// A read, by `key`'s task (the owner's for `None`).
+		fn read_as(
+			&mut self,
+			cx: &Context<'_>,
+			buf: &mut [u8],
+			key: Option<&mut WaitKey>,
+		) -> Poll<io::Result<usize>> {
 			if self.write {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				return self.poll_ready(cx);
+				return self.poll_ready(cx, key);
 			}
-			self.poll_io(cx, |mut f| f.read(buf))
+			self.poll_io(cx, key, |mut f| f.read(buf))
 		}
 
-		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		/// A write, by `key`'s task (the owner's for `None`). One that would
+		/// wait is made by the end's thread, which the kernel wakes once it fits
+		/// (`sys::room`); where no thread can be made, the write waits for the
+		/// end to poll writable.
+		fn write_as(
+			&mut self,
+			cx: &Context<'_>,
+			buf: &[u8],
+			mut key: Option<&mut WaitKey>,
+		) -> Poll<io::Result<usize>> {
 			if !self.write {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				return self.poll_ready(cx);
+				return self.poll_ready(cx, key);
 			}
-			// A write that would wait is made by the end's thread, which the
-			// kernel wakes once it fits (`sys::room`).
 			if let Some(room) = &self.room {
 				let file = &self.file;
-				return room.poll_write(cx, buf, |b| write_quietly(file, b));
+				let room_key = match key.as_deref_mut() {
+					Some(key) => key,
+					None => &mut self.ready.own,
+				};
+				if let Some(r) = room.poll_write(cx, buf, room_key, |b| write_quietly(file, b)) {
+					return r;
+				}
 			}
-			self.poll_io(cx, |f| write_quietly(f, buf))
+			self.poll_io(cx, key, |f| write_quietly(f, buf))
+		}
+	}
+
+	impl File for Private {
+		fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			self.read_as(cx, buf, None)
+		}
+
+		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			self.write_as(cx, buf, None)
+		}
+
+		fn poll_read_keyed(
+			&mut self,
+			cx: &mut Context<'_>,
+			buf: &mut [u8],
+			key: &mut WaitKey,
+		) -> Poll<io::Result<usize>> {
+			self.read_as(cx, buf, Some(key))
+		}
+
+		fn poll_write_keyed(
+			&mut self,
+			cx: &mut Context<'_>,
+			bytes: &[u8],
+			_tag: Option<crate::bash::CmdTag>,
+			key: &mut WaitKey,
+		) -> Poll<io::Result<usize>> {
+			self.write_as(cx, bytes, Some(key))
 		}
 
 		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -502,8 +582,133 @@ mod imp {
 			}
 			assert!(matches!(rd.poll_read(&mut cx, &mut []), Poll::Ready(Ok(0))));
 			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(1))));
+			// End of file once no writer is left. Another test of this process
+			// may be spawning a child right now, which holds a copy of every
+			// descriptor until its `exec`, so the read may wait for it first.
 			drop(w);
-			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "end of file");
+			flag.0.store(false, Ordering::SeqCst);
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			loop {
+				match rd.poll_read(&mut cx, &mut buf) {
+					Poll::Ready(Ok(0)) => break,
+					Poll::Ready(other) => panic!("end of file expected: {other:?}"),
+					Poll::Pending => {
+						while !flag.0.swap(false, Ordering::SeqCst) {
+							assert!(std::time::Instant::now() < deadline, "no end of file within 30 s");
+							std::thread::sleep(std::time::Duration::from_millis(1));
+						}
+					},
+				}
+			}
+		}
+
+		// Failure mode: where no write thread can be made (`pthread_create`
+		// at the thread limit) a write that would wait fails, where the base
+		// waited. It must wait for the end to poll writable instead.
+		#[test]
+		fn a_write_waits_for_pollout_where_no_thread_can_be_made() {
+			let (r, w) = os_pipe(b"").unwrap();
+			let mut wd = w.dup().unwrap();
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let mut cx = Context::from_waker(&waker);
+			crate::sys::room::no_thread_on_this_thread(true);
+			let chunk = [3u8; 4096];
+			let mut put = 0;
+			let waited = loop {
+				match wd.poll_write(&mut cx, &chunk) {
+					Poll::Ready(Ok(n)) => put += n,
+					Poll::Ready(Err(e)) => panic!("a write that waits fails: {e}"),
+					Poll::Pending => break true,
+				}
+				assert!(put < 16 << 20, "the pipe never filled");
+			};
+			assert!(waited && put > 0);
+			let mut got = vec![0u8; put];
+			external(r.as_ref()).read_exact(&mut got).unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let n = loop {
+				match wd.poll_write(&mut cx, &chunk) {
+					Poll::Ready(Ok(n)) => break n,
+					Poll::Ready(Err(e)) => panic!("the write that waited: {e}"),
+					Poll::Pending => {
+						assert!(std::time::Instant::now() < deadline, "not written within 30 s");
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+				}
+			};
+			crate::sys::room::no_thread_on_this_thread(false);
+			assert_eq!(n, chunk.len());
+			let mut last = vec![0u8; n];
+			external(r.as_ref()).read_exact(&mut last).unwrap();
+			assert!(last.iter().all(|&b| b == 3), "written by the end itself, once");
+		}
+
+		// Failure mode: two vprocs write the same bytes to one end at once
+		// (two background `echo x` into one pipe), each with its own key
+		// (`Vproc::write_key`). The end hands the room a key of its own
+		// instead of theirs, so one takes the other's result: it finishes
+		// before its own write is made, and the other's write is made twice.
+		#[test]
+		fn two_writers_of_the_same_bytes_each_get_their_own_result() {
+			let (r, w) = os_pipe(b"").unwrap();
+			let fd = RawFd::try_from(w.os_handle().unwrap().0).unwrap();
+			let plain = private(fd, true).unwrap();
+			let fill = || {
+				while (&plain).write(&[0u8; 4096]).is_ok() {}
+				while (&plain).write(&[0u8]).is_ok() {}
+			};
+			let mut wd = w.dup().unwrap();
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let mut cx = Context::from_waker(&waker);
+			let (mut a, mut b) = (WaitKey::default(), WaitKey::default());
+			let x = [7u8; 100];
+			fill();
+			assert!(wd.poll_write_keyed(&mut cx, &x, None, &mut a).is_pending(), "A's write waits");
+			assert!(wd.poll_write_keyed(&mut cx, &x, None, &mut b).is_pending(), "B waits for it");
+			// Free a page: the end's thread makes A's write and wakes both.
+			let mut reader = external(r.as_ref());
+			let mut page = [0u8; 4096];
+			reader.read_exact(&mut page).unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			while !flag.0.swap(false, Ordering::SeqCst) {
+				assert!(std::time::Instant::now() < deadline, "not woken within 30 s");
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+			// The pipe full again: no write can be made at once.
+			fill();
+			assert!(
+				wd.poll_write_keyed(&mut cx, &x, None, &mut b).is_pending(),
+				"B's own write is not made yet: it waits"
+			);
+			assert!(
+				matches!(wd.poll_write_keyed(&mut cx, &x, None, &mut a), Poll::Ready(Ok(100))),
+				"A gets the result of its write"
+			);
+			// Read everything from here to the end, keeping what is not the
+			// zeros the pipe was filled with.
+			let rest = std::thread::spawn(move || {
+				let mut all = Vec::new();
+				reader.read_to_end(&mut all).unwrap();
+				all.into_iter().filter(|&b| b != 0).collect::<Vec<u8>>()
+			});
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			loop {
+				match wd.poll_write_keyed(&mut cx, &x, None, &mut b) {
+					Poll::Ready(Ok(n)) => {
+						assert_eq!(n, 100, "B gets the result of its write");
+						break;
+					},
+					Poll::Ready(Err(e)) => panic!("B's write: {e}"),
+					Poll::Pending => {
+						assert!(std::time::Instant::now() < deadline, "B's write not made within 30 s");
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+				}
+			}
+			drop((wd, w, plain, r));
+			assert_eq!(rest.join().unwrap(), [7u8; 200], "each write once");
 		}
 
 		// Failure mode (review round 2, finding 1): every engine vproc polls
@@ -560,24 +765,24 @@ mod imp {
 		// Failure mode (review round 2, finding 3): a task dropped while it
 		// waited on an idle end kept its own registration on the readiness
 		// thread, so each short-lived extra cancelled there added one
-		// descriptor to the thread's poll set; or a full set forgets a waiter
-		// without waking it. (That live tasks past the cap settle is
-		// `wakers::tests::live_tasks_past_the_cap_settle`.)
+		// descriptor to the thread's poll set; or a waiter was forgotten
+		// without being woken. Each task here is a host task with a key of its
+		// own (`File::poll_read_keyed`), as an extra's fd is.
 		#[test]
 		fn two_hundred_tasks_waiting_on_an_idle_end_are_all_woken() {
 			let (r, w) = io::pipe().unwrap();
 			let mut end = Private::new(private(r.as_raw_fd(), false).unwrap(), false);
 			let flags: Vec<Arc<Flag>> = (0..200).map(|_| Arc::default()).collect();
+			let mut keys: Vec<WaitKey> = (0..200).map(|_| WaitKey::default()).collect();
 			let mut buf = [0u8; 8];
-			for flag in &flags {
+			for (flag, key) in flags.iter().zip(&mut keys) {
 				let waker = Waker::from(Arc::clone(flag));
 				assert!(
-					end.poll_read(&mut Context::from_waker(&waker), &mut buf)
+					end.poll_read_keyed(&mut Context::from_waker(&waker), &mut buf, key)
 						.is_pending()
 				);
 			}
-			// A waiter the full set forgot was woken then; the rest wake once
-			// a byte comes.
+			// Each waits until a byte comes.
 			(&w).write_all(b"x").unwrap();
 			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 			while !flags.iter().all(|f| f.0.load(Ordering::SeqCst)) {
@@ -604,14 +809,27 @@ mod imp {
 		}
 
 		// Failure mode: a shell write to a pipe nobody reads any more waits,
-		// or succeeds, instead of failing as `EPIPE`.
+		// or succeeds, instead of failing as `EPIPE`. Another test of this
+		// process may be spawning a child right now, which holds a copy of the
+		// read end until its `exec`: writes go into the pipe until that copy
+		// goes, and then fail.
 		#[test]
 		fn a_write_with_no_reader_left_is_a_broken_pipe() {
 			let (r, w) = os_pipe(b"").unwrap();
 			let mut wd = w.dup().unwrap();
 			drop(r);
-			let Poll::Ready(Err(e)) = wd.poll_write(&mut noop(), b"x") else {
-				panic!("a write with no reader fails");
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let e = loop {
+				match wd.poll_write(&mut noop(), b"x") {
+					Poll::Ready(Err(e)) => break e,
+					other => {
+						assert!(
+							std::time::Instant::now() < deadline,
+							"a write still went in 30 s after the last reader went: {other:?}"
+						);
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+				}
 			};
 			assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
 			// A handle opened now finds no reader either way: the kernel may
@@ -663,8 +881,27 @@ mod imp {
 			let mut wd = w.dup().unwrap();
 			drop(r);
 			assert!(!take_sigpipe(), "nothing pending before");
-			// The control: a plain write raises one.
-			assert_eq!((&plain).write(b"x").unwrap_err().raw_os_error(), Some(libc::EPIPE));
+			// The control: a plain write raises one. Another test of this
+			// process may be spawning a child right now, which holds a copy of
+			// the read end until its `exec`: the writes go into the pipe until
+			// that copy goes.
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			loop {
+				match (&plain).write(b"x") {
+					Ok(n) => {
+						assert_eq!(n, 1, "a one-byte write to a pipe with room takes the byte");
+						assert!(
+							std::time::Instant::now() < deadline,
+							"a reader still held the pipe after 30 s"
+						);
+						std::thread::sleep(std::time::Duration::from_millis(1));
+					},
+					Err(e) => {
+						assert_eq!(e.raw_os_error(), Some(libc::EPIPE));
+						break;
+					},
+				}
+			}
 			assert!(take_sigpipe(), "a plain write to a pipe with no reader raises SIGPIPE");
 			let Poll::Ready(Err(e)) = wd.poll_write(&mut noop(), b"x") else {
 				panic!("a write with no reader fails");
