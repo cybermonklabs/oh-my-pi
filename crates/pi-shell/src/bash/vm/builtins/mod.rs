@@ -159,10 +159,12 @@ pub enum Control {
 pub struct Wait {
 	/// The children, in order.
 	pub children: Vec<Vpid>,
-	/// Every operand was a pid, not a job spec: bash waits for those with
+	/// The children are the command's operands (`wait id …`, `wait -n id
+	/// …`), not every job: bash waits for each pid operand with
 	/// `wait_for_single_pid`, whose posix-mode deletion forgets the status
-	/// it returned.
-	pub by_pid:   bool,
+	/// it returned (beside a job spec too), and `wait -n` with operands
+	/// (`JWAIT_WAITING`) takes no kept status before it waits for them.
+	pub operands: bool,
 	/// `wait` without operands: the status stays 0 rather than the last
 	/// child's.
 	pub all:      bool,

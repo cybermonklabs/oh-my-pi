@@ -277,7 +277,7 @@ pub fn exec(
 					} else {
 						None
 					};
-					let res = super::redir::apply(k, vp, cx, unit, list, line);
+					let res = super::redir::apply(k, vp, cx, unit, list, &super::redir::Line::at(line));
 					if let Some(scope) = hidden {
 						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
 					}
@@ -4091,11 +4091,11 @@ fn settle_builtin(
 			e.wait_for = w.children;
 			e.wait_into = w.into.map(Box::new);
 			e.waiting = Some(if w.any {
-				Awaited::AnyJob { waited: None }
+				Awaited::AnyJob { waited: None, operands: w.operands }
 			} else if w.all {
 				Awaited::AllJobs
 			} else {
-				Awaited::Jobs { force: w.force, by_pid: w.by_pid }
+				Awaited::Jobs { force: w.force, operands: w.operands }
 			});
 			e.stage = Stage::Await;
 			None
@@ -4435,7 +4435,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			status
 		},
-		Some(Awaited::Jobs { force, by_pid }) => {
+		Some(Awaited::Jobs { force, operands }) => {
 			let mut last = st(vp).status;
 			let mut waited = None;
 			let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
@@ -4448,8 +4448,10 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					last = s;
 					waited_notice(k, vp, cx, v, line);
 					// A posix `wait PID` deletes the job and forgets the
-					// status it returned (`jobs.c:2782-2786`).
-					forget_job(k, cx, vp, v, posix && by_pid);
+					// status it returned (`jobs.c:2782-2786`), for each pid
+					// operand, beside a job spec too.
+					let forget = posix && operands && named_by_pid(vp, v);
+					forget_job(k, cx, vp, v, forget);
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
@@ -4559,17 +4561,19 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
-		Some(Awaited::AnyJob { waited }) => {
+		Some(Awaited::AnyJob { waited, operands }) => {
 			// While the job list is frozen, bash's `wait_for_any_job` returns
 			// at once (`jobs.c:3465`): `wait -n` ends with 127. Its first pass
 			// takes the first finished job not reported yet (`jobs.c:3470-3474`);
 			// else it waits for a child, and then takes the first finished
 			// job in job order, a reported one too (`jobs.c:3614-3619`): one a
 			// function substitution or `lastpipe` marked reported but kept
-			// comes back before the one that just ended. In posix mode it
-			// takes a kept status when no job is left (`jobs.c:3541-3553`),
-			// and deletes the job it returns without keeping its status
-			// (`DEL_NOBGPID`, `jobs.c:3489`).
+			// comes back before the one that just ended. In posix mode and
+			// without operands, bash 5.3 then takes a kept status before it
+			// waits for a job still running (`bgp_findone`, `jobs.c:3538-3553`,
+			// before the loop at 3557; 5.2 waits first), and deletes the job
+			// it returns without keeping its status (`DEL_NOBGPID`,
+			// `jobs.c:3489`).
 			let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 				.unwrap_or(false);
 			let frozen = vp.jobs_frozen();
@@ -4604,13 +4608,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				None => first,
 			};
 			let Some((v, status)) = finished else {
-				if let Some(v) = running {
-					st(vp).waiting = Some(Awaited::AnyJob { waited: Some(waited.unwrap_or(done)) });
-					return Some(Flow::Block(WaitKey::Proc(v)));
-				}
-				// No job left: in posix mode a kept status answers, the
-				// first of the list, and goes (`bgp_findone`, `bgp_delete`).
-				let kept = (posix && !frozen)
+				// The kept status of the first pass only: once it has waited,
+				// a pass finding no job left returns 127 (`jobs.c:3595-3599`).
+				// It is the first of the list, and goes (`bgp_findone`,
+				// `bgp_delete`).
+				let kept = (posix && !frozen && !operands && waited.is_none())
 					.then(|| {
 						vp.jobs
 							.bgp
@@ -4619,6 +4621,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 							.map(|s| (s.vpid, s.pid, s.status))
 					})
 					.flatten();
+				if let (None, Some(v)) = (kept, running) {
+					st(vp).waiting =
+						Some(Awaited::AnyJob { waited: Some(waited.unwrap_or(done)), operands });
+					return Some(Flow::Block(WaitKey::Proc(v)));
+				}
 				let s = st(vp);
 				s.waiting = None;
 				s.stage = Stage::Output;
@@ -4836,6 +4843,27 @@ fn forget_job(
 		}
 		state::forget_status(&mut k.root, cx.store, vp, v);
 	}
+}
+
+/// Whether a pid operand of the `wait` that `vp` runs names child `v`
+/// ([`Vproc::vpid_of`], read while `v`'s job is still in the table): bash
+/// waits for each one with `wait_for_single_pid`, operand by operand, a job
+/// spec beside it or not. A word of digits only is a pid operand: no option
+/// of `wait` is one, and `-p` takes a name.
+fn named_by_pid(vp: &Vproc, v: crate::bash::ids::Vpid) -> bool {
+	let Some(e) = vp
+		.frames
+		.last()
+		.and_then(|f| f.scratch.as_deref())
+		.and_then(|sc| sc.exec.as_deref())
+	else {
+		return false;
+	};
+	e.argv
+		.iter()
+		.filter(|w| !w.is_empty() && w.iter().all(u8::is_ascii_digit))
+		.filter_map(|w| std::str::from_utf8(w).ok()?.parse().ok())
+		.any(|pid| vp.vpid_of(pid) == v)
 }
 
 /// The status of child `v` that `wait` waits for, once it ended: its
@@ -5293,7 +5321,7 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	k.spawned.push(Box::new(child));
 	let s = st(vp);
 	s.wait_for = vec![vpid];
-	s.waiting = Some(Awaited::Jobs { force: true, by_pid: false });
+	s.waiting = Some(Awaited::Jobs { force: true, operands: false });
 	s.stage = Stage::Await;
 	Some(Flow::Block(WaitKey::Proc(vpid)))
 }

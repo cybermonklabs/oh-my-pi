@@ -532,7 +532,6 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return wait_all(ctx, force);
 	}
 	let mut list = Vec::new();
-	let mut by_pid = true;
 	let mut status = 0;
 	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	for a in args {
@@ -567,7 +566,6 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				status = 127;
 			}
 		} else if a.starts_with(b"%") {
-			by_pid = false;
 			match super::jobs::spec(ctx, a) {
 				Ok(n) => {
 					let job = ctx.vp.jobs.get(n).map(|j| (j.vpid, j.state));
@@ -586,7 +584,6 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				},
 			}
 		} else {
-			by_pid = false;
 			ctx.usage(format!("`{}': not a pid or valid job spec", a.as_bstr()));
 			status = 1;
 		}
@@ -594,7 +591,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if list.is_empty() {
 		return done(status);
 	}
-	let wait = Wait { children: list, by_pid, all: false, any: false, into, force };
+	let wait = Wait { children: list, operands: true, all: false, any: false, into, force };
 	Ok(Outcome { status, control: Control::Wait(wait) })
 }
 
@@ -734,7 +731,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	{
 		list.push(last);
 	}
-	let wait = Wait { children: list, by_pid: false, all: true, any: false, into: None, force };
+	let wait = Wait { children: list, operands: false, all: true, any: false, into: None, force };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
 
@@ -761,7 +758,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		});
 		if let Some(pid) = kept {
 			let wait =
-				Wait { children: vec![pid], by_pid: false, all: false, any: true, into, force: true };
+				Wait { children: vec![pid], operands: true, all: false, any: true, into, force: true };
 			return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 		}
 		for a in args {
@@ -799,7 +796,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		}
 	}
 	// With no operand and no job, a posix shell still has the statuses it
-	// kept to answer with (`bgp_findone`, `jobs.c:3541-3553`).
+	// kept to answer with (`bgp_findone`, `jobs.c:3538-3553`).
 	let kept = args.is_empty()
 		&& ctx.vp.jobs.bgp_list_len() != 0
 		&& crate::bash::vm::state::option(
@@ -812,6 +809,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 	if list.is_empty() && !kept {
 		return done(127);
 	}
-	let wait = Wait { children: list, by_pid: false, all: false, any: true, into, force: true };
+	let operands = !args.is_empty();
+	let wait = Wait { children: list, operands, all: false, any: true, into, force: true };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }

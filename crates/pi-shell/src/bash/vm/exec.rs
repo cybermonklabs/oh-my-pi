@@ -3243,10 +3243,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Flow::Next
 		},
 		Opcode::Redir => {
-			// bash: in a fork's base frame, the line bash had as it forked it.
-			let line = super::killed::compound_fork_line(vp, op.node)
-				.unwrap_or_else(|| compound_line(vp, line));
-			match redir::apply(k, vp, cx, unit, op.a, line) {
+			// bash: in a fork's base frame, the line bash had as it forked it,
+			// looked for only once a diagnostic or an expansion needs it.
+			let line = redir::Line::fork(op.node, compound_line(vp, line));
+			match redir::apply(k, vp, cx, unit, op.a, &line) {
 				Ok(()) => {
 					let saves = match top_frame(vp).scratch.take() {
 						Some(mut sc) => {
@@ -5275,8 +5275,9 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		return false;
 	}
 	// bash: a fork made while the trap ran is inside it too
-	// (`SIG_INPROGRESS`, which the child keeps; `run_return_trap` also skips
-	// the RETURN trap while the DEBUG trap runs, `trap.c:1333`).
+	// (`SIG_INPROGRESS`, which the child keeps; and a function called while
+	// the DEBUG trap runs gets no RETURN trap: `execute_function` sets it
+	// aside on `signal_in_progress (DEBUG_TRAP)`, `execute_cmd.c:5295`).
 	if vp.mode.dialect() == Dialect::Bash
 		&& vp.frames.first().is_some_and(|f| {
 			f.traced.running(key) || (key == TrapKey::Return && f.traced.running(TrapKey::Debug))

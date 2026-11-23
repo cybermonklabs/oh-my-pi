@@ -556,10 +556,13 @@ pub struct JobTable {
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap
 	/// interrupted ends with one the trap's own `wait` kept. The root's is in
-	/// the store too ([`crate::bash::store::Key::BgPid`]). Boxed and `None`
-	/// while empty: one pointer per idle vproc.
-	#[expect(clippy::box_collection, reason = "one pointer per idle vproc; a `VecDeque` is four")]
-	pub bgp:      Option<Box<VecDeque<SavedStatus>>>,
+	/// the store too ([`crate::bash::store::Key::BgPid`]). `None` while
+	/// empty: one pointer per idle vproc. Shared: a `$( )` and a stage or job
+	/// that holds its parent's jobs ([`super::exec::inherited_jobs`]) take
+	/// the list without a copy, which a change of either makes
+	/// ([`Arc::make_mut`]).
+	#[serde(with = "shared_statuses")]
+	pub bgp:      Option<Arc<VecDeque<SavedStatus>>>,
 }
 
 /// How many statuses [`JobTable::bgp`] keeps: bash's `MAX_CHILD_MAX`, the
@@ -910,7 +913,7 @@ impl JobTable {
 		pid: u32,
 		status: i32,
 	) -> (SavedStatus, Option<SavedStatus>) {
-		let list = self.bgp.get_or_insert_with(Box::default);
+		let list = Arc::make_mut(self.bgp.get_or_insert_with(Arc::default));
 		if let Some(i) = list.iter().position(|s| s.vpid == vpid) {
 			list.remove(i);
 		}
@@ -927,8 +930,10 @@ impl JobTable {
 
 	/// Forget the status kept for child `vpid` (bash `bgp_delete`).
 	pub fn bgp_delete(&mut self, vpid: Vpid) -> Option<SavedStatus> {
-		let list = self.bgp.as_mut()?;
-		let i = list.iter().position(|s| s.vpid == vpid)?;
+		// Found before the list is made this table's own: a miss copies
+		// nothing.
+		let i = self.bgp.as_deref()?.iter().position(|s| s.vpid == vpid)?;
+		let list = Arc::make_mut(self.bgp.as_mut()?);
 		let gone = list.remove(i);
 		if list.is_empty() {
 			self.bgp = None;
@@ -938,7 +943,34 @@ impl JobTable {
 
 	/// Forget every status kept (bash `bgp_clear`), returned.
 	pub fn bgp_clear(&mut self) -> VecDeque<SavedStatus> {
-		self.bgp.take().map_or_else(VecDeque::new, |list| *list)
+		self
+			.bgp
+			.take()
+			.map_or_else(VecDeque::new, Arc::unwrap_or_clone)
+	}
+}
+
+/// The image of [`JobTable::bgp`]: the list itself (a shared one is written
+/// once per table that holds it, and read back as each table's own).
+mod shared_statuses {
+	use std::{collections::VecDeque, sync::Arc};
+
+	use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+	use super::SavedStatus;
+
+	#[expect(clippy::ref_option, reason = "serde `with` signature")]
+	pub fn serialize<S: Serializer>(
+		list: &Option<Arc<VecDeque<SavedStatus>>>,
+		s: S,
+	) -> Result<S::Ok, S::Error> {
+		list.as_deref().serialize(s)
+	}
+
+	pub fn deserialize<'de, D: Deserializer<'de>>(
+		d: D,
+	) -> Result<Option<Arc<VecDeque<SavedStatus>>>, D::Error> {
+		Ok(Option::<VecDeque<SavedStatus>>::deserialize(d)?.map(Arc::new))
 	}
 }
 
@@ -2238,20 +2270,23 @@ pub enum Awaited {
 	/// Without `force` (`wait -f`) a job that stops ends the wait (status
 	/// 128 + the stop signal), as in bash with job control.
 	Jobs {
-		force:  bool,
-		/// Every operand was a pid, not a job spec: bash waits for those
-		/// with `wait_for_single_pid`, whose posix-mode deletion forgets
-		/// the status it returned.
-		by_pid: bool,
+		force:    bool,
+		/// The children are the `wait` command's operands: bash waits for
+		/// each pid operand with `wait_for_single_pid`, whose posix-mode
+		/// deletion forgets the status it returned, beside a job spec too
+		/// (`command::named_by_pid` finds them among the words).
+		operands: bool,
 	},
 	/// Every background child (`wait` without operands); the status is 0.
 	AllJobs,
 	/// The first of the children to finish (`wait -n`); its status. Once it
 	/// waited, `waited` is how many of them had finished then: when one
 	/// more did, bash's second pass takes any finished job, a reported one
-	/// too (`wait_for_any_job`).
+	/// too (`wait_for_any_job`). With `operands` (bash `JWAIT_WAITING`)
+	/// only the jobs they name count, and no kept status answers.
 	AnyJob {
-		waited: Option<u32>,
+		waited:   Option<u32>,
+		operands: bool,
 	},
 }
 
@@ -2360,8 +2395,12 @@ pub const fn vproc_layout() -> [(&'static str, usize); 5] {
 
 #[cfg(test)]
 mod tests {
-	use super::{BGP_MAX, JobTable};
-	use crate::bash::ids::Vpid;
+	use std::sync::Arc;
+
+	use bstr::BString;
+
+	use super::{BGP_MAX, JobTable, Vproc};
+	use crate::bash::{fd::FdTable, ids::Vpid};
 
 	// Failure mode: past `BGP_MAX` the status of the smallest vproc number
 	// went, not the oldest kept (bash's circular `bgpids.storage` overwrites
@@ -2384,5 +2423,32 @@ mod tests {
 		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top - 2)));
 		assert_eq!(jobs.bgp_search(Vpid(top - 1)), Some(3));
 		assert_eq!(jobs.bgp.as_ref().map_or(0, |list| list.len()), BGP_MAX);
+	}
+
+	// Failure mode: each `$( )`, and each stage or job that holds its
+	// parent's jobs, copied the whole kept list (up to `BGP_MAX` entries,
+	// about 0.75 MiB) as it started. A child's table shares it until one of
+	// the two changes it.
+	#[test]
+	fn a_child_shares_the_kept_statuses_until_one_side_changes_them() {
+		let mut parent =
+			Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		for n in 10..1_010 {
+			parent.jobs.bgp_add(Vpid(n), n, 1);
+		}
+		let shared = |a: &JobTable, b: &JobTable| match (&a.bgp, &b.bgp) {
+			(Some(a), Some(b)) => Arc::ptr_eq(a, b),
+			_ => false,
+		};
+		let mut child = crate::bash::vm::exec::inherited_jobs(&parent, false);
+		assert!(shared(&parent.jobs, &child), "a `$( )` copied its parent's kept statuses");
+		// A miss changes nothing, so it copies nothing.
+		assert_eq!(child.bgp_delete(Vpid(5)), None);
+		assert!(shared(&parent.jobs, &child));
+		assert_eq!(child.bgp_delete(Vpid(10)).map(|s| s.status), Some(1));
+		assert!(!shared(&parent.jobs, &child));
+		assert_eq!(parent.jobs.bgp_search(Vpid(10)), Some(1), "the parent keeps its own");
+		assert_eq!(child.bgp_search(Vpid(10)), None);
+		assert_eq!(child.bgp_list_len(), 999);
 	}
 }

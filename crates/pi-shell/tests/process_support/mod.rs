@@ -95,21 +95,24 @@ const START_LIMIT: Duration = Duration::from_secs(60);
 /// anyway (the kernel's `fs/coredump.c` refuses a pipe dump only at 1), and a
 /// file dump needs more than 1 byte: no command a run starts dumps a core.
 pub struct Run {
-	program: PathBuf,
-	name:    &'static str,
-	args:    Vec<OsString>,
-	ignored: Vec<libc::c_int>,
-	cores:   bool,
-	dir:     Option<PathBuf>,
-	wrap:    Vec<&'static str>,
-	env:     Vec<(&'static str, Option<OsString>)>,
+	program:   PathBuf,
+	name:      &'static str,
+	args:      Vec<OsString>,
+	ignored:   Vec<libc::c_int>,
+	cores:     bool,
+	dir:       Option<PathBuf>,
+	wrap:      Vec<&'static str>,
+	env:       Vec<(&'static str, Option<OsString>)>,
 	/// In a process group of its own (so a signal can go to the group).
-	group:   bool,
+	group:     bool,
+	/// [`Self::go_signalled`] kills what the shell left in its group once it
+	/// has ended ([`Self::ending_its_group`]).
+	end_group: bool,
 	/// [`Self::go_signalled`] signals only once the shell has blocked
 	/// ([`Self::when_blocked`]).
-	blocked: bool,
+	blocked:   bool,
 	/// The file its standard input reads ([`Self::input`]); else the test's.
-	input:   Option<PathBuf>,
+	input:     Option<PathBuf>,
 }
 
 impl Run {
@@ -124,6 +127,7 @@ impl Run {
 			wrap: Vec::new(),
 			env: Vec::new(),
 			group: false,
+			end_group: false,
 			blocked: false,
 			input: None,
 		}
@@ -190,6 +194,16 @@ impl Run {
 	#[must_use]
 	pub const fn own_group(mut self) -> Self {
 		self.group = true;
+		self
+	}
+
+	/// Run in a process group of its own, which [`Self::go_signalled`] ends
+	/// once the shell has: what the shell left running in it is killed then,
+	/// so none of it outlives the run.
+	#[must_use]
+	pub const fn ending_its_group(mut self) -> Self {
+		self.group = true;
+		self.end_group = true;
 		self
 	}
 
@@ -309,8 +323,10 @@ impl Run {
 	/// waits on to go on, so the signal comes while it runs however late it
 	/// is sent; and wait for the shell to end. A shell that ends before the
 	/// file exists, or does not make it within [`START_LIMIT`], fails the
-	/// test; a test that fails or is killed leaves no process of the run
-	/// behind ([`Reaper`], the gate).
+	/// test; so does a command that found no gate (it makes `started` with
+	/// the extension `nogate`). A test that fails or is killed leaves no
+	/// process of the run behind ([`Reaper`], the gate); with
+	/// [`Self::ending_its_group`], neither does one that passes.
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
 		let (gate, gate_writer) = std::io::pipe().expect("a pipe for the gate");
 		let (mut cmd, _link_dir) = self.command_with(Some(gate.as_raw_fd()));
@@ -344,7 +360,16 @@ impl Run {
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
 		drop(gate_writer);
-		child.wait_with_output()
+		let out = if self.end_group {
+			child.wait_ending_group()
+		} else {
+			child.wait_with_output()
+		};
+		assert!(
+			!started.with_extension("nogate").exists(),
+			"a command of the run found no gate on fd {GATE_FD}: {out:?}"
+		);
+		out
 	}
 
 	/// Start it with its standard output and error piped, for a caller that
@@ -386,6 +411,57 @@ impl Reaper {
 		let child = self.child.take().expect("the shell not waited for yet");
 		outcome(child.wait_with_output().expect("wait for the shell"))
 	}
+
+	/// [`Self::wait_with_output`] for a shell that leads its own process
+	/// group ([`Run::own_group`]): once it has exited, and before it is
+	/// reaped (its pid, which names the group, stays its own until then),
+	/// what is left in its group is killed, so no process of the run
+	/// outlives it.
+	fn wait_ending_group(mut self) -> Outcome {
+		let mut child = self.child.take().expect("the shell not waited for yet");
+		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+		let stdout = read_all(child.stdout.take());
+		let stderr = read_all(child.stderr.take());
+		loop {
+			// SAFETY: a zeroed `siginfo_t` is valid; `waitid` writes it.
+			let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+			// SAFETY: waits for this child without reaping it (`WNOWAIT`).
+			let rc = unsafe {
+				libc::waitid(
+					libc::P_PID,
+					pid.unsigned_abs(),
+					&raw mut info,
+					libc::WEXITED | libc::WNOWAIT,
+				)
+			};
+			if rc == 0 {
+				break;
+			}
+			let err = std::io::Error::last_os_error();
+			assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "wait for the shell: {err}");
+		}
+		// SAFETY: kill takes integer ids; the leader is a zombie, not reaped.
+		unsafe { libc::kill(-pid, libc::SIGKILL) };
+		let stdout = stdout.join().expect("the output's reader");
+		let stderr = stderr.join().expect("the error output's reader");
+		let status = child.wait().expect("reap the shell");
+		outcome(std::process::Output { status, stdout, stderr })
+	}
+}
+
+/// Read `pipe` to its end on a thread of its own.
+fn read_all<R: std::io::Read + Send + 'static>(
+	pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+	std::thread::spawn(move || {
+		let mut bytes = Vec::new();
+		if let Some(mut pipe) = pipe {
+			pipe
+				.read_to_end(&mut bytes)
+				.expect("read the shell's output");
+		}
+		bytes
+	})
 }
 
 impl Drop for Reaper {

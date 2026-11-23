@@ -75,7 +75,7 @@ use super::{
 	exec, nested,
 	proc::{
 		Comsub, ForkAt, ForkLine, Frame, FrameKind, JobProc, JobProcs, JobState, LoopKind, LoopRec,
-		PendingWrite, ProcState, ScriptKind, Vproc,
+		PendingWrite, ProcState, Saved, ScriptKind, Vproc,
 	},
 	state,
 };
@@ -482,7 +482,12 @@ pub(super) fn subshell_ended(
 	// goes to the shell's own standard error; obash applies them in the
 	// shell, so the notice goes to the fd 2 the `( … )`'s `Redir` saved.
 	// Written here, at the reap: errexit, the ERR trap and the shell's exit
-	// all act before the `PopRedir` that puts fd 2 back.
+	// all act before the `PopRedir` that puts fd 2 back. It is queued on a
+	// descriptor of its own that holds that file (the lowest free from 10,
+	// as a `{var}` would get), not on fd 2: a write that would block stays
+	// queued for that file, and the vproc runs nothing until the queue is
+	// written (`exec::run_slice`), while fd 2 stays the `( … )`'s. The
+	// `PopRedir` closes it again, as one of the redirection's saves.
 	let saved = redir.and_then(|_| {
 		let f = vp.frames.last()?;
 		let s = f.redirs.last()?.iter().find(|s| s.fd == 2)?;
@@ -493,14 +498,14 @@ pub(super) fn subshell_ended(
 			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
 		return;
 	};
-	// What was queued belongs to the fd 2 the `( … )` redirected.
-	let _ = exec::flush_out(k, vp);
-	let current = vp.fds.get(2).cloned();
-	vp.fds.set(2, saved);
+	let fd = super::jobctl::lowest_free_fd(k, vp, 10);
+	vp.fds.set(fd, saved);
+	if let Some(saves) = vp.frames.last_mut().and_then(|f| f.redirs.last_mut()) {
+		saves.push(Saved { fd, prev: None });
+	}
 	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
 	let _ = exec::flush_out(k, vp);
-	vp.fds.set(2, current);
 }
 
 /// bash's long notice: `NAME: line N: ` at script line `line`, then
@@ -1263,20 +1268,38 @@ mod tests {
 	/// commands whose loop forks a pipeline's two stages again and again. A
 	/// fork records where its parent was, and searches the unit's syntax
 	/// nodes for its line only when a notice or an error names it
-	/// ([`super::fork_line`]): here never (each of the 600 stage forks
-	/// searched before). A stage's `( … )` that `QUIT` kills names its line
-	/// (the `for` header's, as bash 5.3.20 does): the search happens then.
+	/// ([`super::fork_line`]): here never (each of the 60 stage forks
+	/// searched before), also for a stage that is a compound command with
+	/// redirections that succeed (the review of #244 measured 300 searches
+	/// for 300 `{ :; } >/dev/null` stages: each `Redir` looked for its line
+	/// before it applied them, [`crate::bash::vm::redir::Line`]). A stage's
+	/// `( … )` that `QUIT` kills names its line (the `for` header's, as bash
+	/// 5.3.20 does), and so does a stage's redirection that fails: the search
+	/// happens then. The count, not the time, is the measurement: 200
+	/// commands and 30 rounds keep the test short (2,000 and 300 made it the
+	/// library's longest, about a minute on gVisor).
 	#[test]
 	fn a_fork_searches_for_its_line_only_when_a_notice_names_it() {
-		let body = ":\n".repeat(2_000);
-		let quiet = format!("f() {{\n{body}for ((i=0;i<300;i++)); do : | :; done; echo end; }}; f");
+		let body = ":\n".repeat(200);
+		let quiet = format!("f() {{\n{body}for ((i=0;i<30;i++)); do : | :; done; echo end; }}; f");
 		assert_eq!(searches(&quiet), ("end\n".to_owned(), String::new(), 0));
+		let redirected = format!(
+			"f() {{\n{body}for ((i=0;i<30;i++)); do {{ :; }} >/dev/null | :; done; echo end; }}; f"
+		);
+		assert_eq!(searches(&redirected), ("end\n".to_owned(), String::new(), 0));
 		let killed = format!(
 			"f() {{\n{body}for i in 1\ndo : | {{ ( kill -QUIT $BASHPID ); echo a; }}; done; }}; f"
 		);
 		let (out, err, made) = searches(&killed);
 		assert_eq!(out, "a\n");
-		assert!(err.starts_with("bash: line 2002: "), "{err:?}");
+		assert!(err.starts_with("bash: line 202: "), "{err:?}");
 		assert!(made > 0, "the notice's line is searched for");
+		let failed = format!(
+			"f() {{\n{body}for i in 1\ndo {{ :; }} >/nonexistent/x | :; done; echo end; }}; f"
+		);
+		let (out, err, made) = searches(&failed);
+		assert_eq!(out, "end\n");
+		assert!(err.starts_with("bash: line 202: /nonexistent/x: "), "{err:?}");
+		assert!(made > 0, "the error's line is searched for");
 	}
 }

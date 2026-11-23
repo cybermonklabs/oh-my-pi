@@ -3301,7 +3301,7 @@ pub fn load_root(
 		}
 	})?;
 	bgp.sort_by_key(|s| s.seq);
-	let bgp = (!bgp.is_empty()).then(|| Box::new(bgp.into_iter().collect()));
+	let bgp = (!bgp.is_empty()).then(|| std::sync::Arc::new(bgp.into_iter().collect()));
 	vp.jobs = JobTable {
 		list,
 		current: misc(store, MiscKey::JobCurrent)?.and_then(|s| parse(&s)),

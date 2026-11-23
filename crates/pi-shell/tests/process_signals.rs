@@ -1385,6 +1385,14 @@ fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
 		(format!("{TRAP}{E0} | {w1} & disown; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
 		(format!("{TRAP}{E0} | {w1} & disown -a; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
 		(format!("{TRAP}{E0} | {w1} & disown %1; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
+		// Once both stages ended, the job's vproc ends too (obash's own,
+		// none of bash's processes): its end owes no run, as the record
+		// `disown` kept says (`Kernel::disowned_procs`). The foreground
+		// program after `READ2` (its own run) lets it end first.
+		(
+			format!("{TRAP}{E0} | {w1} & disown; {READ2}; /bin/sleep 0.2; echo done"),
+			"chld\nchld\nchld\ndone\n".into(),
+		),
 		(
 			format!("shopt -s lastpipe; {TRAP}{e0} | {w1} & wait %1; echo st=$?"),
 			"chld\nchld\nst=0\n".into(),
@@ -3189,6 +3197,67 @@ fn bash_keeps_the_status_of_each_job_it_deletes() {
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+/// The review of #244's three rows, each as a `-c` string and from a file,
+/// with goldens measured against bash 5.3.20 (and live with a bash 5.3 or
+/// later, [`real_bash_golden`]):
+/// - a posix `wait -n` without operands takes a status the shell kept before it
+///   waits for a job still running (`bgp_findone`, `jobs.c:3538-3553`, before
+///   the loop at 3557; bash 5.2.21 waits first and prints `st=0`);
+/// - a posix `wait` forgets the status it returns for each pid operand, a job
+///   spec beside it or not (`wait_for_single_pid`, `jobs.c:2782-2786`);
+/// - the notice of a `( … ) 2>x` a signal killed reaches the shell's own
+///   standard error when a write there would block: it waits until it is
+///   written (64 KiB already fill the pipe, read only after 2 s; the shell ends
+///   at once by `set -e`).
+#[test]
+fn bash_answers_these_waits_and_writes_this_notice_as_bash_5_3() {
+	let rows = [
+		("set -o posix; (exit 3) & wait %1; /bin/sleep 5 & wait -n; echo st=$?; kill $!", "st=3\n"),
+		(
+			"set -o posix; (exit 3) & p=$!; /bin/sleep 1 & wait $p %2; wait $p 2>/dev/null; echo \
+			 st=$?",
+			"st=127\n",
+		),
+		(
+			"set -e; { printf '%065536d' 0 >&2; ( kill -KILL $BASHPID ) 2>/dev/null; } 2>&1 | { \
+			 SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; wc -l; }",
+			"1\n",
+		),
+	];
+	let dir = tempfile::tempdir().expect("a directory for the scripts");
+	let mut wrong = Vec::new();
+	for (n, (script, out)) in rows.into_iter().enumerate() {
+		let file = dir.path().join(format!("{n}.sh"));
+		fs::write(&file, format!("{script}\n")).expect("write the script");
+		for shown in ["-c", "file"] {
+			let run = |program: &OsStr| {
+				let run = if shown == "-c" {
+					Run::script(program, "bash", script)
+				} else {
+					Run::new(program, "bash", &[&file])
+				};
+				run.spawn().ended_within(EVENT_LIMIT)
+			};
+			let ours = match run(OsStr::new(env!("CARGO_BIN_EXE_obash"))) {
+				Ok(ours) => ours,
+				Err(killed) => {
+					wrong.push(format!("{shown} {script:?}: still running: {killed:?}"));
+					continue;
+				},
+			};
+			let got = (String::from_utf8_lossy(&ours.stdout).into_owned(), ours.end());
+			if got != (out.to_owned(), Some(Exit(0))) {
+				wrong.push(format!("{shown} {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+			}
+			if let Some(bash) = real_bash_golden() {
+				let theirs = run(bash.as_os_str()).expect("bash ends");
+				assert_eq!(masked(&ours), masked(&theirs), "{shown} {script:?}");
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
 /// `should_optimize_fork` counts an EXIT, ERR or RETURN trap set to nothing
 /// (`trap '' ERR`, `signal_is_trapped`), and the ERR and RETURN traps a
 /// subshell has are the ones it inherited at the fork (`errtrace`,
@@ -3263,8 +3332,9 @@ fn bash_forks_a_subshells_last_command_for_a_trap_set_to_nothing() {
 /// A fork made while the DEBUG, ERR or RETURN trap runs runs that trap no
 /// more: bash keeps the trap's `SIG_INPROGRESS` in the child (no fork
 /// clears it), so a `$( )` in the trap's action, under `functrace` or
-/// `errtrace`, does not run the trap again; `run_return_trap` also skips
-/// the RETURN trap while the DEBUG trap runs (`trap.c:1333`). obash ran it
+/// `errtrace`, does not run the trap again; a function called while the
+/// DEBUG trap runs gets no RETURN trap (`execute_function` sets it aside on
+/// `signal_in_progress (DEBUG_TRAP)`, `execute_cmd.c:5295`). obash ran it
 /// again in each substitution, without end. Checked-in goldens measured
 /// with bash 5.3.20 and 5.2.21 (the same; [`bounded_bash_ends`]). A `( … )`
 /// or a pipeline in the DEBUG trap's action does not end in either bash;
@@ -4774,8 +4844,10 @@ fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
 /// Shell code of a command's `/bin/sh -c` script that waits until the run
 /// has sent its signal ([`Run::go_signalled`] makes `$F.sent` then), so the
 /// signal comes while the command runs, however late the run sends it, and
-/// not in a time the command allows.
-const SENT: &str = "read -r x <&9 || :";
+/// not in a time the command allows. The read's end of file is the gate
+/// closing; a command that finds no gate on fd 9 (no wait at all) makes
+/// `$F.nogate`, which fails the run.
+const SENT: &str = "{ true <&9; } 2>/dev/null || : >\"$F.nogate\"; read -r x <&9 || :";
 
 /// A signal case: `shell` runs `script` with `-c` and gets `sig` from
 /// outside (`group`: sent to its process group, else to the shell alone)
@@ -5441,18 +5513,18 @@ fn a_second_terminating_signal_ends_the_exit_trap_at_once() {
 /// process, which may run on; an `INT` that comes during that wait it holds
 /// as for a job (`wait_for`), and goes on where the process caught it. The
 /// substitution ignores `INT` and makes `$F`. In the first row it closes its
-/// output once the run has sent the signal ([`SENT`]), then waits for
-/// `$F.checked`, which the test makes once the shell has ended: a shell that
-/// waited for the substitution's process would never end. In the second it
-/// closes its output first, then waits for the signal, and ends.
+/// output once the run has sent the signal ([`SENT`]), then runs on (60 s at
+/// most), until the run kills what the shell left in its process group once
+/// the shell has ended ([`Run::ending_its_group`]); one that reaches its end
+/// makes `$F.late`: the shell waited for the substitution's process. In the
+/// second it closes its output first, then waits for the signal, and ends.
 #[test]
 fn bash_acts_on_a_held_int_once_the_substitutions_output_ends() {
 	let rows = [
 		(
 			format!(
-				"v=$(trap '' INT; : > \"$F\"; {SENT}; exec >/dev/null 2>&1; n=0; until [ -e \
-				 \"$F.checked\" ]; do n=$((n+1)); [ $n -le 6000 ] || exit 97; /bin/sleep 0.01; done); \
-				 echo after"
+				"v=$(trap '' INT; : > \"$F\"; {SENT}; exec >/dev/null 2>&1; n=0; while [ $n -lt 6000 \
+				 ]; do n=$((n+1)); /bin/sleep 0.01; done; : > \"$F.late\"; exit 97); echo after"
 			),
 			(String::new(), Some(Signal(libc::SIGINT))),
 		),
@@ -5467,9 +5539,11 @@ fn bash_acts_on_a_held_int_once_the_substitutions_output_ends() {
 			let started = dir.path().join("started");
 			let out = Run::script(program, "bash", &script)
 				.env("F", &started)
+				.ending_its_group()
 				.when_blocked()
 				.go_signalled(&started, libc::SIGINT, false);
-			fs::File::create(started.with_extension("checked")).expect("let the substitution end");
+			let late = started.with_extension("late").exists();
+			assert!(!late, "the shell waited for the substitution's process: {out:?}");
 			(String::from_utf8_lossy(&out.stdout).into_owned(), out.end())
 		};
 		assert_eq!(run(OsStr::new(env!("CARGO_BIN_EXE_obash"))), ended, "{script}");

@@ -14,6 +14,7 @@
 //! 1992-1997 Paul Falstad and the zsh development group).
 
 use std::{
+	cell::Cell,
 	sync::Arc,
 	task::{Context, Poll},
 };
@@ -54,6 +55,53 @@ pub enum Halt {
 	Failed,
 }
 
+/// The line a bash redirection list's diagnostics name, and that its
+/// words' substitutions run at. Known, or in the base frame of a fork
+/// bash's `line_number` there ([`super::killed::compound_fork_line`]),
+/// whose first answer can cost a search of the unit's syntax nodes: that
+/// one is found only once something needs it (a word that expands to more
+/// than its own text, a here-document, a redirection left to a program's
+/// process, a failure). A list of plain words that succeeds needs none.
+pub struct Line {
+	at:   Cell<u32>,
+	/// The compound command whose redirections these are, while its fork's
+	/// line is not looked for yet.
+	fork: Cell<Option<u32>>,
+}
+
+impl Line {
+	/// Line `line`.
+	pub const fn at(line: u32) -> Self {
+		Self { at: Cell::new(line), fork: Cell::new(None) }
+	}
+
+	/// The line of compound command `node`'s redirections in a fork's base
+	/// frame, `or` where that frame is none.
+	pub const fn fork(node: u32, or: u32) -> Self {
+		Self { at: Cell::new(or), fork: Cell::new(Some(node)) }
+	}
+
+	/// The line, found now if it is a fork's.
+	fn get(&self, vp: &mut Vproc) -> u32 {
+		if let Some(node) = self.fork.take()
+			&& let Some(line) = super::killed::compound_fork_line(vp, node)
+		{
+			self.at.set(line);
+		}
+		self.at.get()
+	}
+
+	/// The line word `w` expands at: none is needed for a word that is its
+	/// own text (`Word::fixed`, not globbed).
+	fn word(&self, vp: &mut Vproc, w: &crate::bash::ir::Word) -> u32 {
+		if w.fixed && w.noglob {
+			self.at.get()
+		} else {
+			self.get(vp)
+		}
+	}
+}
+
 fn scratch(vp: &mut Vproc) -> &mut super::proc::Scratch {
 	super::exec::scratch(vp)
 }
@@ -64,14 +112,14 @@ fn io(vp: &mut Vproc) -> &mut super::proc::ScratchIo {
 	scratch(vp).io()
 }
 
-/// Apply redirection list `list` of `unit`.
+/// Apply redirection list `list` of `unit`, naming `line` ([`Line`]).
 pub fn apply(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	unit: &Arc<Unit>,
 	list: u32,
-	line: u32,
+	line: &Line,
 ) -> Result<(), Halt> {
 	let redirs = &unit.redirs[list as usize];
 	let zsh = unit.mode.dialect() == Dialect::Zsh;
@@ -100,7 +148,8 @@ pub fn apply(
 		let target = if let Some(t) = io(vp).redir.target.clone().or(copy) {
 			t
 		} else if zsh {
-			let mut words = zsh_target(k, vp, cx, unit, r, multios, line)?;
+			let zline = line.get(vp);
+			let mut words = zsh_target(k, vp, cx, unit, r, multios, zline)?;
 			if words.len() > 1 {
 				// Several words: one redirection each, after the list.
 				let at = u32::try_from(done).unwrap_or(u32::MAX);
@@ -123,7 +172,8 @@ pub fn apply(
 		};
 		let before = io(vp).saved.len();
 		if zsh {
-			zsh_install(k, vp, cx, r, &target, line, multios)?;
+			let zline = line.get(vp);
+			zsh_install(k, vp, cx, r, &target, zline, multios)?;
 		} else if k
 			.deferrals
 			.iter()
@@ -228,15 +278,16 @@ fn target_text(
 	cx: &mut Cx<'_>,
 	unit: &Arc<Unit>,
 	r: &RedirIr,
-	line: u32,
+	line: &Line,
 ) -> Result<BString, Halt> {
 	match &r.target {
 		RedirTargetIr::HereDoc { text, quoted: true } => Ok(text.clone()),
 		RedirTargetIr::HereDoc { text, quoted: false } if unit.mode.dialect() == Dialect::Zsh => {
-			expanding(k, vp, cx, Slot::Redirs, true, line, |ex| ex.zsh_heredoc(text))
-				.map_err(Halt::Flow)
+			let at = line.get(vp);
+			expanding(k, vp, cx, Slot::Redirs, true, at, |ex| ex.zsh_heredoc(text)).map_err(Halt::Flow)
 		},
 		RedirTargetIr::HereDoc { text, quoted: false } => {
+			let line = line.get(vp);
 			let mode = super::exec::mode_of(vp);
 			let tunit = match k.engine.text_unit(
 				text,
@@ -263,8 +314,9 @@ fn target_text(
 		RedirTargetIr::Word(w) => {
 			let word = &unit.words[*w as usize];
 			if r.op == RedirKind::HereString {
+				let at = line.word(vp, word);
 				let mut s =
-					expanding(k, vp, cx, Slot::Redirs, word.parks, line, |ex| ex.scalar(unit, word))
+					expanding(k, vp, cx, Slot::Redirs, word.parks, at, |ex| ex.scalar(unit, word))
 						.map_err(Halt::Flow)?;
 				s.push(b'\n');
 				Ok(s)
@@ -274,7 +326,8 @@ fn target_text(
 				// posix mode the word is pathname-expanded too (a park
 				// replays the expansion; the walk's answers are cached).
 				let glob = !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
-				let (mut fields, globs) = expanding(k, vp, cx, Slot::Redirs, word.parks, line, |ex| {
+				let at = line.word(vp, word);
+				let (mut fields, globs) = expanding(k, vp, cx, Slot::Redirs, word.parks, at, |ex| {
 					let mut out = Vec::new();
 					let mut globs = Vec::new();
 					if glob {
@@ -286,13 +339,13 @@ fn target_text(
 				})
 				.map_err(Halt::Flow)?;
 				if !globs.is_empty() {
-					super::glob::expand_globs(k, vp, cx, &mut fields, &globs, line)
-						.map_err(Halt::Flow)?;
+					super::glob::expand_globs(k, vp, cx, &mut fields, &globs, at).map_err(Halt::Flow)?;
 				}
 				if let Ok([one]) = <[BString; 1]>::try_from(fields) {
 					Ok(one)
 				} else {
-					k.diag(cx, vp, line, Diag::AmbiguousRedirect { word: word_text(unit, *w) });
+					let at = line.get(vp);
+					k.diag(cx, vp, at, Diag::AmbiguousRedirect { word: word_text(unit, *w) });
 					Err(Halt::Failed)
 				}
 			}
@@ -317,10 +370,10 @@ fn zsh_target(
 	line: u32,
 ) -> Result<Vec<BString>, Halt> {
 	let RedirTargetIr::Word(w) = r.target else {
-		return target_text(k, vp, cx, unit, r, line).map(|t| vec![t]);
+		return target_text(k, vp, cx, unit, r, &Line::at(line)).map(|t| vec![t]);
 	};
 	if r.op == RedirKind::HereString {
-		return target_text(k, vp, cx, unit, r, line).map(|t| vec![t]);
+		return target_text(k, vp, cx, unit, r, &Line::at(line)).map(|t| vec![t]);
 	}
 	let word = &unit.words[w as usize];
 	if !multios {
@@ -359,7 +412,7 @@ fn target_fd(
 	cx: &mut Cx<'_>,
 	r: &RedirIr,
 	closing: bool,
-	line: u32,
+	line: &Line,
 ) -> Result<i32, Diag> {
 	match &r.fd {
 		RedirFdIr::Default => Ok(default_fd(r.op)),
@@ -370,7 +423,8 @@ fn target_fd(
 					.ok_or_else(|| Diag::AmbiguousRedirect { word: name.clone() });
 			}
 			let fd = super::jobctl::lowest_free_fd(k, vp, 10);
-			assign_fd_var(k, vp, cx, name, fd, line)?;
+			let at = line.get(vp);
+			assign_fd_var(k, vp, cx, name, fd, at)?;
 			Ok(fd)
 		},
 	}
@@ -448,11 +502,11 @@ fn install(
 	unit: &Arc<Unit>,
 	r: &RedirIr,
 	target: &BString,
-	line: u32,
+	line: &Line,
 ) -> Result<(), Halt> {
 	match r.op {
 		RedirKind::HereDoc | RedirKind::HereString => {
-			let fd = target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd = target_fd(k, vp, cx, r, false, line).map_err(|d| fail_at(k, vp, cx, line, d))?;
 			let h = FdRef::mem(MemBuf::new(target.to_vec()));
 			set_fd(vp, fd, Some(h));
 			Ok(())
@@ -460,7 +514,8 @@ fn install(
 		RedirKind::DupIn | RedirKind::DupOut => {
 			let closing = target.as_slice() == b"-";
 			if closing {
-				let fd = target_fd(k, vp, cx, r, true, line).map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd =
+					target_fd(k, vp, cx, r, true, line).map_err(|d| fail_at(k, vp, cx, line, d))?;
 				set_fd(vp, fd, None);
 				super::exec::coproc_fd_closed(k, vp, cx, fd);
 				return Ok(());
@@ -481,9 +536,10 @@ fn install(
 						RedirTargetIr::HereDoc { .. } => target.clone(),
 					};
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
-					return Err(fail(k, vp, cx, line, Diag::Io { path, err }));
+					return Err(fail_at(k, vp, cx, line, Diag::Io { path, err }));
 				};
-				let fd = target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd =
+					target_fd(k, vp, cx, r, false, line).map_err(|d| fail_at(k, vp, cx, line, d))?;
 				set_fd(vp, fd, Some(h));
 				if moving && src != fd {
 					set_fd(vp, src, None);
@@ -505,10 +561,10 @@ fn install(
 					line,
 				);
 			}
-			Err(fail(k, vp, cx, line, Diag::AmbiguousRedirect { word: target.clone() }))
+			Err(fail_at(k, vp, cx, line, Diag::AmbiguousRedirect { word: target.clone() }))
 		},
 		RedirKind::Close => {
-			let fd = target_fd(k, vp, cx, r, true, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd = target_fd(k, vp, cx, r, true, line).map_err(|d| fail_at(k, vp, cx, line, d))?;
 			set_fd(vp, fd, None);
 			super::exec::coproc_fd_closed(k, vp, cx, fd);
 			Ok(())
@@ -528,7 +584,7 @@ fn install(
 			// its slot free, so the fd is the same on resume.
 			let fd = match &r.fd {
 				RedirFdIr::Var(_) => super::jobctl::lowest_free_fd(k, vp, 10),
-				_ => target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?,
+				_ => target_fd(k, vp, cx, r, false, line).map_err(|d| fail_at(k, vp, cx, line, d))?,
 			};
 			// bash moves a `{var}` fd to 10 or above with `F_DUPFD`, which
 			// fails past `ulimit -n`.
@@ -545,14 +601,15 @@ fn install(
 				vp.out
 					.push_back(super::proc::PendingWrite { fd: 2, bytes: msg.into(), off: 0 });
 				let err = std::io::Error::from(std::io::ErrorKind::InvalidInput);
-				return Err(fail(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
+				return Err(fail_at(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
 			}
 			open_into(k, vp, cx, &[fd], target, flags, line)?;
-			if let RedirFdIr::Var(name) = &r.fd
-				&& let Err(d) = assign_fd_var(k, vp, cx, name, fd, line)
-			{
-				set_fd(vp, fd, None);
-				return Err(fail(k, vp, cx, line, d));
+			if let RedirFdIr::Var(name) = &r.fd {
+				let at = line.get(vp);
+				if let Err(d) = assign_fd_var(k, vp, cx, name, fd, at) {
+					set_fd(vp, fd, None);
+					return Err(fail(k, vp, cx, at, d));
+				}
 			}
 			Ok(())
 		},
@@ -696,8 +753,10 @@ fn collect(
 	cx: &mut Cx<'_>,
 	r: &RedirIr,
 	target: &BString,
-	line: u32,
+	line: &Line,
 ) -> Result<(), Halt> {
+	// Each redirection left to the process carries its message's prefix.
+	let line = line.get(vp);
 	let mut add = Vec::with_capacity(2);
 	match r.op {
 		RedirKind::Close => add.push(ChildRedir::Close { fd: fd_number(k, vp, cx, r, true, line)? }),
@@ -765,7 +824,7 @@ fn fd_number(
 	closing: bool,
 	line: u32,
 ) -> Result<i32, Halt> {
-	target_fd(k, vp, cx, r, closing, line).map_err(|d| fail(k, vp, cx, line, d))
+	target_fd(k, vp, cx, r, closing, &Line::at(line)).map_err(|d| fail(k, vp, cx, line, d))
 }
 
 /// Whether `fd` is open in the process a command spawns at this point of
@@ -811,6 +870,12 @@ fn child_open(
 fn fail(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Halt {
 	k.diag(cx, vp, line, d);
 	Halt::Failed
+}
+
+/// [`fail`] at `line`, found now if it is a fork's ([`Line`]).
+fn fail_at(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: &Line, d: Diag) -> Halt {
+	let at = line.get(vp);
+	fail(k, vp, cx, at, d)
 }
 
 /// zsh's message for a redirection failure.
@@ -1328,7 +1393,7 @@ fn open_into(
 	fds: &[i32],
 	path: &BString,
 	flags: OpenFlags,
-	line: u32,
+	line: &Line,
 ) -> Result<(), Halt> {
 	if let Some(h) = session_tty(vp, path) {
 		for &fd in fds {
@@ -1338,11 +1403,8 @@ fn open_into(
 	}
 	if let Some(src) = dev_fd(path) {
 		let Some(h) = vp.fds.get(src).cloned().filter(FdRef::is_open) else {
-			k.diag(cx, vp, line, Diag::Io {
-				path: path.clone(),
-				err:  std::io::Error::other(crate::bash::fd::BadFd),
-			});
-			return Err(Halt::Failed);
+			let err = std::io::Error::other(crate::bash::fd::BadFd);
+			return Err(fail_at(k, vp, cx, line, Diag::Io { path: path.clone(), err }));
 		};
 		for &fd in fds {
 			set_fd(vp, fd, Some(h.clone()));
@@ -1384,8 +1446,7 @@ fn open_into(
 				} else {
 					Diag::Io { path: path.clone(), err }
 				};
-			k.diag(cx, vp, line, d);
-			Err(Halt::Failed)
+			Err(fail_at(k, vp, cx, line, d))
 		},
 	}
 }

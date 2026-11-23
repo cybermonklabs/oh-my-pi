@@ -56,7 +56,13 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
-/// a variant: an exec target holds it by index.
+/// a variant: an exec target holds it by index. Each layout has a number of
+/// its own: two trees that share a number share a layout. 40 holds, beyond
+/// 37's: `Frame::fork_line` as a `ForkLine`, `Frame::traced`,
+/// `JobTable::copied`, `Awaited::Jobs::operands` (once `by_pid`),
+/// `Awaited::AnyJob::operands`, [`Kernel::disowned_procs`], the take-in
+/// (`TakeInImage`), and no held subshell notices; 38 and 39 are other
+/// layouts of the same work.
 pub const FRAMES_VERSION: u32 = 40;
 
 const MAGIC: [u8; 4] = *b"OBF1";
