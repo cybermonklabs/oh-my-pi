@@ -32,7 +32,7 @@ use bstr::{BStr, BString};
 use super::{
 	Cx, Kernel, Shell,
 	exec::{self, Flow},
-	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Scratch, ScriptKind, Vproc},
+	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Saves, Scratch, ScriptKind, Vproc},
 	state,
 };
 use crate::bash::{
@@ -555,7 +555,7 @@ fn interrupt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	exec::unwind(&mut k.root, cx.store, vp, 1);
 	exec::clear_scratch(&mut k.root, cx.store, vp);
 	let f = &mut vp.frames[0];
-	let saves: Vec<Vec<Saved>> = std::mem::take(&mut f.redirs);
+	let saves: Vec<Saves> = std::mem::take(&mut f.redirs);
 	f.loops.clear();
 	f.enters.clear();
 	f.cases.clear();
@@ -565,7 +565,7 @@ fn interrupt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 		f.unit = None;
 	}
 	for s in saves.into_iter().rev() {
-		exec::restore(vp, s);
+		exec::restore(vp, s.fds);
 	}
 	vp.status = 130;
 	vp.blocked = None;
@@ -927,7 +927,7 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 		let top = vp.frames.len() - 1;
 		let f = &mut vp.frames[top];
 		let mut stand_in = Frame::new(f.unit.clone(), f.pc, f.kind.clone());
-		stand_in.redirs = f.redirs.iter().map(|s| copy_saves(s)).collect();
+		stand_in.redirs = f.redirs.iter().map(|s| copy_saves(&s.fds).into()).collect();
 		stand_in.getopts.clone_from(&f.getopts);
 		let frame = std::mem::replace(f, stand_in);
 		if let Some(sc) = frame.scratch.as_deref() {
@@ -947,7 +947,7 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	let redirs = std::mem::take(&mut f.redirs);
 	f.pc = resume;
 	f.debug_pc = None;
-	let root_saves: Vec<Vec<Saved>> = redirs.iter().map(|s| copy_saves(s)).collect();
+	let root_saves: Vec<Vec<Saved>> = redirs.iter().map(|s| copy_saves(&s.fds)).collect();
 	if let Some(sc) = scratch.as_deref() {
 		undo_scratch(k, cx, vp, sc);
 		live_children(sc, &mut children);

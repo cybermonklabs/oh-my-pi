@@ -31,8 +31,8 @@ use super::{
 	CallOutcome, Cx, Kernel, Shell, host_stdio,
 	proc::{
 		Atom, Awaited, ExecState, Frame, FrameKind, JobState, Live, LoopRec, PendingSub,
-		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Scratch, ScratchIo, ScratchZsh,
-		ScriptKind, Stage, Target, Vproc,
+		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Saves, Scratch, ScratchIo,
+		ScratchZsh, ScriptKind, Stage, Target, Vproc,
 	},
 	state::{self, Root, Scope},
 };
@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -321,7 +321,7 @@ struct FrameImage {
 	enters:            Vec<(u32, u64)>,
 	cases:             Vec<(BString, bool)>,
 	times:             Vec<super::proc::TimeMark>,
-	redirs:            Vec<Vec<SavedImage>>,
+	redirs:            Vec<SavesImage>,
 	scratch:           Option<ScratchImage>,
 	line_shift:        u32,
 	debug_pc:          Option<u32>,
@@ -341,6 +341,14 @@ struct FrameImage {
 struct SavedImage {
 	fd:   i32,
 	prev: Option<u32>,
+}
+
+/// A frame's redirection entry ([`super::proc::Saves`]): the saved fds and
+/// a bash `( … )`'s own `{var}`s still to forget at its fork.
+#[derive(Serialize, Deserialize)]
+struct SavesImage {
+	fds:  Vec<SavedImage>,
+	vars: Option<Vec<super::proc::VarFd>>,
 }
 
 /// An in-flight command substitution and its capture (a memory object).
@@ -370,6 +378,9 @@ struct ScratchImage {
 	probing:      Option<Probe>,
 	input:        Vec<u8>,
 	saved:        Vec<SavedImage>,
+	/// A bash `( … )`'s own `{var}` redirections made so far
+	/// ([`ScratchIo::var_fds`]).
+	var_fds:      Option<Vec<super::proc::VarFd>>,
 	children:     Vec<(Vpid, Option<i32>)>,
 	inline:       Option<super::proc::InlineStage>,
 }
@@ -391,7 +402,7 @@ fn scratch_image(
 		let mut state = ExecState::clone(e);
 		match &mut sc.live {
 			Live::Task(task) => {
-				state.checkpoint = task.checkpoint();
+				state.checkpoint = task.checkpoint().map(Vec::into_boxed_slice);
 				if state.checkpoint.is_none()
 					&& let Some(Awaited::Task(native)) = state.waiting
 				{
@@ -469,6 +480,7 @@ fn scratch_image(
 		probing: sc.probing().cloned(),
 		input: io.map_or_default(|io| io.input.clone()),
 		saved: saved_image(io.map_or_default(|io| io.saved.as_slice()), fds),
+		var_fds: io.and_then(|io| io.var_fds.as_deref().cloned()),
 		children: sc.children.clone(),
 		inline: sc.inline,
 	}
@@ -560,7 +572,14 @@ impl Shell {
 					enters: f.enters.clone(),
 					cases: f.cases.clone(),
 					times: f.times.clone(),
-					redirs: f.redirs.iter().map(|r| saved_image(r, &mut fds)).collect(),
+					redirs: f
+						.redirs
+						.iter()
+						.map(|r| SavesImage {
+							fds:  saved_image(&r.fds, &mut fds),
+							vars: r.vars.as_deref().cloned(),
+						})
+						.collect(),
 					scratch,
 					line_shift: f.line_shift,
 					debug_pc: f.debug_pc,
@@ -967,7 +986,9 @@ impl Shell {
 								)
 								| None => {},
 							}
-							if state.stage == Stage::Lookup && state.target == Some(Target::Search) {
+							if matches!(state.stage, Stage::Lookup | Stage::FailedLookup)
+								&& state.target == Some(Target::Search)
+							{
 								report.reissued_fs += 1;
 							}
 							state
@@ -982,6 +1003,7 @@ impl Shell {
 							&& img.probing.is_none()
 							&& img.input.is_empty()
 							&& saved.is_empty()
+							&& img.var_fds.is_none()
 						{
 							None
 						} else {
@@ -1000,6 +1022,7 @@ impl Shell {
 								zsh: (!img.redir_more.is_empty()).then(|| {
 									Box::new(ScratchZsh { more: img.redir_more, ..ScratchZsh::default() })
 								}),
+								var_fds: img.var_fds.map(Box::new),
 							}))
 						};
 						Some(Box::new(Scratch {
@@ -1035,7 +1058,7 @@ impl Shell {
 				let redirs = f
 					.redirs
 					.into_iter()
-					.map(|r| objs.saved(cx.host, r))
+					.map(|r| Saves { fds: objs.saved(cx.host, r.fds), vars: r.vars.map(Box::new) })
 					.collect();
 				let mut frame = Frame::new(unit, f.pc, f.kind);
 				frame.loops = f.loops;

@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
 		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -1720,7 +1720,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		drop_scratch(root, store, vp, sc);
 	}
 	while let Some(saves) = f.redirs.pop() {
-		restore(vp, saves);
+		restore(vp, saves.fds);
 	}
 	let keep = vp.frames.len();
 	close_procsubs(vp, keep);
@@ -2007,7 +2007,7 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 		saves.push(f.redirs.pop().expect("checked"));
 	}
 	for s in saves {
-		restore(vp, s);
+		restore(vp, s.fds);
 	}
 }
 
@@ -2247,10 +2247,14 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			}
 			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
 			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			// zsh exits 1 from any of them (`errflag` ends `loop` with 1).
+			// failure status); a nested shell is its own `-c` shell, and a
+			// fork of one command reaches what its parent reaches
+			// (`Vproc::fork`). Under `set -e` bash's `report_error` exits at
+			// once with the failure status. zsh exits 1 from any of them
+			// (`errflag` ends `loop` with 1).
 			let command = vp.mode.dialect() != Dialect::Zsh
-				&& super::subshell_depth(vp) == 0
+				&& vp.fork().catches()
+				&& !errexit_on(k, cx, vp)
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -2439,7 +2443,7 @@ pub fn start_sub(
 			let prev = vp.fds.get(1).cloned();
 			if form == ComsubForm::NoFork {
 				vp.fds.set(1, Some(out));
-				frame.redirs.push(vec![Saved { fd: 1, prev }]);
+				frame.redirs.push(vec![Saved { fd: 1, prev }].into());
 			}
 			vp.frames.push(frame);
 			sc.sub = Some(PendingSub::NoFork { capture, value: form == ComsubForm::Value });
@@ -3066,24 +3070,69 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			if let Some(fd) = flush_out(k, vp) {
 				return Flow::Block(WaitKey::Write { fd });
 			}
-			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+			let pc = top_frame(vp).pc;
+			// The own redirections of the command a fork was made for, and of
+			// a `( … )`, are made in the fork without undo; a compound command's
+			// in the shell are undone after it.
+			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
+			let subshell = matches!(
+				unit.ops.get(pc as usize + 1..pc as usize + 3),
+				Some([enter, spawn])
+					if enter.code == Opcode::Enter
+						&& spawn.code == Opcode::Spawn
+						&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
+			);
+			// A bash `( … )`'s own `{var}`s are its fork's: the shell keeps
+			// none (zsh code keeps its own rule).
+			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
+			let owner = redir::Owner::Compound { undo: !forked && !subshell, fork };
+			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
+			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
+				// Past the fork's own redirections, its body runs under bash's
+				// `execute_in_subshell`, which catches its fatal errors.
+				vp.set_fork(super::proc::Fork::CHILD);
+			}
+			match res {
 				Ok(()) => {
 					let saves = match top_frame(vp).scratch.take() {
 						Some(mut sc) => {
-							let saves = sc
-								.io
-								.as_mut()
-								.map_or_default(|io| std::mem::take(&mut io.saved));
+							// The `{var}`s go with the saved fds to the `Spawn`.
+							let saves = sc.io.as_mut().map_or_default(|io| Saves {
+								fds:  std::mem::take(&mut io.saved),
+								vars: io.var_fds.take(),
+							});
 							drop_scratch(&mut k.root, cx.store, vp, sc);
 							saves
 						},
-						None => Vec::new(),
+						None => Saves::default(),
 					};
 					top_frame(vp).redirs.push(saves);
 					Flow::Next
 				},
+				// A fatal expansion error in a `( … )`'s own redirections ends
+				// its fork, which bash makes them in before the subshell's
+				// catcher (`execute_in_subshell`): the subshell fails with the
+				// status the fork exits with (127 from a `-c` string, else 1)
+				// and the shell goes on, with none of its `{var}`s. (zsh code
+				// keeps its own rule.)
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code))) if fork => {
+					redir::forget_var_fds(k, vp, cx);
+					// The message goes to stderr as the redirections so far
+					// left it (`2>/dev/null < ${x:?}` prints none), after a
+					// queued notice, as in the failure path below.
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = code;
+					Flow::Jump(op.b)
+				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
+					// A `( … )`'s own redirections are its fork's: the shell
+					// keeps none of their `{var}`s.
+					if fork {
+						redir::forget_var_fds(k, vp, cx);
+					}
 					// The message goes to stderr as the redirections so far left
 					// it; what would block is written after the restore. No notice
 					// can be pending here: the wait on entry returned with the
@@ -3103,7 +3152,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
-				restore(vp, saves);
+				restore(vp, saves.fds);
 			}
 			Flow::Next
 		},
@@ -3979,6 +4028,36 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
+/// Mark `child`, forked by `vp` to run the job or stage at `entry` (an
+/// async command, a pipeline stage), as bash's fork for it. When the job is
+/// one command (bash's `execute_disk_command` or a compound's own fork:
+/// the entry `Exec` or `Redir` leads straight to the job's end, as
+/// [`bang_stage`]'s `Lone` test reads it) the child gets
+/// [`super::proc::Fork::entry`]: that command's own redirections are made
+/// without undo, and a fatal expansion error in them, or anywhere in a
+/// simple command, reaches what `vp`'s reaches. Any other job (an async
+/// `&&`/`||` list: bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a
+/// compound without redirections of its own catch their own at once.
+pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	// The job's end: its `SubExit`, after a `!`'s `Not`.
+	let ends = |at: u32| match code(at) {
+		Some(Opcode::SubExit) => true,
+		Some(Opcode::Not) => code(at + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
+	let whole = match unit.ops.get(entry as usize) {
+		Some(op) if op.code == Opcode::Exec => ends(entry + 1),
+		Some(op) if op.code == Opcode::Redir => ends(op.b),
+		_ => false,
+	};
+	child.set_fork(if whole {
+		super::proc::Fork::entry(vp.fork())
+	} else {
+		super::proc::Fork::CHILD
+	});
+}
+
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
@@ -4146,7 +4225,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& !vp
 						.frames
 						.iter()
-						.any(|f| f.redirs.iter().flatten().any(|s| s.fd == 0))
+						.any(|f| f.redirs.iter().flat_map(|r| &r.fds).any(|s| s.fd == 0))
 				{
 					let null = k
 						.null_input
@@ -4154,6 +4233,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				if info.kind == SpawnKind::Background {
+					forked_for(&mut child, vp, unit, info.stages[0].entry);
+				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4163,6 +4245,14 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
 				}
+				// The `{var}`s of a subshell's own redirections are its fork's:
+				// the child has them in the snapshot it starts from
+				// (`state::fork_image`), the shell keeps none (below).
+				let fork_vars = if info.kind == SpawnKind::Subshell {
+					top_frame(vp).redirs.last_mut().and_then(|r| r.vars.take())
+				} else {
+					None
+				};
 				children.push(child.vpid);
 				let vpid = child.vpid;
 				k.spawned.push(Box::new(child));
@@ -4187,6 +4277,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					k.emit_op(cx, vp, op.node, EventData::Background { job, pid: vpid });
 					vp.status = 0;
 					return Flow::Jump(info.end);
+				}
+				if let Some(vars) = fork_vars {
+					redir::forget_vars(k, vp, cx, *vars);
 				}
 				k.emit_op(cx, vp, op.node, EventData::Subshell { child: vpid });
 			},
@@ -4229,7 +4322,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
 						vp.fds.set(0, stdin.take());
-						frame.redirs.push(vec![Saved { fd: 0, prev }]);
+						frame.redirs.push(vec![Saved { fd: 0, prev }].into());
 						vp.frames.push(frame);
 						return Flow::Call;
 					}
@@ -4253,6 +4346,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					forked_for(&mut child, vp, unit, stage.entry);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
