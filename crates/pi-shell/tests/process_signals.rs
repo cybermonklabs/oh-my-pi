@@ -802,6 +802,45 @@ fn mask_stage_pids(out: &[u8]) -> Vec<u8> {
 	masked
 }
 
+/// `out` with the pid of each `jobs -l` line (`[N]±`, a space, then the pid
+/// as `%5ld`, `pretty_print_job`) replaced by `PID`, as [`mask_pids`] does
+/// for a notice's: `[1]+ PID Exit 137 …`. The pid's field is checked to be
+/// `%5ld`. A line whose text there starts with no digit (`jobs` without
+/// `-l`) is kept as it is.
+fn mask_job_pids(out: &[u8]) -> Vec<u8> {
+	let mut masked = Vec::with_capacity(out.len());
+	for line in out.split_inclusive(|&b| b == b'\n') {
+		// After `[N]`, its mark and a space.
+		let at = line
+			.strip_prefix(b"[")
+			.and_then(|rest| rest.iter().position(|&b| b == b']'))
+			.map(|i| i + 4)
+			.filter(|&at| at <= line.len());
+		let Some(at) = at else {
+			masked.extend_from_slice(line);
+			continue;
+		};
+		let spaces = line[at..].iter().take_while(|&&b| b == b' ').count();
+		let digits = line[at + spaces..]
+			.iter()
+			.take_while(|b| b.is_ascii_digit())
+			.count();
+		if digits == 0 {
+			masked.extend_from_slice(line);
+			continue;
+		}
+		assert!(
+			spaces + digits >= 5 && (spaces == 0 || spaces + digits == 5),
+			"the pid is printed as `%5ld`: {:?}",
+			String::from_utf8_lossy(line)
+		);
+		masked.extend_from_slice(&line[..at]);
+		masked.extend_from_slice(b"PID");
+		masked.extend_from_slice(&line[at + spaces + digits..]);
+	}
+	masked
+}
+
 /// Stages of the pipelines of
 /// [`bash_reports_a_pipeline_job_killed_by_a_signal`]
 /// and [`bash_reports_a_foreground_pipeline_killed_by_a_signal`]: a program
@@ -1229,6 +1268,456 @@ fn obash_reports_a_job_its_kill_ended_at_the_next_line_where_bash_reaps_later() 
 		(String::from_utf8_lossy(&want).into_owned(), Some(Exit(0))),
 		"{script:?}"
 	);
+}
+
+/// How bash 5.3 shows a job's end in `jobs`, `jobs -l`, the notice at the
+/// next line and `wait`: as each process of the job ended (`WIFEXITED` or
+/// `WIFSIGNALED` of its status, `printable_job_status`), never a status
+/// above 128 read as a signal: an exit with 137 is `Exit 137`, a `KILL`
+/// `Killed`. `jobs` shows how the job's last process ended
+/// (`print_pipeline`'s `last`, under `pipefail` too); `jobs -l` prints a
+/// line for each process (`JLIST_LONG`: its pid, how it shows, nothing where
+/// it is as the first one, `| ` and its command; `Running` for each process
+/// of a running job, one `STOP` stopped too, as bash without job control
+/// never learns of stops); `jobs -p` prints the first process's pid (the
+/// job's `pipe->pid`); `wait` of the pid of any process of a job waits for
+/// the job and returns its status (`find_pipeline`, `job_exit_status`).
+/// Each row runs as a `-c` string and as a script file ([`job_end_rows`])
+/// and waits for its job with builtins only (`W`: until `jobs -r` lists no
+/// job, at most 2,000,000 passes, then exit 97; `GOT`: until the first
+/// process wrote its pid). Checked-in goldens measured with bash 5.3.20 in
+/// both forms, on runc and gVisor, as uid 1000 and root, all the same; the
+/// stopped pipeline's row was measured without its `: "$!"` (which waits
+/// for the job's pid before the `STOP`), `GOT` without its bound. bash
+/// 5.2.21 pads each status to 24 columns; in a `-c` string it has forgotten
+/// a job that exited by the line `wait %1` is on (`wait: %1: no such job`,
+/// status 127: the rows of an exit with 137, with 1 and of a pipeline), and
+/// in both forms one `TERM` ended. The rows of a job killed before its
+/// stages started (`KILLED`) count the different pids of its notice and of
+/// its `jobs -l` with `awk`; they were not measured as written: the notice
+/// is the one measured for the same job in
+/// [`bash_reports_a_pipeline_job_killed_by_a_signal`].
+#[test]
+fn bash_shows_how_each_job_ended() {
+	use stage::{E0, E3, T};
+	const W: &str = "n=0; while jobs -r >\"$F\"; [ -s \"$F\" ]; do n=$((n + 1)); [ $n -lt 2000000 \
+	                 ] || exit 97; done";
+	const GOT: &str = "n=0; until [ -s \"$F.first\" ]; do n=$((n + 1)); [ $n -lt 2000000 ] || exit \
+	                   97; done; read f < \"$F.first\"";
+	// A first stage that writes its pid into `$F.first`, then runs the rest.
+	const FIRST: &str = "/bin/sh -c 'echo $$ > \"$F.first\"; ";
+	const P: &str = "jobs -p >\"$F.p\"; read p < \"$F.p\"";
+	const WHICH: &str =
+		"[ \"$p\" = \"$f\" ] && echo first || { [ \"$p\" = \"$!\" ] && echo last || echo other; }";
+	const STOP: &str = ": \"$!\"; kill -STOP %1; /bin/sleep 0.3";
+	const E1: &str = "/bin/sh -c 'exit 1'";
+	const E137: &str = "/bin/sh -c 'exit 137'";
+	const K9: &str = "/bin/sh -c 'kill -9 $$'";
+	const R137: &str = "/bin/sh -c 'read x; exit 137'";
+	const PIPE: &str = "/bin/sleep 3 | /bin/sleep 3 &";
+	// A pipeline job this shell's `kill` ended before its vproc started the
+	// stages, and the number of different pids in the notice `wait` wrote
+	// into `$F.e` (the first line's fourth field, each other line's first)
+	// and in the `jobs -l` lines in `$F.l` (the first line's second field).
+	const KILLED: &str = "/bin/sleep 5 | /bin/sleep 6 & kill -KILL %1";
+	const PIDS_E: &str =
+		"awk '{ p = NR == 1 ? $4 : $1; if (!(p in s)) n++; s[p] } END { print n + 0 }' \"$F.e\"";
+	const PIDS_L: &str =
+		"awk '{ p = NR == 1 ? $2 : $1; if (!(p in s)) n++; s[p] } END { print n + 0 }' \"$F.l\"";
+	let killed = desc(libc::SIGKILL);
+	let killed = killed.as_str();
+	let terminated = desc(libc::SIGTERM);
+	// `jobs`' line of job 1; `jobs -l`'s, its pid masked ([`mask_job_pids`]);
+	// that of each further process with no status, where it is as the first
+	// ([`mask_stage_pids`]).
+	let line = |status: &str, text: &str| format!("[1]+  {status:<27}{text}\n");
+	let long = |status: &str, text: &str| format!("[1]+ PID {status:<27}{text}\n");
+	let next = |text: &str| format!("     PID {:<25}| {text}\n", "");
+	let running =
+		[long("Running", "/bin/sleep 3"), next("/bin/sleep 3 &"), line("Running", PIPE)].concat();
+	// The first process writes its pid; the last ends with 5.
+	let stages = format!("{FIRST}exit 3' | /bin/sh -c 'exit 5' & {GOT}");
+	let none = String::new;
+	let rows: Vec<(String, String, String)> = vec![
+		// An external that exits with 137 or 1, or that `KILL` or `TERM` ends.
+		(format!("{E137} & {W}; jobs; echo st=$?"), line("Exit 137", E137) + "st=0\n", none()),
+		(format!("{E137} & {W}; jobs -l"), long("Exit 137", E137), none()),
+		(format!("{E137} & {W}\n:\nwait %1; echo st=$?"), "st=137\n".into(), none()),
+		(format!("{E1} & {W}; jobs; jobs -l"), line("Exit 1", E1), none()),
+		(format!("{E1} & {W}\n:\nwait %1; echo st=$?"), "st=1\n".into(), none()),
+		(format!("{K9} & {W}; jobs; jobs -l"), line(killed, K9), none()),
+		(
+			format!("{K9} & {W}\n:\nwait %1; echo st=$?"),
+			"st=127\n".into(),
+			format!("NAME: line 2: PID {killed:<27}{K9}\nNAME: line 3: wait: %1: no such job\n"),
+		),
+		(format!("{T} & {W}; jobs; jobs -l"), line(terminated.as_str(), T), none()),
+		(format!("{T} & {W}\n:\nwait %1; echo st=$?"), "st=143\n".into(), none()),
+		// A pipeline: how its last process ended, under `pipefail` too.
+		(
+			format!("echo a | {R137} & {W}; jobs; jobs -l"),
+			line("Exit 137", &format!("echo a | {R137}")),
+			none(),
+		),
+		(format!("echo a | {R137} & {W}\n:\nwait %1; echo st=$?"), "st=137\n".into(), none()),
+		(format!("{K9} | {E0} & {W}; jobs; jobs -l"), line("Done", &format!("{K9} | {E0}")), none()),
+		(
+			format!("set -o pipefail; {K9} | {E0} & {W}; jobs; jobs -l\n:\nwait %1; echo st=$?"),
+			line("Done", &format!("{K9} | {E0}")) + "st=127\n",
+			"NAME: line 3: wait: %1: no such job\n".into(),
+		),
+		// Two processes that ended the same way; posix mode; the directory.
+		(format!("{E3} | {E3} & {W}; jobs -l"), long("Exit 3", E3) + &next(E3), none()),
+		(
+			format!("set -o posix; {E3} & {W}; jobs; {E137} & {W}; jobs; jobs -l"),
+			line("Done(3)", E3) + &line("Done(137)", E137),
+			none(),
+		),
+		(
+			format!("cd /; {E3} | {E137} & cd /tmp; {W}; jobs; jobs -l"),
+			line("Exit 137", &format!("{E3} | {E137}  (wd: /)")),
+			none(),
+		),
+		// A running pipeline, one `STOP` stopped, and one of groups.
+		(format!("{PIPE} jobs -l; jobs; kill %1; wait"), running.clone(), none()),
+		(format!("{PIPE} {STOP}; jobs -l; jobs; kill -CONT %1; kill %1; wait"), running, none()),
+		(
+			"{ /bin/sleep 3; } | { /bin/sleep 3; } & jobs -l; kill %1; wait".into(),
+			long("Running", "{ /bin/sleep 3; }") + &next("{ /bin/sleep 3; } &"),
+			none(),
+		),
+		// `wait` keeps the job `$!` names; a group's job.
+		(
+			format!("{E137} & {W}; wait; echo st=$?; jobs"),
+			"st=0\n".to_owned() + &line("Exit 137", E137),
+			none(),
+		),
+		(
+			format!("{K9} & {W}; wait; echo st=$?; jobs"),
+			"st=0\n".to_owned() + &line(killed, K9),
+			none(),
+		),
+		(format!("{{ exit 137; }} & {W}; jobs; jobs -l"), line("Exit 137", "{ exit 137; }"), none()),
+		(
+			format!("{{ kill -9 $BASHPID; }} & {W}; jobs; jobs -l"),
+			line(killed, "{ kill -9 $BASHPID; }"),
+			none(),
+		),
+		// `jobs -p` names the first process; `wait` of its pid, the job.
+		(
+			format!("{FIRST}exec /bin/sleep 3' | /bin/sleep 3 & {GOT}; {P}; {WHICH}; kill %1; wait"),
+			"first\n".into(),
+			none(),
+		),
+		(
+			format!("{stages}; wait $f; echo st=$?; wait $!; echo st2=$?"),
+			"st=5\nst2=5\n".into(),
+			none(),
+		),
+		(
+			format!("{stages}; {W}; wait $f; echo st=$?; wait $!; echo st2=$?"),
+			"st=5\nst2=5\n".into(),
+			none(),
+		),
+		// Each process of a job killed before its stages started has a pid of
+		// its own (bash forks each as it starts the job): in the notice and in
+		// `jobs -l`. Standard error goes to a file or nowhere: bash writes the
+		// notice from `wait`, or at the next line it reads when it reaped the
+		// job before, and one `jobs -l` listed before bash reaped it later.
+		(format!("exec 2>\"$F.e\"; {KILLED}; wait\n:\n{PIDS_E}"), "2\n".into(), none()),
+		(
+			format!("exec 2>/dev/null; {KILLED}; jobs -l >\"$F.l\"; {PIDS_L}; wait"),
+			"2\n".into(),
+			none(),
+		),
+	];
+	let mut wrong = Vec::new();
+	job_end_rows(&rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Each `(script, stdout, stderr)` of `rows`, run by bash as a `-c` string
+/// and as a script file (`bash FILE`), each run in a directory of its own
+/// where `$F` names a scratch file and in a process group of its own (a
+/// stopped process of a row is then never in an orphaned group: gVisor
+/// sends `HUP` to such a group, the test's too, whenever one of its
+/// processes ends): what obash printed on each stream, its pids masked
+/// ([`mask_pids`], [`mask_job_pids`], [`mask_stage_pids`]) and each
+/// diagnostic's name (`bash`, or the file) as `NAME` ([`mask_names`]), and
+/// how it ended, against the checked-in golden and a clean exit. A wrong row
+/// goes into `wrong`, and so does a shell still running after
+/// [`EVENT_LIMIT`]. With a live bash 5.3 or later ([`real_bash_golden`]) its
+/// output, masked so and with the current and previous job marks blanked
+/// ([`unmark_jobs`]), must equal obash's, blanked so.
+fn job_end_rows(rows: &[(String, String, String)], wrong: &mut Vec<String>) {
+	let mask = |b: &[u8]| {
+		let masked = mask_names(&mask_stage_pids(&mask_job_pids(&mask_pids(b))));
+		String::from_utf8_lossy(&masked).into_owned()
+	};
+	let masked = |o: Outcome| (mask(&o.stdout), mask(&o.stderr), o.end());
+	let run = |program: &OsStr, file: bool, script: &str| {
+		let dir = tempfile::tempdir().expect("a directory for the row");
+		let cmd = if file {
+			let path = dir.path().join("s.sh");
+			fs::write(&path, format!("{script}\n")).expect("write the script");
+			Run::new(program, "bash", &[&path])
+		} else {
+			Run::script(program, "bash", script)
+		};
+		let spawned = cmd.env("F", dir.path().join("f")).own_group().spawn();
+		let ended = spawned.ended_within(EVENT_LIMIT);
+		ended.map(masked).map_err(masked)
+	};
+	let bash = real_bash_golden();
+	for (script, stdout, stderr) in rows {
+		for file in [false, true] {
+			let form = if file { "file" } else { "-c" };
+			let ours = match run(OsStr::new(env!("CARGO_BIN_EXE_obash")), file, script) {
+				Ok(ours) => ours,
+				Err(killed) => {
+					wrong.push(format!(
+						"{form} {script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"
+					));
+					continue;
+				},
+			};
+			if (&ours.0, &ours.1, ours.2) != (stdout, stderr, Some(Exit(0))) {
+				let want = (stdout, stderr);
+				wrong.push(format!("{form} {script:?}\n  got:  {ours:?}\n  want: {want:?}"));
+			}
+			if let Some(bash) = &bash {
+				let theirs = run(bash.as_os_str(), file, script).unwrap_or_else(|killed| {
+					panic!("{form} {script:?}: bash still ran after {EVENT_LIMIT:?}: {killed:?}")
+				});
+				let unmarked = |o: &(String, String, _)| (unmark_jobs(&o.0), unmark_jobs(&o.1), o.2);
+				assert_eq!(unmarked(&ours), unmarked(&theirs), "{form} {script:?}");
+			}
+		}
+	}
+}
+
+/// `out` with the current or previous job's mark of each job line (`[N]+`,
+/// `[N]-`) as a blank (`[N] `). bash 5.3.20 on gVisor listed some finished
+/// jobs without their `+` (`[1]   Exit 137`), in other rows on each run;
+/// on runc, and in the goldens, they have it. Only for comparing obash with
+/// a live bash.
+fn unmark_jobs(out: &str) -> String {
+	out.split_inclusive('\n')
+		.map(|line| {
+			let at = line.strip_prefix('[').and_then(|rest| {
+				let close = rest.find(']')?;
+				rest[..close]
+					.bytes()
+					.all(|b| b.is_ascii_digit())
+					.then_some(close + 2)
+			});
+			match at {
+				Some(at) if matches!(line.as_bytes().get(at), Some(b'+' | b'-')) => {
+					format!("{} {}", &line[..at], &line[at + 1..])
+				},
+				_ => line.to_owned(),
+			}
+		})
+		.collect()
+}
+
+/// An interactive bash reports its foreground job that a signal killed, a
+/// command, a pipeline or the job `fg` resumed (`notify_of_job_status` for
+/// a foreground job): after `INT` a newline before its next prompt; after
+/// another signal but `PIPE`, `print_pipeline` with `JLIST_STANDARD`: how
+/// its last process ended (`j_strsignal`) padded to 27 columns, then its
+/// command (the job's, without ` &`; a pipeline's processes' joined by
+/// ` | `), with `(core dumped) ` before it where the process dumped a core,
+/// which no row here does. A job that exits with 130 died of no signal and
+/// gets nothing (bash reads how the job ended, `WIFSIGNALED`, not its
+/// status). The job `fg` resumes loops until the file `$F` exists, which
+/// the test makes once the screen shows `fg`'s line of the job's command;
+/// the rows from the command's line to the next prompt are compared, on a
+/// screen wide enough that no row wraps. The `fg` rows of an exit with 130
+/// and of `INT` were recorded by hand with bash 5.3.20 and 5.2.21, the
+/// same, and the `fg` row of `KILL` with bash 5.3.20 in a builds Job; the
+/// others follow bash 5.3's `jobs.c`. All are compared live with a bash 5.3
+/// or later ([`real_bash_golden`]).
+#[test]
+fn an_interactive_bash_reports_a_foreground_job_a_signal_killed() -> io::Result<()> {
+	let killed = desc(libc::SIGKILL);
+	let terminated = desc(libc::SIGTERM);
+	// How the job `fg` resumes ends, or a command run in the foreground
+	// (`fg` false), and the row bash writes for it, if any: a pipeline's is
+	// how its last process ended.
+	let cases = [
+		("exit 130", true, None),
+		("kill -INT $$", true, Some("")),
+		("kill -KILL $$", true, Some(killed.as_str())),
+		("kill -TERM $$", true, Some(terminated.as_str())),
+		("/bin/sh -c 'kill -KILL $$'", false, Some(killed.as_str())),
+		("/bin/sh -c 'kill -TERM $$'", false, Some(terminated.as_str())),
+		("/bin/sh -c 'exit 0' | /bin/sh -c 'kill -KILL $$'", false, Some(killed.as_str())),
+	];
+	for (end, fg, shown) in cases {
+		let ours = Spawn::obash_as("bash");
+		let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+		let shells =
+			std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+		for (who, spawn) in shells {
+			let dir = tempfile::tempdir()?;
+			let file = dir.path().join("F");
+			let mut shell = spawn
+				.size(50, 200)
+				.args(["--norc", "--noprofile", "-i"])
+				.env("F", &file)
+				.env("PS1", "P$ ")
+				.spawn()?;
+			// The rows a prompt starts.
+			let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 1)?;
+			let (typed, job) = if fg {
+				let job = format!("/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; {end}'");
+				shell.write(format!("{job} &\r"))?;
+				shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+				shell.write("fg\r")?;
+				shell.wait_screen(TIMEOUT, |s| s.contents().ends_with(&job))?;
+				fs::write(&file, "")?;
+				(String::from("P$ fg"), Some(job))
+			} else {
+				shell.write(format!("{end}\r"))?;
+				(format!("P$ {end}"), None)
+			};
+			let after = if fg { 3 } else { 2 };
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == after)?;
+			let screen = shell.screen().contents();
+			let rows: Vec<&str> = screen
+				.lines()
+				.skip_while(|row| *row != typed)
+				.skip(1)
+				.collect();
+			// No row, a blank row (`INT`), or the description and the command.
+			let cmd = job.as_deref().unwrap_or(end);
+			let line = shown.map(|desc| {
+				if desc.is_empty() {
+					String::new()
+				} else {
+					format!("{desc:<27}{cmd}")
+				}
+			});
+			let want: Vec<&str> = job
+				.as_deref()
+				.into_iter()
+				.chain(line.as_deref())
+				.chain(["P$"])
+				.collect();
+			assert_eq!(rows, want, "{who}: {end}, fg {fg}: {:?}", shell.output());
+		}
+	}
+	Ok(())
+}
+
+/// With job control (an interactive bash), `jobs -l` shows each process of
+/// a pipeline job as it is (`print_pipeline` with `JLIST_LONG`; `waitchld`
+/// waits with `WUNTRACED` and `WCONTINUED`): once `kill -STOP` stopped its
+/// first process by its pid (`jobs -p`), the job still runs, and so does
+/// each line (`Running`; the second line shows it, as its state is not the
+/// first's); once its last process stopped too, no process runs and the job
+/// is stopped (`set_job_status_and_cleanup`): the first line shows the
+/// signal's description and the second, stopped by it too, nothing; `kill
+/// -CONT %1` runs the job again (`set_job_running`) and `kill -STOP %1`
+/// stops the whole of it. Each `jobs -l` goes into a file, its pids masked
+/// ([`mask_job_pids`], [`mask_stage_pids`]). The goldens follow bash 5.3's
+/// `jobs.c`, not measured; compared live with a bash 5.3 or later
+/// ([`real_bash_golden`]).
+#[test]
+fn an_interactive_jobs_l_shows_each_process_of_a_job_as_it_is() -> io::Result<()> {
+	let stopped = desc(libc::SIGSTOP);
+	let first = |status: &str| format!("[1]+ PID {status:<27}/bin/sleep 30\n");
+	// No status where the process is as the first one.
+	let second = |status: &str, tail: &str| {
+		let w = if status.is_empty() { 25 } else { 27 };
+		format!("     PID {status:<w$}| /bin/sleep 30{tail}\n")
+	};
+	let steps = [
+		("kill -STOP $f", first("Running") + &second("Running", " &")),
+		("kill -STOP $!", first(stopped.as_str()) + &second("", "")),
+		("kill -CONT %1", first("Running") + &second("", " &")),
+		("kill -STOP %1", first(stopped.as_str()) + &second("", "")),
+	];
+	let ours = Spawn::obash_as("bash");
+	let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+	let shells = std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+	for (who, spawn) in shells {
+		let dir = tempfile::tempdir()?;
+		let mut shell = spawn
+			.size(50, 120)
+			.args(["--norc", "--noprofile", "-i"])
+			.env("F", dir.path().join("F"))
+			.env("PS1", "P$ ")
+			.spawn()?;
+		let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+		let mut at = 1;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == at)?;
+		let mut run = |shell: &mut pty_support::Pty, line: &str| -> io::Result<()> {
+			at += 1;
+			shell.write(format!("{line}\r"))?;
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == at)
+		};
+		run(&mut shell, "/bin/sleep 30 | /bin/sleep 30 &")?;
+		run(&mut shell, "jobs -p >\"$F.p\"; read f <\"$F.p\"")?;
+		let mut lists = Vec::new();
+		for (i, (kill, _)) in steps.iter().enumerate() {
+			run(&mut shell, &format!("{kill}; /bin/sleep 0.5; jobs -l >\"$F.{i}\""))?;
+			let list = fs::read(dir.path().join(format!("F.{i}")))?;
+			lists.push(String::from_utf8_lossy(&mask_stage_pids(&mask_job_pids(&list))).into_owned());
+		}
+		run(&mut shell, "kill -KILL %1")?;
+		let want: Vec<&str> = steps.iter().map(|(_, want)| want.as_str()).collect();
+		assert_eq!(lists, want, "{who}: {:?}", shell.output());
+	}
+	Ok(())
+}
+
+/// A stop the terminal sends (`TSTP` to the foreground job's process group,
+/// as `^Z` does) stops each process of a pipeline job that `fg` resumed,
+/// a stage obash runs itself (`read x`, a builtin) too, as bash's process
+/// for it stops with the group; `bg` runs each of them again
+/// (`set_job_running`): `jobs -l` then shows the job running and its second
+/// process as its first (nothing). Its pids masked ([`mask_job_pids`],
+/// [`mask_stage_pids`]). The golden follows bash 5.3's `jobs.c`; bash
+/// 5.3.20 printed it on runc in a builds Job, and it is compared live with
+/// a bash 5.3 or later ([`real_bash_golden`]). The test sends the `TSTP` to
+/// the job's group itself once `fg` printed the job
+/// ([`pty_support::Pty::signal_job`]): gVisor does not tell the terminal's
+/// foreground group.
+#[test]
+fn an_interactive_bg_runs_each_process_of_a_stopped_job_again() -> io::Result<()> {
+	let want = format!("[1]+ PID {:<27}/bin/sleep 30\n     PID {:<25}| read x &\n", "Running", "");
+	let ours = Spawn::obash_as("bash");
+	let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+	let shells = std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+	for (who, spawn) in shells {
+		let dir = tempfile::tempdir()?;
+		let mut shell = spawn
+			.size(50, 120)
+			.args(["--norc", "--noprofile", "-i"])
+			.env("F", dir.path().join("F"))
+			.env("PS1", "P$ ")
+			.spawn()?;
+		let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 1)?;
+		shell.write("/bin/sleep 30 | read x &\r")?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+		shell.write("fg\r")?;
+		shell.wait_screen(TIMEOUT, |s| s.contents().ends_with("/bin/sleep 30 | read x"))?;
+		shell.signal_job(&["sleep"], libc::SIGTSTP, TIMEOUT)?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 3)?;
+		shell.write("bg\r")?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 4)?;
+		shell.write("/bin/sleep 0.5; jobs -l >\"$F\"\r")?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 5)?;
+		let list = fs::read(dir.path().join("F"))?;
+		let list = String::from_utf8_lossy(&mask_stage_pids(&mask_job_pids(&list))).into_owned();
+		shell.write("kill -KILL %1\r")?;
+		assert_eq!(list, want, "{who}: {:?}", shell.output());
+	}
+	Ok(())
 }
 
 /// A subshell's notice names it by the pid the shell shows for it

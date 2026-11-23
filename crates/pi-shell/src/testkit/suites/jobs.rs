@@ -189,6 +189,22 @@ fn reported_and_waited_jobs_leave_the_table() {
 	);
 }
 
+/// `jobs -n` shows how a job ended, not its status: one that exited with
+/// 137 as `Exit 137`, one `KILL` ended as `Killed` (bash 5.3.20, `bash -c`;
+/// bash 5.2.21 prints the second as a notice on standard error).
+#[test]
+fn jobs_shows_an_exit_with_137_apart_from_a_kill() {
+	let (out, err, _) =
+		run("set -m; { exit 137; } & (:); jobs -n; { kill -9 $BASHPID; } & (:); jobs -n");
+	let exited = "Exit 137";
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	assert_eq!(
+		out,
+		format!("[1]+  {exited:<27}{{ exit 137; }}\n[1]+  {killed:<27}{{ kill -9 $BASHPID; }}\n")
+	);
+	assert_eq!(err, "");
+}
+
 #[test]
 fn a_process_substitution_sets_the_last_background_pid() {
 	let (out, ..) = run("read x < <(exit 123); wait $!; echo $?");

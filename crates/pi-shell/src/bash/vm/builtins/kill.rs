@@ -167,7 +167,7 @@ pub(super) fn target(
 		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
 		// (the job runs, the current job stays).
 		if send == Send::Signal(Signal::Cont) && matches!(job.state, JobState::Stopped(_)) {
-			job.state = JobState::Running;
+			job.set_running();
 			job.notified = true;
 		}
 		if ends(send) && !has_program(job) {

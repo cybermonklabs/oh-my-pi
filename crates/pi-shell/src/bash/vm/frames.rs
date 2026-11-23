@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use super::{
 	CallOutcome, Cx, Kernel, Shell, host_stdio,
 	proc::{
-		Atom, Awaited, ExecState, Frame, FrameKind, JobState, Live, LoopRec, PendingSub,
-		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Scratch, ScratchIo, ScratchZsh,
-		ScriptKind, Stage, Target, Vproc,
+		Atom, Awaited, ExecState, Frame, FrameKind, Live, LoopRec, PendingSub, PendingWrite, Probe,
+		ProbeResult, RedirProgress, Run, Saved, Scratch, ScratchIo, ScratchZsh, ScriptKind, Stage,
+		Target, Vproc,
 	},
 	state::{self, Overlay, Root, Scope},
 };
@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 37;
+pub const FRAMES_VERSION: u32 = 41;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -100,6 +100,9 @@ struct Image {
 	/// Subshell notices held for a redirection's end
 	/// ([`Kernel::held_notices`]).
 	held:      Vec<(Vpid, u32, BString)>,
+	/// The vpids reserved for the stages of background pipeline jobs
+	/// ([`Kernel::stage_vpids`]).
+	stages:    Vec<(Vpid, Vec<Vpid>)>,
 }
 
 /// One fd object.
@@ -673,6 +676,7 @@ impl Shell {
 			deferrals: k.deferrals.clone(),
 			deaths: k.deaths.clone(),
 			held: k.held_notices.clone(),
+			stages: k.stage_vpids.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -831,6 +835,12 @@ impl Shell {
 			.into_iter()
 			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
+		// A job's vproc that was not restored starts no stages.
+		k.stage_vpids = img
+			.stages
+			.into_iter()
+			.filter(|(job, _)| img.procs.iter().any(|p| p.vpid == *job))
+			.collect();
 		k.held_notices = img
 			.held
 			.into_iter()
@@ -865,10 +875,12 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
-				for (id, facts) in &f.job_facts {
-					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
-						job.set_facts(facts);
-					}
+				// A job the image holds no facts for has none
+				// ([`crate::bash::store::Job::set_facts`]).
+				let platform = engine.config().platform;
+				for job in &mut vp.jobs.list {
+					let facts = f.job_facts.iter().find(|(id, _)| *id == job.id);
+					job.set_facts(facts.map_or(&[][..], |(_, facts)| facts.as_slice()), platform);
 				}
 				vp.last_bg = f.last_bg;
 				vp.getopts = f.getopts;
@@ -1106,8 +1118,9 @@ impl Shell {
 	}
 
 	/// Restored without frames: a child vproc the store lists as running has
-	/// no execution position; it is lost (status 137, its job done, a
-	/// [`Lost::Vproc`] entry). Records of children of vprocs that are gone
+	/// no execution position; it is lost (status 137, its job done as one
+	/// `KILL` ended, [`super::proc::Job::ended`]: `jobs` shows it `Killed`,
+	/// a [`Lost::Vproc`] entry). Records of children of vprocs that are gone
 	/// (subshells' children) are dropped, and so are the root's function
 	/// scopes (the calls they belonged to are gone).
 	fn lose_running(
@@ -1131,8 +1144,7 @@ impl Shell {
 				report.lost.push(Lost::Vproc { vpid });
 				self.k.proc_exited(cx.store, vpid, parent, 137);
 				if let Some(job) = self.procs[0].jobs.by_vpid_mut(vpid) {
-					job.state = JobState::Done(137);
-					job.notified = false;
+					job.ended(137, Some(crate::bash::signal::Signal::Kill));
 				}
 			}
 		}

@@ -41,7 +41,7 @@ use hashbrown::{DefaultHashBuilder, HashTable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bash::{
-	ids::{JobId, ModeId, UnitId, Vpid},
+	ids::{JobId, ModeId, Platform, UnitId, Vpid},
 	signal::Signal,
 	zshopt::{ZshOpt, ZshOpts},
 };
@@ -554,7 +554,8 @@ pub struct Job {
 	pub id:        JobId,
 	/// `%n`.
 	pub number:    u32,
-	/// The job's root vproc (its process group leader for `jobs -p`, `$!`).
+	/// The job's root vproc (`$!`; for a job of one process, its process
+	/// group leader for `jobs -p` too).
 	pub vpid:      Vpid,
 	/// The command as bash prints it (`jobs`, `fg`, `bg`).
 	pub text:      BString,
@@ -584,9 +585,12 @@ pub struct Job {
 	pub os_pid:    Option<u32>,
 	/// The signal that ended the job (bash `WIFSIGNALED` of its status,
 	/// `raw_job_exit_status`), set with [`JobState::Done`]: `None` for one
-	/// that exited, with 137 too. A job of one process takes that process's;
-	/// one of [`Self::procs`] that of the process whose end is its status
-	/// ([`JobProcs::status_process`]). Not part of this record's layout,
+	/// that exited, with 137 too. A job of one process takes that process's
+	/// (its vproc's, whatever it ran); one of [`Self::procs`] that of the
+	/// process whose end is its status ([`JobProcs::status_process`]). With
+	/// the status it is how the job ended, which `jobs`, the notices and
+	/// `wait` read: a status alone does not tell an exit with 137 from a
+	/// death by `KILL` ([`JobFact::Exited`]). Not part of this record's layout,
 	/// which a store written before it was kept must still decode: the store
 	/// keeps it in the job's [`Record::JobFacts`] ([`Job::facts`]), the frames
 	/// image next to a subshell's job table.
@@ -595,12 +599,13 @@ pub struct Job {
 	/// The job's processes (bash's job's `PROCESS` list), when it has
 	/// several: the stages of the pipeline that is the job's whole command
 	/// (`a | b &`), which bash forks as it starts the job. Recorded as the
-	/// job starts, each naming the job's vproc until that vproc starts the
-	/// stages; a process it never started ends with it. `None` for a job of
-	/// one process, which is the job's own vproc ([`Self::pid`],
-	/// [`Self::state`], [`Self::signal`]), and for a pipeline whose last
-	/// stage the job's vproc runs itself (`lastpipe`). Boxed: most jobs have
-	/// none. A fact ([`Job::facts`]), as [`Self::signal`] is.
+	/// job starts, each with the vpid its stage's vproc gets when the job's
+	/// vproc starts the stages (reserved then, `Kernel::stage_vpids`); a
+	/// process it never started ends with it. `None` for a job of one
+	/// process, which is the job's own vproc ([`Self::pid`], [`Self::state`],
+	/// [`Self::signal`]), and for a pipeline whose last stage the job's vproc
+	/// runs itself (`lastpipe`). Boxed: most jobs have none. A fact
+	/// ([`Job::facts`]), as [`Self::signal`] is.
 	#[serde(skip)]
 	pub procs:     Option<Box<JobProcs>>,
 	/// This shell's `kill` ended the job with no OS status for obash to reap,
@@ -625,8 +630,10 @@ pub struct Job {
 }
 
 impl Job {
-	/// The pid `jobs -l`/`-p` and the diagnostics show for the job: its
-	/// program's OS pid ([`Job::os_pid`]), else its vproc's virtual pid.
+	/// The pid `$!` and the diagnostics show for the job, and `jobs -l`/`-p`
+	/// for a job of one process (one of [`Self::procs`] shows those of its
+	/// processes): its program's OS pid ([`Job::os_pid`]), else its vproc's
+	/// virtual pid.
 	pub const fn pid(&self) -> u32 {
 		match self.os_pid {
 			Some(pid) => pid,
@@ -639,6 +646,70 @@ impl Job {
 		self.vpid.0 == pid || matches!(self.os_pid, Some(os) if os == pid)
 	}
 
+	/// The job ended with `status`, `died_of` that signal (bash's `waitchld`
+	/// for its last process): done and not reported yet, its
+	/// [`Self::signal`] that of its own process, or of the process of its
+	/// [`Self::procs`] whose end is its status. Each of those processes not
+	/// reaped as its own (its vproc ended before it started them, or without
+	/// them) ended with it; returns how many did.
+	pub fn ended(&mut self, status: i32, died_of: Option<Signal>) -> u32 {
+		self.state = JobState::Done(status);
+		self.notified = false;
+		let mut with_it = 0;
+		self.signal = match self.procs.as_deref_mut() {
+			None => died_of,
+			Some(procs) => {
+				for p in &mut procs.list {
+					if matches!(p.state, ProcState::Running | ProcState::Stopped(_)) {
+						p.state = ProcState::ended(status, died_of);
+						with_it += 1;
+					}
+				}
+				procs.signal()
+			},
+		};
+		with_it
+	}
+
+	/// Process `vpid` of the job's [`Self::procs`] stopped (`Some` of the
+	/// signal) or continued (`None`), and the job's state follows from its
+	/// processes as bash's `waitchld` sets it ([`JobProcs::job_state`]): the
+	/// job stops once none of its processes runs, and runs again once one
+	/// does. Nothing changes for a job that ended or has no such process.
+	pub fn process_changed(&mut self, vpid: Vpid, stop: Option<Signal>) {
+		let Some(procs) = self.procs.as_deref_mut() else {
+			return;
+		};
+		if matches!(self.state, JobState::Done(_)) {
+			return;
+		}
+		let Some(p) = procs.get_mut(vpid) else {
+			return;
+		};
+		p.state = match (p.state, stop) {
+			(ProcState::Running | ProcState::Stopped(_), Some(sig)) => ProcState::Stopped(sig),
+			(ProcState::Stopped(_), None) => ProcState::Running,
+			(state, _) => state,
+		};
+		if let Some(state) = procs.job_state() {
+			self.state = state;
+		}
+	}
+
+	/// The job runs again (bash `set_job_running`, which `bg`, `fg` and a
+	/// `kill -CONT` of a stopped job do): it and each of its processes
+	/// ([`Self::procs`]) that has not ended.
+	pub fn set_running(&mut self) {
+		self.state = JobState::Running;
+		if let Some(procs) = self.procs.as_deref_mut() {
+			for p in &mut procs.list {
+				if matches!(p.state, ProcState::Stopped(_)) {
+					p.state = ProcState::Running;
+				}
+			}
+		}
+	}
+
 	/// What the job holds outside its record's layout ([`JobFact`]), in
 	/// order; empty for most jobs.
 	pub fn facts(&self) -> Vec<JobFact> {
@@ -649,13 +720,22 @@ impl Job {
 		if let Some(procs) = &self.procs {
 			facts.push(JobFact::Procs((**procs).clone()));
 		}
+		if self.exited_above_128() {
+			facts.push(JobFact::Exited);
+		}
 		facts
+	}
+
+	/// The job exited with a status above 128, and no signal ended it
+	/// ([`JobFact::Exited`]), as [`Self::ended`] left it.
+	const fn exited_above_128(&self) -> bool {
+		self.signal.is_none() && matches!(self.state, JobState::Done(status) if status > 128)
 	}
 
 	/// Whether the job has any facts ([`Job::facts`]). A job's facts never
 	/// go: a job that had some has some.
 	pub const fn has_facts(&self) -> bool {
-		self.signal.is_some() || self.procs.is_some()
+		self.signal.is_some() || self.procs.is_some() || self.exited_above_128()
 	}
 
 	/// Whether `have` are this job's facts ([`Job::facts`]), compared in
@@ -669,18 +749,41 @@ impl Job {
 				.procs
 				.as_deref()
 				.is_none_or(|procs| matches!(have.next(), Some(JobFact::Procs(p)) if p == procs))
+			&& (!self.exited_above_128() || have.next() == Some(&JobFact::Exited))
 			&& have.next().is_none()
 	}
 
-	/// Take `facts` ([`Job::facts`]) back; what they do not name is unset.
-	pub fn set_facts(&mut self, facts: &[JobFact]) {
+	/// Take `facts` ([`Job::facts`]) back; what they do not name is unset. A
+	/// finished job with a status above 128 whose facts name neither the
+	/// signal that ended it nor [`JobFact::Exited`] comes from a store
+	/// written before the job's signal was kept, whose `jobs` read such a
+	/// status as a death by the signal 128 + n: it reads so here too (by
+	/// `platform`'s numbers), or as its processes say when it has them
+	/// ([`JobProcs::signal`]).
+	pub fn set_facts(&mut self, facts: &[JobFact], platform: Platform) {
 		self.signal = None;
 		self.procs = None;
+		let mut exited = false;
 		for fact in facts {
 			match fact {
 				JobFact::Signal(sig) => self.signal = Some(*sig),
 				JobFact::Procs(procs) => self.procs = Some(Box::new(procs.clone())),
+				JobFact::Exited => exited = true,
 			}
+		}
+		if let JobState::Done(status) = self.state
+			&& status > 128
+			&& self.signal.is_none()
+			&& !exited
+		{
+			self.signal = self.procs.as_deref().map_or_else(
+				|| {
+					u8::try_from(status - 128)
+						.ok()
+						.and_then(|n| Signal::from_number(n, platform))
+				},
+				JobProcs::signal,
+			);
 		}
 	}
 
@@ -751,6 +854,12 @@ pub enum JobFact {
 	Signal(Signal),
 	/// [`Job::procs`].
 	Procs(JobProcs),
+	/// The job exited with a status above 128 ([`JobState::Done`]), and no
+	/// signal ended it ([`Job::signal`] unset): an exit with 137 is no death
+	/// by `KILL`. Kept so that a job with neither this nor
+	/// [`Self::Signal`] is known to come from a store written before
+	/// [`Job::signal`] was kept ([`Job::set_facts`]).
+	Exited,
 }
 
 /// The processes of a job that has several (bash's job's `PROCESS` list).
@@ -785,6 +894,21 @@ impl JobProcs {
 		self.status_process().and_then(|p| p.state.signal())
 	}
 
+	/// The state of a job of these processes that has not ended (bash
+	/// `set_job_status_and_cleanup`, from its processes): running while one
+	/// of them runs, else stopped by the signal that stopped the last of them
+	/// that is stopped. `None` once all ended (the job's own end sets its
+	/// state).
+	pub fn job_state(&self) -> Option<JobState> {
+		if self.list.iter().any(|p| p.state == ProcState::Running) {
+			return Some(JobState::Running);
+		}
+		self.list.iter().rev().find_map(|p| match p.state {
+			ProcState::Stopped(sig) => Some(JobState::Stopped(sig)),
+			_ => None,
+		})
+	}
+
 	/// The process of vproc `vpid`.
 	pub fn get_mut(&mut self, vpid: Vpid) -> Option<&mut JobProc> {
 		self.list.iter_mut().find(|p| p.vpid == vpid)
@@ -803,7 +927,7 @@ pub struct JobProc {
 	/// Its command as bash prints it (bash's `p->command`); a pipeline the
 	/// shell waits for fills it only for a notice.
 	pub text:   BString,
-	/// Running, or how it ended.
+	/// Running, stopped, or how it ended.
 	pub state:  ProcState,
 }
 
@@ -827,12 +951,16 @@ impl JobProc {
 /// and `status`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcState {
-	/// Not reaped yet.
+	/// Not reaped yet, and not stopped.
 	Running,
 	/// It exited with this status (bash `WIFEXITED`), 137 too.
 	Exited(i32),
 	/// A signal ended it (bash `WIFSIGNALED`).
 	Killed(Signal),
+	/// This signal stopped it (bash `WIFSTOPPED`, `PS_STOPPED`), with job
+	/// control: without it bash never learns of a stop. A new variant at the
+	/// end: an older [`JobFact::Procs`] has none.
+	Stopped(Signal),
 }
 
 impl ProcState {
@@ -846,7 +974,7 @@ impl ProcState {
 	pub const fn signal(self) -> Option<Signal> {
 		match self {
 			Self::Killed(sig) => Some(sig),
-			Self::Running | Self::Exited(_) => None,
+			Self::Running | Self::Exited(_) | Self::Stopped(_) => None,
 		}
 	}
 
@@ -854,7 +982,7 @@ impl ProcState {
 	/// `EXECUTION_SUCCESS`).
 	pub const fn failed(self) -> bool {
 		match self {
-			Self::Running | Self::Exited(0) => false,
+			Self::Running | Self::Stopped(_) | Self::Exited(0) => false,
 			Self::Exited(_) | Self::Killed(_) => true,
 		}
 	}

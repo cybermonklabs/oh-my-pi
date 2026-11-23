@@ -493,7 +493,7 @@ pub const BGP_MAX: usize = 32_768;
 pub struct SavedStatus {
 	/// The child vproc.
 	pub vpid:   Vpid,
-	/// The pid `$!` and `jobs -p` showed for it ([`Job::pid`]).
+	/// The pid `$!` showed for it ([`Job::pid`]).
 	pub pid:    u32,
 	/// How it ended (128 plus the signal's number for one a signal killed).
 	pub status: i32,
@@ -585,6 +585,16 @@ impl JobTable {
 	/// ([`Job::os_pid`]).
 	pub fn by_pid(&self, pid: u32) -> Option<&Job> {
 		self.list.iter().find(|j| j.named_by(pid))
+	}
+
+	/// The job one of whose processes ([`Job::procs`]) `pid` names: its
+	/// program's OS pid or its vproc's virtual pid ([`JobProc::pid`]).
+	pub fn by_process_pid(&self, pid: u32) -> Option<&Job> {
+		self.list.iter().find(|j| {
+			j.procs
+				.as_deref()
+				.is_some_and(|procs| procs.list.iter().any(|p| p.pid() == pid))
+		})
 	}
 
 	/// Add a background job (bash `stop_pipeline` for an async list): it

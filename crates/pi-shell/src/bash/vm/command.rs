@@ -4681,18 +4681,21 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				super::exec::spend_exit_trap(vp);
 			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
-				let text = vp
-					.frames
-					.last()
-					.and_then(|f| f.unit.as_ref())
-					.and_then(|u| {
-						let n = u.nodes.get(op.node as usize)?;
-						u.source
-							.get(n.lo as usize..n.hi as usize)
-							.map(<[u8]>::to_vec)
-					})
-					.unwrap_or_default();
-				super::jobctl::fg_done(k, cx, vp, killed, &text);
+				// bash prints the command as it prints a job's (`p->command`,
+				// [`super::exec::job_text`]); zsh its source text.
+				let unit = vp.frames.last().and_then(|f| f.unit.clone());
+				let text = match unit {
+					Some(u) if vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+						super::exec::job_text(k, cx, vp, &u, op.node)
+					},
+					Some(u) => u
+						.nodes
+						.get(op.node as usize)
+						.and_then(|n| u.source.get(n.lo as usize..n.hi as usize))
+						.map_or_else(BString::default, BString::from),
+					None => BString::default(),
+				};
+				super::jobctl::fg_done(k, cx, vp, killed, &text, None);
 			}
 			let in_place = st(vp).in_place;
 			if let (Some(sig), false) = (killed, replacing) {

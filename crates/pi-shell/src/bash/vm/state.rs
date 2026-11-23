@@ -3257,17 +3257,22 @@ pub fn load_root(
 		}
 		bg
 	});
+	// A job without a facts record has none ([`Job::set_facts`]: one from a
+	// store written before they were kept reads as its status says).
+	let platform = root.platform();
 	let mut list = Vec::new();
 	store.scan(Table::Job, &mut |_, rec| {
 		if let Record::Job(job) = rec {
-			list.push(job.clone());
+			let mut job = job.clone();
+			job.set_facts(&[], platform);
+			list.push(job);
 		}
 	})?;
 	store.scan(Table::JobFacts, &mut |key, rec| {
 		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
 			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
 		{
-			job.set_facts(facts);
+			job.set_facts(facts, platform);
 		}
 	})?;
 	list.sort_by_key(|j| j.number);
