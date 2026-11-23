@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `$!` of a background job is there at once, as in bash and zsh, when the job runs a builtin whose output waits for the shell (`printf … &`, also as a function's command or a pipeline's last stage), a loop that never ends, a command substitution or a `set -T` DEBUG trap action that waits for the shell, `eval`, `.` or `source` again without end, or (zsh) a redirection whose FIFO open waits: reading `$!`, or `kill`, `wait` or `jobs -p` of it, no longer waits for the job to end. A job that `exec`s its program after builtins, loops, command substitutions or subshells that waited for nothing (`f() { cd /; exec prog; }; f &`) has the program's pid in `$!`, as in bash. A job that runs another program before its `exec`, or reads a pipe, or (read while it waits) runs past a scheduler slice or opens a FIFO in zsh, keeps its own pid, which the `kill` and `wait` builtins accept but `ps`, `/bin/kill` and `/proc` cannot find.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
