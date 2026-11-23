@@ -9,6 +9,7 @@ import {
 	type RpcFrame,
 	RpcLink,
 	type RpcMethod,
+	RpcTimeoutError,
 	registerRpcError,
 	rpcLossy,
 	rpcSync,
@@ -137,6 +138,25 @@ describe("RpcLink", () => {
 		const { link } = await startFixture();
 		expect(await link.call("syncAfterNotify")).toEqual(["first", "second"]);
 		expect(await link.call("syncAdd", 2, 40)).toBe(42);
+	});
+
+	it("fails a sync call at its own deadline and gives the next sync call its own reply, not the late one", async () => {
+		// If this regresses, a worker whose short sync call (a forwarded YAML parse) timed
+		// out on a busy main thread hangs on it instead, or takes main's late answer to it
+		// as the reply to its next sync call (an agent list, a setting, a credential).
+		const { link } = await startFixture();
+		link.handle("stall", ms => {
+			Bun.sleepSync(ms);
+			return -1;
+		});
+		// Awaited, not `expect(…).rejects`, which waits on the promise without delivering
+		// the worker messages this rejection arrives in.
+		const timedOut = await link.call("stallWithin", 20, 300).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(timedOut).toBeInstanceOf(RpcTimeoutError);
+		expect(await link.call("syncAdd", 20, 22)).toBe(42);
 	});
 
 	it("rebuilds registered error classes thrown by the remote handler", async () => {
