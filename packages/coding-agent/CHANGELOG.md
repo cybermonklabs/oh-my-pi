@@ -11,6 +11,11 @@
 
 - The `voice` that RPC `live_start`/`live_connect` (and `RpcClient.liveStart()`/`liveConnect()`, and the Python SDK's `live_start()`, which returns `None`) and extension `startLive` return is optional: with `live.provider: openai` it is absent, since GPT-Live gets no voice from omp, and a `voice` passed in is ignored
 
+### Fixed
+
+- A stop while a live call connects (`/live off`, RPC `abort` or `live_stop`) now cancels the pending session request at once, so the start answers `The live call was stopped while it connected` instead of waiting for the server; and the call ends clean, as an open call's stop does, instead of ending with `Live transport is not connected` (nothing is sent to a call that is not up)
+- ACP clients are no longer offered `/live`, which ACP answers as not available
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

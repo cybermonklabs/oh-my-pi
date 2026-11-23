@@ -208,6 +208,12 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 	 */
 	acpInputHint?: string;
 	/**
+	 * Not offered to ACP clients (`available_commands_update`), though ACP still runs `handle` when the
+	 * command is typed: the command needs what no ACP host has (`/live` drives the host's live call, which
+	 * only RPC mode and the terminal run), so ACP answers it as not available. RPC mode still lists it.
+	 */
+	acpHidden?: boolean;
+	/**
 	 * Text/ACP-mode handler. The same body is invoked from the ACP dispatcher
 	 * and, via the TUI adapter, when no `handleTui` override is provided.
 	 *
