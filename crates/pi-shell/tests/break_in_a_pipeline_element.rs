@@ -303,6 +303,86 @@ const BASH_FORKS: &[(&str, &str)] = &[
 		"source-file-element-level",
 		"d=$(mktemp -d); printf 'echo $BASH_SUBSHELL\\n' > \"$d/s\"; . \"$d/s\" | cat; rm -r \"$d\"",
 	),
+	// A substitution in an element's words is one level down from the
+	// element, not two: the element's raise is for its own command only.
+	("cmdsub-in-element-level", "f() { echo $BASH_SUBSHELL; }; echo \"[$(f)]\" | cat"),
+	("cmdsub-in-last-element-level", "f() { echo $BASH_SUBSHELL; }; : | echo \"[$(f)]\""),
+	("cmdsub-eval-in-element-level", "echo \"[$(eval 'echo $BASH_SUBSHELL')]\" | cat"),
+	("procsub-in-element-level", "f() { echo $BASH_SUBSHELL; }; cat <(f) | cat"),
+	(
+		"cmdsub-in-function-element-level",
+		"f() { echo $BASH_SUBSHELL; }; g() { echo \"$1\"; }; g \"[$(f)]\" | cat",
+	),
+	// An async pipeline (a job of one pipeline) forks each element as an
+	// async command: every element, compound or `( … )` too, is one level
+	// down, with no raise.
+	("bg-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; f | cat & wait"),
+	("bg-pipeline-eval-level", "eval 'echo $BASH_SUBSHELL' | cat & wait"),
+	("bg-pipeline-builtin-level", "echo $BASH_SUBSHELL | cat & wait"),
+	("bg-not-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; ! f | cat & wait"),
+	("bg-pipeline-function-cmdsub-word-level", "f() { echo $BASH_SUBSHELL; }; f $(:) | cat & wait"),
+	("bg-pipeline-group-element-level", "{ echo $BASH_SUBSHELL; } | cat & wait"),
+	("bg-pipeline-subshell-element-level", "( echo $BASH_SUBSHELL ) | cat & wait"),
+	("bg-pipeline-while-element-level", "while :; do echo $BASH_SUBSHELL; break; done | cat & wait"),
+	("bg-pipeline-last-subshell-level", ": | ( echo $BASH_SUBSHELL ) & wait"),
+	("bg-pipeline-last-group-level", ": | { echo $BASH_SUBSHELL; } & wait"),
+	(
+		"bg-pipeline-subshell-redir-cmdsub-level",
+		"( echo $BASH_SUBSHELL ) 2>$(echo /dev/null) | cat & wait",
+	),
+	("bg-pipeline-not-group-element-level", "! { echo $BASH_SUBSHELL; } | cat & wait"),
+	("bg-pipeline-cmdsub-in-element-level", "echo \"[$(echo $BASH_SUBSHELL)]\" | cat & wait"),
+	// Not an async pipeline: a timed one, a group or an and-or job.
+	(
+		"bg-timed-pipeline-function-level",
+		"TIMEFORMAT=; f() { echo $BASH_SUBSHELL; }; time f | cat & wait",
+	),
+	("bg-group-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; { f | cat; } & wait"),
+	("bg-and-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; true && f | cat & wait"),
+	("group-element-function-level", "f() { echo $BASH_SUBSHELL; }; { f; } | cat"),
+	// A fatal error (`${x?}`, `set -u`) in a forked element or async command
+	// of a `-c` string: its own words and a function it runs reach the
+	// shell's command loop (127); a builtin it runs (`eval`), a subshell, a
+	// compound element and a substitution have their own `top_level` (1).
+	("function-element-fatal", "f() { echo ${x?boom}; }; f | cat; echo ps=${PIPESTATUS[*]}"),
+	("function-last-element-fatal", "f() { echo ${x?boom}; }; : | f; echo st=$?"),
+	(
+		"function-element-fatal-cmdsub-word",
+		"f() { echo ${x?boom}; }; f $(:) | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-fatal-set-u",
+		"set -u; f() { echo $nosuch_q; }; f | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-fatal-pipefail",
+		"set -o pipefail; f() { echo ${x?boom}; }; f | cat; echo st=$?",
+	),
+	(
+		"function-element-fatal-nested",
+		"g() { echo ${x?boom}; }; f() { g; }; f | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-fatal-eval-in-function",
+		"f() { eval 'echo ${x?boom}'; }; f | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	(
+		"function-element-fatal-inner-pipeline",
+		"g() { echo ${x?b}; }; f() { g | cat; echo f:${PIPESTATUS[*]}; }; f | cat; echo \
+		 ps=${PIPESTATUS[*]}",
+	),
+	("eval-element-fatal", ": | eval 'echo ${x?boom}'; echo st=$?"),
+	("builtin-element-fatal-word", ": | echo ${x?boom}; echo st=$?"),
+	("subshell-element-fatal", "f() { echo ${x?boom}; }; ( f ) | cat; echo ps=${PIPESTATUS[*]}"),
+	("group-element-fatal", "f() { echo ${x?boom}; }; { f; } | cat; echo ps=${PIPESTATUS[*]}"),
+	("cmdsub-fatal", "f() { echo ${x?boom}; }; x=$(f); echo st=$?"),
+	("bg-function-fatal", "f() { echo ${x?boom}; }; f & wait $!; echo st=$?"),
+	("bg-word-fatal", "echo ${x?boom} & wait $!; echo st=$?"),
+	("bg-eval-fatal", "eval 'echo ${x?boom}' & wait $!; echo st=$?"),
+	(
+		"bg-pipeline-function-fatal",
+		"set -o pipefail; f() { echo ${x?boom}; }; f | cat & wait $!; echo st=$?",
+	),
 ];
 
 /// The fork shapes only zsh runs.
@@ -322,6 +402,28 @@ const ZSH_FORKS: &[(&str, &str)] = &[
 		"zmodload zsh/zpty; zpty z 'break; echo in'; zpty -r z l; [[ $l == *'not in while'* ]] && \
 		 echo msg; [[ $l == in* ]] && echo in; zpty -d z",
 	),
+	// zsh counts every element it forks, a simple command too
+	// (`entersubsh`); the last element runs in the shell; an async
+	// pipeline's elements, compound or `( … )` too, sit at the job's level.
+	("function-element-level", "f() { echo $ZSH_SUBSHELL; }; f | cat"),
+	("builtin-element-level", "echo $ZSH_SUBSHELL | cat"),
+	("eval-element-level", "eval 'echo $ZSH_SUBSHELL' | cat"),
+	("function-middle-element-level", "f() { echo $ZSH_SUBSHELL; }; : | f | cat"),
+	("function-element-level-cmdsub-word", "f() { echo $ZSH_SUBSHELL; }; f $(:) | cat"),
+	("function-last-element-level", "f() { echo $ZSH_SUBSHELL; }; : | f"),
+	("three-elements-level", "echo $ZSH_SUBSHELL | cat | cat"),
+	("cmdsub-in-element-level", "echo \"[$(echo $ZSH_SUBSHELL)]\" | cat"),
+	("element-in-subshell-level", "( echo $ZSH_SUBSHELL | cat )"),
+	("element-in-cmdsub-level", "echo $(echo $ZSH_SUBSHELL | cat)"),
+	("subshell-element-level", "(echo $ZSH_SUBSHELL) | cat"),
+	("group-element-level", "{ echo $ZSH_SUBSHELL; } | cat"),
+	("bg-pipeline-function-level", "f() { echo $ZSH_SUBSHELL; }; f | cat & wait"),
+	("bg-pipeline-last-function-level", "f() { echo $ZSH_SUBSHELL; }; : | f & wait"),
+	("bg-group-pipeline-level", "{ echo $ZSH_SUBSHELL | cat; } & wait"),
+	("bg-pipeline-group-element-level", "{ echo $ZSH_SUBSHELL; } | cat & wait"),
+	("bg-pipeline-subshell-element-level", "( echo $ZSH_SUBSHELL ) | cat & wait"),
+	("bg-pipeline-last-subshell-level", ": | ( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-pipeline-not-group-element-level", "! { echo $ZSH_SUBSHELL; } | cat & wait"),
 ];
 
 /// The fork rows, `fork/x<loops>/<name>`: each shape at top level, in a
