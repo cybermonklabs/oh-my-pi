@@ -1042,4 +1042,68 @@ mod tests {
 			.find(|(w, i)| *w != i.to_be_bytes());
 		assert!(first_wrong.is_none(), "out of order at word {:?}", first_wrong.map(|(_, i)| i));
 	}
+
+	// Failure mode: two tasks read one fed pipe while the pump's write is in
+	// hand and the OS pipe is empty, so both wait on the feed's drain. If the
+	// drain keeps one readiness registration, the second task's replaces the
+	// first's, and when the pump's bytes land in the pipe only the second
+	// task is woken: the first waits until something else wakes it, and
+	// where nothing does (an extra reading on a tokio task of its own beside
+	// the shell), never. Every task that waits on the drain must be woken
+	// once the pipe holds bytes.
+	#[test]
+	fn every_task_waiting_on_a_feed_is_woken_when_its_bytes_come() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let bytes = b"bytes for two readers\n";
+		assert!(matches!(write.poll_write(&mut cx, bytes), Poll::Ready(Ok(n)) if n == bytes.len()));
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(true);
+		let mut key = WaitKey::default();
+		feed.poll(&cx, &mut key);
+		assert_eq!(feed.state.lock().chunk.pending(), bytes, "the pump holds the bytes");
+		assert_eq!(feed.drain.as_ref().expect("a drain").available(), 0, "the OS pipe is empty");
+		// Two readers, each with a waker of its own, each waiting on the feed.
+		let first = Arc::new(Woken::default());
+		let second = Arc::new(Woken::default());
+		let mut buf = [0u8; 64];
+		for reader in [&first, &second] {
+			let waker = Waker::from(Arc::clone(reader));
+			let mut rcx = Context::from_waker(&waker);
+			assert!(
+				read.poll_read(&mut rcx, &mut buf).is_pending(),
+				"the pump's bytes are not in the pipe yet"
+			);
+		}
+		// The pump's write is let go and made: its bytes land in the OS pipe.
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(false);
+		feed.poll(&cx, &mut key);
+		let woke = |w: &Woken| w.0.load(std::sync::atomic::Ordering::SeqCst);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while !(woke(&first) && woke(&second)) && std::time::Instant::now() < deadline {
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			feed.drain.as_ref().expect("a drain").available(),
+			bytes.len(),
+			"the pump's bytes are in the pipe"
+		);
+		assert!(woke(&second), "the second reader was woken within 5 s");
+		assert!(
+			woke(&first),
+			"the first reader was woken within 5 s: its wait was not replaced by the second's"
+		);
+		assert_eq!(read_all(&read, &[&feed], bytes.len()), bytes, "the pump's bytes, once");
+	}
 }
