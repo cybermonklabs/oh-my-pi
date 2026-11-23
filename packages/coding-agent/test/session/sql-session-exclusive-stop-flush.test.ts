@@ -6,17 +6,30 @@
  * case holds its store's release of the claims, so the stop waits there and the process lives on, and reads what
  * `flush()`, `flushSync()` and `close()` reported meanwhile. Two paths of the release reach the stop: the recovery of
  * a queued append's write conflict, once an older build put another session over the file (every SQL backend), and a
- * lease another holder took over, which the database fence finds (the backends whose claim is a lease row). SQLite
- * always; PostgreSQL and MySQL (MySQL 8 or MariaDB) when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a
- * database.
+ * lease another holder took over, which the database fence finds (the backends whose claim is a lease row). The
+ * controls stop a session before it writes anything (a resume another process holds; an idle session whose heartbeat
+ * finds its lease taken over): storage then holds every entry, so flush and close resolve, also when the load owes a
+ * republish (an older build's version, a torn record), and so does `AgentSession.dispose()`; only a turn the seal
+ * drops makes them reject. A stop during a switch keeps the session that stopped. Last, a close after the session was
+ * sealed (a dispose) whose own write the fence refuses reports that write's loss. SQLite always; PostgreSQL and MySQL
+ * (MySQL 8 or MariaDB) when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import {
 	LEASE_BACKENDS,
 	type LeaseDb,
+	LeaseProcess,
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	transcript,
@@ -26,6 +39,8 @@ import {
 const ID = "01a1f700-0000-7000-8000-000000000001";
 /** Timings under which no heartbeat runs during a test: only a write meets the loss. */
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
+/** Timings under which a heartbeat finds a takeover within 200 ms, with no write. */
+const FAST = { expiryMs: 1_000, heartbeatMs: 200 };
 
 function sessionFile(db: LeaseDb): string {
 	return path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
@@ -71,6 +86,16 @@ async function outcome(call: Promise<unknown>): Promise<string> {
 	);
 }
 
+/** How `manager.flushSync()` ended: `"returned"`, or the message it threw. */
+function syncOutcome(manager: SessionManager): string {
+	try {
+		manager.flushSync();
+		return "returned";
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
+	}
+}
+
 /** Open the session at `file` in `storage` as a resume does, claiming it. */
 async function resume(storage: SqlSessionStorage, file: string): Promise<SessionManager> {
 	const manager = await SessionManager.open(file, path.dirname(file), storage, { suppressBreadcrumb: true });
@@ -88,12 +113,7 @@ async function reportsThroughTheStop(manager: SessionManager, hold: { reached: b
 	await until(() => hold.reached, 10_000, { what: "the stop to reach its release of the store's claims" });
 	manager.appendMessage(userTurn("finished during the stop's wait"));
 	const afterStop = await outcome(manager.flush());
-	let sync = "returned";
-	try {
-		manager.flushSync();
-	} catch (err) {
-		sync = err instanceof Error ? err.message : String(err);
-	}
+	const sync = syncOutcome(manager);
 	return { inFlight, afterStop, sync, closed: await outcome(manager.close()) };
 }
 
@@ -174,6 +194,358 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				untouched: true,
 			});
 			releaseNext?.();
+		}, 30_000);
+	});
+}
+
+/** {@link transcript} as an older build wrote it: its header names version 2, which the load migrates. */
+function olderTranscript(id: string, text: string): string {
+	const [header = "", ...rest] = transcript(id, text).split("\n");
+	return [JSON.stringify({ ...JSON.parse(header), version: 2 }), ...rest].join("\n");
+}
+
+/**
+ * What storage holds of the session before another process claims it, each read back whole by the resume. The last
+ * two leave the load owing a republish before its next append (a migration; a record it skips), so the stored bytes
+ * are not the entries' as this build writes them, yet storage holds every entry.
+ */
+const STORED = [
+	{ what: "a current transcript", content: transcript(ID, "stored") },
+	{ what: "an older build's transcript", content: olderTranscript(ID, "stored") },
+	{
+		what: "a transcript whose last record is torn",
+		content: `${transcript(ID, "stored")}{"type":"message","id":"m2"`,
+	},
+];
+
+/** Another omp process with its own store on `db`'s database; a `claim` command makes it hold a session. */
+function anotherProcess(db: LeaseDb): Promise<LeaseProcess> {
+	return LeaseProcess.start(
+		{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+		db.dir.join("holder"),
+	);
+}
+
+/**
+ * Resume the session at `file` in `storage` while another process holds it: the resume's claim is refused, so the
+ * session stops before it writes anything. Returns once the stop reached its release of the store's claims.
+ */
+async function resumeHeldElsewhere(
+	storage: SqlSessionStorage,
+	file: string,
+	hold: { reached: boolean },
+): Promise<SessionManager> {
+	const manager = await resume(storage, file);
+	await until(() => hold.reached, 10_000, { what: "the stop to reach its release of the store's claims" });
+	return manager;
+}
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`OMP_SESSION_EXCLUSIVE=1 stop at a resume another process holds (${adapter})`, () => {
+		for (const { what, content } of STORED) {
+			it(`lets flush, flushSync and close resolve when the stop left every entry stored: ${what}`, async () => {
+				// If this fails, a stop alone rejects: a caller is told entries are unsaved that storage holds.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open({ lease: STILL });
+				const hold = holdClaimRelease(storage);
+				const file = sessionFile(db);
+				await storage.writeText(file, content);
+				await storage.drain();
+				const before = await db.row(file);
+				await using holder = await anotherProcess(db);
+				expect((await holder.run({ op: "claim", sessionId: ID, path: file })).held).toBe(true);
+				using _exclusive = exclusive();
+
+				const manager = await resumeHeldElsewhere(storage, file, hold);
+				const flushed = await outcome(manager.flush());
+				const sync = syncOutcome(manager);
+				const closed = await outcome(manager.close());
+
+				expect({
+					flushed,
+					sync,
+					closed,
+					paths: await db.paths(),
+					untouched: Bun.deepEquals(await db.row(file), before),
+				}).toEqual({ flushed: "resolved", sync: "returned", closed: "resolved", paths: [file], untouched: true });
+			}, 30_000);
+		}
+
+		it("rejects flush, flushSync and close with the stop once the seal dropped a turn appended during its wait", async () => {
+			// Storage holds every entry the resume read, as in the case above: only the dropped turn is unsaved.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "stored"));
+			await storage.drain();
+			const before = await db.row(file);
+			await using holder = await anotherProcess(db);
+			expect((await holder.run({ op: "claim", sessionId: ID, path: file })).held).toBe(true);
+			using _exclusive = exclusive();
+
+			const manager = await resumeHeldElsewhere(storage, file, hold);
+			manager.appendMessage(userTurn("finished during the stop's wait"));
+			const flushed = await outcome(manager.flush());
+			const sync = syncOutcome(manager);
+			const closed = await outcome(manager.close());
+
+			const stop = expect.stringContaining(
+				`Session ${ID} stops (open-elsewhere): another omp process holds its lease.`,
+			);
+			expect({
+				flushed,
+				sync,
+				closed,
+				paths: await db.paths(),
+				untouched: Bun.deepEquals(await db.row(file), before),
+			}).toEqual({ flushed: stop, sync: stop, closed: stop, paths: [file], untouched: true });
+		}, 30_000);
+	});
+}
+
+const OTHER_ID = "01a1f700-0000-7000-8000-0000000000e2";
+/** The stop's own words once a write found another holder took the lease over. */
+const TAKEN_OVER = `Session ${ID} stops (open-elsewhere): another omp process took its lease over.`;
+/** The last record of an older build's write that a SIGKILL cut off. */
+const TORN = `{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-11-17T00:00:01.000Z","message":{"role":"assistant","conte`;
+
+/** An assistant turn, as a provider's answer is recorded. */
+function assistantTurn(text: string) {
+	return {
+		role: "assistant" as const,
+		provider: "anthropic",
+		model: "claude-3-7-sonnet",
+		content: [{ type: "text" as const, text }],
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		},
+		api: "anthropic-messages" as const,
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * Let another holder take the session's lease over: age the lease row and acquire it from a second store, again when
+ * a heartbeat refreshed the row between the two. Returns the taker's release.
+ */
+async function takeOver(db: LeaseDb, file: string): Promise<() => void> {
+	const taker = await db.open({ lease: STILL });
+	for (let tries = 0; tries < 40; tries++) {
+		await db.ageLease(ID, 3_600_000);
+		const release = await taker.acquireSessionClaim?.(ID, file);
+		if (release) return release;
+		// A heartbeat refreshed the row between the two statements: age it again at once.
+	}
+	throw new Error("the second store never took the lease over");
+}
+
+for (const { adapter, url } of ROW_LEASE_BACKENDS) {
+	describe.skipIf(!url)(`OMP_SESSION_EXCLUSIVE=1 stop of an idle session (${adapter})`, () => {
+		it("lets AgentSession.dispose() resolve once the heartbeat found the lease taken over, every turn stored", async () => {
+			// If this fails, the dispose's own exit marker, which the seal drops, makes close() report the stop.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const tempDir = TempDir.createSync("@omp-exclusive-stop-dispose-");
+			const authStorage = createInMemoryAuthStorage();
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			try {
+				const storage = await db.open({ lease: FAST });
+				const hold = holdClaimRelease(storage);
+				const file = sessionFile(db);
+				await storage.writeText(file, transcript(ID, "before"));
+				await storage.drain();
+				const manager = await resume(storage, file);
+				const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!model) throw new Error("expected the bundled anthropic claude-sonnet-4-5");
+				const session = new AgentSession({
+					agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
+					sessionManager: manager,
+					settings: Settings.isolated(),
+					modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+					agentId: "Main",
+				});
+				// The dispose records its exit marker only for a session with an assistant turn.
+				manager.appendMessage(assistantTurn("the stored answer"));
+				await manager.flush();
+				const stored = await db.row(file);
+				const release = await takeOver(db, file);
+				await until(() => hold.reached, 15_000, { what: "the stop to reach its release of the store's claims" });
+
+				const disposed = await outcome(session.dispose());
+
+				expect({
+					disposed,
+					answerStored: stored?.content.includes("the stored answer"),
+					untouched: Bun.deepEquals(await db.row(file), stored),
+				}).toEqual({ disposed: "resolved", answerStored: true, untouched: true });
+				release();
+			} finally {
+				authStorage.close();
+				AsyncJobManager.resetForTests();
+				tempDir.removeSync();
+			}
+		}, 60_000);
+
+		it("lets flush, flushSync and close resolve when the stop comes before any write after a load that skipped a torn record", async () => {
+			// If this fails, a load that leaves no byte-level proof of its entries counts them unsaved until a write.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: FAST });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const torn = `${transcript(ID, "before")}${TORN}`;
+			await storage.writeText(file, torn);
+			await storage.drain();
+			const manager = await resume(storage, file);
+			const loaded = manager.getEntries().length;
+			const release = await takeOver(db, file);
+			await until(() => hold.reached, 15_000, { what: "the stop to reach its release of the store's claims" });
+
+			const flushed = await outcome(manager.flush());
+			const sync = syncOutcome(manager);
+			const closed = await outcome(manager.close());
+
+			expect({ flushed, sync, closed, loaded, untouched: (await db.row(file))?.content === torn }).toEqual({
+				flushed: "resolved",
+				sync: "returned",
+				closed: "resolved",
+				loaded: 1,
+				untouched: true,
+			});
+			release();
+		}, 30_000);
+
+		it("rejects a switch that a stop interrupts, and keeps judging the session that stopped", async () => {
+			// If this fails, the switch loads the other session, and flush and close judge that one: they resolve,
+			// though the turn the stop's cause refused is not stored.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+			await storage.drain();
+			const manager = await resume(storage, file);
+			const before = await db.row(file);
+			const other = await db.row(otherFile);
+			const release = await takeOver(db, file);
+
+			// No heartbeat runs: the append's write meets the fence while the switch drains it, the first to see the loss.
+			manager.appendMessage(userTurn("refused by the fence"));
+			const switched = await outcome(manager.setSessionFile(otherFile));
+			const flushed = await outcome(manager.flush());
+			const closed = await outcome(manager.close());
+
+			const stop = expect.stringContaining(TAKEN_OVER);
+			expect({
+				switched,
+				flushed,
+				closed,
+				stopped: hold.reached,
+				file: manager.getSessionFile(),
+				id: manager.getSessionId(),
+				untouched: Bun.deepEquals(await db.row(file), before),
+				otherUntouched: Bun.deepEquals(await db.row(otherFile), other),
+			}).toEqual({
+				switched: expect.stringContaining(
+					`${TAKEN_OVER} OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id, so it opens no other session.`,
+				),
+				flushed: stop,
+				closed: stop,
+				stopped: true,
+				file,
+				id: ID,
+				untouched: true,
+				otherUntouched: true,
+			});
+			release();
+		}, 30_000);
+	});
+
+	describe.skipIf(!url)(`a close after the seal whose write the lease fence refuses (${adapter})`, () => {
+		/**
+		 * Resume the session at `file`; with `takeover`, let another holder take its lease over first, unseen (no
+		 * heartbeat runs). Then append a turn, seal the session as a dispose does, and close it: the turn's write is the
+		 * first since the takeover. How the close ended.
+		 */
+		async function closeAfterSeal(db: LeaseDb, storage: SqlSessionStorage, takeover: boolean): Promise<string> {
+			const file = sessionFile(db);
+			const manager = await resume(storage, file);
+			if (takeover) await takeOver(db, file);
+			manager.appendMessage(userTurn("appended before the seal"));
+			manager.seal();
+			return outcome(manager.close());
+		}
+
+		it("rejects with the stop under OMP_SESSION_EXCLUSIVE=1, the turn unsaved", async () => {
+			// If this fails, nothing moves or stops a sealed session, the refusal latches nothing, and close resolves.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const before = await db.row(file);
+
+			const closed = await closeAfterSeal(db, storage, true);
+
+			expect({
+				closed,
+				stopped: hold.reached,
+				paths: await db.paths(),
+				untouched: Bun.deepEquals(await db.row(file), before),
+			}).toEqual({ closed: expect.stringContaining(TAKEN_OVER), stopped: true, paths: [file], untouched: true });
+		}, 30_000);
+
+		it("moves the session to a sibling that holds the turn without OMP_SESSION_EXCLUSIVE=1", async () => {
+			// If this fails, close resolves with the turn stored nowhere.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const before = await db.row(file);
+
+			const closed = await closeAfterSeal(db, storage, true);
+
+			const siblings = (await db.paths()).filter(stored => stored !== file);
+			const sibling = siblings[0] === undefined ? undefined : await db.row(siblings[0]);
+			expect({
+				closed,
+				siblings: siblings.length,
+				turnInSibling: sibling?.content.includes("appended before the seal"),
+				untouched: Bun.deepEquals(await db.row(file), before),
+			}).toEqual({ closed: "resolved", siblings: 1, turnInSibling: true, untouched: true });
+		}, 30_000);
+
+		it("resolves with the turn stored when no other holder took the lease over", async () => {
+			// The control of the cases above: the same close with the lease still this store's.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+
+			const closed = await closeAfterSeal(db, storage, false);
+
+			expect({
+				closed,
+				stopped: hold.reached,
+				paths: await db.paths(),
+				turnStored: (await db.row(file))?.content.includes("appended before the seal"),
+			}).toEqual({ closed: "resolved", stopped: false, paths: [file], turnStored: true });
 		}, 30_000);
 	});
 }

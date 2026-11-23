@@ -16,6 +16,7 @@ import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_
 import { COST_GATE_NOTICE_SOURCE } from "../session/cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
+import { SessionExclusiveStopError } from "../session/session-manager";
 import { flushTelemetryExport } from "../telemetry-export";
 import { parseSlashCommand, parseSubcommand } from "../slash-commands/helpers/parse";
 import type { SlashCommandRuntime } from "../slash-commands/types";
@@ -641,17 +642,22 @@ async function runPrintModeCore(
 	// an OMP-owned Chromium cannot survive the exit (issue #5643).
 	//
 	// A latched store failure rethrows from `dispose()`; report it as lost
-	// durability rather than letting it escape as a raw fatal dump.
+	// durability rather than letting it escape as a raw fatal dump. So does an
+	// `OMP_SESSION_EXCLUSIVE=1` stop that left entries unsaved, whose stop line
+	// on stderr already names the reason.
 	let durabilityFailure = false;
 	try {
 		await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 	} catch (error) {
-		if (!persistenceFailure || error !== persistenceFailure) throw error;
-		durabilityFailure = true;
-		// The store is still failing at teardown, so this is the moment the
-		// transcript stops being retryable and becomes lost.
-		writeStderrLine(formatPersistenceDurabilityFailure(persistenceFailure.message));
-		await stderrTail;
+		if (error instanceof SessionExclusiveStopError) durabilityFailure = true;
+		else {
+			if (!persistenceFailure || error !== persistenceFailure) throw error;
+			durabilityFailure = true;
+			// The store is still failing at teardown, so this is the moment the
+			// transcript stops being retryable and becomes lost.
+			writeStderrLine(formatPersistenceDurabilityFailure(persistenceFailure.message));
+			await stderrTail;
+		}
 	}
 
 	// Text mode reports the terminal failure on stderr exactly as before: same

@@ -62,6 +62,7 @@ import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
 import { probeSessionLeases } from "../../session/session-storage";
+import { SessionExclusiveStopError } from "../../session/session-manager";
 import {
 	assertSessionsOnDisk,
 	NO_SESSION_LEASE_REASON,
@@ -1849,7 +1850,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * at dispose makes `dispose()` reject, and the `notice` frame it emits is
 	 * queued on the asynchronous `outputWriter`: drain that writer before exiting
 	 * or the client never learns the failure (review 3983906393). The durability
-	 * loss is mirrored on stderr and the exit code is nonzero. A dispose
+	 * loss is mirrored on stderr and the exit code is nonzero. An
+	 * `OMP_SESSION_EXCLUSIVE=1` stop that left entries unsaved ends the same
+	 * way, exit 1, its own stop line on stderr naming the reason. A dispose
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
@@ -1865,6 +1868,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			await liveBridge.stop();
 			await session.dispose();
 		} catch (error) {
+			if (error instanceof SessionExclusiveStopError) {
+				// The stop line is on stderr already (the rejection waits for it), and the stop ends the process 1 too.
+				await outputWriter.close();
+				return postmortem.exitAfterCleanup(1);
+			}
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
 			// The notice frame this failure queued must reach the client before the
 			// process ends (review 3983906393).

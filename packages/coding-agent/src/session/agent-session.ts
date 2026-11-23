@@ -3947,6 +3947,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		) {
 			return;
 		}
+		// A session that stopped under OMP_SESSION_EXCLUSIVE=1 writes nothing more: the marker would be dropped, and a
+		// dropped entry makes flushSync() and close() report the stop as entries left unsaved.
+		if (this.sessionManager.isExclusiveStopped()) return;
 		const kind: SessionExitData["kind"] =
 			reason === "dispose" || reason === postmortem.Reason.MANUAL
 				? "normal"
