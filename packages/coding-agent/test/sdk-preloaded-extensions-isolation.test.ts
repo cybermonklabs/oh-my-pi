@@ -13,7 +13,8 @@
  * The paths a session forwards name each file of a caller-loaded result at
  * its prepared entry's scope; a file with no prepared entry is the caller's
  * own, `explicit`, and so is a bare path or a prepared extension without a
- * scope that a caller passes.
+ * scope that a caller passes. A factory a caller passes in `extensions` is
+ * kept as a prepared extension at `inline` scope.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
@@ -22,7 +23,7 @@ import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionFactory, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -185,6 +186,20 @@ describe("createAgentSession forwarding of extensions a caller passes without a 
 			expect(session.preparedExtensions?.map(({ path, scope }) => ({ path, scope }))).toEqual([
 				{ path: file, scope: "explicit" },
 			]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps a host's inline extension factory as a prepared extension at inline scope", async () => {
+		const factory: ExtensionFactory = () => {};
+
+		const { session } = await createSession({ extensions: [factory] });
+
+		try {
+			const kept = session.preparedExtensions?.filter(extension => extension.factory === factory);
+			// A revive in another project keeps only explicit and inline entries: at any other scope it drops the factory.
+			expect(kept?.map(({ scope }) => scope)).toEqual(["inline"]);
 		} finally {
 			await session.dispose();
 		}

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { type ExtensionModule, extensionModuleCapability } from "@oh-my-pi/pi-coding-agent/capability/extension-module";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -13,7 +14,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { ExtensionPathEntry } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
-import { getAgentDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getPluginsDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 import { filterUserScoped } from "./utils/filter-user-extensions";
 
@@ -843,6 +844,34 @@ describe("extensions discovery", () => {
 			fs.writeFileSync(both, extensionCode);
 
 			expect(await discoverScopes([both])).toEqual([["both.ts", "explicit"]]);
+		});
+
+		it("is an installed plugin's install scope for its module and hook, project or user", async () => {
+			// The user plugin root follows the home directory: one under this test's directory keeps its entries in view.
+			const home = tempDir.join("home");
+			vi.spyOn(os, "homedir").mockReturnValue(home);
+			// Rebuild the directory resolver, which reads the home directory when it is built.
+			setAgentDir(getAgentDir());
+			/** Installs plugin `name` in `pluginsDir`: a manifest module `<name>.ts` and a hook `<name>-hook.ts`. */
+			const install = (pluginsDir: string, name: string) => {
+				const pluginDir = path.join(pluginsDir, "node_modules", name);
+				const manifest = { name, version: "1.0.0", omp: { extensions: [`./${name}.ts`] } };
+				const dependencies = { [name]: manifest.version };
+				fs.mkdirSync(path.join(pluginDir, "hooks", "pre"), { recursive: true });
+				fs.writeFileSync(path.join(pluginsDir, "package.json"), JSON.stringify({ dependencies }));
+				fs.writeFileSync(path.join(pluginDir, "package.json"), JSON.stringify(manifest));
+				fs.writeFileSync(path.join(pluginDir, `${name}.ts`), extensionCode);
+				fs.writeFileSync(path.join(pluginDir, "hooks", "pre", `${name}-hook.ts`), extensionCode);
+			};
+			install(path.join(getProjectAgentDir(tempDir.path()), "plugins"), "project-plugin");
+			install(getPluginsDir(home), "user-plugin");
+
+			expect(Object.fromEntries(await discoverScopes([]))).toEqual({
+				"project-plugin.ts": "project",
+				"project-plugin-hook.ts": "project",
+				"user-plugin.ts": "user",
+				"user-plugin-hook.ts": "user",
+			});
 		});
 
 		it("is explicit for an explicit or configured package root's hooks; a native hook keeps its level", async () => {
