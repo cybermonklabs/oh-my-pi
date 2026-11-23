@@ -5,196 +5,69 @@
  * that closure keeps reachable is retained for the life of the process; a
  * reviver that pins the disposed session leaks one full session graph per
  * spawned subagent.
+ *
+ * Each check runs in a process of its own with concurrent JIT compilation off:
+ * in a process that has warmed the session code, an optimizing-JIT plan on a
+ * background thread can keep the watched object reachable for seconds, so a
+ * collection there says little about what the reviver holds.
  */
-import { afterEach, beforeEach, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
+import { expect, it } from "bun:test";
 import * as path from "node:path";
-import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
-import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { localSession } from "../helpers/local-session";
 
-const AGENT_ID = "ParkedRelease";
-const MOCK_API_SOURCE = "test/parked-subagent-session-release";
-// After earlier files warm the session code, JSC's optimizing-JIT worklist can
-// keep an object referenced by an in-flight compile reachable for a few seconds
-// (observed ~4 s locally, >8 s on loaded CI runners); collection is polled past
-// that window. A healthy release returns on the first poll that sees it collected,
-// so the deadline only bounds how long a real leak takes to fail.
-const COLLECT_DEADLINE_MS = 15_000;
+const probePath = path.join(import.meta.dir, "../fixtures/parked-subagent-release-probe.ts");
 
-const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
-let savedEnv: Record<string, string | undefined> = {};
-let root: string;
-
-function restoreEnvValue(key: string, value: string | undefined): void {
-	if (value === undefined) {
-		delete process.env[key];
-		delete Bun.env[key];
-		return;
-	}
-	process.env[key] = value;
-	Bun.env[key] = value;
+interface ProbeResult {
+	collected: boolean;
+	waitedMs: number;
+	parked?: { status?: string; session: unknown };
+	adoptedAtPark?: boolean;
+	adoptedAfter?: boolean;
+	revivedSetting?: boolean;
 }
 
-beforeEach(async () => {
-	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
-	root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-parked-release-"));
-	const home = path.join(root, "home");
-	await fs.mkdir(home, { recursive: true });
-	restoreEnvValue("HOME", home);
-	vi.spyOn(os, "homedir").mockReturnValue(home);
-	setAgentDir(path.join(home, ".omp", "agent"));
-	AgentRegistry.resetGlobalForTests();
-	AgentLifecycleManager.resetGlobalForTests();
-	registerMockApi(MOCK_API_SOURCE);
-});
-
-afterEach(async () => {
-	await AgentLifecycleManager.global().dispose();
-	AgentLifecycleManager.resetGlobalForTests();
-	AgentRegistry.resetGlobalForTests();
-	unregisterCustomApis(MOCK_API_SOURCE);
-	vi.restoreAllMocks();
-	for (const key of ENV_KEYS) restoreEnvValue(key, savedEnv[key]);
-	__resetDirsFromEnvForTests();
-	// The subagent session opened agent.db and models.db under root; Windows cannot delete open files.
-	AgentStorage.close();
-	closeModelCache();
-	await removeWithRetries(root);
-});
-
-/** Kept out of the test body so no strong local binding outlives the capture. */
-function weakRefToLiveSession(id: string): WeakRef<AgentSession> {
-	const session = AgentRegistry.global().get(id)?.session;
-	if (!session) throw new Error(`subagent ${id} has no live session to observe`);
-	return new WeakRef(localSession(session));
-}
-
-async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<boolean> {
-	const deadline = Date.now() + deadlineMs;
-	for (;;) {
-		Bun.gc(true);
-		if (ref.deref() === undefined) return true;
-		if (Date.now() > deadline) return false;
-		await Bun.sleep(100);
-	}
-}
-
-/** Makes a settings write in the live session's own overlay, then observes the overlay weakly (outside the test body). */
-function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
-	const session = localSession(AgentRegistry.global().get(id)?.session);
-	cfgContextPromotionEnabled.set(session, true);
-	return new WeakRef(session.settings);
-}
-
-/** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
-async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void }> {
-	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
-	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
-	// ~/.omp and load the developer's installed plugins as project plugins.
-	const cwd = path.join(root, "home", "work");
-	const artifactsDir = path.join(root, "artifacts");
-	await fs.mkdir(cwd, { recursive: true });
-	await fs.mkdir(artifactsDir, { recursive: true });
-
-	const authStorage = createInMemoryAuthStorage();
-	authStorage.keys.setRuntime("mock", "test-key");
-	const modelRegistry = new ModelRegistry(authStorage);
-	const mock = createMockModel({
-		handler: context =>
-			(context.tools ?? []).some(tool => tool.name === "yield")
-				? { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] }
-				: { content: ["label"] },
+/** Runs the probe for `watched` in a process of its own; `held` keeps the watched object (the control). */
+async function probe(watched: "session" | "settings", reference: "dropped" | "held"): Promise<ProbeResult> {
+	const child = Bun.spawn([process.execPath, probePath, watched, reference], {
+		cwd: path.join(import.meta.dir, "../../../.."),
+		env: { ...process.env, BUN_JSC_useConcurrentJIT: "0" },
+		stdout: "pipe",
+		stderr: "pipe",
 	});
-	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
-	const availableSpy = vi
-		.spyOn(modelRegistry, "getAvailable")
-		.mockImplementation(kind => [mock, ...catalogAvailable(kind)]);
-	try {
-		const result = await runSubprocess({
-			cwd,
-			artifactsDir,
-			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
-			task: "report done",
-			index: 0,
-			id: AGENT_ID,
-			modelOverride: "mock/mock-model",
-			authStorage,
-			modelRegistry,
-			settings: Settings.isolated({
-				// No TTL timer: the test parks explicitly through the same path the timer takes.
-				"task.agentIdleTtlMs": 0,
-				"async.enabled": false,
-				"compaction.enabled": false,
-				"retry.enabled": false,
-				"todo.enabled": false,
-				"todo.reminders": false,
-				"advisor.enabled": false,
-				modelRoles: { default: "mock/mock-model" },
-			}),
-			enableLsp: false,
-			enableMCP: false,
-			enableIrc: false,
-		});
-		expect(result.exitCode).toBe(0);
-	} catch (error) {
-		authStorage.close();
-		throw error;
-	}
-	return {
-		// Recorded mock calls carry stream options with closures bound to the session.
-		release: () => {
-			mock.reset();
-			availableSpy.mockRestore();
-		},
-		close: () => authStorage.close(),
-	};
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	expect(exitCode, stderr).toBe(0);
+	return JSON.parse(stdout) as ProbeResult;
 }
 
 it("releases a parked keep-alive subagent's session while the agent stays revivable", async () => {
-	const run = await runKeptAliveSubagent();
-	try {
-		const sessionRef = weakRefToLiveSession(AGENT_ID);
-		await AgentLifecycleManager.global().park(AGENT_ID);
-		expect(AgentRegistry.global().get(AGENT_ID)).toMatchObject({ status: "parked", session: null });
-		expect(AgentLifecycleManager.global().has(AGENT_ID)).toBe(true);
-
-		run.release();
-		expect(await collected(sessionRef, COLLECT_DEADLINE_MS)).toBe(true);
-		// Still adopted after collection: the release did not come from dropping the reviver.
-		expect(AgentLifecycleManager.global().has(AGENT_ID)).toBe(true);
-	} finally {
-		run.close();
-	}
+	const result = await probe("session", "dropped");
+	expect(result.parked).toEqual({ status: "parked", session: null });
+	expect(result.adoptedAtPark).toBe(true);
+	expect(result.collected, `the parked session is still reachable after ${result.waitedMs} ms of collections`).toBe(
+		true,
+	);
+	// Still adopted after collection: the release did not come from dropping the reviver.
+	expect(result.adoptedAfter).toBe(true);
 }, 30_000);
 
 it("parks without retaining the run's settings overlay and revives with the settings it wrote", async () => {
-	const run = await runKeptAliveSubagent();
-	try {
-		// A write the subagent made to its own settings during the run.
-		const settingsRef = writeAndObserveLiveSettings(AGENT_ID);
+	const result = await probe("settings", "dropped");
+	// The reviver held the run's whole overlay — merged view, memoized values, listener buckets —
+	// for as long as the parked agent stayed adopted.
+	expect(
+		result.collected,
+		`the run's settings overlay is still reachable after ${result.waitedMs} ms of collections`,
+	).toBe(true);
+	expect(result.revivedSetting).toBe(true);
+}, 30_000);
 
-		await AgentLifecycleManager.global().park(AGENT_ID);
-		run.release();
-		// The reviver held the run's whole overlay — merged view, memoized values, listener buckets —
-		// for as long as the parked agent stayed adopted.
-		expect(await collected(settingsRef, COLLECT_DEADLINE_MS)).toBe(true);
+it("keeps a parked session something else still holds (control)", async () => {
+	expect((await probe("session", "held")).collected).toBe(false);
+}, 30_000);
 
-		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
-		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
-	} finally {
-		run.close();
-	}
+it("keeps a run's settings overlay something else still holds (control)", async () => {
+	expect((await probe("settings", "held")).collected).toBe(false);
 }, 30_000);
