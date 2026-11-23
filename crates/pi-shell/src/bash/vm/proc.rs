@@ -372,6 +372,32 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// The statuses of background jobs that left the table (bash's bgp
+	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
+	/// `wait PID` finds one once its job left the table. The root's is in
+	/// the store too ([`crate::bash::store::Key::BgPid`]). Boxed and `None`
+	/// while empty: one pointer per idle vproc.
+	#[expect(clippy::box_collection, reason = "one pointer per idle vproc; a `VecDeque` is four")]
+	pub bgp:      Option<Box<VecDeque<SavedStatus>>>,
+}
+
+/// How many statuses [`JobTable::bgp`] keeps: bash's `MAX_CHILD_MAX`, the
+/// most `js.c_childmax` takes. Past it the oldest kept goes, as bash's
+/// circular `bgpids.storage` overwrites its oldest cell.
+pub const BGP_MAX: usize = 32_768;
+
+/// A status kept for a job that left the table ([`JobTable::bgp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedStatus {
+	/// The child vproc.
+	pub vpid:   Vpid,
+	/// The pid `$!` and `jobs -p` showed for it ([`Job::pid`]).
+	pub pid:    u32,
+	/// How it ended (128 plus the signal's number for one a signal killed).
+	pub status: i32,
+	/// Its place in the list: kept later than every smaller one (a store
+	/// image keeps the order by it).
+	pub seq:    u64,
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -473,6 +499,70 @@ impl JobTable {
 		if reset {
 			self.reset_current();
 		}
+	}
+
+	/// The status kept for child `vpid` (bash `bgp_search`).
+	pub fn bgp_search(&self, vpid: Vpid) -> Option<i32> {
+		self.bgp_saved(vpid).map(|s| s.status)
+	}
+
+	/// The entry kept for child `vpid`, the latest.
+	pub fn bgp_saved(&self, vpid: Vpid) -> Option<&SavedStatus> {
+		self
+			.bgp
+			.iter()
+			.flat_map(|list| list.iter().rev())
+			.find(|s| s.vpid == vpid)
+	}
+
+	/// The child whose kept status `pid` names (its shown pid or vpid).
+	pub fn bgp_named(&self, pid: u32) -> Option<Vpid> {
+		self
+			.bgp
+			.iter()
+			.flat_map(|list| list.iter().rev())
+			.find(|s| s.pid == pid || s.vpid.0 == pid)
+			.map(|s| s.vpid)
+	}
+
+	/// Keep `status` for child `vpid`, shown as `pid` (bash `bgp_add`), as
+	/// the latest, in place of one kept for the same child; past
+	/// [`BGP_MAX`] the oldest goes. The entry kept, and the one gone.
+	pub fn bgp_add(
+		&mut self,
+		vpid: Vpid,
+		pid: u32,
+		status: i32,
+	) -> (SavedStatus, Option<SavedStatus>) {
+		let list = self.bgp.get_or_insert_with(Box::default);
+		if let Some(i) = list.iter().position(|s| s.vpid == vpid) {
+			list.remove(i);
+		}
+		let seq = list.back().map_or(0, |s| s.seq + 1);
+		let saved = SavedStatus { vpid, pid, status, seq };
+		list.push_back(saved);
+		let gone = if list.len() > BGP_MAX {
+			list.pop_front()
+		} else {
+			None
+		};
+		(saved, gone)
+	}
+
+	/// Forget the status kept for child `vpid` (bash `bgp_delete`).
+	pub fn bgp_delete(&mut self, vpid: Vpid) -> Option<SavedStatus> {
+		let list = self.bgp.as_mut()?;
+		let i = list.iter().position(|s| s.vpid == vpid)?;
+		let gone = list.remove(i);
+		if list.is_empty() {
+			self.bgp = None;
+		}
+		gone
+	}
+
+	/// Forget every status kept (bash `bgp_clear`), returned.
+	pub fn bgp_clear(&mut self) -> VecDeque<SavedStatus> {
+		self.bgp.take().map_or_else(VecDeque::new, |list| *list)
 	}
 
 	fn state(&self, number: Option<u32>) -> Option<JobState> {
@@ -702,22 +792,26 @@ pub enum DeferPhase {
 
 impl Vproc {
 	/// The vproc a pid operand (`kill`, `wait`, `disown`) names here: a
-	/// job's or `$!`'s OS pid maps to its vproc; any other number is taken
-	/// as a virtual pid.
+	/// job's, `$!`'s or a kept status's ([`JobTable::bgp`]) OS pid maps to
+	/// its vproc; any other number is taken as a virtual pid.
 	pub fn vpid_of(&self, pid: u32) -> Vpid {
 		match self.jobs.by_pid(pid) {
 			Some(job) => job.vpid,
-			None => self.last_bg.named_by(pid).unwrap_or(Vpid(pid)),
+			None => self
+				.last_bg
+				.named_by(pid)
+				.or_else(|| self.jobs.bgp_named(pid))
+				.unwrap_or(Vpid(pid)),
 		}
 	}
 
-	/// The pid the user knows the child `v` by (`wait -p`): its job's or
-	/// `$!`'s OS pid, else its virtual pid.
+	/// The pid the user knows the child `v` by (`wait -p`): its job's,
+	/// `$!`'s or its kept status's OS pid, else its virtual pid.
 	pub fn shown_pid(&self, v: Vpid) -> u32 {
 		match self.jobs.by_vpid(v) {
 			Some(job) => job.pid(),
 			None if self.last_bg.is(v) => self.last_bg.os().unwrap_or(v.0),
-			None => v.0,
+			None => self.jobs.bgp_saved(v).map_or(v.0, |s| s.pid),
 		}
 	}
 }
@@ -1813,8 +1907,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B. bash's kept statuses (`JobTable::bgp`, one
+// pointer, `None` while empty) grow `Vproc` from 672 to 680 B.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
@@ -1836,4 +1931,33 @@ pub const fn vproc_layout() -> [(&'static str, usize); 5] {
 		("ScratchIo", size_of::<ScratchIo>()),
 		("ExecState", size_of::<ExecState>()),
 	]
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{BGP_MAX, JobTable};
+	use crate::bash::ids::Vpid;
+
+	// Failure mode: past `BGP_MAX` the status of the smallest vproc number
+	// went, not the oldest kept (bash's circular `bgpids.storage` overwrites
+	// its oldest cell).
+	#[test]
+	fn the_oldest_kept_status_goes_first() {
+		let mut jobs = JobTable::default();
+		// Kept largest vproc first: the oldest kept has the largest number.
+		let top = u32::try_from(BGP_MAX).expect("BGP_MAX fits u32") + 100;
+		for n in 0..u32::try_from(BGP_MAX).expect("BGP_MAX fits u32") {
+			assert_eq!(jobs.bgp_add(Vpid(top - n), top - n, 1).1, None);
+		}
+		let (_, gone) = jobs.bgp_add(Vpid(1), 1, 2);
+		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top)), "the oldest kept goes");
+		assert_eq!(jobs.bgp_search(Vpid(top)), None);
+		assert_eq!(jobs.bgp_search(Vpid(1)), Some(2));
+		// Kept again, a status is the latest: the next to go is the one after.
+		assert_eq!(jobs.bgp_add(Vpid(top - 1), top - 1, 3).1, None);
+		let (_, gone) = jobs.bgp_add(Vpid(2), 2, 4);
+		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top - 2)));
+		assert_eq!(jobs.bgp_search(Vpid(top - 1)), Some(3));
+		assert_eq!(jobs.bgp.as_ref().map_or(0, |list| list.len()), BGP_MAX);
+	}
 }
