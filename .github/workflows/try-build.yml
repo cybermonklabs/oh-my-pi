@@ -1,0 +1,53 @@
+name: Try build (no release)
+
+# A test build of one branch: the linux-x64 omp binary, built and smoke-tested
+# as sami-build.yml's release_binary does, then uploaded as a workflow artifact.
+# It publishes no release and pushes no tag.
+
+on:
+  push:
+    branches:
+      - try/live-typed-on-509a2d77
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - id: bazel
+        uses: ./.github/actions/bazel-cache
+      - name: Build native addons
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern --dest packages/natives/native
+      - name: Build binary
+        env:
+          RELEASE_TARGETS: linux-x64
+        run: bun run ci:release:build-binaries
+      - name: Smoke test binary
+        run: |
+          runtime_dir="$(mktemp -d)"
+          bin="./packages/coding-agent/binaries/omp-linux-x64"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" "$bin" --version
+          out="$(HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" "$bin" --smoke-test)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qxF 'smoke-test: ok'
+      - name: Package and checksum
+        run: |
+          asset="omp-try-live-typed-${GITHUB_SHA::12}-linux-x64"
+          mkdir -p "release/${asset}/bin"
+          cp packages/coding-agent/binaries/omp-linux-x64 "release/${asset}/bin/omp"
+          tar -C release -czf "release/${asset}.tar.gz" "$asset"
+          (cd release && sha256sum "${asset}.tar.gz" "${asset}/bin/omp") | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omp-try-linux-x64
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
