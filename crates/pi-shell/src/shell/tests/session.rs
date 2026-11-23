@@ -2098,7 +2098,9 @@ async fn wait_accepts_last_background_process_id() {
 /// bash 5.3 then answers with the slow job too.) A `wait -n` that waited for
 /// both would wait for itself: after 30 s, far above the milliseconds a
 /// correct run takes, the test makes the file, and the slow job's status
-/// fails the script.
+/// fails the script. The slow job also ends, with 97, once its parent, this
+/// test process, is gone: it leads a session of its own, and after a killed
+/// test nothing would make the file.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_n_p_records_completed_process_id() {
@@ -2109,9 +2111,10 @@ async fn wait_n_p_records_completed_process_id() {
 		let _ = std::fs::write(released, b"");
 	});
 	let options = ShellExecuteOptions {
-		command: "sh -c 'until [ -e released ]; do sleep 0.01; done; exit 42' & slow=$!; sh -c \
-		          'exit 13' & fast=$!; wait -n -p hit \"$slow\" \"$fast\"; status=$?; : > released; \
-		          wait \"$slow\"; [ \"$status\" -eq 13 ] && [ \"$hit\" = \"$fast\" ]"
+		command: "sh -c 'until [ -e released ]; do kill -0 \"$PPID\" 2>/dev/null || exit 97; sleep \
+		          0.01; done; exit 42' & slow=$!; sh -c 'exit 13' & fast=$!; wait -n -p hit \
+		          \"$slow\" \"$fast\"; status=$?; : > released; wait \"$slow\"; [ \"$status\" -eq \
+		          13 ] && [ \"$hit\" = \"$fast\" ]"
 			.to_string(),
 		cwd: Some(dir.path().to_string_lossy().into_owned()),
 		..Default::default()
