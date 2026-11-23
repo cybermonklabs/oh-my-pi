@@ -1,0 +1,60 @@
+# The proof that gVisor runs on ubuntu-24.04 GitHub runners before sami checks' gVisor rows are
+# built on it: runsc from a pinned release on the systrap platform, a container that prints
+# gVisor's banner, and the test image those rows will use, checked under runsc. Runs on a push of
+# this branch only; the rows replace it.
+name: sami checks gVisor (proof)
+
+on:
+  push:
+    branches:
+      - feat/sami-checks-gvisor
+
+permissions:
+  contents: read
+
+cache-mode: none
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SC: ${{ github.workspace }}/sc
+
+jobs:
+  tools:
+    name: reference tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - name: Build
+        run: bash tool/.github/sami-checks/tools.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/up/sc-tools.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  proof:
+    name: runsc on ubuntu-24.04
+    needs: tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/tools
+      - name: gVisor
+        run: bash tool/.github/sami-checks/gvisor-host.sh "$SC/tools/sc-tools.tgz"
