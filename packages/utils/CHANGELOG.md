@@ -34,6 +34,13 @@
 - `ptree` commands with `subreaper: true` now reliably terminate all descendants on graceful shutdown.
 - `fatal()` in a worker thread now reaches the parent's `error` listeners instead of only exiting with code 1.
 - Fixed the terminal stderr guard leaking a copy of the terminal into processes spawned from native code.
+### Added
+
+- Added `initializeSqliteSchema(db, apply)`, which runs an idempotent schema initializer read-only first and writes, under `BEGIN IMMEDIATE`, only when the schema needs a change
+
+### Changed
+
+- `openSqliteDatabase` and `openSqliteDatabaseSync` keep retrying a store another process holds locked for up to 60 s with jittered exponential backoff (was four attempts within about 5 s, and none for the synchronous opener), and the final error says how long they waited
 
 ## [18.16.0] - 2026-11-02
 

@@ -35,6 +35,9 @@
 ### Changed
 
 - Development installs reuse fastembed’s ONNX Runtime instead of installing a duplicate native runtime.
+### Fixed
+
+- Fixed opening a memory bank taking its write lock on every open (two FTS triggers were dropped and recreated each time), which failed opens with `database is locked` while another process wrote the bank
 
 ## [18.14.2] - 2026-10-31
 

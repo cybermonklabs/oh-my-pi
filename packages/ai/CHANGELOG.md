@@ -7,6 +7,8 @@
 ### Added
 
 - Added the `base64SkipThoughtSignature` compat flag so Gemini gateways that decode `thoughtSignature` as base64 (such as the Hyperspace AI LLM proxy) can receive the unsigned-tool-call bypass sentinel without rejecting the request with a 400 ([#18586](https://github.com/can1357/oh-my-pi/pull/18586) by [@tuandinh0801](https://github.com/tuandinh0801)).
+- Fixed opening the auth credential store taking `agent.db`'s write lock on every start, which failed concurrent starts with `database is locked`
+- Fixed Codex WebSocket turns sending a delta `input` after a pooled socket reconnected (closed, idle eviction, token refresh, or prewarm routing-hint change) or when `onPayload` deleted `previous_response_id` (including when it also rewrote the input), and skipped late prewarm while a socket is busy or holding accepted steering ([#17809](https://github.com/can1357/oh-my-pi/pull/17809) by [@xiangnan0811](https://github.com/xiangnan0811)).
 
 ### Changed
 
