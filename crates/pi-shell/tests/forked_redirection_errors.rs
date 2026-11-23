@@ -4,12 +4,15 @@
 //!
 //! - (h) A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in the
 //!   redirections of a command bash runs in a fork of its own (an external, a
-//!   name not found, `command X`, a null command that redirects fd 0) ends that
-//!   fork, not the shell: the command fails with 127 under `-c` or 1 from a
-//!   script, and the shell goes on. An asynchronous simple command's or a
-//!   pipeline stage's fatal error lands where its parent's would: 127 under
-//!   `-c`. A subshell, a command substitution and a compound job catch their
-//!   own (status 1).
+//!   name not found, `command X`, a null command that redirects fd 0 or a
+//!   `{var}`) ends that fork, not the shell: the command fails with 127 under
+//!   `-c` or 1 from a script, and the shell goes on. An asynchronous simple
+//!   command's or a pipeline stage's fatal error lands where its parent's
+//!   would: 127 under `-c`, and no `!` after it runs. A subshell, a command
+//!   substitution and a compound job catch their own (status 1).
+//! - An asynchronous or piped null command bash forks for (fd 0 or a `{var}`)
+//!   exits 0 whatever its redirections do: bash forks it again, and the job's
+//!   fork exits at once.
 //! - (g) A duplication whose source is not open names, as bash's
 //!   `redirection_error` does, the number of a literal source (`<&07` is `7`),
 //!   the word of an expanded one copied onto the operator's own fd (`<&$fd`),
@@ -23,9 +26,11 @@
 //! - A `( … )`'s own redirections are made in its fork: a fatal error in them
 //!   fails the subshell (127 under `-c`, else 1), and the shell goes on.
 //! - A command bash forks for before its redirections, and a `( … )`, leave no
-//!   `{var}` fd and no `{var}` value in the shell when those redirections fail
-//!   (a temporary assignment to the variable included), and the name of the
-//!   command is still looked up (and hashed) in the shell.
+//!   `{var}` fd and no `{var}` value in the shell, whether those redirections
+//!   fail (a temporary assignment to the variable included) or the command runs
+//!   (it gets them itself); and the name of the command is still looked up (and
+//!   hashed) in the shell. A builtin, a function, a `{ }` and `exec` keep
+//!   theirs.
 //! - An async `&&` or `||` list is bash's subshell (`CMD_FORCE_SUBSHELL`): a
 //!   fatal error anywhere in it exits 1, under `-c` too; a lone async command
 //!   is still the command's own fork (127 under `-c`).
@@ -38,15 +43,26 @@ mod obash_support;
 
 use std::{fs, os::unix::process::CommandExt as _, path::Path};
 
+use bstr::BStr;
 use obash_support::{obash, output};
+use pi_shell::{
+	bash::{Budget, Script, store::Key},
+	testkit::{
+		FakeHost, Fault, MemFs, Outcome, Rig,
+		fault::{comparable, skeleton_init},
+		run::{Stop, advance, advance_or_blocked, wait_runnable},
+		run_script,
+	},
+};
 
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 254 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// 326 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
 	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
 	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
-	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c, r2-null-c/c
+	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c,
+	// g-fn-close-move-bg/c
 	("h-ext", false, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
 	("h-ext", true, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
 	("h-notfound", false, "nosuch < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
@@ -1705,7 +1721,6 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"a=1\nb=1\nc=1\nd=2\n",
 		"",
 	),
-	("r2-null-c", true, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
 	(
 		"r3-and-first",
 		false,
@@ -1934,6 +1949,523 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"v=[old]\n",
 		"./s.sh: line 1: nonexist: No such file or directory\n",
 	),
+	(
+		"r4-not-ext-fatal",
+		false,
+		"! /bin/cat < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-not-ext-fatal",
+		true,
+		"! /bin/cat < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-not-echo-fatal",
+		false,
+		"! echo ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-not-echo-fatal",
+		true,
+		"! echo ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-not-sub-fatal",
+		false,
+		"! ( : ) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-not-sub-fatal",
+		true,
+		"! ( : ) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-not-ext-fatal-fg",
+		false,
+		"! /bin/cat < ${x:?u}; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-not-ext-fatal-fg",
+		true,
+		"! /bin/cat < ${x:?u}; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-ext-var",
+		false,
+		"/bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-ext-var",
+		true,
+		"/bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-sub-var",
+		false,
+		"( : ) {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-sub-var",
+		true,
+		"( : ) {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-sub-var-two",
+		false,
+		"( : ) {v}<in < ${x:?u}; ( : ) {w}<in; echo \"v=[$v] w=[$w]\"; read -r l <&10 && echo open",
+		1,
+		"v=[] w=[]\n",
+		"bash: line 1: x: u\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-sub-var-two",
+		true,
+		"( : ) {v}<in < ${x:?u}; ( : ) {w}<in; echo \"v=[$v] w=[$w]\"; read -r l <&10 && echo open",
+		1,
+		"v=[] w=[]\n",
+		"./s.sh: line 1: x: u\n./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-sub-var-inside",
+		false,
+		"printf 'x\\n' > in; ( echo \"in=[$v]\"; read -r l <&$v; echo \"l=$l\" ) {v}<in; echo \
+		 \"out=[$v]\"",
+		0,
+		"in=[10]\nl=x\nout=[]\n",
+		"",
+	),
+	(
+		"r4-sub-var-inside",
+		true,
+		"printf 'x\\n' > in; ( echo \"in=[$v]\"; read -r l <&$v; echo \"l=$l\" ) {v}<in; echo \
+		 \"out=[$v]\"",
+		0,
+		"in=[10]\nl=x\nout=[]\n",
+		"",
+	),
+	(
+		"r4-ext-var-inside",
+		false,
+		"printf 'x\\n' > in; /bin/bash -c 'read -r l <&10; echo \"l=$l\"' {v}<in; echo \"out=[$v]\"",
+		0,
+		"l=x\nout=[]\n",
+		"",
+	),
+	(
+		"r4-ext-var-inside",
+		true,
+		"printf 'x\\n' > in; /bin/bash -c 'read -r l <&10; echo \"l=$l\"' {v}<in; echo \"out=[$v]\"",
+		0,
+		"l=x\nout=[]\n",
+		"",
+	),
+	("r4-ext-var-used", false, "/bin/cat {v}<in <&$v; echo \"v=[$v]\"", 0, "hello\nv=[]\n", ""),
+	("r4-ext-var-used", true, "/bin/cat {v}<in <&$v; echo \"v=[$v]\"", 0, "hello\nv=[]\n", ""),
+	("r4-ext-var-kept", false, "v=old; /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
+	("r4-ext-var-kept", true, "v=old; /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
+	("r4-ext-var-assign", false, "v=1 /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
+	("r4-ext-var-assign", true, "v=1 /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
+	(
+		"r4-ext-var-assign-old",
+		false,
+		"v=old; v=1 /bin/true {v}<in; echo \"v=[$v]\"",
+		0,
+		"v=[old]\n",
+		"",
+	),
+	(
+		"r4-ext-var-assign-old",
+		true,
+		"v=old; v=1 /bin/true {v}<in; echo \"v=[$v]\"",
+		0,
+		"v=[old]\n",
+		"",
+	),
+	(
+		"r4-notfound-var",
+		false,
+		"nosuch {v}<in 2>/dev/null; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-notfound-var",
+		true,
+		"nosuch {v}<in 2>/dev/null; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-command-ext-var",
+		false,
+		"command /bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-command-ext-var",
+		true,
+		"command /bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-null-var",
+		false,
+		"{v}<in; echo \"v=[${v-unset}]\"; read -r l <&10 && echo open",
+		1,
+		"v=[unset]\n",
+		"bash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-null-var",
+		true,
+		"{v}<in; echo \"v=[${v-unset}]\"; read -r l <&10 && echo open",
+		1,
+		"v=[unset]\n",
+		"./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r4-group-var",
+		false,
+		"{ :; } {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-group-var",
+		true,
+		"{ :; } {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-builtin-var",
+		false,
+		": {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-builtin-var",
+		true,
+		": {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-exec-var",
+		false,
+		"exec {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-exec-var",
+		true,
+		"exec {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-fn-var",
+		false,
+		"f() { :; }; f {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-fn-var",
+		true,
+		"f() { :; }; f {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		0,
+		"v=[10]\nopen\n",
+		"",
+	),
+	(
+		"r4-path-var-fail",
+		false,
+		"{PATH}</dev/null cat < nonexist; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-path-var-fail",
+		true,
+		"{PATH}</dev/null cat < nonexist; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-path-var-fatal",
+		false,
+		"{PATH}</dev/null cat < ${x:?u}; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-path-var-fatal",
+		true,
+		"{PATH}</dev/null cat < ${x:?u}; hash",
+		0,
+		"hits	command\n   1	/usr/bin/cat\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-var-errexit",
+		false,
+		"set -e; /bin/true {v}<in; echo \"v=[$v]\"; /bin/false {w}<in; echo not",
+		1,
+		"v=[]\n",
+		"",
+	),
+	(
+		"r4-var-errexit",
+		true,
+		"set -e; /bin/true {v}<in; echo \"v=[$v]\"; /bin/false {w}<in; echo not",
+		1,
+		"v=[]\n",
+		"",
+	),
+	(
+		"r4-var-err-trap",
+		false,
+		"trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo \"st=$? v=[$v]\"",
+		0,
+		"err=1 v=[]\nst=1 v=[]\n",
+		"",
+	),
+	(
+		"r4-var-err-trap",
+		true,
+		"trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo \"st=$? v=[$v]\"",
+		0,
+		"err=1 v=[]\nst=1 v=[]\n",
+		"",
+	),
+	(
+		"r4-var-err-trap-e",
+		false,
+		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo not",
+		1,
+		"err=1 v=[]\n",
+		"",
+	),
+	(
+		"r4-var-err-trap-e",
+		true,
+		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo not",
+		1,
+		"err=1 v=[]\n",
+		"",
+	),
+	(
+		"r4-null-async-fatal",
+		false,
+		"< ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-null-async-fatal",
+		true,
+		"< ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-null-async-fail",
+		false,
+		"< nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-async-fail",
+		true,
+		"< nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-var-async-fail",
+		false,
+		"{v}<nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-var-async-fail",
+		true,
+		"{v}<nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-pipe-fail",
+		false,
+		"< nonexist | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=0\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-pipe-fail",
+		true,
+		"< nonexist | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-null-pipe-fatal",
+		false,
+		"< ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-null-pipe-fatal",
+		true,
+		"< ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-not-null-fatal",
+		false,
+		"! < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-not-null-fatal",
+		true,
+		"! < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	("r4-not-null-ok", false, "! < in & wait $!; echo \"st=$?\"", 0, "st=0\n", ""),
+	("r4-not-null-ok", true, "! < in & wait $!; echo \"st=$?\"", 0, "st=0\n", ""),
+	("r4-not-null-var-ok", false, "! {v}<in & wait $!; echo \"st=$?\"", 0, "st=0\n", ""),
+	("r4-not-null-var-ok", true, "! {v}<in & wait $!; echo \"st=$?\"", 0, "st=0\n", ""),
+	(
+		"r4-null-async-out-fatal",
+		false,
+		"> ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r4-null-async-out-fatal",
+		true,
+		"> ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r4-null-async-out-fail",
+		false,
+		"> /nonexist/x & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: /nonexist/x: No such file or directory\n",
+	),
+	(
+		"r4-null-async-out-fail",
+		true,
+		"> /nonexist/x & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: /nonexist/x: No such file or directory\n",
+	),
+	(
+		"r4-group-null-async",
+		false,
+		"{ < nonexist; } & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r4-group-null-async",
+		true,
+		"{ < nonexist; } & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"g-fn-close-move-bg",
+		true,
+		"f() { echo x <&7-; }; f & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: redirection error: cannot duplicate fd: Bad file descriptor\n./s.sh: line 1: 7: \
+		 Bad file descriptor\n",
+	),
 ];
 
 /// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this
@@ -2031,7 +2563,15 @@ const ROWS53: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"bash: redirection error: cannot duplicate fd: Bad file descriptor\nbash: line 1: 7: Bad \
 		 file descriptor\n",
 	),
-	("r2-null-c", false, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "bash: line 1: x: u\n"),
+	(
+		"g-fn-close-move-bg",
+		false,
+		"f() { echo x <&7-; }; f & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: redirection error: cannot duplicate fd: Bad file descriptor\nbash: line 1: 7: Bad \
+		 file descriptor\n",
+	),
 ];
 
 /// The directory a row runs in: `in` and the FIFO `fifo`.
@@ -2139,4 +2679,126 @@ fn a_duplication_of_a_closed_fd_is_named_as_bash_names_it() {
 fn rows_bash_5_2_runs_otherwise_are_as_bash_5_3_runs_them() {
 	assert!(ROWS53.len() > 10, "{} rows", ROWS53.len());
 	check(ROWS53);
+}
+
+/// A `( … )`'s own `{var}`s are its fork's (the subshell reads the fd, the
+/// shell keeps neither fd nor value) also when the shell is imaged and
+/// restored into a fresh engine over a `MemFs` whose every answer comes late:
+/// at every op and at every other open (`Rig::run`, which images a `{var}`
+/// between the list and the subshell's fork), and at every other wait with
+/// no op run on between ([`imaged_at_every_other_wait`], which images one
+/// while a later open of its list waits). The subshell reads a here-string's
+/// fd: a memory object survives an image, where a host file's fd is lost by
+/// design (`FdObjImage::Host`).
+#[test]
+fn a_subshells_own_var_is_its_forks_across_a_restore() {
+	const SRC: &[u8] =
+		b"( read -r l <&$v; echo \"in=[$v] l=$l\" ) {v}<<<x; echo \"out=[$v]\"; ( : ) \
+	                     {w}</in {x}</in {y}</in < /missing; echo \"w=[$w] x=[$x] y=[$y]\"";
+	let host = || {
+		let fs = MemFs::with_latency(5, 1.0, 1);
+		fs.add_file("/in", b"x\n", 0o644);
+		FakeHost::new().with_fs(fs)
+	};
+	let plain = run_script(host(), SRC, &[], Fault::None);
+	let imaged = run_script(host(), SRC, &[], Fault::Snapshot { every: 1 });
+	assert!(imaged.snapshots > 10, "{} snapshots", imaged.snapshots);
+	let mid_list = imaged_at_every_other_wait(host(), SRC);
+	assert!(mid_list.snapshots > 0, "no snapshot mid-list");
+	let want = (0, "in=[10] l=x\nout=[]\nw=[] x=[] y=[]\n".to_owned());
+	// Each run's difference is reported, not only the first one's.
+	let wrong: Vec<String> =
+		[("plain", &plain), ("imaged", &imaged), ("imaged mid-list", &mid_list)]
+			.into_iter()
+			.filter_map(|(what, got)| {
+				let err = String::from_utf8_lossy(&got.stderr);
+				let out = (got.status, String::from_utf8_lossy(&got.stdout).into_owned());
+				(out != want || !err.contains("/missing: No such file or directory"))
+					.then(|| format!("{what}: {out:?}, stderr {err:?}"))
+			})
+			.collect();
+	assert!(wrong.is_empty(), "want {want:?}:\n{}", wrong.join("\n"));
+}
+
+/// Run `src` as a `-c` script, imaged and restored at every other wait of
+/// the shell and waiting at the others: unlike `Rig::run`, which runs on to
+/// the op's end after each wait it images, an op that waits at several opens
+/// is imaged between them.
+fn imaged_at_every_other_wait(host: FakeHost, src: &[u8]) -> Outcome {
+	let mut rig = Rig::new(host, skeleton_init(&[]));
+	let id = rig.shell().submit(Script::command(src.to_vec()));
+	let mut image = true;
+	let status = loop {
+		let (shell, host, store) = rig.parts();
+		match advance_or_blocked(shell, host, store, id, Budget::default()) {
+			Stop::Done(status) => break status,
+			Stop::Blocked if image => {
+				rig.snapshot();
+				image = false;
+			},
+			Stop::Blocked => {
+				let (shell, host, _) = rig.parts();
+				if !host.fire_next_timer() {
+					wait_runnable(&shell.control());
+				}
+				image = true;
+			},
+			Stop::Yield => {},
+			other => panic!("unexpected {other:?}"),
+		}
+	};
+	let outcome = Outcome {
+		status,
+		stdout: rig.host.stdout.bytes(),
+		stderr: rig.host.stderr.bytes(),
+		events: comparable(&rig.host.events),
+		snapshots: rig.snapshots,
+		pauses: rig.pauses,
+	};
+	let (shell, host, store) = rig.parts();
+	host.assert_no_leaks(shell, store);
+	outcome
+}
+
+/// The shell drops a `( … )`'s own `{var}`s once the subshell's fork is
+/// made: while the subshell runs (here held by a native task, and imaged
+/// and restored there) the shell holds no `v`, and the subshell still has
+/// its value and its fd (a here-string's: a memory object survives the
+/// image, a host file's fd does not).
+#[test]
+fn a_running_subshell_keeps_its_own_var_that_the_shell_dropped() {
+	const SRC: &[u8] = b"( echo \"in=[$v]\"; hold; read -r l <&$v; echo \"l=$l v=[$v]\" ) {v}<<<x; \
+	                     echo \"out=[$v]\"";
+	let mut host = FakeHost::new();
+	host.countdown("hold", 20, 0);
+	let mut rig = Rig::new(host, skeleton_init(&[]));
+	let id = rig.shell().submit(Script::command(SRC.to_vec()));
+	let one = Budget { max_ops: 1, max_ns: u64::MAX };
+	// Until the subshell has started: it prints `in=` before it holds.
+	loop {
+		let (shell, host, store) = rig.parts();
+		if host.stdout.bytes().starts_with(b"in=") {
+			break;
+		}
+		assert_eq!(advance(shell, host, store, id, one), Stop::Yield, "before the subshell's hold");
+	}
+	let shell_v = |rig: &mut Rig| rig.parts().2.record(Key::Var(BStr::new("v"))).cloned();
+	assert_eq!(shell_v(&mut rig), None, "the shell holds the subshell's `{{var}}` while it runs");
+	rig.snapshot();
+	assert_eq!(shell_v(&mut rig), None, "the restored shell holds the subshell's `{{var}}`");
+	let status = loop {
+		let (shell, host, store) = rig.parts();
+		match advance(shell, host, store, id, Budget::default()) {
+			Stop::Done(status) => break status,
+			Stop::Yield => {},
+			other => panic!("unexpected {other:?}"),
+		}
+	};
+	let (_, host, _) = rig.parts();
+	assert_eq!(
+		(status, String::from_utf8_lossy(&host.stdout.bytes()).into_owned()),
+		(0, "in=[10]\nl=x v=[10]\nout=[]\n".to_owned()),
+		"stderr: {}",
+		String::from_utf8_lossy(&host.stderr.bytes())
+	);
 }

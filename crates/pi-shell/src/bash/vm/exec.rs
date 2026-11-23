@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
 		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -1646,7 +1646,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		drop_scratch(root, store, vp, sc);
 	}
 	while let Some(saves) = f.redirs.pop() {
-		restore(vp, saves);
+		restore(vp, saves.fds);
 	}
 	let keep = vp.frames.len();
 	close_procsubs(vp, keep);
@@ -1933,7 +1933,7 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 		saves.push(f.redirs.pop().expect("checked"));
 	}
 	for s in saves {
-		restore(vp, s);
+		restore(vp, s.fds);
 	}
 }
 
@@ -2369,7 +2369,7 @@ pub fn start_sub(
 			let prev = vp.fds.get(1).cloned();
 			if form == ComsubForm::NoFork {
 				vp.fds.set(1, Some(out));
-				frame.redirs.push(vec![Saved { fd: 1, prev }]);
+				frame.redirs.push(vec![Saved { fd: 1, prev }].into());
 			}
 			vp.frames.push(frame);
 			sc.sub = Some(PendingSub::NoFork { capture, value: form == ComsubForm::Value });
@@ -2996,7 +2996,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 						&& spawn.code == Opcode::Spawn
 						&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
 			);
-			let owner = redir::Owner::Compound { undo: !forked && !subshell };
+			// A bash `( … )`'s own `{var}`s are its fork's: the shell keeps
+			// none (zsh code keeps its own rule).
+			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
+			let owner = redir::Owner::Compound { undo: !forked && !subshell, fork };
 			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
 			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
 				// Past the fork's own redirections, its body runs under bash's
@@ -3007,14 +3010,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				Ok(()) => {
 					let saves = match top_frame(vp).scratch.take() {
 						Some(mut sc) => {
-							let saves = sc
-								.io
-								.as_mut()
-								.map_or_default(|io| std::mem::take(&mut io.saved));
+							// The `{var}`s go with the saved fds to the `Spawn`.
+							let saves = sc.io.as_mut().map_or_default(|io| Saves {
+								fds:  std::mem::take(&mut io.saved),
+								vars: io.var_fds.take(),
+							});
 							drop_scratch(&mut k.root, cx.store, vp, sc);
 							saves
 						},
-						None => Vec::new(),
+						None => Saves::default(),
 					};
 					top_frame(vp).redirs.push(saves);
 					Flow::Next
@@ -3025,9 +3029,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// status the fork exits with (127 from a `-c` string, else 1)
 				// and the shell goes on, with none of its `{var}`s. (zsh code
 				// keeps its own rule.)
-				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
-					if subshell && !forked && unit.mode.dialect() != Dialect::Zsh =>
-				{
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code))) if fork => {
 					redir::forget_var_fds(k, vp, cx);
 					// The message goes to stderr as the redirections so far
 					// left it (`2>/dev/null < ${x:?}` prints none).
@@ -3040,7 +3042,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				Err(redir::Halt::Failed) => {
 					// A `( … )`'s own redirections are its fork's: the shell
 					// keeps none of their `{var}`s.
-					if subshell && !forked && unit.mode.dialect() != Dialect::Zsh {
+					if fork {
 						redir::forget_var_fds(k, vp, cx);
 					}
 					// The message goes to stderr as the redirections so far left
@@ -3054,7 +3056,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
-				restore(vp, saves);
+				restore(vp, saves.fds);
 			}
 			Flow::Next
 		},
@@ -4130,7 +4132,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& !vp
 						.frames
 						.iter()
-						.any(|f| f.redirs.iter().flatten().any(|s| s.fd == 0))
+						.any(|f| f.redirs.iter().flat_map(|r| &r.fds).any(|s| s.fd == 0))
 				{
 					let null = k
 						.null_input
@@ -4149,6 +4151,19 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
+				}
+				// The `{var}`s of a subshell's own redirections are its fork's:
+				// the child keeps each as its own (a shell's later write shows
+				// through to a child of the root), the shell none (below).
+				let fork_vars = if info.kind == SpawnKind::Subshell {
+					top_frame(vp).redirs.last_mut().and_then(|r| r.vars.take())
+				} else {
+					None
+				};
+				for var in fork_vars.iter().flat_map(|vars| vars.iter()) {
+					if let Err(err) = state::pin_global(cx.store, &mut child, &var.name) {
+						k.fail(err);
+					}
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -4174,6 +4189,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					k.emit_op(cx, vp, op.node, EventData::Background { job, pid: vpid });
 					vp.status = 0;
 					return Flow::Jump(info.end);
+				}
+				if let Some(vars) = fork_vars {
+					redir::forget_vars(k, vp, cx, *vars);
 				}
 				k.emit_op(cx, vp, op.node, EventData::Subshell { child: vpid });
 			},
@@ -4216,7 +4234,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
 						vp.fds.set(0, stdin.take());
-						frame.redirs.push(vec![Saved { fd: 0, prev }]);
+						frame.redirs.push(vec![Saved { fd: 0, prev }].into());
 						vp.frames.push(frame);
 						return Flow::Call;
 					}

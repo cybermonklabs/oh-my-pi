@@ -732,6 +732,29 @@ pub fn global<'s>(
 	}
 }
 
+/// Give `child`, just made, its own copy of global variable `name` as the
+/// store holds it now, unless one of its scopes or its overlay binds the
+/// name already: a later write of the shell's no longer shows through (a
+/// subshell's `{var}`, which the shell takes back once the fork is made).
+///
+/// # Errors
+/// [`StoreError`] when the store fails or the record is no variable.
+pub fn pin_global(
+	store: &mut dyn StateStore,
+	child: &mut Vproc,
+	name: &[u8],
+) -> Result<(), StoreError> {
+	let Some(ov) = child.overlay.as_mut() else {
+		return Ok(());
+	};
+	if ov.vars.contains_key(name) || child.scopes.iter().any(|s| s.vars.contains_key(name)) {
+		return Ok(());
+	}
+	let var = global(store, name)?.cloned();
+	ov.vars.insert(BString::from(name), var);
+	Ok(())
+}
+
 /// A scalar root `Misc` value.
 ///
 /// # Errors

@@ -84,6 +84,9 @@ pub enum Owner {
 	Compound {
 		/// Made in the shell and undone after the command.
 		undo: bool,
+		/// A bash `( … )`'s own, which bash makes in the subshell's fork:
+		/// the shell keeps none of their `{var}`s ([`forgets_vars`]).
+		fork: bool,
 	},
 }
 
@@ -387,13 +390,14 @@ fn set_fd(vp: &mut Vproc, fd: i32, h: Option<FdRef>) {
 }
 
 /// The fd a redirection targets; `{var}` allocates one ≥ 10 and stores it
-/// (`closing`: reads the fd it holds).
+/// (`closing`: reads the fd it holds; `record`: [`assign_fd_var`]'s).
 fn target_fd(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	r: &RedirIr,
 	closing: bool,
+	record: bool,
 	line: u32,
 ) -> Result<i32, Diag> {
 	match &r.fd {
@@ -405,24 +409,31 @@ fn target_fd(
 					.ok_or_else(|| Diag::AmbiguousRedirect { word: name.clone() });
 			}
 			let fd = super::jobctl::lowest_free_fd(k, vp, 10);
-			assign_fd_var(k, vp, cx, name, fd, line)?;
+			assign_fd_var(k, vp, cx, name, fd, record, line)?;
 			Ok(fd)
 		},
 	}
 }
 
-/// Store `fd` in the `{var}` named `name`, noting the variable's binding
-/// before: a simple command's in [`super::proc::ExecState::var_fds`], a
-/// compound's `Redir` op's in [`super::proc::ScratchIo::var_fds`].
+/// Store `fd` in the `{var}` named `name`. With `record` (bash makes the
+/// redirection in a fork, [`forgets_vars`]) the variable's binding before
+/// is noted for the shell to put back: a simple command's in
+/// [`super::proc::ExecState::var_fds`], a `( … )`'s `Redir` op's in
+/// [`super::proc::ScratchIo::var_fds`].
 fn assign_fd_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	name: &[u8],
 	fd: i32,
+	record: bool,
 	line: u32,
 ) -> Result<(), Diag> {
-	let before = var_before(k, vp, cx, name);
+	let before = if record {
+		var_before(k, vp, cx, name)
+	} else {
+		None
+	};
 	let (base, index) = builtins::split_subscript(name);
 	let lhs = Lhs { name: base, index, append: false };
 	let value = AssignValue::Scalar(BString::from(fd.to_string()));
@@ -473,19 +484,34 @@ fn var_before(k: &Kernel, vp: &Vproc, cx: &mut Cx<'_>, name: &[u8]) -> Option<Va
 	Some(VarFd { fd: -1, name: base, prior })
 }
 
-/// Undo the `{var}` redirections made so far when bash made them in a fork
-/// (a command bash forks for before its redirections: an external, a null
-/// command that forks; a `( … )`'s own) and they fail: neither the fd nor
-/// the variable reaches the shell. Each fd is closed and each variable gets
-/// its binding back.
+/// Whether bash makes the redirections `owner` makes in a fork of its own,
+/// so that the shell keeps none of their `{var}`s: a simple command bash
+/// forks for before its redirections (an external, a name not found,
+/// `command X`, a null command that [`null_forks`]), a bash `( … )`'s own.
+/// Only theirs are recorded ([`assign_fd_var`]).
+fn forgets_vars(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, owner: Owner) -> bool {
+	match owner {
+		Owner::Compound { fork, .. } => fork,
+		Owner::Simple { null_forks } => null_forks || super::command::forks_for(k, cx, vp),
+	}
+}
+
+/// Undo the `{var}` redirections made so far that bash made in a fork
+/// ([`forgets_vars`]), when they fail or the command ends: neither the fd
+/// nor the variable reaches the shell.
 pub(super) fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 	let vars = match super::exec::scratch(vp).exec.as_mut() {
 		Some(e) => e.var_fds.take(),
 		None => io(vp).var_fds.take(),
 	};
-	let Some(vars) = vars else {
-		return;
-	};
+	if let Some(vars) = vars {
+		forget_vars(k, vp, cx, *vars);
+	}
+}
+
+/// Close each `{var}` fd of `vars` and give each variable its binding
+/// back, latest first.
+pub(super) fn forget_vars(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, vars: Vec<VarFd>) {
 	for VarFd { fd, name, prior } in vars.into_iter().rev() {
 		vp.fds.set(fd, None);
 		state::store_var(&mut k.root, cx.store, vp, &name, prior, Level::Dynamic);
@@ -536,9 +562,12 @@ fn install(
 	line: u32,
 	owner: Owner,
 ) -> Result<(), Halt> {
+	// A `{var}` bash makes in a fork is recorded, for the shell to forget.
+	let record = matches!(r.fd, RedirFdIr::Var(_)) && forgets_vars(k, cx, vp, owner);
 	match r.op {
 		RedirKind::HereDoc | RedirKind::HereString => {
-			let fd = target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd =
+				target_fd(k, vp, cx, r, false, record, line).map_err(|d| fail(k, vp, cx, line, d))?;
 			let h = FdRef::mem(MemBuf::new(target.to_vec()));
 			set_fd(vp, fd, Some(h));
 			Ok(())
@@ -546,7 +575,8 @@ fn install(
 		RedirKind::DupIn | RedirKind::DupOut => {
 			let closing = target.as_slice() == b"-";
 			if closing {
-				let fd = target_fd(k, vp, cx, r, true, line).map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd =
+					target_fd(k, vp, cx, r, true, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
 				set_fd(vp, fd, None);
 				super::exec::coproc_fd_closed(k, vp, cx, fd);
 				return Ok(());
@@ -576,7 +606,8 @@ fn install(
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
 					return Err(fail(k, vp, cx, line, Diag::Io { path, err }));
 				};
-				let fd = target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd = target_fd(k, vp, cx, r, false, record, line)
+					.map_err(|d| fail(k, vp, cx, line, d))?;
 				set_fd(vp, fd, Some(h));
 				if moving && src != fd {
 					set_fd(vp, src, None);
@@ -601,7 +632,8 @@ fn install(
 			Err(fail(k, vp, cx, line, Diag::AmbiguousRedirect { word: target.clone() }))
 		},
 		RedirKind::Close => {
-			let fd = target_fd(k, vp, cx, r, true, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd =
+				target_fd(k, vp, cx, r, true, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
 			set_fd(vp, fd, None);
 			super::exec::coproc_fd_closed(k, vp, cx, fd);
 			Ok(())
@@ -621,7 +653,9 @@ fn install(
 			// its slot free, so the fd is the same on resume.
 			let fd = match &r.fd {
 				RedirFdIr::Var(_) => super::jobctl::lowest_free_fd(k, vp, 10),
-				_ => target_fd(k, vp, cx, r, false, line).map_err(|d| fail(k, vp, cx, line, d))?,
+				_ => {
+					target_fd(k, vp, cx, r, false, false, line).map_err(|d| fail(k, vp, cx, line, d))?
+				},
 			};
 			// bash moves a `{var}` fd to 10 or above with `F_DUPFD`, which
 			// fails past `ulimit -n`.
@@ -642,7 +676,7 @@ fn install(
 			}
 			open_into(k, vp, cx, &[fd], target, flags, line)?;
 			if let RedirFdIr::Var(name) = &r.fd
-				&& let Err(d) = assign_fd_var(k, vp, cx, name, fd, line)
+				&& let Err(d) = assign_fd_var(k, vp, cx, name, fd, record, line)
 			{
 				set_fd(vp, fd, None);
 				return Err(fail(k, vp, cx, line, d));
@@ -693,7 +727,7 @@ fn dup_name(unit: &Unit, r: &RedirIr, src: i32, target: &BString) -> BString {
 /// made for, an external, a null command that [`null_forks`]).
 fn undone(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, owner: Owner) -> bool {
 	match owner {
-		Owner::Compound { undo } => undo,
+		Owner::Compound { undo, .. } => undo,
 		Owner::Simple { null_forks } => {
 			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
 			!forked && !null_forks && !super::command::forks_for(k, cx, vp)
@@ -909,7 +943,7 @@ fn fd_number(
 	closing: bool,
 	line: u32,
 ) -> Result<i32, Halt> {
-	target_fd(k, vp, cx, r, closing, line).map_err(|d| fail(k, vp, cx, line, d))
+	target_fd(k, vp, cx, r, closing, false, line).map_err(|d| fail(k, vp, cx, line, d))
 }
 
 /// Whether `fd` is open in the process a command spawns at this point of
@@ -1224,7 +1258,8 @@ fn zsh_install(
 			let h = FdRef::mem(MemBuf::new(target.to_vec()));
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, line).map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line)
+					.map_err(|d| fail(k, vp, cx, line, d));
 			}
 			place_on(k, vp, cx, fd, h, false)
 		},
@@ -1265,7 +1300,8 @@ fn zsh_install(
 			let fd = zsh_target_fd(k, vp, cx, r).map_err(|d| fail(k, vp, cx, line, d))?;
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, line).map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line)
+					.map_err(|d| fail(k, vp, cx, line, d));
 			}
 			place_on(k, vp, cx, fd, h, output)
 		},
@@ -1289,7 +1325,8 @@ fn zsh_install(
 			let h = zsh_open(k, vp, cx, target, flags, line)?;
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, line).map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line)
+					.map_err(|d| fail(k, vp, cx, line, d));
 			}
 			// `<>` is both: never part of a multio.
 			if r.op == RedirKind::ReadWrite {

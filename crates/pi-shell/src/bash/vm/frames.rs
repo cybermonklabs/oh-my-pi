@@ -30,8 +30,8 @@ use super::{
 	CallOutcome, Cx, Kernel, Shell, host_stdio,
 	proc::{
 		Atom, Awaited, ExecState, Frame, FrameKind, JobState, Live, LoopRec, PendingSub,
-		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Scratch, ScratchIo, ScratchZsh,
-		ScriptKind, Stage, Target, Vproc,
+		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Saves, Scratch, ScratchIo,
+		ScratchZsh, ScriptKind, Stage, Target, Vproc,
 	},
 	state::{self, Overlay, Root, Scope},
 };
@@ -317,7 +317,7 @@ struct FrameImage {
 	enters:            Vec<(u32, u64)>,
 	cases:             Vec<(BString, bool)>,
 	times:             Vec<super::proc::TimeMark>,
-	redirs:            Vec<Vec<SavedImage>>,
+	redirs:            Vec<SavesImage>,
 	scratch:           Option<ScratchImage>,
 	line_shift:        u32,
 	debug_pc:          Option<u32>,
@@ -337,6 +337,14 @@ struct FrameImage {
 struct SavedImage {
 	fd:   i32,
 	prev: Option<u32>,
+}
+
+/// A frame's redirection entry ([`super::proc::Saves`]): the saved fds and
+/// a bash `( … )`'s own `{var}`s still to forget at its fork.
+#[derive(Serialize, Deserialize)]
+struct SavesImage {
+	fds:  Vec<SavedImage>,
+	vars: Option<Vec<super::proc::VarFd>>,
 }
 
 /// An in-flight command substitution and its capture (a memory object).
@@ -366,7 +374,8 @@ struct ScratchImage {
 	probing:      Option<Probe>,
 	input:        Vec<u8>,
 	saved:        Vec<SavedImage>,
-	/// A compound's `{var}` redirections made so far ([`ScratchIo::var_fds`]).
+	/// A bash `( … )`'s own `{var}` redirections made so far
+	/// ([`ScratchIo::var_fds`]).
 	var_fds:      Option<Vec<super::proc::VarFd>>,
 	children:     Vec<(Vpid, Option<i32>)>,
 	inline:       Option<super::proc::InlineStage>,
@@ -549,7 +558,14 @@ impl Shell {
 					enters: f.enters.clone(),
 					cases: f.cases.clone(),
 					times: f.times.clone(),
-					redirs: f.redirs.iter().map(|r| saved_image(r, &mut fds)).collect(),
+					redirs: f
+						.redirs
+						.iter()
+						.map(|r| SavesImage {
+							fds:  saved_image(&r.fds, &mut fds),
+							vars: r.vars.as_deref().cloned(),
+						})
+						.collect(),
 					scratch,
 					line_shift: f.line_shift,
 					debug_pc: f.debug_pc,
@@ -1020,7 +1036,7 @@ impl Shell {
 				let redirs = f
 					.redirs
 					.into_iter()
-					.map(|r| objs.saved(cx.host, r))
+					.map(|r| Saves { fds: objs.saved(cx.host, r.fds), vars: r.vars.map(Box::new) })
 					.collect();
 				let mut frame = Frame::new(unit, f.pc, f.kind);
 				frame.loops = f.loops;

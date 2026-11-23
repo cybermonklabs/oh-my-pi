@@ -280,8 +280,43 @@ pub fn exec(
 					if let Some(scope) = hidden {
 						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
 					}
+					// The command the job's own fork was made for (an async
+					// command, a pipeline stage: `exec::forked_for`) in bash code
+					// (zsh code keeps its own rule).
+					let entry = unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+						&& vp.frames.len() == 1
+						&& vp.fork().at_entry();
+					// bash forks a null command it forks for once more there
+					// (`execute_null_command` under the job's early fork) and the
+					// job's fork exits 0 without waiting, whatever the
+					// redirections do in the second (`sh_exit`: no `!` after it).
+					if entry
+						&& null_forks
+						&& matches!(
+							res,
+							Ok(())
+								| Err(
+									super::redir::Halt::Failed
+										| super::redir::Halt::Flow(Flow::Exit(_) | Flow::Discard(_))
+								)
+						) {
+						let s = st(vp);
+						s.status = 0;
+						s.control = Some(Transfer::Exit(0));
+						s.stage = Stage::Finish;
+						if let Some(fd) = exec::flush_out(k, vp) {
+							return Flow::Block(WaitKey::Write { fd });
+						}
+						continue;
+					}
 					match res {
 						Ok(()) => {},
+						// In the job's own fork the fork is the command's: a fatal
+						// error ends it with its status (127 or 1), and nothing after
+						// the command runs (a `!` included).
+						Err(super::redir::Halt::Flow(Flow::Exit(code))) if entry => {
+							return Flow::Exit(code);
+						},
 						// A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in
 						// the redirections of a command bash runs in a fork of its
 						// own (an external, a null command that redirects fd 0) ends
@@ -337,9 +372,11 @@ pub fn exec(
 								};
 							// A command bash forks for fails in its fork (bash's
 							// `execute_disk_command`, `execute_null_command`'s
-							// `forcefork`), after the shell looked its name up.
+							// `forcefork`), after the shell looked its name up with
+							// the values before its `{var}`s (`{PATH}<f` too): they go
+							// before the lookup; a null command's go at `Finish`.
 							let forks = !null && forks_for(k, cx, vp);
-							if forks || null_forks {
+							if forks {
 								forget_var_fds(k, vp, cx, scoped);
 							}
 							let s = st(vp);
@@ -440,6 +477,15 @@ pub fn exec(
 			},
 			Stage::Finish => {
 				k.forget_deferral(vp.vpid);
+				// A command bash forks for made its `{var}`s in its fork: once
+				// it has run, the shell keeps none (its temporary scope hidden,
+				// as when they were made).
+				if st(vp).var_fds.is_some() {
+					let scoped = st(vp)
+						.scoped
+						.then(|| state::scope_count(&k.root, vp).saturating_sub(1));
+					forget_var_fds(k, vp, cx, scoped);
+				}
 				return finish(k, vp, cx, op);
 			},
 		}

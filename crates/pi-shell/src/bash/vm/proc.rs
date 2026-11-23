@@ -1024,7 +1024,7 @@ pub struct Frame {
 	/// `time` starts.
 	pub times:             Vec<TimeMark>,
 	/// fds saved by `Redir` ops, innermost last.
-	pub redirs:            Vec<Vec<Saved>>,
+	pub redirs:            Vec<Saves>,
 	/// Scratch of the op at `pc` while it is parked or calling.
 	pub scratch:           Option<Box<Scratch>>,
 	/// Lines subtracted from diagnostic line numbers: bash numbers a
@@ -1105,6 +1105,23 @@ pub struct TimeMark {
 pub struct Saved {
 	pub fd:   i32,
 	pub prev: Option<FdRef>,
+}
+
+/// What one redirection list left for its end to undo ([`Frame::redirs`]):
+/// the fd slots it saved, and the `{var}`s a bash `( … )`'s own list made,
+/// which bash makes in the subshell's fork: the shell forgets them once
+/// that fork is made (the `Spawn` after it), `None` everywhere else.
+#[derive(Default)]
+pub struct Saves {
+	pub fds:  Vec<Saved>,
+	#[expect(clippy::box_collection, reason = "moved whole from `ScratchIo::var_fds`")]
+	pub vars: Option<Box<Vec<VarFd>>>,
+}
+
+impl From<Vec<Saved>> for Saves {
+	fn from(fds: Vec<Saved>) -> Self {
+		Self { fds, vars: None }
+	}
 }
 
 /// A loop record (`break`/`continue` targets, the loop's status).
@@ -1320,10 +1337,11 @@ pub struct ScratchIo {
 	/// The zsh part ([`ScratchZsh`]), created by zsh code on first use
 	/// ([`Self::zsh()`]): a bash op's progress neither carries nor clears it.
 	pub zsh:     Option<Box<ScratchZsh>>,
-	/// The `{var}` redirections a compound's `Redir` op made so far (a
-	/// simple command's are [`ExecState::var_fds`]): a `( … )` whose own
-	/// redirections fail fatally leaves neither the fd nor the value in the
-	/// shell ([`super::redir::forget_var_fds`]). Boxed: few ops have one.
+	/// The `{var}` redirections a bash `( … )`'s own `Redir` op made so far
+	/// (a simple command's are [`ExecState::var_fds`]), which bash makes in
+	/// the subshell's fork: when they fail the shell forgets them at once
+	/// ([`super::redir::forget_var_fds`]), else after the fork
+	/// ([`Saves::vars`]). No other op takes one. Boxed: few ops have one.
 	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
 	pub var_fds: Option<Box<Vec<VarFd>>>,
 }
@@ -1603,10 +1621,12 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
-	/// The command's `{var}` redirections made so far. A command bash
-	/// makes them for in its fork leaves neither the fd nor the value in
-	/// the shell when they fail ([`super::redir::forget_var_fds`]). Boxed:
-	/// few commands have one.
+	/// The `{var}` redirections made so far of a command bash makes them for
+	/// in its fork (an external, a name not found, a null command that
+	/// forks): neither the fd nor the value reaches the shell, which forgets
+	/// them when they fail or when the command ends
+	/// ([`super::redir::forget_var_fds`]). No other command takes one.
+	/// Boxed: few commands have one.
 	#[expect(
 		clippy::box_collection,
 		reason = "8 B where a Vec is 24: the size guard below counts every byte"
@@ -1614,8 +1634,9 @@ pub struct ExecState {
 	pub var_fds:     Option<Box<Vec<VarFd>>>,
 }
 
-/// A `{var}` redirection a simple command made: the fd, and the variable's
-/// name and declared binding before it took the fd (`None`: unbound).
+/// A `{var}` redirection bash makes in a fork (a command bash forks for, a
+/// `( … )`'s own): the fd, and the variable's name and declared binding
+/// before it took the fd (`None`: unbound).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarFd {
 	pub fd:    i32,
