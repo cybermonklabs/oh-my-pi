@@ -12,9 +12,12 @@ use crate::proctree;
 
 mod builtins;
 mod env_cwd;
+mod output_drain;
 mod process_control;
 mod redirections;
+mod run_deadline;
 mod session;
+mod stopped_reader;
 
 /// The standard streams of a command a test runs on a session directly;
 /// `None` is the null device.

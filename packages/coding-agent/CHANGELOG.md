@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bash tool: on a loaded machine, a command's last output could be lost (`status 0`, no output): once the command ended, the shell waited 250 ms for its output reader and then dropped what the reader had not yet read. Output the command wrote before it ended is now always kept; only a background job's later output is still cut, once the pipe is quiet or 2 s after the command ended. A command that ended within its timeout is no longer reported as timed out while its output is still being delivered. If that delivery stalls for 2 s (5 s on Windows) past the timeout, the shell drops the rest, and the bash tool keeps the command's exit code and heads the output with `[Output incomplete: the command finished before its timeout, but delivery of its output stalled after the timeout and the rest was dropped]`
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

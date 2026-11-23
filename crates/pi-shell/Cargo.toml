@@ -64,6 +64,7 @@ winreg.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 # The engine benches print their own statistics.
 [[bench]]
