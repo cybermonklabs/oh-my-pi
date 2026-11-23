@@ -5,6 +5,7 @@ import type { ConversationPosition } from "../modes/utils/conversation-position"
 import type { MCPManager } from "../mcp/manager";
 import type { MCPServerConfig } from "../mcp/types";
 import type { AgentSession } from "../session/agent-session";
+import type { InputOrigin } from "../session/agent-session-types";
 import type { SessionManager } from "../session/session-manager";
 
 /** Declarative subcommand definition for commands like /mcp. */
@@ -78,6 +79,14 @@ export interface SlashCommandRuntime {
 	signal?: AbortSignal;
 	/** Emit text to the operator. TUI maps to `ctx.showStatus`, ACP to `sessionUpdate`. */
 	output: (text: string) => Promise<void> | void;
+	/**
+	 * `"outside"` when a client or a person typed the command over RPC, ACP or print: commands that send
+	 * the history to a model (`/compact`, `/handoff`) then end the session's cyber-policy hold as a
+	 * prompt from outside does. The TUI's `handle` adapter leaves it unset: the TUI's `/compact` and
+	 * `/handoff` run their `handleTui` handlers, which pass the origin themselves. Unset when an
+	 * extension or the session runs a command.
+	 */
+	origin?: InputOrigin;
 	/** Re-advertise the available command list (no-op outside ACP). */
 	refreshCommands: () => Promise<void> | void;
 	/**

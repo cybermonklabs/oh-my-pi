@@ -31,8 +31,8 @@ export const frameDefs = {
 			"httpStatus?": "number.integer",
 			retryable: doc("boolean", "Transient: resubmitting later may succeed (omp's own retries are exhausted)."),
 			"code?": doc(
-				"'cost_cap'",
-				"`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.",
+				"'cost_cap' | 'cyber_policy'",
+				"`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again.",
 			),
 		},
 		'Failure detail of a `prompt_result` with `status: "error"`.',

@@ -3,6 +3,7 @@ import { getHeadersFromError, getShouldRetryFromHeaders } from "../utils/retry-a
 import {
 	ALIYUN_MM_GATEWAY_PATTERN,
 	CODEX_HTTP_BODY_READ_ERROR_PATTERN,
+	isCyberPolicyRefusal,
 	isRetryableStreamEnvelopeError,
 	isTransientStreamDropError,
 	isTransientStreamParseError,
@@ -46,9 +47,12 @@ function isTransientTransportMessage(message: string): boolean {
  * A captured `x-should-retry` response header overrides the status and text
  * heuristics below: a server or gateway that already retried and answered
  * `false` must not be replayed by provider retry loops.
+ * A `cyber_policy` refusal is never retryable, whatever a header says: it judges the request's
+ * content, and each copy sent adds a refusal to the organization's record.
  */
 export function isProviderRetryableError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
+	if (isCyberPolicyRefusal(error)) return false;
 	if (isUsageLimit(error)) return false;
 	const verdict = getShouldRetryFromHeaders(getHeadersFromError(error));
 	if (verdict !== undefined) return verdict;

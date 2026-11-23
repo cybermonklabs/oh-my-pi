@@ -238,7 +238,11 @@ const EMPTY_RESPONSE_PATTERN = /\bthought-only response without final output\b/i
  *  other "malformed response" errors (e.g. an image API's) stay terminal. */
 const MALFORMED_RESPONSE_FINISH_PATTERN = /\bfinish reason:\s*MALFORMED_RESPONSE\b/i;
 const CONTENT_FILTER_PATTERN = /\b(?:incomplete:\s*)?content_filter\b/i;
-const ACCOUNT_POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
+/**
+ * OpenAI's refusal of content it flags for cybersecurity risk: the `cyber_policy` code, and the sentences
+ * its message carries when a body or event arrives without that code.
+ */
+const CYBER_POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber|\bflagged for possible cybersecurity risk\b/i;
 export const ANTHROPIC_ACCOUNT_POLICY_PATTERN =
 	/\b(?:oauth_not_allowed_for_organization|permission_error)\b|\bOAuth authentication is currently not allowed for this organization\b/i;
 
@@ -661,8 +665,11 @@ function classifyText(
 		if (MALFORMED_RESPONSE_FINISH_PATTERN.test(errorMessage)) kinds |= Flag.Transient;
 		if (isContentBlockedText(errorMessage)) kinds |= Flag.ContentBlocked;
 
+		// A cyber-policy refusal judges the request's content, so it is blocked content and never an
+		// account policy: another credential or route would receive the same content, and each copy sent
+		// adds a refusal to the organization's record.
+		if (CYBER_POLICY_PATTERN.test(errorMessage)) kinds |= Flag.ContentBlocked;
 		if (
-			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
 			isCodexChatGPTAccountPolicyText(errorMessage, provider, modelId) ||
 			(provider === "cursor" && isCursorPlanPolicyText(errorMessage))
 		) {
@@ -781,8 +788,8 @@ export function classify(error: unknown, api?: Api): number {
 				kinds |= (link as { errorId: number }).errorId & KIND_MASK;
 			}
 			if ("code" in link && typeof link.code === "string") {
-				if (ACCOUNT_POLICY_PATTERN.test(link.code)) {
-					kinds |= Flag.AccountPolicy | Flag.ContentBlocked;
+				if (CYBER_POLICY_PATTERN.test(link.code)) {
+					kinds |= Flag.ContentBlocked;
 				} else if (ANTHROPIC_ACCOUNT_POLICY_PATTERN.test(link.code)) {
 					kinds |= Flag.AccountPolicy;
 				}
@@ -882,6 +889,31 @@ export function isUsageLimit(error: unknown, api?: Api): boolean {
 /** Whether an upstream rejection is an account-scoped policy denial worth retrying with a sibling credential. */
 export function isAccountPolicyError(error: unknown, api?: Api): boolean {
 	return is(classify(error, api), Flag.AccountPolicy);
+}
+
+/**
+ * Whether `error` (an error, its causes, an assistant message or a message string) is OpenAI's
+ * `cyber_policy` refusal. No credential, route or retry cures it, and every copy sent again adds a
+ * refusal to the organization's record, so a caller ends the model call instead of sending it again.
+ */
+export function isCyberPolicyRefusal(error: unknown): boolean {
+	const seen = new Set<object>();
+	let link: unknown = error;
+	while (link !== undefined && link !== null) {
+		if (typeof link === "string") return CYBER_POLICY_PATTERN.test(link);
+		if (typeof link !== "object" || seen.has(link)) return false;
+		seen.add(link);
+		if ("code" in link && typeof link.code === "string" && CYBER_POLICY_PATTERN.test(link.code)) return true;
+		if (
+			"errorMessage" in link &&
+			typeof link.errorMessage === "string" &&
+			CYBER_POLICY_PATTERN.test(link.errorMessage)
+		)
+			return true;
+		if ("message" in link && typeof link.message === "string" && CYBER_POLICY_PATTERN.test(link.message)) return true;
+		link = "cause" in link ? link.cause : undefined;
+	}
+	return false;
 }
 
 /**

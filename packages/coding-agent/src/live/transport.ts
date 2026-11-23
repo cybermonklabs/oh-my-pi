@@ -21,6 +21,9 @@ const MAX_ERROR_BODY_LENGTH = 2_048;
 const SIDEBAND_CONNECT_ATTEMPTS = 5;
 const SIDEBAND_CONNECT_TIMEOUT_MS = 15_000;
 const LIVE_PROVIDER = "openai-codex";
+
+/** The route this transport's call goes to (Codex realtime), as a cyber-policy hold names it. */
+export const CODEX_LIVE_ROUTE = { provider: LIVE_PROVIDER, id: "live" } as const;
 const LIVE_ORIGINATOR = "Codex Desktop";
 const LIVE_CALL_ID_PATTERN = /^rtc_[\w-]+$/;
 
@@ -66,6 +69,23 @@ export interface LiveTransportOptions {
 	 * keeps only the sideband.
 	 */
 	sdpOffer?: string;
+	/**
+	 * Why the call may send nothing to OpenAI now (the session tree's cyber-policy hold), or `undefined`. The
+	 * transport reads it in the same synchronous step as each send it guards: the signaling POST that opens the call
+	 * (it carries the instructions), and every sideband frame but `session.close` (the session's text:
+	 * `delegation.context.append`, `session.context.append`, and any frame type added later). A held POST is not
+	 * sent and `connect()` rejects with the hold's message; a held frame is not sent and `send()` rejects with it.
+	 * `session.close`, which only ends the call and carries no text, is not held.
+	 */
+	holdReason?: () => string | undefined;
+}
+
+/**
+ * Whether the hold holds `message`: every frame but `session.close`, which only ends the call. A frame type added
+ * later is held unless it is that one, so a new frame that carries the session's text cannot go out unread.
+ */
+function heldByHold(message: LiveClientMessage): boolean {
+	return message.type !== "session.close";
 }
 
 /** Extracts the server-assigned `rtc_*` call ID from a signaling Location header. */
@@ -230,13 +250,17 @@ export class CodexLiveTransport {
 			"Content-Type": "application/json",
 		});
 		const fetchImpl = wrapFetchForProxy(fetch, LIVE_PROVIDER);
+		const body = JSON.stringify({
+			sdp: offer,
+			session: buildLiveSessionPayload(this.#options.instructions, this.#options.voice),
+		});
+		// Read in the same step as the POST: the attestation, the credential and (with a native peer) the offer
+		// were awaited after the caller's own read.
+		this.#throwIfHeld();
 		const response = await fetchImpl(SIGNALING_URL, {
 			method: "POST",
 			headers,
-			body: JSON.stringify({
-				sdp: offer,
-				session: buildLiveSessionPayload(this.#options.instructions, this.#options.voice),
-			}),
+			body,
 			signal: this.#options.signal,
 		});
 		const responseBody = await response.text();
@@ -385,7 +409,16 @@ export class CodexLiveTransport {
 		} catch {}
 	}
 
-	/** Serialize one Frameless Bidi control message onto the call's sideband WebSocket. */
+	/** Throws the hold's message when {@link LiveTransportOptions.holdReason} holds the call's sends now. */
+	#throwIfHeld(): void {
+		const reason = this.#options.holdReason?.();
+		if (reason !== undefined) throw new Error(reason);
+	}
+
+	/**
+	 * Serialize one Frameless Bidi control message onto the call's sideband WebSocket. Every frame but `session.close`
+	 * reads {@link LiveTransportOptions.holdReason} in the same step as the write, and a held one rejects unsent.
+	 */
 	send(message: LiveClientMessage): Promise<void> {
 		const operation = this.#sendTail.then(() => {
 			if (this.#state !== "connected") throw new Error("Live transport is not connected");
@@ -393,6 +426,7 @@ export class CodexLiveTransport {
 			if (!sideband || sideband.readyState !== WebSocket.OPEN) {
 				throw new Error("Codex live sideband is not connected");
 			}
+			if (heldByHold(message)) this.#throwIfHeld();
 			sideband.send(JSON.stringify(message));
 		});
 		this.#sendTail = operation.catch(() => {});

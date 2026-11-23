@@ -245,10 +245,17 @@ export interface RpcPromptError {
 	model?: string;
 	/** HTTP status reported by the provider, when the failure came from a request. */
 	httpStatus?: number;
-	/** The failure is classified transient: resubmitting later may succeed. OMP's own retries are already exhausted. */
+	/**
+	 * The failure is classified transient: resubmitting later may succeed. OMP's own retries are already
+	 * exhausted. Never set for a `cyber_policy` refusal.
+	 */
 	retryable: boolean;
-	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. */
-	code?: "cost_cap";
+	/**
+	 * `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	 * `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a
+	 * refusal; resubmitting the same content is refused again.
+	 */
+	code?: "cost_cap" | "cyber_policy";
 }
 
 /**

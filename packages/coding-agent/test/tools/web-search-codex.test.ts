@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { AuthStorage, type FetchImpl, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, addModelCallGuard, type FetchImpl, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
@@ -326,6 +326,31 @@ describe("searchCodex model selection", () => {
 		expect(capturedRequest?.body?.model).toBe("gpt-5.6-luna");
 		expect(result.model).toBe("gpt-5.6-luna");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
+	});
+
+	// A Codex web search is a model call (its query is drawn from the conversation): while a model-call hold
+	// stands on the selected model it sends nothing; with no hold the same search is sent.
+	it.each([
+		["holds a Codex search while a model-call hold stands on its model", true],
+		["sends the same Codex search when no hold stands (control)", false],
+	])("%s", async (_name, held) => {
+		const model = codexModel("gpt-5.6-luna");
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const outcome = await searchCodex(
+				makeSearchParams("held codex search", mockCodexFetch("gpt-5.6-luna"), model),
+			).then(
+				() => "sent",
+				(error: unknown) => String(error),
+			);
+			expect(capturedRequest === null).toBe(held);
+			if (held) expect(outcome).toContain("held: cyber_policy");
+			else expect(outcome).toBe("sent");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("uses email-only OAuth credentials without an account header", async () => {

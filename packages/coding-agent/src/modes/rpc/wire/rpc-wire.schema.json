@@ -4589,8 +4589,12 @@
 					"type": "integer"
 				},
 				"code": {
-					"const": "cost_cap",
-					"description": "`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request."
+					"enum": [
+						"cost_cap",
+						"cyber_policy"
+					],
+					"type": "string",
+					"description": "`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again."
 				}
 			},
 			"required": [

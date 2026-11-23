@@ -1,9 +1,10 @@
 import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import { cyberPolicyHoldMessage } from "../session/cyber-policy-closure";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
@@ -16,12 +17,29 @@ import {
 	type LiveServerEvent,
 } from "./protocol";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
-import { CodexLiveTransport } from "./transport";
+import { CODEX_LIVE_ROUTE, CodexLiveTransport } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
+
+/**
+ * Why the live call to `route` may send nothing now, or `undefined` when it may. The call runs on OpenAI (today Codex
+ * realtime only, `CODEX_LIVE_ROUTE`) and carries the session's text, so while the session tree's cyber-policy closure
+ * is active (OpenAI refused the tree's content) none of the session's text goes out and no call opens; the hold's
+ * message names `route`, the route the call goes to. It is read where each of those sends happens: the transport
+ * reads it (`LiveTransportOptions.holdReason`) in the same synchronous step as the signaling POST that opens the call
+ * (it carries the instructions) and as every sideband frame but `session.close`; the controller reads it before it
+ * builds the transport and again once the call has connected, before any audio or text, and closes a held call.
+ * `session.close`, which only ends the call, is not held.
+ */
+export function liveCallHoldReason(
+	session: Pick<AgentSession, "cyberPolicyClosure">,
+	route: Pick<Model, "provider" | "id">,
+): string | undefined {
+	return session.cyberPolicyClosure.active ? cyberPolicyHoldMessage(route) : undefined;
+}
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -179,6 +197,9 @@ export class LiveSessionController {
 		}
 
 		try {
+			// The call itself goes to OpenAI: none starts while a refusal holds the session's OpenAI routes.
+			const held = liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE);
+			if (held) throw new Error(held);
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
 			const transport = new CodexLiveTransport({
@@ -191,12 +212,18 @@ export class LiveSessionController {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
 				},
+				// Read by the transport in the step of the signaling POST and of every frame but `session.close`.
+				holdReason: () => liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE),
 			});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped while connecting.");
 			}
+			// A refusal recorded while the call connected (after the POST went out) closes it before any audio
+			// or session text: the catch below stops the call and closes the transport.
+			const heldOnConnect = liveCallHoldReason(this.#session, CODEX_LIVE_ROUTE);
+			if (heldOnConnect) throw new Error(heldOnConnect);
 			this.#unsubscribeSession = this.#session.subscribe(event =>
 				this.#guardEvent(() => this.#handleSessionEvent(event)),
 			);
@@ -482,7 +509,10 @@ export class LiveSessionController {
 		if (!transport || this.#stopped) return;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (!this.#stopped) await transport.send(message);
+				if (this.#stopped) return;
+				// The transport reads the hold in the step of the write and rejects a held frame; the catch below
+				// then ends the call, since the session's answer can no longer reach it.
+				await transport.send(message);
 			})
 			.catch(cause => this.#reportFailure(toError(cause)));
 	}

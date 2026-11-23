@@ -8,6 +8,7 @@ import { readSseJson, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import { ThinkingFenceStripper } from "../dialect/thinking-fence-strip";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -1089,6 +1090,9 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				};
 				let response: Response;
 				try {
+					// Each send (the first, the global-endpoint retry after a regional 404, and each empty-response
+					// resend after its backoff) reads the model-call guards right before it goes out.
+					assertModelCallAllowed(model);
 					response = await fetchImpl(requestUrl, init);
 					if (!response.ok) {
 						const errorText = await response.text().catch(() => "");
@@ -1170,8 +1174,13 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				} catch {
 					throw new AIError.AbortError();
 				}
+				// Open the resend before the output is reset for it: `openStreamAt` reads the model-call guards
+				// right before each request (the regional URL, and the global URL after a regional 404), so a
+				// resend held at either one, or one that fails, ends with the answer before the resend (its
+				// thinking and usage) as any held send does.
+				const nextBody = await openStream();
 				resetGoogleStreamOutputForRetry(output);
-				body = await openStream();
+				body = nextBody;
 			}
 
 			output.duration = performance.now() - startTime;

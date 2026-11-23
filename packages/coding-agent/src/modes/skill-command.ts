@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getSkillSlashCommandName, parseSkillInvocation } from "../extensibility/skills";
+import type { InputOrigin } from "../session/agent-session-types";
 import { type CustomMessage, SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../session/messages";
 import type { InteractiveModeContext } from "./types";
 
@@ -50,6 +51,8 @@ interface InvokeSkillCommandOptions {
 	 * If the skill fails before reaching the session, it goes back to the editor with them as one list.
 	 */
 	followUps?: string[];
+	/** Where the command came from; see {@link InputOrigin}. Default: inside. */
+	origin?: InputOrigin;
 }
 
 /** Built custom-message payload and delivery options for a `/skill:` command. */
@@ -109,8 +112,8 @@ export async function invokeSkillCommandFromText(
 			return false;
 		}
 		const promptOptions = options?.queueOnly
-			? { ...built.options, queueOnly: true, onPromptQueued: options.onPromptQueued }
-			: { ...built.options, followUps: options?.followUps };
+			? { ...built.options, queueOnly: true, onPromptQueued: options.onPromptQueued, origin: options.origin }
+			: { ...built.options, followUps: options?.followUps, origin: options?.origin };
 		optimistic = options?.optimistic === true && !options?.queueOnly && !ctx.session.isStreaming;
 		if (optimistic) {
 			ctx.renderOptimisticSkillMessage(

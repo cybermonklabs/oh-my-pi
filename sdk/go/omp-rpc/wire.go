@@ -4791,7 +4791,7 @@ type PromptError struct {
 	Provider   *string `json:"provider,omitempty"`
 	Model      *string `json:"model,omitempty"`
 	HTTPStatus *int64  `json:"httpStatus,omitempty"`
-	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again.
 	Code *PromptErrorCode `json:"code,omitempty"`
 }
 
@@ -4818,7 +4818,8 @@ func (v *PromptError) decodeFrom(raw map[string]json.RawMessage) error {
 type PromptErrorCode string
 
 const (
-	PromptErrorCodeCostCap PromptErrorCode = "cost_cap"
+	PromptErrorCodeCostCap     PromptErrorCode = "cost_cap"
+	PromptErrorCodeCyberPolicy PromptErrorCode = "cyber_policy"
 )
 
 func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
@@ -4827,7 +4828,7 @@ func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := PromptErrorCode(s); value {
-	case PromptErrorCodeCostCap:
+	case PromptErrorCodeCostCap, PromptErrorCodeCyberPolicy:
 		*v = value
 		return nil
 	}

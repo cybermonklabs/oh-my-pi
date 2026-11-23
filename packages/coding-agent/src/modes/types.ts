@@ -32,7 +32,7 @@ import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
-import type { DroppedPrompt } from "../session/agent-session-types";
+import type { DroppedPrompt, InputOrigin } from "../session/agent-session-types";
 import type { AgentViewSession } from "../session/agent-session-handle";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
@@ -103,6 +103,11 @@ export type SubmittedUserInput = {
 	followUps?: string[];
 	/** Set by `submitInteractiveInput` for a custom-message submission: the session took it (started a turn or queued it into one). */
 	dispatched?: boolean;
+	/**
+	 * `"outside"` for input a person typed or the CLI passed (it ends the session's cyber-policy
+	 * closure); unset for loop iterations, goal continuations and other submissions the mode makes.
+	 */
+	origin?: InputOrigin;
 	cancelled: boolean;
 	started: boolean;
 };
@@ -501,6 +506,7 @@ export interface InteractiveModeContext {
 			display?: boolean;
 			streamingBehavior?: "steer" | "followUp";
 			followUps?: string[];
+			origin?: InputOrigin;
 		},
 		options?: { preserveDraft?: boolean; clearEditor?: boolean },
 	): SubmittedUserInput;
@@ -606,7 +612,7 @@ export interface InteractiveModeContext {
 		customInstructions?: string,
 		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
-		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
+		options?: Pick<CompactOptions, "internalGuidance" | "readerModel" | "origin">,
 	): Promise<CompactionOutcome>;
 	handleHandoffCommand(customInstructions?: string): Promise<void>;
 	handleShakeCommand(mode: ShakeMode): Promise<void>;
@@ -752,7 +758,11 @@ export interface InteractiveModeContext {
 	disableGoalMode(message?: string): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
-	resolvePlanReview(reviewId: string, choice: PlanReviewChoice, input?: { feedback?: string; role?: string }): boolean;
+	resolvePlanReview(
+		reviewId: string,
+		choice: PlanReviewChoice,
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
+	): boolean;
 	getPendingPlanReview(): PlanReviewRequestedEvent | undefined;
 	openPlanReview(options?: { fromExtension?: boolean }): Promise<boolean>;
 	readonly sessionModes: ExtensionSessionModes;

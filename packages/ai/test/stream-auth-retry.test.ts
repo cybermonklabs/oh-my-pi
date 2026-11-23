@@ -767,7 +767,13 @@ describe("streamSimple resolver auth retry", () => {
 		expect(eventTypes).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
 	});
 
-	it("rotates through every distinct sibling on Codex cyber-policy denials", async () => {
+	// A cyber-policy refusal flags the request's content, not the credential that sent it: each copy sent
+	// again adds a refusal to the organization's record, so no sibling credential may receive it.
+	it.each([
+		["an in-stream Codex error event", undefined],
+		["an HTTP 400 body", 400],
+		["an HTTP 403 body", 403],
+	] as const)("sends a cyber-policy refusal from %s once and rotates to no sibling", async (_name, errorStatus) => {
 		const keys: unknown[] = [];
 		const eventTypes: string[] = [];
 		const contexts: ApiKeyResolveContext[] = [];
@@ -790,7 +796,7 @@ describe("streamSimple resolver auth retry", () => {
 					stream.push({
 						type: "error",
 						reason: "error",
-						error: assistantError(errorMessage, undefined, errorId),
+						error: assistantError(errorMessage, errorStatus, errorId),
 					});
 				});
 				return stream;
@@ -808,10 +814,12 @@ describe("streamSimple resolver auth retry", () => {
 			eventTypes.push(event.type);
 		}
 
-		expect((await stream.result()).content).toEqual([{ type: "text", text: "ok" }]);
-		expect(keys).toEqual(pool);
-		expect(contexts.map(ctx => ctx.lastChance)).toEqual([false, true, true, true]);
-		expect(eventTypes).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("code=cyber_policy");
+		expect(keys).toEqual(["credential-A"]);
+		expect(contexts.map(ctx => ctx.lastChance)).toEqual([false]);
+		expect(eventTypes).toEqual(["start", "error"]);
 	});
 
 	it("stops replay-safe usage rotation when the resolver cycles to an attempted credential", async () => {

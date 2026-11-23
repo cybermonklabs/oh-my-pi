@@ -613,7 +613,7 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 		expect(second).not.toBe(first);
 	});
 
-	test("rotateSessionCredential(cyber policy) soft-blocks the denied account and rotates", async () => {
+	test("rotateSessionCredential(cyber policy) neither blocks the account nor rotates", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 		registerProvider();
 		await authStorage.credentials.set(PROVIDER, [
@@ -623,15 +623,24 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 
 		const first = await authStorage.keys.get(PROVIDER, "cyber-policy");
 		const usageLimitSpy = vi.spyOn(authStorage.limits, "markReached");
-		const rotated = await authStorage.limits.rotate(PROVIDER, "cyber-policy", {
-			error: new Error(
+		const rows = authStorage.credentials.list(PROVIDER);
+		// The refusal judges the request's content: another account would get the same content, and
+		// a sent copy is one more refusal on the organization's record.
+		for (const error of [
+			new Error(
 				"Codex error event: This content was flagged for possible cybersecurity risk. Join Trusted Access for Cyber. (code=cyber_policy)",
 			),
-		});
+			new ProviderHttpError("This content was flagged for possible cybersecurity risk.", 403, {
+				code: "cyber_policy",
+			}),
+		]) {
+			const rotated = await authStorage.limits.rotate(PROVIDER, "cyber-policy", { error });
+			expect(rotated).toEqual({ switched: false });
+		}
 
-		expect(rotated.switched).toBe(true);
 		expect(usageLimitSpy).not.toHaveBeenCalled();
-		expect(await authStorage.keys.get(PROVIDER, "cyber-policy")).not.toBe(first);
+		expect(authStorage.blocks.list(rows.map(row => row.id))).toEqual([]);
+		expect(await authStorage.keys.get(PROVIDER, "cyber-policy")).toBe(first);
 	});
 
 	test.each([
@@ -662,9 +671,12 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 			const key = await authStorage.keys.get(PROVIDER, sessionId);
 			expect(key).toBe("denied-B");
 			const rotation = await authStorage.limits.rotate(PROVIDER, sessionId, {
+				// An account-scoped denial a sibling account may not share (a cyber-policy refusal no longer is one).
 				error: usageLimit
 					? usageLimitError()
-					: "This content was flagged for possible cybersecurity risk. (code=cyber_policy)",
+					: new ProviderHttpError("OAuth authentication is currently not allowed for this organization.", 403, {
+							code: "oauth_not_allowed_for_organization",
+						}),
 				waitForSibling,
 			});
 			if (waitForSibling === false) {

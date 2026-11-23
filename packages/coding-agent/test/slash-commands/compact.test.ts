@@ -12,7 +12,12 @@ function acpRuntime() {
 	const compact = vi.fn(async (_instructions?: string, _options?: CompactOptions) => {});
 	const getContextUsage = vi.fn(() => undefined);
 	const output = vi.fn();
-	const runtime = { session: { compact, getContextUsage }, output } as unknown as SlashCommandRuntime;
+	// An ACP client's command, as the ACP agent's runtime marks it: input from outside the session.
+	const runtime = {
+		session: { compact, getContextUsage },
+		output,
+		origin: "outside",
+	} as unknown as SlashCommandRuntime;
 	return { compact, output, runtime };
 }
 
@@ -34,27 +39,27 @@ describe("/compact dispatch (ACP)", () => {
 	it("compacts with the configured strategy and no mode for a bare invocation", async () => {
 		const h = acpRuntime();
 		await executeAcpBuiltinSlashCommand("/compact", h.runtime);
-		expect(h.compact).toHaveBeenCalledWith(undefined, undefined);
+		expect(h.compact).toHaveBeenCalledWith(undefined, { origin: "outside" });
 	});
 
 	it("threads each mode subcommand into compact()", async () => {
 		for (const mode of ["soft", "remote", "snapcompact"] as const satisfies readonly CompactMode[]) {
 			const h = acpRuntime();
 			await executeAcpBuiltinSlashCommand(`/compact ${mode}`, h.runtime);
-			expect(h.compact).toHaveBeenCalledWith(undefined, { mode });
+			expect(h.compact).toHaveBeenCalledWith(undefined, { mode, origin: "outside" });
 		}
 	});
 
 	it("splits a mode from its focus instructions", async () => {
 		const h = acpRuntime();
 		await executeAcpBuiltinSlashCommand("/compact soft focus on the parser", h.runtime);
-		expect(h.compact).toHaveBeenCalledWith("focus on the parser", { mode: "soft" });
+		expect(h.compact).toHaveBeenCalledWith("focus on the parser", { mode: "soft", origin: "outside" });
 	});
 
 	it("treats a non-mode argument as plain focus instructions (backward compatible)", async () => {
 		const h = acpRuntime();
 		await executeAcpBuiltinSlashCommand("/compact summarize the auth flow", h.runtime);
-		expect(h.compact).toHaveBeenCalledWith("summarize the auth flow", undefined);
+		expect(h.compact).toHaveBeenCalledWith("summarize the auth flow", { origin: "outside" });
 	});
 
 	it("rejects focus text on snapcompact without compacting", async () => {
@@ -133,13 +138,13 @@ describe("/compact dispatch (TUI)", () => {
 		const handled = await executeBuiltinSlashCommand("/compact soft fix the bug", h.runtime);
 		expect(handled).toBe(true);
 		expect(h.setText).toHaveBeenCalledWith("");
-		expect(h.handleCompactCommand).toHaveBeenCalledWith("fix the bug", "soft");
+		expect(h.handleCompactCommand).toHaveBeenCalledWith("fix the bug", "soft", undefined, { origin: "outside" });
 	});
 
 	it("passes no mode for a bare /compact", async () => {
 		const h = tuiRuntime();
 		await executeBuiltinSlashCommand("/compact", h.runtime);
-		expect(h.handleCompactCommand).toHaveBeenCalledWith(undefined, undefined);
+		expect(h.handleCompactCommand).toHaveBeenCalledWith(undefined, undefined, undefined, { origin: "outside" });
 	});
 
 	it("warns on snapcompact + focus text and does not compact", async () => {

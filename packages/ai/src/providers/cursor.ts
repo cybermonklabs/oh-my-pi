@@ -184,6 +184,7 @@ import {
 import { classifyJsonPrefix } from "@oh-my-pi/pi-utils/json-parse";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -1526,8 +1527,14 @@ function streamCursorWithWireMode(
 				}
 				h2Client = client;
 				client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
+				// Each request (the first, the stream retry after its backoff, the HTTP/1 and wire-model fallbacks)
+				// reads the model-call guards right before it opens, after the `onPayload` hooks and the proxy
+				// tunnel. A held request fails like any other send error and ends with the output streamed so far.
+				assertModelCallAllowed(model);
 				runTransport = wrapHttp2RunTransport(client.request(requestHeaders));
 			} else {
+				// The model-call guards' read right before the request opens (see the HTTP/2 branch above).
+				assertModelCallAllowed(model);
 				runTransport = createHttp1RunTransport({
 					baseUrl,
 					headers: requestHeaders,
@@ -2215,12 +2222,14 @@ function streamCursorWithWireMode(
 			// them here settles their live cards and pairs the server-owned calls
 			// (`connect_scm`, native todo) that nothing else answers — an
 			// unpaired call is stripped from every rebuilt transcript.
-			// Undefined only when the failure predates the state's construction,
-			// in which case no block was ever opened.
-			if (openBlockState) {
-				endCurrentTextBlock(output, stream, openBlockState);
-				endCurrentThinkingBlock(output, stream, openBlockState);
-				flushOpenToolCalls(output, stream, openBlockState);
+			// A resend that fails before its state is built (a model-call hold right before it opens) still owns
+			// the blocks the earlier request left open: they arrive in `retryContext.blockState`. Undefined only on
+			// a first request that failed before its state was built, when no block was ever opened.
+			const blocksToClose = openBlockState ?? retryContext?.blockState;
+			if (blocksToClose) {
+				endCurrentTextBlock(output, stream, blocksToClose);
+				endCurrentThinkingBlock(output, stream, blocksToClose);
+				flushOpenToolCalls(output, stream, blocksToClose);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
 			// #8345/#15830: a server-side per-conversation rejection (a bare

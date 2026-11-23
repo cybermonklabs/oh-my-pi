@@ -9,7 +9,9 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { guardedRequestUrl, guardModelRequest } from "@oh-my-pi/pi-ai/model-call-guard";
 import { fetchWithRetry } from "@oh-my-pi/pi-utils";
+import { configuredModel, configuredRequestError, retryUnlessCyberPolicy } from "./guard-model";
 import { type CompleteOptions, callHostLlm, getHostLlmBackend } from "./llm-backends";
 import { envFlag, envInt, envString } from "../util/env";
 import {
@@ -325,43 +327,56 @@ export async function callRemoteLlm(
 		return null;
 	}
 
+	const modelName = llmModelName();
 	const body = JSON.stringify({
-		model: llmModelName(),
+		model: modelName,
 		messages: [{ role: "user", content: prompt }],
 		max_tokens: llmMaxTokens(),
 		temperature,
 		stop: ["</s>", "<|user|>"],
 	});
+	// The request goes out by raw fetch, past pi-ai's dispatch functions, so it meets the model-call guards
+	// itself. `guardModelRequest` holds it before it starts and reports an error it meets (a `cyber_policy`
+	// refusal included) to the guards before the catch below sees it; the URL reads them again before each
+	// attempt, in the step of its send, so a held attempt sends nothing, unretried. A `cyber_policy` refusal
+	// is never retried. Every failure still ends the call with no summary (null).
+	const model = configuredModel(modelName, baseUrl);
+	const url = guardedRequestUrl(model, `${baseUrl}/chat/completions`);
 	const fetchImpl = options.fetch ?? fetch;
 	try {
-		// withAuth re-resolves the key on 401 (force-refresh, then sibling
-		// rotation) when the configured key is a resolver. An empty static key
-		// attempts without an Authorization header (local/proxy setups).
-		const response = await withAuth(llmApiKey(), async key => {
-			const headers: Record<string, string> = { "Content-Type": "application/json" };
-			if (key !== "") {
-				headers.Authorization = `Bearer ${key}`;
-			}
-			const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
-				method: "POST",
-				headers,
-				body,
-				signal: AbortSignal.timeout(60000),
-				fetch: fetchImpl,
+		return await guardModelRequest(model, async () => {
+			// withAuth re-resolves the key on 401 (force-refresh, then sibling
+			// rotation) when the configured key is a resolver. An empty static key
+			// attempts without an Authorization header (local/proxy setups).
+			const response = await withAuth(llmApiKey(), async key => {
+				const headers: Record<string, string> = { "Content-Type": "application/json" };
+				if (key !== "") {
+					headers.Authorization = `Bearer ${key}`;
+				}
+				const res = await fetchWithRetry(url, {
+					method: "POST",
+					headers,
+					body,
+					signal: AbortSignal.timeout(60000),
+					fetch: fetchImpl,
+					shouldRetryResponse: retryUnlessCyberPolicy,
+				});
+				if (res.status === 401) {
+					throw new ProviderHttpError("mnemopi remote LLM request unauthorized (401)", 401, {
+						headers: res.headers,
+					});
+				}
+				return res;
 			});
-			if (res.status === 401) {
-				throw new ProviderHttpError("mnemopi remote LLM request unauthorized (401)", 401, { headers: res.headers });
+			if (!response.ok) {
+				throw await configuredRequestError("mnemopi remote LLM request failed", response);
 			}
-			return res;
+			const data = (await response.json()) as {
+				choices?: Array<{ message?: { content?: unknown } }>;
+			};
+			const content = data.choices?.[0]?.message?.content;
+			return typeof content === "string" ? content : null;
 		});
-		if (!response.ok) {
-			return null;
-		}
-		const data = (await response.json()) as {
-			choices?: Array<{ message?: { content?: unknown } }>;
-		};
-		const content = data.choices?.[0]?.message?.content;
-		return typeof content === "string" ? content : null;
 	} catch {
 		return null;
 	}

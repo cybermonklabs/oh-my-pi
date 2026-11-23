@@ -975,6 +975,7 @@ const streamOpenAICompletionsOnce = (
 					}
 					const { events, response, requestId } = await postOpenAIStream<ChatCompletionChunk>({
 						url: completionsUrl,
+						model,
 						headers: headersWithTimeout,
 						body: params,
 						signal: requestSignal,

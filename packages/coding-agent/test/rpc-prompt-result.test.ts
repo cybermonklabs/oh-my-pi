@@ -193,6 +193,43 @@ describe("RpcPromptResults", () => {
 		]);
 	});
 
+	// A cyber_policy refusal relayed as a gateway 5xx reads as transient by status; a client that
+	// resubmits it sends the refused content again. Synthetic refusal text only.
+	test("reports a cyber_policy refusal as not retryable, with its code, whatever its status", async () => {
+		const { frames, session, results } = createHarness();
+		// Still streaming when the result is written, as a run's own error is reported.
+		session.isStreaming = true;
+		results.settle(results.begin("req_cyber"));
+		results.observe(
+			agentEnd([
+				assistant({
+					stopReason: "error",
+					errorStatus: 503,
+					errorMessage: "503 cyber_policy: This content was flagged for possible cybersecurity risk.",
+				}),
+			]),
+		);
+		await flushFrames();
+
+		expect(frames).toEqual([
+			{
+				type: "prompt_result",
+				id: "req_cyber",
+				agentInvoked: true,
+				status: "error",
+				sessionSettled: false,
+				error: {
+					message: "503 cyber_policy: This content was flagged for possible cybersecurity risk.",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					httpStatus: 503,
+					retryable: false,
+					code: "cyber_policy",
+				},
+			},
+		]);
+	});
+
 	test("reports an interrupted prompt's own aborted run, not the replacement run still streaming", async () => {
 		const { frames, session, results } = createHarness();
 		const interrupted = results.begin("req_old");

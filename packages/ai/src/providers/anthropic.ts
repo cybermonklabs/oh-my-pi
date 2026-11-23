@@ -23,6 +23,7 @@ import {
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { waitForRetry } from "../utils/retry-wait";
 import { getEnvApiKey } from "../env-api-key";
@@ -2690,6 +2691,10 @@ const streamAnthropicOnce = (
 					maxRetries: 0,
 					...(requestHeaders ? { headers: requestHeaders } : {}),
 				};
+				// Each pass of this loop sends again (after a provider retry's backoff, a slow-mode or fallback-credit
+				// wait, a cache-control or thread recovery): each send reads the model-call guards right before it
+				// goes out. A held send throws out of the loop and ends the call with the hold's `cyber_policy` error.
+				assertModelCallAllowed(model);
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...wireParams, stream: true }, requestOptions)

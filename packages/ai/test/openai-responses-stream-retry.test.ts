@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { postOpenAIStream } from "@oh-my-pi/pi-ai/utils/openai-http";
 import type {
@@ -287,6 +288,41 @@ describe("OpenAI Responses transient stream retry", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(result.content).toMatchObject([{ type: "text", text: "Recovered" }]);
 		expect(result.stopReason).toBe("stop");
+	});
+
+	// The transient stream retry waits, then opens a new request. A hold that begins during that wait (another
+	// call of the tree meets a refusal) holds the new request: nothing is sent again, and the call ends on the
+	// held error. The test above is the control: with no hold, the retry is sent and recovers.
+	it("holds the transient stream retry when a hold begins during its wait", async () => {
+		let held = false;
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		const fetchMock = vi.fn(async () =>
+			createSseResponse([
+				{ type: "response.created", response: { id: "resp_gateway", status: "in_progress" } },
+				{
+					type: "error",
+					error: {
+						code: "stream_incomplete",
+						message: "Upstream websocket closed before response.completed: Upstream websocket receive failed",
+					},
+				},
+			]),
+		) as FetchImpl;
+		try {
+			const result = await streamOpenAIResponses(model, context, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerRetryWait: async () => {
+					held = true;
+				},
+			}).result();
+
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("held: cyber_policy");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("retries a truncated pending tool call with a fresh request and clean state", async () => {
@@ -623,6 +659,7 @@ describe("OpenAI Responses transient stream retry", () => {
 
 		const { response } = await postOpenAIStream({
 			url: "https://example.openai.azure.com/openai/v1/responses",
+			model,
 			headers: {},
 			body: {},
 			signal: new AbortController().signal,

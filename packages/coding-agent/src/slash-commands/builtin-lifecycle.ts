@@ -251,7 +251,12 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
 				try {
-					await runtime.session.compact(parsed.instructions, parsed.mode ? { mode: parsed.mode } : undefined);
+					// Typed by a client or a person over RPC, ACP or print: the runtime says so with its origin. The TUI's
+					// `/compact` runs `handleTui` below, which passes the origin itself.
+					await runtime.session.compact(parsed.instructions, {
+						...(parsed.mode ? { mode: parsed.mode } : {}),
+						origin: runtime.origin,
+					});
 				} catch (err) {
 					// RPC `abort` and ACP `session/cancel` propagate their explicit
 					// USER_INTERRUPT_LABEL through the compaction abort signal. The client
@@ -315,7 +320,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				ctx.runYieldCompaction();
 				return;
 			}
-			await ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			// A person's `/compact`: input from outside the session.
+			await ctx.handleCompactCommand(parsed.instructions, parsed.mode, undefined, { origin: "outside" });
 		},
 	},
 	{
@@ -368,7 +374,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const runHandoff = async (): Promise<void> => {
 				let result: HandoffResult | undefined;
 				try {
-					result = await runtime.session.handoff(command.args || undefined);
+					result = await runtime.session.handoff(command.args || undefined, { origin: runtime.origin });
 				} catch (err) {
 					const message = errorMessage(err);
 					// A user interrupt (ACP `session/cancel`, TUI Esc) already settled the

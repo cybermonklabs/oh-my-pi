@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { AnthropicMessagesClient, type AnthropicMessagesClientLike } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
@@ -656,6 +657,54 @@ describe("anthropic provider retry delays", () => {
 		expect(providerRetryWait).toHaveBeenCalledTimes(1);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered from tls retry" }]);
+	});
+
+	// Each pass of the provider loop sends again: the send reads the model-call guards right before it goes
+	// out, so a hold that begins during the backoff holds the retry and the call ends on the held error.
+	it.each([
+		["holds the retry when a model-call hold begins during its backoff", true, 1],
+		["retries when no hold begins (control)", false, 2],
+	])("%s", async (_label, holdDuringWait, expectedAttempts) => {
+		let attempt = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempt += 1;
+			if (attempt === 1) {
+				return createRejectedAnthropicRequest(
+					new AIError.AnthropicApiError(
+						529,
+						'529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+						new Headers({ "retry-after": "1" }),
+					),
+				) as never;
+			}
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				events: createSuccessfulAnthropicEvents("after backoff"),
+			}) as never;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+		let held = false;
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (held && candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const result = await streamAnthropic(model, context, {
+				client,
+				providerRetryWait: async () => {
+					held = holdDuringWait;
+				},
+			}).result();
+
+			expect(attempt).toBe(expectedAttempts);
+			if (holdDuringWait) {
+				expect(result.stopReason).toBe("error");
+				expect(result.errorMessage).toContain("held: cyber_policy");
+			} else {
+				expect(result.stopReason).toBe("stop");
+			}
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("does not retry permanent TLS configuration failures", async () => {

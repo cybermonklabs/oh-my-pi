@@ -188,7 +188,7 @@ describe("InteractiveMode goal mode integration", () => {
 
 		await harness.mode.startGoalAtStartup(objective);
 
-		expect(prompt).toHaveBeenCalledWith(objective, { streamingBehavior: "steer" });
+		expect(prompt).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", origin: "outside" });
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
 	});
 
@@ -248,7 +248,7 @@ describe("InteractiveMode goal mode integration", () => {
 
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe(objective);
 		expect(sendGoalModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images, origin: "outside" });
 	});
 
 	it("steers replacement goal objective attachments while streaming", async () => {
@@ -263,7 +263,7 @@ describe("InteractiveMode goal mode integration", () => {
 
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe(objective);
 		expect(sendGoalModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(objective, { streamingBehavior: "steer", images, origin: "outside" });
 	});
 	it("steers plan prompt attachments while streaming", async () => {
 		Object.defineProperty(harness.session, "isStreaming", { configurable: true, get: () => true });
@@ -275,7 +275,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await harness.mode.handlePlanModeCommand(text, { images, imageLinks: ["file:///shot.png"] })).toBe(true);
 
 		expect(sendPlanModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(text, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(text, { streamingBehavior: "steer", images, origin: "outside" });
 	});
 
 	it("steers vibe prompt attachments while streaming", async () => {
@@ -289,7 +289,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await harness.mode.handleVibeModeCommand(text, { images, imageLinks: ["file:///shot.png"] })).toBe(true);
 
 		expect(sendVibeModeContext).toHaveBeenCalledWith({ deliverAs: "steer" });
-		expect(promptSpy).toHaveBeenCalledWith(text, { streamingBehavior: "steer", images });
+		expect(promptSpy).toHaveBeenCalledWith(text, { streamingBehavior: "steer", images, origin: "outside" });
 	});
 
 	const attachmentCases: Array<{

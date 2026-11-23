@@ -1381,7 +1381,10 @@ export class UiHelpers {
 		if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 	}
 
-	/** Deliver one compaction-queued message; `onQueued` receives what it pushes onto the session queues. */
+	/**
+	 * Deliver one compaction-queued message; `onQueued` receives what it pushes onto the session queues.
+	 * Only typed input is queued here, so each delivery is input from outside the session.
+	 */
 	async #deliverQueuedMessage(
 		message: CompactionQueuedMessage,
 		onQueued: (queued: readonly AgentMessage[]) => void,
@@ -1399,6 +1402,7 @@ export class UiHelpers {
 				streamingBehavior: message.mode,
 				images: message.images,
 				onPromptQueued: onQueued,
+				origin: "outside",
 			});
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
 			return;
@@ -1409,13 +1413,14 @@ export class UiHelpers {
 				queueOnly: true,
 				images: message.images,
 				onPromptQueued: onQueued,
+				origin: "outside",
 			})
 		) {
 			return;
 		}
 		if (this.ctx.isKnownSlashCommand(message.text)) {
 			// No `streamingBehavior`: this prompt never queues (a busy session rejects it).
-			const forwarded = await this.ctx.session.prompt(message.text);
+			const forwarded = await this.ctx.session.prompt(message.text, { origin: "outside" });
 			this.#parkLoopOnLocalConsume(message.text, forwarded);
 			return;
 		}
@@ -1423,8 +1428,11 @@ export class UiHelpers {
 			message.text,
 			() =>
 				message.mode === "followUp"
-					? this.ctx.session.followUp(message.text, message.images, { onPromptQueued: onQueued })
-					: this.ctx.session.steer(message.text, message.images, { onPromptQueued: onQueued }),
+					? this.ctx.session.followUp(message.text, message.images, {
+							onPromptQueued: onQueued,
+							origin: "outside",
+						})
+					: this.ctx.session.steer(message.text, message.images, { onPromptQueued: onQueued, origin: "outside" }),
 			{ imageCount: message.images?.length ?? 0 },
 		);
 	}
@@ -1601,6 +1609,8 @@ export class UiHelpers {
 								...built.options,
 								onPromptQueued: onFirstQueued,
 								onPromptAdmitted: onFirstAdmitted,
+								// Typed by a person while the session compacted: input from outside the session.
+								origin: "outside",
 							})
 							.then(sent => {
 								if (sent === false) onFirstDropped();
@@ -1614,6 +1624,8 @@ export class UiHelpers {
 						images: first.images,
 						onPromptQueued: onFirstQueued,
 						onPromptAdmitted: onFirstAdmitted,
+						// Typed by a person while the session compacted: input from outside the session.
+						origin: "outside",
 					})
 					.catch((error: unknown) => {
 						disposeFirstPrompt();
