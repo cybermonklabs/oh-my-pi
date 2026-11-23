@@ -275,6 +275,8 @@ pub fn exec(
 					let null_forks = null && super::redir::null_forks(&unit.redirs[list as usize]);
 					let owner = super::redir::Owner::Simple { null_forks };
 					let res = super::redir::apply(k, vp, cx, unit, list, line, owner);
+					// Where the hidden scope goes back, for `forget_var_fds`.
+					let scoped = hidden.is_some().then_some(at);
 					if let Some(scope) = hidden {
 						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
 					}
@@ -294,7 +296,7 @@ pub fn exec(
 								forks_for(k, cx, vp)
 							} =>
 						{
-							super::redir::forget_var_fds(k, vp, cx);
+							forget_var_fds(k, vp, cx, scoped);
 							let s = st(vp);
 							s.status = if null { 1 } else { code };
 							// bash looks the name up (and hashes it) in the shell
@@ -338,7 +340,7 @@ pub fn exec(
 							// `forcefork`), after the shell looked its name up.
 							let forks = !null && forks_for(k, cx, vp);
 							if forks || null_forks {
-								super::redir::forget_var_fds(k, vp, cx);
+								forget_var_fds(k, vp, cx, scoped);
 							}
 							let s = st(vp);
 							s.status = 1;
@@ -1884,6 +1886,22 @@ const fn catch_builtin(vp: &mut Vproc) {
 	}
 }
 
+/// [`super::redir::forget_var_fds`] for a simple command whose temporary
+/// scope went back at `scoped` after its redirections: they assigned their
+/// `{var}`s with that scope hidden (bash's `expanding_redir`), so the old
+/// values go back with it hidden again, not into it.
+fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, scoped: Option<usize>) {
+	let Some(at) = scoped else {
+		super::redir::forget_var_fds(k, vp, cx);
+		return;
+	};
+	let scope = state::pop_scope(&mut k.root, cx.store, vp);
+	super::redir::forget_var_fds(k, vp, cx);
+	if let Some(scope) = scope {
+		state::insert_scope(&mut k.root, cx.store, vp, at, scope);
+	}
+}
+
 /// Whether bash runs the simple command on top of `vp` (its words
 /// expanded, its name not yet looked up) in a fork that makes its
 /// redirections itself (`execute_disk_command`): a name that is not a
@@ -2158,7 +2176,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						&extensions,
 					));
 					sc.io().search =
-						Some(PathSearch { cands, idx: 0, checking_exec: false, nonexec: None });
+						Some(Box::new(PathSearch { cands, idx: 0, checking_exec: false, nonexec: None }));
 				},
 			}
 		}

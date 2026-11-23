@@ -1310,8 +1310,9 @@ pub struct ScratchIo {
 	/// The probe whose fs operation is in flight (`Scratch::live`), with its
 	/// partial progress.
 	pub probing: Option<Probe>,
-	/// PATH search of the probe in flight.
-	pub search:  Option<PathSearch>,
+	/// PATH search of the probe in flight (boxed: the size guard below,
+	/// and few ops search).
+	pub search:  Option<Box<PathSearch>>,
 	/// Bytes read so far by an `Input`/`Read` probe.
 	pub input:   Vec<u8>,
 	/// The pathname-expansion walk of the `Glob` probe in flight.
@@ -1319,12 +1320,18 @@ pub struct ScratchIo {
 	/// The zsh part ([`ScratchZsh`]), created by zsh code on first use
 	/// ([`Self::zsh()`]): a bash op's progress neither carries nor clears it.
 	pub zsh:     Option<Box<ScratchZsh>>,
+	/// The `{var}` redirections a compound's `Redir` op made so far (a
+	/// simple command's are [`ExecState::var_fds`]): a `( … )` whose own
+	/// redirections fail fatally leaves neither the fd nor the value in the
+	/// shell ([`super::redir::forget_var_fds`]). Boxed: few ops have one.
+	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
+	pub var_fds: Option<Box<Vec<VarFd>>>,
 }
 
 impl ScratchIo {
 	/// Clear for the next op, keeping the vectors' allocations.
 	fn clear(&mut self) {
-		let Self { redir, saved, probes, probing, search, input, walk, zsh } = self;
+		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds } = self;
 		*redir = RedirProgress::default();
 		saved.clear();
 		probes.clear();
@@ -1335,6 +1342,7 @@ impl ScratchIo {
 		if let Some(z) = zsh {
 			z.clear();
 		}
+		*var_fds = None;
 	}
 
 	/// The op's zsh I/O progress, created on first use.

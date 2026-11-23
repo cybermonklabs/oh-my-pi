@@ -22,9 +22,13 @@
 //!   (`eval 'echo ${x:?u}' &`); a function gets none (127 under `-c`).
 //! - A `( … )`'s own redirections are made in its fork: a fatal error in them
 //!   fails the subshell (127 under `-c`, else 1), and the shell goes on.
-//! - A command bash forks for before its redirections leaves no `{var}` fd and
-//!   no `{var}` value in the shell when they fail, and its name is still looked
-//!   up (and hashed) in the shell.
+//! - A command bash forks for before its redirections, and a `( … )`, leave no
+//!   `{var}` fd and no `{var}` value in the shell when those redirections fail
+//!   (a temporary assignment to the variable included), and the name of the
+//!   command is still looked up (and hashed) in the shell.
+//! - An async `&&` or `||` list is bash's subshell (`CMD_FORCE_SUBSHELL`): a
+//!   fatal error anywhere in it exits 1, under `-c` too; a lone async command
+//!   is still the command's own fork (127 under `-c`).
 //!
 //! Each row runs in a fresh directory holding `in` ("hello") and a FIFO
 //! `fifo`, its program named `bash` (as bash names itself in messages).
@@ -39,7 +43,7 @@ use obash_support::{obash, output};
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 226 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// 254 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
 	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
 	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
 	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c, r2-null-c/c
@@ -1702,6 +1706,234 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"",
 	),
 	("r2-null-c", true, "< ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
+	(
+		"r3-and-first",
+		false,
+		"echo ${x:?u} && echo b & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-and-first",
+		true,
+		"echo ${x:?u} && echo b & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-and-second",
+		false,
+		"/bin/true && echo ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-and-second",
+		true,
+		"/bin/true && echo ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-or-first",
+		false,
+		"echo ${x:?u} || echo b & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-or-first",
+		true,
+		"echo ${x:?u} || echo b & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-or-ext-redir",
+		false,
+		"/bin/cat < ${x:?u} || echo \"rc=$?\" & wait $!; echo \"st=$?\"",
+		0,
+		"rc=1\nst=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-or-ext-redir",
+		true,
+		"/bin/cat < ${x:?u} || echo \"rc=$?\" & wait $!; echo \"st=$?\"",
+		0,
+		"rc=1\nst=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-or-sub-redir",
+		false,
+		"( echo g ) < ${x:?u} || echo b & wait $!; echo \"st=$?\"",
+		0,
+		"b\nst=0\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-or-sub-redir",
+		true,
+		"( echo g ) < ${x:?u} || echo b & wait $!; echo \"st=$?\"",
+		0,
+		"b\nst=0\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-and-group-move",
+		false,
+		"/bin/true && { :; } <&7- & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: redirection error: cannot duplicate fd: Bad file descriptor\nbash: line 1: 7: Bad \
+		 file descriptor\n",
+	),
+	(
+		"r3-and-group-move",
+		true,
+		"/bin/true && { :; } <&7- & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: redirection error: cannot duplicate fd: Bad file descriptor\n./s.sh: line 1: 7: \
+		 Bad file descriptor\n",
+	),
+	(
+		"r3-lone-ext-redir",
+		false,
+		"/bin/cat < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-lone-ext-redir",
+		true,
+		"/bin/cat < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-and-ext-fail",
+		false,
+		"/bin/true && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r3-and-ext-fail",
+		true,
+		"/bin/true && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r3-sub-var-fatal",
+		false,
+		"( : ) {v}<in < ${x:?u}; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: x: u\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r3-sub-var-fatal",
+		true,
+		"( : ) {v}<in < ${x:?u}; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: x: u\n./s.sh: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r3-sub-var-fail",
+		false,
+		"( : ) {v}<in < nonexist; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: nonexist: No such file or directory\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r3-sub-var-fail",
+		true,
+		"( : ) {v}<in < nonexist; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: 10: Bad file \
+		 descriptor\n",
+	),
+	(
+		"r3-sub-var-kept",
+		false,
+		"v=1; ( : ) {v}<in < nonexist; echo \"v=[$v]\"",
+		0,
+		"v=[1]\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r3-sub-var-kept",
+		true,
+		"v=1; ( : ) {v}<in < nonexist; echo \"v=[$v]\"",
+		0,
+		"v=[1]\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r3-assign-var-fail",
+		false,
+		"v=1 /bin/cat {v}<in < nonexist; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"bash: line 1: nonexist: No such file or directory\nbash: line 1: 10: Bad file descriptor\n",
+	),
+	(
+		"r3-assign-var-fail",
+		true,
+		"v=1 /bin/cat {v}<in < nonexist; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		1,
+		"v=[]\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: 10: Bad file \
+		 descriptor\n",
+	),
+	(
+		"r3-assign-var-fatal",
+		false,
+		"v=1 /bin/cat {v}<in < ${x:?u}; echo \"v=[$v]\"",
+		0,
+		"v=[]\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r3-assign-var-fatal",
+		true,
+		"v=1 /bin/cat {v}<in < ${x:?u}; echo \"v=[$v]\"",
+		0,
+		"v=[]\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r3-assign-var-old",
+		false,
+		"v=old; v=1 /bin/cat {v}<in < nonexist; echo \"v=[$v]\"",
+		0,
+		"v=[old]\n",
+		"bash: line 1: nonexist: No such file or directory\n",
+	),
+	(
+		"r3-assign-var-old",
+		true,
+		"v=old; v=1 /bin/cat {v}<in < nonexist; echo \"v=[$v]\"",
+		0,
+		"v=[old]\n",
+		"./s.sh: line 1: nonexist: No such file or directory\n",
+	),
 ];
 
 /// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this

@@ -366,6 +366,8 @@ struct ScratchImage {
 	probing:      Option<Probe>,
 	input:        Vec<u8>,
 	saved:        Vec<SavedImage>,
+	/// A compound's `{var}` redirections made so far ([`ScratchIo::var_fds`]).
+	var_fds:      Option<Vec<super::proc::VarFd>>,
 	children:     Vec<(Vpid, Option<i32>)>,
 	inline:       Option<super::proc::InlineStage>,
 }
@@ -463,6 +465,7 @@ fn scratch_image(
 		probing: sc.probing().cloned(),
 		input: io.map_or_default(|io| io.input.clone()),
 		saved: saved_image(io.map_or_default(|io| io.saved.as_slice()), fds),
+		var_fds: io.and_then(|io| io.var_fds.as_deref().cloned()),
 		children: sc.children.clone(),
 		inline: sc.inline,
 	}
@@ -962,6 +965,7 @@ impl Shell {
 							&& img.probing.is_none()
 							&& img.input.is_empty()
 							&& saved.is_empty()
+							&& img.var_fds.is_none()
 						{
 							None
 						} else {
@@ -980,6 +984,7 @@ impl Shell {
 								zsh: (!img.redir_more.is_empty()).then(|| {
 									Box::new(ScratchZsh { more: img.redir_more, ..ScratchZsh::default() })
 								}),
+								var_fds: img.var_fds.map(Box::new),
 							}))
 						};
 						Some(Box::new(Scratch {

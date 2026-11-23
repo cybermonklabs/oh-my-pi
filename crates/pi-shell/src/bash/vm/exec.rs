@@ -3023,10 +3023,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// its fork, which bash makes them in before the subshell's
 				// catcher (`execute_in_subshell`): the subshell fails with the
 				// status the fork exits with (127 from a `-c` string, else 1)
-				// and the shell goes on. (zsh code keeps its own rule.)
+				// and the shell goes on, with none of its `{var}`s. (zsh code
+				// keeps its own rule.)
 				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
 					if subshell && !forked && unit.mode.dialect() != Dialect::Zsh =>
 				{
+					redir::forget_var_fds(k, vp, cx);
 					// The message goes to stderr as the redirections so far
 					// left it (`2>/dev/null < ${x:?}` prints none).
 					let _ = flush_out(k, vp);
@@ -3036,6 +3038,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
+					// A `( … )`'s own redirections are its fork's: the shell
+					// keeps none of their `{var}`s.
+					if subshell && !forked && unit.mode.dialect() != Dialect::Zsh {
+						redir::forget_var_fds(k, vp, cx);
+					}
 					// The message goes to stderr as the redirections so far left
 					// it; what would block is written after the restore.
 					let _ = flush_out(k, vp);
@@ -3926,19 +3933,30 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
-/// Mark `child`, forked by `vp` to run the command at `entry` (an async
-/// command, a pipeline stage), as bash's fork for it
-/// ([`super::proc::Fork::entry`]): that command's own redirections are made
-/// without undo, and a fatal expansion error in them, or anywhere in a simple
-/// command, reaches what `vp`'s reaches: bash's fork runs a simple command and
-/// a compound's own redirections before any `execute_in_subshell` catches. A
-/// compound without redirections of its own catches its own at once.
+/// Mark `child`, forked by `vp` to run the job or stage at `entry` (an
+/// async command, a pipeline stage), as bash's fork for it. When the job is
+/// one command (bash's `execute_disk_command` or a compound's own fork:
+/// the entry `Exec` or `Redir` leads straight to the job's end, as
+/// [`bang_stage`]'s `Lone` test reads it) the child gets
+/// [`super::proc::Fork::entry`]: that command's own redirections are made
+/// without undo, and a fatal expansion error in them, or anywhere in a
+/// simple command, reaches what `vp`'s reaches. Any other job (an async
+/// `&&`/`||` list: bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a
+/// compound without redirections of its own catch their own at once.
 pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
-	let own = unit
-		.ops
-		.get(entry as usize)
-		.is_some_and(|op| matches!(op.code, Opcode::Exec | Opcode::Redir));
-	child.set_fork(if own {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	// The job's end: its `SubExit`, after a `!`'s `Not`.
+	let ends = |at: u32| match code(at) {
+		Some(Opcode::SubExit) => true,
+		Some(Opcode::Not) => code(at + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
+	let whole = match unit.ops.get(entry as usize) {
+		Some(op) if op.code == Opcode::Exec => ends(entry + 1),
+		Some(op) if op.code == Opcode::Redir => ends(op.b),
+		_ => false,
+	};
+	child.set_fork(if whole {
 		super::proc::Fork::entry(vp.fork())
 	} else {
 		super::proc::Fork::CHILD

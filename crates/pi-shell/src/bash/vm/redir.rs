@@ -411,8 +411,9 @@ fn target_fd(
 	}
 }
 
-/// Store `fd` in the `{var}` named `name`, noting a simple command's
-/// variable binding before ([`super::proc::ExecState::var_fds`]).
+/// Store `fd` in the `{var}` named `name`, noting the variable's binding
+/// before: a simple command's in [`super::proc::ExecState::var_fds`], a
+/// compound's `Redir` op's in [`super::proc::ScratchIo::var_fds`].
 fn assign_fd_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -421,11 +422,7 @@ fn assign_fd_var(
 	fd: i32,
 	line: u32,
 ) -> Result<(), Diag> {
-	let before = if super::exec::scratch(vp).exec.is_some() {
-		var_before(k, vp, cx, name)
-	} else {
-		None
-	};
+	let before = var_before(k, vp, cx, name);
 	let (base, index) = builtins::split_subscript(name);
 	let lhs = Lhs { name: base, index, append: false };
 	let value = AssignValue::Scalar(BString::from(fd.to_string()));
@@ -446,12 +443,12 @@ fn assign_fd_var(
 		let msg = format!("{}: cannot assign fd to variable", name.as_bstr()).into();
 		return Err(Diag::Usage { msg });
 	}
-	if let Some(var) = before
-		&& let Some(e) = super::exec::scratch(vp).exec.as_mut()
-	{
-		e.var_fds
-			.get_or_insert_with(Box::default)
-			.push(VarFd { fd, ..var });
+	if let Some(var) = before {
+		let var = VarFd { fd, ..var };
+		match super::exec::scratch(vp).exec.as_mut() {
+			Some(e) => e.var_fds.get_or_insert_with(Box::default).push(var),
+			None => io(vp).var_fds.get_or_insert_with(Box::default).push(var),
+		}
 	}
 	Ok(())
 }
@@ -476,17 +473,17 @@ fn var_before(k: &Kernel, vp: &Vproc, cx: &mut Cx<'_>, name: &[u8]) -> Option<Va
 	Some(VarFd { fd: -1, name: base, prior })
 }
 
-/// Undo the `{var}` redirections made so far for a command bash forks for
-/// before its redirections (an external, a null command that forks) when
-/// they fail: bash makes them in that fork, so neither the fd nor the
-/// variable reaches the shell. Each fd is closed and each variable gets
+/// Undo the `{var}` redirections made so far when bash made them in a fork
+/// (a command bash forks for before its redirections: an external, a null
+/// command that forks; a `( … )`'s own) and they fail: neither the fd nor
+/// the variable reaches the shell. Each fd is closed and each variable gets
 /// its binding back.
 pub(super) fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
-	let Some(vars) = super::exec::scratch(vp)
-		.exec
-		.as_mut()
-		.and_then(|e| e.var_fds.take())
-	else {
+	let vars = match super::exec::scratch(vp).exec.as_mut() {
+		Some(e) => e.var_fds.take(),
+		None => io(vp).var_fds.take(),
+	};
+	let Some(vars) = vars else {
 		return;
 	};
 	for VarFd { fd, name, prior } in vars.into_iter().rev() {
