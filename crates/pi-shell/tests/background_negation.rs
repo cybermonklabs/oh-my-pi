@@ -115,8 +115,9 @@ fn negation_before_and_after_time() {
 
 /// `jobs` shows a job's own `!` pipeline as bash 5.2.21 and 5.3.20 do:
 /// without the `!` for simple commands and a pipeline of several (it is a
-/// flag of the commands there), with it for a lone compound command and in
-/// an and-or list. The job waits on a FIFO written after `jobs`.
+/// flag of the commands there), with it for a lone compound command, in an
+/// and-or list and in a timed pipeline (`time ! cmd`). The job waits on a
+/// FIFO written after `jobs`.
 #[test]
 fn jobs_shows_a_jobs_own_bang_as_bash_does() {
 	let row = |job: &str| format!("mkfifo ff; {job} & jobs; echo > ff; wait");
@@ -127,5 +128,6 @@ fn jobs_shows_a_jobs_own_bang_as_bash_does() {
 		("brace", &row("! { read x; } < ff"), false, &running("! { read x; } < ff"), 0),
 		("subshell", &row("! ( read x ) < ff"), false, &running("! ( read x ) < ff"), 0),
 		("and-or", &row("true && ! read x < ff"), false, &running("true && ! read x < ff"), 0),
+		("timed", &row("TIMEFORMAT=; time ! read x < ff"), false, &running("time ! read x < ff"), 0),
 	]);
 }

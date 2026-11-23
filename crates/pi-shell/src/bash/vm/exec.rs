@@ -4261,13 +4261,13 @@ pub(super) fn job_text(
 			// &` is `a | b`): it is a flag of those commands, which the
 			// printed text leaves out. A lone compound command keeps it (`!
 			// { false; }`, `! ( false )`, `! [[ … ]]`), and so does a timed
-			// pipeline (`time ! false`).
+			// pipeline (`time ! false`), whose text starts with `time `, so
+			// the `! ` prefix below is never there to take off.
 			let hidden = list.items().one().is_some_and(|item| {
 				let and_or = item.and_or();
 				let p = and_or.first();
 				and_or.rest().len() == 0
 					&& p.bang()
-					&& p.time().is_none()
 					&& (p.stages().len() > 1
 						|| p.stages().one().is_some_and(|c| {
 							matches!(c.kind(), crate::bash::syntax::tree::CommandKind::Simple(_))
