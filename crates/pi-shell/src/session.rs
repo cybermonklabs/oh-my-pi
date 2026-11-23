@@ -215,6 +215,10 @@ pub struct RunOutcome {
 	pub exited:    bool,
 	/// The shell's working directory after the command.
 	pub cwd:       BString,
+	/// Process substitutions the command started still run and hold its
+	/// stdout and stderr open (`cmd > >(slow-reader)`): they reach end of
+	/// file when those end, not with the command.
+	pub held:      bool,
 }
 
 /// Failure of a [`Session`] call.
@@ -769,8 +773,9 @@ impl Driver {
 			.into_iter()
 			.filter(|v| !earlier.contains(v))
 			.collect();
-		if let Some(held) = self.host.streams().end_run(!holders.is_empty()) {
-			self.held.push((held, holders));
+		let held = !holders.is_empty();
+		if let Some(streams) = self.host.streams().end_run(held) {
+			self.held.push((streams, holders));
 		}
 		self.host.set_pipe_tap(None);
 		self.host.set_event_sink(None);
@@ -783,7 +788,7 @@ impl Driver {
 		self.image.publish(&self.store);
 		let cwd = store_cwd(&self.store);
 		// The caller may have stopped waiting (dropped future).
-		let _ = reply.send(RunOutcome { status, cancelled: applied > 0, exited, cwd });
+		let _ = reply.send(RunOutcome { status, cancelled: applied > 0, exited, cwd, held });
 	}
 
 	/// Close the streams of each ended command whose process

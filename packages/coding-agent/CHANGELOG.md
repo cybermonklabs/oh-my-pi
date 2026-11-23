@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed the `bash` tool and `omp bash` losing what a process substitution writes after the command ends, as bash keeps it: `cmd > >(sleep 0.2; cat)` and `exec > >(tee log)` now deliver their output (the tool's wait for late output is unchanged: 250 ms without output); `$(cmd > >(filter))` reads until `filter` ends; `wait $!` and `wait` right after a builtin's `>(…)` wait for it instead of failing with `not a child of this shell`
+- Fixed the `bash` tool and `omp bash` losing what a process substitution writes after the command ends, as bash keeps it: `cmd > >(sleep 0.2; cat)` and `exec > >(tee log)` now deliver their output (the tool waits up to 2 s for a process substitution the command left running, instead of stopping after 250 ms without output); `$(cmd > >(filter))` reads until `filter` ends; `wait $!` and `wait` right after a builtin's `>(…)` wait for it instead of failing with `not a child of this shell`
 
 ## [18.18.6] - 2026-11-09
 

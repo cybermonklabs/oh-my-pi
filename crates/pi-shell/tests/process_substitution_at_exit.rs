@@ -161,9 +161,7 @@ fn a_zsh_process_substitution_outlives_the_shell() {
 }
 
 /// The bash tool's two paths: a one-shot `execute_shell` and a retained
-/// `Shell`. The substitution writes inside the tool's wait for late output
-/// (250 ms without any), and nothing reaches the retained shell's next
-/// command.
+/// `Shell`. Nothing reaches the retained shell's next command.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bash_tool_keeps_a_process_substitutions_output() {
 	let row = "/bin/echo hi > >(sleep 0.05; /bin/cat); echo after";
@@ -197,4 +195,42 @@ async fn the_bash_tool_keeps_a_process_substitutions_output() {
 			"{command}"
 		);
 	}
+}
+
+/// The bash tool's one-shot path: `row`'s status, output and duration.
+async fn one_shot(row: &str) -> (Option<i32>, String, Duration) {
+	let (tx, rx) = flume::unbounded::<String>();
+	let start = std::time::Instant::now();
+	let result = execute_shell(
+		ShellExecuteOptions { command: row.to_owned(), ..Default::default() },
+		Some(tx),
+		CancelToken::new(Some(20_000)),
+	)
+	.await
+	.expect("execute_shell");
+	(result.exit_code, rx.drain().collect(), start.elapsed())
+}
+
+/// While a substitution holds the command's output, the tool waits for its
+/// end of file rather than for 250 ms without output: what it writes 0.5 s
+/// and 1.5 s after the command arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bash_tool_waits_for_a_substitution_that_writes_late() {
+	for delay in ["0.5", "1.5"] {
+		let row = format!("/bin/echo hi > >(sleep {delay}; /bin/cat); echo after");
+		let (status, output, _) = one_shot(&row).await;
+		assert_eq!((status, output.as_str()), (Some(0), "after\nhi\n"), "{row}");
+	}
+}
+
+/// A substitution that never ends holds the tool for its 2 s cap, then the
+/// command's own output comes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bash_tool_stops_waiting_for_a_substitution_at_its_cap() {
+	let (status, output, took) = one_shot(": > >(sleep 30); echo after").await;
+	assert_eq!((status, output.as_str()), (Some(0), "after\n"));
+	assert!(
+		(Duration::from_millis(1900)..Duration::from_secs(10)).contains(&took),
+		"returned after {took:?}, not at the 2 s cap"
+	);
 }

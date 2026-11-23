@@ -1476,12 +1476,16 @@ async fn run_shell_command_once(
 	// for a short period, then cancel. A cancelled run is the exception: the
 	// processes its cancel signalled may still be running their TERM traps, so
 	// the reader stays open until they close the pipe or the cancel bridge
-	// releases it (`CANCEL_READER_GRACE`).
+	// releases it (`CANCEL_READER_GRACE`). While process substitutions the
+	// command started still run (`RunOutcome::held`), the pipe reaches EOF
+	// when they end: the drain waits for that, not for a pause in the
+	// output, up to `POST_EXIT_MAX`.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 	const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 	let cancelled = cancel_token.is_cancelled();
+	let held = result.as_ref().is_ok_and(|outcome| outcome.held);
 	let mut reader_finished = false;
 	let mut reader_output = None;
 	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
@@ -1502,7 +1506,7 @@ async fn run_shell_command_once(
 				}
 				idle_timer.as_mut().reset(time::Instant::now() + POST_EXIT_IDLE);
 			}
-			() = &mut idle_timer, if !cancelled => break,
+			() = &mut idle_timer, if !cancelled && !held => break,
 			() = &mut max_timer, if !cancelled => break,
 		}
 	}
@@ -1612,12 +1616,14 @@ async fn run_shell_command_streams_in_filesystem(
 
 	// As in `run_shell_command_once`: a short drain after the run, except
 	// that a cancelled run's readers stay open for its TERM traps until the
-	// cancel bridge releases them.
+	// cancel bridge releases them, and a run whose process substitutions
+	// still hold its streams is drained until EOF, up to `POST_EXIT_MAX`.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 	const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 	let cancelled = cancel_token.is_cancelled();
+	let held = result.as_ref().is_ok_and(|outcome| outcome.held);
 	let mut stdout_finished = false;
 	let mut stderr_finished = false;
 	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
@@ -1642,7 +1648,7 @@ async fn run_shell_command_streams_in_filesystem(
 				}
 				idle_timer.as_mut().reset(time::Instant::now() + POST_EXIT_IDLE);
 			}
-			() = &mut idle_timer, if !cancelled => break,
+			() = &mut idle_timer, if !cancelled && !held => break,
 			() = &mut max_timer, if !cancelled => break,
 		}
 	}
