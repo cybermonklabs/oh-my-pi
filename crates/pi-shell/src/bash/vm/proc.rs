@@ -98,10 +98,10 @@ pub struct Vproc {
 	/// past 65,535 loops) that shares `trap_frames`'s former 4 bytes, so
 	/// `Vproc` keeps its size.
 	pub outer_loops:   u16,
-	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
+	/// The command being run (`BASH_COMMAND`, [`BashCommand`]).
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
-	pub command:       Option<(Arc<Unit>, u32)>,
+	pub command:       Option<BashCommand>,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -759,16 +759,34 @@ pub struct Coproc {
 	pub write: i32,
 }
 
+/// What `BASH_COMMAND` names (bash's `the_printed_command_except_trap`),
+/// printed when it is read. 16 bytes, as the `(unit, node)` pair it
+/// replaced: `Vproc` keeps its size.
+#[derive(Clone, Debug)]
+pub enum BashCommand {
+	/// The op at pc `.1` of the unit: a simple command's `Exec`, the `Enter`
+	/// of `[[ ]]` or `(( ))`, the head of a `for` iteration (`ForNext`), of a
+	/// `select` (`ForIn`) or a `case` (`CaseWord`), or an arith-for
+	/// expression evaluated as written (`Arith`, [`Op::LITERAL`]).
+	///
+	/// [`Op::LITERAL`]: crate::bash::ir::Op::LITERAL
+	Op(Arc<Unit>, u32),
+	/// An arith-for expression as expanded (bash prints it `((…))` after
+	/// expanding it, before its DEBUG trap).
+	Expanded(Box<BString>),
+}
+
 impl Vproc {
-	/// `BASH_COMMAND`: the source text of the current command.
-	pub fn command_text(&self) -> &[u8] {
-		self.command.as_ref().map_or(&[][..], |(unit, node)| {
-			unit
-				.nodes
-				.get(*node as usize)
-				.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
-				.unwrap_or_default()
-		})
+	/// `BASH_COMMAND`: the current command as bash prints it
+	/// ([`BashCommand`]).
+	pub fn command_text(&self) -> BString {
+		match &self.command {
+			None => BString::default(),
+			Some(BashCommand::Expanded(expr)) => {
+				BString::from(crate::bash::syntax::arith_command(expr))
+			},
+			Some(BashCommand::Op(unit, pc)) => super::exec::command_text(unit, *pc),
+		}
 	}
 
 	pub const fn has_work(&self) -> bool {
