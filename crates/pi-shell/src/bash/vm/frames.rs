@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 37;
+pub const FRAMES_VERSION: u32 = 38;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -97,9 +97,9 @@ struct Image {
 	deferrals: Vec<super::proc::Deferral>,
 	/// Subshells dying of a signal, not reaped yet ([`Kernel::deaths`]).
 	deaths:    Vec<(Vpid, crate::bash::signal::Signal)>,
-	/// Subshell notices held for a redirection's end
-	/// ([`Kernel::held_notices`]).
-	held:      Vec<(Vpid, u32, BString)>,
+	/// The processes of pipeline jobs `disown` deleted
+	/// ([`Kernel::disowned_procs`]).
+	disowned:  Vec<(Vpid, Box<super::proc::JobProcs>)>,
 }
 
 /// One fd object.
@@ -340,7 +340,8 @@ struct FrameImage {
 	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
-	fork_line:         Option<u32>,
+	fork_line:         super::proc::ForkLine,
+	traced:            super::proc::Traced,
 	getopts:           super::proc::GetoptsState,
 }
 
@@ -574,6 +575,7 @@ impl Shell {
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
 					fork_line: f.fork_line,
+					traced: f.traced,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
 			}
@@ -672,7 +674,7 @@ impl Shell {
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
 			deaths: k.deaths.clone(),
-			held: k.held_notices.clone(),
+			disowned: k.disowned_procs.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -831,10 +833,10 @@ impl Shell {
 			.into_iter()
 			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
-		k.held_notices = img
-			.held
+		k.disowned_procs = img
+			.disowned
 			.into_iter()
-			.filter(|(v, ..)| img.procs.iter().any(|p| p.vpid == *v))
+			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
@@ -1085,6 +1087,7 @@ impl Shell {
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
 				frame.fork_line = f.fork_line;
+				frame.traced = f.traced;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
 				if matches!(frame.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {

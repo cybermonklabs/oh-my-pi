@@ -1304,11 +1304,19 @@ fn a_subshells_notice_names_the_pid_the_shell_shows_for_it() {
 /// input to its end instead), and `kill %1` ends every process at once: bash
 /// reaps them together. That kill is `TERM`, which gets no notice: after
 /// `kill -KILL %1` the point of the notice is a race in bash (its trap run,
-/// `wait`), where obash reaps the job at once.
+/// `wait`), where obash reaps the job at once. The same for `! a | b &`
+/// (bash drops the `!` of an asynchronous pipeline, `execute_cmd.c:1119-1120`,
+/// and runs the pipeline as the job) and for a job `disown` deleted (bash
+/// still reaps each of its processes and counts each, `waitchld`'s
+/// `children_exited`, `jobs.c:4161-4166`): there the shell runs builtins
+/// only until the trap has run twice (`READ2`), and its first stage ends at
+/// once.
 #[test]
 fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
 	use stage::{E0, PF, R0};
 	const TRAP: &str = "trap 'echo chld; echo >>\"$F\"' CHLD; ";
+	// Builtins only, until `$F` has two lines.
+	const READ2: &str = "until { read -r a && read -r b; } 2>/dev/null <\"$F\"; do :; done";
 	// The shell has gone, or is a zombie its runner has not reaped yet.
 	const GONE: &str =
 		"case $(ps -o stat= -p $PPID 2>/dev/null | tr -d \" \") in Z*|\"\") true;; *) false;; esac";
@@ -1351,6 +1359,10 @@ fn bash_runs_the_chld_trap_for_each_process_of_a_pipeline_job() {
 			format!("chld\nchld\n{}st=137\n", at(&[("Done", &e0), (killed, &w1k)])),
 		),
 		(format!("{TRAP}{e0} | {w1} & wait; echo done"), "chld\nchld\ndone\n".into()),
+		(format!("{TRAP}! {e0} | {w1} & wait; echo done"), "chld\nchld\ndone\n".into()),
+		(format!("{TRAP}{E0} | {w1} & disown; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
+		(format!("{TRAP}{E0} | {w1} & disown -a; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
+		(format!("{TRAP}{E0} | {w1} & disown %1; {READ2}; echo done"), "chld\nchld\ndone\n".into()),
 		(
 			format!("shopt -s lastpipe; {TRAP}{e0} | {w1} & wait %1; echo st=$?"),
 			"chld\nchld\nst=0\n".into(),
@@ -1752,11 +1764,22 @@ fn bash_keeps_finished_jobs_while_the_job_list_is_frozen() {
 
 /// Each `(script, stdout)` of `rows` as a bash `-c` string after `exec
 /// 2>&1`: what obash printed (pids masked) and how it ended, against the
-/// checked-in golden and a clean exit; a wrong row goes into `wrong`, and so
-/// does a shell still running after [`EVENT_LIMIT`]. With a live bash 5.3
-/// or later ([`real_bash_golden`]) its output must equal obash's.
+/// checked-in golden and a clean exit ([`bounded_bash_ends`]).
 fn bounded_bash_rows(rows: Vec<(String, String)>, wrong: &mut Vec<String>) {
-	for (script, out) in rows {
+	let rows = rows
+		.into_iter()
+		.map(|(script, out)| (script, out, Exit(0)))
+		.collect();
+	bounded_bash_ends(rows, wrong);
+}
+
+/// Each `(script, stdout, end)` of `rows` as a bash `-c` string after `exec
+/// 2>&1`: what obash printed (pids masked) and how it ended, against the
+/// checked-in golden and `end`; a wrong row goes into `wrong`, and so does a
+/// shell still running after [`EVENT_LIMIT`]. With a live bash 5.3 or later
+/// ([`real_bash_golden`]) its output must equal obash's.
+fn bounded_bash_ends(rows: Vec<(String, String, End)>, wrong: &mut Vec<String>) {
+	for (script, out, end) in rows {
 		let script = format!("exec 2>&1; {script}");
 		let start = |program: &OsStr| Run::script(program, "bash", &script).spawn();
 		let ours = match start(OsStr::new(env!("CARGO_BIN_EXE_obash"))).ended_within(EVENT_LIMIT) {
@@ -1767,8 +1790,8 @@ fn bounded_bash_rows(rows: Vec<(String, String)>, wrong: &mut Vec<String>) {
 			},
 		};
 		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
-		if got != (out.clone(), Some(Exit(0))) {
-			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		if got != (out.clone(), Some(end)) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {:?}", (&out, end)));
 		}
 		if let Some(bash) = real_bash_golden() {
 			let theirs = start(bash.as_os_str()).end_within(EVENT_LIMIT, &script);
@@ -2606,6 +2629,9 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
 	const KK: &str = "/bin/sh -c 'kill -KILL $$'";
 	const GONE: &str = "while kill -0 $! 2>/dev/null; do :; done";
+	/// A last stage that ends once the shell reaped the stage whose pid it
+	/// reads.
+	const READER: &str = "/bin/sh -c 'read p; while kill -0 $p 2>/dev/null; do :; done'";
 	let notice = |line, sig, text: &str| {
 		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
 	};
@@ -2731,16 +2757,12 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 			format!("x=1 /bin/sleep 30 & kill -KILL $!; {GONE}; jobs; echo next"),
 			format!("[1]+  {:<27}x=1 /bin/sleep 30\nnext\n", desc(libc::SIGKILL)),
 		),
-		// `$!` is the last stage, which ends after the first: the shell blocks
-		// in a foreground program (the first stage ends then), which also lets
-		// obash end the job before `kill -0` fails (with builtins only it
-		// fails before obash's `jobs` shows the job done).
+		// `$!` is the last stage: the job is done once the shell reaped it,
+		// with builtins only between; it ends once the shell reaped the first
+		// stage (whose pid it reads).
 		(
-			format!(
-				"x=1 {kw} | cat & while kill -0 $! 2>/dev/null; do /bin/sleep 0.01; done; jobs; echo \
-				 next"
-			),
-			format!("[1]+  {:<27}x=1 {kw} | cat\nnext\n", "Done"),
+			format!("x=1 /bin/sh -c 'echo $$; kill -KILL $$' | {READER} & {GONE}; jobs; echo next"),
+			format!("[1]+  {:<27}x=1 /bin/sh -c 'echo $$; kill -KILL $$' | {READER}\nnext\n", "Done"),
 		),
 		(
 			format!("( x=1 {kw} ) & wait; echo st=$?"),
@@ -2755,6 +2777,1038 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 	let mut wrong = Vec::new();
 	bounded_bash_rows(rows, &mut wrong);
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The end of a DEBUG trap reports the background job a signal killed while
+/// it ran (`run_debug_trap`'s `notify_and_cleanup`, `trap.c:1304`), naming
+/// the line bash holds for the command the trap ran for: where a simple
+/// command's first word ends, where a `[[ ]]` or `(( ))` ends; a compound
+/// command's own line. The job dies once the trap made a file, and the trap
+/// waits for its reap with builtins only. Checked-in goldens measured with
+/// bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_names_the_commands_own_line_at_the_end_of_a_debug_trap() {
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\n(( 1 +\n1 )); echo x\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					3,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"x\nend\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\n[[ a &&\nb ]]\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					3,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\nx=$((1+\n1))\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					3,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\necho a\\\n b\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					2,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"a b\nend\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\nfor i in 1\ndo :; done\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					2,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\ncase a\nin a) :;; esac\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					2,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\nf() {\ntrue\n}\nf\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					5,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\necho one\necho two\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					2,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"one\ntwo\nend\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\nx=1 y=2\necho z\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					2,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"z\nend\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			"d=$(mktemp -d); /bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \
+			 \\$\\$\" & p=$!; trap \": > $d/f; while kill -0 \\$p 2>/dev/null; do :; done\" \
+			 DEBUG\nif (( 1 +\n1 )); then :; fi\necho end\nrm -r \"$d\""
+				.to_owned(),
+			[
+				n(
+					3,
+					libc::SIGKILL,
+					"/bin/sh -c \"until [ -e $d/f ]; do sleep 0.01; done; kill -KILL \\$\\$\"",
+				),
+				"end\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The notice of a foreground `( … )` a signal killed is written at its
+/// reap, on the shell's standard error (not through the `( … )`'s own
+/// redirections): before `set -e` ends the shell, before the ERR trap runs,
+/// and before the EXIT trap. Checked-in goldens measured with bash 5.3.20
+/// ([`bounded_bash_ends`]).
+#[test]
+fn bash_writes_a_subshells_notice_before_errexit_and_the_err_trap() {
+	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!("set -e; ( {Q} ) 2>/dev/null; echo no"),
+			n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+			Exit(131),
+		),
+		(
+			format!("set -e; ( : ; {Q} ) 2>/dev/null; echo no"),
+			n(1, libc::SIGQUIT, "( :; /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+			Exit(131),
+		),
+		(
+			format!("set -e; f() {{ ( {Q} ) 2>/dev/null; }}; f; echo no"),
+			n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+			Exit(131),
+		),
+		(
+			format!("set -e; f() {{ ( : ; {Q} ) 2>/dev/null; }}; f; echo no"),
+			n(1, libc::SIGQUIT, "( :; /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+			Exit(131),
+		),
+		(
+			format!("trap 'echo e' ERR; ( {Q} ) 2>/dev/null; echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+				"e\nst=131\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("trap 'echo e' ERR; ( : ; {Q} ) 2>/dev/null; echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "( :; /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+				"e\nst=131\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("set -e; trap 'echo e' ERR; ( {Q} ) 2>/dev/null; echo no"),
+			[n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"), "e\n".to_owned()]
+				.concat(),
+			Exit(131),
+		),
+		(
+			format!("( {Q} ) 2>/dev/null; echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+				"st=131\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("set -e; {Q} 2>/dev/null; echo no"),
+			n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$' 2> /dev/null"),
+			Exit(131),
+		),
+		(
+			format!("trap 'echo e' ERR; {Q} 2>/dev/null; echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$' 2> /dev/null"), "e\nst=131\n".to_owned()]
+				.concat(),
+			Exit(0),
+		),
+		(
+			format!("set -e; ( {Q} ); echo no"),
+			n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' )"),
+			Exit(131),
+		),
+		(
+			format!("trap 'echo x' EXIT; set -e; ( {Q} ) 2>/dev/null; echo no"),
+			[n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"), "x\n".to_owned()]
+				.concat(),
+			Exit(131),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash's bgp list: `wait` marks the job it waited for reported and leaves
+/// it in the table (`jobs`, `wait %1` and a later `wait -n` still find it);
+/// deleting a job keeps its status (`delete_job`, `jobs.c:1501-1505`), in
+/// posix mode too, but for posix `wait -n` (`DEL_NOBGPID`) and posix `wait
+/// PID`, which forgets the status it returned; posix `wait -n` with no job
+/// takes a kept status; a plain `wait` deletes the finished jobs, then
+/// clears the list; a `$( )` inherits it. `disown` keeps the status a job
+/// has then (0 while it runs, which `wait PID` returns at once); `disown
+/// -a` keeps none (`delete_all_jobs`). Checked-in goldens measured with
+/// bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_keeps_the_status_of_each_job_it_deletes() {
+	const X3: &str = "/bin/sh -c 'exit 3'";
+	const KK: &str = "/bin/sh -c 'kill -KILL $$'";
+	const PGONE: &str = "while kill -0 $p 2>/dev/null; do :; done";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!(
+				"{X3} & p=$!; /bin/sleep 2 & wait $p; echo w=$?; wait -n; echo n=$?; wait -n; echo \
+				 n2=$?"
+			),
+			"w=3\nn=3\nn2=0\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; wait $p; jobs %1; echo j=$?"),
+			"[1]+  Exit 3                     /bin/sh -c 'exit 3'\nj=0\n".to_owned(),
+			Exit(0),
+		),
+		(format!("{X3} & p=$!; wait $p; wait %1; echo w=$?"), "w=3\n".to_owned(), Exit(0)),
+		(
+			format!("set -o posix; {X3} & p=$!; wait %1; /bin/true; wait $p 2>/dev/null; echo w=$?"),
+			"w=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("set -o posix; {X3} & p=$!; {PGONE}; jobs >/dev/null; wait -n; echo n=$?"),
+			"n=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; {PGONE}; jobs; wait; wait $p 2>/dev/null; echo w=$?"),
+			"[1]+  Exit 3                     /bin/sh -c 'exit 3'\nw=127\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; {PGONE}; disown; wait; wait $p 2>/dev/null; echo w=$?"),
+			"w=127\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{KK} & p=$!; {PGONE}\nwait; wait $p 2>/dev/null; echo w=$?"),
+			[n(2, libc::SIGKILL, "/bin/sh -c 'kill -KILL $$'"), "w=127\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; wait $p; echo a=$?; echo $(wait $p 2>/dev/null; echo b=$?)"),
+			"a=3\nb=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("set -o posix; {X3} & p=$!; wait $p; echo a=$?; wait $p 2>/dev/null; echo b=$?"),
+			"a=3\nb=127\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("set -o posix; {X3} & p=$!; {PGONE}; wait -n; echo n=$?; wait -n; echo n2=$?"),
+			"n=3\nn2=127\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; wait $p; echo a=$?; /bin/true; wait $p; echo b=$?"),
+			"a=3\nb=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; wait $p; echo a=$?; jobs; wait $p; echo b=$?"),
+			"a=3\nb=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("( {X3} & p=$!; wait $p; echo a=$?; wait $p; echo b=$? )"),
+			"a=3\nb=3\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"/bin/sleep 30 & p=$!; disown; wait $p; echo w=$?; kill $p".to_owned(),
+			"w=0\n".to_owned(),
+			Exit(0),
+		),
+		// The status `disown` kept answers at once, not the program's end.
+		(
+			"/bin/sleep 30 & p=$!; disown; kill $p; wait $p; echo w=$?".to_owned(),
+			"w=0\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{X3} & p=$!; {PGONE}; disown -a; wait $p 2>/dev/null; echo w=$?"),
+			"w=127\n".to_owned(),
+			Exit(0),
+		),
+		(format!("{X3} & p=$!; {PGONE}; disown %1; wait $p; echo w=$?"), "w=3\n".to_owned(), Exit(0)),
+		(
+			format!("{X3} & p=$!; {PGONE}; disown -r; wait $p; echo w=$?; jobs"),
+			"w=3\n".to_owned(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `should_optimize_fork` counts an EXIT, ERR or RETURN trap set to nothing
+/// (`trap '' ERR`, `signal_is_trapped`), and the ERR and RETURN traps a
+/// subshell has are the ones it inherited at the fork (`errtrace`,
+/// `functrace`): the subshell forks its last command and reports it.
+/// Checked-in goldens measured with bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_forks_a_subshells_last_command_for_a_trap_set_to_nothing() {
+	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!("( trap '' ERR; : ; {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "st=131\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("f() {{ ( trap '' RETURN; : ; {Q} ); echo in=$?; }}; f; echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "in=131\nst=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("set -E; trap '' ERR; ( : ; {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "st=131\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("trap 'echo e' ERR; ( set -E; : ; {Q} ); echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "( set -E; :; /bin/sh -c 'kill -QUIT $$' )"),
+				"e\nst=131\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("( trap '' EXIT; : ; {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "st=131\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("set -E; trap 'echo e' ERR; ( : ; {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "e\ne\nst=131\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("set -T; f() {{ trap '' RETURN; ( : ; {Q} ); echo in=$?; }}; f; echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "in=131\nst=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("trap '' ERR; ( : ; {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "( :; /bin/sh -c 'kill -QUIT $$' )"), "st=131\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("( trap '' USR1; : ; {Q} ); echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "( trap '' USR1; :; /bin/sh -c 'kill -QUIT $$' )"),
+				"st=131\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A `! ( … )` that ends a subshell's list keeps its `!` in the notice;
+/// bash takes `CMD_INVERT_RETURN` only off the subshell's whole command
+/// (`execute_cmd.c:1808-1809`). Checked-in goldens measured with bash
+/// 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_keeps_the_bang_of_a_subshell_that_ends_a_list() {
+	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!("( : ; ! ( {Q} ) ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "! ( /bin/sh -c 'kill -QUIT $$' )"), "st=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("( : ; ! ( {Q} ) 2>/dev/null ); echo st=$?"),
+			[
+				n(1, libc::SIGQUIT, "! ( /bin/sh -c 'kill -QUIT $$' ) 2> /dev/null"),
+				"st=0\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("( ! ( {Q} ) ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "( /bin/sh -c 'kill -QUIT $$' )"), "st=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("( : ; ! {Q} ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "/bin/sh -c 'kill -QUIT $$'"), "st=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("( ! ( {Q} ); : ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "! ( /bin/sh -c 'kill -QUIT $$' )"), "st=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("( : ; ! ( : ; {Q} ) ); echo st=$?"),
+			[n(1, libc::SIGQUIT, "! ( :; /bin/sh -c 'kill -QUIT $$' )"), "st=0\n".to_owned()].concat(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash re-parses a substring operand's `$( )` (`${y:$(…)}`,
+/// `${y:0:$(…)}`) and reports there, before the command prints. Checked-in
+/// goldens measured with bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_reports_as_it_reparses_a_substring_operand() {
+	const WB: &str = "/bin/sleep 30 & kill -KILL $!; while kill -0 $! 2>/dev/null; do :; done";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:$(echo 1)}}\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "\nnext\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:0:$(echo 1)}}\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "\nnext\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:$(echo 1):$(echo 1)}}\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "\nnext\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:1}}\necho next"),
+			["\n".to_owned(), n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:0:1}}\necho next"),
+			["\n".to_owned(), n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=set; unset y; echo ${{y:$((1+1))}}\necho next"),
+			["\n".to_owned(), n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A background pipeline's job is done once the shell reaped its last
+/// process: `jobs` agrees with `kill -0 $!`, which names the last stage,
+/// with builtins only between them. The last stage ends once the shell
+/// reaped the first (whose pid it reads), so the job is done when `$!` is
+/// gone. Checked-in goldens measured with bash 5.3.20
+/// ([`bounded_bash_ends`]).
+#[test]
+fn a_background_pipeline_is_done_once_its_last_process_is_reaped() {
+	const P3: &str = "/bin/sh -c 'echo $$; exit 3'";
+	const PK: &str = "/bin/sh -c 'echo $$; kill -KILL $$'";
+	const PW: &str = "/bin/sh -c 'read p; while kill -0 $p 2>/dev/null; do :; done'";
+	const GONE: &str = "while kill -0 $! 2>/dev/null; do :; done";
+	const PGONE: &str = "while kill -0 $p 2>/dev/null; do :; done";
+	let rows = vec![
+		(
+			format!("{P3} | {PW} & {GONE}; jobs; echo next"),
+			"[1]+  Done                       /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; \
+			 while kill -0 $p 2>/dev/null; do :; done'\nnext\n"
+				.to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{PK} | {PW} & {GONE}; jobs; echo next"),
+			"[1]+  Done                       /bin/sh -c 'echo $$; kill -KILL $$' | /bin/sh -c 'read \
+			 p; while kill -0 $p 2>/dev/null; do :; done'\nnext\n"
+				.to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{P3} | {PW} & {GONE}; jobs %1; echo j=$?"),
+			"[1]+  Done                       /bin/sh -c 'echo $$; exit 3' | /bin/sh -c 'read p; \
+			 while kill -0 $p 2>/dev/null; do :; done'\nj=0\n"
+				.to_owned(),
+			Exit(0),
+		),
+		(format!("{P3} | {PW} & p=$!; {PGONE}; wait $p; echo w=$?"), "w=0\n".to_owned(), Exit(0)),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The line of a compound command's redirection error in a forked process
+/// (a `( … )`, a job, a stage): bash's `line_number`, which a simple
+/// command does not keep: a `for`, `select`, `case` or arithmetic `for`
+/// header around it inside the fork's command, else the line bash had as
+/// it forked the process (a `( … )`'s last line; the parent's line). A
+/// loop's own redirections are applied before it runs. Checked-in goldens
+/// measured with bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
+	let rows = vec![
+		(
+			"{ { :; } >/x\n:\n} & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ { :; } >/x\n:\n} | cat".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n{ { :; } >/x; } &\nwait\n}\nf".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"for i in 1\ndo { { :; } >/x; } & wait; done".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ :\n{ :; } >/x\n:\n} & wait".to_owned(),
+			"bash: line 4: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ { :; } >/x; } & wait".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"x=1\n{ { :; } >/x\n} & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ while false; do :; done >/x\n} & wait".to_owned(),
+			"bash: line 2: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"( { :; } >/x\n:\n) & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ { :; } >/x\n} | { cat\n}".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"echo | { { :; } >/x\n:\n}".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ ( { :; } >/x\n:\n) ; } & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ for i in 1\ndo { :; } >/x; done\n} & wait".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"( for i in 1\ndo { :; } >/x; done\n) & wait".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ if :\nthen { :; } >/x; fi\n} & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ case a in\na) { :; } >/x;; esac\n} & wait".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ :\ng() { { :; } >/x; }\ng\n} & wait".to_owned(),
+			"bash: line 2: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ while :\ndo { :; } >/x; break; done\n} & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"for i in 1\ndo\n{ { :; } >/x\n} & wait; done".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"{ for i in 1\ndo :; done >/x\n} & wait".to_owned(),
+			"bash: line 3: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"( for i in 1\ndo\nfor j in 2\ndo :; done >/x\ndone\n)".to_owned(),
+			"bash: line 1: /x: Permission denied\n".to_owned(),
+			Exit(1),
+		),
+		(
+			"{ { :; } >/x\n} 2>&1 | cat".to_owned(),
+			"bash: line 2: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"( :\n{ :; } >/x\n:\n)".to_owned(),
+			"bash: line 4: /x: Permission denied\n".to_owned(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash forks a pipeline stage's or a job's simple command before it
+/// expands its words, with the parent's jobs: a substitution it re-parses
+/// there prints the notice of a job a signal killed (as the parent will
+/// too); the command then runs without them (`without_job_control`), but
+/// for `jobs`, which lists them (`jobs_hack`). A `{ }`, a `( … )`, a
+/// backquote and posix mode print none. Checked-in goldens measured with
+/// bash 5.3.20 ([`bounded_bash_ends`]).
+#[test]
+fn bash_reports_from_a_forked_simple_command_as_it_expands_its_words() {
+	const WB: &str = "/bin/sleep 30 & kill -KILL $!; while kill -0 $! 2>/dev/null; do :; done";
+	let n = |line, sig, text: &str| {
+		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
+	};
+	let rows = vec![
+		(
+			format!("{WB}; echo x | echo $(echo a\necho b)\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo $(echo a\necho b) | cat\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | {{ echo $(echo a\necho b); }}\necho next"),
+			["a b\n".to_owned(), n(3, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | ( echo $(echo a\necho b) )\necho next"),
+			["a b\n".to_owned(), n(3, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo $(echo a\necho b) & wait\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "a b\nnext\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | /bin/echo $(echo a\necho b)\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | cat | echo $(echo a\necho b)\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; {{ echo $(echo a\necho b); }} & wait\necho next"),
+			"a b\nnext\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | echo `echo a`\necho next"),
+			["a\n".to_owned(), n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | f=$(echo a\necho b)\necho next"),
+			[
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | echo ${{ echo a; }}\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a\n".to_owned(),
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | echo <(:) >/dev/null\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; set -o posix; echo x | echo $(echo a\necho b)\necho next"),
+			"a b\nnext\n".to_owned(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; jobs -r | cat\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | jobs -r\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | jobs\necho next"),
+			[
+				format!("[1]+  {:<27}/bin/sleep 30\n", desc(libc::SIGKILL)),
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo x | wait; echo w=$?\necho next"),
+			["w=0\n".to_owned(), n(2, libc::SIGKILL, "/bin/sleep 30"), "next\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo $(echo a\necho b) | wait\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; x=1 echo $(echo a\necho b) | cat\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; echo $(echo a\necho b) >/dev/null | cat\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; /bin/echo $(echo a\necho b) & wait\necho next"),
+			[n(2, libc::SIGKILL, "/bin/sleep 30"), "a b\nnext\n".to_owned()].concat(),
+			Exit(0),
+		),
+		(
+			format!("{WB}; f() {{ echo $1; }}; echo x | f $(echo a\necho b)\necho next"),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!(
+				"{WB}; echo x | echo $(echo a\necho b); echo y | echo $(echo a\necho b)\necho next"
+			),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(4, libc::SIGKILL, "/bin/sleep 30"),
+				"next\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+		(
+			format!(
+				"{WB}; echo x | echo $(echo a\necho b)\necho y | echo $(echo a\necho b)\necho next"
+			),
+			[
+				n(2, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\n".to_owned(),
+				n(3, libc::SIGKILL, "/bin/sleep 30"),
+				"a b\nnext\n".to_owned(),
+			]
+			.concat(),
+			Exit(0),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_ends(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// bash 5.3.20's cleanup points in an interactive shell with job control
+/// (`bash -i -c` on a terminal, `set -m`): `REAP` deletes no reported job
+/// at the end of a loop body or an arithmetic `for` test (only `if
+/// (job_control == 0 || interactive_shell == 0)`, `execute_cmd.c:2979`);
+/// the second command of a `;` connection is a cleanup point
+/// (`execute_cmd.c:2883-2884`; not in posix mode, a subshell or a trap);
+/// and a line read from a string (`-c`, `eval`, a substitution's re-parse)
+/// is none (`interactive_shell == 0 || SHOULD_PROMPT ()`, `parse.y:2526`).
+/// Each row's job finished and `${ jobs; }` marked it reported. The job's
+/// own `[1] PID` line and `jobs`' error go to `/dev/null`: obash's `-i -c`
+/// does not print the former, and names the line in the latter.
+/// Checked-in goldens measured with bash 5.3.20 (compared live only with a
+/// bash 5.3 or later, [`real_bash_golden`]).
+#[test]
+fn an_interactive_bash_with_job_control_cleans_up_at_each_semicolon() -> io::Result<()> {
+	const X3: &str = "/bin/sh -c 'exit 3'";
+	let listed = format!("[1]+  {:<27}{X3}\n", "Exit 3");
+	let start = format!(
+		"exec 2>&1; set -m; {{ {X3} & }} 2>/dev/null; while kill -0 $! 2>/dev/null; do :; done; "
+	);
+	let kept = |status: &str| format!("{listed}{status}\n");
+	let rows: Vec<(&str, String)> = vec![
+		("x=${ jobs; } && for i in 1; do :; done && jobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		("x=${ jobs; }; jobs %1 2>/dev/null; echo j=$?", "j=1\n".to_owned()),
+		("x=${ jobs; } && while :; do break; done && jobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		(
+			"x=${ jobs; } && for ((i=0;i<1;i++)); do :; done && jobs %1 2>/dev/null; echo j=$?",
+			kept("j=0"),
+		),
+		("x=${ jobs; }\njobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		("{ x=${ jobs; }; jobs %1 2>/dev/null; echo j=$?; }", "j=1\n".to_owned()),
+		("x=${ jobs; } && jobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		(
+			"set -o posix; x=$(jobs); x=${ jobs; }; jobs %1 2>/dev/null; echo j=$?",
+			format!("[1]+  {:<27}{X3}\nj=0\n", "Done(3)"),
+		),
+		(
+			"set +m; x=${ jobs; } && for i in 1; do :; done && jobs %1 2>/dev/null; echo j=$?",
+			"j=1\n".to_owned(),
+		),
+		("set +m; x=${ jobs; }; jobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		(
+			"trap 'x=${ jobs; }; jobs %1 2>/dev/null; echo t=$?' USR1; kill -USR1 $$; jobs %1 \
+			 2>/dev/null; echo j=$?",
+			format!("{listed}t=0\nj=1\n"),
+		),
+		("( x=${ jobs; }; jobs %1 2>/dev/null; echo s=$? ); echo j=$?", "s=1\nj=0\n".to_owned()),
+		("x=${ jobs; } && echo $(:) >/dev/null && jobs %1 2>/dev/null; echo j=$?", kept("j=0")),
+		("x=${ jobs; } && eval 'jobs %1 2>/dev/null'; echo j=$?", kept("j=0")),
+		("{ x=${ jobs; }\njobs %1 2>/dev/null; echo j=$?; }", "j=1\n".to_owned()),
+		("f() { x=${ jobs; }; jobs %1 2>/dev/null; echo j=$?; }; f", "j=1\n".to_owned()),
+		(
+			"x=${ jobs; } && for i in 1 2; do jobs %1 2>/dev/null; echo i=$?; done",
+			format!("{listed}i=0\ni=1\n"),
+		),
+	];
+	let run = |spawn: Spawn, script: &str| -> io::Result<String> {
+		let mut shell = spawn
+			.args(["--norc", "--noprofile", "-i", "-c", script])
+			.spawn()?;
+		shell.wait(EVENT_LIMIT)?;
+		Ok(shell.output().replace("\r\n", "\n"))
+	};
+	let mut wrong = Vec::new();
+	for (row, want) in rows {
+		let script = format!("{start}{row}");
+		let ours = run(Spawn::obash_as("bash"), &script)?;
+		if ours != want {
+			wrong.push(format!("{row:?}\n  got:  {ours:?}\n  want: {want:?}"));
+		}
+		if let Some(bash) = real_bash_golden() {
+			assert_eq!(ours, run(Spawn::new(bash).argv0("bash"), &script)?, "{row:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+	Ok(())
 }
 
 /// What job `a` of

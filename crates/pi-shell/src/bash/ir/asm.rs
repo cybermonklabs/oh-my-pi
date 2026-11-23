@@ -13,8 +13,10 @@
 //! Directives: `.unit MODE FEATURES`, `.source STR`, `.line N` (first
 //! script line, default 1), `.root NODE` (function bodies), `.tables HEX` (all
 //! side tables: aliases, nodes, words, lists, cmds, names, strs, redirs,
-//! spawns, pats, ariths, conds, funcs). Code lines are `PC OPCODE a=A b=B @NODE
-//! [cond] [ctx] [syntax] [select]`, editable by hand; `;` starts a comment.
+//! spawns, pats, ariths, conds, funcs), `.semis PC…` (bash: where the second
+//! command of a `;` connection starts, [`Unit::semis`]). Code lines are `PC
+//! OPCODE a=A b=B @NODE [cond] [ctx] [syntax] [select]`, editable by hand; `;`
+//! starts a comment.
 //! Strings escape `\\`, `\"`, `\n`, `\t` and other bytes outside printable
 //! ASCII as `\xHH`. Op event bits are derived from the opcode; the unit id is
 //! recomputed.
@@ -89,6 +91,10 @@ pub fn disasm(unit: &Unit) -> String {
 		let _ = write!(out, "{b:02x}");
 	}
 	out.push('\n');
+	if !unit.semis.is_empty() {
+		let pcs: Vec<String> = unit.semis.iter().map(u32::to_string).collect();
+		let _ = writeln!(out, ".semis {}", pcs.join(" "));
+	}
 	let mut comment = |what: &str, i: usize, v: &dyn std::fmt::Debug| {
 		let _ = writeln!(out, "; {what} {i}: {v:?}");
 	};
@@ -190,6 +196,13 @@ pub fn asm(text: &str) -> Result<Unit, AsmError> {
 				unit.ariths = t.ariths;
 				unit.conds = t.conds;
 				unit.funcs = t.funcs;
+			},
+			".semis" => {
+				unit.semis = rest
+					.split_whitespace()
+					.map(str::parse)
+					.collect::<Result<_, _>>()
+					.map_err(|_| err("bad semis"))?;
 			},
 			pc => {
 				let pc: usize = pc.parse().map_err(|_| err("unknown directive"))?;

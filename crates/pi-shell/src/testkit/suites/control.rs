@@ -468,9 +468,10 @@ fn a_pipelines_processes_outlive_every_snapshot() {
 /// Every stage of a background job's pipeline is one subshell level below
 /// the shell that started the job (bash forks each as an asynchronous
 /// command), a group or a `( … )` stage too, and a lastpipe job's last
-/// stage; a pipeline inside a job's group counts the group's level.
-/// Goldens: bash 5.3.20 and 5.2.21, the same; zsh 5.9's `$ZSH_SUBSHELL`
-/// the same for the first three.
+/// stage, under `!` too (bash drops the `!` of an asynchronous pipeline,
+/// `execute_cmd.c:1119-1120`); a pipeline inside a job's group counts the
+/// group's level. Goldens: bash 5.3.20 and 5.2.21, the same; zsh 5.9's
+/// `$ZSH_SUBSHELL` the same for the first three.
 #[test]
 fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
 	let mut wrong = Vec::new();
@@ -488,6 +489,9 @@ fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
 		("{ true | { echo n=$BASH_SUBSHELL; }; } & wait".into(), "n=2\n"),
 		("( true | { echo m=$BASH_SUBSHELL; } ) & wait".into(), "m=2\n"),
 		(format!("{{ echo fg=$BASH_SUBSHELL; }} | {CAT}"), "fg=1\n"),
+		("! true | { echo bl=$BASH_SUBSHELL; } & wait".into(), "bl=1\n"),
+		("! true | ( echo bp=$BASH_SUBSHELL ) & wait".into(), "bp=1\n"),
+		(format!("! {{ echo bg=$BASH_SUBSHELL; }} | {CAT} & wait"), "bg=1\n"),
 	] {
 		let mut r = rig();
 		r.run(Script::command(src.as_bytes()), Fault::None);

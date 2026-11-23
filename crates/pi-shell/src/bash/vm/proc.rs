@@ -132,6 +132,44 @@ pub struct Vproc {
 	pub zle:           Option<Box<super::zle::Zle>>,
 }
 
+/// Whether a vproc's fork passed on the traps bash resets in a child
+/// (`reset_or_restore_signal_handlers`, `trap.c:1467-1473`): the ERR trap
+/// with `errtrace`, the DEBUG and RETURN traps with `functrace`, as those
+/// options were when it forked. The shell itself forked from nothing, and
+/// every trap it sets is its own. One byte: it rides in `Vproc`'s padding
+/// (idle vproc ≤ 2 KiB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Traced(u8);
+
+impl Traced {
+	/// `errtrace` at the fork.
+	const ERR: u8 = 1;
+	/// This vproc was forked at all.
+	const FORKED: u8 = 4;
+	/// `functrace` at the fork.
+	const FUNC: u8 = 2;
+	/// The shell itself: nothing was reset.
+	pub const ROOT: Self = Self(0);
+
+	/// A fork made with `errtrace` and `functrace` as given.
+	pub const fn forked(err: bool, func: bool) -> Self {
+		Self(Self::FORKED | if err { Self::ERR } else { 0 } | if func { Self::FUNC } else { 0 })
+	}
+
+	/// Whether the `key` trap of a parent is in effect here.
+	pub const fn keeps(self, key: crate::bash::store::TrapKey) -> bool {
+		use crate::bash::store::TrapKey;
+		if self.0 & Self::FORKED == 0 {
+			return true;
+		}
+		match key {
+			TrapKey::Err => self.0 & Self::ERR != 0,
+			TrapKey::Debug | TrapKey::Return => self.0 & Self::FUNC != 0,
+			_ => true,
+		}
+	}
+}
+
 /// The terminal of the session a vproc runs in when it is not the shell's
 /// ([`VprocZsh::ctty`]).
 #[derive(Clone, Debug, Default)]
@@ -473,6 +511,10 @@ pub struct JobTable {
 	/// Where a command or process substitution leaves this shell: which
 	/// background jobs a signal killed it reports ([`super::killed`]).
 	pub comsub:   Comsub,
+	/// A pipeline stage or job bash forks for one simple command
+	/// ([`Copied`]): the parent's jobs it holds while it expands the
+	/// command's words.
+	pub copied:   Copied,
 	/// The statuses `wait` collected (bash's bgp list, `bgp_add`), oldest
 	/// first, at most [`BGP_MAX`]: `wait PID` finds one once its job left the
 	/// table, and a `wait` a trap interrupted ends with one the trap's own
@@ -532,6 +574,25 @@ impl Comsub {
 			Self::Own | Self::Fork => Self::Fork,
 		}
 	}
+}
+
+/// The parent's jobs a pipeline stage or job holds that bash forks for one
+/// simple command (`execute_simple_command`'s child, which expands the
+/// command's words after the fork): its report points report them as the
+/// parent's do while it expands (a `$( )` there prints the notice of a job
+/// a signal killed, [`super::killed`]); as the command runs bash's
+/// `execute_subshell_builtin_or_function` drops them (`without_job_control`),
+/// but for a `jobs` stage, which keeps listing them (`jobs_hack`), and a
+/// program replaces the process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Copied {
+	/// No such copy (the jobs are the shell's own, or copies it only lists).
+	#[default]
+	No,
+	/// Dropped once the words are expanded.
+	Drop,
+	/// Kept, listed only, once the words are expanded (`jobs`).
+	Keep,
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -772,6 +833,11 @@ impl JobTable {
 			}
 		}
 		found
+	}
+
+	/// How many statuses are kept ([`Self::bgp`]).
+	pub fn bgp_list_len(&self) -> usize {
+		self.bgp.as_deref().map_or(0, VecDeque::len)
 	}
 
 	/// The status kept for child `vpid` (bash `bgp_search`).
@@ -1325,8 +1391,13 @@ pub struct Frame {
 	/// ([`super::killed::wait_line`]): the last line of a `( … )`, where
 	/// bash's parser recorded it (`Subshell->line`; also the line of errors
 	/// of the compound commands a `( … )` runs directly), else the line its
-	/// parent had reached.
-	pub fork_line:         Option<u32>,
+	/// parent had reached (also the line of errors of the compound commands
+	/// a job or a stage runs directly), resolved only when one needs it
+	/// ([`ForkLine`]).
+	pub fork_line:         ForkLine,
+	/// The base frame of a child vproc: whether the ERR, DEBUG and RETURN
+	/// traps reached it at its fork ([`Traced`]).
+	pub traced:            Traced,
 	/// A function frame: the getopts state at the call, put back on return
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
@@ -1356,8 +1427,74 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
-			fork_line: None,
+			fork_line: ForkLine::NONE,
+			traced: Traced::ROOT,
 			getopts: None,
+		}
+	}
+}
+
+/// [`Frame::fork_line`]: bash's `line_number` as it forked a process. The
+/// line a parent had reached is that of the innermost `for`, `select`,
+/// `case` or arithmetic `for` around its command (a search of every
+/// syntax node of the unit), so a fork records where the parent was
+/// ([`ForkAt`]) and [`super::killed::fork_line`] searches only when a
+/// notice or an error names the line. Eight bytes (a frame is at its
+/// 256-byte bound): what it holds in the top three bits of `at`, the
+/// parent's op in the others, and a line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkLine {
+	at:   u32,
+	line: u32,
+}
+
+/// What a [`ForkLine`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkAt {
+	/// Not the base frame of a fork.
+	None,
+	/// The line: a `( … )`'s own (its last), or one found already.
+	Line(u32),
+	/// The parent's top frame ran op `pc` of this frame's unit, numbered
+	/// with this frame's line shift: the line of a `for`, `select`, `case`
+	/// or arithmetic `for` around that op (inside the parent's own command
+	/// when `within`: the parent is a fork too), else `then`.
+	At { pc: u32, then: u32, within: bool },
+	/// As [`Self::At`], the parent in a function: else the line the
+	/// function's body starts on.
+	InFunction { pc: u32 },
+}
+
+impl ForkLine {
+	/// Where `at` keeps what the line is.
+	const KIND: u32 = 29;
+	/// The highest op a [`ForkAt`] names; a fork from a later one resolves
+	/// its line at once.
+	pub const MAX_PC: u32 = (1 << Self::KIND) - 1;
+	/// Not the base frame of a fork.
+	pub const NONE: Self = Self { at: 0, line: 0 };
+
+	/// `at` packed ([`Self::MAX_PC`] bounds its op).
+	pub const fn new(at: ForkAt) -> Self {
+		let (kind, pc, line) = match at {
+			ForkAt::None => return Self::NONE,
+			ForkAt::Line(line) => (1, 0, line),
+			ForkAt::At { pc, then, within: false } => (2, pc, then),
+			ForkAt::At { pc, then, within: true } => (3, pc, then),
+			ForkAt::InFunction { pc } => (4, pc, 0),
+		};
+		Self { at: (kind << Self::KIND) | (pc & Self::MAX_PC), line }
+	}
+
+	/// What it holds.
+	pub const fn get(self) -> ForkAt {
+		let pc = self.at & Self::MAX_PC;
+		match self.at >> Self::KIND {
+			1 => ForkAt::Line(self.line),
+			2 => ForkAt::At { pc, then: self.line, within: false },
+			3 => ForkAt::At { pc, then: self.line, within: true },
+			4 => ForkAt::InFunction { pc },
+			_ => ForkAt::None,
 		}
 	}
 }
@@ -2064,7 +2201,11 @@ pub enum Awaited {
 	/// Without `force` (`wait -f`) a job that stops ends the wait (status
 	/// 128 + the stop signal), as in bash with job control.
 	Jobs {
-		force: bool,
+		force:  bool,
+		/// Every operand was a pid, not a job spec: bash waits for those
+		/// with `wait_for_single_pid`, whose posix-mode deletion forgets
+		/// the status it returned.
+		by_pid: bool,
 	},
 	/// Every background child (`wait` without operands); the status is 0.
 	AllJobs,

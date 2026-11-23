@@ -159,6 +159,10 @@ pub enum Control {
 pub struct Wait {
 	/// The children, in order.
 	pub children: Vec<Vpid>,
+	/// Every operand was a pid, not a job spec: bash waits for those with
+	/// `wait_for_single_pid`, whose posix-mode deletion forgets the status
+	/// it returned.
+	pub by_pid:   bool,
 	/// `wait` without operands: the status stays 0 rather than the last
 	/// child's.
 	pub all:      bool,

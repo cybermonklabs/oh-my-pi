@@ -206,8 +206,8 @@ fn wait_for_a_missing_job() {
 /// Every stage of a background job's pipeline is one level below the shell
 /// (`$ZSH_SUBSHELL` 1): the stages the job's process forks, and its last
 /// stage, which it runs itself (`last1`), a `( … )` there too, with no fork
-/// of its own. A pipeline inside a job's group counts the group's level.
-/// Goldens: zsh 5.9.
+/// of its own, under `!` too. A pipeline inside a job's group counts the
+/// group's level. Goldens: zsh 5.9.
 #[test]
 fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
 	const READ: &str = "{ read l; print -r -- $l; }";
@@ -222,6 +222,8 @@ fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
 		("true | ( print r=$ZSH_SUBSHELL ) 2>/dev/null & wait".into(), "r=1\n"),
 		("{ true | ( print n=$ZSH_SUBSHELL ); } & wait".into(), "n=2\n"),
 		("true | ( print fp=$ZSH_SUBSHELL )".into(), "fp=1\n"),
+		("! true | ( print bp=$ZSH_SUBSHELL ) & wait".into(), "bp=1\n"),
+		(format!("! {{ print bg=$ZSH_SUBSHELL; }} | {READ} & wait"), "bg=1\n"),
 	] {
 		let (out, ..) = zsh(&src);
 		if out != want {

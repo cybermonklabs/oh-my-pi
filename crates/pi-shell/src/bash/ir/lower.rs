@@ -656,7 +656,17 @@ impl Lower {
 			return Ok(());
 		}
 		let zsh = self.unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		let mut after = syn::Sep::None;
 		for item in list.items() {
+			// bash: a command after a `;` or a newline is the second of a `;`
+			// connection ([`Unit::semis`]).
+			if !zsh && matches!(after, syn::Sep::Semi | syn::Sep::Newline) {
+				let pc = self.here();
+				if self.unit.semis.last() != Some(&pc) {
+					self.unit.semis.push(pc);
+				}
+			}
+			after = item.sep();
 			let ao = item.and_or();
 			let ao_id = ao.id().0;
 			let sep = item.sep();

@@ -231,8 +231,10 @@ fn an_ended_last_stage_is_no_longer_signalled() {
 }
 
 // Failure mode: `wait -n -p` names the virtual pid while `$!` showed the OS
-// pid, `disown` of the OS pid finds no job, or `kill`/`wait` of a disowned
-// job's OS pid no longer reach it.
+// pid, `disown` of the OS pid finds no job, or `kill` of a disowned job's OS
+// pid no longer reaches it. `wait` of that pid returns the status `disown`
+// kept as it deleted the running job, 0, at once (bash 5.3.20: `delete_job`
+// keeps it, and `wait_for_single_pid` answers with it for a pid in no job).
 #[test]
 fn wait_p_and_disown_take_the_os_pid() {
 	let world = World::new();
@@ -241,7 +243,8 @@ fn wait_p_and_disown_take_the_os_pid() {
 		"/x/true & p=$!; wait -n -p v; echo \"$v $p\"; /x/sleeper & q=$!; disown \"$q\"; echo \
 		 \"disown=$? jobs=$(jobs -p)\"; kill \"$q\"; wait \"$q\"; echo $?",
 	);
-	assert_eq!(out, "5001 5001\ndisown=0 jobs=\n143\n");
+	assert_eq!(out, "5001 5001\ndisown=0 jobs=\n0\n");
+	assert_eq!(world.got(FIRST + 1), [Signal::Term], "`kill` reached the disowned job");
 }
 
 // Failure mode: a job whose program traps `TERM` is marked done (143) when

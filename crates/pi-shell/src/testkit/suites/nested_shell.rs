@@ -166,6 +166,7 @@ fn a_script_without_shebang_in_a_job_ignores_int_only_in_the_jobs_own_process() 
 		("/w/ns 2>\"$(echo /dev/null)\" & wait", kept, vec![both]),
 		("true | /w/ns \"$(echo a)\" & wait", kept, vec![both]),
 		("! /w/ns & wait", kept, vec![both]),
+		("! true | /w/ns & wait", kept, vec![both]),
 		("( trap '' INT; trap - INT; exec /w/ns ) & wait", reset, vec![quit]),
 		("( trap '' INT; trap - INT; ( exec /w/ns ) ) & wait", reset, vec![quit]),
 		("( trap 'echo x' INT; trap - INT; exec /w/ns ) & wait", reset, vec![quit]),

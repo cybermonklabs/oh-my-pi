@@ -3406,11 +3406,17 @@ fn param_reparsed(unit: &Unit, p: &ParamIr) -> bool {
 		OpIr::Trim { pat, .. } => [Some(*pat), None],
 		OpIr::Replace { pat, rep, .. } => [Some(*pat), *rep],
 		OpIr::Case { pat, .. } => [*pat, None],
+		// `${x:off:len}`: arithmetic text, re-parsed as `$(( ))` text is.
+		OpIr::Substr { offset, len } => {
+			if arith_reparsed(offset) || len.as_ref().is_some_and(|l| arith_reparsed(l)) {
+				return true;
+			}
+			[None, None]
+		},
 		OpIr::None
 		| OpIr::Length
 		| OpIr::Indirect
 		| OpIr::PrefixNames { .. }
-		| OpIr::Substr { .. }
 		| OpIr::Transform(_) => [None, None],
 	};
 	std::iter::once(index)

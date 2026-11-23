@@ -1829,18 +1829,33 @@ pub fn record<'a>(
 }
 
 /// Whether `record` (the `key` trap as `vp`'s overlay or the root holds
-/// it) is a caught-signal trap `vp` inherited instead of setting it: a
-/// subshell lists it (bash 5.3, [`listed_traps`]) but does not run it.
-/// Called by [`record`] and [`scan`]; the `trap` builtin drops them when a
-/// subshell changes a trap.
+/// it) is a trap `vp` inherited instead of setting it, and does not run: a
+/// caught-signal trap, which a subshell lists (bash 5.3,
+/// [`listed_traps`]); and the ERR, DEBUG or RETURN trap of a fork made
+/// without `errtrace` or `functrace`
+/// (`reset_or_restore_signal_handlers`, `trap.c:1467-1473`;
+/// [`super::proc::Traced`]). Called by [`record`] and [`scan`]; the `trap`
+/// builtin drops them when a subshell changes a trap.
 pub fn inherited_trap(
 	vp: &Vproc,
 	key: crate::bash::store::TrapKey,
 	record: Option<&Record>,
 ) -> bool {
-	matches!(key, crate::bash::store::TrapKey::Signal(_))
+	use crate::bash::store::TrapKey;
+	if vp.own_traps.has(key) || record.is_none() {
+		return false;
+	}
+	if matches!(key, TrapKey::Err | TrapKey::Debug | TrapKey::Return)
+		&& !vp
+			.frames
+			.first()
+			.map_or(super::proc::Traced::ROOT, |f| f.traced)
+			.keeps(key)
+	{
+		return true;
+	}
+	matches!(key, TrapKey::Signal(_))
 		&& vp.parent.is_some()
-		&& !vp.own_traps.has(key)
 		&& matches!(record, Some(Record::Trap { action, .. }) if !action.is_empty())
 }
 
@@ -3295,6 +3310,7 @@ pub fn load_root(
 			.unwrap_or(0),
 		subshell: false,
 		comsub: super::proc::Comsub::No,
+		copied: super::proc::Copied::No,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);

@@ -532,6 +532,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return wait_all(ctx, force);
 	}
 	let mut list = Vec::new();
+	let mut by_pid = true;
 	let mut status = 0;
 	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	for a in args {
@@ -566,6 +567,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				status = 127;
 			}
 		} else if a.starts_with(b"%") {
+			by_pid = false;
 			match super::jobs::spec(ctx, a) {
 				Ok(n) => {
 					let job = ctx.vp.jobs.get(n).map(|j| (j.vpid, j.state));
@@ -584,6 +586,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				},
 			}
 		} else {
+			by_pid = false;
 			ctx.usage(format!("`{}': not a pid or valid job spec", a.as_bstr()));
 			status = 1;
 		}
@@ -591,7 +594,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if list.is_empty() {
 		return done(status);
 	}
-	let wait = Wait { children: list, all: false, any: false, into, force };
+	let wait = Wait { children: list, by_pid, all: false, any: false, into, force };
 	Ok(Outcome { status, control: Control::Wait(wait) })
 }
 
@@ -632,12 +635,16 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
-/// finished child whose status is kept (its process's, or one `wait`
-/// collected, bash's bgp list), or the running process substitution or
-/// coprocess `$!` names. zsh 5.9: not the job whose end runs the `CHLD`
-/// trap, while it runs ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its
-/// status reaches zsh's list of background statuses once the trap is over);
-/// another finished job is one.
+/// finished child whose status the shell kept when it deleted its job
+/// (bash's bgp list), a finished child that was no job (a process
+/// substitution `$!` names), or the running process substitution or
+/// coprocess `$!` names. A finished job whose job and status are both gone
+/// (a plain `wait` clears the list, `jobs.c:2863-2865`, and the shell
+/// forgets those children with it) is none, as in bash. zsh 5.9: not the
+/// job whose end runs the `CHLD` trap, while it runs
+/// ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its status reaches
+/// zsh's list of background statuses once the trap is over); another
+/// finished job is one.
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& ctx.vp.zsh.as_ref().is_some_and(|z| z.chld_own == Some(pid))
@@ -725,7 +732,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	{
 		list.push(last);
 	}
-	let wait = Wait { children: list, all: true, any: false, into: None, force };
+	let wait = Wait { children: list, by_pid: false, all: true, any: false, into: None, force };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
 
@@ -751,7 +758,8 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
-			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };
+			let wait =
+				Wait { children: vec![pid], by_pid: false, all: false, any: true, into, force: true };
 			return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 		}
 		for a in args {
@@ -788,9 +796,20 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 			}
 		}
 	}
-	if list.is_empty() {
+	// With no operand and no job, a posix shell still has the statuses it
+	// kept to answer with (`bgp_findone`, `jobs.c:3541-3553`).
+	let kept = args.is_empty()
+		&& ctx.vp.jobs.bgp_list_len() != 0
+		&& crate::bash::vm::state::option(
+			&mut ctx.k.root,
+			ctx.cx.store,
+			ctx.vp,
+			crate::bash::store::OptId::Posix,
+		)
+		.unwrap_or(false);
+	if list.is_empty() && !kept {
 		return done(127);
 	}
-	let wait = Wait { children: list, all: false, any: true, into, force: true };
+	let wait = Wait { children: list, by_pid: false, all: false, any: true, into, force: true };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }

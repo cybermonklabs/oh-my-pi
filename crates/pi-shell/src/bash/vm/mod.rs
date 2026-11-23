@@ -485,11 +485,13 @@ pub struct Kernel {
 	/// [`Self::int_notes`]: a wait the EXIT trap begins rewrites those. In
 	/// the frames image: a snapshot between the death and the reap keeps it.
 	pub deaths:             Vec<(Vpid, Signal)>,
-	/// Notices of foreground subshells a signal killed
-	/// ([`killed::subshell_ended`]) held until the `( … )`'s own
-	/// redirections are undone: the vproc, the depth of its frame, the
-	/// notice. An entry goes when its vproc ends. In the frames image.
-	pub held_notices:       Vec<(Vpid, u32, BString)>,
+	/// The processes of bash pipeline jobs that `disown` deleted while they
+	/// ran ([`proc::Job::procs`]), by the job's vproc: bash still reaps each
+	/// of them and runs the `CHLD` trap once for each (`waitchld` counts
+	/// every child it reaps, a pid it has no job for too, `jobs.c:4161-4166`),
+	/// so the record outlives the job ([`Shell::reaped`]). An entry goes
+	/// with its vproc. In the frames image.
+	pub disowned_procs:     Vec<(Vpid, Box<proc::JobProcs>)>,
 	/// The vprocs whose pending `INT` trap bash runs with the job list
 	/// frozen ([`proc::ScriptKind::Trap`]'s `frozen`): the `INT` came while
 	/// the vproc waited for a forked foreground command (bash's `wait_for`
@@ -708,7 +710,7 @@ impl Kernel {
 			pseudo_traps: exec::PseudoTraps::default(),
 			int_notes: Vec::new(),
 			deaths: Vec::new(),
-			held_notices: Vec::new(),
+			disowned_procs: Vec::new(),
 			frozen_ints: Vec::new(),
 			forward: crate::bash::SigSet::EMPTY,
 			program_in_place: false,
@@ -2179,7 +2181,6 @@ impl Shell {
 				let died = self.k.died_of(p.vpid);
 				self.k.set_int_note(p.vpid, None);
 				self.k.frozen_ints.retain(|v| *v != p.vpid);
-				self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 				self.reaped(cx, p.parent, p.vpid, p.status, died, false);
 			} else {
 				i += 1;
@@ -2213,27 +2214,15 @@ impl Shell {
 				continue;
 			};
 			let job = jp.vpid;
-			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
-			let waiting = self.procs[s].jobs.by_vpid(job).is_some_and(|entry| {
-				!entry.inherited
-					&& entry
-						.procs
-						.as_ref()
-						.is_some_and(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
-			});
-			if !waiting {
-				continue;
-			}
 			let stages: Vec<Vpid> = jp
 				.frames
 				.first()
 				.and_then(|f| f.scratch.as_deref())
 				.filter(|_| runs_pipeline(jp))
 				.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
-			let Some(procs) = self.procs[s]
-				.jobs
-				.by_vpid_mut(job)
-				.and_then(|entry| entry.procs.as_deref_mut())
+			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
+			let Some(procs) = job_procs(&mut self.procs, &mut self.k.disowned_procs, s, job)
+				.filter(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
 			else {
 				continue;
 			};
@@ -2327,6 +2316,13 @@ impl Shell {
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
 		}
+		// The processes of a pipeline job `disown` deleted go with its vproc.
+		let disowned = self
+			.k
+			.disowned_procs
+			.iter()
+			.position(|(v, _)| *v == vpid)
+			.map(|at| self.k.disowned_procs.swap_remove(at).1);
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
 		};
@@ -2334,8 +2330,16 @@ impl Shell {
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
 		// The runs of the `CHLD` trap this end owes: one for the process it
-		// is, or one for each process of its pipeline job that ended with it.
-		let mut owed = 1;
+		// is, or one for each process of its pipeline job that ended with it
+		// (a job `disown` deleted too: bash reaps its processes all the same).
+		let mut owed: usize = 1;
+		if let Some(procs) = disowned.filter(|_| !background) {
+			owed = procs
+				.list
+				.iter()
+				.filter(|p| p.state == proc::ProcState::Running)
+				.count();
+		}
 		if let Some(job) = job {
 			job.state = proc::JobState::Done(status);
 			job.signal = match job.procs.as_deref_mut() {
@@ -2396,7 +2400,8 @@ impl Shell {
 	/// of a pipeline says so ([`proc::JobProc`]), of one `i` waits for
 	/// ([`proc::PipelineWait::procs`]) or of the one that is the whole
 	/// command of the job `i` is the vproc of ([`proc::Job::procs`], in its
-	/// parent's table). Returns that parent, in the last case.
+	/// parent's table, or kept since `disown` deleted the job,
+	/// [`Kernel::disowned_procs`]). Returns that parent, in the last case.
 	fn process_ended(&mut self, i: usize, vpid: Vpid, end: proc::ProcState) -> Option<usize> {
 		let p = &mut self.procs[i];
 		let waited = p
@@ -2413,10 +2418,7 @@ impl Shell {
 		let s = p
 			.parent
 			.and_then(|v| self.procs.iter().position(|q| q.vpid == v))?;
-		let q = self.procs[s]
-			.jobs
-			.by_vpid_mut(job)
-			.and_then(|j| j.procs.as_deref_mut())
+		let q = job_procs(&mut self.procs, &mut self.k.disowned_procs, s, job)
 			.and_then(|procs| procs.get_mut(vpid))?;
 		q.state = end;
 		Some(s)
@@ -2668,7 +2670,6 @@ impl Shell {
 			self.rr = 0;
 			self.k.set_int_note(p.vpid, None);
 			self.k.frozen_ints.retain(|v| *v != p.vpid);
-			self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 			let died = self.k.died_of(p.vpid);
 			self.reaped(cx, p.parent, p.vpid, status, died, pipeline);
 		}
@@ -3483,7 +3484,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob { .. })
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
-			e.waiting = Some(proc::Awaited::Jobs { force: true });
+			e.waiting = Some(proc::Awaited::Jobs { force: true, by_pid: false });
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;
@@ -3734,6 +3735,15 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 				if !whole {
 					return None;
 				}
+				// `! a | b &`: bash drops the `!` of an asynchronous
+				// pipeline, which is still the job's processes
+				// ([`exec::job_pipeline`]).
+				if spawn.kind == ir::SpawnKind::Pipeline
+					&& code_at(end) == Some(ir::Opcode::Not)
+					&& exec::job_pipeline(unit, frame.pc)
+				{
+					end += 1;
+				}
 			}
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
@@ -3774,6 +3784,26 @@ fn runs_pipeline(p: &Vproc) -> bool {
 				.and_then(|op| unit.spawns.get(op.a as usize))
 				.is_some_and(|spawn| matches!(spawn.kind, ir::SpawnKind::Pipeline))
 		})
+}
+
+/// The record of the processes of the pipeline job whose vproc is `job`, a
+/// child of vproc `s` ([`proc::Job::procs`]): in `s`'s job table, or kept
+/// since `disown` deleted the job while they ran
+/// ([`Kernel::disowned_procs`]).
+fn job_procs<'a>(
+	procs: &'a mut [Box<Vproc>],
+	disowned: &'a mut [(Vpid, Box<proc::JobProcs>)],
+	s: usize,
+	job: Vpid,
+) -> Option<&'a mut proc::JobProcs> {
+	match procs.get_mut(s)?.jobs.by_vpid_mut(job) {
+		Some(entry) if !entry.inherited => entry.procs.as_deref_mut(),
+		Some(_) => None,
+		None => disowned
+			.iter_mut()
+			.find(|(v, _)| *v == job)
+			.map(|(_, rec)| &mut **rec),
+	}
 }
 
 /// `vp` spawned the program of OS pid `pid`: where `vp` is a pipeline's
@@ -3869,7 +3899,7 @@ impl Vproc {
 	/// A child of `self` (subshell, pipeline stage, background job, command
 	/// substitution) that starts running `unit` at `entry` with `fds`.
 	pub fn child(
-		&self,
+		&mut self,
 		k: &mut Kernel,
 		store: &mut dyn StateStore,
 		unit: Arc<Unit>,
@@ -3879,7 +3909,8 @@ impl Vproc {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
 		// bash's `line_number` as it forks: a `( … )`'s own line, the last
 		// (`Subshell->line`; its body follows its `Spawn` op), else the line
-		// the parent has reached ([`killed::wait_line`]).
+		// the parent has reached ([`killed::fork_at`], found only when a
+		// notice or an error names it).
 		let fork_line = entry
 			.checked_sub(1)
 			.and_then(|pc| unit.ops.get(pc as usize))
@@ -3891,20 +3922,17 @@ impl Vproc {
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
 			.map_or_else(
-				|| {
-					let node = self
-						.frames
-						.last()
-						.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize))
-						.map_or(0, |op| op.node);
-					killed::wait_line(self, node)
+				|| killed::fork_at(self, &unit),
+				|op| {
+					proc::ForkLine::new(proc::ForkAt::Line(
+						(unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
+					))
 				},
-				|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
 			);
 		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
-		frame.fork_line = Some(fork_line);
+		frame.fork_line = fork_line;
 		self.child_running(k, store, fds, frame)
 	}
 
@@ -3966,6 +3994,13 @@ impl Vproc {
 		vp.rlimits.clone_from(&self.rlimits);
 		vp.lineage = self.lineage;
 		jobctl::inherit(k, vp.vpid, self.vpid);
+		// bash `reset_or_restore_signal_handlers` (`trap.c:1467-1473`): a
+		// child keeps the ERR trap only with `errtrace`, and the DEBUG and
+		// RETURN traps only with `functrace`, as they are when it forks.
+		frame.traced = proc::Traced::forked(
+			state::option(&mut k.root, store, self, OptId::Errtrace).unwrap_or(false),
+			state::option(&mut k.root, store, self, OptId::Functrace).unwrap_or(false),
+		);
 		vp.mode = self.mode;
 		vp.zle.clone_from(&self.zle);
 		vp.set_sticky(self.sticky().cloned());
