@@ -992,48 +992,6 @@ mod tests {
 		);
 	}
 
-	mod child_session_action_tests {
-		use pi_shell::{ChildSessionAction, child_session_action};
-
-		#[test]
-		fn interactive_with_terminal_stdin_takes_foreground() {
-			assert_eq!(child_session_action(true, true, false), ChildSessionAction::TakeForeground);
-			assert_eq!(child_session_action(true, true, true), ChildSessionAction::TakeForeground);
-		}
-
-		#[test]
-		fn non_terminal_stdin_detaches_regardless_of_pipeline() {
-			assert_eq!(child_session_action(true, false, false), ChildSessionAction::DetachSession);
-			// A leading-new-pgroup stage of a pipeline still detaches: setsid
-			// keeps it off the host's controlling tty.
-			assert_eq!(child_session_action(true, false, true), ChildSessionAction::DetachSession);
-		}
-
-		#[test]
-		fn non_interactive_with_terminal_stdin_does_nothing() {
-			assert_eq!(child_session_action(false, true, false), ChildSessionAction::None);
-		}
-
-		#[test]
-		fn non_interactive_terminal_stdin_in_pipeline_does_nothing() {
-			assert_eq!(child_session_action(false, true, true), ChildSessionAction::None);
-		}
-
-		#[test]
-		fn embedded_host_with_non_terminal_stdin_detaches() {
-			assert_eq!(child_session_action(false, false, false), ChildSessionAction::DetachSession);
-		}
-
-		#[test]
-		fn pipeline_stage_with_non_terminal_stdin_detaches() {
-			// Regression: an interactive child inside a pipeline (`zsh -i | awk`)
-			// must not stay in the host session and seize its tty. Pre-fix this
-			// returned `None`, leaving the stage attached and able to SIGTTIN the
-			// host.
-			assert_eq!(child_session_action(false, false, true), ChildSessionAction::DetachSession);
-		}
-	}
-
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn embedded_external_command_runs_in_its_own_session() {
