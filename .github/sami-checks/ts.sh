@@ -12,6 +12,9 @@ mode=$1
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
 bun=$(command -v bun)
 mkdir -p "$SC/res/logs"
+# The Chrome the browser tests launch: the pinned Chrome for Testing (bun.sh chrome), when set.
+chrome_env=()
+[ -n "${PUPPETEER_EXECUTABLE_PATH:-}" ] && chrome_env=(PUPPETEER_EXECUTABLE_PATH="$PUPPETEER_EXECUTABLE_PATH")
 
 one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 	local row=$1 unit=$2 dir=$3 bound=$4 safe home log junit s rc secs
@@ -22,7 +25,7 @@ one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 	home=$(mktemp -d)
 	s=$(date +%s)
 	(cd "$SC_TREE/$dir" && timeout -k 10 "$bound" env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
-		"$bun" test --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
+		${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
 	rc=$?
 	secs=$(($(date +%s) - s))
 	rm -rf "${home:?}"
@@ -32,6 +35,19 @@ one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 }
 
 case $mode in
+webmcp-probe)
+	# A diagnostic, not a unit: test/tools/browser-webmcp.test.ts against the runner's own
+	# google-chrome and against the pinned Chrome for Testing, each in a fresh HOME.
+	for exe in "$(command -v google-chrome || true)" "${PUPPETEER_EXECUTABLE_PATH:-}"; do
+		[ -n "$exe" ] || continue
+		home=$(mktemp -d)
+		out=$( (cd "$SC_TREE/packages/coding-agent" && timeout -k 10 600 env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
+			PUPPETEER_EXECUTABLE_PATH="$exe" "$bun" test ./test/tools/browser-webmcp.test.ts < /dev/null) 2>&1)
+		rm -rf "${home:?}"
+		echo "WEBMCP $("$exe" --version) ($exe): $(printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail)$' | tr -s ' \n' ' ')"
+		printf '%s\n' "$out" | grep -m 3 -E 'does not expose WebMCP|no native WebMCP|cannot invoke' || true
+	done
+	;;
 small)
 	while IFS=$'\t' read -r -a f; do
 		one ts-small "${f[0]}" "${f[1]}" "${f[2]}" "${f[@]:3}"

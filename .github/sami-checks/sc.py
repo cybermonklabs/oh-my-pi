@@ -44,7 +44,9 @@ PI_SHELL = "pi-shell"
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing (the markers sami-build's
 # rust_test reads, .github/sami/rust-test.sh): a passing test that prints one did not pass.
-SKIP_MARKER = re.compile(r"^\s*(skipped:|skipping\b|SKIP\b|not run:|UNKNOWN:)|UNCOMPARED", re.M)
+# A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
+# a line that only mentions the word later (`the host half is skipped: ...`) does not.
+SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -62,8 +64,12 @@ def set_matrix():
     return [{"who": w, "shard": s, "name": f"set-{w}-{s}"} for w in SET_WHO for s in range(1, SET_SHARDS + 1)]
 
 
+def builtins_matrix():
+    return [{"who": w, "name": f"builtins-{w}"} for w in SET_WHO]
+
+
 def workspace_matrix():
-    return [{"part": p, "name": f"workspace-{p}"} for p in range(1, WORKSPACE_PARTS + 1)]
+    return [{"who": w, "part": p, "name": f"workspace-{w}-{p}"} for w in SET_WHO for p in range(1, WORKSPACE_PARTS + 1)]
 
 
 def ts_matrix():
@@ -72,7 +78,7 @@ def ts_matrix():
 
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
-    names += [m["name"] for m in ts_matrix()] + ["builtins", "ts-small", "checkts"]
+    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts"]
     return names
 
 
@@ -97,6 +103,7 @@ def cmd_plan():
         "set": json.dumps(set_matrix()),
         "set_shards": SET_SHARDS,
         "workspace": json.dumps(workspace_matrix()),
+        "builtins": json.dumps(builtins_matrix()),
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
@@ -189,6 +196,7 @@ def skip_verdict(res):
         res["passed"] -= len(s)
         if res["status"] == "PASS":
             res["status"] = "UNKNOWN"
+            res["skip_only"] = True
             res["note"] = f"{len(s)} passing test(s) printed a skip marker and checked nothing: " + ", ".join(s[:12])
     return res
 
@@ -325,6 +333,13 @@ def parse_bun(junit, log, exit_code, secs, row, unit):
     if res["status"] != "UNKNOWN" and not m:
         res["status"] = "UNKNOWN"
         res["note"] = "bun ended without its summary line (`Ran N tests across M files.`), so the files after its last output never ran"
+        return res
+    # bun's own counts must agree with what the JUnit reader counted.
+    own = {k: int(n) for n, k in re.findall(r"^\s*(\d+) (pass|fail)\s*$", text, re.M)}
+    if res["status"] != "UNKNOWN" and (own.get("pass"), own.get("fail", 0)) != (res["passed"] + len(res["self_skipped"]), res["failed"]):
+        res["status"] = "UNKNOWN"
+        res["note"] = (f"bun counts {own.get('pass')} pass and {own.get('fail', 0)} fail, the JUnit report "
+                       f"{res['passed'] + len(res['self_skipped'])} and {res['failed']}")
     return res
 
 
@@ -333,7 +348,7 @@ def parse_plain(exit_code, secs, row, unit, log):
         tail = open(log, encoding="utf-8", errors="replace").read().splitlines()[-15:]
     except OSError:
         return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note="no log")
-    if exit_code in ("124", "137") or (exit_code.isdigit() and int(exit_code) > 128):
+    if exit_code in ("124", "125", "126", "127", "137") or (exit_code.isdigit() and int(exit_code) > 128):
         return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: the time bound or a signal ended it")
     ok = exit_code == "0"
     return result(row, unit, "runner", "PASS" if ok else "FAIL", exit_code, secs, int(ok), int(not ok),
@@ -365,9 +380,11 @@ def expected_units(build_dir):
             exp.append(("lib4", PI_SHELL, "runner"))
     else:
         notes["set-runner"] = notes["set-root"] = notes["lib4"] = "the build gave no binary list, so the set could not run"
-    exp.append(("builtins", "pi-builtins", "runner"))
-    for p in range(1, WORKSPACE_PARTS + 1):
-        exp.append(("workspace", f"part {p}/{WORKSPACE_PARTS}", "runner"))
+    for who in SET_WHO:
+        exp.append(("builtins", "pi-builtins", who))
+    for who in SET_WHO:
+        for p in range(1, WORKSPACE_PARTS + 1):
+            exp.append(("workspace", f"part {p}/{WORKSPACE_PARTS}", who))
     for unit, _, _, _ in TS_SMALL:
         exp.append(("ts-small", unit, "runner"))
     for s in range(1, CODING_AGENT_SHARDS + 1):
@@ -381,7 +398,22 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def cmd_summary(results_dir, build_dir):
+def read_known(path):
+    """known-failures.txt: (row, user, unit, test) -> reason."""
+    known = {}
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            if not line.strip() or line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 5:
+                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
+            known[tuple(f[:4])] = f[4]
+    return known
+
+
+def cmd_summary(results_dir, build_dir, known_path=None):
+    known = read_known(known_path)
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -389,17 +421,24 @@ def cmd_summary(results_dir, build_dir):
         if k in got:
             dup.add(k)
         got[k] = r
+    # The tests each (unit, user) passed without a skip marker: a test that skipped itself as one
+    # user is covered when the same test passed as the other.
+    passed_as = {}
+    for r in results:
+        bad = set(r["failures"]) | set(r.get("self_skipped", []))
+        passed_as.setdefault((r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
     lines.append("")
-    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed. "
-                 "A unit is UNKNOWN when its runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with "
-                 "its summary line), when a passing test printed a skip marker, or when no job (or more than one) "
+    lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed, "
+                 "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
+                 "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line), when a "
+                 "passing test printed a skip marker and passed as no other user, or when no job (or more than one) "
                  "reported it; its row is then UNKNOWN too.")
     lines.append("")
-    lines.append("| Row | Verdict | Units: pass / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
+    lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
     all_ok = True
     details = []
@@ -412,14 +451,23 @@ def cmd_summary(results_dir, build_dir):
                 r = result(key, e[1], e[2], "UNKNOWN", "-", 0, note="no result: its job reported nothing (it failed before its upload, did not run, or its upload was planted away)")
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
+            elif r.get("skip_only") and r["status"] == "UNKNOWN":
+                others = [w for w in SET_WHO if w != r["who"]]
+                open_ = [s for s in r["self_skipped"] if not any(s in passed_as.get((r["unit"], w), ()) for w in others)]
+                if open_:
+                    r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
+                else:
+                    r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+            if r["status"] == "FAIL" and r["failures"] and all((key, r["who"], r["unit"], f) in known for f in r["failures"]):
+                r = dict(r, status="KNOWN")
             rs.append(r)
         if key in notes and not units:
             verdict, counts = "UNKNOWN", "-"
             details.append(f"- **{title}**: UNKNOWN: {notes[key]}")
         else:
-            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "FAIL", "UNKNOWN")}
-            verdict = "UNKNOWN" if n["UNKNOWN"] or not rs else ("FAIL" if n["FAIL"] else "PASS")
-            counts = f"{n['PASS']} / {n['FAIL']} / {n['UNKNOWN']}"
+            n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "KNOWN", "FAIL", "UNKNOWN")}
+            verdict = ("UNKNOWN" if n["UNKNOWN"] or not rs else "FAIL" if n["FAIL"] else "KNOWN" if n["KNOWN"] else "PASS")
+            counts = f"{n['PASS']} / {n['KNOWN']} / {n['FAIL']} / {n['UNKNOWN']}"
         tp = sum(r["passed"] for r in rs)
         tf = sum(r["failed"] for r in rs)
         ti = sum(r["ignored"] for r in rs)
@@ -427,16 +475,35 @@ def cmd_summary(results_dir, build_dir):
         longest = max(rs, key=lambda r: r["seconds"], default=None)
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
-        if verdict != "PASS":
+        if verdict not in ("PASS", "KNOWN"):
             all_ok = False
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`")
+                why = known.get((key, r["who"], r["unit"], f))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
+                               + (f"KNOWN ({why})" if why else "**NEW**"))
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
     lines.append("")
+    # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
+    # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
+    # neither: it stays.
+    stale = []
+    for (row, who, unit, test), why in sorted(known.items()):
+        r = got.get((row, unit, who))
+        if r is None or r["status"] == "UNKNOWN" or test in r["failures"]:
+            continue
+        names = {n for n, _ in r["tests"]}
+        stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else "no longer in its unit")
+                     + f" (listed for: {why})")
+    if stale:
+        all_ok = False
+        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("")
+        lines.extend(stale)
+        lines.append("")
     if details:
         lines.append("### Each failing test and each UNKNOWN")
         lines.append("")
@@ -539,10 +606,20 @@ def selftest():
         f.write("(pass) x\n")
     check("bun without its summary line", parse_bun(ju, blog, "1", 1, "ts-small", "u")["status"], "UNKNOWN")
     with open(blog, "a") as f:
-        f.write("Ran 3 tests across 1 file. [2.00s]\n")
+        f.write(" 1 pass\n 1 skip\n 1 fail\nRan 3 tests across 1 file. [2.00s]\n")
     check("bun fail", parse_bun(ju, blog, "1", 1, "ts-small", "u")["status"], "FAIL")
+    blog2 = os.path.join(d, "b2.log")
+    with open(blog2, "w") as f:
+        f.write(" 2 pass\n 1 fail\nRan 3 tests across 1 file. [2.00s]\n")
+    check("bun counts that differ from the JUnit report", parse_bun(ju, blog2, "1", 1, "ts-small", "u")["status"], "UNKNOWN")
     check("check:ts timed out", parse_plain("124", 1, "checkts", "check:ts", blog)["status"], "UNKNOWN")
+    check("check:ts could not run", parse_plain("127", 1, "checkts", "check:ts", blog)["status"], "UNKNOWN")
     check("check:ts failed", parse_plain("2", 1, "checkts", "check:ts", blog)["status"], "FAIL")
+    for line, want in (("t: not run: this process cannot give a file to uid 65534", True),
+                       ("fifo-case: skipped: no FIFO", True), ("skipped: bare", True),
+                       ("cp --reflink=always: the host half is skipped: no reflink", False),
+                       ("running 1 test", False), ("test result: ok. 1 passed", False)):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), want)
 
     check("assign is longest-first", assign(["a", "b", "c", "d"], {"a": 100, "b": 60, "c": 50, "d": 10}, 2),
           {"a": 1, "b": 2, "c": 2, "d": 1})
@@ -570,17 +647,20 @@ def selftest():
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
                   open(os.path.join(res, f"{i}.json"), "w"))
 
+    known_file = os.path.join(d, "known.txt")
+    open(known_file, "w").write("# none\n")
+
     def summary():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = cmd_summary(res, build)
+            rc = cmd_summary(res, build, known_file)
         return rc, buf.getvalue()
 
     rc, out = summary()
     check("summary exit with a silent unit", rc, 1)
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
-    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 1 |" in out, True)
-    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 |" in out, True)
+    check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
     json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1),
               open(os.path.join(res, "silent.json"), "w"))
@@ -591,6 +671,41 @@ def selftest():
     rc, out = summary()
     check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (1, True))
     os.remove(os.path.join(res, "dup.json"))
+    # A test that skipped itself as the runner's user and passed as root is covered; one that
+    # skipped itself as both users is not.
+    def nx(who, skipped, passed):
+        return dict(result("builtins", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
+                           tests=[(n, 1.0) for n in passed + skipped], self_skipped=skipped), skip_only=bool(skipped))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"] == "builtins":
+            os.remove(os.path.join(res, f))
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    rc, out = summary()
+    check("a self-skip covered by root", ("| pi-builtins, nextest default profile | **PASS** |" in out, rc), (True, 0))
+    json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
+    rc, out = summary()
+    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # The known-failure list: a failure it names reads KNOWN, one it does not is NEW, and an entry
+    # whose test passed is listed for removal and fails the summary.
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=1,
+                     failures=["k"], tests=[("k", 1.0), ("p", 1.0)]),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"], r["who"]) == ("set-runner", "pi-shell::zle_pty", "runner") and f != "zle-runner.json":
+            os.remove(os.path.join(res, f))
+    rc, out = summary()
+    check("an unlisted failure is NEW", ("FAILED `k`: **NEW**" in out, "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("a listed failure is KNOWN", ("FAILED `k`: KNOWN (the host's zsh)" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, True, 0))
+    open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
+    rc, out = summary()
+    check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
+    open(known_file, "w").write("# none\n")
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()

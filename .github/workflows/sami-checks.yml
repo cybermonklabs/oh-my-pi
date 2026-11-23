@@ -22,8 +22,9 @@
 #     as root, each over 4 shards balanced by measured time (.github/sami-checks/pi-shell-seconds.txt);
 #   - the pi-shell lib in one libtest process at 4 threads: the runner's run of the lib binary in
 #     the set, read as its own row;
-#   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml;
-#   - the rest of the root workspace under nextest, in 2 partitions;
+#   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml, as
+#     the runner's user and as root;
+#   - the rest of the root workspace under nextest, in 2 partitions, as both users;
 #   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
 #     job; coding-agent --isolate over 10 shards by file; check:ts. The host addon they load is
 #     built once, in the natives job.
@@ -38,9 +39,15 @@
 # Where the result is. The summary job's step summary: a row per check (PASS, FAIL or UNKNOWN),
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
 # and the units by time. A unit whose runner did not end normally (libtest 0 or 101, nextest 0 or
-# 100, bun 0 or 1 with its summary line and JUnit report) or that no job reported is UNKNOWN, and
-# so is its row. The summary job fails unless every row passed, so the run's colour is the
+# 100, bun 0 or 1 with its summary line, JUnit report and matching counts), in which a passing test
+# printed a skip marker (unless the same test passed as the other user), or that no job or two
+# jobs reported, is UNKNOWN, and so is its row. The summary job fails unless every row passed, so the run's colour is the
 # result. Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
+# Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
+# reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
+# row whose only failures are known reads KNOWN, and an entry whose test passed is listed for removal
+# and fails the summary. The browser tests run against the Chrome for Testing build the tree's
+# puppeteer-core pins (bun.sh chrome), not the runner's google-chrome.
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
@@ -107,6 +114,7 @@ jobs:
       set_shards: ${{ steps.plan.outputs.set_shards }}
       workspace: ${{ steps.plan.outputs.workspace }}
       workspace_parts: ${{ steps.plan.outputs.workspace_parts }}
+      builtins: ${{ steps.plan.outputs.builtins }}
       ts: ${{ steps.plan.outputs.ts }}
       ca_shards: ${{ steps.plan.outputs.ca_shards }}
     steps:
@@ -302,7 +310,11 @@ jobs:
           retention-days: 14
 
   builtins:
-    name: pi-builtins
+    name: pi-builtins ${{ matrix.who }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.builtins) }}
     needs: [plan, tools, build]
     if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
@@ -334,16 +346,16 @@ jobs:
       - name: Host
         run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
       - name: Tests
-        run: bash tool/.github/sami-checks/nextest.sh builtins pi-builtins 'package(pi-builtins)'
+        run: bash tool/.github/sami-checks/nextest.sh builtins pi-builtins "${{ matrix.who }}" 'package(pi-builtins)'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ always() && needs.plan.outputs.silent != 'builtins' }}
+        if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
         with:
-          name: sc-res-builtins
+          name: sc-res-${{ matrix.name }}
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
 
   workspace:
-    name: workspace ${{ matrix.part }}
+    name: workspace ${{ matrix.who }} ${{ matrix.part }}
     needs: [plan, tools, build]
     if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
     strategy:
@@ -380,7 +392,7 @@ jobs:
         run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
       - name: Tests
         run: |
-          bash tool/.github/sami-checks/nextest.sh workspace "part ${{ matrix.part }}/${{ needs.plan.outputs.workspace_parts }}" \
+          bash tool/.github/sami-checks/nextest.sh workspace "part ${{ matrix.part }}/${{ needs.plan.outputs.workspace_parts }}" "${{ matrix.who }}" \
             'not (package(pi-shell) | package(pi-builtins))' "count:${{ matrix.part }}/${{ needs.plan.outputs.workspace_parts }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
@@ -417,6 +429,11 @@ jobs:
           path: ${{ github.workspace }}/tree/packages/natives/native
       - name: The only addon a workspace load reads
         run: bash tool/.github/sami-checks/bun.sh addon
+      - name: The Chrome the tree's puppeteer-core pins
+        run: bash tool/.github/sami-checks/bun.sh chrome
+      - name: WebMCP probe (the runner's Chrome and the pinned one; a diagnostic)
+        continue-on-error: true
+        run: bash tool/.github/sami-checks/ts.sh webmcp-probe
       - name: Tests
         run: bash tool/.github/sami-checks/ts.sh small
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -451,12 +468,6 @@ jobs:
           persist-credentials: false
       - name: bun 1.4.5
         run: bash tool/.github/sami-checks/bun.sh
-      - name: bun store (main's)
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.bun/install/cache
-          key: bun-Linux-sami-checks
-          restore-keys: bun-Linux-
       - name: bun install
         working-directory: tree
         run: bun install --frozen-lockfile
@@ -466,6 +477,8 @@ jobs:
           path: ${{ github.workspace }}/tree/packages/natives/native
       - name: The only addon a workspace load reads
         run: bash tool/.github/sami-checks/bun.sh addon
+      - name: The Chrome the tree's puppeteer-core pins
+        run: bash tool/.github/sami-checks/bun.sh chrome
       - name: Tests
         run: bash tool/.github/sami-checks/ts.sh ca "${{ matrix.shard }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -556,7 +569,7 @@ jobs:
         run: |
           mkdir -p "$SC/report" "$SC/results" "$SC/build"
           rc=0
-          python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" > "$SC/report/summary.md" || rc=$?
+          python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" tool/.github/sami-checks/known-failures.txt > "$SC/report/summary.md" || rc=$?
           cat "$SC/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json,os,sys; sys.path.insert(0, "tool/.github/sami-checks"); import sc; json.dump(sc.load_results(sys.argv[1]), open(sys.argv[2], "w"))' "$SC/results" "$SC/report/results.json"
           exit "$rc"

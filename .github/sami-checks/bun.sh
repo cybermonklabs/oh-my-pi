@@ -4,6 +4,11 @@
 # bun.sh addon    the natives job's addon is the only addon a workspace load reads
 #                 (packages/natives/native and bun's own directory: loader-state.js), as the
 #                 gate kit's place_addon checks.
+# bun.sh chrome   the Chrome for Testing build the tree's puppeteer-core pins (chrome.ts), as
+#                 PUPPETEER_EXECUTABLE_PATH for the later steps: the browser tests run against the
+#                 Chrome the tree targets. The runner's own google-chrome launches with the tree's
+#                 --enable-features=WebMCPTesting,DevToolsWebMCPSupport and still gives pages no
+#                 WebMCP (9 browser-webmcp tests failed on it in runs 45231893264 and 45245119907).
 set -euo pipefail
 case "${1:-install}" in
 install)
@@ -25,5 +30,11 @@ addon)
 	echo "ADDONS $n: $found"
 	[ "$n" = 1 ] || { echo "::error title=Addon::expected exactly one addon where the loader looks, found $n"; exit 1; }
 	sha256sum $found
+	;;
+chrome)
+	exe=$(bun "$(dirname "$0")/chrome.ts" "$SC_TREE" "$RUNNER_TEMP/chrome" | tail -n 1)
+	[ -x "$exe" ] || { echo "::error title=Chrome::chrome.ts gave no executable ($exe)"; exit 1; }
+	echo "CHROME pinned: $("$exe" --version) at $exe; the runner's own: $(google-chrome --version 2> /dev/null || echo none)"
+	echo "PUPPETEER_EXECUTABLE_PATH=$exe" >> "$GITHUB_ENV"
 	;;
 esac

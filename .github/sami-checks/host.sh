@@ -30,6 +30,14 @@ sudo install -d -o root -g root -m 0755 /mnt/sc/tmp-root
 echo probe > /mnt/sc/tmp-runner/p && cp --reflink=always /mnt/sc/tmp-runner/p /mnt/sc/tmp-runner/p2 ||
 	fail "/mnt/sc takes no reflink"
 rm -f /mnt/sc/tmp-runner/p /mnt/sc/tmp-runner/p2
+# Search permission (x, not read) on the workspace's ancestors: a test run as root that re-runs its
+# own binary as another uid (cp's other-owner test runs it as uid 1000) must reach the binary, and
+# GitHub's /home/runner is 0750 (run 45254699112: "uid 1000 cannot run the test binary").
+d=$GITHUB_WORKSPACE
+while [ "$d" != / ]; do
+	sudo chmod o+x "$d"
+	d=$(dirname "$d")
+done
 
 fifo=$SC_STICKY_FIFO
 sudo install -d -o root -g root -m 1777 "$(dirname "$fifo")"
