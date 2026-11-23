@@ -801,6 +801,18 @@ fn trapped(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
 	) && !cx.host.ignored_signals().contains(sig)
 }
 
+/// bash `signal_is_trapped` in a command substitution's process for `sig`,
+/// as `vp` starts it: the child's `reset_signal_handlers` (`trap.c:1448-1456`)
+/// takes off every trap but one that ignores its signal (`trap '' SIG`), so
+/// only `vp`'s trap with an empty action counts there, unless the signal was
+/// ignored when the shell started ([`trapped`]).
+pub(super) fn ignored_by_trap(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
+	matches!(
+		state::record(cx.store, vp, Key::Trap(TrapKey::Signal(sig))),
+		Ok(Some(Record::Trap { action, .. })) if action.is_empty()
+	) && !cx.host.ignored_signals().contains(sig)
+}
+
 /// Whether the real shell runs the command of `op` with `exec` and no fork:
 /// it is the last of the `-c` string (nothing is left to parse), run at its
 /// top level (no function, `eval`, `source` or trap) or at the top of a
