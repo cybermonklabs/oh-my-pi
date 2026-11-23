@@ -770,8 +770,8 @@ export interface ExtensionLiveStartOptions {
 export interface ExtensionLiveSession {
 	/** SDP answer to apply to the extension's peer. */
 	sdpAnswer: string;
-	/** Voice in use. */
-	voice: string;
+	/** Voice in use; none on GPT-Live's API (`live.provider: openai`), which gets no voice from omp. */
+	voice?: string;
 	/**
 	 * Ends the session; resolves once it has stopped. Safe to call repeatedly. The host has no media
 	 * peer, so it never sees the extension's peer go away: call this when that peer disconnects

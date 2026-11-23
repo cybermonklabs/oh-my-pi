@@ -22,7 +22,7 @@ interface ContextHarness {
 	editorRefocused: Promise<void>;
 }
 
-function createContext(): ContextHarness {
+function createContext(settings: Record<string, unknown> = { "live.voice": "vale" }): ContextHarness {
 	const editor = {
 		getUseTerminalCursor: vi.fn(() => true),
 		setUseTerminalCursor: vi.fn(),
@@ -31,7 +31,7 @@ function createContext(): ContextHarness {
 	const mounted: unknown[] = [];
 	const refocused = Promise.withResolvers<void>();
 	const ctx = {
-		settings: Settings.isolated({ "live.voice": "vale" }),
+		settings: Settings.isolated(settings),
 		keybindings: { getKeys: vi.fn(() => ["ctrl+l"]) },
 		session: {},
 		extractAssistantText: vi.fn(() => ""),
@@ -159,6 +159,26 @@ describe("LiveCommandController", () => {
 		await controller.handleCommand();
 		await live.stop();
 		expect(ends).toEqual([undefined]);
+	});
+
+	it("gives an extension session on GPT-Live's API (`live.provider: openai`) no voice", async () => {
+		const { ctx } = createContext({ "live.voice": "vale", "live.provider": "openai" });
+		const received: (string | undefined)[] = [];
+		const controller = new LiveCommandController(ctx, options => {
+			received.push(options.voice);
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			Object.defineProperty(session, "sdpAnswer", { value: "v=0 answer" });
+			return session;
+		});
+		const live = await controller.startRemote({ sdpOffer: "v=0 offer", voice: "cove" });
+		try {
+			expect(received).toEqual([undefined]);
+			expect(live).not.toHaveProperty("voice");
+		} finally {
+			await live.stop();
+		}
 	});
 
 	it("lets exactly one of two starts queued behind a closing session win", async () => {

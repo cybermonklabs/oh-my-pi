@@ -38,7 +38,11 @@ export const cfgLiveVoice = register({
 	},
 });
 
-/** The voice a live session uses: an explicit choice, else the `live.voice` setting, else the default. */
-export function resolveLiveVoice(scope: ScopeLike, voice?: string): string {
+/**
+ * The voice a live session sends: an explicit choice, else the `live.voice` setting, else the default.
+ * None on GPT-Live's API (`live.provider: openai`), which gets no voice from omp and uses its own.
+ */
+export function resolveLiveVoice(scope: ScopeLike, voice?: string): string | undefined {
+	if (cfgLiveProvider.get(scope) === "openai") return undefined;
 	return voice?.trim() || cfgLiveVoice.get(scope) || DEFAULT_LIVE_VOICE;
 }

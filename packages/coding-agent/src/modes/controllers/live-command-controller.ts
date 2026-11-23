@@ -99,7 +99,7 @@ export class LiveCommandController {
 			await stop();
 			throw new Error("The live session stopped before its SDP answer was available");
 		}
-		return { sdpAnswer, voice, stop };
+		return voice === undefined ? { sdpAnswer, stop } : { sdpAnswer, voice, stop };
 	}
 
 	/** Stop the active live session and restore the editor. */
@@ -135,7 +135,7 @@ export class LiveCommandController {
 	 * Starts a session. A connect failure is shown, cleaned up and returned; the slot check and
 	 * claim (`#session = session`) run synchronously, so concurrent starts cannot both win.
 	 */
-	async #start(voice: string, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
+	async #start(voice: string | undefined, remote?: ExtensionLiveStartOptions): Promise<LiveStartOutcome> {
 		if (this.#session) throw new Error("A live session is already active");
 		this.#assistantTranscriptTurn = 0;
 		this.#assistantTranscriptStartedAt = 0;

@@ -186,16 +186,16 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	},
 	{
 		name: "live_start",
-		doc: "Start a live voice session bound to this session; returns the voice in use.",
+		doc: "Start a live voice session bound to this session; returns the voice in use, none with `live.provider: openai`.",
 		params: { "voice?": "string", "instructions?": "string" },
-		result: { voice: "string" },
+		result: { "voice?": "string" },
 		unwrap: "voice",
 	},
 	{
 		name: "live_connect",
 		doc: "Start a live voice session whose audio runs on a caller-owned WebRTC peer: send its SDP offer, apply the returned answer.",
 		params: { sdpOffer: "string", "voice?": "string", "instructions?": "string" },
-		result: { voice: "string", sdpAnswer: "string" },
+		result: { "voice?": "string", sdpAnswer: "string" },
 	},
 	{ name: "live_stop", doc: "Stop the live voice session, if any." },
 	{

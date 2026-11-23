@@ -882,10 +882,11 @@ export class RpcClient {
 
 	/**
 	 * Start a GPT live voice session bound to this session; resolves once it is connected
-	 * and recording. `instructions` replaces the bundled live prompt (Handlebars:
-	 * `{{username}}`, `{{firstName}}`). Frames arrive through {@link onLive}.
+	 * and recording, with the voice in use (none with `live.provider: openai`). `instructions`
+	 * replaces the bundled live prompt (Handlebars: `{{username}}`, `{{firstName}}`). Frames
+	 * arrive through {@link onLive}.
 	 */
-	async liveStart(options?: { voice?: string; instructions?: string }): Promise<{ voice: string }> {
+	async liveStart(options?: { voice?: string; instructions?: string }): Promise<{ voice?: string }> {
 		const response = await this.#send({
 			type: "live_start",
 			voice: options?.voice,
@@ -903,7 +904,7 @@ export class RpcClient {
 	async liveConnect(
 		sdpOffer: string,
 		options?: { voice?: string; instructions?: string },
-	): Promise<{ voice: string; sdpAnswer: string }> {
+	): Promise<{ voice?: string; sdpAnswer: string }> {
 		const response = await this.#send({
 			type: "live_connect",
 			sdpOffer,

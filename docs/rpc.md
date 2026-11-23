@@ -1483,18 +1483,20 @@ session runs per RPC server.
 
 ### Commands
 
-- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice: string }`
-- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice: string, sdpAnswer: string }`
+- `{ id?, type: "live_start", voice?: string, instructions?: string }` → `data: { voice?: string }`
+- `{ id?, type: "live_connect", sdpOffer: string, voice?: string, instructions?: string }` → `data: { voice?: string, sdpAnswer: string }`
 - `{ id?, type: "live_stop" }`
 - `{ id?, type: "live_mute", muted?: boolean }` → `data: { muted: boolean }`
 
 `live_start` responds once the session is connected and recording, so it is
 dispatched concurrently like `bash`; `live_stop` sent meanwhile cancels the
 connection and the pending `live_start` then fails. `voice` defaults to the
-`live.voice` setting and the response reports the voice used. `instructions`
-replaces the bundled live prompt; it is rendered as a Handlebars template with
-`{{username}}` and `{{firstName}}` of the local OS account. Starting while a
-session is connecting, active, or closing, or while dictation is active, fails.
+`live.voice` setting and the response reports the voice used; with
+`live.provider: openai`, which sends GPT-Live no voice, the response has none and
+`voice` is ignored. `instructions` replaces the bundled live prompt; it is
+rendered as a Handlebars template with `{{username}}` and `{{firstName}}` of the
+local OS account. Starting while a session is connecting, active, or closing, or
+while dictation is active, fails.
 
 `live_connect` starts the same session with the audio on the client's own
 WebRTC peer instead of the host's microphone and speakers. `sdpOffer` is that
