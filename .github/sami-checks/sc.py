@@ -853,6 +853,16 @@ def selftest():
     json.dump(gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0), open(os.path.join(res, "gv-env.json"), "w"))
     rc, out = summary()
     check("the summary lists the gVisor environment test", f"skipped itself `{envt}`: \"UNKNOWN: fs.protected_fifos" in out, True)
+    # The same through a nextest JUnit report (the gv-nextest path and its test names).
+    gj = os.path.join(d, "gv.xml")
+    with open(gj, "w") as f:
+        f.write('<testsuites><testsuite name="pi-builtins"><testcase classname="pi-builtins" name="cp::tests::ok" time="1"/>'
+                '<testcase classname="pi-builtins" name="cp::tests::a_read_only_file_cp_wrote_gets_its_attributes" time="1">'
+                '<system-out>skipped: under gVisor an attribute set after the mode changed is refused in some runs\n'
+                '</system-out></testcase></testsuite></testsuites>')
+    r = gv_environment(parse_junit(gj, "0", 1, "gv-builtins-root", "pi-builtins", "root", (0,), (100,)), test_outputs(gj, "junit"))
+    check("gVisor env self-skip set apart (JUnit)", (r["status"], [e["test"] for e in r["environment"]], r.get("skip_only")),
+          ("PASS", ["pi-builtins::cp::tests::a_read_only_file_cp_wrote_gets_its_attributes"], None))
     # A gVisor self-skip is covered by the other user's gVisor pass, never by a host row's.
     def gnx(who, skipped, passed):
         return dict(result(f"gv-builtins-{who}", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
