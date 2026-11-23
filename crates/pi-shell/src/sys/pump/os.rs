@@ -171,14 +171,13 @@ impl Timer {
 
 #[cfg(unix)]
 mod imp {
-	#[cfg(any(target_os = "linux", target_os = "android"))]
-	use std::sync::Arc;
 	use std::{
 		fs,
 		io::{self, Read, Write},
 		os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 		ptr,
-		task::{Context, Poll},
+		sync::Arc,
+		task::{Context, Poll, Waker},
 		time::{Duration, Instant},
 	};
 
@@ -202,8 +201,31 @@ mod imp {
 	pub struct Drain {
 		/// Declared first: forgotten by the readiness thread before the
 		/// descriptor closes.
-		watch: Mutex<Option<ready::Watch>>,
-		file:  fs::File,
+		watch:   Mutex<Option<ready::Watch>>,
+		/// Every task waiting for the pipe to hold bytes: more than one can
+		/// read one fed pipe at once (the engine and an extra on a task of its
+		/// own), and one readiness registration would keep only the last.
+		waiting: Arc<Waiting>,
+		file:    fs::File,
+	}
+
+	/// The tasks waiting on a [`Drain`], all woken by its one readiness
+	/// registration.
+	#[derive(Default)]
+	struct Waiting(Mutex<Vec<Waker>>);
+
+	impl std::task::Wake for Waiting {
+		fn wake(self: Arc<Self>) {
+			self.wake_by_ref();
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			// Taken out first: no lock is held while the tasks are woken.
+			let waiting = std::mem::take(&mut *self.0.lock());
+			for waker in waiting {
+				waker.wake();
+			}
+		}
 	}
 
 	impl Drain {
@@ -220,7 +242,7 @@ mod imp {
 					.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
 					.open(format!("/proc/self/fd/{}", read.as_raw_fd()))
 					.ok()
-					.map(|file| Self { watch: Mutex::new(None), file })
+					.map(|file| Self { watch: Mutex::new(None), waiting: Arc::default(), file })
 			}
 			#[cfg(not(any(target_os = "linux", target_os = "android")))]
 			{
@@ -230,12 +252,40 @@ mod imp {
 		}
 
 		/// Read what the pipe holds; `Pending` while it holds nothing and a
-		/// writer may still write (`cx` woken once it does), `Ok(0)` at end of
-		/// file.
+		/// writer may still write (`cx` woken once it does, with every other
+		/// task waiting here), `Ok(0)` at end of file.
 		pub fn poll_read(&self, cx: &Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
 			let mut watch = self.watch.lock();
 			let file = &self.file;
-			poll_io(cx, file.as_raw_fd(), ready::READ, &mut watch, || (&*file).read(buf))
+			let mut registered = false;
+			loop {
+				match (&*file).read(buf) {
+					Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+					r => return Poll::Ready(r),
+				}
+				if registered {
+					return Poll::Pending;
+				}
+				{
+					let mut waiting = self.waiting.0.lock();
+					if !waiting.iter().any(|w| w.will_wake(cx.waker())) {
+						waiting.push(cx.waker().clone());
+					}
+				}
+				// One registration for all of them: a new one replaces the
+				// old, which may have fired already.
+				*watch = None;
+				match ready::watch(
+					file.as_raw_fd(),
+					ready::READ,
+					&Waker::from(Arc::clone(&self.waiting)),
+				) {
+					Ok(w) => *watch = Some(w),
+					Err(e) => return Poll::Ready(Err(e)),
+				}
+				registered = true;
+			}
 		}
 
 		/// Read what the pipe holds now, without a readiness wait:
@@ -350,7 +400,8 @@ mod imp {
 		{
 			drop(theirs_write);
 			let ours = OsPipe(UnixEnd::new(OwnedFd::from(ours_write))?);
-			let drain = Drain { watch: Mutex::new(None), file: ours_read };
+			let drain =
+				Drain { watch: Mutex::new(None), waiting: Arc::default(), file: ours_read };
 			return Ok((ours, theirs_read, Some(drain)));
 		}
 		let (ours, read) = pipe(true)?;
