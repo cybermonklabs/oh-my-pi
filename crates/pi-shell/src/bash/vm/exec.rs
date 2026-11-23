@@ -24,8 +24,11 @@ use super::{
 };
 use crate::bash::{
 	diag::Diag,
-	event::{CompiledUnit, Construct, EventData, NodeKind, Origin, WaitKey, assign_preview},
-	fd::FdRef,
+	event::{
+		CompiledUnit, Construct, EventData, NodeKind, Origin, RedirKind, WaitKey, assign_preview,
+	},
+	fd::{FdOrigin, FdRef},
+	fs::{FileKind, FsOp, FsPoll, OpenFlags},
 	host::{ResolveCtx, Resolved, Via},
 	ids::{Dialect, ModeId, UnitId, Vpid},
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
@@ -767,6 +770,8 @@ fn run_boundary(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 		*stdin = from_stdin;
 	}
 	vp.frames.push(Frame::new(None, 0, kind));
+	// Each run is a command read anew: bash's `stdin_redir` starts clear.
+	vp.jobs.stdin_redir = false;
 	// zsh `parseargs`: commands read from standard input set `shinstdin`.
 	if from_stdin
 		&& vp.overlay.is_none()
@@ -1276,6 +1281,16 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 	let top_level = matches!(frame.kind, FrameKind::Script { what: ScriptKind::Run, .. });
 	if top_level && vp.parent.is_none() {
 		super::jobctl::command_read(k);
+	}
+	// bash's `reader_loop` clears `stdin_redir` before each command a
+	// script file or an interactive shell reads; a `-c` string runs whole
+	// (`parse_and_execute`), as `eval`, `.` and traps do.
+	if top_level
+		&& !matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		) {
+		vp.jobs.stdin_redir = false;
 	}
 	if let Some(lines) = read {
 		let now = cx.host.wall().secs;
@@ -2979,31 +2994,37 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			let pc = top_frame(vp).pc;
+			if let Some(on) = redir_stdin_redir(vp, unit, pc, op) {
+				vp.jobs.stdin_redir = on;
+			}
+			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore.
+					let _ = flush_out(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
@@ -3962,6 +3983,242 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	(group && exec).then_some(BangStage::Exec)
 }
 
+/// bash's `stdin_redirects` (`redir.c` `stdin_redirection`): whether
+/// redirection list `redirs` of `unit` changes fd 0 as bash counts it. Any
+/// `<`, `<>`, here-document or here-string counts, whatever its fd; a
+/// `<&` copy and a `<&-`/`>&-` close count only on fd 0; a move (`<&N-`),
+/// an output redirection and a `{var}` redirection never do.
+fn stdin_redirects(unit: &Unit, redirs: Option<u32>) -> bool {
+	let Some(list) = redirs.and_then(|r| unit.redirs.get(r as usize)) else {
+		return false;
+	};
+	list.iter().any(|r| {
+		// The fd matters only for `<&`, `>&` and a close: `<&`'s default is
+		// 0, the others' 1.
+		let fd = match r.fd {
+			ir::RedirFdIr::Var(_) => return false,
+			ir::RedirFdIr::Num(n) => n,
+			ir::RedirFdIr::Default => u32::from(r.op != RedirKind::DupIn),
+		};
+		match r.op {
+			RedirKind::In | RedirKind::ReadWrite | RedirKind::HereDoc | RedirKind::HereString => true,
+			RedirKind::DupIn | RedirKind::DupOut => {
+				// The word as written: bash's parser reads a lone `-` as a
+				// close and a word ending in `-` as a move.
+				let word = match r.target {
+					ir::RedirTargetIr::Word(w) => word_source(unit, w),
+					ir::RedirTargetIr::HereDoc { .. } => &[],
+				};
+				let close = word == b"-";
+				fd == 0 && (close || (r.op == RedirKind::DupIn && word.last() != Some(&b'-')))
+			},
+			RedirKind::Close => fd == 0,
+			RedirKind::Out
+			| RedirKind::Append
+			| RedirKind::Clobber
+			| RedirKind::OutErr
+			| RedirKind::AppendErr => false,
+		}
+	})
+}
+
+/// Whether bash opens `/dev/null` on fd 0 for the job whose body starts at
+/// `entry` when its `&` marks it (`CMD_STDIN_REDIR`). The mark lands on
+/// the job's command: a lone simple or compound command keeps fd 0 when
+/// its own redirections change it ([`stdin_redirects`]; under `time`, which
+/// forks a subshell for it, a simple command's no longer count); a
+/// pipeline's stages never see the mark unless `time` forks that subshell;
+/// any other body (an and-or list) is forked into a subshell that opens
+/// it.
+fn job_opens_null(unit: &Unit, entry: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	// `time` and `!` wrap the job's command: `[TimeStart] … [Not]
+	// [TimeEnd]`, then the job's `SubExit`.
+	let timed = code(entry) == Some(Opcode::TimeStart);
+	let ends_job = |mut at: u32| {
+		while matches!(code(at), Some(Opcode::Not | Opcode::TimeEnd)) {
+			at += 1;
+		}
+		code(at) == Some(Opcode::SubExit)
+	};
+	let at = entry + u32::from(timed);
+	let Some(op) = unit.ops.get(at as usize) else {
+		return true;
+	};
+	match op.code {
+		Opcode::Exec if ends_job(at + 1) => {
+			timed || !stdin_redirects(unit, unit.cmds.get(op.a as usize).and_then(|c| c.redirs))
+		},
+		Opcode::Redir if ends_job(op.b) => !stdin_redirects(unit, Some(op.a)),
+		Opcode::Spawn
+			if unit
+				.spawns
+				.get(op.a as usize)
+				.is_some_and(|s| s.kind == SpawnKind::Pipeline && ends_job(s.end)) =>
+		{
+			timed
+		},
+		_ => true,
+	}
+}
+
+/// What an asynchronous command whose body starts at `entry` gets on fd 0
+/// in place of the shell's: the null device, read-write (`Some(true)`) or
+/// read-only (`Some(false)`), or nothing (`None`). Under job control, and
+/// outside a subshell, it always keeps fd 0. Otherwise:
+/// - bash (`execute_connection`'s `&`, `async_redirect_stdin`): read-only,
+///   unless [`stdin_redir`](super::proc::JobTable::stdin_redir) is set or the
+///   job's own command keeps fd 0 ([`job_opens_null`]);
+/// - zsh (`entersubsh` with `ESUB_ASYNC`, before the job's redirections):
+///   read-write, only when fd 0 is a terminal.
+pub(super) fn async_stdin(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	unit: &Unit,
+	entry: u32,
+) -> Option<bool> {
+	if job_control(k, cx, vp) && !super::nested::in_subshell(cx.store, vp) {
+		return None;
+	}
+	if unit.mode.dialect() == Dialect::Zsh {
+		let tty = vp.fds.get(0).and_then(FdRef::kind) == Some(FileKind::Tty);
+		return tty.then_some(true);
+	}
+	(!vp.jobs.stdin_redir && job_opens_null(unit, entry)).then_some(false)
+}
+
+/// The shared `/dev/null` of [`Kernel::dev_null`] (`rw`: read-write),
+/// opened through the host's filesystem on first use. `Err` is the wait
+/// key while the open is pending ([`Kernel::dev_null_opening`] keeps it:
+/// every op that waits for it polls the same open).
+fn dev_null(k: &mut Kernel, cx: &mut Cx<'_>, rw: bool) -> Result<std::io::Result<FdRef>, WaitKey> {
+	let slot = usize::from(rw);
+	if let Some(h) = &k.dev_null[slot] {
+		return Ok(Ok(h.clone()));
+	}
+	let flags = if rw {
+		OpenFlags::READ.with(OpenFlags::WRITE)
+	} else {
+		OpenFlags::READ
+	};
+	let mut tcx = Context::from_waker(&k.waker);
+	let res = match k.dev_null_opening[slot].take() {
+		Some(mut p) => {
+			let r = p.poll(&mut tcx);
+			if r.is_pending() {
+				k.dev_null_opening[slot] = Some(p);
+			}
+			r
+		},
+		None => match cx.host.fs().open(BStr::new(DEV_NULL), flags, 0) {
+			FsPoll::Ready(r) => Poll::Ready(r),
+			FsPoll::Pending(mut p) => {
+				let r = p.poll(&mut tcx);
+				if r.is_pending() {
+					k.dev_null_opening[slot] = Some(p);
+				}
+				r
+			},
+		},
+	};
+	let Poll::Ready(res) = res else {
+		return Err(WaitKey::Fs { op: FsOp::Open, path: BString::from(DEV_NULL) });
+	};
+	Ok(res.map(|file| {
+		let h = FdRef::open(file, FdOrigin::Host);
+		k.dev_null[slot] = Some(h.clone());
+		h
+	}))
+}
+
+const DEV_NULL: &[u8] = b"/dev/null";
+
+/// zsh's `can't open /dev/null: …` (`entersubsh`), queued on the job
+/// `child`, which then runs nothing and ends with status 1.
+fn null_failed(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	child: &mut Vproc,
+	err: &std::io::Error,
+	line: u32,
+) {
+	let diag =
+		Diag::Usage { msg: format!("can't open /dev/null: {}", super::redir::zsh_errno(err)).into() };
+	let bytes = k.render_diag(cx, vp, line, &diag);
+	child
+		.out
+		.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	child.status = 1;
+}
+
+/// Whether `vp` runs, in its only frame, the code a forked job or pipeline
+/// stage starts with at `pc` (after a job's `time`): the command bash forks
+/// for it, whose own redirections `execute_in_subshell` applies before
+/// running it.
+fn forks_at(vp: &Vproc, unit: &Unit, pc: u32) -> bool {
+	let [Frame { kind: FrameKind::Subshell, .. }] = vp.frames.as_slice() else {
+		return false;
+	};
+	let timed = pc
+		.checked_sub(1)
+		.and_then(|at| unit.ops.get(at as usize))
+		.is_some_and(|op| op.code == Opcode::TimeStart);
+	unit.spawns.iter().any(|s| match s.kind {
+		SpawnKind::Background => {
+			let entry = s.stages[0].entry;
+			entry == pc || (timed && entry + 1 == pc)
+		},
+		SpawnKind::Pipeline => s.stages.iter().any(|st| st.entry == pc),
+		SpawnKind::Subshell | SpawnKind::Coproc { .. } => false,
+	})
+}
+
+/// bash's `stdin_redir` once the `Redir` op `op` at `pc` runs
+/// (`execute_command_internal` for a compound command with redirections
+/// run in the shell): whether they change fd 0 ([`stdin_redirects`]).
+/// `None` leaves it: for a `( … )`'s own redirections (its child decides,
+/// [`subshell_stdin_redir`]) and for those of the command a forked job or
+/// stage starts with ([`forks_at`]).
+fn redir_stdin_redir(vp: &Vproc, unit: &Unit, pc: u32, op: Op) -> Option<bool> {
+	let at = |i: u32| unit.ops.get(i as usize);
+	let subshell = at(pc + 1).is_some_and(|e| e.code == Opcode::Enter)
+		&& at(pc + 2).is_some_and(|s| {
+			s.code == Opcode::Spawn
+				&& s.node == op.node
+				&& unit
+					.spawns
+					.get(s.a as usize)
+					.is_some_and(|s| s.kind == SpawnKind::Subshell)
+		});
+	if subshell || forks_at(vp, unit, pc) {
+		return None;
+	}
+	Some(stdin_redirects(unit, Some(op.a)))
+}
+
+/// bash's `stdin_redir` in the child of the `( … )` spawned at `pc`
+/// (`execute_in_subshell`): whether the subshell's own redirections change
+/// fd 0, or it is a whole pipeline stage fed by a pipe (not one `lastpipe`
+/// runs in the shell).
+fn subshell_stdin_redir(vp: &Vproc, unit: &Unit, pc: u32) -> bool {
+	let node = unit.ops.get(pc as usize).map(|op| op.node);
+	// `[Redir] Enter Spawn`, all on the subshell's node.
+	let own = pc
+		.checked_sub(2)
+		.and_then(|at| unit.ops.get(at as usize))
+		.filter(|r| r.code == Opcode::Redir && Some(r.node) == node);
+	if own.is_some_and(|r| stdin_redirects(unit, Some(r.a))) {
+		return true;
+	}
+	let start = pc.saturating_sub(if own.is_some() { 2 } else { 1 });
+	matches!(vp.frames.as_slice(), [Frame { kind: FrameKind::Subshell, .. }])
+		&& unit.spawns.iter().any(|s| {
+			s.kind == SpawnKind::Pipeline && s.stages.iter().skip(1).any(|st| st.entry == start)
+		})
+}
+
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
 /// started `stages` (`(vproc, entry)`; the last one a child, or the job's
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
@@ -4022,6 +4279,18 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.as_ref()
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
+		// An async command's `/dev/null` comes first: its open may park the
+		// op before anything else happens.
+		let null = match info.kind {
+			SpawnKind::Background => match async_stdin(k, cx, vp, unit, info.stages[0].entry) {
+				Some(rw) => match dev_null(k, cx, rw) {
+					Ok(opened) => Some((rw, opened)),
+					Err(key) => return Flow::Block(key),
+				},
+				None => None,
+			},
+			_ => None,
+		};
 		// A job that forks (a subshell, pipeline, job or coprocess of its
 		// own) is not just one program: it keeps its virtual pid. The
 		// pipeline a job's body is passes the decision to its last stage
@@ -4039,28 +4308,37 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			SpawnKind::Subshell | SpawnKind::Background => {
 				let mut fds = vp.fds.clone();
 				let control = info.kind == SpawnKind::Background && job_control(k, cx, vp);
-				// An async command reads `/dev/null` without job control, unless
-				// an enclosing compound command redirected stdin (bash
-				// `stdin_redir`, `CMD_STDIN_REDIR`)…
-				// …or the shell runs as a pipeline element reading a pipe.
-				let piped = vp.fds.get(0).is_some_and(|h| {
-					h.origin() == crate::bash::fd::FdOrigin::Mem
-						&& h.kind() == Some(crate::bash::fs::FileKind::Pipe)
-				});
-				if info.kind == SpawnKind::Background
-					&& !control
-					&& !piped
-					&& !vp
-						.frames
-						.iter()
-						.any(|f| f.redirs.iter().flatten().any(|s| s.fd == 0))
-				{
-					let null = k
-						.null_input
-						.get_or_insert_with(|| FdRef::mem(mem::MemBuf::new(Vec::new())));
-					fds.set(0, Some(null.clone()));
+				let mut entry = info.stages[0].entry;
+				let mut failed = None;
+				match null {
+					Some((_, Ok(h))) => fds.set(0, Some(h)),
+					Some((rw, Err(err))) => {
+						// zsh's job reports and exits 1 (`entersubsh`); bash's
+						// reports and keeps the shell's stdin
+						// (`async_redirect_stdin`).
+						if rw {
+							entry = info.end - 1;
+						}
+						failed = Some((rw, err));
+					},
+					None => {},
 				}
-				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				let pc = top_frame(vp).pc;
+				let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+				if let Some((rw, err)) = failed {
+					let line = line_of(vp, op.node);
+					if rw {
+						null_failed(k, cx, vp, &mut child, &err, line);
+					} else {
+						let bytes = k.render_diag(cx, vp, line, &Diag::AsyncStdin { err });
+						child
+							.out
+							.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+					}
+				}
+				if info.kind == SpawnKind::Subshell {
+					child.jobs.stdin_redir = subshell_stdin_redir(vp, unit, pc);
+				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4078,7 +4356,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// Known by its program's OS pid if the first command it runs
 					// spawns it (bash's subshell `exec`s a lone simple command):
 					// readers of the pid wait for that decision.
-					if let Some(stage) = bang_stage(unit, info.stages[0].entry) {
+					if entry == info.stages[0].entry
+						&& let Some(stage) = bang_stage(unit, entry)
+					{
 						k.bangs.push(Bang { vproc: vpid, job: vpid, stage });
 					}
 					let job = k.job_id(cx.store);
@@ -4166,6 +4446,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// stage (`jobs -p | xargs kill`).
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
 						child.jobs = inherited_jobs(vp, true);
+					}
+					// bash: a stage fed by a pipe keeps it for its async
+					// commands (`stdin_redir`, set in the forked stage).
+					if i > 0 {
+						child.jobs.stdin_redir = true;
 					}
 					children.push(child.vpid);
 					k.spawned.push(Box::new(child));
@@ -4370,6 +4655,9 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash runs a coprocess as a subshell (`CMD_WANT_SUBSHELL`) fed by a
+	// pipe: its async commands keep that pipe (`stdin_redir`).
+	child.jobs.stdin_redir = true;
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}

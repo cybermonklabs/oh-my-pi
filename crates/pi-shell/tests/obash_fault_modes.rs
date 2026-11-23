@@ -184,6 +184,33 @@ fn an_inherited_fd_skips_every_snapshot() {
 	assert_eq!(num(&lines[0], "restored"), 0, "{lines:?}");
 }
 
+/// A bash background job reads the shell's shared `/dev/null` (bash gives
+/// it one without job control). A snapshot carries it, opening it again on
+/// restore: a job that holds it through a loop costs no snapshot, restored
+/// in the process (step mode) and in a new one (exec mode).
+#[test]
+fn a_background_jobs_dev_null_is_carried_by_every_snapshot() {
+	let script = "{ read -r x; i=0; while [ $i -lt 40 ]; do i=$((i + 1)); done; echo \"job [$x] \
+	              $i\"; } & wait; echo end";
+	let dir = tempfile::tempdir().unwrap();
+	let stats_path = dir.path().join("stats");
+	let (out, _) = obash(&["-c", script], &[
+		("PI_SHELL_FAULT", "3:1"),
+		("PI_SHELL_FAULT_STATS", stats_path.to_str().unwrap()),
+	]);
+	assert_eq!(String::from_utf8_lossy(&out.stdout), "job [] 40\nend\n");
+	let lines = stats(&stats_path);
+	assert_eq!(lines.len(), 1);
+	assert!(num(&lines[0], "snapshots") > 0, "{lines:?}");
+	assert_eq!(num(&lines[0], "skipped_fd"), 0, "step: {lines:?}");
+	assert_eq!(num(&lines[0], "restored"), num(&lines[0], "snapshots"), "step: {lines:?}");
+	let (plain, line) = same_as_plain(script, "1:3", "exec", &[]);
+	assert_eq!(plain.stdout, b"job [] 40\nend\n");
+	assert!(num(&line, "snapshots") > 0, "{line:?}");
+	assert_eq!(num(&line, "skipped_fd"), 0, "exec: {line:?}");
+	assert_eq!(num(&line, "restored"), num(&line, "snapshots"), "exec: {line:?}");
+}
+
 #[test]
 fn pause_mode_pauses_without_changing_anything() {
 	let (_, line) = same_as_plain(LOOPS, "7:2", "pause", &[]);

@@ -40,7 +40,7 @@ use crate::bash::{
 	error::{ExtError, Incompatibility, RestoreError},
 	event::{EventData, EventMask, OriginChain, WaitKey},
 	fd::{FdOrigin, FdRef, FdTable},
-	fs::FileKind,
+	fs::{FileKind, FsPoll, OpenFlags},
 	host::{Host, StdFd},
 	ids::{CallId, ModeId, RunId, UnitId, Vpid},
 	ir::{
@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -109,6 +109,9 @@ enum FdObjImage {
 	Lost(FdOrigin),
 	/// Closed.
 	Closed,
+	/// The shell's shared `/dev/null` ([`Kernel::dev_null`]; read-write if
+	/// `rw`), opened again through the host's filesystem.
+	DevNull { rw: bool },
 }
 
 /// Numbers the fd and memory objects of an image, once each.
@@ -118,6 +121,9 @@ struct FdImager {
 	by_obj: HashMap<usize, u32>,
 	mems:   Vec<MemImage>,
 	by_mem: HashMap<usize, u32>,
+	/// Identities of the kernel's two shared `/dev/null` objects, imaged
+	/// as [`FdObjImage::DevNull`] (not lost).
+	nulls:  [Option<usize>; 2],
 }
 
 impl FdImager {
@@ -130,12 +136,16 @@ impl FdImager {
 			let (key, end) = m.key();
 			(self.mem(key, || m.image()), end)
 		});
-		let img = match (mem, h.origin(), h.kind()) {
-			(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
-			(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
-			(None, FdOrigin::Host, Some(kind)) => FdObjImage::Host(kind),
-			(None, origin @ (FdOrigin::Host | FdOrigin::Mem), _) => FdObjImage::Lost(origin),
-			(None, FdOrigin::Closed, _) => FdObjImage::Closed,
+		let img = if let Some(slot) = self.nulls.iter().position(|k| *k == Some(h.key())) {
+			FdObjImage::DevNull { rw: slot == 1 }
+		} else {
+			match (mem, h.origin(), h.kind()) {
+				(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
+				(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
+				(None, FdOrigin::Host, Some(kind)) => FdObjImage::Host(kind),
+				(None, origin @ (FdOrigin::Host | FdOrigin::Mem), _) => FdObjImage::Lost(origin),
+				(None, FdOrigin::Closed, _) => FdObjImage::Closed,
+			}
 		};
 		let i = self.objs.len() as u32;
 		self.objs.push(img);
@@ -165,11 +175,23 @@ struct FdRebuild<'s> {
 	mems:  Vec<MemObj>,
 	built: Vec<Option<FdRef>>,
 	stdio: &'s mut [Option<FdRef>; 3],
+	/// The kernel's shared `/dev/null` objects ([`Kernel::dev_null`]): the
+	/// kernel's own when it holds them, else opened again on first use.
+	nulls: [Option<FdRef>; 2],
 }
 
 impl FdRebuild<'_> {
 	/// Fd object `i`.
 	fn fd(&mut self, host: &mut dyn Host, i: u32) -> FdRef {
+		if let Some(&FdObjImage::DevNull { rw }) = self.objs.get(i as usize) {
+			let h = self.nulls[usize::from(rw)]
+				.get_or_insert_with(|| reopen_null(host, rw))
+				.clone();
+			if let Some(slot) = self.built.get_mut(i as usize) {
+				*slot = Some(h.clone());
+			}
+			return h;
+		}
 		self.build(i, |s| host.stdio(s))
 	}
 
@@ -201,6 +223,9 @@ impl FdRebuild<'_> {
 				.map_or_else(|| FdRef::lost(FdOrigin::Mem), FdRef::mem),
 			Some(FdObjImage::Lost(origin)) => FdRef::lost(*origin),
 			Some(FdObjImage::Closed) | None => FdRef::closed(),
+			// Built without a host: lost, which an external reads as the
+			// null device.
+			Some(FdObjImage::DevNull { .. }) => FdRef::lost(FdOrigin::Host),
 		};
 		if let Some(slot) = self.built.get_mut(i) {
 			*slot = Some(h.clone());
@@ -232,6 +257,22 @@ impl FdRebuild<'_> {
 	}
 }
 
+/// The shared `/dev/null` ([`Kernel::dev_null`], `rw`: read-write), opened
+/// again for a restore. A restore cannot wait: an open the host's
+/// filesystem does not answer at once, or one that fails, leaves the object
+/// lost, which an external reads as the null device.
+fn reopen_null(host: &mut dyn Host, rw: bool) -> FdRef {
+	let flags = if rw {
+		OpenFlags::READ.with(OpenFlags::WRITE)
+	} else {
+		OpenFlags::READ
+	};
+	match host.fs().open(BStr::new(b"/dev/null"), flags, 0) {
+		FsPoll::Ready(Ok(file)) => FdRef::open(file, FdOrigin::Host),
+		_ => FdRef::lost(FdOrigin::Host),
+	}
+}
+
 /// One vproc. The fields in [`Fields`] are the root vproc's store records
 /// (`state::sync_root`), so the root's image has none.
 #[derive(Serialize, Deserialize)]
@@ -251,6 +292,9 @@ struct ProcImage {
 	/// This vproc's EXIT trap has already been started (a forked subshell
 	/// has no `Run` to keep the flag on).
 	exit_trap_run: bool,
+	/// bash's `stdin_redir` (`JobTable::stdin_redir`; not in `Fields`, so
+	/// the root vproc keeps it too).
+	stdin_redir:   bool,
 	procsubs:      Vec<(u32, i32)>,
 	coprocs:       Vec<super::proc::Coproc>,
 	restore_opts:  Vec<BString>,
@@ -523,7 +567,14 @@ impl Shell {
 		}
 		let mut procs = Vec::with_capacity(self.procs.len());
 		let mut runs = Vec::new();
-		let mut fds = FdImager::default();
+		// The kernel's shared `/dev/null`s are carried (opened again on
+		// restore), not lost.
+		let nulls = self
+			.k
+			.dev_null
+			.each_ref()
+			.map(|h| h.as_ref().map(FdRef::key));
+		let mut fds = FdImager { nulls, ..FdImager::default() };
 		for p in &mut self.procs {
 			let mut frames = Vec::with_capacity(p.frames.len());
 			for f in &mut p.frames {
@@ -563,6 +614,7 @@ impl Shell {
 			}
 			for (fd, h) in p.fds.iter() {
 				if h.origin() == FdOrigin::Host
+					&& !nulls.contains(&Some(h.key()))
 					&& let Some(kind) = h.kind()
 				{
 					report.lost.push(Lost::Fd { vpid: p.vpid, fd, kind });
@@ -609,6 +661,7 @@ impl Shell {
 				stopped: p.stopped,
 				transient: p.transient,
 				exit_trap_run: p.exit_trap_run,
+				stdin_redir: p.jobs.stdin_redir,
 				procsubs: p.procsubs.clone(),
 				coprocs: p.coprocs.clone(),
 				restore_opts: p.restore_opts.clone(),
@@ -804,6 +857,7 @@ impl Shell {
 				.collect(),
 			built,
 			stdio,
+			nulls: k.dev_null.clone(),
 		};
 		let mut procs = Vec::with_capacity(img.procs.len());
 		for p in img.procs {
@@ -841,6 +895,7 @@ impl Shell {
 			vp.pending_traps = p.pending_traps;
 			vp.stopped = p.stopped;
 			vp.exit_trap_run = p.exit_trap_run;
+			vp.jobs.stdin_redir = p.stdin_redir;
 			vp.procsubs = p.procsubs;
 			vp.coprocs = p.coprocs;
 			vp.restore_opts = p.restore_opts;
@@ -1041,6 +1096,7 @@ impl Shell {
 			}
 			procs.push(Box::new(vp));
 		}
+		k.dev_null = objs.nulls;
 		if procs.is_empty() {
 			self.procs.push(loaded);
 			return Ok(());
@@ -1371,6 +1427,7 @@ mod tests {
 				.map(|m| MemObj::rebuild(m, Waker::noop()))
 				.collect(),
 			stdio: &mut stdio,
+			nulls: [None, None],
 		};
 		let [r, w, w_again, w2] = ids.map(|i| back.build(i, |_| None));
 		// The rebuild table holds every built fd until restore ends.

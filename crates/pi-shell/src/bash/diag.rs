@@ -223,6 +223,13 @@ pub enum Diag {
 		/// OS error.
 		err:  io::Error,
 	},
+	/// An asynchronous command's `/dev/null` failed to open (bash
+	/// `async_redirect_stdin`); it keeps the shell's stdin.
+	#[error("cannot redirect standard input from /dev/null: {}", strerror(.err))]
+	AsyncStdin {
+		/// OS error.
+		err: io::Error,
+	},
 	/// A redirection word expanded to zero or several fields.
 	#[error("{word}: ambiguous redirect")]
 	AmbiguousRedirect {

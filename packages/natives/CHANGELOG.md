@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the standard input of a background command in bash mode: without job control it reads `/dev/null`, unless its own redirections change stdin, it is a pipeline, or an enclosing compound command, subshell, pipeline stage or coprocess redirected stdin, as bash does; before, it read an empty in-memory pipe, also when it redirected stdin itself (`cat <&0 &`). In zsh mode a background command keeps the shell's stdin unless that is a terminal, as zsh does. A read-only `/dev/null` now refuses writes.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
