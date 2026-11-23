@@ -963,8 +963,8 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 	}
 
 	let script = "echo $$ > \"$1\"; : > \"$2\"; if test \"$3\" -eq 1; then kill -STOP $$; fi; \
-	              while ! test -e \"$4\"; do kill -0 \"$PPID\" 2>/dev/null || exit 97; \
-	              sleep 0.01; done";
+	              while ! test -e \"$4\"; do kill -0 \"$PPID\" 2>/dev/null || exit 97; sleep 0.01; \
+	              done";
 	let (_pty_master, pty_slave) = pseudo_terminal_session();
 	for stage_count in [2_usize, 3] {
 		for stopped_subset in 1..(1_usize << stage_count) {
