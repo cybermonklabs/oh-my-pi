@@ -5,20 +5,16 @@
  * One session request (`POST {base}/live/sessions`, the session settings and the WebRTC SDP offer in
  * one JSON body) answered by a 201 that names the session and carries the SDP answer; then the
  * session's sideband WebSocket (`{base}/live/sessions/{id}/attach`) for its events and the client's
- * messages. Both carry the `openai` provider's key as the bearer, and nothing else.
+ * messages. Both carry the `openai` provider's key as the bearer, and nothing else. GPT-Live's public
+ * events and messages differ from Codex's; this transport maps them both ways, so the controller is the
+ * same for both routes.
  */
 import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
-import { isRecord, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { kNoAuth } from "../config/model-provider-discovery";
-import {
-	buildOpenAILiveSessionRequest,
-	type LiveClientMessage,
-	type LiveServerEvent,
-	parseLiveRecord,
-	parseOpenAILiveServerEvent,
-} from "./protocol";
+import { type LiveClientMessage, type LiveServerEvent, parseLiveServerEvent } from "./protocol";
 import type { CodexLiveTransport, LiveTransportCallbacks } from "./transport";
 
 /** The provider whose key (and base URL, when models.yml sets one) the route uses; also its proxy scope. */
@@ -93,6 +89,30 @@ function bounded(text: string, limit: number): string {
 	return text.length <= limit ? text : `${text.slice(0, limit)}…`;
 }
 
+/** Parses a JSON string from an event channel into a record, or `undefined`. */
+function parseRecord(payload: string): Record<string, unknown> | undefined {
+	try {
+		const parsed: unknown = JSON.parse(payload);
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * A controller message in GPT-Live's form. The controller writes a delegation's progress to Codex's
+ * commentary channel and its result to the spoken one; GPT-Live takes progress as silent thinking and
+ * the result as commentary, which it speaks. `session.close` is the same on both routes.
+ */
+function toOpenAIMessage(message: LiveClientMessage): unknown {
+	if (message.type !== "delegation.context.append") return message;
+	return {
+		type: message.channel === "commentary" ? "session.thinking.append" : "session.commentary.append",
+		delegation_id: message.delegation_item_id,
+		content: message.content.map(part => part.text).join(""),
+	};
+}
+
 /** Configuration of one GPT-Live call. */
 export interface OpenAILiveTransportOptions {
 	route: OpenAILiveRoute;
@@ -119,6 +139,10 @@ export class OpenAILiveTransport implements Pick<
 	#unexpectedFailureReported = false;
 	/** Event ids already delivered, in arrival order; see {@link SEEN_EVENT_IDS_LIMIT}. */
 	readonly #seenEventIds = new Set<string>();
+	/** The user's words since the previous delegation; see {@link #mapEvent}. */
+	#userWords = "";
+	/** The speaker of the transcript line being said, and its words so far; see {@link #mapEvent}. */
+	#line: { role: "user" | "assistant"; text: string } | undefined;
 
 	constructor(options: OpenAILiveTransportOptions) {
 		this.#options = options;
@@ -188,17 +212,16 @@ export class OpenAILiveTransport implements Pick<
 	}
 
 	/**
-	 * The session request: the session settings and the SDP offer, with the provider's key and no other
-	 * credential. No redirect is followed, so the key stays at the provider's origin.
+	 * The session request: the model, the instructions, client delegation and the SDP offer, with the
+	 * provider's key and no other credential. No redirect is followed, so the key stays at the provider's origin.
 	 */
 	async #signal(offer: string): Promise<{ id: string; answer: string }> {
 		const { route } = this.#options;
 		const url = new URL(openAILiveSessionsUrl(route.baseUrl));
-		const body = buildOpenAILiveSessionRequest({
-			model: route.model,
-			instructions: this.#options.instructions,
-			sdp: offer,
-		});
+		const body = {
+			session: { model: route.model, instructions: this.#options.instructions, delegation: { type: "client" } },
+			transport: { type: "webrtc", sdp: offer },
+		};
 		const response = await fetch(url, {
 			method: "POST",
 			headers: {
@@ -222,7 +245,7 @@ export class OpenAILiveTransport implements Pick<
 			const detail = bounded(text.trim().replaceAll(/\s+/g, " ") || response.statusText, MAX_ERROR_BODY_LENGTH);
 			throw new Error(`GPT-Live session failed (${response.status}): ${detail}`);
 		}
-		const answer = parseLiveRecord(text);
+		const answer = parseRecord(text);
 		const id = isRecord(answer?.session) ? answer.session.id : undefined;
 		if (typeof id !== "string" || !id) throw new Error("GPT-Live session returned no session id");
 		if (!SESSION_ID_PATTERN.test(id)) {
@@ -322,7 +345,7 @@ export class OpenAILiveTransport implements Pick<
 	/** Delivers one event, once: the sideband replays the 3 s before it attached, which the data channel delivered. */
 	#handleEvent(payload: string): void {
 		if (this.#state === "closing" || this.#state === "closed") return;
-		const record = parseLiveRecord(payload);
+		const record = parseRecord(payload);
 		if (!record) return;
 		const eventId = record.event_id;
 		if (typeof eventId === "string") {
@@ -333,11 +356,66 @@ export class OpenAILiveTransport implements Pick<
 				if (oldest !== undefined) this.#seenEventIds.delete(oldest);
 			}
 		}
-		const event = parseOpenAILiveServerEvent(record);
-		if (!event) return;
-		try {
-			this.#options.callbacks.onEvent(event);
-		} catch {}
+		for (const event of this.#mapEvent(record)) {
+			try {
+				this.#options.callbacks.onEvent(event);
+			} catch {}
+		}
+	}
+
+	/**
+	 * GPT-Live's public events as the controller's (Codex's) events.
+	 * - Its transcript comes in deltas with no end-of-turn event, so one speaker's line ends when the other
+	 *   speaker starts.
+	 * - Its delegation carries only an id: OpenAI's client delegation guide says to use the transcript
+	 *   events for what the user wants. So the delegation's text is the user's words since the previous
+	 *   delegation, sent at once; words that arrive after it go with the next one.
+	 * - Its `error` reports a problem in the session "such as an invalid client command" (OpenAI's Live
+	 *   reference), and the session stays open, so an `error` is logged and does not end the call. The
+	 *   call ends when the sideband closes.
+	 */
+	#mapEvent(record: Record<string, unknown>): LiveServerEvent[] {
+		switch (record.type) {
+			case "session.input_transcript.delta":
+			case "session.output_transcript.delta": {
+				const delta = record.delta;
+				if (typeof delta !== "string" || !delta) return [];
+				const role = record.type === "session.input_transcript.delta" ? "user" : "assistant";
+				if (role === "user") this.#userWords += delta;
+				const events: LiveServerEvent[] = [];
+				const previous = this.#line;
+				if (previous && previous.role !== role) {
+					events.push({ type: "turn.done", turn: { role: previous.role, transcript: previous.text } });
+				}
+				const text = (previous?.role === role ? previous.text : "") + delta;
+				this.#line = { role, text };
+				const type = role === "user" ? "input_transcript.added" : "output_transcript.added";
+				events.push({ type, item: { text } });
+				return events;
+			}
+			case "session.delegation.created": {
+				const delegation = record.delegation;
+				if (!isRecord(delegation) || typeof delegation.id !== "string" || delegation.target !== "client") {
+					return [];
+				}
+				const text = this.#userWords.trim();
+				this.#userWords = "";
+				const content = text ? [{ type: "input_text" as const, text }] : [];
+				return [
+					{
+						type: "delegation.created",
+						item: { type: "delegation", target: "client", id: delegation.id, content },
+					},
+				];
+			}
+			case "error":
+				logger.warn("GPT-Live reported an error; the call stays open", { error: record.error });
+				return [];
+			default: {
+				const event = parseLiveServerEvent(record);
+				return event ? [event] : [];
+			}
+		}
 	}
 
 	#handleOutputLevel(level: number): void {
@@ -357,7 +435,7 @@ export class OpenAILiveTransport implements Pick<
 		} catch {}
 	}
 
-	/** Serialize one message onto the session's sideband. */
+	/** Serialize one message onto the session's sideband, in GPT-Live's form. */
 	send(message: LiveClientMessage): Promise<void> {
 		const operation = this.#sendTail.then(() => {
 			if (this.#state !== "connected") throw new Error("Live transport is not connected");
@@ -365,7 +443,7 @@ export class OpenAILiveTransport implements Pick<
 			if (!sideband || sideband.readyState !== WebSocket.OPEN) {
 				throw new Error("GPT-Live sideband is not connected");
 			}
-			sideband.send(JSON.stringify(message));
+			sideband.send(JSON.stringify(toOpenAIMessage(message)));
 		});
 		this.#sendTail = operation.catch(() => {});
 		return operation;

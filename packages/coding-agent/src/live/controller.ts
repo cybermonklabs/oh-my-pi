@@ -2,12 +2,10 @@ import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
+import { prompt, toError } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
-import { LiveCallTranscript } from "./call-transcript";
-import { OpenAILiveTransport, resolveOpenAILiveRoute } from "./openai-transport";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
 import {
@@ -17,6 +15,7 @@ import {
 	type LiveClientMessage,
 	type LiveServerEvent,
 } from "./protocol";
+import { OpenAILiveTransport, resolveOpenAILiveRoute } from "./openai-transport";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { cfgLiveProvider } from "./settings";
 import { CodexLiveTransport } from "./transport";
@@ -25,10 +24,6 @@ import { DEFAULT_LIVE_VOICE } from "./voices";
 
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
-/** How long a GPT-Live delegation waits for the user's transcript to reach its offset before it is sent anyway. */
-const DELEGATION_TRANSCRIPT_WAIT_MS = 3_000;
-/** Request text of a delegation that no transcript reached before it was sent. */
-const NO_WORDS_REQUEST = "(no words reached omp for this request)";
 
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
@@ -114,12 +109,6 @@ export class LiveSessionController {
 	readonly #sdpOffer: string | undefined;
 
 	#transport: CodexLiveTransport | OpenAILiveTransport | undefined;
-	/** The words of a GPT-Live call (`live.provider: openai`); unset on Codex, whose delegations carry their text. */
-	#callTranscript: LiveCallTranscript | undefined;
-	/** GPT-Live delegations waiting for the user's transcript to reach their offset, oldest first. */
-	#pendingDelegations: { id: string; offsetMs: number; expired: boolean; timer: NodeJS.Timeout }[] = [];
-	/** The speaker whose GPT-Live transcript line is open in the live view. */
-	#openTranscriptRole: LiveTranscript["role"] | undefined;
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -198,26 +187,22 @@ export class LiveSessionController {
 				onEvent: (event: LiveServerEvent) => this.#guardEvent(() => this.#handleLiveEvent(event)),
 				onOutputLevel: (level: number) => this.#guardEvent(() => this.#handleOutputLevel(level)),
 			};
-			const viaOpenAI = cfgLiveProvider.get(this.#session.settings) === "openai";
-			const transport = viaOpenAI
-				? new OpenAILiveTransport({
-						route: await resolveOpenAILiveRoute(this.#session.modelRegistry, this.#session.sessionId),
-						instructions,
-						sdpOffer: this.#sdpOffer,
-						callbacks,
-					})
-				: new CodexLiveTransport({
-						authStorage: this.#session.modelRegistry.authStorage,
-						sessionId: this.#session.sessionId,
-						instructions,
-						voice: this.#voice,
-						sdpOffer: this.#sdpOffer,
-						callbacks,
-					});
-			if (viaOpenAI) this.#callTranscript = new LiveCallTranscript();
-			if (this.#stopped) {
-				throw this.#failure ?? new Error("The live session stopped while starting.");
-			}
+			const transport =
+				cfgLiveProvider.get(this.#session.settings) === "openai"
+					? new OpenAILiveTransport({
+							route: await resolveOpenAILiveRoute(this.#session.modelRegistry, this.#session.sessionId),
+							instructions,
+							sdpOffer: this.#sdpOffer,
+							callbacks,
+						})
+					: new CodexLiveTransport({
+							authStorage: this.#session.modelRegistry.authStorage,
+							sessionId: this.#session.sessionId,
+							instructions,
+							voice: this.#voice,
+							sdpOffer: this.#sdpOffer,
+							callbacks,
+						});
 			this.#transport = transport;
 			await transport.connect();
 			if (this.#stopped) {
@@ -283,9 +268,6 @@ export class LiveSessionController {
 
 	async #stop(): Promise<void> {
 		this.#stopped = true;
-		// No GPT-Live delegation is dropped: one still waiting for its transcript becomes a turn now.
-		for (const pending of this.#pendingDelegations) pending.expired = true;
-		this.#flushDelegations();
 		this.#outputActivity.dispose();
 		this.#unsubscribeSession?.();
 		this.#unsubscribeSession = undefined;
@@ -355,67 +337,6 @@ export class LiveSessionController {
 			case "error":
 				this.#reportFailure(new Error(event.message));
 				break;
-			case "transcript.delta":
-				this.#handleTranscriptDelta(event);
-				break;
-			case "delegation.requested":
-				this.#queueDelegation(event.id, event.offsetMs);
-				break;
-			case "warning":
-				logger.warn("GPT-Live rejected a command or cut its speech", { message: event.message });
-				break;
-		}
-	}
-
-	/** A GPT-Live transcript fragment: kept for the next request, shown in the live view, and it may send a waiting delegation. */
-	#handleTranscriptDelta(event: Extract<LiveServerEvent, { type: "transcript.delta" }>): void {
-		this.#callTranscript?.add(event);
-		const open = this.#openTranscriptRole;
-		if (open && open !== event.role) this.#finishOpenTranscriptLine();
-		this.#openTranscriptRole = event.role;
-		this.#addTranscript(event.role, event.text);
-		this.#flushDelegations();
-	}
-
-	#finishOpenTranscriptLine(): void {
-		const role = this.#openTranscriptRole;
-		if (!role) return;
-		this.#openTranscriptRole = undefined;
-		this.#finishTranscript(role, role === "user" ? this.#userTranscript : this.#assistantTranscript);
-	}
-
-	/**
-	 * A GPT-Live delegation names only its offset on the call's timeline, and the transcript of the
-	 * user's words before it can still be on its way; it waits until the user's own transcript reaches
-	 * the offset, or {@link DELEGATION_TRANSCRIPT_WAIT_MS}, and becomes a turn either way.
-	 */
-	#queueDelegation(id: string, offsetMs: number): void {
-		this.#finishOpenTranscriptLine();
-		const pending = {
-			id,
-			offsetMs,
-			expired: false,
-			timer: setTimeout(() => {
-				pending.expired = true;
-				this.#guardEvent(() => this.#flushDelegations());
-			}, DELEGATION_TRANSCRIPT_WAIT_MS),
-		};
-		this.#pendingDelegations.push(pending);
-		this.#flushDelegations();
-	}
-
-	/** Sends, oldest first, each waiting delegation whose user transcript has arrived or whose wait is over. */
-	#flushDelegations(): void {
-		const transcript = this.#callTranscript;
-		if (!transcript) return;
-		for (let next = this.#pendingDelegations[0]; next; next = this.#pendingDelegations[0]) {
-			if (!next.expired && !transcript.reached(next.offsetMs)) return;
-			this.#pendingDelegations.shift();
-			clearTimeout(next.timer);
-			const lines = transcript.takeRequest(next.offsetMs);
-			// GPT-Live's delegation carries no text: the request is the words said before its offset.
-			const request = lines.length > 0 ? lines.join("\n") : NO_WORDS_REQUEST;
-			this.#startDelegatedTurn(next.id, request);
 		}
 	}
 
@@ -427,11 +348,7 @@ export class LiveSessionController {
 		}
 		request = request.trim();
 		if (!request) return;
-		this.#startDelegatedTurn(event.item.id, request);
-	}
-
-	#startDelegatedTurn(delegationId: string, request: string): void {
-		this.#activeDelegationId = delegationId;
+		this.#activeDelegationId = event.item.id;
 		this.#refreshAudioPhase();
 		void this.#session
 			.sendCustomMessage(
@@ -461,12 +378,7 @@ export class LiveSessionController {
 		const progress = this.#extractAssistantText(message).trim();
 		if (!progress) return;
 		for (const chunk of chunkLiveContext(progress)) {
-			// GPT-Live takes progress as silent thinking; Codex as delegation context on the commentary channel.
-			this.#queueSend(
-				this.#callTranscript
-					? { type: "session.thinking.append", delegation_id: delegationId, content: chunk }
-					: buildDelegationContextAppend(delegationId, chunk, "commentary"),
-			);
+			this.#queueSend(buildDelegationContextAppend(delegationId, chunk, "commentary"));
 		}
 	}
 
@@ -480,12 +392,7 @@ export class LiveSessionController {
 			if (!text) continue;
 			const finalContext = prompt.render(agentFinalMessageTemplate, { message: text });
 			for (const chunk of chunkLiveContext(finalContext)) {
-				// GPT-Live says a commentary append aloud; Codex a delegation context append.
-				this.#queueSend(
-					this.#callTranscript
-						? { type: "session.commentary.append", delegation_id: delegationId, content: chunk }
-						: buildDelegationContextAppend(delegationId, chunk),
-				);
+				this.#queueSend(buildDelegationContextAppend(delegationId, chunk));
 			}
 			break;
 		}

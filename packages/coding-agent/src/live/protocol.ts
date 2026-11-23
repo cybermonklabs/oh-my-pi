@@ -20,7 +20,7 @@ export type LiveSessionPayload = {
 	delegation: { type: "client" };
 };
 
-/** Messages sent by the client over the Frameless Bidi data channel or a GPT-Live sideband. */
+/** Messages sent by the client over the Frameless Bidi data channel. */
 export type LiveClientMessage =
 	| {
 			type: "delegation.context.append";
@@ -33,11 +33,9 @@ export type LiveClientMessage =
 			channel?: LiveContextChannel;
 			content: LiveInputTextContent[];
 	  }
-	/** GPT-Live (`live.provider: openai`): a delegation's progress (not spoken) and its result (spoken). */
-	| { type: "session.thinking.append" | "session.commentary.append"; delegation_id: string; content: string }
 	| { type: "session.close" };
 
-/** Parsed live server events (Frameless Bidi and GPT-Live's public API), including unsupported wire types. */
+/** Parsed Frameless Bidi server events, including unsupported wire event types. */
 export type LiveServerEvent =
 	| {
 			type: "session.started" | "session.updated";
@@ -56,17 +54,11 @@ export type LiveServerEvent =
 			};
 	  }
 	| { type: "error"; message: string }
-	// GPT-Live's public API; see {@link parseOpenAILiveServerEvent}.
-	| { type: "transcript.delta"; role: "user" | "assistant"; text: string; startMs: number; endMs: number }
-	| { type: "delegation.requested"; id: string; offsetMs: number }
-	/** A rejected command or a moderation cut: the call stays open. */
-	| { type: "warning"; message: string }
 	| { type: "unknown"; wireType: string };
 
 type UnknownRecord = Record<string, unknown>;
 
-/** A JSON string or decoded value from a live event channel, as a record; `null` when it is not one. */
-export function parseLiveRecord(payload: unknown): UnknownRecord | null {
+function parsePayload(payload: unknown): UnknownRecord | null {
 	let parsed = payload;
 	if (typeof payload === "string") {
 		try {
@@ -145,7 +137,7 @@ function parseErrorEvent(payload: UnknownRecord): LiveServerEvent | null {
 
 /** Parse a JSON string or decoded value from the Frameless Bidi data channel. */
 export function parseLiveServerEvent(payload: unknown): LiveServerEvent | null {
-	const parsed = parseLiveRecord(payload);
+	const parsed = parsePayload(payload);
 	if (!parsed || typeof parsed.type !== "string") return null;
 
 	switch (parsed.type) {
@@ -204,60 +196,6 @@ export function buildSessionContextAppend(text: string, channel?: LiveContextCha
 /** Build the message that gracefully closes a live session. */
 export function buildSessionClose(): LiveClientMessage {
 	return { type: "session.close" };
-}
-
-/** Body of `POST {base}/live/sessions`, GPT-Live's public WebRTC session request. */
-export interface OpenAILiveSessionRequest {
-	session: { model: string; instructions: string; delegation: { type: "client" } };
-	transport: { type: "webrtc"; sdp: string };
-}
-
-/** Build the GPT-Live session request: the model, the instructions, client delegation, and the caller's SDP offer. */
-export function buildOpenAILiveSessionRequest(options: {
-	model: string;
-	instructions: string;
-	sdp: string;
-}): OpenAILiveSessionRequest {
-	return {
-		session: { model: options.model, instructions: options.instructions, delegation: { type: "client" } },
-		transport: { type: "webrtc", sdp: options.sdp },
-	};
-}
-
-function isFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
-}
-
-/**
- * Map a GPT-Live public event onto the controller's events. Transcript deltas keep their text exactly
- * (spaces included) and their interval on the call's timeline; a delegation names no task text, only
- * its id and timeline offset; an `error` in a running call is a warning, since a rejected command or a
- * moderation cut leaves the call open.
- */
-export function parseOpenAILiveServerEvent(payload: unknown): LiveServerEvent | null {
-	const parsed = parseLiveRecord(payload);
-	if (!parsed || typeof parsed.type !== "string") return null;
-	switch (parsed.type) {
-		case "session.input_transcript.delta":
-		case "session.output_transcript.delta": {
-			const { delta, start_ms: startMs, end_ms: endMs } = parsed;
-			if (typeof delta !== "string" || !isFiniteNumber(startMs) || !isFiniteNumber(endMs)) return null;
-			const role = parsed.type === "session.input_transcript.delta" ? "user" : "assistant";
-			return { type: "transcript.delta", role, text: delta, startMs, endMs };
-		}
-		case "session.delegation.created": {
-			const delegation = parsed.delegation;
-			if (!isRecord(delegation) || typeof delegation.id !== "string" || delegation.target !== "client") return null;
-			if (!isFiniteNumber(parsed.offset_ms)) return null;
-			return { type: "delegation.requested", id: delegation.id, offsetMs: parsed.offset_ms };
-		}
-		case "error": {
-			const error = parseErrorEvent(parsed);
-			return error?.type === "error" ? { type: "warning", message: error.message } : null;
-		}
-		default:
-			return { type: "unknown", wireType: parsed.type };
-	}
 }
 
 function utf8ByteLength(codePoint: number): number {

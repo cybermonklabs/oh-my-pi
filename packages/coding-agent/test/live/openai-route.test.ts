@@ -6,7 +6,7 @@ import {
 	openAILiveSessionsUrl,
 	resolveOpenAILiveRoute,
 } from "@oh-my-pi/pi-coding-agent/live/openai-transport";
-import { type LiveServerEvent, parseOpenAILiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
+import { buildDelegationContextAppend, type LiveServerEvent } from "@oh-my-pi/pi-coding-agent/live/protocol";
 
 /** Headers only Codex calls carry besides {@link OPENAI_HEADERS}; the API route must never send one. */
 const CODEX_ONLY_HEADERS = ["x-oai-attestation", "openai-alpha", "x-session-id"];
@@ -132,57 +132,87 @@ describe("GPT-Live transport", () => {
 			expect(new URL(upgrade.url).pathname).toBe("/v1/live/sessions/live_123/attach");
 			expect(upgrade.headers.get("authorization")).toBe("Bearer sk-test");
 			expectNoCodexHeaders(upgrade);
-			const sent = api.message();
-			await transport.send({
-				type: "session.thinking.append",
-				delegation_id: "item_1",
-				content: "Reading the log.",
-			});
+			// The controller's delegation messages, in Codex's form: progress on the commentary channel, the result spoken.
+			let sent = api.message();
+			await transport.send(buildDelegationContextAppend("item_1", "Reading the log.", "commentary"));
 			expect(await sent).toEqual({
 				type: "session.thinking.append",
 				delegation_id: "item_1",
 				content: "Reading the log.",
 			});
+			sent = api.message();
+			await transport.send(buildDelegationContextAppend("item_1", "CI is green."));
+			expect(await sent).toEqual({
+				type: "session.commentary.append",
+				delegation_id: "item_1",
+				content: "CI is green.",
+			});
+			sent = api.message();
+			await transport.send({ type: "session.close" });
+			expect(await sent).toEqual({ type: "session.close" });
 		} finally {
 			await transport.close();
 			api.server.stop(true);
 		}
 	});
 
-	test("delivers the sideband's events once each, mapped onto the controller's", async () => {
-		const usage = { type: "session.usage.updated", event_id: "e4", usage: { seconds: 12 } };
-		const delegation = {
+	test("maps the sideband's events onto the controller's, once each; a delegation gets the user's words since the previous one", async () => {
+		const delegation = (id: string, eventId: string) => ({
 			type: "session.delegation.created",
-			event_id: "e3",
+			event_id: eventId,
 			offset_ms: 1300,
-			delegation: { id: "item_9", type: "delegation", target: "client" },
-		};
+			delegation: { id, type: "delegation", target: "client" },
+		});
+		const first = delegation("item_9", "e4");
 		const api = liveApiServer({
 			events: [
-				{ type: "session.input_transcript.delta", event_id: "e1", delta: "deploy ", start_ms: 900, end_ms: 1200 },
-				{ type: "session.output_transcript.delta", event_id: "e2", delta: "On it.", start_ms: 1500, end_ms: 1900 },
-				delegation,
+				{ type: "session.input_transcript.delta", event_id: "e1", delta: "deploy ", start_ms: 900, end_ms: 1000 },
+				{ type: "session.input_transcript.delta", event_id: "e2", delta: "main", start_ms: 1000, end_ms: 1200 },
+				{ type: "session.output_transcript.delta", event_id: "e3", delta: "On it.", start_ms: 1500, end_ms: 1900 },
+				first,
 				// The attach replays what the call already delivered.
-				delegation,
-				usage,
-				{ type: "error", event_id: "e5", error: { message: "content too long", code: "invalid_value" } },
+				first,
+				{ type: "session.usage.updated", event_id: "e5", usage: { seconds: 12 } },
+				// An error such as an invalid client command leaves the session open: logged, not a failure.
+				{ type: "error", event_id: "e6", error: { message: "content too long", code: "invalid_value" } },
+				{ type: "session.input_transcript.delta", event_id: "e7", delta: 3 },
+				{ ...delegation("item_x", "e8"), delegation: { id: "item_x", type: "delegation", target: "responses" } },
+				{
+					type: "session.input_transcript.delta",
+					event_id: "e9",
+					delta: " and test",
+					start_ms: 2000,
+					end_ms: 2400,
+				},
+				delegation("item_10", "e10"),
+				delegation("item_11", "e11"),
 			],
 		});
 		const events: LiveServerEvent[] = [];
 		const done = Promise.withResolvers<void>();
 		const transport = transportFor(api.base, event => {
 			events.push(event);
-			if (event.type === "warning") done.resolve();
+			if (event.type === "delegation.created" && event.item.id === "item_11") done.resolve();
+		});
+		const delegated = (id: string, text?: string): LiveServerEvent => ({
+			type: "delegation.created",
+			item: { type: "delegation", target: "client", id, content: text ? [{ type: "input_text", text }] : [] },
 		});
 		try {
 			await transport.connect();
 			await done.promise;
 			expect(events).toEqual([
-				{ type: "transcript.delta", role: "user", text: "deploy ", startMs: 900, endMs: 1200 },
-				{ type: "transcript.delta", role: "assistant", text: "On it.", startMs: 1500, endMs: 1900 },
-				{ type: "delegation.requested", id: "item_9", offsetMs: 1300 },
+				{ type: "input_transcript.added", item: { text: "deploy " } },
+				{ type: "input_transcript.added", item: { text: "deploy main" } },
+				{ type: "turn.done", turn: { role: "user", transcript: "deploy main" } },
+				{ type: "output_transcript.added", item: { text: "On it." } },
+				delegated("item_9", "deploy main"),
 				{ type: "unknown", wireType: "session.usage.updated" },
-				{ type: "warning", message: "content too long" },
+				{ type: "turn.done", turn: { role: "assistant", transcript: "On it." } },
+				{ type: "input_transcript.added", item: { text: " and test" } },
+				// Sent at once with the words that have arrived; with none, the controller makes no turn.
+				delegated("item_10", "and test"),
+				delegated("item_11"),
 			]);
 		} finally {
 			await transport.close();
@@ -239,19 +269,5 @@ describe("GPT-Live transport", () => {
 			redirecting.stop(true);
 			elsewhere.server.stop(true);
 		}
-	});
-});
-
-describe("GPT-Live events", () => {
-	test("ignore delegations for another target and malformed transcript deltas", () => {
-		expect(
-			parseOpenAILiveServerEvent({
-				type: "session.delegation.created",
-				offset_ms: 10,
-				delegation: { id: "item_1", type: "delegation", target: "responses" },
-			}),
-		).toBeNull();
-		expect(parseOpenAILiveServerEvent({ type: "session.input_transcript.delta", delta: 3 })).toBeNull();
-		expect(parseOpenAILiveServerEvent("not json")).toBeNull();
 	});
 });
