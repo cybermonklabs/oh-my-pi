@@ -12,9 +12,13 @@ import * as logger from "./logger";
 /**
  * How long an open keeps retrying a store another process holds locked. A start only reads a current
  * schema, so it waits here only while peers create or migrate the store, or run WAL recovery. The
- * worst case measured: 100 `omp -p` starts at once on an empty agent dir, at load average ~410, with
- * another process committing every 2 s; the slowest open waited 22 s before its winning attempt.
- * The budget is about three times that.
+ * budget is about three times the worst case #17968 measured: 100 `omp -p` starts at once on an empty
+ * agent dir, at load average ~410, with another process committing every 2 s; the slowest open waited
+ * 22 s before its winning attempt. That run waited up to 1 s in SQLite's busy handler per attempt.
+ * Remeasured with {@link BUSY_ATTEMPT_TIMEOUT_MS} attempts, without that load (100 starts on an empty
+ * agent.db against a peer holding the write lock 2.0 s of every 2.05 s, runc and gVisor): every start
+ * opened, the slowest after 5.9 s (2.6 s with 1 s attempts, which catch the peer's 50 ms gaps sooner).
+ * Not remeasured at that load.
  */
 const BUSY_RETRY_BUDGET_MS = 60_000;
 const BUSY_BASE_DELAY_MS = 100;
@@ -211,11 +215,15 @@ class BusyRetries {
 		return performance.now() - this.#startedAt + delay > BUSY_RETRY_BUDGET_MS ? undefined : delay;
 	}
 
-	/** The final BUSY error, saying how long the open waited. Keeps the SQLite code. */
+	/** The final BUSY error, saying how long the open waited and what is known of the holder. Keeps the SQLite code. */
 	exhausted(error: unknown): Error {
 		const final = toError(error);
 		const seconds = Math.round((performance.now() - this.#startedAt) / 1000);
-		final.message += `; still locked after ${seconds} s and ${this.#attempts} attempts: another process holds the database's write lock`;
+		const holder =
+			(final as { code?: unknown }).code === "SQLITE_BUSY_RECOVERY"
+				? "a connection was recovering the write-ahead log"
+				: "another connection, in this process or another, held a lock the open needed";
+		final.message += `; still locked after ${seconds} s and ${this.#attempts} attempts: ${holder}`;
 		return final;
 	}
 }
@@ -237,12 +245,10 @@ function failedAttempt(
 	return new SqliteAttemptFailure(error, identity);
 }
 
-function openConnection(dbPath: string, busyTimeoutMs: number): Database {
+/** A new connection to the store, from a process whose SQLite takes the lock shim's locks. */
+function newConnection(dbPath: string): Database {
 	ensureSqliteLockShim();
-	const db = new Database(dbPath);
-	// WAL recovery can bypass the busy handler; both it and retries are needed (#2421).
-	db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
-	return db;
+	return new Database(dbPath);
 }
 
 /**
@@ -276,7 +282,10 @@ async function openWithBusyRetries<T>(
 		let opened: T;
 		const identity = sqliteFileIdentity(dbPath);
 		try {
-			db = openConnection(dbPath, BUSY_ATTEMPT_TIMEOUT_MS);
+			// Assigned before any statement, so a failing PRAGMA still closes the connection below.
+			db = newConnection(dbPath);
+			// WAL recovery can bypass the busy handler; both it and retries are needed (#2421).
+			db.run(`PRAGMA busy_timeout = ${BUSY_ATTEMPT_TIMEOUT_MS}`);
 			opened = await initialize(db);
 		} catch (caught) {
 			// The attempt's connection is closed here, or handed to corruption recovery, which closes it.
@@ -301,7 +310,8 @@ function openOnceSync<T>(dbPath: string, initialize: (db: Database) => T, option
 	let db: Database | undefined;
 	const identity = sqliteFileIdentity(dbPath);
 	try {
-		db = openConnection(dbPath, options.busyTimeoutMs ?? getDbBusyTimeoutMs());
+		db = newConnection(dbPath);
+		db.run(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? getDbBusyTimeoutMs()}`);
 		return initialize(db);
 	} catch (caught) {
 		throw failedAttempt(dbPath, db, caught, identity, options);

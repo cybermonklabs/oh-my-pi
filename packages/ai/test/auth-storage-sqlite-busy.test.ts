@@ -193,6 +193,8 @@ db.close();`,
 		);
 		expect(String(error)).toContain(dbPath);
 		expect(String(error)).toMatch(/still locked after \d+ s and \d+ attempts/);
+		// SQLITE_BUSY_RECOVERY says what held the database; it is not another process's write lock.
+		expect(String(error)).toContain("a connection was recovering the write-ahead log");
 		expect(error).toMatchObject({ code: "SQLITE_BUSY_RECOVERY" });
 		// Doubling, jittered delays capped at 2 s, stopping within the 60 s budget.
 		expect(delays.length).toBeGreaterThan(4);

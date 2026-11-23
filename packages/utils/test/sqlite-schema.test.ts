@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { getDbBusyTimeoutMs, setInteractiveHost } from "../src/env";
 import { initializeSqliteSchema, isSqliteBusyError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
 import { TempDir } from "../src/temp";
@@ -239,4 +239,40 @@ describe("open BUSY budget", () => {
 		expect(waited).toBeLessThan(HOLD_MS / 2);
 		await peer.exited;
 	}, 30_000);
+
+	test("an attempt whose busy_timeout PRAGMA fails closes its connection", async () => {
+		await using dir = await TempDir.create("@omp-sqlite-pragma-fail-");
+		const dbPath = dir.join("store.db");
+		createStore(dbPath);
+		const run = Database.prototype.run;
+		const close = Database.prototype.close;
+		let failed = 0;
+		let closed = 0;
+		const runSpy = spyOn(Database.prototype, "run").mockImplementation(function (
+			this: Database,
+			...args: Parameters<typeof run>
+		) {
+			if (String(args[0]).startsWith("PRAGMA busy_timeout")) {
+				failed++;
+				throw new Error("planted busy_timeout failure");
+			}
+			return run.apply(this, args);
+		});
+		const closeSpy = spyOn(Database.prototype, "close").mockImplementation(function (
+			this: Database,
+			...args: Parameters<typeof close>
+		) {
+			closed++;
+			return close.apply(this, args);
+		});
+		try {
+			await expect(openSqliteDatabase(dbPath, db => db)).rejects.toThrow("planted busy_timeout failure");
+			expect(() => openSqliteDatabaseSync(dbPath, db => db)).toThrow("planted busy_timeout failure");
+		} finally {
+			runSpy.mockRestore();
+			closeSpy.mockRestore();
+		}
+		expect(failed).toBe(2);
+		expect(closed).toBe(2);
+	});
 });
