@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- In bash mode `$_` follows each command, as in bash. After a simple command it is the command's last word: its name when the command has no arguments, and empty after a command of assignments only. An external command gets `_` set to its own path. Before this, `$_` kept the value the shell imported (`mkdir -p d && cd "$_"` changed to the wrong directory)
+- In bash mode `$_` follows each command, as in bash. After a simple command it is the command's last word: its name when the command has no arguments, and empty after a command of assignments only. It is assigned as `_=word` is, so `_`'s attributes apply (`declare -u _` gives `B`; a readonly `_` keeps its value and bash's `_: readonly variable` is printed), and `_` is not exported after it. `exit` and `return` do not set it. An external command gets `_` set to its own path, and a script with no `#!` line its name; `env _=x cmd` gives `cmd` that `_`. Before this, `$_` kept the value the shell imported (`mkdir -p d && cd "$_"` changed to the wrong directory).
 
 ## [18.18.6] - 2026-11-09
 

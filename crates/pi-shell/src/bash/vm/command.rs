@@ -469,7 +469,7 @@ fn assignment_statement(
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
 	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`).
-	bash_last_arg(k, vp, cx, BString::default());
+	bash_last_arg(k, vp, cx, line, BString::default());
 	Some(Flow::Next)
 }
 
@@ -607,7 +607,7 @@ fn plain_statement(
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
-		bash_last_arg(k, vp, cx, argv.last().cloned().unwrap_or_default());
+		bash_last_arg(k, vp, cx, line, argv.pop().unwrap_or_default());
 		return Some(Flow::Next);
 	}
 	// The stages take over from the expanded words: a builtin that needs
@@ -2364,11 +2364,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
 			} else {
-				// bash gives `_` the program's path for a command it runs, not
-				// for `exec` (which passes the exported `_`, if any: the one the
-				// shell imported, until a command binds it unexported). A
-				// utility's command (`env`, `xargs`) runs through `exec`, so it
-				// gets none either, as the program GNU's `env -i` starts.
+				// An external the shell runs gets `_` as its path. One `exec`
+				// starts gets only an exported `_`, if any (bash passes the
+				// environment it last built, whose `_` is the last external's
+				// path; this shell builds none to keep). A utility's command
+				// (`env`, `xargs`) runs through `exec`, so it gets an explicit
+				// `_=VALUE` the utility gives it, else none.
 				let path = exec_as.is_none().then_some(&path[..]);
 				match build_env(k, cx, vp, path) {
 					Ok(env) => env,
@@ -4712,9 +4713,12 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	// bash `bind_lastarg`: the command's last word (its name when it has
-	// no argument, empty after an assignment-only command).
-	let last = (vp.mode.dialect() == crate::bash::ids::Dialect::Bash)
-		.then(|| st(vp).argv.last().cloned().unwrap_or_default());
+	// no argument, empty after an assignment-only command). `exit`,
+	// `return` and `exec` leave before it: an EXIT or RETURN trap sees the
+	// command before them.
+	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& !matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
+	let last = binds.then(|| st(vp).argv.pop().unwrap_or_default());
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4736,7 +4740,8 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		vp.fds.set_command_tag(None);
 	}
 	if let Some(last) = last {
-		bash_last_arg(k, vp, cx, last);
+		let line = exec::line_of(vp, op.node);
+		bash_last_arg(k, vp, cx, line, last);
 	}
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
@@ -4771,23 +4776,59 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 }
 
 /// bash `bind_lastarg`: after a simple command `$_` is its last word (its
-/// name when it has no argument, empty after an assignment-only command).
-/// It is the shell variable `_`, bound at the innermost scope that declares
-/// it (`local _`) and without its export attribute, so an external gets
-/// `_` only as its own path ([`build_env`]). A readonly `_` keeps its
-/// value (bash also prints `_: readonly variable` there; this does not).
-/// Pipelines, `( )` and background jobs bind it in their own vprocs only.
-fn bash_last_arg(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, last: BString) {
-	let readonly = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
-		Ok(v) => v.is_some_and(|v| v.attrs.contains(Attrs::READONLY)),
+/// name when it has no argument, empty after an assignment-only command),
+/// assigned as `_=word` would be: at the innermost scope that declares `_`
+/// (`local _`), through its attributes (`-u`, `-l`, `-i`; `-n` assigns the
+/// variable it names; an array's element 0 takes it), a readonly one kept
+/// with bash's error. Then `_` is not exported, so an external gets it only
+/// as its own path ([`build_env`]). A plain `_`, the usual case, takes the
+/// bytes in place. Pipelines, `( )` and background jobs bind it in their
+/// own vprocs only.
+fn bash_last_arg(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, last: BString) {
+	let cur = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
+		Ok(v) => v.map(|v| (v.attrs, matches!(v.value, crate::bash::store::VarValue::Str(_)))),
 		Err(err) => {
 			k.fail(err);
 			return;
 		},
 	};
-	if !readonly {
-		let var = Var::scalar(last, Attrs::default());
-		state::store_var(&mut k.root, cx.store, vp, b"_", Some(var), Level::Dynamic);
+	let exported = match cur {
+		None => {
+			let var = Var::scalar(last, Attrs::default());
+			state::store_var(&mut k.root, cx.store, vp, b"_", Some(var), Level::Dynamic);
+			return;
+		},
+		Some((attrs, true)) if attrs.without(Attrs::EXPORT) == Attrs::NONE => {
+			let edit = state::VarEdit::Set { elem: None, value: &last, append: false };
+			if let Err(err) = state::edit_var(&mut k.root, cx.store, vp, b"_", Level::Dynamic, edit) {
+				k.fail(err);
+				return;
+			}
+			attrs.contains(Attrs::EXPORT)
+		},
+		Some((attrs, _)) => {
+			let lhs = Lhs { name: b"_", index: None, append: false };
+			if let Err(d) =
+				builtins::set_value(k, cx, vp, lhs, AssignValue::Scalar(last), Level::Dynamic)
+			{
+				k.diag(cx, vp, line, d);
+			}
+			attrs.contains(Attrs::EXPORT)
+		},
+	};
+	if exported {
+		let var = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
+			Ok(Some(v)) => Var { attrs: v.attrs.without(Attrs::EXPORT), value: v.value.clone() },
+			Ok(None) => return,
+			Err(err) => {
+				k.fail(err);
+				return;
+			},
+		};
+		let edit = state::VarEdit::Replace(var);
+		if let Err(err) = state::edit_var(&mut k.root, cx.store, vp, b"_", Level::Dynamic, edit) {
+			k.fail(err);
+		}
 	}
 }
 
@@ -4874,11 +4915,17 @@ fn run_script_file(
 		exec_failed(k, cx, vp);
 		return None;
 	}
+	// `$0` is the file bash tried: a name with `/` as written, else the
+	// PATH (or hash table) result. The new shell's `_` is that name too, as
+	// an external's is its path (not after `exec`).
+	let name = st(vp).argv[0].clone();
+	let file = if name.contains(&b'/') { name } else { path };
 	// The environment the program would have been given (`exec -c`: none).
 	let env = if st(vp).exec_as.as_ref().is_some_and(|e| e.clear_env) {
 		EnvView::new(Vec::new())
 	} else {
-		match build_env(k, cx, vp, None) {
+		let underscore = st(vp).exec_as.is_none().then_some(&file[..]);
+		match build_env(k, cx, vp, underscore) {
 			Ok(env) => env,
 			Err(err) => {
 				k.fail(err);
@@ -4886,10 +4933,6 @@ fn run_script_file(
 			},
 		}
 	};
-	// `$0` is the file bash tried: a name with `/` as written, else the
-	// PATH (or hash table) result.
-	let name = st(vp).argv[0].clone();
-	let file = if name.contains(&b'/') { name } else { path };
 	super::nested::start_script(k, vp, cx, &env, &file, &text)
 }
 
@@ -5280,8 +5323,9 @@ fn build_env(
 			}
 		}
 	}
+	// An external's `_` is its path: pushed last, it replaces an exported
+	// `_` ([`EnvView::new`] keeps the later of two names).
 	if let Some(path) = path.filter(|_| vp.mode.dialect() == crate::bash::ids::Dialect::Bash) {
-		pairs.retain(|(n, _)| n.as_slice() != b"_");
 		pairs.push((BString::from("_"), BString::from(path)));
 	}
 	Ok(EnvView::new(pairs))
