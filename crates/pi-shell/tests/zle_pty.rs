@@ -2,9 +2,9 @@
 //! `zsh -f -i`, against the real `/bin/zsh -f -i` on the same pty session
 //! (same keys, same rc file): the final screens must match.
 //!
-//! Each case types its keys in one write, waits until the line editor has
-//! handled them and waits for the next key ([`Pty::zle_sync`]), and
-//! compares what the terminal shows.
+//! Each case types its keys a line at a time, a `^C` in a write of its own,
+//! waits until the line editor has handled them and waits for the next key
+//! ([`Pty::zle_sync`]), and compares what the terminal shows.
 
 #![cfg(unix)]
 
