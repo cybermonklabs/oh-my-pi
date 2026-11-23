@@ -15,7 +15,7 @@ import {
 	type LiveClientMessage,
 	type LiveServerEvent,
 } from "./protocol";
-import { OpenAILiveTransport, resolveOpenAILiveRoute } from "./openai-transport";
+import { OpenAILiveTransport } from "./openai-transport";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
 import { cfgLiveProvider } from "./settings";
 import { CodexLiveTransport } from "./transport";
@@ -190,7 +190,8 @@ export class LiveSessionController {
 			const transport =
 				cfgLiveProvider.get(this.#session.settings) === "openai"
 					? new OpenAILiveTransport({
-							route: await resolveOpenAILiveRoute(this.#session.modelRegistry, this.#session.sessionId),
+							registry: this.#session.modelRegistry,
+							sessionId: this.#session.sessionId,
 							instructions,
 							sdpOffer: this.#sdpOffer,
 							callbacks,

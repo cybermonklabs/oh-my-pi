@@ -63,7 +63,8 @@ function liveApiServer(options: ApiServerOptions = {}) {
 
 function transportFor(base: string, onEvent: (event: LiveServerEvent) => void = () => {}): OpenAILiveTransport {
 	return new OpenAILiveTransport({
-		route: { baseUrl: base, apiKey: "sk-test", model: "gpt-live-1.1" },
+		registry: { getProviderBaseUrl: () => base, getApiKeyForProvider: async () => "sk-test" },
+		sessionId: "s1",
 		instructions: "Be brief.",
 		sdpOffer: "v=0 offer",
 		callbacks: { onEvent, onOutputLevel: () => {} },

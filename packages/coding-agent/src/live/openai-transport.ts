@@ -115,7 +115,9 @@ function toOpenAIMessage(message: LiveClientMessage): unknown {
 
 /** Configuration of one GPT-Live call. */
 export interface OpenAILiveTransportOptions {
-	route: OpenAILiveRoute;
+	/** Resolves the `openai` provider's key and base URL when the call connects; see {@link resolveOpenAILiveRoute}. */
+	registry: OpenAILiveRegistry;
+	sessionId: string;
 	instructions: string;
 	callbacks: LiveTransportCallbacks;
 	/** SDP offer from a caller-owned WebRTC peer; unset makes a native peer (see `LiveTransportOptions.sdpOffer`). */
@@ -169,6 +171,9 @@ export class OpenAILiveTransport implements Pick<
 	}
 
 	async #connect(): Promise<void> {
+		// Resolved here, not before the transport exists, so a close while the key resolves stops the call.
+		const route = await resolveOpenAILiveRoute(this.#options.registry, this.#options.sessionId);
+		if (this.#state !== "connecting") throw new Error("Live transport is closed");
 		let offer = this.#options.sdpOffer;
 		let peer: LiveWebRtcPeer | undefined;
 		if (offer === undefined) {
@@ -177,7 +182,7 @@ export class OpenAILiveTransport implements Pick<
 			offer = await peer.createOffer();
 		}
 		if (this.#state !== "connecting") throw new Error("Live transport is closed");
-		const session = await this.#signal(offer);
+		const session = await this.#signal(route, offer);
 		if (peer) {
 			await peer.acceptAnswer(session.answer);
 			peer.setMuted(this.#muted);
@@ -186,7 +191,7 @@ export class OpenAILiveTransport implements Pick<
 			this.#sdpAnswer = session.answer;
 		}
 		if (this.#state !== "connecting") throw new Error("Live transport is closed");
-		await this.#connectSideband(openAILiveAttachUrl(this.#options.route.baseUrl, session.id));
+		await this.#connectSideband(openAILiveAttachUrl(route.baseUrl, session.id), route.apiKey);
 		if (this.#state !== "connecting") throw new Error("Live transport is closed");
 		this.#state = "connected";
 	}
@@ -215,8 +220,7 @@ export class OpenAILiveTransport implements Pick<
 	 * The session request: the model, the instructions, client delegation and the SDP offer, with the
 	 * provider's key and no other credential. No redirect is followed, so the key stays at the provider's origin.
 	 */
-	async #signal(offer: string): Promise<{ id: string; answer: string }> {
-		const { route } = this.#options;
+	async #signal(route: OpenAILiveRoute, offer: string): Promise<{ id: string; answer: string }> {
 		const url = new URL(openAILiveSessionsUrl(route.baseUrl));
 		const body = {
 			session: { model: route.model, instructions: this.#options.instructions, delegation: { type: "client" } },
@@ -256,11 +260,11 @@ export class OpenAILiveTransport implements Pick<
 		return { id, answer: sdp };
 	}
 
-	async #connectSideband(url: string): Promise<void> {
+	async #connectSideband(url: string, apiKey: string): Promise<void> {
 		let failure = new Error("GPT-Live sideband connection failed");
 		for (let attempt = 0; attempt < SIDEBAND_CONNECT_ATTEMPTS; attempt++) {
 			try {
-				await this.#openSideband(url);
+				await this.#openSideband(url, apiKey);
 				return;
 			} catch (cause) {
 				failure = toError(cause);
@@ -271,9 +275,9 @@ export class OpenAILiveTransport implements Pick<
 		throw failure;
 	}
 
-	async #openSideband(url: string): Promise<void> {
+	async #openSideband(url: string, apiKey: string): Promise<void> {
 		const options = {
-			headers: { Authorization: `Bearer ${this.#options.route.apiKey}` },
+			headers: { Authorization: `Bearer ${apiKey}` },
 			proxy: getProxyForUrl(OPENAI_PROVIDER, new URL(url)),
 		} satisfies Bun.WebSocketOptions;
 		const socket: Bun.WebSocket = Reflect.construct(WebSocket, [url, options]);

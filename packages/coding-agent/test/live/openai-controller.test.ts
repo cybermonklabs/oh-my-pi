@@ -57,21 +57,19 @@ function call(settings: Record<string, unknown>) {
 		sdpOffer: "v=0 offer",
 		callbacks: { onPhase: () => {}, onLevels: () => {}, onTranscript: () => {}, onTerminal: () => {} },
 	});
-	return { controller, openai, codex };
+	return { controller, openai, codex, session };
 }
 
 describe("live.provider", () => {
-	test("openai calls GPT-Live with the openai provider's base URL and key", async () => {
+	test("openai calls GPT-Live with the session's model registry, which holds the openai provider's key", async () => {
 		const live = call({ "live.provider": "openai" });
 		await live.controller.start();
 		expect(live.codex).toEqual([]);
 		expect(live.openai).toHaveLength(1);
 		const options = live.openai[0]!.options as OpenAILiveTransportOptions;
-		expect(options.route).toEqual({
-			baseUrl: "https://gateway.example/v1",
-			apiKey: "sk-test",
-			model: "gpt-live-1.1",
-		});
+		// The transport resolves the key and base URL itself when it connects (see openai-route.test.ts).
+		expect(options.registry).toBe(live.session.modelRegistry);
+		expect(options.sessionId).toBe("s1");
 		expect(options.sdpOffer).toBe("v=0 offer");
 		await live.controller.stop();
 	});
