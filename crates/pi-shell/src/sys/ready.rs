@@ -3,8 +3,10 @@
 //! The other end of a FIFO, a `/dev/fd/N` or a socket may be a vproc of the
 //! same engine, so a `read(2)` or `write(2)` that waits in the kernel would
 //! deadlock the scheduler. [`StdFile`](crate::sys::StdFile) therefore asks
-//! [`now`] first and only does I/O that cannot wait; otherwise it registers
-//! the engine waker with [`watch`] and returns `Pending`.
+//! [`now`] first and only does I/O that cannot wait; otherwise the polling
+//! task waits by its key beside the other tasks waiting in that direction
+//! ([`Wakers`](crate::sys::Wakers)), the first registers one [`watch`] whose
+//! waker wakes them all, and the poll returns `Pending`.
 //!
 //! The descriptor's flags are never changed: `O_NONBLOCK` lives on the open
 //! file description, which externals inherit and other processes may share.
@@ -177,6 +179,8 @@ fn run(mut wake: PipeReader) {
 		if ready.is_empty() {
 			continue;
 		}
+		#[cfg(test)]
+		let held = DISPATCH.lock();
 		let mut woken = Vec::with_capacity(ready.len());
 		POLLER.entries.lock().retain(|e| {
 			if ready.contains(&e.id) {
@@ -186,10 +190,25 @@ fn run(mut wake: PipeReader) {
 				true
 			}
 		});
+		#[cfg(test)]
+		drop(held);
 		for w in woken {
 			w.wake();
 		}
 	}
+}
+
+/// Test only: taken by the readiness thread between finding watched
+/// descriptors ready and taking their registrations ([`hold_wakes`]).
+#[cfg(test)]
+static DISPATCH: Mutex<()> = Mutex::new(());
+
+/// Test only: while the guard lives, the readiness thread wakes nobody. It
+/// stops before it takes the registrations it found ready, so a test can
+/// poll a file that is ready before the file's earlier waiters are woken.
+#[cfg(test)]
+pub(crate) fn hold_wakes() -> parking_lot::MutexGuard<'static, ()> {
+	DISPATCH.lock()
 }
 
 /// Wait until the wake pipe or a watched fd is ready: whether the wake pipe

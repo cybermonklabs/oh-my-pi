@@ -379,8 +379,9 @@ fn write_now<'b>(ctx: &Ctx<'_, '_>, fd: i32, mut bytes: &'b [u8]) -> &'b [u8] {
 	let waker = ctx.k.waker.clone();
 	let mut tcx = std::task::Context::from_waker(&waker);
 	let handle = ctx.vp.fds.handle(fd);
+	let mut key = ctx.vp.write_key.lock();
 	while !bytes.is_empty() {
-		match handle.poll_write(&mut tcx, bytes) {
+		match handle.poll_write_keyed(&mut tcx, bytes, &mut key) {
 			std::task::Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
 			_ => break,
 		}

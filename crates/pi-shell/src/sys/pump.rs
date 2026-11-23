@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 use self::os::OsPipe;
 use crate::{
 	bash::{FdRef, File},
-	sys::lifecycle::Tracker,
+	sys::{WaitKey, lifecycle::Tracker},
 };
 
 /// Engine side of a pump.
@@ -74,31 +74,55 @@ impl End {
 	/// Linux cannot reopen a socket through `/dev/fd/N` (`cat <(…)`, ENXIO).
 	pub fn direction(&mut self) -> (bool, bool) {
 		let mut cx = Context::from_waker(Waker::noop());
-		let readable = !matches!(self.poll_read(&mut cx, &mut []), Poll::Ready(Err(_)));
-		let writable = !matches!(self.poll_write(&mut cx, &[]), Poll::Ready(Err(_)));
+		let readable =
+			!matches!(self.poll_read(&mut cx, &mut [], &mut WaitKey::default()), Poll::Ready(Err(_)));
+		let writable =
+			!matches!(self.poll_write(&mut cx, &[], &mut WaitKey::default()), Poll::Ready(Err(_)));
 		(readable, writable)
 	}
 }
 
-/// Pollable I/O on either side of a pump.
+/// Pollable I/O on either side of a pump. `key` is the pump's own wait on
+/// an engine object that the engine and other tasks may wait on too
+/// ([`File::poll_read_keyed`]); a copy keeps one per direction.
 pub(super) trait PollIo {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>>;
+	fn poll_write(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>>;
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
 impl PollIo for End {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		match self {
-			Self::Fd(f) => f.poll_read(cx, buf),
-			Self::File(f) => f.poll_read(cx, buf),
+			Self::Fd(f) => f.poll_read_keyed(cx, buf, key),
+			Self::File(f) => f.poll_read_keyed(cx, buf, key),
 		}
 	}
 
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+	fn poll_write(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		match self {
-			Self::Fd(f) => f.poll_write(cx, buf),
-			Self::File(f) => f.poll_write(cx, buf),
+			Self::Fd(f) => f.poll_write_keyed(cx, buf, key),
+			Self::File(f) => f.poll_write_keyed(cx, buf, None, key),
 		}
 	}
 
@@ -111,11 +135,21 @@ impl PollIo for End {
 }
 
 impl PollIo for OsPipe {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		_key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		Self::poll_read(self, cx, buf)
 	}
 
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+	fn poll_write(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		_key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		Self::poll_write(self, cx, buf)
 	}
 
@@ -136,11 +170,19 @@ struct Chunk {
 	end:   usize,
 	/// The source ended (end of file or an error): flush, then done.
 	eof:   bool,
+	/// This copy's wait on its engine-side object (only one side is one).
+	key:   WaitKey,
 }
 
 impl Chunk {
 	fn new() -> Self {
-		Self { buf: vec![0; BUF].into_boxed_slice(), start: 0, end: 0, eof: false }
+		Self {
+			buf:   vec![0; BUF].into_boxed_slice(),
+			start: 0,
+			end:   0,
+			eof:   false,
+			key:   WaitKey::default(),
+		}
 	}
 
 	/// Read but not written yet.
@@ -163,7 +205,7 @@ impl Chunk {
 					let _ = std::task::ready!(dst.poll_flush(cx));
 					return Poll::Ready(());
 				}
-				match std::task::ready!(src.poll_read(cx, &mut self.buf)) {
+				match std::task::ready!(src.poll_read(cx, &mut self.buf, &mut self.key)) {
 					Ok(0) => self.eof = true,
 					Ok(n) => {
 						self.start = 0;
@@ -174,7 +216,8 @@ impl Chunk {
 				}
 				continue;
 			}
-			match std::task::ready!(dst.poll_write(cx, &self.buf[self.start..self.end])) {
+			match std::task::ready!(dst.poll_write(cx, &self.buf[self.start..self.end], &mut self.key))
+			{
 				Ok(n) if n > 0 => self.start += n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
 				// The reader is gone (EPIPE) or the object failed.
@@ -647,6 +690,42 @@ mod tests {
 		let mut rest = Vec::new();
 		(&child).read_to_end(&mut rest).unwrap();
 		assert!(rest.is_empty(), "the child reads end of file");
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the pump's
+	// key. A pump copying a program's output into an engine object that the
+	// engine writes too waits there with its copy's key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_pump_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = FdRef::from_file(Box::new(writer));
+		let (mut ours, child) = os::pipe(false).unwrap();
+		(&child).write_all(b"x").unwrap();
+		let mut dst = End::Fd(sink.clone());
+		let mut chunk = Chunk::new();
+		let (pump, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (pw, ew) = (Waker::from(Arc::clone(&pump)), Waker::from(Arc::clone(&engine)));
+		assert!(
+			chunk
+				.poll_copy(&mut Context::from_waker(&pw), &mut ours, &mut dst)
+				.is_pending(),
+			"no room"
+		);
+		assert_eq!(chunk.pending(), b"x", "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		pump.wait("the pump, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
 	}
 
 	#[derive(Default)]

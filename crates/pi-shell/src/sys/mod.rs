@@ -13,6 +13,8 @@
 //!   [`File`](crate::bash::File) over `std::fs`, always `Ready` (local
 //!   syscalls), for `obash` and tests.
 //! - [`std_stream`]: the process's own stdin/stdout/stderr as engine files.
+//! - [`Wakers`] and [`WaitKey`]: the tasks waiting on one thing, one slot per
+//!   task's key, all woken at once.
 //! - [`Parker`]: blocks a drive loop's thread until the engine may make
 //!   progress; on Linux it also waits for the exits of externals spawned with
 //!   [`Exits::Park`].
@@ -52,7 +54,14 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
+#[cfg(all(test, unix))]
+pub(crate) use crate::sys::fs::pending_polls;
+/// Test only: a full FIFO whose writer is a [`StdFile`], and a waker that
+/// records being woken.
+#[cfg(all(test, unix))]
+pub(crate) use crate::sys::fs::tests::fifos as test_fifos;
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;
 pub use crate::sys::{
@@ -60,6 +69,7 @@ pub use crate::sys::{
 	park::Parker,
 	relay::{ByteDecoder, OutputDecoding},
 	spawn::{Exits, Leftover, NativeSpawner, Sessions, SpawnConfig, dispositions_changed},
+	wakers::{WaitKey, Wakers},
 };
 pub(crate) use crate::sys::{pump::End, relay::Relays};
 

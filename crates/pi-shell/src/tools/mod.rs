@@ -377,28 +377,36 @@ impl Child {
 	}
 }
 
-/// Output a tool writes to the caller's fds, in order, without blocking.
+/// Output a tool writes to the caller's fds, in order, without blocking,
+/// under a key of the call's own ([`ShellApi::write_keyed`]): a write part
+/// way keeps its progress by it (a zsh multios tee, a provider file), and
+/// it goes with the call, so a call dropped while its write waits (a
+/// cancelled run, a killed shell) leaves no progress for the vproc's next
+/// write.
 #[derive(Default)]
-struct Out(VecDeque<(i32, Vec<u8>)>);
+struct Out {
+	queue: VecDeque<(i32, Vec<u8>)>,
+	key:   crate::sys::WaitKey,
+}
 
 impl Out {
 	fn push(&mut self, fd: i32, bytes: impl Into<Vec<u8>>) {
 		let bytes = bytes.into();
 		if !bytes.is_empty() {
-			self.0.push_back((fd, bytes));
+			self.queue.push_back((fd, bytes));
 		}
 	}
 
 	/// Write what fits; `true` once everything is written (or failed: a
 	/// closed stderr loses the message, as it would for any command).
 	fn flush(&mut self, api: &mut ShellApi<'_, '_>) -> bool {
-		while let Some((fd, bytes)) = self.0.front_mut() {
-			match api.write(*fd, bytes) {
+		while let Some((fd, bytes)) = self.queue.front_mut() {
+			match api.write_keyed(*fd, bytes, &mut self.key) {
 				IoPoll::Ready(Ok(n)) if n > 0 && n < bytes.len() => {
 					bytes.drain(..n);
 				},
 				IoPoll::Ready(_) => {
-					self.0.pop_front();
+					self.queue.pop_front();
 				},
 				IoPoll::WouldBlock(_) => return false,
 			}
