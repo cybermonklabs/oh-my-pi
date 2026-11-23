@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hindsight's persisted first-turn recall no longer writes a hash of the API token into the session: its scope is the server, bank and tag filter, so the session file, its copies and the SQL session store hold nothing derived from the token. A session holding a recall entry of the earlier format recalls afresh once on its next first turn, then reuses the new entry
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
