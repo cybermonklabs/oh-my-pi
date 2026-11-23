@@ -3976,13 +3976,16 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	if group && exec {
 		Some(BangStage::Exec)
 	} else {
-		// A timed group whose first command runs a program: that command
-		// decides at once ([`BangStage::First`]). Any other timed body keeps
-		// the virtual pid at once: deciding at a later command could hold
-		// `$!` while the body loops (`time { while :; do :; done; } &`).
-		// A timed subshell body (`time ( cmd; … ) &`, lowered `Enter,
-		// Spawn … SubExit, Leave`) whose first command runs a program hands
-		// the decision to the subshell (`spawn`).
+		// A timed group whose only command runs a program: that program is
+		// the job's whole life, so it decides at once
+		// ([`BangStage::First`]). Any other timed body keeps the virtual
+		// pid at once. A body with a second command would be known by its
+		// first program, which an outside `kill` ends while the body runs
+		// on, and deciding at a later command could hold `$!` while the
+		// body loops (`time { while :; do :; done; } &`). A timed subshell
+		// body (`time ( cmd ) &`, lowered `Enter, Spawn … SubExit, Leave`)
+		// whose only command runs a program hands the decision to the
+		// subshell (`spawn`).
 		let subshell = code(entry) == Some(Opcode::Enter)
 			&& unit.ops.get(entry as usize + 1).is_some_and(|op| {
 				op.code == Opcode::Spawn
@@ -3993,18 +3996,21 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 							&& s
 								.stages
 								.first()
-								.is_some_and(|st| program_first(unit, st.entry))
+								.is_some_and(|st| program_only(unit, st.entry))
 					})
 			});
-		(timed && (subshell || program_first(unit, entry))).then_some(BangStage::First)
+		(timed && (subshell || program_only(unit, entry))).then_some(BangStage::First)
 	}
 }
 
-/// Whether the code at `at` starts with a simple command whose literal name
-/// is no shell builtin (it may run a program), directly or as the first
-/// command of a group (`{ cmd; … }`): such a body decides its job's pid at
-/// its first dispatch ([`BangStage::First`]).
-pub(super) fn program_first(unit: &Unit, at: u32) -> bool {
+/// Whether the code at `at` is one simple command whose literal name is no
+/// shell builtin (it may run a program), alone or as the only command of a
+/// group (`{ cmd; }`), and nothing after it: that program is the body's
+/// whole life, so the body decides its job's pid at its dispatch
+/// ([`BangStage::First`]). The body ends at a `SubExit` (a job's or a
+/// subshell's), at `TimeEnd` then `SubExit` (a timed job), or at `End` (a
+/// function body).
+pub(super) fn program_only(unit: &Unit, at: u32) -> bool {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	let program = |at: u32| {
 		code(at) == Some(Opcode::Exec)
@@ -4020,7 +4026,16 @@ pub(super) fn program_first(unit: &Unit, at: u32) -> bool {
 						if crate::bash::ids::IntrinsicId::from_name(name).is_none())
 				})
 	};
-	program(at) || (code(at) == Some(Opcode::Enter) && program(at + 1))
+	let ends = |at: u32| match code(at) {
+		Some(Opcode::SubExit | Opcode::End) => true,
+		Some(Opcode::TimeEnd) => code(at + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
+	(program(at) && ends(at + 1))
+		|| (code(at) == Some(Opcode::Enter)
+			&& program(at + 1)
+			&& code(at + 2) == Some(Opcode::Leave)
+			&& ends(at + 3))
 }
 
 /// Whether the background job whose body starts at `entry` is timed
@@ -4109,7 +4124,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		// (`time ( cmd; … ) &`): the subshell's first command decides
 		// ([`BangStage::First`]).
 		let own_subshell = info.kind == SpawnKind::Subshell
-			&& program_first(unit, info.stages[0].entry)
+			&& program_only(unit, info.stages[0].entry)
 			&& k
 				.bangs
 				.iter()

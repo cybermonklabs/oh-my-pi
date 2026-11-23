@@ -43,22 +43,30 @@ fn assert_rows(rows: &[(&str, String, bool, &str)]) {
 	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+// Every wait in these rows has its own bound: a loop that counts and exits
+// 97, so a row whose signal never comes fails (a status 97, or `w=97`)
+// instead of leaving a program running after the test.
+
 /// `b` writes its pid to L and exits 0; `a` writes R once `b` is gone,
 /// waits for G, and exits 7. Then `kill $!`, `wait $!`: the job, not `b`,
 /// ends with 143.
-const LAST_ENDED: &str = "time /bin/sh -c 'until [ -s L ]; do :; done; read p < L; while [ -e \
-                          /proc/$p ]; do :; done; : > R; until [ -e G ]; do :; done; exit 7' | \
-                          /bin/sh -c 'echo $$ > L; exit 0' & q=$!; until [ -e R ]; do :; done; \
-                          kill $q 2>/dev/null; echo k=$?; : > G; wait $q; echo w=$?";
+const LAST_ENDED: &str = "time /bin/sh -c 'n=0; until [ -s L ]; do n=$((n+1)); [ $n -le 2000 ] || \
+                          exit 97; sleep 0.01; done; read p < L; while [ -e /proc/$p ]; do \
+                          n=$((n+1)); [ $n -le 4000 ] || exit 97; sleep 0.01; done; : > R; until \
+                          [ -e G ]; do n=$((n+1)); [ $n -le 6000 ] || exit 97; sleep 0.01; done; \
+                          exit 7' | /bin/sh -c 'echo $$ > L; exit 0' & q=$!; n=0; until [ -e R ]; \
+                          do n=$((n+1)); [ $n -le 2000 ] || exit 97; sleep 0.01; done; kill $q \
+                          2>/dev/null; echo k=$?; : > G; wait $q; echo w=$?";
 
 /// The first program writes its pid to S and runs until G. `kill -0 $!`
 /// finds the job, `kill $!` ends it (143), and the first program runs on,
 /// as in bash 5.2.21, 5.3.20 and zsh 5.9 (bash's subshell dies; its child
 /// does not get the signal).
-const FIRST_RUNS: &str = "time /bin/sh -c 'echo $$ > S; until [ -e G ]; do sleep 0.01; done' | \
-                          /bin/true & p=$!; until [ -s S ]; do :; done; kill -0 $p; echo k0=$?; \
-                          kill $p; echo k=$?; wait $p; echo w=$?; /bin/kill -0 $(cat S) && echo \
-                          first=alive || echo first=gone; : > G";
+const FIRST_RUNS: &str = "time /bin/sh -c 'echo $$ > S; n=0; until [ -e G ]; do n=$((n+1)); [ $n \
+                          -le 2000 ] || exit 97; sleep 0.01; done' | /bin/true & p=$!; n=0; until \
+                          [ -s S ]; do n=$((n+1)); [ $n -le 2000 ] || exit 97; sleep 0.01; done; \
+                          kill -0 $p; echo k0=$?; kill $p; echo k=$?; wait $p; echo w=$?; \
+                          /bin/kill -0 $(cat S) && echo first=alive || echo first=gone; : > G";
 
 #[test]
 fn kill_and_wait_of_a_timed_jobs_pid_act_on_the_whole_job() {
@@ -87,8 +95,10 @@ fn kill_and_wait_of_a_timed_jobs_pid_act_on_the_whole_job() {
 }
 
 /// A program that runs until G or a signal, holding no output open (bash's
-/// subshell can be killed while it runs on).
-const RUNS: &str = "/bin/sh -c 'until [ -e G ]; do sleep 0.01; done' >/dev/null 2>&1";
+/// subshell can be killed while it runs on); it gives up after 10 s (97),
+/// before the harness's 30 s bound.
+const RUNS: &str = "/bin/sh -c 'n=0; until [ -e G ]; do n=$((n+1)); [ $n -le 1000 ] || exit 97; \
+                    sleep 0.01; done' >/dev/null 2>&1";
 
 #[test]
 fn a_timed_jobs_pid_is_a_real_process() {
@@ -114,35 +124,33 @@ fn a_timed_jobs_pid_is_a_real_process() {
 	]);
 }
 
-/// A timed group or function whose first command runs a program is known
-/// by that program, which stands for the job (`kill $!` ends it, 143); a
-/// body that loops in the shell keeps the virtual pid at once, so `$!` does
+/// `/bin/kill -0` of `$!`, then the builtin `kill` and `wait`.
+const PROBE: &str = "p=$!; /bin/kill -0 \"$p\" && echo alive=yes || echo alive=no; kill $p; echo \
+                     k=$?; wait $p; echo w=$?; : > G";
+
+/// A timed group, subshell or function whose only command runs a program
+/// is known by that program, the job's whole life, which stands for the job
+/// (`kill $!` ends it, 143). A body with a second command keeps the virtual
+/// pid at once (no other program finds it), so an outside `kill` cannot end
+/// its first program while the body runs on; the builtin `kill` still ends
+/// the whole job. A body that loops in the shell keeps it too, so `$!` does
 /// not wait for it.
 #[test]
-fn a_timed_group_or_function_is_known_by_its_first_program() {
-	let probe = "p=$!; /bin/kill -0 \"$p\" && echo alive=yes || echo alive=no; kill $p; echo k=$?; \
-	             wait $p; echo w=$?; : > G";
+fn a_timed_body_is_known_by_its_program_only_when_that_program_is_its_whole_life() {
+	let row = |name: &'static str, body: String, want: &'static str| {
+		(name, format!("exec 2>/dev/null; TIMEFORMAT=; {body} & {PROBE}"), false, want)
+	};
+	let real = "alive=yes\nk=0\nw=143\n";
+	let not = "alive=no\nk=0\nw=143\n";
 	assert_rows(&[
-		(
-			"group",
-			format!("exec 2>/dev/null; TIMEFORMAT=; time {{ {RUNS}; }} & {probe}"),
-			false,
-			"alive=yes\nk=0\nw=143\n",
-		),
-		(
-			"function",
-			format!("exec 2>/dev/null; TIMEFORMAT=; f() {{ {RUNS}; }}; time f & {probe}"),
-			false,
-			"alive=yes\nk=0\nw=143\n",
-		),
-		(
-			"function calling a function",
-			format!(
-				"exec 2>/dev/null; TIMEFORMAT=; g() {{ {RUNS}; }}; f() {{ g; }}; time f & {probe}"
-			),
-			false,
-			"alive=yes\nk=0\nw=143\n",
-		),
+		row("group", format!("time {{ {RUNS}; }}"), real),
+		row("subshell", format!("time ( {RUNS} )"), real),
+		row("function", format!("f() {{ {RUNS}; }}; time f"), real),
+		row("function calling a function", format!("g() {{ {RUNS}; }}; f() {{ g; }}; time f"), real),
+		row("two-command group", format!("time {{ {RUNS}; /bin/echo rest; }}"), not),
+		row("two-command subshell", format!("time ( {RUNS}; /bin/echo rest )"), not),
+		row("two-command function", format!("f() {{ {RUNS}; /bin/echo rest; }}; time f"), not),
+		row("builtin first in a function", format!("f() {{ :; {RUNS}; }}; time f"), not),
 		(
 			"loop",
 			String::from(
@@ -155,27 +163,49 @@ fn a_timed_group_or_function_is_known_by_its_first_program() {
 	]);
 }
 
-/// A timed subshell whose first command runs a program is known by it too;
-/// a timed builtin keeps the virtual pid at once, so the job has not run
+/// An outside `kill` of a two-command body's `$!` finds no process (the
+/// limit): the body runs on to its end. bash 5.2.21 and 5.3.20 name their
+/// subshell, so there the kill ends the job (`kill=0`, `w=143`, no `rest`).
+#[test]
+fn an_outside_kill_of_a_two_command_body_finds_no_process() {
+	assert_rows(&[(
+		"group",
+		format!(
+			"exec 2>/dev/null; TIMEFORMAT=; time {{ {RUNS}; /bin/echo rest; }} & p=$!; /bin/kill \
+			 \"$p\"; echo kill=$?; : > G; wait $p; echo w=$?"
+		),
+		false,
+		"kill=1\nrest\nw=0\n",
+	)]);
+}
+
+/// The `TIMEFORMAT` report after an outside `kill` of the program `$!`
+/// names is still printed (the limit): obash cannot tell that kill from the
+/// program's own death by a signal, after which bash prints it too. bash
+/// 5.2.21 and 5.3.20 print none here: the kill ended their subshell.
+#[test]
+fn the_report_after_an_outside_kill_of_the_named_program_is_printed() {
+	assert_rows(&[(
+		"prog",
+		format!(
+			"exec 2>&1; TIMEFORMAT=report; time {RUNS} & p=$!; /bin/kill \"$p\"; wait $p; echo w=$?; \
+			 : > G"
+		),
+		false,
+		"report\nw=143\n",
+	)]);
+}
+
+/// A timed builtin keeps the virtual pid at once, so the job has not run
 /// when `kill $!` ends it (143), as bash's subshell has not either.
 #[test]
-fn a_timed_subshell_and_a_timed_builtin() {
-	let probe = "p=$!; /bin/kill -0 \"$p\" && echo alive=yes || echo alive=no; kill $p; echo k=$?; \
-	             wait $p; echo w=$?; : > G";
-	assert_rows(&[
-		(
-			"subshell",
-			format!("exec 2>/dev/null; TIMEFORMAT=; time ( {RUNS} ) & {probe}"),
-			false,
-			"alive=yes\nk=0\nw=143\n",
+fn a_timed_builtin_keeps_the_virtual_pid() {
+	assert_rows(&[(
+		"builtin",
+		String::from(
+			"exec 2>/dev/null; TIMEFORMAT=; time : & p=$!; kill $p; echo k=$?; wait $p; echo w=$?",
 		),
-		(
-			"builtin",
-			String::from(
-				"exec 2>/dev/null; TIMEFORMAT=; time : & p=$!; kill $p; echo k=$?; wait $p; echo w=$?",
-			),
-			false,
-			"k=0\nw=143\n",
-		),
-	]);
+		false,
+		"k=0\nw=143\n",
+	)]);
 }

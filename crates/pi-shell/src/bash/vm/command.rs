@@ -2750,14 +2750,14 @@ fn call_function(
 			return Some(Flow::Discard(1));
 		},
 	};
-	// A timed job's function call: its body's first command decides if it
-	// may run a program, else the job keeps its virtual pid at once
-	// ([`BangStage::First`]).
+	// A timed job's function call: a body whose only command may run a
+	// program decides at that command, else the job keeps its virtual pid at
+	// once ([`BangStage::First`]).
 	if k
 		.bangs
 		.iter()
 		.any(|b| b.vproc == vp.vpid && b.stage == BangStage::First)
-		&& !super::exec::program_first(&body, 0)
+		&& !super::exec::program_only(&body, 0)
 	{
 		k.settle_bang(vp.vpid, None);
 	}

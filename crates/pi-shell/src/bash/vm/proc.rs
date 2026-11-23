@@ -738,14 +738,26 @@ pub enum BangStage {
 	/// The job's body is a pipeline: its last stage, once started, decides
 	/// as a job body of its own would (`$!` names the last process).
 	Pipeline,
-	/// The job's body is a timed compound command or function call (`time
-	/// { … } &`, `time f &`): bash's forced subshell, which `$!` names,
-	/// lives as long as the job. The body's first command decides: an
-	/// external it runs in the job's vproc makes the job known by that
-	/// program, which stands for the whole job ([`Bang::timed`]); a function
-	/// call leaves the decision to the function's first command; anything
-	/// else (a builtin, a subshell or pipeline in a vproc of its own) keeps
-	/// the virtual pid.
+	/// The job's body is a timed group, subshell or function call whose
+	/// only command may run a program (`time { cmd; } &`, `time ( cmd ) &`,
+	/// `f() { cmd; }; time f &`): bash's forced subshell, which `$!` names,
+	/// lives as long as the job, and here that program is the job's whole
+	/// life. An external that command runs makes the job known by that
+	/// program, which stands for the job ([`Bang::timed`]); a function call
+	/// leaves the decision to the function's body; a builtin keeps the
+	/// virtual pid.
+	///
+	/// Limits. A timed body with a second command (`time { cmd; more; } &`,
+	/// `time ( cmd; more ) &`, `f() { cmd; more; }; time f &`), a timed
+	/// builtin, `time command cmd &` and `time exec cmd &` keep the job's
+	/// virtual pid at once, as before: `/bin/kill -0 "$!"` and `ps -p "$!"`
+	/// do not find it, where bash finds its subshell; builtin `kill` and
+	/// `wait` act on the job. A first program as `$!` would let an outside
+	/// `kill` end that program while the body runs on. And when an outside
+	/// `kill` ends the program `$!` names, the job still prints its
+	/// `TIMEFORMAT` report (bash's killed subshell prints none): obash
+	/// cannot tell that kill from the program's own death by a signal, for
+	/// which bash prints the report too.
 	First,
 }
 
