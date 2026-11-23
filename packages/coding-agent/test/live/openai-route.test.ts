@@ -282,13 +282,14 @@ describe("GPT-Live transport", () => {
 				{ type: "input_transcript.added", item: { text: "deploy main" } },
 				{ type: "turn.done", turn: { role: "user", transcript: "deploy main" } },
 				{ type: "output_transcript.added", item: { text: "On it." } },
-				// The voice's transcript has passed the offset, and the user's words before it are in.
-				heard("item_9", "deploy main"),
+				// The voice's transcript passing the offset does not release item_9: the user's words can follow.
 				{ type: "unknown", wireType: "session.usage.updated" },
 				{ type: "turn.done", turn: { role: "assistant", transcript: "On it." } },
 				{ type: "input_transcript.added", item: { text: " and test" } },
+				// The user's transcript has passed the offset: the turn is the words before it.
+				heard("item_9", "deploy main"),
 				{ type: "input_transcript.added", item: { text: " and test thanks" } },
-				// The user's transcript has passed the offset: the words after it wait for the next delegation.
+				// The same for item_10: the words after item_9's offset and before its own.
 				heard("item_10", "and test"),
 			]);
 		} finally {

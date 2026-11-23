@@ -581,11 +581,20 @@ export class OpenAILiveTransport implements Pick<
 	}
 
 	/**
-	 * Keeps one fragment of the user's words, unless it is from before the latest delegation handed over
-	 * (that turn has gone); drops words older than {@link DELEGATION_WORDS_WINDOW_MS}.
+	 * Keeps one fragment of the user's words; drops words older than {@link DELEGATION_WORDS_WINDOW_MS}.
+	 * A fragment from before the latest delegation handed over comes too late for that turn, which has
+	 * gone: it is logged, not kept for the next delegation, whose request it is not.
 	 */
 	#addUserWords(startMs: number, text: string): void {
-		if (!Number.isFinite(startMs) || startMs < this.#handedOverOffsetMs) return;
+		if (!Number.isFinite(startMs)) return;
+		if (startMs < this.#handedOverOffsetMs) {
+			logger.warn("GPT-Live transcribed the user's words after their delegation was handed over", {
+				startMs,
+				delegationOffsetMs: this.#handedOverOffsetMs,
+				words: text,
+			});
+			return;
+		}
 		const oldest = this.#transcriptEndMs.user - DELEGATION_WORDS_WINDOW_MS;
 		this.#userWords = this.#userWords.filter(words => words.startMs >= oldest);
 		this.#userWords.push({ startMs, text });
@@ -616,10 +625,11 @@ export class OpenAILiveTransport implements Pick<
 	/**
 	 * Hands the waiting delegations over in order, each as a turn of the user's words before its offset.
 	 * GPT-Live may send a delegation before the transcript of the words that led to it, and sends no
-	 * event that ends the user's transcript. So a delegation goes once the transcript has reached its
-	 * offset: the user's transcript (no earlier word of the user can follow), or the voice's while some
-	 * of the user's words before the offset have arrived. Failing both, it goes after
-	 * {@link DELEGATION_WAIT_CAP_MS}. It is never dropped: with no words, its turn says none were heard.
+	 * event that ends the user's transcript. So a delegation goes once the user's transcript has reached
+	 * its offset (no earlier word of the user can follow), or after {@link DELEGATION_WAIT_CAP_MS} with
+	 * the words that have arrived. The voice's transcript does not release it: the user's words before
+	 * the offset can still follow the voice's. It is never dropped: with no words, its turn says none
+	 * were heard.
 	 */
 	#releaseDelegations(): LiveServerEvent[] {
 		const events: LiveServerEvent[] = [];
@@ -627,9 +637,7 @@ export class OpenAILiveTransport implements Pick<
 			const offsetMs = next.offsetMs;
 			const earliest = offsetMs - DELEGATION_WORDS_WINDOW_MS;
 			const words = this.#userWords.filter(part => part.startMs < offsetMs && part.startMs >= earliest);
-			const reached =
-				this.#transcriptEndMs.user >= offsetMs || (words.length > 0 && this.#transcriptEndMs.assistant >= offsetMs);
-			if (!reached && !next.expired) break;
+			if (this.#transcriptEndMs.user < offsetMs && !next.expired) break;
 			clearTimeout(next.timer);
 			this.#pendingDelegations.shift();
 			this.#userWords = this.#userWords.filter(part => part.startMs >= offsetMs);

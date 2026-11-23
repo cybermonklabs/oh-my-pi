@@ -290,6 +290,49 @@ describe("GPT-Live delegations", () => {
 		}
 	}, 10_000);
 
+	test("the voice speaking past a delegation does not send its turn before the user's words for it", async () => {
+		// The review's probe A: old words, the voice past the offset, then the request's words.
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "thanks", 100, 400),
+				voiceSaid("t2", "You're welcome.", 500, 1_000),
+				delegated("d1", "item_1", 5_000),
+				voiceSaid("t3", "On it.", 5_100, 5_400),
+				userSaid("t4", " deploy main", 4_000, 4_800),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("thanks deploy main")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("the rest of a request that arrives after the voice's words still joins its turn", async () => {
+		// The review's probe B: part of the request, the voice past the offset, then the rest.
+		const stub = gptLiveStub({
+			frames: [
+				userSaid("t1", "deploy main", 4_000, 4_400),
+				delegated("d1", "item_1", 5_000),
+				voiceSaid("t2", "On it.", 5_100, 5_400),
+				userSaid("t3", " and run the tests", 4_400, 4_900),
+			],
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			expect(call.turns).toEqual([heard("deploy main and run the tests")]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
 	test("the user's words with no timing join the next delegation's turn, before or after it arrives", async () => {
 		// OpenAI's SDKs type `start_ms` and `end_ms` as required; a gateway that rewrites events can drop them.
 		const untimed = (eventId: string, delta: string) => ({
