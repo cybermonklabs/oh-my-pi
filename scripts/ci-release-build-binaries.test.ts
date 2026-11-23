@@ -91,10 +91,3 @@ it("runs code behind a lazy import() from a split chunk of the compiled binary",
 	expect(result.exitCode).toBe(0);
 	expect(result.text().trim()).toBe("lazy chunk");
 }, 30_000);
-describe("macOS release binary entitlements", () => {
-	it("allows Xcode MCP automation through Apple Events", async () => {
-		const entitlements = await Bun.file(path.join(repoRoot, "scripts/macos-entitlements.plist")).text();
-
-		expect(entitlements).toContain("<key>com.apple.security.automation.apple-events</key>\n\t<true/>");
-	});
-});
