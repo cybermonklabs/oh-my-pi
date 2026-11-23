@@ -1,9 +1,15 @@
 {"id":"err/e/and-list-first-false","script":"set -e; trap 'echo T$?' ERR; false && true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/and-list-last-false","script":"set -e; trap 'echo T$?' ERR; true && false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/arith-false","script":"set -e; trap 'echo T$?' ERR; (( 0 )); echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/background-last-subshell","script":"set -e; trap 'echo T$?' ERR; true | ( false ) & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/case-and-first-false","script":"set -e; trap 'echo T$?' ERR; case x in x) false && true;; esac; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/case-body-false","script":"set -e; trap 'echo T$?' ERR; case x in x) false;; esac; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/cond-and-left","script":"set -e; trap 'echo T$?' ERR; [[ -z x && -n x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/cond-false","script":"set -e; trap 'echo T$?' ERR; [[ -z x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/cond-not","script":"set -e; trap 'echo T$?' ERR; [[ ! -n x ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/cond-or","script":"set -e; trap 'echo T$?' ERR; [[ -n '' || -n '' ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/cond-plain","script":"set -e; trap 'echo T$?' ERR; [[ -n '' ]]; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/condition-last-subshell","script":"set -e; trap 'echo T$?' ERR; if true | ( false ); then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/elif-cond-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; elif false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/else-body-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; else false; fi; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/errtrace-background-and-list","script":"set -e; trap 'echo T$?' ERR; set -E; true && false & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
@@ -11,12 +17,17 @@
 {"id":"err/e/errtrace-background-group-false","script":"set -e; trap 'echo T$?' ERR; set -E; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
 {"id":"err/e/errtrace-background-pipeline","script":"set -e; trap 'echo T$?' ERR; set -E; true | false & wait $!; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/errtrace-background-subshell","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
+{"id":"err/e/errtrace-background-subshell-redir","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) 2>/dev/null & wait $!; echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
 {"id":"err/e/errtrace-first-cmdsub-word-cat","script":"set -e; trap 'echo T$?' ERR; set -E; false $(:) | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/errtrace-first-cond-cat","script":"set -e; trap 'echo T$?' ERR; set -E; [[ -z x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-cond-not-cat","script":"set -e; trap 'echo T$?' ERR; set -E; [[ ! -n x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
 {"id":"err/e/errtrace-first-false-cat","script":"set -e; trap 'echo T$?' ERR; set -E; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/errtrace-first-function-cat","script":"set -e; trap 'echo T$?' ERR; set -E; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-group-bad-redir-cat","script":"set -e; trap 'echo T$?' ERR; set -E; { :; } </nope | cat; echo end:$?","stdout":"end:0\n","stderr":"SH: line 1: /nope: No such file or directory\n","status":0}
 {"id":"err/e/errtrace-first-group-cat","script":"set -e; trap 'echo T$?' ERR; set -E; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
 {"id":"err/e/errtrace-first-subshell-cat","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-first-subshell-redir-cat","script":"set -e; trap 'echo T$?' ERR; set -E; ( false ) 2>/dev/null | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/e/errtrace-last-subshell","script":"set -e; trap 'echo T$?' ERR; set -E; true | ( false ); echo end:$?","stdout":"T1\nT1\n","stderr":"","status":1}
 {"id":"err/e/errtrace-middle-false-cat","script":"set -e; trap 'echo T$?' ERR; set -E; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/for-and-first-false","script":"set -e; trap 'echo T$?' ERR; for i in 1; do false && true; done; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/for-body-false","script":"set -e; trap 'echo T$?' ERR; for i in 1; do false; done; echo end:$?","stdout":"T1\n","stderr":"","status":1}
@@ -31,7 +42,11 @@
 {"id":"err/e/if-body-false","script":"set -e; trap 'echo T$?' ERR; if true; then false; fi; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/if-body-not-true","script":"set -e; trap 'echo T$?' ERR; if true; then ! true; fi; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/if-cond-false","script":"set -e; trap 'echo T$?' ERR; if false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/e/last-group","script":"set -e; trap 'echo T$?' ERR; true | { false; }; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/last-subshell","script":"set -e; trap 'echo T$?' ERR; true | ( false ); echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/last-subshell-redir","script":"set -e; trap 'echo T$?' ERR; true | ( false ) 2>/dev/null; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/lastpipe-last-false","script":"set -e; trap 'echo T$?' ERR; shopt -s lastpipe; true | false; echo end:$?","stdout":"T1\n","stderr":"","status":1}
+{"id":"err/e/negated-last-subshell","script":"set -e; trap 'echo T$?' ERR; ! true | ( true ); echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/e/nested-while","script":"set -e; trap 'echo T$?' ERR; i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; done; done; echo end:$?","stdout":"T1\n","stderr":"","status":1}
 {"id":"err/e/not-false","script":"set -e; trap 'echo T$?' ERR; ! false; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/e/not-true","script":"set -e; trap 'echo T$?' ERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
@@ -52,9 +67,15 @@
 {"id":"err/n/and-list-first-false","script":"trap 'echo T$?' ERR; false && true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/and-list-last-false","script":"trap 'echo T$?' ERR; true && false; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/arith-false","script":"trap 'echo T$?' ERR; (( 0 )); echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/background-last-subshell","script":"trap 'echo T$?' ERR; true | ( false ) & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/case-and-first-false","script":"trap 'echo T$?' ERR; case x in x) false && true;; esac; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/case-body-false","script":"trap 'echo T$?' ERR; case x in x) false;; esac; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/cond-and-left","script":"trap 'echo T$?' ERR; [[ -z x && -n x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/cond-false","script":"trap 'echo T$?' ERR; [[ -z x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/cond-not","script":"trap 'echo T$?' ERR; [[ ! -n x ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/cond-or","script":"trap 'echo T$?' ERR; [[ -n '' || -n '' ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/cond-plain","script":"trap 'echo T$?' ERR; [[ -n '' ]]; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/condition-last-subshell","script":"trap 'echo T$?' ERR; if true | ( false ); then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/elif-cond-false","script":"trap 'echo T$?' ERR; if false; then :; elif false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/else-body-false","script":"trap 'echo T$?' ERR; if false; then :; else false; fi; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/errtrace-background-and-list","script":"trap 'echo T$?' ERR; set -E; true && false & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
@@ -62,12 +83,17 @@
 {"id":"err/n/errtrace-background-group-false","script":"trap 'echo T$?' ERR; set -E; { false; } & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/errtrace-background-pipeline","script":"trap 'echo T$?' ERR; set -E; true | false & wait $!; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/errtrace-background-subshell","script":"trap 'echo T$?' ERR; set -E; ( false ) & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/errtrace-background-subshell-redir","script":"trap 'echo T$?' ERR; set -E; ( false ) 2>/dev/null & wait $!; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/errtrace-first-cmdsub-word-cat","script":"trap 'echo T$?' ERR; set -E; false $(:) | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/errtrace-first-cond-cat","script":"trap 'echo T$?' ERR; set -E; [[ -z x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-cond-not-cat","script":"trap 'echo T$?' ERR; set -E; [[ ! -n x ]] | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
 {"id":"err/n/errtrace-first-false-cat","script":"trap 'echo T$?' ERR; set -E; false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/errtrace-first-function-cat","script":"trap 'echo T$?' ERR; set -E; f() { false; }; f | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-group-bad-redir-cat","script":"trap 'echo T$?' ERR; set -E; { :; } </nope | cat; echo end:$?","stdout":"end:0\n","stderr":"SH: line 1: /nope: No such file or directory\n","status":0}
 {"id":"err/n/errtrace-first-group-cat","script":"trap 'echo T$?' ERR; set -E; { false; } | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
 {"id":"err/n/errtrace-first-subshell-cat","script":"trap 'echo T$?' ERR; set -E; ( false ) | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-first-subshell-redir-cat","script":"trap 'echo T$?' ERR; set -E; ( false ) 2>/dev/null | cat; echo end:$?","stdout":"T1\nend:0\n","stderr":"","status":0}
+{"id":"err/n/errtrace-last-subshell","script":"trap 'echo T$?' ERR; set -E; true | ( false ); echo end:$?","stdout":"T1\nT1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/errtrace-middle-false-cat","script":"trap 'echo T$?' ERR; set -E; true | false | cat; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/for-and-first-false","script":"trap 'echo T$?' ERR; for i in 1; do false && true; done; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/for-body-false","script":"trap 'echo T$?' ERR; for i in 1; do false; done; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
@@ -82,7 +108,11 @@
 {"id":"err/n/if-body-false","script":"trap 'echo T$?' ERR; if true; then false; fi; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/if-body-not-true","script":"trap 'echo T$?' ERR; if true; then ! true; fi; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/if-cond-false","script":"trap 'echo T$?' ERR; if false; then :; fi; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
+{"id":"err/n/last-group","script":"trap 'echo T$?' ERR; true | { false; }; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/last-subshell","script":"trap 'echo T$?' ERR; true | ( false ); echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/last-subshell-redir","script":"trap 'echo T$?' ERR; true | ( false ) 2>/dev/null; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/lastpipe-last-false","script":"trap 'echo T$?' ERR; shopt -s lastpipe; true | false; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"err/n/negated-last-subshell","script":"trap 'echo T$?' ERR; ! true | ( true ); echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/nested-while","script":"trap 'echo T$?' ERR; i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; done; done; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/not-false","script":"trap 'echo T$?' ERR; ! false; echo end:$?","stdout":"end:0\n","stderr":"","status":0}
 {"id":"err/n/not-true","script":"trap 'echo T$?' ERR; ! true; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
@@ -100,6 +130,26 @@
 {"id":"err/n/while-in-function","script":"trap 'echo T$?' ERR; f() { i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; done; }; f; echo end:$?","stdout":"T1\nend:1\n","stderr":"","status":0}
 {"id":"err/n/while-not-true","script":"trap 'echo T$?' ERR; i=0; while [ $i -lt 1 ]; do i=$((i+1)); ! true; done; echo end:$?","stdout":"end:1\n","stderr":"","status":0}
 {"id":"err/n/while-two-iterations","script":"trap 'echo T$?' ERR; i=0; while [ $i -lt 2 ]; do i=$((i+1)); false; done; echo end:$?","stdout":"T1\nT1\nend:1\n","stderr":"","status":0}
+{"id":"exit/c/continue-loop","script":"trap 'continue; echo t' EXIT; for i in 1 2; do echo a$i; exit 3; done","stdout":"a1\nt\n","stderr":"SH: line 1: continue: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/end-of-script","script":"trap 'break; echo t' EXIT; for i in 1; do :; done","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"exit/c/eval-loop","script":"trap 'break; echo t' EXIT; eval 'for i in 1; do exit 3; done'","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/function-loop","script":"trap 'break; echo t' EXIT; f() { for i in 1; do exit 3; done; }; f","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/loop-eval","script":"trap 'break; echo t' EXIT; for i in 1; do eval 'exit 3'; done","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/loop-function","script":"trap 'break; echo t' EXIT; f() { exit 3; }; for i in 1; do f; done","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/no-loop","script":"trap 'break; echo t' EXIT; exit 3","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/subshell-loop","script":"trap 'break; echo t' EXIT; ( trap 'break; echo s' EXIT; for i in 1; do exit 3; done ); echo st=$?","stdout":"st=3\nt\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"exit/c/top-loop","script":"trap 'break; echo t' EXIT; for i in 1; do exit 3; done","stdout":"t\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/c/two-loops","script":"trap 'echo t0; break 2; echo t' EXIT; for o in 1; do for i in 1; do exit 3; done; done","stdout":"t0\nt\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/s/continue-loop","script":"trap 'continue; echo t' EXIT; for i in 1 2; do echo a$i; exit 3; done","stdout":"a1\n","stderr":"","status":3}
+{"id":"exit/s/end-of-script","script":"trap 'break; echo t' EXIT; for i in 1; do :; done","stdout":"t\n","stderr":"s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"exit/s/eval-loop","script":"trap 'break; echo t' EXIT; eval 'for i in 1; do exit 3; done'","stdout":"t\n","stderr":"s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/s/function-loop","script":"trap 'break; echo t' EXIT; f() { for i in 1; do exit 3; done; }; f","stdout":"","stderr":"","status":3}
+{"id":"exit/s/loop-eval","script":"trap 'break; echo t' EXIT; for i in 1; do eval 'exit 3'; done","stdout":"","stderr":"","status":3}
+{"id":"exit/s/loop-function","script":"trap 'break; echo t' EXIT; f() { exit 3; }; for i in 1; do f; done","stdout":"t\n","stderr":"s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/s/no-loop","script":"trap 'break; echo t' EXIT; exit 3","stdout":"t\n","stderr":"s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"exit/s/subshell-loop","script":"trap 'break; echo t' EXIT; ( trap 'break; echo s' EXIT; for i in 1; do exit 3; done ); echo st=$?","stdout":"st=3\nt\n","stderr":"s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"exit/s/top-loop","script":"trap 'break; echo t' EXIT; for i in 1; do exit 3; done","stdout":"","stderr":"","status":3}
+{"id":"exit/s/two-loops","script":"trap 'echo t0; break 2; echo t' EXIT; for o in 1; do for i in 1; do exit 3; done; done","stdout":"t0\n","stderr":"","status":3}
 {"id":"fatal/c/async-in-async","script":"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g & wait $!; echo st=$?","stdout":"in:127\nst=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/async-in-element","script":"f() { echo ${x?boom}; }; g() { f & wait $!; echo in:$?; }; g | cat; echo ps=${PIPESTATUS[*]}","stdout":"in:127\nps=0 0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/bg-and-then-group-redir","script":"true && { :; } 2>\"${zz?u}\" & wait $!; echo w=$?","stdout":"w=1\n","stderr":"SH: line 1: zz: u\n","status":0}
@@ -1070,12 +1120,19 @@
 {"id":"source/file-continue","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'echo s; continue; echo x' > s.sh; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\na2\ns\ne:0\n","stderr":"","status":0}
 {"id":"source/file-defines-function","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'g() { break; }' > s.sh; . ./s.sh; for i in 1; do g; done; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:0\ne:0\n","stderr":"./s.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"source/file-eval-error","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'eval nosuchcmd_q' > s.sh; . ./s.sh; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:127\ne:0\n","stderr":"./s.sh: line 1: nosuchcmd_q: command not found\n","status":0}
+{"id":"source/file-loop-return-trap-break","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'for j in 1; do return 3; done' > s.sh; trap 'echo r; break; echo r2' RETURN; . ./s.sh; echo after:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"r\nr2\nafter:3\ne:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"source/file-loop-return-trap-break2-caller","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'for j in 1; do return 3; done' > s.sh; trap 'break 2' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\nend:3\ne:0\n","stderr":"","status":0}
+{"id":"source/file-loop-return-trap-continue-caller","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'for j in 1; do return 3; done' > s.sh; trap 'continue' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\na2\nend:3\ne:0\n","stderr":"","status":0}
 {"id":"source/file-nested","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'printf \"%s\\n\" break > t.sh; . ./t.sh' > s.sh; . ./s.sh; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:0\ne:0\n","stderr":"./t.sh: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
+{"id":"source/file-own-loop-break","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'for k in a b; do echo $k; break; done; echo in' > s.sh; . ./s.sh; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"a\nin\ntop:0\ne:0\n","stderr":"","status":0}
 {"id":"source/file-own-loop-break2","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'for j in 1 2; do echo j$j; break 2; done; echo in' > s.sh; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\nj1\ne:0\n","stderr":"","status":0}
 {"id":"source/file-source-break","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'echo s; break; echo x' > s.sh; for i in 1 2; do echo a$i; source ./s.sh; echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\ne:0\n","stderr":"","status":0}
 {"id":"source/file-subshell-error","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '(nosuchcmd_q)' > s.sh; . ./s.sh; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:127\ne:0\n","stderr":"./s.sh: line 1: nosuchcmd_q: command not found\n","status":0}
 {"id":"source/file-syntax-error","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'if' > s.sh; . ./s.sh; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:2\ne:0\n","stderr":"./s.sh: line 2: syntax error: unexpected end of file from `if' command on line 1\n","status":0}
 {"id":"source/file-unbound","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' 'set -u; echo $nosuchvar_q' > s.sh; ( . ./s.sh ); echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:1\ne:0\n","stderr":"./s.sh: line 1: nosuchvar_q: unbound variable\n","status":0}
+{"id":"source/herestring-break","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break; echo x\"; echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\ne:0\n","stderr":"","status":0}
+{"id":"source/herestring-break2","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; for o in X Y; do echo o$o; for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break 2; echo x\"; echo b$i:$?; done; echo c$o:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"oX\na1\ns\ne:0\n","stderr":"","status":0}
+{"id":"source/herestring-continue","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; continue; echo x\"; echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\na2\ns\ne:0\n","stderr":"","status":0}
 {"id":"source/main-function","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; f() { nosuchcmd_q; }; f; echo top:$?; echo e:$?; cd /; rm -r \"$d\"","stdout":"top:127\ne:0\n","stderr":"SH: line 1: nosuchcmd_q: command not found\n","status":0}
 {"id":"source/procsub-break","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; for i in 1 2; do echo a$i; . <(echo 'echo s; break; echo x'); echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\ne:0\n","stderr":"","status":0}
 {"id":"source/procsub-continue","script":"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '' > s.sh; for i in 1 2; do echo a$i; . <(echo 'echo s; continue; echo x'); echo b$i:$?; done; echo e:$?; cd /; rm -r \"$d\"","stdout":"a1\ns\na2\ns\ne:0\n","stderr":"","status":0}
@@ -1122,9 +1179,24 @@
 {"id":"trap/err/while/break/none","script":"trap 'break' ERR; i=0; while [ $i -lt 2 ]; do i=$((i+1)); echo a$i; false; echo b$i:$?; done; echo e:$?","stdout":"a1\ne:1\n","stderr":"","status":0}
 {"id":"trap/err/while/continue/2","script":"trap 'continue 2' ERR; for o in X Y; do echo o$o; i=0; while [ $i -lt 2 ]; do i=$((i+1)); echo a$i; false; echo b$i:$?; done; echo e:$?; echo c$o:$?; done; echo E:$?","stdout":"oX\na1\noY\na1\nE:1\n","stderr":"","status":0}
 {"id":"trap/err/while/continue/none","script":"trap 'continue' ERR; i=0; while [ $i -lt 2 ]; do i=$((i+1)); echo a$i; false; echo b$i:$?; done; echo e:$?","stdout":"a1\na2\ne:1\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-and-list","script":"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo hit && echo x$i; echo b$i; done; echo end","stdout":"a1\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-eval","script":"trap '[[ $BASH_COMMAND == \"eval echo e1\" ]] && break' DEBUG; for i in 1 2; do echo a$i; eval echo e1; echo b$i; done; echo end","stdout":"a1\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-failing-command","script":"trap 'echo T' ERR; trap '[[ $BASH_COMMAND == \"false\" ]] && break' DEBUG; for i in 1 2; do echo a$i; false; echo b$i; done; echo end:$?","stdout":"a1\nend:1\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-for-header","script":"trap '[[ $BASH_COMMAND == for* ]] && break' DEBUG; for i in 1 2; do echo a$i; done; echo end","stdout":"end\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-function","script":"f() { echo in-f; }; trap '[[ $BASH_COMMAND == f ]] && break' DEBUG; for i in 1 2; do echo a$i; f; echo b$i; done; echo end","stdout":"a1\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-last-command","script":"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo hit; done; echo end","stdout":"a1\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-runs-the-command","script":"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo hit; echo b$i; done; echo end","stdout":"a1\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break-while","script":"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; while [ $n -lt 2 ]; do n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end","stdout":"a1\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-break2-nested","script":"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break 2' DEBUG; for o in 1 2; do for i in 1 2; do echo a$o$i; echo hit; echo b$o$i; done; echo o$o; done; echo end","stdout":"a11\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-continue-for","script":"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo a$i; echo hit; echo b$i; done; echo end","stdout":"a1\nhit\na2\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-continue-for-external","script":"trap '[[ $BASH_COMMAND == \"/bin/echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo a$i; /bin/echo hit; echo b$i; done; echo end","stdout":"a1\nhit\na2\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-continue-for-header","script":"trap '[[ $BASH_COMMAND == for* ]] && continue' DEBUG; for i in 1 2; do echo a$i; done; echo end","stdout":"end\n","stderr":"","status":0}
+{"id":"trap/own/debug-continue-while","script":"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; while [ $n -lt 2 ]; do n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end","stdout":"a1\nhit\na2\nhit\nend\n","stderr":"","status":0}
+{"id":"trap/own/debug-continue-while-failing","script":"n=0; trap 'echo T' ERR; trap '[[ $BASH_COMMAND == false ]] && continue' DEBUG; while [ $n -lt 2 ]; do n=$((n+1)); echo a$n; false; echo b$n; done; echo end:$?","stdout":"a1\na2\nend:1\n","stderr":"","status":0}
 {"id":"trap/own/debug-errexit","script":"set -e; trap '[[ $BASH_COMMAND == \": hit\" ]] && { echo t; break; }; true' DEBUG; for i in 1 2; do echo a$i; : hit; echo b$i; done; echo e; false; echo after","stdout":"a1\nt\ne\n","stderr":"","status":1}
 {"id":"trap/own/exit-in-function-loop","script":"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo h; }; h; echo e:$?","stdout":"j1\nt1\nt2\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":3}
 {"id":"trap/own/exit-in-function-loop-continue","script":"trap 'echo t1; continue; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo h; }; for i in 1 2; do echo a$i; h; done; echo e:$?","stdout":"a1\nj1\nt1\nt2\n","stderr":"SH: line 1: continue: only meaningful in a `for', `while', or `until' loop\n","status":3}
+{"id":"trap/own/return-break-no-loop-exit-trap","script":"set -T; trap 'break' RETURN; trap 'echo X' EXIT; g() { for i in 1; do return; done; }; g; echo after","stdout":"","stderr":"","status":0}
 {"id":"trap/own/return-functrace","script":"set -T; g() { :; }; trap 'echo r; break' RETURN; for i in 1 2; do echo a$i; g; echo b$i:$?; done; echo e:$?","stdout":"a1\nr\nb1:0\na2\nr\nb2:0\ne:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\nSH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"trap/own/return-in-own-loop","script":"set -T; trap 'echo r; break' RETURN; g() { for i in 1 2; do echo g$i; return 5; done; echo after; }; g; echo s:$?","stdout":"g1\nr\n","stderr":"","status":5}
 {"id":"trap/own/return-in-own-loop-caller-loop","script":"set -T; trap 'echo r; break' RETURN; g() { for i in 1 2; do echo g$i; return 5; done; echo after; }; for o in X Y; do echo o$o; g; echo s:$?; done; echo E:$?","stdout":"oX\ng1\nr\nE:5\n","stderr":"","status":0}

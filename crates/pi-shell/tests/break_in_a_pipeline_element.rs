@@ -862,6 +862,8 @@ const TRAP_SHAPES: &[(&str, &str, &str)] = &[
 /// inside its own loop leaves that loop's level counted, and bash's
 /// `breaking` outlives the return, skipping the callers' commands up to
 /// their next loop. A DEBUG trap's `break` leaves `set -e` on.
+/// A DEBUG trap's `break` or `continue` lets the trapped command run; at a
+/// `for` iteration's DEBUG point, `$BASH_COMMAND` is the loop's header.
 const BASH_TRAP_SHAPES: &[(&str, &str)] = &[
 	(
 		"return-functrace",
@@ -910,6 +912,87 @@ const BASH_TRAP_SHAPES: &[(&str, &str)] = &[
 		"exit-in-function-loop-continue",
 		"trap 'echo t1; continue; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; \
 		 echo h; }; for i in 1 2; do echo a$i; h; done; echo e:$?",
+	),
+	// A RETURN trap's `break` that finds no loop past the function leaves
+	// bash's `breaking` set to the run's end: the EXIT trap does nothing.
+	(
+		"return-break-no-loop-exit-trap",
+		"set -T; trap 'break' RETURN; trap 'echo X' EXIT; g() { for i in 1; do return; done; }; g; \
+		 echo after",
+	),
+	// A DEBUG trap's `break` or `continue` lets the trapped command run
+	// (bash tests `breaking` when the next command starts): its output,
+	// its status, not its ERR trap (`breaking` skips that trap's commands);
+	// a function or `eval` it starts runs none of its commands.
+	(
+		"debug-break-runs-the-command",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-last-command",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit; done; echo end",
+	),
+	(
+		"debug-break-and-list",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit && echo x$i; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-failing-command",
+		"trap 'echo T' ERR; trap '[[ $BASH_COMMAND == \"false\" ]] && break' DEBUG; for i in 1 2; \
+		 do echo a$i; false; echo b$i; done; echo end:$?",
+	),
+	(
+		"debug-break-function",
+		"f() { echo in-f; }; trap '[[ $BASH_COMMAND == f ]] && break' DEBUG; for i in 1 2; do echo \
+		 a$i; f; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-eval",
+		"trap '[[ $BASH_COMMAND == \"eval echo e1\" ]] && break' DEBUG; for i in 1 2; do echo a$i; \
+		 eval echo e1; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-while",
+		"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; while [ $n -lt 2 ]; do \
+		 n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end",
+	),
+	(
+		"debug-break2-nested",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break 2' DEBUG; for o in 1 2; do for i in 1 \
+		 2; do echo a$o$i; echo hit; echo b$o$i; done; echo o$o; done; echo end",
+	),
+	(
+		"debug-continue-while",
+		"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; while [ $n -lt 2 ]; do \
+		 n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end",
+	),
+	(
+		"debug-continue-while-failing",
+		"n=0; trap 'echo T' ERR; trap '[[ $BASH_COMMAND == false ]] && continue' DEBUG; while [ $n \
+		 -lt 2 ]; do n=$((n+1)); echo a$n; false; echo b$n; done; echo end:$?",
+	),
+	(
+		"debug-continue-for",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo a$i; \
+		 echo hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-continue-for-external",
+		"trap '[[ $BASH_COMMAND == \"/bin/echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo \
+		 a$i; /bin/echo hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-continue-for-header",
+		"trap '[[ $BASH_COMMAND == for* ]] && continue' DEBUG; for i in 1 2; do echo a$i; done; \
+		 echo end",
+	),
+	(
+		"debug-break-for-header",
+		"trap '[[ $BASH_COMMAND == for* ]] && break' DEBUG; for i in 1 2; do echo a$i; done; echo \
+		 end",
 	),
 ];
 
@@ -1285,6 +1368,28 @@ const BASH_ERR_SHAPES: &[(&str, &str)] = &[
 	("errtrace-background-pipeline", "set -E; true | false & wait $!"),
 	("errtrace-background-subshell", "set -E; ( false ) & wait $!"),
 	("lastpipe-last-false", "shopt -s lastpipe; true | false"),
+	// A `[[ ]]` whose status comes from a `!` or from the left side of
+	// `&&` is judged at its end; the plain forms are the controls.
+	("cond-not", "[[ ! -n x ]]"),
+	("cond-and-left", "[[ -z x && -n x ]]"),
+	("cond-plain", "[[ -n '' ]]"),
+	("cond-or", "[[ -n '' || -n '' ]]"),
+	("errtrace-first-cond-not-cat", "set -E; [[ ! -n x ]] | cat"),
+	// A compound element or job led by its own redirection is the
+	// element's own command; `( false ) | cat` is the control.
+	("errtrace-first-subshell-redir-cat", "set -E; ( false ) 2>/dev/null | cat"),
+	("errtrace-first-group-bad-redir-cat", "set -E; { :; } </nope | cat"),
+	("errtrace-background-subshell-redir", "set -E; ( false ) 2>/dev/null & wait $!"),
+	// The parent judges a pipeline's last `( … )` element with the
+	// pipeline's status, then the pipeline (two ERR traps); not a group, a
+	// `!` pipeline, a condition or a job.
+	("last-subshell", "true | ( false )"),
+	("errtrace-last-subshell", "set -E; true | ( false )"),
+	("last-subshell-redir", "true | ( false ) 2>/dev/null"),
+	("last-group", "true | { false; }"),
+	("negated-last-subshell", "! true | ( true )"),
+	("condition-last-subshell", "if true | ( false ); then :; fi"),
+	("background-last-subshell", "true | ( false ) & wait $!"),
 ];
 
 /// The ERR shapes only zsh has. `{ } always { }` is judged at its end like
@@ -1411,6 +1516,29 @@ const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
 		"",
 		"for i in 1 2; do echo a$i; . <(echo 'echo s; continue; echo x'); echo b$i:$?; done",
 	),
+	// A `.` of `/dev/stdin` fed by a here-string is a `.` file too.
+	(
+		"herestring-break",
+		"",
+		"for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break; echo x\"; echo b$i:$?; done",
+	),
+	(
+		"herestring-continue",
+		"",
+		"for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; continue; echo x\"; echo b$i:$?; done",
+	),
+	(
+		"herestring-break2",
+		"",
+		"for o in X Y; do echo o$o; for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break 2; \
+		 echo x\"; echo b$i:$?; done; echo c$o:$?; done",
+	),
+	// The file's own loop takes its `break`; the file goes on.
+	(
+		"file-own-loop-break",
+		"for k in a b; do echo $k; break; done; echo in",
+		". ./s.sh; echo top:$?",
+	),
 	(
 		"return-trap-break",
 		"echo s",
@@ -1450,6 +1578,24 @@ const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
 	("file-eval-error", "eval nosuchcmd_q", ". ./s.sh; echo top:$?"),
 	("file-cmdsub-error", "x=$(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
 	("file-subshell-error", "(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
+	// A `return` from inside the file's own loop: its RETURN trap runs
+	// after bash restored `loop_level` (`_evalfile`), so the file's loop is
+	// out of its reach; the caller's loops are in it.
+	(
+		"file-loop-return-trap-break",
+		"for j in 1; do return 3; done",
+		"trap 'echo r; break; echo r2' RETURN; . ./s.sh; echo after:$?",
+	),
+	(
+		"file-loop-return-trap-break2-caller",
+		"for j in 1; do return 3; done",
+		"trap 'break 2' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?",
+	),
+	(
+		"file-loop-return-trap-continue-caller",
+		"for j in 1; do return 3; done",
+		"trap 'continue' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?",
+	),
 ];
 
 /// [`SOURCE_SHAPES`] only zsh has: its `.` does not count the caller's
@@ -1590,7 +1736,8 @@ enum Runner<'a> {
 }
 
 /// Run row `id`'s `script` as `dialect` with `runner`: with `-c`, or for a
-/// `fatal/s/` row from the script file `s.sh` in a directory of its own.
+/// `fatal/s/` or `exit/s/` row from the script file `s.sh` in a directory
+/// of its own.
 fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outcome {
 	let mut cmd = match runner {
 		Runner::Oracle(program) => command(program),
@@ -1605,7 +1752,7 @@ fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outc
 		}
 		cmd.arg("-f");
 	}
-	let out = if id.starts_with("fatal/s/") {
+	let out = if id.starts_with("fatal/s/") || id.starts_with("exit/s/") {
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let dir = env::temp_dir().join(format!(
 			"pi-loop-{}-{}",
@@ -1852,6 +1999,49 @@ fn zsh_source_matches_zsh() {
 #[test]
 fn bash_fatal_errors_match_bash() {
 	assert_rows(Dialect::Bash, "fatal/", &fatals());
+}
+
+/// The loops the EXIT trap of `exit` sees, from a script file
+/// (`exit/s/<name>`) and with `-c` (`exit/c/<name>`): bash's `loop_level`
+/// as the exit left it. A function starts at level 0, and the exit's jump
+/// out of `parse_and_execute` (a `-c` string, `eval`, `.`, a trap action)
+/// restores the level saved there; a script file's loops stay. A `break`
+/// that reaches past the trap ends it silently.
+const EXIT_LOOP_SHAPES: &[(&str, &str)] = &[
+	("top-loop", "trap 'break; echo t' EXIT; for i in 1; do exit 3; done"),
+	("function-loop", "trap 'break; echo t' EXIT; f() { for i in 1; do exit 3; done; }; f"),
+	("loop-function", "trap 'break; echo t' EXIT; f() { exit 3; }; for i in 1; do f; done"),
+	("eval-loop", "trap 'break; echo t' EXIT; eval 'for i in 1; do exit 3; done'"),
+	("loop-eval", "trap 'break; echo t' EXIT; for i in 1; do eval 'exit 3'; done"),
+	("no-loop", "trap 'break; echo t' EXIT; exit 3"),
+	("continue-loop", "trap 'continue; echo t' EXIT; for i in 1 2; do echo a$i; exit 3; done"),
+	(
+		"two-loops",
+		"trap 'echo t0; break 2; echo t' EXIT; for o in 1; do for i in 1; do exit 3; done; done",
+	),
+	("end-of-script", "trap 'break; echo t' EXIT; for i in 1; do :; done"),
+	(
+		"subshell-loop",
+		"trap 'break; echo t' EXIT; ( trap 'break; echo s' EXIT; for i in 1; do exit 3; done ); \
+		 echo st=$?",
+	),
+];
+
+/// The EXIT-trap rows: each [`EXIT_LOOP_SHAPES`] shape from a script and
+/// with `-c`.
+fn exit_loops() -> Vec<Row> {
+	EXIT_LOOP_SHAPES
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("exit/c/{name}"), x.to_owned()), (format!("exit/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
+/// The EXIT trap of `exit` sees the loops bash's does ([`EXIT_LOOP_SHAPES`]).
+#[test]
+fn bash_exit_traps_see_the_exit_loops() {
+	assert_rows(Dialect::Bash, "exit/", &exit_loops());
 }
 
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert

@@ -948,10 +948,22 @@ pub enum ScriptKind {
 		key:           crate::bash::store::TrapKey,
 		status:        i32,
 		cancel:        Option<i32>,
-		return_target: Option<usize>,
+		/// The frame (index) of the function or `.` file that returns once
+		/// the trap ends; a `u32` keeps [`Frame`] within its size bound.
+		return_target: Option<u32>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// bash: the loops an EXIT trap that `exit` started sees, its
+		/// `loop_level` as the exit left it ([`super::exec::exit_seen_loops`]):
+		/// a `break` or `continue` reaching past the trap ends it silently.
+		#[serde(default)]
+		loops:         u16,
+		/// bash: an ERR trap the parent ran for a pipeline's last `( … )`
+		/// element (`execute_cmd.c`'s subshell judgement): the pipeline is
+		/// judged too, so the trap runs again when it ends.
+		#[serde(default)]
+		again:         bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1050,6 +1062,11 @@ pub struct Frame {
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
 	pub subshell_line:     Option<u32>,
+	/// bash: a `break N` or `continue N` its DEBUG trap ran before the op
+	/// at [`Self::debug_pc`], held until that op ends (bash runs the
+	/// trapped command and tests `breaking` when the next command starts):
+	/// `N << 1 | continue`, 0 for none.
+	pub held_break:        u32,
 	/// A function frame: the getopts state at the call, put back on return
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
@@ -1081,6 +1098,7 @@ impl Frame {
 			ignore_errexit: false,
 			command_loop: false,
 			subshell_line: None,
+			held_break: 0,
 			getopts: None,
 		}
 	}

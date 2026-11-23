@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 33;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -340,6 +340,10 @@ struct FrameImage {
 	ignore_errexit:    bool,
 	command_loop:      bool,
 	subshell_line:     Option<u32>,
+	/// A DEBUG trap's `break`/`continue` held until the trapped op ends
+	/// (`Frame::held_break`).
+	#[serde(default)]
+	held_break:        u32,
 	getopts:           super::proc::GetoptsState,
 }
 
@@ -570,6 +574,7 @@ impl Shell {
 					ignore_errexit: f.ignore_errexit,
 					command_loop: f.command_loop,
 					subshell_line: f.subshell_line,
+					held_break: f.held_break,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
 			}
@@ -1052,6 +1057,7 @@ impl Shell {
 				frame.ignore_errexit = f.ignore_errexit;
 				frame.command_loop = f.command_loop;
 				frame.subshell_line = f.subshell_line;
+				frame.held_break = f.held_break;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
 				if matches!(frame.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
