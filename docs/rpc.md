@@ -1554,12 +1554,16 @@ A call can take a while to connect. A `prompt` frame's `/live on` therefore
 runs in the background: its response (`agentInvoked: false`) comes at once, and
 the one-line answer follows as a `command_output` when the start ends, so the
 input queue stays free meanwhile. `/live off` or `abort` sent while the call
-connects stops it, and the start answers `Live call did not start: …`.
+connects stops it at once: the pending session request is cancelled, the start
+answers `Live call did not start: The live call was stopped while it
+connected`, and the call ends clean (`live_end` with no `error`), as the stop of
+an open call does. The same holds for `live_stop` during a `live_start`.
 
 The live frames above are sent as for `live_start`. The checks `live_start`
 makes (dictation, a session change or shutdown) apply to `/live on` too. ACP,
 print mode and subagents run no live session and answer `/live` as not
-available; the interactive terminal's `/live` opens its own live view.
+available, and ACP clients are not offered `/live`; the interactive terminal's
+`/live` opens its own live view.
 
 ### API billing (`live.provider: openai`)
 

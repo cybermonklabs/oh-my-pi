@@ -11,7 +11,7 @@
  */
 import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import { LiveWebRtcPeer } from "@oh-my-pi/pi-natives";
-import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, sleepLong, toError } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { kNoAuth } from "../config/model-provider-discovery";
 import {
@@ -241,12 +241,17 @@ export interface OpenAILiveTransportOptions {
 	callbacks: LiveTransportCallbacks;
 	/** SDP offer from a caller-owned WebRTC peer; unset makes a native peer (see `LiveTransportOptions.sdpOffer`). */
 	sdpOffer?: string;
+	/**
+	 * Cancels the connect: an abort while the transport connects ends the session request and the
+	 * sideband's attempts, and the connect rejects. Once the call is up an abort does nothing.
+	 */
+	signal?: AbortSignal;
 }
 
 /** GPT-Live call over its public API, with a native or caller-owned media peer; the surface of {@link CodexLiveTransport}. */
 export class OpenAILiveTransport implements Pick<
 	CodexLiveTransport,
-	"sdpAnswer" | "connect" | "send" | "pushAudio" | "setMuted" | "close"
+	"sdpAnswer" | "connected" | "connect" | "send" | "pushAudio" | "setMuted" | "close"
 > {
 	readonly #options: OpenAILiveTransportOptions;
 	#peer: LiveWebRtcPeer | undefined;
@@ -258,6 +263,10 @@ export class OpenAILiveTransport implements Pick<
 	#sendTail: Promise<void> = Promise.resolve();
 	#muted = false;
 	#unexpectedFailureReported = false;
+	/** Aborted by {@link close}: a close while the call connects ends its requests, as `options.signal` does. */
+	readonly #requests = new AbortController();
+	/** What the connect's requests (the session request, the sideband's attempts and their backoff) stop on. */
+	readonly #requestSignal: AbortSignal;
 	/** Event ids already delivered, in arrival order; see {@link SEEN_EVENT_IDS_LIMIT}. */
 	readonly #seenEventIds = new Set<string>();
 	/** The `event_id` of each message sent, with its type, oldest first; see {@link SENT_EVENT_IDS_LIMIT}. */
@@ -283,11 +292,19 @@ export class OpenAILiveTransport implements Pick<
 
 	constructor(options: OpenAILiveTransportOptions) {
 		this.#options = options;
+		this.#requestSignal = options.signal
+			? AbortSignal.any([options.signal, this.#requests.signal])
+			: this.#requests.signal;
 	}
 
 	/** SDP answer for the caller's peer once an `sdpOffer` call has been signaled. */
 	get sdpAnswer(): string | undefined {
 		return this.#sdpAnswer;
+	}
+
+	/** Whether the call is up: signaled, its media channel open and its sideband attached. */
+	get connected(): boolean {
+		return this.#state === "connected";
 	}
 
 	/** Make the media peer, open the session, and attach its sideband. */
@@ -296,6 +313,7 @@ export class OpenAILiveTransport implements Pick<
 		if (this.#connectPromise) return this.#connectPromise;
 		if (this.#state === "closing" || this.#state === "closed")
 			return Promise.reject(new Error("Live transport is closed"));
+		if (this.#requestSignal.aborted) return Promise.reject(new Error("Live transport is closed"));
 		this.#state = "connecting";
 		const operation = this.#connect().catch(async (cause: unknown) => {
 			await this.close();
@@ -375,6 +393,8 @@ export class OpenAILiveTransport implements Pick<
 			body: JSON.stringify(body),
 			redirect: "manual",
 			proxy: getProxyForUrl(OPENAI_PROVIDER, url),
+			// A stop while the request is out ends it: a session request with no answer would hold the start.
+			signal: this.#requestSignal,
 		});
 		// Server text is redacted before it is cut, so a cut cannot leave part of an echoed key behind.
 		if (response.status >= 300 && response.status < 400) {
@@ -418,7 +438,7 @@ export class OpenAILiveTransport implements Pick<
 			} catch (cause) {
 				failure = toError(cause);
 				if (this.#state !== "connecting") throw failure;
-				if (attempt + 1 < SIDEBAND_CONNECT_ATTEMPTS) await Bun.sleep(200 * 2 ** attempt);
+				if (attempt + 1 < SIDEBAND_CONNECT_ATTEMPTS) await sleepLong(200 * 2 ** attempt, this.#requestSignal);
 			}
 		}
 		throw failure;
@@ -443,7 +463,12 @@ export class OpenAILiveTransport implements Pick<
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
+			this.#requestSignal.removeEventListener("abort", onAbort);
 			reject(error);
+		};
+		const onAbort = (): void => {
+			socket.close(1000, "stopped");
+			rejectConnect(new Error("Live transport is closed"));
 		};
 		socket.onopen = () => {
 			// A socket that opens after the transport was closed is closed, never kept.
@@ -455,6 +480,7 @@ export class OpenAILiveTransport implements Pick<
 			opened = true;
 			settled = true;
 			clearTimeout(timeout);
+			this.#requestSignal.removeEventListener("abort", onAbort);
 			this.#sideband = socket;
 			resolve();
 		};
@@ -486,6 +512,8 @@ export class OpenAILiveTransport implements Pick<
 				this.#reportFailure(`GPT-Live sideband closed (${event.code})${detail}`);
 			}
 		};
+		if (this.#requestSignal.aborted) onAbort();
+		else this.#requestSignal.addEventListener("abort", onAbort, { once: true });
 		await promise;
 	}
 
@@ -744,6 +772,7 @@ export class OpenAILiveTransport implements Pick<
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#state = "closing";
+		this.#requests.abort(new Error("Live transport is closed"));
 		const operation = this.#close();
 		this.#closePromise = operation;
 		return operation;

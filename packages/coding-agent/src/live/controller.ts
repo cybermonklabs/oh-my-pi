@@ -25,6 +25,9 @@ import { DEFAULT_LIVE_VOICE } from "./voices";
 const MIN_BARGE_IN_LEVEL = 0.04;
 const OUTPUT_ECHO_RATIO = 0.65;
 
+/** Why a start ends when a stop is asked for before the call is up. */
+const STOPPED_WHILE_CONNECTING = "The live call was stopped while it connected";
+
 /** Incremental or final transcript for one realtime conversational turn. */
 export interface LiveTranscript {
 	role: "user" | "assistant";
@@ -138,6 +141,8 @@ export class LiveSessionController {
 	 * speaker starts, so there the same text again is a new line, such as a second "yes".
 	 */
 	#finishedLinesRepeat = true;
+	/** Aborted by a stop before the call is up: ends the session request and the sideband's attempts. */
+	readonly #connectAbort = new AbortController();
 	readonly #outputActivity = new OutputActivity(() =>
 		this.#guardEvent(() => {
 			if (!this.#activeDelegationId) this.#refreshAudioPhase();
@@ -202,6 +207,7 @@ export class LiveSessionController {
 						instructions,
 						sdpOffer: this.#sdpOffer,
 						callbacks,
+						signal: this.#connectAbort.signal,
 					})
 				: new CodexLiveTransport({
 						authStorage: this.#session.modelRegistry.authStorage,
@@ -210,6 +216,7 @@ export class LiveSessionController {
 						voice: this.#voice,
 						sdpOffer: this.#sdpOffer,
 						callbacks,
+						signal: this.#connectAbort.signal,
 					});
 			this.#transport = transport;
 			await transport.connect();
@@ -245,6 +252,11 @@ export class LiveSessionController {
 			this.#recorder = recorder;
 			this.#refreshAudioPhase();
 		} catch (cause) {
+			// A stop asked for during the start is not a failure: the stop ends the call, clean, and the start says why.
+			if (this.#stopped) {
+				await this.stop();
+				throw this.#failure ?? new Error(STOPPED_WHILE_CONNECTING);
+			}
 			const error = toError(cause);
 			this.#reportFailure(error);
 			await this.stop();
@@ -276,6 +288,8 @@ export class LiveSessionController {
 
 	async #stop(): Promise<void> {
 		this.#stopped = true;
+		// A stop before the call is up cancels its connect at once; an open call is told to close below.
+		if (!this.#transport?.connected) this.#connectAbort.abort(new Error(STOPPED_WHILE_CONNECTING));
 		this.#outputActivity.dispose();
 		this.#unsubscribeSession?.();
 		this.#unsubscribeSession = undefined;
@@ -295,10 +309,13 @@ export class LiveSessionController {
 		const transport = this.#transport;
 		this.#transport = undefined;
 		if (transport) {
-			try {
-				await transport.send(buildSessionClose());
-			} catch (cause) {
-				cleanupError ??= toError(cause);
+			// Only a call that is up can be told to close; a stop before then ends clean, as an open call's stop does.
+			if (transport.connected) {
+				try {
+					await transport.send(buildSessionClose());
+				} catch (cause) {
+					cleanupError ??= toError(cause);
+				}
 			}
 			try {
 				await transport.close();
