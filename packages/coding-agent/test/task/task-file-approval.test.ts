@@ -407,6 +407,50 @@ describe("taskFile approval binding", () => {
 		10_000,
 	);
 
+	// If this regresses, a FIFO renamed over a task file after its approval is opened at dispatch: the call
+	// still fails, but its open lets another process's writer, blocked until a reader comes, go on.
+	// Windows has no FIFOs.
+	it.skipIf(process.platform === "win32")(
+		"refuses a FIFO renamed over an approved task file without releasing a writer blocked in its open",
+		async () => {
+			const taskFile = path.join(directory, "task.md");
+			await Bun.write(taskFile, "Approved assignment.");
+			const fifo = path.join(directory, "task.fifo");
+			expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+			// The writer opens the FIFO by a second name, which the rename over the task file leaves in place.
+			const writerPath = path.join(directory, "writer.fifo");
+			await fs.promises.link(fifo, writerPath);
+			const writer = Bun.spawn(["sh", "-c", 'echo started && printf x > "$1"', "sh", writerPath], {
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			try {
+				await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
+				// The approval captured the regular file; the FIFO takes its name before the call runs.
+				const { wrapper, context } = await createWrapper(async () => {
+					await fs.promises.rename(fifo, taskFile);
+					return "Approve";
+				});
+
+				const result = await wrapper.execute("fifo-swapped", { taskFile }, undefined, undefined, context);
+
+				expect(result.isError).toBe(true);
+				expect(result.content).toEqual([
+					expect.objectContaining({ text: expect.stringContaining("changed after approval; retry the call") }),
+				]);
+				// Real clock on purpose: the passing outcome is another process not exiting, which no event signals
+				// and fake timers cannot advance; the wait bounds how long a late exit can go unseen.
+				const outcome = await Promise.race([writer.exited, Bun.sleep(2_000).then(() => "still blocked")]);
+				expect(outcome).toBe("still blocked");
+				expect(executions).toHaveLength(0);
+			} finally {
+				writer.kill();
+				await writer.exited;
+			}
+		},
+		10_000,
+	);
+
 	it("restores the outer file binding after a nested wrapper invocation", async () => {
 		const { taskFile, restricted } = await linkedFiles();
 		let prompts = 0;
