@@ -8,6 +8,7 @@
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
+  sc.py frames DIR COMMIT RES      the frames row's units from frames.sh's runs in DIR, one JSON file each in RES
   sc.py summary RESULTS BUILD              the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py selftest                           the counters and the summary against hand-made inputs
 
@@ -57,6 +58,17 @@ ROWS = (
     ("TypeScript suites", "ts-small"),
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
+    ("frames: this build reads the previous release's stored frames", "frames"),
+    ("frames controls: each plant must be caught", "frames-plant"),
+)
+
+# The frames row (sami-checks-frames.yml, frames.sh): (row key, unit). A control's unit passes when
+# its plant was caught.
+FRAMES_UNITS = (
+    ("frames", "previous release"),
+    ("frames", "every version"),
+    ("frames-plant", "check() takes any version or build"),
+    ("frames-plant", "body one byte off"),
 )
 
 
@@ -79,6 +91,7 @@ def ts_matrix():
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts"]
+    names += ["frames"]
     return names
 
 
@@ -390,7 +403,152 @@ def expected_units(build_dir):
     for s in range(1, CODING_AGENT_SHARDS + 1):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
+    for row, unit in FRAMES_UNITS:
+        exp.append((row, unit, "runner"))
     return exp, notes
+
+
+def read_text(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+
+
+def frames_run(runs, label):
+    """One run of frames.sh (test-cross, test-kit, plant-cross, plant-kit): its libtest result and its
+    log, or UNKNOWN with the reason it did not run. A run names one test, so it must run exactly one."""
+    skip = read_text(os.path.join(runs, f"{label}.skip"))
+    if skip is not None:
+        return result("frames", label, "runner", "UNKNOWN", "-", 0, note=skip.strip() or "it did not run"), ""
+    exit_code = (read_text(os.path.join(runs, f"{label}.exit")) or "-").strip()
+    try:
+        secs = float(read_text(os.path.join(runs, f"{label}.secs")) or 0)
+    except ValueError:
+        secs = 0
+    r = parse_libtest(os.path.join(runs, f"{label}.log"), exit_code, secs, "frames", label, "runner")
+    n = r["passed"] + r["failed"]
+    if r["status"] != "UNKNOWN" and n != 1:
+        r.update(status="UNKNOWN", note=f"it ran {n} tests, not the one it names")
+    return r, read_text(os.path.join(runs, f"{label}.log")) or ""
+
+
+def scframes(log, key):
+    """The text after each `SCFRAMES <key>` in a log, wherever it starts in its line."""
+    return [m.group(1).strip() for m in re.finditer(r"SCFRAMES " + re.escape(key) + r"(.*)", log)]
+
+
+def panic_of(log):
+    """The message of the last panic in a log."""
+    m = re.findall(r"panicked at [^\n]*\n([^\n]*)", log)
+    return m[-1].strip() if m else ""
+
+
+def frames_units(frames_dir, commit):
+    """The frames row's four units (FRAMES_UNITS) from frames.sh's runs in frames_dir/runs.
+
+    The read of the previous release's frames (test-cross) takes the refusal path when their build
+    id is not this build's, else the restore path. A pass counts only when the control of its path
+    was caught: the kit's plant (frames.rs check() takes any version or build; plant-cross must
+    fail) for the refusal path, the body planted one byte off under this build's header
+    (test-cross's control line) for the restore path. The kit's every-version row (test-kit)
+    counts only when it fails under the kit's plant (plant-kit), and prints one KITFRAMES case
+    line per version from 30."""
+    runs = os.path.join(frames_dir, "runs")
+    pick = dict(l.partition("=")[::2] for l in (read_text(os.path.join(frames_dir, "base", "pick.txt")) or "").splitlines())
+    t_cross, t_cross_log = frames_run(runs, "test-cross")
+    t_kit, t_kit_log = frames_run(runs, "test-kit")
+    p_cross, p_cross_log = frames_run(runs, "plant-cross")
+    p_kit, p_kit_log = frames_run(runs, "plant-kit")
+    cases = scframes(t_cross_log, "case: ") or scframes(p_cross_log, "case: ")
+    case, _, case_text = cases[0].partition("; ") if cases else (None, "", "")
+
+    def unit(row, name, r, status, note, failures=(), tests=None):
+        counts = (int(status == "PASS"), int(status == "FAIL")) if tests is None else (r["passed"], r["failed"])
+        return result(row, name, "runner", status, r["exit"], r["seconds"], *counts, r["ignored"], failures,
+                      [tuple(t) for t in (tests or ())], note)
+
+    def caught(r):
+        return {"FAIL": True, "PASS": False}.get(r["status"])
+
+    def reason(r, log):
+        return (scframes(log, "read FAIL: ") or [panic_of(log) or r["note"] or "no reason read"])[0]
+
+    kit_c = caught(p_kit)
+    cross_c = caught(p_cross) if case == "refused" else ("n/a" if case == "restored" else None)
+    said = [{True: f"the kit's row failed under it: {panic_of(p_kit_log) or 'no panic read'}",
+             False: "the kit's row PASSED under it",
+             None: f"the kit's row under it was not read: {p_kit['note']}"}[kit_c],
+            {True: f"the read of the previous release failed under it: {reason(p_cross, p_cross_log)}",
+             False: "the read of the previous release PASSED under it, on its refusal path",
+             "n/a": "the read takes the restore path (the same build id), which the plant does not touch",
+             None: f"the read of the previous release under it was not read: {p_cross['note'] or 'no case line'}"}[cross_c]]
+    code = "FAIL" if False in (kit_c, cross_c) else ("UNKNOWN" if None in (kit_c, cross_c) else "PASS")
+    code_plant = unit("frames-plant", "check() takes any version or build", p_kit, code,
+                      "" if code == "FAIL" else "; ".join(said),
+                      ["the plant was not caught: " + "; ".join(said)] if code == "FAIL" else ())
+
+    hit, missed, unread = (scframes(t_cross_log, k) for k in ("control caught: ", "control NOT caught: ", "control unknown: "))
+    if hit:
+        data_plant = unit("frames-plant", "body one byte off", t_cross, "PASS", f"the read failed on it: {hit[0]}")
+    elif missed:
+        data_plant = unit("frames-plant", "body one byte off", t_cross, "FAIL", "",
+                          [f"the read passed on the previous release's frames one byte off under this build's header: {missed[0]}"])
+    else:
+        data_plant = unit("frames-plant", "body one byte off", t_cross, "UNKNOWN",
+                          unread[0] if unread else f"the read printed no control line ({t_cross['note'] or t_cross['status']})")
+
+    base = pick.get("base", "")
+    which = f"{commit[:12]} read the frames of {base[:12] or 'no previous release'}"
+    which += f" ({pick['tag']})" if pick.get("tag") else (f" ({pick['how']})" if pick.get("how") else "")
+    ok = scframes(t_cross_log, "read ok: ")
+    unknown = scframes(t_cross_log, "unknown: ")
+    control = code_plant if case == "refused" else data_plant
+    tests = t_cross["tests"]
+    if t_cross["status"] == "UNKNOWN":
+        prev = unit("frames", "previous release", t_cross, "UNKNOWN", f"{which}: {t_cross['note']}", tests=tests)
+    elif unknown:
+        prev = unit("frames", "previous release", t_cross, "UNKNOWN", f"{which}: {unknown[0]}", tests=tests)
+    elif t_cross["status"] == "FAIL":
+        prev = unit("frames", "previous release", t_cross, "FAIL", f"{which}: {case_text}",
+                    [reason(t_cross, t_cross_log)], tests=tests)
+    elif not ok:
+        prev = unit("frames", "previous release", t_cross, "UNKNOWN", f"{which}: it passed without its result line", tests=tests)
+    elif control["status"] != "PASS":
+        prev = unit("frames", "previous release", t_cross, "UNKNOWN",
+                    f"{which}: the read passed ({ok[0]}), but its control `{control['unit']}` is {control['status']}, "
+                    "so this pass cannot be told from a check that cannot fail", tests=tests)
+    else:
+        prev = unit("frames", "previous release", t_cross, "PASS", f"{which}: {ok[0]}", tests=tests)
+
+    cur = re.search(r"KITFRAMES build FRAMES_VERSION=(\d+)", t_kit_log)
+    cur = int(cur.group(1)) if cur else None
+    lines = len(re.findall(r"KITFRAMES stored=", t_kit_log))
+    want = cur - 29 if cur is not None and cur >= 30 else None
+    tests = t_kit["tests"]
+    if t_kit["status"] == "UNKNOWN":
+        every = unit("frames", "every version", t_kit, "UNKNOWN", t_kit["note"], tests=tests)
+    elif t_kit["status"] == "FAIL":
+        every = unit("frames", "every version", t_kit, "FAIL", "", [panic_of(t_kit_log) or "no panic read"], tests=tests)
+    elif want is None or lines != want:
+        every = unit("frames", "every version", t_kit, "FAIL", "",
+                     [f"{lines} KITFRAMES case lines for FRAMES_VERSION {cur}, not {want} (one per version from 30)"], tests=tests)
+    elif kit_c is not True:
+        every = unit("frames", "every version", t_kit, "UNKNOWN",
+                     f"it passed, but the kit's plant was not caught ({said[0]}), so this pass cannot be told from a check that cannot fail",
+                     tests=tests)
+    else:
+        every = unit("frames", "every version", t_kit, "PASS",
+                     f"FRAMES_VERSION {cur}: versions 30 to {cur - 1} refused as another build's, kept, and dropped by "
+                     f"drop_frames (run 255, kept=yes); {cur} restored", tests=tests)
+    return [prev, every, code_plant, data_plant]
+
+
+def cmd_frames(frames_dir, commit, res_dir):
+    os.makedirs(res_dir, exist_ok=True)
+    for i, r in enumerate(frames_units(frames_dir, commit)):
+        json.dump(r, open(os.path.join(res_dir, f"frames-{i}.json"), "w", encoding="utf-8"))
+        print(f"UNIT {r['row']} / {r['unit']}: {r['status']}: {r['note']}{' FAILED: ' + ' / '.join(r['failures']) if r['failures'] else ''}")
 
 
 def fmt_secs(s):
@@ -480,6 +638,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
+            elif r["note"]:
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): {r['status']}: {r['note']}")
             for f in r["failures"]:
                 why = known.get((key, r["who"], r["unit"], f))
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
@@ -505,7 +665,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         lines.extend(stale)
         lines.append("")
     if details:
-        lines.append("### Each failing test and each UNKNOWN")
+        lines.append("### Each failing test, each UNKNOWN and each note")
         lines.append("")
         lines.extend(details[:400])
         if len(details) > 400:
@@ -706,17 +866,94 @@ def selftest():
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
     open(known_file, "w").write("# none\n")
+    # A frames unit no job reported is UNKNOWN, and so is its row; with none reported, both rows.
+    frames_files = [os.path.join(res, f"{i}.json") for i, e in enumerate(exp) if e[0] in ("frames", "frames-plant")]
+    check("the plan expects the four frames units", len(frames_files), 4)
+    for f in frames_files[:1]:
+        os.remove(f)
+    rc, out = summary()
+    check("summary with the frames read missing", (rc, "`previous release` (runner): UNKNOWN: no result" in out,
+          "| frames: this build reads the previous release's stored frames | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out), (1, True, True))
+    for f in frames_files[1:]:
+        os.remove(f)
+    rc, out = summary()
+    check("summary with no frames result", (rc, "| frames: this build reads the previous release's stored frames | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
+          "| frames controls: each plant must be caught | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out), (1, True, True))
+
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
+
+    # The frames row's units from frames.sh's runs (hand-made logs).
+    def frames_case(runs, pick="base=" + "b" * 40 + "\ntag=v1-sami.20261123-000000\nhow=x\n"):
+        fd = tempfile.mkdtemp(dir=d)
+        os.makedirs(os.path.join(fd, "runs"))
+        os.makedirs(os.path.join(fd, "base"))
+        open(os.path.join(fd, "base", "pick.txt"), "w").write(pick)
+        for label, spec in runs.items():
+            p = os.path.join(fd, "runs", label)
+            if isinstance(spec, str):
+                open(p + ".skip", "w").write(spec)
+                continue
+            ok, text = spec
+            t_s = {"type": "test", "event": "started", "name": "t"}
+            t_e = {"type": "test", "event": "ok" if ok else "failed", "name": "t", "exec_time": 0.1}
+            end = {"type": "suite", "event": "ok" if ok else "failed", "passed": int(ok), "failed": int(not ok)}
+            with open(p + ".log", "w") as f:
+                f.write(json.dumps({"type": "suite", "event": "started", "test_count": 1}) + "\n" + json.dumps(t_s) + "\n")
+                f.write("".join(l + "\n" for l in text) + json.dumps(t_e) + "\n" + json.dumps(end) + "\n")
+            open(p + ".exit", "w").write("0\n" if ok else "101\n")
+            open(p + ".secs", "w").write("1.5\n")
+        return {r["unit"]: r for r in frames_units(fd, "c" * 40)}
+
+    def st(units):
+        return tuple(units[u]["status"] for u in ("previous release", "every version", "check() takes any version or build", "body one byte off"))
+
+    panic = ["thread 't' panicked at src/a.rs:1:1:"]
+    kit_ok = (True, ["KITFRAMES build FRAMES_VERSION=32 IR_VERSION=17 pkg=1"] + [f"KITFRAMES stored={v} current=32" for v in (30, 31, 32)])
+    kit_caught = (False, ["KITFRAMES build FRAMES_VERSION=32"] + panic + ["frames of version 30 on a build of 32: None"])
+    refused = "SCFRAMES case: refused; frames of 31 on 32"
+    good = {
+        "test-cross": (True, [refused, "SCFRAMES control caught: Corrupt", "SCFRAMES read ok: refused (Build) and kept"]),
+        "test-kit": kit_ok,
+        "plant-cross": (False, [refused] + panic + ["SCFRAMES read FAIL: restored; frames of another build id must be refused"]),
+        "plant-kit": kit_caught,
+    }
+    u = frames_case(good)
+    check("frames: every unit passes", st(u), ("PASS",) * 4)
+    check("frames: the read names both commits", u["previous release"]["note"].startswith("cccccccccccc read the frames of bbbbbbbbbbbb (v1-sami.20261123-000000)"), True)
+    u = frames_case({**good, "plant-kit": (True, kit_ok[1])})
+    check("frames: the kit's plant not caught", st(u), ("UNKNOWN", "UNKNOWN", "FAIL", "PASS"))
+    u = frames_case({**good, "plant-cross": (True, [refused, "SCFRAMES read ok: restored"])})
+    check("frames: the plant passes the refusal path", st(u), ("UNKNOWN", "PASS", "FAIL", "PASS"))
+    restored = "SCFRAMES case: restored; the same build id"
+    u = frames_case({**good, "test-cross": (True, [restored, "SCFRAMES control NOT caught: restored", "SCFRAMES read ok: restored"]),
+                     "plant-cross": (True, [restored, "SCFRAMES read ok: restored"])})
+    check("frames: the restore path's control not caught", st(u), ("UNKNOWN", "PASS", "PASS", "FAIL"))
+    u = frames_case({**good, "test-cross": (True, [restored, "SCFRAMES control caught: Corrupt", "SCFRAMES read ok: restored"]),
+                     "plant-cross": (True, [restored, "SCFRAMES read ok: restored"])})
+    check("frames: the restore path passes with its control", st(u), ("PASS",) * 4)
+    u = frames_case({**good, "test-cross": (False, [refused, "SCFRAMES control caught: Corrupt"] + panic + ["SCFRAMES read FAIL: restore fails with Corrupt"])})
+    check("frames: a failed read", (st(u)[0], u["previous release"]["failures"]), ("FAIL", ["restore fails with Corrupt"]))
+    gone = "no frames of the previous release: the base job uploaded none"
+    u = frames_case({**good, "test-cross": gone, "plant-cross": gone}, pick="")
+    check("frames: no previous release", (st(u), u["previous release"]["note"].endswith(gone)), (("UNKNOWN", "PASS", "UNKNOWN", "UNKNOWN"), True))
+    u = frames_case({**good, "test-kit": (True, kit_ok[1][:3])})
+    check("frames: a KITFRAMES case line missing", st(u)[1], "FAIL")
+    u = frames_case({k: v for k, v in good.items() if k != "test-cross"})
+    check("frames: a run with no log", st(u)[0], "UNKNOWN")
+    u = frames_case({**good, "test-cross": (True, [refused, "SCFRAMES unknown: a version of 128 or more"])})
+    check("frames: the header the row reads changed", st(u)[0], "UNKNOWN")
+    check("the plan takes frames as a silent job", "frames" in all_job_names(), True)
 
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
-          "assignment and per-user weights, and the summary's UNKNOWN for a unit no job or two jobs reported")
+          "assignment and per-user weights, the frames row's units, and the summary's UNKNOWN for a unit "
+          "no job or two jobs reported")
 
 
 def main(argv):
@@ -738,6 +975,8 @@ def main(argv):
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":
         print(json.dumps(parse_plain(*a)))
+    elif c == "frames":
+        cmd_frames(*a)
     elif c == "summary":
         sys.exit(cmd_summary(*a))
     elif c == "selftest":
