@@ -11,7 +11,9 @@
   sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
   sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
-  sc.py summary RESULTS BUILD              the step summary (markdown) on stdout; exit 1 unless every row passed
+  sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
+  sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
+  sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
@@ -20,8 +22,9 @@ with no JUnit report or no summary line, a command the time bound or a signal en
 whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
 gives no verdict for, and a unit the plan expects that no job reported, or that two jobs reported,
 are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
-compared nothing: it is counted apart, named, and its unit is UNKNOWN. A test that started and
-never ended is named.
+compared nothing: it is counted apart, named, and its unit is UNKNOWN, unless each of its skip
+lines is a sub-case that partial-skips.txt lets that test skip and the entry's witness line is in
+its output; then it passes and is listed as partial. A test that started and never ended is named.
 """
 
 import json
@@ -61,15 +64,25 @@ CLIPPY_CONTROL = "ScClippyControl"
 # did not pass. The forms are the tree's own (sc.py skip-forms lists every print of the tree that
 # says skip, not run or nothing checked, and fails on one this rule does not read): `skipped: ...`,
 # `skipped, ...`, `skipped mode 0200: ...`, `skipping ...`, `SKIP: ...`, `NOT-RUN ...`,
-# `UNKNOWN: ...`, `UNCOMPARED`, each at the start of a line or after a `<case>: ` prefix or one
-# capitalised word (`CHILD skipped: ...`). A line that says the word later (`<util>: the host half
-# is skipped: ...`, a partial check) does not count.
+# `UNKNOWN: ...`, each at the start of a line, after one capitalised word (`CHILD skipped: ...`), or
+# after up to 8 `<prefix>: ` segments, since a case name can itself hold ": " (pi-iso cow.rs prints
+# `/dev/shm: 3 bytes onto 5, ... failing: skipped, ...`); and `UNCOMPARED`, `nothing was checked`,
+# `the test saw nothing` and `nothing to test` anywhere in a line. A line that says the word later
+# (`<util>: the host half is skipped: ...`, a partial check) does not count. Each segment ends at its
+# first colon and takes all the blanks after it, so a line is tried in a bounded number of ways.
 SKIP_MARKER = re.compile(
-    r"^\s*(?:[^\n:]{1,200}:\s+|[A-Z][A-Z0-9_-]*\s+)?(?:skipped\b|skipping\b|SKIP\b|not run\b|NOT-RUN\b|UNKNOWN:)|UNCOMPARED|nothing was checked|the test saw nothing",
+    r"^[ \t]*(?![ \t])(?:[^\n:]{0,200}:[ \t]+(?![ \t])){0,8}(?:[A-Z][A-Z0-9_-]*[ \t]+)?"
+    r"(?:skipped\b|skipping\b|SKIP\b|not run\b|NOT-RUN\b|UNKNOWN:)"
+    r"|UNCOMPARED|nothing was checked|the test saw nothing|nothing to test",
     re.M,
 )
-# A literal of the tree that says it skips, did not run or checked nothing (sc.py skip-forms).
-SKIP_WORD = re.compile(r"\bskip(?:ped|ping|s)?\b|\bnot[ -]run\b|NOT-RUN|UNCOMPARED|nothing was checked", re.I)
+# A line or literal that says it skips, did not run, gave up or checked nothing (sc.py skip-forms
+# and skip-lines): each one must be read by SKIP_MARKER or be named in skip-forms-not-markers.txt.
+SKIP_WORD = re.compile(
+    r"\bskip(?:ped|ping|s)?\b|\bnot[ -]run\b|NOT-RUN|UNCOMPARED|nothing was checked|nothing to test"
+    r"|\bnot checked\b|\bchecked nothing\b|\bnot compared\b",
+    re.I,
+)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -202,7 +215,7 @@ def cmd_shard(who, n, k, meta, weights_path):
 
 
 def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=0, failures=(), tests=(),
-           note="", self_skipped=()):
+           note="", self_skipped=(), partial=()):
     return {
         "row": row,
         "unit": unit,
@@ -214,15 +227,66 @@ def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=
         "failed": failed,
         "ignored": ignored,
         "self_skipped": list(self_skipped),
+        "partial": [list(p) for p in partial],
         "failures": list(failures),
         "tests": [[n, round(t, 3)] for n, t in tests],
         "note": note,
     }
 
 
+PARTIAL_SKIPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "partial-skips.txt")
+
+
+def literal_pattern(lit):
+    """A format literal as a pattern of the whole line it prints, each `{...}` argument any text."""
+    parts = re.split(r"(\{\{|\}\}|\{[^{}]*\})", lit)
+    return re.compile("".join(
+        re.escape(p[0]) if p in ("{{", "}}") else ".*" if p.startswith("{") else re.escape(p) for p in parts))
+
+
+def read_partial_skips(path=PARTIAL_SKIPS):
+    """partial-skips.txt: [test, format literal, witness regex, reason] per entry."""
+    out = []
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            if line.strip() and not line.startswith("#"):
+                f = line.rstrip("\n").split("\t")
+                if len(f) != 4:
+                    sys.exit(f"{path}: not four tab-separated fields: {line!r}")
+                out.append(f)
+    return out
+
+
+def partial_rules(path=PARTIAL_SKIPS):
+    """test -> [(the literal's line pattern, the witness, the reason)]."""
+    rules = {}
+    for test, lit, witness, reason in read_partial_skips(path):
+        rules.setdefault(test, []).append((literal_pattern(lit), re.compile(witness, re.M), reason))
+    return rules
+
+
+def skip_reading(name, out, rules):
+    """How a passing test's output reads: None when no line of it holds a skip marker; else (the
+    number of skip lines, the reason) when each skip line is printed by a literal the partial-skip list
+    lets this test skip and that entry's witness is in the output (a partial pass), else (n, None)."""
+    lines = [l.strip() for l in out.splitlines() if SKIP_MARKER.search(l)]
+    if not lines:
+        return None
+    live = [(p, r) for p, w, r in rules.get(name, ()) if w.search(out)]
+    used = []
+    for l in lines:
+        why = next((r for p, r in live if p.fullmatch(l)), None)
+        if why is None:
+            return len(lines), None
+        if why not in used:
+            used.append(why)
+    return len(lines), "; ".join(used)
+
+
 def skip_verdict(res):
     """A unit whose passing tests printed a skip marker: those tests are not passes, and the unit
-    is UNKNOWN unless it already failed or is UNKNOWN for another reason."""
+    is UNKNOWN unless it already failed or is UNKNOWN for another reason. A partial pass (the
+    partial-skip list) stays a pass and is only listed."""
     s = res["self_skipped"]
     if s:
         res["passed"] -= len(s)
@@ -233,13 +297,14 @@ def skip_verdict(res):
     return res
 
 
-def parse_libtest(log, exit_code, secs, row, unit, who):
+def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKIPS):
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
     Lines that are not events (a child's or a thread's own writes) are ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped = set(), set(), set(), {}, [], []
+    started, ended, slow, times, failures, skipped, partial = set(), set(), set(), {}, [], [], []
     passed = failed = ignored = 0
     suite_end = None
+    rules = partial_rules(partial_path)
     try:
         lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
     except OSError:
@@ -264,7 +329,10 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
                 ended.add(name)
                 if e == "ok":
                     passed += 1
-                    if SKIP_MARKER.search(ev.get("stdout") or ""):
+                    k = skip_reading(name, ev.get("stdout") or "", rules)
+                    if k and k[1]:
+                        partial.append((name, k[0], k[1]))
+                    elif k:
                         skipped.append(name)
                 elif e == "ignored":
                     ignored += 1
@@ -281,7 +349,8 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     unfinished = sorted(started - ended)
 
     def r(status, note=""):
-        return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped)
+        return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped,
+                      partial)
 
     if code not in (0, 101):
         note = f"exit {exit_code}: the binary did not finish"
@@ -326,7 +395,7 @@ def junit_cases(path):
         yield full, kind, t, out
 
 
-def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits):
+def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, partial_path=PARTIAL_SKIPS):
     try:
         code = int(exit_code)
     except ValueError:
@@ -340,11 +409,19 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits):
     passed = sum(1 for c in cases if c[1] == "ok")
     failures = [c[0] for c in cases if c[1] == "failed"]
     ignored = sum(1 for c in cases if c[1] == "skipped")
-    skipped = [c[0] for c in cases if c[1] == "ok" and SKIP_MARKER.search(c[3])]
+    rules = partial_rules(partial_path)
+    skipped, partial = [], []
+    for c in cases:
+        k = skip_reading(c[0], c[3], rules) if c[1] == "ok" else None
+        if k and k[1]:
+            partial.append((c[0], k[0], k[1]))
+        elif k:
+            skipped.append(c[0])
     tests = [(c[0], c[2]) for c in cases if c[1] != "skipped"]
 
     def r(s, note=""):
-        return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped)
+        return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped,
+                      partial)
 
     if code not in ok_exits + fail_exits:
         return r("UNKNOWN", f"exit {exit_code}: the run did not finish")
@@ -602,6 +679,8 @@ def expected_units(build_dir):
     for c in CLIPPY_CRATES:
         exp.append(("clippy", c, "runner"))
     exp.append(("skipforms", "tree", "runner"))
+    # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
+    exp.append(("skipforms", "runtime", "runner"))
     return exp, notes
 
 
@@ -665,11 +744,16 @@ def rust_literals(text):
     return out
 
 
-def literal_sample(lit):
-    """What a format literal prints, roughly: line continuations joined, `{...}` arguments as `x`."""
+# A format argument as `x`, and as a value that itself holds ": ", blanks and a comma, as a case name
+# built with format! does at run time (pi-iso cow.rs: `{case}: skipped, ...`, case `{place}: ...`).
+ARG_SAMPLES = ("x", "x: y, z")
+
+
+def literal_sample(lit, arg="x"):
+    """What a format literal prints, roughly: line continuations joined, each `{...}` argument as `arg`."""
     s = re.sub(r"\\\n\s*", "", lit).replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
     s = s.replace("{{", "\0").replace("}}", "\1")
-    s = re.sub(r"\{[^{}]*\}", "x", s)
+    s = re.sub(r"\{[^{}]*\}", lambda _: arg, s)
     return s.replace("\0", "{").replace("\1", "}")
 
 
@@ -687,45 +771,125 @@ def printed(text, off):
     return False
 
 
-def skip_forms(tree, exceptions_path):
-    """Every literal under <tree>/crates that says skip, not run or nothing checked must be read by
-    SKIP_MARKER or be named in the exceptions file (`<path>\\t<start of the literal>\\t<reason>`) as
-    not a skip marker. Returns (unread literals, exceptions that match nothing)."""
-    exc = []
-    for line in open(exceptions_path, encoding="utf-8"):
+def read_not_markers(path):
+    """skip-forms-not-markers.txt: [path, start of the printed text with arguments as x, reason]."""
+    out = []
+    for line in open(path, encoding="utf-8"):
         if line.strip() and not line.startswith("#"):
             f = line.rstrip("\n").split("\t")
             if len(f) != 3:
-                sys.exit(f"{exceptions_path}: not three tab-separated fields: {line!r}")
-            exc.append([f[0], f[1], False])
-    unread = []
+                sys.exit(f"{path}: not three tab-separated fields: {line!r}")
+            out.append(f)
+    return out
+
+
+def skip_forms(tree, exceptions_path, partial_path=PARTIAL_SKIPS):
+    """Every literal under <tree>/crates that says skip, not run, gave up or checked nothing must be
+    read by SKIP_MARKER, with its arguments as each of ARG_SAMPLES, or be named in the exceptions file
+    (`<path>\\t<start of the literal, arguments as x>\\t<reason>`) as not a skip marker. A literal of
+    the partial-skip list must still be printed somewhere. Returns (unread literals, exceptions and
+    partial-skip entries that match nothing, the number of .rs files read)."""
+    exc = [[e[0], e[1], False] for e in read_not_markers(exceptions_path)]
+    partial = [(e[0], e[1]) for e in read_partial_skips(partial_path)]
+    partial_lits = {lit for _, lit in partial}
+    printed_lits = set()
+    unread, files_read = [], 0
     for dp, dirs, files in os.walk(os.path.join(tree, "crates")):
         dirs[:] = sorted(d for d in dirs if d != "target")
         for f in sorted(files):
             if not f.endswith(".rs"):
                 continue
+            files_read += 1
             p = os.path.join(dp, f)
             rel = os.path.relpath(p, tree)
             text = open(p, encoding="utf-8", errors="replace").read()
             for off, lit in rust_literals(text):
-                s = literal_sample(lit)
-                if not SKIP_WORD.search(s) or SKIP_MARKER.search(s) or not printed(text, off):
+                if lit in partial_lits and printed(text, off):
+                    printed_lits.add(lit)
+                samples = [literal_sample(lit, a) for a in ARG_SAMPLES]
+                bad = [s for s in samples if SKIP_WORD.search(s) and not SKIP_MARKER.search(s)]
+                if not bad or not printed(text, off):
                     continue
-                hit = [e for e in exc if e[0] == rel and s.startswith(e[1])]
+                hit = [e for e in exc if e[0] == rel and samples[0].startswith(e[1])]
                 for e in hit:
                     e[2] = True
                 if not hit:
-                    unread.append(f"{rel}:{text.count(chr(10), 0, off) + 1}: {s[:160]!r}")
+                    unread.append(f"{rel}:{text.count(chr(10), 0, off) + 1}: {bad[0][:160]!r}")
     stale = [f"{e[0]}: {e[1]!r}" for e in exc if not e[2]]
-    return unread, stale
+    stale += [f"partial-skips.txt, {test}: {lit!r}" for test, lit in partial if lit not in printed_lits]
+    return unread, stale, files_read
 
 
 def cmd_skip_forms(tree, exceptions_path):
-    unread, stale = skip_forms(tree, exceptions_path)
+    unread, stale, files_read = skip_forms(tree, exceptions_path)
     fails = [f"a skip print the summary does not read: {u}" for u in unread]
-    fails += [f"an exception that names no literal of the tree any more: {s}" for s in stale]
-    return result("skipforms", "tree", "runner", "FAIL" if fails else "PASS", 0, 0, int(not fails), len(fails),
-                  failures=fails, note="" if fails else "every skip print of the tree is read or named as not a marker")
+    fails += [f"an entry that names no printed literal of the tree any more: {s}" for s in stale]
+    if fails:
+        status, note = "FAIL", ""
+    elif not files_read:
+        status, note = "UNKNOWN", f"no .rs file under {tree}/crates: nothing was scanned"
+    else:
+        status, note = "PASS", f"every skip print of the {files_read} .rs files is read or named as not a marker"
+    return result("skipforms", "tree", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
+
+
+def passing_outputs(results_dir, unreadable):
+    """(report, test, output) of each test that passed in a results directory: the passing cases of
+    each JUnit report (nextest, bun) and the `ok` events of each libtest log (the pi-shell set).
+    A report that does not parse is added to `unreadable`."""
+    for dp, dirs, files in os.walk(results_dir):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(dp, f)
+            if f.endswith(".junit.xml"):
+                try:
+                    cases = list(junit_cases(p))
+                except ET.ParseError:
+                    unreadable.append(os.path.relpath(p, results_dir))
+                    continue
+                for name, kind, _, out in cases:
+                    if kind == "ok":
+                        yield p, name, out
+            elif f.endswith(".log"):
+                for line in open(p, encoding="utf-8", errors="replace"):
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "test" and ev.get("event") == "ok":
+                        yield p, ev.get("name", "?"), ev.get("stdout") or ""
+
+
+def skip_lines(results_dir, exceptions_path):
+    """The run-time half of skip-forms: each line a passing test printed that SKIP_WORD selects must be
+    read by SKIP_MARKER or match an entry of the exceptions file (its text from the line's start,
+    each `x` any text). Returns ({unread line: [report and test, ...]}, tests read, unreadable reports)."""
+    pats = [re.compile(r"[ \t]*" + ".*?".join(re.escape(p) for p in e[1].split("x")))
+            for e in read_not_markers(exceptions_path)]
+    unread, tests, unreadable = {}, 0, []
+    for p, name, out in passing_outputs(results_dir, unreadable):
+        tests += 1
+        for line in out.splitlines():
+            if SKIP_WORD.search(line) and not SKIP_MARKER.search(line) and not any(r.match(line) for r in pats):
+                unread.setdefault(line.strip()[:200], []).append(f"{os.path.relpath(p, results_dir)} {name}")
+    return unread, tests, unreadable
+
+
+def cmd_skip_lines(results_dir, exceptions_path):
+    unread, tests, unreadable = skip_lines(results_dir, exceptions_path)
+    fails = [f"a skip line the summary does not read: {line!r}, printed {len(w)} time(s), first by {w[0]}"
+             for line, w in sorted(unread.items())]
+    if fails:
+        status, note = "FAIL", ""
+    elif not tests:
+        status, note = "UNKNOWN", f"no passing test's output under {results_dir}: nothing was read"
+    elif unreadable:
+        status, note = "UNKNOWN", f"{len(unreadable)} JUnit report(s) do not parse: " + ", ".join(unreadable[:5])
+    else:
+        status, note = "PASS", f"every skip line of {tests} passing tests is read or named as not a marker"
+    return result("skipforms", "runtime", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
 
 
 def cmd_summary(results_dir, build_dir, known_path=None):
@@ -753,7 +917,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
                  "0/101), when a passing test printed a skip marker and passed as no other user, when a clean clippy "
                  "crate's planted control was not caught, when the platform checks gave its platform no verdict, or "
-                 "when no job (or more than one) reported it; its row is then UNKNOWN too.")
+                 "when no job (or more than one) reported it; its row is then UNKNOWN too. A test whose only skip "
+                 "lines are sub-cases the partial-skip list names for it, with that entry's witness line in its "
+                 "output, passes and is listed as partial.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -803,16 +969,20 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                + (f"KNOWN ({why})" if why else "**NEW**"))
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
+            for f, n, why in r.get("partial", []):
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
-    # neither: it stays.
+    # neither: it stays. A flaky entry (its reason starts `flaky: `) is not listed when its test passed.
     stale = []
     for (row, who, unit, test), why in sorted(known.items()):
         r = got.get((row, unit, who))
         if r is None or r["status"] == "UNKNOWN" or test in r["failures"]:
             continue
         names = {n for n, _ in r["tests"]}
+        if test in names and why.startswith("flaky: "):
+            continue
         stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else "no longer in its unit")
                      + f" (listed for: {why})")
     if stale:
@@ -822,7 +992,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         lines.extend(stale)
         lines.append("")
     if details:
-        lines.append("### Each failing test and each UNKNOWN")
+        lines.append("### Each failing test, each UNKNOWN and each partial pass")
         lines.append("")
         lines.extend(details[:400])
         if len(details) > 400:
@@ -937,6 +1107,50 @@ def selftest():
                        ("cp --reflink=always: the host half is skipped: no reflink", False),
                        ("running 1 test", False), ("test result: ok. 1 passed", False)):
         check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), want)
+    # The tree's real skip lines at run time (run 45272140047 on 509a2d77): pi-iso cow.rs:928, whose
+    # case name holds ": ", and pi-shell zsh_mod_zftp.rs:352's give-up; and lines that are no marker.
+    cow = [f"/dev/shm: {n}, the clone into the emptied file{w} failing: skipped, this filesystem does not clone"
+           for n in ("3 bytes onto 5", "4101 bytes onto 8192") for w in ("", " and the clone back", " and both ways back")]
+    zftp = "no free /etc/services port: nothing to test"
+    for line in cow + [zftp, "a: b: c: d: e: f: g: h: skipped, eight prefixes"]:
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), True)
+    for line in ("cp --reflink=always: the host half is skipped: names do not fold in /mnt/sc/tmp-root/.tmp5Dxs0i",
+                 "the temporary directory: FICLONE says yes", "/dev/shm: FICLONE says Operation not supported (os error 95)",
+                 "a: b: c: d: e: f: g: h: i: skipped, nine prefixes", "x: the test passed, it skipped nothing"):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), False)
+    # The partial-skip list: cow.rs's test passes as partial only with its witness and only those lines.
+    from xml.sax.saxutils import escape
+    pf = os.path.join(d, "partial.txt")
+    open(pf, "w").write("p::cow\t{case}: skipped, this filesystem does not clone\t^the temporary directory: FICLONE says yes$\ttmpfs rows\n"
+                        "cow\t{case}: skipped, this filesystem does not clone\t^the temporary directory: FICLONE says yes$\ttmpfs rows\n")
+    witness = "the temporary directory: FICLONE says yes\n/dev/shm: FICLONE says Operation not supported (os error 95)\n"
+    cow_err = witness + "\n".join(cow) + "\n"
+
+    def jx(name, err):
+        p = os.path.join(d, "cow.xml")
+        with open(p, "w") as f:
+            f.write(f'<testsuites><testsuite name="p"><testcase classname="p" name="{name}" time="1"><system-out>\n'
+                    f'running 1 test\n\n</system-out><system-err>{escape(err)}</system-err></testcase></testsuite></testsuites>')
+        r = parse_junit(p, "0", 1, "workspace", "u", "r", (0,), (100,), pf)
+        return r["status"], r["self_skipped"], r["partial"]
+
+    def lx(name, out):
+        p = os.path.join(d, "cow.log")
+        with open(p, "w") as f:
+            for e in (s0, {"type": "test", "event": "started", "name": name},
+                      {"type": "test", "event": "ok", "name": name, "exec_time": 0.1, "stdout": out}, end_ok):
+                f.write(json.dumps(e) + "\n")
+        r = parse_libtest(p, "0", 1, "set-runner", "u", "runner", pf)
+        return r["status"], r["self_skipped"], r["partial"]
+
+    check("JUnit: cow.rs's lines with the witness", jx("cow", cow_err), ("PASS", [], [["p::cow", 6, "tmpfs rows"]]))
+    check("JUnit: cow.rs's lines without the witness", jx("cow", "\n".join(cow) + "\n"), ("UNKNOWN", ["p::cow"], []))
+    check("JUnit: cow.rs's lines and one more skip line", jx("cow", cow_err + "skipped: no FIFO\n"), ("UNKNOWN", ["p::cow"], []))
+    check("JUnit: cow.rs's lines in a test the list does not name", jx("other", cow_err), ("UNKNOWN", ["p::other"], []))
+    check("JUnit: zftp's give-up", jx("zftp", zftp + "\n"), ("UNKNOWN", ["p::zftp"], []))
+    check("libtest: cow.rs's lines with the witness", lx("cow", cow_err), ("PASS", [], [["cow", 6, "tmpfs rows"]]))
+    check("libtest: cow.rs's lines without the witness", lx("cow", "\n".join(cow) + "\n"), ("UNKNOWN", ["cow"], []))
+    check("libtest: zftp's give-up", lx("zftp", zftp + "\n"), ("UNKNOWN", ["zftp"], []))
 
     check("assign is longest-first", assign(["a", "b", "c", "d"], {"a": 100, "b": 60, "c": 50, "d": 10}, 2),
           {"a": 1, "b": 2, "c": 2, "d": 1})
@@ -1074,6 +1288,16 @@ def selftest():
     rc, out = summary()
     check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
     json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # A partial pass is a pass, listed with its reason.
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"], r["who"]) == ("workspace", "part 1/2", "runner"):
+            os.remove(os.path.join(res, f))
+    json.dump(result("workspace", "part 1/2", "runner", "PASS", 0, 1, passed=1, tests=[("p::cow", 1.0)],
+                     partial=[("p::cow", 6, "tmpfs rows")]), open(os.path.join(res, "ws.json"), "w"))
+    rc, out = summary()
+    check("a partial pass in the summary", ("| workspace, nextest (not pi-shell, pi-builtins) | **PASS** |" in out,
+          "`part 1/2` (runner): `p::cow`: partial: 6 sub-cases skipped (tmpfs rows)" in out, rc), (True, True, 0))
     # The known-failure list: a failure it names reads KNOWN, one it does not is NEW, and an entry
     # whose test passed is listed for removal and fails the summary.
     json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=1,
@@ -1091,6 +1315,18 @@ def selftest():
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
+    # A flaky entry (its reason starts `flaky: `) is KNOWN when its test fails and is not listed for
+    # removal when it passes; it is listed when its test is no longer in its unit.
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
+    rc, out = summary()
+    check("a flaky entry: KNOWN when it fails, kept when it passed",
+          ("FAILED `k`: KNOWN (flaky: a race)" in out, "`p`: passed" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc),
+          (True, False, True, 0))
+    open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tgone\tflaky: a race\n")
+    rc, out = summary()
+    check("a flaky entry whose test left its unit is to be removed",
+          ("`gone`: no longer in its unit (listed for: flaky: a race)" in out, rc), (True, 1))
     open(known_file, "w").write("# none\n")
     # A platform failure on the list reads KNOWN too; a timeout of the same test is another failure.
     for f in os.listdir(res):
@@ -1122,13 +1358,55 @@ def selftest():
                          '    eprintln!("NOT-RUN {case}: this kernel runs a program held open for writing");\n'
                          '    let c = \'"\';\n    eprintln!(r#"skipped mode 0200: "raw" ok"#);\n'
                          '    eprintln!("{case}: the host half is skipped: names do not fold");\n}\n')
-    open(exf, "w").write("crates/c/src/lib.rs\tx: the host half is skipped\ta partial check\n")
-    check("skip-forms on known forms", skip_forms(tree, exf), ([], []))
+    pfs = os.path.join(d, "partial-forms.txt")
+    open(pfs, "w").write("c::t\t{case}: skipped, it needs root\tw\tr\n")
+    open(os.path.join(tree, "crates", "c", "src", "more.rs"), "w").write(
+        'fn m(case: &str) {\n    eprintln!("{case}: skipped, this filesystem does not clone");\n'
+        '    eprintln!("no free /etc/services port: nothing to test");\n'
+        '    eprintln!("this system carries no TCP urgent data: the mark is not checked");\n}\n')
+    open(exf, "w").write("crates/c/src/lib.rs\tx: the host half is skipped\ta partial check\n"
+                         "crates/c/src/more.rs\tthis system carries no TCP urgent data\ta partial check\n")
+    check("skip-forms on known forms", skip_forms(tree, exf, pfs), ([], [], 2))
+    # skip-lines, the run-time half, on a results directory: cow.rs's lines are read, the named partial
+    # check is not a marker, and a failed test's lines are not read at all.
+    rt = os.path.join(d, "rt")
+    os.makedirs(os.path.join(rt, "sc-res-w", "logs"))
+    check("skip-lines with no report", cmd_skip_lines(rt, exf)["status"], "UNKNOWN")
+    with open(os.path.join(rt, "sc-res-w", "logs", "w.junit.xml"), "w") as f:
+        f.write('<testsuites><testsuite name="p"><testcase classname="p" name="cow" time="1"><system-err>'
+                + escape(cow_err + zftp + "\ncp: the host half is skipped: names do not fold in /tmp/.tmpX\n")
+                + '</system-err></testcase><testcase classname="p" name="f" time="1"><failure/><system-err>'
+                'a failed test, skipping in a new way\n</system-err></testcase></testsuite></testsuites>')
+    check("skip-lines on read and named lines", cmd_skip_lines(rt, exf)["status"], "PASS")
+    # Controls: b523cbf8's rule read one `<prefix>: ` and no `nothing to test`; with it both halves
+    # report cow.rs's form and the zftp give-up.
+    g = globals()
+    kept = g["SKIP_MARKER"]
+    g["SKIP_MARKER"] = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+|[A-Z][A-Z0-9_-]*\s+)?(?:skipped\b|skipping\b|SKIP\b|"
+                                  r"not run\b|NOT-RUN\b|UNKNOWN:)|UNCOMPARED|nothing was checked|the test saw nothing", re.M)
+    try:
+        unread = skip_forms(tree, exf, pfs)[0]
+        lines = cmd_skip_lines(rt, exf)["failures"]
+    finally:
+        g["SKIP_MARKER"] = kept
+    check("skip-forms with the one-prefix rule", [u for u in unread if "more.rs" in u],
+          ["crates/c/src/more.rs:2: 'x: y, z: skipped, this filesystem does not clone'",
+           "crates/c/src/more.rs:3: 'no free /etc/services port: nothing to test'"])
+    check("skip-lines with the one-prefix rule", (len(lines), sum(zftp in l for l in lines)), (7, 1))
     open(src, "a").write('fn u() { eprintln!("no check here, skipping quietly"); }\n')
-    unread, _ = skip_forms(tree, exf)
+    unread = skip_forms(tree, exf, pfs)[0]
     check("skip-forms catches a planted new form", unread, ["crates/c/src/lib.rs:10: 'no check here, skipping quietly'"])
+    with open(os.path.join(rt, "sc-res-w", "logs", "set.log"), "w") as f:
+        f.write(json.dumps({"type": "test", "event": "ok", "name": "q", "stdout": "no clone here, skipping quietly\n"}) + "\n")
+    r = cmd_skip_lines(rt, exf)
+    check("skip-lines catches a planted line", (r["status"], r["failures"]),
+          ("FAIL", ["a skip line the summary does not read: 'no clone here, skipping quietly', printed 1 time(s), "
+                    "first by sc-res-w/logs/set.log q"]))
     open(exf, "a").write("crates/c/src/lib.rs\tgone\tstale\n")
-    check("skip-forms names a stale exception", skip_forms(tree, exf)[1], ["crates/c/src/lib.rs: 'gone'"])
+    check("skip-forms names a stale exception", skip_forms(tree, exf, pfs)[1], ["crates/c/src/lib.rs: 'gone'"])
+    open(pfs, "a").write("c::t\t{case}: gone too\tw\tr\n")
+    check("skip-forms names a stale partial-skip entry", skip_forms(tree, exf, pfs)[1],
+          ["crates/c/src/lib.rs: 'gone'", "partial-skips.txt, c::t: '{case}: gone too'"])
     for line in ("x: skipped, this filesystem does not clone", "CHILD skipped: uid 1000", "skipped mode 0200: root",
                  "NOT-RUN t: this kernel", "SKIP: running as root", "skipping reftable coverage: x"):
         check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line)), True)
@@ -1142,8 +1420,9 @@ def selftest():
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest, bun and clippy counters, the "
-          "platform report reader, the shard assignment and per-user weights, and the summary's UNKNOWN for a "
-          "unit no job or two jobs reported")
+          "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
+          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
+          "entries, and skip-forms and skip-lines with their controls")
 
 
 def main(argv):
@@ -1175,6 +1454,8 @@ def main(argv):
         sys.exit(cmd_summary(*a))
     elif c == "skip-forms":
         print(json.dumps(cmd_skip_forms(*a)))
+    elif c == "skip-lines":
+        print(json.dumps(cmd_skip_lines(*a)))
     elif c == "selftest":
         selftest()
     else:

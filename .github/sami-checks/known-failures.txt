@@ -2,6 +2,9 @@
 # own yet. The summary shows each failure as KNOWN (with this reason) or NEW; a row whose only
 # failures are known reads KNOWN. An entry whose test passed or no longer exists is listed in
 # the summary to be removed, and the summary job fails until it is, so the list only shrinks.
+# A flaky entry, whose reason starts with `flaky: `, names a test that fails in some runs and passes
+# in others: it reads KNOWN when it fails and is not listed for removal when it passes (it still is
+# when its test no longer exists).
 # One per line, tab-separated: <row> <user> <unit> <test> <reason>.
 # Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, macos, windows, clippy (sc.py
 # ROWS). A platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" or
@@ -48,11 +51,12 @@ set-root	root	pi-shell::zsh_comp_pty	spell_word_corrects_a_command	root's zsh pr
 set-root	root	pi-shell::zsh_comp_pty	zls_colors_parameter	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	zls_colors_types_patterns_and_selection	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
-set-root	root	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	a race in the real zsh, not in obash
+set-root	root	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: a race in the real zsh, not in obash (platform-reds row 18)
 set-root	root	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-root	root	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_comp_pty	options_and_values_of_arguments	fails against zsh 5.9 on every tree since Cut7 (no fix yet)
 set-runner	runner	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
+set-runner	runner	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: a race in the real zsh, not in obash (platform-reds row 18)
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 # Windows: the fork peer's platform-reds report, each red at upstream 9058ab9d (10/10 there); at bfd23484 in run 45278357371.
