@@ -12,9 +12,20 @@
 {"id":"fatal/c/bg-subshell-element","script":"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) & wait $!; echo st=$?","stdout":"in:1 0\nst=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/bg-subshell-inner-word","script":"( : \"${zz?u}\" ) & wait $!; echo st=$?","stdout":"st=1\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/bg-subshell-redir-word","script":"( : ) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-arith-redir-word","script":"TIMEFORMAT=; time (( 1 )) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-case-redir-word","script":"TIMEFORMAT=; time case a in a) :;; esac 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-cond-redir-word","script":"TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-for-redir-word","script":"TIMEFORMAT=; time for x in 1; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/bg-timed-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?","stdout":"st=1\n","stderr":"SH: line 1: x: u\n","status":0}
+{"id":"fatal/c/bg-timed-group-inner-word","script":"TIMEFORMAT=; time { : \"${zz?u}\"; } & wait $!; echo st=$?","stdout":"st=1\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-group-redir-word","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-group-redir-word-piped","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat & wait $!; echo st=$?","stdout":"st=0\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-if-redir-word","script":"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/bg-timed-negated-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time ! f & wait $!; echo st=$?","stdout":"st=1\n","stderr":"SH: line 1: x: u\n","status":0}
+{"id":"fatal/c/bg-timed-negated-group-redir-word","script":"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/bg-timed-simple-word","script":"TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-subshell-redir-word","script":"TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
+{"id":"fatal/c/bg-timed-while-redir-word","script":"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=127\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/cmdsub-async","script":"f() { echo ${x?boom}; }; x=$(f & wait $!; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/cmdsub-bg-pipeline","script":"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat & wait $!; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/cmdsub-element","script":"f() { echo ${x?boom}; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"","stdout":"x=in:1 0 st=0\n","stderr":"SH: line 1: x: boom\n","status":0}
@@ -27,6 +38,7 @@
 {"id":"fatal/c/cmdsub-last-element","script":"f() { echo ${x?boom}; }; x=$(: | f; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/element-group-redir-word","script":"{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=127 0\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/element-timed-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time f | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=127 0\n","stderr":"SH: line 1: x: u\n","status":0}
+{"id":"fatal/c/element-timed-group-redir-word","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=127 0\n","stderr":"SH: line 1: zz: u\n","status":0}
 {"id":"fatal/c/eval-element-inner","script":"f() { echo ${x?boom}; }; : | eval 'f | cat; echo in:${PIPESTATUS[*]}'; echo st=$?","stdout":"in:1 0\nst=0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/eval-in-function-element-inner","script":"f() { echo ${x?boom}; }; g() { eval 'f | cat; echo in:${PIPESTATUS[*]}'; }; g | cat; echo ps=${PIPESTATUS[*]}","stdout":"in:127 0\nps=0 0\n","stderr":"SH: line 1: x: boom\n","status":0}
 {"id":"fatal/c/function-cmdsub-element","script":"f() { echo ${x?boom}; }; g() { x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x\"; }; g; echo st=$?","stdout":"x=in:1 0\nst=0\n","stderr":"SH: line 1: x: boom\n","status":0}
@@ -58,9 +70,20 @@
 {"id":"fatal/s/bg-subshell-element","script":"f() { echo ${x?boom}; }; ( f | cat; echo in:${PIPESTATUS[*]} ) & wait $!; echo st=$?","stdout":"in:1 0\nst=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/bg-subshell-inner-word","script":"( : \"${zz?u}\" ) & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/bg-subshell-redir-word","script":"( : ) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-arith-redir-word","script":"TIMEFORMAT=; time (( 1 )) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-case-redir-word","script":"TIMEFORMAT=; time case a in a) :;; esac 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-cond-redir-word","script":"TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-for-redir-word","script":"TIMEFORMAT=; time for x in 1; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/bg-timed-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: x: u\n","status":0}
+{"id":"fatal/s/bg-timed-group-inner-word","script":"TIMEFORMAT=; time { : \"${zz?u}\"; } & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-group-redir-word","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-group-redir-word-piped","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat & wait $!; echo st=$?","stdout":"st=0\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-if-redir-word","script":"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/bg-timed-negated-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time ! f & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: x: u\n","status":0}
+{"id":"fatal/s/bg-timed-negated-group-redir-word","script":"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/bg-timed-simple-word","script":"TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-subshell-redir-word","script":"TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
+{"id":"fatal/s/bg-timed-while-redir-word","script":"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?","stdout":"st=1\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/cmdsub-async","script":"f() { echo ${x?boom}; }; x=$(f & wait $!; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/cmdsub-bg-pipeline","script":"set -o pipefail; f() { echo ${x?boom}; }; x=$(f | cat & wait $!; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/cmdsub-element","script":"f() { echo ${x?boom}; }; x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x st=$?\"","stdout":"x=in:1 0 st=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
@@ -73,6 +96,7 @@
 {"id":"fatal/s/cmdsub-last-element","script":"f() { echo ${x?boom}; }; x=$(: | f; echo in:$?); echo \"x=$x st=$?\"","stdout":"x=in:1 st=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/element-group-redir-word","script":"{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=1 0\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/element-timed-function","script":"TIMEFORMAT=; f() { echo ${x:?u}; }; time f | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=1 0\n","stderr":"s.sh: line 1: x: u\n","status":0}
+{"id":"fatal/s/element-timed-group-redir-word","script":"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}","stdout":"ps=1 0\n","stderr":"s.sh: line 1: zz: u\n","status":0}
 {"id":"fatal/s/eval-element-inner","script":"f() { echo ${x?boom}; }; : | eval 'f | cat; echo in:${PIPESTATUS[*]}'; echo st=$?","stdout":"in:1 0\nst=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/eval-in-function-element-inner","script":"f() { echo ${x?boom}; }; g() { eval 'f | cat; echo in:${PIPESTATUS[*]}'; }; g | cat; echo ps=${PIPESTATUS[*]}","stdout":"in:1 0\nps=0 0\n","stderr":"s.sh: line 1: x: boom\n","status":0}
 {"id":"fatal/s/function-cmdsub-element","script":"f() { echo ${x?boom}; }; g() { x=$(f | cat; echo in:${PIPESTATUS[*]}); echo \"x=$x\"; }; g; echo st=$?","stdout":"x=in:1 0\nst=0\n","stderr":"s.sh: line 1: x: boom\n","status":0}

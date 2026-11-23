@@ -509,8 +509,10 @@ const FATALS: &[(&str, &str)] = &[
 	("bg-negated-simple-word", "! : \"${zz?u}\" & wait $!; echo st=$?"),
 	("bg-subshell-redir-word", "( : ) 2>\"${zz?u}\" & wait $!; echo st=$?"),
 	("element-group-redir-word", "{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}"),
-	// A job running a function reaches the command loop; a timed job is
-	// forked through `execute_in_subshell`, its own `top_level` (1).
+	// A job running a function reaches the command loop. A timed job is
+	// forked through `execute_in_subshell`, its own `top_level`, so what it
+	// runs ends there (1); but a timed compound's own redirection is
+	// expanded before that, at the fork's (127 with `-c`).
 	("bg-function-colon", "f() { echo ${x:?u}; }; f & wait $!; echo st=$?"),
 	("bg-timed-function", "TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?"),
 	("bg-timed-simple-word", "TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?"),
@@ -527,6 +529,41 @@ const FATALS: &[(&str, &str)] = &[
 	(
 		"bg-function-timed-inside",
 		"exec 2>/dev/null; f() { time echo ${x:?u}; }; f & wait $!; echo st=$?",
+	),
+	("bg-timed-group-redir-word", "TIMEFORMAT=; time { :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-timed-subshell-redir-word", "TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-if-redir-word",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-while-redir-word",
+		"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-for-redir-word",
+		"TIMEFORMAT=; time for x in 1; do :; done 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	(
+		"bg-timed-case-redir-word",
+		"TIMEFORMAT=; time case a in a) :;; esac 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	("bg-timed-cond-redir-word", "TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-timed-arith-redir-word", "TIMEFORMAT=; time (( 1 )) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-negated-group-redir-word",
+		"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" & wait $!; echo st=$?",
+	),
+	// Controls: piped (the job is a pipeline: `cat`'s status), and a word
+	// inside the timed compound (1).
+	(
+		"bg-timed-group-redir-word-piped",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat & wait $!; echo st=$?",
+	),
+	("bg-timed-group-inner-word", "TIMEFORMAT=; time { : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	(
+		"element-timed-group-redir-word",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}",
 	),
 	// No program runs (an external in flight skips a snapshot): these two
 	// also run under snapshots.

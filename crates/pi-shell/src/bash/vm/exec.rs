@@ -2302,8 +2302,9 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 /// forking shell when it forked): the command loop only when the forking
 /// shell's error would reach it too, so not for an element forked inside
 /// `( … )`, `$( )` or `<( )`. So do a negated simple job (`! f &`) and a
-/// compound element's or job's own redirection (`{ :; } 2>"$w" &`), which
-/// bash's child expands before it runs the compound. A background job that
+/// compound element's or job's own redirection (`{ :; } 2>"$w" &`, timed
+/// too: `time { :; } 2>"$w" &`), which bash's child expands before it runs
+/// the compound. A background job that
 /// is one async pipeline passes its stored answer on: bash forks that
 /// pipeline's elements from the shell itself ([`async_pipeline`]), so
 /// obash's job vproc stands for no fork of bash's. A nested shell (depth
@@ -2338,11 +2339,21 @@ pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 					.get(1)
 					.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }));
 		}
+		// The stage's first op past its words' substitution bodies, and
+		// past a `time` of the job's whole body (`[TimeStart] Redir Enter …`).
+		let first = |entry: u32| {
+			let at = skip_blocks(unit, entry);
+			if code(at) == Some(Opcode::TimeStart) {
+				skip_blocks(unit, at + 1)
+			} else {
+				at
+			}
+		};
 		let own_redir = vp.frames.len() == 1
 			&& code(pc) == Some(Opcode::Redir)
 			&& unit.spawns.iter().any(|s| {
 				matches!(s.kind, SpawnKind::Pipeline | SpawnKind::Background)
-					&& s.stages.iter().any(|st| skip_blocks(unit, st.entry) == pc)
+					&& s.stages.iter().any(|st| first(st.entry) == pc)
 			});
 		let async_job = vp.frames.len() == 1
 			&& unit.ops.get(pc as usize).is_some_and(|op| {
