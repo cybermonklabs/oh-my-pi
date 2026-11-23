@@ -170,6 +170,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const results = await Promise.all(
 		tasks.map(({ root, hookType }) =>
 			loadFilesFromDir<Hook>(ctx, path.join(root.path, "hooks", hookType), PROVIDER_ID, root.level, {
+				origin: root.origin,
 				transform: (name, _content, filePath, source) => {
 					const baseName = name.includes(".") ? name.slice(0, name.lastIndexOf(".")) : name;
 					const tool = baseName === "*" ? "*" : baseName;

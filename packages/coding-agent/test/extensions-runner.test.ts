@@ -89,7 +89,13 @@ describe("ExtensionRunner", () => {
 			.map(entry => path.join(extensionsDir, entry.name))
 			.sort();
 		const explicitPaths = configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath));
-		const result = await loadExtensions([...discoveredPaths, ...explicitPaths], tempDir.path());
+		const result = await loadExtensions(
+			[
+				...discoveredPaths.map(file => ({ path: file, scope: "project" as const })),
+				...explicitPaths.map(file => ({ path: file, scope: "explicit" as const })),
+			],
+			tempDir.path(),
+		);
 		const testRoots = [
 			extensionsDir,
 			...configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath)),

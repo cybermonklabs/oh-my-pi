@@ -10,8 +10,9 @@ import {
 	shareSession,
 } from "../src/export/share";
 import { SecretObfuscator } from "../src/secrets/obfuscator";
-import type { SessionEntry, SessionHeader } from "../src/session/session-entries";
+import type { SessionEntry, SessionHeader, SessionInitEntry } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import type { SubagentSpawnSpec } from "../src/task/spawn-spec";
 
 const IV_LENGTH = 12;
 const TEST_MAX_SEALED_BYTES = 4_000;
@@ -157,6 +158,61 @@ describe("buildShareSnapshot", () => {
 
 		expect(JSON.stringify(snapshot)).not.toContain(secret);
 		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("drops a subagent's spawn spec from its shared session_init and keeps the rest of the record", () => {
+		const contextMarker = "spawncontext-QWERTY";
+		const planMarker = "spawnplan-ASDFG";
+		const spawnSpec: SubagentSpawnSpec = {
+			v: 1,
+			model: "anthropic/claude-sonnet-4-5",
+			thinkingLevel: null,
+			perCallModel: false,
+			settings: { layers: { global: {}, overrides: {}, derived: false } },
+			tools: { mountedToolNames: [], keepTodo: false, customTools: [] },
+			policy: { cwd: "/work" },
+			identity: { agentId: "Child" },
+			prompt: {
+				id: "Child",
+				agentSystemPrompt: "agent prompt",
+				context: `shared background ${contextMarker}`,
+				planReference: `the plan ${planMarker}`,
+				planReferencePath: "local://PLAN.md",
+				worktree: "",
+				structured: true,
+				outputSchemaOverridesAgent: false,
+				ircEnabled: false,
+			},
+			wake: { agent: { name: "task", description: "", source: "bundled" } },
+		};
+		const init: SessionInitEntry = {
+			type: "session_init",
+			id: "si",
+			parentId: null,
+			timestamp: "2026-10-04T00:00:00.000Z",
+			systemPrompt: ["base"],
+			task: "work",
+			tools: ["read"],
+			agent: "task",
+		};
+		const shared = (entry: SessionInitEntry) => {
+			const sm = {
+				getHeader: () => sessionData([], "x").header,
+				getEntries: () => [entry],
+				getLeafId: () => "si",
+			} as unknown as SessionManager;
+			// Redaction runs only when the obfuscator holds a secret.
+			const obfuscator = new SecretObfuscator([{ type: "plain", content: "unrelated-secret-ZXCV" }]);
+			return JSON.parse(JSON.stringify(buildShareSnapshot(sm, { obfuscator }))) as SessionData;
+		};
+
+		const snapshot = shared({ ...init, spawnSpec });
+		const flat = JSON.stringify(snapshot);
+
+		expect(flat).not.toContain(contextMarker);
+		expect(flat).not.toContain(planMarker);
+		expect(snapshot.entries[0]).not.toHaveProperty("spawnSpec");
+		expect(snapshot).toEqual(shared(init));
 	});
 
 	test("redacts header cwd, bookmark labels, and file-mention paths", () => {

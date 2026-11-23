@@ -5,13 +5,16 @@ import * as path from "node:path";
 import { type ExtensionModule, extensionModuleCapability } from "@oh-my-pi/pi-coding-agent/capability/extension-module";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getCapability, initializeWithSettings } from "@oh-my-pi/pi-coding-agent/discovery";
+import { withOmpExtensionRootScope } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import {
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
 	loadExtensions,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import type { ExtensionPathEntry } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
-import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getProjectAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 import { filterUserScoped } from "./utils/filter-user-extensions";
 
 describe("extensions discovery", () => {
@@ -246,9 +249,8 @@ describe("extensions discovery", () => {
 		const permissionError = Object.assign(new Error("permission denied"), { code: "EACCES" });
 		const readdirSpy = vi.spyOn(fsPromises, "readdir").mockRejectedValueOnce(permissionError);
 		try {
-			await expect(
-				discoverExtensionPaths([packageDir], tempDir.path(), undefined, { ambient: false }),
-			).resolves.toEqual([path.join(sourceDir, "main.ts")]);
+			const entries = await discoverExtensionPaths([packageDir], tempDir.path(), undefined, { ambient: false });
+			expect(entries.map(entry => entry.path)).toEqual([path.join(sourceDir, "main.ts")]);
 		} finally {
 			readdirSpy.mockRestore();
 		}
@@ -695,10 +697,11 @@ describe("extensions discovery", () => {
 		const nativeExtensionPath = path.join(extensionsDir, "provider.ts");
 		fs.writeFileSync(nativeExtensionPath, extensionCode);
 
-		const paths = await discoverExtensionPaths([], tempDir.path(), undefined, {
+		const entries = await discoverExtensionPaths([], tempDir.path(), undefined, {
 			ambient: true,
 			includeAmbientHooks: false,
 		});
+		const paths = entries.map(entry => entry.path);
 
 		expect(paths).toContain(nativeExtensionPath);
 		expect(paths).not.toContain(hookPath);
@@ -744,12 +747,26 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(explicitPath, extensionCodeWithTool("explicit"));
 
 		// Use loadExtensions directly to skip discovery
-		const result = await loadExtensions([explicitPath], tempDir.path());
+		const result = await loadExtensions([{ path: explicitPath, scope: "explicit" }], tempDir.path());
 
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(1);
 		expect(result.extensions[0].tools.has("explicit")).toBe(true);
 		expect(result.extensions[0].tools.has("discovered")).toBe(false);
+	});
+
+	it("loads a bare extension path as the caller's explicit entry", async () => {
+		// A caller that passes a path string, not an entry, still loads it: as its own file, which a moved revive keeps.
+		const bare = tempDir.join("bare.ts");
+		fs.writeFileSync(bare, extensionCodeWithTool("bare"));
+
+		const result = await loadExtensions([bare], tempDir.path());
+
+		expect(result.errors).toEqual([]);
+		expect(result.extensions.flatMap(extension => [...extension.tools.keys()])).toEqual(["bare"]);
+		expect(result.preparedExtensions?.map(({ path, scope }) => ({ path, scope }))).toEqual([
+			{ path: bare, scope: "explicit" },
+		]);
 	});
 
 	it("discoverExtensionPaths only invokes the native extension-module provider (#4198)", async () => {
@@ -779,5 +796,84 @@ describe("extensions discovery", () => {
 		} finally {
 			for (const spy of spies) spy.mockRestore();
 		}
+	});
+
+	describe("the scope discoverExtensionPaths gives each entry", () => {
+		let settingsState: SettingsTestState;
+		let userExtensionsDir: string;
+
+		beforeEach(() => {
+			settingsState = beginSettingsTest();
+			setAgentDir(tempDir.join("agent"));
+			userExtensionsDir = path.join(getAgentDir(), "extensions");
+			fs.mkdirSync(userExtensionsDir, { recursive: true });
+		});
+		afterEach(() => {
+			restoreSettingsTestState(settingsState);
+		});
+
+		/** Each entry under this test's directory, as its file name and scope; a moved revive keeps only `explicit`. */
+		const scopes = (entries: ExtensionPathEntry[]) =>
+			filterUserScoped(entries, tempDir.path()).map(entry => [path.basename(entry.path), entry.scope] as const);
+		const discoverScopes = async (configuredPaths: string[]) =>
+			scopes(await discoverExtensionPaths(configuredPaths, tempDir.path(), undefined, { ambient: true }));
+
+		it("is project for a native project module", async () => {
+			fs.writeFileSync(path.join(extensionsDir, "own.ts"), extensionCode);
+
+			expect(await discoverScopes([])).toEqual([["own.ts", "project"]]);
+		});
+
+		it("is user for an agent-directory module", async () => {
+			fs.writeFileSync(path.join(userExtensionsDir, "mine.ts"), extensionCode);
+
+			expect(await discoverScopes([])).toEqual([["mine.ts", "user"]]);
+		});
+
+		it("is explicit for a configured path", async () => {
+			const configured = tempDir.join("configured.ts");
+			fs.writeFileSync(configured, extensionCode);
+
+			expect(await discoverScopes([configured])).toEqual([["configured.ts", "explicit"]]);
+		});
+
+		it("is explicit, in one entry, for a project module also passed explicitly", async () => {
+			// Found first as the project's own, then as an explicit path: the user chose it, so a moved revive keeps it.
+			const both = path.join(extensionsDir, "both.ts");
+			fs.writeFileSync(both, extensionCode);
+
+			expect(await discoverScopes([both])).toEqual([["both.ts", "explicit"]]);
+		});
+
+		it("is explicit for an explicit or configured package root's hooks; a native hook keeps its level", async () => {
+			const projectConfigDir = getProjectAgentDir(tempDir.path());
+			const explicitRoot = tempDir.join("explicit-package");
+			const configuredRoot = tempDir.join("configured-package");
+			const hooks = [
+				path.join(projectConfigDir, "hooks", "pre", "native.ts"),
+				path.join(explicitRoot, "hooks", "pre", "from-explicit.ts"),
+				path.join(configuredRoot, "hooks", "pre", "from-configured.ts"),
+			];
+			for (const hook of hooks) {
+				fs.mkdirSync(path.dirname(hook), { recursive: true });
+				fs.writeFileSync(hook, extensionCode);
+			}
+			// The project's `extensions` setting, which hook discovery reads from disk outside a session.
+			fs.writeFileSync(
+				path.join(projectConfigDir, "config.yml"),
+				`extensions: ${JSON.stringify([configuredRoot])}\n`,
+			);
+
+			// A session's `--extension` roots reach hook discovery through its invocation scope.
+			const entries = await withOmpExtensionRootScope([explicitRoot], "merge", () =>
+				discoverExtensionPaths([explicitRoot, configuredRoot], tempDir.path(), undefined, { ambient: true }),
+			);
+
+			expect(Object.fromEntries(scopes(entries))).toEqual({
+				"native.ts": "project",
+				"from-explicit.ts": "explicit",
+				"from-configured.ts": "explicit",
+			});
+		});
 	});
 });

@@ -15,11 +15,13 @@ import {
 	CURRENT_SESSION_VERSION,
 	type SessionEntry,
 	type SessionHeader,
+	type SessionInitEntry,
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { SubagentSpawnSpec } from "@oh-my-pi/pi-coding-agent/task/spawn-spec";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { isTaskToolDetails, type TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { getAgentDir, getTerminalSessionsDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
@@ -145,6 +147,68 @@ describe("SessionManager.forkFrom", () => {
 		expect(await Bun.file(path.join(forkArtifactsDir, "1.read.log")).text()).toBe("tool output");
 		expect(await Bun.file(path.join(forkArtifactsDir, "nested", "result.txt")).text()).toBe("nested output");
 		expect(await Bun.file(path.join(sourceArtifactsDir, "1.read.log")).text()).toBe("tool output");
+	});
+
+	it("a plain fork of a subagent transcript keeps its session_init's spawn spec", async () => {
+		using tempDir = TempDir.createSync("@omp-session-fork-spawn-spec-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const sourceFile = path.join(sessionDir, "source.jsonl");
+		const timestamp = new Date().toISOString();
+		const spawnSpec: SubagentSpawnSpec = {
+			v: 1,
+			model: "anthropic/claude-sonnet-4-5",
+			thinkingLevel: null,
+			perCallModel: false,
+			settings: { layers: { global: {}, overrides: {}, derived: false } },
+			tools: { toolNames: ["read"], mountedToolNames: [], keepTodo: false, customTools: [] },
+			policy: { cwd, taskDepth: 1 },
+			identity: { agentId: "Child", parentAgentId: "Main" },
+			prompt: {
+				id: "Child",
+				agentSystemPrompt: "agent prompt",
+				context: "",
+				planReference: "",
+				planReferencePath: "",
+				worktree: "",
+				structured: true,
+				outputSchemaOverridesAgent: false,
+				ircEnabled: false,
+			},
+			wake: { agent: { name: "task", description: "", source: "bundled" } },
+		};
+		const sourceHeader: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "subagent-source",
+			timestamp,
+			cwd,
+		};
+		const init: SessionInitEntry = {
+			type: "session_init",
+			id: "child-init",
+			parentId: null,
+			timestamp,
+			systemPrompt: ["child prompt"],
+			task: "child task",
+			tools: ["read"],
+			agent: "task",
+			spawnSpec,
+		};
+		await Bun.write(sourceFile, `${[sourceHeader, init].map(entry => JSON.stringify(entry)).join("\n")}\n`);
+
+		const plain = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+			copyArtifacts: false,
+			suppressBreadcrumb: true,
+		});
+		try {
+			const plainFile = plain.getSessionFile();
+			if (!plainFile) throw new Error("expected forked session file");
+			expect((await SessionManager.peekSessionInit(plainFile))?.init?.spawnSpec).toEqual(spawnSpec);
+		} finally {
+			await plain.close();
+		}
 	});
 
 	it("does not copy artifacts when the caller opts out", async () => {

@@ -19,6 +19,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -84,8 +85,11 @@ const thinking = { mode: "effort", efforts: [Effort.Medium, Effort.High] } as co
  * the `read` results and efforts each model saw when the cut-off call ran again.
  * `handoff` records a prewalk handoff to `high` effort before the cut-off call;
  * `fallback` follows that handoff with a retry fallback hop back to the spawn model.
+ * `settings` go over the restoring process's settings.
  */
-async function restoreInterruptedChild(options: { transcript?: "handoff" | "fallback" } = {}) {
+async function restoreInterruptedChild(
+	options: { transcript?: "handoff" | "fallback"; settings?: Readonly<Record<string, unknown>> } = {},
+) {
 	const cwd = path.join(root, "home", "work");
 	await fs.mkdir(cwd, { recursive: true });
 	const notes = path.join(cwd, "notes.txt");
@@ -171,6 +175,7 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		"advisor.enabled": false,
 		modelRoles: { default: `mock/${SPAWN_MODEL}` },
 		defaultThinkingLevel: Effort.Medium,
+		...options.settings,
 	});
 	const session = {
 		sessionManager: {
@@ -225,4 +230,20 @@ it("revives a subagent whose handoff target failed over on the spawn model, not 
 	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
 	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
 	expect(readResults[HANDOFF_MODEL]).toEqual([]);
+}, 20_000);
+
+it("omp --restore of a subagent whose record has no spawn spec runs its turn on the record's agent and the live wake limit", async () => {
+	const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn");
+	const { delivered } = await restoreInterruptedChild({ settings: { "task.maxRuntimeMs": 60_000 } });
+
+	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
+	expect(followUp).toHaveBeenCalledTimes(1);
+	const [turn] = followUp.mock.calls[0] ?? [];
+	// The record's own agent name and prompt, with the runtime-neutral source and no spawn's description,
+	// index or spawning tool call; the live wake limit.
+	expect(turn?.agent).toEqual({ name: AGENT_ID, description: "", systemPrompt: "test", source: "user" });
+	expect(turn?.description).toBeUndefined();
+	expect(turn?.index ?? 0).toBe(0);
+	expect(turn?.parentToolCallId).toBeUndefined();
+	expect(turn?.maxRuntimeMs).toBe(60_000);
 }, 20_000);

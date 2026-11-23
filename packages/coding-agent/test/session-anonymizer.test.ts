@@ -262,6 +262,22 @@ describe("SessionAnonymizer", () => {
 		expect(mounted[1]).toBe(tools[2]);
 	});
 
+	test("keeps a session_init's spawn spec as an opaque marker under its own key", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "session_init",
+			spawnSpec: {
+				v: 1,
+				model: "anthropic/claude-sonnet-4-5",
+				prompt: { context: "the launch codes are hunter2", planReference: "invoiceParser rewrite" },
+			},
+		});
+
+		expect(at(result, "spawnSpec")).toMatch(/^\[redacted #\d+: \d+ chars, 1 line\]$/);
+		const json = JSON.stringify(result);
+		for (const secret of ["hunter2", "invoiceParser", "claude-sonnet"]) expect(json).not.toContain(secret);
+	});
+
 	test("rewrites shell commands keeping programs, flags, and operators", () => {
 		const anonymizer = new SessionAnonymizer();
 		const out = anonymizer.command(
