@@ -87,7 +87,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				None => unblock(k, cx, vp),
 			}
 		}
-		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
+		// A builtin parked on its take-in (`Kernel::asking`) is still in its
+		// command, with the command's redirections: a trap waits until the
+		// command is over, as bash runs a trap between commands.
+		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY
+			&& !vp.waiting_foreground()
+			&& !k.asking(vp.vpid)
+		{
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.frames.iter().any(|frame| {
 					matches!(frame.kind, FrameKind::Script {

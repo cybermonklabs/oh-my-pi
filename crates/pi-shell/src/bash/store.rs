@@ -216,6 +216,9 @@ pub enum Table {
 	/// [`Record::Alias`]); regular aliases are [`Table::Alias`] in every
 	/// dialect.
 	ZshAlias,
+	/// The statuses the root shell keeps for background jobs that left the
+	/// table (bash's bgp list; [`Key::BgPid`]).
+	BgPid,
 }
 
 crate::bash::packed_names::packed_names!(Table, Display);
@@ -263,6 +266,11 @@ pub enum Key<'a> {
 		/// Alias name or suffix.
 		name:   &'a BStr,
 	},
+	/// A status the root shell keeps for a background job that left the
+	/// table, `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed
+	/// it; `SEQ` its place in the kept order, oldest first): `wait PID`
+	/// finds it (bash `bgp_search`).
+	BgPid(Vpid),
 }
 
 impl Key<'_> {
@@ -283,13 +291,14 @@ impl Key<'_> {
 			Self::Local { .. } => Table::Local,
 			Self::ZshOpt(_) => Table::ZshOpt,
 			Self::ZshAlias { .. } => Table::ZshAlias,
+			Self::BgPid(_) => Table::BgPid,
 		}
 	}
 
 	/// Whether a fork copies this record into the child's
 	/// [`crate::bash::Image`] (see [`MiscKey::forked`]). The process table,
-	/// the root's job table (a field of each vproc) and the root's scopes
-	/// are not.
+	/// the root's job table and kept statuses (fields of each vproc) and the
+	/// root's scopes are not.
 	pub const fn forked(&self) -> bool {
 		match self {
 			Self::Var(_)
@@ -302,7 +311,9 @@ impl Key<'_> {
 			| Self::ZshOpt(_)
 			| Self::ZshAlias { .. } => true,
 			Self::Misc(m) => m.forked(),
-			Self::Job(_) | Self::Proc(_) | Self::Scope(_) | Self::Local { .. } => false,
+			Self::Job(_) | Self::Proc(_) | Self::Scope(_) | Self::Local { .. } | Self::BgPid(_) => {
+				false
+			},
 		}
 	}
 
@@ -323,6 +334,7 @@ impl Key<'_> {
 			Self::Local { depth, name } => KeyBuf::Local { depth, name: name.into() },
 			Self::ZshOpt(o) => KeyBuf::ZshOpt(o),
 			Self::ZshAlias { suffix, name } => KeyBuf::ZshAlias { suffix, name: name.into() },
+			Self::BgPid(p) => KeyBuf::BgPid(p),
 		}
 	}
 }
@@ -378,6 +390,8 @@ pub enum KeyBuf {
 		/// Alias name or suffix.
 		name:   BString,
 	},
+	/// See [`Key::BgPid`].
+	BgPid(Vpid),
 }
 
 impl KeyBuf {
@@ -400,6 +414,7 @@ impl KeyBuf {
 			Self::ZshAlias { suffix, name } => {
 				Key::ZshAlias { suffix: *suffix, name: BStr::new(name) }
 			},
+			Self::BgPid(p) => Key::BgPid(*p),
 		}
 	}
 }
@@ -1785,6 +1800,7 @@ mod tests {
 			Key::Local { depth: 1, name: BStr::new("x") },
 			Key::ZshOpt(ZshOpt::Extendedglob),
 			Key::ZshAlias { suffix: true, name: BStr::new("txt") },
+			Key::BgPid(Vpid(9)),
 		];
 		for key in keys {
 			assert_eq!(s.hash_one(key), s.hash_one(key.to_buf()), "{key:?}");

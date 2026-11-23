@@ -24,6 +24,7 @@ mod empty_name;
 mod errexit;
 mod events;
 mod executor;
+mod exits_taken_in;
 mod expand;
 mod getopts;
 mod host_hooks;
