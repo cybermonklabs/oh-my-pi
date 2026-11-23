@@ -678,6 +678,7 @@ fn write_now(
 		return Err((0, 0, super::proc::HandedOff::default()));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
+	let mut key = vp.write_key.lock();
 	for (i, c) in chunks.iter().enumerate() {
 		let Chunk::Out(fd, bytes) = c else {
 			unreachable!("checked above");
@@ -685,7 +686,7 @@ fn write_now(
 		let handle = vp.fds.handle(*fd);
 		let mut off = 0;
 		while off < bytes.len() {
-			match handle.poll_write_marked(&mut tcx, &bytes[off..]) {
+			match handle.poll_write_marked_keyed(&mut tcx, &bytes[off..], &mut key) {
 				Poll::Ready(Ok((n, None))) if n > 0 => off += n,
 				Poll::Ready(Ok((n, Some(mark)))) if n > 0 => {
 					let handed = super::proc::HandedOff { file: Some(handle), mark: Some(mark) };
@@ -4789,6 +4790,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 	st(vp).writes.front()?;
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
+	let key = Arc::clone(&vp.write_key);
 	loop {
 		let fd = st(vp).writes.front()?.fd;
 		let handle = vp.fds.handle(fd);
@@ -4823,7 +4825,10 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 			}
 			continue;
 		}
-		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
+		// The guard goes before the arms, which may write diagnostics.
+		let polled =
+			handle.poll_write_marked_keyed(&mut tcx, &pending.bytes[pending.off..], &mut key.lock());
+		match polled {
 			Poll::Ready(Ok((written, mark))) if written > 0 => {
 				pending.off += written;
 				pending.handed.mark = mark;

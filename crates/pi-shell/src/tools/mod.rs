@@ -455,15 +455,21 @@ impl Child {
 
 /// Output a tool writes to the caller's fds, in order, without blocking:
 /// each entry's fd, the bytes still to write, and the mark of the chunk a
-/// writer thread took last.
+/// writer thread took last; written under a key of the call's own
+/// ([`ShellApi::write_keyed`]), which goes with the call, so a call dropped
+/// while its write waits (a cancelled run, a killed shell) leaves nothing
+/// behind for the vproc's next write.
 #[derive(Default)]
-struct Out(VecDeque<(i32, Vec<u8>, Option<crate::bash::Mark>)>);
+struct Out {
+	queue: VecDeque<(i32, Vec<u8>, Option<crate::bash::Mark>)>,
+	key:   crate::sys::WaitKey,
+}
 
 impl Out {
 	fn push(&mut self, fd: i32, bytes: impl Into<Vec<u8>>) {
 		let bytes = bytes.into();
 		if !bytes.is_empty() {
-			self.0.push_back((fd, bytes, None));
+			self.queue.push_back((fd, bytes, None));
 		}
 	}
 
@@ -474,12 +480,12 @@ impl Out {
 	/// until its fd has settled, so what runs after the tool comes after its
 	/// output.
 	fn flush(&mut self, api: &mut ShellApi<'_, '_>) -> bool {
-		while let Some((fd, bytes, mark)) = self.0.front_mut() {
+		while let Some((fd, bytes, mark)) = self.queue.front_mut() {
 			if let Some(taken) = mark {
 				match api.settle_marked(*fd, std::slice::from_ref(taken)) {
 					IoPoll::Ready(Ok(())) => *mark = None,
 					IoPoll::Ready(Err(_)) => {
-						self.0.pop_front();
+						self.queue.pop_front();
 						continue;
 					},
 					IoPoll::WouldBlock(_) => return false,
@@ -488,19 +494,19 @@ impl Out {
 			if bytes.is_empty() {
 				match api.settle(*fd) {
 					IoPoll::Ready(_) => {
-						self.0.pop_front();
+						self.queue.pop_front();
 					},
 					IoPoll::WouldBlock(_) => return false,
 				}
 				continue;
 			}
-			match api.write_marked(*fd, bytes) {
+			match api.write_marked(*fd, bytes, &mut self.key) {
 				IoPoll::Ready(Ok((n, taken))) if n > 0 => {
 					bytes.drain(..n);
 					*mark = taken;
 				},
 				IoPoll::Ready(_) => {
-					self.0.pop_front();
+					self.queue.pop_front();
 				},
 				IoPoll::WouldBlock(_) => return false,
 			}

@@ -276,18 +276,20 @@ enum LineAt {
 }
 
 /// Write `bytes` from `*off` until all of it is out of the shell, as zsh's
-/// blocking `write` does ([`crate::bash::FdRef::poll_write_out`]): `Pending`
-/// while the descriptor does not take it or its writer thread has not
-/// written what it took. A failed write ends it: zsh does not check these.
+/// blocking `write` does ([`crate::bash::FdRef::poll_write_out_keyed`],
+/// with the vproc's key): `Pending` while the descriptor does not take it
+/// or its writer thread has not written what it took. A failed write ends
+/// it: zsh does not check these.
 fn write_whole(
 	tcx: &mut Context<'_>,
 	h: &FdRef,
 	bytes: &[u8],
 	off: &mut usize,
 	unsettled: &mut crate::bash::Unsettled,
+	key: &mut crate::sys::WaitKey,
 ) -> Poll<()> {
 	while *off < bytes.len() {
-		match h.poll_write_out(tcx, &bytes[*off..], unsettled) {
+		match h.poll_write_out_keyed(tcx, &bytes[*off..], unsettled, key) {
 			Poll::Ready(Ok(n)) if n > 0 => *off += n,
 			Poll::Ready(_) => break,
 			Poll::Pending => return Poll::Pending,
@@ -508,7 +510,11 @@ pub fn perform(
 				return Ok(ZftpAns::Wrote(Err(Fail::timeout())));
 			}
 			let unsettled = &mut l.unsettled;
-			match vp.fds.handle(*fd).poll_write_out(tcx, data, unsettled) {
+			let polled =
+				vp.fds
+					.handle(*fd)
+					.poll_write_out_keyed(tcx, data, unsettled, &mut vp.write_key.lock());
+			match polled {
 				Poll::Ready(Ok(n)) => ZftpAns::Wrote(Ok(n)),
 				Poll::Ready(Err(e)) => ZftpAns::Wrote(Err(Fail::of(&e))),
 				Poll::Pending => return Err(WaitKey::Write { fd: *fd }),
@@ -521,8 +527,9 @@ pub fn perform(
 				_ => 0,
 			};
 			let h = vp.fds.handle(*fd);
+			let mut key = vp.write_key.lock();
 			while off < data.len() {
-				match h.poll_write_out(tcx, &data[off..], &mut l.unsettled) {
+				match h.poll_write_out_keyed(tcx, &data[off..], &mut l.unsettled, &mut key) {
 					Poll::Ready(Ok(n)) if n > 0 => off += n,
 					Poll::Ready(_) => break,
 					Poll::Pending => {
@@ -553,7 +560,8 @@ pub fn perform(
 				// writer thread still holds the one before, it waits, under the
 				// line's timeout as zsh's `zfalarm` covers that write.
 				if let LineAt::Answer(cmd, mut off) = st.at {
-					let polled = write_whole(tcx, &h, &cmd, &mut off, unsettled);
+					let polled =
+						write_whole(tcx, &h, &cmd, &mut off, unsettled, &mut vp.write_key.lock());
 					st.at = LineAt::Answer(cmd, off);
 					if polled.is_pending() {
 						if timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
@@ -701,7 +709,9 @@ pub fn perform(
 				Step::Urgent(off) => off,
 				_ => 0,
 			};
-			if write_whole(tcx, &h, &[IAC, IP, IAC], &mut off, &mut l.unsettled).is_pending() {
+			let urgent = [IAC, IP, IAC];
+			let mut key = vp.write_key.lock();
+			if write_whole(tcx, &h, &urgent, &mut off, &mut l.unsettled, &mut key).is_pending() {
 				l.step = Step::Urgent(off);
 				return Err(WaitKey::Write { fd: *fd });
 			}
@@ -983,7 +993,12 @@ impl Xfer {
 						// zsh `zfwrite_block`: the header in one write.
 						let len = end - off;
 						let h = [0, (len >> 8) as u8, (len & 0xff) as u8];
-						let polled = hout.poll_write_out(tcx, &h, &mut self.unsettled);
+						let polled = hout.poll_write_out_keyed(
+							tcx,
+							&h,
+							&mut self.unsettled,
+							&mut vp.write_key.lock(),
+						);
 						let r = match self.call(tcx, cx, wtmout, polled) {
 							Poll::Ready(r) => r,
 							Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
@@ -1013,7 +1028,12 @@ impl Xfer {
 						}
 						continue;
 					}
-					let polled = hout.poll_write_out(tcx, &self.buf[off..end], &mut self.unsettled);
+					let polled = hout.poll_write_out_keyed(
+						tcx,
+						&self.buf[off..end],
+						&mut self.unsettled,
+						&mut vp.write_key.lock(),
+					);
 					let r = match self.call(tcx, cx, wtmout, polled) {
 						Poll::Ready(r) => r,
 						Poll::Pending => return Err(WaitKey::Write { fd: fdout }),

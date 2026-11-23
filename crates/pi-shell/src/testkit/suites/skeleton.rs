@@ -213,7 +213,7 @@ fn rig_with_callouts() -> Rig {
 		"greet",
 		Arc::new(|api: &mut ShellApi<'_, '_>, argv: &[BString]| {
 			let msg = format!("hi {}\n", String::from_utf8_lossy(&argv[1]));
-			match api.write(1, msg.as_bytes()) {
+			match api.write_keyed(1, msg.as_bytes(), &mut crate::sys::WaitKey::default()) {
 				IoPoll::Ready(Ok(n)) if n == msg.len() => CallOutcome::Exit(0),
 				_ => CallOutcome::Error("short write".into()),
 			}

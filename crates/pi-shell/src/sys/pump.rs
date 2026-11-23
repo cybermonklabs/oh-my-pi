@@ -78,22 +78,35 @@ impl End {
 	/// Linux cannot reopen a socket through `/dev/fd/N` (`cat <(…)`, ENXIO).
 	pub fn direction(&mut self) -> (bool, bool) {
 		let mut cx = Context::from_waker(Waker::noop());
-		let readable = !matches!(self.poll_read(&mut cx, &mut []), Poll::Ready(Err(_)));
-		let writable = !matches!(self.poll_write_marked(&mut cx, &[]), Poll::Ready(Err(_)));
+		let readable =
+			!matches!(self.poll_read(&mut cx, &mut [], &mut WaitKey::default()), Poll::Ready(Err(_)));
+		let writable = !matches!(
+			self.poll_write_marked(&mut cx, &[], &mut WaitKey::default()),
+			Poll::Ready(Err(_))
+		);
 		(readable, writable)
 	}
 }
 
-/// Pollable I/O on either side of a pump.
+/// Pollable I/O on either side of a pump. `key` is the pump's own wait on
+/// an engine object that the engine and other tasks may wait on too
+/// ([`File::poll_read_keyed`]); a copy keeps one per direction.
 pub(super) trait PollIo {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>>;
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 	/// A write, with the mark of the chunk a writer thread took
-	/// ([`File::poll_write_marked`]; `None` when it wrote as it took).
+	/// ([`File::poll_write_keyed`]; `None` when it wrote as it took), as the
+	/// task `key` names.
 	fn poll_write_marked(
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>>;
 	/// Ready once the chunks of `marks` are out, with their first error
 	/// ([`File::poll_settle_marked`]).
@@ -104,10 +117,15 @@ pub(super) trait PollIo {
 }
 
 impl PollIo for End {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		match self {
-			Self::Fd(f) => f.poll_read(cx, buf),
-			Self::File(f) => f.poll_read(cx, buf),
+			Self::Fd(f) => f.poll_read_keyed(cx, buf, key),
+			Self::File(f) => f.poll_read_keyed(cx, buf, key),
 		}
 	}
 
@@ -122,10 +140,11 @@ impl PollIo for End {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		match self {
-			Self::Fd(f) => f.poll_write_marked(cx, buf),
-			Self::File(f) => f.poll_write_marked(cx, buf),
+			Self::Fd(f) => f.poll_write_marked_keyed(cx, buf, key),
+			Self::File(f) => f.poll_write_keyed(cx, buf, None, key),
 		}
 	}
 
@@ -146,7 +165,12 @@ impl PollIo for End {
 }
 
 impl PollIo for OsPipe {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		_key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		Self::poll_read(self, cx, buf)
 	}
 
@@ -155,6 +179,7 @@ impl PollIo for OsPipe {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		_key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		Self::poll_write(self, cx, buf).map_ok(|n| (n, None))
 	}
@@ -193,11 +218,20 @@ struct Chunk {
 	/// The chunk a writer thread of `dst` took last: settled before the next
 	/// one goes, and its failure is `dst`'s refusal.
 	mark:  Option<Mark>,
+	/// This copy's wait on its engine-side object (only one side is one).
+	key:   WaitKey,
 }
 
 impl Chunk {
 	fn new() -> Self {
-		Self { buf: vec![0; BUF].into_boxed_slice(), start: 0, end: 0, eof: false, mark: None }
+		Self {
+			buf:   vec![0; BUF].into_boxed_slice(),
+			start: 0,
+			end:   0,
+			eof:   false,
+			mark:  None,
+			key:   WaitKey::default(),
+		}
 	}
 
 	/// Read but not written yet.
@@ -233,7 +267,7 @@ impl Chunk {
 					let _ = std::task::ready!(dst.poll_flush(cx));
 					return Poll::Ready(());
 				}
-				let read = match src.poll_read(cx, &mut self.buf) {
+				let read = match src.poll_read(cx, &mut self.buf, &mut self.key) {
 					Poll::Ready(read) => read,
 					Poll::Pending => {
 						// Nothing to copy now: what `dst` took moves on out
@@ -259,7 +293,11 @@ impl Chunk {
 			if !std::task::ready!(self.settle(cx, dst)) {
 				return Poll::Ready(());
 			}
-			match std::task::ready!(dst.poll_write_marked(cx, &self.buf[self.start..self.end])) {
+			match std::task::ready!(dst.poll_write_marked(
+				cx,
+				&self.buf[self.start..self.end],
+				&mut self.key
+			)) {
 				Ok((n, mark)) if n > 0 => {
 					self.start += n;
 					self.mark = mark;
@@ -860,6 +898,42 @@ mod tests {
 				assert_eq!(failed, 1, "chunks handed off after the first one failed");
 			},
 		);
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the pump's
+	// key. A pump copying a program's output into an engine object that the
+	// engine writes too waits there with its copy's key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_pump_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = FdRef::from_file(Box::new(writer));
+		let (mut ours, child) = os::pipe(false).unwrap();
+		(&child).write_all(b"x").unwrap();
+		let mut dst = End::Fd(sink.clone());
+		let mut chunk = Chunk::new();
+		let (pump, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (pw, ew) = (Waker::from(Arc::clone(&pump)), Waker::from(Arc::clone(&engine)));
+		assert!(
+			chunk
+				.poll_copy(&mut Context::from_waker(&pw), &mut ours, &mut dst)
+				.is_pending(),
+			"no room"
+		);
+		assert_eq!(chunk.pending(), b"x", "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		pump.wait("the pump, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
 	}
 
 	#[derive(Default)]

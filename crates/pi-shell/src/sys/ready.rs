@@ -3,8 +3,10 @@
 //! The other end of a FIFO, a `/dev/fd/N` or a socket may be a vproc of the
 //! same engine, so a `read(2)` or `write(2)` that waits in the kernel would
 //! deadlock the scheduler. [`StdFile`](crate::sys::StdFile) therefore asks
-//! [`now`] first and only does I/O that cannot wait; otherwise it registers
-//! the engine waker with [`watch`] and returns `Pending`.
+//! [`now`] first and only does I/O that cannot wait; otherwise the polling
+//! task waits by its key beside the other tasks waiting in that direction
+//! ([`Wakers`](crate::sys::Wakers)), the first registers one [`watch`] whose
+//! waker wakes them all, and the poll returns `Pending`.
 //!
 //! The descriptor's flags are never changed: `O_NONBLOCK` lives on the open
 //! file description, which externals inherit and other processes may share.
@@ -75,6 +77,14 @@ pub fn write_room(fd: RawFd) -> usize {
 		0 if failed(fd) => WRITE_CHUNK,
 		free => free.min(WRITE_CHUNK),
 	}
+}
+
+/// Test only: what a pipe holds when empty (`F_GETPIPE_SZ`).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub fn pipe_capacity(fd: RawFd) -> usize {
+	// SAFETY: `F_GETPIPE_SZ` takes no argument; `fd` is the caller's open
+	// descriptor.
+	usize::try_from(unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) }).expect("F_GETPIPE_SZ")
 }
 
 /// Whether `fd` reports an error or a hang-up now (a pipe's write end whose
@@ -316,6 +326,8 @@ fn run(mut wake: PipeReader) {
 			// Data is present, so this read returns at once.
 			let _ = wake.read(&mut drain);
 		}
+		#[cfg(test)]
+		let held = DISPATCH.lock();
 		let mut woken = Vec::with_capacity(ready.len());
 		let now = Instant::now();
 		POLLER.timers.lock().retain(|(at, waker)| {
@@ -336,6 +348,8 @@ fn run(mut wake: PipeReader) {
 				}
 			});
 		}
+		#[cfg(test)]
+		drop(held);
 		for w in woken {
 			w.wake();
 		}
@@ -348,6 +362,19 @@ fn poll_timeout(timeout: Option<Duration>) -> libc::c_int {
 	timeout.map_or(-1, |d| {
 		libc::c_int::try_from(d.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
 	})
+}
+
+/// Test only: taken by the readiness thread between finding watched
+/// descriptors ready and taking their registrations ([`hold_wakes`]).
+#[cfg(test)]
+static DISPATCH: Mutex<()> = Mutex::new(());
+
+/// Test only: while the guard lives, the readiness thread wakes nobody. It
+/// stops before it takes the registrations it found ready, so a test can
+/// poll a file that is ready before the file's earlier waiters are woken.
+#[cfg(test)]
+pub(crate) fn hold_wakes() -> parking_lot::MutexGuard<'static, ()> {
+	DISPATCH.lock()
 }
 
 /// Wait until the wake pipe or a watched fd is ready, or `timeout` passed:

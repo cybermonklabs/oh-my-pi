@@ -146,6 +146,8 @@ struct Relay {
 	/// The grace ended and the decoder released what it held: the drain no
 	/// longer waits on held bytes.
 	released: bool,
+	/// The relay's wait on its sink, which the engine may wait on too.
+	key:      WaitKey,
 }
 
 impl Relay {
@@ -164,6 +166,7 @@ impl Relay {
 			target: None,
 			grace: None,
 			released: false,
+			key: WaitKey::default(),
 		}
 	}
 
@@ -193,7 +196,11 @@ impl Relay {
 				} else {
 					&self.buf[..self.raw_len]
 				};
-				match std::task::ready!(self.sink.poll_write_marked(cx, &bytes[self.sent..])) {
+				match std::task::ready!(self.sink.poll_write_marked(
+					cx,
+					&bytes[self.sent..],
+					&mut self.key
+				)) {
 					Ok((n, mark)) if n > 0 => {
 						self.sent += n;
 						self.mark = mark;
@@ -1332,5 +1339,35 @@ mod refusal_tests {
 				drop(filler);
 			},
 		);
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the relay's
+	// key. A relay writing a program's output into an engine object that the
+	// engine writes too waits there with its own key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_relay_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = crate::bash::FdRef::from_file(Box::new(writer));
+		let (pipe, mut program) = os::pipe(false).unwrap();
+		program.write_all(b"x").unwrap();
+		let mut relay = Relay::new(pipe, None, End::Fd(sink.clone()));
+		let (relayed, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (rw, ew) = (Waker::from(Arc::clone(&relayed)), Waker::from(Arc::clone(&engine)));
+		assert!(relay.poll(&mut Context::from_waker(&rw)).is_pending(), "no room");
+		assert_eq!(relay.raw_len, 1, "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		relayed.wait("the relay, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
 	}
 }

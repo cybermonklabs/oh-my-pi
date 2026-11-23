@@ -280,6 +280,61 @@ impl FdRef {
 		}
 	}
 
+	/// [`Self::poll_read`] for a host task that may wait beside the engine
+	/// and other tasks on this object: `key`, which the task's future holds,
+	/// keeps its wait apart ([`File::poll_read_keyed`]).
+	pub fn poll_read_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_read_keyed(cx, buf, key),
+			None => Poll::Ready(Ok(0)),
+		}
+	}
+
+	/// [`Self::poll_write`] for a writer that may wait beside others, as
+	/// [`Self::poll_read_keyed`]. A chunk a writer thread took is not
+	/// settled here: a writer that needs its error writes with
+	/// [`Self::poll_write_out_keyed`].
+	pub fn poll_write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self
+			.poll_write_marked_keyed(cx, bytes, key)
+			.map_ok(|(n, _)| n)
+	}
+
+	/// [`Self::poll_write_keyed`] with the mark of the chunk a writer thread
+	/// took ([`File::poll_write_keyed`]); the caller settles it.
+	pub fn poll_write_marked_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self.write_keyed(cx, bytes, None, key)
+	}
+
+	/// [`Self::poll_write_marked_keyed`] attributed to `tag`.
+	fn write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_keyed(cx, bytes, tag, key),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
 	/// Attribute successful visible writes to `tag` using a trace-only heap
 	/// wrapper. Non-observed handles are returned unchanged; retagging
 	/// replaces rather than nests wrappers. Shared-description identity,
@@ -414,6 +469,24 @@ impl FdRef {
 		}
 	}
 
+	/// [`Self::poll_write_out`] as the writer `key` names
+	/// ([`File::poll_write_keyed`]): a write part way keeps its progress by
+	/// its key (a zsh multios tee, a provider file), and the write is done
+	/// only once its bytes are out of the shell.
+	pub fn poll_write_out_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		unsettled: &mut Unsettled,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => unsettled.poll_write_file_keyed(f, cx, buf, key),
+			// Closed since its chunk was taken: that chunk is the thread's.
+			None => Poll::Ready(unsettled.0.take().map(|(n, _)| n).ok_or_else(bad_fd)),
+		}
+	}
+
 	/// Kind of the underlying object; `None` when closed or lost.
 	pub fn kind(&self) -> Option<FileKind> {
 		self.0.state.lock().file_ref().map(File::kind)
@@ -490,8 +563,31 @@ impl Unsettled {
 		cx: &mut Context<'_>,
 		buf: &[u8],
 	) -> Poll<io::Result<usize>> {
+		self.poll_with(file, cx, |file, cx| file.poll_write_marked(cx, buf))
+	}
+
+	/// [`Self::poll_write_file`] as the writer `key` names
+	/// ([`File::poll_write_keyed`]).
+	pub fn poll_write_file_keyed(
+		&mut self,
+		file: &mut dyn File,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.poll_with(file, cx, |file, cx| file.poll_write_keyed(cx, buf, None, key))
+	}
+
+	/// Write with `write` unless a chunk is still unsettled, then settle the
+	/// chunk a writer thread took, with its error, before it is counted.
+	fn poll_with(
+		&mut self,
+		file: &mut dyn File,
+		cx: &mut Context<'_>,
+		write: impl FnOnce(&mut dyn File, &mut Context<'_>) -> Poll<io::Result<(usize, Option<Mark>)>>,
+	) -> Poll<io::Result<usize>> {
 		if self.0.is_none() {
-			match std::task::ready!(file.poll_write_marked(cx, buf)) {
+			match std::task::ready!(write(file, cx)) {
 				Ok((n, Some(mark))) => self.0 = Some((n, mark)),
 				other => return Poll::Ready(other.map(|(n, _)| n)),
 			}
@@ -539,6 +635,27 @@ impl File for TaggedOutput {
 		self
 			.base
 			.poll_write_tagged(cx, bytes, tag.unwrap_or(self.tag))
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.base.poll_read_keyed(cx, bytes, key)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self
+			.base
+			.write_keyed(cx, bytes, Some(tag.unwrap_or(self.tag)), key)
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

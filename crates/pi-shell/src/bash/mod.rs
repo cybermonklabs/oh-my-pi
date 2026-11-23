@@ -59,6 +59,8 @@ pub mod term;
 mod text;
 pub mod trace;
 mod vm;
+#[cfg(test)]
+pub(crate) use vm::TEE_HOLD;
 pub mod zshopt;
 
 pub mod pattern;

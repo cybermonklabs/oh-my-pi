@@ -340,8 +340,9 @@ fn flush(ctx: &mut Ctx<'_, '_>, c: &mut Curses) {
 fn flush_now(ctx: &Ctx<'_, '_>, c: &mut Curses) -> Result<(), Need> {
 	let h = ctx.vp.fds.handle(1);
 	let mut tcx = Context::from_waker(&ctx.k.waker);
+	let mut key = ctx.vp.write_key.lock();
 	while !c.pending.is_empty() {
-		match h.poll_write_out(&mut tcx, &c.pending, &mut c.unsettled) {
+		match h.poll_write_out_keyed(&mut tcx, &c.pending, &mut c.unsettled, &mut key) {
 			Poll::Ready(Ok(n)) if n > 0 => {
 				c.pending = c.pending.split_off(n.min(c.pending.len()));
 			},

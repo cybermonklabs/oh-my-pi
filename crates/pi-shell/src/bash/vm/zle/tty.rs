@@ -44,10 +44,14 @@ pub struct Tty {
 	/// `$TERM` they belong to.
 	pub caps:
 		Option<(bstr::BString, std::sync::Arc<crate::bash::vm::builtins::zsh_prompt::TermCaps>)>,
+	/// The key the editor's display writes use ([`crate::sys::WaitKey`]),
+	/// as each vproc's writes use its own: a subshell's copy gets a new one.
+	pub key:     crate::sys::WaitKey,
 }
 
 impl Clone for Tty {
-	/// A subshell's copy: the same terminal, nothing pending.
+	/// A subshell's copy: the same terminal, nothing pending, a key of its
+	/// own.
 	fn clone(&self) -> Self {
 		Self {
 			file:      self.file.clone(),
@@ -58,6 +62,7 @@ impl Clone for Tty {
 			fetch:     self.fetch,
 			size:      self.size,
 			caps:      self.caps.clone(),
+			key:       crate::sys::WaitKey::default(),
 		}
 	}
 }
@@ -76,6 +81,7 @@ impl Tty {
 			fetch: false,
 			size: (80, 24),
 			caps: None,
+			key: crate::sys::WaitKey::default(),
 		})
 	}
 
@@ -162,19 +168,21 @@ impl Tty {
 		self.out.extend_from_slice(bytes);
 	}
 
-	/// Write what is queued; the wait key while the terminal will not
-	/// take more, or while what its writer thread took is not out yet
-	/// ([`FdRef::poll_write_out`]): what runs next (an external writing to
-	/// the terminal) comes after the display. A write error drops the bytes
-	/// (zsh ignores them too).
+	/// Write what is queued, with the editor's key; the wait key while the
+	/// terminal will not take more, or while what its writer thread took is
+	/// not out yet ([`FdRef::poll_write_out_keyed`]): what runs next (an
+	/// external writing to the terminal) comes after the display. A write
+	/// error drops the bytes (zsh ignores them too).
 	pub fn flush(&mut self, k: &Kernel) -> Option<WaitKey> {
 		let mut tcx = Context::from_waker(&k.waker);
 		let mut off = 0;
 		while off < self.out.len() {
-			match self
-				.file
-				.poll_write_out(&mut tcx, &self.out[off..], &mut self.unsettled)
-			{
+			match self.file.poll_write_out_keyed(
+				&mut tcx,
+				&self.out[off..],
+				&mut self.unsettled,
+				&mut self.key,
+			) {
 				Poll::Ready(Ok(n)) if n > 0 => off += n,
 				Poll::Ready(_) => {
 					off = self.out.len();
@@ -205,10 +213,56 @@ impl Tty {
 
 	/// zsh `noquery(0)` for `$PENDING`: input waiting on the terminal.
 	/// The engine can tell only whether some is there, not how much: 1
-	/// when there is, else 0.
+	/// when there is, else 0. The probe waits with a key of its own, dropped
+	/// at once: as the engine's own, it would replace the editor's wait for
+	/// input with a waker that wakes nobody.
 	pub fn pending_input(&self) -> usize {
-		let waker = std::task::Waker::noop();
-		let mut tcx = Context::from_waker(waker);
-		usize::from(self.file.poll_read(&mut tcx, &mut []).is_ready())
+		let mut tcx = Context::from_waker(std::task::Waker::noop());
+		let mut key = crate::sys::WaitKey::default();
+		usize::from(
+			self
+				.file
+				.poll_read_keyed(&mut tcx, &mut [], &mut key)
+				.is_ready(),
+		)
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::{io::Write, os::fd::OwnedFd, sync::Arc, task::Waker};
+
+	use super::*;
+	use crate::sys::{StdFile, test_fifos::Flag};
+
+	// Failure mode (review of #111 at 3b9fe7ab): `$PENDING` polled the
+	// terminal as its owner with a waker that wakes nobody, which replaced
+	// the editor's wait for input: typed keys did not wake the editor.
+	#[test]
+	fn pending_input_keeps_the_editors_wait() {
+		let (r, mut w) = std::io::pipe().unwrap();
+		let tty = Tty {
+			file:      FdRef::from_file(Box::new(StdFile::new(std::fs::File::from(OwnedFd::from(r))))),
+			out:       Vec::new(),
+			unsettled: crate::bash::Unsettled::default(),
+			eofchar:   None,
+			raw:       false,
+			fetch:     false,
+			size:      (80, 24),
+			caps:      None,
+			key:       crate::sys::WaitKey::default(),
+		};
+		let editor = Arc::new(Flag::default());
+		let waker = Waker::from(Arc::clone(&editor));
+		let mut b = [0u8; 1];
+		assert!(
+			tty.file
+				.poll_read(&mut Context::from_waker(&waker), &mut b)
+				.is_pending()
+		);
+		assert_eq!(tty.pending_input(), 0, "nothing typed");
+		w.write_all(b"k").unwrap();
+		editor.wait("the editor, waiting for input, woken by a typed key");
+		assert_eq!(tty.pending_input(), 1, "a key typed");
 	}
 }
