@@ -199,6 +199,38 @@ impl StreamFile {
 			.as_mut()
 			.map_or(empty, |file| f(&mut **file))
 	}
+
+	/// The one write path: marked, observed and ordered. The plain and the
+	/// marked write are this one without a tag; `key` is the wait of a task
+	/// polling beside the engine ([`File::poll_write_keyed`]), `None` the
+	/// engine's.
+	fn write(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::CmdTag>,
+		key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		let _order = self.write_order.as_ref().map(|order| order.lock());
+		let mut slot = self.slots[self.index].lock();
+		let Some(file) = slot.as_mut() else {
+			return Poll::Ready(Ok((bytes.len(), None)));
+		};
+		let result = match key {
+			Some(key) => file.poll_write_keyed(cx, bytes, None, key),
+			None => file.poll_write_marked(cx, bytes),
+		};
+		if self.index != 0
+			&& let Poll::Ready(Ok((n, _))) = &result
+			&& *n != 0
+			&& let Some(events) = &self.events
+		{
+			let t_ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+			let fd = if self.merged { 1 } else { self.index as i32 };
+			events.output(tag, t_ns, fd, &bytes[..*n]);
+		}
+		result
+	}
 }
 
 impl File for StreamFile {
@@ -212,34 +244,36 @@ impl File for StreamFile {
 		})
 	}
 
-	/// The one write path: marked, observed and ordered. The plain and the
-	/// marked write are this one without a tag.
 	fn poll_write_tagged(
 		&mut self,
 		cx: &mut Context<'_>,
 		bytes: &[u8],
 		tag: Option<crate::bash::CmdTag>,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
-		let _order = self.write_order.as_ref().map(|order| order.lock());
-		let mut slot = self.slots[self.index].lock();
-		let Some(file) = slot.as_mut() else {
-			return Poll::Ready(Ok((bytes.len(), None)));
-		};
-		let result = file.poll_write_marked(cx, bytes);
-		if self.index != 0
-			&& let Poll::Ready(Ok((n, _))) = &result
-			&& *n != 0
-			&& let Some(events) = &self.events
-		{
-			let t_ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-			let fd = if self.merged { 1 } else { self.index as i32 };
-			events.output(tag, t_ns, fd, &bytes[..*n]);
-		}
-		result
+		self.write(cx, bytes, tag, None)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self.write(cx, bytes, tag, Some(key))
 	}
 
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
 		self.with(Poll::Ready(Ok(0)), |f| f.poll_read(cx, buf))
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.with(Poll::Ready(Ok(0)), |f| f.poll_read_keyed(cx, buf, key))
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {

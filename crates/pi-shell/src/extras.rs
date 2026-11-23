@@ -58,6 +58,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	bash::{EnvView, FdRef, FileKind, NativeRef, OsHandle, Signal, Task},
 	git::flag_on,
+	sys::WaitKey,
 	tools::ToolConfig,
 };
 
@@ -290,15 +291,20 @@ impl fmt::Debug for FdHandle {
 
 #[async_trait::async_trait]
 impl pi_vfs::FileHandle for FdHandle {
+	/// The extra's thread waits apart from the engine and any other task
+	/// waiting on the same object: its own key, which this future holds and
+	/// frees when the read ends or is dropped.
 	async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 		let fd = self.fd()?;
-		std::future::poll_fn(|cx| fd.poll_read(cx, buf)).await
+		let mut key = WaitKey::default();
+		std::future::poll_fn(|cx| fd.poll_read_keyed(cx, buf, &mut key)).await
 	}
 
 	/// A zero-length write never waits: it fails only as a write would (an
 	/// engine pipe with no reader left is `BrokenPipe`), which is how an
 	/// extra asks whether its reader is gone (`OpenFile::reader_gone`).
-	/// Any other write returns once its bytes are out (written and settled,
+	/// Any other write waits with a key of its own, as [`Self::read`], and
+	/// returns once its bytes are out (written and settled,
 	/// [`crate::bash::File::poll_settle`]), so the command after the extra
 	/// comes after its output, and a chunk that failed after its hand-off
 	/// is this write's error.
@@ -310,7 +316,9 @@ impl pi_vfs::FileHandle for FdHandle {
 				Poll::Pending => Ok(0),
 			};
 		}
-		let (n, mark) = std::future::poll_fn(|cx| fd.poll_write_marked(cx, buf)).await?;
+		let mut key = WaitKey::default();
+		let (n, mark) =
+			std::future::poll_fn(|cx| fd.poll_write_marked_keyed(cx, buf, &mut key)).await?;
 		std::future::poll_fn(|cx| fd.poll_settle_marked(cx, mark.as_slice())).await?;
 		Ok(n)
 	}
@@ -443,7 +451,8 @@ impl Drop for ExtraTask {
 	}
 }
 
-/// A builtin pi withholds (`suspend`): says so on stderr, status 1.
+/// A builtin pi withholds (`suspend`): says so on stderr, status 1. Its
+/// writes wait with a key of their own, as an extra's do ([`FdHandle`]).
 pub struct Refusal {
 	stderr:    FdRef,
 	message:   Vec<u8>,
@@ -453,6 +462,7 @@ pub struct Refusal {
 	mark:      Option<crate::bash::Mark>,
 	/// A cancelling signal arrived: end now, settled or not.
 	cancelled: bool,
+	key:       WaitKey,
 }
 
 impl Refusal {
@@ -460,7 +470,7 @@ impl Refusal {
 	pub(crate) fn new(name: &[u8], stderr: FdRef) -> Self {
 		let mut message = name.to_vec();
 		message.extend_from_slice(b": not available in this shell\n");
-		Self { stderr, message, written: 0, mark: None, cancelled: false }
+		Self { stderr, message, written: 0, mark: None, cancelled: false, key: WaitKey::default() }
 	}
 }
 
@@ -484,7 +494,7 @@ impl Task for Refusal {
 			}
 			match self
 				.stderr
-				.poll_write_marked(cx, &self.message[self.written..])
+				.poll_write_marked_keyed(cx, &self.message[self.written..], &mut self.key)
 			{
 				Poll::Ready(Ok((n, mark))) if n > 0 => {
 					self.written += n;
@@ -614,5 +624,64 @@ mod tests {
 		);
 		released.store(true, std::sync::atomic::Ordering::SeqCst);
 		assert!(matches!(write.as_mut().poll(&mut cx), Poll::Ready(Ok(1))));
+	}
+
+	// Failure mode (review of #111 at 2fb85be7): `suspend`'s refusal wrote
+	// stderr with no key, so through a tee it shared the progress of the
+	// file's own keyless writes.
+	#[test]
+	fn a_refusal_writes_with_a_key() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		use crate::bash::fs::{File, SeekFrom};
+		/// Counts (keyed, keyless) writes; takes every byte.
+		#[derive(Clone, Default)]
+		struct Probe(Arc<(AtomicUsize, AtomicUsize)>);
+		impl File for Probe {
+			fn poll_read(&mut self, _: &mut Context<'_>, _: &mut [u8]) -> Poll<io::Result<usize>> {
+				Poll::Ready(Ok(0))
+			}
+
+			fn poll_write(&mut self, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+				self.0.1.fetch_add(1, Ordering::SeqCst);
+				Poll::Ready(Ok(buf.len()))
+			}
+
+			fn poll_write_keyed(
+				&mut self,
+				_: &mut Context<'_>,
+				buf: &[u8],
+				_: Option<crate::bash::CmdTag>,
+				_: &mut WaitKey,
+			) -> Poll<io::Result<(usize, Option<crate::bash::Mark>)>> {
+				self.0.0.fetch_add(1, Ordering::SeqCst);
+				Poll::Ready(Ok((buf.len(), None)))
+			}
+
+			fn poll_flush(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+
+			fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+				Err(io::ErrorKind::Unsupported.into())
+			}
+
+			fn kind(&self) -> FileKind {
+				FileKind::Pipe
+			}
+
+			fn os_handle(&self) -> Option<OsHandle> {
+				None
+			}
+
+			fn dup(&self) -> io::Result<Box<dyn File>> {
+				Ok(Box::new(self.clone()))
+			}
+		}
+		let probe = Probe::default();
+		let mut refusal = Refusal::new(b"suspend", FdRef::from_file(Box::new(probe.clone())));
+		assert_eq!(refusal.poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(1));
+		let counts = (probe.0.0.load(Ordering::SeqCst), probe.0.1.load(Ordering::SeqCst));
+		assert_eq!(counts, (1, 0), "(keyed, keyless) writes");
 	}
 }
