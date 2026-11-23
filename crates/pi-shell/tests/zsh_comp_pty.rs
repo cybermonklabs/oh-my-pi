@@ -73,16 +73,16 @@ fn snapshot_path(name: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/zsh_comp_pty/{name}.txt"))
 }
 
-/// Type `keys` in one write and wait until the line editor has handled them
-/// and drawn everything it draws before it waits for the next key. One
-/// answer of the [`Pty::zle_sync`] handler comes after the work the keys
-/// started; the second comes after what the editor drew once that handler
-/// returned, which in zsh is nothing unless the handler invalidated the
-/// display. A redraw there (obash once redrew after every handler) is then
-/// on every screen read, not only on the ones it reached first.
+/// Type `keys`, a line at a time ([`Pty::type_lines`]), and wait until the
+/// line editor has handled them and drawn everything it draws before it
+/// waits for the next key. One answer of the [`Pty::zle_sync`] handler
+/// comes after the work the keys started; the second comes after what the
+/// editor drew once that handler returned, which in zsh is nothing unless
+/// the handler invalidated the display. A redraw there (obash once redrew
+/// after every handler) is then on every screen read, not only on the ones
+/// it reached first.
 fn step(pty: &mut Pty, keys: &str) -> io::Result<()> {
-	pty.write(keys)?;
-	pty.zle_sync(STEP)?;
+	pty.type_lines(keys, STEP)?;
 	pty.zle_sync(STEP)
 }
 

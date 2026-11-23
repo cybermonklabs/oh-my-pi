@@ -49,10 +49,10 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` in one write and wait until the line editor has handled it.
+/// Type `text`, a line at a time, and wait until the line editor has
+/// handled it ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.write(text)?;
-	pty.zle_sync(TIMEOUT)
+	pty.type_lines(text, TIMEOUT)
 }
 
 /// The final screens of `drive` against both shells after sourcing the rc

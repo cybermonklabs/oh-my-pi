@@ -32,10 +32,10 @@ fn spawn(real: bool) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` in one write and wait until the line editor has handled it.
+/// Type `text`, a line at a time, and wait until the line editor has
+/// handled it ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.write(text)?;
-	pty.zle_sync(TIMEOUT)
+	pty.type_lines(text, TIMEOUT)
 }
 
 /// Run `drive` against both shells; assert the final screens match.

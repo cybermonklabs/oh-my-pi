@@ -670,6 +670,28 @@ impl Pty {
 			.map(drop)
 	}
 
+	/// Type `text` and wait until the line editor has handled it
+	/// ([`Self::zle_sync`]): the keys up to and including each `\r` in one
+	/// write, then the wait, so the line a `\r` accepts has run before the
+	/// next keys come, as it had for a typist. Keys still unread while the
+	/// shell runs a line can be echoed by the terminal: on macOS obash's
+	/// screen showed the keys after an accepted line echoed in front of its
+	/// output, zsh's did not, and on Linux neither did.
+	///
+	/// # Errors
+	///
+	/// As [`Self::write`] and [`Self::zle_sync`].
+	pub fn type_lines(&mut self, text: &str, timeout: Duration) -> io::Result<()> {
+		if text.is_empty() {
+			return self.zle_sync(timeout);
+		}
+		for line in text.split_inclusive('\r') {
+			self.write(line)?;
+			self.zle_sync(timeout)?;
+		}
+		Ok(())
+	}
+
 	/// The terminal side, opened anew (not as a controlling terminal) to
 	/// query it.
 	fn open_tty(&self) -> io::Result<fs::File> {

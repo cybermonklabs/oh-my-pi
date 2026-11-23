@@ -37,16 +37,16 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 }
 
 /// Type `text` and wait until the line editor has handled it. The keys go
-/// in one write, but a `^C` goes in a write of its own once the editor has
-/// handled the keys before it: the terminal turns `^C` into `SIGINT` as it
-/// receives it and drops the keys still waiting to be read. The `^C` goes
-/// once the shell blocks waiting for the next key ([`wait_shell_blocked`],
-/// on Linux and macOS): a shell that has just answered a sync is still
-/// returning from that handler, and a `^C` sent then went unanswered
-/// (under gVisor the shell drew nothing after it for the whole
-/// [`TIMEOUT`]). The editor never reads that key, so the wait after it is
-/// first for the shell's answer to the interrupt (it leaves the line and
-/// draws the next one), then for the editor.
+/// a line at a time ([`Pty::type_lines`]), and a `^C` goes in a write of
+/// its own once the editor has handled the keys before it: the terminal
+/// turns `^C` into `SIGINT` as it receives it and drops the keys still
+/// waiting to be read. The `^C` goes once the shell blocks waiting for the
+/// next key ([`wait_shell_blocked`], on Linux and macOS): a shell that has
+/// just answered a sync is still returning from that handler, and a `^C`
+/// sent then went unanswered (under gVisor the shell drew nothing after it
+/// for the whole [`TIMEOUT`]). The editor never reads that key, so the wait
+/// after it is first for the shell's answer to the interrupt (it leaves the
+/// line and draws the next one), then for the editor.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	for (i, part) in text.split('\x03').enumerate() {
 		if i > 0 {
@@ -56,8 +56,7 @@ fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 			pty.zle_sync(TIMEOUT)?;
 		}
 		if !part.is_empty() {
-			pty.write(part)?;
-			pty.zle_sync(TIMEOUT)?;
+			pty.type_lines(part, TIMEOUT)?;
 		}
 	}
 	Ok(())

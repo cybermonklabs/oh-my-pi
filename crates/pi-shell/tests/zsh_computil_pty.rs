@@ -42,10 +42,10 @@ fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 		.cwd(cwd)
 }
 
-/// Type `text` in one write and wait until the shell has handled it.
+/// Type `text`, a line at a time, and wait until the shell has handled it
+/// ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.write(text)?;
-	pty.zle_sync(SLOW)
+	pty.type_lines(text, SLOW)
 }
 
 /// Source the rc file, clear the screen, then `drive` (each shell's
