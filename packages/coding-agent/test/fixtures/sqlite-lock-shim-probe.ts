@@ -15,6 +15,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ToolSession } from "../../src/tools";
 
 const [mode, row, dir] = process.argv.slice(2);
 if ((mode !== "hold" && mode !== "open") || !row || !dir) {
@@ -101,6 +102,34 @@ const rows: Record<string, Row> = {
 			cache.clear();
 		},
 	},
+	// clear() alone: in the row above, record() has already installed the shim before clear() runs. The
+	// approval cache keeps a rollback journal, so a session holds no lock between statements; here the
+	// holder reads in a transaction for 3 s, and clear() must wait for that read, then delete.
+	"approvals-clear": {
+		file: async () => path.join(dir, "approval-cache.db"),
+		prepare: async () => {
+			const { ApprovalCache } = await import("../../src/tools/approval-cache");
+			new ApprovalCache(dir).record("probe", "probe");
+		},
+		holderOpen: async () => {
+			const reader = new Database(path.join(dir, "approval-cache.db"));
+			reader.run("BEGIN");
+			reader.query("SELECT count(*) FROM grants").get();
+			setTimeout(() => reader.run("COMMIT"), 3_000);
+		},
+		open: async () => {
+			const { ApprovalCache } = await import("../../src/tools/approval-cache");
+			const start = performance.now();
+			new ApprovalCache(dir).clear();
+			const waited = performance.now() - start;
+			// A bare read that installs nothing, so the lock kind read afterwards is still clear()'s.
+			const check = new Database(path.join(dir, "approval-cache.db"), { readonly: true });
+			const left = check.query<{ n: number }, []>("SELECT count(*) AS n FROM grants").get()?.n;
+			check.close();
+			if (waited < 200) throw new Error(`clear() did not wait for the holder's read (${Math.round(waited)} ms)`);
+			if (left !== 0) throw new Error(`clear() left ${left} grants`);
+		},
+	},
 	"github-cache": {
 		file: async () => (await utils()).getGithubCacheDbPath(),
 		open: async () => {
@@ -128,6 +157,34 @@ const rows: Record<string, Row> = {
 			const db = await openSqliteReadConnection(path.join(dir, "read-tool.db"));
 			db.query("SELECT count(*) FROM t").get();
 			db.close();
+		},
+	},
+	"write-tool": {
+		file: async () => path.join(dir, "write-tool.db"),
+		prepare: async () => {
+			const db = new Database(path.join(dir, "write-tool.db"), { create: true });
+			db.run("PRAGMA journal_mode=WAL");
+			db.run("CREATE TABLE IF NOT EXISTS t (x)");
+			db.close();
+		},
+		holderOpen: async () => {},
+		open: async () => {
+			const { Settings } = await import("../../src/config/settings");
+			const { WriteTool } = await import("../../src/tools/write");
+			const session: ToolSession = {
+				cwd: dir,
+				hasUI: false,
+				getSessionFile: () => path.join(dir, "session.jsonl"),
+				getSessionSpawns: () => "*",
+				getArtifactsDir: () => dir,
+				settings: Settings.isolated(),
+				enableLsp: false,
+			};
+			const result = await new WriteTool(session).execute("probe", {
+				path: `${path.join(dir, "write-tool.db")}:t`,
+				content: '{"x": 1}',
+			});
+			if (result.isError) throw new Error(JSON.stringify(result.content));
 		},
 	},
 	"commit-cache": {
