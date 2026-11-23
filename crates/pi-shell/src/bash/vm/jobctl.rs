@@ -301,6 +301,13 @@ pub fn shout_waits(k: &mut Kernel, vp: &Vproc) -> bool {
 	k.jobctl.root == Some(vp.vpid) && drain_shout(k)
 }
 
+/// Whether vproc `vp` is the shell itself and its job notices are not all
+/// out ([`shout_waits`], without writing): a notice leaves the queue only
+/// once the terminal's writer thread has written it.
+pub fn shout_pending(k: &Kernel, vp: &Vproc) -> bool {
+	k.jobctl.root == Some(vp.vpid) && !k.jobctl.shout.items.is_empty()
+}
+
 /// [`drain_shout`] with the waker `waker` (the kernel's, or the leaving
 /// shell's own thread, [`Shell::leave_job_control`]). A notice that fails
 /// is lost, as zsh ignores `shout`'s errors.
@@ -2360,6 +2367,74 @@ mod tests {
 				            or directory\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want, "the op waited: {waited}");
 				assert!(waited, "the op did not wait for the notice queued while it was parked");
+			},
+		);
+	}
+
+	/// A builtin on the fast path (`echo 42`) with fd 1 on the terminal,
+	/// while the line editor's end of line is still in the terminal's writer
+	/// thread (the editor flushes once at the end of a line and goes on):
+	/// the output comes after the editor's bytes, as zsh's blocking writes
+	/// order them. Written at once by the fast path, the output came first,
+	/// as in the interactive prompt test's `bash-5.3$ echo $((6 * 7))42`.
+	#[test]
+	fn a_fast_builtins_output_reaches_the_terminal_after_the_editors_bytes() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_fast_builtins_output_reaches_the_terminal_after_the_editors_bytes"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) =
+					shell_with_fd_on_its_terminal_written_at_once(1);
+				// No event reports the command, so `echo` takes the fast path
+				// (`plain_statement`), as at an interactive prompt.
+				shell.set_event_mask(crate::bash::EventMask::NONE);
+				let held = crate::sys::hold_writers();
+				let mut tty = super::super::zle::tty::Tty::open(&shell.k).unwrap();
+				tty.put(b"% echo 42\n");
+				assert!(tty.flush(&shell.k).is_some(), "the editor's bytes were out while held");
+				let mut zle = super::super::zle::Zle::new(false);
+				zle.tty = Some(tty);
+				shell.procs[0].zle = Some(Box::new(zle));
+				shell.submit(crate::bash::Script::command(b"echo 42".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let want = "% echo 42\r\n42\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A builtin on the fast path (`echo 42`) with fd 1 on the terminal,
+	/// while a job notice is still going out there: the output comes after
+	/// the notice, as zsh writes the notice with blocking writes first.
+	/// Written at once by the fast path, the output came first.
+	#[test]
+	fn a_fast_builtins_output_reaches_the_terminal_after_a_job_notice() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_fast_builtins_output_reaches_the_terminal_after_a_job_notice"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) =
+					shell_with_fd_on_its_terminal_written_at_once(1);
+				// No event reports the command, so `echo` takes the fast path.
+				shell.set_event_mask(crate::bash::EventMask::NONE);
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				shell.submit(crate::bash::Script::command(b"echo 42".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let want = "[1]  + continued  sleep 100\r\n42\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
 		);
 	}

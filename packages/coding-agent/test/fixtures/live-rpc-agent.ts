@@ -27,6 +27,13 @@ const sessionManager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 const runtime = new ExtensionRuntime();
 const extension = await loadExtensionFromFactory(
 	pi => {
+		// `/bridge <text>` forwards `<text>` as typed input, the way a chat bridge relays a person's line, and
+		// reports what `sendUserInput` answered as a `notify` UI request.
+		pi.registerCommand("bridge", {
+			handler: async (args, ctx) => {
+				ctx.ui.notify(JSON.stringify(await pi.sendUserInput(args)));
+			},
+		});
 		pi.registerCommand("dictation-new-session", {
 			handler: async (_args, ctx) => {
 				await ctx.newSession();
@@ -66,7 +73,13 @@ const extension = await loadExtensionFromFactory(
 );
 const extensionRunner = new ExtensionRunner([extension], runtime, cwd, sessionManager, modelRegistry);
 const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-const mock = createMockModel({ provider: model.provider, id: model.id, handler: () => ({ content: ["Done"] }) });
+// `OMP_LIVE_TURN_MS` keeps each model turn running that long, so a test can type into a running turn.
+const turnMs = Number(process.env.OMP_LIVE_TURN_MS ?? 0);
+const mock = createMockModel({
+	provider: model.provider,
+	id: model.id,
+	handler: () => ({ content: ["Done"], delayMs: turnMs }),
+});
 const agent = new Agent({
 	getApiKey: () => "test-key",
 	initialState: { model, systemPrompt: ["Test"], tools: [] },
@@ -86,6 +99,7 @@ const session = new AgentSession({
 class FakeLiveSession implements RpcLiveSession {
 	muted = false;
 	#stopped: Promise<void> | undefined;
+	readonly #stopRequested = Promise.withResolvers<void>();
 	constructor(readonly options: LiveSessionControllerOptions) {}
 
 	get sdpAnswer(): string | undefined {
@@ -97,6 +111,11 @@ class FakeLiveSession implements RpcLiveSession {
 		callbacks.onPhase("connecting");
 		callbacks.onTranscript(undefined);
 		await Bun.sleep(1);
+		// `OMP_LIVE_CONNECT_UNTIL_STOP` keeps the call connecting until a stop, as a server that never answers does.
+		if (process.env.OMP_LIVE_CONNECT_UNTIL_STOP === "1") {
+			await this.#stopRequested.promise;
+			throw new Error("The live call was stopped while it connected");
+		}
 		callbacks.onTranscript({ role: "user", turn: 1, text: "hello", final: true });
 		callbacks.onPhase("listening");
 	}
@@ -106,6 +125,7 @@ class FakeLiveSession implements RpcLiveSession {
 	}
 
 	stop(): Promise<void> {
+		this.#stopRequested.resolve();
 		this.#stopped ??= (async () => {
 			await Bun.write(
 				path.join(cwd, "live-stopped.json"),

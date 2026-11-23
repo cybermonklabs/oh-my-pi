@@ -929,6 +929,23 @@ pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	flush_queued(k, vp)
 }
 
+/// Whether [`flush_out`] would wait now, without writing anything: the
+/// shell's job notices still going out to its terminal, the editor's
+/// display bytes not out (queued, or taken by the terminal's writer thread
+/// and not settled), or diagnostics queued in `vp.out`. A writer that goes
+/// around the staged output (the fast path's `write_now` in
+/// [`super::command`]) writes only when this is false: written at once on
+/// another writer thread, its bytes could reach the terminal first.
+pub fn output_waits(k: &Kernel, vp: &Vproc) -> bool {
+	super::jobctl::shout_pending(k, vp)
+		|| vp
+			.zle
+			.as_deref()
+			.and_then(|z| z.tty.as_ref())
+			.is_some_and(super::zle::tty::Tty::pending)
+		|| !vp.out.is_empty()
+}
+
 /// [`flush_out`] without waiting for the shell's job notices: for a
 /// failed compound redirection's message, which belongs on the fd 2 its
 /// redirections left. The `Redir` op restores the fds in the same step,
