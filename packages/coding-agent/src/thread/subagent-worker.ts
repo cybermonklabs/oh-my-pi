@@ -37,6 +37,7 @@ import { type RpcFrame, RpcLink } from "./rpc";
 import type { ThreadService, WorkerPeer } from "./services";
 import { prewarmModelRegistryMirror } from "./services/auth";
 import { THREAD_SERVICES } from "./services/index";
+import { parseTextFormatForWorker } from "./text-format-forwarding";
 import { isSubagentWorkerLog, receiveWorkerLog } from "./worker-log";
 
 const DEFAULT_INIT_TIMEOUT_MS = 30_000;
@@ -247,6 +248,7 @@ export class SubagentWorker implements WorkerPeer {
 		let bootMs = 0;
 		try {
 			this.link.handle("ping", nonce => nonce);
+			this.link.handle("parseTextFormat", parseTextFormatForWorker);
 			for (const service of this.#services) service.installMain?.(this);
 			const init: SubagentWorkerInit = {
 				type: "subagent-worker-init",

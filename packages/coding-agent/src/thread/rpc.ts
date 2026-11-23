@@ -11,7 +11,8 @@
  *   parks on a SharedArrayBuffer counter, and dequeues the reply from a
  *   dedicated reply port with `receiveMessageOnPort`. The main thread never
  *   blocks on a worker, so a sync call cannot deadlock; it only waits for the
- *   main event loop to reach the request.
+ *   main event loop to reach the request. {@link RpcLink.callSyncWithin} is
+ *   the same call with its own deadline instead of the link's.
  *
  * Values cross by structured clone after encoding the kinds the subagent
  * boundary needs:
@@ -457,7 +458,23 @@ export class RpcLink<Local extends RpcApi, Remote extends RpcApi> {
 	 * @throws the remote handler's error, rebuilt.
 	 */
 	callSync<K extends keyof Remote & string>(method: K, ...args: Remote[K]["args"]): Remote[K]["result"] {
-		return typedResult<Remote[K]["result"]>(this.#requestSync(method, args));
+		return typedResult<Remote[K]["result"]>(this.#requestSync(method, args, this.#syncTimeoutMs));
+	}
+
+	/**
+	 * Worker only: {@link callSync} with a deadline of `timeoutMs` instead of
+	 * the link's `syncTimeoutMs`. The main-side handler MUST be synchronous.
+	 *
+	 * @throws {RpcClosedError} after close.
+	 * @throws {RpcTimeoutError} when main does not reply within `timeoutMs`.
+	 * @throws the remote handler's error, rebuilt.
+	 */
+	callSyncWithin<K extends keyof Remote & string>(
+		timeoutMs: number,
+		method: K,
+		...args: Remote[K]["args"]
+	): Remote[K]["result"] {
+		return typedResult<Remote[K]["result"]>(this.#requestSync(method, args, timeoutMs));
 	}
 
 	/** Close the link: reject pending calls, drop handles, detach the endpoint. Idempotent. */
@@ -505,14 +522,14 @@ export class RpcLink<Local extends RpcApi, Remote extends RpcApi> {
 		this.#endpoint.send({ t: "note", m: method, a: encoded, raw: encoded === args });
 	}
 
-	#requestSync(method: string, args: unknown[], lossy = false): unknown {
+	#requestSync(method: string, args: unknown[], timeoutMs: number, lossy = false): unknown {
 		const sync = this.#sync;
 		if (!sync) throw new Error(`RPC link ${this.name} has no sync channel`);
 		if (this.#closed !== undefined) throw RpcClosedError.forLink(this.name, this.#closed);
 		const id = this.#nextId++;
 		const encoded = this.#encodeArgs(args, lossy);
 		this.#endpoint.send({ t: "sync", id, m: method, a: encoded, raw: encoded === args });
-		const deadline = performance.now() + this.#syncTimeoutMs;
+		const deadline = performance.now() + timeoutMs;
 		for (;;) {
 			// Load before draining: a reply posted after the drain bumps the counter and voids the wait.
 			const seen = Atomics.load(sync.counter, 0);
@@ -526,9 +543,7 @@ export class RpcLink<Local extends RpcApi, Remote extends RpcApi> {
 			}
 			const remaining = deadline - performance.now();
 			if (remaining <= 0) {
-				throw new RpcTimeoutError(
-					`Sync RPC ${method} on ${this.name} got no reply within ${this.#syncTimeoutMs}ms`,
-				);
+				throw new RpcTimeoutError(`Sync RPC ${method} on ${this.name} got no reply within ${timeoutMs}ms`);
 			}
 			Atomics.wait(sync.counter, 0, seen, remaining);
 		}
@@ -984,7 +999,7 @@ export class RpcLink<Local extends RpcApi, Remote extends RpcApi> {
 	#importFunction(id: number, sync: boolean, lossy: boolean): (...args: unknown[]) => unknown {
 		return this.#adopt(id, () =>
 			sync && this.#sync
-				? (...args: unknown[]): unknown => this.#requestSync(FN_METHOD, [id, ...args], lossy)
+				? (...args: unknown[]): unknown => this.#requestSync(FN_METHOD, [id, ...args], this.#syncTimeoutMs, lossy)
 				: (...args: unknown[]): Promise<unknown> => {
 						const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 						this.#request(FN_METHOD, [id, ...args], { resolve, reject }, lossy);
@@ -1007,7 +1022,8 @@ export class RpcLink<Local extends RpcApi, Remote extends RpcApi> {
 				this.#request(OBJ_METHOD, [id, method, ...args], { resolve, reject }, lossy);
 				return promise;
 			},
-			callSync: (method, ...args) => this.#requestSync(OBJ_METHOD, [id, method, ...args], lossy),
+			callSync: (method, ...args) =>
+				this.#requestSync(OBJ_METHOD, [id, method, ...args], this.#syncTimeoutMs, lossy),
 			notify: (method, ...args) => this.#notifyRaw(OBJ_METHOD, [id, method, ...args], lossy),
 		};
 	}
