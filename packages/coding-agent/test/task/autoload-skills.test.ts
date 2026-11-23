@@ -2,12 +2,15 @@ import { afterEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionSendQueue } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/send-queue";
 import type { ExtensionActions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import * as skillsModule from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -18,6 +21,7 @@ import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -539,6 +543,149 @@ describe("autoloadSkills through task spawn", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	// A parent session with no skills hands each subagent the one shared, frozen
+	// empty skill list (`spawnedSubagentSkills`, extensibility/skills.ts). The
+	// subagent's own extension contributes a skill through `resources_discover`
+	// at startup, and the merge (`#mergeDiscoveredSkillDirectories`,
+	// session/session-tools.ts) must replace that shared list, not write into it.
+	// Path: runStructuredSubagent with the real createAgentSession (the spy only
+	// records what it is given and what it returns), so the extension loads from
+	// its file and the real startup discovery and autoload run.
+	// If this regresses, a skill one subagent discovers leaks into every later
+	// subagent of a parent with no skills, or the discovery throws.
+	it("delivers a skill discovered by a subagent spawned from a session with no skills", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-subagent-found-skill-"));
+		const mockApiSource = "test/autoload-skills-subagent-discovery";
+		const authStorage = createInMemoryAuthStorage();
+		const agentIds = ["FoundSkillFirst", "FoundSkillSecond"];
+		const children: AgentSession[] = [];
+		try {
+			const skillsDir = path.join(root, "skills");
+			await Bun.write(
+				path.join(skillsDir, "subagent-found-skill", "SKILL.md"),
+				"---\nname: subagent-found-skill\ndescription: Found by the subagent's own extension.\n---\n\nFound skill body.\n",
+			);
+			const extPath = path.join(root, "ext", "skill-finder.ts");
+			await Bun.write(
+				extPath,
+				`export default function (pi) {
+	pi.on("resources_discover", () => ({ skillPaths: [${JSON.stringify(skillsDir)}] }));
+}
+`,
+			);
+
+			registerMockApi(mockApiSource);
+			authStorage.keys.setRuntime("mock", "test-key");
+			const model = createMockModel({ id: "subagent-model", handler: () => ({ content: ["Done."] }) });
+			const modelRegistry = new ModelRegistry(authStorage, path.join(root, "models.yml"));
+			const find = modelRegistry.find.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "find").mockImplementation((provider, id) =>
+				provider === "mock" && id === model.id ? model : find(provider, id),
+			);
+			vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => [model]);
+			vi.spyOn(modelRegistry, "getAll").mockImplementation(() => [model]);
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+				agents: [
+					{
+						name: "skill-agent",
+						description: "Autoloads the skill its extension finds",
+						systemPrompt: "test",
+						source: "project",
+						tools: ["read"],
+						autoloadSkills: ["subagent-found-skill"],
+					},
+				],
+				projectAgentsDir: null,
+			});
+
+			const parentSkills: Skill[] = [];
+			// Extension paths the parent forwards to the subagents it spawns.
+			let parentExtensionPaths = [extPath];
+			const parent = {
+				cwd: root,
+				hasUI: false,
+				settings: Settings.isolated({
+					"task.isolation.enabled": false,
+					"compaction.enabled": false,
+					"retry.enabled": false,
+					"async.enabled": false,
+					"todo.enabled": false,
+					"advisor.enabled": false,
+					modelRoles: { default: `mock/${model.id}` },
+				}),
+				authStorage,
+				modelRegistry,
+				enableMCP: false,
+				enableLsp: false,
+				enableIrc: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				getSessionAgents: () => [],
+				skills: parentSkills,
+				contextFiles: [],
+				promptTemplates: [],
+				rules: [],
+				get extensionPaths() {
+					return parentExtensionPaths;
+				},
+				customToolPaths: [],
+			} as unknown as ToolSession;
+
+			const forwardedSkills: Array<Skill[] | undefined> = [];
+			const createAgentSession = sdkModule.createAgentSession;
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				forwardedSkills.push(options?.skills);
+				const created = await createAgentSession(options);
+				children.push(created.session);
+				return created;
+			});
+			const spawn = (id: string) =>
+				runStructuredSubagent({
+					session: parent,
+					invocationKind: "task",
+					assignment: "do work",
+					agent: "skill-agent",
+					structured: false,
+					identity: { id },
+					keepAlive: false,
+				});
+			const sharedEmptySkills = skillsModule.spawnedSubagentSkills([]);
+
+			const first = await spawn(agentIds[0]);
+			expect(first.result.exitCode, first.result.error).toBe(0);
+			// The subagent session started from the shared frozen empty list...
+			expect(forwardedSkills[0]).toBe(sharedEmptySkills);
+			// ...and its own extension's skill reached it.
+			expect(children[0]?.skills.map(skill => skill.name)).toEqual(["subagent-found-skill"]);
+			// The agent autoloads it: the skill body reaches the subagent's model.
+			const firstRequests = model.calls.length;
+			expect(firstRequests).toBeGreaterThan(0);
+			expect(JSON.stringify(model.calls[0]?.context.messages)).toContain("Found skill body.");
+
+			// The same parent, now forwarding no extension, spawns again.
+			parentExtensionPaths = [];
+			const second = await spawn(agentIds[1]);
+			expect(second.result.exitCode, second.result.error).toBe(0);
+			expect(forwardedSkills[1]).toBe(sharedEmptySkills);
+			expect(children[1]?.skills).toEqual([]);
+			expect(model.calls.length).toBeGreaterThan(firstRequests);
+			for (const call of model.calls.slice(firstRequests)) {
+				expect(JSON.stringify(call.context.messages)).not.toContain("Found skill body.");
+			}
+
+			expect(parent.skills).toEqual([]);
+			const shared = skillsModule.spawnedSubagentSkills([]);
+			expect(shared).toEqual([]);
+			expect(Object.isFrozen(shared)).toBe(true);
+		} finally {
+			await Promise.all(children.map(child => child.dispose()));
+			for (const id of agentIds) AgentRegistry.global().unregister(id);
+			unregisterCustomApis(mockApiSource);
+			authStorage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe("subagent session_init persistence ordering (regression: PR #9379 review)", () => {
