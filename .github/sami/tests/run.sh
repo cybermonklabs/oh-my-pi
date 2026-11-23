@@ -888,23 +888,29 @@ fi
 # ref's own lookup takes before main's) that release_binary would restore.
 # The workflow sets cache-mode: none, so a job's cache token can neither
 # restore nor save unless the job sets a mode of its own. So: the workflow
-# has cache-mode: none; every job but release_binary sets none or no mode,
+# has cache-mode: none; every job but release_binary has no line that names
+# cache-mode other than `    cache-mode: none` (GitHub also reads the value
+# on the next line, a quoted key, and a job whose keys are indented deeper),
 # has no actions/cache step, and passes `cache: "false"` to every
 # bun-install step, which then sets cache=none and runs neither of its cache
 # steps. release_binary passes `cache: "false"` to its bun-install step too,
 # since bun-install's own save runs on main. release_binary may restore, and
 # saves only on a push to sami-candidate, the ref the release is built on:
 # cache-mode takes no expression, so each of its actions/cache/save steps
-# starts its `if:` with that condition and has no `||`, and it has no
-# actions/cache step (which saves in its post step, under no condition of the
-# job's). Its steps use only the actions it uses today, and
-# .github/actions/bazel-cache calls no action, so no other caching action can
-# save under release_binary's token. A line under jobs: that is not a plain
-# `  <id>:` stops the lint, because its steps would be read as the job
-# above's.
+# starts its `if:` with that condition, has no `||` and nothing after the
+# expression's `}}`, on its line or on a deeper line that YAML folds into the
+# value (GitHub reads an `if:` with text outside `${{ }}` as a string, and a
+# string that is not empty is true): the line after it is the step's next
+# key, or nothing at all (a blank line or a comment after a guard that ends
+# the step fails the lint). And it has no actions/cache step (which saves in
+# its post step, under no condition of the job's). Its steps use only the
+# actions it uses today, and .github/actions/bazel-cache calls no action, so
+# no other caching action can save under release_binary's token. A line
+# under jobs: that is not a plain `  <id>:` stops the lint, because its steps
+# would be read as the job above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok mode saves ns others
-	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\]*\}\}\\n'
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -921,7 +927,6 @@ cache_lint() {
 	for job in $jobs; do
 		ok=1
 		awk -v j="  $job:" '$0 == j { on = 1; next } on && (/^  [A-Za-z_][A-Za-z0-9_-]*:$/ || /^[^ #]/) { exit } on' "$wf" >"$scratch/job.yml"
-		mode="$(sed -n 's/^    cache-mode: *\([^ #]*\).*$/\1/p' "$scratch/job.yml")"
 		steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$scratch/job.yml")"
 		bun="$(printf '%s\n' "$steps" | grep -F 'uses: ./.github/actions/bun-install' || true)"
 		n="$(printf '%s' "$bun" | grep -c . || true)"
@@ -955,8 +960,9 @@ cache_lint() {
 				echo "release_binary: save steps: $ns, each only on a push to sami-candidate; bun-install steps: $n, each with cache: \"false\""
 			fi
 		else
-			if [ -n "$mode" ] && [ "$mode" != none ]; then
-				echo "$job has cache-mode: $mode"
+			modes="$(grep -vE '^ *#' "$scratch/job.yml" | grep -F 'cache-mode' | grep -vxF '    cache-mode: none' || true)"
+			if [ -n "$modes" ]; then
+				echo "$job has a cache-mode line other than [    cache-mode: none]: $(printf '%s\n' "$modes" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 				ok=0
 			fi
 			if printf '%s\n' "$steps" | grep -qE 'uses: *actions/cache'; then
@@ -1013,8 +1019,8 @@ wlint W9-rust-test-bun-install-with-cache 1 'rust_test has a bun-install step wi
 # Any cache access outside release_binary: the workflow's default, a job's own
 # mode, a cache step in a job none of the cases above names.
 wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none' 's/^cache-mode: none$/cache-mode: read/' ''
-wlint W11-carry-cache-mode-read 1 'carry has cache-mode: read' 's/^  carry:$/&\n    cache-mode: read/' ''
-wlint W12-rust-test-cache-mode-write 1 'rust_test has cache-mode: write' 's/^  rust_test:$/&\n    cache-mode: write/' ''
+wlint W11-carry-cache-mode-read 1 'carry has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: read\]' 's/^  carry:$/&\n    cache-mode: read/' ''
+wlint W12-rust-test-cache-mode-write 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: write\]' 's/^  rust_test:$/&\n    cache-mode: write/' ''
 wlint W13-publish-cache-step 1 'publish has an actions/cache step' 's|^      - name: Find the candidate run$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
 # release_binary saves only on a push to sami-candidate; a dispatch, a pull
 # request, a push to another ref or any other event only restores.
@@ -1029,6 +1035,16 @@ wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on 
 wlint W20-release-binary-other-cache-action 1 'release_binary uses an action outside its list: Swatinem/rust-cache@v2' 's|^      - name: Point Bazel at the release build cache$|      - uses: Swatinem/rust-cache@v2\n&|' ''
 wlint W21-bazel-cache-action-calls-an-action 1 'bazel-cache.yml calls an action' '' '' 's|^   steps:$|&\n      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830|'
 wlint W22-job-line-with-a-comment 1 'job line cache_lint cannot read' 's/^  carry:$/  carry: # the carry check/' ''
+# GitHub reads these spellings of a job's mode too: the value on the next
+# line, a quoted key, and a job whose keys are indented 6 spaces.
+wlint W23-rust-test-cache-mode-on-the-next-line 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode:\]' 's/^  rust_test:$/&\n    cache-mode:\n      write/' ''
+wlint W24-rust-test-cache-mode-quoted-key 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    "cache-mode": write\]' 's/^  rust_test:$/&\n    "cache-mode": write/' ''
+wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[      cache-mode: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^    /      /;s/^  rust_test:$/&\n      cache-mode: write/' ''
+# GitHub reads an if: with text outside ${{ }} as a string, which is true,
+# so nothing may follow the save guard's expression, on its line (W26) or
+# on a deeper line that YAML folds into the value (W27).
+wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
+wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

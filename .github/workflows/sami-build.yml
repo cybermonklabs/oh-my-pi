@@ -3,8 +3,8 @@ name: Build sami branch
 # How the release owner cuts a release:
 #   1. Push the composed candidate to sami-candidate. That push runs every
 #      job here but publish: carry, version, release_binary (it builds,
-#      smoke-tests, uploads and attests the archives), rust_test and
-#      rust_test_macos.
+#      smoke-tests, uploads and attests the archives), release_cache_prune,
+#      rust_test and rust_test_macos.
 #   2. Wait for that run to go green.
 #   3. Fast-forward sami to exactly that commit.
 #   4. The push to sami runs only publish, which publishes that run's
@@ -17,6 +17,9 @@ name: Build sami branch
 # (.github/sami/release-candidate.sh). A run on sami other than that push (a
 # dispatch) runs no job; a dispatch on another ref builds and tests, and
 # attests nothing.
+# The release build cache is saved only on a push to sami-candidate, where
+# release_cache_prune keeps one entry per target; sami, where nothing is
+# built, keeps none.
 # Known limit: any identity of the agent App sjawhar-agent[bot] can move sami
 # and sami-candidate. No ruleset guards either ref, by the decision of
 # 2026-11-23: a push to sami that no green candidate run built publishes
@@ -37,7 +40,7 @@ permissions:
 # cache-mode: write, and every other job gets a cache token that can do
 # neither. rust_test and rust_test_macos run test code with root on their
 # runners; that code therefore cannot write an entry that release_binary
-# restores. Harness cases W1 to W22 (.github/sami/tests/run.sh) keep it so.
+# restores. Harness cases W1 to W27 (.github/sami/tests/run.sh) keep it so.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
 cache-mode: none
 
@@ -61,7 +64,7 @@ jobs:
     outputs:
       notes: ${{ steps.check.outputs.notes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -105,7 +108,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       timestamp: ${{ steps.version.outputs.timestamp }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: sjawhar/.github/.github/actions/sami-version@v1
         id: version
         with:
@@ -134,7 +137,16 @@ jobs:
       # GitHub's 10 GB cache limit for the whole repository: Bazel's disk
       # cache (its garbage collection deletes the least recently used
       # actions), and the downloads (Bazel's repository cache and the cargo
-      # registry), which are emptied when they grow past theirs.
+      # registry), which are emptied when they grow past theirs. Each push
+      # to sami-candidate saves a new entry per target (the key ends in the
+      # commit, and GitHub never overwrites a key), and release_cache_prune
+      # then deletes the entries it supersedes. So on sami-candidate the
+      # cache holds one entry per target, about 1.40 GB for linux-x64 and
+      # 0.95 GB for darwin-arm64 (about 2.35 GB), and up to twice that in the
+      # minutes between a save and the prune; sami, where nothing is built,
+      # holds none. Without the prune the ref would gain about 2.35 GB a
+      # push, and past 10 GB GitHub deletes the least recently used entries
+      # of every workflow in the repository.
       RELEASE_CACHE_PATHS: |
         ~/.cache/omp-release-bazel
         ~/.cargo/registry/index
@@ -157,7 +169,7 @@ jobs:
             native_targets: darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Bun version follows package.json "packageManager" (exact pin or floor),
       # the same way upstream's CI does; a hard pin here lags upstream's floor
       # and produced a binary that crashed at startup under 18.2.0's bytecode.
@@ -247,7 +259,7 @@ jobs:
           echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
       - name: Upload the addon rust_test loads
         if: ${{ matrix.target == 'linux-x64' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: natives-linux-x64-modern
           path: ${{ runner.temp }}/natives-linux-x64-modern
@@ -294,7 +306,7 @@ jobs:
           subject-path: |
             release/*.tar.gz
             release/*.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mise-${{ matrix.target }}
           path: |
@@ -303,10 +315,10 @@ jobs:
           if-no-files-found: error
       # Only a push to sami-candidate saves the cache; a dispatch or any other
       # event only restores. cache-mode takes no expression, so this condition
-      # on the bound and save steps enforces it (harness cases W14 to W19). A
-      # failed build's finished actions are still valid results, so the
-      # cache is saved whenever the native build ran. A re-run of the same
-      # commit restored its exact key and has nothing to save.
+      # on the bound and save steps enforces it (harness cases W14 to W19, W26
+      # and W27). A failed build's finished actions are still valid results,
+      # so the cache is saved whenever the native build ran. A re-run of the
+      # same commit restored its exact key and has nothing to save.
       - name: Bound the release build cache
         id: release-cache-bound
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
@@ -376,6 +388,73 @@ jobs:
         with:
           path: ${{ env.RELEASE_CACHE_PATHS }}
           key: ${{ steps.release-cache.outputs.cache-primary-key }}
+
+  release_cache_prune:
+    # Keeps the newest release build cache entry of each target in this
+    # ref and deletes the rest (see release_binary's env). It runs on a push
+    # to sami-candidate, the only run that saves an entry; a push to sami
+    # builds and saves nothing. No checkout and no member code: it only
+    # lists and deletes this ref's entries whose key starts with
+    # omp-release-bazel-v1-<ref>-, and this job alone may delete cache
+    # entries.
+    name: Keep one release build cache per target
+    needs: release_binary
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+    # The run's conclusion, which publish reads, follows the build and the
+    # tests; a failed prune shows only on this job.
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded release build caches of this ref
+        run: |
+          prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
+          # A line per entry: id, key, creation time, bytes, group. The group
+          # is the key without its -<64 hex lock hash>-<40 hex commit> end,
+          # so it names the ref and the target. A key without that end is
+          # UNGROUPED: it is never deleted, and it fails the step.
+          list() {
+            gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
+              -f key="$prefix" -f ref="$GITHUB_REF" -F per_page=100 \
+              -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, (.key | if test("-[0-9a-f]{64}-[0-9a-f]{40}$") then sub("-[0-9a-f]{64}-[0-9a-f]{40}$"; "") else "UNGROUPED" end)] | @tsv'
+          }
+          list >caches.tsv
+          echo "CACHES $(wc -l <caches.tsv) entries of this ref before"
+          if [ ! -s caches.tsv ]; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: no entry of $GITHUB_REF has a key that starts with $prefix, so nothing was pruned; the key format may have changed"
+            exit 0
+          fi
+          if cut -f5 caches.tsv | grep -qx UNGROUPED; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: an entry of $GITHUB_REF has a key without the -<lock hash>-<commit> end, so it is not pruned; the key format may have changed"
+          fi
+          # Newest first: each entry after the first of its group is superseded.
+          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '$5 == "UNGROUPED" { next } ($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
+          while IFS=$'\t' read -r id key created size _; do
+            # The run of a later push may have deleted it first: that is done too.
+            if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" >/dev/null 2>&1; then
+              echo "DELETED $key ($((size / 1000000)) MB, created $created)"
+            else
+              echo "GONE $key (deleted elsewhere, or the delete failed)"
+            fi
+          done <superseded.tsv
+          list >after.tsv
+          # Only the entries listed before the deletes count: an entry a later
+          # push saved while this job ran is for that run's prune.
+          awk -F'\t' 'NR == FNR { seen[$1] = 1; next }
+            { total++; s += $4 }
+            !($1 in seen) { later++; next }
+            $5 == "UNGROUPED" { print "UNGROUPED " $2; bad = 1; next }
+            { n[$5]++ }
+            END {
+              for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], (n[g] == 1 ? "y" : "ies"); if (n[g] > 1) bad = 1 }
+              if (later) printf "LATER %d entries a later push saved while this job ran\n", later
+              printf "CACHES %d entries of this ref after, %.2f GB\n", total, s / 1e9; exit bad }' caches.tsv after.tsv
 
   rust_test:
     # Upstream runs these tests in ci.yml's rust_validate job, on upstream's
