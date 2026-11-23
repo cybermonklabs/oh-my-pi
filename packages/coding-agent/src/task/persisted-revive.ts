@@ -480,11 +480,12 @@ async function liveParent(
 ): Promise<LiveParent | undefined> {
 	if (session instanceof RemoteAgentSession) {
 		let served: SubagentParentInputs | null;
-		let settings: Settings | undefined;
+		let settings: Settings;
 		try {
 			served = await session.subagentParentInputs(id, descriptors);
+			if (!served) return undefined;
 			// Served layers that fail the check, as stored ones are checked, are an answer the revive cannot take.
-			settings = served ? settingsFromSource(served.settings) : undefined;
+			settings = settingsFromSource(served.settings);
 		} catch (error) {
 			logger.warn("Revived subagent could not read its live parent's inputs; it takes the root's", {
 				subagent: id,
@@ -492,7 +493,6 @@ async function liveParent(
 			});
 			return undefined;
 		}
-		if (!served || !settings) return undefined;
 		// Owner policy, read from the parent's mirror while it lives; held weakly, as a spawn holds the provider.
 		const parent = new WeakRef(session);
 		const roots = session.effectiveExtensionRoots;
@@ -770,7 +770,7 @@ async function chooseColdReviveModel(args: {
 			model: model ? formatModelStringWithRouting(model) : undefined,
 		});
 	};
-	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity)) {
+	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity, known)) {
 		if (!model || !modelRegistry.hasConfiguredAuth(model)) continue;
 		if (ceiling && !modelSupportsEffortCeiling(model, ceiling)) continue;
 		moved(model);
@@ -812,7 +812,7 @@ async function choosePerCallModel(args: {
 			refusal = error;
 		}
 	}
-	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity)) {
+	for await (const { candidate, model } of args.models.chainModels(args.chain(), identity, saved)) {
 		if (!model) {
 			unknown.push(formatRetryFallbackBaseSelector(candidate));
 			continue;
@@ -1056,7 +1056,7 @@ function coldReviveSpawnSpec(
 	}
 	if (!parts.prompt) legacy.replayPrompt = true;
 	// Only a record with no spec keeps the workspace roots its header holds; a malformed policy part does not.
-	if (!parts.stored) legacy.policy = true;
+	if (!parts.stored) legacy.keepHeaderRoots = true;
 	const spawnSpec: SubagentSpawnSpec = {
 		v: SPAWN_SPEC_VERSION,
 		model: parts.model?.model ?? null,
@@ -1151,7 +1151,7 @@ function coldReviveSpawnSpec(
 					artifactsDir: path.dirname(spec.sessionFile),
 				},
 	};
-	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt || legacy.policy ? legacy : undefined };
+	return { spawnSpec, legacy: legacy.tools || legacy.replayPrompt || legacy.keepHeaderRoots ? legacy : undefined };
 }
 
 /**

@@ -169,29 +169,27 @@ export async function loadSecrets(
 	agentDir: string,
 	extraProjectDirs: readonly string[] = [],
 ): Promise<SecretEntry[]> {
-	const projectPath = path.join(cwd, ".omp", "secrets.yml");
-	const globalPath = path.join(agentDir, "secrets.yml");
-
-	const globalEntries = await loadSecretsFile(globalPath);
-	const projectEntries = await loadSecretsFile(projectPath);
-	const read = new Set([path.resolve(cwd)]);
-	for (const dir of extraProjectDirs) {
+	const globalEntries = await loadSecretsFile(path.join(agentDir, "secrets.yml"));
+	// `cwd`'s project first, whole; each other project adds only the contents no project before it holds.
+	const projectEntries: SecretEntry[] = [];
+	const projectContents = new Set<string>();
+	const read = new Set<string>();
+	for (const dir of [cwd, ...extraProjectDirs]) {
 		const resolved = path.resolve(dir);
 		if (read.has(resolved)) continue;
 		read.add(resolved);
-		const loaded = new Set(projectEntries.map(e => e.content));
-		for (const entry of await loadSecretsFile(path.join(resolved, ".omp", "secrets.yml"))) {
-			if (!loaded.has(entry.content)) projectEntries.push(entry);
+		const entries = await loadSecretsFile(path.join(resolved, ".omp", "secrets.yml"));
+		for (const entry of entries) {
+			if (!projectContents.has(entry.content)) projectEntries.push(entry);
 		}
+		for (const entry of entries) projectContents.add(entry.content);
 	}
 
 	if (globalEntries.length === 0) return projectEntries;
 	if (projectEntries.length === 0) return globalEntries;
 
 	// Merge: project overrides global by content match
-	const projectContents = new Set(projectEntries.map(e => e.content));
-	const merged = [...globalEntries.filter(e => !projectContents.has(e.content)), ...projectEntries];
-	return merged;
+	return [...globalEntries.filter(e => !projectContents.has(e.content)), ...projectEntries];
 }
 
 /** Minimum env var value length to consider as a secret. */

@@ -460,10 +460,13 @@ that grant authority; and a stored LSP, IRC or MCP value never turns on what the
 has off. So the revive from the file takes the subagent's ids from its registry entry; a task
 depth never shallower than its live parent chain; the credential source and workspace roots of
 its live parent where its spawn passed them (the root session's where the parent is not live);
-the tree's cost gate and the live parent's prepared extensions whatever the stored list of live
-inputs names; context discovery in the root session's cwd; the cache-warming value every spawn
-writes (off); its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the soft
-request budget) never looser than the live settings. Before it builds the session, a revive
+the tree's cost gate and the live parent's prepared extensions whatever the stored list of
+live inputs names; the SDK's own discovery in the root session's working directory (the slash
+commands and the custom TS commands it finds there, and the extensions only where no prepared
+extensions are passed), while the context files, skills, rules, prompt templates and workspace
+tree come from the live parent or the root; the cache-warming value every spawn writes (off);
+its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the soft request
+budget) never looser than the live settings. Before it builds the session, a revive
 of a file with `spawnSpec`, the in-memory one too, writes the workspace roots of the file's
 header once, as the roots the session uses: those of the spawn's policy (on the revive from
 the file, as named above) together with those of the live `workspace.additionalDirectories`

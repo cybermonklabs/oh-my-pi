@@ -51,10 +51,9 @@ const ACCEPTED_DIFFERENCES = [
 	"2. Settings that the subagent wrote to its overlay during its run: the warm revive keeps them; the cold revive restores the overlay the spawn wrote.",
 	"3. A family cache candidate that the parent stashed at spawn and that no request promoted yet (pendingCacheCandidate): the warm revive holds it in memory; the cold revive does not have it.",
 	"4. On a later build, the IRC roster: the warm revive can keep the roster that the live prompt showed; the cold revive collects it again.",
-	"5. A live input of a parent that is not live, and a discovery list whose contents changed on disk since the spawn.",
+	"5. A live input of a parent that is not live, and a discovery list whose contents changed on disk since the spawn and the root has not moved (difference 8).",
 	"6. A seance consult writes no spec, so its cold revive stays on its own route.",
 	"7. A custom tool that the cold revive cannot build again: both revives keep it in the tool list; on the cold revive a call to it answers that it is unavailable.",
-	"8. A value that the cold revive holds to the live process after live state changed since the spawn (cwd, additionalDirectories, credentialSourceSessionId, the wake maxRuntimeMs and the soft request budget): the cold revive follows the live state, the warm revive keeps the spawn's. No route here changes live state, so these are equal on every route.",
 ] as const;
 
 /** Whether this run printed {@link ACCEPTED_DIFFERENCES}: the first comparison of the differing options prints them. */
@@ -125,7 +124,7 @@ const OPTION_COMPARES = {
 	// Derived from the stored per-call flag.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
-	// Derived from the session file's cwd: where it differs from cwd, which no route here makes it.
+	// The session file's cwd, on every build: both revives pass the header's.
 	secretsProjectDirs: "data",
 	// Set by no subagent build, so the SDK default holds on every path.
 	additionalExtensionPaths: "data",
@@ -555,6 +554,7 @@ function defineRouteCases(result: () => ParityRun): void {
 	}, 30_000);
 
 	it("on a route that changes no live state, the values accepted difference 8 names are equal on both revives", () => {
+		// Both builds of the secret mask load the project secrets of the tools' directory, so a mask entry is only added.
 		const { warm, cold } = result();
 		const liveHeld = (revived: RevivedSubagent) => {
 			const { options } = revived.build;

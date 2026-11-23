@@ -226,7 +226,7 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	// Where discovery runs; at a cold revive the root session's cwd, as before spawn specs.
 	cwd: "S, cold L root",
 	additionalDirectories: "S, cold L parent",
-	// The session file's cwd, where its tools run, where it differs from `cwd` (a cold revive after the root moved).
+	// The session file's cwd, where its tools run, on every build (read once where it is `cwd`).
 	secretsProjectDirs: "D",
 	agentDir: "N",
 	spawns: "S",

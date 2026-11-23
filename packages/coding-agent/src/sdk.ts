@@ -585,8 +585,9 @@ export interface CreateAgentSessionOptions {
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
 	/**
-	 * Project directories besides cwd whose `.omp/secrets.yml` the secret mask also loads (each once; the global
-	 * secrets load once either way): a session whose tools run in another directory than cwd masks its secrets too.
+	 * Project directories whose `.omp/secrets.yml` the secret mask loads besides cwd's (each directory once, cwd
+	 * included; the global secrets load once either way): a session whose tools run in another directory than cwd
+	 * masks its secrets too.
 	 */
 	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */

@@ -1336,7 +1336,7 @@ export const SUBAGENT_OVERLAY_SETTINGS = [
 ] as const;
 
 /** The id of a setting a spawn writes to a subagent's overlay: one of {@link SUBAGENT_OVERLAY_SETTINGS}. */
-export type SubagentOverlaySettingId = (typeof SUBAGENT_OVERLAY_SETTINGS)[number];
+type SubagentOverlaySettingId = (typeof SUBAGENT_OVERLAY_SETTINGS)[number];
 
 /** The ids a spawn writes to a subagent's overlay: the restored ones, and the roots an isolated run clears. */
 type SubagentOverlayWriteId = SubagentOverlaySettingId | "workspace.additionalDirectories";
@@ -4310,7 +4310,7 @@ export interface SubagentLegacyRevive {
 	/** Every build returns the held base prompt, the builds after the revived session's first model call too. */
 	replayPrompt?: boolean;
 	/** The record holds no spawn spec: the session keeps the workspace roots its file's header holds. */
-	policy?: boolean;
+	keepHeaderRoots?: boolean;
 }
 
 /** Inputs of {@link buildSubagentSession}. */
@@ -4358,13 +4358,14 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 	const settings =
 		launch?.settings ?? restoreSubagentSettings(live.settingsParent, revive?.cache?.settings ?? spec.settings);
 	if (live.parentArtifactManager) sessionManager.adoptArtifactManager(live.parentArtifactManager);
-	// A revive whose spec states its policy writes its file header's workspace roots once, before the build, as the
-	// roots the build uses: the policy's (at a cold revive, the live parent's, or the root's where the parent is not
-	// live) and the live settings'. The SDK's merge then changes nothing, so a warm revive rewrites the file for its
-	// roots only where these changed, and a root the run took from a live settings edit stays while the setting holds
-	// it. A root only the reopened header holds, which a writer of the session store can edit, is not kept. A record
-	// with no spec keeps its header's roots, as before spawn specs.
-	if (revive && !revive.legacy?.policy) {
+	// A revive of a record that holds a spawn spec (the warm revive too) writes its file header's workspace roots
+	// once, before the build, as the roots the build uses: the policy's (at a cold revive, the live parent's, or the
+	// root's where the parent is not live) and the live settings'. A spec whose policy part is missing or malformed
+	// brings no policy roots, so only the live setting's roots are written. The SDK's merge then changes nothing, so
+	// a warm revive rewrites the file for its roots only where these changed, and a root the run took from a live
+	// settings edit stays while the setting holds it. A root only the reopened header holds, which a writer of the
+	// session store can edit, is not kept. A record with no spec keeps its header's roots, as before spawn specs.
+	if (revive && !revive.legacy?.keepHeaderRoots) {
 		await sessionManager.setAdditionalDirectories([
 			...(spec.policy.additionalDirectories ?? []),
 			...cfgWorkspaceAdditionalDirectories.get(settings),
@@ -4474,16 +4475,6 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 /** `stored`, unless the live process turns the capability off. */
 function narrowedToLive(stored: boolean | undefined, allowed: boolean | undefined): boolean | undefined {
 	return allowed === false ? false : stored;
-}
-
-/**
- * The project directory besides the build's `cwd` whose secrets the session's mask loads: the cwd of its session
- * file, where its tools run, where discovery runs in another directory (a cold revive after the root session moved).
- * The spawn and a warm revive build in their session's cwd, so they pass none.
- */
-function toolSecretsProjectDirs(cwd: string | undefined, sessionManager: SessionManager): string[] | undefined {
-	const toolsCwd = sessionManager.getCwd();
-	return cwd !== undefined && path.resolve(cwd) === path.resolve(toolsCwd) ? undefined : [toolsCwd];
 }
 
 /** The spawn's effort ceiling, lowered to the live `task.maxEffort` when that is lower. */
@@ -4661,7 +4652,9 @@ function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
 	const enableMCP = restricted ? false : narrowedToLive(policy.enableMCP, live.policy.enableMCP);
 	return {
 		cwd: policy.cwd,
-		secretsProjectDirs: toolSecretsProjectDirs(policy.cwd, input.sessionManager),
+		// The cwd of the session file, where its tools run: the mask loads its project secrets too (once where it is
+		// `cwd`), so a cold revive after the root session moved still masks them.
+		secretsProjectDirs: [input.sessionManager.getCwd()],
 		costGate: live.costGate,
 		additionalDirectories: policy.additionalDirectories,
 		authStorage: live.authStorage,
@@ -5008,15 +5001,16 @@ export class RevivedModels {
 	 * Each model a retry-fallback `chain` names when the stored model `identity` is gone or refused, in the
 	 * chain's order, every entry read as the live retry walk reads it (a provider wildcard keeps the failing
 	 * model's id under another provider, without an aggregator's vendor prefix the target provider does not
-	 * use): the entry's selector, and the model {@link lookup} gives for it, if any. Where `identity` names no
-	 * model, the registry's discovery runs first, so the walk sees what it adds, also where the model is held
-	 * under a disabled provider.
+	 * use): the entry's selector, and the model {@link lookup} gives for it, if any. `held`: the model the caller
+	 * resolved `identity` to. Where it is none, the registry's discovery runs first, so the walk sees what it
+	 * adds, also where the model is held under a disabled provider.
 	 */
 	async *chainModels(
 		chain: readonly string[],
 		identity: string,
+		held: Model | undefined,
 	): AsyncGenerator<{ candidate: RetryFallbackSelector; model: Model | undefined }> {
-		if (!this.lookup(identity)) await this.#discover();
+		if (!held) await this.#discover();
 		// A stored identity is exact: no part of its id is read as a thinking level.
 		const slash = identity.indexOf("/");
 		const current: RetryFallbackSelector = {

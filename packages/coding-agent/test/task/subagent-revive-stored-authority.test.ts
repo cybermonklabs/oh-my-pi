@@ -63,18 +63,20 @@ function editHeaderRoots(file: string, roots: string[]): Promise<number> {
 
 /**
  * A test process with a live root parent and the cold reviver over it, with `id` spawned by the root and parked;
- * `prepare` runs on the root before the spawn.
+ * `prepare` runs on the root before the spawn, `beforePark` between the spawn and the park.
  */
 async function spawnAndPark(
 	id: string,
 	settings: Readonly<Record<string, unknown>> = {},
 	prepare?: (env: ReviveEnv, root: LiveParent) => void,
+	beforePark?: (env: ReviveEnv, root: LiveParent) => Promise<void>,
 ): Promise<{ env: ReviveEnv; root: LiveParent; sessionFile: string }> {
 	const env = await openReviveEnv(settings);
 	const root = env.createLiveParent();
 	env.installColdReviver(root);
 	prepare?.(env, root);
 	const spawned = await env.spawn({ ...spawnerOptions(root.toolSession), ...env.subagentInputs(id) });
+	await beforePark?.(env, root);
 	await env.park(id);
 	return { env, root, sessionFile: spawned.sessionFile };
 }
@@ -470,24 +472,22 @@ describe("a root the live workspace.additionalDirectories setting gained during 
 	let failure: string | undefined;
 
 	beforeAll(async () => {
-		env = await openReviveEnv();
-		const root = env.createLiveParent();
-		env.installColdReviver(root);
-		await env.spawn({ ...spawnerOptions(root.toolSession), ...env.subagentInputs(id) });
-		added = path.join(env.root, "added");
-		await fs.mkdir(added, { recursive: true });
-		// The subagent's session follows a live edit of the setting into its file's header.
-		const live = localSession(AgentRegistry.global().get(id)?.session);
-		const followed = Promise.withResolvers<void>();
-		const addRoot = live.sessionManager.addWorkspaceDirectory.bind(live.sessionManager);
-		vi.spyOn(live.sessionManager, "addWorkspaceDirectory").mockImplementation(async directory => {
-			const resolved = await addRoot(directory);
-			if (live.sessionManager.getAdditionalDirectories().includes(added)) followed.resolve();
-			return resolved;
+		const opened = await spawnAndPark(id, {}, undefined, async opening => {
+			added = path.join(opening.root, "added");
+			await fs.mkdir(added, { recursive: true });
+			// The subagent's session follows a live edit of the setting into its file's header.
+			const live = localSession(AgentRegistry.global().get(id)?.session);
+			const followed = Promise.withResolvers<void>();
+			const addRoot = live.sessionManager.addWorkspaceDirectory.bind(live.sessionManager);
+			vi.spyOn(live.sessionManager, "addWorkspaceDirectory").mockImplementation(async directory => {
+				const resolved = await addRoot(directory);
+				if (live.sessionManager.getAdditionalDirectories().includes(added)) followed.resolve();
+				return resolved;
+			});
+			cfgWorkspaceAdditionalDirectories.override(opening.settings, [added]);
+			await followed.promise;
 		});
-		cfgWorkspaceAdditionalDirectories.override(env.settings, [added]);
-		await followed.promise;
-		await env.park(id);
+		env = opened.env;
 		const warm = await env.revive(id);
 		warmRoots = warm.session.sessionManager.getAdditionalDirectories();
 		await env.park(id);
