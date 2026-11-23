@@ -19,21 +19,22 @@ use serde_json::{Map, Value};
 use crate::wire::{Command, GetTreeCommand, RpcResponse};
 
 /// `serde_json::from_slice::<Value>(text)`, also for a `get_tree` answer that
-/// nests deeper than it reads, but only in its `data`: that answer's result
-/// takes its `data` into a [`DeepJson`] without recursion, while decoding any
-/// other value copies it by recursion, so other text that nests that deep fails
-/// as `serde_json` fails it. Scalars and member names are still read by
-/// `serde_json`.
+/// nests deeper than it reads, but only in its `data.tree`: that answer's
+/// result takes its `tree` into a [`DeepJson`] without recursion, while
+/// decoding any other value copies it by recursion, so other text that nests
+/// that deep fails as `serde_json` fails it, in a member that a later duplicate
+/// replaces too. Scalars and member names are still read by `serde_json`.
 pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
 	let error = match serde_json::from_slice(text) {
 		Ok(value) => return Ok(value),
 		Err(error) => error,
 	};
-	// Text it refuses for another reason fails the deep parse too.
+	// Text it refuses for another reason, or for depth outside `data.tree`,
+	// fails the deep parse too.
 	let Ok(value) = parse_deep(text) else {
 		return Err(error);
 	};
-	if is_deep_only_in_tree_data(&value) {
+	if is_get_tree_answer(&value) {
 		Ok(value)
 	} else {
 		drop_deep(value);
@@ -41,17 +42,9 @@ pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
 	}
 }
 
-/// Whether `value` is a `get_tree` answer whose members other than `data` nest
-/// no deeper than `serde_json` reads.
-fn is_deep_only_in_tree_data(value: &Value) -> bool {
-	let Some(members) = value.as_object() else {
-		return false;
-	};
-	members.get("type").and_then(Value::as_str) == Some("response")
-		&& members.get("command").and_then(Value::as_str) == Some(GetTreeCommand::NAME)
-		&& members
-			.iter()
-			.all(|(key, member)| key == "data" || !nests_deeper_than(member, SERDE_JSON_MAX_DEPTH - 1))
+fn is_get_tree_answer(value: &Value) -> bool {
+	value.get("type").and_then(Value::as_str) == Some("response")
+		&& value.get("command").and_then(Value::as_str) == Some(GetTreeCommand::NAME)
 }
 
 /// Drops with [`drop_deep`] the `data` of `response` when it nests deeper than
@@ -214,6 +207,11 @@ impl Open {
 	}
 }
 
+/// Parses `text` as `serde_json` does, also where it nests deeper than
+/// `serde_json` reads, but only inside the `data.tree` member of the top-level
+/// object: a container that opens that deep anywhere else fails the parse, so
+/// every value outside `data.tree`, which decoding copies and drops by
+/// recursion, nests no deeper than one `serde_json` reads.
 fn parse_deep(text: &[u8]) -> Result<Value, serde_json::Error> {
 	let mut open = Vec::new();
 	let parsed = parse_into(text, &mut open);
@@ -230,6 +228,7 @@ fn parse_into(text: &[u8], open: &mut Vec<Open>) -> Result<Value, serde_json::Er
 		// A value starts at `at`: open a container, or read a scalar whole.
 		let mut value = match text.get(at) {
 			Some(b'[') => {
+				check_depth(at, open)?;
 				at = skip_space(text, at + 1);
 				if text.get(at) != Some(&b']') {
 					open.push(Open::Array(Vec::new()));
@@ -239,6 +238,7 @@ fn parse_into(text: &[u8], open: &mut Vec<Open>) -> Result<Value, serde_json::Er
 				Value::Array(Vec::new())
 			},
 			Some(b'{') => {
+				check_depth(at, open)?;
 				at = skip_space(text, at + 1);
 				if text.get(at) != Some(&b'}') {
 					let (key, next) = read_key(text, at)?;
@@ -273,7 +273,11 @@ fn parse_into(text: &[u8], open: &mut Vec<Open>) -> Result<Value, serde_json::Er
 					b']'
 				},
 				Open::Object(members, key) => {
-					members.insert(std::mem::take(key), value);
+					// A member that a later duplicate replaces may nest deep, in
+					// `data.tree`.
+					if let Some(replaced) = members.insert(std::mem::take(key), value) {
+						drop_deep(replaced);
+					}
 					b'}'
 				},
 			};
@@ -299,6 +303,22 @@ fn parse_into(text: &[u8], open: &mut Vec<Open>) -> Result<Value, serde_json::Er
 			}
 		}
 	}
+}
+
+/// Fails the container that opens at `at`, inside the containers `open`, when
+/// it is more than [`SERDE_JSON_MAX_DEPTH`] levels deep anywhere but in the
+/// `data.tree` member of the top-level object ([`parse_deep`]).
+fn check_depth(at: usize, open: &[Open]) -> Result<(), serde_json::Error> {
+	let reading = |container: Option<&Open>, member: &str| matches!(container, Some(Open::Object(_, key)) if key == member);
+	if open.len() < SERDE_JSON_MAX_DEPTH
+		|| (reading(open.first(), "data") && reading(open.get(1), "tree"))
+	{
+		return Ok(());
+	}
+	Err(serde_json::Error::custom(format_args!(
+		"nested deeper than {SERDE_JSON_MAX_DEPTH} levels outside `data.tree` at byte {at} of the \
+		 JSON text"
+	)))
 }
 
 fn skip_space(text: &[u8], mut at: usize) -> usize {
@@ -500,7 +520,32 @@ impl Drop for Detached {
 
 #[cfg(test)]
 mod tests {
+	use std::thread;
+
 	use super::*;
+
+	const DEPTH: usize = 200_000;
+
+	fn deep() -> String {
+		format!("{}{}", "[".repeat(DEPTH), "]".repeat(DEPTH))
+	}
+
+	fn get_tree_answer(data: &str) -> String {
+		format!(r#"{{"type":"response","command":"get_tree","success":true,"data":{data}}}"#)
+	}
+
+	/// Runs `test` on a thread with the stack the client's reader thread gets
+	/// (`thread::spawn`'s default without `RUST_MIN_STACK`, 2 MiB): dropping a
+	/// value [`DEPTH`] levels deep by recursion there overflows the stack and
+	/// aborts the test process.
+	fn on_a_reader_stack(test: impl FnOnce() + Send + 'static) {
+		thread::Builder::new()
+			.stack_size(2 << 20)
+			.spawn(test)
+			.unwrap()
+			.join()
+			.unwrap();
+	}
 
 	#[test]
 	fn parses_as_serde_json_does() {
@@ -536,37 +581,91 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_and_disposes_of_a_value_of_any_depth() {
-		let depth = 200_000;
-		let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+	fn parses_and_disposes_of_a_tree_of_any_depth() {
+		let deep = deep();
+		let text = format!(r#"{{"data":{{"tree":{deep}}}}}"#);
 		assert!(serde_json::from_str::<Value>(&text).is_err());
-		let mut value = parse_deep(text.as_bytes()).unwrap();
+		let mut parsed = parse_deep(text.as_bytes()).unwrap();
+		let mut value = parsed["data"]["tree"].take();
 		let mut levels = 0;
 		while let Value::Array(mut items) = value {
 			levels += 1;
 			value = items.pop().unwrap_or(Value::Null);
 		}
-		assert_eq!(levels, depth);
+		assert_eq!(levels, DEPTH);
 		drop_deep(parse_deep(text.as_bytes()).unwrap());
 		// An error after a deep member disposes of what it built.
-		let broken = format!("[{}{},x]", "[".repeat(depth), "]".repeat(depth));
+		let broken = format!(r#"{{"data":{{"tree":[{deep},x]}}}}"#);
 		assert!(parse_deep(broken.as_bytes()).is_err());
 	}
 
 	#[test]
-	fn parses_deeper_than_serde_json_only_in_the_data_of_a_get_tree_answer() {
-		let depth = 200_000;
-		let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-		let response =
-			format!(r#"{{"type":"response","command":"get_tree","success":true,"data":{deep}}}"#);
-		drop_deep(parse(response.as_bytes()).unwrap());
+	fn parses_deeper_than_serde_json_only_in_the_tree_of_a_get_tree_answer() {
+		let deep = deep();
+		drop_deep(parse(get_tree_answer(&format!(r#"{{"tree":{deep}}}"#)).as_bytes()).unwrap());
 		for text in [
 			deep.clone(),
 			format!(r#"{{"type":"big","pad":{deep}}}"#),
 			format!(r#"{{"type":"response","command":"get_tree","success":false,"error":{deep}}}"#),
-			format!(r#"{{"type":"response","command":"get_messages","success":true,"data":{deep}}}"#),
+			format!(
+				r#"{{"type":"response","command":"get_messages","success":true,"data":{{"tree":{deep}}}}}"#
+			),
 		] {
 			assert!(parse(text.as_bytes()).is_err());
 		}
+	}
+
+	// If this regresses, a frame with a deep member that a later duplicate
+	// replaces drops that member by recursion, which overflows the reader
+	// thread's stack and aborts the process.
+	#[test]
+	fn drops_a_deep_member_a_later_duplicate_replaces_without_recursion() {
+		on_a_reader_stack(|| {
+			let deep = deep();
+			let text = get_tree_answer(&format!(r#"{{"tree":[{{"a":{deep},"a":1}}]}}"#));
+			let value = parse(text.as_bytes()).unwrap();
+			assert_eq!(value["data"]["tree"][0]["a"], 1);
+			drop_deep(value);
+		});
+	}
+
+	// If this regresses, a `get_tree` answer whose `data` nests deep in a member
+	// that a later duplicate replaces aborts the process on the reader thread,
+	// or is taken as that answer, instead of failing as `serde_json` fails it.
+	#[test]
+	fn refuses_a_get_tree_answer_deep_in_a_member_a_duplicate_replaces() {
+		on_a_reader_stack(|| {
+			let deep = deep();
+			let text = get_tree_answer(&format!(r#"{{"a":{deep},"a":1}}"#));
+			if let Ok(value) = parse(text.as_bytes()) {
+				drop_deep(value);
+				panic!("the answer was taken");
+			}
+		});
+	}
+
+	// If this regresses, a `get_tree` answer that nests deep outside its `tree`
+	// is taken, and decoding it (which detaches only `tree`) copies or drops
+	// the deep member by recursion, which overflows the caller's stack and
+	// aborts the process.
+	#[test]
+	fn refuses_a_get_tree_answer_deep_outside_its_tree() {
+		on_a_reader_stack(|| {
+			let deep = deep();
+			for (index, data) in [
+				format!(r#"{{"tree":[],"leafId":{deep}}}"#),
+				format!(r#"{{"tree":[],"unknown":{deep}}}"#),
+				format!(r#"[{{"tree":{deep}}}]"#),
+				deep.clone(),
+			]
+			.iter()
+			.enumerate()
+			{
+				if let Ok(value) = parse(get_tree_answer(data).as_bytes()) {
+					drop_deep(value);
+					panic!("answer {index} was taken");
+				}
+			}
+		});
 	}
 }
