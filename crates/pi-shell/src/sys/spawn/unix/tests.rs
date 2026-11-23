@@ -843,8 +843,9 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 	drop(s.spawn(sp).unwrap());
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let cx = Context::from_waker(&waker);
+	let mut key = crate::sys::WaitKey::default();
 	while out.captured() != b"late\n" {
-		NativeSpawner::poll_orphans(&cx);
+		NativeSpawner::poll_orphans(&cx, &mut key);
 		thread::park_timeout(Duration::from_millis(50));
 	}
 }
