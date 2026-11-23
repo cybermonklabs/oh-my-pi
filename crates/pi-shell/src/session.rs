@@ -3863,4 +3863,114 @@ mod tests {
 			},
 		}
 	}
+
+	/// Runs `script` with stdout a pipe the test filled with 'P's before the
+	/// run, so a write through a zsh multios tee on stdout stays in the tee's
+	/// queue; a reader starts 300 ms after the run did and reads to the end.
+	/// Returns what stdout got after the 'P's.
+	#[cfg(target_os = "linux")]
+	fn stdout_after_a_full_pipe(script: &str) -> Vec<u8> {
+		use std::{
+			io::Write,
+			os::fd::{AsRawFd, OwnedFd},
+		};
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut s = session();
+			let (mut out_r, out_w) = io::pipe().unwrap();
+			let mut out_w = std::fs::File::from(OwnedFd::from(out_w));
+			let fd = out_w.as_raw_fd();
+			// SAFETY: fcntl on a descriptor this test owns.
+			let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+			// SAFETY: as above.
+			unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+			let mut filled = 0;
+			loop {
+				match out_w.write(&[b'P'; 4096]) {
+					Ok(n) => filled += n,
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+					Err(e) => panic!("filling stdout: {e}"),
+				}
+			}
+			// SAFETY: as above.
+			unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+			let reader = std::thread::spawn(move || {
+				std::thread::sleep(std::time::Duration::from_millis(300));
+				let mut got = Vec::new();
+				out_r.read_to_end(&mut got).unwrap();
+				got
+			});
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(out_w),
+				stderr: Some(
+					std::fs::OpenOptions::new()
+						.write(true)
+						.open("/dev/null")
+						.unwrap(),
+				),
+			};
+			tokio::time::timeout(
+				std::time::Duration::from_secs(60),
+				s.run(script, stdio, CancellationToken::new()),
+			)
+			.await
+			.unwrap_or_else(|_| panic!("the run did not return within 60 s"))
+			.unwrap();
+			drop(s);
+			let got = reader.join().unwrap();
+			assert!(
+				got.len() >= filled && got[..filled].iter().all(|&b| b == b'P'),
+				"stdout lost the {filled} 'P's the test wrote first"
+			);
+			got[filled..].to_vec()
+		})
+	}
+
+	// Failure mode: `syswrite` through a zsh multios tee counted what the
+	// tee had only queued as written and ended; the group's redirections
+	// closed the tee, and what its queue held was lost (with 1 MiB, 983,040
+	// of 1,048,576 bytes came out). A write through `FdRef::poll_write_out`
+	// now ends once every target of the tee has its bytes.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_syswrite_through_a_multios_tee_is_out_before_the_tee_closes() {
+		let got = stdout_after_a_full_pipe(
+			"emulate zsh -c 'zmodload zsh/system; { syswrite -o 1 END; } >&1 >/dev/null'",
+		);
+		assert_eq!(String::from_utf8_lossy(&got), "END");
+	}
+
+	// Failure mode: as above for `sysread -o`, which writes what it read
+	// through the same `FdRef::poll_write_out`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_sysread_writing_through_a_multios_tee_is_out_before_the_tee_closes() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("in");
+		std::fs::write(&path, "END").unwrap();
+		let got = stdout_after_a_full_pipe(&format!(
+			"emulate zsh -c 'zmodload zsh/system; {{ sysread -i 3 -o 1; }} 3<{} >&1 >/dev/null'",
+			path.display()
+		));
+		assert_eq!(String::from_utf8_lossy(&got), "END");
+	}
+
+	// Failure mode: a builtin's output written at once (`write_now`, a
+	// bash-mode `printf` with nothing queued before it) counted what a zsh
+	// multios tee had only queued as written, so it was never settled; the
+	// run ended, the shell's stdout (the tee `exec` made) closed, and the
+	// bytes were lost. A tee's write now has a mark, which hands the output
+	// to the staged writer that settles it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_builtin_written_at_once_through_a_multios_tee_is_out_before_the_run_ends() {
+		let got = stdout_after_a_full_pipe("emulate zsh -c 'exec >&1 >/dev/null'\nprintf %s END");
+		assert_eq!(String::from_utf8_lossy(&got), "END");
+	}
 }
