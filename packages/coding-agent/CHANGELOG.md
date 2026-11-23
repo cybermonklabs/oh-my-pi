@@ -15,6 +15,7 @@
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
 - A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context, as the status line shows it (a prompt no request has answered yet included), is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); a rate limit that cuts off an answer already on screen waits the same way and then continues that answer on the same model, never walking the chain; overloads and server errors still walk the chain at once
 - A parked task subagent writes the inputs it is revived from to its own transcript when it parks and reads them back when it is revived, so it keeps less in memory while parked; when its transcript holds none (a park that could not write them), it is revived the way a subagent restored from disk is
+- A turn waits before its next model request or tool result while the session storage (such as SQL storage) has too many transcript appends queued, so a backlogged database slows the turn instead of growing memory
 
 ### Fixed
 
