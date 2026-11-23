@@ -110,6 +110,23 @@ async function until(check: () => boolean, ms = 4_000): Promise<void> {
 	while (!check() && Date.now() < deadline) await Bun.sleep(10);
 }
 
+function userSaid(eventId: string, delta: string, startMs: number, endMs: number) {
+	return { type: "session.input_transcript.delta", event_id: eventId, delta, start_ms: startMs, end_ms: endMs };
+}
+
+function voiceSaid(eventId: string, delta: string, startMs: number, endMs: number) {
+	return { type: "session.output_transcript.delta", event_id: eventId, delta, start_ms: startMs, end_ms: endMs };
+}
+
+function delegated(eventId: string, id: string, offsetMs: number) {
+	return {
+		type: "session.delegation.created",
+		event_id: eventId,
+		offset_ms: offsetMs,
+		delegation: { id, type: "delegation", target: "client" },
+	};
+}
+
 describe("GPT-Live call lifecycle", () => {
 	test("a stop while the key resolves sends no session request and leaves no call open", async () => {
 		const stub = gptLiveStub();
@@ -132,6 +149,41 @@ describe("GPT-Live call lifecycle", () => {
 			await Bun.sleep(100);
 			expect(stub.posts).toEqual([]);
 			expect(stub.upgrades).toEqual([]);
+		} finally {
+			await call.controller.stop();
+			stub.server.stop(true);
+		}
+	}, 10_000);
+
+	test("GPT-Live refusing the agent's answer ends the call with its reason; another error does not", async () => {
+		const stub = gptLiveStub({
+			frames: [
+				{
+					type: "error",
+					event_id: "e0",
+					error: { type: "invalid_request_error", message: "about nothing omp sent" },
+				},
+				userSaid("t1", "is CI green", 100, 900),
+				delegated("d1", "item_1", 1_000),
+				voiceSaid("t2", "Checking.", 1_100, 1_400),
+			],
+			onMessage: (message, socket) => {
+				if (message.type !== "session.commentary.append") return;
+				const error = {
+					type: "invalid_request_error",
+					message: "Unknown delegation",
+					client_event_id: message.event_id,
+				};
+				socket.send(JSON.stringify({ type: "error", event_id: "e1", error }));
+			},
+		});
+		const call = liveCall(stub.base);
+		try {
+			await call.controller.start();
+			await until(() => call.turns.length >= 1);
+			call.answer();
+			const ended = await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]);
+			expect(String(ended)).toMatch(/GPT-Live refused omp's session\.commentary\.append: Unknown delegation/);
 		} finally {
 			await call.controller.stop();
 			stub.server.stop(true);

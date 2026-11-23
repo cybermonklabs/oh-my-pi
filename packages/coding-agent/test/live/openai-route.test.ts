@@ -133,13 +133,15 @@ describe("GPT-Live transport", () => {
 			expect(new URL(upgrade.url).pathname).toBe("/v1/live/sessions/live_123/attach");
 			expect(upgrade.headers.get("authorization")).toBe("Bearer sk-test");
 			expectNoCodexHeaders(upgrade);
-			// The controller's delegation messages, in Codex's form: progress on the commentary channel, the result spoken.
+			// The controller's delegation messages, in Codex's form: progress on the commentary channel, the result
+			// spoken. Each has an event_id, which an error about it names.
 			let sent = api.message();
 			await transport.send(buildDelegationContextAppend("item_1", "Reading the log.", "commentary"));
 			expect(await sent).toEqual({
 				type: "session.thinking.append",
 				delegation_id: "item_1",
 				content: "Reading the log.",
+				event_id: expect.stringMatching(/^omp_\d+$/),
 			});
 			sent = api.message();
 			await transport.send(buildDelegationContextAppend("item_1", "CI is green."));
@@ -147,10 +149,11 @@ describe("GPT-Live transport", () => {
 				type: "session.commentary.append",
 				delegation_id: "item_1",
 				content: "CI is green.",
+				event_id: expect.stringMatching(/^omp_\d+$/),
 			});
 			sent = api.message();
 			await transport.send({ type: "session.close" });
-			expect(await sent).toEqual({ type: "session.close" });
+			expect(await sent).toEqual({ type: "session.close", event_id: expect.stringMatching(/^omp_\d+$/) });
 		} finally {
 			await transport.close();
 			api.server.stop(true);

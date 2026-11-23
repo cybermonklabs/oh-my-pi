@@ -31,6 +31,8 @@ const SIDEBAND_CONNECT_TIMEOUT_MS = 15_000;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 /** Event ids remembered to drop the 3 s the sideband replays from the data channel when it attaches. */
 const SEEN_EVENT_IDS_LIMIT = 1_024;
+/** How many sent messages' `event_id`s are remembered, to name the message an `error` refers to. */
+const SENT_EVENT_IDS_LIMIT = 256;
 
 type Lifecycle = "idle" | "connecting" | "connected" | "closing" | "closed";
 
@@ -104,7 +106,7 @@ function parseRecord(payload: string): Record<string, unknown> | undefined {
  * commentary channel and its result to the spoken one; GPT-Live takes progress as silent thinking and
  * the result as commentary, which it speaks. `session.close` is the same on both routes.
  */
-function toOpenAIMessage(message: LiveClientMessage): unknown {
+function toOpenAIMessage(message: LiveClientMessage): { type: string } {
 	if (message.type !== "delegation.context.append") return message;
 	return {
 		type: message.channel === "commentary" ? "session.thinking.append" : "session.commentary.append",
@@ -141,6 +143,9 @@ export class OpenAILiveTransport implements Pick<
 	#unexpectedFailureReported = false;
 	/** Event ids already delivered, in arrival order; see {@link SEEN_EVENT_IDS_LIMIT}. */
 	readonly #seenEventIds = new Set<string>();
+	/** The `event_id` of each message sent, with its type, oldest first; see {@link SENT_EVENT_IDS_LIMIT}. */
+	readonly #sentEventIds = new Map<string, string>();
+	#sentCount = 0;
 	/** The user's words since the previous delegation; see {@link #mapEvent}. */
 	#userWords = "";
 	/** The speaker of the transcript line being said, and its words so far; see {@link #mapEvent}. */
@@ -374,9 +379,10 @@ export class OpenAILiveTransport implements Pick<
 	 * - Its delegation carries only an id: OpenAI's client delegation guide says to use the transcript
 	 *   events for what the user wants. So the delegation's text is the user's words since the previous
 	 *   delegation, sent at once; words that arrive after it go with the next one.
-	 * - Its `error` reports a problem in the session "such as an invalid client command" (OpenAI's Live
-	 *   reference), and the session stays open, so an `error` is logged and does not end the call. The
-	 *   call ends when the sideband closes.
+	 * - Its `error` reports a problem in the session "such as an invalid client command", and names that
+	 *   command by its `client_event_id` (OpenAI's Live reference); the session stays open (the delegation
+	 *   guide, on `responses_validation_failed`). An error that names one of omp's messages fails the call,
+	 *   as a failed send does on Codex, so a refused answer is not lost unseen. Any other is logged.
 	 */
 	#mapEvent(record: Record<string, unknown>): LiveServerEvent[] {
 		switch (record.type) {
@@ -412,9 +418,18 @@ export class OpenAILiveTransport implements Pick<
 					},
 				];
 			}
-			case "error":
-				logger.warn("GPT-Live reported an error; the call stays open", { error: record.error });
+			case "error": {
+				const error: Record<string, unknown> = isRecord(record.error) ? record.error : {};
+				const clientEventId = error.client_event_id ?? record.client_event_id;
+				const refused = typeof clientEventId === "string" ? this.#sentEventIds.get(clientEventId) : undefined;
+				if (refused === undefined) {
+					logger.warn("GPT-Live reported an error; the call stays open", { error: record.error });
+				} else {
+					const reason = typeof error.message === "string" ? error.message : "no reason given";
+					this.#reportFailure(`GPT-Live refused omp's ${refused}: ${reason}`);
+				}
 				return [];
+			}
 			default: {
 				const event = parseLiveServerEvent(record);
 				return event ? [event] : [];
@@ -439,7 +454,10 @@ export class OpenAILiveTransport implements Pick<
 		} catch {}
 	}
 
-	/** Serialize one message onto the session's sideband, in GPT-Live's form. */
+	/**
+	 * Serialize one message onto the session's sideband, in GPT-Live's form, with an `event_id` that an
+	 * `error` about it names; see {@link #mapEvent}.
+	 */
 	send(message: LiveClientMessage): Promise<void> {
 		const operation = this.#sendTail.then(() => {
 			if (this.#state !== "connected") throw new Error("Live transport is not connected");
@@ -447,7 +465,14 @@ export class OpenAILiveTransport implements Pick<
 			if (!sideband || sideband.readyState !== WebSocket.OPEN) {
 				throw new Error("GPT-Live sideband is not connected");
 			}
-			sideband.send(JSON.stringify(toOpenAIMessage(message)));
+			const wire = toOpenAIMessage(message);
+			const eventId = `omp_${++this.#sentCount}`;
+			this.#sentEventIds.set(eventId, wire.type);
+			if (this.#sentEventIds.size > SENT_EVENT_IDS_LIMIT) {
+				const [oldest] = this.#sentEventIds.keys();
+				if (oldest !== undefined) this.#sentEventIds.delete(oldest);
+			}
+			sideband.send(JSON.stringify({ ...wire, event_id: eventId }));
 		});
 		this.#sendTail = operation.catch(() => {});
 		return operation;
