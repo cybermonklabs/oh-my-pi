@@ -909,7 +909,7 @@ describe("the transaction runner's state table", () => {
 		expect(ends(failed)).toEqual({ releases: 0, closes: 1 });
 	});
 
-	it("12. any repairless, the fourth attempt too: a close() and a warning for each attempt, the fourth error thrown", async () => {
+	it(`12. any repairless, all ${PG_REPAIR_RETRIES + 1} attempts (PG_REPAIR_RETRIES + 1): a close() and a warning for each attempt, the last attempt's error thrown`, async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
 		const attempts = PG_REPAIR_RETRIES + 1;
@@ -1068,7 +1068,7 @@ describe("the transaction runner's state table", () => {
 		expect(new Set(fake.server.blobs.keys())).toEqual(new Set([IMAGE_HASH, ICON_HASH]));
 	});
 
-	it("13. any repairless, three repairless attempts then a clean one: three close() calls, the operation resolves on the fourth reservation", async () => {
+	it(`13. any repairless, ${PG_REPAIR_RETRIES} repairless attempts (PG_REPAIR_RETRIES) then a clean one: ${PG_REPAIR_RETRIES} close() calls, the operation resolves on reservation ${PG_REPAIR_RETRIES + 1}`, async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
 		const repairless: ConnectionScript[] = [
