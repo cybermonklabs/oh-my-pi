@@ -70,7 +70,7 @@ import {
 	SPAWN_TASK,
 	type SpawnedSubagent,
 	sessionInitRecords,
-	spawnerOptions,
+	taskSpawn,
 	type ToolResultText,
 	userTexts,
 	WAKE_BODY,
@@ -120,16 +120,6 @@ async function wakeWithin(env: ReviveEnv, session: AgentSession, id: string): Pr
 	} finally {
 		clearTimeout(timer);
 	}
-}
-
-/** A task spawn of `id` by `parent`, with `extra` over the shared spawn inputs. */
-function taskSpawn(
-	env: ReviveEnv,
-	parent: ToolSession,
-	id: string,
-	extra: Partial<ExecutorOptions> = {},
-): ExecutorOptions {
-	return { ...spawnerOptions(parent), ...env.subagentInputs(id), ...extra };
 }
 
 async function spawnAndPark(env: ReviveEnv, options: ExecutorOptions): Promise<SpawnedSubagent> {
@@ -1583,7 +1573,7 @@ describe("a prewalk target of a provider disabled between the park and the reviv
 		env.scriptDiscovery();
 		env.addModel("mock-other-prewalk", { provider: DISABLED_PROVIDER });
 		const agent = fixtureAgent({ prewalk: target });
-		await spawnAndPark(env, { ...taskSpawn(env, opened.root.toolSession, id), ...env.subagentInputs(id, agent) });
+		await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id, { agent }));
 		env.dropWarmReviver(id);
 		cfgDisabledProviders.set(env.settings, [DISABLED_PROVIDER]);
 		warn = vi.spyOn(logger, "warn");

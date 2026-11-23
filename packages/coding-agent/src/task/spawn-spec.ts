@@ -276,8 +276,8 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	extensionRoots: "L",
 	preloadedExtensions: "N",
 	deferredExtensionPaths: "N",
-	// At a cold revive whose live inputs came from a session in another directory: that session's, without the
-	// entries discovery found as a project's own, after the stored directory's project-level ones.
+	// At a cold revive whose live inputs came from a session in another directory: that session's explicit and inline
+	// entries, after the project and user entries (plugins included) discovery finds in the stored directory.
 	preloadedExtensionPaths: "L",
 	preloadedPreparedExtensions: "L",
 	// At a cold revive only where the live session's cwd is the stored session's; else the SDK discovers them there.

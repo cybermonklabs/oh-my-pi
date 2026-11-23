@@ -798,7 +798,7 @@ describe("subagent runs routed into pooled workers", () => {
 	);
 
 	it(
-		"a cold revive whose worker-homed live parent's mirrored settings fail the main-side check reads that parent's settings as the main settings below them, with a warning",
+		"a cold revive whose worker-homed live parent's mirrored settings fail the main-side check takes the root's inputs, with a warning, and that parent's settings read as the main settings below them, with a warning",
 		async () => {
 			const warnings: string[] = [];
 			cleanups.push(
@@ -846,10 +846,13 @@ describe("subagent runs routed into pooled workers", () => {
 			}).not.toThrow();
 			expect(parentSettings).toBeInstanceOf(Settings);
 			expect(rejected).toHaveBeenCalled();
+			const tookRoot = warnings.filter(message =>
+				message.startsWith("Revived subagent could not read its live parent's inputs; it takes the root's"),
+			);
 			const fellBack = warnings.filter(message =>
 				message.startsWith("Worker-homed session's settings do not restore"),
 			);
-			expect(fellBack).toHaveLength(1);
+			expect({ tookRoot: tookRoot.length, fellBack: fellBack.length }).toEqual({ tookRoot: 1, fellBack: 1 });
 			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},
 		TEST_TIMEOUT_MS,

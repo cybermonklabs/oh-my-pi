@@ -197,7 +197,7 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 	});
 });
 
-describe("a cold revive of a record whose stored list of live inputs leaves out the cost gate, the extensions and the extension roots", () => {
+describe("a cold revive of a record whose stored list of live inputs leaves out costGate and preloadedPreparedExtensions", () => {
 	const id = "StoredLiveInputs";
 	let env: ReviveEnv | undefined;
 	let root: LiveParent | undefined;
@@ -211,10 +211,9 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 		});
 		env = opened.env;
 		root = opened.root;
-		const dropped = ["costGate", "preloadedPreparedExtensions", "preloadedExtensionPaths", "extensionRoots"];
 		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const names = Array.isArray(spec.liveInputs) ? spec.liveInputs : [];
-			spec.liveInputs = names.filter(name => !dropped.includes(name));
+			spec.liveInputs = names.filter(name => name !== "costGate" && name !== "preloadedPreparedExtensions");
 		});
 		({ revived, failure } = await reviveCold(env, id));
 	}, 60_000);
@@ -229,11 +228,9 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 		expect(revived?.build.options.costGate).toBe(root?.toolSession.costGate);
 	});
 
-	it("extensionRoots: with no extensions of its own the revive discovers them under the owner's extension roots", () => {
-		if (!root || !revived) throw new Error(`The revive built no session: ${failure}`);
-		expect(revived.build.options.preloadedPreparedExtensions).toBeUndefined();
-		expect(revived.build.options.preloadedExtensionPaths).toBeUndefined();
-		expect(revived.build.options.extensionRoots?.()).toEqual(root.toolSession.effectiveExtensionRoots?.());
+	it("preloadedPreparedExtensions: the live parent's, whatever the list names, so the revive discovers no extensions of its own", () => {
+		expect(failure).toBeUndefined();
+		expect(revived?.build.options.preloadedPreparedExtensions).toBe(root?.toolSession.preparedExtensions);
 	});
 });
 

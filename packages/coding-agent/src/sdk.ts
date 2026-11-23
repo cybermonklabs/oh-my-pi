@@ -130,7 +130,6 @@ import {
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
-import type { DiscoverExtensionPathOptions } from "./extensibility/extensions/loader";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { partitionStartupExtensions, recordStartupVerdicts } from "./extensibility/extensions/startup-deferral";
@@ -1165,8 +1164,7 @@ export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsRe
 type ExtensionDiscoveryOptions = Pick<
 	CreateAgentSessionOptions,
 	"disableExtensionDiscovery" | "additionalExtensionPaths" | "extensionRoots"
-> &
-	Pick<DiscoverExtensionPathOptions, "includeAmbientHooks" | "level">;
+> & { includeAmbientHooks?: boolean };
 
 type CliExtensionProviderOptions = ExtensionDiscoveryOptions & {
 	/** Discover extension model catalogs after registration (default true); usage-only commands skip it. */
@@ -1195,19 +1193,22 @@ export async function discoverSessionExtensionPaths(
 	return discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, {
 		ambient: !explicitOnly,
 		includeAmbientHooks: options.includeAmbientHooks,
-		level: options.level,
 	});
 }
 
 /**
- * The source entries of the file-backed extensions `result` bound, each at the scope it was imported with: what a
- * session forwards to its children. Inline factories (`<inline-N>`) are per-session and left out.
+ * The source entries of the file-backed extensions `result` bound: each bound extension's file but the inline
+ * factories (`<inline-N>`, per-session), at the scope of the prepared entry it was imported from; a file no
+ * prepared entry names (a caller-loaded result without them) is the caller's own, `explicit`. What a session
+ * forwards to its children.
  */
 function boundExtensionPaths(result: LoadExtensionsResult): ExtensionPathEntry[] {
-	const bound = new Set(result.extensions.map(extension => extension.resolvedPath));
-	return (result.preparedExtensions ?? [])
-		.filter(prepared => prepared.scope !== "inline" && bound.has(prepared.resolvedPath))
-		.map(prepared => ({ path: prepared.resolvedPath, scope: prepared.scope }));
+	const scopes = new Map(
+		(result.preparedExtensions ?? []).map(prepared => [prepared.resolvedPath, prepared.scope] as const),
+	);
+	return result.extensions
+		.filter(extension => !extension.resolvedPath.startsWith("<inline"))
+		.map(({ resolvedPath }) => ({ path: resolvedPath, scope: scopes.get(resolvedPath) ?? "explicit" }));
 }
 
 /**

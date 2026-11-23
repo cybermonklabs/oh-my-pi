@@ -13,11 +13,12 @@ import {
 	resolveAgentAdvisorRolePattern,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
+import type { EffectiveExtensionRoots } from "../capability/types";
 import type { KeptOverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { extensionPathKey, importExtensionModule } from "../extensibility/extensions/loader";
-import type { ExtensionPathEntry } from "../extensibility/extensions/types";
+import type { ExtensionPathEntry, ExtensionScope } from "../extensibility/extensions/types";
 import { MCPManager } from "../mcp/manager";
 import unavailableCustomToolsPrompt from "../prompts/system/unavailable-custom-tools.md" with { type: "text" };
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
@@ -190,10 +191,11 @@ export interface PreparedColdRevive {
 	 */
 	readonly live: ColdReviveLiveInputs;
 	/**
-	 * The cwd of the session {@link live} came from, where it is not the stored session's: such a revive builds on
-	 * the main thread, where a session given no MCP manager discovers the project's MCP servers. Undefined elsewhere.
+	 * The session {@link live} came from works in another directory than the stored session's: the revive builds on
+	 * the main thread, since in a worker a session given no MCP manager takes the process's shared one, while on main
+	 * it discovers the stored directory's MCP servers.
 	 */
-	readonly foreignSourceCwd: string | undefined;
+	readonly buildsOnMain: boolean;
 	/** The model a spawn spec's model or a per-call worker starts on; absent, the record's patterns decide. */
 	readonly model: ExplicitBuildModel | undefined;
 	/**
@@ -362,10 +364,9 @@ export function createPersistedSubagentReviverFactory(
 				settings: ctx.settings,
 			};
 			const spec: PersistedReviveSpec = { ...target, prepared: await prepareColdRevive(ctx, target, init) };
-			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker), except one whose live
-			// inputs came from a session in another directory: in a worker, a session given no MCP manager takes the
-			// process's shared one, so that revival builds on main, where it discovers the stored directory's servers.
-			const pool = spec.prepared.foreignSourceCwd === undefined ? subagentWorkerPool(ctx.settings) : undefined;
+			// Worker mode: a revival is placed like a fresh spawn (main thread or a worker), except one that builds on
+			// main ({@link PreparedColdRevive.buildsOnMain}).
+			const pool = spec.prepared.buildsOnMain ? undefined : subagentWorkerPool(ctx.settings);
 			return pool
 				? revivePersistedPlaced(pool, spec, expectedRef, revivePersistedSubagent)
 				: revivePersistedSubagent(spec, expectedRef);
@@ -393,7 +394,7 @@ export async function prepareColdRevive(
 	const descriptors = parts.tools?.customTools ?? [];
 	const parent = await liveParent(target.id, parentSession, descriptors);
 	const agentName = persistedAgentName(target.displayName, init);
-	const { live, foreignSourceCwd } = await coldReviveLiveInputs(
+	const { live, buildsOnMain } = await coldReviveLiveInputs(
 		ctx,
 		parent,
 		{
@@ -467,7 +468,7 @@ export async function prepareColdRevive(
 	const rootTools = root.evalToolSession;
 	return {
 		live,
-		foreignSourceCwd,
+		buildsOnMain,
 		model,
 		prewalkTarget,
 		discoveryRan: models.discoveryRan,
@@ -654,12 +655,14 @@ function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boo
 
 /**
  * Live inputs a cold revive passes whatever its record's list names, since leaving one out lets the subagent do
- * more than the live process allows: without the tree's cost gate it starts its own, which `session.maxCost` does
- * not reach. Every spawner passes it. The owner's extension roots pass whatever the list names where the subagent
- * gets no extensions of its own ({@link coldReviveLiveInputs}).
+ * more than the live process allows. Without the tree's cost gate it starts its own, which `session.maxCost` does
+ * not reach; without the prepared extensions it loses a host's inline policy hooks and, as a restricted child, the
+ * hooks it inherits. Every spawner passes both. The owner's extension roots pass whatever the list names where the
+ * subagent gets no extensions of its own ({@link coldReviveLiveInputs}).
  */
 const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
 	costGate: true,
+	preloadedPreparedExtensions: true,
 };
 
 /**
@@ -670,9 +673,10 @@ const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
  * own objects, as cold revives took them before spawn specs. Where the cwd of the session they come from is not
  * `storedCwd`, the stored session's (undefined for a seance consult), that session's own tool sources serve another
  * directory: its custom-tool paths and its MCP manager do not pass, so the SDK discovers the custom tools and the
- * project's MCP servers in the stored directory; its extensions follow the stored directory
- * ({@link storedDirectoryExtensions}); and the secret mask loads its project secrets beside the stored directory's.
- * That session's cwd is then returned as `foreignSourceCwd`.
+ * project's MCP servers in the stored directory; of its extensions only the explicit (configured included) and inline
+ * ones stay, beside those discovery finds in the stored directory under the live owner's extension policy
+ * ({@link storedDirectoryExtensions}); the secret mask loads that session's project secrets beside the stored
+ * directory's; and the revive builds on the main thread.
  */
 async function coldReviveLiveInputs(
 	ctx: PersistedSubagentReviveContext,
@@ -680,7 +684,7 @@ async function coldReviveLiveInputs(
 	agent: AgentIdentity,
 	names: readonly SpawnLiveInputName[] | undefined,
 	storedCwd: string | undefined,
-): Promise<{ live: ColdReviveLiveInputs; foreignSourceCwd: string | undefined }> {
+): Promise<{ live: ColdReviveLiveInputs; buildsOnMain: boolean }> {
 	const root = ctx.session;
 	// What the process allows: the root's policy, whichever session the other inputs come from.
 	const rootTools = root.evalToolSession;
@@ -733,48 +737,48 @@ async function coldReviveLiveInputs(
 		}
 	}
 	if (!live.preloadedPreparedExtensions && !live.preloadedExtensionPaths) live.extensionRoots = ownerRoots;
-	if (!elsewhere || storedCwd === undefined) return { live, foreignSourceCwd: undefined };
+	if (!elsewhere) return { live, buildsOnMain: false };
 	live.secretsProjectDirs = [sourceCwd];
-	return { live: await storedDirectoryExtensions(live, ownerRoots, storedCwd), foreignSourceCwd: sourceCwd };
+	await storedDirectoryExtensions(live, root.effectiveExtensionRoots, ctx.settings, storedCwd);
+	return { live, buildsOnMain: true };
 }
 
 /**
- * `live` with its extensions moved to `storedCwd`, the stored session's cwd: of the prepared extensions and the
- * extension paths, each but the project-scoped ones of the session they came from (whatever directory that session
- * found them in), after the project-scoped extensions of `storedCwd`, found under `roots`, the owner's extension
- * roots, as a session's own discovery finds them, and each prepared there. A host's inline entry and a user,
- * plugin or explicit entry stay; a file the kept entries hold is not added again, so it is bound once, at the scope
- * the session it came from gave it.
+ * Moves `live`'s extensions to `storedCwd`, the stored session's cwd. Of the prepared extensions (else the extension
+ * paths) of the session they came from, only the explicit entries (configured ones included) and the inline ones
+ * stay. Every project and user entry, plugins included, comes from one discovery in `storedCwd` under `owner`, the
+ * live owner's extension roots (their explicit-only mode, with `settings`' disabled list), whatever the record's list
+ * names and whatever that session's own roots are; it skips explicit and configured paths, which only the kept
+ * entries carry. Each discovered entry is prepared there and placed first, in discovery's order; a file the kept
+ * entries hold is not added again, so it is bound once, at the scope the session it came from gave it. Where prepared
+ * extensions pass, the session reads no extension paths, so none pass.
  */
 async function storedDirectoryExtensions(
 	live: ColdReviveLiveInputs,
-	roots: ColdReviveLiveInputs["extensionRoots"],
+	owner: EffectiveExtensionRoots,
+	settings: Settings,
 	storedCwd: string,
-): Promise<ColdReviveLiveInputs> {
+): Promise<void> {
 	const { preloadedPreparedExtensions: preparedExtensions, preloadedExtensionPaths: extensionPaths } = live;
-	if (!preparedExtensions && !extensionPaths) return live;
-	const project = await discoverSessionExtensionPaths(
-		{ extensionRoots: roots, level: "project" },
-		storedCwd,
-		live.settingsParent,
-	);
-	const projectKeys = await Promise.all(project.map(entry => extensionPathKey(entry.path)));
+	if (!preparedExtensions && !extensionPaths) return;
+	const ambientOnly = (): EffectiveExtensionRoots => ({ ...owner, explicit: [], configured: [] });
+	const discovered = await discoverSessionExtensionPaths({ extensionRoots: ambientOnly }, storedCwd, settings);
+	const discoveredKeys = await Promise.all(discovered.map(entry => extensionPathKey(entry.path)));
 	const notHeldBy = async (keptFiles: readonly string[]): Promise<ExtensionPathEntry[]> => {
 		const held = new Set(await Promise.all(keptFiles.map(extensionPathKey)));
-		return project.filter((_, index) => !held.has(projectKeys[index]));
+		return discovered.filter((_, index) => !held.has(discoveredKeys[index]));
 	};
-	const moved: ColdReviveLiveInputs = { ...live };
+	const stays = (scope: ExtensionScope): boolean => scope === "explicit" || scope === "inline";
 	if (preparedExtensions) {
-		const kept = preparedExtensions.filter(entry => entry.scope !== "project");
+		const kept = preparedExtensions.filter(entry => stays(entry.scope));
 		const added = await notHeldBy(kept.map(entry => entry.resolvedPath));
 		const imported = await Promise.all(added.map(entry => importExtensionModule(entry, storedCwd)));
-		moved.preloadedPreparedExtensions = [...imported, ...kept];
+		live.preloadedPreparedExtensions = [...imported, ...kept];
+		live.preloadedExtensionPaths = undefined;
+	} else if (extensionPaths) {
+		const kept = extensionPaths.filter(entry => stays(entry.scope));
+		live.preloadedExtensionPaths = [...(await notHeldBy(kept.map(entry => entry.path))), ...kept];
 	}
-	if (extensionPaths) {
-		const kept = extensionPaths.filter(entry => entry.scope !== "project");
-		moved.preloadedExtensionPaths = [...(await notHeldBy(kept.map(entry => entry.path))), ...kept];
-	}
-	return moved;
 }
 
 /**

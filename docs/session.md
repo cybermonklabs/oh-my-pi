@@ -462,7 +462,8 @@ directory of the file's header, as the reopened session manager reads it: where 
 and where the spawn and the in-memory revive build it. It takes the subagent's ids from its
 registry entry; a task depth never shallower than its live parent chain; the credential source
 and workspace roots of its live parent where its spawn passed them (the root session's where
-the parent is not live); the tree's cost gate whatever the stored list of live inputs names; the
+the parent is not live); the tree's cost gate, and the prepared extensions of the live parent or
+the root, whatever the stored list of live inputs names; the
 SDK's own discovery in the file's working directory (the slash commands and the custom TS
 commands it finds there), while the context files, skills, rules, prompt templates and
 workspace tree come from the live parent or the root; the cache-warming value every spawn
@@ -473,11 +474,12 @@ owner's policy. Where the working directory of the session its live inputs come 
 parent, or the root session where the parent is not live) is not the file's, it builds on the
 main thread, not in a worker, and that session's tool sources follow the file's directory: no
 custom-tool paths and no MCP manager are passed, so the SDK discovers the custom tools and the
-project's MCP servers there; of the prepared extensions and extension paths, each that
-discovery found as a project's own (in whatever directory that session found it) is left out,
-and those of the file's directory, found under the owner's policy, are added first (a host's
-inline extensions and the user's, plugin and configured ones stay, a file that is also one of
-those included, and an extension both lists hold is bound once). A per-call worker's
+project's MCP servers there; of that session's prepared extensions (else its extension paths)
+only its explicit and inline ones stay (those passed with `--extension` or configured in the
+`extensions` setting, and a host's inline extensions), and every project and user extension,
+plugins included, comes from discovery in the file's directory under the owner's policy (its
+explicit-only mode and disabled list, and that directory's plugin overrides), added first; an
+extension both hold is bound once. A per-call worker's
 agent definition is still looked up in the live parent's working directory (the root
 session's where the parent is not live). Before it builds the session, a revive
 of a file with `spawnSpec`, the in-memory one too, writes the workspace roots of the file's

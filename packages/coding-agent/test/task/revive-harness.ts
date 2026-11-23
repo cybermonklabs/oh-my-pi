@@ -560,6 +560,19 @@ export function spawnerOptions(session: ToolSession, restrictToolNames = false):
 	};
 }
 
+/**
+ * A task spawn of `id` by `parent` in `env`, with `extra` over the shared spawn inputs. `extra.agent` is the spawned
+ * agent and `extra.restrictToolNames` makes the spawner's own options restricted, as a restricted spawn takes them.
+ */
+export function taskSpawn(
+	env: ReviveEnv,
+	parent: ToolSession,
+	id: string,
+	extra: Partial<ExecutorOptions> = {},
+): ExecutorOptions {
+	return { ...spawnerOptions(parent, extra.restrictToolNames), ...env.subagentInputs(id, extra.agent), ...extra };
+}
+
 interface ReviveEnvParts {
 	root: string;
 	cwd: string;

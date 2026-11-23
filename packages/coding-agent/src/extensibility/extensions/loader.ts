@@ -733,11 +733,6 @@ export interface DiscoverExtensionPathOptions {
 	ambient?: boolean;
 	/** Include ambient hook factories. Disable for read-only catalog commands. */
 	includeAmbientHooks?: boolean;
-	/**
-	 * `"project"`: only a project's own entries (native modules and hooks of the project, plugins of project scope),
-	 * without those also found at user level. Configured paths are not read: they are never a project's own.
-	 */
-	level?: "project";
 }
 
 /**
@@ -759,7 +754,6 @@ export async function discoverExtensionPaths(
 	const entries: ExtensionPathEntry[] = [];
 	/** Each entry by its key, so a file found again keeps the one entry. */
 	const byKey = new Map<string, ExtensionPathEntry>();
-	const configured = options.level === "project" ? [] : configuredPaths;
 	const disabled = new Set(disabledExtensionIds ?? []);
 	const loadOptions = disabledExtensionIds ? { cwd, disabledExtensions: disabledExtensionIds } : { cwd };
 
@@ -807,7 +801,7 @@ export async function discoverExtensionPaths(
 			}
 		}
 	} else {
-		for (const configuredPath of configured) {
+		for (const configuredPath of configuredPaths) {
 			for (const hookPath of await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd))) {
 				if (isDisabledName(getExtensionNameFromPath(hookPath))) continue;
 				await addPath(hookPath, "explicit");
@@ -822,12 +816,12 @@ export async function discoverExtensionPaths(
 	}
 	// 4. Explicitly configured paths, never a project's own whatever level their setting came from. Configured file
 	// paths bypass the disabled-name filter.
-	for (const module of await listPackageExtensionModules(configured, cwd, { plugins: false })) {
+	for (const module of await listPackageExtensionModules(configuredPaths, cwd, { plugins: false })) {
 		if (module.toggleable && isDisabledName(getExtensionNameFromPath(module.path))) continue;
 		await addPath(module.path, "explicit");
 	}
 
-	return options.level === "project" ? entries.filter(entry => entry.scope === "project") : entries;
+	return entries;
 }
 
 /**

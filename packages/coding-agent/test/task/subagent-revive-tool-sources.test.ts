@@ -1,10 +1,11 @@
 /**
  * A subagent revived from its stored session builds in the directory its tools run in, project A, after the session
  * its live inputs come from moved to project B: it finds A's custom tools, project MCP servers, project extensions
- * and custom commands, and none of B's, and it keeps the user's extensions, the root's explicit (`--extension`)
- * ones and the host's inline ones. A child of a live subagent that works in the child's own directory keeps that
- * subagent's tool sources. Each case spawns a real subagent in A on a scripted model, parks it, revives it warm,
- * drops its warm reviver as a worker's exit does, and revives it cold through the persisted reviver factory.
+ * and custom commands, and none of B's, it loads the user's plugins as A's plugin overrides allow them, and it keeps
+ * the user's extensions, the root's explicit (`--extension`) ones and the host's inline ones. A child of a live
+ * subagent that works in the child's own directory keeps that subagent's tool sources. Each case spawns a real
+ * subagent in A on a scripted model, parks it, revives it warm, drops its warm reviver as a worker's exit does, and
+ * revives it cold through the persisted reviver factory.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { appendFileSync } from "node:fs";
@@ -20,10 +21,9 @@ import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import { discoverSessionExtensionPaths } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { SubagentWorkerPool, setSubagentWorkerPoolForTests } from "@oh-my-pi/pi-coding-agent/thread/subagent-worker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getPluginsDir } from "@oh-my-pi/pi-utils";
 import {
 	editSessionRecords,
 	fixtureAgent,
@@ -33,7 +33,7 @@ import {
 	type RecordedRequest,
 	type ReviveEnv,
 	type RevivedSubagent,
-	spawnerOptions,
+	taskSpawn,
 	userTexts,
 	WAKE_BODY,
 } from "./revive-harness";
@@ -50,6 +50,22 @@ const EU = "eu_probe";
 const EI = "ei_probe";
 /** The tool of the extension the root is started with by `--extension` (EX), a file outside every project. */
 const EX = "ex_probe";
+/** The tool of the extension the settings' `extensions` list names (EG), a file outside every project. */
+const EG = "eg_probe";
+/**
+ * The tools of the user's plugins: P, which A's plugin overrides disable and B's do not; N, of which A's and B's
+ * `.omp` hold project copies (tools na and nb); M, of which only B's `.omp` holds a project copy (tool mb).
+ */
+const P = "p_probe";
+const N = "n_probe";
+const NA = "na_probe";
+const NB = "nb_probe";
+const M = "m_probe";
+const MB = "mb_probe";
+/** The package names of P, N and M, which a project copy shares with the user's. */
+const PLUGIN_P = "p-probe-plugin";
+const PLUGIN_N = "n-probe-plugin";
+const PLUGIN_M = "m-probe-plugin";
 /** The tool names of the MCP servers that A's and B's project configs name (MA, MB). */
 const MA_PREFIX = "mcp__ma_";
 const MB_PREFIX = "mcp__mb_";
@@ -130,11 +146,32 @@ interface Projects {
 	readonly userExtension: string;
 	/** EX's file, which the owner's extension roots name as explicit. */
 	readonly explicitExtension: string;
+	/** EG's file, which the owner's extension roots name as configured (the settings' `extensions` list). */
+	readonly configuredExtension: string;
 	/** EI, the extension the host passes inline. */
 	readonly inline: PreparedExtension;
 }
 
-/** Writes A's and B's tool sources, the user's extension EU, the explicit extension EX and the host's inline one EI. */
+/** Writes a plugin root at `root` holding `plugins` (package name to the tool its extension registers). */
+async function writePluginRoot(
+	root: string,
+	plugins: Readonly<Record<string, string>>,
+	hookLog: string,
+): Promise<void> {
+	const dependencies = Object.fromEntries(Object.keys(plugins).map(name => [name, "1.0.0"]));
+	await Bun.write(path.join(root, "package.json"), JSON.stringify({ dependencies }));
+	for (const [name, tool] of Object.entries(plugins)) {
+		const dir = path.join(root, "node_modules", name);
+		const manifest = { name, version: "1.0.0", omp: { extensions: ["./index.ts"] } };
+		await Bun.write(path.join(dir, "package.json"), JSON.stringify(manifest));
+		await Bun.write(path.join(dir, "index.ts"), extensionSource(tool, hookLog));
+	}
+}
+
+/**
+ * Writes A's and B's tool sources, the user's extension EU, the user's plugins P, N and M with A's and B's project
+ * copies and A's plugin overrides, the explicit extension EX, the configured extension EG and the host's inline EI.
+ */
 async function writeProjects(env: ReviveEnv): Promise<Projects> {
 	const a = env.cwd;
 	const b = path.join(env.root, "project-b");
@@ -161,9 +198,20 @@ async function writeProjects(env: ReviveEnv): Promise<Projects> {
 	}
 	const userExtension = path.join(getAgentDir(), "extensions", `${EU}.ts`);
 	await Bun.write(userExtension, extensionSource(EU, hookLog));
-	// EX's hook writes to a log of its own: the restricted case counts the hooks of EU, EI and EA only.
+	// EX's, EG's and the plugins' hooks write to a log of their own: the restricted case counts EU, EI and EA only.
+	const otherHookLog = path.join(env.root, "other-hooks.log");
 	const explicitExtension = path.join(env.root, "explicit", `${EX}.ts`);
-	await Bun.write(explicitExtension, extensionSource(EX, path.join(env.root, "explicit-hooks.log")));
+	await Bun.write(explicitExtension, extensionSource(EX, otherHookLog));
+	const configuredExtension = path.join(env.root, "configured", `${EG}.ts`);
+	await Bun.write(configuredExtension, extensionSource(EG, otherHookLog));
+	const pluginsDir = getPluginsDir();
+	if (!pluginsDir.startsWith(env.root + path.sep)) {
+		throw new Error(`The user's plugins directory is outside the test home: ${pluginsDir}`);
+	}
+	await writePluginRoot(pluginsDir, { [PLUGIN_P]: P, [PLUGIN_N]: N, [PLUGIN_M]: M }, otherHookLog);
+	await writePluginRoot(path.join(a, ".omp", "plugins"), { [PLUGIN_N]: NA }, otherHookLog);
+	await writePluginRoot(path.join(b, ".omp", "plugins"), { [PLUGIN_N]: NB, [PLUGIN_M]: MB }, otherHookLog);
+	await Bun.write(path.join(a, ".omp", "plugin-overrides.json"), JSON.stringify({ disabled: [PLUGIN_P] }));
 	const inlineFactory: ExtensionFactory = pi => {
 		pi.on("session_start", () => appendFileSync(hookLog, `${EI}\n`));
 		pi.registerTool({
@@ -186,7 +234,19 @@ async function writeProjects(env: ReviveEnv): Promise<Projects> {
 		error: null,
 	};
 	await Bun.write(path.join(c, ".omp", "extensions", `${EC}.ts`), extensionSource(EC, hookLog));
-	return { a, b, c, realA: await fs.realpath(a), hookLog, ranCa, ranCb, userExtension, explicitExtension, inline };
+	return {
+		a,
+		b,
+		c,
+		realA: await fs.realpath(a),
+		hookLog,
+		ranCa,
+		ranCb,
+		userExtension,
+		explicitExtension,
+		configuredExtension,
+		inline,
+	};
 }
 
 /** One test process: its env, its live root, its projects, and the MCP managers the root's scans connected. */
@@ -205,13 +265,13 @@ interface ToolSourceProcess {
 
 /**
  * A test process whose root starts in A; `roots`, where given, is the owner's extension-root policy over its projects,
- * else it names EX as explicit and merges the ambient sources.
+ * else it names EX as explicit and EG as configured and merges the ambient sources.
  */
 async function openToolSourceProcess(
 	roots: (projects: Projects) => EffectiveExtensionRoots = projects => ({
 		explicit: [projects.explicitExtension],
 		mode: "merge",
-		configured: [],
+		configured: [projects.configuredExtension],
 		configuredLevel: "user",
 	}),
 ): Promise<ToolSourceProcess> {
@@ -249,11 +309,6 @@ async function openToolSourceProcess(
 	};
 }
 
-/** A spawn of `id` by `parent`, with `extra` over the shared spawn inputs. */
-function spawnOptions(env: ReviveEnv, parent: ToolSession, id: string, extra: Partial<ExecutorOptions> = {}) {
-	return { ...spawnerOptions(parent), ...env.subagentInputs(id), ...extra };
-}
-
 /** A tool call the scripted model answers with. */
 function toolCall(name: string): MockResponse {
 	return { content: [{ type: "toolCall", name, arguments: {} }] };
@@ -273,9 +328,15 @@ function probeTurn(request: RecordedRequest): MockResponse | undefined {
 	return woken ? toolCall(TA) : undefined;
 }
 
-/** The tool-source tools a session holds: the custom tools, the extensions' tools and the MCP servers' tools. */
+/** The tools of the user's plugins and their project copies. */
+const PLUGIN_TOOLS = [P, N, NA, NB, M, MB];
+
+/**
+ * The tool-source tools a session holds: the custom tools, the extensions' and the plugins' tools and the MCP
+ * servers' tools.
+ */
 function sourceTools(session: AgentSession): string[] {
-	const named = [TA, TB, EA, EB, EC, EU, EI, EX];
+	const named = [TA, TB, EA, EB, EC, EU, EI, EX, EG, ...PLUGIN_TOOLS];
 	return session
 		.getAllToolNames()
 		.filter(name => named.includes(name) || name.startsWith(MA_PREFIX) || name.startsWith(MB_PREFIX))
@@ -285,6 +346,11 @@ function sourceTools(session: AgentSession): string[] {
 /** The tools of B's sources (TB, EB, MB's) a tool-source list holds. */
 function fromB(tools: readonly string[]): string[] {
 	return tools.filter(name => name === TB || name === EB || name.startsWith(MB_PREFIX));
+}
+
+/** The plugins' tools a tool-source list holds. */
+function pluginTools(tools: readonly string[]): string[] {
+	return tools.filter(name => PLUGIN_TOOLS.includes(name));
 }
 
 /** What the cold-revived subagent's tools, extensions and commands did. */
@@ -354,7 +420,7 @@ async function warmRevive(env: ReviveEnv, id: string): Promise<string[]> {
  * what the run observed, so a failing case reports every clause's value.
  */
 function defineColdRunCases(title: string, result: () => ColdRun | undefined, projects: () => Projects | undefined) {
-	it(`${title}: the tool list holds A's tools (TA, MA's, ea), eu, ei and ex, and none of B's, as the warm revive's does`, () => {
+	it(`${title}: the tool list holds A's tools (TA, MA's, ea), eu, ei, ex and eg, and none of B's, as the warm revive's does`, () => {
 		const run = result();
 		if (!run) throw new Error("The test process did not start");
 		const tools = sourceTools(run.cold.session);
@@ -367,11 +433,20 @@ function defineColdRunCases(title: string, result: () => ColdRun | undefined, pr
 			cwd: run.cold.build.options.cwd,
 		}).toEqual({
 			coldFromB: [],
-			cold: expect.arrayContaining([TA, EA, EU, EI, EX]),
+			cold: expect.arrayContaining([TA, EA, EU, EI, EX, EG]),
 			coldHoldsMa: true,
 			warmFromB: [],
-			warm: expect.arrayContaining([TA, EA, EU, EI, EX]),
+			warm: expect.arrayContaining([TA, EA, EU, EI, EX, EG]),
 			cwd: projects()?.a,
+		});
+	}, 30_000);
+
+	it(`${title}: of the user's plugins the list holds A's project copy na of N and the user's m, and no p, n, nb or mb, as the warm revive's does`, () => {
+		const run = result();
+		const cold = run ? sourceTools(run.cold.session) : [];
+		expect({ cold: pluginTools(cold), warm: pluginTools(run?.warmTools ?? []) }).toEqual({
+			cold: [M, NA],
+			warm: [M, NA],
 		});
 	}, 30_000);
 
@@ -402,7 +477,7 @@ describe("a live root restarted in B, whose custom-tool paths, extensions and MC
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
-		await env.spawn(spawnOptions(env, root.toolSession, id));
+		await env.spawn(taskSpawn(env, root.toolSession, id));
 		await env.park(id);
 		const warmTools = await warmRevive(env, id);
 		await process.startRootIn(projects.b);
@@ -441,7 +516,7 @@ describe("a live root restarted in B and then moved to C, whose project extensio
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
-		await env.spawn(spawnOptions(env, root.toolSession, id));
+		await env.spawn(taskSpawn(env, root.toolSession, id));
 		await env.park(id);
 		await process.startRootIn(projects.b);
 		// The root moves on to C as `/move` moves it; its extensions stay those it was built with in B.
@@ -474,7 +549,7 @@ describe("a spawner that passed no custom-tool paths and no MCP manager, its roo
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
 		await env.spawn(
-			spawnOptions(env, root.toolSession, id, { preloadedCustomToolPaths: undefined, mcpManager: undefined }),
+			taskSpawn(env, root.toolSession, id, { preloadedCustomToolPaths: undefined, mcpManager: undefined }),
 		);
 		await env.park(id);
 		const warmTools = await warmRevive(env, id);
@@ -502,8 +577,8 @@ describe("a nested subagent whose parent is parked, under a root with no tool se
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
-		await env.spawn(spawnOptions(env, root.toolSession, parentId));
-		await env.spawn(spawnOptions(env, env.toolSessionOf(parentId), id));
+		await env.spawn(taskSpawn(env, root.toolSession, parentId));
+		await env.spawn(taskSpawn(env, env.toolSessionOf(parentId), id));
 		await env.park(id);
 		const warmTools = await warmRevive(env, id);
 		await env.park(parentId);
@@ -532,7 +607,7 @@ describe("a record with no spawn spec, in a process with no MCP manager, its roo
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
-		const spawned = await env.spawn(spawnOptions(env, root.toolSession, id, { mcpManager: undefined }));
+		const spawned = await env.spawn(taskSpawn(env, root.toolSession, id, { mcpManager: undefined }));
 		await env.park(id);
 		const warmTools = await warmRevive(env, id);
 		await editSessionRecords(spawned.sessionFile, record => {
@@ -571,7 +646,7 @@ describe("an owner's explicit-only extension policy naming EU only, its root res
 			configuredLevel: "user",
 		}));
 		const { env, root, projects } = process;
-		await env.spawn(spawnOptions(env, root.toolSession, id));
+		await env.spawn(taskSpawn(env, root.toolSession, id));
 		await env.park(id);
 		warmTools = await warmRevive(env, id);
 		await process.startRootIn(projects.b);
@@ -609,7 +684,7 @@ describe("a restricted (plan-mode) subagent, whose extensions are its parent's h
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
 		const agent = fixtureAgent({ tools: ["read", "grep", "yield"] });
-		await env.spawn({ ...spawnerOptions(root.toolSession, true), ...env.subagentInputs(id, agent) });
+		await env.spawn(taskSpawn(env, root.toolSession, id, { restrictToolNames: true, agent }));
 		await env.park(id);
 		warmHooks = await hooksDuring(projects.hookLog, async () => {
 			await env.revive(id);
@@ -642,7 +717,7 @@ describe("worker mode on, the subagent placed in a worker, its root restarted in
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root, projects } = process;
-		await env.spawn(spawnOptions(env, root.toolSession, id));
+		await env.spawn(taskSpawn(env, root.toolSession, id));
 		await env.park(id);
 		await process.startRootIn(projects.b);
 		// Every revive this pool places goes to a worker, which this test process does not start.
@@ -674,6 +749,72 @@ describe("worker mode on, the subagent placed in a worker, its root restarted in
 	}, 30_000);
 });
 
+/**
+ * Spawns, under the root of `process`, a parent that works in W as a vibe worker's spawner spawns one
+ * (`vibe/runtime.ts`: the root's prepared extensions and extension paths, EX among them, and no extension roots, so
+ * the parent's own roots name no explicit extension), and that parent's child, stored in A; parks the child, revives
+ * it warm, then cold while the parent is live. Returns both revives' tool-source lists.
+ */
+async function rootlessParentRun(process: ToolSourceProcess, id: string): Promise<{ warm: string[]; cold: string[] }> {
+	const { env, root, projects } = process;
+	const parentId = `${id}Parent`;
+	const workDir = path.join(env.root, "parent-work");
+	await fs.mkdir(workDir, { recursive: true });
+	await env.spawn(taskSpawn(env, root.toolSession, parentId, { cwd: workDir, extensionRoots: undefined }));
+	await env.spawn(taskSpawn(env, env.toolSessionOf(parentId), id, { cwd: projects.a }));
+	await env.park(id);
+	const warm = await warmRevive(env, id);
+	env.dropWarmReviver(id);
+	const cold = sourceTools((await env.revive(id)).session);
+	return { warm, cold };
+}
+
+describe("a nested child, stored in A, of a live parent that works in W, spawned with the root's extensions and no extension roots", () => {
+	let process: ToolSourceProcess | undefined;
+	let run: { warm: string[]; cold: string[] } | undefined;
+
+	beforeAll(async () => {
+		process = await openToolSourceProcess();
+		run = await rootlessParentRun(process, "RootlessChild");
+	}, 90_000);
+
+	afterAll(async () => {
+		await process?.close();
+	}, 30_000);
+
+	it("parent without extension roots: the tool list holds ex, the parent's explicit extension, beside ea, eu and ei, as the warm revive's does", () => {
+		expect(run).toEqual({
+			cold: expect.arrayContaining([EA, EU, EI, EX]),
+			warm: expect.arrayContaining([EA, EU, EI, EX]),
+		});
+	}, 30_000);
+});
+
+describe("that nested child under a live owner whose extension roots are explicit-only, naming EX", () => {
+	let process: ToolSourceProcess | undefined;
+	let run: { warm: string[]; cold: string[] } | undefined;
+
+	beforeAll(async () => {
+		process = await openToolSourceProcess(projects => ({
+			explicit: [projects.explicitExtension],
+			mode: "explicit-only",
+			configured: [],
+			configuredLevel: "user",
+		}));
+		run = await rootlessParentRun(process, "ExplicitOwnerChild");
+	}, 90_000);
+
+	afterAll(async () => {
+		await process?.close();
+	}, 30_000);
+
+	it("explicit-only owner, parent without extension roots: the cold list holds ex and none of ea, eu or p", () => {
+		const cold = run?.cold ?? [];
+		const others = cold.filter(name => name === EA || name === EU || name === P);
+		expect({ ex: cold.includes(EX), others }).toEqual({ ex: true, others: [] });
+	}, 30_000);
+});
+
 describe("a nested child of a live subagent that works in its own directory, the root not moved", () => {
 	const parentId = "WorktreeParent";
 	const id = "WorktreeChild";
@@ -688,9 +829,9 @@ describe("a nested child of a live subagent that works in its own directory, the
 		const { env, root } = process;
 		worktree = path.join(env.root, "worktree");
 		await fs.mkdir(worktree, { recursive: true });
-		await env.spawn(spawnOptions(env, root.toolSession, parentId, { cwd: worktree }));
+		await env.spawn(taskSpawn(env, root.toolSession, parentId, { cwd: worktree }));
 		parent = env.toolSessionOf(parentId);
-		await env.spawn(spawnOptions(env, parent, id));
+		await env.spawn(taskSpawn(env, parent, id));
 		await env.park(id);
 		warm = await env.revive(id);
 		await env.park(id);
