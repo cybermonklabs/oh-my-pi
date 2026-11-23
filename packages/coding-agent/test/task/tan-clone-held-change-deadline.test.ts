@@ -75,11 +75,12 @@ it("sends the changed prompt from a /tan clone once the parent's held change is 
 	const overlay = dir.join("overlay.yml");
 	await Bun.write(overlay, OVERLAY);
 	const settings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.path(), configFiles: [overlay] });
-	// The clone's first request is answered with a call, and the clock passes the deadline before its next request.
+	// The clone's first request is answered with a call, and the clock passes the deadline while the clone runs that
+	// call, before its next request. No request is in flight when the clock moves: a stream's deadlines run on
+	// `Date.now`, so a jump inside a response would time that response out and retry it.
 	let cloneFirstTurn = -1;
 	const gateway = mockGatewayFetch(turn => {
 		if (turn !== cloneFirstTurn) return answer(turn, { cacheWriteTokens: 100 });
-		setClock(8 * MINUTE_MS);
 		return toolCallAnswer(turn, "read", { path: "overlay.yml" }, { cacheWriteTokens: 100 });
 	});
 	const authStorage = createInMemoryAuthStorage();
@@ -117,6 +118,9 @@ it("sends the changed prompt from a /tan clone once the parent's held change is 
 		vi.spyOn(sdk, "createAgentSession").mockImplementation(async options => {
 			const created = await realCreate(options);
 			sessions.push(created.session);
+			created.session.subscribe(event => {
+				if (event.type === "tool_execution_start") setClock(8 * MINUTE_MS);
+			});
 			return created;
 		});
 		const manager = parent.asyncJobManager;
