@@ -341,6 +341,15 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("bg-group-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; { f | cat; } & wait"),
 	("bg-and-pipeline-function-level", "f() { echo $BASH_SUBSHELL; }; true && f | cat & wait"),
 	("group-element-function-level", "f() { echo $BASH_SUBSHELL; }; { f; } | cat"),
+	// A `( … )` job counts once (a `time` or `!` around it too); an and-or
+	// job that starts with one is forked whole, and the `( … )` again.
+	("bg-subshell-level", "( echo $BASH_SUBSHELL ) & wait"),
+	("bg-negated-subshell-level", "! ( echo $BASH_SUBSHELL ) & wait"),
+	("bg-timed-subshell-level", "TIMEFORMAT=; time ( echo $BASH_SUBSHELL ) & wait"),
+	("bg-subshell-and-list-level", "( echo $BASH_SUBSHELL ) && : & wait"),
+	("bg-subshell-or-list-level", "( echo $BASH_SUBSHELL; false ) || : & wait"),
+	("bg-subshell-redir-and-list-level", "( echo $BASH_SUBSHELL ) 2>/dev/null && : & wait"),
+	("bg-timed-subshell-and-list-level", "TIMEFORMAT=; time ( echo $BASH_SUBSHELL ) && : & wait"),
 	// A fatal error (`${x?}`, `set -u`) in a forked element or async command
 	// of a `-c` string: its own words and a function it runs reach the
 	// shell's command loop (127); a builtin it runs (`eval`), a subshell, a
@@ -511,8 +520,9 @@ const FATALS: &[(&str, &str)] = &[
 	("element-group-redir-word", "{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}"),
 	// A job running a function reaches the command loop. A timed job is
 	// forked through `execute_in_subshell`, its own `top_level`, so what it
-	// runs ends there (1); but a timed compound's own redirection is
-	// expanded before that, at the fork's (127 with `-c`).
+	// runs ends there (1); but the own redirection of a timed compound that
+	// is the whole job is expanded before that, at the fork's (127 with
+	// `-c`).
 	("bg-function-colon", "f() { echo ${x:?u}; }; f & wait $!; echo st=$?"),
 	("bg-timed-function", "TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?"),
 	("bg-timed-simple-word", "TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?"),
@@ -565,6 +575,83 @@ const FATALS: &[(&str, &str)] = &[
 		"element-timed-group-redir-word",
 		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}",
 	),
+	// A compound with its own redirection that is only the first command
+	// of a job's and-or list, timed or not: bash forks the whole list
+	// (`execute_connection`), whose child sets its own `top_level` before
+	// the list runs the compound, so the redirection's error ends there
+	// (1); so too a group or subshell job holding the timed compound. The
+	// controls: a lone compound job, negated or timed, ends at the fork's
+	// (127 with `-c`).
+	("bg-group-redir-and-list", "{ :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-timed-group-redir-and-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-subshell-redir-and-list", "( : ) 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-timed-subshell-redir-and-list",
+		"TIMEFORMAT=; time ( : ) 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-group-redir-or-list", "{ :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?"),
+	(
+		"bg-timed-group-redir-or-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-and-then-timed-group-redir",
+		"TIMEFORMAT=; true && time { :; } 2>\"${zz?u}\" & wait $!; echo w=$?",
+	),
+	("bg-and-then-group-redir", "true && { :; } 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	(
+		"bg-timed-pipe-and-list",
+		"TIMEFORMAT=; time { :; } 2>\"${zz?u}\" | cat && echo and & wait $!; echo w=$?",
+	),
+	("bg-group-holding-timed", "TIMEFORMAT=; { time { :; } 2>\"${zz?u}\"; } & wait $!; echo w=$?"),
+	(
+		"bg-negated-timed-and-list",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-if-redir-and-list",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-if-redir-or-list",
+		"TIMEFORMAT=; time if :; then :; fi 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-negated-timed-or-list",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" || echo or & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-negated-group-redir-and-list",
+		"TIMEFORMAT=; time ! { :; } 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-while-redir-and-list",
+		"TIMEFORMAT=; time while false; do :; done 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	(
+		"bg-timed-cond-redir-and-list",
+		"TIMEFORMAT=; time [[ -n x ]] 2>\"${zz?u}\" && echo and & wait $!; echo w=$?",
+	),
+	("bg-if-redir-and-list", "if :; then :; fi 2>\"${zz?u}\" && echo and & wait $!; echo w=$?"),
+	(
+		"bg-group-list-holding-timed",
+		"TIMEFORMAT=; { time { :; } 2>\"${zz?u}\"; echo after; } & wait $!; echo w=$?",
+	),
+	(
+		"bg-subshell-holding-timed",
+		"TIMEFORMAT=; ( time { :; } 2>\"${zz?u}\"; echo after ) & wait $!; echo w=$?",
+	),
+	(
+		"bg-negated-timed-group-redir-word",
+		"TIMEFORMAT=; ! time { :; } 2>\"${zz?u}\" & wait $!; echo w=$?",
+	),
+	("bg-negated-group-redir-word", "! { :; } 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	("bg-if-redir-word", "if :; then :; fi 2>\"${zz?u}\" & wait $!; echo w=$?"),
+	// A lone simple job's fatal word (127 with `-c`).
+	("bg-echo-word", "echo ${u?m} & wait $!; echo $?"),
 	// No program runs (an external in flight skips a snapshot): these two
 	// also run under snapshots.
 	("top-element-builtin-reader", "f() { echo ${x?boom}; }; f | :; echo ps=${PIPESTATUS[*]}"),
@@ -623,6 +710,13 @@ const ZSH_FORKS: &[(&str, &str)] = &[
 	("bg-pipeline-subshell-element-level", "( echo $ZSH_SUBSHELL ) | cat & wait"),
 	("bg-pipeline-last-subshell-level", ": | ( echo $ZSH_SUBSHELL ) & wait"),
 	("bg-pipeline-not-group-element-level", "! { echo $ZSH_SUBSHELL; } | cat & wait"),
+	// Not bash's rule: a `( … )` that starts a job counts once however the
+	// job goes on (`!`, `&& :`), and a timed `( … )` job counts twice.
+	("bg-subshell-level", "( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-negated-subshell-level", "! ( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-timed-subshell-level", "exec 2>/dev/null; time ( echo $ZSH_SUBSHELL ) & wait"),
+	("bg-subshell-and-list-level", "( echo $ZSH_SUBSHELL ) && : & wait"),
+	("bg-subshell-redir-and-list-level", "( echo $ZSH_SUBSHELL ) 2>/dev/null && : & wait"),
 ];
 
 /// The fork rows, `fork/x<loops>/<name>`: each shape at top level, in a

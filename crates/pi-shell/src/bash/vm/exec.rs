@@ -2301,14 +2301,19 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 /// shell ([`Frame::command_loop`] of its base frame, this answer for the
 /// forking shell when it forked): the command loop only when the forking
 /// shell's error would reach it too, so not for an element forked inside
-/// `( … )`, `$( )` or `<( )`. So do a negated simple job (`! f &`) and a
-/// compound element's or job's own redirection (`{ :; } 2>"$w" &`, timed
-/// too: `time { :; } 2>"$w" &`), which bash's child expands before it runs
-/// the compound. A background job that
-/// is one async pipeline passes its stored answer on: bash forks that
-/// pipeline's elements from the shell itself ([`async_pipeline`]), so
-/// obash's job vproc stands for no fork of bash's. A nested shell (depth
-/// 0) is its own shell.
+/// `( … )`, `$( )` or `<( )`. So do a negated simple job (`! f &`) and the
+/// own redirection of a compound that is a whole element or job
+/// (`{ :; } 2>"$w" | cat`, `{ :; } 2>"$w" &`, a job's timed or negated
+/// too: `time { :; } 2>"$w" &`): bash forks that compound itself
+/// (`execute_command_internal`), and its child expands the compound's
+/// redirections (`execute_in_subshell`) before it sets a `top_level` of its
+/// own. Not a compound that is only the first command of a job's and-or
+/// list (`{ :; } 2>"$w" && : &`, timed too): bash forks the whole list
+/// (`execute_connection`), and that child sets its `top_level` before the
+/// list runs the compound (1). A background job that is one async pipeline
+/// passes its stored answer on: bash forks that pipeline's elements from
+/// the shell itself ([`async_pipeline`]), so obash's job vproc stands for no
+/// fork of bash's. A nested shell (depth 0) is its own shell.
 pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 	let Some(base) = vp.frames.first() else {
 		return super::subshell_depth(vp) == 0;
@@ -2349,8 +2354,12 @@ pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 				at
 			}
 		};
+		// The compound whose redirection is at `pc` must be the stage's whole
+		// command ([`ends_stage`] past the `Redir`'s `b`, just past its
+		// `PopRedir`), not the first command of an and-or list.
 		let own_redir = vp.frames.len() == 1
 			&& code(pc) == Some(Opcode::Redir)
+			&& ends_stage(unit, unit.ops[pc as usize].b)
 			&& unit.spawns.iter().any(|s| {
 				matches!(s.kind, SpawnKind::Pipeline | SpawnKind::Background)
 					&& s.stages.iter().any(|st| first(st.entry) == pc)
@@ -4074,35 +4083,58 @@ fn bash_case_hit(
 }
 
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
-/// async command starting at `entry`: a `( … )` counts once, at its own
-/// `Spawn`; a simple command in a pipeline expands at the parent's level
-/// (bash's "not for pipes yet": [`raise_element_level`] counts it when it
-/// runs a builtin or function) unless `zsh`, whose `entersubsh` counts every
-/// element it forks; anything else is one more. The bodies of its
-/// substitutions come first ([`skip_blocks`]).
+/// async command starting at `entry`: a `( … )` that is the stage's whole
+/// command counts once, at its own `Spawn` (a job's `time` or `!` around it
+/// too: bash forks the `( … )` as the job); a simple command in a pipeline
+/// expands at the parent's level (bash's "not for pipes yet":
+/// [`raise_element_level`] counts it when it runs a builtin or function);
+/// anything else is one more, so too an and-or job that starts with a
+/// `( … )`: bash forks the whole list (`execute_connection`) and the
+/// `( … )` again. In `zsh`, `entersubsh` counts every element it forks, a
+/// `( … )` that starts a job counts once however the job goes on, and a
+/// timed `( … )` job twice. The bodies of its substitutions come first
+/// ([`skip_blocks`]).
 fn stage_level(unit: &Unit, entry: u32, background: bool, zsh: bool) -> u32 {
-	let ops = unit
-		.ops
-		.get(skip_blocks(unit, entry) as usize..)
-		.unwrap_or_default();
-	let ops = match ops.first() {
-		Some(op) if op.code == Opcode::Redir => &ops[1..],
-		_ => ops,
-	};
-	match ops {
-		[enter, spawn, ..]
-			if enter.code == Opcode::Enter
-				&& spawn.code == Opcode::Spawn
-				&& unit
-					.spawns
-					.get(spawn.a as usize)
-					.is_some_and(|s| s.kind == SpawnKind::Subshell) =>
-		{
-			0
-		},
-		[exec, ..] if exec.code == Opcode::Exec && !background => u32::from(zsh),
-		_ => 1,
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let mut at = skip_blocks(unit, entry);
+	// A job's `time` of its whole body (`TimeStart … TimeEnd`).
+	if background && !zsh && code(at) == Some(Opcode::TimeStart) {
+		at = skip_blocks(unit, at + 1);
 	}
+	// Past a compound's own redirection: its `Redir`'s `b` is just past the
+	// `PopRedir` that follows the compound.
+	let (start, end) = match unit.ops.get(at as usize) {
+		Some(op) if op.code == Opcode::Redir => (at + 1, Some(op.b)),
+		_ => (at, None),
+	};
+	// A `( … )`, whose `Leave` is at its spawn's end.
+	if code(start) == Some(Opcode::Enter)
+		&& let Some(op) = unit.ops.get(start as usize + 1)
+		&& op.code == Opcode::Spawn
+		&& let Some(s) = unit.spawns.get(op.a as usize)
+		&& s.kind == SpawnKind::Subshell
+		&& (zsh || ends_stage(unit, end.unwrap_or(s.end + 1)))
+	{
+		return 0;
+	}
+	if code(start) == Some(Opcode::Exec) && !background {
+		return u32::from(zsh);
+	}
+	1
+}
+
+/// Whether only its pipeline's `!` and a job's `time` (`Not`, `TimeEnd`)
+/// come between `at`, just past a stage's first command, and the stage's
+/// `SubExit`: that command is the stage's whole command, not the first of
+/// an and-or list (`{ :; } 2>"$w" && : &`, a list bash forks whole).
+fn ends_stage(unit: &Unit, mut at: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	for wrap in [Opcode::Not, Opcode::TimeEnd] {
+		if code(at) == Some(wrap) {
+			at += 1;
+		}
+	}
+	code(at) == Some(Opcode::SubExit)
 }
 
 /// bash's `execute_subshell_builtin_or_function`: a forked pipeline
@@ -4375,7 +4407,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp));
 				}
 				if info.kind == SpawnKind::Background {
-					let level = stage_level(unit, info.stages[0].entry, true, false);
+					let zsh = unit.mode.dialect() == Dialect::Zsh;
+					let level = stage_level(unit, info.stages[0].entry, true, zsh);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
