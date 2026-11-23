@@ -1613,11 +1613,14 @@ async fn run_shell_command_once(
 	if let Ok(outcome) = &result {
 		session.cwd.clone_from(&outcome.cwd);
 	}
-	scope.deadline.end_command();
 
+	// Closing the files the command dropped (a provider's close can take a
+	// while) is part of the command: the deadline still stops the run until
+	// they are closed, and only then does the command end.
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
 		report_close_failure(&mut diagnostics, &err, &mut result);
 	}
+	scope.deadline.end_command();
 	// Release the extra writer so the reader can reach EOF.
 	drop(diagnostics);
 
@@ -1765,11 +1768,13 @@ async fn run_shell_command_streams_in_filesystem(
 	if let Ok(outcome) = &result {
 		session.cwd.clone_from(&outcome.cwd);
 	}
-	scope.deadline.end_command();
 
+	// As in `run_shell_command_once`: the dropped files are closed under the
+	// deadline, and only then does the command end.
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
 		report_close_failure(&mut diagnostics, &err, &mut result);
 	}
+	scope.deadline.end_command();
 	// Release the extra writer so the stderr reader can reach EOF.
 	drop(diagnostics);
 

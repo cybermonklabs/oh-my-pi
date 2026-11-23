@@ -8,7 +8,8 @@
 //! The clock is paused, so every time below is the runtime's, not the
 //! machine's, and each line of output is read as a chunk of its own
 //! (`READ_LEN`), so the drain's length does not depend on how the pipe's
-//! bytes happen to be read.
+//! bytes happen to be read. The close tests at the end are the exception
+//! (see there).
 
 use super::*;
 
@@ -182,4 +183,179 @@ async fn a_chain_segment_after_the_deadline_does_not_start() {
 	let _ = std::fs::remove_dir_all(&root);
 	assert_eq!((result.exit_code, result.timed_out), (None, true));
 	assert!(!ran, "the second segment started after the deadline");
+}
+
+/// Closing a file the command dropped is part of the command: a provider
+/// whose close takes `SLOW_CLOSE` keeps the command from ending, so a
+/// deadline that passes during the close stops the run, which times out.
+///
+/// The clock is paused, as above: the shell runs on the test's runtime, so
+/// no time passes until it waits, and the first wait after the command's
+/// work is the close. The deadline then comes first however slow the
+/// machine is, and the file has been written by then. Unix only: on Windows
+/// the reader's blocking read of the still-open pipe is in flight during
+/// the close, and the paused clock does not move while it does.
+#[cfg(unix)]
+mod slow_close {
+	use std::{io::SeekFrom, path::Path};
+
+	use async_trait::async_trait;
+	use parking_lot::Mutex;
+
+	use super::*;
+
+	const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
+	const SLOW_CLOSE: Duration = Duration::from_secs(10);
+	const COMMAND: &str = "echo x > slow://f; echo done";
+
+	/// `slow://`: a directory whose files take what is written to them and
+	/// close after `SLOW_CLOSE`.
+	#[derive(Debug, Default)]
+	struct SlowClose {
+		written: Arc<Mutex<Vec<u8>>>,
+	}
+
+	#[derive(Debug)]
+	struct SlowHandle {
+		written: Arc<Mutex<Vec<u8>>>,
+	}
+
+	fn file_meta(len: u64) -> pi_vfs::Metadata {
+		pi_vfs::Metadata::new(
+			pi_vfs::FileType::from_kind(pi_vfs::FileKind::File),
+			len,
+			pi_vfs::Permissions::from_mode(0o644),
+		)
+	}
+
+	#[async_trait]
+	impl pi_vfs::FileHandle for SlowHandle {
+		async fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+			Ok(0)
+		}
+
+		async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+			self.written.lock().extend_from_slice(buf);
+			Ok(buf.len())
+		}
+
+		async fn seek(&self, _pos: SeekFrom) -> io::Result<u64> {
+			Ok(self.written.lock().len() as u64)
+		}
+
+		async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+			Ok(file_meta(self.written.lock().len() as u64))
+		}
+
+		async fn close(&self) -> io::Result<()> {
+			time::sleep(SLOW_CLOSE).await;
+			Ok(())
+		}
+	}
+
+	#[async_trait]
+	impl pi_vfs::FileSystem for SlowClose {
+		async fn open(
+			&self,
+			path: &Path,
+			_options: &pi_vfs::OpenOptions,
+		) -> io::Result<pi_vfs::File> {
+			if path == Path::new("slow://") {
+				return Err(io::ErrorKind::IsADirectory.into());
+			}
+			Ok(pi_vfs::File::from_handle(SlowHandle { written: self.written.clone() }))
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			if path == Path::new("slow://") {
+				return Ok(pi_vfs::Metadata::new(
+					pi_vfs::FileType::from_kind(pi_vfs::FileKind::Dir),
+					0,
+					pi_vfs::Permissions::from_mode(0o755),
+				));
+			}
+			Ok(file_meta(self.written.lock().len() as u64))
+		}
+
+		async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			Ok(pi_vfs::ReadDir::from_entries(Vec::new()))
+		}
+	}
+
+	/// The provider, and what was written to it.
+	fn slow_close() -> (pi_vfs::Fs, Arc<Mutex<Vec<u8>>>) {
+		let provider = SlowClose::default();
+		let written = provider.written.clone();
+		(pi_vfs::Fs::new(Arc::new(provider)), written)
+	}
+
+	/// A run that times out at the deadline: the file was written, and the
+	/// run did not wait for its close.
+	fn assert_timed_out_at_the_deadline(
+		(exit_code, timed_out): (Option<i32>, bool),
+		ran: Duration,
+		written: &Mutex<Vec<u8>>,
+	) {
+		assert_eq!((exit_code, timed_out), (None, true), "after {ran:?}");
+		assert!(ran < SLOW_CLOSE, "the run waited {ran:?} for the file's close");
+		assert_eq!(written.lock().as_slice(), b"x\n");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_deadline_stops_shell_run_while_a_dropped_file_closes() {
+		let (filesystem, written) = slow_close();
+		let (tx, _rx) = flume::unbounded::<String>();
+		let started = time::Instant::now();
+		let result = Shell::new(Some(ShellOptions { filesystem, ..Default::default() }))
+			.run(
+				ShellRunOptions { command: COMMAND.into(), ..Default::default() },
+				Some(tx),
+				CancelToken::with_timeout(Some(CLOSE_DEADLINE)),
+			)
+			.await
+			.expect("run");
+		assert_timed_out_at_the_deadline(
+			(result.exit_code, result.timed_out),
+			started.elapsed(),
+			&written,
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_deadline_stops_execute_shell_while_a_dropped_file_closes() {
+		let (filesystem, written) = slow_close();
+		let (tx, _rx) = flume::unbounded::<String>();
+		let started = time::Instant::now();
+		let result = execute_shell(
+			ShellExecuteOptions { command: COMMAND.into(), filesystem, ..Default::default() },
+			Some(tx),
+			CancelToken::with_timeout(Some(CLOSE_DEADLINE)),
+		)
+		.await
+		.expect("execute");
+		assert_timed_out_at_the_deadline(
+			(result.exit_code, result.timed_out),
+			started.elapsed(),
+			&written,
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_deadline_stops_execute_shell_streams_while_a_dropped_file_closes() {
+		let (filesystem, written) = slow_close();
+		let (tx, _rx) = flume::unbounded::<Bytes>();
+		let started = time::Instant::now();
+		let result = execute_shell_streams(
+			ShellExecuteOptions { command: COMMAND.into(), filesystem, ..Default::default() },
+			StreamSinks { stdout: Some(tx), stderr: None },
+			CancelToken::with_timeout(Some(CLOSE_DEADLINE)),
+		)
+		.await
+		.expect("execute");
+		assert_timed_out_at_the_deadline(
+			(result.exit_code, result.timed_out),
+			started.elapsed(),
+			&written,
+		);
+	}
 }
