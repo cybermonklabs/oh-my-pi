@@ -36,7 +36,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
-import { $env, $flag, getAutoQaDbPath, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAutoQaDbPath,
+	getInstallId,
+	logger,
+	openSqliteDatabaseSync,
+	VERSION,
+} from "@oh-my-pi/pi-utils";
 import type { Settings } from "..";
 import type { ToolSession } from "./index";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -291,7 +299,7 @@ export function openAutoQaDb(): Database | null {
 	if (!dbPath) return null;
 	try {
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		const db = new Database(dbPath, { create: true });
+		const db = openSqliteDatabaseSync(dbPath, db => db);
 		// Install the busy handler BEFORE any lock-taking statement. See #2421.
 		db.run("PRAGMA busy_timeout = 5000");
 		// `pushed` is tri-state: 0 = queued, 1 = accepted by the collector,

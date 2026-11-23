@@ -10,7 +10,7 @@ import {
 	hasRecurringTariff,
 } from "@oh-my-pi/pi-catalog/models";
 import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getStatsDbPath, openSqliteDatabaseSync, VERSION } from "@oh-my-pi/pi-utils";
 import { ChunkedInsert } from "./chunked-insert";
 import { classifyAgentType, type ParseSessionResult, type SessionParserState } from "./parser";
 import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
@@ -162,7 +162,7 @@ export async function initDb(): Promise<Database> {
 	// Ensure directory exists
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
-	db = new Database(getStatsDbPath());
+	db = openSqliteDatabaseSync(getStatsDbPath(), db => db);
 	// Install the busy handler BEFORE any lock-taking statement. See
 	// https://github.com/can1357/oh-my-pi/issues/2421.
 	db.run("PRAGMA busy_timeout = 5000");

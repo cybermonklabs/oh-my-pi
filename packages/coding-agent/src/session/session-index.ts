@@ -20,11 +20,12 @@
  * against the right file. Never versions the db — `PRAGMA user_version` is
  * owned by HistoryStorage's rebuild pass, which drops only its own tables.
  */
-import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
+import type { Database, SQLQueryBindings, Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	isSqliteBusyError,
+	openSqliteDatabaseSync,
 	readSalvageableRows,
 	sqliteFileIdentity,
 	type SqliteFileIdentity,
@@ -95,7 +96,7 @@ function openSessionIndex(): SessionIndexHandle | undefined {
 	closeHandle();
 	try {
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		const db = new Database(dbPath);
+		const db = openSqliteDatabaseSync(dbPath, db => db);
 		// Install the busy handler BEFORE any lock-taking statement (see #2421).
 		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 		db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);

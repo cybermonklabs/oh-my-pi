@@ -2,7 +2,7 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getAutoresearchDbPath, getAutoresearchProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { getAutoresearchDbPath, getAutoresearchProjectDir, logger, openSqliteDatabaseSync } from "@oh-my-pi/pi-utils";
 import type { ASIData, ExperimentStatus, MetricDirection, NumericMetricMap } from "@oh-my-pi/pi-tui/tools/autoresearch";
 
 /**
@@ -261,7 +261,7 @@ export class AutoresearchStorage {
 		this.#dbPath = dbPath;
 		this.#projectDir = projectDir;
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		this.#db = new Database(dbPath);
+		this.#db = openSqliteDatabaseSync(dbPath, db => db);
 		// Install the busy handler BEFORE any lock-taking statement. See #2421.
 		this.#db.run("PRAGMA busy_timeout = 5000");
 		this.#db.run(SCHEMA_SQL);

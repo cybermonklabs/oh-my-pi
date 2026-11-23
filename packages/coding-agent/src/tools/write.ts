@@ -15,6 +15,7 @@ import type {
 
 import {
 	BINARY_SNIFF_BYTES,
+	ensureSqliteLockShim,
 	isEnoent,
 	isProbablyBinaryHeader,
 	isRecord,
@@ -862,6 +863,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
+			// The file can be one of omp's own stores (#15586); `create: false` cannot go through
+			// openSqliteDatabaseSync, so install the lock shim first.
+			ensureSqliteLockShim();
 			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
 			db.run("PRAGMA busy_timeout = 3000");
 			// FK enforcement is per-connection and off by default; enable it so edits

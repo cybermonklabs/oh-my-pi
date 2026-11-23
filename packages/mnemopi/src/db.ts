@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { ensureSqliteLockShim } from "@oh-my-pi/pi-utils";
 import { dbPath } from "./config";
 
 export type SqlitePageSize = number | "os";
@@ -78,6 +79,9 @@ type ExtensionDatabase = Database & { loadExtension(path: string): void };
 
 export function openDatabase(path: DatabasePath = dbPath(), options: OpenDatabaseOptions = {}): Database {
 	if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+	// A bank is shared with other omp processes, which lock it with open-file-description locks
+	// (#15586); this open passes its own flags, so install the shim first.
+	ensureSqliteLockShim();
 	const db = new Database(path, {
 		create: options.create ?? true,
 		readwrite: options.readwrite ?? true,

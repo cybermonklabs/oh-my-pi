@@ -1,6 +1,7 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { openSqliteDatabaseSync } from "@oh-my-pi/pi-utils";
 import type { TrialRow } from "./types";
 
 export interface TbSummaryRow {
@@ -67,7 +68,7 @@ export class TbStore {
 
 	constructor(dbPath: string) {
 		fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
-		this.#db = new Database(dbPath);
+		this.#db = openSqliteDatabaseSync(dbPath, db => db);
 		this.#db.run("PRAGMA journal_mode = WAL");
 		this.#db.run(SCHEMA);
 	}

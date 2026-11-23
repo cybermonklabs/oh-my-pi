@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Readable } from "node:stream";
@@ -21,6 +21,7 @@ import {
 	hashPath,
 	isPidAlive,
 	normalizePathForComparison,
+	openSqliteDatabaseSync,
 	readLines,
 	type FileLockHandle,
 } from "@oh-my-pi/pi-utils";
@@ -1143,7 +1144,7 @@ function tableExists(db: Database, table: string): boolean {
 
 function deleteHistoryRowsForSessions(dbPath: string, sessionIds: string[]): { deleted: number; ftsRebuilt: boolean } {
 	if (sessionIds.length === 0) return { deleted: 0, ftsRebuilt: false };
-	const db = new Database(dbPath);
+	const db = openSqliteDatabaseSync(dbPath, db => db);
 	try {
 		db.run("PRAGMA busy_timeout = 5000");
 		const hasHistory = tableExists(db, "history") && tableHasColumn(db, "history", "session_id");
@@ -1390,7 +1391,7 @@ function buildStatsCleanupPlans(
 	}));
 	const nodes = [...archivedNodes, ...retainedNodes];
 
-	const db = new Database(dbPath);
+	const db = openSqliteDatabaseSync(dbPath, db => db);
 	try {
 		db.run("PRAGMA busy_timeout = 5000");
 		for (const storedPath of collectStoredStatsSessionPaths(db)) {
@@ -1601,7 +1602,7 @@ async function populateStatsTransferTargets(context: StatsCleanupContext): Promi
  */
 function reconcileStatsRowsForSessions(dbPath: string, plans: StatsCleanupPlan[]): number {
 	if (plans.length === 0) return 0;
-	const db = new Database(dbPath);
+	const db = openSqliteDatabaseSync(dbPath, db => db);
 	try {
 		db.run("PRAGMA busy_timeout = 5000");
 		const sessionTables = STATS_SESSION_TABLES.filter(
@@ -2254,7 +2255,7 @@ async function checkpointWal(dbPath: string, apply: boolean): Promise<WalCheckpo
 	};
 	if (!apply || !(await pathExists(dbPath))) return result;
 
-	const db = new Database(dbPath);
+	const db = openSqliteDatabaseSync(dbPath, db => db);
 	let checkpointAttempted = false;
 	try {
 		db.run("PRAGMA busy_timeout = 5000");
