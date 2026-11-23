@@ -2301,10 +2301,13 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 /// shell ([`Frame::command_loop`] of its base frame, this answer for the
 /// forking shell when it forked): the command loop only when the forking
 /// shell's error would reach it too, so not for an element forked inside
-/// `( … )`, `$( )` or `<( )`. A background job that is one async pipeline
-/// passes its stored answer on: bash forks that pipeline's elements from
-/// the shell itself ([`async_pipeline`]), so obash's job vproc stands for
-/// no fork of bash's. A nested shell (depth 0) is its own shell.
+/// `( … )`, `$( )` or `<( )`. So do a negated simple job (`! f &`) and a
+/// compound element's or job's own redirection (`{ :; } 2>"$w" &`), which
+/// bash's child expands before it runs the compound. A background job that
+/// is one async pipeline passes its stored answer on: bash forks that
+/// pipeline's elements from the shell itself ([`async_pipeline`]), so
+/// obash's job vproc stands for no fork of bash's. A nested shell (depth
+/// 0) is its own shell.
 pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 	let Some(base) = vp.frames.first() else {
 		return super::subshell_depth(vp) == 0;
@@ -2312,18 +2315,37 @@ pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 	if vp.parent.is_some()
 		&& let Some(unit) = base.unit.as_deref()
 	{
-		let forked_simple = simple_stage(unit, base.pc).is_some_and(|si| {
+		let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+		let pc = base.pc;
+		let forked_simple = simple_stage(unit, pc).is_some_and(|si| {
 			matches!(unit.spawns[si].kind, SpawnKind::Pipeline | SpawnKind::Background)
 		});
-		if forked_simple {
+		// `! f &`: the job's simple command, then its `Not`.
+		let negated_job = code(pc) == Some(Opcode::Exec)
+			&& code(pc + 1) == Some(Opcode::Not)
+			&& code(pc + 2) == Some(Opcode::SubExit)
+			&& unit.spawns.iter().any(|s| {
+				s.kind == SpawnKind::Background
+					&& s
+						.stages
+						.first()
+						.is_some_and(|st| stage_command(unit, st.entry) == pc)
+			});
+		if forked_simple || negated_job {
 			return base.command_loop
 				&& vp
 					.frames
 					.get(1)
 					.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }));
 		}
+		let own_redir = vp.frames.len() == 1
+			&& code(pc) == Some(Opcode::Redir)
+			&& unit.spawns.iter().any(|s| {
+				matches!(s.kind, SpawnKind::Pipeline | SpawnKind::Background)
+					&& s.stages.iter().any(|st| skip_blocks(unit, st.entry) == pc)
+			});
 		let async_job = vp.frames.len() == 1
-			&& unit.ops.get(base.pc as usize).is_some_and(|op| {
+			&& unit.ops.get(pc as usize).is_some_and(|op| {
 				op.code == Opcode::Spawn
 					&& unit
 						.spawns
@@ -2331,7 +2353,7 @@ pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 						.is_some_and(|s| s.kind == SpawnKind::Pipeline)
 					&& async_pipeline(unit, op.a as usize)
 			});
-		if async_job {
+		if own_redir || async_job {
 			return base.command_loop;
 		}
 	}
@@ -4102,16 +4124,21 @@ pub fn raise_element_level(vp: &mut Vproc) {
 /// bodies and a redirection ([`stage_command`]). `None` for an op in a
 /// substitution's body (which ends at a `SubExit` of its own) or in a
 /// compound stage.
+///
+/// The stage needs no end test: only a simple command lowers to an `Exec`
+/// (a compound's first op is `Enter`, `Spawn`, `FuncDef` or `CallAnon`),
+/// and its `Exec` is its last op. So when a stage's own command is the
+/// `Exec` at `pc` and a `SubExit` follows it, that `SubExit` is the
+/// stage's: the stage ends at `pc + 2`.
 fn simple_stage(unit: &Unit, pc: u32) -> Option<usize> {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	if code(pc) != Some(Opcode::Exec) || code(pc + 1) != Some(Opcode::SubExit) {
 		return None;
 	}
 	unit.spawns.iter().position(|s| {
-		s.stages.iter().enumerate().any(|(i, st)| {
-			let end = s.stages.get(i + 1).map_or(s.end, |next| next.entry);
-			end == pc + 2 && stage_command(unit, st.entry) == pc
-		})
+		s.stages
+			.iter()
+			.any(|st| stage_command(unit, st.entry) == pc)
 	})
 }
 

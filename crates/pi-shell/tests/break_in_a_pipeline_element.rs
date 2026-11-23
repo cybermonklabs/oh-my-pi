@@ -250,6 +250,12 @@ const BASH_FORKS: &[(&str, &str)] = &[
 	("posix-alone", "set -o posix; break"),
 	("element-procsub-word", ": | x=<(:) break"),
 	("bg-procsub-word", "x=<(:) break & wait"),
+	// A lone `break` as a forked element with an external reader, as a
+	// `( … )` and as a substitution: bash prints the message only for the
+	// `( … )`.
+	("element-break-cat", "break | cat"),
+	("subshell-break-alone", "( break )"),
+	("cmdsub-break-alone", "x=$( break )"),
 	// `$BASH_SUBSHELL`: a builtin or external element's words expand at its
 	// parent's level; a builtin or function element then runs one level
 	// down (a function, `eval`, `.`, a builtin's callback), however its
@@ -487,6 +493,40 @@ const FATALS: &[(&str, &str)] = &[
 	(
 		"subshell-bg-pipeline",
 		"set -o pipefail; f() { echo ${x?boom}; }; ( f | cat & wait $!; echo in:$? ); echo st=$?",
+	),
+	// A compound element's or job's own redirection, a negated simple job,
+	// and the forms bash ends with 1 (a list inside the compound, a
+	// subshell, a substitution).
+	("bg-group-redir-word", "{ :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-pipeline-group-redir-word", "true | { :; } 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-simple-word", ": \"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-group-inner-word", "{ : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	("bg-subshell-inner-word", "( : \"${zz?u}\" ) & wait $!; echo st=$?"),
+	("bg-pipeline-group-inner-word", "true | { : \"${zz?u}\"; } & wait $!; echo st=$?"),
+	("subshell-group-redir-word", "( { :; } 2>\"${zz?u}\" ); echo st=$?"),
+	("cmdsub-group-redir-word", "x=$( { :; } 2>\"${zz?u}\" ); echo st=$?"),
+	("bg-negated-function", "f() { echo ${x?boom}; }; ! f & wait $!; echo st=$?"),
+	("bg-negated-simple-word", "! : \"${zz?u}\" & wait $!; echo st=$?"),
+	("bg-subshell-redir-word", "( : ) 2>\"${zz?u}\" & wait $!; echo st=$?"),
+	("element-group-redir-word", "{ :; } 2>\"${zz?u}\" | cat; echo ps=${PIPESTATUS[*]}"),
+	// A job running a function reaches the command loop; a timed job is
+	// forked through `execute_in_subshell`, its own `top_level` (1).
+	("bg-function-colon", "f() { echo ${x:?u}; }; f & wait $!; echo st=$?"),
+	("bg-timed-function", "TIMEFORMAT=; f() { echo ${x:?u}; }; time f & wait $!; echo st=$?"),
+	("bg-timed-simple-word", "TIMEFORMAT=; time : \"${zz?u}\" & wait $!; echo st=$?"),
+	(
+		"bg-timed-negated-function",
+		"TIMEFORMAT=; f() { echo ${x:?u}; }; time ! f & wait $!; echo st=$?",
+	),
+	(
+		"element-timed-function",
+		"TIMEFORMAT=; f() { echo ${x:?u}; }; time f | cat; echo ps=${PIPESTATUS[*]}",
+	),
+	// `time` inside the function the job runs: the status only (stderr
+	// closed), the timing report being another member's.
+	(
+		"bg-function-timed-inside",
+		"exec 2>/dev/null; f() { time echo ${x:?u}; }; f & wait $!; echo st=$?",
 	),
 	// No program runs (an external in flight skips a snapshot): these two
 	// also run under snapshots.
