@@ -73,7 +73,15 @@ jobs:
       # GitHub's 10 GB cache limit for the whole repository: Bazel's disk
       # cache (its garbage collection deletes the least recently used
       # actions), and the downloads (Bazel's repository cache and the cargo
-      # registry), which are emptied when they grow past theirs.
+      # registry), which are emptied when they grow past theirs. Each push
+      # to sami saves a new entry per target (the key ends in the commit,
+      # and GitHub never overwrites a key), and release_cache_prune then
+      # deletes the entries it supersedes. So on sami the cache holds one
+      # entry per target, about 1.40 GB for linux-x64 and 0.95 GB for
+      # darwin-arm64 (about 2.35 GB), and up to twice that in the minutes
+      # between a save and the prune. Without the prune the ref would gain
+      # about 2.35 GB a push, and past 10 GB GitHub deletes the least
+      # recently used entries of every workflow in the repository.
       RELEASE_CACHE_PATHS: |
         ~/.cache/omp-release-bazel
         ~/.cargo/registry/index
@@ -264,6 +272,59 @@ jobs:
         with:
           path: ${{ env.RELEASE_CACHE_PATHS }}
           key: ${{ steps.release-cache.outputs.cache-primary-key }}
+
+  release_cache_prune:
+    # Keeps the newest release build cache entry of each target in this
+    # ref and deletes the rest (see release_binary's env). No checkout and
+    # no member code: it only lists and deletes this ref's entries whose
+    # key starts with omp-release-bazel-v1-<ref>-, and this job alone may
+    # delete cache entries.
+    name: Keep one release build cache per target
+    needs: release_binary
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami' }}
+    # The run's conclusion follows the release; a failed prune shows only
+    # on this job.
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded release build caches of this ref
+        run: |
+          prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
+          # A line per entry: id, key, creation time, bytes, group. The group
+          # is the key without its -<64 hex lock hash>-<40 hex commit> end,
+          # so it names the ref and the target.
+          list() {
+            gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
+              -f key="$prefix" -f ref="$GITHUB_REF" -F per_page=100 \
+              -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, (.key | sub("-[0-9a-f]{64}-[0-9a-f]{40}$"; ""))] | @tsv'
+          }
+          list >caches.tsv
+          echo "CACHES $(wc -l <caches.tsv) entries of this ref before"
+          if [ ! -s caches.tsv ]; then
+            echo "::warning title=Release build cache::CACHES UNKNOWN: no entry of $GITHUB_REF has a key that starts with $prefix, so nothing was pruned; the key format may have changed"
+            exit 0
+          fi
+          # Newest first: each entry after the first of its group is superseded.
+          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
+          while IFS=$'\t' read -r id key created size _; do
+            # The run of a later push may have deleted it first: that is done too.
+            if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" >/dev/null 2>&1; then
+              echo "DELETED $key ($((size / 1000000)) MB, created $created)"
+            else
+              echo "GONE $key (deleted elsewhere, or the delete failed)"
+            fi
+          done <superseded.tsv
+          list >after.tsv
+          awk -F'\t' '{ n[$5]++; s += $4 } END {
+            for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], n[g] == 1 ? "y" : "ies"; if (n[g] > 1) bad = 1 }
+            printf "CACHES %d entries of this ref after, %.2f GB\n", NR, s / 1e9; exit bad }' after.tsv
 
   rust_test:
     # Upstream runs these tests in ci.yml's rust_validate job, on upstream's
