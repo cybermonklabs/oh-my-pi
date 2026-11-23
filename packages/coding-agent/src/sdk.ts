@@ -584,6 +584,11 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
+	/**
+	 * Project directories besides cwd whose `.omp/secrets.yml` the secret mask also loads (each once; the global
+	 * secrets load once either way): a session whose tools run in another directory than cwd masks its secrets too.
+	 */
+	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
@@ -2199,7 +2204,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// reflect actual loaded secrets, not just the setting toggle. Reassigned when
 	// `secrets.enabled` first turns on mid-session (see the watch after session creation).
 	let obfuscator: SecretObfuscator | undefined = cfgSecretsEnabled.get(settings)
-		? await buildSecretObfuscator(cwd, agentDir, options.agentDir)
+		? await buildSecretObfuscator(cwd, agentDir, options.agentDir, options.secretsProjectDirs)
 		: undefined;
 
 	// An abnormal process exit after a non-terminal message tail is durable
@@ -5259,7 +5264,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (next.secretsEnabled !== previous.secretsEnabled) {
 				try {
 					if (cfgSecretsEnabled.get(settings) && !obfuscator) {
-						const built = await buildSecretObfuscator(cwd, agentDir, options.agentDir);
+						const built = await buildSecretObfuscator(
+							cwd,
+							agentDir,
+							options.agentDir,
+							options.secretsProjectDirs,
+						);
 						if (!obfuscator && built) {
 							obfuscator = built;
 							session.setObfuscator(built);

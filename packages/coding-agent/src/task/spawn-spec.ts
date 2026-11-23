@@ -191,6 +191,10 @@ export interface SubagentSpawnSpec {
  * - `N`: set by no subagent build, so the SDK default holds on every path.
  * - `S+L`: stored descriptors rebuilt over a live input (custom tools over the parent's eval kernel).
  * - `S over L`: stored layers applied over a live base (the overlay over the parent `Settings`).
+ * - `S, cold L root`: stored for the spawn's first build and a warm revive; at a cold revive the root
+ *   session's live value.
+ * - `S, cold L parent`: stored for the spawn's first build and a warm revive; at a cold revive the live
+ *   parent session's value, the root session's where the parent is not live.
  * - `S+held+L`: built from the stored prompt inputs, the transcript's held base prompt and the live
  *   default blocks (`systemPrompt`).
  * - `S+P`: stored at spawn, plus the writes of the run that only a warm revive holds.
@@ -208,6 +212,8 @@ export type InputClass =
 	| "N"
 	| "S+L"
 	| "S over L"
+	| "S, cold L root"
+	| "S, cold L parent"
 	| "S+held+L"
 	| "S+P"
 	| "launch"
@@ -217,15 +223,18 @@ export type InputClass =
 type InputClasses<T> = Readonly<Record<keyof T, InputClass>>;
 
 const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> = {
-	cwd: "S",
-	additionalDirectories: "S",
+	// Where discovery runs; at a cold revive the root session's cwd, as before spawn specs.
+	cwd: "S, cold L root",
+	additionalDirectories: "S, cold L parent",
+	// The session file's cwd, where its tools run, where it differs from `cwd` (a cold revive after the root moved).
+	secretsProjectDirs: "D",
 	agentDir: "N",
 	spawns: "S",
 	inheritedSessionAgents: "L",
 	authStorage: "L",
 	modelRegistry: "L",
 	getApiKey: "L",
-	credentialSourceSessionId: "S",
+	credentialSourceSessionId: "S, cold L parent",
 	oauthAccountPools: "L",
 	model: "S",
 	modelRole: "N",

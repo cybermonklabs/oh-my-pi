@@ -1,19 +1,24 @@
 /**
  * A stored spawn spec never widens what the live process allows. A writer of the session store edits a parked
  * subagent's stored record (its ids, depth, cwd, credential source, workspace roots, cache-warming value, prompt id,
- * artifacts dir, settings overlay, list of live inputs and wake limits, and the workspace roots of its file's
- * header); the cold revive builds the subagent from the live values instead: the depth of the live parent chain,
- * the ids of the registry ref, the live parent's credential source, roots, cost gate and extensions, discovery at
- * the live root's cwd, the constants every spawn writes, and limits no looser than the live settings.
+ * artifacts dir, settings overlay, list of live inputs and wake limits, the shape of its policy part, and the
+ * workspace roots of its file's header); the cold revive builds the subagent from the live values instead: the
+ * depth of the live parent chain, the ids of the registry ref, the live parent's credential source, roots, cost
+ * gate and extensions, discovery at the live root's cwd, the constants every spawn writes, and limits no looser
+ * than the live settings. A revive writes the header's workspace roots once, as the roots its session uses, so a
+ * warm revive rewrites no file for unchanged roots and a root the run took from the live settings stays.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { cfgWorkspaceAdditionalDirectories } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { cfgTaskMaxRecursionDepth, cfgTaskSoftRequestBudget } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { localSession } from "../helpers/local-session";
 import {
 	expectEndedAtLimit,
 	heldTurn,
@@ -104,6 +109,17 @@ async function reviveCold(env: ReviveEnv, id: string): Promise<{ revived?: Reviv
 	} catch (error) {
 		return { failure: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+/** Counts, from now on, the whole-file rewrites of `file` through the session storage the session manager writes by. */
+function countRewrites(file: string): () => number {
+	const lines = vi.spyOn(FileSessionStorage.prototype, "writeLinesAtomic");
+	const text = vi.spyOn(FileSessionStorage.prototype, "writeTextAtomic");
+	const target = path.resolve(file);
+	return () => {
+		const written = [...lines.mock.calls, ...text.mock.calls].map(([fpath]) => path.resolve(fpath));
+		return written.filter(fpath => fpath === target).length;
+	};
 }
 
 describe("a cold revive of a record whose stored depth, cwd, credential source, roots, cache warming, prompt id and settings, and whose header's roots, were edited", () => {
@@ -397,4 +413,121 @@ describe("a cold revive of a record whose stored soft request budget was edited 
 			.some(request => userTexts(request).some(text => text.includes(BUDGET_NOTICE)));
 		expect(notified).toBe(true);
 	}, 30_000);
+});
+
+describe("a cold revive of a record whose stored policy part has a shape no spawn writes, and whose header's roots were edited", () => {
+	const id = "MalformedPolicy";
+	let env: ReviveEnv | undefined;
+	let revived: RevivedSubagent | undefined;
+	let failure: string | undefined;
+	let changed = 0;
+	let elsewhere = "";
+
+	beforeAll(async () => {
+		const opened = await spawnAndPark(id, { "providers.cacheWarming": "idle" });
+		env = opened.env;
+		elsewhere = path.join(env.root, "elsewhere");
+		await fs.mkdir(elsewhere, { recursive: true });
+		changed = await editStoredSpec(opened.sessionFile, spec => {
+			part(spec, "policy").taskDepth = "x";
+		});
+		await editHeaderRoots(opened.sessionFile, [elsewhere]);
+		({ revived, failure } = await reviveCold(env, id));
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("the edit reached every session_init of the record, and the revive built the subagent", () => {
+		expect(changed).toBeGreaterThan(0);
+		expect(failure).toBeUndefined();
+	});
+
+	it("policy.cacheWarming: the constant every spawn writes, false, so the session holds no cache warmer", () => {
+		expect(revived?.build.options.cacheWarming).toBe(false);
+		expect(revived?.session.cacheWarmingStatus).toBeUndefined();
+	});
+
+	it("the header's additionalDirectories: a root only the header holds is not kept", () => {
+		if (!revived) throw new Error(`The revive built no session: ${failure}`);
+		expect(revived.session.sessionManager.getAdditionalDirectories()).not.toContain(elsewhere);
+	});
+});
+
+describe("a warm revive of a subagent whose spawner has a workspace root", () => {
+	const id = "WarmRoots";
+	let env: ReviveEnv | undefined;
+	let root: LiveParent | undefined;
+	let rewrites = -1;
+	let roots: string[] = [];
+
+	beforeAll(async () => {
+		const opened = await spawnAndPark(id);
+		env = opened.env;
+		root = opened.root;
+		const rewritten = countRewrites(opened.sessionFile);
+		const revived = await env.revive(id);
+		rewrites = rewritten();
+		roots = revived.session.sessionManager.getAdditionalDirectories();
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("rewrites the whole session file zero times for its roots, and the session holds the spawner's root", () => {
+		expect(root?.toolSession.additionalDirectories?.length).toBeGreaterThan(0);
+		expect(roots).toEqual(root?.toolSession.additionalDirectories ?? []);
+		expect(rewrites).toBe(0);
+	});
+});
+
+describe("a root the live workspace.additionalDirectories setting gained during the subagent's run", () => {
+	const id = "LiveSettingRoot";
+	let env: ReviveEnv | undefined;
+	let added = "";
+	let warmRoots: string[] = [];
+	let coldRoots: string[] = [];
+	let failure: string | undefined;
+
+	beforeAll(async () => {
+		env = await openReviveEnv();
+		const root = env.createLiveParent();
+		env.installColdReviver(root);
+		await env.spawn({ ...spawnerOptions(root.toolSession), ...env.subagentInputs(id) });
+		added = path.join(env.root, "added");
+		await fs.mkdir(added, { recursive: true });
+		// The subagent's session follows a live edit of the setting into its file's header.
+		const live = localSession(AgentRegistry.global().get(id)?.session);
+		const followed = Promise.withResolvers<void>();
+		const addRoot = live.sessionManager.addWorkspaceDirectory.bind(live.sessionManager);
+		vi.spyOn(live.sessionManager, "addWorkspaceDirectory").mockImplementation(async directory => {
+			const resolved = await addRoot(directory);
+			if (live.sessionManager.getAdditionalDirectories().includes(added)) followed.resolve();
+			return resolved;
+		});
+		cfgWorkspaceAdditionalDirectories.override(env.settings, [added]);
+		await followed.promise;
+		await env.park(id);
+		const warm = await env.revive(id);
+		warmRoots = warm.session.sessionManager.getAdditionalDirectories();
+		await env.park(id);
+		const cold = await reviveCold(env, id);
+		failure = cold.failure;
+		coldRoots = cold.revived?.session.sessionManager.getAdditionalDirectories() ?? [];
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("is still a root of the warm-revived session while the setting holds it", () => {
+		expect(warmRoots).toContain(added);
+	});
+
+	it("is still a root of the cold-revived session while the setting holds it", () => {
+		expect(failure).toBeUndefined();
+		expect(coldRoots).toContain(added);
+	});
 });

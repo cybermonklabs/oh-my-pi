@@ -1,9 +1,11 @@
 /**
  * A revived subagent runs on the spawn's model, thinking level, LSP and cache-warming values and wake-turn
- * limit, wherever the cold revive runs. Unless a case says other, it spawns a real
- * subagent on a scripted model, parks it, drops its warm reviver as a subagent worker's exit does, and
- * revives it cold through the persisted reviver factory; `createAgentSession`'s options are read through
- * the harness's call-through spy and every request as the provider received it.
+ * limit, wherever the cold revive runs; after the root session moved it still masks the project secrets of
+ * the directory its tools run in, and with its parent parked it takes the root session's workspace roots and
+ * credential source. Unless a case says other, it spawns a real subagent on a scripted model, parks it, drops
+ * its warm reviver as a subagent worker's exit does, and revives it cold through the persisted reviver factory;
+ * `createAgentSession`'s options are read through the harness's call-through spy and every request as the
+ * provider received it.
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -22,12 +24,14 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import * as lspModule from "@oh-my-pi/pi-coding-agent/lsp";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { cfgSecretsEnabled } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { CostGate } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import { type ExecutorOptions, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { assertPerCallModelApproved } from "@oh-my-pi/pi-coding-agent/task/model-approval";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
@@ -52,6 +56,7 @@ import {
 	holdWake,
 	type LifecycleFrame,
 	type LiveParent,
+	LOOKUP_TOOL,
 	lastToolResult,
 	limitLogged,
 	openReviveEnv,
@@ -64,6 +69,7 @@ import {
 	type SpawnedSubagent,
 	sessionInitRecords,
 	spawnerOptions,
+	type ToolResultText,
 	userTexts,
 	WAKE_BODY,
 } from "./revive-harness";
@@ -1598,5 +1604,192 @@ describe("a prewalk target of a provider disabled between the park and the reviv
 		expect(cold.build.options.prewalk).toBeUndefined();
 		const skipped = warn.mock.calls.filter(([, fields]) => isRecord(fields) && fields.subagent === id);
 		expect(skipped.map(([, fields]) => (isRecord(fields) ? fields.target : undefined))).toContain(target);
+	}, 30_000);
+});
+
+/** A secret of project A: the test process's cwd, where the subagent is spawned and where its tools run. */
+const SECRET_A = "fixture-secret-alpha-4f81c2d9";
+/** A secret of project B, the directory the root session moves to while the subagent is parked. */
+const SECRET_B = "fixture-secret-bravo-93e07a1b";
+/** A file of project A whose read result holds {@link SECRET_A} after {@link ALPHA_ROW}. */
+const ALPHA_FILE = "alpha.txt";
+const ALPHA_ROW = "alpha row:";
+/** A file of project A whose read result holds {@link SECRET_B} after {@link BRAVO_ROW}. */
+const BRAVO_FILE = "bravo.txt";
+const BRAVO_ROW = "bravo row:";
+
+/** Writes project A's and project B's `.omp/secrets.yml`, each naming its secret, and A's two files; returns B. */
+async function writeSecretProjects(env: ReviveEnv): Promise<string> {
+	const projectB = path.join(env.root, "project-b");
+	for (const [dir, secret] of [
+		[env.cwd, SECRET_A],
+		[projectB, SECRET_B],
+	]) {
+		await fs.mkdir(path.join(dir, ".omp"), { recursive: true });
+		await Bun.write(path.join(dir, ".omp", "secrets.yml"), `- type: plain\n  content: ${secret}\n`);
+	}
+	await Bun.write(path.join(env.cwd, ALPHA_FILE), `${ALPHA_ROW} ${SECRET_A}\n`);
+	await Bun.write(path.join(env.cwd, BRAVO_FILE), `${BRAVO_ROW} ${SECRET_B}\n`);
+	return projectB;
+}
+
+/**
+ * Whether the content of a request's messages carries `text`: what a provider is sent, not the `details` a tool
+ * result keeps for the session's own display.
+ */
+function carries(request: RecordedRequest | undefined, text: string): boolean {
+	return JSON.stringify(request?.messages.map(message => message.content) ?? []).includes(text);
+}
+
+/** The next wake turns read `file` in the subagent's tools' directory before they answer; none reads with no file. */
+function readOnWake(env: ReviveEnv, file?: string): void {
+	env.turns = file
+		? { ...env.turns, wakeToolCall: { name: "read", arguments: { path: file } } }
+		: { yieldArguments: env.turns.yieldArguments };
+}
+
+describe("project secrets after the root session moved to another directory", () => {
+	const id = "SecretsAfterMove";
+	let env: ReviveEnv | undefined;
+	let projectB = "";
+	let warmRequest: RecordedRequest | undefined;
+	let cold: RevivedSubagent | undefined;
+	let coldFirst: RecordedRequest | undefined;
+	let coldNext: RecordedRequest | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({ "secrets.enabled": true });
+		env = opened.env;
+		projectB = await writeSecretProjects(env);
+		await env.spawn(taskSpawn(env, opened.root.toolSession, id));
+		// A tool result holding SA enters the transcript before the park.
+		readOnWake(env, ALPHA_FILE);
+		await env.wake(liveSession(id), id);
+		readOnWake(env);
+		await env.park(id);
+		// The root session moves to project B, as `/move` and `/wt` move it.
+		await opened.root.session.sessionManager.moveTo(projectB);
+		const warm = await env.revive(id);
+		warmRequest = await env.wake(warm.session, id);
+		await env.park(id);
+		cold = await reviveCold(env, id);
+		readOnWake(env, BRAVO_FILE);
+		coldFirst = await env.wake(cold.session, id);
+		coldNext = env.requests.at(-1);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("project secrets: after the root moved, the first request after the warm revive carries SA masked", () => {
+		expect(carries(warmRequest, ALPHA_ROW)).toBe(true);
+		expect(carries(warmRequest, SECRET_A)).toBe(false);
+	}, 30_000);
+
+	it("project secrets: after the root moved, the first request after the cold revive carries SA masked, and the request after a tool result holding SB carries SB masked", () => {
+		expect(cold?.build.options.cwd).toBe(projectB);
+		expect(carries(coldFirst, ALPHA_ROW)).toBe(true);
+		expect(carries(coldFirst, SECRET_A)).toBe(false);
+		expect(coldNext).not.toBe(coldFirst);
+		expect(carries(coldNext, BRAVO_ROW)).toBe(true);
+		expect(carries(coldNext, SECRET_B)).toBe(false);
+	}, 30_000);
+});
+
+describe("project secrets after the root session moved, secrets.enabled turned on after the cold revive", () => {
+	const id = "SecretsTurnedOn";
+	let env: ReviveEnv | undefined;
+	let request: RecordedRequest | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess();
+		env = opened.env;
+		const projectB = await writeSecretProjects(env);
+		await env.spawn(taskSpawn(env, opened.root.toolSession, id));
+		readOnWake(env, ALPHA_FILE);
+		await env.wake(liveSession(id), id);
+		await env.park(id);
+		await opened.root.session.sessionManager.moveTo(projectB);
+		const cold = await reviveCold(env, id);
+		readOnWake(env, BRAVO_FILE);
+		await env.wake(cold.session, id);
+		// Turning the setting on builds the session's secret mask; the build is installed through `setObfuscator`.
+		const installed = Promise.withResolvers<void>();
+		const setObfuscator = cold.session.setObfuscator.bind(cold.session);
+		vi.spyOn(cold.session, "setObfuscator").mockImplementation(obfuscator => {
+			setObfuscator(obfuscator);
+			installed.resolve();
+		});
+		cfgSecretsEnabled.override(env.settings, true);
+		await installed.promise;
+		readOnWake(env);
+		request = await env.wake(cold.session, id);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("project secrets: with secrets.enabled off at the cold revive and turned on during the session, the request after it carries SA and SB masked", () => {
+		expect(carries(request, ALPHA_ROW)).toBe(true);
+		expect(carries(request, BRAVO_ROW)).toBe(true);
+		expect(carries(request, SECRET_A)).toBe(false);
+		expect(carries(request, SECRET_B)).toBe(false);
+	}, 30_000);
+});
+
+describe("a nested subagent whose parent is parked, the root session's workspace roots changed after the spawn", () => {
+	const parentId = "RootsParent";
+	const childId = "RootsChild";
+	let env: ReviveEnv | undefined;
+	let root: LiveParent | undefined;
+	let cold: RevivedSubagent | undefined;
+	let second = "";
+	let lookup: ToolResultText | undefined;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess();
+		env = opened.env;
+		root = opened.root;
+		await env.spawn(taskSpawn(env, root.toolSession, parentId));
+		const parent = env.toolSessionOf(parentId);
+		// The root's kernel and the parent's both define the child's custom tool.
+		env.kernels.define(root.toolSession, [LOOKUP_TOOL]);
+		env.kernels.define(parent, [LOOKUP_TOOL]);
+		const customTools = createEvalCustomTools(parent, [LOOKUP_TOOL]);
+		await spawnAndPark(env, taskSpawn(env, parent, childId, { description: "lookup rows", customTools }));
+		await env.park(parentId);
+		second = path.join(env.root, "second-root");
+		await fs.mkdir(second, { recursive: true });
+		// The root session gains a second workspace root, as `/add-dir` adds one.
+		await root.session.sessionManager.addWorkspaceDirectory(second);
+		cold = await reviveCold(env, childId);
+		env.turns = { ...env.turns, wakeToolCall: { name: LOOKUP_TOOL.name, arguments: { key: "a" } } };
+		await env.wake(cold.session, childId);
+		lookup = lastToolResult(cold.session, LOOKUP_TOOL.name);
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("a parked parent: the cold revive takes the root session's live workspace roots and its session id as the credential source", () => {
+		if (!root || !cold) throw new Error("The test process did not start");
+		const roots = root.toolSession.additionalDirectories;
+		expect(roots).toHaveLength(2);
+		expect(roots).toContain(second);
+		// One comparison, so a failure names each of the two values the revive got.
+		const { additionalDirectories, credentialSourceSessionId } = cold.build.options;
+		expect({ additionalDirectories, credentialSourceSessionId }).toEqual({
+			additionalDirectories: roots,
+			credentialSourceSessionId: root.session.sessionManager.getSessionId(),
+		});
+	}, 30_000);
+
+	it("a parked parent: the child's custom tool stays unavailable, though the root's kernel defines a tool of its name", () => {
+		expect(lookup?.isError).toBe(true);
+		expect(lookup?.text).toMatch(/unavailable/i);
+		expect(env?.kernels.calls).toEqual([]);
 	}, 30_000);
 });

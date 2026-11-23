@@ -128,9 +128,18 @@ export function sessionSettingsSource(settings: Settings): SessionSettingsSource
 	return { base: current ?? null, layers };
 }
 
-/** Main side: the settings `source` describes, each worker-local layer restored over its main base. */
+/** Main side: the main instance the worker-local layers of `source` apply over; an isolated one where it names none. */
+export function settingsSourceBase(source: SessionSettingsSource): Settings {
+	return source.base ?? Settings.isolated();
+}
+
+/**
+ * Main side: the settings `source` describes, each worker-local layer restored over its main base.
+ *
+ * @throws Error where a layer fails the check `restoreOverlay` makes.
+ */
 export function settingsFromSource(source: SessionSettingsSource): Settings {
-	let settings = source.base ?? Settings.isolated();
+	let settings = settingsSourceBase(source);
 	for (const layers of source.layers) settings = settings.restoreOverlay(layers);
 	return settings;
 }

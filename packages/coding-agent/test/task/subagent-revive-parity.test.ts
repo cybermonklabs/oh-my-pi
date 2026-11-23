@@ -43,7 +43,8 @@ const VERDICT_SCHEMA = {
 
 /**
  * The accepted differences between a warm and a cold revive: the only options in which the two may differ.
- * Only the first is an option of a revive's build; the others name state the builds do not compare.
+ * Only the first is an option of a revive's build that differs on these routes; the others name state the builds
+ * do not compare, or values that differ only where live state changed since the spawn, which no route here changes.
  */
 const ACCEPTED_DIFFERENCES = [
 	"1. The per-call approval closure (assertDispatchModel): the warm revive keeps the spawn's; the cold revive builds one against the grants as they are at the revive.",
@@ -53,6 +54,7 @@ const ACCEPTED_DIFFERENCES = [
 	"5. A live input of a parent that is not live, and a discovery list whose contents changed on disk since the spawn.",
 	"6. A seance consult writes no spec, so its cold revive stays on its own route.",
 	"7. A custom tool that the cold revive cannot build again: both revives keep it in the tool list; on the cold revive a call to it answers that it is unavailable.",
+	"8. A value that the cold revive holds to the live process after live state changed since the spawn (cwd, additionalDirectories, credentialSourceSessionId, the wake maxRuntimeMs and the soft request budget): the cold revive follows the live state, the warm revive keeps the spawn's. No route here changes live state, so these are equal on every route.",
 ] as const;
 
 /** Whether this run printed {@link ACCEPTED_DIFFERENCES}: the first comparison of the differing options prints them. */
@@ -86,10 +88,12 @@ type Compare =
  * when `createAgentSession` gains an option this table does not class.
  */
 const OPTION_COMPARES = {
-	// Stored in the spawn spec.
+	// Stored for the spawn and a warm revive; held to the live process at a cold revive (accepted difference 8,
+	// where live state changed since the spawn: no route here changes it).
 	cwd: "data",
 	additionalDirectories: "data",
 	credentialSourceSessionId: "data",
+	// Stored in the spawn spec.
 	model: "model",
 	thinkingLevel: "data",
 	thinkingLevelCeiling: "data",
@@ -121,6 +125,8 @@ const OPTION_COMPARES = {
 	// Derived from the stored per-call flag.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
+	// Derived from the session file's cwd: where it differs from cwd, which no route here makes it.
+	secretsProjectDirs: "data",
 	// Set by no subagent build, so the SDK default holds on every path.
 	additionalExtensionPaths: "data",
 	advertiseHeadlessAsk: "data",
@@ -546,6 +552,22 @@ function defineRouteCases(result: () => ParityRun): void {
 			return !Bun.deepEquals(cold, warm);
 		});
 		expect(differing).toEqual([]);
+	}, 30_000);
+
+	it("on a route that changes no live state, the values accepted difference 8 names are equal on both revives", () => {
+		const { warm, cold } = result();
+		const liveHeld = (revived: RevivedSubagent) => {
+			const { options } = revived.build;
+			if (!revived.wake) throw new Error("The revive attached no wake-turn monitor");
+			return {
+				cwd: options.cwd,
+				additionalDirectories: options.additionalDirectories,
+				credentialSourceSessionId: options.credentialSourceSessionId,
+				maxRuntimeMs: revived.wake.maxRuntimeMs,
+				softRequestBudget: revived.wake.softRequestBudget,
+			};
+		};
+		expect(liveHeld(cold)).toEqual(liveHeld(warm));
 	}, 30_000);
 }
 

@@ -202,6 +202,7 @@ import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
 	cfgCompactionThresholdTokens,
+	cfgWorkspaceAdditionalDirectories,
 } from "../session/context-settings";
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
@@ -4289,7 +4290,7 @@ export interface SubagentLegacyRevive {
 	tools?: { mountedToolNames: string[] | undefined; keepDevices: boolean };
 	/** Every build returns the held base prompt, the builds after the revived session's first model call too. */
 	replayPrompt?: boolean;
-	/** The record states no policy: the session keeps the workspace roots its file's header holds. */
+	/** The record holds no spawn spec: the session keeps the workspace roots its file's header holds. */
 	policy?: boolean;
 }
 
@@ -4338,10 +4339,18 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 	const settings =
 		launch?.settings ?? restoreSubagentSettings(live.settingsParent, revive?.cache?.settings ?? spec.settings);
 	if (live.parentArtifactManager) sessionManager.adoptArtifactManager(live.parentArtifactManager);
-	// A revive whose spec states its policy takes its workspace roots from that policy (at a cold revive, the live
-	// parent's) and the live settings, never from the roots the reopened file's header holds, which a writer of the
-	// session store can edit. A record with no spec keeps them, as before spawn specs.
-	if (revive && !revive.legacy?.policy) await sessionManager.setAdditionalDirectories([]);
+	// A revive whose spec states its policy writes its file header's workspace roots once, before the build, as the
+	// roots the build uses: the policy's (at a cold revive, the live parent's, or the root's where the parent is not
+	// live) and the live settings'. The SDK's merge then changes nothing, so a warm revive rewrites the file for its
+	// roots only where these changed, and a root the run took from a live settings edit stays while the setting holds
+	// it. A root only the reopened header holds, which a writer of the session store can edit, is not kept. A record
+	// with no spec keeps its header's roots, as before spawn specs.
+	if (revive && !revive.legacy?.policy) {
+		await sessionManager.setAdditionalDirectories([
+			...(spec.policy.additionalDirectories ?? []),
+			...cfgWorkspaceAdditionalDirectories.get(settings),
+		]);
+	}
 	const inputs: SubagentPromptInputs = {
 		...spec.prompt,
 		outputSchema: spec.prompt.outputSchema,
@@ -4446,6 +4455,16 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 /** `stored`, unless the live process turns the capability off. */
 function narrowedToLive(stored: boolean | undefined, allowed: boolean | undefined): boolean | undefined {
 	return allowed === false ? false : stored;
+}
+
+/**
+ * The project directory besides the build's `cwd` whose secrets the session's mask loads: the cwd of its session
+ * file, where its tools run, where discovery runs in another directory (a cold revive after the root session moved).
+ * The spawn and a warm revive build in their session's cwd, so they pass none.
+ */
+function toolSecretsProjectDirs(cwd: string | undefined, sessionManager: SessionManager): string[] | undefined {
+	const toolsCwd = sessionManager.getCwd();
+	return cwd !== undefined && path.resolve(cwd) === path.resolve(toolsCwd) ? undefined : [toolsCwd];
 }
 
 /** The spawn's effort ceiling, lowered to the live `task.maxEffort` when that is lower. */
@@ -4623,6 +4642,7 @@ function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
 	const enableMCP = restricted ? false : narrowedToLive(policy.enableMCP, live.policy.enableMCP);
 	return {
 		cwd: policy.cwd,
+		secretsProjectDirs: toolSecretsProjectDirs(policy.cwd, input.sessionManager),
 		costGate: live.costGate,
 		additionalDirectories: policy.additionalDirectories,
 		authStorage: live.authStorage,

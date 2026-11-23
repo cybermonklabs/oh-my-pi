@@ -116,6 +116,7 @@ import {
 	type SessionRunState,
 	type SessionViewState,
 	settingsFromSource,
+	settingsSourceBase,
 	toWireData,
 } from "./session-mirror";
 
@@ -417,10 +418,24 @@ export class RemoteAgentSession implements AgentViewSession {
 		return this.#state.hindsightActive;
 	}
 
-	/** Main-side equivalent of the child's settings: the mirrored main instance under the child's own overlay layers. */
+	/**
+	 * Main-side equivalent of the child's settings: the mirrored main instance under the child's own overlay layers.
+	 * Where a layer fails the check `restoreOverlay` makes, the mirrored main instance alone, with a warning: a reader
+	 * of a session's settings does not expect a throw.
+	 */
 	get settings(): Settings {
 		if (this.#settings) return this.#settings;
-		const settings = settingsFromSource(this.#view.settings);
+		const source = this.#view.settings;
+		let settings: Settings;
+		try {
+			settings = settingsFromSource(source);
+		} catch (error) {
+			logger.warn("Worker-homed session's settings do not restore on main; reading the main settings below them", {
+				agent: this.agentId ?? this.instanceKey,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			settings = settingsSourceBase(source);
+		}
 		this.#settings = settings;
 		return settings;
 	}

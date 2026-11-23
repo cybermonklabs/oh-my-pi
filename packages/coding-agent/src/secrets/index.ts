@@ -160,15 +160,30 @@ export * from "./patterns";
 export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
 
 /**
- * Load secrets from project-local and global secrets.yml files.
- * Project-local entries override global entries with matching content.
+ * Load secrets from project-local and global secrets.yml files: the project file of `cwd`, and that of each
+ * of `extraProjectDirs` (each directory read once). Project-local entries override global entries with
+ * matching content, and the entries of `cwd`'s project those of the other projects.
  */
-export async function loadSecrets(cwd: string, agentDir: string): Promise<SecretEntry[]> {
+export async function loadSecrets(
+	cwd: string,
+	agentDir: string,
+	extraProjectDirs: readonly string[] = [],
+): Promise<SecretEntry[]> {
 	const projectPath = path.join(cwd, ".omp", "secrets.yml");
 	const globalPath = path.join(agentDir, "secrets.yml");
 
 	const globalEntries = await loadSecretsFile(globalPath);
 	const projectEntries = await loadSecretsFile(projectPath);
+	const read = new Set([path.resolve(cwd)]);
+	for (const dir of extraProjectDirs) {
+		const resolved = path.resolve(dir);
+		if (read.has(resolved)) continue;
+		read.add(resolved);
+		const loaded = new Set(projectEntries.map(e => e.content));
+		for (const entry of await loadSecretsFile(path.join(resolved, ".omp", "secrets.yml"))) {
+			if (!loaded.has(entry.content)) projectEntries.push(entry);
+		}
+	}
 
 	if (globalEntries.length === 0) return projectEntries;
 	if (projectEntries.length === 0) return globalEntries;
@@ -249,8 +264,9 @@ export function builtinCredentialSecretEntries(): SecretEntry[] {
 
 /**
  * Build the session secret obfuscator from every configured source: secrets.yml
- * (project + global), secret-shaped environment variables, and the built-in
- * credential patterns. Callers gate on `secrets.enabled`.
+ * (project + global, plus the project files of `extraProjectDirs`), secret-shaped
+ * environment variables, and the built-in credential patterns. Callers gate on
+ * `secrets.enabled`.
  *
  * Only CONFIGURED entries force startup key creation: a configured
  * obfuscate-mode secret — or a default (no custom `replacement`) replace-mode
@@ -272,8 +288,9 @@ export async function buildSecretObfuscator(
 	cwd: string,
 	agentDir: string,
 	keyDir?: string,
+	extraProjectDirs?: readonly string[],
 ): Promise<SecretObfuscator | undefined> {
-	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
+	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir, extraProjectDirs);
 	const envEntries = collectEnvSecrets();
 	// Built-in credential-pattern entries come last so user-configured entries
 	// (plain literals, custom regexes) take precedence in the scan order.

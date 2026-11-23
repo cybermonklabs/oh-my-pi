@@ -202,7 +202,10 @@ export interface PreparedColdRevive {
 	readonly unavailableTools: readonly string[];
 	/** The root session's cwd, where a revived subagent discovers its context (its tools run in its header's). */
 	readonly rootCwd: string;
-	/** The live parent's policy fields a spawn takes from its spawner; undefined where no parent is live. */
+	/**
+	 * The policy fields a spawn takes from its spawner: the live parent's, else the root tool session's (the parent
+	 * is not live, or its home cannot answer); undefined where neither holds a tool session (a host's root).
+	 */
 	readonly parentPolicy: ParentPolicy | undefined;
 }
 
@@ -450,6 +453,9 @@ export async function prepareColdRevive(
 		}
 	}
 	const tools = coldReviveCustomTools(target.id, descriptors, parent?.customTools ?? []);
+	// The policy alone falls back to the root's, as the live inputs do: the custom tools of a parent that is not
+	// live are asked of no kernel, the root's included.
+	const rootTools = root.evalToolSession;
 	return {
 		live,
 		model,
@@ -459,7 +465,7 @@ export async function prepareColdRevive(
 		customTools: tools.customTools,
 		unavailableTools: tools.unavailable,
 		rootCwd: root.sessionManager.getCwd(),
-		parentPolicy: parent?.policy,
+		parentPolicy: parent ? parent.policy : rootTools && parentPolicy(rootTools),
 	};
 }
 
@@ -484,8 +490,11 @@ async function liveParent(
 ): Promise<LiveParent | undefined> {
 	if (session instanceof RemoteAgentSession) {
 		let served: SubagentParentInputs | null;
+		let settings: Settings | undefined;
 		try {
 			served = await session.subagentParentInputs(id, descriptors);
+			// Served layers that fail the check, as stored ones are checked, are an answer the revive cannot take.
+			settings = served ? settingsFromSource(served.settings) : undefined;
 		} catch (error) {
 			logger.warn("Revived subagent could not read its live parent's inputs; it takes the root's", {
 				subagent: id,
@@ -493,14 +502,14 @@ async function liveParent(
 			});
 			return undefined;
 		}
-		if (!served) return undefined;
+		if (!served || !settings) return undefined;
 		// Owner policy, read from the parent's mirror while it lives; held weakly, as a spawn holds the provider.
 		const parent = new WeakRef(session);
 		const roots = session.effectiveExtensionRoots;
 		return {
 			inputs: {
 				...served.live,
-				settings: settingsFromSource(served.settings),
+				settings,
 				extensionRoots: () => parent.deref()?.effectiveExtensionRoots ?? roots,
 			},
 			policy: served.policy,
@@ -1079,8 +1088,8 @@ async function coldReviveModel(
 
 /**
  * The spawn spec the build starts from: each part of the record's spec, and for each part it lacks (every
- * part of a record an older omp wrote, or of a seance consult) what the cold revive built before spawn
- * specs, with the values every spawn gives (`cacheWarming: false`) applied to a record with no spec. A stored
+ * part of a record an older omp wrote, or of a seance consult) or holds in a shape no spawn writes what the
+ * cold revive built before spawn specs, with the values every spawn gives (`cacheWarming: false`). A stored
  * value never widens what the live process allows: the fields of a stored part that select a place, an
  * authority or a limit take the live value, or the narrower of the stored and the live one.
  */
@@ -1123,7 +1132,8 @@ function coldReviveSpawnSpec(
 		legacy.tools = { mountedToolNames: restoredSeance ? undefined : init.mountedTools, keepDevices: !restoredSeance };
 	}
 	if (!parts.prompt) legacy.replayPrompt = true;
-	if (!parts.policy) legacy.policy = true;
+	// Only a record with no spec keeps the workspace roots its header holds; a malformed policy part does not.
+	if (!parts.stored) legacy.policy = true;
 	const spawnSpec: SubagentSpawnSpec = {
 		v: SPAWN_SPEC_VERSION,
 		model: parts.model?.model ?? null,
@@ -1148,8 +1158,8 @@ function coldReviveSpawnSpec(
 					cwd: spec.prepared.rootCwd,
 					// Never shallower than the live parent chain, so `task.maxRecursionDepth` holds.
 					taskDepth: Math.max(parts.policy.taskDepth ?? spec.taskDepth, spec.taskDepth),
-					// Where the spawn passed them, the spawner's as the live parent holds them now, never the record's;
-					// none where the parent is not live, or where the spawn passed none (a vibe worker's spawner).
+					// Where the spawn passed them, the spawner's as the live parent holds them now (the root's where the
+					// parent is not live), never the record's; none where the spawn passed none (a vibe worker's spawner).
 					credentialSourceSessionId:
 						parts.policy.credentialSourceSessionId === undefined
 							? undefined
@@ -1162,9 +1172,9 @@ function coldReviveSpawnSpec(
 			: {
 					cwd: restoredSeance?.cwd ?? spec.prepared.rootCwd,
 					enableLsp: spec.prepared.live.policy.enableLsp,
-					// A constant of every spawn, applied to a record with no spec: a spec whose policy part is missing or
-					// malformed takes the legacy policy alone.
-					...(parts.stored ? {} : { cacheWarming: false }),
+					// The constant every spawn writes, for a record with no spec and for a spec whose policy part is
+					// missing or malformed alike.
+					cacheWarming: false,
 					...(restricted ? { enableIrc: false, enableMCP: false } : { enableMCP: !spec.prepared.live.mcpManager }),
 					// Old files predate persisted spawns: deny re-spawning rather than let
 					// createAgentSession default to wildcard ("*").

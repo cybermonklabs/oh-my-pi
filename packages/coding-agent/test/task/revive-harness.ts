@@ -47,7 +47,12 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import * as settingsStreamModule from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
-import { type ExecutorOptions, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	type ExecutorOptions,
+	type IrcWakeTurnMonitorOptions,
+	runSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ContextFileEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -170,6 +175,8 @@ export interface RevivedSubagent {
 	readonly build: RecordedBuild;
 	/** The system prompt builder applied to {@link PROMPT_PROBE} right after the revive, before any model call. */
 	readonly prompt: unknown;
+	/** The options of the wake-turn monitor the revive attached; undefined when it attached none on this thread. */
+	readonly wake: IrcWakeTurnMonitorOptions | undefined;
 }
 
 /** An IRC send to a parked subagent and the first request of the turn it woke. */
@@ -543,6 +550,8 @@ export class ReviveEnv {
 	readonly spawnModel: MockModel;
 	readonly requests: RecordedRequest[] = [];
 	readonly builds: RecordedBuild[] = [];
+	/** Every wake-turn monitor's options, in the order the monitors were attached on this thread. */
+	readonly wakes: IrcWakeTurnMonitorOptions[] = [];
 	turns: ScriptedTurns = { yieldArguments: { type: "result", data: "done" } };
 	/** A test's own answer to a request, asked before {@link turns}; undefined leaves the request to them. */
 	respond: ((request: RecordedRequest) => MockResponse | undefined) | undefined;
@@ -588,6 +597,11 @@ export class ReviveEnv {
 			return create(options);
 		});
 		this.#createTools = vi.spyOn(toolsModule, "createTools");
+		const attach = executorModule.attachIrcWakeTurnMonitor;
+		vi.spyOn(executorModule, "attachIrcWakeTurnMonitor").mockImplementation((session, options) => {
+			this.wakes.push(options);
+			attach(session, options);
+		});
 		vi.spyOn(jsContextManager, "invokeJsTool").mockImplementation(this.kernels.answer);
 		this.#lifecycle = localLifecycle();
 		this.#adopt = vi.spyOn(this.#lifecycle, "adopt");
@@ -711,13 +725,21 @@ export class ReviveEnv {
 	 * A live root session holding the discovery fixtures: its tool session is what a spawner reads,
 	 * and `evalToolSession` exposes that same tool session on the root, where a cold revive reads
 	 * the live parent's inputs. `policy` is what the parent's process allows (each on by default).
+	 * Its session manager holds its working directory and workspace roots, which its tool session
+	 * reads, as a session's does; `moveTo` and `addWorkspaceDirectory` change them as `/move` (or
+	 * `/wt`) and `/add-dir` do.
 	 */
 	createLiveParent(settings: Settings = this.settings, policy: LivePolicy = {}): LiveParent {
 		const roots: EffectiveExtensionRoots = { explicit: [], mode: "merge", configured: [], configuredLevel: "user" };
 		const preparedExtensions: PreparedExtension[] = [];
 		const sessionAgents: AgentDefinition[] = [];
+		let cwd = this.cwd;
+		let workspaceRoots = [this.#extraDir];
+		const sessionId = "root-session";
 		const toolSession: ToolSession = {
-			cwd: this.cwd,
+			get cwd() {
+				return cwd;
+			},
 			hasUI: false,
 			settings,
 			getSessionFile: () => null,
@@ -732,8 +754,11 @@ export class ReviveEnv {
 			enableMCP: policy.enableMCP ?? true,
 			enableLsp: policy.enableLsp ?? true,
 			...(policy.enableIrc === undefined ? {} : { enableIrc: policy.enableIrc }),
-			additionalDirectories: [this.#extraDir],
-			getCredentialSourceSessionId: () => "root-credential-source",
+			get additionalDirectories() {
+				return [...workspaceRoots];
+			},
+			// A root session's tool session gives its own session id as a spawn's credential source.
+			getCredentialSourceSessionId: () => sessionId,
 			contextFiles: this.fixtures.contextFiles,
 			skills: this.fixtures.skills,
 			rules: this.fixtures.rules,
@@ -747,7 +772,21 @@ export class ReviveEnv {
 			localProtocolOptions: { getArtifactsDir: () => null, getSessionId: () => null },
 		};
 		const session = {
-			sessionManager: { getCwd: () => this.cwd, getArtifactManager: () => undefined },
+			sessionManager: {
+				getSessionId: () => sessionId,
+				getCwd: () => cwd,
+				getAdditionalDirectories: () => [...workspaceRoots],
+				moveTo: async (next: string) => {
+					cwd = path.resolve(next);
+				},
+				addWorkspaceDirectory: async (directory: string) => {
+					const resolved = path.resolve(cwd, directory);
+					if (workspaceRoots.includes(resolved)) return null;
+					workspaceRoots = [...workspaceRoots, resolved];
+					return resolved;
+				},
+				getArtifactManager: () => undefined,
+			},
 			get effectiveExtensionRoots() {
 				return roots;
 			},
@@ -829,12 +868,14 @@ export class ReviveEnv {
 	/** Revive a parked subagent through the lifecycle: warm while its reviver is adopted, cold after it is dropped. */
 	async revive(id: string): Promise<RevivedSubagent> {
 		const first = this.builds.length;
+		const firstWake = this.wakes.length;
 		const session = localSession(await this.#lifecycle.ensureLive(id));
 		const build = this.builds.slice(first).findLast(candidate => candidate.options.agentId === id);
 		if (!build) throw new Error(`The revive of ${id} built no session`);
 		const systemPrompt = build.options.systemPrompt;
 		const prompt = typeof systemPrompt === "function" ? systemPrompt([PROMPT_PROBE]) : systemPrompt;
-		return { session, build, prompt };
+		const wake = this.wakes.slice(firstWake).findLast(options => options.id === id);
+		return { session, build, prompt, wake };
 	}
 
 	/** Wake a live subagent with an IRC message, as a peer does, and return the first request of that turn. */

@@ -5,7 +5,8 @@
 ### Fixed
 
 - Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
-- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids, credential source, workspace roots, discovery cwd, artifacts directory, cost gate and prepared extensions now come from the live registry entry and parent, its task depth and wake limits are held to the live parent chain and settings, its cache warming stays off as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids and artifacts directory now come from the live registry entry, its credential source, workspace roots, cost gate and prepared extensions from the live parent (the root session where the parent is not live), and its discovery cwd from the root session; its task depth and wake limits are held to the live parent chain and settings, its cache warming stays off as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed a subagent revived from its stored transcript after the root session moved to another directory leaving unmasked the project secrets (`.omp/secrets.yml`) of the directory its tools run in
 
 ## [18.18.6] - 2026-11-09
 

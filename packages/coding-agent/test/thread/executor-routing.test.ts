@@ -4,7 +4,7 @@
  * and a scripted OpenAI-compatible server the worker's model registry finds through
  * `models.yml` (the worker mirror re-reads it, so no spies reach into the worker).
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -731,6 +731,66 @@ describe("subagent runs routed into pooled workers", () => {
 			expect(server.toolResults.slice(resultsBefore).join("\n")).toContain(`${KERNEL_ANSWER}:a`);
 			expect(warnings.filter(message => message.includes("no live kernel defines"))).toEqual([]);
 			// Let the wake turn settle before teardown.
+			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"a cold revive of a subagent whose worker-homed parent serves settings the check rejects takes the root's inputs, with the warning",
+		async () => {
+			const warnings: string[] = [];
+			cleanups.push(
+				logger.registerLogSink(event => {
+					if (event.level === "warn") warnings.push(event.message);
+				}),
+			);
+			const parentAgent: AgentDefinition = { ...AGENT, tools: ["read", "bash", "eval"] };
+			const parentRun = await runSubprocess(runOptions("CheckedParent", DEFINE_TOOL_TASK, { agent: parentAgent }));
+			expect(parentRun.exitCode).toBe(0);
+			const parent = mirrorOf(AgentRegistry.global().get("CheckedParent")?.session);
+			await waitFor(() => !parent.ircWakesPending);
+			const customTools = createEvalCustomTools({ settings } as unknown as ToolSession, [PARENT_LOOKUP]);
+			const childRun = await runSubprocess(
+				runOptions("CheckedChild", "ping", { customTools, parentAgentId: "CheckedParent" }),
+			);
+			expect(childRun.output).toBe("pong");
+			const child = mirrorOf(AgentRegistry.global().get("CheckedChild")?.session);
+			await waitFor(() => !child.ircWakesPending);
+			const lifecycle = AgentLifecycleManager.global();
+			expect(await lifecycle.release("CheckedChild", undefined, { tombstone: true })).toBe(true);
+			// The parent's home answers with a settings layer that names no setting of this build.
+			const serve = parent.subagentParentInputs.bind(parent);
+			const served = vi.spyOn(parent, "subagentParentInputs").mockImplementation(async (id, descriptors) => {
+				const inputs = await serve(id, descriptors);
+				if (!inputs) return inputs;
+				const unknownLayer = { global: { noSuchSetting: true }, overrides: {}, derived: true };
+				return { ...inputs, settings: { ...inputs.settings, layers: [...inputs.settings.layers, unknownLayer] } };
+			});
+			cleanups.push(() => served.mockRestore());
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+			const resultsBefore = server.toolResults.length;
+			const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "CheckedChild", body: CALL_TOOL_TASK });
+			expect(receipt.outcome).toBe("revived");
+			expect(served).toHaveBeenCalled();
+			const unreadable = warnings.filter(message => message.includes("could not read its live parent's inputs"));
+			expect(unreadable.length).toBeGreaterThan(0);
+			const woken = mirrorOf(AgentRegistry.global().get("CheckedChild")?.session);
+			await waitFor(() => server.toolResults.length > resultsBefore);
+			// On the root's inputs no kernel is asked, so the child's call to the parent's tool answers unavailable.
+			const results = server.toolResults.slice(resultsBefore).join("\n");
+			expect(results).not.toContain(KERNEL_ANSWER);
+			expect(results).toMatch(/unavailable/i);
 			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
 		},
 		TEST_TIMEOUT_MS,
