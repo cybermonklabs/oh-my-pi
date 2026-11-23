@@ -2013,7 +2013,10 @@ interface PreparedProviderCall {
 	ownedDialect: Dialect | undefined;
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
-	/** Records this call's per-call messages as the previous main request's; called once the request goes out. */
+	/**
+	 * Records this call's per-call messages as the previous main request's; called as the provider dispatches the
+	 * request (its `beforeDispatch`), past the stream function's own gates.
+	 */
 	perCallMessagesSent?: () => void;
 }
 
@@ -2316,7 +2319,11 @@ async function streamAssistantResponse(
 	// provider. Holding here covers those awaits and the retries the stream
 	// layer dispatches itself (re-sample, rotated credential). The caller's
 	// own hold is asked again after each wait on the gate, so what it checks
-	// is checked after the pause rather than before it.
+	// is checked after the pause rather than before it. Past every hold the
+	// provider sends: only a request that gets there becomes the one the next
+	// request compares its per-call messages with, and one a stream function's
+	// own gate stopped (a spend cap, a model check) or an abort ended sends
+	// nothing and leaves that record as it was.
 	const callerHold = config.beforeDispatch;
 	const beforeDispatch: DispatchHold = async () => {
 		for (;;) {
@@ -2330,6 +2337,7 @@ async function streamAssistantResponse(
 			await waitForProcessPause(config, finalRequestSignal);
 		}
 		finalRequestSignal?.throwIfAborted();
+		providerCall.perCallMessagesSent?.();
 	};
 	// Awaiting the hold proves only that the gate was open when it answered.
 	// The transport reads this in the same synchronous step that sends, so a
@@ -2342,8 +2350,6 @@ async function streamAssistantResponse(
 		return await runInActiveSpan(chatSpan, async () => {
 			if (agentPauseGate.paused) await waitForProcessPause(config, finalRequestSignal);
 			onProviderStart?.();
-			// Past every gate: the request goes out, so the next one compares its per-call messages with this one's.
-			providerCall.perCallMessagesSent?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey: telemetryApiKey,

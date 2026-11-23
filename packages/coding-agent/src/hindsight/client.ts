@@ -12,6 +12,7 @@ import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import type { DispatchHold } from "@oh-my-pi/pi-ai";
 import { dispatchWhenOpen } from "@oh-my-pi/pi-ai/utils/dispatch-hold";
 import { USER_AGENT, truncate, tryParseJson } from "@oh-my-pi/pi-utils";
+import { endpointUrl } from "../utils/endpoint-url";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import type { HindsightConfig } from "./config";
 
@@ -289,18 +290,12 @@ export interface HindsightClientApi {
 }
 
 /**
- * The base URL the client sends its requests under for `apiUrl` (`hindsight.apiUrl`), as `fetch` reads it: parsed as
- * a URL (scheme and host lowercased, a default port dropped, dot segments resolved) and without trailing slashes; a
- * value that does not parse only loses its trailing slashes. Spellings that reach the same server give the same base
- * URL, which names the server in a recorded recall's scope (`hindsightRecallScope`).
+ * The server `config` names, as the client reaches it ({@link endpointUrl} of `hindsight.apiUrl`): spellings that
+ * reach the same server give the same string, which names the server in a recorded recall's scope
+ * (`hindsightRecallScope`); null without `hindsight.apiUrl`.
  */
-export function hindsightBaseUrl(apiUrl: string): string {
-	return (URL.parse(apiUrl)?.href ?? apiUrl).replace(/\/+$/, "");
-}
-
-/** The server `config` names, as the client reaches it ({@link hindsightBaseUrl}); null without `hindsight.apiUrl`. */
 export function hindsightServer(config: HindsightConfig): string | null {
-	return config.hindsightApiUrl === null ? null : hindsightBaseUrl(config.hindsightApiUrl);
+	return config.hindsightApiUrl === null ? null : endpointUrl(config.hindsightApiUrl);
 }
 
 /** The API token `config` names, without surrounding whitespace: the account a recall and a running session compare. */
@@ -318,7 +313,7 @@ export class HindsightApi implements HindsightClientApi {
 	#hold: DispatchHold;
 
 	constructor(options: HindsightApiOptions) {
-		this.#baseUrl = hindsightBaseUrl(options.baseUrl);
+		this.#baseUrl = endpointUrl(options.baseUrl);
 		this.#headers = {
 			"User-Agent": options.userAgent ?? DEFAULT_USER_AGENT,
 			"Content-Type": "application/json",

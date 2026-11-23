@@ -11,7 +11,7 @@ import type {
 } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
-import { BankManager } from "@oh-my-pi/pi-mnemopi/core/banks";
+import { bankDbPathIn } from "@oh-my-pi/pi-mnemopi/core/banks";
 import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
@@ -1322,11 +1322,14 @@ function createMemory(config: MnemopiBackendConfig, bank: string, beforeDispatch
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-/** The database `bank` lives in: the configured one for the shared bank, else the bank's own beside it. */
+/**
+ * The database `bank` lives in: the configured one for the shared bank, else the bank's own beside it. Creates nothing,
+ * so a read of a recall's scope (a resume, `omp render`) leaves the memories directory as it found it.
+ */
 export function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
-	return new BankManager(dirname(config.dbPath)).getBankDbPath(bank);
+	return bankDbPathIn(dirname(config.dbPath), bank);
 }
 
 function mergeRecallResult(

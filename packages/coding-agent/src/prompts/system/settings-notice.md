@@ -14,7 +14,7 @@ These settings changed after a settings notice above, and the change it describe
 {{/each}}
 {{/if}}
 {{#if disabledTools.length}}
-Disabled by this change; they stay listed until the rebuild, and calls to them are refused from now on: {{#list disabledTools join=", "}}`{{this}}`{{/list}}
+{{#if released}}Disabled by that change; gone now, no longer listed or declared: {{else}}Disabled by this change; they stay listed until the rebuild, and calls to them are refused from now on: {{/if}}{{#list disabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 {{#if unlistedDisabledTools.length}}
 Disabled by this change; calls to them are refused from now on: {{#list unlistedDisabledTools join=", "}}`{{this}}`{{/list}}
@@ -23,7 +23,7 @@ Disabled by this change; calls to them are refused from now on: {{#list unlisted
 No longer disabled; calls to them run again from now on: {{#list reenabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 {{#if enabledTools.length}}
-Enabled by this change; available after the rebuild: {{#list enabledTools join=", "}}`{{this}}`{{/list}}
+{{#if released}}Enabled by that change; available now: {{else}}Enabled by this change; available after the rebuild: {{/if}}{{#list enabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 {{#if noLongerEnabledTools.length}}
 {{#if released}}No longer enabled; not available: {{else}}No longer enabled; not available after the rebuild: {{/if}}{{#list noLongerEnabledTools join=", "}}`{{this}}`{{/list}}

@@ -5601,7 +5601,11 @@ describe("agentLoop pre-model-call gate", () => {
 		let note = "status: idle";
 		const agent = new Agent({
 			initialState: { model: mock.model },
-			streamFn: mock.stream,
+			// As every transport does, the stream function calls `beforeDispatch` as it sends, which takes the record.
+			streamFn: (model, context, options) => {
+				options?.beforeDispatch?.();
+				return mock.stream(model, context, options);
+			},
 			transformContext: async messages => {
 				const status: AgentMessage = { role: "user", content: note, timestamp: 0 };
 				markPerCallContextMessage(status);
