@@ -771,7 +771,8 @@ mod tests {
 
 	/// A helper left asleep after its writer wrote (the `stuck` hook, as
 	/// gVisor leaves one) does not keep the open from its bytes: a look takes
-	/// the open, and the helper is woken and closes what it gets.
+	/// the open, and the look's write opens wake the helper before the drop
+	/// does; the helper closes what it gets.
 	#[test]
 	fn a_look_takes_an_open_whose_helper_was_left_asleep() {
 		let (_dir, path) = new_fifo();
@@ -799,10 +800,31 @@ mod tests {
 			.unwrap();
 		assert!(opened.shared.slot.lock().rescued, "the result is not the look's");
 		assert_eq!(drain(reader).0, b"ab");
+		// The look's write opens end the helper's `open(2)` before the drop,
+		// whose own end would end it too.
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		while !opened.shared.slot.lock().returned {
+			assert!(std::time::Instant::now() < deadline, "the look's wake-up did not end the open");
+			thread::sleep(Duration::from_millis(10));
+		}
 		let shared = Arc::clone(&opened.shared);
 		drop(opened);
 		assert!(shared.slot.lock().returned, "the helper is still asleep");
 		assert_eq!(Arc::strong_count(&shared), 1, "the helper or the watcher outlived the drop");
+	}
+
+	/// Lets a helper the `stay` hook holds go when dropped, so a test that
+	/// fails before it lets the helper go fails instead of hanging in the
+	/// drop's join. It holds no reference that counts: tests count them.
+	struct LetGo(std::sync::Weak<Shared<fs::File>>);
+
+	impl Drop for LetGo {
+		fn drop(&mut self) {
+			if let Some(shared) = self.0.upgrade() {
+				shared.slot.lock().stay = false;
+				shared.done.notify_all();
+			}
+		}
 	}
 
 	/// A drop does not wait for a helper the look took the open from when the
@@ -813,14 +835,23 @@ mod tests {
 	fn a_drop_leaves_a_helper_the_look_could_not_wake() {
 		let (_dir, path) = new_fifo();
 		let mut opened = reading(&path, Slot { stuck: true, stay: true, ..Slot::default() });
+		let _let_go = LetGo(Arc::downgrade(&opened.shared));
 		while !opened.shared.slot.lock().opening {
 			thread::yield_now();
 		}
-		let mut writer = fs::OpenOptions::new()
-			.write(true)
-			.custom_flags(libc::O_NONBLOCK)
-			.open(&path)
-			.unwrap();
+		// The stuck helper opens its read end after it set `opening`: until
+		// then a write open that does not wait fails with ENXIO.
+		let mut writer = loop {
+			match fs::OpenOptions::new()
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&path)
+			{
+				Ok(writer) => break writer,
+				Err(e) if e.raw_os_error() == Some(libc::ENXIO) => thread::yield_now(),
+				Err(e) => panic!("{e}"),
+			}
+		};
 		writer.write_all(b"ab").unwrap();
 		drop(writer);
 		let reader = opened
