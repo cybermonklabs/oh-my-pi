@@ -23,6 +23,7 @@ mod coproc_jobs;
 mod errexit;
 mod events;
 mod executor;
+mod exits_taken_in;
 mod expand;
 mod getopts;
 mod host_hooks;

@@ -812,18 +812,25 @@ pub(super) fn cleanup_dead_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc)
 	if !vp.jobs.iter().any(reported) || vp.mode.dialect() != Dialect::Bash || vp.jobs_kept() {
 		return;
 	}
-	let gone: Vec<(Vpid, u32, i32)> = vp
+	let gone: Vec<(Vpid, u32, i32, bool)> = vp
 		.jobs
 		.iter()
 		.filter(|j| reported(j))
 		.filter_map(|j| match j.state {
-			JobState::Done(status) => Some((j.vpid, j.pid(), status)),
+			JobState::Done(status) => Some((j.vpid, j.pid(), status, j.inherited)),
 			_ => None,
 		})
 		.collect();
 	vp.jobs.remove_where(reported);
-	for (vpid, pid, status) in gone {
+	for (vpid, pid, status, inherited) in gone {
 		state::save_status(&mut k.root, cx.store, vp, vpid, pid, status);
+		// The kept list answers `wait PID` for it from now on, and stops once
+		// it forgets the status: the child's own record, which would answer
+		// too, goes. A command substitution's copy of its parent's job is no
+		// child of `vp`: its record stays the parent's.
+		if !inherited {
+			let _ = k.proc_collect(cx.store, vpid);
+		}
 	}
 }
 

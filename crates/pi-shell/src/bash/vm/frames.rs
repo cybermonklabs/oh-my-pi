@@ -749,6 +749,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;

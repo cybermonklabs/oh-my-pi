@@ -13,6 +13,7 @@ use crate::bash::{
 	ControlHandle, Platform,
 	diag::Diag,
 	event::{EventData, WaitKey},
+	ids::Vpid,
 	signal::{SigTarget, Signal},
 	store::OptId,
 	vm::{
@@ -20,7 +21,7 @@ use crate::bash::{
 		expand::Stop,
 		jobctl,
 		proc::{Job, JobLookup, JobState, LastBg, ScriptKind},
-		quote,
+		quote, state,
 	},
 };
 
@@ -29,6 +30,32 @@ use crate::bash::{
 /// `suspend` and `wait` (stopped jobs) depend on it.
 pub fn active(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
 	Ok(!ctx.vp.jobs.subshell && ctx.option(OptId::Monitor)?)
+}
+
+/// Take in the exits already available before a builtin reports or
+/// decides by the state of this vproc's jobs, as bash's job states follow
+/// its children's exits at once (its `SIGCHLD` handler's `waitchld`): with
+/// a job of its own still running here, the builtin parks and asks
+/// ([`crate::bash::vm::Kernel::ask_exits`]); it is answered once every
+/// other vproc that was parked has had its next turn, so the job's vprocs
+/// that wait for an exited program or for ended children take it in and
+/// end before the builtin runs again. It waits for no running job. A job a
+/// command substitution lists is its parent's, copied when it started.
+pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
+	if ctx.k.exits_taken(ctx.vp.vpid) {
+		return Ok(());
+	}
+	let Some(job) = ctx
+		.vp
+		.jobs
+		.iter()
+		.find(|j| !j.inherited && !matches!(j.state, JobState::Done(_)))
+	else {
+		return Ok(());
+	};
+	let vpid = job.vpid;
+	ctx.k.ask_exits(ctx.vp.vpid);
+	Err(Need::Park(WaitKey::Proc(vpid)))
 }
 
 /// Why a job spec named no job.
@@ -165,7 +192,8 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 }
 
 /// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`, which deletes none while the job list is frozen).
+/// `cleanup_dead_jobs`, which deletes none while the job list is frozen and
+/// keeps each one's status for `wait PID`, `delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
 		super::super::killed::cleanup_dead_jobs(ctx.k, ctx.cx, ctx.vp);
@@ -183,6 +211,22 @@ fn ended(ctx: &mut Ctx<'_, '_>) {
 	let line = ctx.line;
 	if let Some(bytes) = super::super::killed::jobs_ended(ctx.k, ctx.cx, ctx.vp, line) {
 		ctx.out_fd(2, &bytes);
+	}
+}
+
+/// Keep `status` for the job of child `vpid`, shown as `pid`, that left
+/// the table (bash `bgp_add`). The kept list answers `wait PID` for it from
+/// now on, and stops answering once it forgets the status (a plain `wait`,
+/// `disown -a`, a posix `wait PID`): so the child's own record, which would
+/// answer too, is collected. A copy of the parent's job (a command
+/// substitution's) is not this vproc's child: its record stays the
+/// parent's.
+fn keep_status(ctx: &mut Ctx<'_, '_>, vpid: Vpid, pid: u32, status: i32, inherited: bool) {
+	state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, vpid, pid, status);
+	if !inherited {
+		// A child still running keeps its record (`proc_collect` takes only
+		// an ended one's).
+		let _ = ctx.k.proc_collect(ctx.cx.store, vpid);
 	}
 }
 
@@ -217,6 +261,7 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if execute {
 		return execute_with_pids(ctx, o.rest);
 	}
+	take_in_exits(ctx)?;
 	// A job `jobs` finds done is one bash's `jobs` shows done only once it
 	// reaped it ([`crate::bash::store::Job::unreaped`]).
 	let finished: Vec<u32> = ctx
@@ -371,6 +416,7 @@ pub fn fg_bg(ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 			Err(st) => return done(st),
 		}
 	};
+	take_in_exits(ctx)?;
 	if fg {
 		// `fg %1 &` (and `%1 &`) puts the job in the background.
 		if args.last().is_some_and(|a| a.as_slice() == b"&") {
@@ -532,6 +578,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		Ok(o) => o,
 		Err(st) => return done(st),
 	};
+	take_in_exits(ctx)?;
 	let nohup = o.has(b'h');
 	let running_only = o.has(b'r');
 	if o.rest.is_empty() && (o.has(b'a') || running_only) {
@@ -548,7 +595,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			drop_job(ctx, number, nohup, false);
 		}
 		if !running_only && !nohup && !ctx.vp.jobs_kept() {
-			let gone: Vec<crate::bash::ids::Vpid> = ctx
+			let gone: Vec<Vpid> = ctx
 				.vp
 				.jobs
 				.bgp
@@ -560,7 +607,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			for v in gone {
 				ctx.k.proc_collect(ctx.cx.store, v);
 			}
-			crate::bash::vm::state::clear_statuses(&mut ctx.k.root, ctx.cx.store, ctx.vp);
+			state::clear_statuses(&mut ctx.k.root, ctx.cx.store, ctx.vp);
 		}
 		return done(0);
 	}
@@ -597,11 +644,13 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 }
 
 /// `disown`'s effect on one job: `nohup` marks it, else it is deleted
-/// (bash warns when that drops a stopped job), but not while no job may be
-/// deleted (bash `delete_job` returns at once, `jobs.c:1492`). With `keep`
-/// its status is kept, as `delete_job` keeps an asynchronous job's
-/// (`jobs.c:1501-1505`): how it ended, or 0 while it runs (bash reads the
-/// status its process has then); without, a finished job's child is
+/// (bash warns when that drops a stopped job) and is no child of this shell
+/// any more ([`crate::bash::vm::Kernel::disown`]: `wait` neither waits for
+/// it nor finds it, except by the status `keep` keeps), but not while no
+/// job may be deleted (bash `delete_job` returns at once, `jobs.c:1492`).
+/// With `keep` its status is kept, as `delete_job` keeps an asynchronous
+/// job's (`jobs.c:1501-1505`): how it ended, or 0 while it runs (bash reads
+/// the status its process has then); without, a finished job's child is
 /// forgotten with it (`DEL_NOBGPID`: `wait PID` finds no child).
 fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 	if nohup {
@@ -616,6 +665,9 @@ fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 	let Some(job) = ctx.vp.jobs.remove(number) else {
 		return;
 	};
+	if !job.inherited {
+		ctx.k.disown(ctx.cx.store, job.vpid);
+	}
 	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	// bash still reaps the processes of a pipeline job it deleted, and runs
 	// the `CHLD` trap for each ([`crate::bash::vm::Kernel::disowned_procs`]).
@@ -632,17 +684,12 @@ fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 				JobState::Done(status) => status,
 				_ => 0,
 			};
-			crate::bash::vm::state::save_status(
-				&mut ctx.k.root,
-				ctx.cx.store,
-				ctx.vp,
-				job.vpid,
-				job.pid(),
-				status,
-			);
+			keep_status(ctx, job.vpid, job.pid(), status, job.inherited);
 		},
-		(false, JobState::Done(_)) if bash => {
-			ctx.k.proc_collect(ctx.cx.store, job.vpid);
+		// No status is kept: an ended job's record goes too (a running
+		// one's stays: `proc_collect` takes only an ended one's).
+		(false, _) if bash && !job.inherited => {
+			let _ = ctx.k.proc_collect(ctx.cx.store, job.vpid);
 		},
 		_ => {},
 	}

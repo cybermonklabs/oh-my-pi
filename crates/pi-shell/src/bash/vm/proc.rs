@@ -515,12 +515,12 @@ pub struct JobTable {
 	/// ([`Copied`]): the parent's jobs it holds while it expands the
 	/// command's words.
 	pub copied:   Copied,
-	/// The statuses `wait` collected (bash's bgp list, `bgp_add`), oldest
-	/// first, at most [`BGP_MAX`]: `wait PID` finds one once its job left the
-	/// table, and a `wait` a trap interrupted ends with one the trap's own
-	/// `wait` collected. The root's is in the store too
-	/// ([`crate::bash::store::Key::BgPid`]). Boxed and `None` while empty:
-	/// one pointer per idle vproc.
+	/// The statuses of background jobs that left the table (bash's bgp
+	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
+	/// `wait PID` finds one once its job left the table, and a `wait` a trap
+	/// interrupted ends with one the trap's own `wait` kept. The root's is in
+	/// the store too ([`crate::bash::store::Key::BgPid`]). Boxed and `None`
+	/// while empty: one pointer per idle vproc.
 	#[expect(clippy::box_collection, reason = "one pointer per idle vproc; a `VecDeque` is four")]
 	pub bgp:      Option<Box<VecDeque<SavedStatus>>>,
 }
@@ -530,7 +530,7 @@ pub struct JobTable {
 /// circular `bgpids.storage` overwrites its oldest cell.
 pub const BGP_MAX: usize = 32_768;
 
-/// A status `wait` collected ([`JobTable::bgp`]).
+/// A status kept for a job that left the table ([`JobTable::bgp`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedStatus {
 	/// The child vproc.

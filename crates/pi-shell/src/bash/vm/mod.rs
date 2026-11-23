@@ -382,26 +382,50 @@ pub enum CallOutcome {
 /// caches). Persistent state lives in the [`StateStore`]. `Send`; holds no
 /// host references.
 pub struct Shell {
-	k:       Kernel,
+	k:         Kernel,
 	/// Boxed: a `Vproc` is ~650 bytes and the vector doubles, so idle
 	/// subshells would pay up to twice that in spare capacity (target:
 	/// ≤ 2 KiB per idle vproc).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
-	procs:   Vec<Box<Vproc>>,
-	rr:      usize,
+	procs:     Vec<Box<Vproc>>,
+	rr:        usize,
 	/// A slice cut short by the step budget or a control request: the vproc
 	/// and the ops it has left. The next step continues it, so which vproc
 	/// runs when depends only on op counts, never on where the host's steps,
 	/// pauses or snapshots fall.
-	slice:   Option<(Vpid, u32)>,
+	slice:     Option<(Vpid, u32)>,
 	/// Subshell vprocs that ended since the last orphan check: their
 	/// children are orphans ([`EngineConfig::end_orphan_jobs`] only).
 	///
 	/// [`EngineConfig::end_orphan_jobs`]: crate::bash::EngineConfig::end_orphan_jobs
-	gone:    Vec<Vpid>,
+	gone:      Vec<Vpid>,
 	/// Orphaned job trees still watched for in-engine work (see the
 	/// `orphans` module); empty unless [`Self::gone`] ever had entries.
-	orphans: Vec<Vpid>,
+	orphans:   Vec<Vpid>,
+	/// Builtins' asks to take in the exits already available, not answered
+	/// yet ([`Kernel::ask_exits`], [`Self::take_in_exits`]). Not imaged, as
+	/// [`Self::slice`]: a restored builtin runs again and asks again.
+	taking_in: Vec<TakeIn>,
+	/// Vprocs adopted that have not had a turn yet: a take-in owes none of
+	/// the asker's own such jobs a turn ([`Self::take_in_exits`]). Not
+	/// imaged: a restored vproc counts as one that had its turn.
+	fresh:     Vec<Vpid>,
+}
+
+/// One builtin's ask to take in the exits already available
+/// ([`Kernel::ask_exits`]), until the scheduler answers it
+/// ([`Shell::take_in_exits`]). Every vproc keeps its place in the
+/// round-robin; nothing runs out of turn.
+struct TakeIn {
+	/// The vproc whose builtin asked.
+	asker: Vpid,
+	/// The vprocs that had work when it asked, but for the asker's own jobs
+	/// that had not had a turn yet.
+	seen:  Vec<Vpid>,
+	/// The turns still owed before the answer: each vproc of `seen` once,
+	/// and once more the parent of each of them that ended since (it takes
+	/// that end in).
+	owed:  Vec<Vpid>,
 }
 
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
@@ -573,6 +597,18 @@ pub struct Kernel {
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// Vprocs whose builtin is about to report job state and asked first to
+	/// take in the exits already available ([`Kernel::ask_exits`]); the
+	/// scheduler answers after the turn (`Shell::take_in_exits`). Not
+	/// imaged: a restored builtin runs again and asks again.
+	pub exits_asked:        Vec<Vpid>,
+	/// Vprocs whose ask the scheduler answered: their builtin, run again,
+	/// reports now ([`Kernel::exits_taken`]). Not imaged.
+	pub exits_taken:        Vec<Vpid>,
+	/// Jobs `disown` dropped before the scheduler adopted them: their
+	/// record names no parent (`Shell::adopt`, [`Kernel::disown`]). Empty
+	/// between turns; not imaged.
+	pub disowned:           Vec<Vpid>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
 	/// without an overlay, with the [`state::Root::opts_gen`] and mode they
 	/// were read under: every `(( ))` asks.
@@ -729,6 +765,9 @@ impl Kernel {
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
+			exits_asked: Vec::new(),
+			exits_taken: Vec::new(),
+			disowned: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
@@ -745,6 +784,44 @@ impl Kernel {
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {
 			self.deferrals.retain(|d| d.vproc != vproc);
+		}
+	}
+
+	/// `vpid`'s builtin is about to report job state: the scheduler first
+	/// takes in the exits already available ([`Kernel::exits_asked`]), then
+	/// the builtin runs again.
+	pub fn ask_exits(&mut self, vpid: Vpid) {
+		if !self.exits_asked.contains(&vpid) {
+			self.exits_asked.push(vpid);
+		}
+	}
+
+	/// Whether the scheduler answered `vpid`'s [`Kernel::ask_exits`]; the
+	/// answer is used up.
+	pub fn exits_taken(&mut self, vpid: Vpid) -> bool {
+		let Some(i) = self.exits_taken.iter().position(|&v| v == vpid) else {
+			return false;
+		};
+		self.exits_taken.swap_remove(i);
+		true
+	}
+
+	/// `disown` dropped the job whose vproc is `vpid`: it is no child of the
+	/// shell for `wait` any more (bash deletes the job; `wait` neither waits
+	/// for it nor finds it, unless by the status bash keeps), so its record
+	/// names no parent ([`Self::started`] is false) and keeps doing so once it
+	/// ends ([`Self::proc_exited`]); `kill` still finds the process while it
+	/// runs. It is still the shell's child for its end: bash's `waitchld`
+	/// counts every child it reaps, so the end owes a `SIGCHLD` trap run as
+	/// any child's does (`Shell::reaped` takes the vproc's parent).
+	pub fn disown(&mut self, store: &mut dyn StateStore, vpid: Vpid) {
+		if self.spawned.iter().any(|p| p.vpid == vpid) {
+			self.disowned.push(vpid);
+			return;
+		}
+		if let Ok(Some(&Record::Proc { status, .. })) = store.get(Key::Proc(vpid)) {
+			let rec = Record::Proc { parent: None, status };
+			self.root.write(store, Change::Put(Key::Proc(vpid), rec));
 		}
 	}
 
@@ -878,7 +955,9 @@ impl Kernel {
 	}
 
 	/// Child vproc `vpid` of `parent` ended with `status`; the record stays
-	/// until the status is collected ([`Self::proc_collect`]).
+	/// until the status is collected ([`Self::proc_collect`]). A record
+	/// `disown` left with no parent ([`Self::disown`]) keeps naming none:
+	/// `wait` does not find it, and `kill` of `$!` still sees the child gone.
 	pub fn proc_exited(
 		&mut self,
 		store: &mut dyn StateStore,
@@ -887,6 +966,10 @@ impl Kernel {
 		status: i32,
 	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
+		let parent = match store.get(Key::Proc(vpid)) {
+			Ok(Some(Record::Proc { parent: None, .. })) => None,
+			_ => parent,
+		};
 		let rec = Record::Proc { parent, status: Some(status) };
 		self.root.write(store, Change::Put(Key::Proc(vpid), rec));
 	}
@@ -1856,6 +1939,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		})
 	}
 
@@ -2122,11 +2207,15 @@ impl Shell {
 			let used = ops - before;
 			let p = &self.procs[i];
 			let ran = p.vpid;
+			self.fresh.retain(|&v| v != ran);
 			self.slice = (used < left && p.has_work() && p.blocked.is_none() && !p.stopped)
 				.then_some((ran, left - used));
 			self.adopt(cx);
 			self.end_orphans(cx, Some(ran));
 			self.job_events(cx);
+			if !self.k.exits_asked.is_empty() || !self.taking_in.is_empty() {
+				self.take_in_exits(ran);
+			}
 		}
 	}
 
@@ -2134,14 +2223,18 @@ impl Shell {
 	/// subshell vprocs that finished.
 	fn adopt(&mut self, cx: &mut Cx<'_>) {
 		for p in &self.k.spawned {
-			let rec = Record::Proc { parent: p.parent, status: None };
+			// A job `disown` dropped before it got here is no child.
+			let parent = p.parent.filter(|_| !self.k.disowned.contains(&p.vpid));
+			let rec = Record::Proc { parent, status: None };
 			self
 				.k
 				.root
 				.write(cx.store, Change::Put(Key::Proc(p.vpid), rec));
 		}
 		self.stages_started();
+		self.fresh.extend(self.k.spawned.iter().map(|p| p.vpid));
 		self.procs.append(&mut self.k.spawned);
+		self.k.disowned.clear();
 		self.apply_settled();
 		let mut i = 0;
 		while i < self.procs.len() {
@@ -2181,6 +2274,10 @@ impl Shell {
 				let died = self.k.died_of(p.vpid);
 				self.k.set_int_note(p.vpid, None);
 				self.k.frozen_ints.retain(|v| *v != p.vpid);
+				// A job `disown` dropped is still the shell's child: bash reaps
+				// it and runs the `CHLD` trap for it (`waitchld`,
+				// `jobs.c:4161-4166`).
+				self.ended(p.vpid, p.parent);
 				self.reaped(cx, p.parent, p.vpid, p.status, died, false);
 			} else {
 				i += 1;
@@ -2258,6 +2355,105 @@ impl Shell {
 				if let Some(q) = waited {
 					q.os_pid = Some(pid);
 				}
+			}
+		}
+	}
+
+	/// Builtins about to report job state asked to take in the exits
+	/// already available first ([`Kernel::exits_asked`]): bash's job states
+	/// follow its children's exits at once (`waitchld`, run by its
+	/// `SIGCHLD` handler), before a builtin reads them. The asker is
+	/// answered ([`Kernel::exits_taken`]) once every other vproc that had
+	/// work when it asked has had its next turn of the round-robin, and the
+	/// parent of each of those that ended since one turn more
+	/// ([`Self::ended`]): a vproc that waits for an exited program or for
+	/// ended children polls again and takes the end in, and an end climbs
+	/// its job. Waking every parked vproc at the ask makes each of them
+	/// runnable; until the answer the asker parks again whenever it runs. A
+	/// job the asker started that has not had a turn yet ([`Self::fresh`])
+	/// has not run, so it has no exit to take in and is owed nothing:
+	/// `{ exit 3; } & jobs` lists the job `Running`, as bash does when its
+	/// child has not ended yet.
+	///
+	/// Nothing runs out of turn, so the round-robin's fairness is the one
+	/// the scheduler has without a take-in: only the asker waits, for at
+	/// most two turns of each of the `n` vprocs it saw (`2n`); one that runs
+	/// on parks or runs on, and is not waited for. An owed vproc that cannot
+	/// run (stopped, gone, out of work) owes nothing. An owed vproc is never
+	/// parked here: the ask wakes every parked vproc, a vproc leaves `owed`
+	/// at its turn, and the end that owes a parent its turn wakes it too.
+	fn take_in_exits(&mut self, ran: Vpid) {
+		for t in &mut self.taking_in {
+			t.owed.retain(|&v| v != ran);
+		}
+		let mut asked = false;
+		for asker in std::mem::take(&mut self.k.exits_asked) {
+			if !self.procs.iter().any(|p| p.vpid == asker)
+				|| self.taking_in.iter().any(|t| t.asker == asker)
+			{
+				continue;
+			}
+			let seen: Vec<Vpid> = self
+				.procs
+				.iter()
+				.filter(|p| {
+					p.vpid != asker
+						&& p.has_work()
+						&& !p.stopped
+						&& !(p.parent == Some(asker) && self.fresh.contains(&p.vpid))
+				})
+				.map(|p| p.vpid)
+				.collect();
+			self
+				.taking_in
+				.push(TakeIn { asker, owed: seen.clone(), seen });
+			asked = true;
+		}
+		if asked {
+			// Parked vprocs poll again: each owed one is runnable.
+			self.k.ctl.notify();
+		}
+		let mut answered = Vec::new();
+		let procs = &self.procs;
+		self.taking_in.retain(|t| {
+			let owing = t.owed.iter().any(|&v| {
+				procs
+					.iter()
+					.any(|p| p.vpid == v && p.has_work() && !p.stopped)
+			});
+			if !owing {
+				answered.push(t.asker);
+			}
+			owing
+		});
+		if answered.is_empty() {
+			return;
+		}
+		self
+			.k
+			.exits_taken
+			.retain(|&v| self.procs.iter().any(|p| p.vpid == v));
+		for asker in answered {
+			if self.procs.iter().any(|p| p.vpid == asker) {
+				self.k.exits_taken.push(asker);
+			}
+		}
+		// The askers are parked: they run again.
+		self.k.ctl.notify();
+	}
+
+	/// Vproc `vpid`, a child of `parent`, ended: a take-in that saw it owes
+	/// its parent one turn more, in which the parent takes the end in
+	/// ([`Self::take_in_exits`]).
+	fn ended(&mut self, vpid: Vpid, parent: Option<Vpid>) {
+		self.fresh.retain(|&v| v != vpid);
+		let Some(parent) = parent else {
+			return;
+		};
+		for t in &mut self.taking_in {
+			t.owed.retain(|&v| v != vpid);
+			if t.seen.contains(&vpid) && parent != t.asker && !t.owed.contains(&parent) {
+				t.owed.push(parent);
 			}
 		}
 	}
@@ -2671,6 +2867,8 @@ impl Shell {
 			self.k.set_int_note(p.vpid, None);
 			self.k.frozen_ints.retain(|v| *v != p.vpid);
 			let died = self.k.died_of(p.vpid);
+			self.ended(p.vpid, p.parent);
+			self.k.ctl.notify();
 			self.reaped(cx, p.parent, p.vpid, status, died, pipeline);
 		}
 	}

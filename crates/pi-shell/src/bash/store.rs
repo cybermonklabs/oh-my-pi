@@ -190,8 +190,8 @@ pub enum Table {
 	/// What a root job holds outside its [`Record::Job`]'s layout
 	/// ([`Key::JobFacts`], [`Record::JobFacts`]).
 	JobFacts,
-	/// The statuses the root shell's `wait` collected, kept after their jobs
-	/// left the table (bash's bgp list; [`Key::BgPid`]).
+	/// The statuses the root shell keeps for background jobs that left the
+	/// table (bash's bgp list; [`Key::BgPid`]).
 	BgPid,
 }
 
@@ -242,10 +242,10 @@ pub enum Key<'a> {
 	},
 	/// The [`JobFact`]s of root job [`Key::Job`] `id`, when it has any.
 	JobFacts(JobId),
-	/// A status the root shell's `wait` collected for its child vproc,
-	/// `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed it;
-	/// `SEQ` its place in the kept order, oldest first): `wait PID` finds it
-	/// once the job left the table (bash `bgp_search`).
+	/// A status the root shell keeps for a background job that left the
+	/// table, `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed
+	/// it; `SEQ` its place in the kept order, oldest first): `wait PID`
+	/// finds it (bash `bgp_search`).
 	BgPid(Vpid),
 }
 

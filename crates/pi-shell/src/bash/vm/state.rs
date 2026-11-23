@@ -3147,9 +3147,10 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_marks = (jobs.current, jobs.previous, jobs.chld);
 }
 
-/// Keep the status `status` that `vp`'s `wait` collected for child `vpid`,
-/// shown as `pid` ([`JobTable::bgp`], bash `bgp_add`); the root's is written
-/// to the store at once ([`Key::BgPid`], `STATUS:PID:SEQ`), one record each.
+/// Keep the status `status` of `vp`'s background job `vpid` that left the
+/// table, shown as `pid` ([`JobTable::bgp`], bash `bgp_add`); the root's is
+/// written to the store at once ([`Key::BgPid`], `STATUS:PID:SEQ`), one
+/// record each.
 pub fn save_status(
 	root: &mut Root,
 	store: &mut dyn StateStore,
@@ -4138,5 +4139,36 @@ mod tests {
 		assert_eq!(misc(&store, MiscKey::ChldOwed), None);
 		assert_eq!(misc(&store, MiscKey::Getopts), None);
 		assert_eq!(misc(&store, MiscKey::Rlimits), None);
+	}
+
+	// Failure mode: the root's kept statuses ([`JobTable::bgp`]) were not in
+	// the store, so a shell loaded from it lost them (`wait PID`: not a
+	// child), or kept them out of their order, so the wrong one went first.
+	#[test]
+	fn kept_statuses_load_back_in_their_order_and_go_from_the_store() {
+		let (mut store, mut root, mut vp) = shell();
+		save_status(&mut root, &mut store, &mut vp, Vpid(9), 4242, 5);
+		save_status(&mut root, &mut store, &mut vp, Vpid(7), 4243, 3);
+		// Kept again: the latest.
+		save_status(&mut root, &mut store, &mut vp, Vpid(9), 4242, 6);
+		let mut fresh =
+			Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		let mut root2 = Root::load(&mut store).unwrap();
+		load_root(&mut root2, &mut store, &mut fresh).unwrap();
+		assert_eq!(fresh.jobs.bgp, vp.jobs.bgp);
+		let order: Vec<Vpid> = fresh
+			.jobs
+			.bgp
+			.iter()
+			.flat_map(|l| l.iter())
+			.map(|s| s.vpid)
+			.collect();
+		assert_eq!(order, [Vpid(7), Vpid(9)]);
+		assert_eq!(fresh.vpid_of(4242), Vpid(9), "its pid names it");
+		forget_status(&mut root, &mut store, &mut vp, Vpid(7));
+		assert_eq!(store.record(Key::BgPid(Vpid(7))), None);
+		clear_statuses(&mut root, &mut store, &mut vp);
+		assert_eq!(store.record(Key::BgPid(Vpid(9))), None);
+		assert_eq!(vp.jobs.bgp, None);
 	}
 }

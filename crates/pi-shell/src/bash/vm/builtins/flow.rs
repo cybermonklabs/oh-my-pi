@@ -636,12 +636,14 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
 /// finished child whose status the shell kept when it deleted its job
-/// (bash's bgp list), a finished child that was no job (a process
-/// substitution `$!` names), or the running process substitution or
-/// coprocess `$!` names. A finished job whose job and status are both gone
-/// (a plain `wait` clears the list, `jobs.c:2863-2865`, and the shell
-/// forgets those children with it) is none, as in bash. zsh 5.9: not the
-/// job whose end runs the `CHLD` trap, while it runs
+/// (bash's bgp list, [`crate::bash::vm::proc::JobTable::bgp`]), a finished
+/// child that was no job (a process substitution `$!` names) whose record
+/// is not collected yet, or the running process substitution or coprocess
+/// `$!` names. A finished job whose job and status are both gone (a plain
+/// `wait` clears the list, `jobs.c:2863-2865`, and the shell forgets those
+/// children with it) is none, as in bash; a job `disown` dropped is one
+/// only by the status it kept (its record names no parent). zsh 5.9: not
+/// the job whose end runs the `CHLD` trap, while it runs
 /// ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its status reaches
 /// zsh's list of background statuses once the trap is over); another
 /// finished job is one.
