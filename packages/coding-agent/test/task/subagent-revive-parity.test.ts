@@ -12,7 +12,6 @@ import { formatModelStringWithRouting } from "@oh-my-pi/pi-coding-agent/config/m
 import { isIrcEnabled } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
-import { refreshAgentDiscovery } from "@oh-my-pi/pi-coding-agent/task";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
@@ -496,9 +495,6 @@ const ROUTES: ParityRoute[] = [
 				const cwd = run.cold.build.options.cwd;
 				if (cwd === undefined) throw new Error("The cold revive passed no cwd");
 				const underRootRoots = await discoverAgents(cwd, undefined, root.toolSession.effectiveExtensionRoots?.());
-				// The task tool lists what a discovery under the session's own extension roots finds once one is
-				// published (as `/marketplace` publishes it); before that it lists what the process found first.
-				await refreshAgentDiscovery(cwd, run.cold.session.effectiveExtensionRoots);
 				const coldTask = run.cold.session.getToolByName("task")?.description;
 				expect({
 					warm: run.warm.build.options.extensionRoots?.(),
