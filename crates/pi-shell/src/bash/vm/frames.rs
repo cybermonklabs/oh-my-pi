@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 33;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -259,6 +259,8 @@ struct ProcImage {
 	trace_base:    u32,
 	/// `$BASH_SUBSHELL`.
 	subshell:      u32,
+	/// The forking shell's loops it runs inside (`Vproc::outer_loops`).
+	outer_loops:   u16,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
@@ -332,6 +334,7 @@ struct FrameImage {
 	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
+	command_loop:      bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
 }
@@ -571,6 +574,7 @@ impl Shell {
 					debug_errexit: f.debug_errexit,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
+					command_loop: f.command_loop,
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
@@ -628,6 +632,7 @@ impl Shell {
 				restore_opts: p.restore_opts.clone(),
 				trace_base: p.trace_base,
 				subshell: p.subshell,
+				outer_loops: p.outer_loops,
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
@@ -886,6 +891,7 @@ impl Shell {
 			vp.restore_opts = p.restore_opts;
 			vp.trace_base = p.trace_base;
 			vp.subshell = p.subshell;
+			vp.outer_loops = p.outer_loops;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
 			vp.mode = p.mode;
@@ -1075,6 +1081,7 @@ impl Shell {
 				frame.debug_errexit = f.debug_errexit;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
+				frame.command_loop = f.command_loop;
 				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
