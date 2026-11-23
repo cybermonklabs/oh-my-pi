@@ -22,6 +22,7 @@ import {
 	tryLoadMentalModelsBlock,
 } from "./mental-models";
 import { RecallFailureWait, type RecallWait, recallSkippedNotice } from "./recall-wait";
+import { nextRetainWindow, persistRetainedThrough } from "./retain-entry";
 import { countUserTurns, extractMessages } from "./transcript";
 import { type DrainResult, HindsightOutbox, type RetainInput } from "./outbox";
 
@@ -274,6 +275,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	// or silently retaining nothing forever. Hashing is orders of magnitude
 	// cheaper than the re-formatting this cache avoids.
 	#lastRetainedPrefixKey: string = "";
+	/** In-flight transcript retain run; see {@link #requestRetain}. */
+	#retainRun?: Promise<void>;
+	/** Retain requested while {@link #retainRun} is in flight. */
+	#pendingRetain?: "auto" | "forced";
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	#recallGeneration = 0;
@@ -480,15 +485,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			transcript = windowTranscript;
 		}
 
-		await ensureBankExists(this.client, this.bankId, this.config, this.banksSet);
-		await this.client.retain(this.bankId, transcript, {
-			documentId,
-			context: this.config.retainContext,
-			metadata: { session_id: this.sessionId },
-			tags: this.retainTags,
-			timestamp: sourceTimestamp,
-			async: true,
-		});
+		await this.#sendRetain(documentId, transcript, sourceTimestamp);
 		if (nextCachedTranscript !== undefined) {
 			this.#cachedTranscript = nextCachedTranscript;
 			// prefixKey hashes [0, hashedThrough) of this same snapshot; extend it instead of rehashing from 0.
@@ -497,11 +494,42 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		}
 	}
 
-	async maybeRetainOnAgentEnd(): Promise<void> {
+	/**
+	 * Single-flight entry for transcript retains. At most one retain runs per session;
+	 * requests arriving meanwhile coalesce into one follow-up that re-reads the session
+	 * when it starts, so it carries the latest turns. A forced request wins over a
+	 * pending auto one. Resolves once the queue drains.
+	 */
+	#requestRetain(forced: boolean): Promise<void> {
+		this.#pendingRetain = forced || this.#pendingRetain === "forced" ? "forced" : "auto";
+		// #drainRetains always awaits before returning, so its `finally` cannot clear
+		// #retainRun before this assignment lands.
+		this.#retainRun ??= this.#drainRetains();
+		return this.#retainRun;
+	}
+
+	async #drainRetains(): Promise<void> {
+		try {
+			while (this.#pendingRetain) {
+				const kind = this.#pendingRetain;
+				this.#pendingRetain = undefined;
+				if (kind === "forced") await this.#forceRetain();
+				else await this.#retainIfDue();
+			}
+		} finally {
+			this.#retainRun = undefined;
+		}
+	}
+
+	async #retainIfDue(): Promise<void> {
 		if (!this.config.autoRetain) return;
-		// Cheap gate first: most agent_end events are not retain turns, so skip text extraction.
+		// Cheap gate first: most turn ends are not retain turns, so skip text extraction.
 		const userTurns = countUserTurns(this.session.sessionManager);
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
+		if (this.config.retainMode === "last-turn") {
+			await this.#retainSinceMarker(false, userTurns);
+			return;
+		}
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
 
@@ -525,7 +553,19 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		}
 	}
 
-	async forceRetainCurrentSession(): Promise<void> {
+	/**
+	 * `/memory enqueue`: retain now, after any in-flight retain settles: the whole transcript in
+	 * `full-session` mode; in `last-turn` mode the last turns again plus anything no retain sent.
+	 */
+	forceRetainCurrentSession(): Promise<void> {
+		return this.#requestRetain(true);
+	}
+
+	async #forceRetain(): Promise<void> {
+		if (this.config.retainMode === "last-turn") {
+			await this.#retainSinceMarker(true, countUserTurns(this.session.sessionManager));
+			return;
+		}
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
 		// Forced retains are user-initiated rebuilds (`/memory enqueue`): drop the
@@ -546,6 +586,81 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 				error: String(err),
 			});
 		}
+	}
+
+	/**
+	 * A `last-turn` retain: sends what no earlier retain to this scope sent, as one new
+	 * document, then appends a marker naming the last entry it sent ({@link nextRetainWindow}).
+	 * `forced` (`/memory enqueue`) also sends the last turns again. Runs inside
+	 * {@link #drainRetains}, so two turn ends never read the same marker.
+	 */
+	async #retainSinceMarker(forced: boolean, userTurns: number): Promise<void> {
+		const sessionManager = this.session.sessionManager;
+		const scope = this.#retainScope();
+		const window = nextRetainWindow(sessionManager.getEntries(), scope, {
+			everyNTurns: this.config.retainEveryNTurns,
+			overlapTurns: this.config.retainOverlapTurns,
+			forced,
+		});
+		this.#lastRetainedMessageIndex = 0;
+		this.#cachedTranscript = "";
+		this.#lastRetainedPrefixKey = "";
+		const transcript = window
+			? prepareRetentionTranscript(window.messages, true, { includeTimestamps: true }).transcript
+			: null;
+		try {
+			if (window && transcript) {
+				const retainedAt = new Date();
+				await this.#sendRetain(
+					`${this.sessionId}-${retainedAt.getTime()}`,
+					transcript,
+					this.#sessionSourceTimestamp() ?? retainedAt,
+				);
+				// A session switch while the retain ran points the session manager at another
+				// file; the marker names an entry of the file the window came from, so only a
+				// file that holds that entry (this one, or a fork of it) records it.
+				if (sessionManager.getEntry(window.lastEntryId)) {
+					persistRetainedThrough(sessionManager, scope, window.lastEntryId);
+				}
+			}
+			this.lastRetainedTurn = userTurns;
+			if (this.config.debug) {
+				logger.debug(forced ? "Hindsight: forced retain succeeded" : "Hindsight: auto-retain succeeded", {
+					providerSessionId: this.sessionId,
+					bankId: this.bankId,
+					userTurns,
+					messages: transcript && window ? window.messages.length : 0,
+				});
+			}
+		} catch (err) {
+			logger.warn(forced ? "Hindsight: forced retain failed" : "Hindsight: auto-retain failed", {
+				providerSessionId: this.sessionId,
+				bankId: this.bankId,
+				error: String(err),
+			});
+		}
+	}
+
+	async #sendRetain(documentId: string, transcript: string, sourceTimestamp: Date): Promise<void> {
+		await ensureBankExists(this.client, this.bankId, this.config, this.banksSet);
+		await this.client.retain(this.bankId, transcript, {
+			documentId,
+			context: this.config.retainContext,
+			metadata: { session_id: this.sessionId },
+			tags: this.retainTags,
+			timestamp: sourceTimestamp,
+			async: true,
+		});
+	}
+
+	/**
+	 * Identifies the server, bank and tags a transcript retain writes to, so a retain marker
+	 * only counts for the same ones and a change of bank starts that bank's position afresh.
+	 * Nothing in it derives from the API token: the marker is written into the session, which
+	 * is stored, copied and read wherever the transcript is.
+	 */
+	#retainScope(): string {
+		return JSON.stringify(["hindsight", this.config.hindsightApiUrl, this.bankId, this.retainTags ?? []]);
 	}
 
 	async beforeAgentStartPrompt(
@@ -732,7 +847,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe(event => {
 			if (event.type === "agent_end") {
-				void this.maybeRetainOnAgentEnd();
+				void this.#requestRetain(false);
 				// Drain any queued tool-initiated retain calls now that the turn
 				// is settled. The queue is also debounced/size-bounded, but
 				// flushing here keeps the bank fresh between turns.

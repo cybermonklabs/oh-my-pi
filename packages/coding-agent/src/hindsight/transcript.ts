@@ -34,19 +34,40 @@ export interface ReadonlySessionManagerLike {
  */
 export function extractMessages(sessionManager: ReadonlySessionManagerLike): HindsightMessage[] {
 	const messages: HindsightMessage[] = [];
-
 	for (const entry of sessionManager.getEntries()) {
-		if (entry.type !== "message") continue;
-		const msg = entry.message;
-		const role = msg.role;
-		if (role !== "user" && role !== "assistant") continue;
-
-		const text = role === "user" ? extractUserText(msg) : extractAssistantText(msg as AssistantMessage);
-		if (!hasSubstantiveContent(text)) continue;
-		messages.push({ role, content: text, timestamp: entry.timestamp });
+		const message = toHindsightMessage(entry);
+		if (message) messages.push(message);
 	}
-
 	return messages;
+}
+
+/** A message {@link extractMessages} keeps, with the id of the session entry it came from. */
+export interface HindsightMessageEntry {
+	entryId: string;
+	/** Position of the entry in `entries`, the session file's order. */
+	index: number;
+	message: HindsightMessage;
+}
+
+/** {@link extractMessages} over `entries`, keeping each message's entry id and position. */
+export function extractMessageEntries(entries: readonly SessionEntry[]): HindsightMessageEntry[] {
+	const records: HindsightMessageEntry[] = [];
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		const message = toHindsightMessage(entry);
+		if (message) records.push({ entryId: entry.id, index, message });
+	}
+	return records;
+}
+
+function toHindsightMessage(entry: SessionEntry): HindsightMessage | undefined {
+	if (entry.type !== "message") return undefined;
+	const msg = entry.message;
+	const role = msg.role;
+	if (role !== "user" && role !== "assistant") return undefined;
+	const text = role === "user" ? extractUserText(msg) : extractAssistantText(msg as AssistantMessage);
+	if (!hasSubstantiveContent(text)) return undefined;
+	return { role, content: text, timestamp: entry.timestamp };
 }
 
 /**
