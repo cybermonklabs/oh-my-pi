@@ -197,10 +197,11 @@ fn compound_and_builtin_jobs_keep_virtual_pids() {
 
 // Failure mode: a background pipeline's `$!` is the shell's virtual pid,
 // which `kill` cannot reach as a program, instead of its last program's
-// (bash: `kill $!` signals that program), also under `!` and `time`.
+// (bash: `kill $!` signals that program), also under `!`. A timed one is
+// `a_timed_background_job_is_known_by_its_program`'s.
 #[test]
 fn a_background_pipeline_is_known_by_its_last_program() {
-	for prefix in ["", "! ", "time "] {
+	for prefix in ["", "! "] {
 		let world = World::new();
 		let (out, _) =
 			run(world.host(), &format!("{prefix}/x/true | /x/trap42 & p=$!; kill $p; wait; echo $p"));
@@ -214,6 +215,34 @@ fn a_background_pipeline_is_known_by_its_last_program() {
 		assert_eq!(out, format!("{pid}\n"), "{prefix:?}");
 		assert_eq!(world.got(pid), [Signal::Term], "{prefix:?}");
 	}
+}
+
+// Failure mode: `$!` of a timed background job (`time a | b &`, `time cmd
+// &`) is the job's virtual pid, no process (`/bin/kill -0 "$!"`, `ps -p`
+// and pid files find nothing), where bash names its forced subshell
+// (`CMD_FORCE_SUBSHELL`), a process that lives as long as the job. The job
+// is known by its program as the untimed body would be (a pipeline's last
+// one, the lone one), and that pid stands for the whole job, as bash's
+// subshell does: `kill -0 $!` finds the job while it runs and `kill $!`
+// ends it (`wait $!` gives 143). The pipeline case, whose first program
+// runs on after `kill $!` as in bash, is in tests/timed_background_job.rs
+// (real programs; the fake externals here cannot end that program).
+#[test]
+fn a_timed_background_job_is_known_by_its_program() {
+	let world = World::new();
+	let (out, _) = run(
+		world.host(),
+		"TIMEFORMAT=; time /x/true | /x/true & a=$!; wait; time /x/true & b=$!; wait; echo $a $b",
+	);
+	assert_eq!(out, format!("{} {}\n", FIRST + 1, FIRST + 2));
+	let world = World::new();
+	let (out, _) = run(
+		world.host(),
+		"TIMEFORMAT=; time /x/sleeper & p=$!; kill -0 $p; echo \"k0=$?\"; kill $p; echo \"k=$?\"; \
+		 wait $p; echo \"w=$? $p\"",
+	);
+	assert_eq!(out, format!("k0=0\nk=0\nw=143 {FIRST}\n"));
+	assert_eq!(world.got(FIRST), [Signal::Term], "`kill $!` reached the program");
 }
 
 // Failure mode: once a pipeline's last program ended, `kill` of its pid
