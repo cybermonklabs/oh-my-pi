@@ -41,6 +41,8 @@ pub fn active(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
 /// that wait for an exited program or for ended children take it in and
 /// end before the builtin runs again. It waits for no running job. A job a
 /// command substitution lists is its parent's, copied when it started.
+/// Run again before the answer once every job of its own has ended, the
+/// builtin withdraws its ask and goes on.
 pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
 	if ctx.k.exits_taken(ctx.vp.vpid) {
 		return Ok(());
@@ -51,6 +53,7 @@ pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
 		.iter()
 		.find(|j| !j.inherited && !matches!(j.state, JobState::Done(_)))
 	else {
+		ctx.k.withdraw_exits(ctx.vp.vpid);
 		return Ok(());
 	};
 	let vpid = job.vpid;

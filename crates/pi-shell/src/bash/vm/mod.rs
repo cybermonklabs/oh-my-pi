@@ -548,9 +548,11 @@ pub struct Kernel {
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
 	/// Vprocs whose builtin is about to report job state and asked first to
-	/// take in the exits already available ([`Kernel::ask_exits`]); the
-	/// scheduler answers after the turn (`Shell::take_in_exits`). Imaged:
-	/// the asker stays parked across a snapshot.
+	/// take in the exits already available ([`Kernel::ask_exits`]). Each
+	/// stays here until the scheduler answers it after a turn
+	/// (`Shell::take_in_exits`) or its builtin goes on without the answer
+	/// ([`Kernel::withdraw_exits`]). Imaged: the asker stays parked across a
+	/// snapshot.
 	pub exits_asked:        Vec<Vpid>,
 	/// Vprocs whose ask the scheduler answered: their builtin, run again,
 	/// reports now ([`Kernel::exits_taken`]). Imaged.
@@ -708,6 +710,20 @@ impl Kernel {
 		};
 		self.exits_taken.swap_remove(i);
 		true
+	}
+
+	/// `vpid`'s builtin goes on without the answer to its ask: every job of
+	/// its vproc ended before the answer came (a parked asker runs again at
+	/// each wake), so nothing is left to take in, and it asks no more.
+	pub fn withdraw_exits(&mut self, vpid: Vpid) {
+		self.exits_asked.retain(|&v| v != vpid);
+	}
+
+	/// Whether `vpid`'s builtin asked to take in exits and has not run again
+	/// since its answer ([`Kernel::exits_asked`], [`Kernel::exits_taken`]):
+	/// its command is still running, with that command's redirections.
+	pub fn asking(&self, vpid: Vpid) -> bool {
+		self.exits_asked.contains(&vpid) || self.exits_taken.contains(&vpid)
 	}
 
 	/// `disown` dropped the job whose vproc is `vpid`: it is no child of the
@@ -2150,15 +2166,27 @@ impl Shell {
 	/// run (stopped, gone, out of work) owes nothing. An owed vproc is never
 	/// parked here: the ask wakes every parked vproc, a vproc leaves `owed`
 	/// at its turn, and the end that owes a parent its turn wakes it too.
+	///
+	/// An ask stays in [`Kernel::exits_asked`] until it is answered or the
+	/// builtin withdraws it ([`Kernel::withdraw_exits`]); a gone asker asks
+	/// no more. Until its builtin has used the answer ([`Kernel::asking`]),
+	/// no signal trap starts in the asker (`exec::run_slice`): its command
+	/// still runs, with its redirections, and the trap runs once that
+	/// command is over, as bash runs a trap between commands.
 	fn take_in_exits(&mut self, ran: Vpid) {
 		for t in &mut self.taking_in {
 			t.owed.retain(|&v| v != ran);
 		}
+		let procs = &self.procs;
+		self
+			.k
+			.exits_asked
+			.retain(|&v| procs.iter().any(|p| p.vpid == v));
+		let asking = &self.k.exits_asked;
+		self.taking_in.retain(|t| asking.contains(&t.asker));
 		let mut asked = false;
-		for asker in std::mem::take(&mut self.k.exits_asked) {
-			if !self.procs.iter().any(|p| p.vpid == asker)
-				|| self.taking_in.iter().any(|t| t.asker == asker)
-			{
+		for &asker in &self.k.exits_asked {
+			if self.taking_in.iter().any(|t| t.asker == asker) {
 				continue;
 			}
 			let seen: Vec<Vpid> = self
@@ -2197,15 +2225,14 @@ impl Shell {
 		if answered.is_empty() {
 			return;
 		}
+		self.k.exits_asked.retain(|v| !answered.contains(v));
 		self
 			.k
 			.exits_taken
 			.retain(|&v| self.procs.iter().any(|p| p.vpid == v));
-		for asker in answered {
-			if self.procs.iter().any(|p| p.vpid == asker) {
-				self.k.exits_taken.push(asker);
-			}
-		}
+		// Each asker answered is one still here: its take-in is one of
+		// `exits_asked`, which keeps only those.
+		self.k.exits_taken.extend(answered);
 		// The askers are parked: they run again.
 		self.k.ctl.notify();
 	}

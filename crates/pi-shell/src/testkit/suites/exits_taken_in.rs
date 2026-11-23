@@ -573,6 +573,58 @@ fn kill_of_a_job_pid_takes_in_the_exits_first() {
 	}
 }
 
+// Failure mode: a builtin parked for its take-in was still in its command,
+// with the command's redirections, and the `CHLD` trap the take-in's reap
+// owed started there: the trap's stderr went to the builtin's
+// `2>/dev/null`, and `jobs` listed the job after the trap's output. bash
+// runs a trap between commands (5.3.20 with `/bin/sh -c 'exit 7'` for the
+// held program: `chld` on stderr). The trap runs once the builtin's
+// command is over, before the next command. In bash mode the foreground
+// `/x/quiet` runs the trap once first; zsh runs it for background jobs
+// only.
+#[test]
+fn a_trap_waits_until_the_builtin_that_took_the_exit_in_is_done() {
+	let kill = "/x/held & p=$!; /x/quiet; kill -0 $p 2>/dev/null; echo \"k=$?\"";
+	for (zsh, err) in [(false, "chld\nchld\n"), (true, "chld\n")] {
+		let world = World::new();
+		let script = format!("trap 'echo chld >&2' CHLD; {kill}");
+		let (out, got, _) = run(&world, &script, zsh);
+		assert_eq!((out.as_str(), got.as_str()), ("k=1\n", err), "zsh={zsh}");
+	}
+	let world = World::new();
+	let (out, err, _) =
+		run(&world, "trap 'echo chld' CHLD; /x/held & p=$!; /x/quiet; jobs; echo end", false);
+	assert_eq!(out, "chld\n[1]+  Exit 7                     /x/held\nchld\nend\n");
+	assert_eq!(err, "");
+}
+
+// Failure mode: a builtin run again before its answer, once every job of
+// its own had ended, went on and left its ask behind: no trap started in
+// the shell until that ask was answered and a later take-in used the
+// answer up, so `end` came before the trap of the job `jobs` took in, and
+// that later builtin skipped its own take-in. The subshell `(:)` gives the
+// held job and a disowned loop their first turn, so the take-in of `jobs`
+// owes each a turn; the held job's end sends the round back to the shell
+// before the loop's turn, and `jobs`, run again, finds its only job done.
+// It withdraws its ask (`Kernel::withdraw_exits`), and the trap runs
+// before `echo end`. Without the withdrawal `end` comes first; before the
+// trap waited for the builtin, the trap ran inside `jobs >/dev/null`. The
+// `chld` lines: the subshell, `/x/quiet`, the held job, then the loop,
+// which runs on for many turns and ends by itself.
+#[test]
+fn a_builtin_that_goes_on_unanswered_withdraws_its_ask() {
+	let (out, err, _) = run_bounded(
+		"trap 'echo chld' CHLD; /x/held & ( i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done ) & \
+		 b=$!; disown %2; (:); /x/quiet; jobs >/dev/null; echo end; while kill -0 $b 2>/dev/null; \
+		 do :; done",
+		false,
+		Fault::None,
+		"no fault",
+	);
+	assert_eq!(out, "chld\nchld\nchld\nend\nchld\n");
+	assert_eq!(err, "");
+}
+
 /// [`run_with`] on a world of its own, in a thread of its own: a run that
 /// has not finished after 30 s fails the test (`what` names the fault). The
 /// thread of a run that never ends spins on until the test process exits.
@@ -596,7 +648,12 @@ fn run_bounded(src: &'static str, zsh: bool, fault: Fault, what: &str) -> (Strin
 // the same turns, and no other.
 #[test]
 fn an_ask_outlives_a_snapshot() {
-	let rows: [(&'static str, bool); 13] = [
+	let rows: [(&'static str, bool); 14] = [
+		(
+			"trap 'echo chld >&2' CHLD; { exit 3; } & p=$!; :; kill -0 $p 2>/dev/null; echo \
+			 alive=$?; wait",
+			false,
+		),
 		("{ while :; do :; done; } & kill -KILL $!; wait $!; echo st=$?", false),
 		("( { while :; do :; done; } & kill -KILL $!; wait $!; echo st=$? )", false),
 		("{ while :; do :; done; } & jobs; kill %1; wait; echo end", false),

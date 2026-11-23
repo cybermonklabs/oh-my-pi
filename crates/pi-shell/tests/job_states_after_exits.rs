@@ -60,13 +60,29 @@ fn normalised(text: &str) -> String {
 	out
 }
 
-/// `obash -c script` in `dir`, as [`obash_support::obash`] starts it, and
-/// killed when the thread that spawns it ends (`PR_SET_PDEATHSIG`), so a
-/// test that is killed takes its row's shell with it. The job's stages end
-/// once that shell is gone: each of their waits checks `$PPID`.
-fn row_command(dir: &Path, script: &str) -> Command {
+/// How a row's script reaches obash: as `obash -c script`, or as a file
+/// (`row.sh` in the row's directory) that `obash row.sh` reads.
+#[derive(Clone, Copy, Debug)]
+enum Via {
+	Command,
+	File,
+}
+
+/// `obash -c script` (or `obash row.sh`, `via`) in `dir`, as
+/// [`obash_support::obash`] starts it, and killed when the thread that
+/// spawns it ends (`PR_SET_PDEATHSIG`), so a test that is killed takes its
+/// row's shell with it. The job's stages end once that shell is gone: each
+/// of their waits checks `$PPID`.
+fn row_command(dir: &Path, script: &str, via: Via) -> Command {
 	let mut cmd = obash_support::obash();
-	cmd.args(["-c", script]).current_dir(dir);
+	match via {
+		Via::Command => cmd.args(["-c", script]),
+		Via::File => {
+			std::fs::write(dir.join("row.sh"), script).unwrap();
+			cmd.arg("row.sh")
+		},
+	};
+	cmd.current_dir(dir);
 	let test = std::process::id();
 	// SAFETY: the hook runs in the forked child before `exec` and only calls
 	// prctl and getppid (plain syscalls, async-signal-safe).
@@ -89,15 +105,20 @@ fn row_command(dir: &Path, script: &str) -> Command {
 /// every row whose output, error text or exit status (0) differs from
 /// Bash's.
 fn assert_rows(rows: &[Row]) {
+	assert_rows_via(rows, Via::Command);
+}
+
+/// [`assert_rows`], with each script reaching obash as `via` says.
+fn assert_rows_via(rows: &[Row], via: Via) {
 	let mut mismatches = Vec::new();
 	for row in rows {
 		let dir = tempfile::tempdir().unwrap();
-		let result = obash_support::output(&mut row_command(dir.path(), row.script));
+		let result = obash_support::output(&mut row_command(dir.path(), row.script, via));
 		let out = String::from_utf8_lossy(&result.stdout).into_owned();
 		let err = normalised(&String::from_utf8_lossy(&result.stderr));
 		if (result.status.code(), out.as_str(), err.as_str()) != (Some(0), row.out, row.err) {
 			mismatches.push(format!(
-				"{}: `{}`\n  bash: Some(0) {:?} {:?}\n  omp:  {:?} {out:?} {err:?}",
+				"{} ({via:?}): `{}`\n  bash: Some(0) {:?} {:?}\n  omp:  {:?} {out:?} {err:?}",
 				row.name,
 				row.script,
 				row.out,
@@ -593,6 +614,32 @@ fn kill_of_bang_finds_no_process_once_its_job_left() {
 	]);
 }
 
+/// A `CHLD` trap that a builtin's take-in owed runs once the builtin's
+/// command is over, outside that command's redirections and before the
+/// next command, as bash runs a trap between commands: here `kill -0`
+/// takes the job's end in, its `2>/dev/null` does not hide the trap's
+/// stderr, and the trap's `chld` comes before the `jobs` that follows. Each
+/// row runs as `obash -c` and from a file.
+#[test]
+fn a_chld_trap_runs_once_the_builtin_that_took_the_exit_in_is_done() {
+	let rows = [
+		Row {
+			name:   "chld/stderr",
+			script: r"trap 'echo chld >&2; echo out' CHLD; /bin/sh -c 'exit 3' & while kill -0 $! 2>/dev/null; do :; done; echo end",
+			out:    "out\nend\n",
+			err:    "chld\n",
+		},
+		Row {
+			name:   "chld/before-jobs",
+			script: r"trap 'echo chld' CHLD; /bin/sh -c 'exit 3' & while kill -0 $! 2>/dev/null; do :; done; jobs; echo end",
+			out:    "chld\n[1]+  Exit 3                     /bin/sh -c 'exit 3'\nend\n",
+			err:    "",
+		},
+	];
+	assert_rows_via(&rows, Via::Command);
+	assert_rows_via(&rows, Via::File);
+}
+
 /// Set to a directory, this test binary is the stand-in of
 /// [`a_killed_test_leaves_no_row_process_behind`]: a test killed while its
 /// row runs.
@@ -647,7 +694,7 @@ fn pid_written(dir: &Path, name: &str, stand_in: &mut Child, deadline: Instant) 
 #[test]
 fn a_killed_test_leaves_no_row_process_behind() {
 	if let Some(dir) = std::env::var_os(STAND_IN) {
-		let mut row = row_command(Path::new(&dir), HELD)
+		let mut row = row_command(Path::new(&dir), HELD, Via::Command)
 			.stdout(Stdio::null())
 			.stderr(Stdio::null())
 			.spawn()
