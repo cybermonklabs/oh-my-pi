@@ -669,6 +669,7 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		return Err((0, 0));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
+	let mut key = vp.write_key.lock();
 	for (i, c) in chunks.iter().enumerate() {
 		let Chunk::Out(fd, bytes) = c else {
 			unreachable!("checked above");
@@ -676,7 +677,7 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		let handle = vp.fds.handle(*fd);
 		let mut off = 0;
 		while off < bytes.len() {
-			match handle.poll_write(&mut tcx, &bytes[off..]) {
+			match handle.poll_write_keyed(&mut tcx, &bytes[off..], &mut key) {
 				Poll::Ready(Ok(n)) if n > 0 => off += n,
 				// Blocked, failed or refused: the staged output waits or
 				// reports it.
@@ -4586,6 +4587,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 	st(vp).writes.front()?;
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
+	let key = Arc::clone(&vp.write_key);
 	loop {
 		let state = st(vp);
 		let pending = state.writes.front()?;
@@ -4597,7 +4599,10 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
-		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
+		// The guard goes before the arms, which may write diagnostics.
+		let polled =
+			handle.poll_write_keyed(&mut tcx, &pending.bytes[pending.off..], &mut key.lock());
+		match polled {
 			Poll::Ready(Ok(written)) if written > 0 => {
 				pending.off += written;
 				if pending.off >= pending.bytes.len() {

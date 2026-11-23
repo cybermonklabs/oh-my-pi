@@ -327,6 +327,41 @@ pub trait File: Send {
 	) -> Poll<io::Result<usize>> {
 		self.poll_write(cx, bytes)
 	}
+	/// [`Self::poll_read`] for a task that may wait on this object beside
+	/// other tasks (a host task reading an engine fd the engine reads too).
+	/// `key` keeps that task's wait apart from theirs and frees it when the
+	/// key is dropped: the task's future holds it. The keyless methods wait as
+	/// the object's owner, the engine, whose vprocs share one waker: one wait
+	/// per object and direction, which each keyless poll replaces.
+	///
+	/// The default ignores the key, which is right only for an object that
+	/// keeps the waker of every task that waits on it (a memory pipe) or never
+	/// waits. An object that does its I/O through another [`File`] must pass
+	/// the key on to it (a sub key per object it waits on at once,
+	/// [`WaitKey::sub`](crate::sys::WaitKey::sub)): with the default, the
+	/// task's wait on that object would be its owner's, and the owner's next
+	/// poll would replace it.
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		let _ = key;
+		self.poll_read(cx, buf)
+	}
+	/// [`Self::poll_write_tagged`] for a task that may wait beside others,
+	/// as [`Self::poll_read_keyed`].
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		let _ = key;
+		self.poll_write_tagged(cx, bytes, tag)
+	}
 	/// Duplicate (`n>&m` into an external, `exec 3>&1`).
 	fn dup(&self) -> io::Result<Box<dyn File>>;
 }

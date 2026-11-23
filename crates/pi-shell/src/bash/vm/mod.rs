@@ -2274,7 +2274,13 @@ impl Shell {
 		}
 		exec::unwind(&mut self.k.root, cx.store, p, 0);
 		while state::drop_scope(&mut self.k.root, cx.store, p) {}
-		p.out.clear();
+		// Queued output may be part way under its key (`Vproc::out_key`): it
+		// goes with the key, as a dropped op's does ([`exec::drop_scratch`]).
+		if !p.out.is_empty() {
+			p.out.clear();
+			p.out_key = None;
+			p.write_key = proc::WriteKey::default();
+		}
 		p.blocked = None;
 		p.stopped = false;
 		p.status = status;
@@ -2447,8 +2453,19 @@ impl Shell {
 				if !ignored {
 					let process = &mut self.procs[i];
 					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
+					// A `CHLD` or `WINCH` trap waits while the command it would
+					// interrupt writes; another runs now, under its own key
+					// ([`Vproc::holds_trap`]).
+					if !process.holds_trap(sig) {
 						process.blocked = None;
+					}
+					#[cfg(test)]
+					if matches!(sig, Signal::Chld | Signal::Winch) && process.writing_now() {
+						self
+							.k
+							.engine
+							.traps_held()
+							.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					}
 					// bash: a trapped signal ends the `wait` builtin with 128 + n
 					// (then the trap runs); `SIGCHLD` does not.
@@ -2684,8 +2701,17 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
-		if !p.waiting_foreground() {
+		// While the command the trap would interrupt is part way in a write,
+		// the vproc stays as it is: the trap runs once the write ends
+		// ([`Vproc::holds_trap`]).
+		if !p.holds_trap(Signal::Chld) {
 			p.blocked = None;
+		}
+		#[cfg(test)]
+		if p.writing_now() {
+			k.engine
+				.traps_held()
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		}
 	}
 }
@@ -2816,6 +2842,10 @@ impl Vproc {
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,
+			// A key of its own, a subshell's too (`child_running`).
+			write_key: proc::WriteKey::default(),
+			trap_keys: Vec::new(),
+			out_key: None,
 		}
 	}
 

@@ -477,7 +477,11 @@ pub fn perform(
 			if l.timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
 				return Ok(ZftpAns::Wrote(Err(Fail::timeout())));
 			}
-			match vp.fds.handle(*fd).poll_write(tcx, data) {
+			let polled = vp
+				.fds
+				.handle(*fd)
+				.poll_write_keyed(tcx, data, &mut vp.write_key.lock());
+			match polled {
 				Poll::Ready(Ok(n)) => ZftpAns::Wrote(Ok(n)),
 				Poll::Ready(Err(e)) => ZftpAns::Wrote(Err(Fail::of(&e))),
 				Poll::Pending => return Err(WaitKey::Write { fd: *fd }),
@@ -490,8 +494,9 @@ pub fn perform(
 				_ => 0,
 			};
 			let h = vp.fds.handle(*fd);
+			let mut key = vp.write_key.lock();
 			while off < data.len() {
-				match h.poll_write(tcx, &data[off..]) {
+				match h.poll_write_keyed(tcx, &data[off..], &mut key) {
 					Poll::Ready(Ok(n)) if n > 0 => off += n,
 					Poll::Ready(_) => break,
 					Poll::Pending => {
@@ -540,7 +545,7 @@ pub fn perform(
 					(LineAt::Option(answer), _) => {
 						// `(char)EOF` is 0xff.
 						let cmd = [IAC, answer, ch.unwrap_or(0xff)];
-						let _ = h.poll_write(tcx, &cmd);
+						let _ = h.poll_write_keyed(tcx, &cmd, &mut vp.write_key.lock());
 						st.at = LineAt::Plain;
 						continue;
 					},
@@ -644,7 +649,7 @@ pub fn perform(
 		},
 		ZftpOp::Urgent { fd } => {
 			let h = vp.fds.handle(*fd);
-			let _ = h.poll_write(tcx, &[IAC, IP, IAC]);
+			let _ = h.poll_write_keyed(tcx, &[IAC, IP, IAC], &mut vp.write_key.lock());
 			if let (Some(oh), Some(s)) = (h.os_handle(), cx.host.sockets()) {
 				let _ = s.send_urgent(oh, &[SYNCH]);
 			}
@@ -918,7 +923,7 @@ impl Xfer {
 						// zsh `zfwrite_block`: the header in one write.
 						let len = end - off;
 						let h = [0, (len >> 8) as u8, (len & 0xff) as u8];
-						let polled = hout.poll_write(tcx, &h);
+						let polled = hout.poll_write_keyed(tcx, &h, &mut vp.write_key.lock());
 						let r = match self.call(tcx, cx, wtmout, polled) {
 							Poll::Ready(r) => r,
 							Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
@@ -948,7 +953,8 @@ impl Xfer {
 						}
 						continue;
 					}
-					let polled = hout.poll_write(tcx, &self.buf[off..end]);
+					let polled =
+						hout.poll_write_keyed(tcx, &self.buf[off..end], &mut vp.write_key.lock());
 					let r = match self.call(tcx, cx, wtmout, polled) {
 						Poll::Ready(r) => r,
 						Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
