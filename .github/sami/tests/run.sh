@@ -905,12 +905,30 @@ fi
 # actions/cache step (which saves in its post step, under no condition of
 # the job's). Its steps use only the actions it uses
 # today, and .github/actions/bazel-cache calls no action, so no other caching
-# action can save under release_binary's token. A line under jobs: that is
-# not a plain `  <id>:` stops the lint, because its steps would be read as
-# the job above's.
+# action can save under release_binary's token. release_cache_prune holds
+# actions: write (it deletes cache entries; the token can also delete runs
+# and artifacts, re-run and dispatch workflows), so it must not run member
+# code. It has no checkout, so member code would have to be fetched or
+# named. None of its lines (comments aside) names an action (`uses:`), an
+# interpreter or downloader from a fixed list (bash, sh, bun, node, python,
+# curl, wget, pwsh and the like), git, a `./`, `../` or `.github/` path or
+# GITHUB_WORKSPACE, and each line that calls gh names actions/caches (or
+# `gh cache`) before any ` #`. Other tools that fetch code (cargo, go,
+# docker) are not on the list. No other job, and not the workflow, has a
+# line with write-all or with an actions key that does not read read or
+# none on that line (GitHub also reads a value on the next line); and the
+# workflow has a permissions key, so no job takes the repository's default
+# token permissions. A line under jobs: that is not a plain `  <id>:`
+# stops the lint, because its steps would be read as the job above's.
 cache_lint() {
-	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others
+	local wf="$1" action="$2" bazel_action="$3" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw
 	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
+	# These four read each line with a space added at its end (and the first
+	# two at its start too), so no pattern needs an anchor inside a group.
+	local member_code='[^[:alnum:]_.-](bash|sh|zsh|dash|bun|bunx|node|npx|npm|python|python3|perl|ruby|deno|curl|wget|pwsh|powershell|source|git)[^[:alnum:]_.-]|[^[:alnum:]_.]\.\.?/|\.github/|GITHUB_WORKSPACE'
+	local gh_call='[^[:alnum:]_.-]gh[^[:alnum:]_.-]'
+	local actions_key=$'[^[:alnum:]_/-]["\']?actions["\']?[[:space:]]*:'
+	local actions_safe=$'actions["\']?[[:space:]]*:[[:space:]]*["\']?(read|none)["\']?[[:space:]]*[,}#[:space:]]'
 	if ! grep -qxE 'cache-mode: *none' "$wf"; then
 		echo "$wf has no workflow-level cache-mode: none"
 		rc=1
@@ -921,7 +939,7 @@ cache_lint() {
 		echo "UNKNOWN: $wf has a job line cache_lint cannot read: $bad"
 		return 1
 	fi
-	for job in release_binary rust_test rust_test_macos; do
+	for job in release_binary release_cache_prune rust_test rust_test_macos; do
 		printf '%s\n' "$jobs" | grep -qxF "$job" || { echo "UNKNOWN: $wf has no $job job"; return 1; }
 	done
 	for job in $jobs; do
@@ -967,12 +985,41 @@ cache_lint() {
 				echo "$job has an actions/cache step"
 				ok=0
 			fi
+			if [ "$job" = release_cache_prune ]; then
+				acts="$(grep -vE '^ *#' "$scratch/job.yml" | grep -E 'uses.?[[:space:]]*:' || true)"
+				if [ -n "$acts" ]; then
+					echo "release_cache_prune uses an action, so it could run member code: $(printf '%s\n' "$acts" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				scripts="$(grep -vE '^ *#' "$scratch/job.yml" | sed 's/.*/ & /' | grep -E -- "$member_code" | sed 's/^ //; s/ $//' || true)"
+				if [ -n "$scripts" ]; then
+					echo "release_cache_prune names an interpreter, a downloader, git, a repository path or GITHUB_WORKSPACE, so it could run member code: $(printf '%s\n' "$scripts" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+				fetches="$(grep -vE '^ *#' "$scratch/job.yml" | awk -v g="$gh_call" '{ l = " " $0 " "; if (l !~ g) next; t = l; sub(/[[:space:]]#.*/, " ", t); if (t ~ /actions\/caches/ || t ~ /[^[:alnum:]_.-]gh[[:space:]]+cache[[:space:]]/) next; print }' || true)"
+				if [ -n "$fetches" ]; then
+					echo "release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: $(printf '%s\n' "$fetches" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+					ok=0
+				fi
+			fi
 			if [ "$ok" = 1 ]; then
 				echo "$job: cache-mode none; no actions/cache step; bun-install steps: $n, each with cache: \"false\""
+			fi
+			if [ "$ok" = 1 ] && [ "$job" = release_cache_prune ]; then
+				echo "release_cache_prune: no action; no listed interpreter or downloader, git, ./, ../ or .github/ path or GITHUB_WORKSPACE; each gh call names actions/caches or gh cache outside a comment"
 			fi
 		fi
 		[ "$ok" = 1 ] || rc=1
 	done
+	if ! grep -qE '^permissions:' "$wf"; then
+		echo "$wf has no workflow-level permissions, so a job without its own takes the repository's default, which can grant actions: write"
+		rc=1
+	fi
+	aw="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { on = 0; job = "" } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { job = substr($0, 3, length($0) - 3); next } !/^ *#/ { print (job == "" ? "the workflow" : job) "\t" $0 " " }' "$wf" | awk -F'\t' -v k="$actions_key" -v s="$actions_safe" '$1 != "release_cache_prune" { t = $0; gsub(s, " ", t); if (t ~ k || t ~ /write-all/) print }' || true)"
+	if [ -n "$aw" ]; then
+		printf '%s\n' "$aw" | awk -F'\t' '{ sub(/ $/, "", $2); printf "%s names an actions permission other than read or none, which only release_cache_prune may hold: [%s]\n", $1, $2 }'
+		rc=1
+	fi
 	if grep -qE '^ *(- )?uses:' "$bazel_action"; then
 		echo "$bazel_action calls an action"
 		rc=1
@@ -1043,6 +1090,23 @@ wlint W25-rust-test-keys-indented-six 1 'rust_test has a cache-mode line other t
 # on a deeper line that YAML folds into the value (W27).
 wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
 wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to sami' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
+# release_cache_prune holds actions: write, so it runs no member code: no
+# action (W28), no interpreter, git or repository path (W29), and no gh
+# call but on actions/caches (W35, and W37 with actions/caches only in a
+# comment). No other job (W30, W34 with the value on the next line, W36
+# with read only in a comment, W33 by write-all) and not the workflow (W32)
+# names an actions permission other than read or none, and the workflow
+# has a permissions key (W31).
+wlint W28-release-cache-prune-checkout 1 'release_cache_prune uses an action, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Delete superseded release build caches of this ref$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
+wlint W29-release-cache-prune-repository-script 1 'release_cache_prune names an interpreter, a downloader, git, a repository path or GITHUB_WORKSPACE, so it could run member code: \[          bash \.github/sami/rust-test\.sh\]' 's|^          list >caches.tsv$|          bash .github/sami/rust-test.sh\n&|' ''
+wlint W30-rust-test-actions-write 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write/' ''
+wlint W31-no-workflow-permissions 1 'has no workflow-level permissions' '/^permissions:$/,/^  contents: write$/d' ''
+wlint W32-workflow-actions-write 1 'the workflow names an actions permission other than read or none, which only release_cache_prune may hold: \[  actions: write\]' 's/^  contents: write$/&\n  actions: write/' ''
+wlint W33-version-write-all 1 'version names an actions permission other than read or none, which only release_cache_prune may hold: \[    permissions: write-all\]' 's/^  version:$/&\n    permissions: write-all/' ''
+wlint W34-rust-test-actions-write-on-the-next-line 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions:\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions:\n        write/' ''
+wlint W35-release-cache-prune-gh-repo-clone 1 'release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: \[          gh repo clone "\$GH_REPO" src -- --depth 1\]' 's|^          list >caches.tsv$|          gh repo clone "$GH_REPO" src -- --depth 1\n&|' ''
+wlint W36-rust-test-actions-write-read-in-a-comment 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write # was actions: read\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write # was actions: read/' ''
+wlint W37-release-cache-prune-gh-caches-in-a-comment 1 'release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: \[          gh api "repos/\$GH_REPO/contents/p\.sh" >p # not actions/caches\]' 's|^          list >caches.tsv$|          gh api "repos/$GH_REPO/contents/p.sh" >p # not actions/caches\n&|' ''
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

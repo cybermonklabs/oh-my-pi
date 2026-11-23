@@ -278,7 +278,10 @@ jobs:
     # ref and deletes the rest (see release_binary's env). No checkout and
     # no member code: it only lists and deletes this ref's entries whose
     # key starts with omp-release-bazel-v1-<ref>-, and this job alone may
-    # delete cache entries.
+    # delete cache entries. Harness cases W28 to W37 check that it names no
+    # action, listed interpreter or downloader, git or repository path and
+    # calls gh only on actions/caches or `gh cache`, and that no other
+    # job's line grants actions write.
     name: Keep one release build cache per target
     needs: release_binary
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami' }}
