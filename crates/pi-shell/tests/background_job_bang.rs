@@ -549,10 +549,13 @@ async fn a_job_that_runs_something_before_exec_is_known_by_its_program() {
 /// `exec`: the reader waits no longer, as the job may never end (read
 /// after the loop, `$!` is the program's:
 /// [`a_job_that_runs_something_before_exec_is_known_by_its_program`]).
-/// Older than this change and kept: an `eval` whose text runs another
-/// program first names that program, which has ended (`not-found`; bash
-/// names its subshell, alive). `kill` and `wait` of `$!` still reach the
-/// program.
+/// A job that stops before its `exec` (`kill -STOP $BASHPID`) while a
+/// reader of `$!` waits keeps its own pid too: a stopped job makes no
+/// progress, so the reader would wait until something continues it, which
+/// here is the reader's own next command. Older than this change and kept:
+/// an `eval` whose text runs another program first names that program,
+/// which has ended (`not-found`; bash names its subshell, alive). `kill`
+/// and `wait` of `$!` still reach the program.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_waits_before_exec_keeps_its_own_pid() {
 	let rows = [
@@ -566,6 +569,15 @@ async fn a_job_that_waits_before_exec_keeps_its_own_pid() {
 			"virtual\nst=143\n",
 		),
 		(alive_row(r#"eval "/bin/true; $c""#), "not-found\nst=143\n"),
+		(
+			probe_row(
+				"f() { kill -STOP $BASHPID; exec PROG; }; f",
+				r#"p=$!; sleep 0.5; kill -CONT "$p"; "#,
+				"",
+				&format!(r#"[ "$p" = "$(cat "$T")" ] && echo program || {KIND}"#),
+			),
+			"virtual\nst=143\n",
+		),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_outputs(&rows, "the stated difference").await;
@@ -663,4 +675,66 @@ fn bang_of_a_zsh_source_job_does_not_wait_for_its_file() {
 		r#"d=$(mktemp -d); mkfifo "$d/f"; . "$d/f" & p=$!; echo 'echo hi' > "$d/f"; wait "$p"; echo "st=$?"; rm -r "$d""#,
 		"hi\nst=0\n",
 	)]);
+}
+
+/// A function job whose command substitution, subshell, pipeline stage or
+/// job of its own opens a FIFO the row writes only after `$!`: `$!` names
+/// the job at once (bash 5.2.21 and 5.3.20: `st=0`). A child's filesystem
+/// wait is a wait; at 2f8e0b78 it counted as the job's progress, and every
+/// row hung to the run's bound (at 31f4f5a0 each passed). The last three
+/// rows open the FIFO in the job's own vproc (`read`, a `while read` loop,
+/// `mapfile`): that open decides where it is made, as before, and stays
+/// the job's progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn bang_of_a_job_whose_child_opens_a_fifo_is_there_at_once() {
+	let opened = |body: &str| {
+		format!(
+			r#"d=$(mktemp -d); mkfifo "$d/q"; f() {{ {body}; exec /bin/true; }}; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#
+		)
+	};
+	let rows = [
+		opened(r#"x=$(< "$d/q")"#),
+		opened(r#"x=$(read -r l < "$d/q"; echo "$l")"#),
+		opened(r#"( read -r l < "$d/q" )"#),
+		opened(r#"read -r l < "$d/q" | :"#),
+		opened(r#"x=$(. "$d/q")"#),
+		opened(r#"{ read -r l < "$d/q"; } & wait"#),
+		opened(r#"read -r l < "$d/q""#),
+		opened(r#"while read -r l; do :; done < "$d/q""#),
+		opened(r#"mapfile -t a < "$d/q""#),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|s| (s.as_str(), "st=0\n")).collect();
+	assert_bash_outputs(&rows).await;
+}
+
+/// zsh: see [`bang_of_a_job_whose_child_opens_a_fifo_is_there_at_once`]
+/// (zsh 5.9: `st=0`).
+#[test]
+fn bang_of_a_zsh_job_whose_substitution_opens_a_fifo_is_there_at_once() {
+	assert_zsh_outputs(&[(
+		r#"d=$(mktemp -d); mkfifo "$d/q"; f() { x=$(< "$d/q"); exec /bin/true }; f & p=$!; echo l=1 > "$d/q"; wait "$p"; echo "st=$?"; rm -r "$d""#,
+		"st=0\n",
+	)]);
+}
+
+/// Under obash's pending-fs test mode (`PI_SHELL_FS=pending`: every fs op
+/// answers pending first), a function job's own stat of a file
+/// (`[ -e file ]`) before its `exec` is progress, not a wait: `$!` is the
+/// program's pid, as in bash (the pid probe, [`pid_row`]). (An open there
+/// decides the job's own pid where it is made, as a FIFO open does:
+/// `redir::defer` cannot tell a pending open from a FIFO's.)
+#[test]
+fn the_jobs_own_filesystem_answer_is_progress() {
+	let row = pid_row(r#"echo in > "$D/in"; f() { [ -e "$D/in" ]; exec PROG; }; f"#);
+	let out = output(
+		obash()
+			.env("PI_SHELL_FS", "pending")
+			.args(["-c", row.as_str()]),
+	);
+	let stdout = String::from_utf8_lossy(&out.stdout);
+	assert_eq!(
+		(out.status.code(), stdout.as_ref()),
+		(Some(0), "program\nst=143\n"),
+		"`{row}` under PI_SHELL_FS=pending\n  bash: Some(0) \"program\\nst=143\\n\""
+	);
 }

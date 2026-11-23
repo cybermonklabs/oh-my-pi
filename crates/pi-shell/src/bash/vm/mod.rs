@@ -2119,8 +2119,9 @@ impl Shell {
 	/// ([`proc::Bang`]). The job keeps its virtual pid once it would make
 	/// that reader wait: when what decides it is stopped, or waits for
 	/// anything but an in-engine child of its own (a command substitution,
-	/// a subshell), a program's launch or a filesystem answer; or when it
-	/// has run a scheduler slice ([`SLICE`] ops) since the reader parked,
+	/// a subshell), a program's launch or its own filesystem answer (a
+	/// child's, such as a FIFO open, is a wait: [`Self::bang_waits`]); or when
+	/// it has run a scheduler slice ([`SLICE`] ops) since the reader parked,
 	/// so a job that runs without end never holds the reader. Until then
 	/// the job runs on and may still `exec` its program, which gives it the
 	/// program's OS pid, as bash's forked child is known by its pid at once.
@@ -2159,11 +2160,16 @@ impl Shell {
 
 	/// Whether `vproc`, which decides a job's pid, would wait (it is
 	/// stopped, or parked on anything but an in-engine child that is not
-	/// waiting itself, a program's launch or a filesystem answer; a cycle
-	/// of vprocs parked on each other waits too), and whether `ran` is on
-	/// its way: `vproc` or a child it waits for, transitively. (Only the
-	/// job's own program can be launching: any other decides when it
-	/// starts, `bang_dispatch`.)
+	/// waiting itself, a program's launch or its own filesystem answer; a
+	/// cycle of vprocs parked on each other waits too), and whether `ran`
+	/// is on its way: `vproc` or a child it waits for, transitively. (Only
+	/// the job's own program can be launching: any other decides when it
+	/// starts, `bang_dispatch`.) A child's filesystem wait (a command
+	/// substitution, subshell, pipeline stage or job of the job's own) is a
+	/// wait: outside obash's pending-fs test mode only a FIFO open or read
+	/// pends, and it may wait for what the shell does after it reads `$!`.
+	/// The job's own FIFO opens and reads decide where they are made
+	/// (`redir::defer`, zsh's redirections, `.`).
 	fn bang_waits(&self, vproc: Vpid, ran: Vpid) -> (bool, bool) {
 		let mut v = vproc;
 		let mut on_its_way = false;
@@ -2176,9 +2182,8 @@ impl Shell {
 				return (true, on_its_way);
 			}
 			match p.blocked.as_ref().map(|b| &b.key) {
-				None | Some(WaitKey::Spawn { .. } | WaitKey::Fs { .. }) => {
-					return (false, on_its_way);
-				},
+				None | Some(WaitKey::Spawn { .. }) => return (false, on_its_way),
+				Some(WaitKey::Fs { .. }) => return (v != vproc, on_its_way),
 				Some(WaitKey::Proc(child)) => v = *child,
 				Some(_) => return (true, on_its_way),
 			}
