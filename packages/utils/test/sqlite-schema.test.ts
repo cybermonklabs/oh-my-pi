@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { initializeSqliteSchema, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
+import { initializeSqliteSchema, isSqliteBusyError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
 import { TempDir } from "../src/temp";
 
 const SCHEMA = "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY, value TEXT)";
@@ -19,15 +19,22 @@ function holdWriteLock(dbPath: string): Database {
 	return holder;
 }
 
-/** Another process that holds the write lock for `ms`, then commits. Resolves once it holds it. */
+/**
+ * Another process that holds the write lock for `ms`, then commits. Resolves once it holds it. It takes
+ * the lock kind every omp process takes (the SQLite lock shim, #15586): with POSIX locks in the holder,
+ * an open under gVisor waits out the whole hold and then succeeds instead of reporting the lock.
+ */
 async function holdWriteLockInChild(dbPath: string, ms: number): Promise<Bun.Subprocess<"ignore", "pipe", "inherit">> {
 	const script = `
 		const { Database } = require("bun:sqlite");
-		const db = new Database(${JSON.stringify(dbPath)});
-		db.run("BEGIN IMMEDIATE");
-		db.run("INSERT INTO entries (value) VALUES ('peer')");
-		console.log("held");
-		setTimeout(() => { db.run("COMMIT"); db.close(); }, ${ms});
+		import(${JSON.stringify(`${import.meta.dir}/../src/sqlite.ts`)}).then(({ ensureSqliteLockShim }) => {
+			ensureSqliteLockShim();
+			const db = new Database(${JSON.stringify(dbPath)});
+			db.run("BEGIN IMMEDIATE");
+			db.run("INSERT INTO entries (value) VALUES ('peer')");
+			console.log("held");
+			setTimeout(() => { db.run("COMMIT"); db.close(); }, ${ms});
+		});
 	`;
 	const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "inherit" });
 	const { value } = await child.stdout.getReader().read();
@@ -144,20 +151,30 @@ describe("open BUSY budget", () => {
 		await peer.exited;
 	}, 30_000);
 
-	test("openSqliteDatabaseSync waits out a peer's long write transaction", async () => {
+	// The synchronous opener runs on its caller's thread (the TUI's event loop for the caches that use
+	// it), so it does not sleep out a peer's lock: it fails after the connection's busy timeout and its
+	// caller falls back.
+	test("openSqliteDatabaseSync fails a peer's long write transaction without waiting it out", async () => {
 		await using dir = await TempDir.create("@omp-sqlite-busy-sync-");
 		const dbPath = dir.join("store.db");
 		createStore(dbPath);
 		const peer = await holdWriteLockInChild(dbPath, HOLD_MS);
-		const rows = openSqliteDatabaseSync(dbPath, db => {
-			try {
+		const start = performance.now();
+		let opened: Database | undefined;
+		let error: unknown;
+		try {
+			opened = openSqliteDatabaseSync(dbPath, db => {
 				db.run("INSERT INTO entries (value) VALUES ('mine')");
-				return db.query<{ value: string }, []>("SELECT value FROM entries ORDER BY id").all();
-			} finally {
-				db.close();
-			}
-		});
-		expect(rows).toEqual([{ value: "peer" }, { value: "mine" }]);
+				return db;
+			});
+		} catch (caught) {
+			error = caught;
+		}
+		const waited = performance.now() - start;
+		opened?.close();
+		expect(String(error)).toContain("database is locked");
+		expect(isSqliteBusyError(error)).toBe(true);
+		expect(waited).toBeLessThan(HOLD_MS / 2);
 		await peer.exited;
 	}, 30_000);
 });

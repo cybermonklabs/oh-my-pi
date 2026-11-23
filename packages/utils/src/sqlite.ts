@@ -252,22 +252,19 @@ async function openWithBusyRetries<T>(
 	}
 }
 
-/** Synchronous {@link openWithBusyRetries}: the same budget, blocking the thread between attempts. */
-function openWithBusyRetriesSync<T>(dbPath: string, initialize: (db: Database) => T, options: SqliteOpenOptions): T {
-	const retries = new BusyRetries();
-	for (;;) {
-		let db: Database | undefined;
-		const identity = sqliteFileIdentity(dbPath);
-		try {
-			db = openConnection(dbPath);
-			return initialize(db);
-		} catch (caught) {
-			const failure = failedAttempt(dbPath, db, caught, identity, options);
-			if (!isSqliteBusyError(failure.original) || failure.db) throw failure;
-			const delay = retries.nextDelay();
-			if (delay === undefined) throw new SqliteAttemptFailure(retries.exhausted(failure.original), identity);
-			Bun.sleepSync(delay);
-		}
+/**
+ * One synchronous attempt. It does not retry a BUSY store: its callers open on the thread that runs
+ * them (the TUI's event loop when a cache opens at startup or in a session), where sleeping out a
+ * peer's lock freezes the UI, and each of them falls back when its store cannot open.
+ */
+function openOnceSync<T>(dbPath: string, initialize: (db: Database) => T, options: SqliteOpenOptions): T {
+	let db: Database | undefined;
+	const identity = sqliteFileIdentity(dbPath);
+	try {
+		db = openConnection(dbPath);
+		return initialize(db);
+	} catch (caught) {
+		throw failedAttempt(dbPath, db, caught, identity, options);
 	}
 }
 
@@ -393,9 +390,11 @@ export async function openSqliteDatabase<T>(
 }
 
 /**
- * Synchronous counterpart to {@link openSqliteDatabase}, with the same BUSY budget; it blocks the
- * thread between attempts, which a store whose schema is current only reaches during a peer's
- * migration or WAL recovery. Corruption recovery, when enabled, is bounded to one replacement.
+ * Synchronous counterpart to {@link openSqliteDatabase} with a single attempt: a store another process
+ * holds locked fails after the connection's busy timeout instead of waiting out the lock. Its callers
+ * run on the thread that opens the store, the TUI's event loop included, and fall back when the open
+ * fails; a store that must wait for a peer opens through {@link openSqliteDatabase}. Corruption
+ * recovery, when enabled, is bounded to one replacement.
  */
 export function openSqliteDatabaseSync<T>(
 	dbPath: string,
@@ -403,13 +402,13 @@ export function openSqliteDatabaseSync<T>(
 	options: SqliteOpenOptions = {},
 ): T {
 	try {
-		return openWithBusyRetriesSync(dbPath, initialize, options);
+		return openOnceSync(dbPath, initialize, options);
 	} catch (error) {
 		recoverCorruptDatabase(dbPath, error, options);
 	}
 
 	try {
-		return openWithBusyRetriesSync(dbPath, initialize, {});
+		return openOnceSync(dbPath, initialize, {});
 	} catch (error) {
 		throw annotateSqliteError(error instanceof SqliteAttemptFailure ? error.original : error, dbPath);
 	}

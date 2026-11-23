@@ -8,7 +8,7 @@
 
 ### Changed
 
-- `openSqliteDatabase` and `openSqliteDatabaseSync` keep retrying a store another process holds locked for up to 60 s with jittered exponential backoff (was four attempts within about 5 s, and none for the synchronous opener), and the final error says how long they waited ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
+- `openSqliteDatabase` keeps retrying a store another process holds locked for up to 60 s with jittered exponential backoff (was four attempts, about 5 s in headless hosts and about 21 s in interactive ones), and the final error says how long it waited; `openSqliteDatabaseSync` still makes one attempt, because its callers open on the UI thread and fall back when the open fails ([#17968](https://github.com/can1357/oh-my-pi/pull/17968))
 
 ## [18.18.2] - 2026-11-08
 
