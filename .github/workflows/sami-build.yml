@@ -122,14 +122,18 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.RELEASE_CACHE_PATHS }}
-          key: omp-release-bazel-v1-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
+          # Each key names the run's ref, so an entry that a run on another
+          # ref wrote (a restore also looks in main's scope) cannot match by
+          # accident. A run elsewhere that writes a key with this name on
+          # purpose still could; no enabled workflow on main does.
+          key: omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
           # An upstream version bump rewrites Cargo.lock, so most releases
-          # take the last fallback, the newest entry for this target. Bazel
-          # keys each action by the digests of its inputs, so an older entry
-          # gives fewer hits, never a wrong output.
+          # take the last fallback, the newest entry for this ref and target.
+          # Bazel keys each action by the digests of its inputs, so an older
+          # entry gives fewer hits, never a wrong output.
           restore-keys: |
-            omp-release-bazel-v1-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
-            omp-release-bazel-v1-${{ matrix.target }}-
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-
       - name: Point Bazel at the release build cache
         env:
           RC: ${{ steps.bazel.outputs.rc }}
