@@ -462,24 +462,27 @@ directory of the file's header, as the reopened session manager reads it: where 
 and where the spawn and the in-memory revive build it. It takes the subagent's ids from its
 registry entry; a task depth never shallower than its live parent chain; the credential source
 and workspace roots of its live parent where its spawn passed them (the root session's where
-the parent is not live); the tree's cost gate, and the prepared extensions of the live parent or
-the root, whatever the stored list of live inputs names; the
+the parent is not live); the tree's cost gate and the prepared extensions of the live parent or
+the root, whatever the stored list of live inputs names; that session's extension roots, and
+where the list leaves them out (as on a route whose spawner passes none, such as a vibe
+worker's, where the in-memory revive passes none) their mode and configured list without their
+explicit list, so what the session and its own subagents discover holds to the owner's
+extension policy and its task tool offers no agent its spawn did not have; the
 SDK's own discovery in the file's working directory (the slash commands and the custom TS
 commands it finds there), while the context files, skills, rules, prompt templates and
 workspace tree come from the live parent or the root; the cache-warming value every spawn
 writes (off); its own directory for its artifacts; and wake limits (`maxRuntimeMs`, the soft
-request budget) never looser than the live settings. Where it passes no extensions of its own,
-it passes the owner's extension roots, so the session discovers its extensions under the
-owner's policy. Where the working directory of the session its live inputs come from (the live
-parent, or the root session where the parent is not live) is not the file's, it builds on the
+request budget) never looser than the live settings. Where the working directory
+of the session its live inputs come from (the live parent, or the root session where the
+parent is not live) is not the file's, it builds on the
 main thread, not in a worker, and that session's tool sources follow the file's directory: no
 custom-tool paths and no MCP manager are passed, so the SDK discovers the custom tools and the
 project's MCP servers there; of that session's prepared extensions (else its extension paths)
 only its explicit and inline ones stay (those passed with `--extension` or configured in the
 `extensions` setting, and a host's inline extensions), and every project and user extension,
-plugins included, comes from discovery in the file's directory under the owner's policy (its
-explicit-only mode and disabled list, and that directory's plugin overrides), added first; an
-extension both hold is bound once. A per-call worker's
+plugins included, comes from discovery in the file's directory under the root session's policy
+(its explicit-only mode, the live settings' disabled list, and that directory's plugin
+overrides), added first; an extension both hold is bound once. A per-call worker's
 agent definition is still looked up in the live parent's working directory (the root
 session's where the parent is not live). Before it builds the session, a revive
 of a file with `spawnSpec`, the in-memory one too, writes the workspace roots of the file's

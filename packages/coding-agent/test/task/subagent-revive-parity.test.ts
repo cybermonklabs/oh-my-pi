@@ -6,11 +6,15 @@
  * spawn input inventory then has its own case, so a failure names the option.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { formatModelStringWithRouting } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { isIrcEnabled } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
+import { refreshAgentDiscovery } from "@oh-my-pi/pi-coding-agent/task";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { buildWorkPoolOutputSchema } from "@oh-my-pi/pi-coding-agent/task/workpool-yield";
@@ -35,6 +39,8 @@ import {
 } from "./revive-harness";
 
 const CHANGED_CONTEXT_TEXT = "Context fixture, changed while parked: report each row in two lines.";
+/** An agent defined under the root's explicit extension root (`<root>/agents/*.md`) on the vibe-worker route. */
+const EXPLICIT_ROOT_AGENT = "explicit-root-agent";
 const VERDICT_SCHEMA = {
 	type: "object",
 	properties: { verdict: { type: "string" } },
@@ -54,6 +60,7 @@ const ACCEPTED_DIFFERENCES = [
 	"5. A live input of a parent that is not live, and a discovery list whose contents changed on disk since the spawn and the root has not moved (difference 8).",
 	"6. A seance consult writes no spec, so its cold revive stays on its own route.",
 	"7. A custom tool that the cold revive cannot build again: both revives keep it in the tool list; on the cold revive a call to it answers that it is unavailable.",
+	"9. The extension roots on a route whose spawner passes none (a vibe worker): the warm revive passes none; the cold revive passes the live parent's (the root's where the parent is not live) with an empty explicit list, so its task tool offers no agent of an explicit root.",
 ] as const;
 
 /** Whether this run printed {@link ACCEPTED_DIFFERENCES}: the first comparison of the differing options prints them. */
@@ -339,8 +346,19 @@ interface ParityRoute {
 	readonly settings?: Readonly<Record<string, unknown>>;
 	readonly yieldArguments?: Record<string, unknown>;
 	options(env: ReviveEnv, root: LiveParent): Promise<ExecutorOptions> | ExecutorOptions;
+	/** The root's extension roots, where the route needs other than the default (none explicit, merge). */
+	readonly roots?: (env: ReviveEnv) => Promise<EffectiveExtensionRoots>;
 	/** Runs on the spawned subagent before its first park; returns it with the last request it sent by then. */
 	readonly beforePark?: (env: ReviveEnv, spawned: SpawnedSubagent) => Promise<SpawnedSubagent>;
+	/**
+	 * An accepted difference this route's revives show: its options are not compared, and `check` asserts what each
+	 * revive passes there.
+	 */
+	readonly accepted?: {
+		readonly title: string;
+		readonly options: readonly OptionName[];
+		check(run: ParityRun, root: LiveParent): Promise<void>;
+	};
 }
 
 const ROUTES: ParityRoute[] = [
@@ -441,9 +459,20 @@ const ROUTES: ParityRoute[] = [
 	},
 	{
 		title: "a vibe worker",
+		// The root's explicit extension root holds an agent (`<root>/agents/*.md`) its own spawns can name.
+		roots: async env => {
+			const explicitRoot = path.join(env.root, "explicit-root");
+			await Bun.write(
+				path.join(explicitRoot, "agents", `${EXPLICIT_ROOT_AGENT}.md`),
+				`---\nname: ${EXPLICIT_ROOT_AGENT}\ndescription: Agent of the root's explicit extension root.\n---\n\nCheck the rows.\n`,
+			);
+			return { explicit: [explicitRoot], mode: "merge", configured: [], configuredLevel: "user" };
+		},
 		options: (env, root) => {
-			const agent = getBundledAgent("sonic");
-			if (!agent) throw new Error("Expected the bundled sonic agent");
+			const sonic = getBundledAgent("sonic");
+			if (!sonic) throw new Error("Expected the bundled sonic agent");
+			// A worker that may spawn, so its task tool lists the agents its extension roots discover.
+			const agent = { ...sonic, spawns: "*" as const };
 			// `vibe/runtime.ts` passes no extension roots, directories, credential source or MCP flag.
 			return {
 				...spawnerOptions(root.toolSession),
@@ -460,6 +489,33 @@ const ROUTES: ParityRoute[] = [
 				keepAlive: true,
 			};
 		},
+		accepted: {
+			title: "accepted difference 9: the warm revive passes no extension roots, and the cold revive the live parent's without their explicit list, so its task tool does not offer the explicit root's agent",
+			options: ["extensionRoots"],
+			check: async (run, root) => {
+				const cwd = run.cold.build.options.cwd;
+				if (cwd === undefined) throw new Error("The cold revive passed no cwd");
+				const underRootRoots = await discoverAgents(cwd, undefined, root.toolSession.effectiveExtensionRoots?.());
+				// The task tool lists what a discovery under the session's own extension roots finds once one is
+				// published (as `/marketplace` publishes it); before that it lists what the process found first.
+				await refreshAgentDiscovery(cwd, run.cold.session.effectiveExtensionRoots);
+				const coldTask = run.cold.session.getToolByName("task")?.description;
+				expect({
+					warm: run.warm.build.options.extensionRoots?.(),
+					cold: run.cold.build.options.extensionRoots?.(),
+					rootRootsOffer: underRootRoots.agents.some(agent => agent.name === EXPLICIT_ROOT_AGENT),
+					coldHasTask: coldTask !== undefined,
+					coldOffers: coldTask?.includes(EXPLICIT_ROOT_AGENT),
+				}).toEqual({
+					warm: undefined,
+					// The root's roots (merge, no configured list) without the explicit root.
+					cold: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
+					rootRootsOffer: true,
+					coldHasTask: true,
+					coldOffers: false,
+				});
+			},
+		},
 	},
 	{
 		title: "a nested subagent whose parent is live",
@@ -473,9 +529,11 @@ const ROUTES: ParityRoute[] = [
 	},
 ];
 
-function defineRouteCases(result: () => ParityRun): void {
+function defineRouteCases(result: () => ParityRun, accepted: readonly OptionName[] = []): void {
+	const compared = (option: OptionName): boolean =>
+		OPTION_COMPARES[option] !== "accepted" && !accepted.includes(option);
 	for (const option of OPTION_NAMES) {
-		if (OPTION_COMPARES[option] === "accepted") continue;
+		if (!compared(option)) continue;
 		it(`the cold revive is built with the warm revive's ${option}`, () => {
 			const { warm, cold } = compareOption(result(), option);
 			expect(cold).toEqual(warm);
@@ -547,7 +605,7 @@ function defineRouteCases(result: () => ParityRun): void {
 		}
 		const run = result();
 		const differing = OPTION_NAMES.filter(option => {
-			if (OPTION_COMPARES[option] === "accepted") return false;
+			if (!compared(option)) return false;
 			const { warm, cold } = compareOption(run, option);
 			return !Bun.deepEquals(cold, warm);
 		});
@@ -577,13 +635,18 @@ function defineRouteCases(result: () => ParityRun): void {
 for (const route of ROUTES) {
 	describe(`warm and cold revives of ${route.title}`, () => {
 		let env: ReviveEnv | undefined;
+		let root: LiveParent | undefined;
 		let run: ParityRun | undefined;
+		const ran = (): ParityRun => {
+			if (!run) throw new Error(`The route "${route.title}" did not run`);
+			return run;
+		};
 
 		beforeAll(async () => {
 			const opened = await openReviveEnv(route.settings);
 			env = opened;
 			if (route.yieldArguments) opened.turns = { yieldArguments: route.yieldArguments };
-			const root = opened.createLiveParent();
+			root = opened.createLiveParent(undefined, undefined, await route.roots?.(opened));
 			const options = await route.options(opened, root);
 			const { beforePark } = route;
 			run = await opened.runParity(root, options, beforePark && (spawned => beforePark(opened, spawned)));
@@ -593,10 +656,19 @@ for (const route of ROUTES) {
 			await env?.close();
 		}, 30_000);
 
-		defineRouteCases(() => {
-			if (!run) throw new Error(`The route "${route.title}" did not run`);
-			return run;
-		});
+		defineRouteCases(ran, route.accepted?.options);
+
+		const { accepted } = route;
+		if (accepted) {
+			it(
+				accepted.title,
+				async () => {
+					if (!root) throw new Error(`The route "${route.title}" did not run`);
+					await accepted.check(ran(), root);
+				},
+				30_000,
+			);
+		}
 	});
 }
 

@@ -657,8 +657,8 @@ function isPerCallRecord(parts: SpawnSpecParts, init: PersistedSessionInit): boo
  * Live inputs a cold revive passes whatever its record's list names, since leaving one out lets the subagent do
  * more than the live process allows. Without the tree's cost gate it starts its own, which `session.maxCost` does
  * not reach; without the prepared extensions it loses a host's inline policy hooks and, as a restricted child, the
- * hooks it inherits. Every spawner passes both. The owner's extension roots pass whatever the list names where the
- * subagent gets no extensions of its own ({@link coldReviveLiveInputs}).
+ * hooks it inherits. Every spawner passes both. The extension roots follow their own rule
+ * ({@link coldReviveLiveInputs}).
  */
 const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
 	costGate: true,
@@ -668,14 +668,15 @@ const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
 /**
  * The live inputs of a subagent build: the live parent's (`parent`), else the root tool session's, as a spawn
  * of either reads them, limited to those the spawn passed where its spec names them, except the inputs of
- * {@link KEPT_LIVE_INPUTS}. Where it then passes no extensions of its own, the subagent discovers them, under the
- * owner's extension roots whatever the list names. A root built without a tool session (a host's root) gives its
- * own objects, as cold revives took them before spawn specs. Where the cwd of the session they come from is not
- * `storedCwd`, the stored session's (undefined for a seance consult), that session's own tool sources serve another
- * directory: its custom-tool paths and its MCP manager do not pass, so the SDK discovers the custom tools and the
- * project's MCP servers in the stored directory; of its extensions only the explicit (configured included) and inline
- * ones stay, beside those discovery finds in the stored directory under the live owner's extension policy
- * ({@link storedDirectoryExtensions}); the secret mask loads that session's project secrets beside the stored
+ * {@link KEPT_LIVE_INPUTS}, which pass whatever the list names. Extension roots the list leaves out pass as that
+ * session's without their explicit list, so what the subagent and its own subagents discover still holds to the
+ * owner's mode and configured list. A root built without a tool session (a host's root) gives its own objects, as
+ * cold revives took them before spawn specs. Where the cwd of the session they come from is not `storedCwd`, the
+ * stored session's (undefined for a seance consult), that session's own tool sources serve another directory: its
+ * custom-tool paths and its MCP manager do not pass, so the SDK discovers the custom tools and the project's MCP
+ * servers in the stored directory; of its extensions only the explicit (configured included) and inline ones stay,
+ * beside those discovery finds in the stored directory under the root session's extension policy
+ * ({@link moveExtensionsToStoredDirectory}); the secret mask loads that session's project secrets beside the stored
  * directory's; and the revive builds on the main thread.
  */
 async function coldReviveLiveInputs(
@@ -729,39 +730,43 @@ async function coldReviveLiveInputs(
 			policy,
 		};
 	}
-	const ownerRoots = live.extensionRoots;
+	const sourceRoots = live.extensionRoots;
 	if (names) {
 		const passed = new Set<string>(names);
 		for (const name of SPAWN_LIVE_INPUT_NAMES) {
 			if (!passed.has(name) && KEPT_LIVE_INPUTS[name] !== true) live[name] = undefined;
 		}
+		// The explicit list (`--extension`, `additionalExtensionPaths`) holds in both modes, and the agents and
+		// commands of its packages would give the subagent spawn targets its spawn did not have.
+		if (sourceRoots && !passed.has("extensionRoots")) {
+			live.extensionRoots = () => ({ ...sourceRoots(), explicit: [] });
+		}
 	}
-	if (!live.preloadedPreparedExtensions && !live.preloadedExtensionPaths) live.extensionRoots = ownerRoots;
 	if (!elsewhere) return { live, buildsOnMain: false };
 	live.secretsProjectDirs = [sourceCwd];
-	await storedDirectoryExtensions(live, root.effectiveExtensionRoots, ctx.settings, storedCwd);
+	await moveExtensionsToStoredDirectory(live, root.effectiveExtensionRoots, ctx.settings, storedCwd);
 	return { live, buildsOnMain: true };
 }
 
 /**
  * Moves `live`'s extensions to `storedCwd`, the stored session's cwd. Of the prepared extensions (else the extension
  * paths) of the session they came from, only the explicit entries (configured ones included) and the inline ones
- * stay. Every project and user entry, plugins included, comes from one discovery in `storedCwd` under `owner`, the
- * live owner's extension roots (their explicit-only mode, with `settings`' disabled list), whatever the record's list
- * names and whatever that session's own roots are; it skips explicit and configured paths, which only the kept
- * entries carry. Each discovered entry is prepared there and placed first, in discovery's order; a file the kept
- * entries hold is not added again, so it is bound once, at the scope the session it came from gave it. Where prepared
- * extensions pass, the session reads no extension paths, so none pass.
+ * stay. Every project and user entry, plugins included, comes from one discovery in `storedCwd` under `rootRoots`,
+ * the root session's extension roots (their explicit-only mode, with `settings`' disabled list), whatever the
+ * record's list names and whatever that session's own roots are; it skips explicit and configured paths, which only
+ * the kept entries carry. Each discovered entry is prepared there and placed first, in discovery's order; a file the
+ * kept entries hold is not added again, so it is bound once, at the scope the session it came from gave it. Where
+ * prepared extensions pass, the session reads no extension paths, so none pass.
  */
-async function storedDirectoryExtensions(
+async function moveExtensionsToStoredDirectory(
 	live: ColdReviveLiveInputs,
-	owner: EffectiveExtensionRoots,
+	rootRoots: EffectiveExtensionRoots,
 	settings: Settings,
 	storedCwd: string,
 ): Promise<void> {
 	const { preloadedPreparedExtensions: preparedExtensions, preloadedExtensionPaths: extensionPaths } = live;
 	if (!preparedExtensions && !extensionPaths) return;
-	const ambientOnly = (): EffectiveExtensionRoots => ({ ...owner, explicit: [], configured: [] });
+	const ambientOnly = (): EffectiveExtensionRoots => ({ ...rootRoots, explicit: [], configured: [] });
 	const discovered = await discoverSessionExtensionPaths({ extensionRoots: ambientOnly }, storedCwd, settings);
 	const discoveredKeys = await Promise.all(discovered.map(entry => extensionPathKey(entry.path)));
 	const notHeldBy = async (keptFiles: readonly string[]): Promise<ExtensionPathEntry[]> => {

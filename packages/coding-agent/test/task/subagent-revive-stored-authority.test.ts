@@ -12,6 +12,7 @@
 import { afterAll, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { cfgWorkspaceAdditionalDirectories } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -64,16 +65,18 @@ function editHeaderRoots(file: string, roots: string[]): Promise<number> {
 
 /**
  * A test process with a live root parent and the cold reviver over it, with `id` spawned by the root and parked;
- * `prepare` runs on the root before the spawn, `beforePark` between the spawn and the park.
+ * `prepare` runs on the root before the spawn, `beforePark` between the spawn and the park. `roots`, where given, is
+ * the root's extension-root policy.
  */
 async function spawnAndPark(
 	id: string,
 	settings: Readonly<Record<string, unknown>> = {},
 	prepare?: (env: ReviveEnv, root: LiveParent) => void,
 	beforePark?: (env: ReviveEnv, root: LiveParent) => Promise<void>,
+	roots?: (env: ReviveEnv) => EffectiveExtensionRoots,
 ): Promise<{ env: ReviveEnv; root: LiveParent; sessionFile: string }> {
 	const env = await openReviveEnv(settings);
-	const root = env.createLiveParent();
+	const root = env.createLiveParent(undefined, undefined, roots?.(env));
 	env.installColdReviver(root);
 	prepare?.(env, root);
 	const spawned = await env.spawn({ ...spawnerOptions(root.toolSession), ...env.subagentInputs(id) });
@@ -197,7 +200,7 @@ describe("a cold revive of a record whose stored depth, cwd, credential source, 
 	});
 });
 
-describe("a cold revive of a record whose stored list of live inputs leaves out costGate and preloadedPreparedExtensions", () => {
+describe("a cold revive of a record whose stored list of live inputs leaves out costGate, preloadedPreparedExtensions and extensionRoots, under an explicit-only root with one explicit path", () => {
 	const id = "StoredLiveInputs";
 	let env: ReviveEnv | undefined;
 	let root: LiveParent | undefined;
@@ -205,15 +208,27 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 	let failure: string | undefined;
 
 	beforeAll(async () => {
-		const opened = await spawnAndPark(id, {}, (opening, parent) => {
-			// The tree's cost gate, which every spawner passes on.
-			parent.toolSession.costGate = new CostGate(opening.settings, 0, () => {});
-		});
+		const opened = await spawnAndPark(
+			id,
+			{},
+			(opening, parent) => {
+				// The tree's cost gate, which every spawner passes on.
+				parent.toolSession.costGate = new CostGate(opening.settings, 0, () => {});
+			},
+			undefined,
+			opening => ({
+				explicit: [path.join(opening.root, "explicit-extension.ts")],
+				mode: "explicit-only",
+				configured: [path.join(opening.root, "configured-extension.ts")],
+				configuredLevel: "project",
+			}),
+		);
 		env = opened.env;
 		root = opened.root;
+		const dropped = ["costGate", "preloadedPreparedExtensions", "extensionRoots"];
 		await editStoredSpawnSpecs(opened.sessionFile, spec => {
 			const names = Array.isArray(spec.liveInputs) ? spec.liveInputs : [];
-			spec.liveInputs = names.filter(name => name !== "costGate" && name !== "preloadedPreparedExtensions");
+			spec.liveInputs = names.filter(name => !dropped.includes(name));
 		});
 		({ revived, failure } = await reviveCold(env, id));
 	}, 60_000);
@@ -231,6 +246,19 @@ describe("a cold revive of a record whose stored list of live inputs leaves out 
 	it("preloadedPreparedExtensions: the live parent's, whatever the list names, so the revive discovers no extensions of its own", () => {
 		expect(failure).toBeUndefined();
 		expect(revived?.build.options.preloadedPreparedExtensions).toBe(root?.toolSession.preparedExtensions);
+	});
+
+	it("extensionRoots: the live parent's mode, configured list and level without its explicit list, so the session gains no spawn targets its spawn did not have", () => {
+		expect(failure).toBeUndefined();
+		const rootRoots = root?.toolSession.effectiveExtensionRoots?.();
+		if (!rootRoots) throw new Error("The root holds no extension roots");
+		expect(rootRoots.explicit).toHaveLength(1);
+		expect(revived?.build.options.extensionRoots?.()).toEqual({
+			explicit: [],
+			mode: "explicit-only",
+			configured: rootRoots.configured,
+			configuredLevel: "project",
+		});
 	});
 });
 
