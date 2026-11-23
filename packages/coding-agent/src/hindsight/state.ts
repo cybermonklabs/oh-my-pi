@@ -710,14 +710,14 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	}
 
 	/**
-	 * Identifies the server, account, bank and tag filter a recall reads, so a persisted
-	 * recall is only reused for the same ones. The account is a hash of the API token.
+	 * Identifies the server, bank and tag filter a recall reads, so a persisted recall is only
+	 * reused for the same ones. Nothing in it derives from the API token: the recall entry is
+	 * written into the session, which is stored, copied and read wherever the transcript is.
 	 */
 	#recallScope(): string {
 		return JSON.stringify([
 			"hindsight",
 			this.config.hindsightApiUrl,
-			Bun.hash(this.config.hindsightApiToken ?? "").toString(16),
 			this.bankId,
 			this.recallTags ?? [],
 			this.recallTagsMatch ?? null,
