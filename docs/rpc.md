@@ -1549,6 +1549,10 @@ GPT-Live there works the same way.
 2. A WebSocket at `{base as ws(s)}/live/sessions/{id}/attach` with the same
    bearer carries the call's events and omp's messages.
 
+The key goes nowhere else. Where the server's text could repeat it (a redirect's
+`Location`, an error body or `error` event, the sideband's close reason, a
+session id in the attach URL), every error and log line has `[key]` instead.
+
 The rest of the call is the same as on Codex. GPT-Live's delegation event names
 no task text, only its `offset_ms` on the session timeline, so its turn is the
 user's transcribed words before that offset (at most the minute before it), under

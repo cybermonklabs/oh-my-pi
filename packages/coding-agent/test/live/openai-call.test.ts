@@ -36,6 +36,10 @@ interface StubOptions {
 	onMessage?: (message: Record<string, unknown>, socket: { send(data: string): unknown }) => void;
 	/** Closes the sideband this long after it opens. */
 	closeAfterMs?: number;
+	/** The reason of that close; defaults to `gone`. */
+	closeReason?: string;
+	/** Answers every attach with a 404, so the sideband never opens. */
+	refuseAttach?: boolean;
 }
 
 function gptLiveStub(options: StubOptions = {}) {
@@ -55,7 +59,7 @@ function gptLiveStub(options: StubOptions = {}) {
 				);
 			}
 			const attach = decodeURIComponent(url.pathname) === `/v1/live/sessions/${sessionId}/attach`;
-			if (attach && srv.upgrade(request)) {
+			if (attach && !options.refuseAttach && srv.upgrade(request)) {
 				upgrades.push(decodeURIComponent(url.pathname));
 				return undefined;
 			}
@@ -64,7 +68,9 @@ function gptLiveStub(options: StubOptions = {}) {
 		websocket: {
 			open(socket) {
 				for (const frame of options.frames ?? []) socket.send(JSON.stringify(frame));
-				if (options.closeAfterMs !== undefined) setTimeout(() => socket.close(1011, "gone"), options.closeAfterMs);
+				if (options.closeAfterMs !== undefined) {
+					setTimeout(() => socket.close(1011, options.closeReason ?? "gone"), options.closeAfterMs);
+				}
 			},
 			message(socket, data) {
 				options.onMessage?.(JSON.parse(String(data)), socket);
@@ -344,6 +350,94 @@ describe("GPT-Live call lifecycle", () => {
 			await call.controller.stop();
 			stub.server.stop(true);
 		}
+	});
+
+	describe("a key the server echoes is in no error or log line", () => {
+		test("from a redirect's Location", async () => {
+			const stub = gptLiveStub({
+				answer: request => {
+					const echo = encodeURIComponent(request.headers.get("authorization") ?? "");
+					return new Response(null, {
+						status: 307,
+						headers: { Location: `https://elsewhere.example/v1?a=${echo}` },
+					});
+				},
+			});
+			const call = liveCall(stub.base);
+			try {
+				const error = await call.controller.start().then(
+					() => "started",
+					(cause: unknown) => String(cause),
+				);
+				expect(error).toContain("redirected (307)");
+				expect(error).toContain("[key]");
+				expect(error).not.toContain(KEY);
+			} finally {
+				await call.controller.stop();
+				stub.server.stop(true);
+			}
+		});
+
+		test("from the sideband's close reason", async () => {
+			const stub = gptLiveStub({ closeAfterMs: 200, closeReason: `bad bearer ${KEY}` });
+			const call = liveCall(stub.base);
+			try {
+				await call.controller.start();
+				const ended = String(await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]));
+				expect(ended).toContain("GPT-Live sideband closed (1011): bad bearer [key]");
+				expect(ended).not.toContain(KEY);
+			} finally {
+				await call.controller.stop();
+				stub.server.stop(true);
+			}
+		}, 10_000);
+
+		test("from GPT-Live's errors, the one logged and the one that ends the call", async () => {
+			const stub = gptLiveStub({
+				frames: [
+					{ type: "error", event_id: "e0", error: { message: `bad bearer ${KEY}` } },
+					userSaid("t1", "is CI green", 100, 900),
+					delegated("d1", "item_1", 1_000),
+					voiceSaid("t2", "Checking.", 1_100, 1_400),
+				],
+				onMessage: (message, socket) => {
+					if (message.type !== "session.commentary.append") return;
+					const error = { message: `bad bearer ${KEY}`, client_event_id: message.event_id };
+					socket.send(JSON.stringify({ type: "error", event_id: "e1", error }));
+				},
+			});
+			const warn = vi.spyOn(logger, "warn");
+			const call = liveCall(stub.base);
+			try {
+				await call.controller.start();
+				await until(() => call.turns.length >= 1);
+				call.answer();
+				const ended = String(await Promise.race([call.ended, Bun.sleep(3_000).then(() => "still open")]));
+				expect(ended).toContain("GPT-Live refused omp's session.commentary.append: bad bearer [key]");
+				expect(ended).not.toContain(KEY);
+				expect(warn).toHaveBeenCalledWith("GPT-Live reported an error; the call stays open", expect.anything());
+				expect(JSON.stringify(warn.mock.calls)).not.toContain(KEY);
+			} finally {
+				await call.controller.stop();
+				stub.server.stop(true);
+			}
+		}, 10_000);
+
+		test("from a session id that the sideband's URL carries", async () => {
+			const stub = gptLiveStub({ sessionId: `live-${KEY}`, refuseAttach: true });
+			const call = liveCall(stub.base);
+			try {
+				const error = await call.controller.start().then(
+					() => "started",
+					(cause: unknown) => String(cause),
+				);
+				expect(error).toContain("GPT-Live sideband");
+				expect(error).not.toContain(KEY);
+			} finally {
+				await call.controller.stop();
+				stub.server.stop(true);
+			}
+		}, 10_000);
 	});
 
 	test("an opaque session id with `.` and `:` is accepted", async () => {

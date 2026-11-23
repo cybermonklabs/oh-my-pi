@@ -108,6 +108,11 @@ function bounded(text: string, limit: number): string {
 	return text.length <= limit ? text : `${text.slice(0, limit)}…`;
 }
 
+/** `text` with each copy of `apiKey` replaced: a server can echo the bearer back in any text it sends. */
+function redactKey(text: string, apiKey: string): string {
+	return apiKey ? text.replaceAll(apiKey, "[key]") : text;
+}
+
 /** Parses a JSON string from an event channel into a record, or `undefined`. */
 function parseRecord(payload: string): Record<string, unknown> | undefined {
 	try {
@@ -218,6 +223,11 @@ export class OpenAILiveTransport implements Pick<
 	#handedOverOffsetMs = Number.NEGATIVE_INFINITY;
 	/** The speaker of the transcript line being said, and its words so far; see {@link #mapEvent}. */
 	#line: { role: "user" | "assistant"; text: string } | undefined;
+	/**
+	 * Removes the key from server text bound for an error or a log; set once the key is resolved. The key
+	 * stays in this closure for the call's life, as it does in the sideband's headers.
+	 */
+	#redact: (text: string) => string = text => text;
 
 	constructor(options: OpenAILiveTransportOptions) {
 		this.#options = options;
@@ -235,9 +245,12 @@ export class OpenAILiveTransport implements Pick<
 		if (this.#state === "closing" || this.#state === "closed")
 			return Promise.reject(new Error("Live transport is closed"));
 		this.#state = "connecting";
-		const operation = this.#connect().catch(async error => {
+		const operation = this.#connect().catch(async (cause: unknown) => {
 			await this.close();
-			throw error;
+			// Every connect failure can carry server text: a redirect, a refused session, the sideband's URL.
+			const error = toError(cause);
+			const message = this.#redact(error.message);
+			throw message === error.message ? error : new Error(message);
 		});
 		this.#connectPromise = operation;
 		return operation;
@@ -246,6 +259,7 @@ export class OpenAILiveTransport implements Pick<
 	async #connect(): Promise<void> {
 		// Resolved here, not before the transport exists, so a close while the key resolves stops the call.
 		const route = await resolveOpenAILiveRoute(this.#options.registry, this.#options.sessionId);
+		this.#redact = text => redactKey(text, route.apiKey);
 		if (this.#state !== "connecting") throw new Error("Live transport is closed");
 		let offer = this.#options.sdpOffer;
 		let peer: LiveWebRtcPeer | undefined;
@@ -310,17 +324,20 @@ export class OpenAILiveTransport implements Pick<
 			redirect: "manual",
 			proxy: getProxyForUrl(OPENAI_PROVIDER, url),
 		});
+		// Server text is redacted before it is cut, so a cut cannot leave part of an echoed key behind.
 		if (response.status >= 300 && response.status < 400) {
 			await response.body?.cancel();
-			const location = bounded(response.headers.get("location") ?? "nowhere", MAX_LOCATION_LENGTH);
+			const location = bounded(
+				redactKey(response.headers.get("location") ?? "nowhere", route.apiKey),
+				MAX_LOCATION_LENGTH,
+			);
 			throw new Error(
 				`GPT-Live session request was redirected (${response.status}) to ${location}; no redirect is followed`,
 			);
 		}
 		const text = await response.text();
 		if (!response.ok) {
-			// A server that echoes the request's headers must not put the key into the error.
-			const reply = text.trim().replaceAll(/\s+/g, " ").replaceAll(route.apiKey, "[key]");
+			const reply = redactKey(text.trim().replaceAll(/\s+/g, " "), route.apiKey);
 			const detail = bounded(reply || response.statusText, MAX_ERROR_BODY_LENGTH);
 			throw new Error(`GPT-Live session failed (${response.status}): ${detail}`);
 		}
@@ -511,9 +528,10 @@ export class OpenAILiveTransport implements Pick<
 				const error: Record<string, unknown> = isRecord(record.error) ? record.error : {};
 				const clientEventId = error.client_event_id ?? record.client_event_id;
 				const refused = typeof clientEventId === "string" ? this.#sentEventIds.get(clientEventId) : undefined;
-				const reason = typeof error.message === "string" ? error.message : "no reason given";
+				const reason = this.#redact(typeof error.message === "string" ? error.message : "no reason given");
 				if (refused === undefined) {
-					logger.warn("GPT-Live reported an error; the call stays open", { error: record.error });
+					const detail = record.error === undefined ? undefined : this.#redact(JSON.stringify(record.error));
+					logger.warn("GPT-Live reported an error; the call stays open", { error: detail });
 				} else if (refused === "session.thinking.append") {
 					logger.warn("GPT-Live refused omp's progress note; the call stays open", { reason });
 				} else {
@@ -580,13 +598,14 @@ export class OpenAILiveTransport implements Pick<
 		} catch {}
 	}
 
+	/** Ends the call with `message`, once; the key is removed from it, since it can quote the server. */
 	#reportFailure(message: string): void {
 		if ((this.#state !== "connecting" && this.#state !== "connected") || this.#unexpectedFailureReported) {
 			return;
 		}
 		this.#unexpectedFailureReported = true;
 		try {
-			this.#options.callbacks.onEvent({ type: "error", message });
+			this.#options.callbacks.onEvent({ type: "error", message: this.#redact(message) });
 		} catch {}
 	}
 
