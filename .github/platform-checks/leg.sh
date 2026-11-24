@@ -15,6 +15,9 @@ mkdir -p "$res"
 	echo "offset=$PC_OFFSET"
 	echo "count=$PC_COUNT"
 	echo "image=${ImageOS:-?}/${ImageVersion:-?}"
+	# The bash the tests compare with when they read PI_TEST_REAL_BASH (the host step sets it on macOS).
+	echo "pi_test_real_bash=${PI_TEST_REAL_BASH:-unset}"
+	if [ -n "${PI_TEST_REAL_BASH:-}" ]; then echo "pi_test_real_bash_version=$("$PI_TEST_REAL_BASH" --version | head -n 1)"; fi
 } > "$meta"
 fail() {
 	echo "note=$*" >> "$meta"

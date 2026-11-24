@@ -11,6 +11,7 @@
 #     -f head=<sha> [-f base=<sha>] [-f plant=<sha>] [-f platforms=macos,windows,ubuntu] \
 #     [-f crates=pi-shell] [-f filter='<nextest filterset>'] [-f repeat=1] [-f legs=1] \
 #     [-f retries=0] [-f flaky_passes=false] [-f timeout_minutes=10] [-f as_root=false]
+#     [-f skip_bash_install=false]
 #
 # Inputs are used exactly as given: no spaces in lists, whole numbers written plainly. A plant
 # is a commit whose own change (plant^..plant) is applied to head; the plan fails when it does
@@ -130,6 +131,11 @@ on:
         type: string
       as_root:
         description: "Also run the ubuntu legs as root"
+        required: false
+        default: false
+        type: boolean
+      skip_bash_install:
+        description: "Control: the macOS legs skip the Homebrew bash install, and must read UNKNOWN"
         required: false
         default: false
         type: boolean
