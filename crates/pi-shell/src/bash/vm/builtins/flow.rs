@@ -556,6 +556,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				break;
 			};
 			let child = ctx.vp.vpid_of(pid);
+			finished_copy_left(ctx, child);
 			if is_child(ctx, child) {
 				list.push(child);
 			} else {
@@ -629,6 +630,29 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 		}
 	}
 	Ok(found)
+}
+
+/// bash's command or process substitution has its shell's jobs in its own
+/// table, and `wait PID` of one that finished returns its status
+/// (`wait_for` finds the job dead) and deletes it, its status kept
+/// (`delete_job`'s `bgp_add`): a `wait` there of `$!` after `x=$(…)`. Here
+/// the copy ([`crate::bash::vm::proc::Job::inherited`]) leaves the table
+/// with its status kept ([`crate::bash::vm::proc::JobTable::bgp`]), which
+/// the wait then returns. A running copy is no child of the substitution's
+/// process, and stays. bash only.
+fn finished_copy_left(ctx: &mut Ctx<'_, '_>, child: Vpid) {
+	use crate::bash::vm::proc::JobState;
+	if ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
+		return;
+	}
+	let Some((number, pid, status)) = ctx.vp.jobs.by_vpid(child).and_then(|j| match j.state {
+		JobState::Done(status) if j.inherited => Some((j.number, j.pid(), status)),
+		_ => None,
+	}) else {
+		return;
+	};
+	ctx.vp.jobs.remove(number);
+	crate::bash::vm::state::save_status(&mut ctx.k.root, ctx.cx.store, ctx.vp, child, pid, status);
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a

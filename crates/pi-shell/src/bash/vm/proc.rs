@@ -473,6 +473,14 @@ pub struct JobTable {
 	/// Where a command or process substitution leaves this shell: which
 	/// background jobs a signal killed it reports ([`super::killed`]).
 	pub comsub:   Comsub,
+	/// This shell is a fork (a subshell, a pipeline stage, a background
+	/// job, a command or process substitution) of a shell whose job list
+	/// was kept as it forked ([`Vproc::jobs_kept`], or this flag of that
+	/// shell): bash's fork keeps `jobs_list_frozen`, so this shell, and a
+	/// command or process substitution it starts, drops no finished job
+	/// ([`super::killed`]'s `mark_unreported`,
+	/// [`super::exec::drop_finished_jobs`]).
+	pub kept:     bool,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap

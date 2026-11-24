@@ -2533,9 +2533,14 @@ pub fn start_sub(
 				}
 			}
 			// bash keeps job control and the job list in `$( )`: `jobs`
-			// lists the parent's jobs, `fg` finds no current job.
+			// lists the parent's jobs, `fg` finds no current job. bash 5.3
+			// drops the finished jobs it would not report there first,
+			// unless the parent's job list is frozen.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 			child.jobs.comsub = super::proc::Comsub::Own;
+			if child.mode.dialect() != Dialect::Zsh {
+				drop_finished_jobs(k, cx, vp, &mut child);
+			}
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -2810,8 +2815,17 @@ pub fn start_procsub(
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
 	// bash's `process_substitute` sets `SUBSHELL_COMSUB` too: it reports no
-	// job a signal killed ([`super::killed`]).
+	// job a signal killed ([`super::killed`]). Its process keeps the job
+	// list (no `without_job_control`), and drops first the finished jobs a
+	// command substitution drops: `cat <(jobs)` lists what `$(jobs)` lists.
+	let bash = child.mode.dialect() != Dialect::Zsh;
+	if bash {
+		child.jobs = inherited_jobs(vp, true);
+	}
 	child.jobs.comsub = super::proc::Comsub::Own;
+	if bash {
+		drop_finished_jobs(k, cx, vp, &mut child);
+	}
 	zsh_subshell_traps(k, cx, &mut child, false);
 	// bash's `process_substitute` calls `setup_async_signals` too: without
 	// job control it ignores `INT` and `QUIT`.
@@ -4798,10 +4812,13 @@ pub(super) fn fork_async_ignored(
 }
 
 /// The job table a child that lists its parent's jobs starts with (a
-/// command substitution, a `jobs` pipeline stage): copies of them, which
-/// are not its children, and the statuses its parent kept for `wait PID`
-/// (bash's child has the parent's bgp list: a command substitution's `wait
-/// PID` finds one); `subshell` turns job control off.
+/// command or process substitution, a `jobs` pipeline stage): copies of
+/// them, which are not its children, and the statuses its parent kept for
+/// `wait PID` (bash's child has the parent's bgp list: a command
+/// substitution's `wait PID` finds one); `subshell` turns job control off.
+/// A fork keeps its shell's frozen job list: the parent's own
+/// ([`Vproc::jobs_kept`]) or the one it started with
+/// ([`super::proc::JobTable::kept`]).
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
 	let mut list = parent.list.clone();
@@ -4815,7 +4832,65 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		chld: 0,
 		subshell,
 		comsub: parent.comsub,
+		kept: parent.kept || vp.jobs_kept(),
 		bgp: parent.bgp.clone(),
+	}
+}
+
+/// bash 5.3 for the process of a command or process substitution of a shell
+/// that is not interactive (`process_substitute` sets `SUBSHELL_COMSUB` and
+/// `startup_state` 2 too): before the child reads its first command,
+/// `shell_getc`'s `notify_and_cleanup` (parse.y) deletes each finished job
+/// that `notify_of_job_status` marks notified there: every one but the job
+/// `$!` names, and not one that a
+/// SIGINT, SIGTERM or SIGPIPE killed, nor one that a signal the shell
+/// ignores with `trap '' SIG` killed (the child's `signal_is_trapped`,
+/// [`super::killed::ignored_by_trap`]); one that a signal the shell traps
+/// with a command killed goes. bash judges that by how the job ended (its
+/// wait status, [`crate::bash::store::Job::signal`]), not by its status: a
+/// job that exited 130, 141 or 143 goes. Without job control a background
+/// job starts with SIGINT ignored, so only one of a shell with job control
+/// (`set -m`) dies of it. Each one deleted keeps its status for `wait PID`
+/// (`delete_job`'s `bgp_add`),
+/// and the current and previous jobs are chosen again as `delete_job` does.
+/// `vp` dropped its own first, as it expanded the substitution
+/// (`xparse_dolparen` re-parses it through `shell_getc` too,
+/// [`super::killed::expanded`]): a `( … )`, job or stage forked from a `-c`
+/// shell drops every finished job there, `$!`'s too, so the child gets none.
+/// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`: where
+/// `vp`'s job list is kept ([`Vproc::jobs_kept`]: the last stage of a
+/// `lastpipe` pipeline, a function substitution, a trap run with the list
+/// frozen), or `vp` is itself a fork of a shell whose list was kept then
+/// (a subshell, a pipeline stage, a background job, a command or process
+/// substitution: [`super::proc::JobTable::kept`], which [`inherited_jobs`]
+/// set), `notify_and_cleanup` returns before `cleanup_dead_jobs`, and the
+/// child keeps every job. An interactive shell's command substitution reads
+/// no line through that path, and keeps every job too.
+fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut Vproc) {
+	if child.jobs.kept || super::jobctl::interactive(k) {
+		return;
+	}
+	let mut kept = |j: &super::proc::Job| {
+		use crate::bash::Signal;
+		match j.signal {
+			Some(Signal::Int | Signal::Term | Signal::Pipe) => true,
+			Some(sig) => super::killed::ignored_by_trap(cx, vp, sig),
+			None => false,
+		}
+	};
+	let dropped: Vec<(u32, Vpid, u32, i32)> = child
+		.jobs
+		.iter()
+		.filter_map(|j| match j.state {
+			super::proc::JobState::Done(status) if !kept(j) && !child.last_bg.is(j.vpid) => {
+				Some((j.number, j.vpid, j.pid(), status))
+			},
+			_ => None,
+		})
+		.collect();
+	for (number, vpid, pid, status) in dropped {
+		child.jobs.remove(number);
+		state::save_status(&mut k.root, cx.store, child, vpid, pid, status);
 	}
 }
 
