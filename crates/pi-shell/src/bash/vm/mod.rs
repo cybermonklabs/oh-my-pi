@@ -510,6 +510,13 @@ pub struct Kernel {
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
+	/// `extdebug`: pipeline stages a failing DEBUG trap skips, waiting for
+	/// their `Spawn` ([`proc::DebugSkip`]), one list per vproc and frame:
+	/// imaged (a snapshot can fall between two stages' traps). A list whose
+	/// `Spawn` never ran (a trap `return`ed) is dropped when a `Spawn` at
+	/// that frame or above next runs its stage traps (also with the trap
+	/// gone: the pseudo-trap check stays set once a DEBUG trap was).
+	pub debug_skips:        Vec<proc::DebugSkip>,
 	/// `(job, ops)`: the ops what decides a background job's pid has run
 	/// since a reader of the pid parked ([`Shell::decide_waited_bangs`]);
 	/// dropped when the job settles. Not imaged: a restored shell gives a
@@ -641,6 +648,7 @@ impl Kernel {
 			exec_signals: HashMap::new(),
 			reported_signal: None,
 			bangs: Vec::new(),
+			debug_skips: Vec::new(),
 			bang_spent: Vec::new(),
 			bang_kin: Vec::new(),
 			settled: Vec::new(),
@@ -1816,6 +1824,7 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			callout: false,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {

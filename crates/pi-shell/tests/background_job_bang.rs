@@ -331,12 +331,12 @@ async fn bang_of_a_source_job_does_not_wait_for_its_file() {
 /// its action waits, so `$!` names the job at once. The substitution row
 /// hung to the run's bound.
 ///
-/// The lone-job rows: bash runs a lone command's trap (and a pipeline
-/// stage's) in the shell before it forks, where `(( BASH_SUBSHELL ))` is
-/// false and the action does nothing; this engine runs it in the job. An
-/// action there that waits on the FIFO, or loops without end (as a lone
-/// function call's trap does in bash's child too), leaves `$!` waiting
-/// for nothing: the loop rows hung to the run's bound.
+/// The lone-job rows: a lone command's trap (and a pipeline stage's) runs
+/// in the shell before it forks, as bash runs it, where
+/// `(( BASH_SUBSHELL ))` is false and the action does nothing. A lone
+/// function call's trap runs again in the job under `set -T`, as in bash's
+/// child: an action there that loops without end leaves `$!` waiting for
+/// nothing. The loop rows hung to the run's bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn bang_of_a_job_does_not_wait_for_its_debug_trap() {
 	let in_function = |action: &str| {
@@ -442,11 +442,10 @@ async fn bang_of_a_job_that_reenters_eval_or_source_is_there_at_once() {
 /// The process `$!` names for a job a wrapper runs, by the pid probe
 /// ([`pid_row`]), as bash names it: a program `eval`, `.` or `source`
 /// `exec`s is `$!`; `command` and `exec` run the program as the job;
-/// `time` keeps the job's own pid. In a lone job's DEBUG trap under
-/// `set -T`, which bash runs in the shell before it forks, a builtin, a
-/// loop or a command substitution decides nothing. With nothing to run,
-/// `eval` answers at once, and a `builtin` whose output waits leaves the
-/// job its own pid.
+/// `time` keeps the job's own pid. A lone job's DEBUG trap runs in the
+/// shell before it forks, as bash runs it, so nothing it runs decides.
+/// With nothing to run, `eval` answers at once, and a `builtin` whose
+/// output waits leaves the job its own pid.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrapped_jobs_bang_names_what_bash_names() {
 	let rows = [
