@@ -659,7 +659,8 @@ fn read_input(
 				return Err(need);
 			},
 		};
-		let ProbeResult::Input { data: d, eof, timed_out } = answer else {
+		// zsh's `read` takes a failed read as the end of its input.
+		let ProbeResult::Input { data: d, eof, timed_out, .. } = answer else {
 			return Ok((data, true, false));
 		};
 		data.extend_from_slice(&d);

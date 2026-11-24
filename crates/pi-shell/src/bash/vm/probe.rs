@@ -19,7 +19,7 @@ use super::{
 use crate::bash::{
 	diag,
 	event::WaitKey,
-	fd::FdRef,
+	fd::{BadFd, FdOrigin, FdRef},
 	fs::{Access, FileKind, FsOp, FsPoll, OpenFlags, Stat, StatKind},
 	host::Deadline,
 	ids::Platform,
@@ -343,6 +343,9 @@ pub fn perform(
 		},
 		Probe::Input { fd, delim, lines, nchars, timeout_ns, .. } => {
 			let handle = input_handle(k, vp, *fd);
+			// A closed fd fails as read(2) does (`EBADF`); a lost one (a host
+			// file a restore could not reopen) reads end of file.
+			let closed = handle.origin() == FdOrigin::Closed;
 			let seekable = handle.kind() == Some(FileKind::Regular);
 			// A Windows console in line mode ends a line with `\r\n`; a Unix
 			// terminal maps the `\r` to `\n` itself (ICRNL). Pipes and files
@@ -364,6 +367,7 @@ pub fn perform(
 						data:      line_input(std::mem::take(input), console_lines),
 						eof:       false,
 						timed_out: false,
+						error:     None,
 					};
 				}
 				// On seekable fds read ahead, then give back what follows
@@ -377,18 +381,28 @@ pub fn perform(
 				let want = nchars.map_or(want, |n| want.min(n - input.len()));
 				let start = input.len();
 				input.resize(start + want, 0);
-				let polled = handle.poll_read(&mut tcx, &mut input[start..]);
+				let polled = if closed {
+					Poll::Ready(Err(std::io::Error::other(BadFd)))
+				} else {
+					handle.poll_read(&mut tcx, &mut input[start..])
+				};
 				let got = match &polled {
 					Poll::Ready(Ok(n)) => *n,
 					_ => 0,
 				};
 				input.truncate(start + got);
 				match polled {
-					Poll::Ready(Ok(0) | Err(_)) => {
+					// A failed read(2) ends the input too; its error goes with
+					// the bytes read before it, for bash's `read error`.
+					Poll::Ready(res @ (Ok(0) | Err(_))) => {
+						let error = res
+							.err()
+							.map(|e| BString::from(diag::strerror(&e).as_bytes()));
 						break ProbeResult::Input {
-							data:      line_input(std::mem::take(input), console_lines),
-							eof:       true,
+							data: line_input(std::mem::take(input), console_lines),
+							eof: true,
 							timed_out: false,
+							error,
 						};
 					},
 					Poll::Ready(Ok(n)) => {
@@ -423,6 +437,7 @@ pub fn perform(
 									data:      BString::from(std::mem::take(input)),
 									eof:       false,
 									timed_out: true,
+									error:     None,
 								};
 							}
 						}

@@ -68,8 +68,9 @@ impl End {
 	/// [`SpawnSpec::extra_fds`](crate::bash::SpawnSpec::extra_fds) carries no
 	/// direction, so it is probed with zero-length I/O, which transfers
 	/// nothing and which the wrong direction refuses, as `read(2)`/`write(2)`
-	/// on an fd opened the other way do (`EBADF`; the engine's pipe ends answer
-	/// `Unsupported`). `Pending` counts as capable (a full or empty pipe).
+	/// on an fd opened the other way do (`EBADF`; the engine's objects answer
+	/// [`BadFd`](crate::bash::fd::BadFd)). `Pending` counts as capable (a
+	/// full or empty pipe).
 	/// The child must get a pipe in that direction rather than a socket:
 	/// Linux cannot reopen a socket through `/dev/fd/N` (`cat <(…)`, ENXIO).
 	pub fn direction(&mut self) -> (bool, bool) {

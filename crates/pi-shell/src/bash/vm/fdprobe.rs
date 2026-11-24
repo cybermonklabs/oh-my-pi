@@ -181,14 +181,18 @@ fn unsupported() -> io::Error {
 }
 
 /// Whether a zero-length poll's error means "not this direction" (the
-/// [`File`] direction contract, or `EBADF` from a descriptor opened the
-/// other way) rather than a condition `select(2)` reports as ready.
+/// [`File`] direction contract: `EBADF` from a descriptor opened the other
+/// way or from an engine object, or `Unsupported`) rather than a condition
+/// `select(2)` reports as ready.
 fn wrong_direction(e: &io::Error) -> bool {
 	#[cfg(unix)]
 	if e.raw_os_error() == Some(libc::EBADF) {
 		return true;
 	}
 	e.kind() == io::ErrorKind::Unsupported
+		|| e
+			.get_ref()
+			.is_some_and(|inner| inner.is::<crate::bash::fd::BadFd>())
 }
 
 /// Install `file` at `slot` with `flags`: its fd.

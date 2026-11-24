@@ -129,8 +129,10 @@ impl Drop for PipeWriter {
 	}
 }
 
-fn unsupported<T>() -> Poll<io::Result<T>> {
-	Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+/// The wrong direction of a pipe end fails as read(2) or write(2) on a
+/// kernel pipe's other end does: `EBADF`.
+fn bad_fd<T>() -> Poll<io::Result<T>> {
+	Poll::Ready(Err(io::Error::other(crate::bash::fd::BadFd)))
 }
 
 impl File for PipeReader {
@@ -157,7 +159,7 @@ impl File for PipeReader {
 	}
 
 	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
-		unsupported()
+		bad_fd()
 	}
 
 	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -184,7 +186,7 @@ impl File for PipeReader {
 
 impl File for PipeWriter {
 	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
-		unsupported()
+		bad_fd()
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {

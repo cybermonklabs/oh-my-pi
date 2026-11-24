@@ -278,10 +278,14 @@ pub trait DirIter: Send {
 /// of a partially written buffer in its frames, so a write interrupted by a
 /// snapshot resumes after restore.
 ///
-/// Direction contract: a zero-length read or write in a direction the object
-/// cannot do fails with `Unsupported` (like `EBADF` on an fd opened the other
-/// way); in a direction it can do, it moves nothing and returns `Ok(0)` or
-/// `Pending`. Hosts probe this to give an external a one-way OS pipe for an
+/// Direction contract: a read or write in a direction the object cannot do,
+/// zero-length too, fails with `EBADF` (an OS error, or
+/// [`BadFd`](crate::bash::fd::BadFd) for an engine object), as read(2) and
+/// write(2) on an fd opened the other way do; a host object that cannot tell
+/// may answer `Unsupported`. In a direction it can do, a zero-length call
+/// moves nothing and returns `Ok(0)` or `Pending`. Builtins report the error
+/// with its text (`read error: Bad file descriptor`), and
+/// hosts probe this to give an external a one-way OS pipe for an
 /// engine-only fd (`/dev/fd/63` of `cat <(…)` must be openable by path).
 pub trait File: Send {
 	/// Read into `buf`; `Ok(0)` is end of file. Must not block.

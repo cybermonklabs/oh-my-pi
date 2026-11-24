@@ -64,7 +64,8 @@ pub struct StdFile {
 	/// `F_GETFL`; `None` when unknown).
 	#[cfg(unix)]
 	access: Option<libc::c_int>,
-	/// The null device: a write is complete without a syscall.
+	/// The null device opened for writing: a write is complete without a
+	/// syscall. A read-only one is not: its write fails with `EBADF`.
 	null:   bool,
 	/// Read-ahead of a regular file this engine opened for reading only
 	/// ([`StdFile::opened`]); `None` for every other file and once the
@@ -174,9 +175,11 @@ impl StdFile {
 	)]
 	fn with_kind(file: fs::File, kind: FileKind, null: bool) -> Self {
 		// Only a descriptor that waits for readiness consults its access
-		// mode ([`Self::gated`]); a regular file or device skips the `fcntl`.
+		// mode ([`Self::gated`]), and the null device, whose writes skip the
+		// syscall only when it was opened for writing; a regular file or
+		// another device skips the `fcntl`.
 		#[cfg(unix)]
-		let access = waits(kind)
+		let access = (waits(kind) || null)
 			.then(|| {
 				use std::os::fd::AsRawFd;
 				// SAFETY: F_GETFL only reads the flags of our open descriptor.
@@ -184,6 +187,8 @@ impl StdFile {
 				(flags >= 0).then_some(flags & libc::O_ACCMODE)
 			})
 			.flatten();
+		#[cfg(unix)]
+		let null = null && access != Some(libc::O_RDONLY);
 		Self {
 			file,
 			kind,
