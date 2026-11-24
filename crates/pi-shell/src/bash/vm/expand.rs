@@ -18,7 +18,7 @@ use std::{borrow::Cow, fmt::NumBuffer, sync::Arc};
 use bstr::{BStr, BString, ByteSlice};
 
 use super::{
-	Cx, Kernel, arith,
+	Cx, Kernel, arith, dynvars,
 	proc::{Atom, Vproc},
 	quote,
 	state::{self, Level, Var, VarEdit},
@@ -177,6 +177,9 @@ pub struct Expander<'e, 'c> {
 	/// The command evaluating arithmetic here (`((` for `(( ))` and the
 	/// arith-`for` header): it prefixes non-fatal arithmetic warnings.
 	pub arith_cmd:  Option<&'static str>,
+	/// The operator of the parameter expansion being read, for the
+	/// lookups a read of a special variable makes ([`dynvars::Site`]).
+	dyn_op:         dynvars::Op,
 	ifs:            IfsCache,
 	/// `set -f` and `shopt extglob`, looked up once per expansion.
 	glob_opts:      Option<GlobOpts>,
@@ -267,6 +270,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			line,
 			sub_status: None,
 			arith_cmd: None,
+			dyn_op: dynvars::Op::Value,
 			ifs: IfsCache::Unknown,
 			glob_opts: None,
 			pool: Vec::new(),
@@ -314,6 +318,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 		f(self)?;
 		self.note(|| Atom::Done);
 		Ok(())
+	}
+
+	/// The lookups bash makes of the special variable `s` at `site`
+	/// ([`dynvars::look`]), once although a park replays this expansion.
+	pub fn look_once(&mut self, s: dynvars::Special, site: dynvars::Site) -> X<()> {
+		self.effect(|ex| Ok(dynvars::look(ex.k, ex.cx, ex.vp, s.name(), site)?))
 	}
 
 	fn read_atom(&mut self, f: impl FnOnce(&mut Self) -> X<Val>) -> X<Val> {
@@ -566,6 +576,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				vp:       &mut *self.vp,
 				prefix:   self.arith_cmd,
 				expanded: false,
+				element:  dynvars::Site::ArithElement,
 			};
 			arith::eval(expanded, &mut env)
 		};
@@ -1044,7 +1055,34 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	// ---- parameters --------------------------------------------------------
 
+	/// One parameter expansion, its operator kept in [`Self::dyn_op`]
+	/// while it reads: a read of bash code's special `RANDOM` or `SECONDS`
+	/// makes the lookups bash makes for that operator.
 	fn param(
+		&mut self,
+		unit: &Arc<Unit>,
+		p: &ParamIr,
+		sink: &mut Sink<'_>,
+		quoted: bool,
+		rhs: bool,
+	) -> X<()> {
+		let op = match &p.op {
+			OpIr::Length => dynvars::Op::Length,
+			OpIr::Transform(b'a' | b'A') => dynvars::Op::Attrs,
+			OpIr::Substr { .. }
+			| OpIr::Trim { .. }
+			| OpIr::Replace { .. }
+			| OpIr::Case { .. }
+			| OpIr::Transform(_) => dynvars::Op::Operator,
+			_ => dynvars::Op::Value,
+		};
+		let outer = std::mem::replace(&mut self.dyn_op, op);
+		let res = self.param_op(unit, p, sink, quoted, rhs);
+		self.dyn_op = outer;
+		res
+	}
+
+	fn param_op(
 		&mut self,
 		unit: &Arc<Unit>,
 		p: &ParamIr,
@@ -1117,7 +1155,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let names = self.read_atom(|ex| {
 					let vars =
 						state::scan(&ex.k.root, ex.cx.store, ex.vp, crate::bash::store::Table::Var)?;
-					let items = vars
+					let mut items: Vec<BString> = vars
 						.into_iter()
 						.filter_map(|(k, _)| match k {
 							crate::bash::store::KeyBuf::Var(n) if n.starts_with(prefix.as_slice()) => {
@@ -1126,6 +1164,9 @@ impl<'e, 'c> Expander<'e, 'c> {
 							_ => None,
 						})
 						.collect();
+					// bash's dynamic variables this shell keeps no variable for.
+					dynvars::with_listed(ex.k, ex.cx.store, ex.vp, &mut items)?;
+					items.retain(|n| n.starts_with(prefix.as_slice()));
 					Ok(Val::List { items, star: false })
 				})?;
 				let items = match names {
@@ -1730,10 +1771,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.and_then(|s| s.parse().ok())
 						.unwrap_or(0);
 					// A scalar has only `[0]`; an unset or empty array reads as
-					// 0 without the warning `${e[-1]}` gives.
+					// 0 without the warning `${e[-1]}` gives. Bash code's
+					// special `RANDOM` and `SECONDS` are scalars.
+					let special = dynvars::visible(self.k, self.cx.store, self.vp, &name)?.is_some();
 					let (before, empty) =
 						match state::lookup(&self.k.root, self.cx.store, self.vp, &name)? {
-							None => (false, !is_dynamic(&name)),
+							None => (special, !is_dynamic(&name)),
 							Some(v) => match &v.value {
 								VarValue::Str(_) => (true, false),
 								_ => (v.next_index() > 0 && v.next_index() + n < 0, v.next_index() == 0),
@@ -1770,14 +1813,23 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// Run `f` on the value of `p` in place when `p` is a plain set scalar
 	/// reference (`$name` or `$1`, no subscript, not indirect, not a dynamic
-	/// variable) and no replay log is recorded; `None` otherwise (the
-	/// general path copies the value).
+	/// variable nor a name reference to `RANDOM` or `SECONDS`) and no replay
+	/// log is recorded; `None` otherwise (the general path copies the value).
 	fn with_scalar<R>(&mut self, p: &ParamIr, f: impl FnOnce(&[u8]) -> R) -> X<Option<R>> {
 		if self.record || p.indirect || p.index.is_some() {
 			return Ok(None);
 		}
 		match &p.param {
 			ParamRef::Var(name) if !is_dynamic(name) => {
+				// A reference to bash code's special `RANDOM` or `SECONDS`
+				// reads it as the name does ([`Self::var_value`]).
+				if state::may_be_nameref(&self.k.root, self.vp)
+					&& let state::Deref::To { name: target, index: None } =
+						state::deref(&self.k.root, self.cx.store, self.vp, name)?
+					&& dynvars::Special::of(&target).is_some()
+				{
+					return Ok(None);
+				}
 				Ok(state::lookup(&self.k.root, self.cx.store, self.vp, name)?
 					.and_then(Var::as_scalar)
 					.map(f))
@@ -2420,9 +2472,40 @@ impl<'e, 'c> Expander<'e, 'c> {
 		})
 	}
 
+	/// A read of bash code's special `RANDOM` or `SECONDS` (`index` 0, or
+	/// every element when `list`): the lookups bash 5.3.20 makes before
+	/// and after the read for this subscript and [`Self::dyn_op`]
+	/// ([`dynvars::Site::ExpandBefore`]), the read one lookup more. A
+	/// subscript other than 0 names no element.
+	fn special_value(&mut self, s: dynvars::Special, index: Option<&[u8]>, list: bool) -> X<Val> {
+		let sub = match index {
+			_ if list => dynvars::Sub::All,
+			None => dynvars::Sub::None,
+			Some(b"0") => dynvars::Sub::Zero,
+			Some(_) => dynvars::Sub::Other,
+		};
+		let e = dynvars::Expansion { sub, op: self.dyn_op };
+		for _ in 0..dynvars::Site::ExpandBefore(e).lookups() {
+			dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		}
+		let value = dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		for _ in 0..dynvars::Site::ExpandAfter(e).lookups() {
+			dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		}
+		let text = BString::from(value.format_into(&mut NumBuffer::new()));
+		Ok(match sub {
+			dynvars::Sub::None | dynvars::Sub::Zero => Val::Str(text),
+			dynvars::Sub::Other => Val::Unset,
+			dynvars::Sub::All => Val::List { items: vec![text], star: false },
+		})
+	}
+
 	/// Value of variable `name` (element `index`, or every element when
 	/// `list`), including bash's dynamic variables.
 	fn var_value(&mut self, name: &[u8], index: Option<&[u8]>, list: bool) -> X<Val> {
+		if let Some(s) = dynvars::visible(self.k, self.cx.store, self.vp, name)? {
+			return self.special_value(s, index, list);
+		}
 		if let Some(v) = self.dynamic(name)? {
 			return Ok(match (v, list) {
 				(DynVal::Str(s), true) => Val::List { items: vec![s], star: false },
@@ -2485,6 +2568,13 @@ impl<'e, 'c> Expander<'e, 'c> {
 				};
 				return self.var_value(&target, Some(key.as_slice()), false);
 			},
+			// A reference to bash code's special `RANDOM` or `SECONDS`
+			// reads it as the name does.
+			state::Deref::To { name: target, index: None } => {
+				if let Some(s) = dynvars::visible(self.k, self.cx.store, self.vp, &target)? {
+					return self.special_value(s, index, list);
+				}
+			},
 			state::Deref::To { .. } | state::Deref::Plain => {},
 		}
 		let Some(var) = state::lookup(&self.k.root, self.cx.store, self.vp, name)? else {
@@ -2546,16 +2636,21 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// `${!name}` / `${!a[@]}`.
 	fn indirect(&mut self, unit: &Arc<Unit>, p: &ParamIr) -> X<Val> {
-		// `${!ref}` of a nameref is the name it refers to.
+		// `${!ref}` of a nameref is the name it refers to (bash looks that
+		// variable up: a special one's value function runs).
 		if let (ParamRef::Var(name), None) = (&p.param, &p.index)
 			&& state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?
 				.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
 		{
 			let name = name.clone();
 			return self.read_atom(|ex| {
-				Ok(state::lookup_declared(&ex.k.root, ex.cx.store, ex.vp, &name)?
+				let target = state::lookup_declared(&ex.k.root, ex.cx.store, ex.vp, &name)?
 					.and_then(Var::as_scalar)
-					.map_or(Val::Unset, |s| Val::Str(BString::from(s))))
+					.map(BString::from);
+				if let Some(t) = &target {
+					dynvars::look(ex.k, ex.cx, ex.vp, t, dynvars::Site::Indirect)?;
+				}
+				Ok(target.map_or(Val::Unset, Val::Str))
 			});
 		}
 		// `${!a[@]}` lists the keys; with an operator (`${!v[@]@Q}`) it is an
@@ -2566,6 +2661,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			let name = name.clone();
 			let star = matches!(p.index, Some(SubIr::Star));
 			let v = self.read_atom(|ex| {
+				dynvars::look(ex.k, ex.cx, ex.vp, &name, dynvars::Site::Keys)?;
 				if let Some(table) = dynamic_table(&name) {
 					let items = ex.hash_table(table)?.into_iter().map(|(k, _)| k).collect();
 					return Ok(Val::List { items, star });
@@ -2588,7 +2684,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 			quoted:   p.quoted,
 			braced:   p.braced,
 		};
-		let target = match self.value(unit, &direct)? {
+		let v = self.value(unit, &direct)?;
+		// bash looks a special variable up once more after its value.
+		if let (ParamRef::Var(n), None) = (&p.param, &p.index)
+			&& dynvars::Special::of(n).is_some()
+		{
+			self.effect(|ex| Ok(dynvars::look(ex.k, ex.cx, ex.vp, n, dynvars::Site::Indirect)?))?;
+		}
+		let target = match v {
 			Val::Str(s) => s,
 			Val::List { items, .. } => BString::from(items.join(&b' ')),
 			// bash: an unset variable cannot be followed (`a[7]: invalid
@@ -2866,24 +2969,23 @@ fn dynamic_value(
 	name: &[u8],
 ) -> Result<Option<DynVal>, StoreError> {
 	Ok(Some(match name {
+		// Bash code's `RANDOM` and `SECONDS` are variables with value
+		// functions: [`Expander::var_value`] reads them while they are
+		// special ([`dynvars`]); after `unset` or an array assignment, or
+		// with a local or temporary of the name in scope, they are plain.
+		b"RANDOM" | b"SECONDS" if vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+			return Ok(None);
+		},
 		b"RANDOM" => {
 			DynVal::Str(BString::from(k.next_random(cx, vp).format_into(&mut NumBuffer::new())))
 		},
 		b"SRANDOM" => DynVal::Str(BString::from(
 			((cx.host.random() & 0xffff_ffff) as u32).format_into(&mut NumBuffer::new()),
 		)),
-		b"SECONDS" => {
-			// After `unset SECONDS`, or with a local or temporary `SECONDS`
-			// in scope, bash code's `SECONDS` is a plain variable.
-			if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& !seconds_visible(k, cx.store, vp)?
-			{
-				return Ok(None);
-			}
-			let secs = k.seconds_now(vp, cx.host.now_ns());
-			seconds_read(k, cx, vp, secs)?;
-			DynVal::Str(BString::from(secs.format_into(&mut NumBuffer::new())))
-		},
+		b"SECONDS" => DynVal::Str(BString::from(
+			k.seconds_now(vp, cx.host.now_ns())
+				.format_into(&mut NumBuffer::new()),
+		)),
 		b"EPOCHSECONDS" => {
 			DynVal::Str(BString::from(cx.host.wall().secs.format_into(&mut NumBuffer::new())))
 		},
@@ -2915,94 +3017,6 @@ fn dynamic_value(
 		},
 		_ => return Ok(None),
 	}))
-}
-
-/// Whether bash code's `SECONDS` as `vp` sees it is the shell's clock: not
-/// after `unset SECONDS`, and not while a local or temporary `SECONDS` is in
-/// scope (bash makes those plain variables; `make_local_variable` copies no
-/// dynamic value).
-pub(crate) fn seconds_visible(
-	k: &Kernel,
-	store: &mut dyn crate::bash::store::StateStore,
-	vp: &Vproc,
-) -> Result<bool, StoreError> {
-	Ok(!k.seconds_plain(vp)
-		&& state::lookup_declared_scoped(&k.root, store, vp, b"SECONDS")?
-			.1
-			.is_none())
-}
-
-/// bash's `get_seconds`, run by every lookup of the shell's `SECONDS` (a
-/// read of `$SECONDS`, and `declare`, `local` and `export` of the name,
-/// which call `find_variable`): the variable gets the integer attribute
-/// (`set_int_value` with flag 1), so a `SECONDS=` after it is arithmetic,
-/// and its value (the text a `SECONDS+=` appends to) becomes `secs`, the
-/// count now.
-fn seconds_read(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &mut Vproc,
-	secs: i64,
-) -> Result<(), StoreError> {
-	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
-		return Ok(());
-	}
-	let text = BString::from(secs.format_into(&mut NumBuffer::new()));
-	let var = state::global_in(cx.store, vp, b"SECONDS")?;
-	if var.is_some_and(|v| {
-		v.attrs.contains(Attrs::INTEGER)
-			&& !v.attrs.contains(Attrs::INVISIBLE)
-			&& matches!(&v.value, VarValue::Str(s) if *s == text)
-	}) {
-		return Ok(());
-	}
-	let attrs = var
-		.map_or(Attrs::NONE, |v| v.attrs)
-		.without(Attrs::INVISIBLE)
-		.with(Attrs::INTEGER);
-	let var = Var { attrs, value: VarValue::Str(text) };
-	state::store_var(&mut k.root, cx.store, vp, b"SECONDS", Some(var), Level::Global);
-	Ok(())
-}
-
-/// A lookup of the shell's `SECONDS` outside an expansion (`declare`,
-/// `local`, `export`): [`seconds_read`] when bash code's `SECONDS` is the
-/// shell's clock.
-pub(crate) fn seconds_lookup(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &mut Vproc,
-) -> Result<(), StoreError> {
-	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !seconds_visible(k, cx.store, vp)? {
-		return Ok(());
-	}
-	let secs = k.seconds_now(vp, cx.host.now_ns());
-	seconds_read(k, cx, vp, secs)
-}
-
-/// bash makes the shell's `SECONDS` a plain variable before an element, a
-/// compound or an array attribute reaches it (`convert_var_to_array` and
-/// `convert_var_to_assoc` drop the dynamic value and the assign function).
-/// The lookup before it (`find_variable`) reads the clock, so the array's
-/// element 0 is the count and the variable is integer. A readonly
-/// `SECONDS` stays the clock: the assignment, or the `declare -a`/`-A`
-/// (bash 5.3.20's `invalid_readonly_attrs`), that follows refuses it.
-pub(crate) fn seconds_to_plain(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &mut Vproc,
-) -> Result<(), StoreError> {
-	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !seconds_visible(k, cx.store, vp)? {
-		return Ok(());
-	}
-	let secs = k.seconds_now(vp, cx.host.now_ns());
-	seconds_read(k, cx, vp, secs)?;
-	if state::global_in(cx.store, vp, b"SECONDS")?.is_some_and(|v| v.attrs.contains(Attrs::READONLY))
-	{
-		return Ok(());
-	}
-	k.set_seconds_plain(cx.store, vp);
-	Ok(())
 }
 
 /// Whether [`Expander::dynamic`] computes `name` (keep in sync).
@@ -3874,7 +3888,8 @@ pub fn arith_value(
 	vp: &mut Vproc,
 	text: &[u8],
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: None, expanded: false };
+	let mut env =
+		Vars { k, cx, vp, prefix: None, expanded: false, element: dynvars::Site::ArithElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -3982,7 +3997,8 @@ pub fn arith_command(
 	vp: &mut Vproc,
 	text: &[u8],
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: Some("(("), expanded: false };
+	let mut env =
+		Vars { k, cx, vp, prefix: Some("(("), expanded: false, element: dynvars::Site::ArithElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -3996,7 +4012,7 @@ pub fn arith_let(
 	text: &[u8],
 	expanded: bool,
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: None, expanded };
+	let mut env = Vars { k, cx, vp, prefix: None, expanded, element: dynvars::Site::LetElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -4009,6 +4025,9 @@ struct Vars<'v, 'c> {
 	prefix:   Option<&'static str>,
 	/// The text is expanded already (`let` with `assoc_expand_once`).
 	expanded: bool,
+	/// The lookups an element assignment makes of a special variable
+	/// before it becomes a plain array: `let`'s or another evaluation's.
+	element:  dynvars::Site,
 }
 
 impl arith::Env for Vars<'_, '_> {
@@ -4088,8 +4107,13 @@ impl arith::Env for Vars<'_, '_> {
 		name: &[u8],
 		index: Option<&[u8]>,
 	) -> Result<Option<arith::Value>, arith::Error> {
-		// `$((RANDOM))`, `$((LINENO))`: dynamic variables are computed here
-		// too.
+		// Bash code's special `RANDOM` and `SECONDS` ([`dynvars`]).
+		match dynvars::visible(self.k, self.cx.store, self.vp, name) {
+			Ok(Some(s)) => return self.special_read(s, index),
+			Ok(None) => {},
+			Err(e) => return Err(self.store_failed(e)),
+		}
+		// `$((LINENO))`: dynamic variables are computed here too.
 		if is_dynamic(name) {
 			let line = super::exec::current_line(self.vp);
 			if let Ok(Some(v)) = dynamic_value(self.k, self.cx, self.vp, line, name) {
@@ -4126,6 +4150,14 @@ impl arith::Env for Vars<'_, '_> {
 				.map(arith::Value::of);
 			return self.unbound_checked(name, value);
 		};
+		// A reference to a special variable reads it as the name does.
+		if let state::Deref::To { name: t, index: None } = &target {
+			match dynvars::visible(self.k, self.cx.store, self.vp, t) {
+				Ok(Some(s)) => return self.special_read(s, index),
+				Ok(None) => {},
+				Err(e) => return Err(self.store_failed(e)),
+			}
+		}
 		let (name, index) = deref_target(&target, name, index);
 		let var = state::lookup(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
@@ -4142,24 +4174,28 @@ impl arith::Env for Vars<'_, '_> {
 		let (name, index) = deref_target(&target, name, index);
 		let mut buf = NumBuffer::new();
 		let text = value.format_into(&mut buf).as_bytes();
-		// bash's arithmetic assignment is `bind_int_variable`: on the
-		// shell's `SECONDS` it runs `assign_seconds`, as `SECONDS=` does,
-		// and an element (`SECONDS[0]`) makes `SECONDS` a plain array first.
-		let seconds_clock = name == b"SECONDS"
-			&& self.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-			&& match seconds_visible(self.k, self.cx.store, self.vp) {
-				Ok(visible) => visible,
-				Err(e) => {
-					self.k.fail(e);
-					return Err(arith::Error::Expand { diag: Box::new(Diag::StoreFailed) });
-				},
+		// bash's arithmetic assignment is `bind_int_variable`: it looks a
+		// special `RANDOM` or `SECONDS` up first (through a reference
+		// twice), then runs its assignment function as `NAME=` does; an
+		// element makes it a plain array first ([`dynvars`]).
+		let special = match dynvars::visible(self.k, self.cx.store, self.vp, name) {
+			Ok(s) => s.is_some(),
+			Err(e) => return Err(self.store_failed(e)),
+		};
+		if special {
+			let res = if index.is_some() {
+				dynvars::to_plain(self.k, self.cx, self.vp, name, Some(self.element))
+			} else {
+				let site = if matches!(target, state::Deref::To { .. }) {
+					dynvars::Site::NamerefAssign
+				} else {
+					dynvars::Site::ArithAssign
+				};
+				dynvars::look(self.k, self.cx, self.vp, name, site)
 			};
-		if seconds_clock
-			&& index.is_some()
-			&& let Err(e) = seconds_to_plain(self.k, self.cx, self.vp)
-		{
-			self.k.fail(e);
-			return Err(arith::Error::Expand { diag: Box::new(Diag::StoreFailed) });
+			if let Err(e) = res {
+				return Err(self.store_failed(e));
+			}
 		}
 		let cur = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
@@ -4177,7 +4213,7 @@ impl arith::Env for Vars<'_, '_> {
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
 			return Ok(());
 		}
-		if seconds_clock && index.is_none() {
+		if special && index.is_none() {
 			let lhs = super::builtins::Lhs { name, index: None, append: false };
 			let value = super::proc::AssignValue::Scalar(BString::from(text));
 			super::builtins::set_value(self.k, self.cx, self.vp, lhs, value, Level::Dynamic)
@@ -4305,6 +4341,39 @@ fn assign_number(var: &mut Var, index: Option<&[u8]>, text: &[u8]) {
 }
 
 impl Vars<'_, '_> {
+	/// A read of bash code's special `RANDOM` or `SECONDS` in arithmetic:
+	/// one lookup, an element's one more first
+	/// ([`dynvars::Site::ArithElementRead`]); element 0 is the value,
+	/// another is unset.
+	fn special_read(
+		&mut self,
+		s: dynvars::Special,
+		index: Option<&[u8]>,
+	) -> Result<Option<arith::Value>, arith::Error> {
+		let before = if index.is_some() {
+			dynvars::Site::ArithElementRead.lookups()
+		} else {
+			0
+		};
+		let mut value = 0;
+		for _ in 0..=before {
+			value = match dynvars::lookup(self.k, self.cx, self.vp, s) {
+				Ok(v) => v,
+				Err(e) => return Err(self.store_failed(e)),
+			};
+		}
+		let value = index
+			.is_none_or(|i| i == b"0")
+			.then_some(arith::Value::Number(value));
+		self.unbound_checked(s.name(), value)
+	}
+
+	/// A failed store: the kernel takes the error, the evaluation fails.
+	fn store_failed(&mut self, e: StoreError) -> arith::Error {
+		self.k.fail(e);
+		arith::Error::Expand { diag: Box::new(Diag::StoreFailed) }
+	}
+
 	/// `value` as [`arith::Env::get`] returns it: an unset one is an error
 	/// under `set -u`, naming `name` (bash names the array for an unset
 	/// element).

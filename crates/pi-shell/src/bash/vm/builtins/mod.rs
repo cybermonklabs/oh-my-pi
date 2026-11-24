@@ -330,6 +330,27 @@ impl<'a, 'c> Ctx<'a, 'c> {
 		}
 	}
 
+	/// Run `look` once in this command although the builtin runs again
+	/// after a probe or a command substitution: `look` makes the lookups
+	/// bash makes of a special `RANDOM` or `SECONDS` at one site
+	/// ([`super::dynvars`]), each a `$RANDOM` draw. The first run logs it
+	/// done ([`Atom::Done`](super::proc::Atom::Done)) at this point of the
+	/// replay log, a re-run skips it. Call it only for a name
+	/// [`super::dynvars::named`] names (nothing is logged for another).
+	pub fn once(
+		&mut self,
+		look: impl FnOnce(&mut Self) -> Result<(), crate::bash::store::StoreError>,
+	) -> Result<(), Need> {
+		if matches!(self.log.get(self.log_cursor), Some(super::proc::Atom::Done)) {
+			self.log_cursor += 1;
+			return Ok(());
+		}
+		look(self)?;
+		self.log.insert(self.log_cursor, super::proc::Atom::Done);
+		self.log_cursor += 1;
+		Ok(())
+	}
+
 	/// Queue bytes for stdout.
 	pub fn out(&mut self, bytes: &[u8]) {
 		self.out_fd(1, bytes);

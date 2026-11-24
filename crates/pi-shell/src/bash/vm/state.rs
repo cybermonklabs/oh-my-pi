@@ -268,18 +268,29 @@ pub struct Scope {
 	pub zsh:        Option<Box<ZshScope>>,
 }
 
-impl Random {
-	/// The generator as [`MiscKey::Random`] stores it: `seed:last`.
-	pub fn encode(self) -> BString {
-		BString::from(format!("{}:{}", self.seed, self.last))
+/// The shell's generator as [`MiscKey::Random`] stores it: `seed:last`, and
+/// `:plain` once bash code removed `RANDOM`'s special meaning
+/// (`Kernel::random_plain`).
+pub fn random_record(rand: Random, plain: bool) -> BString {
+	let mut s = BString::from(format!("{}:{}", rand.seed, rand.last));
+	if plain {
+		s.extend_from_slice(b":plain");
 	}
+	s
+}
 
-	/// A generator from [`Random::encode`]'s text.
-	pub fn decode(text: &[u8]) -> Option<Self> {
-		let text = std::str::from_utf8(text).ok()?;
-		let (seed, last) = text.split_once(':')?;
-		Some(Self { seed: seed.parse().ok()?, last: last.parse().ok()? })
-	}
+/// The generator and the plain flag from [`random_record`]'s text.
+pub fn parse_random_record(text: &[u8]) -> Option<(Random, bool)> {
+	let text = std::str::from_utf8(text).ok()?;
+	let mut parts = text.splitn(3, ':');
+	let seed = parts.next()?.parse().ok()?;
+	let last = parts.next()?.parse().ok()?;
+	let plain = match parts.next() {
+		None => false,
+		Some("plain") => true,
+		Some(_) => return None,
+	};
+	Some((Random { seed, last }, plain))
 }
 
 /// What the engine derives from the root state in the store. Kept exact by
@@ -3236,15 +3247,17 @@ mod tests {
 	}
 
 	#[test]
-	fn random_state_round_trips_through_its_text() {
+	fn random_state_round_trips_through_its_record() {
 		let mut r = Random::default();
 		r.seed(42);
 		r.next();
-		let mut back = Random::decode(&r.encode()).unwrap();
-		assert_eq!(back, r);
+		let (mut back, plain) = parse_random_record(&random_record(r, false)).unwrap();
+		assert_eq!((back, plain), (r, false));
 		assert_eq!(back.next(), 26794, "continues the sequence");
-		assert_eq!(Random::decode(b"7"), None);
-		assert_eq!(Random::decode(b"x:1"), None);
+		assert_eq!(parse_random_record(&random_record(r, true)), Some((r, true)));
+		assert_eq!(parse_random_record(b"7"), None);
+		assert_eq!(parse_random_record(b"x:1"), None);
+		assert_eq!(parse_random_record(b"1:2:other"), None);
 	}
 
 	// Golden: 2100 keys `k1`…`k2100` grow bash's table (1024 → 4096 buckets).

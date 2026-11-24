@@ -438,7 +438,8 @@ fn fresh_shell(
 		reseed: false,
 		start_ns: cx.host.now_ns(),
 		seconds,
-		plain: false,
+		seconds_plain: false,
+		random_plain: false,
 	});
 	child.rlimits.clone_from(&vp.rlimits);
 	child.lineage = vp.lineage;

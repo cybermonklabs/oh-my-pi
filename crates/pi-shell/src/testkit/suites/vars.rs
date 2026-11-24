@@ -8,7 +8,7 @@
 use bstr::BString;
 
 use crate::{
-	bash::{Script, ShellInit},
+	bash::{EventMask, Script, ShellInit},
 	testkit::{FakeHost, Fault, MemFs, Rig, fault::skeleton_init, run_script},
 };
 
@@ -157,6 +157,385 @@ fn random_subshell_reseeds_unless_assigned() {
 		 && echo own; echo $s $n",
 	);
 	assert_eq!((out.as_str(), err.as_str()), ("own\n19344 19344\n", ""));
+}
+
+/// bash looks a special `RANDOM` up, and so draws, as many times as each
+/// builtin, assignment and expansion looks the name up (`find_variable`
+/// runs `get_random`): `declare -i RANDOM` twice, `${RANDOM:0}` three
+/// times, `let 'RANDOM[1]=8'` four. Each form runs after `RANDOM=5`; the
+/// next `$RANDOM` shows how many it drew (18498, 29338, 982, 6493, 16756
+/// are the first five values after `RANDOM=5`). One form or more per
+/// `dynvars::Site` and per cell of its expansion table. Goldens from bash
+/// 5.3.20.
+#[test]
+fn random_draws_as_often_as_bash_looks_it_up() {
+	for (form, want) in [
+		("declare RANDOM", "[] 29338\n"),
+		("export RANDOM", "[] 29338\n"),
+		("declare -p RANDOM > /dev/null", "[] 29338\n"),
+		("declare -i RANDOM", "[] 982\n"),
+		("declare -g RANDOM", "[] 982\n"),
+		("declare RANDOM+=1", "[] 889\n"),
+		("declare -n RANDOM 2> /dev/null", "[] 6493\n"),
+		("f() { local RANDOM; }; f", "[] 16756\n"),
+		("f() { declare -p RANDOM; }; f", "declare -i RANDOM=\"18498\"\n[] 29338\n"),
+		("export RANDOM+=1", "[] 1187\n"),
+		("declare 'RANDOM[1]=8'", "[] 18498\n"),
+		("RANDOM[1]=8", "[] 29338\n"),
+		("printf -v 'RANDOM[1]' 8", "[] 29338\n"),
+		("RANDOM+=(8)", "[] 18498\n"),
+		("read -a RANDOM <<< 8", "[] 8\n"),
+		("((RANDOM+=1))", "[] 13373\n"),
+		("((RANDOM[1]=8))", "[] 982\n"),
+		("x=$((RANDOM[1]=8))", "[8] 982\n"),
+		("let 'RANDOM[1]=8'", "[] 6493\n"),
+		("x=$((RANDOM[0]))", "[29338] 982\n"),
+		("x=$((RANDOM[1]))", "[0] 982\n"),
+		("declare -n r=RANDOM; r+=1", "[] 889\n"),
+		("declare -n r=RANDOM; ((r=7))", "[] 19344\n"),
+		("declare -n r='RANDOM[1]'; r=8", "[] 982\n"),
+		("RANDOM=7 true", "[] 29338\n"),
+		("f() { :; }; RANDOM=7 f", "[] 29338\n"),
+		("for x in $RANDOM; do :; done", "[18498] 29338\n"),
+		("unset 'RANDOM[1]' 2>/dev/null", "[] 29338\n"),
+		("test -v RANDOM", "[] 29338\n"),
+		("[[ -v RANDOM ]]", "[] 29338\n"),
+		("[[ -v RANDOM[1] ]]", "[] 982\n"),
+		("declare -n r=RANDOM; [[ -v r ]]", "[] 29338\n"),
+		("n=RANDOM; x=${!n}", "[18498] 29338\n"),
+		("declare -n r=RANDOM; x=${!r}", "[RANDOM] 29338\n"),
+		("x=${!RANDOM[@]}", "[0] 29338\n"),
+		("x=$RANDOM", "[18498] 29338\n"),
+		("x=${RANDOM}", "[18498] 29338\n"),
+		("x=${RANDOM:0}", "[18498] 6493\n"),
+		("x=${RANDOM@a}", "[i] 6493\n"),
+		("x=${#RANDOM}", "[5] 29338\n"),
+		("x=${RANDOM[0]-y}", "[29338] 982\n"),
+		("x=${RANDOM[0]:0}", "[6493] 16756\n"),
+		("x=${RANDOM[0]@a}", "[i] 16756\n"),
+		("x=${RANDOM[1]-y}", "[y] 982\n"),
+		("x=${RANDOM[1]:0}", "[] 982\n"),
+		("x=${RANDOM[1]@a}", "[i] 16756\n"),
+		("x=${RANDOM[@]}", "[29338] 982\n"),
+		("x=${RANDOM[@]:0}", "[29338] 6493\n"),
+		("x=${RANDOM[@]@a}", "[i] 6493\n"),
+		("x=${#RANDOM[@]}", "[1] 29338\n"),
+		("declare -n r=RANDOM; x=$r", "[18498] 29338\n"),
+		("declare -n r=RANDOM; x=$((r))", "[18498] 29338\n"),
+		("declare -n r=RANDOM; echo \"$r\" ${r} > /dev/null", "[] 982\n"),
+		("x=${!RANDOM}", "[] 982\n"),
+		("x=$((RANDOM))", "[18498] 29338\n"),
+		// A value that seeds nothing shows the lookups before it.
+		("for RANDOM in '1+'; do :; done 2> /dev/null", "[] 29338\n"),
+		("set -k; true RANDOM=7; set +k", "[] 29338\n"),
+		("set -k; true RANDOM=$RANDOM; set +k", "[] 982\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+	// bash's `${#NAME[-1]}` of a scalar fails, naming the subscript, also
+	// before anything assigned or read `RANDOM`.
+	for src in
+		["RANDOM=5; x=${#RANDOM[-1]}; echo \"[${x-}] $RANDOM\"", "x=${#RANDOM[-1]}; echo \"[$x]\""]
+	{
+		let (out, err) = run(src);
+		assert_eq!(out, "", "{src}");
+		assert!(err.ends_with("line 1: [-1]: bad array subscript\n"), "{src}: {err}");
+	}
+}
+
+/// bash applies a subshell's redirections in the child, after the fork: a
+/// `$RANDOM` there draws from the child's generator and leaves the shell's
+/// sequence and value cell alone. A group's, a function's and a builtin's
+/// are the shell's. Goldens from bash 5.3.20.
+#[test]
+fn random_in_a_subshells_redirections_is_the_childs() {
+	for (form, want) in [
+		("( : ) > f$RANDOM", "[] 18498\n"),
+		("( : $RANDOM ) > f$RANDOM", "[] 18498\n"),
+		("( : ) > f$RANDOM; RANDOM+=1", "[] 2539\n"),
+		("( : ) > f$RANDOM & wait", "[] 18498\n"),
+		("{ :; } > f$RANDOM & wait", "[] 18498\n"),
+		("true > f$RANDOM", "[] 29338\n"),
+		("{ true; } > f$RANDOM", "[] 29338\n"),
+		("f() { :; }; f > f$RANDOM", "[] 29338\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
+/// A readonly `RANDOM` refuses `((RANDOM=5))`, `unset RANDOM` and
+/// `declare -a RANDOM` (bash 5.3.20) after the lookups bash makes there,
+/// and stays special: after `RANDOM=7` and `readonly RANDOM` (one lookup),
+/// the arithmetic assignment and `unset` look it up once, `declare -a`
+/// twice. Goldens from bash 5.3.20.
+#[test]
+fn random_readonly_refusals_look_it_up_first() {
+	for (src, want, diag) in [
+		(
+			"RANDOM=7; readonly RANDOM; ((RANDOM=5)); echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; unset RANDOM; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: unset: RANDOM: cannot unset: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -a RANDOM; echo \"st=$? $RANDOM\"",
+			"st=1 20442\n",
+			"line 1: declare: RANDOM: readonly variable\n",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.ends_with(diag), "{src}: {err}");
+	}
+}
+
+/// A builtin that a command substitution in text it expands itself, or a
+/// file probe, parks runs again from its start; an assignment's value that
+/// parks is expanded again. The lookups of `RANDOM` before the park are
+/// made once, as bash makes them once. Each form runs with events on and
+/// off: with them off a builtin first runs on the fast path, which hands
+/// its replay log to the staged re-run. Goldens from bash 5.3.20.
+#[test]
+fn random_lookups_happen_once_when_a_command_runs_again() {
+	for (form, want) in [
+		("a=(1); declare RANDOM a='($(echo 2))'", "[] 29338\n"),
+		("declare -a RANDOM='($(echo 7))'", "[] 7\n"),
+		("f() { local -a RANDOM a='($(echo 2))'; }; f", "[] 16756\n"),
+		("test -v RANDOM -a -e /", "[] 29338\n"),
+		("[ -v RANDOM -a -e / ]", "[] 29338\n"),
+		("[[ -v RANDOM && -e / ]]", "[] 29338\n"),
+		("unset 'RANDOM[$(echo 1)]' 2>/dev/null", "[] 29338\n"),
+		("a=(1 2); unset RANDOM 'a[$(echo 1)]'; x=${#a[@]}", "[1] \n"),
+		("[[ -v RANDOM[$(echo 0)] ]]", "[] 982\n"),
+		("RANDOM=7 x=$(echo 1) true", "[] 29338\n"),
+		("RANDOM=$(echo 7) true", "[] 29338\n"),
+		("RANDOM=7 x=$RANDOM true", "[] 29338\n"),
+		("RANDOM=$RANDOM true", "[] 982\n"),
+		("x=${RANDOM}$(echo 1)", "[184981] 29338\n"),
+		("x=$((RANDOM))$(echo 1)", "[184981] 29338\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+		let mut rig = Rig::new(FakeHost::new(), skeleton_init(&[]));
+		rig.shell().set_event_mask(EventMask::NONE);
+		rig.run(Script::command(src.into_bytes()), Fault::None);
+		let out = String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned();
+		let err = String::from_utf8_lossy(&rig.host.stderr.bytes()).into_owned();
+		assert_eq!((out.as_str(), err.as_str()), (want, ""), "{form} (events off)");
+	}
+}
+
+/// bash's `RANDOM=` (`assign_random`): the value is arithmetic while
+/// `RANDOM` is integer (it is from the start), else a decimal number; one
+/// that is neither seeds nothing. The variable's value is then the seed,
+/// the text `RANDOM+=` adds to, as it is the last draw after a read. A
+/// temporary or local `RANDOM` is a plain variable; the shell's sequence
+/// goes on after it. Goldens from bash 5.3.20.
+#[test]
+fn random_assignment_seeds_as_bash_does() {
+	for (src, want) in [
+		("RANDOM=abc; echo $RANDOM; RANDOM=0; echo $RANDOM", "20814\n20814\n"),
+		(
+			"RANDOM=5; declare +i RANDOM; RANDOM=1+6; echo $RANDOM; RANDOM=7; echo $RANDOM",
+			"982\n19344\n",
+		),
+		("x=7; RANDOM=x; echo $RANDOM", "19344\n"),
+		(
+			"RANDOM=4294967303; echo $RANDOM; RANDOM=4294967303; declare -p RANDOM",
+			"19344\ndeclare -i RANDOM=\"19344\"\n",
+		),
+		("for RANDOM in 7; do echo $RANDOM; done", "19344\n"),
+		("read RANDOM <<< 7; echo $RANDOM", "19344\n"),
+		("printf -v RANDOM 7; echo $RANDOM", "19344\n"),
+		("declare -n r=RANDOM; r=7; echo $RANDOM", "19344\n"),
+		("declare -i x; x='RANDOM=7'; echo $x $RANDOM", "7 19344\n"),
+		("RANDOM=7; RANDOM+=1; echo $RANDOM", "3386\n"),
+		("RANDOM=7; x=$RANDOM; RANDOM+=1; echo $x $RANDOM", "19344 4086\n"),
+		("RANDOM=7; ((RANDOM+=1)); echo $RANDOM", "4086\n"),
+		("RANDOM=7; declare RANDOM+=1; echo $RANDOM", "9530\n"),
+		("f() { echo $RANDOM $RANDOM; }; RANDOM=7 f; RANDOM=7; echo $RANDOM", "7 7\n19344\n"),
+		("RANDOM=5; RANDOM=7 declare -p RANDOM; echo $RANDOM", "declare -x RANDOM=\"7\"\n29338\n"),
+		("RANDOM=5; RANDOM=$RANDOM eval 'echo $RANDOM'; echo $RANDOM", "29338\n982\n"),
+		("RANDOM=7; readonly RANDOM; echo $RANDOM $RANDOM", "26956 7409\n"),
+		("RANDOM=7; readonly RANDOM; declare -p RANDOM", "declare -ir RANDOM=\"26956\"\n"),
+		(
+			"f() { local RANDOM; echo \"[$RANDOM]\"; RANDOM=5; echo $RANDOM $RANDOM; }; f; RANDOM=7; \
+			 echo $RANDOM",
+			"[]\n5 5\n19344\n",
+		),
+		(
+			"f() { local RANDOM=5; g; }; g() { echo $RANDOM; RANDOM=6; echo $RANDOM; }; f; RANDOM=7; \
+			 echo $RANDOM",
+			"5\n6\n19344\n",
+		),
+		(
+			"f() { local RANDOM; ((RANDOM=5)); echo $RANDOM $RANDOM; }; f; RANDOM=7; echo $RANDOM",
+			"5 5\n19344\n",
+		),
+		("f() { local RANDOM=5; declare -p RANDOM; }; f", "declare -- RANDOM=\"5\"\n"),
+		("f() { local -i RANDOM=2+3; echo $RANDOM; }; f", "5\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `unset RANDOM` and an element, compound or array-attribute assignment
+/// (bash's `convert_var_to_array`) make the shell's `RANDOM` a plain
+/// variable for good, in children too: an array's element 0 is the last
+/// value and the array is integer. A local's `unset` is only the local's.
+/// Goldens from bash 5.3.20.
+#[test]
+fn random_unset_and_array_forms_make_it_plain() {
+	for (src, want) in [
+		("unset RANDOM; echo \"[$RANDOM]\"; RANDOM=5; echo $RANDOM $RANDOM", "[]\n5 5\n"),
+		("unset RANDOM; (echo \"[$RANDOM]\"); RANDOM=5; (echo $RANDOM)", "[]\n5\n"),
+		("unset RANDOM; declare -i RANDOM; RANDOM=1+1; echo $RANDOM", "2\n"),
+		(
+			"f() { local RANDOM=5; unset RANDOM; echo \"[$RANDOM]\"; }; f; RANDOM=7; echo $RANDOM",
+			"[]\n19344\n",
+		),
+		(
+			"RANDOM[0]=7; echo \"$RANDOM $RANDOM\"; declare -p RANDOM",
+			"7 7\ndeclare -ai RANDOM=([0]=\"7\")\n",
+		),
+		(
+			"RANDOM=7; RANDOM[1]=8; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"26956\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; RANDOM[-1]=8; declare -p RANDOM", "declare -ai RANDOM=([0]=\"8\")\n"),
+		(
+			"RANDOM=(7 8); echo \"$RANDOM\"; declare -p RANDOM",
+			"7\ndeclare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; RANDOM=([1]=8); declare -p RANDOM", "declare -ai RANDOM=([1]=\"8\")\n"),
+		(
+			"read -a RANDOM <<< \"7 8\"; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		(
+			"mapfile -t RANDOM <<< $'7\\n8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; declare -a RANDOM; declare -p RANDOM", "declare -ai RANDOM=([0]=\"26956\")\n"),
+		("RANDOM=7; declare -A RANDOM; declare -p RANDOM", "declare -Ai RANDOM=([0]=\"26956\" )\n"),
+		("((RANDOM[0]=7)); declare -p RANDOM", "declare -ai RANDOM=([0]=\"7\")\n"),
+		(
+			"RANDOM=7; let 'RANDOM[1]=8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"20442\" [1]=\"8\")\n",
+		),
+		(
+			"RANDOM=7; declare 'RANDOM[1]=8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"19344\" [1]=\"8\")\n",
+		),
+		(
+			"RANDOM=7; : ${RANDOM[1]:=8}; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"20442\" [1]=\"8\")\n",
+		),
+		(
+			"f() { local RANDOM; RANDOM[0]=5; echo \"$RANDOM\"; }; f; RANDOM=7; echo $RANDOM",
+			"5\n19344\n",
+		),
+		("RANDOM[0]=5; RANDOM=7; echo $RANDOM $RANDOM", "7 7\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `declare -p`, `set`, `export -p` and the environment show the value the
+/// last lookup or assignment left in `RANDOM` and `SECONDS` (`declare -p
+/// RANDOM` looks it up first; the listings do not); `${RANDOM@a}`,
+/// `${RANDOM@A}` and the keys read it as a scalar; a name reference to it
+/// reads it as the name does. Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+#[expect(
+	clippy::literal_string_with_formatting_args,
+	reason = "Bash parameter expansion is intentional fixture syntax, not Rust formatting."
+)]
+fn random_and_seconds_show_their_last_value() {
+	let set_line = |name: &str| {
+		format!("set | while IFS= read -r l; do [[ $l == {name}=* ]] && echo \"$l\"; done")
+	};
+	// The name after `declare -FLAGS ` (bash's `BASH_EXECUTION_STRING` line
+	// holds the script text, so a substring test would match it too).
+	let declare_line = |name: &str| {
+		format!(
+			"declare -p | while IFS= read -r l; do n=${{l#declare -* }}; [[ ${{n%%=*}} == {name} ]] \
+			 && echo \"$l\"; done"
+		)
+	};
+	for (src, want) in [
+		(
+			"RANDOM=7; declare -p RANDOM; echo $RANDOM".to_owned(),
+			"declare -i RANDOM=\"19344\"\n26956\n",
+		),
+		(
+			"RANDOM=7; echo $RANDOM; declare -p RANDOM".to_owned(),
+			"19344\ndeclare -i RANDOM=\"26956\"\n",
+		),
+		(format!("RANDOM=7; {}; echo $RANDOM", set_line("RANDOM")), "RANDOM=7\n19344\n"),
+		(format!("RANDOM=7; x=$RANDOM; {}", set_line("RANDOM")), "RANDOM=19344\n"),
+		(
+			format!("RANDOM=7; {}; echo $RANDOM", declare_line("RANDOM")),
+			"declare -i RANDOM=\"7\"\n19344\n",
+		),
+		(
+			"RANDOM=7; export RANDOM; export -p | while IFS= read -r l; do [[ $l == *' RANDOM='* ]] \
+			 && echo \"$l\"; done"
+				.to_owned(),
+			"declare -ix RANDOM=\"19344\"\n",
+		),
+		(format!("SECONDS=100; {}", set_line("SECONDS")), "SECONDS=100\n"),
+		(format!("SECONDS=100; {}", declare_line("SECONDS")), "declare -- SECONDS=\"100\"\n"),
+		("RANDOM=7; echo ${RANDOM@a}; readonly RANDOM; echo ${RANDOM@a}".to_owned(), "i\nir\n"),
+		(
+			"RANDOM=7; echo ${RANDOM@A}; export RANDOM; echo ${RANDOM@A}".to_owned(),
+			"declare -i RANDOM='19344'\ndeclare -ix RANDOM='22989'\n",
+		),
+		("RANDOM=7; echo \"${!RANDOM[@]}\" \"${!RANDOM[*]}\"".to_owned(), "0 0\n"),
+		("echo \"${!SECONDS[@]}\" ${SECONDS@a}".to_owned(), "0 i\n"),
+		("RANDOM=7; declare -n r=RANDOM; echo $r $r".to_owned(), "19344 26956\n"),
+		(
+			"RANDOM=7; declare -n r=RANDOM; echo \"$r\" ${r} ${r:-x} ${#r} $RANDOM".to_owned(),
+			"19344 26956 7409 5 22989\n",
+		),
+		("RANDOM=7; declare -n r=RANDOM; echo ${r[0]}".to_owned(), "26956\n"),
+		("declare -n s=SECONDS; s=100; echo $SECONDS $s".to_owned(), "100 100\n"),
+	] {
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `${!prefix@}`, `${!prefix*}` and `compgen -v` list bash's dynamic
+/// variables, which this shell computes on use (`dynvars::LISTED`):
+/// `FUNCNAME` only in a function, `PIPESTATUS` once a command ran,
+/// `RANDOM` and `SECONDS` not after `unset` until they are assigned.
+/// Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+fn dynamic_variables_are_listed_by_name() {
+	let (out, err) = run(
+		"compgen -v PIPESTATUS; echo \"st=$?\"; compgen -v PIPESTATUS; f() { compgen -v FUNCNAME; \
+		 }; f; compgen -v FUNCNAME || echo none; for n in RANDOM SRANDOM SECONDS EPOCHSECONDS \
+		 EPOCHREALTIME LINENO BASH_COMMAND BASH_CMDS BASH_ALIASES DIRSTACK BASHPID BASH_SUBSHELL \
+		 PIPESTATUS BASH_SOURCE BASH_LINENO BASH_ARGC BASH_ARGV; do eval \"set -- \\${!$n@}\"; s=-; \
+		 for v; do [ \"$v\" = $n ] && s=@; done; eval \"set -- \\${!$n*}\"; for v; do [ \"$v\" = $n \
+		 ] && s+=*; done; for v in $(compgen -v $n); do [ \"$v\" = $n ] && s+=c; done; echo \"$n \
+		 $s\"; done; unset RANDOM SECONDS; echo \"[${!RANDOM@}] [${!SECONDS*}]\"; compgen -v \
+		 SECONDS || echo none; RANDOM=1; echo ${!RANDOM@}",
+	);
+	assert_eq!(
+		out,
+		"st=1\nPIPESTATUS\nFUNCNAME\nnone\nRANDOM @*c\nSRANDOM @*c\nSECONDS @*c\nEPOCHSECONDS \
+		 @*c\nEPOCHREALTIME @*c\nLINENO @*c\nBASH_COMMAND @*c\nBASH_CMDS @*c\nBASH_ALIASES \
+		 @*c\nDIRSTACK @*c\nBASHPID @*c\nBASH_SUBSHELL @*c\nPIPESTATUS @*c\nBASH_SOURCE \
+		 @*c\nBASH_LINENO @*c\nBASH_ARGC @*c\nBASH_ARGV @*c\n[] []\nnone\nRANDOM\n"
+	);
+	assert_eq!(err, "");
 }
 
 /// `SECONDS=n` restarts the count from n (bash `assign_seconds`; the

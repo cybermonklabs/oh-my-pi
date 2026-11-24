@@ -10,6 +10,7 @@
 - Fixed `export 'a[0]=x'` and `readonly 'a[0]=x'` in the `bash` tool assigning an array element: as in bash, a subscripted name is not a valid identifier for them
 - Fixed `declare -a`, `-A`, `-i`, `-l`, `-u`, `-c` (and their `+` forms) in the `bash` tool changing a readonly variable: as in bash 5.3, they now fail with `readonly variable` and status 1, and the variable stays as it was (bash 5.2 changed it)
 - Fixed `readonly -a`, `readonly -A`, `export -a` and `export -A` with a name and no value in the `bash` tool making the variable an array (and failing with `readonly variable` on a readonly one): as in bash, they give the name only the readonly or export attribute, with status 0
+- Fixed `$RANDOM` in the `bash` tool behaving unlike bash 5.3's: `RANDOM=` now takes arithmetic, a value that is neither arithmetic nor a number seeds nothing, `RANDOM+=` adds to the last seed or value, a `local` or temporary `RANDOM` is a plain variable, `unset RANDOM` and an element, compound or `-a`/`-A` assignment make it one for good; `declare -p RANDOM`, `set` and the environment show its last value; every builtin, assignment and expansion draws as many numbers as bash's does (`declare -i RANDOM` two, `${RANDOM:0}` three), once when a command runs again after a `$(…)`; a subshell's redirections draw from the subshell's generator; `declare -n r=RANDOM; echo $r` draws; and `${!prefix@}`, `${!prefix*}` and `compgen -v` list bash's dynamic variables (`RANDOM`, `SECONDS`, `LINENO`, `PIPESTATUS` once a command ran, …)
 
 ## [18.18.6] - 2026-11-09
 

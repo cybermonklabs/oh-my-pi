@@ -1919,6 +1919,29 @@ fn compound_line(vp: &Vproc, line: u32) -> u32 {
 		.unwrap_or(line)
 }
 
+/// A compound command's redirections (`Opcode::Redir`): bash applies a
+/// subshell's in the child, after the fork ([`redir::apply_in_child`]); a
+/// group's or a loop's in the shell.
+fn compound_redirs(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	op: Op,
+	line: u32,
+) -> Result<(), redir::Halt> {
+	let line = compound_line(vp, line);
+	if unit
+		.nodes
+		.get(op.node as usize)
+		.is_some_and(|n| matches!(n.kind, NodeKind::Subshell))
+	{
+		redir::apply_in_child(k, vp, cx, unit, op.a, line)
+	} else {
+		redir::apply(k, vp, cx, unit, op.a, line)
+	}
+}
+
 const fn depths(f: &Frame) -> Depths {
 	Depths {
 		enters: f.enters.len() as u32,
@@ -2985,7 +3008,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+		Opcode::Redir => match compound_redirs(k, vp, cx, unit, op, line) {
 			Ok(()) => {
 				let saves = match top_frame(vp).scratch.take() {
 					Some(mut sc) => {
