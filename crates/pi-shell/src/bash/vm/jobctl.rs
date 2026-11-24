@@ -2680,4 +2680,64 @@ mod tests {
 			},
 		);
 	}
+
+	/// `PROMPT_SP` still in the terminal's writer thread (its hold queued),
+	/// then the mail notice, then the prompt the editor draws (zsh
+	/// `preprompt`, then `zleread`): the terminal gets them in that order, as
+	/// zsh's blocking writes give them. Queued behind the hold, the notice
+	/// went out after the prompt (`% You have new mail.`).
+	#[test]
+	fn the_mail_notice_reaches_the_terminal_before_the_prompt() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_mail_notice_reaches_the_terminal_before_the_prompt"),
+			|| {
+				use super::super::zle::reader;
+				let (mut shell, _host, _store, mut master) = shell_with_a_terminal();
+				let _ = editing_with_display(&mut shell, b"", |_| zexec::WResult::Done(0));
+				let held = crate::sys::hold_writers();
+				reader::put_tty(&shell.k, &mut shell.procs[0], b"%  \r");
+				assert!(!shell.procs[0].out.is_empty(), "PROMPT_SP queued no hold");
+				reader::put_tty(&shell.k, &mut shell.procs[0], b"You have new mail.\n");
+				shell.procs[0]
+					.zle
+					.as_deref_mut()
+					.and_then(|z| z.tty.as_mut())
+					.expect("the editor's terminal")
+					.put(b"% ");
+				drop(held);
+				flush(&mut shell.k, &mut shell.procs[0]);
+				let want = "%  \rYou have new mail.\r\n% ";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// An error message queued between `PROMPT_SP` (still in the terminal's
+	/// writer thread, its hold queued) and the mail notice (zsh's `empty
+	/// MAILPATH component` on standard error): the notice waits behind the
+	/// message, as zsh's blocking writes order them. Only the hold lets
+	/// display bytes join the display at once.
+	#[test]
+	fn display_bytes_wait_behind_a_message_queued_before_them() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::display_bytes_wait_behind_a_message_queued_before_them"),
+			|| {
+				use super::super::zle::reader;
+				let (mut shell, _host, _store, mut master) =
+					shell_with_fd_on_its_terminal_written_at_once(2);
+				let _ = editing_with_display(&mut shell, b"", |_| zexec::WResult::Done(0));
+				let held = crate::sys::hold_writers();
+				reader::put_tty(&shell.k, &mut shell.procs[0], b"%  \r");
+				shell.procs[0].out.push_back(PendingWrite::new(
+					2,
+					BString::from("zsh: empty MAILPATH component: ?x\n"),
+				));
+				reader::put_tty(&shell.k, &mut shell.procs[0], b"You have new mail.\n");
+				drop(held);
+				flush(&mut shell.k, &mut shell.procs[0]);
+				let want = "%  \rzsh: empty MAILPATH component: ?x\r\nYou have new mail.\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
 }

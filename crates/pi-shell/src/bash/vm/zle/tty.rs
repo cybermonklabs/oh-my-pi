@@ -245,3 +245,9 @@ pub fn hold(out: &mut VecDeque<PendingWrite>) {
 		out.push_back(PendingWrite::new(FD, BString::default()));
 	}
 }
+
+/// Whether `out` holds output still to write: anything but a [`hold`],
+/// which writes nothing.
+pub fn has_output(out: &VecDeque<PendingWrite>) -> bool {
+	out.iter().any(|w| w.fd != FD || !w.bytes.is_empty())
+}

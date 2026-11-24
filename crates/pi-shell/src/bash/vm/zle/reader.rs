@@ -1463,14 +1463,17 @@ fn end_input(vp: &mut Vproc) {
 
 /// Write display bytes to the editing terminal (zsh `shout`), standard
 /// error without one. Behind output the shell still has queued, they wait
-/// their turn there (`exec::flush_out`); bytes the terminal does not take
-/// at once hold the vproc's next op ([`Tty::flush_or_hold`]): zsh's writes
-/// block, so nothing reaches the terminal out of order.
+/// their turn there (`exec::flush_out`). Behind only a hold (an earlier
+/// write still going out, [`super::tty::hold`]) they join the display, so
+/// what the editor draws next comes after them: `PROMPT_SP`, the mail
+/// notice, then the prompt, as zsh writes them. Bytes the terminal does not
+/// take at once hold the vproc's next op ([`Tty::flush_or_hold`]): zsh's
+/// writes block, so nothing reaches the terminal out of order.
 pub(crate) fn put_tty(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
 	if bytes.is_empty() {
 		return;
 	}
-	if !vp.out.is_empty() {
+	if super::tty::has_output(&vp.out) {
 		vp.out
 			.push_back(PendingWrite::new(super::tty::FD, BString::from(bytes)));
 		return;
