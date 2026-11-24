@@ -184,6 +184,64 @@ fn an_inherited_fd_skips_every_snapshot() {
 	assert_eq!(num(&lines[0], "restored"), 0, "{lines:?}");
 }
 
+/// A bash background job reads the shell's shared `/dev/null` (bash gives
+/// it one without job control). A snapshot carries it, opening it again on
+/// restore: a job that holds it through a loop costs no snapshot, restored
+/// in the process (step mode) and in a new one (exec mode). It is opened
+/// again read-only, as bash opened it: a write to it still fails.
+#[test]
+fn a_background_jobs_dev_null_is_carried_by_every_snapshot() {
+	let script = "{ read -r x; i=0; while [ $i -lt 40 ]; do i=$((i + 1)); done; echo x >&0; echo \
+	              \"job [$x] $i w=$?\"; } & wait; echo end";
+	let dir = tempfile::tempdir().unwrap();
+	let stats_path = dir.path().join("stats");
+	let (out, _) = obash(&["-c", script], &[
+		("PI_SHELL_FAULT", "3:1"),
+		("PI_SHELL_FAULT_STATS", stats_path.to_str().unwrap()),
+	]);
+	assert_eq!(String::from_utf8_lossy(&out.stdout), "job [] 40 w=1\nend\n");
+	let lines = stats(&stats_path);
+	assert_eq!(lines.len(), 1);
+	assert!(num(&lines[0], "snapshots") > 0, "{lines:?}");
+	assert_eq!(num(&lines[0], "skipped_fd"), 0, "step: {lines:?}");
+	assert_eq!(num(&lines[0], "restored"), num(&lines[0], "snapshots"), "step: {lines:?}");
+	let (plain, line) = same_as_plain(script, "1:3", "exec", &[]);
+	assert_eq!(plain.stdout, b"job [] 40 w=1\nend\n");
+	assert!(num(&line, "snapshots") > 0, "{line:?}");
+	assert_eq!(num(&line, "skipped_fd"), 0, "exec: {line:?}");
+	assert_eq!(num(&line, "restored"), num(&line, "snapshots"), "exec: {line:?}");
+}
+
+/// A restore that cannot open the shared `/dev/null` again (the host's
+/// filesystem answers later, `PI_SHELL_FS=pending`, and a restore cannot
+/// wait) reports the job's fd 0 lost, so the run is one a conformance
+/// harness leaves out (`PI_SHELL_LOST_LOG`). The kernel keeps nothing it
+/// could not open again: a later job opens `/dev/null` anew
+/// (`frames::tests::a_dev_null_a_restore_cannot_open_is_lost_and_not_kept`).
+#[test]
+fn a_dev_null_a_restore_cannot_reopen_is_reported() {
+	let script = "{ i=0; while [ $i -lt 40 ]; do i=$((i + 1)); done; } & wait; echo end";
+	let dir = tempfile::tempdir().unwrap();
+	let log = dir.path().join("lost.log");
+	let stats_path = dir.path().join("stats");
+	let (out, _) = obash(&["--fault=3:1", "--fault-mode=step", "-c", script], &[
+		("PI_SHELL_FS", "pending"),
+		("PI_SHELL_LOST_LOG", log.to_str().unwrap()),
+		("PI_SHELL_FAULT_STATS", stats_path.to_str().unwrap()),
+	]);
+	assert_eq!(String::from_utf8_lossy(&out.stdout), "end\n");
+	let lines = stats(&stats_path);
+	assert_eq!(lines.len(), 1, "{lines:?}");
+	assert!(num(&lines[0], "restored") > 0, "{lines:?}");
+	let logged = fs::read_to_string(&log).unwrap_or_default();
+	assert!(
+		logged
+			.lines()
+			.any(|l| l.starts_with("lost Fd") && l.contains("fd: 0") && l.contains("kind: Device")),
+		"no lost fd 0 reported: {logged:?}"
+	);
+}
+
 #[test]
 fn pause_mode_pauses_without_changing_anything() {
 	let (_, line) = same_as_plain(LOOPS, "7:2", "pause", &[]);

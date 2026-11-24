@@ -397,6 +397,9 @@ pub struct Shell {
 	orphans: Vec<Vpid>,
 }
 
+/// An `open` the host's filesystem has not answered yet.
+pub type PendingOpen = Box<dyn crate::bash::fs::FsPending<Box<dyn crate::bash::fs::File>>>;
+
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
 /// borrow a vproc and the kernel at once).
 pub struct Kernel {
@@ -487,12 +490,21 @@ pub struct Kernel {
 	/// one `Host::now_ns` with the previous `CmdEnd` (xeon overhead profile:
 	/// `now_ns` a third of the default-mask event cost). Not imaged.
 	pub clock:              Option<u64>,
-	/// The empty document an async command without job control reads as
-	/// `/dev/null`, shared by all of them (it never yields a byte, so one
-	/// object serves every reader): an fd object and two buffers less per
-	/// background vproc (idle vproc ≤ 2 KiB). Not imaged (a restored
-	/// child keeps its own object).
+	/// The empty document a line-editor widget function reads on fd 0
+	/// ([`zle::exec::push_call`]), shared by all of them (it never yields a
+	/// byte, so one object serves every reader). Not imaged (a restored
+	/// vproc keeps its own object).
 	pub null_input:         Option<FdRef>,
+	/// `/dev/null` as an asynchronous command gets it on fd 0
+	/// ([`exec::async_stdin`]): opened read-only (bash) and read-write
+	/// (zsh) through the host's filesystem once each, then shared by every
+	/// job (one host descriptor, not one per background vproc). A snapshot
+	/// carries it: a restore opens it again (`frames::FdObjImage::DevNull`),
+	/// so a job holding it does not keep the shell from being imaged.
+	pub dev_null:           [Option<FdRef>; 2],
+	/// The pending opens of [`Self::dev_null`] (same slots): every op that
+	/// waits for one polls it. Not imaged: a restored op opens anew.
+	pub dev_null_opening:   [Option<PendingOpen>; 2],
 	/// `(label, caller)`: the labeled subshell trees host callouts started
 	/// ([`ShellApi::run_subshell_in`]) and the vproc that ran each callout;
 	/// virtual signals to the caller reach the tree (`Shell::deliver`).
@@ -624,6 +636,8 @@ impl Kernel {
 			zsh_arith_recent: zsh::math::Recent::default(),
 			clock: None,
 			null_input: None,
+			dev_null: [None, None],
+			dev_null_opening: [None, None],
 			callout_labels: Vec::new(),
 			exited: None,
 			exec_signals: HashMap::new(),
@@ -2842,7 +2856,7 @@ impl Vproc {
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
 			.map(|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift));
-		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
+		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell { fork: None });
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
 		frame.subshell_line = subshell_line;
@@ -2938,6 +2952,8 @@ impl Vproc {
 		{
 			vp.jobs = exec::inherited_jobs(self, true);
 		}
+		// bash's `stdin_redir` is a global the fork copies.
+		vp.jobs.stdin_redir = self.jobs.stdin_redir;
 		vp.calls = callstack::inherited(self);
 		vp.trace_base = xtrace::level(self) - 1;
 		// Started from a context where `set -e` is ignored (the parent's op

@@ -840,7 +840,8 @@ fn seed_pipeline(vp: &mut Vproc, unit: &Unit) {
 		return;
 	};
 	let base = matches!(f.kind, FrameKind::Stage)
-		|| (vp.frames.len() == 1 && matches!(f.kind, FrameKind::Subshell | FrameKind::Job { .. }));
+		|| (vp.frames.len() == 1
+			&& matches!(f.kind, FrameKind::Subshell { .. } | FrameKind::Job { .. }));
 	if !base {
 		return;
 	}
