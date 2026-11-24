@@ -19,8 +19,8 @@ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import {
-	type ExecutorOptions,
 	type FollowUpTurnOptions,
+	type SubagentRunOptions,
 	type SubagentRunRequest,
 	subagentRunRequest,
 } from "../task/executor";
@@ -30,7 +30,7 @@ import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { isMainThread, type ThreadId } from "./identity";
 import type { WorkerThreadLink } from "./protocol";
 import { RemoteAgentSession } from "./remote-agent-session";
-import { bridgeIntegrationOptions } from "./services/integrations";
+import { bridgeIntegrationOptions, bridgePersistedReviveSpec } from "./services/integrations";
 import { existingSubagentWorkerPool, type SubagentWorker, type SubagentWorkerPool } from "./subagent-worker";
 
 /** This worker's link to main, once the executor thread service installed it. */
@@ -128,8 +128,8 @@ async function callOnWorker(
  */
 export async function runSubprocessPlaced(
 	pool: SubagentWorkerPool,
-	options: ExecutorOptions,
-	runHere: (options: ExecutorOptions) => Promise<SingleResult>,
+	options: SubagentRunOptions,
+	runHere: (options: SubagentRunOptions) => Promise<SingleResult>,
 ): Promise<SingleResult> {
 	const placed = pool.place();
 	let request: SubagentRunRequest | undefined;
@@ -202,7 +202,8 @@ export async function runFollowUpTurnOnHome(
 
 /**
  * Main thread: cold-revive the agent of `spec` where `pool` places it, like a fresh spawn: in a
- * worker (returning its mirror) or through `reviveHere` on this thread.
+ * worker (returning its mirror), its live inputs bridged as a run's are, or through `reviveHere`
+ * on this thread.
  */
 export async function revivePersistedPlaced(
 	pool: SubagentWorkerPool,
@@ -213,7 +214,11 @@ export async function revivePersistedPlaced(
 	const placement = await pool.acquire();
 	try {
 		if (!placement.worker) return await reviveHere(spec, expected);
-		return await placement.worker.link.call("revivePersisted", { ...spec, storage: undefined }, expected);
+		return await placement.worker.link.call(
+			"revivePersisted",
+			bridgePersistedReviveSpec({ ...spec, storage: undefined }),
+			expected,
+		);
 	} finally {
 		// A worker-homed revived session's open mirror retains its worker from here on.
 		placement.release();

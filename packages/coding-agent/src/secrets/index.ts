@@ -157,23 +157,36 @@ export * from "./patterns";
 export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from "./placeholder";
 
 /**
- * Load secrets from project-local and global secrets.yml files.
- * Project-local entries override global entries with matching content.
+ * Load secrets from project-local and global secrets.yml files: the project file of `cwd`, and that of each
+ * of `extraProjectDirs` (each directory read once). Project-local entries override global entries with
+ * matching content, and the entries of `cwd`'s project those of the other projects.
  */
-export async function loadSecrets(cwd: string, agentDir: string): Promise<SecretEntry[]> {
-	const projectPath = projectSecretsFilePath(cwd);
-	const globalPath = globalSecretsFilePath(agentDir);
-
-	const globalEntries = await loadSecretsFile(globalPath);
-	const projectEntries = await loadSecretsFile(projectPath);
+export async function loadSecrets(
+	cwd: string,
+	agentDir: string,
+	extraProjectDirs: readonly string[] = [],
+): Promise<SecretEntry[]> {
+	const globalEntries = await loadSecretsFile(globalSecretsFilePath(agentDir));
+	// `cwd`'s project first, whole; each other project adds only the contents no project before it holds.
+	const projectEntries: SecretEntry[] = [];
+	const projectContents = new Set<string>();
+	const read = new Set<string>();
+	for (const dir of [cwd, ...extraProjectDirs]) {
+		const resolved = path.resolve(dir);
+		if (read.has(resolved)) continue;
+		read.add(resolved);
+		const entries = await loadSecretsFile(projectSecretsFilePath(resolved));
+		for (const entry of entries) {
+			if (!projectContents.has(entry.content)) projectEntries.push(entry);
+		}
+		for (const entry of entries) projectContents.add(entry.content);
+	}
 
 	if (globalEntries.length === 0) return projectEntries;
 	if (projectEntries.length === 0) return globalEntries;
 
 	// Merge: project overrides global by content match
-	const projectContents = new Set(projectEntries.map(e => e.content));
-	const merged = [...globalEntries.filter(e => !projectContents.has(e.content)), ...projectEntries];
-	return merged;
+	return [...globalEntries.filter(e => !projectContents.has(e.content)), ...projectEntries];
 }
 
 /** Collect environment variable values that look like secrets. */
@@ -212,8 +225,9 @@ export function builtinCredentialSecretEntries(): SecretEntry[] {
 
 /**
  * Build the session secret obfuscator from every configured source: secrets.yml
- * (project + global), secret-shaped environment variables, and the built-in
- * credential patterns. Callers gate on `secrets.enabled`.
+ * (project + global, plus the project files of `extraProjectDirs`), secret-shaped
+ * environment variables, and the built-in credential patterns. Callers gate on
+ * `secrets.enabled`.
  *
  * Only CONFIGURED entries force startup key creation: a configured
  * obfuscate-mode secret — or a default (no custom `replacement`) replace-mode
@@ -235,8 +249,9 @@ export async function buildSecretObfuscator(
 	cwd: string,
 	agentDir: string,
 	keyDir?: string,
+	extraProjectDirs?: readonly string[],
 ): Promise<SecretObfuscator | undefined> {
-	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
+	const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir, extraProjectDirs);
 	const envEntries = collectEnvSecrets();
 	// Built-in credential-pattern entries come last so user-configured entries
 	// (plain literals, custom regexes) take precedence in the scan order.

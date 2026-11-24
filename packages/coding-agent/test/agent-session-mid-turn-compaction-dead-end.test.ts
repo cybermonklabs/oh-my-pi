@@ -92,7 +92,7 @@ describe("AgentSession mid-turn compaction dead-end", () => {
 			}
 			extensionLines.push("}");
 			fs.writeFileSync(extensionPath, extensionLines.join("\n"));
-			const loaded = await loadExtensions([extensionPath], tempDir.path());
+			const loaded = await loadExtensions([{ path: extensionPath, scope: "explicit" }], tempDir.path());
 			extensionRunner = new ExtensionRunner(
 				loaded.extensions,
 				loaded.runtime,
