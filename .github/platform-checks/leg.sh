@@ -38,13 +38,13 @@ cat > "$cfg" << EOF
 [profile.platform-checks]
 fail-fast = false
 failure-output = "final"
-success-output = "never"
+success-output = "$([ "${PC_KEEP_SUCCESS_OUTPUT:-}" = true ] && echo final || echo never)"
 retries = $PC_RETRIES
 slow-timeout = { period = "${PC_SLOW_PERIOD:-60s}", terminate-after = $PC_TIMEOUT_MINUTES, grace-period = "${PC_GRACE:-10s}" }
 
 [profile.platform-checks.junit]
 path = "junit.xml"
-store-success-output = false
+store-success-output = $([ "${PC_KEEP_SUCCESS_OUTPUT:-}" = true ] && echo true || echo false)
 store-failure-output = true
 EOF
 

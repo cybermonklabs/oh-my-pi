@@ -43,6 +43,7 @@ env:
   PC_RETRIES: ${{ github.event.inputs.retries }}
   PC_TIMEOUT_MINUTES: ${{ github.event.inputs.timeout_minutes }}
   PC_SKIP_BASH_INSTALL: ${{ github.event.inputs.skip_bash_install }}
+  PC_KEEP_SUCCESS_OUTPUT: ${{ github.event.inputs.keep_success_output }}
   PC_PLANT_TREE: ${{ inputs.plant_tree }}
 
 jobs:
