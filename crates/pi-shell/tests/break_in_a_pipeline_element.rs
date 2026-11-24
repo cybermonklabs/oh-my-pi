@@ -1311,10 +1311,19 @@ fn remove_dir(dir: &Path) {
 	fs::remove_dir_all(dir).unwrap();
 }
 
+/// The record of `dialect`. Under cargo the compile-time manifest dir exists
+/// at runtime; under Bazel the compile-time sandbox path is gone, so fall back
+/// to the runfiles-relative layout (test cwd is the workspace runfiles root and
+/// the fixtures ride along as `data`).
 fn fixture(dialect: Dialect) -> PathBuf {
-	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("tests/fixtures/break_in_a_pipeline_element")
-		.join(format!("{}.jsonl", dialect.name()))
+	let manifest =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/break_in_a_pipeline_element");
+	let root = if manifest.is_dir() {
+		manifest
+	} else {
+		PathBuf::from("crates/pi-shell/tests/fixtures/break_in_a_pipeline_element")
+	};
+	root.join(format!("{}.jsonl", dialect.name()))
 }
 
 /// The recorded rows of `dialect`, by id: script and outcome.
