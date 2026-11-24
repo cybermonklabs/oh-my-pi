@@ -155,7 +155,7 @@ import {
 	writeTerminalBreadcrumb,
 } from "./session-paths";
 import { maskSessionEntry, maskTitleUpdate } from "./session-entry-mask";
-import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
+import { forgetExternalizedImages, persistedEntryText } from "./session-persistence";
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	defaultSessionStorage,
@@ -3087,7 +3087,7 @@ export class SessionManager {
 		const masked = isEntryPatchRecord(source)
 			? maskEntryPatchRecord(source, this.#index, mask, form)
 			: maskSessionEntry(source, mask, form);
-		return `${stringifyJson(prepareEntryForPersistence(masked, this.#blobs)) ?? "null"}\n`;
+		return `${persistedEntryText(masked, this.#blobs)}\n`;
 	}
 
 	/**

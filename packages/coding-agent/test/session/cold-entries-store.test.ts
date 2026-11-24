@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
 import { BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
@@ -12,7 +13,9 @@ import {
 	type SessionEntry,
 	type SessionHeader,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { prepareEntryForPersistence } from "@oh-my-pi/pi-coding-agent/session/session-persistence";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getBlobsDir,
@@ -106,12 +109,15 @@ function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
 /** Levels past what `JSON.stringify` recurses (Bun's stops near 40,000) and a recursive walk; `JSON.parse` reads 400,000. */
 const DEEP_LEVELS = 50_000;
 
-/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `{ leaf: "bottom" }`. */
-function deepDetails(): unknown {
-	let node: unknown = { leaf: "bottom" };
+/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `bottom`. */
+function deepDetails(bottom: Record<string, unknown> = { leaf: "bottom" }): unknown {
+	let node: unknown = bottom;
 	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
 	return node;
 }
+
+/** Raw subprocess events a tool kept; a written line leaves them out. */
+const JSONL_EVENTS = [{ type: "stdout", text: "event" }];
 
 /** How many `next` levels `value` nests, and the value at the bottom. */
 function nestingOf(value: unknown): { levels: number; bottom: unknown } {
@@ -126,11 +132,18 @@ function nestingOf(value: unknown): { levels: number; bottom: unknown } {
 
 /**
  * A session whose tool result `r1` has `details` nested {@link DEEP_LEVELS}
- * levels (a tool returns any JSON). With `compacted`, `r1` lies before the cut
- * of `c1`, which keeps `u2` on; without it the session ends at `u2`, every
- * entry whole.
+ * levels (a tool returns any JSON) around `bottom` (`{ leaf: "bottom" }` when
+ * not given). With `compacted`, `r1` lies before the cut of `c1`, which keeps
+ * `u2` on; without it the session ends at `u2`, every entry whole. With
+ * `jsonlEvents`, `r1`'s message and the bottom of its `details` hold
+ * {@link JSONL_EVENTS}, which a written line leaves out.
  */
-function writeDeepSession(dir: string, compacted: boolean): Promise<string> {
+function writeDeepSession(
+	dir: string,
+	options: { compacted: boolean; jsonlEvents?: boolean; bottom?: Record<string, unknown> },
+): Promise<string> {
+	const { compacted, jsonlEvents = false, bottom = { leaf: "bottom" } } = options;
+	const events = jsonlEvents ? { jsonlEvents: JSONL_EVENTS } : {};
 	const records: FixtureRecord[] = [
 		{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 } },
 		{
@@ -150,9 +163,10 @@ function writeDeepSession(dir: string, compacted: boolean): Promise<string> {
 				toolCallId: "call-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: `r1 ${BODY}` }],
-				details: deepDetails(),
+				details: deepDetails({ ...bottom, ...events }),
 				isError: false,
 				timestamp: 2,
+				...events,
 			},
 		},
 		{ type: "message", id: "u2", message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 } },
@@ -467,7 +481,7 @@ describe("cold entry store", () => {
 	// A transcript line holds JSON as deep as JSON.parse reads; JSON.stringify and a recursive walk stop far short of it.
 	it("resumes an entry before the cut nested deeper than JSON.stringify recurses cold, and reads it back", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
-		const manager = await open(await writeDeepSession(dir.path(), true));
+		const manager = await open(await writeDeepSession(dir.path(), { compacted: true }));
 		const r1 = entry(manager, "r1");
 
 		expect(isColdEntry(r1)).toBe(true);
@@ -478,7 +492,7 @@ describe("cold entry store", () => {
 
 	it("moves an entry nested deeper than JSON.stringify recurses out of memory at a compaction, and reads it back", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
-		const manager = await open(await writeDeepSession(dir.path(), false));
+		const manager = await open(await writeDeepSession(dir.path(), { compacted: false }));
 		expect(isColdEntry(entry(manager, "r1"))).toBe(false);
 
 		manager.appendCompaction(`c1 ${BODY}`, undefined, "u2", 1000);
@@ -488,6 +502,78 @@ describe("cold entry store", () => {
 		expect(nestingOf(toolResultOf(r1).details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 		expect(toolResultOf(r1).content).toEqual([{ type: "text", text: `r1 ${BODY}` }]);
 		await manager.close();
+	});
+
+	for (const compacted of [true, false]) {
+		// Each load of the cold variant spends about 1.5 s in JSON.stringify on `r1`'s record before the writer that
+		// keeps its own stack writes it.
+		it(`rewrites a session holding ${compacted ? "a cold" : "a whole"} entry nested deeper than JSON.stringify recurses, and a resume reads it back`, async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const file = await writeDeepSession(dir.path(), { compacted, jsonlEvents: true });
+			const manager = await open(file);
+			expect(isColdEntry(entry(manager, "r1"))).toBe(compacted);
+
+			await manager.rewriteEntries();
+			await manager.close();
+			// The written line went through persistence, which leaves raw subprocess events out at every depth.
+			expect(await Bun.file(file).text()).not.toContain("jsonlEvents");
+			const reopened = await open(file);
+			const message = toolResultOf(entry(reopened, "r1"));
+			expect(nestingOf(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+			expect(message.content).toEqual([{ type: "text", text: `r1 ${BODY}` }]);
+			await reopened.close();
+		}, 20_000);
+	}
+
+	it("masks a secret at the bottom of an entry nested deeper than JSON.stringify recurses when it rewrites the session", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const secret = "sk-deep-0123456789abcdef0123456789abcdef";
+		await Bun.write(path.join(dir.path(), "secrets.yml"), "[]");
+		const mask = new SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: secret }), agentDir: dir.path() }).snapshot(
+			dir.path(),
+		);
+		expect(mask.maskText(secret)).not.toBe(secret);
+		vi.spyOn(SessionManager.prototype, "storeMask").mockReturnValue(mask);
+		const file = await writeDeepSession(dir.path(), { compacted: false, bottom: { leaf: secret } });
+		const manager = await open(file);
+
+		await manager.rewriteEntries();
+		await manager.close();
+		expect(await Bun.file(file).text()).not.toContain(secret);
+		const reopened = await open(file);
+		const details = toolResultOf(entry(reopened, "r1")).details;
+		expect(nestingOf(details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: mask.maskText(secret) } });
+		await reopened.close();
+	});
+
+	// The walks keep their own stack, so a cycle must end them as the end of the call stack ended the recursion.
+	it("refuses a live entry holding a cycle at once when it writes or masks it", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		await Bun.write(path.join(dir.path(), "secrets.yml"), "[]");
+		const held = "alpha-bravo-cycle-1234";
+		const env = { SERVICE_API_KEY: held };
+		const mask = new SessionStoreMasker({ env: () => env, agentDir: dir.path() }).snapshot(dir.path());
+		expect(mask.empty).toBe(false);
+		const details: Record<string, unknown> = { leaf: "bottom" };
+		details.self = { details };
+		const cyclic: SessionEntry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: TIMESTAMP,
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "r1" }],
+				details,
+				isError: false,
+				timestamp: 2,
+			},
+		};
+
+		expect(() => prepareEntryForPersistence(cyclic, new BlobStore(dir.path()))).toThrow(TypeError);
+		expect(() => maskSessionEntry(cyclic, mask)).toThrow(TypeError);
 	});
 
 	it("makes a cold entry whole when one of its fields is assigned, and persists the write", async () => {
