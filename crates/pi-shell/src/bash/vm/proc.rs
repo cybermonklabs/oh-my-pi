@@ -1950,3 +1950,87 @@ pub const fn vproc_layout() -> [(&'static str, usize); 5] {
 		("ExecState", size_of::<ExecState>()),
 	]
 }
+
+#[cfg(test)]
+mod parked_on_fork_tests {
+	use super::*;
+
+	fn shell() -> Vproc {
+		Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false)
+	}
+
+	fn frame_with(scratch: Scratch) -> Frame {
+		// `FrameKind::Job { one: None }` does not matter here: the function
+		// reads nothing of the frame but its scratch (and, for the subshell
+		// branch, its `unit` and `pc`). A frame with no unit reports its
+		// current op as `None`, which the Redir-op check rules out.
+		let mut f = Frame::new(None, 0, FrameKind::Job { stop_at: 0, one: None });
+		f.scratch = Some(Box::new(scratch));
+		f
+	}
+
+	fn exec_scratch(waiting: Option<Awaited>, wait_for: Vec<Vpid>) -> Scratch {
+		let tag = CmdTag { run: RunId(0), vpid: Vpid(1), seq: 0 };
+		let mut es = ExecState::new(tag, 0);
+		es.waiting = waiting;
+		es.wait_for = wait_for;
+		Scratch { exec: Some(Box::new(es)), ..Scratch::default() }
+	}
+
+	// A program's redirection fork: the shell is parked on `WaitKey::Proc`
+	// for it, its top frame's `exec` is `Awaited::Fork`, and `wait_for`
+	// names that vproc. `parked_on_fork` returns the fork's vpid.
+	#[test]
+	fn awaited_fork_for_the_blocked_vproc_counts() {
+		let fork = Vpid(42);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(fork), at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), Some(fork));
+	}
+
+	// The `wait_for.first() == Some(&v)` guard: the shell is blocked on a
+	// different vproc from the one `Awaited::Fork` names, so the top frame
+	// is not parked on its own redirection fork. A plant that drops this
+	// guard would widen `Awaited::Fork` to every vproc the shell could be
+	// blocked on, so `parked_on_fork` would say Some here instead of None.
+	#[test]
+	fn awaited_fork_for_a_different_vproc_is_not_parked() {
+		let blocked_on = Vpid(42);
+		let fork = Vpid(43);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(blocked_on), at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), None);
+	}
+
+	// The `Opcode::Redir` guard of the no-exec branch: with one child in
+	// the scratch and no running command, the current op must be the
+	// `Redir` whose fork we are parked on. A frame with no unit reports
+	// no op, so `parked_on_fork` returns None. A plant that drops this
+	// guard would widen the no-exec branch to every vproc with one
+	// child, which a plain `( sleep 0.1; ) & wait` reaches.
+	#[test]
+	fn no_exec_without_a_redir_op_is_not_parked() {
+		let child = Vpid(42);
+		let sc = Scratch { children: vec![(child, None)], ..Scratch::default() };
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(child), at: 0 });
+		vp.frames.push(frame_with(sc));
+		assert_eq!(vp.parked_on_fork(), None);
+	}
+
+	// The shell is blocked on something other than a vproc: no fork
+	// answers, whatever the frame says.
+	#[test]
+	fn blocked_on_a_non_proc_key_is_not_parked() {
+		let fork = Vpid(42);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Read { fd: 0 }, at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), None);
+	}
+}

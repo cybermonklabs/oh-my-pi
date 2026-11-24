@@ -5786,6 +5786,96 @@ fn run_func_trap(
 }
 
 #[cfg(test)]
+mod in_loop_tests {
+	use bstr::BString;
+
+	use super::{OneCommand, ScriptKind, in_loop};
+	use crate::bash::{
+		fd::FdTable,
+		ids::Vpid,
+		vm::proc::{Frame, FrameKind, Vproc},
+	};
+
+	fn shell() -> Vproc {
+		Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false)
+	}
+
+	// A `FrameKind::Job` with `one` ends the walk with the loop level the
+	// fork kept of the shell's: the fork is of one command, not a `(…)`,
+	// so `break_loops` looks no farther (bash sets `loop_level = 0` for a
+	// subshell, which `( … )` reflects by `in_loop: false`). The arm
+	// `break_loops` reads for the same decision is pinned by the rows
+	// `z-break-loop-null`, `z-break-noloop-valsub` and the like; this arm
+	// of the free function is reached when a nested word is expanded in
+	// such a fork and needs to know whether a break would end a `${ ;}` on
+	// top of it.
+	#[test]
+	fn a_fork_in_a_loop_answers_true_from_its_one() {
+		let mut vp = shell();
+		vp.frames.push(Frame::new(None, 0, FrameKind::Job {
+			stop_at: 0,
+			one:     Some(OneCommand { trap_exit: None, in_loop: true }),
+		}));
+		vp.frames.push(Frame::new(None, 0, FrameKind::NoFork));
+		assert!(in_loop(&vp));
+	}
+
+	// The same fork, forked outside every loop, answers false.
+	#[test]
+	fn a_fork_outside_any_loop_answers_false_from_its_one() {
+		let mut vp = shell();
+		vp.frames.push(Frame::new(None, 0, FrameKind::Job {
+			stop_at: 0,
+			one:     Some(OneCommand { trap_exit: None, in_loop: false }),
+		}));
+		vp.frames.push(Frame::new(None, 0, FrameKind::NoFork));
+		assert!(!in_loop(&vp));
+	}
+
+	// `Eval`, `NoFork` and `Stage` frames are crossed; a frame of another
+	// kind on the walk ends it with `false`.
+	#[test]
+	fn a_subshell_frame_ends_the_walk_with_false() {
+		let mut vp = shell();
+		vp.frames.push(Frame::new(None, 0, FrameKind::Subshell));
+		vp.frames.push(Frame::new(None, 0, FrameKind::NoFork));
+		assert!(!in_loop(&vp));
+	}
+
+	// The crossable kinds: an `Eval`-script, a `NoFork` (`${ ;}`) and a
+	// `Stage` frame all pass the walk to the next frame; a `Job` with
+	// `one: None` (a suspended job, not one of this rule's forks) is not
+	// crossed.
+	#[test]
+	fn a_job_without_one_ends_the_walk_with_false() {
+		let mut vp = shell();
+		vp.frames
+			.push(Frame::new(None, 0, FrameKind::Job { stop_at: 0, one: None }));
+		vp.frames.push(Frame::new(None, 0, FrameKind::NoFork));
+		assert!(!in_loop(&vp));
+	}
+
+	// A script frame with an `Eval` kind is crossable; a `Run` script
+	// frame ends the walk.
+	#[test]
+	fn an_eval_frame_is_crossed_and_a_run_frame_ends_the_walk() {
+		let mut vp = shell();
+		vp.frames.push(Frame::new(
+			None,
+			0,
+			FrameKind::script(b"", crate::bash::syntax::Pos::default(), ScriptKind::Run),
+		));
+		vp.frames.push(Frame::new(
+			None,
+			0,
+			FrameKind::script(b"", crate::bash::syntax::Pos::default(), ScriptKind::Eval),
+		));
+		vp.frames.push(Frame::new(None, 0, FrameKind::NoFork));
+		assert!(!in_loop(&vp));
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::{BASH_TIMEFORMAT, POSIX_TIMEFORMAT, time_report};
 
