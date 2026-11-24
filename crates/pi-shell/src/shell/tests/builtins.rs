@@ -1595,6 +1595,10 @@ async fn xargs_parallel_signal_death_stops_scheduling() {
 	// Each loop gives up after 3000 polls (at least 30 s), longer than the
 	// run's 20 s bound: if xargs held the killed child until the first command
 	// ended, the bound fails the test before a loop could give up and pass it.
+	// They poll every 10 ms. The second waits for the death of a process that
+	// is not its child, which no shell primitive waits on. The first could read
+	// a FIFO instead, but a read cannot give up: under a faulty xargs that
+	// never starts `second`, the child would outlive the test.
 	let script = concat!(
 		"case \"$1\" in ",
 		"first) n=0; until [ -s \"$0\" ] || [ $n -ge 3000 ]; do sleep 0.01; n=$((n+1)); done; ",
@@ -1713,9 +1717,12 @@ async fn uutils_head_stdin_read_is_cancellable() {
 
 	let canceller = tokio::spawn(async move {
 		// Once `head` has taken the byte, its next read waits.
+		// Only polling sees the byte leave: checks 1 ms apart at first, at most
+		// 20 ms apart later.
+		let mut backoff = crate::testkit::Backoff::new();
 		time::timeout(Duration::from_secs(5), async {
 			while queued_in_pipe(&probe) > 0 {
-				time::sleep(Duration::from_millis(10)).await;
+				time::sleep(backoff.pause()).await;
 			}
 		})
 		.await

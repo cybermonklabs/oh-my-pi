@@ -366,10 +366,12 @@ mod tests {
 	}
 
 	/// Returns once this process's thread `tid` sleeps (state `S`), as a
-	/// parked thread does; fails after 10 seconds.
+	/// parked thread does, looking 1 ms apart at first and at most 20 ms apart
+	/// later; fails after 10 seconds.
 	#[cfg(target_os = "linux")]
 	fn wait_until_asleep(tid: libc::pid_t) {
 		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		let mut backoff = crate::testkit::Backoff::new();
 		loop {
 			let stat =
 				std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap_or_default();
@@ -382,7 +384,7 @@ mod tests {
 				return;
 			}
 			assert!(std::time::Instant::now() < deadline, "the reader never parked");
-			thread::sleep(Duration::from_millis(1));
+			thread::sleep(backoff.pause());
 		}
 	}
 

@@ -30,3 +30,24 @@ pub use crate::testkit::{
 
 #[cfg(test)]
 mod suites;
+
+/// The pauses between the checks of a test's wait that only polling can
+/// see: 1 ms at first, twice as long after each failed check, and at most
+/// 20 ms, so a long wait costs almost no CPU.
+#[cfg(all(test, unix))]
+pub(crate) struct Backoff(std::time::Duration);
+
+#[cfg(all(test, unix))]
+impl Backoff {
+	pub(crate) const fn new() -> Self {
+		Self(std::time::Duration::from_millis(1))
+	}
+
+	/// The pause before the next check; it doubles the one after, up to
+	/// 20 ms.
+	pub(crate) fn pause(&mut self) -> std::time::Duration {
+		let pause = self.0;
+		self.0 = (pause * 2).min(std::time::Duration::from_millis(20));
+		pause
+	}
+}

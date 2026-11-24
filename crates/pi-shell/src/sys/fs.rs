@@ -1453,7 +1453,9 @@ mod tests {
 			let writer = thread::spawn(move || {
 				// The writer comes once the helper waits in open(2) for it: until
 				// then a non-blocking write open finds no reader (ENXIO).
+				// Tried 1 ms apart at first, at most 20 ms apart later.
 				let deadline = Instant::now() + Duration::from_secs(10);
+				let mut backoff = crate::testkit::Backoff::new();
 				let mut file = loop {
 					match fs::OpenOptions::new()
 						.write(true)
@@ -1465,7 +1467,7 @@ mod tests {
 						Err(e) => panic!("{e}"),
 					}
 					assert!(Instant::now() < deadline, "the open never waited for a writer");
-					thread::sleep(Duration::from_millis(1));
+					thread::sleep(backoff.pause());
 				};
 				file.write_all(b"x").unwrap();
 			});

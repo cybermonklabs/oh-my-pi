@@ -1233,16 +1233,19 @@ fn spawn_piped(
 pub(crate) mod wait {
 	use std::time::{Duration, Instant};
 
+	use crate::host::Backoff;
+
 	/// How long a test waits for an event before it fails.
 	const BOUND: Duration = Duration::from_secs(30);
 
-	/// Polls `ready` every millisecond until it holds; fails naming `what` when
-	/// it does not within 30 s.
+	/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms; fails
+	/// naming `what` when it does not within 30 s.
 	pub(crate) fn until(what: &str, mut ready: impl FnMut() -> bool) {
 		let deadline = Instant::now() + BOUND;
+		let mut backoff = Backoff::new();
 		while !ready() {
 			assert!(Instant::now() < deadline, "timed out after {BOUND:?} waiting for {what}");
-			std::thread::sleep(Duration::from_millis(1));
+			std::thread::sleep(backoff.pause());
 		}
 	}
 

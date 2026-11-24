@@ -3229,6 +3229,33 @@ mod testing {
 		tree
 	}
 
+	/// The pauses between the checks of a wait only polling can see: 1 ms
+	/// at first, twice as long after each failed check, and at most 20 ms, so
+	/// a long wait costs almost no CPU.
+	#[cfg(any(
+		all(feature = "util.rsync", any(unix, windows)),
+		all(feature = "util.cat", target_os = "linux")
+	))]
+	pub(crate) struct Backoff(std::time::Duration);
+
+	#[cfg(any(
+		all(feature = "util.rsync", any(unix, windows)),
+		all(feature = "util.cat", target_os = "linux")
+	))]
+	impl Backoff {
+		pub(crate) const fn new() -> Self {
+			Self(std::time::Duration::from_millis(1))
+		}
+
+		/// The pause before the next check; it doubles the one after, up to
+		/// 20 ms.
+		pub(crate) fn pause(&mut self) -> std::time::Duration {
+			let pause = self.0;
+			self.0 = (pause * 2).min(std::time::Duration::from_millis(20));
+			pause
+		}
+	}
+
 	/// A chain of directories named `d` below `top`, as deep as paths may go,
 	/// made for a test; dropping it removes the chain deepest first, by path,
 	/// with the files in its deepest directory. A tempdir dropped with the
@@ -4086,4 +4113,9 @@ pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_pro
 pub(crate) use testing::tree_with_sparse_file;
 #[cfg(all(test, any(feature = "util.du", feature = "util.find")))]
 pub(crate) use testing::DeepChain;
+#[cfg(all(
+	test,
+	any(all(feature = "util.rsync", any(unix, windows)), all(feature = "util.cat", target_os = "linux"))
+))]
+pub(crate) use testing::Backoff;
 

@@ -130,9 +130,11 @@ fn ctrl_c_ends_a_foreground_command_like_zsh() -> io::Result<()> {
 
 /// Wait until `sleep` has exec'd in the terminal's session (forked by the
 /// shell or exec'd in its place): `^C` then comes while the command runs,
-/// not while a shell starts.
+/// not while a shell starts. It looks 1 ms apart at first, at most 20 ms
+/// apart later.
 fn wait_for_sleep(pty: &Pty) -> io::Result<()> {
 	let deadline = Instant::now() + TIMEOUT;
+	let mut pause = Duration::from_millis(1);
 	while !proc::session_members(pty.pid())?
 		.iter()
 		.any(|p| p.name == "sleep" && p.state != proc::ProcState::Zombie)
@@ -140,7 +142,8 @@ fn wait_for_sleep(pty: &Pty) -> io::Result<()> {
 		if Instant::now() >= deadline {
 			return Err(io::Error::new(io::ErrorKind::TimedOut, "sleep never ran on the terminal"));
 		}
-		std::thread::sleep(Duration::from_millis(5));
+		std::thread::sleep(pause);
+		pause = (pause * 2).min(Duration::from_millis(20));
 	}
 	Ok(())
 }

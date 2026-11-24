@@ -328,9 +328,10 @@ mod tests {
 					.ok()
 					.flatten()
 					.expect("cat's blocking-pool thread never started");
+				let mut backoff = crate::host::Backoff::new();
 				tokio::time::timeout(Duration::from_secs(10), async {
 					while thread_state(tid) != Some('S') {
-						tokio::time::sleep(Duration::from_millis(1)).await;
+						tokio::time::sleep(backoff.pause()).await;
 					}
 				})
 				.await

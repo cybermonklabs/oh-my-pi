@@ -53,19 +53,32 @@ mod tests {
 
 		// Leave the child unreaped so it remains visible in the process snapshot,
 		// and wait until it has exited: `WNOWAIT` sees the exit without reaping.
+		// The wait blocks in `waitid` on a thread of its own: the runtime's
+		// shutdown would wait for a blocking-pool thread, and the timeout would
+		// not end the test.
 		#[cfg(target_os = "linux")]
 		{
 			use nix::{
-				sys::wait::{Id, WaitPidFlag, WaitStatus, waitid},
+				errno::Errno,
+				sys::wait::{Id, WaitPidFlag, waitid},
 				unistd::Pid,
 			};
 			let child_pid = Pid::from_raw(i32::try_from(pid)?);
-			let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG;
-			let deadline = std::time::Instant::now() + Duration::from_secs(10);
-			while waitid(Id::Pid(child_pid), flags)? == WaitStatus::StillAlive {
-				anyhow::ensure!(std::time::Instant::now() < deadline, "the child did not exit");
-				tokio::time::sleep(Duration::from_millis(1)).await;
-			}
+			let (sender, exited) = tokio::sync::oneshot::channel();
+			std::thread::spawn(move || {
+				let done = loop {
+					match waitid(Id::Pid(child_pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {
+						Err(Errno::EINTR) => {},
+						done => break done,
+					}
+				};
+				let _ = sender.send(done);
+			});
+			let Ok(exited) = tokio::time::timeout(Duration::from_secs(10), exited).await else {
+				let _ = child.kill();
+				anyhow::bail!("the child did not exit");
+			};
+			exited??;
 		}
 		// Elsewhere, give the trivial command time to reach its exited state.
 		#[cfg(not(target_os = "linux"))]

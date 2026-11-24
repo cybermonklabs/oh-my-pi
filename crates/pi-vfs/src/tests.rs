@@ -728,20 +728,21 @@ impl Drop for OpenMark {
 	}
 }
 
-/// Whether a thread named `name` sleeps within three seconds, polled every
-/// millisecond on the runtime's timer. Without `/proc`, `true` after 200 ms
-/// instead.
+/// Whether a thread named `name` sleeps within three seconds, polled with
+/// pauses from 1 ms up to 20 ms on the runtime's timer. Without `/proc`,
+/// `true` after 200 ms instead.
 #[cfg(unix)]
 async fn named_thread_sleeps(name: &str) -> bool {
 	#[cfg(target_os = "linux")]
 	{
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 		let named_asleep = |tid: libc::pid_t| thread_name(tid) == name && asleep(tid);
+		let mut backoff = Backoff::new();
 		while !thread_ids().into_iter().any(named_asleep) {
 			if tokio::time::Instant::now() >= deadline {
 				return false;
 			}
-			tokio::time::sleep(Duration::from_millis(1)).await;
+			tokio::time::sleep(backoff.pause()).await;
 		}
 		true
 	}
@@ -838,14 +839,36 @@ fn unread(file: &std::fs::File) -> libc::c_int {
 	bytes
 }
 
-/// Polls `ready` every millisecond until it holds; fails after 20 seconds,
-/// naming `what` it never saw.
+/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms; fails
+/// after 20 seconds, naming `what` it never saw.
 #[cfg(target_os = "linux")]
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 	let deadline = std::time::Instant::now() + Duration::from_secs(20);
+	let mut backoff = Backoff::new();
 	while !ready() {
 		assert!(std::time::Instant::now() < deadline, "never saw {what}");
-		std::thread::sleep(Duration::from_millis(1));
+		std::thread::sleep(backoff.pause());
+	}
+}
+
+/// The pauses between the checks of a wait only polling can see: 1 ms at
+/// first, twice as long after each failed check, and at most 20 ms, so a
+/// long wait costs almost no CPU.
+#[cfg(target_os = "linux")]
+struct Backoff(Duration);
+
+#[cfg(target_os = "linux")]
+impl Backoff {
+	const fn new() -> Self {
+		Self(Duration::from_millis(1))
+	}
+
+	/// The pause before the next check; it doubles the one after, up to
+	/// 20 ms.
+	fn pause(&mut self) -> Duration {
+		let pause = self.0;
+		self.0 = (pause * 2).min(Duration::from_millis(20));
+		pause
 	}
 }
 

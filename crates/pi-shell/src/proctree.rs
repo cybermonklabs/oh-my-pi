@@ -1157,48 +1157,54 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	fn signals_taken(pid: i32, program: &str) {
 		let deadline = std::time::Instant::now() + Duration::from_secs(20);
+		// Only polling sees the name change: checks 1 ms apart at first, at
+		// most 20 ms apart later.
+		let mut backoff = crate::testkit::Backoff::new();
 		loop {
 			let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-			if comm.trim_end() == program || child_event(pid, libc::WEXITED) {
+			if comm.trim_end() == program || child_event(pid, libc::WEXITED, false) {
 				break;
 			}
 			assert!(
 				std::time::Instant::now() < deadline,
 				"child {pid} never ran {program} in 20 s (comm {comm:?})",
 			);
-			std::thread::sleep(Duration::from_millis(1));
+			std::thread::sleep(backoff.pause());
 		}
 		// SAFETY: plain syscall; `pid` is the test's own unreaped child.
 		let rc = unsafe { libc::kill(pid, libc::SIGSTOP) };
 		assert_eq!(rc, 0, "SIGSTOP to {pid}: {}", std::io::Error::last_os_error());
-		let deadline = std::time::Instant::now() + Duration::from_secs(20);
-		while !child_event(pid, libc::WSTOPPED | libc::WEXITED) {
-			assert!(
-				std::time::Instant::now() < deadline,
-				"child {pid} neither stopped nor died in 20 s after SIGSTOP",
-			);
-			std::thread::sleep(Duration::from_millis(1));
+		// A thread blocks in `waitid` until the child is stopped or dead.
+		let (taken, waited) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let _ = taken.send(child_event(pid, libc::WSTOPPED | libc::WEXITED, true));
+		});
+		match waited.recv_timeout(Duration::from_secs(20)) {
+			Ok(true) => {},
+			Ok(false) => panic!("waitid on {pid} reported no event while it blocked"),
+			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				panic!("waitid on {pid} failed (see the helper thread's panic)")
+			},
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+				panic!("child {pid} neither stopped nor died in 20 s after SIGSTOP")
+			},
 		}
 	}
 
-	/// Whether child `pid` has an event of `kinds` to report, without
-	/// blocking and without reaping it.
+	/// Whether child `pid` has an event of `kinds` to report, without reaping
+	/// it. With `block`, waits until it has one.
 	#[cfg(target_os = "linux")]
-	fn child_event(pid: i32, kinds: libc::c_int) -> bool {
+	fn child_event(pid: i32, kinds: libc::c_int, block: bool) -> bool {
+		let now = if block { 0 } else { libc::WNOHANG };
 		loop {
 			// SAFETY: siginfo_t is plain data, valid zeroed.
 			let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
 			// SAFETY: `info` is writable; WNOWAIT leaves the child waitable.
 			let rc = unsafe {
-				libc::waitid(
-					libc::P_PID,
-					pid as libc::id_t,
-					&raw mut info,
-					kinds | libc::WNOHANG | libc::WNOWAIT,
-				)
+				libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, kinds | now | libc::WNOWAIT)
 			};
 			if rc == 0 {
-				// SAFETY: `info` is a valid siginfo_t; with WNOHANG its pid
+				// SAFETY: `info` is a valid siginfo_t; without `block` its pid
 				// stays 0 when the child has nothing to report.
 				return unsafe { info.si_pid() } != 0;
 			}

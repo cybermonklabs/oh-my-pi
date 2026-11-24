@@ -1140,10 +1140,12 @@ mod tests {
 	}
 
 	/// Waits until process `pid` sleeps in a blocking call: state `S` in
-	/// `/proc/<pid>/stat`.
+	/// `/proc/<pid>/stat`, looked at 1 ms apart at first and at most 20 ms
+	/// apart later.
 	#[cfg(target_os = "linux")]
 	async fn wait_until_asleep(pid: i32) {
 		let deadline = time::Instant::now() + Duration::from_secs(30);
+		let mut pause = Duration::from_millis(1);
 		loop {
 			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
 			// `pid (comm) state ...`: comm may hold spaces and parentheses, so
@@ -1155,7 +1157,8 @@ mod tests {
 				return;
 			}
 			assert!(time::Instant::now() < deadline, "process {pid} never went to sleep");
-			time::sleep(Duration::from_millis(5)).await;
+			time::sleep(pause).await;
+			pause = (pause * 2).min(Duration::from_millis(20));
 		}
 	}
 

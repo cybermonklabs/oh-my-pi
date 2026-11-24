@@ -918,7 +918,10 @@ mod tests {
 		unsafe { libc::kill(pid, 0) == 0 }
 	}
 
-	/// A shell loop that ends once `go` exists, looking every 10 ms.
+	/// A shell loop that ends once `go` exists, looking every 10 ms. The
+	/// interval stays: the `sleep` runs in the engine, not as a process, and
+	/// in `background_output_is_captured_when_waited_in_starting_run` the job
+	/// parked in it is the Blocked event the test waits for.
 	fn until_exists(go: &std::path::Path) -> String {
 		format!("while [ ! -e '{}' ]; do sleep 0.01; done", go.display())
 	}
