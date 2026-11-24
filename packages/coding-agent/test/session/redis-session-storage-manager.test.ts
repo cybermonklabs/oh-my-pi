@@ -17,6 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { holdsWindows, readWindow } from "../helpers/fake-redis-windows";
 
 interface FakeRedis extends RedisSessionStorageClient {
 	strings: Map<string, string>;
@@ -110,6 +111,14 @@ function createFakeRedis(): FakeRedis {
 					getHash(titleKey).delete(filePath);
 				}
 				return paths.length;
+			}
+			if (script.includes("OMP_READ_WINDOW")) {
+				const value = strings.get(keys[0]);
+				return readWindow(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
+			}
+			if (script.includes("OMP_CHECK_WINDOWS")) {
+				const value = strings.get(keys[0]);
+				return holdsWindows(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
 			}
 			throw new Error("Unsupported Redis script");
 		},

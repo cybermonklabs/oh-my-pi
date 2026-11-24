@@ -4,8 +4,8 @@ import {
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
 import { STALE_STAGING_MS, utf8Parts } from "./session-staging";
-import { SessionWriteConflictError } from "./session-storage";
-import { eexist } from "./session-storage-errors";
+import { SessionReadConflictError, SessionWriteConflictError } from "./session-storage";
+import { eexist, enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -45,6 +45,8 @@ const DEFAULT_PREFIX = "omp:sessions:";
 const DEFAULT_SCAN_COUNT = 500;
 /** Bytes of each part a streamed full write appends to its staging key. */
 const STAGING_PART_BYTES = 1024 * 1024;
+/** Most bytes one window of a chunked read (`readChunks`) fetches. */
+const READ_WINDOW_BYTES = 1024 * 1024;
 
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
@@ -132,6 +134,82 @@ if ARGV[2] ~= "" then
 	text = redis.call("GETRANGE", KEYS[1], ARGV[1], ARGV[2])
 end
 return {redis.call("STRLEN", KEYS[1]), text}`;
+
+// One window of a chunked read: the key's size, and from byte ARGV[1] at most
+// ARGV[2] bytes, up to ARGV[3], the size the read's first window saw ("" for
+// the first window, which reads up to the size it finds). A window starts and
+// ends between characters, so its bytes decode to a string and encode back to
+// the same bytes: a first window from inside a character starts at the byte
+// that begins it (a later one starts where the last one ended), and a window
+// that stops short of the read's end ends before the character its next byte
+// continues, never as nothing (each backs over at most three continuation
+// bytes, and not at all where the bytes are not UTF-8). Returns {size, the
+// window's byte length, its SHA-1, the window, the bytes it starts before
+// ARGV[1]}; {size} alone when the key is shorter than ARGV[3] now, and nil
+// when it is missing.
+const READ_WINDOW_SCRIPT = `-- OMP_READ_WINDOW
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local size = redis.call("STRLEN", KEYS[1])
+local stop = size
+if ARGV[3] ~= "" then
+	stop = tonumber(ARGV[3])
+	if size < stop then
+		return {size}
+	end
+end
+-- The continuation bytes (10xxxxxx), at most three and none before byte
+-- floor, that run back from byte at to the byte that begins their character;
+-- 0 when byte at begins one, or when no such byte is found.
+local function back_to_start(at, floor)
+	local probe = redis.call("GETRANGE", KEYS[1], math.max(floor, at - 3), at)
+	local back = 0
+	while back < 3 and #probe - back > 1 do
+		local byte = string.byte(probe, #probe - back)
+		if byte < 128 or byte >= 192 then
+			break
+		end
+		back = back + 1
+	end
+	if back > 0 and string.byte(probe, #probe - back) >= 192 then
+		return back
+	end
+	return 0
+end
+local first = tonumber(ARGV[1])
+if first >= stop then
+	return {size, 0, "", "", 0}
+end
+local start = first
+if first > 0 and ARGV[3] == "" then
+	start = first - back_to_start(first, 0)
+end
+local last = math.min(start + tonumber(ARGV[2]), stop) - 1
+if last + 1 < stop then
+	last = last - back_to_start(last + 1, start + 1)
+end
+local text = redis.call("GETRANGE", KEYS[1], start, last)
+return {size, string.len(text), redis.sha1hex(text), text, first - start}`;
+
+// The check at the end of a chunked read, in one script, so it compares one
+// state of the key: 1 when the key holds, from byte ARGV[1] on, the windows
+// the read yielded, given as each one's byte length and SHA-1 in order
+// (ARGV[2], ARGV[3], then the next window's); 0 when it does not, or is gone.
+const CHECK_WINDOWS_SCRIPT = `-- OMP_CHECK_WINDOWS
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+local at = tonumber(ARGV[1])
+for i = 2, #ARGV, 2 do
+	local length = tonumber(ARGV[i])
+	local text = redis.call("GETRANGE", KEYS[1], at, at + length - 1)
+	if string.len(text) ~= length or redis.sha1hex(text) ~= ARGV[i + 1] then
+		return 0
+	end
+	at = at + length
+end
+return 1`;
 
 // One script, so the key, its mtime and its title move together: no client's
 // write to either path can land between them. With ARGV[4] == "1" a taken
@@ -228,13 +306,14 @@ function writeReply(result: unknown): [status: number, size: number] {
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
  * `listFilesSync` calls remain available without mirroring full content. A
  * full rewrite streams its body in parts to a staging key of its own and
- * swaps it in (see `writeFullStream`), so the body is never one value here;
- * only the check after a failed publish reads the stored copy back whole,
- * one string and then one buffer, as the Redis backend has no chunked read
- * (`readChunks`): a read of the whole value goes through `readFull`. A read
- * of a whole session is one value too, for the same reason.
+ * swaps it in (see `writeFullStream`), and a chunked read (`readChunks`),
+ * which the check after a failed publish and the loaders of long sessions
+ * take, fetches the stored text in windows of at most
+ * {@link READ_WINDOW_BYTES}, so neither holds the body as one value.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
+	/** Always set: the Redis backend reads a session window by window. */
+	declare readonly readChunks: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	/**
 	 * Warm the metadata index with every existing session key under the configured
 	 * prefix and return the ready-to-use storage. Must be awaited before passing
@@ -314,6 +393,79 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		]);
 		if (!Array.isArray(result)) return null;
 		return { text: String(result[1]), size: Number(result[0]) };
+	}
+
+	/**
+	 * The stored bytes from `fromByte`, a window of at most
+	 * {@link READ_WINDOW_BYTES} per script (`READ_WINDOW_SCRIPT`), each window
+	 * one chunk. A window starts and ends between characters, so its text
+	 * decodes and encodes back to its bytes; a read from inside a character
+	 * fetches that character whole and yields its bytes from `fromByte` on.
+	 * The read stops at the size its first window saw, so an append made
+	 * meanwhile is left out; a key that is gone or shorter than that at a later
+	 * window was deleted or rewritten during the read, which then fails with
+	 * {@link SessionReadConflictError}.
+	 *
+	 * A full rewrite to as many bytes or more is not seen by a window, so once
+	 * the bytes the read yielded come from more than one window, one script at
+	 * the read's end (`CHECK_WINDOWS_SCRIPT`) checks that the key holds them
+	 * still, by each window's byte length and SHA-1 as the window script gave
+	 * them; one that does not is a read conflict too. The check runs when the
+	 * read ends, and also when its consumer closes it before that (a `break`
+	 * out of its loop), whose `return()` then rejects with the conflict. A
+	 * read that fails runs no check.
+	 */
+	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		const key = this.#fileKey(path);
+		// The check's arguments: the byte the first window starts at, then each window's byte length and SHA-1.
+		const windows: string[] = [];
+		let failed = false;
+		try {
+			let at = Math.max(0, Math.trunc(fromByte));
+			let stop: number | undefined;
+			do {
+				const reply = await this.#client.send("EVAL", [
+					READ_WINDOW_SCRIPT,
+					"1",
+					key,
+					String(at),
+					String(READ_WINDOW_BYTES),
+					stop === undefined ? "" : String(stop),
+				]);
+				if (!Array.isArray(reply)) {
+					if (stop === undefined) throw enoent(path);
+					throw new SessionReadConflictError(path);
+				}
+				const size = Number(reply[0]);
+				if (stop === undefined) stop = size;
+				else if (size < stop) throw new SessionReadConflictError(path);
+				const length = Number(reply[1]);
+				if (length === 0) return;
+				// Only a first window from inside a character starts before `at`.
+				const before = Number(reply[4]);
+				if (windows.length === 0) windows.push(String(at - before));
+				windows.push(String(length), String(reply[2]));
+				at += length - before;
+				const bytes = Buffer.from(String(reply[3]), "utf8");
+				yield before > 0 ? bytes.subarray(before) : bytes;
+			} while (at < stop);
+		} catch (err) {
+			failed = true;
+			throw err;
+		} finally {
+			// More than one window: at the read's end, or where its consumer closed it, unless it is failing already.
+			if (!failed && windows.length > 3) await this.#confirmWindows(path, key, windows);
+		}
+	}
+
+	/**
+	 * Fail with {@link SessionReadConflictError} unless `key` still holds the
+	 * windows a {@link readChunks} of `path` yielded: `windows` is the byte the
+	 * first one starts at, then each one's byte length and SHA-1.
+	 */
+	async #confirmWindows(path: string, key: string, windows: string[]): Promise<void> {
+		const held = await this.#client.send("EVAL", [CHECK_WINDOWS_SCRIPT, "1", key, ...windows]);
+		if (Number(held) !== 1) throw new SessionReadConflictError(path);
 	}
 
 	async writeFull(

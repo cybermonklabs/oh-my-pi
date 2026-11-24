@@ -69,10 +69,10 @@ export async function copyTranscriptTree(
 /**
  * Copy `from` to `to` chunk by chunk, appending through a writer in batches of
  * whole lines of about {@link LINE_STREAM_CHUNK}, so a transcript on a store that
- * reads in chunks (file and SQL storage) is never held whole (a line at most), and
- * a store that yields a chunk per stored part (SQL: about one per line) is not
- * appended to once per part; a store without chunked reads (Redis, an SDK store)
- * yields its text as one chunk, which is appended whole. A title slot at its
+ * reads in chunks (file, SQL and Redis storage) is never held whole (a line at
+ * most), and a store that yields a chunk per stored part (SQL: about one per
+ * line) is not appended to once per part; a store without chunked reads (an SDK
+ * store) yields its text as one chunk, which is appended whole. A title slot at its
  * head is set on `to` as a whole write would set it. Returns false, leaving
  * nothing at `to`, when `from` is gone; any other failure removes the partial
  * copy and throws. A full rewrite or delete of `from` between two chunks

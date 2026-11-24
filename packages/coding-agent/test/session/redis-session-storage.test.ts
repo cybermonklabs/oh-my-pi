@@ -23,9 +23,10 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
-import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { holdsWindows, readWindow } from "../helpers/fake-redis-windows";
 
 /** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
 function rewriteLines(text: string, count = 3): string[] {
@@ -38,6 +39,52 @@ function rewriteLines(text: string, count = 3): string[] {
 				`${JSON.stringify({ type: "custom", customType: "n", id: `e${n}`, parentId: null, data: { text } })}\n`,
 		),
 	];
+}
+
+const MiB = 1024 * 1024;
+
+/**
+ * A session of about 3.2 MB: a header, then three entries of "a" and `fill`.
+ * With a `fill` of three bytes, the windows of a read from its start end
+ * inside a character, and two such fills give two bodies of one size.
+ */
+function paddedBody(fill: string): string {
+	const header = `${JSON.stringify({ type: "session", version: 3, id: "redis-chunks", timestamp: "t0", cwd: "/cwd" })}\n`;
+	const pads = Array.from(
+		{ length: 3 },
+		(_, n) =>
+			`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, data: `a${fill.repeat(350_000)}` })}\n`,
+	);
+	return [header, ...pads].join("");
+}
+
+/**
+ * Read `file` through `reader` from `fromByte`, running `race` once right
+ * after the first chunk. What the read gave: the name of the entry of
+ * `bodies` its bytes equal, "read conflict", "a short body" (the start of
+ * one of `bodies`) or "a mix".
+ */
+async function racedRead(
+	reader: RedisSessionStorage,
+	file: string,
+	fromByte: number,
+	race: () => Promise<void>,
+	bodies: Record<string, Buffer>,
+): Promise<string> {
+	const chunks: Uint8Array[] = [];
+	try {
+		for await (const chunk of reader.readChunks(file, fromByte)) {
+			chunks.push(chunk);
+			if (chunks.length === 1) await race();
+		}
+	} catch (err) {
+		if (!(err instanceof SessionReadConflictError)) throw err;
+		return "read conflict";
+	}
+	const read = Buffer.concat(chunks);
+	const named = Object.entries(bodies).find(([, body]) => body.equals(read));
+	if (named) return named[0];
+	return Object.values(bodies).some(body => body.subarray(0, read.length).equals(read)) ? "a short body" : "a mix";
 }
 
 interface FakeRedisCall {
@@ -203,6 +250,15 @@ function createFakeRedis(): FakeRedis {
 				if (value === undefined) return null;
 				const bytes = Buffer.from(value, "utf-8");
 				return [bytes.length, last === "" ? "" : byteRange(bytes, Number(first), Number(last))];
+			}
+			if (script.includes("OMP_READ_WINDOW")) {
+				checkFailure("getrange");
+				const value = strings.get(keys[0]);
+				return readWindow(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
+			}
+			if (script.includes("OMP_CHECK_WINDOWS")) {
+				const value = strings.get(keys[0]);
+				return holdsWindows(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
 			}
 			throw new Error("Unsupported Redis script");
 		},
@@ -584,6 +640,46 @@ describe("RedisSessionStorage", () => {
 		await expect(storage.readTextFrom("/sessions/p/gone.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	// If this regresses, resuming, scanning or checking a long session on Redis storage reads its
+	// whole transcript as one value, or splits a character between two chunks and corrupts it.
+	it("reads in windows of at most 1 MiB by script, each between characters, checked once at the end, never GETting the whole value", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const path = "/sessions/p/chunked.jsonl";
+		// One byte, then 2.4 MB of four-byte characters: a window of 1 MiB from the start ends inside one.
+		const body = `a${"😀".repeat(600_000)}\n`;
+		const bytes = Buffer.from(body);
+		await storage.writeText(path, body);
+		redis.calls.length = 0;
+
+		const chunks = await Array.fromAsync(storage.readChunks(path));
+		// From inside the first character: its last three bytes, then the rest.
+		const fromInside = Buffer.concat(await Array.fromAsync(storage.readChunks(path, 2)));
+
+		expect({
+			equal: Buffer.concat(chunks).equals(bytes),
+			sizes: chunks.map(chunk => chunk.byteLength),
+			decodeWhole: chunks.map(chunk => Buffer.from(new TextDecoder().decode(chunk)).equals(chunk)),
+			fromInside: fromInside.equals(bytes.subarray(2)),
+		}).toEqual({
+			equal: true,
+			sizes: [MiB - 3, MiB, bytes.length - 2 * MiB + 3],
+			decodeWhole: [true, true, true],
+			fromInside: true,
+		});
+		const window = ["send", "-- OMP_READ_WINDOW"];
+		const check = ["send", "-- OMP_CHECK_WINDOWS"];
+		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual([
+			window,
+			window,
+			window,
+			check,
+			window,
+			window,
+			window,
+			check,
+		]);
+	});
+
 	it("custom prefix isolates keyspaces", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis, prefix: "proj-a:" });
 		await storage.writeText("/sessions/x.jsonl", "hello\n");
@@ -788,5 +884,131 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			stored: await client.get(`${prefix}file:/s/r.jsonl`),
 			staging: await client.send("KEYS", [`${prefix}staging:*`]),
 		}).toEqual({ stored: "theirs\n", staging: [] });
+	});
+
+	// If this regresses, a long session's bytes on a Redis server come back with a character split
+	// between two chunks (the loaders then decode it wrong), or from the wrong offset.
+	it("reads the stored bytes in windows of at most 1 MiB that start and end between characters, from any byte", async () => {
+		const { storage } = await open();
+		const results: unknown[] = [];
+		const expected: unknown[] = [];
+		for (const lead of [0, 1, 2, 3]) {
+			// Four-byte characters after `lead` bytes: a window of 1 MiB ends inside one at each of its bytes.
+			const body = `${"a".repeat(lead)}${"😀".repeat(600_000)}\n`;
+			const bytes = Buffer.from(body);
+			const file = `/s/chars-${lead}.jsonl`;
+			await storage.writeText(file, body);
+			for (const fromByte of [
+				0,
+				1,
+				2,
+				3,
+				4,
+				5,
+				MiB + 1,
+				MiB + 2,
+				bytes.length - 2,
+				bytes.length,
+				bytes.length + 5,
+			]) {
+				const chunks = await Array.fromAsync(storage.readChunks(file, fromByte));
+				results.push({
+					lead,
+					fromByte,
+					equal: Buffer.concat(chunks).equals(bytes.subarray(fromByte)),
+					bounded: chunks.every(chunk => chunk.byteLength <= MiB),
+					// Every chunk after the first starts between characters, as every chunk ends.
+					decodeWhole: chunks.slice(1).every(chunk => Buffer.from(new TextDecoder().decode(chunk)).equals(chunk)),
+				});
+				expected.push({ lead, fromByte, equal: true, bounded: true, decodeWhole: true });
+			}
+		}
+		expect(results).toEqual(expected);
+	});
+
+	it("rejects a chunked read with ENOENT for a key another client deleted", async () => {
+		const { client, storage } = await open();
+		await storage.writeText("/s/gone.jsonl", paddedBody("€"));
+		await client.send("DEL", [`${prefix}file:/s/gone.jsonl`]);
+
+		await expect(Array.fromAsync(storage.readChunks("/s/gone.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	// If this regresses, a resume of a session another process keeps appending to fails as raced,
+	// or ends inside a line the read never finished.
+	it("yields exactly the body its first window saw when another client appends between two windows", async () => {
+		const { storage } = await open();
+		const other = await open();
+		const before = paddedBody("€");
+		await storage.writeText("/s/grow.jsonl", before);
+		await other.storage.refresh();
+		const later = `${JSON.stringify({ type: "custom", customType: "pad", id: "q", parentId: null, data: "c".repeat(MiB) })}\n`;
+
+		const outcome = await racedRead(
+			storage,
+			"/s/grow.jsonl",
+			0,
+			async () => {
+				const writer = other.storage.openWriter("/s/grow.jsonl", { flags: "a" });
+				await writer.append(later);
+				await writer.close();
+				await other.storage.drain();
+			},
+			{ "old body": Buffer.from(before), "old body and the appended line": Buffer.from(before + later) },
+		);
+
+		expect(outcome).toBe("old body");
+	});
+
+	// If this regresses, loading, copying or checking a session another process rewrote meanwhile
+	// on Redis yields its first windows from the old transcript and the rest from the new one.
+	for (const race of ["a rewrite to the same size", "a delete and a re-create", "a rewrite to fewer bytes"] as const) {
+		// From the start, and from inside a character with windows left to read.
+		for (const fromByte of [0, MiB / 2 + 1]) {
+			it(`yields one body's bytes or a read conflict when ${race} lands between two windows of a read from byte ${fromByte}`, async () => {
+				const { storage } = await open();
+				const other = await open();
+				const before = Buffer.from(paddedBody("€"));
+				const after = Buffer.from(race === "a rewrite to fewer bytes" ? paddedBody("é") : paddedBody("₤"));
+				await storage.writeText("/s/raced.jsonl", before.toString("utf-8"));
+				await other.storage.refresh();
+
+				const outcome = await racedRead(
+					storage,
+					"/s/raced.jsonl",
+					fromByte,
+					async () => {
+						if (race === "a delete and a re-create") await other.storage.unlink("/s/raced.jsonl");
+						await other.storage.writeText("/s/raced.jsonl", after.toString("utf-8"));
+					},
+					{ "old body": before.subarray(fromByte), "new body": after.subarray(fromByte) },
+				);
+
+				expect(["old body", "new body", "read conflict"]).toContain(outcome);
+			});
+		}
+	}
+
+	// If this regresses, a reader that stops early (a header probe, the Agent Hub roster) keeps
+	// the head of one body and the next window of another without a word.
+	it("rejects the close of a read stopped after two windows that a rewrite between them mixed", async () => {
+		const { storage } = await open();
+		const other = await open();
+		await storage.writeText("/s/stopped.jsonl", paddedBody("€"));
+		await other.storage.refresh();
+
+		const chunks: Uint8Array[] = [];
+		const error = await (async () => {
+			for await (const chunk of storage.readChunks("/s/stopped.jsonl")) {
+				chunks.push(chunk);
+				if (chunks.length === 1) await other.storage.writeText("/s/stopped.jsonl", paddedBody("₤"));
+				if (chunks.length === 2) break;
+			}
+		})().then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect({ chunks: chunks.length, error }).toEqual({ chunks: 2, error: expect.any(SessionReadConflictError) });
 	});
 });

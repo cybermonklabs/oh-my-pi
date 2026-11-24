@@ -189,7 +189,8 @@ function openWatched<S>(Storage: object, create: () => Promise<S>, watch: Backen
 
 /** One case's store: a storage over a table or key prefix of its own, and the cleanup that removes them. */
 interface Store {
-	readonly storage: IndexedSessionStorage;
+	/** Either reads in chunks, so the stored copy is checked without being joined. */
+	readonly storage: RedisSessionStorage | SqlSessionStorage;
 	close(): Promise<void>;
 }
 
@@ -289,37 +290,6 @@ const REWRITES: ReadonlyArray<{
 	},
 ];
 
-/**
- * The stored bytes of `file` as size and SHA-256, never joined: through the
- * storage's chunked read where it has one (SQL); otherwise (Redis) through its
- * sliced read, in windows of whole lines of `lines`, so a window that ends
- * inside a character is read only from a stored copy other than `lines`.
- */
-async function storedDigest(
-	storage: IndexedSessionStorage,
-	file: string,
-	lines: readonly string[],
-): Promise<{ hash: string; bytes: number }> {
-	if (storage.readChunks) return digestStream(storage.readChunks(file));
-	const hasher = new Bun.CryptoHasher("sha256");
-	let offset = 0;
-	let size = 0;
-	let window = 0;
-	const read = async (): Promise<void> => {
-		const slice = await storage.readTextFrom(file, offset, window);
-		hasher.update(slice.text);
-		size = slice.size;
-		offset += window;
-		window = 0;
-	};
-	for (const line of lines) {
-		window += Buffer.byteLength(line);
-		if (window >= MiB) await read();
-	}
-	if (window > 0) await read();
-	return { hash: hasher.digest("hex"), bytes: size };
-}
-
 const originalTmpdir = process.env.TMPDIR;
 
 function restoreTmpdir(): void {
@@ -373,7 +343,8 @@ for (const { kind, url } of BACKENDS) {
 				outcome,
 				seen,
 				spoolWarnings: spoolWarnings(warn.mock.calls).map(([, context]) => context),
-				stored: await storedDigest(store.storage, file, REWRITE.lines),
+				// Size and SHA-256 through the storage's chunked read, never joined.
+				stored: await digestStream(store.storage.readChunks(file)),
 			};
 		}
 

@@ -83,7 +83,7 @@ function messageLine(index: number, body: string): string {
 	return JSON.stringify({ type: "message", id: `m${index}`, message });
 }
 
-/** Sessions in a map, read only whole as Redis and SDK backends read them (no `readChunks`). */
+/** Sessions in a map, read only whole as an SDK backend without `readChunks` reads them. */
 class WholeReadBackend extends MemoryBackend {
 	override readSlices(): Promise<[string, string]> {
 		return Promise.reject(new Error("stage 1 reads no slices"));
