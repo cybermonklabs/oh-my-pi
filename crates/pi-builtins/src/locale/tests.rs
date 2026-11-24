@@ -1,6 +1,8 @@
 //! The shell's locale as a command it starts would see it: its search
 //! path, its working directory, and the locale utility that answers for
-//! it. Each test runs in its own process under nextest.
+//! it. A test that changes or reads what belongs to the whole process runs
+//! in a process of its own, whatever runs it
+//! ([`crate::own_process::own_process`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +18,8 @@ const SHELL_ONLY_LOCALE: &str = "omp_rsync_latin1";
 /// prints a non-ASCII name's bytes (measured: `env -i LOCPATH=… LC_ALL=…
 /// rsync -ai "src/ünï.txt" dst/` prints them) where the C locale escapes
 /// them. `None` on a host without locale sources, which cannot host the
-/// scenario at all.
+/// scenario at all: the calling test skips, after this prints
+/// `skipped: <reason>`.
 #[cfg(target_os = "linux")]
 fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 	let locales = dir.join("locales");
@@ -27,7 +30,24 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 		.output();
 	fs::create_dir_all(dir.join("src")).unwrap();
 	fs::write(dir.join("src/ünï.txt"), b"x\n").unwrap();
-	built.is_ok_and(|built| built.status.success()).then_some(locales)
+	localedef_built(built, "en_US ISO-8859-1").then_some(locales)
+}
+
+/// Whether a `localedef` run built its locale; when not, a skip line for
+/// the calling test.
+#[cfg(target_os = "linux")]
+fn localedef_built(built: std::io::Result<std::process::Output>, what: &str) -> bool {
+	match built {
+		Ok(out) if out.status.success() => true,
+		Ok(out) => {
+			eprintln!("skipped: localedef could not build {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+			false
+		},
+		Err(err) => {
+			eprintln!("skipped: localedef could not run for {what}: {err}");
+			false
+		},
+	}
 }
 
 /// Makes every path below `parent` one no process can enter, root
@@ -164,6 +184,9 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -171,7 +194,7 @@ fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
 	// The same query answers under the ordinary disposition, so what the
 	// second half measures is the disposition and nothing else.
 	let ordinary = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
-	// SAFETY: nextest gives this test its own process, which starts no other
+	// SAFETY: this test has a process of its own (`own_process`), which starts no other
 	// child; the disposition is put back below.
 	let kept = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 	let reaped_for_us = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
@@ -196,8 +219,6 @@ fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_silent_or_flooding_utility_affirms_nothing() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let cases: [(&str, &str, bool); 3] = [
 		("quiet", "printf 'ISO-8859-1\\n'\n", true),
@@ -206,14 +227,195 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 	];
 	for (name, body, accepts) in cases {
 		let program = dir.path().join(name);
-		fs::write(&program, format!("#!/bin/sh\n{body}")).unwrap();
-		fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::testprog::write(&program, &format!("#!/bin/sh\n{body}"));
 		let answer = crate::locale::utility_accepts_for_test(&program, "de_DE@absent;bogus");
 		match (&answer, accepts) {
 			(crate::locale::Loadable::Yes, true) | (crate::locale::Loadable::Unasked(_), false) => {},
 			_ => panic!("{name}: {}", matches!(answer, crate::locale::Loadable::No)),
 		}
 	}
+}
+
+/// A query started while another thread holds the library's abort lock
+/// still answers. glibc 2.41's `sigaction` of `SIGABRT` takes that lock
+/// for writing, and its `posix_spawn` holds it for reading until the
+/// spawn's child runs the program (`_Fork` holds it across the fork
+/// itself); musl takes its one `__abort_lock` in the same three places. A
+/// child made by `clone3` keeps a copy of that lock as it was: the query's
+/// child, putting `SIGABRT` back to default, waited on it until the
+/// query's deadline ended it ("was ended before it finished"), which failed
+/// a run of `locale::tests` about one time in three on Debian 13. Here the
+/// spawn's child is held in an open of a FIFO that has no writer, so the
+/// spawn is in flight for the whole query. glibc before 2.41 takes no such
+/// lock, and there this passes either way; on musl it fails without the
+/// change, as on glibc 2.41.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
+	use std::os::unix::ffi::OsStrExt as _;
+
+	/// Holds the spawner thread and lets the spawn's child out of its open
+	/// on every way out of the test, a failure included, so that no child is
+	/// left waiting there once this process has ended. The child can be in
+	/// one of three places then:
+	///
+	/// * asleep in its open of the FIFO: an open for reading and writing
+	///   never waits on Linux (`fifo(7)`) and counts as a writer, which lets
+	///   it out;
+	/// * short of its lookup of the FIFO's name: removing the name fails its
+	///   open, which ends the spawn;
+	/// * between its lookup and its open: it opens the FIFO it found, name
+	///   or no name, and waits there for a writer. When the last open file of
+	///   a FIFO closes, the kernel lets its pipe go, and the next open makes
+	///   a new one that has no writer (`fs/pipe.c`), so a writer closed
+	///   before that open lets nobody out.
+	///
+	/// So the writer stays open until the spawner has returned, which it
+	/// does only once its child is past the open or has failed it.
+	struct Release<'a> {
+		fifo:    &'a Path,
+		spawner: Option<std::thread::JoinHandle<libc::c_int>>,
+	}
+	impl Release<'_> {
+		/// Whether the spawner has ended.
+		fn spawner_ended(&self) -> bool {
+			self.spawner.as_ref().is_some_and(std::thread::JoinHandle::is_finished)
+		}
+
+		/// Lets the child out as above and returns how the spawner ended;
+		/// `None` once the spawner has been joined. A writer that will not
+		/// open lets nobody out, so the spawner is then left unjoined.
+		fn let_go(&mut self) -> Option<std::io::Result<std::thread::Result<libc::c_int>>> {
+			let spawner = self.spawner.take()?;
+			let writer = match fs::OpenOptions::new().read(true).write(true).open(self.fifo) {
+				Ok(writer) => writer,
+				Err(error) => return Some(Err(error)),
+			};
+			let removed = fs::remove_file(self.fifo);
+			let ended = spawner.join();
+			drop(writer);
+			Some(removed.map(|()| ended))
+		}
+
+		/// The spawner ends before the writer comes only when the spawn
+		/// failed: on success it waits for a child that cannot leave the open
+		/// until then.
+		fn spawn_failed(&mut self) -> ! {
+			match self.spawner.take().map(std::thread::JoinHandle::join) {
+				Some(Ok(status)) => panic!("the spawn ended, status {status}, before its child was held in the open"),
+				Some(Err(panic)) => panic!("the spawn failed before its child was held in the open: {}", panic_text(&*panic)),
+				None => unreachable!("the spawner is joined once"),
+			}
+		}
+	}
+	impl Drop for Release<'_> {
+		fn drop(&mut self) {
+			let _ = self.let_go();
+		}
+	}
+
+	/// What the spawner panicked with.
+	fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+		let text = panic.downcast_ref::<String>().map(String::as_str);
+		text.or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("no message")
+	}
+
+	if !crate::own_process::own_process() {
+		return;
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("locale");
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
+	let fifo = dir.path().join("fifo");
+	let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+	// SAFETY: a valid NUL-terminated path.
+	let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+	assert_eq!(made, 0, "{}", std::io::Error::last_os_error());
+	let (started, spawning) = std::sync::mpsc::channel();
+	let spawner = std::thread::spawn(move || {
+		// SAFETY: gettid takes no arguments.
+		started.send(unsafe { libc::gettid() }).unwrap();
+		// SAFETY: the file actions are initialised before use and destroyed
+		// after it; every pointer names a live NUL-terminated string, and
+		// `argv` and `envp` end in a null pointer.
+		unsafe {
+			let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+			assert_eq!(libc::posix_spawn_file_actions_init(actions.as_mut_ptr()), 0);
+			// The spawn's child opens the FIFO for reading before it runs
+			// `true`, and no writer comes until the query has answered.
+			let open = libc::posix_spawn_file_actions_addopen(
+				actions.as_mut_ptr(),
+				3,
+				fifo_c.as_ptr(),
+				libc::O_RDONLY,
+				0,
+			);
+			assert_eq!(open, 0);
+			let argv = [c"true".as_ptr().cast_mut(), std::ptr::null_mut()];
+			let envp = [std::ptr::null_mut::<libc::c_char>()];
+			let mut pid: libc::pid_t = 0;
+			let spawned = libc::posix_spawn(
+				&raw mut pid,
+				c"/bin/true".as_ptr(),
+				actions.as_ptr(),
+				std::ptr::null(),
+				argv.as_ptr(),
+				envp.as_ptr(),
+			);
+			libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+			assert_eq!(spawned, 0, "posix_spawn: {}", std::io::Error::from_raw_os_error(spawned));
+			let mut status = 0;
+			assert_eq!(libc::waitpid(pid, &raw mut status, 0), pid);
+			status
+		}
+	});
+	let mut release = Release { fifo: &fifo, spawner: Some(spawner) };
+	let Ok(spawning) = spawning.recv() else { release.spawn_failed() };
+	let children = format!("/proc/self/task/{spawning}/children");
+	// The spawn is in flight once its child sleeps in that open. Each pass
+	// ends the wait on a fact: the child asleep there; the spawner ended,
+	// which only a failed spawn does (its panic is reported); or a read
+	// this cannot do (its error is reported). Until one of those, the
+	// spawner has not cloned yet or its child is on its way to the open.
+	// No deadline decides, so a slow machine only waits longer.
+	let child = loop {
+		if release.spawner_ended() {
+			release.spawn_failed();
+		}
+		let listed = match fs::read_to_string(&children) {
+			Ok(listed) => listed,
+			// The thread's directory goes only once the thread has ended.
+			Err(_) if release.spawner_ended() => release.spawn_failed(),
+			Err(error) => panic!("{children}: {error}; the spawn's child cannot be found without it"),
+		};
+		if let Some(child) = listed.split_whitespace().next() {
+			match fs::read_to_string(format!("/proc/{child}/stat")) {
+				Ok(stat) if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) => {
+					break child.to_owned();
+				},
+				Ok(_) => {},
+				// Collected since it was listed: the spawn failed, and the next
+				// pass finds the spawner ended.
+				Err(error)
+					if error.kind() == std::io::ErrorKind::NotFound
+						|| error.raw_os_error() == Some(libc::ESRCH) => {},
+				Err(error) => panic!("/proc/{child}/stat, of the child {children} lists as {listed:?}: {error}"),
+			}
+		}
+		std::thread::yield_now();
+	};
+	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_: &str| None);
+	// A writer lets the spawn's child open the FIFO, run `true` and end.
+	let ended = release.let_go().expect("the spawner, joined here first");
+	let status = match ended.expect("the FIFO opened as a writer, and then removed") {
+		Ok(status) => status,
+		Err(panic) => panic!("the spawn after its child {child} left the open: {}", panic_text(&*panic)),
+	};
+	assert_eq!(status, 0, "the spawn's child {child} ran `true`");
+	assert!(
+		matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
+		"{answer:?}"
+	);
 }
 
 /// A query libc could not be asked is not an observation of the C locale.
@@ -224,13 +426,16 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_refused_query_falls_back_to_the_name_and_says_so() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let (host, capture) = crate::host::Host::for_test("fold", "", dir.path());
 	let mut host = host;
 	host.set_test_var("LC_ALL", "C.UTF-8");
 	host.set_test_var("LOCPATH", locales.to_str().unwrap());
-	// SAFETY: nextest gives this test its own process, which starts no other
+	// SAFETY: this test has a process of its own (`own_process`), which starts no other
 	// child; the disposition is put back below.
 	let kept = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 	let utf8 = crate::locale::ctype_is_utf8(&host);
@@ -316,6 +521,9 @@ fn a_locale_missing_a_category_leaves_the_utilities_in_c() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_competing_reaper_does_not_turn_the_query_into_a_stray_signal() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -406,6 +614,9 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_handed_to_a_task_already_read_is_still_caught() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
 	let (ids_tx, ids_rx) = std::sync::mpsc::channel();
 	let holder = std::thread::spawn(move || {
@@ -494,6 +705,9 @@ fn a_child_handed_to_a_task_already_read_is_still_caught() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let mut copy = Command::new("cp");
@@ -506,7 +720,7 @@ fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
 		.arg(locales.join(ascii))
 		.output()
 		.is_ok_and(|built| built.status.success());
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	let absent = crate::locale::locale_loadable("LC_CTYPE=C;LC_TIME=C.UTF-8", libc::LC_CTYPE_MASK);
@@ -539,6 +753,9 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	use std::sync::mpsc;
 	use std::time::Duration;
 
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	// A locale whose `LC_CTYPE` is a FIFO nobody writes to: the thread that
@@ -547,7 +764,7 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	fs::create_dir_all(blocking.join("omp_rsync_fifo")).unwrap();
 	let fifo = blocking.join("omp_rsync_fifo/LC_CTYPE");
 	nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
-	// SAFETY: nextest gives this test its own process, and nothing else in it
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in it
 	// reads `LOCPATH` concurrently. libc reads it from the process
 	// environment, so this is the only way to aim the holding thread at the
 	// FIFO.
@@ -591,6 +808,9 @@ fn a_descriptor_limit_with_two_to_spare_still_answers() {
 
 	use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -619,12 +839,12 @@ fn a_descriptor_limit_with_two_to_spare_still_answers() {
 }
 
 /// A second locale under `<dir>/<name>`, in `codeset`. `None` on a host
-/// without locale sources.
+/// without locale sources (and a skip line for the calling test).
 #[cfg(target_os = "linux")]
 fn generated_locale(dir: &Path, name: &str, codeset: &str) -> Option<PathBuf> {
 	fs::create_dir_all(dir.join(name)).unwrap();
 	let built = Command::new("localedef").args(["-i", "en_US", "-f", codeset]).arg(dir.join(name)).output();
-	built.is_ok_and(|built| built.status.success()).then(|| dir.to_path_buf())
+	localedef_built(built, &format!("en_US {codeset}")).then(|| dir.to_path_buf())
 }
 
 /// A directory name is not a list element: a working directory holding a
@@ -688,8 +908,6 @@ fn a_vanished_working_directory_is_reported_rather_than_guessed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_locale_utility_that_misbehaves_is_reported() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let env = |_: &str| None;
 	let cases: [(&str, &str, &str); 7] = [
@@ -703,8 +921,7 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 	];
 	for (name, body, expected) in cases {
 		let program = dir.path().join(name);
-		fs::write(&program, format!("#!/bin/sh\n{body}")).unwrap();
-		fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::testprog::write(&program, &format!("#!/bin/sh\n{body}"));
 		let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
 		match (&answer, expected) {
 			(crate::locale::Codeset::Loaded(codeset), "") => assert_eq!(codeset, "ISO-8859-1", "{name}"),
@@ -716,6 +933,37 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 	}
 }
 
+/// A child forked while the utility is written, as another test's thread
+/// can fork at any time, keeps no hold on it: here one is forked in the
+/// middle of the write and lives until the query has run. When these tests
+/// wrote their utilities themselves (`fs::write`), such a child kept the
+/// write descriptor, the kernel refused to run the utility ("Text file
+/// busy"), and the query refused with exit status 126: one whole-crate run
+/// in a runc Job failed so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_forked_while_the_utility_is_written_leaves_it_runnable() {
+	use crate::testprog::{LINGER, LINGERING, end_lingering};
+
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("locale");
+	LINGER.set(true);
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
+	LINGER.set(false);
+	let lingering = LINGERING.get().expect("a child was forked during the write");
+	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_| None);
+	// Read before `end_lingering` reaps it: a child that exited early is a
+	// zombie until then, which `kill(pid, 0)` would still count as alive.
+	let (state, _) = state_and_threads(lingering);
+	end_lingering();
+	assert!(
+		!matches!(state, b'Z' | b'X' | b'?'),
+		"the child forked during the write did not run on while the query ran: state {}",
+		char::from(state)
+	);
+	assert!(matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"), "{answer:?}");
+}
+
 /// Nothing the utility leaves in its process group outlives the query,
 /// whether it answered or not: a descendant that closes the answer pipe and
 /// sleeps used to survive, because the normal-exit path returned without
@@ -724,26 +972,266 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_descendant_of_the_utility_does_not_outlive_the_query() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
-	let program = dir.path().join("locale");
-	let marker = dir.path().join("descendant");
-	// The utility leaves a descendant that closes the pipe it inherited and
-	// sleeps, records that descendant's process id (`$$` in a subshell is
-	// still the shell's), answers, and exits 0.
+	let descendant = query_leaving_a_descendant(dir.path());
+	assert_ended(descendant);
+}
+
+/// The same on a kernel before Linux 6.9, which cannot signal a process
+/// group through a handle: there each member of the group is signalled
+/// through a handle of its own. The test thread sees such a kernel
+/// ([`as_linux_6_8`]), whatever kernel it runs on; GitHub's Ubuntu runners
+/// run 6.8, where the descendant survived every query.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_descendant_of_the_utility_does_not_outlive_the_query_before_linux_6_9() {
+	as_linux_6_8();
+	let dir = tempfile::tempdir().unwrap();
+	let descendant = query_leaving_a_descendant(dir.path());
+	assert_ended(descendant);
+}
+
+/// Before Linux 6.9 the group's members are found by its number, so a group
+/// whose utility was reaped elsewhere — another thread's `waitpid(-1)` can
+/// do that — is not one the query may touch: the number may be anyone's by
+/// then. A member of such a group is left alone, and the same member of a
+/// group whose utility is still unreaped is ended.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
+	use std::io::BufRead as _;
+	use std::os::fd::FromRawFd as _;
+	use std::os::unix::process::CommandExt as _;
+
+	as_linux_6_8();
+	for reaped_elsewhere in [true, false] {
+		// The utility leads its own group and leaves a member in it.
+		let mut utility = Command::new("/bin/sh")
+			.args(["-c", "sleep 30 & echo $!; exec sleep 30"])
+			.process_group(0)
+			.stdout(std::process::Stdio::piped())
+			.spawn()
+			.unwrap();
+		let number = libc::pid_t::try_from(utility.id()).unwrap();
+		let mut line = String::new();
+		std::io::BufReader::new(utility.stdout.take().unwrap()).read_line(&mut line).unwrap();
+		let member: i32 = line.trim().parse().unwrap();
+		// SAFETY: a handle on this test's own unreaped child, owned from here.
+		let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+		let handle = super::ChildHandle(
+			unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) },
+			number,
+		);
+		if reaped_elsewhere {
+			utility.kill().unwrap();
+			utility.wait().unwrap();
+		}
+		handle.end_group();
+		if reaped_elsewhere {
+			std::thread::sleep(std::time::Duration::from_millis(200));
+			// SAFETY: a signal-free existence probe for this test's process.
+			let alive = unsafe { libc::kill(member, 0) } == 0;
+			// SAFETY: the test cleans up what it started.
+			unsafe { libc::kill(member, libc::SIGKILL) };
+			assert!(alive, "a member of a group whose utility was reaped elsewhere was signalled");
+		} else {
+			utility.wait().unwrap();
+			assert_ended(member);
+		}
+	}
+}
+
+/// Before Linux 6.9, a member whose main thread has exited while another of
+/// its threads runs is ended too: its `stat` reads `Z`, as a true zombie's
+/// does, and the walk used to skip it, so it outlived the query
+/// (a review of `77e857a4`). A true zombie in the group is still
+/// skipped: it has ended, and only its parent's wait removes it.
+///
+/// The utility, the member and the zombie are this test's children, so the
+/// test reaps each and sees how it ended, and ends and reaps whatever is left
+/// if it fails. It runs in a process of its own, where the member and the
+/// zombie are forked from a process of two threads.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
+	use std::os::fd::FromRawFd as _;
+	use std::os::unix::process::CommandExt as _;
+
+	if !crate::own_process::own_process() {
+		return;
+	}
+	as_linux_6_8();
+	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
+	let group = libc::pid_t::try_from(utility.id()).unwrap();
+	let mut children = Children { utility, forked: Vec::new() };
+	let member = children.fork_into(group, true);
+	let zombie = children.fork_into(group, false);
+	// The premise, as `/proc` shows it: both read `Z`, and only the member
+	// has a thread left.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	while (state_and_threads(member), state_and_threads(zombie)) != ((b'Z', 2), (b'Z', 1)) {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"premise: member {:?}, zombie {:?}",
+			state_and_threads(member),
+			state_and_threads(zombie)
+		);
+		std::thread::sleep(std::time::Duration::from_millis(10));
+	}
+	assert!(!super::live_member(zombie, group), "a true zombie counts as a live member");
+	// SAFETY: a handle on this test's own unreaped child, owned from here.
+	let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
+	let handle =
+		super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) }, group);
+	handle.end_group();
+	let ended = children.reap_within(member, std::time::Duration::from_secs(2));
+	assert_eq!(children.reap_within(zombie, std::time::Duration::from_secs(2)), Some(0), "the zombie's exit status");
+	// A raw wait status equal to the signal number: ended by `SIGKILL`.
+	assert_eq!(ended, Some(libc::SIGKILL), "the member whose main thread exited outlived end_group");
+}
+
+/// What [`a_member_whose_main_thread_exited_is_ended_before_linux_6_9`]
+/// started: on drop, whatever is not reaped yet is killed and reaped, so a
+/// failure leaves nothing holding the output its own process is read by.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+struct Children {
+	utility: std::process::Child,
+	/// Forked children not reaped yet.
+	forked:  Vec<libc::pid_t>,
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl Children {
+	/// Forks a child of this test into the process group `group`. With
+	/// `main_thread_exits`, the child starts a thread that sleeps and then
+	/// ends its main thread alone with the raw `exit` system call (not
+	/// `exit_group`), which leaves the process as `pthread_exit` would;
+	/// `pthread_exit` itself unwinds, and its unwind would run this test's
+	/// frames in the child. Without it, the child exits 0 at once and stays
+	/// a zombie until this test reaps it. The child makes only
+	/// async-signal-safe calls and `pthread_create`, which glibc's `fork`
+	/// leaves usable, and never returns into this test.
+	fn fork_into(&mut self, group: libc::pid_t, main_thread_exits: bool) -> libc::pid_t {
+		extern "C" fn sleeper(_: *mut libc::c_void) -> *mut libc::c_void {
+			loop {
+				// SAFETY: `pause` only waits for a signal.
+				unsafe { libc::pause() };
+			}
+		}
+		// SAFETY: see above.
+		let child = unsafe { libc::fork() };
+		assert!(child >= 0, "{}", std::io::Error::last_os_error());
+		if child == 0 {
+			// SAFETY: see above.
+			unsafe {
+				if libc::setpgid(0, group) != 0 {
+					libc::_exit(3);
+				}
+				if !main_thread_exits {
+					libc::_exit(0);
+				}
+				let mut thread: libc::pthread_t = 0;
+				if libc::pthread_create(&raw mut thread, std::ptr::null(), sleeper, std::ptr::null_mut()) != 0 {
+					libc::_exit(4);
+				}
+				libc::syscall(libc::SYS_exit, 0);
+				libc::_exit(5);
+			}
+		}
+		self.forked.push(child);
+		child
+	}
+
+	/// Reaps the forked child `number` once it has ended, within `limit`,
+	/// and returns its raw wait status; `None` when it is still running at
+	/// the limit, after which it is killed and reaped.
+	fn reap_within(&mut self, number: libc::pid_t, limit: std::time::Duration) -> Option<libc::c_int> {
+		let deadline = std::time::Instant::now() + limit;
+		let mut status: libc::c_int = 0;
+		let ended = loop {
+			// SAFETY: a non-blocking wait for this test's own child.
+			if unsafe { libc::waitpid(number, &raw mut status, libc::WNOHANG) } == number {
+				break Some(status);
+			}
+			if std::time::Instant::now() >= deadline {
+				// SAFETY: this test's own child, unreaped, so the number is
+				// its.
+				unsafe {
+					libc::kill(number, libc::SIGKILL);
+					libc::waitpid(number, &raw mut status, 0);
+				}
+				break None;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		};
+		self.forked.retain(|forked| *forked != number);
+		ended
+	}
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl Drop for Children {
+	fn drop(&mut self) {
+		let _ = self.utility.kill();
+		let _ = self.utility.wait();
+		for number in self.forked.drain(..) {
+			// SAFETY: this test's own children, unreaped, so each number is
+			// its own.
+			unsafe {
+				libc::kill(number, libc::SIGKILL);
+				libc::waitpid(number, std::ptr::null_mut(), 0);
+			}
+		}
+	}
+}
+
+/// The state letter in `/proc/<number>/stat` and the count in
+/// `/proc/<number>/status`'s `Threads:`, `(b'?', 0)` where either cannot be
+/// read.
+#[cfg(target_os = "linux")]
+fn state_and_threads(number: libc::pid_t) -> (u8, u32) {
+	let state = fs::read(format!("/proc/{number}/stat"))
+		.ok()
+		.and_then(|stat| stat.iter().rposition(|byte| *byte == b')').and_then(|end| stat.get(end + 2).copied()))
+		.unwrap_or(b'?');
+	let threads = fs::read_to_string(format!("/proc/{number}/status"))
+		.ok()
+		.and_then(|status| {
+			status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
+		})
+		.unwrap_or(0);
+	(state, threads)
+}
+
+/// Runs a query whose utility leaves a descendant that closes the pipe it
+/// inherited and sleeps, records that descendant's process id (`$!`; `$$`
+/// in a subshell is still the shell's), answers, and exits 0. Asserts the
+/// answer, and returns the descendant's process id.
+#[cfg(target_os = "linux")]
+fn query_leaving_a_descendant(dir: &Path) -> i32 {
+	let program = dir.join("locale");
+	let marker = dir.join("descendant");
 	let body = format!(
 		"#!/bin/sh\n(exec 1>&-; exec sleep 30) &\necho $! > '{}'\nprintf 'ISO-8859-1\\n'\nexit 0\n",
 		marker.display()
 	);
-	fs::write(&program, body).unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, &body);
 	let env = |_: &str| None;
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
-	assert!(matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"), "{answer:?}");
 	let descendant: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
-	// The kill is delivered as the group leader is reaped; give it the
-	// moment the scheduler needs, then insist the process is gone.
+	if !matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1") {
+		// SAFETY: the test cleans up what it started before failing.
+		unsafe { libc::kill(descendant, libc::SIGKILL) };
+		panic!("{answer:?}");
+	}
+	descendant
+}
+
+/// Fails unless the process `descendant` is gone. The kill is delivered as
+/// the group leader is reaped; this gives it the moment the scheduler
+/// needs, then insists.
+#[cfg(target_os = "linux")]
+fn assert_ended(descendant: i32) {
 	for _ in 0..200 {
 		// SAFETY: a signal-free existence probe for a process this test
 		// started and does not reap.
@@ -755,6 +1243,60 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 	// SAFETY: as above; the test cleans up what it started before failing.
 	unsafe { libc::kill(descendant, libc::SIGKILL) };
 	panic!("the descendant {descendant} outlived the query");
+}
+
+/// Makes this thread, and every process and thread it starts from now on,
+/// see a kernel before Linux 6.9 in the one way the locale query depends
+/// on: `pidfd_send_signal` with `PIDFD_SIGNAL_PROCESS_GROUP` (4) fails with
+/// `EINVAL`, as 6.8 answers any flag (`kernel/signal.c:3890-3892`). A
+/// seccomp filter belongs to the thread that installs it and lasts until
+/// that thread ends, so the rest of the test binary is untouched.
+///
+/// Before it returns it checks the filter took: a call with flag 4 and a
+/// descriptor no process can have open answers `EINVAL`, where Linux 6.9
+/// and later answer `EBADF`.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn as_linux_6_8() {
+	// `linux/filter.h`, `linux/bpf_common.h` and `linux/audit.h`:
+	// `BPF_LD | BPF_W | BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_RET | BPF_K`.
+	const LD_W_ABS: u16 = 0x20;
+	const JMP_JEQ_K: u16 = 0x15;
+	const RET_K: u16 = 0x06;
+	const ARCH: u32 = if cfg!(target_arch = "x86_64") { 0xc000_003e } else { 0xc000_00b7 };
+	// `struct seccomp_data`: `nr` at 0, `arch` at 4, `args[3]` at 40 (its
+	// low 32 bits on these little-endian architectures).
+	const NR: u32 = 0;
+	const ARCH_AT: u32 = 4;
+	const FLAGS_AT: u32 = 16 + 3 * 8;
+	let at = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
+	let jeq = |k, jt, jf| libc::sock_filter { code: JMP_JEQ_K, jt, jf, k };
+	let mut filter = [
+		at(LD_W_ABS, ARCH_AT),
+		jeq(ARCH, 1, 0),
+		at(RET_K, libc::SECCOMP_RET_ALLOW),
+		at(LD_W_ABS, NR),
+		jeq(u32::try_from(libc::SYS_pidfd_send_signal).unwrap(), 0, 3),
+		at(LD_W_ABS, FLAGS_AT),
+		jeq(4, 0, 1),
+		at(RET_K, libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EINVAL).unwrap()),
+		at(RET_K, libc::SECCOMP_RET_ALLOW),
+	];
+	let program = libc::sock_fprog { len: u16::try_from(filter.len()).unwrap(), filter: filter.as_mut_ptr() };
+	// SAFETY: `no_new_privs` and a filter for this thread, from a program
+	// that outlives the call; neither touches memory of this process.
+	unsafe {
+		assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+		assert_eq!(
+			libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const program),
+			0,
+			"{}",
+			std::io::Error::last_os_error()
+		);
+	}
+	// SAFETY: signals nothing: the descriptor is not open.
+	let sent = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, libc::c_int::MAX, 0, 0usize, 4u32) };
+	let err = std::io::Error::last_os_error();
+	assert!(sent < 0 && err.raw_os_error() == Some(libc::EINVAL), "the filter did not take: {sent}, {err}");
 }
 
 /// A standard descriptor the caller has closed must not become the answer.
@@ -769,6 +1311,9 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_closed_standard_descriptor_never_becomes_the_answer() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	// A name only the utility can answer for, so the diagnostics stream is
@@ -779,7 +1324,7 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 	assert!(copy.output().unwrap().status.success());
 	let shell_path = locales.to_str().unwrap().to_owned();
 	let env = move |key: &str| (key == "LOCPATH").then(|| shell_path.clone());
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	for closed in 1..8u32 {
@@ -823,8 +1368,9 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_query_leaves_the_callers_signal_settings_alone() {
-	use std::os::unix::fs::PermissionsExt as _;
-
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -836,7 +1382,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let mut usr1 = nix::sys::signal::SigSet::empty();
 	usr1.add(nix::sys::signal::SIGUSR1);
 	usr1.thread_block().unwrap();
-	// SAFETY: nextest gives this test its own process; the disposition is
+	// SAFETY: this test has a process of its own (`own_process`); the disposition is
 	// put back below.
 	let kept = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 	let before = blocked(nix::sys::signal::SIGUSR1);
@@ -844,8 +1390,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let after = blocked(nix::sys::signal::SIGUSR1);
 	// A utility that raises the signal the caller ignores, then answers.
 	let program = dir.path().join("locale");
-	fs::write(&program, "#!/bin/sh\nkill -PIPE $$\nprintf 'UTF-8\\n'\n").unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, "#!/bin/sh\nkill -PIPE $$\nprintf 'UTF-8\\n'\n");
 	let ignored = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_| None);
 	// SAFETY: as above.
 	unsafe { libc::signal(libc::SIGPIPE, kept) };
@@ -900,9 +1445,11 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 #[test]
 fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	use std::os::fd::AsRawFd as _;
-	use std::os::unix::fs::PermissionsExt as _;
 	use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+	if !crate::own_process::own_process() {
+		return;
+	}
 	/// This test's own number, and the descriptor the handler writes to.
 	static OWNER: AtomicI32 = AtomicI32::new(0);
 	static RECORD: AtomicI32 = AtomicI32::new(-1);
@@ -926,7 +1473,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// SAFETY: reading this process's own number.
 	OWNER.store(unsafe { libc::getpid() }, Ordering::Relaxed);
 	RECORD.store(file.as_raw_fd(), Ordering::Relaxed);
-	// SAFETY: nextest gives this test its own process; the disposition and
+	// SAFETY: this test has a process of its own (`own_process`); the disposition and
 	// the process group are both put back below. `SA_RESTART` keeps the
 	// storm from turning this process's own calls into `EINTR`.
 	let (kept, ignored, grouped) = unsafe {
@@ -1010,8 +1557,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 		 printf 'UTF-8\\n'\n",
 		signal = libc::SIGUSR2
 	);
-	fs::write(&raises, script).unwrap();
-	fs::set_permissions(&raises, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&raises, &script);
 	let ignoring = crate::locale::codeset_from_utility_for_test(&raises, "C.UTF-8", &|_| None);
 	// SAFETY: putting back what this test changed, before it can fail.
 	unsafe {
@@ -1096,6 +1642,9 @@ fn the_ignored_signal_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_name_is_the_name_of_the_data_whatever_punctuation_it_carries() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let literal = ["astra=latin", "astra;latin", "LC_CTYPE=astra;LC_TIME=C"];
@@ -1124,7 +1673,7 @@ fn a_name_is_the_name_of_the_data_whatever_punctuation_it_carries() {
 		);
 		// In process: neither search path is set, so the same name has to
 		// read the same way through `newlocale` or not be answered there.
-		// SAFETY: nextest gives this test its own process, and nothing else
+		// SAFETY: this test has a process of its own (`own_process`), and nothing else
 		// in it reads `LOCPATH` concurrently.
 		unsafe { std::env::set_var("LOCPATH", &locales) };
 		let here = crate::locale::loaded_codeset(name, &env, None);
@@ -1177,7 +1726,13 @@ fn the_shells_conversion_configuration_reaches_the_lookup() {
 		.env("LOCPATH", &locales)
 		.env("GCONV_PATH", &gconv)
 		.output();
-	let Ok(reference) = reference else { return };
+	let reference = match reference {
+		Ok(reference) => reference,
+		Err(err) => {
+			eprintln!("skipped: /usr/bin/locale could not run: {err}");
+			return;
+		},
+	};
 	let reference = String::from_utf8_lossy(&reference.stdout).trim().to_owned();
 	let locales = locales.to_str().unwrap().to_owned();
 	let gconv = gconv.to_str().unwrap().to_owned();
@@ -1192,14 +1747,15 @@ fn the_shells_conversion_configuration_reaches_the_lookup() {
 
 /// A German and an English locale, both UTF-8 and complete, under
 /// `<dir>/utility-locales`, built with `localedef`. `None` on a host without
-/// locale sources. Nothing here depends on what the host has installed.
+/// locale sources (and a skip line for the calling test). Nothing here
+/// depends on what the host has installed.
 #[cfg(target_os = "linux")]
 fn utility_locales(dir: &Path) -> Option<PathBuf> {
 	let locales = dir.join("utility-locales");
 	for (name, source) in [("de_XX.UTF-8", "de_DE"), ("en_XX.UTF-8", "en_US")] {
 		fs::create_dir_all(locales.join(name)).unwrap();
 		let built = Command::new("localedef").args(["-i", source, "-f", "UTF-8"]).arg(locales.join(name)).output();
-		if !built.is_ok_and(|built| built.status.success()) {
+		if !localedef_built(built, &format!("{source} UTF-8")) {
 			return None;
 		}
 	}
@@ -1245,6 +1801,9 @@ fn df_grouping(line: &str) -> Option<char> {
 ))]
 #[tokio::test]
 async fn the_utilities_honour_a_locale_only_the_shell_exports() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = utility_locales(dir.path()) else { return };
 	assert!(std::env::var_os("LOCPATH").is_none(), "the premise: this process has no LOCPATH");
@@ -1286,9 +1845,12 @@ async fn the_utilities_honour_a_locale_only_the_shell_exports() {
 ))]
 #[tokio::test]
 async fn a_missing_category_leaves_the_utilities_in_c() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = utility_locales(dir.path()) else { return };
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	let script = format!(
@@ -1318,7 +1880,7 @@ async fn a_missing_category_leaves_the_utilities_in_c() {
 /// Docker's default profile answers `clone3` that way, so that a C library
 /// falls back to `clone`. Once `no_new_privs` is set this needs no
 /// privilege. A filter cannot be taken off again, so the thread keeps it:
-/// the test's own process under nextest, its own thread under `cargo test`.
+/// the test's own process (`own_process`) under any runner.
 ///
 /// With `probe_finds_clone3`, a `clone3` whose size is zero — the
 /// capability probe's question — is answered `EINVAL`, as a kernel that has
@@ -1389,11 +1951,8 @@ fn answer_enosys_on_this_thread(calls: &[libc::c_long], probe_finds_clone3: bool
 /// pass by finding none.
 #[cfg(target_os = "linux")]
 fn latin_utility(dir: &Path) -> PathBuf {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let program = dir.join("latin-locale");
-	fs::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n").unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
 	program
 }
 
@@ -1456,6 +2015,9 @@ fn probe_found_clone3() -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let enosys = format!("os error {}", libc::ENOSYS);
@@ -1491,6 +2053,9 @@ fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let descriptors = open_descriptors();
@@ -1514,6 +2079,9 @@ fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() 
 #[cfg(target_os = "linux")]
 #[test]
 fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let other = program.clone();

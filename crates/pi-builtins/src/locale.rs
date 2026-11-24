@@ -43,8 +43,10 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 }
 
 /// The categories a locale environment names, with the mask `newlocale`
-/// knows each by: the six POSIX ones and, on Linux, the six glibc adds. A
-/// utility's `setlocale(LC_ALL, "")` has to load every one of them.
+/// knows each by: the six POSIX ones and, with glibc, the six glibc adds. A
+/// utility's `setlocale(LC_ALL, "")` has to load every one of them. musl
+/// knows only the POSIX six (`locale.h`), and the libc crate gives the other
+/// masks for glibc alone among the Linux libraries.
 #[cfg(unix)]
 const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_CTYPE", libc::LC_CTYPE_MASK),
@@ -53,17 +55,17 @@ const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_COLLATE", libc::LC_COLLATE_MASK),
 	("LC_MONETARY", libc::LC_MONETARY_MASK),
 	("LC_MESSAGES", libc::LC_MESSAGES_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_PAPER", libc::LC_PAPER_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_NAME", libc::LC_NAME_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_ADDRESS", libc::LC_ADDRESS_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_TELEPHONE", libc::LC_TELEPHONE_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_MEASUREMENT", libc::LC_MEASUREMENT_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_IDENTIFICATION", libc::LC_IDENTIFICATION_MASK),
 ];
 
@@ -1077,11 +1079,16 @@ enum Completion {
 /// through the handle, where a signal fails with `ESRCH` once that process
 /// is gone rather than reaching whoever took its number.
 ///
+/// The second field is the child's number, which is also its process
+/// group's. It is only ever compared, never signalled: on a kernel before
+/// Linux 6.9 [`ChildHandle::end_group`] uses it to find the group's members,
+/// and signals each through a handle of its own.
+///
 /// Where neither exists — a kernel without `CLONE_PIDFD` or without waiting
 /// by handle, or any Unix that is not Linux — no query is started, because
 /// its child could not be ended safely afterwards.
 #[cfg(target_os = "linux")]
-struct ChildHandle(std::os::fd::OwnedFd);
+struct ChildHandle(std::os::fd::OwnedFd, libc::pid_t);
 
 /// `CLONE_PIDFD`: hand back a handle on the new child.
 #[cfg(target_os = "linux")]
@@ -1109,6 +1116,93 @@ const CHILD_NO_SETUP: libc::c_int = 124;
 /// whatever size the library's own `sigset_t` is.
 #[cfg(target_os = "linux")]
 const KERNEL_SIGSET_BYTES: usize = 8;
+
+/// The kernel's `struct sigaction`, which `rt_sigaction` reads and writes
+/// (`include/linux/signal_types.h`): not the library's, whose mask is 128
+/// bytes and whose fields are in another order. Its shape is the
+/// architecture's, so it is written out only for those whose headers were
+/// read (Linux 7.0), and any other stops the build below. x86, arm, arm64,
+/// powerpc and s390 put a restorer between the flags and the mask
+/// (`__ARCH_HAS_SA_RESTORER`, from each one's `asm/signal.h`, or on arm64
+/// from `SA_RESTORER` through `asm-generic/signal.h`); riscv and loongarch
+/// have none. All of them have 64 signals, so the mask is
+/// [`KERNEL_SIGSET_BYTES`] long, and all take the generic call's four
+/// arguments (`kernel/signal.c`).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[allow(dead_code, reason = "the kernel reads and writes every field; this reads the handler")]
+struct KernelSigaction {
+	handler: libc::sighandler_t,
+	flags: libc::c_ulong,
+	#[cfg(any(
+		target_arch = "x86_64",
+		target_arch = "x86",
+		target_arch = "aarch64",
+		target_arch = "arm",
+		target_arch = "powerpc",
+		target_arch = "powerpc64",
+		target_arch = "s390x",
+	))]
+	restorer: libc::sighandler_t,
+	mask: [u8; KERNEL_SIGSET_BYTES],
+}
+
+// Elsewhere the structure or the call has another shape: mips puts the
+// flags first and has 128 signals (`__ARCH_HAS_IRIX_SIGACTION`), and sparc
+// and alpha take the restorer as an argument of the call
+// (`CONFIG_ODD_RT_SIGACTION`). The kernel would refuse such a call or read
+// fields it was not given, so the build stops rather than guess. The
+// library's `sigaction` is no fallback: it waits on the lock
+// `kernel_sigaction` is there to avoid.
+#[cfg(all(
+	target_os = "linux",
+	not(any(
+		target_arch = "x86_64",
+		target_arch = "x86",
+		target_arch = "aarch64",
+		target_arch = "arm",
+		target_arch = "riscv64",
+		target_arch = "riscv32",
+		target_arch = "powerpc",
+		target_arch = "powerpc64",
+		target_arch = "loongarch64",
+		target_arch = "s390x",
+	))
+))]
+compile_error!(
+	"the locale query's child sets signal dispositions with `rt_sigaction` and `KernelSigaction`, whose \
+	 layout is checked for x86, x86_64, arm, aarch64, riscv32, riscv64, loongarch64, powerpc, powerpc64 and \
+	 s390x only: check this architecture's `struct sigaction` and `rt_sigaction` in the kernel's sources \
+	 and add it at `KernelSigaction` in crates/pi-builtins/src/locale.rs"
+);
+
+/// `rt_sigaction(signal, new, old)` through the kernel itself, as the
+/// child sets its mask with `rt_sigprocmask`. The library's `sigaction`
+/// takes a lock for `SIGABRT`, the one that makes `abort`
+/// async-signal-safe, and other calls hold it: glibc 2.41's `sigaction`
+/// takes it for writing (`signal/sigaction.c`), its `posix_spawn` holds it
+/// for reading while the spawn's child runs
+/// (`sysdeps/unix/sysv/linux/spawni.c`), and its `_Fork` across the fork
+/// (`sysdeps/nptl/_Fork.c`); musl takes its one `__abort_lock` in the same
+/// three places (`src/signal/sigaction.c`, `src/process/posix_spawn.c`,
+/// `src/process/_Fork.c`). `fork` leaves the lock free in its child; a
+/// child made by `clone3` or `clone` keeps it as it was, so one made while
+/// another thread was in `posix_spawn` or `fork` waited on it for ever,
+/// until the query's deadline ended it.
+///
+/// # Safety
+///
+/// `new` and `old` are null or valid for a read and a write of a
+/// [`KernelSigaction`].
+#[cfg(target_os = "linux")]
+unsafe fn kernel_sigaction(
+	signal: libc::c_int,
+	new: *const KernelSigaction,
+	old: *mut KernelSigaction,
+) -> libc::c_long {
+	// SAFETY: the caller's contract; the size is the kernel's own.
+	unsafe { libc::syscall(libc::SYS_rt_sigaction, signal, new, old, KERNEL_SIGSET_BYTES) }
+}
 
 /// `clone3`'s argument block, as much of it as this uses.
 #[cfg(target_os = "linux")]
@@ -1404,14 +1498,17 @@ fn start_locale_utility(
 			// * and a signal that cannot be blocked either ends the
 			//   child, because nothing is left to make it safe.
 			//
-			// The numbers the library keeps for itself — 32 and 33 on
-			// glibc 2.39, 32 to 34 on musl — reach the blocking step:
-			// they can be neither read nor set, and `sigaddset` will not
-			// name them, so the bit goes in directly and the mask is
-			// restored through the kernel's own call, which does not take
-			// them back out as `pthread_sigmask` does. They are then
-			// blocked in the utility, where the library never delivered
-			// them to an application anyway.
+			// Dispositions are read and set through the kernel's own call
+			// ([`kernel_sigaction`]), never the library's `sigaction`,
+			// which can wait on a lock this copy of the process holds for
+			// a thread that does not exist here. So the numbers the
+			// library keeps for itself — 32 and 33 on glibc, 32 to 34 on
+			// musl — are read and put back to default like any other;
+			// `execve` would do that to a caught one anyway. Where a
+			// filter refuses them they reach the blocking step, and as
+			// `sigaddset` will not name them, the bit goes in directly and
+			// the mask is restored through the kernel's own call, which
+			// does not take them back out as `pthread_sigmask` does.
 			//
 			// The cost of that last rung, stated rather than engineered
 			// around: a signal that reaches it is blocked in the utility,
@@ -1431,17 +1528,16 @@ fn start_locale_utility(
 				if signal == libc::SIGKILL || signal == libc::SIGSTOP {
 					continue;
 				}
-				let mut default = std::mem::MaybeUninit::<libc::sigaction>::zeroed().assume_init();
-				default.sa_sigaction = libc::SIG_DFL;
-				if libc::sigemptyset(&raw mut default.sa_mask) != 0 {
-					libc::_exit(CHILD_NO_SETUP);
-				}
-				let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-				if libc::sigaction(signal, std::ptr::null(), current.as_mut_ptr()) == 0 {
+				let default = KernelSigaction {
+					handler: libc::SIG_DFL,
+					..std::mem::zeroed()
+				};
+				let mut current = std::mem::MaybeUninit::<KernelSigaction>::zeroed();
+				if kernel_sigaction(signal, std::ptr::null(), current.as_mut_ptr()) == 0 {
 					let current = current.assume_init();
-					if current.sa_sigaction == libc::SIG_IGN
-						|| current.sa_sigaction == libc::SIG_DFL
-						|| libc::sigaction(signal, &raw const default, std::ptr::null_mut()) == 0
+					if current.handler == libc::SIG_IGN
+						|| current.handler == libc::SIG_DFL
+						|| kernel_sigaction(signal, &raw const default, std::ptr::null_mut()) == 0
 					{
 						continue;
 					}
@@ -1449,11 +1545,11 @@ fn start_locale_utility(
 					// The read was refused, so the set is asked what was
 					// there. It answers atomically: nothing of this
 					// process's runs in between.
-					let mut was = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-					if libc::sigaction(signal, &raw const default, was.as_mut_ptr()) == 0 {
+					let mut was = std::mem::MaybeUninit::<KernelSigaction>::zeroed();
+					if kernel_sigaction(signal, &raw const default, was.as_mut_ptr()) == 0 {
 						let was = was.assume_init();
-						if was.sa_sigaction != libc::SIG_IGN
-							|| libc::sigaction(signal, &raw const was, std::ptr::null_mut()) == 0
+						if was.handler != libc::SIG_IGN
+							|| kernel_sigaction(signal, &raw const was, std::ptr::null_mut()) == 0
 						{
 							continue;
 						}
@@ -1554,8 +1650,12 @@ fn start_locale_utility(
 	// SAFETY: a fresh descriptor the kernel wrote for a child it made,
 	// owned from here. Either call fills it in whenever it succeeds with
 	// `CLONE_PIDFD`: `clone3` through `pidfd`, `clone` through `parent_tid`.
-	let started = (child > 0 && handle >= 0)
-		.then(|| ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(handle) }));
+	let started = (child > 0 && handle >= 0).then(|| {
+		ChildHandle(
+			unsafe { std::os::fd::OwnedFd::from_raw_fd(handle) },
+			libc::pid_t::try_from(child).unwrap_or_default(),
+		)
+	});
 	// Read before the mask call below, which reports through its return
 	// value and leaves `errno` as it finds it.
 	let spawned = match (child < 0, started.is_some()) {
@@ -1662,31 +1762,20 @@ impl ChildHandle {
 
 	/// Ends the utility and everything left in its process group.
 	///
-	/// A kernel that does not know `PIDFD_SIGNAL_PROCESS_GROUP` (before
-	/// Linux 6.9) ends the utility alone; a descendant it left in the group
-	/// outlives the query there, which is the one thing this handle buys
-	/// less of than a group signal by number — and a group signal by number
-	/// is what reached somebody else's processes.
+	/// From Linux 6.9 the group is signalled through the handle
+	/// (`PIDFD_SIGNAL_PROCESS_GROUP`). An older kernel refuses that flag with
+	/// `EINVAL` (6.8 `kernel/signal.c:3890-3892`); GitHub's Ubuntu runners
+	/// run 6.8, where a descendant outlived every query. There each member
+	/// is signalled through a handle of its own ([`end_members`]), and the
+	/// utility through this one, in case it left its group.
 	#[cfg(unix)]
 	fn end_group(&self) {
-		use std::os::fd::AsRawFd as _;
-
-		for flags in [PIDFD_SIGNAL_PROCESS_GROUP, 0] {
-			// SAFETY: the descriptor is this handle's and the siginfo
-			// pointer is null, which asks the kernel to synthesise one.
-			let sent = unsafe {
-				libc::syscall(
-					libc::SYS_pidfd_send_signal,
-					self.0.as_raw_fd(),
-					libc::SIGKILL,
-					std::ptr::null_mut::<libc::siginfo_t>(),
-					flags,
-				)
-			};
-			if sent >= 0 {
-				return;
-			}
+		match pidfd_signal(&self.0, libc::SIGKILL, PIDFD_SIGNAL_PROCESS_GROUP) {
+			Ok(()) => return,
+			Err(err) if err.raw_os_error() == Some(libc::EINVAL) => end_members(self),
+			Err(_) => {},
 		}
+		let _ = pidfd_signal(&self.0, libc::SIGKILL, 0);
 	}
 
 	/// Reaps the utility and reports how it ended.
@@ -1717,6 +1806,133 @@ impl ChildHandle {
 			}
 		}
 	}
+}
+
+/// Signals the process `handle` names; `flags` as `pidfd_send_signal` takes
+/// them.
+#[cfg(target_os = "linux")]
+fn pidfd_signal(handle: &std::os::fd::OwnedFd, signal: libc::c_int, flags: libc::c_uint) -> std::io::Result<()> {
+	use std::os::fd::AsRawFd as _;
+
+	// SAFETY: the descriptor is the caller's and the siginfo pointer is
+	// null, which asks the kernel to synthesise one.
+	let sent = unsafe {
+		libc::syscall(
+			libc::SYS_pidfd_send_signal,
+			handle.as_raw_fd(),
+			signal,
+			std::ptr::null_mut::<libc::siginfo_t>(),
+			flags,
+		)
+	};
+	if sent >= 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// Ends every live process in the utility's process group, each through a
+/// handle of its own, on a kernel that cannot signal a group through a
+/// handle. No signal goes by number: a group signalled by its number reaches
+/// whoever holds that number by then, and another thread's `waitpid(-1)` can
+/// reap the utility at any moment and free it (see
+/// `a_competing_reaper_does_not_turn_the_query_into_a_stray_signal`). Exit
+/// signal 0 does not stop that: `execve` puts `SIGCHLD` back (6.8
+/// `fs/exec.c:1180`).
+///
+/// A member is signalled only when this has shown it to be one, with the
+/// utility still holding the group's number (Linux 6.8):
+/// 1. a handle is opened on a process `/proc` lists in the group;
+/// 2. `/proc/<number>/stat` is read again and names the group;
+/// 3. the handle's process is still there (a signal 0 through the handle
+///    succeeds), so the number was not released between 1 and 3, and the
+///    read in 2 was that process's: a number is released only when no task
+///    holds it (`__change_pid`, `kernel/pid.c:340-357`), and a zombie holds
+///    its own until it is reaped (`release_task` → `__unhash_process`,
+///    `kernel/exit.c:127-134`);
+/// 4. after every member is read, the utility is still unreaped, so it held
+///    the group's number at each read in 2, and the group was this query's.
+///    A utility reaped elsewhere ends the walk with nothing signalled.
+///
+/// A member can fork while the others are ended, so the walk is repeated
+/// until it finds none alive, a bounded number of times. One that calls
+/// `setsid` or `setpgid` has left the group and is beyond this, as it is
+/// from Linux 6.9 on.
+#[cfg(target_os = "linux")]
+fn end_members(utility: &ChildHandle) {
+	use std::os::fd::FromRawFd as _;
+
+	let group = utility.1;
+	if group <= 0 {
+		return;
+	}
+	for round in 0..16 {
+		let Ok(listing) = std::fs::read_dir("/proc") else { return };
+		let mut members = Vec::new();
+		for entry in listing.flatten() {
+			let Some(number) = entry.file_name().to_str().and_then(|name| name.parse::<libc::pid_t>().ok()) else {
+				continue;
+			};
+			if !live_member(number, group) {
+				continue;
+			}
+			// SAFETY: opening a handle signals nothing.
+			let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+			let Ok(fd) = libc::c_int::try_from(opened) else { continue };
+			if fd < 0 {
+				continue;
+			}
+			// SAFETY: a descriptor the kernel just opened, owned from here.
+			let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+			if live_member(number, group) && pidfd_signal(&handle, 0, 0).is_ok() {
+				members.push(handle);
+			}
+		}
+		if members.is_empty() || utility.ended().is_err() {
+			return;
+		}
+		for member in &members {
+			let _ = pidfd_signal(member, libc::SIGKILL, 0);
+		}
+		if round > 0 {
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+	}
+}
+
+/// Whether `/proc` shows the process `number` alive in the process group
+/// `group`. `stat`'s second field is the command in parentheses, which can
+/// hold anything, so the fields are read after the last `)`: the state, the
+/// parent, then the process group.
+///
+/// `stat` describes the thread group's leader, so a process whose main
+/// thread has called `pthread_exit` while another of its threads runs reads
+/// `Z`, as one that has ended does. `status`'s `Threads:` tells them apart:
+/// 2 or more for the first, 1 for a true zombie (measured on Linux 6.12 and
+/// 7.0, and on gVisor, which lists no `/proc/<n>/task` entries to count
+/// instead). Such a process is alive, and a signal through its handle
+/// reaches its threads, as the group signal from Linux 6.9 on does.
+#[cfg(target_os = "linux")]
+fn live_member(number: libc::pid_t, group: libc::pid_t) -> bool {
+	let Ok(stat) = std::fs::read(format!("/proc/{number}/stat")) else { return false };
+	let Some(end) = stat.iter().rposition(|byte| *byte == b')') else { return false };
+	let mut fields = stat[end + 1..].split(u8::is_ascii_whitespace).filter(|field| !field.is_empty());
+	let (Some(state), Some(_parent), Some(pgrp)) = (fields.next(), fields.next(), fields.next()) else {
+		return false;
+	};
+	if std::str::from_utf8(pgrp).ok().and_then(|pgrp| pgrp.parse().ok()) != Some(group) {
+		return false;
+	}
+	match state {
+		b"X" => false,
+		b"Z" => process_threads(number).is_some_and(|threads| threads > 1),
+		_ => true,
+	}
+}
+
+/// The number of threads `/proc/<number>/status` gives the process, or
+/// `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+fn process_threads(number: libc::pid_t) -> Option<u32> {
+	let status = std::fs::read_to_string(format!("/proc/{number}/status")).ok()?;
+	status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
 }
 
 /// Ends the locale utility and everything left in its process group, within
