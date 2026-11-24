@@ -680,6 +680,24 @@ fn a_failed_compound_declaration_abandons_the_line() {
 		assert_eq!((out.as_str(), status), ("", 1), "{src}");
 		assert_eq!(err.matches("x: readonly variable").count(), 1, "{src}: {err}");
 	}
+	// A conversion failure is a failed declaration, which `declare` reports
+	// (`builtin_error`), not a failed value: it does not end a `set -e`
+	// shell.
+	let (out, err, status) = run_status(&format!(
+		"set -e\ndeclare -a x=(1)\ndeclare -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"
+	));
+	assert_eq!((out.as_str(), status), ("next st=1 x=1\n", 0));
+	assert_eq!(err.matches("x: cannot convert").count(), 1, "{err}");
+	// The same rule when the readonly variable has no value, and through a
+	// name reference.
+	for src in [
+		format!("readonly x\ndeclare x=(1); echo \"same st=$?\"\n{NEXT}"),
+		format!("readonly x\ndeclare -n r=x\ndeclare r=(1); echo \"same st=$?\"\n{NEXT}"),
+	] {
+		let (out, err, status) = run_status(&src);
+		assert_eq!((out.as_str(), status), ("next st=1 x=\n", 0), "{src}");
+		assert_eq!(err.matches(": readonly variable").count(), 1, "{src}: {err}");
+	}
 }
 
 /// In posix mode an assignment error of `readonly` or `export` (special
@@ -745,6 +763,12 @@ fn set_e_spares_a_failed_value_in_an_eval_whose_status_is_ignored() {
 		(
 			"set -e\nreadonly x=1\nif ( eval 'declare x=(2)'; echo in-sub ); then echo t; else echo \
 			 f; fi\necho \"next st=$?\"",
+			"f\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\ng() { export x=(2); echo in-g; }\nif eval 'g; echo after-g'; then \
+			 echo t; else echo f; fi\necho \"next st=$?\"",
 			"f\nnext st=0\n",
 			0,
 		),
