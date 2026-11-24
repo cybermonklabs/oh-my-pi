@@ -894,7 +894,8 @@ fn expand(
 		pool_words(&mut pool, &mut argv);
 		// One slot per word (a recycled vector has them already): a first
 		// push would reserve four, 72 bytes of slack in every parked
-		// one-word command (idle vproc ≤ 2,416 B). Splitting grows it.
+		// one-word command (idle vproc ≤ 2,048 B back to back). Splitting grows
+		// it.
 		argv.reserve_exact(words.len());
 		compound.clear();
 		globs.clear();

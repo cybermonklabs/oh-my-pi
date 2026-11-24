@@ -95,7 +95,7 @@ pub struct Vproc {
 	/// nested shell) in its low 24 bits ([`super::subshell_depth`]), and the
 	/// vproc's [`Fork`] in its top byte ([`Vproc::fork`]). A field, not an
 	/// image record: a record would cost every subshell a ~530-byte map
-	/// allocation (idle vproc ≤ 2,416 B).
+	/// allocation (idle vproc ≤ 2,048 B back to back).
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
@@ -817,7 +817,7 @@ impl JobTable {
 /// background job, a process substitution, a coprocess) and the
 /// OS pid of the program it runs, once known ([`Job::os_pid`]). Two words,
 /// zero meaning none (no vpid or OS pid is zero): an `Option` pair would
-/// grow every vproc (idle vproc ≤ 2,416 B).
+/// grow every vproc (idle vproc ≤ 2,048 B back to back).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastBg {
 	vpid: u32,
@@ -1412,7 +1412,7 @@ pub struct Frame {
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
 	/// default state: no allocation per call, and 40 bytes less per frame
-	/// (idle vproc ≤ 2,416 B).
+	/// (idle vproc ≤ 2,048 B back to back).
 	pub getopts:           Option<Box<GetoptsState>>,
 }
 
@@ -1713,8 +1713,8 @@ impl Scratch {
 /// probes, PATH search, fd reads and pathname-expansion walks. Most ops need
 /// none of it (an idle background job's parked `Exec` neither), so a
 /// [`Scratch`] holds it boxed and creates it on first use: 232 bytes less per
-/// scratch (idle vproc ≤ 2,416 B). A recycled scratch keeps it cleared, so
-/// an op that redirects or probes in a loop allocates it once.
+/// scratch (idle vproc ≤ 2,048 B back to back). A recycled scratch keeps it
+/// cleared, so an op that redirects or probes in a loop allocates it once.
 #[derive(Default)]
 pub struct ScratchIo {
 	/// Progress of a `Redir` op or the redirection stage of an `Exec`.
@@ -2262,10 +2262,11 @@ impl Live {
 	}
 }
 
-// Size guards for the idle-vproc target (the testkit `memory` bench's
-// `MAX_VPROC_BYTES`, 2,416 B, which says how it was set): an idle
-// background job holds one boxed `Vproc`, one `Frame`, one boxed `Scratch`
-// and one boxed `ExecState`, so every byte here is a byte per idle vproc.
+// Size guards for the idle-vproc targets (the testkit `memory` bench's
+// `MAX_VPROC_NOWRITE_BYTES`, 2,048 B, and `MAX_RETAINED_BYTES`, which
+// say how they were set): an idle background job holds one boxed `Vproc`,
+// one `Frame`, one boxed `Scratch` and one boxed `ExecState`, so every byte
+// here is a byte per idle vproc.
 // Raise a bound only with the bench's numbers in hand. Each of these added
 // a pointer or less: the boxed zsh side table `Vproc::zsh` (`Frame` is
 // unchanged, its zsh state lives there and in `FrameKind`), host lineage
@@ -2281,13 +2282,15 @@ impl Live {
 // no allocation while idle) added 40 B of `Vproc` and 104 B per idle vproc.
 // The bench at Cut10 chain step 5 (a460228e): `Vproc` 696 B, `Frame` 256 B,
 // `Scratch` 216 B, `ExecState` 376 B; 2,013 B per idle vproc forked with no
-// write by the shell between the forks, and 2,321 B with the bench's loop,
-// whose `i` each fork keeps an earlier copy of (its image shares the
-// shell's maps).
-const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2,416 B)");
-const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2,416 B)");
-const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,416 B)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2,416 B)");
+// write by the shell between the forks, and 2,213 to 2,321 B with the
+// bench's loop, whose `i` each fork keeps an earlier copy of (its image
+// shares the shell's maps).
+const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
+const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2,048 B back to back)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).
