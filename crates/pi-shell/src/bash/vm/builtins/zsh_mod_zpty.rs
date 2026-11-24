@@ -42,7 +42,7 @@ use crate::bash::{
 	syntax::{NO_ALIASES, ParseError, Parser, Pos},
 	vm::{
 		ProcState, exec,
-		proc::{Ctty, Probe, ProbeResult, Vproc},
+		proc::{Ctty, Fork, Probe, ProbeResult, Vproc},
 		set_subshell_depth, state, subshell_depth,
 		zsh::params,
 	},
@@ -598,6 +598,11 @@ fn newptycmd(
 	set_subshell_depth(&mut child, subshell_depth(ctx.vp));
 	// A fork: it keeps zsh's `loops` (a `break` there ends the command).
 	child.outer_loops = crate::bash::vm::exec::fork_loops(ctx.vp, true);
+	child.set_fork(if ctx.vp.fork().catches() {
+		Fork::SHELL
+	} else {
+		Fork::CHILD
+	});
 	{
 		let z = child.zsh.get_or_insert_with(Box::default);
 		z.ptys = PtyTable::default();

@@ -47,7 +47,7 @@
 //! | `LoopExit` | – | – | pop the loop record, `$?` = its status, emit `LoopEnd` |
 //! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b` |
 //! | `PopRedir` | – | – | restore the fds saved by the matching `Redir` |
-//! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
+//! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table; flag [`Op::NEGATED`]: a `!` job): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
 //! | `SubExit` | – | – | end of a child's code: the vproc exits with `$?` |
 //! | `CaseWord` | `words` index | – | expand the `case` subject (no splitting) and push it |
 //! | `CaseArm` | `pats` index | next-arm pc | match the subject against the patterns; no match: jump to `b` |
@@ -66,8 +66,8 @@
 //! | `AlwaysEnd` | – | – | pop the try record, `$?` = the try-list's status, resume what ended the try-list early |
 //! | `CallAnon` | `funcs` index | `lists` index | zsh anonymous function: expand the arguments and call the body as function `(anon)` |
 //!
-//! [`IR_VERSION`] changes with every addition, and restore rejects frames of
-//! another version.
+//! [`IR_VERSION`] changes with every addition, and with every change to the
+//! code a source lowers to; restore rejects frames of another version.
 //!
 //! The text form ([`asm`]) is what `obash --ir` prints and what back-end tests
 //! are written in.
@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 19;
 
 /// Opcodes.
 #[derive(
@@ -228,6 +228,9 @@ impl Op {
 	pub const MULTI: u8 = 1 << 6;
 	/// Flag on `CondTest`: an odd run of `!` applies to the primary
 	/// itself, which `set -x` shows (`[[ ! -n x ]]`; not `! ( … )`).
+	/// Flag on a background `Spawn`: the job is a `!` pipeline whose `!`
+	/// its code leaves out (a background job's status is not inverted);
+	/// a job `extdebug` skips before it forks takes it (status 1).
 	pub const NEGATED: u8 = 1 << 5;
 	/// `ForIn` operand `a`: iterate over `"$@"`.
 	pub const POSITIONAL: u32 = u32::MAX;

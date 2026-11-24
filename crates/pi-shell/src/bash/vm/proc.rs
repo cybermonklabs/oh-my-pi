@@ -92,8 +92,11 @@ pub struct Vproc {
 	/// substitution.
 	pub trace_base:    u32,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
-	/// nested shell). A field, not an image record: a record would cost
-	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
+	/// nested shell) in its low 24 bits ([`super::subshell_depth`]), and the
+	/// vproc's [`Fork`] in its top byte ([`Vproc::fork`]). A field, not an
+	/// image record: a record would cost every subshell a ~530-byte map
+	/// allocation (idle vproc ≤ 2 KiB, which leaves no byte for a field of
+	/// its own).
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
@@ -179,6 +182,62 @@ pub struct DebugSkip {
 	pub vproc:   Vpid,
 	pub frame:   u32,
 	pub entries: Vec<u32>,
+}
+
+/// What a vproc's fatal expansion errors reach and whether bash forked it
+/// to run one command ([`Vproc::fork`]), kept in the top byte of
+/// [`Vproc::subshell`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fork(u8);
+
+impl Fork {
+	/// A subshell catcher (bash's `execute_in_subshell`, a command
+	/// substitution's) lies between it and the run's top level.
+	const CAUGHT: u8 = 1;
+	/// A subshell, a command substitution, a compound job: bash's
+	/// `execute_in_subshell` (or the substitution's own catcher) catches its
+	/// fatal errors, which exit with the failure status.
+	pub const CHILD: Self = Self(Self::CAUGHT);
+	/// The one command it was forked for has its own redirections to come.
+	const ENTRY: u8 = 2;
+	/// The shell itself, or a nested shell: bash's `run_one_command` catches
+	/// its fatal errors (a `-c` string exits 127).
+	pub const SHELL: Self = Self(0);
+
+	/// A fork made to run one command (an async command, a pipeline
+	/// stage), bash's fork before it: that command's own redirections are
+	/// made without undo (`RX_UNDOABLE` unset), and a fatal error in them,
+	/// or anywhere in a simple command, reaches what `parent`'s reach.
+	pub const fn entry(parent: Self) -> Self {
+		Self((parent.0 & Self::CAUGHT) | Self::ENTRY)
+	}
+
+	/// A fatal expansion error here reaches the run's top level.
+	pub const fn catches(self) -> bool {
+		self.0 & Self::CAUGHT == 0
+	}
+
+	/// Forked to run one command whose own redirections are still to come:
+	/// the command at the vproc's base frame is that command.
+	pub const fn at_entry(self) -> bool {
+		self.0 & Self::ENTRY != 0
+	}
+}
+
+/// The bits of [`Vproc::subshell`] that hold the depth.
+pub(super) const SUBSHELL_DEPTH: u32 = 0x00ff_ffff;
+
+impl Vproc {
+	/// What this vproc's fatal expansion errors reach, and whether it was
+	/// forked to run one command whose own redirections are still to come.
+	pub const fn fork(&self) -> Fork {
+		Fork((self.subshell >> 24) as u8)
+	}
+
+	/// Set [`Self::fork`].
+	pub const fn set_fork(&mut self, fork: Fork) {
+		self.subshell = (self.subshell & SUBSHELL_DEPTH) | ((fork.0 as u32) << 24);
+	}
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's
@@ -1241,7 +1300,7 @@ pub struct Frame {
 	/// `time` starts.
 	pub times:             Vec<TimeMark>,
 	/// fds saved by `Redir` ops, innermost last.
-	pub redirs:            Vec<Vec<Saved>>,
+	pub redirs:            Vec<Saves>,
 	/// Scratch of the op at `pc` while it is parked or calling.
 	pub scratch:           Option<Box<Scratch>>,
 	/// Lines subtracted from diagnostic line numbers: bash numbers a
@@ -1328,6 +1387,23 @@ pub struct TimeMark {
 pub struct Saved {
 	pub fd:   i32,
 	pub prev: Option<FdRef>,
+}
+
+/// What one redirection list left for its end to undo ([`Frame::redirs`]):
+/// the fd slots it saved, and the `{var}`s a bash `( … )`'s own list made,
+/// which bash makes in the subshell's fork: the shell forgets them once
+/// that fork is made (the `Spawn` after it), `None` everywhere else.
+#[derive(Default)]
+pub struct Saves {
+	pub fds:  Vec<Saved>,
+	#[expect(clippy::box_collection, reason = "moved whole from `ScratchIo::var_fds`")]
+	pub vars: Option<Box<Vec<VarFd>>>,
+}
+
+impl From<Vec<Saved>> for Saves {
+	fn from(fds: Vec<Saved>) -> Self {
+		Self { fds, vars: None }
+	}
 }
 
 /// A loop record (`break`/`continue` targets, the loop's status).
@@ -1577,8 +1653,9 @@ pub struct ScratchIo {
 	/// The probe whose fs operation is in flight (`Scratch::live`), with its
 	/// partial progress.
 	pub probing: Option<Probe>,
-	/// PATH search of the probe in flight.
-	pub search:  Option<PathSearch>,
+	/// PATH search of the probe in flight (boxed: the size guard below,
+	/// and few ops search).
+	pub search:  Option<Box<PathSearch>>,
 	/// Bytes read so far by an `Input`/`Read` probe.
 	pub input:   Vec<u8>,
 	/// The pathname-expansion walk of the `Glob` probe in flight.
@@ -1586,12 +1663,19 @@ pub struct ScratchIo {
 	/// The zsh part ([`ScratchZsh`]), created by zsh code on first use
 	/// ([`Self::zsh()`]): a bash op's progress neither carries nor clears it.
 	pub zsh:     Option<Box<ScratchZsh>>,
+	/// The `{var}` redirections a bash `( … )`'s own `Redir` op made so far
+	/// (a simple command's are [`ExecState::var_fds`]), which bash makes in
+	/// the subshell's fork: when they fail the shell forgets them at once
+	/// ([`super::redir::forget_var_fds`]), else after the fork
+	/// ([`Saves::vars`]). No other op takes one. Boxed: few ops have one.
+	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
+	pub var_fds: Option<Box<Vec<VarFd>>>,
 }
 
 impl ScratchIo {
 	/// Clear for the next op, keeping the vectors' allocations.
 	fn clear(&mut self) {
-		let Self { redir, saved, probes, probing, search, input, walk, zsh } = self;
+		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds } = self;
 		*redir = RedirProgress::default();
 		saved.clear();
 		probes.clear();
@@ -1602,6 +1686,7 @@ impl ScratchIo {
 		if let Some(z) = zsh {
 			z.clear();
 		}
+		*var_fds = None;
 	}
 
 	/// The op's zsh I/O progress, created on first use.
@@ -1840,8 +1925,9 @@ pub struct ExecState {
 	pub scoped:      bool,
 	/// Control transfer to perform once the output is written.
 	pub control:     Option<Transfer>,
-	/// `Task::checkpoint` bytes taken at externalize.
-	pub checkpoint:  Option<Vec<u8>>,
+	/// `Task::checkpoint` bytes taken at externalize (a boxed slice: the
+	/// size guard below counts every byte of this state).
+	pub checkpoint:  Option<Box<[u8]>>,
 	/// Command output still to be written.
 	pub writes:      VecDeque<PendingWrite>,
 	pub status:      i32,
@@ -1865,6 +1951,27 @@ pub struct ExecState {
 	/// subshell level down ([`super::exec::raise_element_level`]), once.
 	#[serde(default)]
 	pub raised:      bool,
+	/// The `{var}` redirections made so far of a command bash makes them for
+	/// in its fork (an external, a name not found, a null command that
+	/// forks): neither the fd nor the value reaches the shell, which forgets
+	/// them when they fail or when the command ends
+	/// ([`super::redir::forget_var_fds`]). No other command takes one.
+	/// Boxed: few commands have one.
+	#[expect(
+		clippy::box_collection,
+		reason = "8 B where a Vec is 24: the size guard below counts every byte"
+	)]
+	pub var_fds:     Option<Box<Vec<VarFd>>>,
+}
+
+/// A `{var}` redirection bash makes in a fork (a command bash forks for, a
+/// `( … )`'s own): the fd, and the variable's name and declared binding
+/// before it took the fd (`None`: unbound).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VarFd {
+	pub fd:    i32,
+	pub name:  BString,
+	pub prior: Option<crate::bash::store::Var>,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1920,6 +2027,10 @@ pub enum Stage {
 	Output,
 	/// Report and finish.
 	Finish,
+	/// The redirections of a command bash forks for failed (its `status` is
+	/// the fork's): resolve the name, as bash does in the shell before it
+	/// forks (hashing it), then finish; the command runs no further.
+	FailedLookup,
 }
 
 /// What a command name resolved to.
