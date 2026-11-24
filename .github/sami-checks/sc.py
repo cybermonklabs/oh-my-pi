@@ -8,6 +8,10 @@
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
+  sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
+  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result against clippy-baseline.txt
+  sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
+  sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
@@ -19,15 +23,17 @@
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
-with no JUnit report or no summary line, a command the time bound or a signal ended, and a unit
-the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
-they belong to. A test that passed after printing a skip marker compared nothing: it is counted
-apart, named, and its unit is UNKNOWN, unless each of its skip lines is a sub-case that
-partial-skips.txt lets that test skip and the entry's witness line is in its output (then it
-passes and is listed as partial), it passed as the other user, or known-failures.txt names each of
-its skip lines for that row and user (`skips: `; then it reads KNOWN). A test that started and
-never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test passed in
-a retry of its whole unit in the same job (the unit's command again, at most twice).
+with no JUnit report or no summary line, a command the time bound or a signal ended, a clippy run
+whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
+gives no verdict for, and a unit the plan expects that no job reported, or that two jobs reported,
+are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
+compared nothing: it is counted apart, named, and its unit is UNKNOWN, unless each of its skip
+lines is a sub-case that partial-skips.txt lets that test skip and the entry's witness line is in
+its output (then it passes and is listed as partial), it passed as the other user, or
+known-failures.txt names each of its skip lines for that row and user (`skips: `; then it reads
+KNOWN). A test that started and never ended is named. A failure with a `flaky: ` entry reads KNOWN
+only when the test passed in a retry of its whole unit in the same job (the unit's command again,
+at most twice; on the platform rows, nextest's own retry of the test's own process).
 """
 
 import json
@@ -53,6 +59,19 @@ TS_SMALL = (
 PI_SHELL = "pi-shell"
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
+# The platform rows: platform-checks.yml, called on the candidate, tests these crates on these
+# platforms (the fork's hand-run platform rows: pi-shell, macOS and Windows).
+PLATFORMS = ("macos", "windows")
+PLATFORM_CRATES = "pi-shell"
+# Each platform's tests run in this many parallel legs, one nextest partition each (count:k/N).
+PLATFORM_PARTITIONS = 3
+# A failed platform test runs once more (nextest retries): one that then passes reads FLAKY, which
+# is a pass a flaky known-failure entry needs; with a single repeat a failure alone shows none.
+PLATFORM_RETRIES = 1
+# The clippy row: the crates the fork's hand-run clippy gate linted, one unit each.
+CLIPPY_CRATES = ("pi-shell", "pi-vcs", "pi-vfs", "pi-walker", "pi-builtins", "pi-natives")
+# The name of the unused import clippy.sh plants as the clippy row's control.
+CLIPPY_CONTROL = "ScClippyControl"
 # What a test prints when it returns early having checked nothing: a passing test that prints one
 # did not pass. The forms are the tree's own (sc.py skip-forms lists every print of the tree that
 # says skip, not run or nothing checked, and fails on one this rule does not read): `skipped: ...`,
@@ -90,6 +109,9 @@ ROWS = (
     ("TypeScript suites", "ts-small"),
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
+    ("macOS: pi-shell, platform checks", "macos"),
+    ("Windows: pi-shell, platform checks", "windows"),
+    ("clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
     ("skip prints the summary reads", "skipforms"),
 )
 
@@ -112,7 +134,10 @@ def ts_matrix():
 
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
-    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts", "skip-forms"]
+    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()]
+    # macos-bash is no job: it skips the macOS legs' Homebrew bash install (the platform checks'
+    # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
+    names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     return names
 
 
@@ -141,6 +166,11 @@ def cmd_plan():
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
+        "platforms": ",".join(PLATFORMS),
+        "platform_crates": PLATFORM_CRATES,
+        "platform_partitions": PLATFORM_PARTITIONS,
+        "platform_retries": PLATFORM_RETRIES,
+        "clippy_crates": " ".join(CLIPPY_CRATES),
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -538,6 +568,296 @@ def parse_plain(exit_code, secs, row, unit, log):
                   failures=[] if ok else [f"{unit}: exit {exit_code}: " + " / ".join(l.strip() for l in tail if l.strip())[-600:]])
 
 
+# The clippy row applies the cut's rule (Cut7's kit: a crate fails only on findings beyond what the
+# release already has) without linting the release a second time: the findings the release has
+# are checked in, one line per (crate, file, lint code, message) with a count. See the file's
+# header for how to regenerate it.
+CLIPPY_BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clippy-baseline.txt")
+
+
+def read_lines(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return None
+
+
+# The key of a compile error that carries no lint code (rustc gives a syntax error none). It is a
+# finding that no baseline line holds: a target that did not compile was never linted.
+UNCODED_ERROR = "error"
+
+
+def clippy_diagnostics(path):
+    """The findings in a `cargo clippy --message-format=json` log, and the numbers of its lines that
+    look like cargo messages (`{"reason":`) but do not parse: ({(file, code, message): {(line,
+    column)}}, [line number]). A finding is a compiler message with a primary span and a code: its
+    lint or error code (diagnostic `code.code`), or UNCODED_ERROR for an error with none. The same
+    finding in several of a crate's targets (a module that the lib test and a test binary both
+    build) is one, by its place. None when there is no log."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    out, unread = {}, []
+    for n, line in enumerate(lines, 1):
+        if not line.startswith('{"reason":'):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            unread.append(n)
+            continue
+        if ev.get("reason") != "compiler-message":
+            continue
+        m = ev.get("message") or {}
+        code = (m.get("code") or {}).get("code") or (UNCODED_ERROR if m.get("level") == "error" else None)
+        span = next((s for s in m.get("spans") or () if s.get("is_primary")), None)
+        if code and span:
+            out.setdefault((span["file_name"], code, m.get("message", "")), set()).add((span["line_start"], span["column_start"]))
+    return out, unread
+
+
+def read_clippy_baseline(path):
+    """{(crate, file, code, message): count} from the baseline file: `crate<TAB>file<TAB>code<TAB>
+    count<TAB>message` a line, `#` comments. A missing or malformed file stops sc.py: the crate then
+    has no result, and reads UNKNOWN."""
+    lines = read_lines(path)
+    if lines is None:
+        sys.exit(f"no clippy baseline at {path}")
+    base = {}
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t", 4)
+        if len(parts) != 5 or not parts[3].isdigit():
+            sys.exit(f"{path}:{n}: want crate<TAB>file<TAB>code<TAB>count<TAB>message")
+        crate, f, code, count, msg = parts
+        base[(crate, f, code, msg)] = int(count)
+    return base
+
+
+def clippy_baseline_lines(log, crate, crate_dir):
+    """The baseline lines of one crate's findings in its log (the regeneration step's input). A
+    compile error with no code is never a baseline line; it and any line that did not parse are
+    named in a comment line instead, so a regenerated baseline cannot take them in unseen."""
+    diags, unread = clippy_diagnostics(log) or ({}, ["(no log)"])
+    own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    for (f, code, msg), locs in sorted(own.items()):
+        if code == UNCODED_ERROR:
+            print(f"# {crate}: a compile error, not a baseline line: {f}:{min(locs)[0]}: {msg}")
+        else:
+            print(f"{crate}\t{f}\t{code}\t{len(locs)}\t{msg}")
+    if unread:
+        print(f"# {crate}: log lines that did not parse, so their findings are missing here: {', '.join(map(str, unread[:12]))}")
+
+
+def clippy_crates(metadata, crates):
+    """Each crate's directory and library root, relative to the workspace root, from
+    `cargo metadata --no-deps`; "-" for what the tree does not have."""
+    meta = json.load(open(metadata, encoding="utf-8"))
+    root = meta["workspace_root"]
+    pkgs = {p["name"]: p for p in meta["packages"]}
+    for c in crates:
+        p = pkgs.get(c)
+        if p is None:
+            print(f"{c}\t-\t-")
+            continue
+        lib = next((t["src_path"] for t in p["targets"] if any(k.endswith("lib") or k == "proc-macro" for k in t["kind"])), None)
+        print(f"{c}\t{os.path.relpath(os.path.dirname(p['manifest_path']), root)}\t{os.path.relpath(lib, root) if lib else '-'}")
+
+
+def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, baseline_path=CLIPPY_BASELINE):
+    """One crate's clippy result, by the cut's rule against the baseline. Its findings are those in
+    files under its own directory (a dependency's are not this crate's). FAIL: a finding whose key
+    the baseline lacks, a key with more places than the baseline counts, or a compile error with no
+    code (UNCODED_ERROR, which no baseline line holds: its target was never linted), each place
+    named `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding.
+    A baseline key with fewer places here is listed (baseline_fell) with the line that replaces it,
+    never a failure. KNOWN and PASS also need the control run to read the unused import clippy.sh
+    planted in the crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no
+    log, a log line that looks like a cargo message but does not parse (its finding is unread), an
+    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0
+    with findings."""
+    base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items()
+            if c == crate and code != UNCODED_ERROR}
+
+    def r(status, failures=(), note="", fell=()):
+        res = result("clippy", crate, "runner", status, exit_code, secs, failed=len(failures), failures=failures, note=note)
+        res["baseline_fell"] = list(fell)
+        return res
+
+    if crate_dir == "-":
+        return r("UNKNOWN", note=f"the tree has no package {crate}")
+    got = clippy_diagnostics(log)
+    if got is None:
+        return r("UNKNOWN", note="no log")
+    diags, unread = got
+    own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    try:
+        code = int(exit_code)
+    except ValueError:
+        code = None
+    if code not in (0, 101):
+        return r("UNKNOWN", note=f"exit {exit_code}: clippy did not finish" + (" (the time bound ended it)" if code == 124 else ""))
+    if code == 101 and not own and not unread:
+        first = next((l for l in read_lines(log) or () if l.startswith("error")), "no error line")
+        return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
+    if code == 0 and own:
+        return r("UNKNOWN", note=f"exit 0 with {sum(map(len, own.values()))} findings under -D warnings")
+    beyond, known = [], 0
+    for (f, lint, msg), places in sorted(own.items()):
+        b = base.get((f, lint, msg), 0)
+        if len(places) > b:
+            more = f" ({len(places)} here, {b} in the baseline)" if b else ""
+            beyond += [f"{f}:{line}: {lint}: {msg}{more}" for line, _ in sorted(places)]
+        else:
+            known += len(places)
+    fell = []
+    for (f, lint, msg), b in sorted(base.items()):
+        n = len(own.get((f, lint, msg), ()))
+        if n < b:
+            fix = "delete its line" if n == 0 else f"its line becomes `{crate}\t{f}\t{lint}\t{n}\t{msg}` (tab-separated)"
+            fell.append(f"{f}: {lint}: {msg} ({n} here, {b} in the baseline): {fix}")
+    if unread:
+        return r("UNKNOWN", beyond, f"log line(s) {', '.join(map(str, unread[:12]))} look like cargo messages and do not parse, "
+                                    "so their findings are unread", fell)
+    ctl = clippy_diagnostics(ctl_log)
+    caught = ctl is not None and any(f == ctl_file and lint == "unused_imports" and CLIPPY_CONTROL in msg for f, lint, msg in ctl[0])
+    said = "the planted control read as a finding beyond the baseline" if caught else (
+        "the control left no log" if ctl is None else f"the control's unused import planted in {ctl_file} was not read as a finding")
+    if beyond:
+        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}", fell)
+    if not caught:
+        return r("UNKNOWN", note=f"{said}, so a clean result proves nothing", fell=fell)
+    if known:
+        return r("KNOWN", note=f"{known} finding(s), each within the baseline; {said}", fell=fell)
+    return r("PASS", note=said, fell=fell)
+
+
+def read_kv(path):
+    out = {}
+    for line in read_lines(path) or ():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def read_tsv(path):
+    rows = [l.split("\t") for l in read_lines(path) or ()]
+    return [dict(zip(rows[0], r)) for r in rows[1:]] if rows else None
+
+
+def platform_results(pc_dir, commit):
+    """One result per platform in PLATFORMS from the platform checks' own report (pc-report:
+    summary.md, verdicts.tsv, tests.tsv) and each leg's meta.env and JUnit report, all found
+    under pc_dir. The verdict is the report's own, for the head tree and the runner's user: PASS
+    reads PASS; FAIL, TIMEOUT and FLAKY read FAIL with each test that did not pass named; any
+    other verdict, a report of another commit, or a platform it gives no verdict for reads UNKNOWN.
+    An UNKNOWN names the head build's failure on that platform, when its build record
+    (pc-build-<platform>-head) shows one, with the first compiler error."""
+    where = {}
+    for dirpath, _, names in os.walk(pc_dir):
+        for n in names:
+            where.setdefault(n, []).append(os.path.join(dirpath, n))
+    unit = PLATFORM_CRATES
+
+    def unknown(note):
+        return [result(p, unit, "runner", "UNKNOWN", "-", 0, note=note) for p in PLATFORMS]
+
+    if len(where.get("verdicts.tsv", ())) != 1:
+        return unknown(f"the platform checks' report (pc-report) was not read: {len(where.get('verdicts.tsv', ()))} verdicts.tsv found")
+    report = os.path.dirname(where["verdicts.tsv"][0])
+    summary = "\n".join(read_lines(os.path.join(report, "summary.md")) or ())
+    verdicts = read_tsv(os.path.join(report, "verdicts.tsv"))
+    tests = read_tsv(os.path.join(report, "tests.tsv"))
+    if verdicts is None or tests is None:
+        return unknown("the platform checks' report has no verdicts.tsv or tests.tsv to read")
+    m = re.search(r"^\| head \| `([0-9a-f]{40})` \|$", summary, re.M)
+    if not m or m.group(1) != commit:
+        return unknown(f"the platform checks' report is of head {m.group(1) if m else '(none named)'}, not {commit}")
+    legs = {}
+    for path in where.get("meta.env", ()):
+        kv = read_kv(path)
+        if (kv.get("tree"), kv.get("who")) == ("head", "user"):
+            legs.setdefault(kv.get("platform"), []).append((kv, os.path.dirname(path)))
+
+    def build_failure(p):
+        for path in where.get("build.env", ()):
+            d = os.path.dirname(path)
+            kv = read_kv(path)
+            if os.path.basename(d) != f"pc-build-{p}-head" or kv.get("exit") in (None, "0"):
+                continue
+            log = read_lines(os.path.join(d, "build-head.log")) or []
+            for i, l in enumerate(log):
+                if re.match(r"error(\[E\d+\])?: ", l):
+                    at = next((x.split("-->", 1)[1].strip() for x in log[i + 1:i + 3] if "-->" in x), "")
+                    return f"the head's test build failed (exit {kv['exit']}): {l.strip()}" + (f" at {at}" if at else "")
+            return f"the head's test build failed (exit {kv['exit']})"
+        return ""
+
+    out = []
+    for p in PLATFORMS:
+        key = lambda row: (row.get("platform"), row.get("tree"), row.get("user")) == (p, "head", "user")
+        lines = [v.get("verdict", "") for v in verdicts if key(v)]
+        if len(lines) != 1:
+            bf = build_failure(p)
+            out.append(result(p, unit, "runner", "UNKNOWN", "-", 0, note=f"the platform checks' report gives {len(lines)} verdicts "
+                              f"for the head on {p}, not 1" + (f"; {bf}" if bf else "")))
+            continue
+        line = lines[0]
+        mine = [t for t in tests if key(t)]
+        # A failure is named as the JUnit report names the test (binary::test), so the known-failure
+        # list can name it. A timeout, or a test with no verdict, gets its verdict after the name, so no
+        # entry makes it KNOWN. Its retries are nextest's own, in the same run (the shared reader,
+        # junit_cases: a <flakyFailure> attempt that then passed is a fail then a pass; each
+        # <rerunFailure> is a fail), one record each, scope own-process, over every repeat of every
+        # leg: failure_reason gives a flaky entry its reason only when one of them passed.
+        bad = []
+        for t in mine:
+            v = t.get("verdict")
+            if v != "PASS":
+                bad.append(f"{t.get('binary')}::{t.get('test')}" + ("" if v in ("FAIL", "FLAKY") else f" ({v})"))
+        times, retries, unrecorded = [], {}, []
+        for _, d in legs.get(p, ()):
+            try:
+                cases = list(junit_cases(os.path.join(d, "junit.xml")))
+            except (OSError, ET.ParseError):
+                continue
+            times += [(c[0], c[2]) for c in cases if c[1] != "skipped"]
+            of = len({c[0] for c in cases if c[1] != "skipped"})
+            for c in cases:
+                outcomes, first, elements = c[4]
+                # Each of nextest's retry elements has its record, as parse_junit requires: else the
+                # reading of them is broken, and the case would read without its retries.
+                if len(outcomes) != elements:
+                    unrecorded.append(c[0])
+                retries.setdefault(c[0], []).extend(
+                    {"outcome": o, "ran": 1, "of": of, "shape": f"nextest's own retry {i} of {len(outcomes)}",
+                     "scope": "own-process", "first_failure": first} for i, o in enumerate(outcomes, 1))
+        secs = max((int(kv.get("run_seconds") or 0) for kv, _ in legs.get(p, ())), default=0)
+        exit_code = ",".join(kv.get("run_exit", "?") for kv, _ in legs.get(p, ())) or "-"
+        ign = re.search(r"\bignored=(\d+)", line)
+        status = {"PASS": "PASS", "FAIL": "FAIL", "TIMEOUT": "FAIL", "FLAKY": "FAIL"}.get(line.split(" ", 1)[0], "UNKNOWN")
+        note = line if status == "UNKNOWN" else ""
+        if (status == "PASS" and (bad or not mine)) or (status == "FAIL" and not bad):
+            status, note = "UNKNOWN", f"the verdict ({line}) and the report's test list disagree"
+        if unrecorded:
+            status, note = "UNKNOWN", "a flaky case has no recorded retry: " + ", ".join(sorted(set(unrecorded))[:12])
+        if status == "UNKNOWN" and build_failure(p):
+            note += "; " + build_failure(p)
+        out.append(result(p, unit, "runner", status, exit_code, secs, len(mine) - len(bad), len(bad),
+                          int(ign.group(1)) if ign else 0, bad, times, note,
+                          retries={f: retries[f] for f in bad if retries.get(f)}))
+    return out
+
+
+def cmd_platforms(pc_dir, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    for r in platform_results(pc_dir, os.environ.get("SC_COMMIT", "")):
+        json.dump(r, open(os.path.join(out_dir, f"{r['row']}.json"), "w", encoding="utf-8"))
+        print(f"PLATFORM {r['row']} {r['status']}: {r['passed']} passed, {r['failed']} not passed {r['note']}")
+
+
 def load_results(results_dir):
     out = []
     for dirpath, _, files in os.walk(results_dir):
@@ -573,6 +893,10 @@ def expected_units(build_dir):
     for s in range(1, CODING_AGENT_SHARDS + 1):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
+    for p in PLATFORMS:
+        exp.append((p, PLATFORM_CRATES, "runner"))
+    for c in CLIPPY_CRATES:
+        exp.append(("clippy", c, "runner"))
     exp.append(("skipforms", "tree", "runner"))
     # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
     exp.append(("skipforms", "runtime", "runner"))
@@ -942,13 +1266,14 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("")
     lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed, "
                  "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
-                 "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line), when a "
-                 "passing test printed a skip marker and passed as no other user (even when every failure of the "
-                 "unit is known), or when no job (or more than one) reported it; its row is then UNKNOWN too. A test "
-                 "whose only skip lines are sub-cases the partial-skip list names for it, with that entry's witness "
-                 "line in its output, passes and is listed as partial. A self-skip the known-failure list names "
-                 "(`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` entry reads KNOWN "
-                 "only when a retry of the test in the same job passed.")
+                 "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
+                 "0/101), when a passing test printed a skip marker and passed as no other user (even when every "
+                 "failure of the unit is known), when a clean clippy crate's planted control was not caught, when the "
+                 "platform checks gave its platform no verdict, or when no job (or more than one) reported it; its "
+                 "row is then UNKNOWN too. A test whose only skip lines are sub-cases the partial-skip list names for "
+                 "it, with that entry's witness line in its output, passes and is listed as partial. A self-skip the "
+                 "known-failure list names (`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` "
+                 "entry reads KNOWN only when a retry of the test in the same job passed.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -1013,6 +1338,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
+            for f in r.get("baseline_fell", []):
+                details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
             for f in r.get("self_skipped", []):
                 why = r.get("known_skips", {}).get(f)
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
@@ -1255,7 +1582,142 @@ def selftest():
         f.write("# c\n10 x\n600 x root\n")
     check("weights per user", (read_weights(wf, "runner")["x"], read_weights(wf, "root")["x"]), (10.0, 600.0))
 
-    # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control).
+    # clippy, by the cut's rule against the checked-in baseline: a crate's own findings beyond the
+    # baseline fail it (a new key, or a key with more places), findings within it read KNOWN, a key
+    # with fewer places is listed for removal; a clean or known result needs its control caught.
+    def write(name, text):
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def diag(f, line, code, msg, level="error"):
+        return json.dumps({"reason": "compiler-message", "message": {"message": msg, "level": level, "code": {"code": code},
+                           "spans": [{"file_name": f, "line_start": line, "column_start": 5, "is_primary": True}]}}) + "\n"
+
+    hashes = "unnecessary hashes around raw string literal"
+    own_a = diag("crates/pi-vfs/src/a.rs", 3, "clippy::needless_raw_string_hashes", hashes)
+    own_b = diag("crates/pi-vfs/src/a.rs", 9, "clippy::needless_raw_string_hashes", hashes)
+    cast = diag("crates/pi-vfs/src/b.rs", 86, "function_casts_as_integer", "direct cast of function item into an integer")
+    dep_f = diag("crates/pi-shell/src/b.rs", 1, "unused_variables", "unused variable: `x`", "warning")
+    # The same place twice (a module two targets build) is one finding.
+    again = own_a
+    noise = '    Checking pi-vfs v0.1.0\n{"reason":"compiler-artifact"}\n' + json.dumps(
+        {"reason": "compiler-message", "message": {"message": "aborting due to 2 previous errors", "code": None, "spans": []}}) + "\n"
+    ctl = write("ctl.log", diag("crates/pi-vfs/src/lib.rs", 90, "unused_imports",
+                                f"unused import: `std::collections::BTreeMap as {CLIPPY_CONTROL}`"))
+    noctl = write("noctl.log", "    Checking pi-vfs v0.1.0\n")
+    bl = write("baseline.txt", "# a comment\n"
+               f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}\n"
+               f"pi-vfs\tcrates/pi-vfs/src/c.rs\tclippy::doc_markdown\t2\titem in documentation is missing backticks\n"
+               f"pi-shell\tcrates/pi-shell/src/b.rs\tunused_variables\t1\tunused variable: `x`\n")
+
+    def cl(text, ex, c=ctl, base=bl):
+        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", base)
+
+    r = cl(noise + dep_f + own_a + again + cast, 101)
+    check("clippy: a key the baseline lacks fails, named by place and lint",
+          (r["status"], r["failures"], r["baseline_fell"]),
+          ("FAIL", ["crates/pi-vfs/src/b.rs:86: function_casts_as_integer: direct cast of function item into an integer"],
+           [f"crates/pi-vfs/src/c.rs: clippy::doc_markdown: item in documentation is missing backticks (0 here, 2 in the baseline): delete its line"]))
+    r = cl(own_a + own_b, 101)
+    check("clippy: a key with more places than the baseline fails, each place named",
+          (r["status"], r["failures"]),
+          ("FAIL", [f"crates/pi-vfs/src/a.rs:3: clippy::needless_raw_string_hashes: {hashes} (2 here, 1 in the baseline)",
+                    f"crates/pi-vfs/src/a.rs:9: clippy::needless_raw_string_hashes: {hashes} (2 here, 1 in the baseline)"]))
+    r = cl(dep_f + own_a, 101)
+    check("clippy: findings within the baseline read KNOWN, a fallen key listed for removal",
+          (r["status"], r["failed"], len(r["baseline_fell"]), "planted control read" in r["note"]), ("KNOWN", 0, 1, True))
+    check("clippy: clean with its control caught", cl(dep_f, 0)["status"], "PASS")
+    check("clippy: findings within the baseline, control not caught", cl(own_a, 101, noctl)["status"], "UNKNOWN")
+    check("clippy: clean with no control log", cl("", 0, os.path.join(d, "absent"))["status"], "UNKNOWN")
+    check("clippy: a new finding fails even with the control not caught", cl(cast, 101, noctl)["status"], "FAIL")
+    check("clippy: killed", cl(own_a, 137)["status"], "UNKNOWN")
+    check("clippy: ended by its bound", "time bound" in cl("", 124)["note"], True)
+    check("clippy: 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
+    check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
+    # A missing log is UNKNOWN by itself, at exit 0 as at 101 (at 101 another branch also gives UNKNOWN).
+    for ex in ("0", "101"):
+        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", bl)
+        check(f"clippy: no log, exit {ex}", (r["status"], r["note"]), ("UNKNOWN", "no log"))
+    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", bl)["status"], "UNKNOWN")
+    check("clippy: the short format names no lint code, so it reads nothing",
+          clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), ({}, []))
+    # A compile error with no code (rustc gives a syntax error code=null) is a finding no baseline
+    # line holds: its target was never linted, so the crate fails beside findings within the baseline.
+    broken = json.dumps({"reason": "compiler-message", "message": {
+        "message": "expected expression, found `;`", "level": "error", "code": None,
+        "spans": [{"file_name": "crates/pi-vfs/tests/broken.rs", "line_start": 3, "column_start": 13, "is_primary": True}]}}) + "\n"
+    uncoded = "crates/pi-vfs/tests/broken.rs:3: error: expected expression, found `;`"
+    r = cl(noise + own_a + broken, 101)
+    check("clippy: a compile error with no code fails beside findings within the baseline",
+          (r["status"], r["failures"]), ("FAIL", [uncoded]))
+    in_base = write("baseline-error.txt", f"pi-vfs\tcrates/pi-vfs/tests/broken.rs\terror\t1\texpected expression, found `;`\n")
+    check("clippy: a compile error with no code fails even when a baseline line names it",
+          cl(broken, 101, base=in_base)["failures"], [uncoded])
+    warned = broken.replace('"level": "error"', '"level": "warning"')
+    check("clippy: a warning with no code is no finding", clippy_diagnostics(write("w.log", warned)), ({}, []))
+    # A line that looks like a cargo message and does not parse hides its finding: UNKNOWN, named.
+    cut = noise + own_a + broken[:60] + "\n"
+    r = cl(cut, 101)
+    check("clippy: a cargo message line that does not parse", (r["status"], r["note"]),
+          ("UNKNOWN", "log line(s) 5 look like cargo messages and do not parse, so their findings are unread"))
+    # A fallen count names the line that replaces it.
+    r = cl(own_a, 101, base=write("baseline-3.txt", f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t3\t{hashes}\n"))
+    check("clippy: a fallen count names its replacement line", (r["status"], r["baseline_fell"]),
+          ("KNOWN", [f"crates/pi-vfs/src/a.rs: clippy::needless_raw_string_hashes: {hashes} (1 here, 3 in the baseline): its line becomes "
+                     f"`pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}` (tab-separated)"]))
+    # The baseline lines a log gives (the regeneration step), read back as the same baseline.
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs")
+    check("clippy: a regenerated baseline names a compile error in a comment, not a line",
+          "# pi-vfs: a compile error, not a baseline line: crates/pi-vfs/tests/broken.rs:3: expected expression, found `;`" in buf.getvalue(), True)
+    regen = write("regen.txt", buf.getvalue())
+    check("clippy: regenerated baseline lines", read_clippy_baseline(regen),
+          {("pi-vfs", "crates/pi-vfs/src/a.rs", "clippy::needless_raw_string_hashes", hashes): 2,
+           ("pi-vfs", "crates/pi-vfs/src/b.rs", "function_casts_as_integer", "direct cast of function item into an integer"): 1})
+    check("clippy: against its own regenerated baseline, a log reads KNOWN",
+          cl(noise + own_a + own_b + cast, 101, base=regen)["status"], "KNOWN")
+
+    # The platform rows: the platform checks' own report, read per platform.
+    commit = "c" * 40
+    pc = os.path.join(d, "pc")
+    rep = os.path.join(pc, "pc-report")
+    leg = os.path.join(pc, "pc-results-macos-head-user-1")
+    os.makedirs(rep)
+    os.makedirs(leg)
+
+    def pc_report(head, verdicts):
+        write("pc/pc-report/summary.md", f"| what | commit |\n|---|---|\n| head | `{head}` |\n| base | `-` |\n")
+        write("pc/pc-report/verdicts.tsv", "platform\ttree\tuser\tverdict\n" + "".join(f"{p}\thead\tuser\t{v}\n" for p, v in verdicts))
+
+    write("pc/pc-report/tests.tsv", "platform\ttree\tuser\tbinary\ttest\tverdict\tpassed\tflaky\tfailed\ttimed_out\tnot_run\n"
+          "macos\thead\tuser\tpi-shell\ta::x\tPASS\t1/1\t0\t0\t0\t0\nmacos\thead\tuser\tpi-shell\ta::y\tTIMEOUT\t0/1\t0\t0\t1\t0\n")
+    write("pc/pc-results-macos-head-user-1/meta.env", "platform=macos\ntree=head\nwho=user\nleg=1\nrun_exit=100\nrun_seconds=2220\n")
+    pc_report(commit, [("macos", "TIMEOUT (1 past the time bound: pi-shell a::y) run=2 ignored=1")])
+    got = {r["row"]: r for r in platform_results(pc, commit)}
+    check("platform timeout reads FAIL with its test named",
+          (got["macos"]["status"], got["macos"]["failures"], got["macos"]["passed"], got["macos"]["ignored"], got["macos"]["seconds"]),
+          ("FAIL", ["pi-shell::a::y (TIMEOUT)"], 1, 1, 2220.0))
+    check("platform the report gives no verdict for", got["windows"]["status"], "UNKNOWN")
+    # A platform whose head build failed: its UNKNOWN names the first compiler error.
+    os.makedirs(os.path.join(pc, "pc-build-windows-head"))
+    write("pc/pc-build-windows-head/build.env", "sha=x\nexit=101\nseconds=898\n")
+    write("pc/pc-build-windows-head/build-head.log", "   Compiling pi-shell v1.0.0\r\nerror[E0063]: missing field `on_busy`\r\n"
+          "   --> crates\\pi-shell\\src\\sys\\spawn\\windows\\tests.rs:688:11\r\nerror: could not compile `pi-shell`\r\n")
+    note = {r["row"]: r for r in platform_results(pc, commit)}["windows"]["note"]
+    check("platform build failure named", "failed (exit 101): error[E0063]: missing field `on_busy` at crates\\pi-shell\\src\\sys\\spawn\\windows\\tests.rs:688:11" in note, True)
+    pc_report(commit, [("macos", "UNKNOWN (no test list: no archive) run=? ignored=?")])
+    check("platform UNKNOWN verdict", platform_results(pc, commit)[0]["status"], "UNKNOWN")
+    pc_report(commit, [("macos", "PASS (2 passed in 1 of 1 repeats) run=2 ignored=0")])
+    check("platform PASS beside a test that did not pass", platform_results(pc, commit)[0]["status"], "UNKNOWN")
+    pc_report("d" * 40, [("macos", "TIMEOUT (1 past the time bound: pi-shell a::y) run=2 ignored=1")])
+    check("platform report of another commit", {r["status"] for r in platform_results(pc, commit)}, {"UNKNOWN"})
+    check("no platform report", {r["status"] for r in platform_results(os.path.join(d, "nopc"), commit)}, {"UNKNOWN"})
+
+    # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control):
+    # a pi-shell binary, a clippy crate and a platform.
+    silent = {("set-root", "pi-shell::zle_pty", "root"), ("clippy", "pi-vfs", "runner"), ("windows", PLATFORM_CRATES, "runner")}
     res = os.path.join(d, "res")
     build = os.path.join(d, "build")
     os.makedirs(res)
@@ -1269,8 +1731,8 @@ def selftest():
     json.dump(meta, open(os.path.join(build, "binaries-metadata.json"), "w"))
     exp, _ = expected_units(build)
     for i, (row, unit, who) in enumerate(exp):
-        if (row, unit, who) == ("set-root", "pi-shell::zle_pty", "root"):
-            continue  # the planted silent unit
+        if (row, unit, who) in silent:
+            continue
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
                   open(os.path.join(res, f"{i}.json"), "w"))
 
@@ -1288,9 +1750,16 @@ def selftest():
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
     check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
+    check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
+    check("summary row of the silent clippy crate",
+          "| clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
+    check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
-    json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1),
-              open(os.path.join(res, "silent.json"), "w"))
+    for row, unit, who in sorted(silent):
+        # The root unit's file is silent.json: a later case replaces it under that name.
+        name = "silent.json" if row == "set-root" else f"silent-{row}.json"
+        json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res, name), "w"))
     rc, _ = summary()
     check("summary exit when every unit passed", rc, 0)
     # A unit two jobs reported is UNKNOWN.
@@ -1620,6 +2089,97 @@ def selftest():
     json.dump(result("ts-ca", "shard 3/10", "runner", "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
               open(os.path.join(res, "ca3.json"), "w"))
     open(known_file, "w").write("# none\n")
+    # A platform failure on the list reads KNOWN too; a timeout of the same test is another failure.
+    for f in os.listdir(res):
+        if json.load(open(os.path.join(res, f)))["row"] == "macos":
+            os.remove(os.path.join(res, f))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "FAIL", "100", 1, passed=1, failed=1,
+                     failures=["pi-shell::a::y"], tests=[("pi-shell::a::y", 1.0), ("pi-shell::a::x", 1.0)]),
+              open(os.path.join(res, "macos.json"), "w"))
+    open(known_file, "w").write("macos\trunner\tpi-shell\tpi-shell::a::y\tmacOS's own bash\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = summary()
+    check("a listed platform failure is KNOWN", ("| macOS: pi-shell, platform checks | **KNOWN** |" in out, rc), (True, 0))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "FAIL", "100", 1, passed=1, failed=1,
+                     failures=["pi-shell::a::y (TIMEOUT)"], tests=[("pi-shell::a::x", 1.0)]),
+              open(os.path.join(res, "macos.json"), "w"))
+    rc, out = summary()
+    check("a platform timeout of a listed failure is NEW", ("| macOS: pi-shell, platform checks | **FAIL** |" in out, rc), (True, 1))
+    # A platform failure's retries are nextest's own, read from the head leg's JUnit report by the
+    # shared reader: a flaky entry gives KNOWN only when a retry passed (<flakyFailure> then a pass);
+    # failing every try (<rerunFailure>) reads NEW; a repeat that passed is not a retry and counts
+    # for nothing; a test that passed only on its retry and has no entry reads NEW, as flaky.
+    def platform_run(name, line, verdict, passed, cases):
+        os.makedirs(os.path.join(d, name, "pc-report"))
+        leg = os.path.join(d, name, "pc-results-macos-head-user-1")
+        os.makedirs(leg)
+        write(f"{name}/pc-report/summary.md", f"| what | commit |\n|---|---|\n| head | `{commit}` |\n")
+        write(f"{name}/pc-report/verdicts.tsv", f"platform\ttree\tuser\tverdict\nmacos\thead\tuser\t{line}\n")
+        write(f"{name}/pc-report/tests.tsv", "platform\ttree\tuser\tbinary\ttest\tverdict\tpassed\tflaky\tfailed\ttimed_out\tnot_run\n"
+              f"macos\thead\tuser\tpi-shell::zle_widgets_pty\ttransposes\t{verdict}\t{passed}\t0\t0\t0\t0\n"
+              "macos\thead\tuser\tpi-shell::zle_widgets_pty\tother\tPASS\t2/2\t0\t0\t0\t0\n")
+        write(f"{name}/pc-results-macos-head-user-1/meta.env", "platform=macos\ntree=head\nwho=user\nleg=1\nrun_exit=100\nrun_seconds=60\n")
+        suites = "".join(f'<testsuite name="pi-shell::zle_widgets_pty@stress-{i}">'
+                         f'<testcase classname="pi-shell::zle_widgets_pty" name="transposes" time="1">{c}</testcase>'
+                         '<testcase classname="pi-shell::zle_widgets_pty" name="other" time="1"/></testsuite>'
+                         for i, c in enumerate(cases))
+        write(f"{name}/pc-results-macos-head-user-1/junit.xml", f"<testsuites>{suites}</testsuites>")
+        r = {x["row"]: x for x in platform_results(os.path.join(d, name), commit)}["macos"]
+        json.dump(r, open(os.path.join(res, "macos.json"), "w"))
+        return r, summary()
+
+    t = "`pi-shell::zle_widgets_pty::transposes`"
+    tn = "pi-shell::zle_widgets_pty::transposes"
+    failed_twice = '<failure message="left 1, right 2"/><rerunFailure message="left 1, right 2"/>'
+    flaky_pass = '<flakyFailure message="no end within 30s"/>'
+    flaky_entry = f"macos\trunner\tpi-shell\t{tn}\tflaky: fails 1 of 2 upstream\n"
+    open(known_file, "w").write(flaky_entry + "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    r, (rc, out) = platform_run("pcf1", "FAIL (1 failed: x) run=4 ignored=0", "FAIL", "0/2", [failed_twice, failed_twice])
+    check("a platform test listed flaky that failed every retry is NEW",
+          ([x["outcome"] for x in r["retries"].get(tn, [])], {x["scope"] for x in r["retries"].get(tn, [])},
+           f"FAILED {t}: **NEW** (listed as `flaky: fails 1 of 2 upstream`, but no retry of its shape passed it: fail (in its own process again" in out,
+           "| macOS: pi-shell, platform checks | **FAIL** |" in out, rc),
+          (["fail", "fail"], {"own-process"}, True, True, 1))
+    r, (rc, out) = platform_run("pcf2", "FAIL (1 failed: x) run=4 ignored=0", "FAIL", "1/2", [failed_twice, ""])
+    check("a platform test listed flaky that passed only in another repeat is NEW",
+          (f"FAILED {t}: **NEW** (listed as `flaky: fails 1 of 2 upstream`, but no retry of its shape passed it" in out, rc), (True, 1))
+    r, (rc, out) = platform_run("pcf3", "FLAKY (1 passed only on a retry: x) run=3 ignored=0", "FLAKY", "1/1", [flaky_pass])
+    check("a platform test listed flaky that passed on its retry is KNOWN",
+          ([x["outcome"] for x in r["retries"].get(tn, [])],
+           f"FAILED {t}: KNOWN (flaky: fails 1 of 2 upstream; it passed on retry 1 of 1, in its own process again: 1 of 2 tests, "
+           "nextest's own retry 1 of 1; first failure: no end within 30s)" in out,
+           "| macOS: pi-shell, platform checks | **KNOWN** |" in out, rc),
+          (["pass"], True, True, 0))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    r, (rc, out) = platform_run("pcf4", "FLAKY (1 passed only on a retry: x) run=3 ignored=0", "FLAKY", "1/1", [flaky_pass])
+    check("a platform test that passed only on its retry, with no entry, is NEW and flaky",
+          (f"FAILED {t}: **NEW** (flaky, and not on the known-failure list: it passed on retry 1 of 1" in out,
+           "| macOS: pi-shell, platform checks | **FAIL** |" in out, rc),
+          (True, True, 1))
+    # A listed flaky test whose passing retry printed a skip line checked nothing on that try: the
+    # shared reader (passed_attempt) gives `skip`, and the test reads NEW.
+    open(known_file, "w").write(flaky_entry + "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    r, (rc, out) = platform_run("pcf5", "FLAKY (1 passed only on a retry: x) run=3 ignored=0", "FLAKY", "1/1",
+                                [flaky_pass + "<system-out>skipped: no zsh here\n</system-out>"])
+    check("a platform test listed flaky whose passing retry skipped is NEW",
+          ([x["outcome"] for x in r["retries"].get(tn, [])],
+           f"FAILED {t}: **NEW** (listed as `flaky: fails 1 of 2 upstream`, but no retry of its shape passed it: skip" in out,
+           "| macOS: pi-shell, platform checks | **FAIL** |" in out, rc),
+          (["skip"], True, True, 1))
+    # A case with nextest's retry elements and no record of them is UNKNOWN by name (the reading of the
+    # elements planted broken, as for parse_junit).
+    g = globals()
+    kept = g["nextest_attempts"]
+    g["nextest_attempts"] = lambda flaky, rerun, out: []
+    try:
+        r, _ = platform_run("pcf6", "FAIL (1 failed: x) run=4 ignored=0", "FAIL", "0/2", [failed_twice, failed_twice])
+    finally:
+        g["nextest_attempts"] = kept
+    check("a platform case with retry elements and no record", (r["status"], r["note"]),
+          ("UNKNOWN", f"a flaky case has no recorded retry: {tn}"))
+    os.remove(os.path.join(res, "macos.json"))
+    json.dump(result("macos", PLATFORM_CRATES, "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "macos.json"), "w"))
+    open(known_file, "w").write("# none\n")
     # skip-forms: a literal that says it skips is read by SKIP_MARKER or named as not a marker; a new
     # form fails the check until one of the two is true.
     tree = os.path.join(d, "tree")
@@ -1695,10 +2255,10 @@ def selftest():
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
-    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the tree's real "
-          "skip lines and partial passes, the shard assignment and per-user weights, the summary's UNKNOWN for a "
-          "unit no job or two jobs reported, the known and flaky entries, and skip-forms and skip-lines with "
-          "their controls")
+    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest, bun and clippy counters, the "
+          "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
+          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
+          "entries, and skip-forms and skip-lines with their controls")
 
 
 def main(argv):
@@ -1720,6 +2280,14 @@ def main(argv):
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":
         print(json.dumps(parse_plain(*a)))
+    elif c == "clippy-crates":
+        clippy_crates(a[0], a[1:])
+    elif c == "clippy":
+        print(json.dumps(parse_clippy(*a)))
+    elif c == "clippy-baseline":
+        clippy_baseline_lines(*a)
+    elif c == "platforms":
+        cmd_platforms(*a)
     elif c == "summary":
         sys.exit(cmd_summary(*a))
     elif c == "skip-forms":

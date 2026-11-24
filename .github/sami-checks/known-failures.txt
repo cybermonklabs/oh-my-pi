@@ -13,6 +13,10 @@
 # flaky failure, never a pass; one whose <rerunFailure> retries all failed stays failed). A flaky
 # failure with no entry reads NEW. An entry is not listed for removal when its test passes (it
 # still is when its test no longer exists).
+# The platform rows (macos, windows) are read the same way from each leg's JUnit report, nextest's
+# own retry in the same run (the same binary, profile, threads and user, under the run's load). A
+# platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" after it when it
+# ran past its time bound, which no entry makes KNOWN. A clippy finding is "<file>: <message>".
 # A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
 # workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
 # 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
@@ -24,7 +28,7 @@
 # An entry whose test ran without skipping itself, or printed no line that starts so, is listed
 # for removal.
 # One per line, tab-separated: <row> <user> <unit> <test> <reason> [<skip line start>].
-# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca (sc.py ROWS).
+# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, macos, windows, clippy (sc.py ROWS).
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_autolist	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
@@ -77,6 +81,22 @@ set-runner	runner	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_
 set-runner	runner	pi-shell::zsh_mod_zpty	zsh_mod_zpty_non_blocking_read_takes_what_is_there	flaky: a race in Cut8 itself (12/30 vs 18/30 on gVisor)
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+# Windows: the fork peer's platform-reds report, each red at upstream 9058ab9d (10/10 there); at bfd23484 in run 45278357371.
+windows	runner	pi-shell	pi-shell::shell::tests::builtins::uutils_find_display_and_actions_split_paths	fails at upstream 9058ab9d (platform-reds row 2): Windows command lookup returns a path without .exe (tools/extra.rs:385-389,427-430)
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::inherited_short_temp_matches_pwd_after_cd	fails at upstream 9058ab9d (platform-reds row 3): the fixture's TEMP has an 8.3 part and a trailing backslash (shell/tests/mod.rs:174-183)
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::session_env_short_temp_matches_pwd_after_cd	fails at upstream 9058ab9d (platform-reds row 4): as row 3
+windows	runner	pi-shell	pi-shell::shell::tests::env_cwd::short_spelled_cwd_matches_stored_long_form	fails at upstream 9058ab9d (platform-reds row 5): the fixture's long path keeps RUNNER~1 (shell/tests/mod.rs:161-166)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_files::zsh_mod_files_mkdir	fails at upstream 9058ab9d (platform-reds row 7): errors carry no C errno on Windows (zsh_mod_files.rs:360-374)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_files::zsh_mod_files_mv_ln_chmod	fails at upstream 9058ab9d (platform-reds row 8): as row 7
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_system_bad_fds_set_errno	fails at upstream 9058ab9d (platform-reds row 9): strerror_of prints the Win32 message table (zsh_mod_system.rs:99-101)
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_system::zsh_mod_system_pipes_do_not_seek	fails at upstream 9058ab9d (platform-reds row 10): as row 9
+windows	runner	pi-shell	pi-shell::testkit::suites::zsh_mod_terminfo::dumb_terminal	fails at upstream 9058ab9d (platform-reds row 11): Windows has no terminfo database and the test has no gate
+windows	runner	pi-shell	pi-shell::obash::externals_start_where_read_stopped	fails at upstream 9058ab9d (platform-reds row 12): the test runs /usr/bin/true, wc and tr, which Windows lacks (tests/obash.rs:163-166)
+# macOS: red at upstream 9058ab9d in run 45287904461 (2 repeats), and at 509a2d77 and a72018dd.
+macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_digest_and_listing_match_zsh	fails at upstream 9058ab9d, 0 of 2 (run 45287904461)
+macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_lists_dumps_zsh_wrote	fails at upstream 9058ab9d, 0 of 2 (run 45287904461)
+macos	runner	pi-shell	pi-shell::zle_widgets_pty::transposes	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461)
+macos	runner	pi-shell	pi-shell::zsh_jobs_pty::a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461); a race in the real zsh, not in obash (platform-reds row 18)
 ts-ca	runner	*	PDF page screenshots in Chromium::paints each requested image-only page instead of the empty viewer	flaky: timed out rendering PDF page 1 (read-pdf.ts:151) in 1 of 4 full coding-agent runs (45287678343); passed 20 of 20 alone at 509a2d77 and a72018dd, 10 on Chrome for Testing 150.0.7871.24 and 10 on the runner's Chrome 157
 ts-ca	runner	*	browser WebMCP helpers::blames the Chrome version only when invokeTool itself is missing, not for another error saying something wasn't found	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
 ts-ca	runner	*	browser WebMCP helpers::cancels the page's tool invocation when the call is aborted	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
