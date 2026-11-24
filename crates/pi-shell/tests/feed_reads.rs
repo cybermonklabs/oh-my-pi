@@ -97,8 +97,13 @@ impl Drop for Row {
 
 /// The first line `script` prints, under `shell`, while its producer (which
 /// reads `$D/gate` before it ends) still runs; then the test opens `gate`
-/// and `fifo` so everything ends.
-fn first_line(shell: &str, script: &str) -> Result<String, String> {
+/// and `fifo` so everything ends. `(line, end)` bound the wait for the line
+/// and then for the shell's end ([`bounds`]).
+fn first_line(
+	shell: &str,
+	script: &str,
+	(line_bound, end_bound): (Duration, Duration),
+) -> Result<String, String> {
 	use std::os::unix::process::CommandExt;
 	// Declared first, so removed after the row's group is gone.
 	let dir = tempfile::tempdir().unwrap();
@@ -122,14 +127,14 @@ fn first_line(shell: &str, script: &str) -> Result<String, String> {
 		let first = std::io::BufReader::new(out).lines().next();
 		let _ = tx.send(first);
 	});
-	let got = line.recv_timeout(HANG);
+	let got = line.recv_timeout(line_bound);
 	poke(&dir.path().join("gate"));
 	poke(&dir.path().join("fifo"));
 	// A shell that does not end once its producer and FIFO are let go fails
-	// its row instead of hanging the run: within `HANG` after its line, or
-	// within 3 s when no line came (it hangs already).
+	// its row instead of hanging the run: within its end bound after its line,
+	// or within 3 s when no line came (it hangs already).
 	let grace = if got.is_ok() {
-		HANG
+		end_bound
 	} else {
 		Duration::from_secs(3)
 	};
@@ -242,7 +247,7 @@ kill $h 2>/dev/null
 	(
 		"every line once and in order past a full pipe",
 		r#"exec 4< <(seq 1 100000; read -r _ < "$D/gate")
-/bin/sleep 60 <&4 &
+/bin/sleep 1000 <&4 &
 h=$!
 sleep 1
 i=0
@@ -257,12 +262,45 @@ kill $h 2>/dev/null
 	),
 ];
 
+/// Each row's bounds: how long the test waits for the row's first line, and
+/// then for its shell to end once the line came. Each is at least twice the
+/// longest correct run of the row, obash's or bash's, measured on gVisor at
+/// 1952m CPU beside 64 busy loops (builds Jobs, tag `fb-20261124T1057`, 38
+/// runs as uid 1000 and as root), and at least [`HANG`]. A shell that does not
+/// end within its bound fails its row, so a hang still fails.
+const BOUNDS: &[(&str, Duration, Duration)] = &[
+	// Longest correct run: line 2.20 s, end 0.44 s.
+	("a holder that never reads", HANG, HANG),
+	// Longest correct run: line 2.06 s, end 0.50 s.
+	("a deferred spawn holding the pipe while its FIFO open waits", HANG, HANG),
+	// Longest correct run: line 2.41 s, end 0.39 s.
+	("reads that interleave with a live holder's", HANG, HANG),
+	// Longest correct run: line 2.41 s, end 0.47 s.
+	("end of file with a live holder", HANG, HANG),
+	// Longest correct run: line 2.19 s, end 0.59 s.
+	("a coprocess", HANG, HANG),
+	// Longest correct run: line 2.14 s, end 0.31 s.
+	("stdin a deferral's own redirection replaces", HANG, HANG),
+	// Longest correct run: line 2.39 s, end 0.60 s.
+	("readiness after a read through the feed", HANG, HANG),
+	// Longest correct run: line 437.4 s (bash; obash 165.6 s), end 0.65 s.
+	("every line once and in order past a full pipe", Duration::from_mins(15), HANG),
+];
+
+/// The bounds of `row` ([`BOUNDS`]): its line's, then its end's.
+fn bounds(row: &str) -> (Duration, Duration) {
+	BOUNDS
+		.iter()
+		.find(|(name, ..)| *name == row)
+		.map_or_else(|| panic!("row {row:?} has no measured bound"), |&(_, line, end)| (line, end))
+}
+
 #[test]
 fn the_shell_reads_the_bytes_an_externals_feed_holds() {
 	let mut wrong = Vec::new();
 	for (name, shell) in shells() {
 		for (row, script, want) in ROWS {
-			match first_line(&shell, script) {
+			match first_line(&shell, script, bounds(row)) {
 				Ok(line) if line == *want => {},
 				got => wrong.push(format!("{name} {row}: {got:?}, want {want:?}")),
 			}
