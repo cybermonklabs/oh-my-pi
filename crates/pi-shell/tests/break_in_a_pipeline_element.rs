@@ -11,7 +11,12 @@
 //! not-found hook), a child's own loops beside its parent's, counts
 //! through `eval`, and the message's redirections and order. The fatal
 //! rows (bash): where a fatal error in a forked simple command ends, run
-//! with `-c` and from a script file. Each row
+//! with `-c` and from a script file. The nofork rows (bash): a `break` or
+//! `continue` in `${| }` or `${ }`, which waits for its command, where a
+//! forked child keeps its parent's loops; the redirection rows (bash): one
+//! in a `( … )`'s or a loop's own redirection, in a forked child's
+//! here-document, and the traps it meets (the nofork `review-trap` row is
+//! one of those); both run with `-c` and from a script file. Each row
 //! prints where it is (`a<n>` per iteration, `b<n>:$?` after the element,
 //! `e:$?` after the loop), so its output says whether the body and the
 //! loop went on. A few rows also run under obash's fault injector, which
@@ -21,8 +26,9 @@
 //! The expected rows are the oracles' output, recorded in
 //! `tests/fixtures/break_in_a_pipeline_element/{bash,zsh}.jsonl` (stdout,
 //! status, and stderr with the program name before `: line` as `SH`).
-//! bash 5.2.21 agrees on every bash row but the three `${ ;}` ones (5.2
-//! has no `${ ;}`). `PI_LOOP_BASH=<bash>` / `PI_LOOP_ZSH=<zsh>` run that
+//! bash 5.2.21 agrees on every bash row but the three `${ ;}` ones and the
+//! nofork and redirection rows with a `${| }` or `${ }` (5.2 has neither).
+//! `PI_LOOP_BASH=<bash>` / `PI_LOOP_ZSH=<zsh>` run that
 //! shell instead of obash against the records; with `PI_LOOP_BLESS=1`
 //! they rewrite them (one test at a time: `--test-threads=1`). zsh has no
 //! `fork/x0/redirected-element` row: zsh 5.9 itself sometimes dies of
@@ -671,6 +677,459 @@ fn fatals() -> Vec<Row> {
 		.collect()
 }
 
+/// A `break` or `continue` in `${| }` or `${ }` (bash 5.3), where the forks
+/// above meet the wait such a break makes: bash's `break` there only sets
+/// `breaking`, so the substitution's body ends, its command runs, and then a
+/// loop takes the break. In a forked simple command, `$( )` or `<( )` that
+/// loop is the forking shell's (bash keeps `loop_level` there): the child
+/// ends after its command, with no message, and the loop goes on. In the
+/// shell the loop ends after the command.
+const NOFORK_BREAKS: &[(&str, &str)] = &[
+	("funsub-element", "for i in 1 2; do echo a ${| break; } | cat; echo b$i; done; echo end:$?"),
+	(
+		"funsub-in-cmdsub",
+		"for i in 1 2; do echo $(echo c ${| break; }) d; echo b$i; done; echo end:$?",
+	),
+	(
+		"funsub-element-continue",
+		"for i in 1 2; do echo a$i ${| continue; } | cat; echo b$i; done; echo end:$?",
+	),
+	(
+		"funsub-in-cmdsub-continue",
+		"for i in 1 2; do echo $(echo c$i ${| continue; }) d; echo b$i; done; echo end:$?",
+	),
+	("funsub-top", "for i in 1 2; do echo a$i ${| break; }; echo b$i; done; echo end:$?"),
+	("valsub-element", "for i in 1 2; do echo a ${ break; } | cat; echo b$i; done; echo end:$?"),
+	("funsub-no-loop-element", "echo a ${| break; } | cat; echo end:$?"),
+	// The child's commands after the waiting one do not run.
+	(
+		"funsub-in-cmdsub-more",
+		"for i in 1 2; do echo $(echo c ${| break; }; echo more) d; echo b$i; done; echo end:$?",
+	),
+	(
+		"funsub-in-procsub-more",
+		"for i in 1 2; do cat <(echo p ${| break; }; echo more); echo b$i; done; echo end:$?",
+	),
+	(
+		"valsub-in-cmdsub-more",
+		"for i in 1 2; do echo $(echo c ${ break; }; echo more) d; echo b$i; done; echo end:$?",
+	),
+	// A program's redirections are expanded in its own fork, where the break
+	// is lost; a builtin's in the child that runs it, which then ends.
+	(
+		"herestring-element",
+		"for i in 1 2; do cat <<< \"h ${| break; } t\" | cat; echo b$i; done; echo end:$?",
+	),
+	(
+		"herestring-in-cmdsub",
+		"for i in 1 2; do echo \"$(cat <<< \"h ${| break; } t\"; echo more)\"; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"builtin-herestring-in-cmdsub",
+		"for i in 1 2; do echo \"$(read v <<< \"${| break; }x\"; echo \"[$v]\"; echo more)\"; echo \
+		 b$i; done; echo end:$?",
+	),
+	// A review's rows, `${| }` in each kind of command (`review-redirected`
+	// writes its file in a directory of its own).
+	("review-element", "for i in 1 2; do echo a ${| break; } | cat; echo in; done; echo out"),
+	("review-select", "select x in a; do echo ${| break; } s; done <<< 1 2>/dev/null; echo out"),
+	("review-until", "until false; do echo u ${| break; }; echo in; done; echo out"),
+	(
+		"review-function-local",
+		"f() { local x=${| break; }; echo \"f[$x]\"; }; for i in 1 2; do f; echo in; done; echo out",
+	),
+	(
+		"review-arith",
+		"for i in 1 2; do (( ${| REPLY=1; break; } + 1 )); echo \"in $?\"; done; echo \"out $?\"",
+	),
+	("review-cond", "for i in 1 2; do [[ ${| break; } ]]; echo \"in $?\"; done; echo \"out $?\""),
+	(
+		"review-redirected",
+		"d=$(mktemp -d); for i in 1 2; do echo a ${| break; } > \"$d/o\"; echo in; done; cat \
+		 \"$d/o\"; rm -r \"$d\"; echo out",
+	),
+	(
+		"review-trap",
+		"trap \"echo trapped\" USR1; for i in 1; do echo ${| kill -USR1 $$; break; } x; echo in; \
+		 done; echo out",
+	),
+	(
+		"review-continue2",
+		"for i in 1 2; do for j in 1 2; do echo \"$i$j\" ${| continue 2; }; echo inner; done; echo \
+		 outer; done; echo out",
+	),
+	(
+		"review-declare",
+		"for i in 1 2; do declare x=${| break; }; echo \"in [$x]\"; done; echo \"out [$x]\"",
+	),
+	("review-errexit", "set -e; for i in 1 2; do false ${| break; }; done; echo \"out $?\""),
+	("review-heredoc", "for i in 1 2; do cat <<E\nh ${| break; } t\nE\necho in; done; echo out"),
+	("review-function-break", "f() { break; }; for i in 1 2; do f; echo in; done; echo out"),
+	(
+		"review-function-funsub",
+		"f() { echo f ${| break; }; echo fin; }; for i in 1 2; do f; echo in; done; echo out",
+	),
+	("review-cmdsub", "for i in 1 2; do echo $(echo c ${| break; }) d; echo in; done; echo out"),
+	(
+		"review-break-on-2",
+		"for i in 1 2 3; do echo \"$i\" ${| [ $i = 2 ] && break; REPLY=r; }; done; echo out",
+	),
+	("review-break2", "for i in 1 2; do echo ${| break 2; } x; echo in; done; echo \"out $?\""),
+];
+
+/// The nofork rows: each [`NOFORK_BREAKS`] shape with `-c` and from a
+/// script.
+fn nofork_breaks() -> Vec<Row> {
+	NOFORK_BREAKS
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("nofork/c/{name}"), x.to_owned()), (format!("nofork/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
+/// A `break` or `continue` in `${| }` or `${ }` where bash expands it
+/// decides which loop takes it (bash 5.3), and a trap it meets.
+///
+/// - A `( … )`'s own redirection: bash expands it in the forked child, where
+///   `loop_level` is 0, so the `break` complains, does nothing, and the rest of
+///   the substitution runs; so do a `$( )` or `<( )` started there.
+/// - A loop's own redirection: bash expands it before the loop counts itself,
+///   and the loop then takes one level, its first test or body skipped (a `for`
+///   binds its first word and a `select` reads its first line first; an
+///   arithmetic `for` evaluates its first two expressions; a count is capped at
+///   the loops outside it). So does a `for`'s break in its own words.
+/// - A here-document of a forked simple command keeps the loop level: no
+///   message.
+/// - A trap the substitution's commands set off runs before its next command,
+///   before a `break` there can leave the trap nothing to run; in a program's
+///   or a `( … )`'s own redirection it waits for that command.
+const REDIR_BREAKS: &[(&str, &str)] = &[
+	(
+		"subshell",
+		"for i in 1 2; do ( true ) > ${| REPLY=/dev/null; break; }; echo b$i; done; echo end:$?",
+	),
+	(
+		"subshell-continue",
+		"for i in 1 2; do ( echo a$i ) 2> ${| REPLY=/dev/null; continue; }; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"subshell-rest",
+		"for i in 1 2; do ( echo a$i ) 2> ${| break; echo more; REPLY=/dev/null; }; echo b$i; done; \
+		 echo end:$?",
+	),
+	(
+		"subshell-own-loop",
+		"for i in 1 2; do ( for j in a; do echo j$j; done ) 2> ${| REPLY=/dev/null; break; }; echo \
+		 b$i; done; echo end:$?",
+	),
+	(
+		"subshell-posix",
+		"set -o posix; for i in 1 2; do ( echo a$i ) 2> ${| REPLY=/dev/null; break; }; echo b$i; \
+		 done; echo end:$?",
+	),
+	(
+		"subshell-timed",
+		"TIMEFORMAT=; for i in 1 2; do time ( echo a$i ) 2> ${| REPLY=/dev/null; break; }; echo \
+		 b$i; done; echo end:$?",
+	),
+	(
+		"subshell-valsub",
+		"for i in 1 2; do ( echo a$i ) 2> ${ echo /dev/null; break; }; echo b$i; done; echo end:$?",
+	),
+	(
+		"subshell-heredoc",
+		"for i in 1 2; do ( cat ) <<E\nh ${| break; } t\nE\necho b$i; done; echo end:$?",
+	),
+	(
+		"subshell-break2",
+		"for o in A; do for i in 1 2; do ( echo a$i ) 2> ${| REPLY=/dev/null; break 2; }; echo b$i; \
+		 done; echo o$o; done; echo end:$?",
+	),
+	(
+		"subshell-status",
+		"for i in 1; do ( exit 3 ) 2> ${| REPLY=/dev/null; break; }; echo b:$?; done; echo end:$?",
+	),
+	(
+		"subshell-nested-funsub",
+		"for i in 1 2; do ( echo a$i ) 2> ${| x=${| break; }; REPLY=/dev/null; }; echo b$i; done; \
+		 echo end:$?",
+	),
+	(
+		"subshell-negated",
+		"for i in 1 2; do ! ( echo a$i ) 2> ${| REPLY=/dev/null; break; }; echo b$i:$?; done; echo \
+		 end:$?",
+	),
+	(
+		"subshell-cmdsub-word",
+		"for i in 1 2; do ( echo a$i ) 2> \"$(break; echo /dev/null)\"; echo b$i; done; echo end:$?",
+	),
+	(
+		"subshell-procsub-word",
+		"for i in 1 2; do ( cat ) < <(break; echo p$i); echo b$i; done; echo end:$?",
+	),
+	(
+		"subshell-cmdsub-in-funsub",
+		"for i in 1 2; do ( echo a$i ) 2> ${| x=$(break; echo y); REPLY=/dev/null; echo \"[$x]\"; \
+		 }; echo b$i; done; echo end:$?",
+	),
+	(
+		"subshell-element",
+		"for i in 1 2; do ( echo a$i ) 2> ${| REPLY=/dev/null; break; } | cat; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"group",
+		"for i in 1 2; do { echo g$i; } 2> ${| REPLY=/dev/null; break; }; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"while",
+		"for i in 1 2; do while true; do true; break; done > ${| REPLY=/dev/null; break; }; echo \
+		 b$i; done; echo end:$?",
+	),
+	(
+		"while-test",
+		"for i in 1 2; do while echo t$i; do echo w$i; break; done 2> ${| REPLY=/dev/null; break; \
+		 }; echo b$i:$?; done; echo end:$?",
+	),
+	(
+		"until",
+		"for i in 1 2; do until echo t; false; do echo u; break; done 2> ${| REPLY=/dev/null; \
+		 break; }; echo b$i:$?; done; echo end:$?",
+	),
+	(
+		"for",
+		"for i in 1 2; do for x in a b; do echo x$x; done 2> ${| REPLY=/dev/null; break; }; echo \
+		 \"b$i:$? [$x]\"; done; echo end:$?",
+	),
+	(
+		"for-empty",
+		"for i in 1 2; do for x in; do echo x$x; done 2> ${| REPLY=/dev/null; break; }; echo b$i; \
+		 done; echo end:$?",
+	),
+	(
+		"arith",
+		"for i in 1 2; do for ((j=0; j<2; j++)); do echo j$j; done 2> ${| REPLY=/dev/null; break; \
+		 }; echo \"b$i:$? $j\"; done; echo end:$?",
+	),
+	(
+		"arith-test-effect",
+		"for i in 1 2; do for ((j=0; j++<2; )); do echo j$j; done 2> ${| REPLY=/dev/null; break; }; \
+		 echo \"b$i:$? $j\"; done; echo end:$?",
+	),
+	(
+		"arith-false",
+		"for i in 1 2; do for ((j=5; j<2; j++)); do echo j$j; done 2> ${| REPLY=/dev/null; break; \
+		 }; echo \"b$i:$? $j\"; done; echo end:$?",
+	),
+	(
+		"select",
+		"for i in 1 2; do select x in a b; do echo s$x; done 2> ${| REPLY=/dev/null; break; } <<< \
+		 1; echo \"b$i:$? [$x]\"; done; echo end:$?",
+	),
+	(
+		"select-eof",
+		"for i in 1 2; do select x in a b; do echo s$x; done 2> ${| REPLY=/dev/null; break; } < \
+		 /dev/null; echo \"b$i:$? [$x]\"; done; echo end:$?",
+	),
+	(
+		"while-continue",
+		"for i in 1 2; do n=0; while (( n++ < 2 )); do echo w$i$n; done 2> ${| REPLY=/dev/null; \
+		 continue; }; echo b$i; done; echo end:$?",
+	),
+	(
+		"until-continue",
+		"for i in 1 2; do n=0; until (( n++ >= 2 )); do echo u$i$n; done 2> ${| REPLY=/dev/null; \
+		 continue; }; echo \"b$i $n\"; done; echo end:$?",
+	),
+	(
+		"for-continue",
+		"for i in 1 2; do for x in a b c; do echo x$x; done 2> ${| REPLY=/dev/null; continue; }; \
+		 echo b$i; done; echo end:$?",
+	),
+	(
+		"arith-continue",
+		"for i in 1 2; do for ((j=0; j<2; j++)); do echo j$j; done 2> ${| REPLY=/dev/null; \
+		 continue; }; echo \"b$i $j\"; done; echo end:$?",
+	),
+	(
+		"select-continue",
+		"for i in 1 2; do select x in a b; do echo s$x; break; done 2> ${| REPLY=/dev/null; \
+		 continue; } <<< $'1\\n2'; echo \"b$i [$x]\"; done; echo end:$?",
+	),
+	(
+		"break2-nested",
+		"for o in A; do for i in 1 2; do while true; do break; done 2> ${| REPLY=/dev/null; break \
+		 2; }; echo b$i; done; echo o$o; done; echo end:$?",
+	),
+	(
+		"break2-capped",
+		"for i in 1 2; do while true; do break; done 2> ${| REPLY=/dev/null; break 2; }; echo b$i; \
+		 done; echo end:$?",
+	),
+	(
+		"continue2-nested",
+		"for o in A B; do for i in 1 2; do while true; do break; done 2> ${| REPLY=/dev/null; \
+		 continue 2; }; echo b$i; done; echo o$o; done; echo end:$?",
+	),
+	(
+		"arith-continue2-capped",
+		"for o in A B; do for ((j=0; j<2; j++)); do echo j$j; done 2> ${| REPLY=/dev/null; continue \
+		 2; }; echo b$o; done; echo end:$?",
+	),
+	(
+		"while-no-loop",
+		"while true; do echo w; break; done 2> ${| REPLY=/dev/null; break; }; echo end:$?",
+	),
+	(
+		"for-own-words",
+		"for i in 1 2; do for x in a ${| break; } b; do echo x$x; done; echo \"b$i [$x]\"; done; \
+		 echo end:$?",
+	),
+	(
+		"select-own-words",
+		"for i in 1 2; do select x in a ${| break; } b; do echo s$x; done 2>/dev/null <<< 1; echo \
+		 \"b$i [$x]\"; done; echo end:$?",
+	),
+	(
+		"while-heredoc",
+		"for i in 1 2; do while read v; do echo r$v; done <<E\nh ${| break; } t\nE\necho b$i; done; \
+		 echo end:$?",
+	),
+	(
+		"while-valsub",
+		"for i in 1 2; do while true; do echo w; break; done 2> ${ echo /dev/null; break; }; echo \
+		 b$i; done; echo end:$?",
+	),
+	(
+		"for-status",
+		"for i in 1; do for x in a; do (exit 4); done 2> ${| REPLY=/dev/null; (exit 3); break; }; \
+		 echo b:$?; done; echo end:$?",
+	),
+	(
+		"until-status",
+		"for i in 1; do until false; do :; done 2> ${| REPLY=/dev/null; (exit 3); break; }; echo \
+		 b:$?; done; echo end:$?",
+	),
+	(
+		"eval-while",
+		"for i in 1 2; do eval 'while true; do break; done 2> ${| REPLY=/dev/null; break; }'; echo \
+		 b$i; done; echo end:$?",
+	),
+	(
+		"while-debug-trap",
+		"trap 'echo dbg' DEBUG; for i in 1; do while true; do break; done 2> ${| REPLY=/dev/null; \
+		 break; }; echo b$i; done; trap - DEBUG; echo end:$?",
+	),
+	(
+		"while-in-function",
+		"f() { while true; do echo w; break; done 2> ${| REPLY=/dev/null; break; }; echo f; }; for \
+		 i in 1 2; do f; echo b$i; done; echo end:$?",
+	),
+	(
+		"async-heredoc",
+		"for i in 1 2; do cat <<E &\nh ${| break; } t\nE\nwait; echo b$i; done; echo end:$?",
+	),
+	(
+		"element-heredoc",
+		"for i in 1 2; do cat <<E | cat\nh ${| break; } t\nE\necho b$i; done; echo end:$?",
+	),
+	(
+		"cmdsub-heredoc",
+		"for i in 1 2; do x=$(cat <<E\nh ${| break; } t\nE\n); echo \"b$i [$x]\"; done; echo end:$?",
+	),
+	(
+		"builtin-element-heredoc",
+		"for i in 1 2; do read v <<E | cat\nh ${| break; } t\nE\necho b$i; done; echo end:$?",
+	),
+	(
+		"procsub-heredoc",
+		"for i in 1 2; do cat <(cat <<E\nh ${| break; } t\nE\n); echo b$i; done; echo end:$?",
+	),
+	(
+		"async-heredoc-continue",
+		"for i in 1 2; do cat <<E &\nh ${| continue; } t\nE\nwait; echo b$i; done; echo end:$?",
+	),
+	(
+		"async-builtin",
+		"for i in 1 2; do echo e$i 2> ${| REPLY=/dev/null; break; } & wait; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"function-async-heredoc",
+		"f() { cat; }; for i in 1 2; do f <<E &\nh ${| break; } t\nE\nwait; echo b$i; done; echo \
+		 end:$?",
+	),
+	(
+		"compound-element-heredoc",
+		"for i in 1 2; do { cat; } <<E | cat\nh ${| break; } t\nE\necho b$i; done; echo end:$?",
+	),
+	(
+		"trap-no-break",
+		"trap \"echo trapped\" USR1; for i in 1; do echo ${| kill -USR1 $$; echo after; } x; echo \
+		 in; done; echo out",
+	),
+	("trap-top", "trap \"echo trapped\" USR1; echo ${| kill -USR1 $$; echo after; } x; echo out"),
+	("trap-assign", "trap \"echo trapped\" USR1; x=${| kill -USR1 $$; echo after; }; echo out"),
+	(
+		"trap-continue",
+		"trap \"echo trapped\" USR1; for i in 1 2; do echo ${| kill -USR1 $$; continue; } x$i; echo \
+		 in; done; echo out",
+	),
+	(
+		"trap-valsub",
+		"trap \"echo trapped\" USR1; for i in 1; do echo ${ kill -USR1 $$; break; } x; echo in; \
+		 done; echo out",
+	),
+	(
+		"trap-heredoc",
+		"trap \"echo trapped\" USR1; for i in 1; do cat <<E\nh ${| kill -USR1 $$; break; } \
+		 t\nE\necho in; done; echo out",
+	),
+	(
+		"trap-program-redirection",
+		"trap \"echo trapped\" USR1; for i in 1; do /bin/echo e 2> ${| kill -USR1 $$; \
+		 REPLY=/dev/null; break; }; echo in; done; echo out",
+	),
+	(
+		"trap-subshell-redirection",
+		"trap \"echo trapped\" USR1; ( echo s ) 2> ${| kill -USR1 $$; REPLY=/dev/null; }; echo out",
+	),
+	(
+		"trap-group-redirection",
+		"trap \"echo trapped\" USR1; { echo g; } 2> ${| kill -USR1 $$; REPLY=/dev/null; }; echo out",
+	),
+	(
+		"trap-two-signals",
+		"trap \"echo t1\" USR1; trap \"echo t2\" USR2; for i in 1; do echo ${| kill -USR1 $$; kill \
+		 -USR2 $$; break; } x; echo in; done; echo out",
+	),
+	(
+		"trap-status",
+		"trap \"echo trapped \\$?\" USR1; for i in 1; do echo ${| (exit 3); kill -USR1 $$; break; } \
+		 x; echo \"in $?\"; done; echo out",
+	),
+	(
+		"trap-function",
+		"trap \"echo trapped\" USR1; f() { echo f ${| kill -USR1 $$; break; } x; echo fin; }; for i \
+		 in 1; do f; echo in; done; echo out",
+	),
+];
+
+/// The redirection rows: each [`REDIR_BREAKS`] shape with `-c` and from a
+/// script.
+fn redir_breaks() -> Vec<Row> {
+	REDIR_BREAKS
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("redir/c/{name}"), x.to_owned()), (format!("redir/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
 /// The fork shapes only zsh runs.
 const ZSH_FORKS: &[(&str, &str)] = &[
 	("procsub-file", "cat =(break; echo s)"),
@@ -806,7 +1265,8 @@ enum Runner<'a> {
 }
 
 /// Run row `id`'s `script` as `dialect` with `runner`: with `-c`, or for a
-/// `fatal/s/` row from the script file `s.sh` in a directory of its own.
+/// `fatal/s/` or `nofork/s/` row from the script file `s.sh` in a directory
+/// of its own.
 fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outcome {
 	let mut cmd = match runner {
 		Runner::Oracle(program) => command(program),
@@ -821,7 +1281,10 @@ fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outc
 		}
 		cmd.arg("-f");
 	}
-	let out = if id.starts_with("fatal/s/") {
+	let out = if ["fatal/s/", "nofork/s/", "redir/s/"]
+		.iter()
+		.any(|prefix| id.starts_with(prefix))
+	{
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let dir = env::temp_dir().join(format!(
 			"pi-loop-{}-{}",
@@ -969,6 +1432,10 @@ const BASH_SNAPSHOT_ROWS: &[&str] = &[
 	"fork/lines/cmdsub",
 	"fatal/c/top-element-builtin-reader",
 	"fatal/c/subshell-element-builtin-reader",
+	"nofork/c/funsub-in-cmdsub-more",
+	"redir/c/subshell-continue",
+	"redir/c/while-continue",
+	"redir/c/for-continue",
 ];
 
 /// [`BASH_SNAPSHOT_ROWS`] for zsh.
@@ -1016,20 +1483,38 @@ fn bash_fatal_errors_match_bash() {
 	assert_rows(Dialect::Bash, "fatal/", &fatals());
 }
 
+/// `break` and `continue` in `${| }` and `${ }` in bash ([`NOFORK_BREAKS`]).
+#[test]
+fn bash_nofork_breaks_match_bash() {
+	assert_rows(Dialect::Bash, "nofork/", &nofork_breaks());
+}
+
+/// `break` and `continue` in `${| }` and `${ }` where bash expands a
+/// redirection, and the traps they meet, in bash ([`REDIR_BREAKS`]).
+#[test]
+fn bash_redirection_breaks_match_bash() {
+	assert_rows(Dialect::Bash, "redir/", &redir_breaks());
+}
+
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
 /// the recorded outcome of each: a forked child's loops
-/// (`Vproc::outer_loops`) and where its fatal error ends
-/// (`Frame::command_loop`) survive the frames image.
+/// (`Vproc::outer_loops`), where its fatal error ends
+/// (`Frame::command_loop`) and a `break` waiting in it
+/// (`Vproc::pending_break`) survive the frames image.
 fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
-	let fatal = if dialect == Dialect::Bash {
+	let bash_only: Vec<Row> = if dialect == Dialect::Bash {
 		fatals()
+			.into_iter()
+			.chain(nofork_breaks())
+			.chain(redir_breaks())
+			.collect()
 	} else {
 		Vec::new()
 	};
 	let rows: Vec<Row> = grid(dialect)
 		.into_iter()
 		.chain(forks(dialect))
-		.chain(fatal)
+		.chain(bash_only)
 		.filter(|(id, _)| ids.contains(&id.as_str()))
 		.collect();
 	assert_eq!(rows.len(), ids.len(), "a snapshot row id names no row");
