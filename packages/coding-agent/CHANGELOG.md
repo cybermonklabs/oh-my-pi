@@ -199,6 +199,7 @@
 - Exiting after aborting a `bash` command now waits for its TERM-resistant foreground processes to be killed ([#18669](https://github.com/can1357/oh-my-pi/issues/18669)).
 - A disposed or switched session now releases every persistent shell it owns, including the ones a surface keeps under a name of its own (`/loop` conditions), instead of holding one native shell per surface for the life of the process ([#18717](https://github.com/can1357/oh-my-pi/pull/18717) by [@eggpeat](https://github.com/eggpeat))
 - Bash tool: a command that times out or is cancelled now behaves like Ctrl+C in a terminal: only what it started is stopped, and the shell keeps its variables, working directory and the `&` jobs earlier commands left running (a server or VM no longer dies with a later command's timeout)
+- With `mnemopi.autoRetain` off, and in subagents, the Mnemopi memory instructions no longer tell the agent that completed turns are retained automatically. The line follows the settings and the session's task depth, so a session's first system prompt, rendered before the memory backend starts, is right too
 
 ### Breaking Changes
 
@@ -230,6 +231,7 @@
 - A session that moves to a new id because another writer holds its file is now a fork: its header names the old id as `parentSession` and no `continuationOf`, and an exact `--resume <id>` opens that id without following a continuation.
 - `SqlSessionStorage` start-up on PostgreSQL takes the database-wide start-up lock only when a table is missing, and then once, making every missing table (and the lease table's index) in one round trip; on tables that exist it sends no `CREATE` at all. Many stores starting at once on a busy database no longer queue on that lock.
 - The `voice` that RPC `live_start`/`live_connect` (and `RpcClient.liveStart()`/`liveConnect()`, and the Python SDK's `live_start()`, which returns `None`) and extension `startLive` return is optional: with `live.provider: openai` it is absent, since GPT-Live gets no voice from omp, and a `voice` passed in is ignored
+- `retain`, the memory instructions and the Mnemopi fact extractor now ask for a memory as a record of what was said or done, by whom, when, why and where to find it, not as a bare rule or command, so a later session can weigh a recalled memory instead of obeying it. The extractor also treats its input as text to extract from, not as a request to answer
 
 ### Security
 

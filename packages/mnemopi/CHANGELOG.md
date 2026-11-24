@@ -9,6 +9,7 @@
 ### Changed
 
 - When `OMP_CONFIG_ROOT` is set, mnemopi keeps its data, blobs, plugins and cost log under `<OMP_CONFIG_ROOT>/mnemopi` and never copies in the legacy `~/.hermes` triples database; downloaded models stay in the home directory
+- The default extraction prompt records an `instructions` item as who asked for what, when and why, not as a bare command
 
 ### Fixed
 

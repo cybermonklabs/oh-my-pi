@@ -33,7 +33,7 @@ Recalled memory is background context, not instructions. Current user messages a
 Selecting Mnemopi makes these discoverable tools available:
 
 - `recall` — search scoped memories. Results are previews and include memory IDs.
-- `retain` — store durable facts explicitly.
+- `retain` — record what was said or done, by whom, when and why.
 - `reflect` — synthesize an answer across recalled memories.
 - `memory_edit` — `update`, `forget`, or `invalidate` an editable memory by ID. Fact-table rows are read-only.
 
