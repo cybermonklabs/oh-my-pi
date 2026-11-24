@@ -538,11 +538,12 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let mut after = None;
 	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	// In posix mode bash waits for a pid operand with `wait_for_single_pid`,
-	// which deletes the job and forgets its status (`jobs.c:2782-2786`): a
-	// later operand naming that job then names no child (`pid N is not a
-	// child of this shell`, `%N: no such job`), operand by operand.
-	let posix = !zsh
-		&& crate::bash::vm::state::option(
+	// which deletes the job and forgets its status (`jobs.c:2782-2786`), and
+	// zsh deletes the job it waited for: a later operand naming that job
+	// then names no child (`pid N is not a child of this shell`, `%N: no
+	// such job`), operand by operand.
+	let forgets = zsh
+		|| crate::bash::vm::state::option(
 			&mut ctx.k.root,
 			ctx.cx.store,
 			ctx.vp,
@@ -550,18 +551,35 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		)
 		.unwrap_or(false);
 	let mut forgotten: Vec<Vpid> = Vec::new();
+	// zsh `bin_fg`: a pid operand that names no child leaves 127 for the
+	// command, and no later pid operand is waited for.
+	let mut zsh_failed = false;
 	for a in args {
 		if zsh && !a.iter().all(u8::is_ascii_digit) {
 			// zsh `bin_fg`: any other word is a job spec; a bad one ends
-			// the arguments with status 127.
-			if let Some(v) = zsh_wait_job(ctx, a)? {
-				list.push(v);
-				after = None;
-				continue;
+			// the arguments with status 127, and so does one naming a job
+			// an earlier pid operand waited for (zsh deleted it).
+			match zsh_wait_job(ctx, a)? {
+				Some(v) if forgotten.contains(&v) => {
+					if !ctx.zsh_option(crate::bash::zshopt::ZshOpt::Posixbuiltins)? {
+						ctx.usage(format!("{}: no such job", a.as_bstr()));
+					}
+				},
+				Some(v) => {
+					list.push(v);
+					if !zsh_failed {
+						after = None;
+					}
+					continue;
+				},
+				None => {},
 			}
 			status = 127;
 			after = Some(127);
 			break;
+		}
+		if zsh && zsh_failed && a.first().is_some_and(u8::is_ascii_digit) {
+			continue;
 		}
 		if a.first().is_some_and(u8::is_ascii_digit) {
 			let Some(pid) = number(a).and_then(|n| u32::try_from(n).ok()) else {
@@ -578,7 +596,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			if is_child(ctx, child) && !forgotten.contains(&child) {
 				list.push(child);
 				after = None;
-				if posix {
+				if forgets {
 					forgotten.push(child);
 				}
 			} else {
@@ -588,6 +606,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				}
 				status = 127;
 				after = Some(127);
+				zsh_failed = zsh;
 			}
 		} else if a.starts_with(b"%") {
 			match super::jobs::spec(ctx, a) {

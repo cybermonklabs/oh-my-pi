@@ -574,6 +574,13 @@ fn plain_statement(
 	if let Err(stop) = expanded {
 		return Some(exec::stop_flow(k, vp, cx, line, stop));
 	}
+	// bash's fork of this simple command expanded its words: the command
+	// runs without the parent's jobs, as [`expand`] does for the others
+	// (bash `without_job_control`). The fast path skipped it, so each `cmd
+	// &` kept a copy of the whole table it was started beside.
+	if vp.jobs.copied != super::proc::Copied::No {
+		exec::copied_jobs_expanded(vp);
+	}
 	// Fields to pathname-expand (directory walks, which may wait), a
 	// function or an external: the stages go on from the expanded words.
 	let id = match id {
@@ -4474,7 +4481,10 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				waited = Some(shown);
 				st(vp).wait_for.remove(0);
 			}
-			if let Some(pid) = waited {
+			// `wait -p` names the last operand's child; a failed last operand
+			// names none and leaves the name as it was (`pstat.pid = NO_PID`,
+			// wait.def).
+			if let (Some(pid), None) = (waited, after) {
 				waited_into(k, vp, cx, line, pid);
 			}
 			// An operand after the last child failed: bash returns the last

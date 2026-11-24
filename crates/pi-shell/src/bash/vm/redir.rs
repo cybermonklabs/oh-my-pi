@@ -61,32 +61,47 @@ pub enum Halt {
 /// whose first answer can cost a search of the unit's syntax nodes: that
 /// one is found only once something needs it (a word that expands to more
 /// than its own text, a here-document, a redirection left to a program's
-/// process, a failure). A list of plain words that succeeds needs none.
+/// process, a failure). A list of plain words that succeeds needs none. A
+/// bash `( … )`'s own line ([`super::exec::subshell_line`]) is found the
+/// same way.
 pub struct Line {
-	at:   Cell<u32>,
-	/// The compound command whose redirections these are, while its fork's
-	/// line is not looked for yet.
-	fork: Cell<Option<u32>>,
+	at:       Cell<u32>,
+	/// The compound command whose redirections these are, while its line
+	/// is not looked for yet.
+	fork:     Cell<Option<u32>>,
+	/// The compound command is a bash `( … )`: its own line first.
+	subshell: bool,
 }
 
 impl Line {
 	/// Line `line`.
 	pub const fn at(line: u32) -> Self {
-		Self { at: Cell::new(line), fork: Cell::new(None) }
+		Self { at: Cell::new(line), fork: Cell::new(None), subshell: false }
 	}
 
 	/// The line of compound command `node`'s redirections in a fork's base
 	/// frame, `or` where that frame is none.
 	pub const fn fork(node: u32, or: u32) -> Self {
-		Self { at: Cell::new(or), fork: Cell::new(Some(node)) }
+		Self { at: Cell::new(or), fork: Cell::new(Some(node)), subshell: false }
 	}
 
-	/// The line, found now if it is a fork's.
+	/// The line of bash `( … )` `node`'s redirections: its own, else (a
+	/// coproc's command) as [`Self::fork`].
+	pub const fn subshell(node: u32, or: u32) -> Self {
+		Self { at: Cell::new(or), fork: Cell::new(Some(node)), subshell: true }
+	}
+
+	/// The line, found now if it is a fork's or a `( … )`'s.
 	fn get(&self, vp: &mut Vproc) -> u32 {
-		if let Some(node) = self.fork.take()
-			&& let Some(line) = super::killed::compound_fork_line(vp, node)
-		{
-			self.at.set(line);
+		if let Some(node) = self.fork.take() {
+			let own = if self.subshell {
+				super::exec::subshell_line(vp, node)
+			} else {
+				None
+			};
+			if let Some(line) = own.or_else(|| super::killed::compound_fork_line(vp, node)) {
+				self.at.set(line);
+			}
 		}
 		self.at.get()
 	}

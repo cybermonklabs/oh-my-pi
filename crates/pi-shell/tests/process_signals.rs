@@ -3258,6 +3258,33 @@ fn bash_answers_these_waits_and_writes_this_notice_as_bash_5_3() {
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+/// The child bash forks for a simple command of one builtin (`cmd &`)
+/// drops the parent's jobs before it runs it (`without_job_control`, but
+/// for `jobs`): its `kill %1` and `wait %1` find no job (`%1: no such
+/// job`), and the parent's job runs on. obash kept a copy of the parent's
+/// whole table in such a child when its words needed no expansion step
+/// (the plain-statement path), so the copy also stayed with every idle
+/// background vproc. Goldens from bash 5.3.20 and 5.2.21
+/// ([`bounded_bash_rows`]).
+#[test]
+fn a_forked_builtin_holds_none_of_the_parents_jobs() {
+	let rows = vec![
+		(
+			"exec 2>/dev/null; /bin/sleep 1 & kill %1 & wait $!; echo k=$?; wait %1; echo st=$?"
+				.to_owned(),
+			"k=1\nst=0\n".to_owned(),
+		),
+		(
+			"exec 2>/dev/null; /bin/sleep 1 & wait %1 & wait $!; echo w=$?; wait %1; echo st=$?"
+				.to_owned(),
+			"w=127\nst=0\n".to_owned(),
+		),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_rows(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
 /// bash's `wait` takes its operands in turn, and returns the last one's
 /// status (`wait_builtin`). In posix mode it waits for a pid operand with
 /// `wait_for_single_pid`, which deletes the job and forgets its status, so
@@ -3271,6 +3298,8 @@ fn bash_answers_these_waits_and_writes_this_notice_as_bash_5_3() {
 fn a_posix_wait_takes_each_operand_in_turn() {
 	const MSG: &str =
 		"e=$(mktemp); wait OPS 2>\"$e\"; echo a=$?; sed \"s/$p/P/\" \"$e\"; rm -f \"$e\"";
+	// Whether `wait -p who` left `who` set.
+	const WHO: &str = "echo a=$?; [ -v who ] && echo who=set || echo who=unset";
 	let posix = |ops: &str| {
 		format!("set -o posix; (exit 3) & p=$!; /bin/sleep 1 & {}", MSG.replace("OPS", ops))
 	};
@@ -3290,6 +3319,21 @@ fn a_posix_wait_takes_each_operand_in_turn() {
 		("(exit 3) & p=$!; wait $p 1 2>/dev/null; echo a=$?".to_owned(), "a=127\n".to_owned()),
 		("(exit 3) & p=$!; wait $p x 2>/dev/null; echo a=$?".to_owned(), "a=1\n".to_owned()),
 		("(exit 3) & p=$!; wait 1 $p 2>/dev/null; echo a=$?".to_owned(), "a=3\n".to_owned()),
+		// `wait -p` names the last operand's child; after a failed last
+		// operand it names none (bash `pstat.pid = NO_PID`).
+		(
+			format!("(exit 3) & p=$!; wait -p who $p 1 2>/dev/null; {WHO}"),
+			"a=127\nwho=unset\n".to_owned(),
+		),
+		(
+			format!("(exit 3) & p=$!; wait -p who $p x 2>/dev/null; {WHO}"),
+			"a=1\nwho=unset\n".to_owned(),
+		),
+		(
+			format!("set -o posix; (exit 3) & p=$!; wait -p who $p $p 2>/dev/null; {WHO}"),
+			"a=127\nwho=unset\n".to_owned(),
+		),
+		(format!("(exit 3) & p=$!; wait -p who $p; {WHO}"), "a=3\nwho=set\n".to_owned()),
 	];
 	let mut wrong = Vec::new();
 	bounded_bash_rows(rows, &mut wrong);
@@ -3794,9 +3838,116 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 			Exit(0),
 		),
 	];
+	// A `( … )` bash runs without a fork of its own keeps the line it finds:
+	// the sole command of another `( … )` (not under `!`: `CMD_NO_FORK`)
+	// that of the one around it, a coproc's command the fork's. The `)`'s
+	// line, not the line a continued redirection list ends on.
+	const X: &str = ">/nonexistent-dir/x";
+	let err =
+		|line: u32| format!("bash: line {line}: /nonexistent-dir/x: No such file or directory\n");
+	let more = [
+		(format!("f() {{\n( (\n:\n) {X}\n) | :\n}}\nf 2>&1; echo end"), 5),
+		(format!(":\n( ( : ) {X}\n) | :\necho end"), 3),
+		(format!(":\n( ( :\n) {X}\n)\necho end"), 4),
+		(format!(":\n( ( :\n) {X}\n) &\nwait\necho end"), 4),
+		(format!("f() {{\n:\n( ( :\n) {X}\n) | :\n}}\nf 2>&1; echo end"), 5),
+		(format!("f() {{\n:\ncoproc ( : ) {X}\nwait\n}}\nf 2>&1; echo end"), 1),
+		(format!("f() {{\n:\ncoproc CP ( : ) {X}\nwait\n}}\nf 2>&1; echo end"), 1),
+		(format!(":\n( ( ( :\n) {X}\n)\n)\necho end"), 5),
+		(format!(":\n( ! ( : ) {X}\n) | :\necho end"), 2),
+		(format!(":\n( ( :\n) {X}\n:\n)\necho end"), 3),
+		(format!(":\n( ( : ) {X} &\nwait\n)\necho end"), 2),
+		(format!("f() {{\n:\n( : ) \\\n{X} | :\n}}\nf 2>&1; echo end"), 3),
+	];
+	let rows = rows
+		.into_iter()
+		.chain(
+			more
+				.into_iter()
+				.map(|(script, line)| (script, format!("{}end\n", err(line)), Exit(0))),
+		)
+		.collect();
 	let mut wrong = Vec::new();
 	bounded_bash_ends(rows, &mut wrong);
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Each `(script, output)` of `rows` as a zsh `-f -c` string after `exec
+/// 2>&1` on a line of its own: what obash printed and how it ended, against
+/// the checked-in golden and a clean exit; with zsh ([`have_zsh`]) zsh's
+/// own output must equal obash's. A shell still running after
+/// [`EVENT_LIMIT`] is a wrong row.
+fn zsh_rows(rows: Vec<(String, String)>) {
+	let mut wrong = Vec::new();
+	for (script, out) in rows {
+		let script = format!("exec 2>&1\n{script}");
+		let start = |program: &OsStr| Run::script(program, "zsh", &script).spawn();
+		let ours = match start(OsStr::new(env!("CARGO_BIN_EXE_obash"))).ended_within(EVENT_LIMIT) {
+			Ok(ours) => ours,
+			Err(killed) => {
+				wrong.push(format!("{script:?}\n  still running after {EVENT_LIMIT:?}: {killed:?}"));
+				continue;
+			},
+		};
+		let got = (String::from_utf8_lossy(&ours.stdout).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if have_zsh() {
+			let theirs = start(zsh_oracle::path().as_os_str()).end_within(EVENT_LIMIT, &script);
+			assert_eq!((&ours.stdout, ours.end()), (&theirs.stdout, theirs.end()), "{script:?}");
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// zsh names the line of a `( … )`'s `(` for its redirection error, as a
+/// pipeline stage, alone, as a job and in a substitution, and the line of a
+/// function's own count in a function; bash names its `)` line
+/// ([`bash_names_the_line_at_the_fork_for_a_compound_redirection_error`]).
+/// Checked-in goldens measured with zsh 5.9.
+#[test]
+fn zsh_names_the_line_of_a_subshells_open_paren_for_its_redirection_error() {
+	let bad = |at: &str| format!("{at}: 9: bad file descriptor\nend\n");
+	// A `{` of a script, kept out of a plain literal (one that reads as a
+	// format argument).
+	let brace = '{';
+	zsh_rows(vec![
+		(":\n( :\n:\n) 3>&9 | :\necho end".to_owned(), bad("zsh:3")),
+		(format!("f() {brace}\n:\n( :\n) 3>&9 | :\n}}\nf\necho end"), bad("f:2")),
+		(":\n( :\n) 3>&9\necho end".to_owned(), bad("zsh:3")),
+		(":\n( :\n) 3>&9 &\nwait\necho end".to_owned(), bad("zsh:3")),
+		("x=$(\n:\n( :\n) 3>&9\n)\necho end".to_owned(), bad("zsh:4")),
+		(format!(":\n{brace} :\n}} 3>&9 | :\necho end"), bad("zsh:3")),
+	]);
+}
+
+/// zsh deletes the job a `wait PID` waited for: a later operand naming it
+/// names no child (`pid N is not a child of this shell`, `%N: no such
+/// job`), 127; a pid operand that names no child leaves 127 for the
+/// command and a later pid operand of a job still running is not waited
+/// for (`bin_fg`; once the job has ended and left the table, zsh answers
+/// that pid from the statuses it keeps, so that row's job runs a second).
+/// obash waited for the deleted job without end. Checked-in goldens
+/// measured with zsh 5.9; the pid in a message is replaced by `P`.
+#[test]
+fn zsh_wait_names_no_child_for_a_job_it_waited_for() {
+	let msg = |job: &str, ops: &str| {
+		format!(
+			"{job} & p=$!; e=$(mktemp); wait {ops} 2>\"$e\"; echo a=$?; sed \"s/$p/P/\" \"$e\"; rm \
+			 -f \"$e\"\necho end"
+		)
+	};
+	let not_one = "a=127\nzsh:wait:2: pid 1 is not a child of this shell\nend\n";
+	zsh_rows(vec![
+		(
+			msg("(exit 3)", "$p $p"),
+			"a=127\nzsh:wait:2: pid P is not a child of this shell\nend\n".to_owned(),
+		),
+		(msg("(exit 3)", "$p %1"), "a=127\nzsh:wait:2: %1: no such job\nend\n".to_owned()),
+		(msg("/bin/sleep 1", "1 $p"), not_one.to_owned()),
+		(msg("(exit 3)", "$p 1"), not_one.to_owned()),
+	]);
 }
 
 /// bash forks a pipeline stage's or a job's simple command before it

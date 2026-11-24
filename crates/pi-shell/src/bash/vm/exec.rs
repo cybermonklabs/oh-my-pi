@@ -2076,6 +2076,143 @@ pub fn end_line(unit: &Unit, node: u32) -> u32 {
 	})
 }
 
+/// bash's line for the redirections of `( … )` `node` of the top frame's
+/// unit: the line its `)` closes on, which bash sets where it forks the
+/// subshell (`execute_command_internal`, `SET_LINE_NUMBER
+/// (command->value.Subshell->line)` before `make_child`), as a pipeline
+/// stage or a job too. A `( … )` bash runs without a fork of its own keeps
+/// the line it finds: the sole command of another `( … )` (`CMD_NO_FORK`,
+/// not under `!` or `time`) that of the `( … )` around it, and a coproc's
+/// command the fork's (`None`: [`super::killed::compound_fork_line`]).
+pub(super) fn subshell_line(vp: &Vproc, node: u32) -> Option<u32> {
+	let f = vp.frames.last()?;
+	let u = f.unit.as_deref()?;
+	let mut node = node;
+	loop {
+		match unforked(u, node) {
+			Unforked::No => break,
+			Unforked::Sole(outer) => node = outer,
+			Unforked::Coproc => return None,
+		}
+	}
+	let n = u.nodes.get(node as usize)?;
+	let close = close_paren(u, node)?;
+	let text = u.source.get(n.lo as usize..close)?;
+	#[expect(clippy::naive_bytecount, reason = "one command's text; no bytecount dependency")]
+	let lines = text.iter().filter(|&&c| c == b'\n').count();
+	let line = n.line + u32::try_from(lines).ok()?;
+	Some((u.line + line).saturating_sub(f.line_shift))
+}
+
+/// Whether bash forks `( … )` `node` itself ([`subshell_line`]).
+enum Unforked {
+	/// It does.
+	No,
+	/// It is the sole command of this `( … )`.
+	Sole(u32),
+	/// It is a coproc's command.
+	Coproc,
+}
+
+fn unforked(u: &Unit, node: u32) -> Unforked {
+	let src: &[u8] = &u.source;
+	let Some(n) = u.nodes.get(node as usize) else {
+		return Unforked::No;
+	};
+	let before = skip_back(src, n.lo as usize);
+	if before.checked_sub(1).and_then(|i| src.get(i)) == Some(&b'(') {
+		let open = u32::try_from(before - 1).unwrap_or(u32::MAX);
+		let outer = u
+			.nodes
+			.iter()
+			.position(|m| m.kind == NodeKind::Subshell && m.lo == open)
+			.and_then(|i| u32::try_from(i).ok());
+		return if let Some(outer) = outer
+			&& src.get(skip_fwd(src, n.hi as usize, false)) == Some(&b')')
+		{
+			Unforked::Sole(outer)
+		} else {
+			Unforked::No
+		};
+	}
+	// `coproc ( … )`, `coproc NAME ( … )`.
+	let (word, at) = word_before(src, before);
+	let (prev, _) = word_before(src, skip_back(src, at));
+	if word == b"coproc" || (!word.is_empty() && prev == b"coproc") {
+		Unforked::Coproc
+	} else {
+		Unforked::No
+	}
+}
+
+/// The byte of `( … )` `node`'s `)`: its last byte, else (redirections
+/// follow it, in the node too) the first `)` after the last syntax node of
+/// its body, which the ops between its `Redir` and `PopRedir` run.
+fn close_paren(u: &Unit, node: u32) -> Option<usize> {
+	let n = u.nodes.get(node as usize)?;
+	let redir = u
+		.ops
+		.iter()
+		.enumerate()
+		.find(|(_, op)| op.code == Opcode::Redir && op.node == node);
+	let at = if let Some((pc, op)) = redir {
+		let body = u.ops.get(pc + 1..op.b as usize)?;
+		let end = body
+			.iter()
+			.filter(|o| o.node != node)
+			.filter_map(|o| u.nodes.get(o.node as usize))
+			.filter(|m| m.lo > n.lo && m.hi <= n.hi)
+			.map(|m| m.hi)
+			.max()?;
+		skip_fwd(&u.source, end as usize, true)
+	} else {
+		(n.hi as usize).checked_sub(1)?
+	};
+	(u.source.get(at) == Some(&b')')).then_some(at)
+}
+
+/// `at`, moved back over blanks, newlines and backslash-newlines.
+const fn skip_back(src: &[u8], mut at: usize) -> usize {
+	while at > 0 {
+		match src[at - 1] {
+			b' ' | b'\t' => at -= 1,
+			b'\n' if at >= 2 && src[at - 2] == b'\\' => at -= 2,
+			b'\n' => at -= 1,
+			_ => break,
+		}
+	}
+	at
+}
+
+/// `at`, moved on over blanks, newlines, backslash-newlines, `;`, comments
+/// and, with `amp`, `&`: what can stand between a list's last command and
+/// the `)` that ends it.
+fn skip_fwd(src: &[u8], mut at: usize, amp: bool) -> usize {
+	while let Some(&c) = src.get(at) {
+		match c {
+			b' ' | b'\t' | b'\n' | b';' => at += 1,
+			b'&' if amp => at += 1,
+			b'\\' if src.get(at + 1) == Some(&b'\n') => at += 2,
+			b'#' => {
+				while src.get(at).is_some_and(|&c| c != b'\n') {
+					at += 1;
+				}
+			},
+			_ => break,
+		}
+	}
+	at
+}
+
+/// The word of name characters that ends at `at`, and where it begins.
+fn word_before(src: &[u8], at: usize) -> (&[u8], usize) {
+	let start = src[..at]
+		.iter()
+		.rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+		.map_or(0, |i| i + 1);
+	(&src[start..at], start)
+}
+
 /// The line bash reports for an error of a compound command (a failed
 /// redirection, a rejected function definition): in the base frame of a
 /// `( … )` child the subshell's last line ([`Frame::fork_line`]), else
@@ -3243,21 +3380,17 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Flow::Next
 		},
 		Opcode::Redir => {
-			// bash: a `( … )` takes its own line (the one its `)` closes on)
-			// before it forks, so its redirections name that line also as a
-			// pipeline stage or a job (`execute_command_internal`,
-			// `SET_LINE_NUMBER (command->value.Subshell->line)`, before
-			// `make_child`). Any other compound command's, in a fork's base
-			// frame, name the line bash had as it forked it, looked for only
-			// once a diagnostic or an expansion needs it.
-			let subshell = unit
-				.nodes
-				.get(op.node as usize)
-				.is_some_and(|n| n.kind == NodeKind::Subshell);
+			// A bash `( … )` names its own line ([`subshell_line`]); any
+			// other compound command's, in a fork's base frame, the line bash
+			// had as it forked it, and zsh's the line of its `(`. Each looked
+			// for only once a diagnostic or an expansion needs it.
+			let subshell = unit.mode.dialect() == Dialect::Bash
+				&& unit
+					.nodes
+					.get(op.node as usize)
+					.is_some_and(|n| n.kind == NodeKind::Subshell);
 			let line = if subshell {
-				redir::Line::at(
-					(unit.line + end_line(unit, op.node)).saturating_sub(top_frame(vp).line_shift),
-				)
+				redir::Line::subshell(op.node, compound_line(vp, line))
 			} else {
 				redir::Line::fork(op.node, compound_line(vp, line))
 			};
