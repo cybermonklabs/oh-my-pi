@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `rm -f` now ignores only an entry that is already gone, as GNU rm does, and reports every other error with exit status 1: a directory it cannot open or list (for want of a file descriptor, say) is named with that reason instead of being skipped and a directory above it reported as not empty, and an operand in a directory it may not search is reported instead of ignored. Without `-f` such an operand is reported with its own reason instead of "No such file or directory", and messages no longer end with ` (os error N)`
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
