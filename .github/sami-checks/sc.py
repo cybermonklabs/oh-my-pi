@@ -56,6 +56,9 @@ PLATFORMS = ("macos", "windows")
 PLATFORM_CRATES = "pi-shell"
 # Each platform's tests run in this many parallel legs, one nextest partition each (count:k/N).
 PLATFORM_PARTITIONS = 3
+# A failed platform test runs once more (nextest retries): one that then passes reads FLAKY, which
+# is a pass a flaky known-failure entry needs; with a single repeat a failure alone shows none.
+PLATFORM_RETRIES = 1
 # The clippy row: the crates the fork's hand-run clippy gate linted, one unit each.
 CLIPPY_CRATES = ("pi-shell", "pi-vcs", "pi-vfs", "pi-walker", "pi-builtins", "pi-natives")
 # The name of the unused import clippy.sh plants as the clippy row's control.
@@ -155,6 +158,7 @@ def cmd_plan():
         "platforms": ",".join(PLATFORMS),
         "platform_crates": PLATFORM_CRATES,
         "platform_partitions": PLATFORM_PARTITIONS,
+        "platform_retries": PLATFORM_RETRIES,
         "clippy_crates": " ".join(CLIPPY_CRATES),
     }
     for k, v in out.items():
@@ -627,9 +631,22 @@ def platform_results(pc_dir, commit):
         line = lines[0]
         mine = [t for t in tests if key(t)]
         # A failure is named as the JUnit report names the test (binary::test), so the known-failure
-        # list can name it; a verdict other than FAIL is added, so a timeout is another failure.
-        bad = [f"{t.get('binary')}::{t.get('test')}" + ("" if t.get("verdict") == "FAIL" else f" ({t.get('verdict')})")
-               for t in mine if t.get("verdict") != "PASS"]
+        # list can name it. A timeout, or a test with no verdict, gets its verdict after the name, so no
+        # entry makes it KNOWN. passed_once names the failures the run shows a pass for: a FLAKY test
+        # (it passed on a retry) or one that passed some repeats (n > 0 in n/N). Only those can a
+        # flaky entry make KNOWN; flaky names the FLAKY ones, which are failures, not passes.
+        bad, passed_once, flaky = [], [], []
+        for t in mine:
+            v = t.get("verdict")
+            if v == "PASS":
+                continue
+            name = f"{t.get('binary')}::{t.get('test')}" + ("" if v in ("FAIL", "FLAKY") else f" ({v})")
+            bad.append(name)
+            if v == "FLAKY":
+                flaky.append(name)
+            m = re.match(r"(\d+)/", t.get("passed") or "")
+            if v == "FLAKY" or (m and int(m.group(1)) > 0):
+                passed_once.append(name)
         times = []
         for _, d in legs.get(p, ()):
             try:
@@ -645,8 +662,9 @@ def platform_results(pc_dir, commit):
             status, note = "UNKNOWN", f"the verdict ({line}) and the report's test list disagree"
         if status == "UNKNOWN" and build_failure(p):
             note += "; " + build_failure(p)
-        out.append(result(p, unit, "runner", status, exit_code, secs, len(mine) - len(bad), len(bad),
-                          int(ign.group(1)) if ign else 0, bad, times, note))
+        r = result(p, unit, "runner", status, exit_code, secs, len(mine) - len(bad), len(bad),
+                   int(ign.group(1)) if ign else 0, bad, times, note)
+        out.append(dict(r, passed_once=passed_once, flaky=flaky))
     return out
 
 
@@ -727,6 +745,16 @@ def known_reason(known, row, who, unit, test):
     moves to another shard when a file is added before it). None when the list does not name it."""
     why = known.get((row, who, unit, test))
     return why if why is not None else known.get((row, who, "*", test))
+
+
+def known_for(known, row, r, f):
+    """known_reason for failure f of result r, except that a flaky entry (its reason starts
+    `flaky: `) names a failure only when r shows a pass for it: a result that lists its passed_once
+    failures (the platform rows) and does not list f failed every repeat and retry of the run."""
+    why = known_reason(known, row, r["who"], r["unit"], f)
+    if why is not None and why.startswith("flaky: ") and "passed_once" in r and f not in r["passed_once"]:
+        return None
+    return why
 
 
 def rust_literals(text):
@@ -966,7 +994,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                         r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
             # Known failures make a unit KNOWN only when nothing else is open: a test that skipped
             # itself here and passed as no other user makes it UNKNOWN.
-            if r["status"] == "FAIL" and r["failures"] and all(known_reason(known, key, r["who"], r["unit"], f) is not None for f in r["failures"]):
+            if r["status"] == "FAIL" and r["failures"] and all(known_for(known, key, r, f) is not None for f in r["failures"]):
                 if open_:
                     r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(open_)} test(s) skipped themselves here "
                                                        "and passed as no other user: " + ", ".join(open_[:12]))
@@ -993,9 +1021,15 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                why = known_reason(known, key, r["who"], r["unit"], f)
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
-                               + (f"KNOWN ({why})" if why is not None else "**NEW**"))
+                why = known_for(known, key, r, f)
+                if why is not None:
+                    said = f"KNOWN ({why})"
+                else:
+                    said = "**NEW**" + (" (flaky: it passed only on a retry)" if f in r.get("flaky", ()) else "")
+                    listed = known_reason(known, key, r["who"], r["unit"], f)
+                    if listed is not None:
+                        said += f" (it failed every repeat and retry, and its flaky entry needs a pass in the run: {listed})"
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {said}")
             for f in r.get("self_skipped", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
             for f, n, why in r.get("partial", []):
@@ -1429,6 +1463,40 @@ def selftest():
               open(os.path.join(res, "macos.json"), "w"))
     rc, out = summary()
     check("a platform timeout of a listed failure is NEW", ("| macOS: pi-shell, platform checks | **FAIL** |" in out, rc), (True, 1))
+    # A flaky entry makes a platform failure KNOWN only when the run shows a pass for the test (FLAKY:
+    # it passed on a retry, or n > 0 in n/N); failing every repeat reads NEW. A FLAKY test the list
+    # does not name is a NEW failure, reported as flaky. Through the report reader, as a run gives it.
+    def platform_run(name, line, verdict, passed):
+        os.makedirs(os.path.join(d, name, "pc-report"))
+        write(f"{name}/pc-report/summary.md", f"| what | commit |\n|---|---|\n| head | `{commit}` |\n")
+        write(f"{name}/pc-report/verdicts.tsv", f"platform\ttree\tuser\tverdict\nmacos\thead\tuser\t{line}\n")
+        write(f"{name}/pc-report/tests.tsv", "platform\ttree\tuser\tbinary\ttest\tverdict\tpassed\tflaky\tfailed\ttimed_out\tnot_run\n"
+              f"macos\thead\tuser\tpi-shell::zle_widgets_pty\ttransposes\t{verdict}\t{passed}\t0\t0\t0\t0\n"
+              "macos\thead\tuser\tpi-shell::zle_widgets_pty\tother\tPASS\t2/2\t0\t0\t0\t0\n")
+        r = {x["row"]: x for x in platform_results(os.path.join(d, name), commit)}["macos"]
+        json.dump(r, open(os.path.join(res, "macos.json"), "w"))
+        return summary()
+
+    t = "`pi-shell::zle_widgets_pty::transposes`"
+    flaky_entry = "macos\trunner\tpi-shell\tpi-shell::zle_widgets_pty::transposes\tflaky: fails 1 of 2 upstream\n"
+    open(known_file, "w").write(flaky_entry + "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = platform_run("pcf1", "FAIL (1 failed: x) run=2 ignored=0", "FAIL", "0/2")
+    check("a flaky entry on a platform test that failed every repeat is NEW",
+          (f"FAILED {t}: **NEW** (it failed every repeat and retry" in out, "| macOS: pi-shell, platform checks | **FAIL** |" in out, rc),
+          (True, True, 1))
+    rc, out = platform_run("pcf2", "FAIL (1 failed: x) run=2 ignored=0", "FAIL", "1/2")
+    check("a flaky entry on a platform test that passed one repeat is KNOWN",
+          (f"FAILED {t}: KNOWN (flaky: fails 1 of 2 upstream)" in out, "| macOS: pi-shell, platform checks | **KNOWN** |" in out, rc),
+          (True, True, 0))
+    rc, out = platform_run("pcf3", "FLAKY (1 passed only on a retry: x) run=2 ignored=0", "FLAKY", "1/1")
+    check("a flaky entry on a platform test that passed on its retry is KNOWN",
+          (f"FAILED {t}: KNOWN (flaky: fails 1 of 2 upstream)" in out, "| macOS: pi-shell, platform checks | **KNOWN** |" in out, rc),
+          (True, True, 0))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
+    rc, out = platform_run("pcf4", "FLAKY (1 passed only on a retry: x) run=2 ignored=0", "FLAKY", "1/1")
+    check("a platform test that passed only on its retry, with no entry, is NEW and flaky",
+          (f"FAILED {t}: **NEW** (flaky: it passed only on a retry)" in out, "| macOS: pi-shell, platform checks | **FAIL** |" in out, rc),
+          (True, True, 1))
     os.remove(os.path.join(res, "macos.json"))
     json.dump(result("macos", PLATFORM_CRATES, "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "macos.json"), "w"))
     open(known_file, "w").write("# none\n")

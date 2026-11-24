@@ -10,8 +10,10 @@
 # whose sorted index mod 10 is the shard's, so a file added before a test moves it to another shard.
 # One per line, tab-separated: <row> <user> <unit> <test> <reason>.
 # Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, macos, windows, clippy (sc.py
-# ROWS). A platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" or
-# " (FLAKY)" after it when that was its verdict; a clippy finding is "<file>: <message>".
+# ROWS). A platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" after
+# it when it ran past its time bound, which no entry makes KNOWN. A flaky entry makes a platform
+# failure KNOWN only when the run shows a pass for it (it passed on its retry, or in some repeat);
+# a test that passed only on its retry and has no entry is NEW. A clippy finding is "<file>: <message>".
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_autolist	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
